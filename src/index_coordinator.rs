@@ -1432,6 +1432,69 @@ mod tests {
         });
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn claimed_request_requeues_same_seq_after_input_alias_drift() {
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let source = workspace.path().join("a.js");
+        let manifest = workspace.path().join("package.json");
+        let alias = workspace.path().join("tsconfig.json");
+        fs::write(&source, "function before() {}\n").unwrap();
+        fs::write(&manifest, "{\"name\":\"before\"}\n").unwrap();
+        fs::hard_link(&manifest, &alias).unwrap();
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let options = IndexOptions::new(workspace.path().to_owned());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (prior, owner) = reconcile_workspace(&store, &options, &cancel, |_| {}).unwrap();
+        fs::write(&source, "function middle() {}\n").unwrap();
+        let request = store.enqueue_request(&options, None).unwrap();
+        let edited = Arc::new(AtomicBool::new(false));
+        let edited_hook = edited.clone();
+        let manifest_hook = fs::canonicalize(&manifest).unwrap();
+        let source_hook = source.clone();
+        let first = crate::capture::with_source_read_hook(
+            move |path, point| {
+                if path == manifest_hook
+                    && point == "alias"
+                    && !edited_hook.swap(true, Ordering::AcqRel)
+                {
+                    let replacement = manifest_hook.with_extension("replacement");
+                    fs::write(&replacement, "{\"name\":\"after\"}\n").unwrap();
+                    fs::rename(replacement, &manifest_hook).unwrap();
+                    fs::write(&source_hook, "function after() {}\n").unwrap();
+                }
+            },
+            || drain_requests_observed_with_native(&store, &owner, |_, _| {}, |_, _, _| {}),
+        )
+        .unwrap();
+        assert!(edited.load(Ordering::Acquire));
+        assert_eq!(first, 0);
+        assert_eq!(store.status().unwrap().revision, prior);
+        let pending = store.request_by_id(&request.id).unwrap().unwrap();
+        assert_eq!(pending.seq, request.seq);
+        assert_eq!(pending.state, "queued");
+        assert!(pending.error_code.is_none() && pending.claim_incarnation.is_none());
+        assert_eq!(
+            drain_requests_observed_with_native(&store, &owner, |_, _| {}, |_, _, _| {}).unwrap(),
+            1
+        );
+        let done = store.request_by_id(&request.id).unwrap().unwrap();
+        assert_eq!(done.seq, request.seq);
+        assert_eq!(done.state, "done");
+        let response = store.evidence_response().unwrap();
+        assert_eq!(
+            response
+                .source_at("a.js", done.revision)
+                .unwrap()
+                .unwrap()
+                .1
+                .text,
+            "function after() {}\n"
+        );
+        response.finish(()).unwrap();
+    }
+
     #[test]
     fn claimed_request_requeues_after_source_input_open_and_read_edits() {
         for phase in ["open", "read"] {

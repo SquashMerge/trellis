@@ -190,6 +190,13 @@ fn source_read_hook(path: &Path, phase: &str) {
     });
 }
 
+fn open_error(path: &Path, expected: &Stamp, error: std::io::Error) -> Result<Vec<u8>> {
+    if metadata(path)?.as_ref() != Some(expected) {
+        return Err(SourceInputDrift("input drift during open").into());
+    }
+    Err(error).with_context(|| format!("opening input: {}", path.display()))
+}
+
 fn regular_read(
     path: &Path,
     cap: u64,
@@ -213,12 +220,7 @@ fn regular_read(
     source_read_hook(path, "open");
     let mut file = match options.open(path) {
         Ok(file) => file,
-        Err(error) => {
-            if metadata(path)?.as_ref() != Some(expected) {
-                return Err(SourceInputDrift("input drift during open").into());
-            }
-            return Err(error).with_context(|| format!("opening input: {}", path.display()));
-        }
+        Err(error) => return open_error(path, expected, error),
     };
     let mut operations = operations;
     if let Some(counts) = operations.as_deref_mut() {
@@ -302,6 +304,8 @@ fn admit_input(
                 path.display()
             );
             if let Some(old_path) = key.and_then(|key| identities.get(&key)) {
+                #[cfg(test)]
+                source_read_hook(old_path, "alias");
                 if metadata(old_path)? != inputs[old_path] {
                     return Err(SourceInputDrift("input alias drift").into());
                 }
@@ -1070,6 +1074,118 @@ mod tests {
     use super::*;
     use std::sync::{Arc, atomic::AtomicBool};
     #[test]
+    fn input_inventory_drift_is_typed_without_source_inventory_change() {
+        let workspace = tempfile::tempdir().unwrap();
+        let exe = tempfile::tempdir().unwrap();
+        let binary = exe.path().join("extractor");
+        fs::write(&binary, b"binary").unwrap();
+        fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
+        let manifest = workspace.path().join("package.json");
+        fs::write(&manifest, "{\"name\":\"before\"}\n").unwrap();
+        let options = IndexOptions::new(workspace.path().to_owned());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let changed = AtomicBool::new(false);
+        let error = Capture::admit_with_executable(
+            &options,
+            &cancel,
+            &|progress| {
+                if progress.phase == "scan" && !changed.swap(true, Ordering::AcqRel) {
+                    fs::write(&manifest, "{\"name\":\"after\"}\n").unwrap();
+                }
+            },
+            binary,
+        )
+        .err()
+        .unwrap();
+        assert!(changed.load(Ordering::Acquire));
+        assert_eq!(
+            error.downcast_ref::<SourceInputDrift>().unwrap().0,
+            "input inventory drift"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn input_alias_drift_is_typed() {
+        let workspace = tempfile::tempdir().unwrap();
+        let exe = tempfile::tempdir().unwrap();
+        let binary = exe.path().join("extractor");
+        fs::write(&binary, b"binary").unwrap();
+        fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
+        let manifest = workspace.path().join("package.json");
+        fs::write(&manifest, "{\"name\":\"before\"}\n").unwrap();
+        fs::hard_link(&manifest, workspace.path().join("tsconfig.json")).unwrap();
+        let canonical = fs::canonicalize(&manifest).unwrap();
+        let options = IndexOptions::new(workspace.path().to_owned());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let error = with_source_read_hook(
+            move |path, phase| {
+                if path == canonical && phase == "alias" {
+                    let replacement = canonical.with_extension("replacement");
+                    fs::write(&replacement, "{\"name\":\"after\"}\n").unwrap();
+                    fs::rename(replacement, &canonical).unwrap();
+                }
+            },
+            || Capture::admit_with_executable(&options, &cancel, &|_| {}, binary),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(
+            error.downcast_ref::<SourceInputDrift>().unwrap().0,
+            "input alias drift"
+        );
+    }
+
+    #[test]
+    fn same_stat_input_bytes_mismatch_is_typed_contents_drift() {
+        let workspace = tempfile::tempdir().unwrap();
+        let exe = tempfile::tempdir().unwrap();
+        let binary = exe.path().join("extractor");
+        fs::write(&binary, b"binary").unwrap();
+        fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
+        let manifest = workspace.path().join("package.json");
+        fs::write(&manifest, "{\"name\":\"same\"}\n").unwrap();
+        let options = IndexOptions::new(workspace.path().to_owned());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut capture =
+            Capture::admit_with_executable(&options, &cancel, &|_| {}, binary).unwrap();
+        let key = fs::canonicalize(workspace.path())
+            .unwrap()
+            .join("package.json");
+        capture
+            .input_bytes
+            .insert(key, Some(Arc::from(b"different cached bytes".as_slice())));
+        let error = capture.verify(&cancel).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<SourceInputDrift>().unwrap().0,
+            "input contents drift"
+        );
+    }
+
+    #[test]
+    fn genuine_open_error_with_unchanged_input_stamp_is_not_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("package.json");
+        fs::write(&path, "{}\n").unwrap();
+        let expected = metadata(&path).unwrap().unwrap();
+        let error = open_error(
+            &path,
+            &expected,
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        )
+        .unwrap_err();
+        assert!(error.downcast_ref::<SourceInputDrift>().is_none());
+        assert_eq!(
+            error
+                .root_cause()
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
     fn pinned_executable_keeps_running_inode_after_path_replacement() {
         let dir = tempfile::tempdir().unwrap();
         let live = dir.path().join("native-bin");
@@ -1093,9 +1209,11 @@ mod tests {
         let image =
             RunningExecutable::from_file(path.clone(), fs::File::open(&path).unwrap()).unwrap();
         fs::write(&path, b"new larger executable binary").unwrap();
+        let error = image.verify_stat().unwrap_err();
+        assert!(error.downcast_ref::<SourceInputDrift>().is_none());
         assert!(
-            image.verify_stat().is_err(),
-            "changing the pinned inode must fail its stat check"
+            error.to_string().contains("executable"),
+            "changing the pinned inode must fail its stat check: {error:#}"
         );
     }
     #[test]
