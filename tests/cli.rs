@@ -1,3 +1,4 @@
+#![cfg(feature = "test-support")]
 use serde_json::Value;
 use std::{fs, process::Command};
 use tempfile::TempDir;

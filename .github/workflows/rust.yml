@@ -42,6 +42,7 @@ jobs:
         run: node tests/browser/node_modules/playwright/cli.js install chromium
         env:
           PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/pw-browsers
+      # verify builds default targets and a separate feature-enabled binary/test lane.
       - run: ./tools/verify
         env:
           PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/pw-browsers

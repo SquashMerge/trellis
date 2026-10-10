@@ -1,3 +1,4 @@
+#![cfg(feature = "test-support")]
 //! Real-process MCP socket ownership, framing, and interrupted-session checks.
 use serde_json::{Value, json};
 use std::{

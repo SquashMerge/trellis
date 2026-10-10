@@ -317,6 +317,7 @@ impl CheckoutRegistry {
             pre_h_hook: std::sync::Mutex::new(None),
             release_permit_fault: AtomicBool::new(false),
         });
+        #[cfg(feature = "test-support")]
         if let Some(reporter) = super::causal_witness::CausalWitness::from_env(key.to_owned()) {
             runtime
                 .resources()?

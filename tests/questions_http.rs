@@ -1,3 +1,4 @@
+#![cfg(feature = "test-support")]
 //! HTTP protocol fixtures are offline; synthetic responses are not model quality evidence.
 mod common;
 use axum::{

@@ -1,3 +1,4 @@
+#![cfg(feature = "test-support")]
 //! Real executable coverage for the user-level socket and provisioned browser.
 //! Selected-workspace HTTP routes remain covered separately by the legacy router;
 //! this control-plane test does not assert that those routes are served by the daemon.

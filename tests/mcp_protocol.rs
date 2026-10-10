@@ -1,3 +1,4 @@
+#![cfg(feature = "test-support")]
 //! Executable stdio contract checks. Requests wait for replies; no timing-dependent queue hooks.
 use serde_json::{Value, json};
 use std::{
