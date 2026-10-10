@@ -903,18 +903,42 @@ impl Store {
         Ok(row)
     }
     pub fn current_request(&self) -> Result<Option<Request>> {
-        let Some((_guard, db)) = self.existing_request_connection()? else {
-            return Ok(None);
-        };
-        let row = db
-            .query_row(
-                &format!("SELECT {COLUMNS} FROM requests WHERE root_device=?1 AND root_inode=?2 ORDER BY seq DESC LIMIT 1"),
-                params![self.identity.device.to_string(), self.identity.inode.to_string()],
-                read,
-            )
-            .optional()?;
-        self.verify_request_root(&row)?;
-        Ok(row)
+        self.current_request_with_retry(std::time::Duration::from_secs(3), || {})
+    }
+
+    fn current_request_with_retry(
+        &self,
+        budget: std::time::Duration,
+        mut on_busy: impl FnMut(),
+    ) -> Result<Option<Request>> {
+        let deadline = std::time::Instant::now() + budget;
+        loop {
+            let attempt = (|| {
+                let Some((_guard, db)) = self
+                    .existing_request_connection()
+                    .map_err(settlement_open_error)?
+                else {
+                    return Ok(None);
+                };
+                let row = super::storage_result(db.query_row(
+                    &format!("SELECT {COLUMNS} FROM requests WHERE root_device=?1 AND root_inode=?2 ORDER BY seq DESC LIMIT 1"),
+                    params![self.identity.device.to_string(), self.identity.inode.to_string()],
+                    read,
+                ).optional())?;
+                self.verify_request_root(&row)?;
+                Ok(row)
+            })();
+            match attempt {
+                Err(ref error)
+                    if super::transient_storage_contention(error)
+                        && std::time::Instant::now() < deadline =>
+                {
+                    on_busy();
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                result => return result,
+            }
+        }
     }
     fn verify_request_root(&self, row: &Option<Request>) -> Result<()> {
         self.identity.verify()?;
@@ -1758,6 +1782,73 @@ mod foreign_root_settlement_tests {
             ),
             (accepted.id, accepted.seq, "failed", Some("root_changed"))
         );
+    }
+
+    #[test]
+    fn current_request_waits_for_existing_queue_initialization_without_creating_schema() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let state = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+        let path = store.request_db_path();
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        let mut attempts = 0;
+        let row = store
+            .current_request_with_retry(std::time::Duration::from_secs(3), || {
+                attempts += 1;
+                let db = Connection::open(&path).unwrap();
+                db.execute_batch(SCHEMA).unwrap();
+                db.execute(
+                    "INSERT INTO queue_identity VALUES (1,?1,?2)",
+                    params![store.workspace_root, store.identity.root_key],
+                )
+                .unwrap();
+            })
+            .unwrap();
+        assert!(row.is_none());
+        assert_eq!(attempts, 1);
+        assert!(store.current_request().unwrap().is_none());
+    }
+
+    #[test]
+    fn current_request_initialization_deadline_is_typed_and_does_not_initialize() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let state = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+        let path = store.request_db_path();
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        let error = store
+            .current_request_with_retry(std::time::Duration::ZERO, || {
+                panic!("no retry after deadline")
+            })
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "storage_busy: requests.db initialization in progress"
+        );
+        let db = Connection::open(&path).unwrap();
+        assert_eq!(
+            db.pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
+                .unwrap(),
+            0
+        );
+        let objects: i64 = db
+            .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(objects, 0);
     }
 
     #[test]
