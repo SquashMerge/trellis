@@ -159,6 +159,44 @@ pub struct SourceOperations {
     pub hashes: usize,
 }
 
+#[cfg(test)]
+type SourceReadHook = Box<dyn Fn(&Path, &str)>;
+#[cfg(test)]
+thread_local! {
+    static SOURCE_READ_HOOK: std::cell::RefCell<Option<SourceReadHook>> =
+        std::cell::RefCell::new(None);
+}
+#[cfg(test)]
+pub(crate) fn with_source_read_hook<T>(
+    hook: impl Fn(&Path, &str) + 'static,
+    run: impl FnOnce() -> T,
+) -> T {
+    SOURCE_READ_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            SOURCE_READ_HOOK.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+    let _reset = Reset;
+    run()
+}
+#[cfg(test)]
+fn source_read_hook(path: &Path, phase: &str) {
+    SOURCE_READ_HOOK.with(|hook| {
+        if let Some(callback) = hook.borrow().as_ref() {
+            callback(path, phase);
+        }
+    });
+}
+
+fn open_error(path: &Path, expected: &Stamp, error: std::io::Error) -> Result<Vec<u8>> {
+    if metadata(path)?.as_ref() != Some(expected) {
+        return Err(SourceInputDrift("input drift during open").into());
+    }
+    Err(error).with_context(|| format!("opening input: {}", path.display()))
+}
+
 fn regular_read(
     path: &Path,
     cap: u64,
@@ -178,26 +216,39 @@ fn regular_read(
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
-    let mut file = options
-        .open(path)
-        .with_context(|| format!("opening input: {}", path.display()))?;
+    #[cfg(test)]
+    source_read_hook(path, "open");
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) => return open_error(path, expected, error),
+    };
     let mut operations = operations;
     if let Some(counts) = operations.as_deref_mut() {
         counts.opens += 1;
     }
-    ensure!(
-        stamp(&file.metadata()?) == *expected,
-        "input drift during open: {}",
-        path.display()
-    );
+    if stamp(&file.metadata()?) != *expected {
+        return Err(SourceInputDrift("input drift during open").into());
+    }
     let mut bytes = Vec::new();
     let mut buffer = [0u8; 65536];
     loop {
         check(cancel)?;
-        let n = file.read(&mut buffer)?;
+        let n = match file.read(&mut buffer) {
+            Ok(n) => n,
+            Err(error) => {
+                if metadata(path)?.as_ref() != Some(expected)
+                    || stamp(&file.metadata()?) != *expected
+                {
+                    return Err(SourceInputDrift("input drift during read").into());
+                }
+                return Err(error).with_context(|| format!("reading input: {}", path.display()));
+            }
+        };
         if n == 0 {
             break;
         }
+        #[cfg(test)]
+        source_read_hook(path, "read");
         ensure!(
             (bytes.len() as u64) + (n as u64) <= cap,
             "input exceeded byte limit: {}",
@@ -205,16 +256,12 @@ fn regular_read(
         );
         bytes.extend_from_slice(&buffer[..n]);
     }
-    ensure!(
-        bytes.len() as u64 == expected.len && stamp(&file.metadata()?) == *expected,
-        "input drift during read: {}",
-        path.display()
-    );
-    ensure!(
-        metadata(path)?.as_ref() == Some(expected),
-        "input replaced during read: {}",
-        path.display()
-    );
+    if bytes.len() as u64 != expected.len || stamp(&file.metadata()?) != *expected {
+        return Err(SourceInputDrift("input drift during read").into());
+    }
+    if metadata(path)?.as_ref() != Some(expected) {
+        return Err(SourceInputDrift("input replaced during read").into());
+    }
     if let Some(counts) = operations {
         counts.complete_reads += 1;
     }
@@ -257,11 +304,11 @@ fn admit_input(
                 path.display()
             );
             if let Some(old_path) = key.and_then(|key| identities.get(&key)) {
-                ensure!(
-                    metadata(old_path)? == inputs[old_path],
-                    "input alias drift: {}",
-                    old_path.display()
-                );
+                #[cfg(test)]
+                source_read_hook(old_path, "alias");
+                if metadata(old_path)? != inputs[old_path] {
+                    return Err(SourceInputDrift("input alias drift").into());
+                }
                 input_bytes
                     .get(old_path)
                     .cloned()
@@ -495,6 +542,15 @@ fn running_executable() -> Result<Arc<RunningExecutable>> {
         .map(Arc::clone)
         .map_err(|message| anyhow::anyhow!(message.clone()))
 }
+
+#[derive(Debug)]
+pub(crate) struct SourceInputDrift(pub(crate) &'static str);
+impl std::fmt::Display for SourceInputDrift {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+impl std::error::Error for SourceInputDrift {}
 
 /// A changed source inventory invalidates only this captured snapshot. A FIFO
 /// owner may retry the same accepted row after proving no publication committed.
@@ -776,21 +832,17 @@ impl Capture {
                 image.verify_stat()?;
                 continue;
             }
-            ensure!(
-                &metadata(path)? == expected,
-                "input inventory drift: {}",
-                path.display()
-            );
+            if &metadata(path)? != expected {
+                return Err(SourceInputDrift("input inventory drift").into());
+            }
             // Relevant config, manifest, ignore and toolchain bytes can change
             // while a filesystem reports an unchanged stat. Do not infer their
             // equality from timestamps at the publication cutoff.
             if let Some(state) = expected {
                 let now = regular_read(path, self.input_cap(path), state, cancel, None)?;
-                ensure!(
-                    self.input_bytes.get(path).and_then(Option::as_deref) == Some(now.as_slice()),
-                    "input contents drift: {}",
-                    path.display()
-                );
+                if self.input_bytes.get(path).and_then(Option::as_deref) != Some(now.as_slice()) {
+                    return Err(SourceInputDrift("input contents drift").into());
+                }
             }
         }
         check(cancel)?;
@@ -1022,6 +1074,118 @@ mod tests {
     use super::*;
     use std::sync::{Arc, atomic::AtomicBool};
     #[test]
+    fn input_inventory_drift_is_typed_without_source_inventory_change() {
+        let workspace = tempfile::tempdir().unwrap();
+        let exe = tempfile::tempdir().unwrap();
+        let binary = exe.path().join("extractor");
+        fs::write(&binary, b"binary").unwrap();
+        fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
+        let manifest = workspace.path().join("package.json");
+        fs::write(&manifest, "{\"name\":\"before\"}\n").unwrap();
+        let options = IndexOptions::new(workspace.path().to_owned());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let changed = AtomicBool::new(false);
+        let error = Capture::admit_with_executable(
+            &options,
+            &cancel,
+            &|progress| {
+                if progress.phase == "scan" && !changed.swap(true, Ordering::AcqRel) {
+                    fs::write(&manifest, "{\"name\":\"after\"}\n").unwrap();
+                }
+            },
+            binary,
+        )
+        .err()
+        .unwrap();
+        assert!(changed.load(Ordering::Acquire));
+        assert_eq!(
+            error.downcast_ref::<SourceInputDrift>().unwrap().0,
+            "input inventory drift"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn input_alias_drift_is_typed() {
+        let workspace = tempfile::tempdir().unwrap();
+        let exe = tempfile::tempdir().unwrap();
+        let binary = exe.path().join("extractor");
+        fs::write(&binary, b"binary").unwrap();
+        fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
+        let manifest = workspace.path().join("package.json");
+        fs::write(&manifest, "{\"name\":\"before\"}\n").unwrap();
+        fs::hard_link(&manifest, workspace.path().join("tsconfig.json")).unwrap();
+        let canonical = fs::canonicalize(&manifest).unwrap();
+        let options = IndexOptions::new(workspace.path().to_owned());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let error = with_source_read_hook(
+            move |path, phase| {
+                if path == canonical && phase == "alias" {
+                    let replacement = canonical.with_extension("replacement");
+                    fs::write(&replacement, "{\"name\":\"after\"}\n").unwrap();
+                    fs::rename(replacement, &canonical).unwrap();
+                }
+            },
+            || Capture::admit_with_executable(&options, &cancel, &|_| {}, binary),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(
+            error.downcast_ref::<SourceInputDrift>().unwrap().0,
+            "input alias drift"
+        );
+    }
+
+    #[test]
+    fn same_stat_input_bytes_mismatch_is_typed_contents_drift() {
+        let workspace = tempfile::tempdir().unwrap();
+        let exe = tempfile::tempdir().unwrap();
+        let binary = exe.path().join("extractor");
+        fs::write(&binary, b"binary").unwrap();
+        fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
+        let manifest = workspace.path().join("package.json");
+        fs::write(&manifest, "{\"name\":\"same\"}\n").unwrap();
+        let options = IndexOptions::new(workspace.path().to_owned());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut capture =
+            Capture::admit_with_executable(&options, &cancel, &|_| {}, binary).unwrap();
+        let key = fs::canonicalize(workspace.path())
+            .unwrap()
+            .join("package.json");
+        capture
+            .input_bytes
+            .insert(key, Some(Arc::from(b"different cached bytes".as_slice())));
+        let error = capture.verify(&cancel).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<SourceInputDrift>().unwrap().0,
+            "input contents drift"
+        );
+    }
+
+    #[test]
+    fn genuine_open_error_with_unchanged_input_stamp_is_not_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("package.json");
+        fs::write(&path, "{}\n").unwrap();
+        let expected = metadata(&path).unwrap().unwrap();
+        let error = open_error(
+            &path,
+            &expected,
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        )
+        .unwrap_err();
+        assert!(error.downcast_ref::<SourceInputDrift>().is_none());
+        assert_eq!(
+            error
+                .root_cause()
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
     fn pinned_executable_keeps_running_inode_after_path_replacement() {
         let dir = tempfile::tempdir().unwrap();
         let live = dir.path().join("native-bin");
@@ -1045,9 +1209,11 @@ mod tests {
         let image =
             RunningExecutable::from_file(path.clone(), fs::File::open(&path).unwrap()).unwrap();
         fs::write(&path, b"new larger executable binary").unwrap();
+        let error = image.verify_stat().unwrap_err();
+        assert!(error.downcast_ref::<SourceInputDrift>().is_none());
         assert!(
-            image.verify_stat().is_err(),
-            "changing the pinned inode must fail its stat check"
+            error.to_string().contains("executable"),
+            "changing the pinned inode must fail its stat check: {error:#}"
         );
     }
     #[test]
