@@ -132,7 +132,7 @@ fn initialization_lock(_: &Path) -> Result<std::fs::File> {
     anyhow::bail!("private ledger requires Unix")
 }
 impl LiveJev {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "test-support"))]
     pub(crate) fn with_test_endpoint(mut self, endpoint: String) -> Self {
         let url = reqwest::Url::parse(&endpoint).unwrap();
         assert_eq!(url.scheme(), "http");

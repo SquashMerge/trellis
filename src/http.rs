@@ -1,4 +1,8 @@
 //! Loopback-only HTTP API. Database and indexing work runs on blocking workers.
+#[cfg(feature = "test-support")]
+use crate::planning::FocusedView;
+#[cfg(feature = "test-support")]
+use crate::store::{EvidenceFence, EvidenceFencePolicy};
 use crate::{
     acp::Acp,
     auth::valid_token,
@@ -7,20 +11,23 @@ use crate::{
     jev,
     live_jev::LiveJev,
     model::*,
-    planning::{
-        self, FocusedView, QuestionPacket, QuestionPreview, QuestionRequest, SelectionEnvelope,
-    },
-    store::{EvidenceFence, EvidenceFencePolicy, Store},
+    planning::{self, QuestionPacket, QuestionPreview, QuestionRequest, SelectionEnvelope},
+    store::Store,
 };
 use anyhow::Context;
 use axum::{
     Json, Router,
     body::{Body, Bytes, to_bytes},
-    extract::{DefaultBodyLimit, Path, Query, Request, State},
+    extract::{Path, Query, Request, State},
     http::{StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, post, put},
+    routing::get,
+};
+#[cfg(feature = "test-support")]
+use axum::{
+    extract::DefaultBodyLimit,
+    routing::{post, put},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -216,14 +223,17 @@ pub struct DaemonState {
     rust_sources: Vec<crate::rust_sources::Root>,
     dependency_options: Option<CatalogOptions>,
     dependencies: Mutex<DependencyIndex>,
-    #[cfg(test)]
+    #[cfg(all(test, feature = "test-support"))]
     dependency_capture_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
-    #[cfg(test)]
+    #[cfg(all(test, feature = "test-support"))]
     outer_fence_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
-    #[cfg(test)]
+    #[cfg(all(test, feature = "test-support"))]
     preview_finish_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(feature = "test-support")]
     token: String,
+    #[cfg(feature = "test-support")]
     hosts: Vec<String>,
+    #[cfg(feature = "test-support")]
     origins: Vec<String>,
     jobs: Mutex<Jobs>,
     queue_tick_started: AtomicBool,
@@ -361,7 +371,9 @@ pub fn new_with_dependency_options(
         "daemon requires a bound loopback address"
     );
     anyhow::ensure!(valid_token(&token), "invalid bearer token");
+    #[cfg(feature = "test-support")]
     let hosts = vec![address.to_string(), format!("localhost:{}", address.port())];
+    #[cfg(feature = "test-support")]
     let origins = hosts.iter().map(|h| format!("http://{h}")).collect();
     Ok(Arc::new(DaemonState {
         store,
@@ -383,15 +395,18 @@ pub fn new_with_dependency_options(
             catalog: None,
             warnings: Vec::new(),
         }),
-        #[cfg(test)]
+        #[cfg(all(test, feature = "test-support"))]
         dependency_capture_hook: Mutex::new(None),
-        #[cfg(test)]
+        #[cfg(all(test, feature = "test-support"))]
         outer_fence_hook: Mutex::new(None),
-        #[cfg(test)]
+        #[cfg(all(test, feature = "test-support"))]
         preview_finish_hook: Mutex::new(None),
         dependency_options: catalog_options,
+        #[cfg(feature = "test-support")]
         token,
+        #[cfg(feature = "test-support")]
         hosts,
+        #[cfg(feature = "test-support")]
         origins,
         provider: jev,
         acp,
@@ -1817,6 +1832,7 @@ async fn db<T: Send + 'static>(
         })?
         .map_err(Into::into)
 }
+#[cfg(feature = "test-support")]
 async fn guard(State(s): State<Arc<DaemonState>>, req: Request, next: Next) -> Response {
     guard_common(&s.token, &s.hosts, &s.origins, req, next).await
 }
@@ -1891,6 +1907,7 @@ async fn guard_common(
         .insert(header::X_CONTENT_TYPE_OPTIONS, "nosniff".parse().unwrap());
     response
 }
+#[cfg(feature = "test-support")]
 pub fn router(state: Arc<DaemonState>) -> Router {
     Router::new()
         .route(
@@ -2079,6 +2096,7 @@ pub fn router(state: Arc<DaemonState>) -> Router {
 }
 // Only endpoints that include a native snapshot need this outer response fence.
 // Durable records and external-source-only routes keep their independent policy.
+#[cfg(feature = "test-support")]
 fn native_response_route(path: &str) -> bool {
     matches!(
         path,
@@ -2100,6 +2118,7 @@ fn native_response_route(path: &str) -> bool {
             | "/api/rust-sources/tree"
     )
 }
+#[cfg(feature = "test-support")]
 async fn evidence_response_guard(
     State(state): State<Arc<DaemonState>>,
     request: Request,
@@ -2144,6 +2163,7 @@ fn dependency_stale() -> ApiError {
         "Dependency catalog or source changed; refresh the catalog",
     )
 }
+#[cfg(feature = "test-support")]
 async fn dependency_work<T: Send + 'static>(
     f: impl FnOnce() -> Result<T, ApiError> + Send + 'static,
 ) -> Result<T, ApiError> {
@@ -2156,12 +2176,14 @@ async fn dependency_work<T: Send + 'static>(
     })?
 }
 impl DaemonState {
+    #[cfg(feature = "test-support")]
     fn requested_catalog(&self, id: &str) -> Result<Arc<Catalog>, ApiError> {
         let revision = self.store.status()?.revision;
         self.catalog_snapshot(revision)
             .filter(|catalog| catalog.id == id)
             .ok_or_else(dependency_stale)
     }
+    #[cfg(feature = "test-support")]
     fn check_catalog(&self, catalog: &Arc<Catalog>) -> Result<(), ApiError> {
         let current = self.requested_catalog(&catalog.id)?;
         if !Arc::ptr_eq(&current, catalog) {
@@ -2170,9 +2192,11 @@ impl DaemonState {
         Ok(())
     }
 }
+#[cfg(feature = "test-support")]
 async fn dependency_status(State(s): State<Arc<DaemonState>>) -> Result<Response, ApiError> {
     dependency_work(move || dependency_status_response(&s, || {}).map_err(ApiError::from)).await
 }
+#[cfg(feature = "test-support")]
 fn dependency_status_response(
     s: &DaemonState,
     after_capture: impl FnOnce(),
@@ -2207,6 +2231,7 @@ fn dependency_status_response(
     let result = Json(payload).into_response();
     response.finish(result)
 }
+#[cfg(feature = "test-support")]
 async fn dependency_refresh(
     State(s): State<Arc<DaemonState>>,
     body: Bytes,
@@ -2247,6 +2272,7 @@ struct DependencySymbolsQuery {
 fn dependency_limit() -> usize {
     100
 }
+#[cfg(feature = "test-support")]
 async fn dependency_symbols(
     State(s): State<Arc<DaemonState>>,
     query: Result<Query<DependencySymbolsQuery>, axum::extract::rejection::QueryRejection>,
@@ -2299,6 +2325,7 @@ struct DependencySourceQuery {
     catalog_id: String,
     source_ref: String,
 }
+#[cfg(feature = "test-support")]
 async fn dependency_source(
     State(s): State<Arc<DaemonState>>,
     query: Result<Query<DependencySourceQuery>, axum::extract::rejection::QueryRejection>,
@@ -2331,6 +2358,7 @@ async fn dependency_source(
     }).await
 }
 
+#[cfg(feature = "test-support")]
 async fn rust_source_roots(State(s): State<Arc<DaemonState>>) -> Json<Value> {
     Json(
         json!({"roots": s.rust_sources.iter().map(|r| json!({"id": r.label, "label": r.label, "path": r.directory.root.to_string_lossy()})).collect::<Vec<_>>()}),
@@ -2382,6 +2410,7 @@ fn rust_source_error(e: std::io::Error) -> ApiError {
         ),
     }
 }
+#[cfg(feature = "test-support")]
 async fn rust_source_tree(
     State(s): State<Arc<DaemonState>>,
     query: Result<Query<RustTreeQuery>, axum::extract::rejection::QueryRejection>,
@@ -2423,6 +2452,7 @@ async fn rust_source_tree(
         )
     })?
 }
+#[cfg(feature = "test-support")]
 async fn rust_source_file(
     State(s): State<Arc<DaemonState>>,
     query: Result<Query<RustFileQuery>, axum::extract::rejection::QueryRejection>,
@@ -2497,6 +2527,7 @@ fn browse_directory_error(e: &std::io::Error) -> ApiError {
     }
 }
 
+#[cfg(feature = "test-support")]
 async fn tree(
     State(s): State<Arc<DaemonState>>,
     query: Result<Query<TreeQuery>, axum::extract::rejection::QueryRejection>,
@@ -2595,6 +2626,7 @@ fn browse_invalid() -> ApiError {
         "Invalid browse or sequence request",
     )
 }
+#[cfg(feature = "test-support")]
 async fn files(
     State(s): State<Arc<DaemonState>>,
     query: Result<Query<FilesQuery>, axum::extract::rejection::QueryRejection>,
@@ -2608,6 +2640,7 @@ async fn files(
         db(s, move |s| s.files_at(pin, q.offset, q.limit)).await?,
     ))
 }
+#[cfg(feature = "test-support")]
 async fn methods(
     State(s): State<Arc<DaemonState>>,
     query: Result<Query<SourceQuery>, axum::extract::rejection::QueryRejection>,
@@ -2637,6 +2670,7 @@ struct SequenceRequest {
     #[serde(default)]
     show_all: bool,
 }
+#[cfg(feature = "test-support")]
 async fn sequence(
     State(s): State<Arc<DaemonState>>,
     body: Bytes,
@@ -2696,6 +2730,7 @@ struct ClassesQuery {
 fn class_limit() -> usize {
     100
 }
+#[cfg(feature = "test-support")]
 async fn classes(
     State(s): State<Arc<DaemonState>>,
     query: Result<Query<ClassesQuery>, axum::extract::rejection::QueryRejection>,
@@ -2709,6 +2744,7 @@ async fn classes(
         .await?,
     ))
 }
+#[cfg(feature = "test-support")]
 async fn navigation(
     State(s): State<Arc<DaemonState>>,
     body: Bytes,
@@ -2722,6 +2758,7 @@ async fn navigation(
     Ok(Json(db(s, move |s| s.navigation_at(&request)).await?))
 }
 
+#[cfg(feature = "test-support")]
 async fn class_diagram(
     State(s): State<Arc<DaemonState>>,
     body: Bytes,
@@ -2732,6 +2769,7 @@ async fn class_diagram(
     Ok(Json(db(s, move |s| s.class_diagram_at(&request)).await?))
 }
 
+#[cfg(feature = "test-support")]
 async fn status(
     State(s): State<Arc<DaemonState>>,
     uri: axum::http::Uri,
@@ -3075,6 +3113,7 @@ struct SymbolsQuery {
 fn limit() -> usize {
     50
 }
+#[cfg(feature = "test-support")]
 async fn symbols(
     State(s): State<Arc<DaemonState>>,
     Query(q): Query<SymbolsQuery>,
@@ -3092,6 +3131,7 @@ struct SymbolQuery {
     #[serde(flatten)]
     pin: PinQuery,
 }
+#[cfg(feature = "test-support")]
 async fn symbol(
     State(s): State<Arc<DaemonState>>,
     Query(q): Query<SymbolQuery>,
@@ -3112,6 +3152,7 @@ struct SourceQuery {
     #[serde(flatten)]
     pin: PinQuery,
 }
+#[cfg(feature = "test-support")]
 async fn source(
     State(s): State<Arc<DaemonState>>,
     Query(q): Query<SourceQuery>,
@@ -3131,6 +3172,7 @@ async fn source(
         .ok_or_else(missing)?;
     Ok(Json(json!({"revision":revision,"file":file})))
 }
+#[cfg(feature = "test-support")]
 async fn query(
     State(s): State<Arc<DaemonState>>,
     pin: Result<Query<PinQuery>, axum::extract::rejection::QueryRejection>,
@@ -3146,6 +3188,7 @@ async fn query(
             .ok_or_else(missing)?,
     ))
 }
+#[cfg(feature = "test-support")]
 async fn views(
     State(s): State<Arc<DaemonState>>,
     pin: Result<Query<PinQuery>, axum::extract::rejection::QueryRejection>,
@@ -3154,6 +3197,7 @@ async fn views(
     let expected = pin.pin()?;
     Ok(Json(db(s, move |s| s.saved_views_at(expected)).await?))
 }
+#[cfg(feature = "test-support")]
 async fn view(
     State(s): State<Arc<DaemonState>>,
     Path(id): Path<String>,
@@ -3168,6 +3212,7 @@ async fn view(
             .ok_or_else(missing)?,
     ))
 }
+#[cfg(feature = "test-support")]
 async fn save_view(
     State(s): State<Arc<DaemonState>>,
     Path(id): Path<String>,
@@ -3183,6 +3228,7 @@ async fn save_view(
     v.validate().map_err(|_| invalid())?;
     Ok(Json(db(s, move |s| s.save_view_at(pin, &v)).await?))
 }
+#[cfg(feature = "test-support")]
 async fn delete_view(
     State(s): State<Arc<DaemonState>>,
     Path(id): Path<String>,
@@ -3191,6 +3237,7 @@ async fn delete_view(
     db(s, move |s| s.delete_view(&id)).await?;
     Ok(StatusCode::NO_CONTENT)
 }
+#[cfg(feature = "test-support")]
 async fn annotations(
     State(s): State<Arc<DaemonState>>,
     pin: Result<Query<PinQuery>, axum::extract::rejection::QueryRejection>,
@@ -3201,6 +3248,7 @@ async fn annotations(
         db(s, move |s| s.saved_annotations_at(expected)).await?,
     ))
 }
+#[cfg(feature = "test-support")]
 async fn save_annotation(
     State(s): State<Arc<DaemonState>>,
     Path(id): Path<String>,
@@ -3216,6 +3264,7 @@ async fn save_annotation(
     a.validate().map_err(|_| invalid())?;
     Ok(Json(db(s, move |s| s.save_annotation_at(pin, &a)).await?))
 }
+#[cfg(feature = "test-support")]
 async fn delete_annotation(
     State(s): State<Arc<DaemonState>>,
     Path(id): Path<String>,
@@ -3277,6 +3326,7 @@ fn question_error(e: anyhow::Error) -> ApiError {
         )
     }
 }
+#[cfg(feature = "test-support")]
 async fn question_work<T: Send + 'static>(
     work: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
 ) -> Result<T, ApiError> {
@@ -3291,6 +3341,7 @@ async fn question_work<T: Send + 'static>(
         })?
         .map_err(question_error)
 }
+#[cfg(feature = "test-support")]
 async fn question_preview(
     State(s): State<Arc<DaemonState>>,
     body: Result<Json<QuestionRequest>, axum::extract::rejection::JsonRejection>,
@@ -3330,6 +3381,7 @@ async fn question_preview(
     })
     .await
 }
+#[cfg(feature = "test-support")]
 async fn cached_packet(
     s: Arc<DaemonState>,
     id: String,
@@ -3363,6 +3415,7 @@ async fn cached_packet(
 }
 // Always run the post-materialization fence, even when assembly fails. Preserve
 // the original materialization error, as Store::with_evidence does.
+#[cfg(feature = "test-support")]
 fn finish_packet_result(
     fence: &EvidenceFence,
     result: Result<Response, ApiError>,
@@ -3376,6 +3429,7 @@ fn finish_packet_result(
         }
     }
 }
+#[cfg(feature = "test-support")]
 async fn question_export(
     State(s): State<Arc<DaemonState>>,
     Path(id): Path<String>,
@@ -3387,10 +3441,12 @@ async fn question_export(
     finish_packet_result(&fence, result)
 }
 #[derive(Serialize)]
+#[cfg(feature = "test-support")]
 struct QuestionSelection {
     selection: SelectionEnvelope,
     view: FocusedView,
 }
+#[cfg(feature = "test-support")]
 async fn question_import(
     State(s): State<Arc<DaemonState>>,
     Path(id): Path<String>,
@@ -3408,6 +3464,7 @@ async fn question_import(
     .map(|value| Json(value).into_response());
     finish_packet_result(&fence, result)
 }
+#[cfg(feature = "test-support")]
 async fn question_selection(
     State(s): State<Arc<DaemonState>>,
     Path(id): Path<String>,
@@ -3424,6 +3481,7 @@ async fn question_selection(
 }
 
 // Status only reads the local ledger. No endpoint other than jev-run contacts Jev.
+#[cfg(feature = "test-support")]
 async fn acp_status(State(s): State<Arc<DaemonState>>) -> Result<Json<Value>, ApiError> {
     let Some(provider) = s.acp.clone() else {
         return Ok(Json(json!({"enabled":false,"status":null})));
@@ -3473,6 +3531,7 @@ fn acp_error(e: anyhow::Error) -> ApiError {
         ),
     }
 }
+#[cfg(feature = "test-support")]
 async fn question_answer(
     State(s): State<Arc<DaemonState>>,
     Path(id): Path<String>,
@@ -3514,6 +3573,7 @@ async fn question_answer(
     finish_packet_result(&fence, result)
 }
 
+#[cfg(feature = "test-support")]
 async fn jev_status(State(s): State<Arc<DaemonState>>) -> Result<Json<Value>, ApiError> {
     let Some(provider) = s.provider.clone() else {
         return Ok(Json(json!({"enabled":false,"budget":null})));
@@ -3562,6 +3622,7 @@ fn live_jev_error(e: anyhow::Error) -> ApiError {
     }
 }
 
+#[cfg(feature = "test-support")]
 async fn question_run(
     State(s): State<Arc<DaemonState>>,
     Path(id): Path<String>,
@@ -3610,7 +3671,7 @@ async fn question_run(
     finish_packet_result(&fence, result)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-support"))]
 mod live_tests {
     use super::*;
     use crate::indexer::index_workspace_bundle;
@@ -6033,6 +6094,7 @@ mod exceptional_recovery_tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "test-support")]
     async fn concurrent_posts_queue_two_requests_across_exceptional_recovery() {
         use tower::ServiceExt;
         let (_tmp, store, state, roots, identity) = fixture();
@@ -6330,11 +6392,13 @@ mod exceptional_recovery_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-support"))]
 mod normal_post_capture_cancellation_tests {
     use super::*;
+    #[cfg(feature = "test-support")]
     use crate::store::topology::{TopologyRoots, WorkspaceIdentity};
     use rusqlite::{OpenFlags, types::Value as SqlValue};
+    #[cfg(feature = "test-support")]
     use std::{fs, time::Duration};
     use tower::ServiceExt;
 
@@ -6479,6 +6543,7 @@ mod normal_post_capture_cancellation_tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "test-support")]
     async fn accepted_job_cannot_be_cancelled_and_full_pair_changes_only_after_leader_drains() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("workspace");
@@ -6564,7 +6629,7 @@ mod normal_post_capture_cancellation_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-support"))]
 mod dependency_lifecycle_tests {
     use super::*;
     fn catalog(id: &str, revision: IndexPin) -> Catalog {
@@ -6578,6 +6643,7 @@ mod dependency_lifecycle_tests {
         }
     }
     #[tokio::test]
+    #[cfg(feature = "test-support")]
     async fn dependency_status_whole_response_fence() {
         use std::io::{Seek, SeekFrom, Write};
         fn find_lock(path: &std::path::Path) -> Option<std::path::PathBuf> {
@@ -7101,7 +7167,7 @@ async fn provision_guard(
 }
 
 /// The provisioned listener has one selection boundary for core checkout routes.
-/// The direct single-checkout router stays available to standalone clients.
+/// The direct single-checkout router is a test-support fixture only.
 async fn provisioned_core(
     State(browser): State<Arc<ProvisionedBrowser>>,
     Path((root_key, suffix)): Path<(String, String)>,

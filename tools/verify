@@ -14,6 +14,8 @@ rust() {
   cargo fmt --all -- --check
   cargo clippy --locked --all-targets -- -D warnings
   cargo test --locked --all-targets
+  CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target}-test-support" cargo clippy --locked --all-targets --features test-support -- -D warnings
+  CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target}-test-support" cargo test --locked --all-targets --features test-support
 }
 semantic() {
   node tools/semantic-contract/test/run.mjs

@@ -1,3 +1,4 @@
+#![cfg(feature = "test-support")]
 mod common;
 use serde_json::{Value, json};
 use std::sync::{Arc, atomic::AtomicBool};

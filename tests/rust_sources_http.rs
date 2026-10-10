@@ -1,3 +1,4 @@
+#![cfg(feature = "test-support")]
 mod common;
 use axum::{
     Router,

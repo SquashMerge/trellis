@@ -25,25 +25,6 @@ use trellis::{
 // SQLite-call wall-clock guarantee or a claim of p99 publication latency.
 const STATUS_RESULT_WAIT: Duration = Duration::from_secs(15);
 
-// Opt-in real-process test barrier. Normal CLI runs never open this socket.
-#[cfg(unix)]
-fn fixture_index_exchange(
-    socket: &mut std::os::unix::net::UnixStream,
-    sent: u8,
-    expected: u8,
-) -> Result<()> {
-    use std::io::{Read, Write};
-    socket
-        .write_all(&[sent])
-        .map_err(|_| anyhow::anyhow!("fixture index IPC send failed"))?;
-    let mut reply = [0u8];
-    socket
-        .read_exact(&mut reply)
-        .map_err(|_| anyhow::anyhow!("fixture index IPC response failed"))?;
-    ensure!(reply[0] == expected, "fixture index IPC response mismatch");
-    Ok(())
-}
-
 #[derive(Parser)]
 #[command(
     name = "trellis",
@@ -474,31 +455,6 @@ async fn main() -> Result<()> {
             let diagnostics = std::env::var("TRELLIS_INDEX_DIAGNOSTICS").as_deref() == Ok("1");
             let command_start = Instant::now();
             let (store, options, _) = args.resolve()?;
-            // Fixture-only owner barrier: unset for every normal CLI invocation.
-            #[cfg(unix)]
-            let fixture_socket = std::env::var_os("TRELLIS_TEST_FINITE_CLI_FD")
-                .map(|fd| -> Result<_> {
-                    use std::os::fd::FromRawFd;
-                    use std::os::unix::net::UnixStream;
-                    use std::time::Duration;
-                    ensure!(
-                        fd.to_str() == Some("3"),
-                        "fixture index IPC descriptor invalid"
-                    );
-                    // Only the opt-in test process passes this Unix socket via dup2.
-                    let socket = unsafe { UnixStream::from_raw_fd(3) };
-                    socket.set_read_timeout(Some(Duration::from_secs(20)))?;
-                    socket.set_write_timeout(Some(Duration::from_secs(20)))?;
-                    Ok(Arc::new(std::sync::Mutex::new(socket)))
-                })
-                .transpose()?;
-            #[cfg(not(unix))]
-            ensure!(
-                std::env::var_os("TRELLIS_TEST_FINITE_CLI_FD").is_none(),
-                "fixture index IPC requires Unix"
-            );
-            let fixture_seen = Arc::new(AtomicBool::new(false));
-            let fixture_failed = Arc::new(AtomicBool::new(false));
             if diagnostics {
                 eprintln!(
                     "index-phase outside_setup_ms={:.3}",
@@ -513,11 +469,6 @@ async fn main() -> Result<()> {
                 flag.store(true, Ordering::Release);
             });
             let queue_start = Instant::now();
-            let fixture_seen_worker = fixture_seen.clone();
-            let fixture_failed_worker = fixture_failed.clone();
-            let fixture_cancel = cancel.clone();
-            #[cfg(unix)]
-            let fixture_socket_worker = fixture_socket.clone();
             let work = tokio::task::spawn_blocking(move || {
                 trellis::index_coordinator::enqueue_and_wait_observed_with_request(
                     &worker_store,
@@ -534,16 +485,6 @@ async fn main() -> Result<()> {
                                 eprintln!("index-mode {mode}");
                             }
                         }
-                        #[cfg(unix)]
-                        if phase.phase == "timing:publish"
-                            && let Some(socket) = fixture_socket_worker.as_ref()
-                            && !fixture_seen_worker.swap(true, Ordering::AcqRel)
-                            && fixture_index_exchange(&mut socket.lock().unwrap(), b'P', b'G')
-                                .is_err()
-                        {
-                            fixture_failed_worker.store(true, Ordering::Release);
-                            fixture_cancel.store(true, Ordering::Release);
-                        }
                     },
                 )
             })
@@ -556,24 +497,7 @@ async fn main() -> Result<()> {
                 );
             }
             signal.abort();
-            ensure!(
-                !fixture_failed.load(Ordering::Acquire),
-                "fixture index IPC failed before FIFO claim"
-            );
             let (own_request_id, revision, session) = work?;
-            #[cfg(unix)]
-            if let Some(socket) = fixture_socket {
-                ensure!(
-                    fixture_seen.load(Ordering::Acquire),
-                    "fixture index IPC missed first publication"
-                );
-                session.verify()?;
-                ensure!(session.is_leader(), "fixture owner lost leadership");
-                let mut socket = socket.lock().unwrap();
-                socket.set_read_timeout(Some(std::time::Duration::from_secs(45)))?;
-                fixture_index_exchange(&mut socket, b'R', b'D')?;
-                session.verify()?;
-            }
             if diagnostics {
                 eprintln!("index-phase coordinator_returned");
             }
@@ -998,7 +922,7 @@ fn try_existing_daemon(command: &Command) -> Result<bool> {
             serde_json::json!({"output": args.output}),
             true,
         ),
-        Command::Index(args) if std::env::var_os("TRELLIS_TEST_FINITE_CLI_FD").is_none() => (
+        Command::Index(args) => (
             "index",
             &args.workspace,
             serde_json::json!({
@@ -1181,6 +1105,7 @@ async fn serve_via_daemon(args: &ServeArgs) -> Result<()> {
     );
     // The opt-in test pause exposes the banner-to-select window. SIGTERM must
     // already be armed; normal serve executions never pause here.
+    #[cfg(feature = "test-support")]
     if std::env::var("TRELLIS_TEST_SERVE_AFTER_BANNER_PAUSE").as_deref() == Ok("1") {
         std::thread::sleep(Duration::from_millis(750));
     }
@@ -1221,6 +1146,7 @@ async fn run_daemon() -> Result<()> {
         return Ok(());
     };
     // Test-only ownership marker: only the elected daemon records its PID.
+    #[cfg(feature = "test-support")]
     if let Some(path) = std::env::var_os("TRELLIS_TEST_DAEMON_PID_FILE") {
         std::fs::write(path, std::process::id().to_string())?;
     }
@@ -1234,6 +1160,7 @@ async fn run_daemon() -> Result<()> {
     let idle = daemon::run_idle_lifecycle(registry.clone());
     tokio::pin!(idle);
     // A single injected accept fault tests that the elected socket survives it.
+    #[cfg(feature = "test-support")]
     let mut injected_accept_errno =
         match std::env::var("TRELLIS_TEST_DAEMON_ACCEPT_ERROR_ONCE").as_deref() {
             Ok("emfile") => Some(libc::EMFILE),
@@ -1244,13 +1171,19 @@ async fn run_daemon() -> Result<()> {
         tokio::select! {
             result = &mut idle => { result.map_err(|e| anyhow::anyhow!("{}", e.reason()))?; break; }
             accepted = async {
+                #[cfg(feature = "test-support")]
                 if let Some(errno) = injected_accept_errno {
                     Err(std::io::Error::from_raw_os_error(errno))
                 } else {
                     listener.accept().await
                 }
+                #[cfg(not(feature = "test-support"))]
+                {
+                    listener.accept().await
+                }
             } => {
-                injected_accept_errno = None;
+                #[cfg(feature = "test-support")]
+                { injected_accept_errno = None; }
                 let (stream, _) = match accepted {
                     Ok(pair) => pair,
                     Err(error) => {

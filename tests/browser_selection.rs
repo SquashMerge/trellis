@@ -274,8 +274,10 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
     let port = listener.local_addr().unwrap().port();
     drop(listener);
     let log = temp.path().join("serve-stderr");
-    let child = command(&home)
-        .env("TRELLIS_TEST_DAEMON_PID_FILE", home.join("auto-daemon.pid"))
+    let mut serve = command(&home);
+    #[cfg(feature = "test-support")]
+    serve.env("TRELLIS_TEST_DAEMON_PID_FILE", home.join("auto-daemon.pid"));
+    let child = serve
         .arg("serve")
         .arg("--workspace")
         .arg(&a)
@@ -312,6 +314,7 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
     })
     .await
     .unwrap();
+    #[cfg(feature = "test-support")]
     assert!(home.join("auto-daemon.pid").exists());
     let global = client
         .get(format!("{base}/api/daemon/status"))
