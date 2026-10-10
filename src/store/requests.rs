@@ -378,15 +378,28 @@ fn read(row: &rusqlite::Row<'_>) -> rusqlite::Result<Request> {
     Ok(request)
 }
 const COLUMNS: &str = "seq,id,root_device,root_inode,options_json,expected_generation,expected_revision,state,claim_incarnation,result_generation,result_revision,error_code,submitted_at,started_at,finished_at";
+// The protected opener has legacy raw SQLite calls. Convert only an exact
+// SQLite lock conflict when this settlement path invokes it.
+fn settlement_open_error(error: anyhow::Error) -> anyhow::Error {
+    if error.chain().any(|cause| matches!(cause.downcast_ref::<rusqlite::Error>(),
+        Some(rusqlite::Error::SqliteFailure(info, _))
+            if matches!(info.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked))) {
+        super::SqliteContention(()).into()
+    } else {
+        error
+    }
+}
+
 fn attest_prior_root_rows(db: &Connection, seen: &[Request]) -> Result<bool> {
     for prior in seen {
-        let row = db
-            .query_row(
+        let row = super::storage_result(
+            db.query_row(
                 &format!("SELECT {COLUMNS} FROM requests WHERE seq=?1"),
                 [prior.seq],
                 read,
             )
-            .optional()?;
+            .optional(),
+        )?;
         if !row.is_some_and(|row| {
             row.id == prior.id
                 && row.seq == prior.seq
@@ -413,13 +426,14 @@ fn attest_foreign_root_settlement(
     inode: &str,
 ) -> Result<bool> {
     for prior in affected {
-        let row = db
-            .query_row(
+        let row = super::storage_result(
+            db.query_row(
                 &format!("SELECT {COLUMNS} FROM requests WHERE seq=?1"),
                 [prior.seq],
                 read,
             )
-            .optional()?;
+            .optional(),
+        )?;
         if !row.is_some_and(|row| {
             row.id == prior.id
                 && row.seq == prior.seq
@@ -434,11 +448,11 @@ fn attest_foreign_root_settlement(
             return Ok(false);
         }
     }
-    let foreign: bool = db.query_row(
+    let foreign: bool = super::storage_result(db.query_row(
         "SELECT EXISTS(SELECT 1 FROM requests WHERE state IN ('queued','running') AND (root_device<>?1 OR root_inode<>?2))",
         params![device, inode],
         |row| row.get(0),
-    )?;
+    ))?;
     Ok(!foreign)
 }
 impl Store {
@@ -1039,63 +1053,78 @@ impl Store {
         }
         let mut after_commit = Some(after_commit);
         let mut seen = Vec::<Request>::new();
-        for _ in 0..2 {
-            let (_guard, mut db) = self.request_connection_for_root_loss(false, true, None)?;
-            let tx = super::storage_result(
-                db.transaction_with_behavior(TransactionBehavior::Immediate),
-            )?;
-            self.identity.verify()?;
-            let affected: Vec<Request> = {
-                let mut statement = tx.prepare(&format!("SELECT {COLUMNS} FROM requests WHERE state IN ('queued','running') AND (root_device<>?1 OR root_inode<>?2) ORDER BY seq"))?;
-                statement
-                    .query_map(
+        // Each protected open has SQLite's three-second busy timeout. Two
+        // attempts bound contention; never start H or claim on uncertain rows.
+        for attempt_number in 0..2 {
+            let attempt = (|| -> Result<bool> {
+                let (_guard, mut db) = self
+                    .request_connection_for_root_loss(false, true, None)
+                    .map_err(settlement_open_error)?;
+                let tx = super::storage_result(
+                    db.transaction_with_behavior(TransactionBehavior::Immediate),
+                )?;
+                self.identity.verify()?;
+                let affected: Vec<Request> = {
+                    let mut statement = super::storage_result(tx.prepare(&format!(
+                        "SELECT {COLUMNS} FROM requests WHERE state IN ('queued','running') AND (root_device<>?1 OR root_inode<>?2) ORDER BY seq"
+                    )))?;
+                    let rows = super::storage_result(statement.query_map(
                         params![
                             self.identity.device.to_string(),
                             self.identity.inode.to_string()
                         ],
                         read,
-                    )?
-                    .collect::<rusqlite::Result<_>>()?
-            };
-            for row in &affected {
-                if !seen.iter().any(|prior| prior.seq == row.seq) {
-                    seen.push(row.clone());
+                    ))?;
+                    super::storage_result(rows.collect::<rusqlite::Result<_>>())?
+                };
+                for row in &affected {
+                    if !seen.iter().any(|prior| prior.seq == row.seq) {
+                        seen.push(row.clone());
+                    }
                 }
-            }
-            let incarnation = Uuid::new_v4().to_string();
-            let changed = super::storage_result(tx.execute(
-                "UPDATE requests SET state='failed',claim_incarnation=?1,started_at=COALESCE(started_at,?2),finished_at=?2,error_code='root_changed' WHERE state IN ('queued','running') AND (root_device<>?3 OR root_inode<>?4)",
-                params![incarnation, now(), self.identity.device.to_string(), self.identity.inode.to_string()],
-            ))?;
-            ensure!(
-                changed == affected.len(),
-                "storage_busy: root failure set changed"
-            );
-            self.identity.verify()?;
-            let committed = super::storage_result(tx.commit());
-            // A failed COMMIT is ambiguous. Never use the same connection's
-            // apparent state as proof: release it and reopen the protected queue.
-            drop(db);
-            let hook_result = if committed.is_ok() {
-                after_commit.take().map_or(Ok(()), |hook| hook())
-            } else {
-                Ok(())
-            };
-            let (_guard, reread) = self.request_connection_for_root_loss(false, true, None)?;
-            let confirmed = attest_foreign_root_settlement(
-                &reread,
-                &affected,
-                &incarnation,
-                &self.identity.device.to_string(),
-                &self.identity.inode.to_string(),
-            )?;
-            if confirmed && attest_prior_root_rows(&reread, &seen)? {
+                let incarnation = Uuid::new_v4().to_string();
+                let changed = super::storage_result(tx.execute(
+                    "UPDATE requests SET state='failed',claim_incarnation=?1,started_at=COALESCE(started_at,?2),finished_at=?2,error_code='root_changed' WHERE state IN ('queued','running') AND (root_device<>?3 OR root_inode<>?4)",
+                    params![incarnation, now(), self.identity.device.to_string(), self.identity.inode.to_string()],
+                ))?;
+                ensure!(
+                    changed == affected.len(),
+                    "storage_busy: root failure set changed"
+                );
                 self.identity.verify()?;
-                return Ok(seen.len());
+                let committed = super::storage_result(tx.commit());
+                // COMMIT failure is ambiguous. Reopen; this connection's apparent
+                // state is not proof of durability.
+                drop(db);
+                if committed.is_ok() {
+                    let _ = after_commit.take().map_or(Ok(()), |hook| hook());
+                }
+                let (_guard, reread) = self
+                    .request_connection_for_root_loss(false, true, None)
+                    .map_err(settlement_open_error)?;
+                let confirmed = attest_foreign_root_settlement(
+                    &reread,
+                    &affected,
+                    &incarnation,
+                    &self.identity.device.to_string(),
+                    &self.identity.inode.to_string(),
+                )? && attest_prior_root_rows(&reread, &seen)?;
+                if confirmed {
+                    self.identity.verify()?;
+                }
+                Ok(confirmed)
+            })();
+            match attempt {
+                Ok(true) => return Ok(seen.len()),
+                Ok(false) if attempt_number == 0 => continue,
+                Err(ref error)
+                    if attempt_number == 0 && super::transient_storage_contention(error) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+                Ok(false) => break,
             }
-            // A post-COMMIT transport failure is treated like an ambiguous
-            // COMMIT. If the reread was incomplete, repeat settlement, not H.
-            let _ = (committed, hook_result);
         }
         anyhow::bail!("storage_busy: root settlement not confirmed")
     }
@@ -1670,6 +1699,62 @@ mod foreign_root_settlement_tests {
                 row.seq,
                 row.state.as_str(),
                 row.error_code.as_deref()
+            ),
+            (accepted.id, accepted.seq, "failed", Some("root_changed"))
+        );
+    }
+
+    #[test]
+    fn locked_post_commit_reopen_returns_typed_busy_without_losing_terminal_row() {
+        let state = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+        let accepted = store
+            .enqueue_request(&IndexOptions::new(root.path().to_owned()), None)
+            .unwrap();
+        let path = store.request_db_path();
+        let setup = Connection::open(&path).unwrap();
+        setup
+            .execute(
+                "UPDATE requests SET root_inode='old' WHERE id=?1",
+                [&accepted.id],
+            )
+            .unwrap();
+        drop(setup);
+        let blocker = Connection::open(&path).unwrap();
+        let error = store
+            .settle_foreign_root_requests_with_hook(|| {
+                blocker.execute_batch("BEGIN EXCLUSIVE")?;
+                Ok(())
+            })
+            .unwrap_err();
+        assert_eq!(error.to_string(), "storage_busy: SQLite lock contention");
+        assert!(
+            error
+                .downcast_ref::<super::super::SqliteContention>()
+                .is_some()
+        );
+        assert!(
+            !error
+                .chain()
+                .any(|cause| cause.downcast_ref::<rusqlite::Error>().is_some())
+        );
+        blocker.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(store.settle_foreign_root_requests().unwrap(), 0);
+        let db = Connection::open(&path).unwrap();
+        let terminal = db
+            .query_row(
+                &format!("SELECT {COLUMNS} FROM requests WHERE id=?1"),
+                [&accepted.id],
+                read,
+            )
+            .unwrap();
+        assert_eq!(
+            (
+                terminal.id,
+                terminal.seq,
+                terminal.state.as_str(),
+                terminal.error_code.as_deref()
             ),
             (accepted.id, accepted.seq, "failed", Some("root_changed"))
         );
