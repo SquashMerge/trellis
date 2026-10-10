@@ -159,6 +159,37 @@ pub struct SourceOperations {
     pub hashes: usize,
 }
 
+#[cfg(test)]
+type SourceReadHook = Box<dyn Fn(&Path, &str)>;
+#[cfg(test)]
+thread_local! {
+    static SOURCE_READ_HOOK: std::cell::RefCell<Option<SourceReadHook>> =
+        std::cell::RefCell::new(None);
+}
+#[cfg(test)]
+pub(crate) fn with_source_read_hook<T>(
+    hook: impl Fn(&Path, &str) + 'static,
+    run: impl FnOnce() -> T,
+) -> T {
+    SOURCE_READ_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            SOURCE_READ_HOOK.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+    let _reset = Reset;
+    run()
+}
+#[cfg(test)]
+fn source_read_hook(path: &Path, phase: &str) {
+    SOURCE_READ_HOOK.with(|hook| {
+        if let Some(callback) = hook.borrow().as_ref() {
+            callback(path, phase);
+        }
+    });
+}
+
 fn regular_read(
     path: &Path,
     cap: u64,
@@ -178,26 +209,44 @@ fn regular_read(
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
-    let mut file = options
-        .open(path)
-        .with_context(|| format!("opening input: {}", path.display()))?;
+    #[cfg(test)]
+    source_read_hook(path, "open");
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) => {
+            if metadata(path)?.as_ref() != Some(expected) {
+                return Err(SourceInputDrift("input drift during open").into());
+            }
+            return Err(error).with_context(|| format!("opening input: {}", path.display()));
+        }
+    };
     let mut operations = operations;
     if let Some(counts) = operations.as_deref_mut() {
         counts.opens += 1;
     }
-    ensure!(
-        stamp(&file.metadata()?) == *expected,
-        "input drift during open: {}",
-        path.display()
-    );
+    if stamp(&file.metadata()?) != *expected {
+        return Err(SourceInputDrift("input drift during open").into());
+    }
     let mut bytes = Vec::new();
     let mut buffer = [0u8; 65536];
     loop {
         check(cancel)?;
-        let n = file.read(&mut buffer)?;
+        let n = match file.read(&mut buffer) {
+            Ok(n) => n,
+            Err(error) => {
+                if metadata(path)?.as_ref() != Some(expected)
+                    || stamp(&file.metadata()?) != *expected
+                {
+                    return Err(SourceInputDrift("input drift during read").into());
+                }
+                return Err(error).with_context(|| format!("reading input: {}", path.display()));
+            }
+        };
         if n == 0 {
             break;
         }
+        #[cfg(test)]
+        source_read_hook(path, "read");
         ensure!(
             (bytes.len() as u64) + (n as u64) <= cap,
             "input exceeded byte limit: {}",
@@ -205,16 +254,12 @@ fn regular_read(
         );
         bytes.extend_from_slice(&buffer[..n]);
     }
-    ensure!(
-        bytes.len() as u64 == expected.len && stamp(&file.metadata()?) == *expected,
-        "input drift during read: {}",
-        path.display()
-    );
-    ensure!(
-        metadata(path)?.as_ref() == Some(expected),
-        "input replaced during read: {}",
-        path.display()
-    );
+    if bytes.len() as u64 != expected.len || stamp(&file.metadata()?) != *expected {
+        return Err(SourceInputDrift("input drift during read").into());
+    }
+    if metadata(path)?.as_ref() != Some(expected) {
+        return Err(SourceInputDrift("input replaced during read").into());
+    }
     if let Some(counts) = operations {
         counts.complete_reads += 1;
     }
@@ -257,11 +302,9 @@ fn admit_input(
                 path.display()
             );
             if let Some(old_path) = key.and_then(|key| identities.get(&key)) {
-                ensure!(
-                    metadata(old_path)? == inputs[old_path],
-                    "input alias drift: {}",
-                    old_path.display()
-                );
+                if metadata(old_path)? != inputs[old_path] {
+                    return Err(SourceInputDrift("input alias drift").into());
+                }
                 input_bytes
                     .get(old_path)
                     .cloned()
@@ -495,6 +538,15 @@ fn running_executable() -> Result<Arc<RunningExecutable>> {
         .map(Arc::clone)
         .map_err(|message| anyhow::anyhow!(message.clone()))
 }
+
+#[derive(Debug)]
+pub(crate) struct SourceInputDrift(pub(crate) &'static str);
+impl std::fmt::Display for SourceInputDrift {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+impl std::error::Error for SourceInputDrift {}
 
 /// A changed source inventory invalidates only this captured snapshot. A FIFO
 /// owner may retry the same accepted row after proving no publication committed.
@@ -776,21 +828,17 @@ impl Capture {
                 image.verify_stat()?;
                 continue;
             }
-            ensure!(
-                &metadata(path)? == expected,
-                "input inventory drift: {}",
-                path.display()
-            );
+            if &metadata(path)? != expected {
+                return Err(SourceInputDrift("input inventory drift").into());
+            }
             // Relevant config, manifest, ignore and toolchain bytes can change
             // while a filesystem reports an unchanged stat. Do not infer their
             // equality from timestamps at the publication cutoff.
             if let Some(state) = expected {
                 let now = regular_read(path, self.input_cap(path), state, cancel, None)?;
-                ensure!(
-                    self.input_bytes.get(path).and_then(Option::as_deref) == Some(now.as_slice()),
-                    "input contents drift: {}",
-                    path.display()
-                );
+                if self.input_bytes.get(path).and_then(Option::as_deref) != Some(now.as_slice()) {
+                    return Err(SourceInputDrift("input contents drift").into());
+                }
             }
         }
         check(cancel)?;
