@@ -1769,13 +1769,22 @@ mod tests {
         let mut work = LeaderWork::new(&store, &owner, &head_options).unwrap();
         let mut daemon_options = head_options.clone();
         daemon_options.max_file_bytes = 1024;
-        work.reconcile_due(&store, &owner, &daemon_options, &cancel, false)
-            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while work.last_accounted_generation.is_none() {
+            // Native watcher ingress can invalidate the cutoff of this first
+            // inventory. Retry the normal tick until the replacement full wake
+            // is acknowledged; never bypass the watch with force=true.
+            work.reconcile_due(&store, &owner, &daemon_options, &cancel, false)
+                .unwrap();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "new option watcher must finish its first full inventory"
+            );
+            if work.last_accounted_generation.is_none() {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
         assert_eq!(work.options.max_file_bytes, 1024);
-        assert!(
-            work.last_accounted_generation.is_some(),
-            "new option watcher must finish its first full inventory"
-        );
         assert_eq!(
             store
                 .recorded_index_options()

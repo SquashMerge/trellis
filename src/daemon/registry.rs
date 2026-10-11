@@ -83,6 +83,7 @@ pub struct BrowserOptions {
     pub cargo_home: Option<PathBuf>,
     pub jev_budget_dir: Option<PathBuf>,
     pub jev_budget_cents: Option<u64>,
+    pub jev_key: Option<String>,
     pub acp_runner: Option<PathBuf>,
     pub acp_state_dir: Option<PathBuf>,
     pub acp_max_attempts: Option<u64>,
@@ -100,6 +101,7 @@ impl Default for BrowserOptions {
             cargo_home: None,
             jev_budget_dir: None,
             jev_budget_cents: None,
+            jev_key: None,
             acp_runner: None,
             acp_state_dir: None,
             acp_max_attempts: None,
@@ -247,7 +249,10 @@ impl CheckoutRegistry {
         });
         let provider = match (config.jev_budget_dir, config.jev_budget_cents) {
             (Some(dir), Some(cap)) => {
-                let key = std::env::var("JEV_KEY")?;
+                let key = config
+                    .jev_key
+                    .or_else(|| std::env::var("JEV_KEY").ok())
+                    .ok_or_else(|| anyhow::anyhow!("JEV_KEY must be configured"))?;
                 Some(Arc::new(crate::live_jev::LiveJev::open(
                     &dir,
                     key,
@@ -605,7 +610,12 @@ impl CheckoutRegistry {
             }
         }
         if let Some(dir) = &config.jev_budget_dir {
-            let key = std::env::var("JEV_KEY").map_err(|_| SelectionError::Unavailable)?;
+            let environment_key = std::env::var("JEV_KEY").ok();
+            let key = config
+                .jev_key
+                .as_deref()
+                .or(environment_key.as_deref())
+                .ok_or(SelectionError::Unavailable)?;
             if key.trim().is_empty()
                 || reqwest::header::HeaderValue::from_str(&format!("Bearer {key}")).is_err()
             {
@@ -760,6 +770,17 @@ impl CheckoutRegistry {
             .map_err(|_| SelectionError::IdentityChanged)?;
         Self::validate_browser_options(identity, options)?;
         self.retire_replaced(identity)?;
+        // An earlier CLI read/index may have activated the checkout with no
+        // browser settings. Once its work drains, release that runtime before
+        // registering serve-scoped providers and source roots.
+        if self.entries.get(&identity.root_key).is_some_and(|entry| {
+            entry.registration.is_none()
+                && entry.sessions.is_empty()
+                && entry.browser_until.is_none()
+                && self.runtimes.contains_key(&identity.root_key)
+        }) {
+            let _ = self.release(&identity.root_key)?;
+        }
         if let Some(entry) = self.entries.get(&identity.root_key)
             && entry.registration.as_ref() != Some(options)
             && (entry.registration.is_some() || self.runtimes.contains_key(&identity.root_key))
@@ -1356,38 +1377,41 @@ impl CheckoutRuntime {
     /// CLI calls share the activated checkout's Store and scheduler; they never
     /// reopen a second Store or independently elect a leader.
     pub fn cli_status(&self) -> anyhow::Result<serde_json::Value> {
-        let (response, _) = self.evidence_response()?;
-        let status = response.status()?;
+        let (response, catching_up) = self.evidence_response()?;
+        let mut status = response.status()?;
+        status.catching_up = catching_up;
         Ok(serde_json::to_value(response.finish(status)?)?)
     }
 
     pub fn cli_symbols(&self, search: &str, limit: usize) -> anyhow::Result<serde_json::Value> {
         anyhow::ensure!((1..=150).contains(&limit), "limit must be 1..150");
         let resources = self.resources()?;
-        let (response, _) = self.evidence_response()?;
+        let (response, catching_up) = self.evidence_response()?;
         // Store::symbols_at performs selected-document attestation and a
         // complete-revision fence. The runtime guard additionally fences H.
         let selected = resources.store.symbols_at(search, limit);
         response.finish(())?;
         let (revision, items) = selected?;
-        Ok(serde_json::json!({"revision": revision, "items": items}))
+        Ok(serde_json::json!({"catchingUp": catching_up,
+            "data": {"revision": revision, "items": items}}))
     }
 
     pub fn cli_query(&self, query: &crate::model::ViewQuery) -> anyhow::Result<serde_json::Value> {
         query.validate()?;
-        let (response, _) = self.evidence_response()?;
+        let (response, catching_up) = self.evidence_response()?;
         let view = response
             .query_view(query)?
             .ok_or_else(|| anyhow::anyhow!("seed not found in current index"))?;
-        Ok(serde_json::to_value(response.finish(view)?)?)
+        Ok(serde_json::json!({"catchingUp": catching_up,
+            "data": response.finish(view)?}))
     }
 
     pub fn cli_export(&self) -> anyhow::Result<serde_json::Value> {
         let resources = self.resources()?;
-        let (response, _) = self.evidence_response()?;
+        let (response, catching_up) = self.evidence_response()?;
         let graph = resources.store.graph();
         response.finish(())?;
-        Ok(serde_json::to_value(graph?)?)
+        Ok(serde_json::json!({"catchingUp": catching_up, "data": graph?}))
     }
 
     pub fn cli_index(&self, options: &IndexOptions) -> anyhow::Result<serde_json::Value> {
@@ -1406,9 +1430,11 @@ impl CheckoutRuntime {
                     let revision = row.revision.ok_or_else(|| {
                         anyhow::anyhow!("store_unavailable: completed request missing pin")
                     })?;
-                    let (response, _) = self.evidence_response()?;
+                    let (response, catching_up) = self.evidence_response()?;
                     response.validate_pin(revision)?;
-                    let status = response.finish(response.status()?)?;
+                    let mut status = response.status()?;
+                    status.catching_up = catching_up;
+                    let status = response.finish(status)?;
                     return Ok(
                         serde_json::json!({"publishedRevision": revision, "status": status}),
                     );
@@ -1946,6 +1972,41 @@ mod selection_tests {
             .status()
             .unwrap();
         assert!(status.success(), "git {args:?}");
+    }
+
+    #[tokio::test]
+    async fn serve_registration_cannot_replace_busy_cli_runtime() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("checkout");
+        git(temp.path(), &["init", "--quiet", root.to_str().unwrap()]);
+        let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+        let roots =
+            TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+        let mut registry = CheckoutRegistry::with_roots(roots);
+        let options = CheckoutOptions(serde_json::json!({"browseRoot": identity.root}));
+        registry.attach_launch(41, &identity).unwrap();
+        let runtime = registry.activate(&identity.root_key).unwrap();
+        assert_eq!(
+            registry.can_register(&identity, &options),
+            Err(SelectionError::RegistrationConflict)
+        );
+        assert!(registry.runtimes.contains_key(&identity.root_key));
+        registry.disconnect(41);
+        runtime.active_reads.fetch_add(1, Ordering::AcqRel);
+        assert_eq!(
+            registry.can_register(&identity, &options),
+            Err(SelectionError::RegistrationConflict)
+        );
+        assert!(registry.runtimes.contains_key(&identity.root_key));
+        runtime.active_reads.fetch_sub(1, Ordering::AcqRel);
+        runtime.h_in_flight.store(true, Ordering::Release);
+        assert_eq!(
+            registry.can_register(&identity, &options),
+            Err(SelectionError::RegistrationConflict)
+        );
+        assert!(registry.runtimes.contains_key(&identity.root_key));
+        // A rejected call cannot install browser settings or change the writer.
+        assert!(registry.entries[&identity.root_key].registration.is_none());
     }
 
     #[test]

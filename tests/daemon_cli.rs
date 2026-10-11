@@ -74,6 +74,62 @@ fn fixture_home_roots_match_linux_and_macos_layouts() {
     assert_eq!(fixture_roots(&home).data, mac.data);
 }
 
+#[test]
+fn help_version_and_unstartable_daemon_never_open_standalone_store() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = short_temp();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let root = checkout(temp.path(), "unstartable");
+    let paths = fixture_socket_paths(&home);
+    let marker = home.join("auto-daemon.pid");
+    for flag in ["--help", "--version"] {
+        let output = cli(&home).arg(flag).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{flag}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!output.stdout.is_empty(), "{flag} printed no response");
+        assert!(!paths.run.exists(), "{flag} started the daemon");
+        assert!(!marker.exists(), "{flag} elected a daemon");
+    }
+
+    // A valid private HOME remains usable, but this ordinary file cannot be
+    // replaced by SocketOwner. The CLI must fail closed, not index locally.
+    fs::create_dir_all(&paths.run).unwrap();
+    for dir in [&paths.run, paths.run.parent().unwrap()] {
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    assert_eq!(paths.socket.parent(), Some(paths.run.as_path()));
+    fs::write(&paths.socket, b"not a socket").unwrap();
+    let started = Instant::now();
+    let output = cli(&home)
+        .arg("index")
+        .arg("--workspace")
+        .arg(&root)
+        .output()
+        .unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(12),
+        "daemon start was unbounded"
+    );
+    assert!(!output.status.success(), "index unexpectedly succeeded");
+    assert!(output.stdout.is_empty(), "index emitted partial output");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("daemon_unavailable"),
+        "untyped daemon failure: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read(&paths.socket).unwrap(), b"not a socket");
+    assert!(!marker.exists(), "failed daemon claimed ownership");
+    assert!(
+        !fixture_roots(&home).cache.join("indexes").exists(),
+        "unstartable daemon fell back to a standalone index"
+    );
+}
+
 fn bounded_fixture_stderr(path: &Path) -> String {
     use std::io::Read;
     let Ok(file) = fs::File::open(path) else {
@@ -125,10 +181,30 @@ fn cli(home: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_trellis"));
     command
         .env("HOME", home)
+        .env("TRELLIS_TEST_DAEMON_PID_FILE", home.join("auto-daemon.pid"))
         .env_remove("XDG_CACHE_HOME")
         .env_remove("XDG_DATA_HOME")
         .stdin(Stdio::null());
     command
+}
+
+/// Cold CLI fixture owns the elected daemon even after its launching CLI exits.
+struct AutoDaemonGuard(std::path::PathBuf);
+impl AutoDaemonGuard {
+    fn for_home(home: &Path) -> Self {
+        Self(home.join("auto-daemon.pid"))
+    }
+}
+impl Drop for AutoDaemonGuard {
+    fn drop(&mut self) {
+        if let Ok(pid) = fs::read_to_string(&self.0)
+            && let Ok(pid) = pid.parse::<u32>()
+            && pid <= i32::MAX as u32
+        {
+            // The private test HOME and PID marker are created by this fixture.
+            unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+        }
+    }
 }
 
 struct Owned(Child);
@@ -202,7 +278,7 @@ fn run(home: &Path, command: &str, root: &Path) -> Value {
     );
     serde_json::from_slice(&output.stdout).unwrap()
 }
-async fn ready(client: &reqwest::Client, address: SocketAddr, child: &mut Child) {
+async fn ready(client: &reqwest::Client, address: SocketAddr, child: &mut Child, home: &Path) {
     let deadline = Instant::now() + Duration::from_secs(12);
     loop {
         if let Ok(reply) = client.get(format!("http://{address}/healthz")).send().await
@@ -212,7 +288,8 @@ async fn ready(client: &reqwest::Client, address: SocketAddr, child: &mut Child)
         }
         assert!(
             child.try_wait().unwrap().is_none(),
-            "serve process exited before /healthz"
+            "serve process exited before /healthz: {}",
+            fixture_daemon_diagnostic(home, &fixture_socket_paths(home).socket)
         );
         assert!(
             Instant::now() < deadline,
@@ -423,7 +500,7 @@ async fn executable_daemon_is_socket_only_until_explicit_serve_and_registers_two
     drop(reserved);
 
     let mut first_serve = detached(serve(&home, &first, address, &token_file));
-    ready(&client, address, &mut first_serve.0).await;
+    ready(&client, address, &mut first_serve.0, &home).await;
     let token = fs::read_to_string(&token_file).unwrap();
     let url = format!("http://{address}/api/checkouts");
     assert_eq!(
@@ -663,7 +740,7 @@ async fn executable_daemon_is_socket_only_until_explicit_serve_and_registers_two
         String::from_utf8_lossy(&symbols.stderr)
     );
     assert!(
-        !serde_json::from_slice::<Value>(&symbols.stdout).unwrap()["items"]
+        !serde_json::from_slice::<Value>(&symbols.stdout).unwrap()["data"]["items"]
             .as_array()
             .unwrap()
             .is_empty()
@@ -702,10 +779,11 @@ async fn executable_daemon_is_socket_only_until_explicit_serve_and_registers_two
 }
 
 #[test]
-fn finite_cli_index_status_symbols_export_fallback_without_daemon() {
+fn cold_cli_commands_start_and_reuse_daemon() {
     let temp = short_temp();
     let home = temp.path().join("home");
     fs::create_dir(&home).unwrap();
+    let _daemon = AutoDaemonGuard::for_home(&home);
     let root = checkout(temp.path(), "fallback");
     let output = cli(&home)
         .arg("index")
@@ -715,7 +793,7 @@ fn finite_cli_index_status_symbols_export_fallback_without_daemon() {
         .unwrap();
     assert!(
         output.status.success(),
-        "index fallback failed: {}",
+        "index daemon start failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     let status = run(&home, "status", &root);
@@ -730,11 +808,11 @@ fn finite_cli_index_status_symbols_export_fallback_without_daemon() {
         .unwrap();
     assert!(
         symbols.status.success(),
-        "symbols fallback failed: {}",
+        "symbols daemon call failed: {}",
         String::from_utf8_lossy(&symbols.stderr)
     );
     let symbols: Value = serde_json::from_slice(&symbols.stdout).unwrap();
-    assert!(!symbols["items"].as_array().unwrap().is_empty());
+    assert!(!symbols["data"]["items"].as_array().unwrap().is_empty());
     let exported = run(&home, "export", &root);
     assert!(exported.is_object());
 }
@@ -940,222 +1018,64 @@ async fn long_home_socket_names_are_private_distinct_connectable_and_recover_aft
     );
 }
 
-#[tokio::test]
-async fn daemon_scheduler_follows_held_checkout_leader_then_claims_same_cli_request() {
-    use std::os::{fd::AsRawFd, unix::net::UnixStream};
-    use trellis::store::topology::WorkspaceIdentity;
-
+#[test]
+fn concurrent_cold_cli_indexes_share_one_daemon_and_keep_fifo_results() {
     let temp = short_temp();
     let home = temp.path().join("home");
     fs::create_dir(&home).unwrap();
-    let root = checkout(temp.path(), "follower");
-    // Establish the durable index before holding its leader lock. Explicit
-    // isolated roots avoid changing process-wide HOME in this parallel test.
-    let initial = cli(&home)
-        .arg("index")
-        .arg("--workspace")
-        .arg(&root)
-        .output()
-        .unwrap();
-    assert!(
-        initial.status.success(),
-        "{}",
-        String::from_utf8_lossy(&initial.stderr)
-    );
-    let initial: Value = serde_json::from_slice(&initial.stdout).unwrap();
-    let initial_revision = initial["publishedRevision"]["indexRevision"]
-        .as_u64()
-        .unwrap();
-    let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
-    let topology = fixture_roots(&home);
-    let leader = topology.leader(&identity).unwrap();
-    let held_incarnation = leader.incarnation.to_string();
-    let leader_file = fs::File::open(topology.leader_lock(&identity)).unwrap();
-    let mut daemon_command = cli(&home);
-    daemon_command.arg("daemon");
-    let mut daemon = detached(daemon_command);
-    let socket = fixture_socket_paths(&home).socket;
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while UnixStream::connect(&socket).is_err() {
-        assert!(
-            daemon.0.try_wait().unwrap().is_none(),
-            "daemon died before socket readiness: {}",
-            fixture_daemon_diagnostic(&home, &socket)
-        );
-        assert!(
-            Instant::now() < deadline,
-            "daemon socket not ready: {}",
-            fixture_daemon_diagnostic(&home, &socket)
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    // This command must reach the daemon socket, not the no-daemon fallback.
-    // Its durable queue row is observed while the leader guard remains alive.
-    let stdout = fs::File::create(temp.path().join("index.stdout")).unwrap();
-    let stderr_path = temp.path().join("index.stderr");
-    let stderr = fs::File::create(&stderr_path).unwrap();
-    let mut request = Owned(
+    let root = checkout(temp.path(), "concurrent");
+    let marker = home.join("elected.pid");
+    let start = || {
         cli(&home)
             .arg("index")
             .arg("--workspace")
             .arg(&root)
-            .stdout(Stdio::from(stdout))
-            .stderr(Stdio::from(stderr))
+            .env("TRELLIS_TEST_DAEMON_PID_FILE", &marker)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .spawn()
-            .unwrap(),
-    );
-    let queue_path = topology.requests_db(&identity);
-    let deadline = Instant::now() + Duration::from_secs(15);
-    let (id, seq): (String, i64) = loop {
-        let db = rusqlite::Connection::open_with_flags(
-            &queue_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .unwrap();
-        let rows: Vec<(String, i64, String)> = db
-            .prepare("SELECT id,seq,state FROM requests ORDER BY seq")
             .unwrap()
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
-            .unwrap()
-            .map(|row| row.unwrap())
-            .collect();
-        if rows.len() == 2 {
-            assert_eq!(rows[1].2, "queued", "daemon claimed despite held leader");
-            break (rows[1].0.clone(), rows[1].1);
-        }
-        assert_eq!(
-            rows.len(),
-            1,
-            "request was unexpectedly duplicated: {rows:?}"
-        );
-        assert!(
-            request.0.try_wait().unwrap().is_none(),
-            "CLI exited before daemon accepted request: {}",
-            fs::read_to_string(&stderr_path).unwrap()
-        );
-        assert!(
-            Instant::now() < deadline,
-            "daemon did not accept index request"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
     };
-    // Multiple scheduler ticks must leave the original ACK queued, its claim
-    // empty, and the held leader incarnation unchanged. flock tests the inode,
-    // not just the contents of a possibly stale lock pathname.
-    let hold_until = Instant::now() + Duration::from_millis(750);
-    while Instant::now() < hold_until {
+    let first = start();
+    let second = start();
+    for child in [first, second] {
+        let output = child.wait_with_output().unwrap();
         assert!(
-            request.0.try_wait().unwrap().is_none(),
-            "request finished during leader hold"
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
         );
+        let response: Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(
-            fs::read_to_string(topology.leader_lock(&identity))
-                .unwrap()
-                .trim(),
-            held_incarnation
+            response["publishedRevision"],
+            response["status"]["revision"]
         );
-        assert_ne!(
-            unsafe { libc::flock(leader_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-            0,
-            "checkout leader lock was released during hold"
-        );
-        let db = rusqlite::Connection::open_with_flags(
-            &queue_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .unwrap();
-        let rows: Vec<(String, i64, String, Option<String>)> = db
-            .prepare("SELECT id,seq,state,claim_incarnation FROM requests ORDER BY seq")
-            .unwrap()
-            .query_map([], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-            })
-            .unwrap()
-            .map(|row| row.unwrap())
-            .collect();
-        assert_eq!(rows.len(), 2, "daemon or CLI enqueued twice: {rows:?}");
-        assert_eq!(
-            (
-                &rows[1].0,
-                rows[1].1,
-                rows[1].2.as_str(),
-                rows[1].3.as_ref()
-            ),
-            (&id, seq, "queued", None),
-            "daemon independently claimed while follower"
-        );
-        tokio::time::sleep(Duration::from_millis(40)).await;
     }
-    drop(leader);
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        if let Some(status) = request.0.try_wait().unwrap() {
-            assert!(
-                status.success(),
-                "request failed: {}",
-                fs::read_to_string(&stderr_path).unwrap()
-            );
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "scheduler did not complete queued request"
-        );
-        tokio::time::sleep(Duration::from_millis(40)).await;
-    }
-    let output: Value =
-        serde_json::from_slice(&fs::read(temp.path().join("index.stdout")).unwrap()).unwrap();
-    let revision = output["publishedRevision"]["indexRevision"]
-        .as_u64()
-        .unwrap();
-    assert!(
-        revision > initial_revision,
-        "daemon may publish mandatory H before the queued request"
-    );
-    let db = rusqlite::Connection::open_with_flags(
-        &queue_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .unwrap();
-    type CompletedRow = (String, i64, String, Option<String>, Option<i64>);
-    let rows: Vec<CompletedRow> = db
-        .prepare("SELECT id,seq,state,claim_incarnation,result_revision FROM requests ORDER BY seq")
+    let elected: u32 = fs::read_to_string(&marker).unwrap().parse().unwrap();
+    assert!(elected > 0);
+    assert!(std::os::unix::net::UnixStream::connect(fixture_socket_paths(&home).socket).is_ok());
+    let roots = fixture_roots(&home);
+    let identity =
+        trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+    let queue = roots
+        .cache
+        .join("indexes")
+        .join(&identity.root_key)
+        .join("requests.db");
+    let db =
+        rusqlite::Connection::open_with_flags(queue, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let rows: Vec<(i64, String, i64)> = db
+        .prepare("SELECT seq,state,result_revision FROM requests ORDER BY seq")
         .unwrap()
-        .query_map([], |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-            ))
-        })
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
         .unwrap()
         .map(|row| row.unwrap())
         .collect();
-    assert_eq!(
-        rows.len(),
-        2,
-        "same request must be completed without re-enqueue"
-    );
-    assert_eq!(
-        (&rows[1].0, rows[1].1, rows[1].2.as_str(), rows[1].4),
-        (&id, seq, "done", Some(revision as i64))
-    );
-    assert_ne!(
-        rows[1].3.as_deref(),
-        Some(held_incarnation.as_str()),
-        "held follower leader claimed job"
-    );
-    assert_eq!(
-        rows[1].3.as_deref(),
-        Some(
-            fs::read_to_string(topology.leader_lock(&identity))
-                .unwrap()
-                .trim()
-        )
-    );
-    assert!(daemon.0.try_wait().unwrap().is_none());
+    assert_eq!(rows.len(), 2);
+    assert!(rows[0].0 < rows[1].0);
+    assert!(rows.iter().all(|(_, state, _)| state == "done"));
+    assert!(rows[0].2 < rows[1].2);
 }
 
 #[tokio::test]
@@ -1429,6 +1349,20 @@ async fn cold_serve_h_preserves_implicit_scip_and_honors_explicit_default_cap() 
         assert_eq!(before["maxFileBytes"], 8192);
         assert_eq!(before["scipPath"], scip_path.to_str().unwrap());
         assert_eq!(before["manifestPath"], manifest_path.to_str().unwrap());
+        // The prior CLI elected this daemon. End that fixture instance before
+        // changing the checkout, so serve tests a cold H instead of racing
+        // registration against an active CLI writer.
+        assert!(home.join("auto-daemon.pid").exists());
+        drop(AutoDaemonGuard::for_home(&home));
+        let socket = fixture_socket_paths(&home).socket;
+        let stop_deadline = Instant::now() + Duration::from_secs(5);
+        while UnixStream::connect(&socket).is_ok() {
+            assert!(
+                Instant::now() < stop_deadline,
+                "prior CLI daemon did not exit"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
         // A second file forces H while the original SCIP input/hash remains
         // valid and can still decorate the unchanged `f` declaration.
         fs::write(
@@ -1468,7 +1402,7 @@ async fn cold_serve_h_preserves_implicit_scip_and_honors_explicit_default_cap() 
             .timeout(Duration::from_secs(2))
             .build()
             .unwrap();
-        ready(&client, address, &mut served.0).await;
+        ready(&client, address, &mut served.0, &home).await;
         let h_deadline = Instant::now() + Duration::from_secs(20);
         loop {
             assert!(
@@ -1541,7 +1475,7 @@ async fn cold_serve_h_preserves_implicit_scip_and_honors_explicit_default_cap() 
             String::from_utf8_lossy(&stderr)
         );
         let graph: Value = serde_json::from_slice(&stdout).unwrap();
-        let symbol = graph["nodes"]
+        let symbol = graph["data"]["nodes"]
             .as_array()
             .unwrap()
             .iter()
@@ -1559,4 +1493,94 @@ async fn cold_serve_h_preserves_implicit_scip_and_honors_explicit_default_cap() 
             );
         }
     }
+}
+
+#[test]
+fn cold_cli_reads_start_daemon_and_keep_data_envelopes() {
+    let temp = short_temp();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let _daemon = AutoDaemonGuard::for_home(&home);
+    let root = checkout(temp.path(), "cold-cli");
+    let indexed = run(&home, "index", &root);
+    assert!(indexed["status"]["catchingUp"].is_boolean());
+    let status = run(&home, "status", &root);
+    assert!(status["catchingUp"].is_boolean());
+    let symbols = run(&home, "symbols", &root);
+    assert!(symbols["catchingUp"].is_boolean());
+    assert!(
+        !symbols["data"]["items"].as_array().unwrap().is_empty(),
+        "CLI symbols lost selected items"
+    );
+    let seed = symbols["data"]["items"][0]["id"].as_str().unwrap();
+    let query = cli(&home)
+        .arg("query")
+        .arg("--workspace")
+        .arg(&root)
+        .arg("--seed")
+        .arg(seed)
+        .output()
+        .unwrap();
+    assert!(
+        query.status.success(),
+        "{}",
+        String::from_utf8_lossy(&query.stderr)
+    );
+    let query: Value = serde_json::from_slice(&query.stdout).unwrap();
+    assert!(query["catchingUp"].is_boolean());
+    assert!(query["data"]["nodes"].is_array());
+    let destination = temp.path().join("graph.json");
+    let output = cli(&home)
+        .arg("export")
+        .arg("--workspace")
+        .arg(&root)
+        .arg("--output")
+        .arg(&destination)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let exported: Value = serde_json::from_slice(&fs::read(&destination).unwrap()).unwrap();
+    assert!(exported["catchingUp"].is_boolean());
+    assert!(exported["data"]["files"].is_array());
+    let repeat = cli(&home)
+        .arg("export")
+        .arg("--workspace")
+        .arg(&root)
+        .arg("--output")
+        .arg(&destination)
+        .output()
+        .unwrap();
+    assert!(!repeat.status.success());
+    let gc = cli(&home).arg("gc").arg("--report").output().unwrap();
+    assert!(
+        gc.status.success(),
+        "{}",
+        String::from_utf8_lossy(&gc.stderr)
+    );
+    assert!(serde_json::from_slice::<Value>(&gc.stdout).is_ok());
+}
+
+#[tokio::test]
+async fn serve_first_carries_jev_credential_to_new_daemon() {
+    let temp = short_temp();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let root = checkout(temp.path(), "serve-first");
+    let token = home.join("token");
+    let bind = free_address();
+    let mut command = serve(&home, &root, bind, &token);
+    command
+        .env("JEV_KEY", "fixture-serve-first")
+        .arg("--jev-budget-dir")
+        .arg(home.join("budget"))
+        .arg("--jev-budget-cents")
+        .arg("10");
+    let mut child = detached(command);
+    ready(&reqwest::Client::new(), bind, &mut child.0, &home).await;
+    let indexed = run(&home, "index", &root);
+    assert!(indexed["status"]["catchingUp"].is_boolean());
 }
