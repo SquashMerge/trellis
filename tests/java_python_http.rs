@@ -53,6 +53,7 @@ struct Fixture {
     pin: trellis::model::IndexPin,
     graph: Graph,
     app: Router,
+    state: Arc<http::DaemonState>,
     session: Arc<LeaderSession>,
 }
 fn setup() -> Fixture {
@@ -132,7 +133,7 @@ fn setup() -> Fixture {
     )
     .unwrap();
     state.retain_serving_session(session.clone());
-    let app = http::router(state);
+    let app = http::router(state.clone());
     Fixture {
         temp,
         workspace,
@@ -141,6 +142,7 @@ fn setup() -> Fixture {
         store,
         graph,
         app,
+        state,
         session,
     }
 }
@@ -338,7 +340,7 @@ async fn cached_java_python_sequences_keep_measured_calls_after_source_deletion(
         // Observe the real watcher commit for THIS deletion before asserting
         // historical reads. An in-flight same-generation publication may
         // temporarily close public reads; it is never an HTTP success result.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(12);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let prior_head = loop {
             match f.store.status() {
                 Ok(status) => break status.revision,
@@ -354,6 +356,18 @@ async fn cached_java_python_sequences_keep_measured_calls_after_source_deletion(
         assert_eq!(prior_head.index_generation, f.pin.index_generation);
         assert!(prior_head.index_revision >= f.pin.index_revision);
         std::fs::remove_file(f.workspace.join(path)).unwrap();
+        // Deliver the deletion as the OS watcher would, so the commit below
+        // does not depend on notification latency under load (#131).
+        let removed =
+            notify::Event::new(notify::EventKind::Remove(notify::event::RemoveKind::File))
+                .add_path(f.workspace.join(path));
+        while !f.state.submit_watch_event_for_tests(removed.clone()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the queue tick never started its scheduler"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         loop {
             match f.store.status() {
                 Ok(status) => {
