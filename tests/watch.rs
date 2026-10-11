@@ -6,7 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 use trellis::{
-    index_coordinator::{self, LeaderWork},
+    index_coordinator::{self, WatcherWork},
     indexer::IndexOptions,
     store::Store,
 };
@@ -23,7 +23,7 @@ fn leader_reconciles_edit_without_explicit_request() {
     let session =
         index_coordinator::establish_serving_session(&store, Some(&options), &cancel).unwrap();
     let before = store.status().unwrap().revision;
-    let mut work = LeaderWork::new(&store, &session, &options).unwrap();
+    let mut work = WatcherWork::new(&store, &session, &options).unwrap();
     fs::write(&source, "function after() { return 2; }\n").unwrap();
     let until = Instant::now() + Duration::from_secs(8);
     while Instant::now() < until && store.status().unwrap().revision == before {
@@ -54,7 +54,7 @@ fn delayed_snapshot_does_not_publish_after_pre_cutoff_edit() {
     let cancel = Arc::new(AtomicBool::new(false));
     let owner =
         index_coordinator::establish_serving_session(&store, Some(&options), &cancel).unwrap();
-    let mut work = LeaderWork::new(&store, &owner, &options).unwrap();
+    let mut work = WatcherWork::new(&store, &owner, &options).unwrap();
     // Drain the initial full wake and establish a known selected baseline.
     work.reconcile_due(&store, &owner, &options, &cancel, true)
         .unwrap();
@@ -105,7 +105,7 @@ fn post_cutoff_hint_stays_pending_after_first_publication() {
     let cancel = Arc::new(AtomicBool::new(false));
     let owner =
         index_coordinator::establish_serving_session(&store, Some(&options), &cancel).unwrap();
-    let mut work = LeaderWork::new(&store, &owner, &options).unwrap();
+    let mut work = WatcherWork::new(&store, &owner, &options).unwrap();
     let before = store.status().unwrap().revision;
     fs::write(&source, "function middle() {}\n").unwrap();
     std::thread::sleep(Duration::from_millis(350));
@@ -177,7 +177,10 @@ fn failed_capture_keeps_dirty_generation_for_successful_retry() {
     // Change before watcher registration so the initial full wake is the only
     // pending signal, with no dependency on notify delivery or event timing.
     fs::write(&source, "function after() {}\n").unwrap();
-    let mut work = LeaderWork::new(&store, &owner, &options).unwrap();
+    let mut work = WatcherWork::new(&store, &owner, &options).unwrap();
+    // A late OS notification for the write above would restart debounce and
+    // postpone this deterministic retry; the initial full wake is internal.
+    work.disable_native_watcher_for_tests();
     std::thread::sleep(Duration::from_millis(350));
     let failed =
         work.reconcile_due_observed(&store, &owner, &options, &cancel, false, |captured, _| {
@@ -240,7 +243,7 @@ fn edits_creates_renames_atomic_saves_and_deletes_match_cold_full() {
     let cancel = Arc::new(AtomicBool::new(false));
     let owner =
         index_coordinator::establish_serving_session(&store, Some(&options), &cancel).unwrap();
-    let mut work = LeaderWork::new(&store, &owner, &options).unwrap();
+    let mut work = WatcherWork::new(&store, &owner, &options).unwrap();
     // Each action happens while the prior immutable snapshot is delayed. The
     // injected notify event takes the same bounded ingress as the real watcher.
     for step in 0..5 {
@@ -543,22 +546,31 @@ fn daemon_watcher_keeps_cli_file_cap_and_selected_export_after_edit() {
 }
 
 #[test]
-fn empty_checkout_final_inventory_preserves_explicit_pin() {
+fn empty_checkout_explicit_request_publishes_fresh_manifest_and_terminal_pin() {
     let state = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
     let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
     let options = IndexOptions::new(workspace.path().to_owned());
     let cancel = Arc::new(AtomicBool::new(false));
-    let (pin, owner) = index_coordinator::enqueue_and_wait(&store, &options, &cancel).unwrap();
-    assert!(owner.is_leader());
+    let (pin, writer) =
+        index_coordinator::reconcile_workspace(&store, &options, &cancel, |_| {}).unwrap();
+    writer.verify().unwrap();
+    let accepted = store.enqueue_request(&options, None).unwrap();
     assert_eq!(
-        store.status().unwrap().revision,
-        pin,
-        "verified empty final inventory must not publish a redundant head"
+        index_coordinator::drain_requests(&store, &writer).unwrap(),
+        1
     );
-    let row = store.current_request().unwrap().unwrap();
+    let published = store.status().unwrap().revision;
+    assert_eq!(published.index_generation, pin.index_generation);
+    assert_eq!(
+        published.index_revision,
+        pin.index_revision + 1,
+        "unchanged explicit FIFO request publishes a fresh manifest"
+    );
+    assert_eq!(store.status().unwrap().stats.files, 0);
+    let row = store.request_by_id(&accepted.id).unwrap().unwrap();
     assert_eq!(row.state, "done");
-    assert_eq!(row.revision, Some(pin));
+    assert_eq!(row.revision, Some(published));
 }
 
 #[test]
@@ -574,7 +586,7 @@ fn periodic_inventory_recovers_unhinted_source_and_absent_ignore_input() {
     let cancel = Arc::new(AtomicBool::new(false));
     let owner =
         index_coordinator::establish_serving_session(&store, Some(&options), &cancel).unwrap();
-    let mut work = LeaderWork::new(&store, &owner, &options).unwrap();
+    let mut work = WatcherWork::new(&store, &owner, &options).unwrap();
     assert!(
         work.reconcile_due(&store, &owner, &options, &cancel, true)
             .unwrap()
@@ -661,7 +673,7 @@ fn periodic_inventory_recovers_unhinted_source_and_absent_ignore_input() {
 }
 
 #[test]
-fn moved_root_stops_old_work_and_new_spelling_has_distinct_leader() {
+fn moved_root_stops_old_work_and_new_spelling_has_distinct_writer() {
     let state = tempfile::tempdir().unwrap();
     let roots = tempfile::tempdir().unwrap();
     let old_root = roots.path().join("old");
@@ -673,7 +685,7 @@ fn moved_root_stops_old_work_and_new_spelling_has_distinct_leader() {
     let cancel = Arc::new(AtomicBool::new(false));
     let owner =
         index_coordinator::establish_serving_session(&old, Some(&options), &cancel).unwrap();
-    let mut work = LeaderWork::new(&old, &owner, &options).unwrap();
+    let mut work = WatcherWork::new(&old, &owner, &options).unwrap();
     let before = old.status().unwrap().revision;
     fs::rename(&old_root, &moved_root).unwrap();
     fs::create_dir(&old_root).unwrap();
@@ -692,7 +704,7 @@ fn moved_root_stops_old_work_and_new_spelling_has_distinct_leader() {
     let successor =
         index_coordinator::establish_serving_session(&relocated, Some(&relocated_options), &cancel)
             .unwrap();
-    assert!(successor.is_leader());
+    successor.verify().unwrap();
     assert_ne!(relocated.root_id(), old.root_id());
     let selected = relocated.status().unwrap().revision;
     assert_eq!(
@@ -713,7 +725,7 @@ fn moved_root_stops_old_work_and_new_spelling_has_distinct_leader() {
 }
 
 #[test]
-fn daemon_root_loss_retries_busy_terminal_transition_without_serving_old_root() {
+fn daemon_root_loss_busy_transition_retains_resources_until_terminal_commit() {
     let state = tempfile::tempdir().unwrap();
     let roots = tempfile::tempdir().unwrap();
     let root = roots.path().join("original");
@@ -749,12 +761,32 @@ fn daemon_root_loss_retries_busy_terminal_transition_without_serving_old_root() 
     );
     assert_eq!(
         daemon.root_loss_retirement_for_tests(),
-        (false, false, true),
-        "old watcher and serving owner retire while EX is kept only for transition retry"
+        (true, true, false),
+        "old resources remain until the accepted queue transition COMMIT is confirmed"
     );
+    let read_error = store.status().unwrap_err();
     assert!(
-        store.status().is_err(),
-        "old root cannot serve selected evidence"
+        read_error.to_string().contains("root_changed"),
+        "{read_error:#}"
+    );
+    let claim_error = store.claim_request(&owner).unwrap_err();
+    assert!(
+        claim_error.to_string().contains("root_changed"),
+        "{claim_error:#}"
+    );
+    let waiting_error = store.request_by_id(&row.id).unwrap_err();
+    assert!(
+        waiting_error.to_string().contains("root_changed"),
+        "{waiting_error:#}"
+    );
+    let before: String = blocker
+        .query_row("SELECT state FROM requests WHERE id=?1", [&row.id], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        before, "queued",
+        "busy transition cannot partially settle the row"
     );
     blocker.execute_batch("ROLLBACK").unwrap();
     daemon.force_root_transition_tick_for_tests().unwrap();
@@ -773,16 +805,19 @@ fn daemon_root_loss_retries_busy_terminal_transition_without_serving_old_root() 
         .unwrap();
     assert_eq!(request_state, "failed");
     assert_eq!(error.as_deref(), Some("root_changed"));
-    assert_eq!(
-        incarnation.as_deref(),
-        Some(owner.incarnation().to_string().as_str())
+    let transition = incarnation.expect("terminal root-loss row needs a transition witness");
+    assert!(uuid::Uuid::parse_str(&transition).is_ok());
+    assert_ne!(
+        transition,
+        owner.incarnation().to_string(),
+        "root-loss terminal settlement is not an ordinary writer claim"
     );
     let relocated = Store::open_for_tests(state.path(), &moved).unwrap();
     let next_options = IndexOptions::new(moved);
     let next =
         index_coordinator::establish_serving_session(&relocated, Some(&next_options), &cancel)
             .unwrap();
-    assert!(next.is_leader());
+    next.verify().unwrap();
     assert_ne!(relocated.root_id(), store.root_id());
     let pin = relocated.status().unwrap().revision;
     assert_eq!(
@@ -914,7 +949,7 @@ fn accepted_watcher_intent_before_debounce_preempts_writer_unit() {
         .unwrap()
         .run_serving(&options, &cancel, |_| {})
         .unwrap();
-    let mut work = LeaderWork::new(&store, &session, &options).unwrap();
+    let mut work = WatcherWork::new(&store, &session, &options).unwrap();
     work.disable_native_watcher_for_tests();
     work.reconcile_due(&store, &session, &options, &cancel, true)
         .unwrap();

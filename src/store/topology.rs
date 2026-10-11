@@ -3,12 +3,12 @@ use anyhow::{Context, Result, bail, ensure};
 use directories::ProjectDirs;
 use sha2::{Digest, Sha256};
 use std::os::unix::{
-    fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt},
+    fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
     io::AsRawFd,
 };
 use std::{
     fs::{self, File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
+    io::{Read, Write},
     path::{Component, Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -145,9 +145,6 @@ impl TopologyRoots {
     pub fn requests_db(&self, identity: &WorkspaceIdentity) -> PathBuf {
         self.index_dir(identity).join("requests.db")
     }
-    pub fn leader_lock(&self, identity: &WorkspaceIdentity) -> PathBuf {
-        self.index_dir(identity).join("leader.lock")
-    }
     pub fn record_dir(&self, identity: &WorkspaceIdentity) -> PathBuf {
         self.data.join("workspaces").join(&identity.record_id)
     }
@@ -181,10 +178,10 @@ impl TopologyRoots {
     }
     pub fn index_use(&self, identity: &WorkspaceIdentity) -> Result<UseGuard> {
         self.prepare_index(identity)?;
-        UseGuard::acquire(&self.index_use_lock(identity), false, false)
+        UseGuard::acquire(&self.index_use_lock(identity), false, true)
     }
     pub fn index_use_existing(&self, identity: &WorkspaceIdentity) -> Result<UseGuard> {
-        self.index_use_existing_with_wait(identity, false)
+        self.index_use_existing_with_wait(identity, true)
     }
     /// Status may hold the existing shared use lock, but must never wait for a
     /// writer or create an index/lock pathname merely to report current state.
@@ -220,8 +217,15 @@ impl TopologyRoots {
         ] {
             private_dir(path)?;
         }
-        UseGuard::acquire_existing(&self.index_use_lock(identity), false, nonblocking)
-            .context("incompatible_index: missing or unsafe use lock")
+        UseGuard::acquire_existing(&self.index_use_lock(identity), false, nonblocking).map_err(
+            |error| {
+                if error.is::<StorageBusy>() {
+                    error
+                } else {
+                    error.context("incompatible_index: missing or unsafe use lock")
+                }
+            },
+        )
     }
     /// Root-loss queue transitions still require the existing protected index directory.
     /// They cannot use the root pathname, which now names a different inode or is absent.
@@ -236,7 +240,7 @@ impl TopologyRoots {
         ] {
             private_dir(path)?;
         }
-        UseGuard::acquire_existing(&self.index_use_lock(identity), false, false)
+        UseGuard::acquire_existing(&self.index_use_lock(identity), false, true)
     }
     /// Exceptional index replacement starts only after every protected handle closes.
     /// Never create or upgrade a use lock while attempting exclusive admission.
@@ -252,139 +256,24 @@ impl TopologyRoots {
         }
         UseGuard::acquire_existing(&self.index_use_lock(identity), true, true)
     }
-    /// Retain the already-held exclusive use guard while taking the same leader inode.
-    /// A missing, replaced or unsafe leader.lock is a refusal, not a creation request.
-    pub fn leader_under_exclusive(
+    /// Admit a daemon-local writer without electing among processes. The shared
+    /// use lock stays held for the writer's lifetime; exclusive GC cannot unlink
+    /// an index while the writer uses it.
+    pub fn writer(&self, identity: Arc<WorkspaceIdentity>) -> Result<WriterGuard> {
+        let use_guard = self.index_use(&identity)?;
+        WriterGuard::new(self, identity, use_guard, false)
+    }
+    /// Activation retains the existing exclusive use lock through publication.
+    pub fn writer_under_exclusive(
         &self,
-        identity: &WorkspaceIdentity,
+        identity: Arc<WorkspaceIdentity>,
         use_guard: UseGuard,
-    ) -> Result<LeaderGuard> {
-        identity.verify()?;
-        use_guard.belongs_to(&self.index_use_lock(identity), true)?;
-        self.acquire_leader(identity, use_guard, false, || Ok(()), || Ok(()), || Ok(()))
+    ) -> Result<WriterGuard> {
+        WriterGuard::new(self, identity, use_guard, true)
     }
     pub fn record_use(&self, identity: &WorkspaceIdentity, exclusive: bool) -> Result<UseGuard> {
         self.prepare_records(identity)?;
         UseGuard::acquire(&self.record_use_lock(identity), exclusive, exclusive)
-    }
-    pub fn leader(&self, identity: &WorkspaceIdentity) -> Result<LeaderGuard> {
-        self.leader_with_lock_hook(identity, || Ok(()), || Ok(()), || Ok(()))
-    }
-    /// Fixture hook: pause after locking or fail just before syncing; never used by production callers.
-    pub fn leader_with_hooks(
-        &self,
-        identity: &WorkspaceIdentity,
-        before_write: impl FnOnce() -> Result<()>,
-        before_sync: impl FnOnce() -> Result<()>,
-    ) -> Result<LeaderGuard> {
-        self.leader_with_lock_hook(identity, || Ok(()), before_write, before_sync)
-    }
-    /// Fixture barrier after opening the leader inode, before taking its lock.
-    pub fn leader_with_lock_hook(
-        &self,
-        identity: &WorkspaceIdentity,
-        after_open: impl FnOnce() -> Result<()>,
-        before_write: impl FnOnce() -> Result<()>,
-        before_sync: impl FnOnce() -> Result<()>,
-    ) -> Result<LeaderGuard> {
-        let use_guard = self.index_use(identity)?;
-        self.acquire_leader(
-            identity,
-            use_guard,
-            true,
-            after_open,
-            before_write,
-            before_sync,
-        )
-    }
-    fn acquire_leader(
-        &self,
-        identity: &WorkspaceIdentity,
-        use_guard: UseGuard,
-        create: bool,
-        after_open: impl FnOnce() -> Result<()>,
-        before_write: impl FnOnce() -> Result<()>,
-        before_sync: impl FnOnce() -> Result<()>,
-    ) -> Result<LeaderGuard> {
-        identity.verify()?;
-        let path = self.leader_lock(identity);
-        let mut hook = Some(after_open);
-        let mut file = None;
-        for _ in 0..(if create { 20 } else { 1 }) {
-            let candidate = open_file(&path, create)?;
-            if let Some(after_open) = hook.take() {
-                after_open()?;
-            }
-            let status =
-                unsafe { libc::flock(candidate.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-            if status != 0 {
-                let e = std::io::Error::last_os_error();
-                if e.kind() == std::io::ErrorKind::WouldBlock {
-                    bail!("storage_busy: {}", path.display());
-                }
-                return Err(e.into());
-            }
-            match private_file(&path, &candidate) {
-                Ok(()) => {
-                    file = Some(candidate);
-                    break;
-                }
-                Err(error) if !create => return Err(error),
-                Err(_) => {} // Retry only normal acquisition against a replaced pathname.
-            }
-        }
-        let mut file = file.context("leader lock pathname changed repeatedly")?;
-        use_guard.verify()?;
-        let predecessor_incarnation = read_incarnation(&file).ok();
-        before_write()?;
-        let incarnation = Uuid::new_v4();
-        file.seek(SeekFrom::Start(0))?;
-        file.set_len(0)?;
-        file.write_all(incarnation.to_string().as_bytes())?;
-        before_sync().context("incarnation_not_durable")?;
-        file.sync_all().context("incarnation_not_durable")?;
-        Ok(LeaderGuard {
-            use_guard,
-            file,
-            path,
-            incarnation,
-            predecessor_incarnation,
-        })
-    }
-    pub fn follower(&self, identity: Arc<WorkspaceIdentity>) -> Result<FollowerGuard> {
-        identity.verify()?;
-        let use_guard = self.index_use_existing(&identity)?;
-        let path = self.leader_lock(&identity);
-        let file = match open_file(&path, false) {
-            Ok(file) => file,
-            Err(error)
-                if error
-                    .downcast_ref::<std::io::Error>()
-                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
-            {
-                return Err(IndexNotReady::new("missing leader lock").into());
-            }
-            Err(error) => return Err(error),
-        };
-        let incarnation = read_incarnation(&file)?;
-        let status = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if status == 0 {
-            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
-            return Err(IndexNotReady::new("leader lock is not held").into());
-        }
-        let error = std::io::Error::last_os_error();
-        if error.kind() != std::io::ErrorKind::WouldBlock {
-            return Err(error.into());
-        }
-        let guard = FollowerGuard {
-            use_guard,
-            file,
-            path,
-            identity,
-            incarnation,
-        };
-        guard.verify(incarnation)?;
-        Ok(guard)
     }
 
     pub fn validate_external(
@@ -647,6 +536,11 @@ impl WorkspaceIdentity {
             marker: self.marker,
             root_handle: self.root_handle.try_clone()?,
         })
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn verified_clone_for_tests(&self) -> Result<Self> {
+        self.verified_clone()
     }
     pub fn verify_readonly(&self) -> Result<()> {
         self.verify_with_marker(true)
@@ -1132,234 +1026,82 @@ impl Drop for UseGuard {
     }
 }
 
+/// A daemon-local writer admission. This is not a cross-process election:
+/// concurrent daemons coordinate mutations through SQLite and retained use locks.
 #[derive(Debug)]
-pub struct LeaderGuard {
+pub struct WriterGuard {
+    identity: Arc<WorkspaceIdentity>,
     use_guard: UseGuard,
-    file: File,
-    path: PathBuf,
+    /// An ephemeral request-claim token, never persisted in an election file.
     pub incarnation: Uuid,
-    /// Sampled only while holding the newly acquired exclusive flock.
-    pub predecessor_incarnation: Option<Uuid>,
 }
-fn read_incarnation(file: &File) -> Result<Uuid> {
-    // A cloned File shares its cursor with the held lock descriptor. Concurrent
-    // verifications must read the same inode without moving that shared cursor.
-    let mut bytes = [0u8; 64];
-    let mut len = 0;
-    while len < bytes.len() {
-        let count = file.read_at(&mut bytes[len..], len as u64)?;
-        if count == 0 {
-            break;
-        }
-        len += count;
+impl WriterGuard {
+    fn new(
+        roots: &TopologyRoots,
+        identity: Arc<WorkspaceIdentity>,
+        use_guard: UseGuard,
+        exclusive: bool,
+    ) -> Result<Self> {
+        identity.verify()?;
+        use_guard.belongs_to(&roots.index_use_lock(&identity), exclusive)?;
+        Ok(Self {
+            identity,
+            use_guard,
+            incarnation: Uuid::new_v4(),
+        })
     }
-    let value = std::str::from_utf8(&bytes[..len])
-        .context("index_not_ready: invalid leader incarnation")?;
-    Uuid::parse_str(value).context("index_not_ready: invalid leader incarnation")
-}
-
-#[cfg(test)]
-mod incarnation_tests {
-    use super::*;
-
-    #[test]
-    fn read_incarnation_preserves_cursor_and_rejects_extra_or_invalid_bytes() {
-        let mut file = tempfile::tempfile().unwrap();
-        let incarnation = Uuid::new_v4();
-        file.write_all(incarnation.to_string().as_bytes()).unwrap();
-        file.seek(SeekFrom::Start(7)).unwrap();
-        assert_eq!(read_incarnation(&file).unwrap(), incarnation);
-        assert_eq!(file.stream_position().unwrap(), 7);
-        assert_eq!(read_incarnation(&file).unwrap(), incarnation);
-        assert_eq!(file.stream_position().unwrap(), 7);
-
-        file.set_len(0).unwrap();
-        file.seek(SeekFrom::Start(0)).unwrap();
-        file.write_all(format!("{incarnation}x").as_bytes())
-            .unwrap();
-        file.seek(SeekFrom::Start(7)).unwrap();
-        assert!(
-            read_incarnation(&file).is_err(),
-            "trailing bytes are invalid"
+    pub fn verify(&self) -> Result<()> {
+        self.identity.verify()?;
+        self.use_guard.verify()
+    }
+    pub fn belongs_to(&self, identity: &WorkspaceIdentity) -> Result<()> {
+        identity.verify()?;
+        self.verify()?;
+        ensure!(
+            self.identity.root == identity.root
+                && self.identity.root_key == identity.root_key
+                && self.identity.record_id == identity.record_id
+                && self.identity.device == identity.device
+                && self.identity.inode == identity.inode,
+            "storage_busy: writer belongs to another workspace"
         );
-        assert_eq!(file.stream_position().unwrap(), 7);
-
-        file.set_len(0).unwrap();
-        file.seek(SeekFrom::Start(0)).unwrap();
-        file.write_all(b"not-a-uuid").unwrap();
-        file.seek(SeekFrom::Start(7)).unwrap();
-        assert!(
-            read_incarnation(&file).is_err(),
-            "malformed UUID is invalid"
-        );
-        assert_eq!(file.stream_position().unwrap(), 7);
+        self.use_guard.verify()
     }
-}
-
-impl LeaderGuard {
-    pub(crate) fn belongs_to_after_root_loss(
-        &self,
-        leader_path: &Path,
-        use_path: &Path,
-    ) -> Result<()> {
-        ensure!(self.path == leader_path, "storage_busy: wrong leader guard");
-        self.use_guard.belongs_to(use_path, false)?;
-        self.verify()
-    }
-    pub fn belongs_to(&self, leader_path: &Path) -> Result<()> {
-        ensure!(self.path == leader_path, "storage_busy: wrong leader guard");
-        self.verify()
-    }
-    /// The staged publisher must use this existing EX guard, never reacquire SH.
     pub fn verify_exclusive_use(&self, use_path: &Path) -> Result<()> {
-        self.use_guard.belongs_to(use_path, true)?;
-        self.verify()
+        self.verify()?;
+        self.use_guard.belongs_to(use_path, true)
     }
     pub(crate) fn exclusive_use_guard(&self, use_path: &Path) -> Result<&UseGuard> {
         self.verify_exclusive_use(use_path)?;
         Ok(&self.use_guard)
     }
-    /// Convert the same held use-lock descriptor after activation; keep leader flock.
     pub fn downgrade_use_to_shared(&mut self) -> Result<()> {
         self.verify()?;
         self.use_guard.downgrade_to_shared()?;
         self.verify()
     }
-    pub fn verify(&self) -> Result<()> {
-        self.use_guard.verify()?;
-        private_file(&self.path, &self.file)?;
-        ensure!(
-            read_incarnation(&self.file)? == self.incarnation,
-            "index_not_ready: leader incarnation changed"
-        );
-        Ok(())
-    }
 }
 
 #[derive(Debug)]
-pub struct FollowerGuard {
-    use_guard: UseGuard,
-    file: File,
-    path: PathBuf,
-    identity: Arc<WorkspaceIdentity>,
-    pub incarnation: Uuid,
+pub struct WriterSession {
+    guard: WriterGuard,
 }
-impl FollowerGuard {
-    pub fn verify(&self, expected: Uuid) -> Result<()> {
-        self.identity.verify()?;
-        self.use_guard.verify()?;
-        private_file(&self.path, &self.file)?;
-        if self.incarnation != expected || read_incarnation(&self.file)? != expected {
-            return Err(IndexNotReady::new("leader incarnation changed").into());
-        }
-        let status = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if status == 0 {
-            unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
-            return Err(IndexNotReady::new("leader lock is not held").into());
-        }
-        let error = std::io::Error::last_os_error();
-        ensure!(
-            error.kind() == std::io::ErrorKind::WouldBlock,
-            "index_not_ready: cannot verify leader lock: {error}"
-        );
-        private_file(&self.path, &self.file)?;
-        if read_incarnation(&self.file)? != expected {
-            return Err(IndexNotReady::new("leader incarnation changed").into());
-        }
-        self.identity.verify()
+impl WriterSession {
+    pub fn writer(guard: WriterGuard) -> Self {
+        Self { guard }
     }
-}
-
-#[derive(Debug)]
-pub enum LeaderSession {
-    Leader {
-        guard: LeaderGuard,
-        identity: Arc<WorkspaceIdentity>,
-    },
-    Follower(FollowerGuard),
-}
-impl LeaderSession {
-    pub fn leader(guard: LeaderGuard, identity: Arc<WorkspaceIdentity>) -> Self {
-        Self::Leader { guard, identity }
-    }
-    pub fn follower(guard: FollowerGuard) -> Self {
-        Self::Follower(guard)
-    }
-    pub fn leader_guard(&self) -> Result<&LeaderGuard> {
-        match self {
-            Self::Leader { guard, .. } => Ok(guard),
-            Self::Follower(_) => bail!("storage_busy: follower cannot publish"),
-        }
+    pub fn writer_guard(&self) -> Result<&WriterGuard> {
+        self.verify()?;
+        Ok(&self.guard)
     }
     pub fn incarnation(&self) -> Uuid {
-        match self {
-            Self::Leader { guard, .. } => guard.incarnation,
-            Self::Follower(g) => g.incarnation,
-        }
+        self.guard.incarnation
     }
     pub fn verify(&self) -> Result<()> {
-        match self {
-            Self::Leader { guard, identity } => {
-                identity.verify()?;
-                guard.verify()
-            }
-            Self::Follower(guard) => guard.verify(guard.incarnation),
-        }
+        self.guard.verify()
     }
-    pub(crate) fn verify_after_root_loss(
-        &self,
-        identity: &WorkspaceIdentity,
-        leader_path: &Path,
-        use_path: &Path,
-    ) -> Result<()> {
-        let Self::Leader {
-            guard,
-            identity: held,
-        } = self
-        else {
-            bail!("storage_busy: follower cannot fail old-root requests");
-        };
-        ensure!(
-            held.root == identity.root
-                && held.root_key == identity.root_key
-                && held.device == identity.device
-                && held.inode == identity.inode,
-            "storage_busy: leader belongs to another root"
-        );
-        ensure!(
-            identity.verify().is_err(),
-            "root_changed: old-root transition requires root loss"
-        );
-        guard.belongs_to_after_root_loss(leader_path, use_path)
-    }
-    pub fn belongs_to(&self, identity: &WorkspaceIdentity, leader_path: &Path) -> Result<()> {
-        let Self::Leader {
-            guard,
-            identity: held,
-        } = self
-        else {
-            bail!("storage_busy: follower cannot publish");
-        };
-        identity.verify()?;
-        held.verify()?;
-        ensure!(
-            held.root == identity.root
-                && held.root_key == identity.root_key
-                && held.record_id == identity.record_id
-                && held.device == identity.device
-                && held.inode == identity.inode,
-            "storage_busy: leader session belongs to another workspace"
-        );
-        guard.belongs_to(leader_path)
-    }
-    pub fn is_leader(&self) -> bool {
-        matches!(self, Self::Leader { .. })
-    }
-}
-
-impl Drop for LeaderGuard {
-    fn drop(&mut self) {
-        unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+    pub fn belongs_to(&self, identity: &WorkspaceIdentity) -> Result<()> {
+        self.guard.belongs_to(identity)
     }
 }
 
@@ -2168,7 +1910,7 @@ fn gc_remove_candidate(
     now: i64,
     guard: UseGuard,
     current: &WorkspaceIdentity,
-    leader: &LeaderGuard,
+    writer: &WriterGuard,
     hook: &mut dyn FnMut(GcStage) -> Result<()>,
 ) -> Result<bool> {
     let admit = (|| -> Result<Vec<(PathBuf, (u64, u64))>> {
@@ -2182,17 +1924,12 @@ fn gc_remove_candidate(
                 .into_string()
                 .map_err(|_| anyhow::anyhow!("non-UTF8 GC entry"))?;
             ensure!(
-                matches!(name.as_str(), "index.db" | "requests.db" | "leader.lock"),
+                matches!(name.as_str(), "index.db" | "requests.db"),
                 "unknown derived index entry"
             );
             names.push(name);
         }
-        ensure!(
-            names.iter().any(|n| n == "index.db") && names.iter().any(|n| n == "leader.lock"),
-            "incomplete GC index"
-        );
-        let leader = open_file_readonly(&dir.join("leader.lock"))?;
-        read_incarnation(&leader)?;
+        ensure!(names.iter().any(|n| n == "index.db"), "incomplete GC index");
         let mut index = readonly_index_db(&dir.join("index.db"))?;
         let tx = index.transaction()?;
         validate_gc_candidate_shape(&tx)?;
@@ -2248,7 +1985,6 @@ fn gc_remove_candidate(
             let meta = file.metadata()?;
             dbs.push((path, (meta.dev(), meta.ino())));
         }
-        private_file(&dir.join("leader.lock"), &leader)?;
         guard.verify()?;
         Ok(dbs)
     })();
@@ -2269,7 +2005,7 @@ fn gc_remove_candidate(
         Ok(names)
     })();
     let Ok(actual) = actual else { return Ok(false) };
-    let mut expected = vec!["index.db".to_owned(), "leader.lock".to_owned()];
+    let mut expected = vec!["index.db".to_owned()];
     if dbs.len() == 2 {
         expected.push("requests.db".to_owned());
     }
@@ -2280,9 +2016,9 @@ fn gc_remove_candidate(
     guard.verify()?;
     hook(GcStage::BeforeCandidateUnlink)?;
     current.verify()?;
-    leader.verify()?;
+    writer.verify()?;
     guard.verify()?;
-    if !super::gc_unlink_sqlite(&dbs, &guard, current, leader, &mut || {
+    if !super::gc_unlink_sqlite(&dbs, &guard, current, writer, &mut || {
         hook(GcStage::AfterFirstDbUnlink)
     })? {
         return Ok(false);
@@ -2290,16 +2026,14 @@ fn gc_remove_candidate(
     // Past this boundary every I/O or authority failure is reported; never
     // claim a skip after even one derived inode has been removed.
     current.verify()?;
-    leader.verify()?;
-    fs::remove_file(dir.join("leader.lock"))?;
-    sync_directory(dir)?;
+    writer.verify()?;
     current.verify()?;
-    leader.verify()?;
+    writer.verify()?;
     fs::remove_dir(dir)?;
     sync_directory(dir.parent().context("GC parent missing")?)?;
     hook(GcStage::AfterParentSync)?;
     current.verify()?;
-    leader.verify()?;
+    writer.verify()?;
     // Lock path is the final name removed, after the directory is gone.
     guard.remove_last()?;
     Ok(true)
@@ -2458,33 +2192,33 @@ impl TopologyRoots {
         guard.remove_last()?;
         Ok(true)
     }
-    /// The advisory report is never a deletion permit. A verified leader records
+    /// The advisory report is never a deletion permit. A verified writer records
     /// its bounded daily attempt before opening any candidate. Every candidate
     /// gets its own nonblocking EX and an independent current-schema inspection.
     pub fn automatic_gc_at(
         &self,
         current: &WorkspaceIdentity,
-        leader: &LeaderGuard,
+        writer: &WriterGuard,
         now_secs: i64,
     ) -> Result<usize> {
-        self.automatic_gc_at_with_hook(current, leader, now_secs, &mut |_| Ok(()))
+        self.automatic_gc_at_with_hook(current, writer, now_secs, &mut |_| Ok(()))
     }
 
     #[doc(hidden)]
     pub fn automatic_gc_at_with_hook(
         &self,
         current: &WorkspaceIdentity,
-        leader: &LeaderGuard,
+        writer: &WriterGuard,
         now_secs: i64,
         hook: &mut dyn FnMut(GcStage) -> Result<()>,
     ) -> Result<usize> {
         current.verify()?;
-        leader.verify()?;
+        writer.verify()?;
         ensure!(
-            leader.use_guard.path == self.index_use_lock(current)
-                && leader.path == self.leader_lock(current),
-            "unsafe_index: foreign GC leader"
+            writer.use_guard.path == self.index_use_lock(current),
+            "unsafe_index: foreign GC writer"
         );
+        writer.belongs_to(current)?;
         ensure!(
             now_secs > 0 && now_secs <= MAX_TRUSTED_SECONDS,
             "invalid GC clock"
@@ -2532,7 +2266,7 @@ impl TopologyRoots {
             staged.sync_all()?;
             schedule.verify()?;
             current.verify()?;
-            leader.verify()?;
+            writer.verify()?;
             hook(GcStage::BeforeStampRename)?;
             match &prior {
                 Some(prior) => private_file(&stamp, prior)?,
@@ -2560,7 +2294,7 @@ impl TopologyRoots {
         };
         let mut removed = 0;
         for entry in fs::read_dir(&parent)? {
-            leader.verify()?;
+            writer.verify()?;
             current.verify()?;
             let entry = entry?;
             let Ok(key) = entry.file_name().into_string() else {
@@ -2577,7 +2311,7 @@ impl TopologyRoots {
                     Err(_) => continue,
                 };
             // Refuse unknown and unsafe entries without creating or recovering files.
-            if gc_remove_candidate(&path, &key, now_secs, guard, current, leader, hook)? {
+            if gc_remove_candidate(&path, &key, now_secs, guard, current, writer, hook)? {
                 removed += 1;
             }
         }
@@ -2700,11 +2434,7 @@ pub fn assert_topology_fixture(store: &crate::store::Store, state: &Path) {
     for path in [&roots.cache, &roots.cache.join("indexes"), &index] {
         private_dir(path).unwrap();
     }
-    for path in [
-        roots.index_db(&identity),
-        roots.index_use_lock(&identity),
-        roots.leader_lock(&identity),
-    ] {
+    for path in [roots.index_db(&identity), roots.index_use_lock(&identity)] {
         let file = open_file(&path, false).unwrap();
         private_file(&path, &file).unwrap();
     }
@@ -2895,7 +2625,9 @@ mod gc_schema_race_tests {
             let other = tempfile::tempdir().unwrap();
             drop(crate::store::Store::open_for_tests(state.path(), other.path()).unwrap());
             let current = WorkspaceIdentity::discover(Some(other.path()), other.path()).unwrap();
-            let leader = roots.leader(&current).unwrap();
+            let writer = roots
+                .writer(Arc::new(current.verified_clone().unwrap()))
+                .unwrap();
             // A report cannot override a live borrowed SQLite inode, even for
             // an exactly allowlisted historical schema and verified EX guard.
             let borrowed = crate::store::retained_sqlite_file(&path, false, false, false).unwrap();
@@ -2908,7 +2640,7 @@ mod gc_schema_race_tests {
                     now,
                     held,
                     &current,
-                    &leader,
+                    &writer,
                     &mut |_| Ok(())
                 )
                 .unwrap(),
@@ -3045,7 +2777,9 @@ mod gc_schema_race_tests {
         drop(db);
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         drop(crate::store::retained_sqlite_file(&path, false, false, false).unwrap());
-        let leader = roots.leader(&current).unwrap();
+        let writer = roots
+            .writer(Arc::new(current.verified_clone().unwrap()))
+            .unwrap();
         assert_eq!(
             inspect_index(&dir, &candidate.root_key, now).unwrap(),
             ("eligible", "age_30_days")
@@ -3075,7 +2809,7 @@ mod gc_schema_race_tests {
                 now,
                 held,
                 &current,
-                &leader,
+                &writer,
                 &mut |_| Ok(())
             )
             .unwrap()
@@ -3095,7 +2829,7 @@ mod gc_schema_race_tests {
                 now,
                 held,
                 &current,
-                &leader,
+                &writer,
                 &mut |_| Ok(())
             )
             .unwrap()
@@ -3113,7 +2847,7 @@ mod gc_schema_race_tests {
                 now,
                 held,
                 &current,
-                &leader,
+                &writer,
                 &mut |_| Ok(())
             )
             .unwrap()
@@ -3122,7 +2856,7 @@ mod gc_schema_race_tests {
         db.pragma_update(None, "user_version", 8_i64).unwrap();
         drop(db);
         let before = fs::read(&path).unwrap();
-        assert_eq!(roots.automatic_gc_at(&current, &leader, now).unwrap(), 0);
+        assert_eq!(roots.automatic_gc_at(&current, &writer, now).unwrap(), 0);
         assert_eq!(
             fs::read(&path).unwrap(),
             before,
@@ -3157,7 +2891,9 @@ mod gc_schema_race_tests {
         )
         .unwrap();
         drop(db);
-        let leader = roots.leader(&current).unwrap();
+        let writer = roots
+            .writer(Arc::new(current.verified_clone().unwrap()))
+            .unwrap();
         assert_eq!(
             inspect_index(&dir, &candidate.root_key, now).unwrap(),
             ("eligible", "age_30_days")
@@ -3187,7 +2923,7 @@ mod gc_schema_race_tests {
                 now,
                 guard,
                 &current,
-                &leader,
+                &writer,
                 &mut |_| Ok(())
             )
             .unwrap()
@@ -3207,7 +2943,7 @@ mod gc_schema_race_tests {
                 now,
                 guard,
                 &current,
-                &leader,
+                &writer,
                 &mut |_| Ok(())
             )
             .unwrap()
@@ -3219,7 +2955,7 @@ mod gc_schema_race_tests {
         let db = rusqlite::Connection::open(&path).unwrap();
         db.execute_batch("DROP VIEW unknown_gc_shape").unwrap();
         drop(db);
-        assert_eq!(roots.automatic_gc_at(&current, &leader, now).unwrap(), 1);
+        assert_eq!(roots.automatic_gc_at(&current, &writer, now).unwrap(), 1);
         assert!(!path.exists());
         assert!(!dir.exists());
     }
@@ -3352,8 +3088,14 @@ mod gc_final_witness_tests {
                 .unwrap();
         drop(crate::store::Store::open_for_tests(state.path(), current_root.path()).unwrap());
         drop(crate::store::Store::open_for_tests(state.path(), candidate_root.path()).unwrap());
-        drop(roots.leader(&candidate).unwrap());
-        let leader = roots.leader(&current).unwrap();
+        drop(
+            roots
+                .writer(Arc::new(candidate.verified_clone().unwrap()))
+                .unwrap(),
+        );
+        let writer = roots
+            .writer(Arc::new(current.verified_clone().unwrap()))
+            .unwrap();
         let now = 1_800_000_000_i64;
         let path = roots.index_db(&candidate);
         rusqlite::Connection::open(&path)
@@ -3366,7 +3108,7 @@ mod gc_final_witness_tests {
         let before = fs::read(&path).unwrap();
         let mut borrowed = None;
         let mut hit = 0;
-        let result = roots.automatic_gc_at_with_hook(&current, &leader, now, &mut |stage| {
+        let result = roots.automatic_gc_at_with_hook(&current, &writer, now, &mut |stage| {
             if stage == GcStage::BeforeCandidateUnlink {
                 hit += 1;
                 borrowed = Some(crate::store::retained_sqlite_file(
@@ -3388,7 +3130,7 @@ mod gc_final_witness_tests {
         let mut live = None;
         let mut hit = 0;
         let result =
-            roots.automatic_gc_at_with_hook(&current, &leader, now + 86_400, &mut |stage| {
+            roots.automatic_gc_at_with_hook(&current, &writer, now + 86_400, &mut |stage| {
                 if stage == GcStage::BeforeCandidateUnlink {
                     hit += 1;
                     live = Some(crate::store::protected_sqlite_open(

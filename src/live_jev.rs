@@ -468,13 +468,13 @@ mod tests {
             |_| {},
         )
         .unwrap();
-        let session = store.leader_session().unwrap();
+        let session = store.writer_session().unwrap();
         let revision = store
             .publish_native(
                 &graph,
                 &capture,
                 &native,
-                session.leader_guard().unwrap(),
+                session.writer_guard().unwrap(),
                 store.index_baseline().unwrap(),
                 &cancel,
             )

@@ -1762,7 +1762,7 @@ async fn browser_only_live_listener_releases_resources_then_exits_with_control_p
     let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
     let roots =
         TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
-    let index_lock = roots.leader_lock(&identity);
+    let index_lock = roots.index_use_lock(&identity);
     let registry = Arc::new(tokio::sync::Mutex::new(CheckoutRegistry::with_roots(roots)));
     let mut provisioner = BrowserProvisioner::new();
     let address = provisioner
@@ -1829,9 +1829,8 @@ async fn browser_only_live_listener_releases_resources_then_exits_with_control_p
     let after_request = std::time::Instant::now();
     let runtime = registry.lock().await.runtime(&identity.root_key).unwrap();
     assert!(runtime.has_active_resources());
-    assert!(!runtime.is_follower());
+    assert!(!runtime.catching_up());
     assert!(open_descriptors(&index_lock) > 0);
-    let retained = open_descriptors(&index_lock);
     for route in ["/healthz", "/", "/api/checkouts", "/api/daemon/status"] {
         let request = client.get(format!("{base}{route}"));
         let response = if route.starts_with("/api/") {
@@ -1855,7 +1854,10 @@ async fn browser_only_live_listener_releases_resources_then_exits_with_control_p
     );
     checked.advance(std::time::Instant::now()).unwrap();
     assert!(runtime.has_active_resources());
-    assert_eq!(open_descriptors(&index_lock), retained);
+    assert!(
+        open_descriptors(&index_lock) > 0,
+        "active browser runtime must retain its index-use descriptor"
+    );
     checked.set_clock_override_for_tests(after_request + Duration::from_secs(30 * 60));
     checked.advance(std::time::Instant::now()).unwrap();
     drop(checked);
@@ -1898,6 +1900,7 @@ async fn browser_only_live_listener_releases_resources_then_exits_with_control_p
     assert!(tokio::net::TcpStream::connect(address).await.is_err());
 }
 
+#[cfg(feature = "test-support")]
 #[tokio::test]
 async fn cold_selected_native_read_is_not_ready_without_a_fabricated_basis() {
     use axum::{
@@ -1982,6 +1985,7 @@ async fn cold_selected_native_read_is_not_ready_without_a_fabricated_basis() {
     drop(runtime);
 }
 
+#[cfg(feature = "test-support")]
 #[tokio::test]
 async fn selected_status_serves_validated_pre_h_head_and_clears_freshness_after_h() {
     use axum::{
@@ -2976,6 +2980,7 @@ async fn production_browser_rejects_every_selector_free_checkout_route_without_a
     }
 }
 
+#[cfg(feature = "test-support")]
 #[tokio::test]
 async fn selected_reads_validated_predecessor_through_owner_handoff() {
     use std::sync::{Arc, Mutex, mpsc};
@@ -3005,6 +3010,10 @@ async fn selected_reads_validated_predecessor_through_owner_handoff() {
         &Arc::new(std::sync::atomic::AtomicBool::new(false)),
     )
     .unwrap();
+    let prior = serde_json::to_value(published.status().unwrap().revision).unwrap();
+    fs::write(root.join("core.js"), "function newHead() {}\n").unwrap();
+    let queued = published.enqueue_request(&options, None).unwrap();
+    drop(old_owner);
     let mut registry = CheckoutRegistry::with_roots(roots);
     registry
         .register(&identity, CheckoutOptions(serde_json::json!({})))
@@ -3024,63 +3033,33 @@ async fn selected_reads_validated_predecessor_through_owner_handoff() {
             .unwrap();
         checked.activate(&identity.root_key).unwrap()
     };
-    let prefix = format!("/api/checkouts/{}", identity.root_key);
-    let old = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            let (code, _, status) = selected_json(
-                browser.clone(),
-                "GET",
-                &format!("{prefix}/status"),
-                Value::Null,
-            )
-            .await;
-            if code == axum::http::StatusCode::OK && runtime.is_follower() {
-                break status;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .unwrap();
-    let prior = old["revision"].clone();
-    assert!(prior["indexRevision"].as_u64().unwrap() > 0);
-    let (lock_tx, lock_rx) = mpsc::sync_channel(1);
-    let (unlock_tx, unlock_rx) = mpsc::sync_channel(1);
-    let unlock_rx = Mutex::new(unlock_rx);
-    runtime.set_leader_before_metadata_hook_for_tests(move || {
-        lock_tx.send(()).unwrap();
-        unlock_rx.lock().unwrap().recv().unwrap();
-    });
-    let (h_tx, h_rx) = mpsc::sync_channel(1);
-    let (resume_tx, resume_rx) = mpsc::sync_channel(1);
-    let resume_rx = Mutex::new(resume_rx);
-    runtime.set_takeover_h_hook_for_tests(Arc::new(move || {
-        h_tx.send(()).unwrap();
-        resume_rx.lock().unwrap().recv().unwrap();
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let release_rx = Mutex::new(release_rx);
+    // Activation schedules reconciliation on Tokio. Set the hook before the
+    // first await so this runtime pauses before its mandatory local H.
+    runtime.set_pre_h_hook_for_tests(Arc::new(move || {
+        entered_tx.send(()).unwrap();
+        release_rx.lock().unwrap().recv().unwrap();
     }));
-    fs::write(root.join("core.js"), "function newHead() {}\n").unwrap();
-    let queued = published.enqueue_request(&options, None).unwrap();
-    drop(old_owner);
+    let prefix = format!("/api/checkouts/{}", identity.root_key);
     tokio::time::timeout(Duration::from_secs(10), async {
-        while lock_rx.try_recv().is_err() {
+        while entered_rx.try_recv().is_err() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("new owner never reached pre-validation boundary");
-    let pending_browser = browser.clone();
-    let files_path = format!("{prefix}/files");
-    let pending = tokio::spawn(async move {
-        selected_json(pending_browser, "GET", &files_path, Value::Null).await
-    });
-    // The owner remains paused *before* SQLite metadata validation. A proved
-    // predecessor must answer without waiting for that validation or H.
-    let (code, headers, files) = tokio::time::timeout(Duration::from_secs(2), pending)
-        .await
-        .expect("proved predecessor waited for metadata validation")
-        .unwrap();
+    .expect("daemon-local H did not reach pre-publication boundary");
+    let (code, headers, files) = selected_json(
+        browser.clone(),
+        "GET",
+        &format!("{prefix}/files"),
+        Value::Null,
+    )
+    .await;
     assert_eq!(code, axum::http::StatusCode::OK, "{files}");
     assert_eq!(headers["X-Trellis-Catching-Up"], "true");
+    assert_eq!(files["revision"], prior);
     assert!(files.to_string().contains("core.js"));
     let (mutation_code, _, mutation_body) = selected_json(
         browser.clone(),
@@ -3095,62 +3074,22 @@ async fn selected_reads_validated_predecessor_through_owner_handoff() {
         "{mutation_body}"
     );
     assert_eq!(mutation_body["error"]["code"], "index_not_ready");
-    let owner_paused_at = std::time::Instant::now();
-    tokio::time::sleep(Duration::from_millis(310)).await;
-    eprintln!(
-        "restricted predecessor served before owner validation; metadata held {:?}",
-        owner_paused_at.elapsed()
-    );
-    // This request ARRIVES after the old 250ms wait cap, while owner SQLite
-    // metadata validation is still blocked; it must not depend on that timer.
-    let (late_code, late_headers, late_status) = selected_json(
+    let (status_code, status_headers, status) = selected_json(
         browser.clone(),
         "GET",
         &format!("{prefix}/status"),
         Value::Null,
     )
     .await;
-    assert_eq!(late_code, axum::http::StatusCode::OK, "{late_status}");
-    assert_eq!(late_status["revision"], prior);
-    assert_eq!(late_headers["X-Trellis-Catching-Up"], "true");
-    let validation_released_at = std::time::Instant::now();
-    unlock_tx.send(()).unwrap();
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while h_rx.try_recv().is_err() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("new owner never reached pre-H boundary");
-    eprintln!(
-        "owner-validation release to H pause: {:?}",
-        validation_released_at.elapsed()
-    );
-    let (code, headers, tree) = selected_json(
-        browser.clone(),
-        "GET",
-        &format!("{prefix}/tree"),
-        Value::Null,
-    )
-    .await;
-    assert_eq!(code, axum::http::StatusCode::OK, "{tree}");
-    assert_eq!(headers["X-Trellis-Catching-Up"], "true");
-    let (code, _, paused) = selected_json(
-        browser.clone(),
-        "GET",
-        &format!("{prefix}/status"),
-        Value::Null,
-    )
-    .await;
-    assert_eq!(code, axum::http::StatusCode::OK, "{paused}");
-    assert_eq!(paused["revision"], prior);
-    assert_eq!(paused["catchingUp"], true);
+    assert_eq!(status_code, axum::http::StatusCode::OK, "{status}");
+    assert_eq!(status["revision"], prior);
+    assert_eq!(status_headers["X-Trellis-Catching-Up"], "true");
     assert_eq!(
         published.request_by_id(&queued.id).unwrap().unwrap().state,
         "queued",
-        "pre-H read authority cannot claim the accepted FIFO head"
+        "pre-H selected reads cannot claim accepted FIFO work"
     );
-    resume_tx.send(()).unwrap();
+    release_tx.send(()).unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let (code, _, status) = selected_json(
@@ -3163,7 +3102,8 @@ async fn selected_reads_validated_predecessor_through_owner_handoff() {
             if code == axum::http::StatusCode::OK && status["catchingUp"] == false {
                 assert!(
                     status["revision"]["indexRevision"].as_u64().unwrap()
-                        > prior["indexRevision"].as_u64().unwrap()
+                        >= prior["indexRevision"].as_u64().unwrap() + 2,
+                    "mandatory H must publish before queued work"
                 );
                 break;
             }
@@ -3171,5 +3111,10 @@ async fn selected_reads_validated_predecessor_through_owner_handoff() {
         }
     })
     .await
-    .expect("new H never published");
+    .expect("local H and accepted FIFO head did not finish");
+    let finished = published.request_by_id(&queued.id).unwrap().unwrap();
+    assert_eq!(
+        (finished.id.as_str(), finished.seq, finished.state.as_str()),
+        (queued.id.as_str(), queued.seq, "done")
+    );
 }

@@ -3,7 +3,7 @@ use super::Store;
 use crate::{
     indexer::{IndexOptions, ReconcileOptions},
     model::IndexPin,
-    store::topology::{LeaderSession, UseGuard},
+    store::topology::{UseGuard, WriterSession},
 };
 use anyhow::{Result, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
@@ -581,8 +581,8 @@ impl Store {
         Ok(QueueProbeAdmission::Ready(opened))
     }
     fn request_connection(&self) -> Result<(UseGuard, super::ProtectedSqliteConnection)> {
-        // A replacement-root follower may accept before it owns the leader lock,
-        // but it must never recreate a missing queue containing old-root ACKs.
+        // A replacement-root caller must never recreate a missing queue
+        // that might contain accepted old-root IDs.
         self.request_connection_for_root_loss(false, self.is_root_replaced(), None)
     }
     /// Read an already-admitted queue without creating requests.db or its schema.
@@ -610,7 +610,7 @@ impl Store {
         &self,
         old_root: bool,
         existing_only: bool,
-        verified_owner: Option<&LeaderSession>,
+        verified_owner: Option<&WriterSession>,
     ) -> Result<(UseGuard, super::ProtectedSqliteConnection)> {
         // Root-loss paths keep their existing queue admission barriers.
         #[cfg(test)]
@@ -674,7 +674,7 @@ impl Store {
                     existing_only && !old_root && self.is_ready_disposition(),
                     "storage_busy: only current Ready owner may recover virgin queue"
                 );
-                self.verify_leader_session(owner)?;
+                self.verify_writer_session(owner)?;
             }
             // IMMEDIATE waits at most the existing three-second SQLite busy
             // timeout. A concurrent initializer can win; re-read while holding
@@ -683,7 +683,7 @@ impl Store {
                 db.transaction_with_behavior(TransactionBehavior::Immediate),
             )?;
             if let Some(owner) = verified_owner {
-                self.verify_leader_session(owner)?;
+                self.verify_writer_session(owner)?;
             }
             let locked_version: i64 =
                 super::storage_result(tx.pragma_query_value(None, "user_version", |r| r.get(0)))?;
@@ -704,7 +704,7 @@ impl Store {
                 ))?;
                 ensure!(objects == 0, "incompatible_queue: unexpected virgin schema");
                 if let Some(owner) = verified_owner {
-                    self.verify_leader_session(owner)?;
+                    self.verify_writer_session(owner)?;
                 }
                 super::storage_result(tx.execute_batch(SCHEMA))?;
                 super::storage_result(tx.execute(
@@ -715,7 +715,7 @@ impl Store {
                 ensure!(locked_version == 1, "incompatible_queue: schema version");
             }
             if let Some(owner) = verified_owner {
-                self.verify_leader_session(owner)?;
+                self.verify_writer_session(owner)?;
             }
             super::storage_result(tx.commit())?;
         } else {
@@ -819,7 +819,7 @@ impl Store {
         tx.commit()?;
         self.identity.verify()?;
         // Return the exact accepted row constructed under the INSERT transaction.
-        // A leader may claim immediately after COMMIT; reading it back would race
+        // The local writer may claim immediately after COMMIT; reading it back would race
         // and mislabel the acknowledgement as already running or terminal.
         Ok(Request {
             seq,
@@ -837,6 +837,21 @@ impl Store {
             finished_at: None,
         })
     }
+    /// Inspect a settled foreign-root row without granting it to a new-root client.
+    #[cfg(feature = "test-support")]
+    pub fn request_any_root_for_tests(&self, id: &str) -> Result<Option<Request>> {
+        let Some((_guard, db)) = self.existing_request_connection()? else {
+            return Ok(None);
+        };
+        Ok(db
+            .query_row(
+                &format!("SELECT {COLUMNS} FROM requests WHERE id=?1"),
+                [id],
+                read,
+            )
+            .optional()?)
+    }
+
     pub fn request_by_id(&self, id: &str) -> Result<Option<Request>> {
         if Uuid::parse_str(id).is_err() {
             return Ok(None);
@@ -952,108 +967,89 @@ impl Store {
         Ok(())
     }
     /// Mark old-root rows before replacement work, or fail this holder's rows after root loss.
-    pub fn fail_changed_root_requests(&self, session: &LeaderSession) -> Result<usize> {
-        let old_root = self.identity.root_path_replaced()?;
-        if old_root {
-            self.verify_old_root_queue_leader(session)?;
-        } else {
-            self.verify_leader_session(session)?;
-            // Before the first durable request, a fresh Ready index has no queue.
-            // RootReplaced must never use this exception: its old ACKs may exist.
-            if self.is_ready_disposition() {
-                match fs::symlink_metadata(self.request_db_path()) {
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        ensure!(
-                            self.request_file_witness.lock().unwrap().is_none(),
-                            "incompatible_queue: accepted requests.db disappeared"
-                        );
-                        return Ok(0);
-                    }
-                    Err(error) => return Err(error.into()),
-                    Ok(_) => {}
-                }
-            }
-        }
-        let (_guard, mut db) = self.request_connection_for_root_loss(
-            old_root,
-            true,
-            (!old_root && self.is_ready_disposition()).then_some(session),
-        )?;
-        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if old_root {
-            self.verify_old_root_queue_leader(session)?;
-        } else {
-            self.verify_leader_session(session)?;
-        }
-        let predicate = if old_root {
-            "root_device=?3 AND root_inode=?4"
-        } else {
-            "(root_device<>?3 OR root_inode<>?4)"
-        };
-        let affected: Vec<Request> = {
-            let read_predicate = predicate.replace("?3", "?1").replace("?4", "?2");
-            let mut statement = tx.prepare(&format!("SELECT {COLUMNS} FROM requests WHERE state IN ('queued','running') AND {read_predicate} ORDER BY seq"))?;
-            let rows = statement.query_map(
-                params![
-                    self.identity.device.to_string(),
-                    self.identity.inode.to_string()
-                ],
-                read,
-            )?;
-            rows.collect::<rusqlite::Result<_>>()?
-        };
-        let changed = tx.execute(&format!("UPDATE requests SET state='failed',claim_incarnation=?1,started_at=COALESCE(started_at,?2),finished_at=?2,error_code='root_changed' WHERE state IN ('queued','running') AND {predicate}"),
-            params![session.incarnation().to_string(),now(),self.identity.device.to_string(),self.identity.inode.to_string()])?;
-        ensure!(
-            changed == affected.len(),
-            "storage_busy: root failure set changed"
-        );
-        if old_root {
-            self.verify_old_root_queue_leader(session)?;
-        } else {
-            self.verify_leader_session(session)?;
-        }
-        // A failed COMMIT is ambiguous even if this Connection can reread its
-        // writes. Never advance to EX on a result without a successful COMMIT.
-        tx.commit()?;
-        self.attest_changed_root_rows(&db, &affected, session)?;
-        Ok(changed)
-    }
-    fn attest_changed_root_rows(
-        &self,
-        db: &Connection,
-        affected: &[Request],
-        session: &LeaderSession,
-    ) -> Result<()> {
-        for prior in affected {
-            let row = db.query_row(
-                &format!("SELECT {COLUMNS} FROM requests WHERE seq=?1"),
-                [prior.seq],
-                read,
-            )?;
-            ensure!(
-                row.id == prior.id
-                    && row.root_device == prior.root_device
-                    && row.root_inode == prior.root_inode
-                    && row.state == "failed"
-                    && row.error_code.as_deref() == Some("root_changed")
-                    && row.claim_incarnation.as_deref()
-                        == Some(session.incarnation().to_string().as_str()),
-                "storage_busy: root failure commit not confirmed"
-            );
-        }
-        Ok(())
-    }
-    fn verify_old_root_queue_leader(&self, session: &LeaderSession) -> Result<()> {
+    /// Settle a lost captured root without retaining an old writer lease.
+    /// A separate protected queue open confirms every terminal row after COMMIT.
+    pub fn fail_changed_root_requests(&self) -> Result<usize> {
         ensure!(
             self.identity.root_path_replaced()?,
-            "root_changed: pathname still names captured root"
+            "root_changed: captured root is still present"
         );
-        session.verify_after_root_loss(
-            &self.identity,
-            &self.roots.leader_lock(&self.identity),
-            &self.roots.index_use_lock(&self.identity),
-        )
+        let mut seen = Vec::<Request>::new();
+        for attempt in 0..2 {
+            let result = (|| -> Result<bool> {
+                let (_guard, mut db) = self.request_connection_for_root_loss(true, true, None)?;
+                let tx = super::storage_result(
+                    db.transaction_with_behavior(TransactionBehavior::Immediate),
+                )?;
+                ensure!(
+                    self.identity.root_path_replaced()?,
+                    "root_changed: captured root returned"
+                );
+                let affected: Vec<Request> = {
+                    let mut statement = super::storage_result(tx.prepare(&format!(
+                        "SELECT {COLUMNS} FROM requests WHERE state IN ('queued','running') AND root_device=?1 AND root_inode=?2 ORDER BY seq"
+                    )))?;
+                    let rows = super::storage_result(statement.query_map(
+                        params![
+                            self.identity.device.to_string(),
+                            self.identity.inode.to_string()
+                        ],
+                        read,
+                    ))?;
+                    super::storage_result(rows.collect::<rusqlite::Result<_>>())?
+                };
+                for row in &affected {
+                    if !seen.iter().any(|prior| prior.seq == row.seq) {
+                        seen.push(row.clone());
+                    }
+                }
+                let transition = Uuid::new_v4().to_string();
+                let changed = super::storage_result(tx.execute(
+                    "UPDATE requests SET state='failed',claim_incarnation=?1,started_at=COALESCE(started_at,?2),finished_at=?2,error_code='root_changed' WHERE state IN ('queued','running') AND root_device=?3 AND root_inode=?4",
+                    params![transition, now(), self.identity.device.to_string(), self.identity.inode.to_string()],
+                ))?;
+                ensure!(
+                    changed == affected.len(),
+                    "storage_busy: root failure set changed"
+                );
+                ensure!(
+                    self.identity.root_path_replaced()?,
+                    "root_changed: captured root returned"
+                );
+                let committed = super::storage_result(tx.commit());
+                drop(db);
+                let (_guard, reread) = self.request_connection_for_root_loss(true, true, None)?;
+                let confirmed = attest_prior_root_rows(&reread, &seen)?
+                    && self.old_root_pending_in(&reread)? == 0;
+                if confirmed {
+                    ensure!(
+                        self.identity.root_path_replaced()?,
+                        "root_changed: captured root returned"
+                    );
+                    return Ok(true);
+                }
+                committed?;
+                Ok(false)
+            })();
+            match result {
+                Ok(true) => return Ok(seen.len()),
+                Ok(false) if attempt == 0 => continue,
+                Err(ref error) if attempt == 0 && super::transient_storage_contention(error) => {
+                    continue;
+                }
+                Err(error) => return Err(error),
+                Ok(false) => break,
+            }
+        }
+        anyhow::bail!("storage_busy: lost-root settlement not confirmed")
+    }
+
+    fn old_root_pending_in(&self, db: &Connection) -> Result<i64> {
+        super::storage_result(db.query_row(
+            "SELECT count(*) FROM requests WHERE state IN ('queued','running') AND root_device=?1 AND root_inode=?2",
+            params![self.identity.device.to_string(), self.identity.inode.to_string()],
+            |row| row.get(0),
+        ))
     }
     /// Settle every accepted foreign-root row before the new root's H or FIFO claim.
     /// The caller serializes checkout writers. Opening the existing queue first lets
@@ -1069,10 +1065,16 @@ impl Store {
         let path = self.request_db_path();
         if matches!(fs::symlink_metadata(&path), Err(ref error) if error.kind() == std::io::ErrorKind::NotFound)
         {
+            // A new daemon creates its queue before first H. After a published
+            // head, absence is corruption: accepted IDs could have been lost.
             ensure!(
-                self.is_ready_disposition() && self.request_file_witness.lock().unwrap().is_none(),
+                self.is_ready_disposition()
+                    && self.request_file_witness.lock().unwrap().is_none()
+                    && self.index_baseline()?.index_revision == 0,
                 "incompatible_queue: accepted requests.db disappeared"
             );
+            let (_guard, db) = self.request_connection()?;
+            drop(db);
             return Ok(0);
         }
         let mut after_commit = Some(after_commit);
@@ -1120,6 +1122,14 @@ impl Store {
                 // COMMIT failure is ambiguous. Reopen; this connection's apparent
                 // state is not proof of durability.
                 drop(db);
+                #[cfg(feature = "test-support")]
+                let committed = if self.run_ambiguous_settlement_hook_for_tests() {
+                    Err(anyhow::anyhow!(
+                        "storage_busy: injected ambiguous root settlement COMMIT"
+                    ))
+                } else {
+                    committed
+                };
                 if committed.is_ok() {
                     let _ = after_commit.take().map_or(Ok(()), |hook| hook());
                 }
@@ -1153,13 +1163,13 @@ impl Store {
         anyhow::bail!("storage_busy: root settlement not confirmed")
     }
 
-    pub fn claim_request(&self, session: &LeaderSession) -> Result<Option<Request>> {
+    pub fn claim_request(&self, session: &WriterSession) -> Result<Option<Request>> {
         // EX ownership alone is not authority to claim. The same incarnation
         // must first commit and attest its selected post-acquisition H.
-        self.verify_reconciled_leader_claim(session)?;
+        self.verify_committed_writer_claim(session)?;
         let (_guard, mut db) = self.request_connection()?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        self.verify_leader_session(session)?;
+        self.verify_writer_session(session)?;
         let row=tx.query_row(&format!("SELECT {COLUMNS} FROM requests WHERE state IN ('queued','running') ORDER BY seq LIMIT 1"), [],read).optional()?;
         let Some(row) = row else { return Ok(None) };
         self.verify_request_root(&Some(row.clone()))?;
@@ -1169,7 +1179,7 @@ impl Store {
         {
             return Ok(None);
         }
-        self.verify_reconciled_leader_claim(session)?;
+        self.verify_committed_writer_claim(session)?;
         tx.execute("UPDATE requests SET state='running',claim_incarnation=?1,started_at=?2 WHERE seq=?3 AND state IN ('queued','running')", params![session.incarnation().to_string(),now(),row.seq])?;
         let claimed = tx.query_row(
             &format!("SELECT {COLUMNS} FROM requests WHERE seq=?1"),
@@ -1185,12 +1195,12 @@ impl Store {
     /// reconciliation rather than attaching a guessed result or republishing.
     pub(crate) fn requeue_busy_claim(
         &self,
-        session: &LeaderSession,
+        session: &WriterSession,
         request: &Request,
         before: Option<IndexPin>,
     ) -> Result<()> {
-        self.verify_leader_session(session)?;
-        self.fail_changed_root_requests(session)?;
+        self.verify_writer_session(session)?;
+        self.settle_foreign_root_requests()?;
         let current = self.recovery_index_baseline()?.pin();
         let observed = self
             .request_by_id(&request.id)?
@@ -1234,7 +1244,7 @@ impl Store {
         );
         let (_use_guard, mut db) = self.request_connection()?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        self.verify_leader_session(session)?;
+        self.verify_writer_session(session)?;
         self.verify_request_root(&Some(observed))?;
         let changed=tx.execute(
             "UPDATE requests SET state='queued',claim_incarnation=NULL,started_at=NULL WHERE seq=?1 AND id=?2 AND state='running' AND claim_incarnation=?3 AND root_device=?4 AND root_inode=?5",
@@ -1244,18 +1254,18 @@ impl Store {
             changed == 1,
             "storage_busy: request claim changed before same-seq requeue"
         );
-        self.verify_leader_session(session)?;
+        self.verify_writer_session(session)?;
         tx.commit()?;
         Ok(())
     }
 
     pub(crate) fn record_and_finish_request(
         &self,
-        session: &LeaderSession,
+        session: &WriterSession,
         request: &Request,
         result: Result<IndexPin>,
     ) -> Result<()> {
-        self.verify_leader_session(session)?;
+        self.verify_writer_session(session)?;
         ensure!(
             request.claim_incarnation.as_deref()
                 == Some(session.incarnation().to_string().as_str()),
@@ -1276,9 +1286,9 @@ impl Store {
         Ok(())
     }
 
-    /// A CLI may retry only its own cached completion while holding that same leader.
+    /// A daemon caller may retry only its own cached completion under the same writer.
     /// Do not convert an ordinary claim/read/publish error into an unbounded retry.
-    pub(crate) fn has_recorded_completion(&self, session: &LeaderSession) -> Result<bool> {
+    pub(crate) fn has_recorded_completion(&self, session: &WriterSession) -> Result<bool> {
         Ok(self
             .pending_request_completion
             .lock()
@@ -1289,8 +1299,8 @@ impl Store {
 
     /// Resolve the one in-flight FIFO head before claiming any newer row. A terminal
     /// reread handles an ambiguous SQLite COMMIT; it must match our cached result.
-    pub(crate) fn retry_recorded_completion(&self, session: &LeaderSession) -> Result<bool> {
-        self.verify_leader_session(session)?;
+    pub(crate) fn retry_recorded_completion(&self, session: &WriterSession) -> Result<bool> {
+        self.verify_writer_session(session)?;
         let mut slot = self.pending_request_completion.lock().unwrap();
         let Some(pending) = slot.as_ref() else {
             return Ok(false);
@@ -1354,7 +1364,7 @@ impl Store {
 
     pub fn finish_request(
         &self,
-        session: &LeaderSession,
+        session: &WriterSession,
         request: &Request,
         result: Result<IndexPin>,
     ) -> Result<()> {
@@ -1362,11 +1372,11 @@ impl Store {
     }
     fn finish_request_outcome(
         &self,
-        session: &LeaderSession,
+        session: &WriterSession,
         request: &Request,
         outcome: &CompletionOutcome,
     ) -> Result<()> {
-        self.verify_leader_session(session)?;
+        self.verify_writer_session(session)?;
         #[cfg(test)]
         if self
             .test_queue_finish_failures
@@ -1381,7 +1391,7 @@ impl Store {
         }
         let (_guard, mut db) = self.request_connection()?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        self.verify_leader_session(session)?;
+        self.verify_writer_session(session)?;
         if let CompletionOutcome::Done(pin) = outcome {
             ensure!(
                 self.status()?.revision == *pin,
@@ -1508,7 +1518,7 @@ mod root_failure_tests {
     use std::sync::mpsc;
 
     #[test]
-    fn root_loss_serializes_prior_accept_and_refuses_late_insert_under_writer_lock() {
+    fn root_loss_serializes_prior_accept_and_refuses_late_insert() {
         let state = tempfile::tempdir().unwrap();
         let parent = tempfile::tempdir().unwrap();
         let root = parent.path().join("workspace");
@@ -1516,7 +1526,7 @@ mod root_failure_tests {
         let store = Store::open_for_tests(state.path(), &root).unwrap();
         let options = IndexOptions::new(root.clone());
         let accepted = store.enqueue_request(&options, None).unwrap();
-        let owner = store.leader_session().unwrap();
+        let _owner = store.writer_session().unwrap();
         let (locked_tx, locked_rx) = mpsc::channel();
         let (resume_tx, resume_rx) = mpsc::channel();
         let worker_store = store.clone();
@@ -1533,7 +1543,7 @@ mod root_failure_tests {
         fs::rename(&root, parent.path().join("old-workspace")).unwrap();
         resume_tx.send(()).unwrap();
         assert!(worker.join().unwrap().is_err());
-        assert_eq!(store.fail_changed_root_requests(&owner).unwrap(), 1);
+        assert_eq!(store.fail_changed_root_requests().unwrap(), 1);
         let db = Connection::open(store.request_db_path()).unwrap();
         let rows: i64 = db
             .query_row("SELECT count(*) FROM requests", [], |r| r.get(0))
@@ -1551,21 +1561,21 @@ mod root_failure_tests {
     }
 
     #[test]
-    fn ready_leader_without_accepted_queue_skips_without_creating_db() {
+    fn ready_writer_bootstraps_empty_queue_before_first_reconciliation() {
         let state = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
         let store = Store::open_for_tests(state.path(), root.path()).unwrap();
         assert!(!store.request_db_path().exists());
-        let owner = store.leader_session().unwrap();
-        // Acquiring the leader sets the publication fence; Ready disposition
-        // still distinguishes this fresh start from exceptional recovery.
+        let _owner = store.writer_session().unwrap();
+        // A daemon-local writer does not turn a ready startup into recovery.
         assert!(store.is_ready_disposition());
-        assert_eq!(store.fail_changed_root_requests(&owner).unwrap(), 0);
-        assert!(!store.request_db_path().exists());
+        assert_eq!(store.settle_foreign_root_requests().unwrap(), 0);
+        assert!(store.request_db_path().exists());
+        assert!(store.current_request().unwrap().is_none());
     }
 
     #[test]
-    fn current_owner_refuses_virgin_version_with_unknown_view_without_replacing_inode() {
+    fn current_writer_refuses_virgin_version_with_unknown_view_without_replacing_inode() {
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
         let state = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
@@ -1593,8 +1603,11 @@ mod root_failure_tests {
             0
         );
         drop(db);
-        let owner = store.leader_session().unwrap();
-        let error = store.fail_changed_root_requests(&owner).unwrap_err();
+        let owner = store.writer_session().unwrap();
+        let error = store
+            .request_connection_for_root_loss(false, true, Some(owner.as_ref()))
+            .err()
+            .expect("unknown virgin schema must not be initialized");
         assert_eq!(
             error.to_string(),
             "incompatible_queue: unexpected virgin schema"
@@ -1631,9 +1644,9 @@ mod root_failure_tests {
             let state = tempfile::tempdir().unwrap();
             let root = tempfile::tempdir().unwrap();
             let store = Store::open_for_tests(state.path(), root.path()).unwrap();
-            let owner = store.leader_session().unwrap();
+            let _owner = store.writer_session().unwrap();
             store.mark_recovery(disposition);
-            assert!(store.fail_changed_root_requests(&owner).is_err());
+            assert!(store.settle_foreign_root_requests().is_err());
             assert!(!store.request_db_path().exists());
         }
     }
@@ -1852,11 +1865,13 @@ mod foreign_root_settlement_tests {
     }
 
     #[test]
-    fn missing_virgin_queue_remains_absent() {
+    fn missing_virgin_queue_bootstraps_empty_queue_before_first_h() {
         let state = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
         let store = Store::open_for_tests(state.path(), root.path()).unwrap();
-        assert_eq!(store.settle_foreign_root_requests().unwrap(), 0);
         assert!(!store.request_db_path().exists());
+        assert_eq!(store.settle_foreign_root_requests().unwrap(), 0);
+        assert!(store.request_db_path().exists());
+        assert!(store.current_request().unwrap().is_none());
     }
 }

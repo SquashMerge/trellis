@@ -26,7 +26,7 @@ mod offline {
         Graph,
         Router,
         Value,
-        Arc<trellis::store::topology::LeaderSession>,
+        Arc<trellis::store::topology::WriterSession>,
     ) {
         let dir = tempfile::tempdir().unwrap();
         let workspace = dir.path().join("workspace");
@@ -45,13 +45,13 @@ mod offline {
             .unwrap()
             .id
             .clone();
-        let session = store.leader_session().unwrap();
+        let session = store.writer_session_for_tests().unwrap();
         store
             .publish_native(
                 &graph,
                 &capture,
                 &native,
-                session.leader_guard().unwrap(),
+                session.writer_guard().unwrap(),
                 store.index_baseline().unwrap(),
                 &cancel,
             )
@@ -236,7 +236,7 @@ async fn enabled_status_exhaustion_and_stale_preflight_are_offline() {
             &graph,
             &capture,
             &native,
-            session.leader_guard().unwrap(),
+            session.writer_guard().unwrap(),
             expected,
             &cancel,
         )

@@ -84,13 +84,13 @@ async fn rust_methods_sequence_and_source_survive_live_file_removal() {
             .iter()
             .any(|f| f.path == "helper.js" && f.language == "javascript")
     );
-    let session = store.leader_session().unwrap();
+    let session = store.writer_session_for_tests().unwrap();
     store
         .publish_native(
             &graph,
             &capture,
             &native,
-            session.leader_guard().unwrap(),
+            session.writer_guard().unwrap(),
             store.index_baseline().unwrap(),
             &cancel,
         )

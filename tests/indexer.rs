@@ -1008,16 +1008,18 @@ fn four_language_noncallable_native_declarations_keep_exact_kind_and_are_not_exe
     }
     let state = tempfile::tempdir().unwrap();
     let store = trellis::store::Store::open_for_tests(state.path(), d.path()).unwrap();
-    let session = store.leader_session().unwrap();
-    let pin = publish_bundle(
+    let (pin, _session) = trellis::index_coordinator::reconcile_workspace(
         &store,
-        &graph,
-        d.path(),
-        session.leader_guard().unwrap(),
-        store.index_baseline().unwrap(),
+        &IndexOptions::new(d.path().to_owned()),
         &cancel(),
+        |_| {},
     )
     .unwrap();
+    assert_eq!(
+        store.graph().unwrap(),
+        graph,
+        "published graph must match captured source"
+    );
     let saved = store.graph().unwrap();
     assert_eq!(saved.nodes, graph.nodes);
     assert_eq!(saved.calls, graph.calls);
@@ -1093,27 +1095,6 @@ fn four_language_noncallable_native_declarations_keep_exact_kind_and_are_not_exe
         }
         assert_eq!(store.source(path).unwrap().unwrap().text, text);
     }
-}
-
-fn publish_bundle(
-    store: &trellis::store::Store,
-    graph: &trellis::model::Graph,
-    workspace: &std::path::Path,
-    leader: &trellis::store::topology::LeaderGuard,
-    expected: trellis::model::IndexPin,
-    cancel: &trellis::model::CancelFlag,
-) -> anyhow::Result<trellis::model::IndexPin> {
-    let (indexed, native, capture) = trellis::indexer::index_workspace_bundle(
-        &trellis::indexer::IndexOptions::new(workspace.to_owned()),
-        store.root_id(),
-        cancel,
-        |_| {},
-    )?;
-    assert_eq!(
-        &indexed, graph,
-        "published graph must match captured source"
-    );
-    store.publish_native(&indexed, &capture, &native, leader, expected, cancel)
 }
 
 #[test]

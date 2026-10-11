@@ -1,230 +1,42 @@
+//! Daemon-local selected reads use a validated committed head during mandatory H.
+//! The retired cross-process predecessor permit and leader lock are not read gates.
 mod common;
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, AtomicU64, Ordering},
-};
+use std::sync::{Arc, atomic::AtomicBool};
 use trellis::{
-    indexer::{self, IndexOptions},
+    index_coordinator::{self, IndexJobCoordinator},
+    indexer::IndexOptions,
     model::CancelFlag,
-    store::{EvidenceFencePolicy, PreHReadPermit, Store},
+    store::Store,
 };
 
-fn fixture() -> (tempfile::TempDir, tempfile::TempDir, Store) {
-    let state = tempfile::tempdir().unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(state.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-    }
-    let work = tempfile::tempdir().unwrap();
-    let store = Store::open_for_tests(state.path(), work.path()).unwrap();
-    (state, work, store)
-}
-
-#[test]
-fn idle_reattach_admits_only_validated_predecessor_and_fences_epoch() {
-    let (_state, work, store) = fixture();
-    std::fs::write(work.path().join("a.js"), "function oldHead() {}\n").unwrap();
-    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
-    let (graph, native, capture) = indexer::index_workspace_bundle(
-        &IndexOptions::new(work.path().to_owned()),
-        store.root_id(),
-        &cancel,
-        |_| {},
-    )
-    .unwrap();
-    let leader = store.leader_session().unwrap();
-    let first = store
-        .publish_native(
-            &graph,
-            &capture,
-            &native,
-            leader.leader_guard().unwrap(),
-            store.index_baseline().unwrap(),
-            &cancel,
-        )
-        .unwrap();
-    let ordinary = store.evidence_response().unwrap();
-    let epoch = Arc::new(AtomicU64::new(1));
-    let permit = store
-        .pre_h_read_permit(&ordinary, &leader, epoch.clone())
-        .unwrap();
-    ordinary.finish(()).unwrap();
-    drop(ordinary);
-    drop(leader);
-
-    let successor = store.leader_for_idle_reattach(&permit).unwrap();
-    assert!(
-        store.evidence_response().is_err(),
-        "ordinary admission stays strict"
-    );
-    let admission = store.evidence_response_pre_h(&permit, successor.clone());
-    assert!(
-        admission.is_ok(),
-        "matching validated predecessor must admit a read: {:?}",
-        admission.as_ref().err().map(ToString::to_string)
-    );
-    let admitted = admission.ok().unwrap();
-    assert_eq!(admitted.status().unwrap().revision, first);
-    admitted.validate_pin(first).unwrap();
-    admitted.finish(()).unwrap();
-    epoch.fetch_add(1, Ordering::AcqRel);
-    assert!(
-        admitted
-            .finish(())
-            .unwrap_err()
-            .to_string()
-            .contains("checkout epoch changed")
-    );
-    assert!(
-        store
-            .evidence_response_pre_h(&permit, successor)
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("checkout epoch changed")
-    );
-}
-
-#[test]
-fn cold_head_cannot_mint_a_permit() {
-    let (_state, _work, store) = fixture();
-    assert!(store.evidence_response().is_err());
-}
-
-#[test]
-fn publication_ends_new_pre_h_admissions_and_resumes_strict_reads() {
-    let (_state, work, store) = fixture();
-    std::fs::write(work.path().join("a.js"), "function oldHead() {}\n").unwrap();
-    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
-    let (graph, native, capture) = indexer::index_workspace_bundle(
-        &IndexOptions::new(work.path().to_owned()),
-        store.root_id(),
-        &cancel,
-        |_| {},
-    )
-    .unwrap();
-    let leader = store.leader_session().unwrap();
-    let first = store
-        .publish_native(
-            &graph,
-            &capture,
-            &native,
-            leader.leader_guard().unwrap(),
-            store.index_baseline().unwrap(),
-            &cancel,
-        )
-        .unwrap();
-    let response = store.evidence_response().unwrap();
-    let permit = store
-        .pre_h_read_permit(&response, &leader, Arc::new(AtomicU64::new(5)))
-        .unwrap();
-    drop(response);
-    drop(leader);
-    let successor = store.leader_for_idle_reattach(&permit).unwrap();
-    let admitted = store
-        .evidence_response_pre_h(&permit, successor.clone())
-        .unwrap();
-    admitted.finish(()).unwrap();
-    drop(admitted);
-    let second = store
-        .publish_native(
-            &graph,
-            &capture,
-            &native,
-            successor.leader_guard().unwrap(),
-            first,
-            &cancel,
-        )
-        .unwrap();
-    assert!(second.index_revision > first.index_revision);
-    assert!(
-        store
-            .evidence_response_pre_h(&permit, successor.clone())
-            .is_err(),
-        "published H must close predecessor admission"
-    );
-    let strict = store.evidence_response().unwrap();
-    assert_eq!(strict.status().unwrap().revision, second);
-    strict.finish(()).unwrap();
-}
-
-#[test]
-fn intervening_leader_incarnation_cannot_reuse_an_idle_permit() {
-    let (_state, work, store) = fixture();
-    std::fs::write(work.path().join("a.js"), "function oldHead() {}\n").unwrap();
-    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
-    let (graph, native, capture) = indexer::index_workspace_bundle(
-        &IndexOptions::new(work.path().to_owned()),
-        store.root_id(),
-        &cancel,
-        |_| {},
-    )
-    .unwrap();
-    let leader = store.leader_session().unwrap();
-    store
-        .publish_native(
-            &graph,
-            &capture,
-            &native,
-            leader.leader_guard().unwrap(),
-            store.index_baseline().unwrap(),
-            &cancel,
-        )
-        .unwrap();
-    let response = store.evidence_response().unwrap();
-    let permit = store
-        .pre_h_read_permit(&response, &leader, Arc::new(AtomicU64::new(1)))
-        .unwrap();
-    drop(response);
-    drop(leader);
-    let intervening = store.leader().unwrap();
-    drop(intervening);
-    assert!(
-        store
-            .leader_for_idle_reattach(&permit)
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("intervening leader")
-    );
-}
-
-fn released_head() -> (
+fn fixture() -> (
     tempfile::TempDir,
     tempfile::TempDir,
     Store,
-    PreHReadPermit,
+    IndexOptions,
+    CancelFlag,
+) {
+    let state = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    std::fs::write(work.path().join("a.js"), "function oldHead() {}\n").unwrap();
+    let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+    let options = IndexOptions::new(work.path().to_owned());
+    let cancel = Arc::new(AtomicBool::new(false));
+    (state, work, store, options, cancel)
+}
+
+fn published() -> (
+    tempfile::TempDir,
+    tempfile::TempDir,
+    Store,
+    IndexOptions,
+    CancelFlag,
     trellis::model::IndexPin,
 ) {
-    let (state, work, store) = fixture();
-    std::fs::write(work.path().join("a.js"), "function oldHead() {}\n").unwrap();
-    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
-    let (graph, native, capture) = indexer::index_workspace_bundle(
-        &IndexOptions::new(work.path().to_owned()),
-        store.root_id(),
-        &cancel,
-        |_| {},
-    )
-    .unwrap();
-    let leader = store.leader_session().unwrap();
-    let pin = store
-        .publish_native(
-            &graph,
-            &capture,
-            &native,
-            leader.leader_guard().unwrap(),
-            store.index_baseline().unwrap(),
-            &cancel,
-        )
-        .unwrap();
-    let response = store.evidence_response().unwrap();
-    let permit = store
-        .pre_h_read_permit(&response, &leader, Arc::new(AtomicU64::new(2)))
-        .unwrap();
-    drop(response);
-    drop(leader);
-    (state, work, store, permit, pin)
+    let (state, work, store, options, cancel) = fixture();
+    let (pin, _writer) =
+        index_coordinator::reconcile_workspace(&store, &options, &cancel, |_| {}).unwrap();
+    (state, work, store, options, cancel, pin)
 }
 
 fn index_db(state: &std::path::Path) -> std::path::PathBuf {
@@ -237,96 +49,72 @@ fn index_db(state: &std::path::Path) -> std::path::PathBuf {
 }
 
 #[test]
-fn standalone_follower_cannot_mint_despite_a_valid_strict_read() {
-    let (state, work, store) = fixture();
-    std::fs::write(work.path().join("a.js"), "function oldHead() {}\n").unwrap();
-    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
-    let (graph, native, capture) = indexer::index_workspace_bundle(
-        &IndexOptions::new(work.path().to_owned()),
-        store.root_id(),
-        &cancel,
-        |_| {},
-    )
-    .unwrap();
-    let standalone = store.leader_session().unwrap();
-    let pin = store
-        .publish_native(
-            &graph,
-            &capture,
-            &native,
-            standalone.leader_guard().unwrap(),
-            store.index_baseline().unwrap(),
-            &cancel,
-        )
-        .unwrap();
-    let daemon_follower = Store::open_for_tests(state.path(), work.path()).unwrap();
-    let response = daemon_follower.evidence_response().unwrap();
-    assert_eq!(response.status().unwrap().revision, pin);
-    response.finish(()).unwrap();
-    let follower_session = daemon_follower.follower_session().unwrap();
-    let refusal = daemon_follower
-        .pre_h_read_permit(&response, &follower_session, Arc::new(AtomicU64::new(1)))
-        .err()
-        .expect("a follower cannot mint a daemon idle permit");
-    assert!(
-        refusal
-            .to_string()
-            .contains("storage_busy: follower cannot publish"),
-        "{refusal:#}"
-    );
+fn cold_head_has_no_valid_selected_revision() {
+    let (_state, _work, store, _options, _cancel) = fixture();
+    assert!(store.evidence_response_daemon_local().is_err());
 }
 
 #[test]
-fn pre_h_denies_claim_and_recovery_closes_admitted_fence() {
-    let (state, _work, store, permit, pin) = released_head();
-    let successor = store.leader_for_idle_reattach(&permit).unwrap();
-    let denied = store.claim_request(&successor).unwrap_err();
-    assert!(
-        denied
-            .to_string()
-            .contains("index_not_ready: mandatory leader reconciliation not committed"),
-        "{denied:#}"
+fn local_h_keeps_validated_prior_head_readable_until_commit_then_selects_new_head() {
+    let (_state, work, store, options, cancel, first) = published();
+    std::fs::write(work.path().join("a.js"), "function newHead() {}\n").unwrap();
+    let coordinator = IndexJobCoordinator::prepare(&store, None).unwrap();
+    let session = coordinator.session();
+    let prior = store.evidence_response_daemon_local().unwrap();
+    assert_eq!(prior.status().unwrap().revision, first);
+    prior.validate_pin(first).unwrap();
+    let (pin, source) = prior.source_at("a.js", None).unwrap().unwrap();
+    assert_eq!(pin, first);
+    assert_eq!(source.text, "function oldHead() {}\n");
+    prior.finish(()).unwrap();
+    drop(prior); // A DELETE-journal writer must not wait behind this read snapshot.
+    let second = coordinator.run(&options, &cancel, |_| {}).unwrap();
+    assert!(second.index_revision > first.index_revision);
+    session.verify().unwrap();
+    let current = store.evidence_response_daemon_local().unwrap();
+    assert_eq!(current.status().unwrap().revision, second);
+    assert_eq!(
+        current.source_at("a.js", None).unwrap().unwrap().1.text,
+        "function newHead() {}\n"
     );
-    let response = store.evidence_response_pre_h(&permit, successor).unwrap();
-    assert_eq!(response.status().unwrap().revision, pin);
-    let fence = response.into_fence(EvidenceFencePolicy::T03);
-    let db = rusqlite::Connection::open(index_db(state.path())).unwrap();
-    db.pragma_update(None, "user_version", 7).unwrap();
-    drop(db);
-    let recovery = store.status().unwrap_err();
-    assert!(
-        recovery.to_string().contains("incompatible_index"),
-        "{recovery:#}"
-    );
-    let refusal = fence.finish(pin).unwrap_err();
-    assert!(
-        refusal
-            .to_string()
-            .contains("store_unavailable: pre-H index recovery pending"),
-        "{refusal:#}"
-    );
+    current.finish(()).unwrap();
 }
 
 #[test]
-fn pre_h_root_schema_and_revision_mismatch_are_refused() {
-    // Each case starts with a separately validated predecessor, not a fabricated permit.
-    let (state, _work, store, permit, _) = released_head();
+fn mandatory_h_blocks_fifo_claim_without_blocking_validated_prior_read() {
+    let (_state, _work, store, options, cancel, first) = published();
+    let accepted = store.enqueue_request(&options, None).unwrap();
+    let coordinator = IndexJobCoordinator::prepare(&store, None).unwrap();
+    let session = coordinator.session();
+    let refused = store.claim_request(&session).unwrap_err();
+    assert!(
+        format!("{refused:#}").contains("index_not_ready"),
+        "{refused:#}"
+    );
+    assert_eq!(
+        store.request_by_id(&accepted.id).unwrap().unwrap().state,
+        "queued"
+    );
+    let prior = store.evidence_response_daemon_local().unwrap();
+    assert_eq!(prior.status().unwrap().revision, first);
+    prior.finish(()).unwrap();
+    drop(prior);
+    let h = coordinator.run(&options, &cancel, |_| {}).unwrap();
+    assert!(h.index_revision > first.index_revision);
+    let claimed = store.claim_request(&session).unwrap().unwrap();
+    assert_eq!(claimed.id, accepted.id);
+    assert_eq!(claimed.state, "running");
+}
+
+#[test]
+fn selected_admission_rejects_corrupt_schema_and_foreign_revision() {
+    let (state, _work, store, _options, _cancel, _) = published();
     let db = rusqlite::Connection::open(index_db(state.path())).unwrap();
     db.pragma_update(None, "user_version", 7).unwrap();
     drop(db);
-    let successor = store.leader_for_idle_reattach(&permit).unwrap();
-    let error = store
-        .evidence_response_pre_h(&permit, successor)
-        .err()
-        .unwrap();
-    assert!(
-        error
-            .to_string()
-            .contains("store_unavailable: pre-H index recovery pending"),
-        "{error:#}"
-    );
+    assert!(store.evidence_response_daemon_local().is_err());
 
-    let (state, _work, store, permit, _) = released_head();
+    let (state, _work, store, _options, _cancel, _) = published();
     let db = rusqlite::Connection::open(index_db(state.path())).unwrap();
     db.execute(
         "UPDATE index_metadata SET index_revision=index_revision+1 WHERE singleton=1",
@@ -334,106 +122,23 @@ fn pre_h_root_schema_and_revision_mismatch_are_refused() {
     )
     .unwrap();
     drop(db);
-    let successor = store.leader_for_idle_reattach(&permit).unwrap();
-    let error = store
-        .evidence_response_pre_h(&permit, successor)
-        .err()
-        .unwrap();
-    assert!(
-        error
-            .to_string()
-            .contains("store_unavailable: pre-H index recovery pending"),
-        "{error:#}"
-    );
+    assert!(store.evidence_response_daemon_local().is_err());
+}
 
-    let (state, _work, store, permit, _) = released_head();
-    let db = rusqlite::Connection::open(index_db(state.path())).unwrap();
-    db.execute(
-        "UPDATE index_metadata SET index_generation=?1 WHERE singleton=1",
-        [uuid::Uuid::new_v4().to_string()],
-    )
-    .unwrap();
-    drop(db);
-    let successor = store.leader_for_idle_reattach(&permit).unwrap();
-    let error = store
-        .evidence_response_pre_h(&permit, successor)
-        .err()
-        .unwrap();
-    assert!(
-        error
-            .to_string()
-            .contains("store_unavailable: pre-H index recovery pending"),
-        "{error:#}"
-    );
-
-    let (_state, work, store, permit, _) = released_head();
+#[test]
+fn selected_result_refuses_lost_root_even_after_materialization() {
+    let (_state, work, store, _options, _cancel, first) = published();
+    let selected = store.evidence_response_daemon_local().unwrap();
+    assert_eq!(selected.status().unwrap().revision, first);
     let moved = work.path().with_extension("moved");
     std::fs::rename(work.path(), &moved).unwrap();
-    let error = store.leader_for_idle_reattach(&permit).err().unwrap();
-    assert!(error.to_string().contains("root_changed"), "{error:#}");
-}
-
-#[test]
-fn pre_h_lock_path_loss_refuses_final_result() {
-    let (state, _work, store, permit, _) = released_head();
-    let successor = store.leader_for_idle_reattach(&permit).unwrap();
-    let admitted = store.evidence_response_pre_h(&permit, successor).unwrap();
-    let index_dir = index_db(state.path()).parent().unwrap().to_path_buf();
-    std::fs::rename(
-        index_dir.join("leader.lock"),
-        index_dir.join("leader.displaced"),
-    )
-    .unwrap();
-    let error = admitted.finish(()).unwrap_err();
+    std::fs::create_dir(work.path()).unwrap();
+    let failure = selected.finish(()).unwrap_err();
     assert!(
-        error
-            .to_string()
-            .contains("store_unavailable: pre-H leader lock unavailable"),
-        "{error:#}"
+        format!("{failure:#}").contains("root_changed"),
+        "{failure:#}"
     );
-}
-
-#[test]
-fn admitted_old_basis_finishes_after_h_publishes() {
-    let (_state, work, store, permit, first) = released_head();
-    let successor = store.leader_for_idle_reattach(&permit).unwrap();
-    let response = store
-        .evidence_response_pre_h(&permit, successor.clone())
-        .unwrap();
-    let selected = response.status().unwrap().revision;
-    assert_eq!(selected, first);
-    let (selected_source_pin, old_source) = response.source_at("a.js", None).unwrap().unwrap();
-    assert_eq!(selected_source_pin, first);
-    assert!(old_source.text.contains("oldHead"));
-    let fence = response.into_fence(EvidenceFencePolicy::T03);
-    std::fs::write(work.path().join("a.js"), "function newHead() {}\n").unwrap();
-    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
-    let (graph, native, capture) = indexer::index_workspace_bundle(
-        &IndexOptions::new(work.path().to_owned()),
-        store.root_id(),
-        &cancel,
-        |_| {},
-    )
-    .unwrap();
-    let second = store
-        .publish_native(
-            &graph,
-            &capture,
-            &native,
-            successor.leader_guard().unwrap(),
-            first,
-            &cancel,
-        )
-        .unwrap();
-    assert!(second.index_revision > first.index_revision);
-    assert_eq!(
-        fence.finish(selected).unwrap(),
-        first,
-        "coherent predecessor result remains finishable"
-    );
-    let current = store.evidence_response().unwrap();
-    assert_eq!(current.status().unwrap().revision, second);
-    let (_, new_source) = current.source_at("a.js", None).unwrap().unwrap();
-    assert!(new_source.text.contains("newHead"));
-    current.finish(()).unwrap();
+    assert!(store.evidence_response_daemon_local().is_err());
+    std::fs::remove_dir(work.path()).unwrap();
+    std::fs::rename(moved, work.path()).unwrap();
 }

@@ -20,7 +20,7 @@ use trellis::{
     model::{Graph, SymbolKind},
     store::{
         SqliteContention, Store,
-        topology::{IndexNotReady, LeaderSession},
+        topology::{IndexNotReady, WriterSession},
     },
 };
 
@@ -54,7 +54,7 @@ struct Fixture {
     pin: trellis::model::IndexPin,
     graph: Graph,
     app: Router,
-    session: Arc<LeaderSession>,
+    session: Arc<WriterSession>,
 }
 fn setup() -> Fixture {
     let temp = tempfile::tempdir().unwrap();
@@ -108,13 +108,14 @@ fn setup() -> Fixture {
     let graph = index_workspace(&options, &cancel, |_| {}).unwrap();
     assert!(!sentinel.exists(), "indexing executed workspace code");
     let store = crate::common::open_store(&temp.path().join("state"), &workspace).unwrap();
-    let session = store.leader_session().unwrap();
+    store.settle_foreign_root_requests().unwrap();
+    let session = store.writer_session_for_tests().unwrap();
     assert_eq!(
         publish_bundle(
             &store,
             &graph,
             &workspace,
-            session.leader_guard().unwrap(),
+            session.writer_guard().unwrap(),
             trellis::model::IndexPin {
                 index_generation: store.index_baseline().unwrap().index_generation,
                 index_revision: 0
@@ -501,7 +502,7 @@ async fn java_python_cached_endpoints_enforce_revision_and_auth() {
             &f.store,
             &f.graph,
             &f.workspace,
-            f.session.leader_guard().unwrap(),
+            f.session.writer_guard().unwrap(),
             trellis::model::IndexPin {
                 index_generation,
                 index_revision: 1
@@ -582,7 +583,7 @@ fn publish_bundle(
     store: &trellis::store::Store,
     graph: &trellis::model::Graph,
     workspace: &std::path::Path,
-    leader: &trellis::store::topology::LeaderGuard,
+    leader: &trellis::store::topology::WriterGuard,
     expected: trellis::model::IndexPin,
     cancel: &trellis::model::CancelFlag,
 ) -> anyhow::Result<trellis::model::IndexPin> {

@@ -45,13 +45,13 @@ fn fixture_with_state() -> (
         .clone();
     assert!(store.status().is_err());
     let baseline = store.index_baseline().unwrap();
-    let session = store.leader_session().unwrap();
+    let session = store.writer_session_for_tests().unwrap();
     store
         .publish_native(
             &graph,
             &capture,
             &native,
-            session.leader_guard().unwrap(),
+            session.writer_guard().unwrap(),
             baseline,
             &cancel,
         )
@@ -175,13 +175,13 @@ async fn recreated_index_rejects_old_generation_at_reused_numeric_revision() {
     )
     .unwrap();
     assert_eq!(fresh_graph, graph);
-    let session = recreated.leader_session().unwrap();
+    let session = recreated.writer_session_for_tests().unwrap();
     recreated
         .publish_native(
             &fresh_graph,
             &capture,
             &native,
-            session.leader_guard().unwrap(),
+            session.writer_guard().unwrap(),
             baseline,
             &cancel,
         )
@@ -417,7 +417,14 @@ async fn active_and_hot_journal_keep_pinned_http_safe() {
         .unwrap()
         .join("index.db");
     let journal = db_path.with_file_name("index.db-journal");
-    let leader_path = db_path.with_file_name("leader.lock");
+    let roots = trellis::store::topology::TopologyRoots::isolated_for_tests(
+        temp.path().join("state/cache"),
+        temp.path().join("state/data"),
+    );
+    let root = temp.path().join("workspace");
+    let identity =
+        trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+    let use_path = roots.index_use_lock(&identity);
     let leader = state.retained_serving_session().unwrap();
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "sqlite_journal_child", "--nocapture"])
@@ -470,7 +477,7 @@ async fn active_and_hot_journal_keep_pinned_http_safe() {
     }
     assert_eq!(std::fs::read(&journal).unwrap(), hot_journal);
     let unrelated =
-        trellis::store::topology::UseGuard::acquire_existing(&leader_path, true, true).unwrap();
+        trellis::store::topology::UseGuard::acquire_existing(&use_path, true, true).unwrap();
     let state = http::new(
         store.clone(),
         IndexOptions::new(temp.path().join("workspace")),
@@ -478,30 +485,41 @@ async fn active_and_hot_journal_keep_pinned_http_safe() {
         "127.0.0.1:7331".parse().unwrap(),
     )
     .unwrap();
-    let app = http::router(state);
+    let app = http::router(state.clone());
     let before = [
         std::fs::read(&db_path).unwrap(),
         std::fs::read(&journal).unwrap(),
-        std::fs::read(&leader_path).unwrap(),
+        std::fs::read(&use_path).unwrap(),
     ];
+    let held_error = store.status().unwrap_err();
     assert!(
-        store
-            .status()
-            .unwrap_err()
-            .to_string()
-            .contains("recovery_required")
+        held_error.to_string().contains("storage_busy"),
+        "{held_error:#}"
     );
     let (code, body) = call(&app, "GET", &url, Value::Null).await;
-    assert_eq!(code, 503, "{body}");
-    assert_eq!(body["error"]["code"], "recovery_required");
-    assert!(store.leader().is_err());
+    assert_eq!(code, 409, "{body}");
+    assert_eq!(body["error"]["code"], "storage_busy");
+    assert!(
+        state.retained_serving_session().is_err(),
+        "exclusive index use prevents a daemon-local H before journal recovery"
+    );
     assert_eq!(
         before,
         [
             std::fs::read(&db_path).unwrap(),
             std::fs::read(&journal).unwrap(),
-            std::fs::read(&leader_path).unwrap()
+            std::fs::read(&use_path).unwrap()
         ]
     );
     drop(unrelated);
+    // Once the external EX holder releases, SQLite may roll back its genuine
+    // hot journal. A selected read must recover the exact prior committed pin
+    // or give a typed recovery refusal, never a partial new revision.
+    match store.status() {
+        Ok(status) => assert_eq!(status.revision, previous),
+        Err(error) => assert!(
+            error.to_string().contains("recovery_required"),
+            "post-EX selected recovery was not typed: {error:#}"
+        ),
+    }
 }

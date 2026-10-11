@@ -209,37 +209,22 @@ fn chained_calls_have_unique_range_ids_and_publish() {
     }));
     let state = tempfile::tempdir().unwrap();
     let store = crate::common::open_store(&state.path().join("state"), d.path()).unwrap();
-    publish_bundle(
+    let (_pin, _session) = trellis::index_coordinator::reconcile_workspace(
         &store,
-        &graph,
-        d.path(),
-        &store.leader().unwrap(),
-        trellis::model::IndexPin {
-            index_generation: store.index_baseline().unwrap().index_generation,
-            index_revision: 0,
-        },
+        &options,
         &Arc::new(AtomicBool::new(false)),
+        |_| {},
     )
     .unwrap();
-}
-
-fn publish_bundle(
-    store: &trellis::store::Store,
-    graph: &trellis::model::Graph,
-    workspace: &std::path::Path,
-    leader: &trellis::store::topology::LeaderGuard,
-    expected: trellis::model::IndexPin,
-    cancel: &trellis::model::CancelFlag,
-) -> anyhow::Result<trellis::model::IndexPin> {
-    let (indexed, native, capture) = trellis::indexer::index_workspace_bundle(
-        &trellis::indexer::IndexOptions::new(workspace.to_owned()),
-        store.root_id(),
-        cancel,
-        |_| {},
-    )?;
+    let published = store.graph().unwrap();
+    assert_eq!(published.files, graph.files);
+    assert_eq!(published.nodes, graph.nodes);
+    let mut actual_calls = published.calls;
+    let mut measured_calls = graph.calls;
+    actual_calls.sort_by(|a, b| a.id.cmp(&b.id));
+    measured_calls.sort_by(|a, b| a.id.cmp(&b.id));
     assert_eq!(
-        &indexed, graph,
-        "published graph must match captured source"
+        actual_calls, measured_calls,
+        "published calls must match measured Rust source"
     );
-    store.publish_native(&indexed, &capture, &native, leader, expected, cancel)
 }

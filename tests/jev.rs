@@ -27,7 +27,7 @@ fn packet_with_links(code: &str, question: &str, synthetic_links: bool) -> Quest
     std::fs::write(work.path().join("a.js"), code).unwrap();
     let cancel = Arc::new(AtomicBool::new(false));
     let store = crate::common::open_store(state.path(), work.path()).unwrap();
-    let (graph, native, capture) = index_workspace_bundle(
+    let (graph, _, _) = index_workspace_bundle(
         &IndexOptions::new(work.path().into()),
         store.root_id(),
         &cancel,
@@ -35,17 +35,14 @@ fn packet_with_links(code: &str, question: &str, synthetic_links: bool) -> Quest
     )
     .unwrap();
     let _ = synthetic_links; // Saved legacy option cannot add semantic links.
-    let session = store.leader_session().unwrap();
-    let revision = store
-        .publish_native(
-            &graph,
-            &capture,
-            &native,
-            session.leader_guard().unwrap(),
-            store.index_baseline().unwrap(),
-            &cancel,
-        )
-        .unwrap();
+    let (revision, session) = trellis::index_coordinator::reconcile_workspace(
+        &store,
+        &IndexOptions::new(work.path().to_owned()),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    assert_eq!(store.graph().unwrap(), graph);
     let request: QuestionRequest = serde_json::from_value(json!({
         "seed":graph.nodes.iter().find(|n| n.name == "seed").unwrap().id,
         "question":question,"expectedRevision":revision

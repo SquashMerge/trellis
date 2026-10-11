@@ -171,7 +171,7 @@ fn corrupt_index_recreation_child() {
     drop(store);
     std::fs::write(&index, b"short").unwrap();
     let recovering = Store::open_for_tests(state.path(), workspace.path()).unwrap();
-    let (pin, _leader) = reconcile_workspace(
+    let (pin, _writer) = reconcile_workspace(
         &recovering,
         &IndexOptions::new(workspace.path().to_owned()),
         &Arc::new(AtomicBool::new(false)),
@@ -232,7 +232,7 @@ fn gc_releases_only_deleted_candidate_witnesses_child() {
     let queue = original
         .enqueue_request(&IndexOptions::new(old.path().to_owned()), None)
         .unwrap();
-    let (pin, old_leader) = reconcile_workspace(
+    let (pin, old_writer) = reconcile_workspace(
         &original,
         &IndexOptions::new(old.path().to_owned()),
         &Arc::new(AtomicBool::new(false)),
@@ -240,11 +240,12 @@ fn gc_releases_only_deleted_candidate_witnesses_child() {
     )
     .unwrap();
     assert!(roots.requests_db(&old_id).exists());
-    drop(old_leader);
+    drop(old_writer);
     drop(original);
     let live = Store::open_for_tests(state.path(), current.path()).unwrap();
-    let live_id = WorkspaceIdentity::discover(Some(current.path()), current.path()).unwrap();
-    let leader = roots.leader(&live_id).unwrap();
+    let live_id =
+        Arc::new(WorkspaceIdentity::discover(Some(current.path()), current.path()).unwrap());
+    let writer = roots.writer(live_id.clone()).unwrap();
     let before = retained_sqlite_witness_count_for_tests();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -258,7 +259,7 @@ fn gc_releases_only_deleted_candidate_witnesses_child() {
             [now - 31 * 24 * 60 * 60],
         )
         .unwrap();
-    assert_eq!(live.automatic_gc_at(&leader, now).unwrap(), 1);
+    assert_eq!(live.automatic_gc_at(&writer, now).unwrap(), 1);
     assert_eq!(
         retained_sqlite_witness_count_for_tests(),
         before - 2,
@@ -306,18 +307,20 @@ fn gc_fault_after_first_unlink_reports_partial_failure_not_success() {
     let candidate_root = tempfile::tempdir().unwrap();
     let roots =
         TopologyRoots::isolated_for_tests(state.path().join("cache"), state.path().join("data"));
-    let current =
-        WorkspaceIdentity::discover(Some(current_root.path()), current_root.path()).unwrap();
-    let candidate =
-        WorkspaceIdentity::discover(Some(candidate_root.path()), candidate_root.path()).unwrap();
+    let current = std::sync::Arc::new(
+        WorkspaceIdentity::discover(Some(current_root.path()), current_root.path()).unwrap(),
+    );
+    let candidate = std::sync::Arc::new(
+        WorkspaceIdentity::discover(Some(candidate_root.path()), candidate_root.path()).unwrap(),
+    );
     drop(Store::open_for_tests(state.path(), current_root.path()).unwrap());
     let store = Store::open_for_tests(state.path(), candidate_root.path()).unwrap();
     store
         .enqueue_request(&IndexOptions::new(candidate_root.path().to_owned()), None)
         .unwrap();
     drop(store);
-    drop(roots.leader(&candidate).unwrap());
-    let leader = roots.leader(&current).unwrap();
+    drop(roots.writer(candidate.clone()).unwrap());
+    let writer = roots.writer(current.clone()).unwrap();
     let now = 1_800_000_000_i64;
     let index = roots.index_db(&candidate);
     Connection::open(&index)
@@ -330,7 +333,7 @@ fn gc_fault_after_first_unlink_reports_partial_failure_not_success() {
     let requests = roots.requests_db(&candidate);
     let queue_before = std::fs::read(&requests).unwrap();
     let mut hit = 0;
-    let result = roots.automatic_gc_at_with_hook(&current, &leader, now, &mut |stage| {
+    let result = roots.automatic_gc_at_with_hook(&current, &writer, now, &mut |stage| {
         if stage == GcStage::AfterFirstDbUnlink {
             hit += 1;
             assert!(!index.exists(), "first derived unlink must have happened");
@@ -345,7 +348,6 @@ fn gc_fault_after_first_unlink_reports_partial_failure_not_success() {
     );
     assert!(!index.exists());
     assert_eq!(std::fs::read(&requests).unwrap(), queue_before);
-    assert!(roots.index_dir(&candidate).join("leader.lock").exists());
     assert!(roots.index_use_lock(&candidate).exists());
     assert!(roots.index_dir(&current).exists());
 }
@@ -358,14 +360,16 @@ fn gc_fault_after_parent_sync_reports_error_before_last_lock_removal() {
     let candidate_root = tempfile::tempdir().unwrap();
     let roots =
         TopologyRoots::isolated_for_tests(state.path().join("cache"), state.path().join("data"));
-    let current =
-        WorkspaceIdentity::discover(Some(current_root.path()), current_root.path()).unwrap();
-    let candidate =
-        WorkspaceIdentity::discover(Some(candidate_root.path()), candidate_root.path()).unwrap();
+    let current = std::sync::Arc::new(
+        WorkspaceIdentity::discover(Some(current_root.path()), current_root.path()).unwrap(),
+    );
+    let candidate = std::sync::Arc::new(
+        WorkspaceIdentity::discover(Some(candidate_root.path()), candidate_root.path()).unwrap(),
+    );
     drop(Store::open_for_tests(state.path(), current_root.path()).unwrap());
     drop(Store::open_for_tests(state.path(), candidate_root.path()).unwrap());
-    drop(roots.leader(&candidate).unwrap());
-    let leader = roots.leader(&current).unwrap();
+    drop(roots.writer(candidate.clone()).unwrap());
+    let writer = roots.writer(current.clone()).unwrap();
     let now = 1_800_000_000_i64;
     Connection::open(roots.index_db(&candidate))
         .unwrap()
@@ -375,7 +379,7 @@ fn gc_fault_after_parent_sync_reports_error_before_last_lock_removal() {
         )
         .unwrap();
     let mut hit = 0;
-    let result = roots.automatic_gc_at_with_hook(&current, &leader, now, &mut |stage| {
+    let result = roots.automatic_gc_at_with_hook(&current, &writer, now, &mut |stage| {
         if stage == GcStage::AfterParentSync {
             hit += 1;
             assert!(!roots.index_dir(&candidate).exists());

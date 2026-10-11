@@ -22,7 +22,7 @@ struct Fixture {
     store: Store,
     state: Arc<http::DaemonState>,
     app: Router,
-    session: Arc<trellis::store::topology::LeaderSession>,
+    session: Arc<trellis::store::topology::WriterSession>,
 }
 fn setup(enabled: bool) -> Fixture {
     let temp = tempfile::tempdir().unwrap();
@@ -52,13 +52,13 @@ fn setup(enabled: bool) -> Fixture {
         |_| {},
     )
     .unwrap();
-    let session = store.leader_session().unwrap();
+    let session = store.writer_session_for_tests().unwrap();
     store
         .publish_native(
             &graph,
             &capture,
             &native,
-            session.leader_guard().unwrap(),
+            session.writer_guard().unwrap(),
             store.index_baseline().unwrap(),
             &cancel,
         )
@@ -267,7 +267,7 @@ async fn source_hash_and_workspace_revision_reject_stale_reads() {
         .store
         .publish(
             &Graph::default(),
-            fixture.session.leader_guard().unwrap(),
+            fixture.session.writer_guard().unwrap(),
             before,
             &Arc::new(AtomicBool::new(false)),
         )
@@ -292,7 +292,7 @@ async fn source_hash_and_workspace_revision_reject_stale_reads() {
             &graph,
             &capture,
             &native,
-            fixture.session.leader_guard().unwrap(),
+            fixture.session.writer_guard().unwrap(),
             before,
             &cancel,
         )
@@ -549,7 +549,6 @@ async fn workspace_generation_reuse() {
     drop(session);
     let exclusive = UseGuard::acquire_existing(&lock, true, true).unwrap();
     std::fs::remove_file(index.join("index.db")).unwrap();
-    std::fs::remove_file(index.join("leader.lock")).unwrap();
     std::fs::remove_dir(index).unwrap();
     exclusive.remove_last().unwrap();
     let replacement =
@@ -564,13 +563,13 @@ async fn workspace_generation_reuse() {
         |_| {},
     )
     .unwrap();
-    let replacement_session = replacement.leader_session().unwrap();
+    let replacement_session = replacement.writer_session_for_tests().unwrap();
     let fresh = replacement
         .publish_native(
             &graph,
             &capture,
             &native,
-            replacement_session.leader_guard().unwrap(),
+            replacement_session.writer_guard().unwrap(),
             replacement.index_baseline().unwrap(),
             &cancel,
         )

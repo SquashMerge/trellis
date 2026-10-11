@@ -1,16 +1,20 @@
 mod common;
+#[cfg(feature = "test-support")]
+use std::collections::BTreeSet;
 use std::{
-    collections::BTreeSet,
     fs,
     sync::{Arc, atomic::AtomicBool},
 };
+#[cfg(feature = "test-support")]
+use trellis::indexer::index_workspace_bundle;
 use trellis::{
-    indexer::{IndexOptions, index_workspace, index_workspace_bundle},
+    indexer::{IndexOptions, index_workspace},
     model::*,
 };
 fn run(options: &IndexOptions) -> Graph {
     index_workspace(options, &Arc::new(AtomicBool::new(false)), |_| {}).unwrap()
 }
+#[cfg(feature = "test-support")]
 #[test]
 fn scopes_defaults_decorators_async_lambdas_utf8_and_publication() {
     let dir = tempfile::tempdir().unwrap();
@@ -80,7 +84,7 @@ fn scopes_defaults_decorators_async_lambdas_utf8_and_publication() {
             &bundle_graph,
             &capture,
             &native,
-            &store.leader().unwrap(),
+            &store.publication_for_tests().unwrap(),
             baseline,
             &cancel,
         )
@@ -92,7 +96,7 @@ fn scopes_defaults_decorators_async_lambdas_utf8_and_publication() {
                 &bundle_graph,
                 &capture,
                 &native,
-                &store.leader().unwrap(),
+                &store.publication_for_tests().unwrap(),
                 pin,
                 &Arc::new(AtomicBool::new(true))
             )

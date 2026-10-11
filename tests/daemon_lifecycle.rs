@@ -372,8 +372,7 @@ async fn timed_release_closes_checkout_handles_and_reattach_runs_h() {
     let lock = base
         .path()
         .join("cache/indexes")
-        .join(&id.root_key)
-        .join("leader.lock");
+        .join(format!("{}.lock", id.root_key));
     registry.attach_launch(1, &id).unwrap();
     let old = registry.activate(&id.root_key).unwrap();
     ready(&old).await;
@@ -408,13 +407,20 @@ async fn timed_release_closes_checkout_handles_and_reattach_runs_h() {
     response.finish(()).unwrap();
 }
 
+#[cfg(feature = "test-support")]
 #[tokio::test]
-async fn absent_prior_head_permit_does_not_pin_idle_resources_or_skip_reattach_h() {
+async fn invalid_prior_head_does_not_pin_idle_resources_or_skip_reattach_h() {
+    use std::os::unix::fs::MetadataExt;
     let (_base, id, mut registry, now) = fixture();
     registry.attach_launch(1, &id).unwrap();
     let old = registry.activate(&id.root_key).unwrap();
     ready(&old).await;
-    old.fail_next_release_permit_for_tests();
+    let queue = _base
+        .path()
+        .join("cache/indexes")
+        .join(&id.root_key)
+        .join("requests.db");
+    let queue_inode = fs::metadata(&queue).unwrap().ino();
     registry.disconnect_at(1, now);
     assert_eq!(
         registry
@@ -425,6 +431,16 @@ async fn absent_prior_head_permit_does_not_pin_idle_resources_or_skip_reattach_h
     );
     assert!(!old.has_active_resources());
     assert!(registry.advance(now + DAEMON_IDLE_DELAY).unwrap().exit);
+    // The released daemon owns no live SQLite handle. Losing its disposable
+    // index.db requires a new H, with no validated predecessor to select.
+    fs::remove_file(
+        _base
+            .path()
+            .join("cache/indexes")
+            .join(&id.root_key)
+            .join("index.db"),
+    )
+    .unwrap();
     registry.attach_launch(2, &id).unwrap();
     let resumed = registry.activate(&id.root_key).unwrap();
     let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
@@ -454,12 +470,41 @@ async fn absent_prior_head_permit_does_not_pin_idle_resources_or_skip_reattach_h
         "{error:#}"
     );
     resume_tx.send(()).unwrap();
-    ready(&resumed).await;
+    let recovered = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok((response, catching_up)) = resumed.evidence_response() {
+                let finished = response.finish(()).is_ok();
+                if finished && !catching_up {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    if recovered.is_err() {
+        let diagnostic = resumed
+            .evidence_response()
+            .err()
+            .map(|error| format!("{error:#}"));
+        panic!(
+            "H did not recover invalid selected head: catching_up={}, retry_waiting={}, reconciliation_error={:?}, admission={diagnostic:?}",
+            resumed.catching_up(),
+            resumed.retry_waiting_for_tests(),
+            resumed.reconciliation_error()
+        );
+    }
     let (response, catching_up) = resumed.evidence_response().unwrap();
     assert!(!catching_up);
     response.finish(()).unwrap();
+    assert_eq!(
+        fs::metadata(&queue).unwrap().ino(),
+        queue_inode,
+        "H recovery must retain the durable queue inode"
+    );
 }
 
+#[cfg(feature = "test-support")]
 #[tokio::test]
 async fn active_writer_and_protected_reader_overlap_orphan_idle_scan() {
     use trellis::store::MaintenanceQueueState;
@@ -601,7 +646,7 @@ async fn active_writer_and_protected_reader_overlap_orphan_idle_scan() {
 }
 
 #[tokio::test]
-async fn committed_fifo_queue_keeps_both_expired_clocks_until_normal_leader_drain() {
+async fn committed_fifo_queue_keeps_both_expired_clocks_until_normal_daemon_drain() {
     let (base, id, mut registry, now) = fixture();
     registry.attach_launch(1, &id).unwrap();
     let runtime = registry.activate(&id.root_key).unwrap();
@@ -680,7 +725,7 @@ fn deleted_or_replaced_orphan_root_with_empty_queue_allows_exit() {
 }
 
 #[test]
-fn replaced_path_retires_only_quiescent_old_incarnation() {
+fn replaced_path_retires_only_quiescent_old_checkout() {
     let (base, old, mut registry, now) = fixture();
     registry.attach_launch(1, &old).unwrap();
     let moved = base.path().join("old");
@@ -690,12 +735,12 @@ fn replaced_path_retires_only_quiescent_old_incarnation() {
     assert_ne!(old.inode, next.inode);
     assert!(
         registry.attach_launch(2, &next).is_err(),
-        "live old client owns original incarnation"
+        "live old client still holds the original checkout"
     );
     registry.disconnect_at(1, now);
     registry
         .attach_launch(2, &next)
-        .expect("quiescent incarnation can be replaced");
+        .expect("quiescent checkout can be replaced");
     registry.disconnect_at(2, now);
     assert!(registry.release(&next.root_key).unwrap());
 }
@@ -717,7 +762,7 @@ fn git_init_retires_quiescent_non_git_identity_at_same_path() {
     registry.disconnect_at(1, now);
     registry
         .attach_launch(2, &next)
-        .expect("git-init starts a new incarnation");
+        .expect("git-init changes the checkout identity");
 }
 
 #[test]
