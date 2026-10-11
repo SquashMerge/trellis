@@ -338,8 +338,24 @@ impl StdinFence {
             let failed = self.fail_fionread.load(SeqCst);
             #[cfg(not(test))]
             let failed = false;
-            (!failed && unsafe { libc::ioctl(self.fd, libc::FIONREAD, &mut pending) } == 0)
-                .then(|| self.read_total.load(SeqCst) + pending.max(0) as u64)
+            (!failed && unsafe { libc::ioctl(self.fd, libc::FIONREAD, &mut pending) } == 0).then(
+                || {
+                    let total = self.read_total.load(SeqCst) + pending.max(0) as u64;
+                    // EOF carries no bytes. With nothing pending, a readable or
+                    // hung-up descriptor means the client has closed its input:
+                    // count it as one more unit, settled only once the reader
+                    // has delivered EOF.
+                    let mut ready = libc::pollfd {
+                        fd: self.fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    let eof_pending = pending <= 0
+                        && unsafe { libc::poll(&mut ready, 1, 0) } > 0
+                        && ready.revents & (libc::POLLIN | libc::POLLHUP) != 0;
+                    total + u64::from(eof_pending)
+                },
+            )
         };
         #[cfg(test)]
         {
@@ -1128,9 +1144,17 @@ mod stdin_fence_tests {
     use super::*;
     use crate::mcp::wire::Frame;
 
-    fn pipe() -> [libc::c_int; 2] {
+    /// A pipe that child processes spawned by concurrent tests cannot inherit:
+    /// an inherited write end would hold off EOF after the test closes it.
+    pub(super) fn pipe() -> [libc::c_int; 2] {
         let mut fds = [0; 2];
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        for fd in fds {
+            assert_eq!(
+                unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+                0
+            );
+        }
         fds
     }
     fn write_line(fd: libc::c_int, line: &str) {
@@ -1231,8 +1255,7 @@ mod reply_gate_tests {
             let workspace =
                 crate::store::topology::WorkspaceIdentity::discover_unattached(Some(&root), &root)
                     .unwrap();
-            let mut fds = [0; 2];
-            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+            let fds = super::stdin_fence_tests::pipe();
             let (frames, fence) = spawn_frame_reader(fds[0]).unwrap();
             Self {
                 _temp: temp,
@@ -1289,7 +1312,9 @@ mod reply_gate_tests {
             // Close the write end first and let the reader reach EOF. Closing a
             // descriptor its reader still polls would let a later fixture's
             // pipe reuse the number and be read by this stale reader.
-            unsafe { libc::close(self.fds[1]) };
+            if self.fds[1] >= 0 {
+                unsafe { libc::close(self.fds[1]) };
+            }
             let deadline = Instant::now() + Duration::from_secs(5);
             while !self.fence.closed.load(Ordering::SeqCst) && Instant::now() < deadline {
                 while self.frames.try_recv().is_ok() {}
@@ -1323,6 +1348,31 @@ mod reply_gate_tests {
                 );
             }));
             assert!(matches!(fixture.gate(), ReplyGate::Write));
+        }
+    }
+
+    #[test]
+    fn stdin_eof_before_the_decision_cancels_the_reply() {
+        for _ in 0..50 {
+            let mut fixture = Fixture::new();
+            // The client closes its input before the reply exists. Precondition:
+            // EOF is observable on the read end before the decision.
+            unsafe { libc::close(fixture.fds[1]) };
+            fixture.fds[1] = -1;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let mut ready = libc::pollfd {
+                    fd: fixture.fds[0],
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                if unsafe { libc::poll(&mut ready, 1, 0) } > 0 {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "EOF never became observable");
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert!(matches!(fixture.gate(), ReplyGate::Cancelled));
         }
     }
 

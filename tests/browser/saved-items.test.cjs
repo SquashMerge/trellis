@@ -243,6 +243,7 @@ async function savedDiagnostics(page, kind, id) {
     loadEnabled:await read(() => load.isEnabled(quick)),
     loadReason:await read(() => load.getAttribute("title",quick)),
     notice:await read(async () => (await page.locator("#notice").textContent(quick))?.slice(0,300)),
+    pageRevision:await read(() => page.evaluate(() => status?.revision ?? null)),
   });
 }
 function readPayload(dbPath, kind, id) {
@@ -294,6 +295,11 @@ for (const kind of ["view","note"]) test(`real browser ${kind} save, edit, stale
   browser=await chromium.launch({headless:true});context=await browser.newContext();page=await context.newPage();
   page.on("pageerror",error=>pageErrors.push(error));
   const requests=[];page.on("request",request=>requests.push({url:request.url(),method:request.method(),body:request.postDataJSON?.()}));
+  // The page's own in-flight API requests: one still open when head moves can
+  // observe the new head and re-render saved rows away from the stale pin (#131).
+  let pageApiInFlight=0;const isApi=request=>new URL(request.url()).pathname.startsWith("/api/");
+  page.on("request",request=>{if(isApi(request))pageApiInFlight++;});
+  for(const done of ["requestfinished","requestfailed"])page.on(done,request=>{if(isApi(request))pageApiInFlight--;});
   await connect(page,server,paths.token);
   const initialLists=requests.filter(request=>[browserPath(page,"views"),browserPath(page,"annotations")].includes(new URL(request.url).pathname));
   assert.equal(initialLists.length,2);for(const request of initialLists)assertPinnedUrl(request.url,P);
@@ -335,14 +341,20 @@ for (const kind of ["view","note"]) test(`real browser ${kind} save, edit, stale
   const dbs=findNamed(paths.temp,"workspace.db");assert.equal(dbs.length,1,JSON.stringify(dbs));const dbPath=dbs[0];
   const anchorBefore=rawJsonProperty(readPayload(dbPath,kind,id),"anchor");assert.ok(anchorBefore?.startsWith("{"),anchorBefore);
   const staleRow=row(page,kind,id);assert.equal(await staleRow.getByRole("button",{name:"Load",exact:true}).isEnabled(),true);
+  // Reach and hold the stale-P page state: let every page request finish
+  // before head moves. The page starts no requests of its own without a job.
+  for(const idleBy=Date.now()+30000,quiet={since:Date.now()};;await delay(25)){
+    if(pageApiInFlight>0)quiet.since=Date.now();else if(Date.now()-quiet.since>=300)break;
+    if(Date.now()>idleBy)throw new Error(`page never went idle before the edit: ${await savedDiagnostics(page,kind,id)}`);
+  }
   writeFileSync(paths.source,SOURCE_Q);const Q=await indexThroughApi(server,paths.token,P,basename(paths.source),SOURCE_Q);
   assert.equal(await seedId(server,paths.token,"seed"),seed,"header edit must retain the original ordinal declaration ID");
-  // The page may refresh its saved list while the new head settles, briefly
-  // disabling Load; wait until the stale row can be loaded again (#131).
-  const staleLoad=staleRow.getByRole("button",{name:"Load",exact:true});
-  for(const enabledBy=Date.now()+30000;!(await staleLoad.isEnabled({timeout:1000}).catch(()=>false));await delay(50)){
-    if(Date.now()>enabledBy)throw new Error(`stale Load never re-enabled: ${await savedDiagnostics(page,kind,id)}`);
-  }
+  // The page must still be at P with nothing in flight: that is the stale state
+  // under test. Anything else is reported, not waited out.
+  const pageRevision=await page.evaluate(()=>status?.revision??null);
+  assert.deepEqual(pageRevision,P,`page left the stale pin during indexing: ${await savedDiagnostics(page,kind,id)}`);
+  assert.equal(pageApiInFlight,0,`page request in flight after indexing: ${await savedDiagnostics(page,kind,id)}`);
+  assert.equal(await staleRow.getByRole("button",{name:"Load",exact:true}).isEnabled(),true,`stale Load disabled at P: ${await savedDiagnostics(page,kind,id)}`);
   baseline=requests.filter(request=>new URL(request.url).pathname===browserPath(page,"query")).length;
   const staleRequestPromise=page.waitForRequest(request=>request.method()==="POST"&&new URL(request.url()).pathname===browserPath(page,"query")&&new URL(request.url()).searchParams.has("indexGeneration"))
     .catch(async error=>{throw new Error(`${error.message}; after Load: ${await savedDiagnostics(page,kind,id)}`);});
