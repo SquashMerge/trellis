@@ -246,7 +246,7 @@ async fn daemon_tick_keeps_pinned_and_current_source_available_across_fifty_edit
     )
     .unwrap();
     state.retain_serving_session(session);
-    let app = http::router(state);
+    let app = http::router(state.clone());
     let load_stop = StopLoad(Arc::new(AtomicBool::new(false)));
     let mut load_thread = None;
     for edit in 0..50 {
@@ -266,7 +266,22 @@ async fn daemon_tick_keeps_pinned_and_current_source_available_across_fifty_edit
         let previous = store.status().unwrap().revision;
         let text = format!("pub fn value() -> i32 {{ {edit} }}\n");
         std::fs::write(&source, &text).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(8);
+        // Deliver the change as the OS watcher would. Publication then does not
+        // depend on notification latency under load; a late native event is a
+        // harmless duplicate (#131).
+        let modified = notify::Event::new(notify::EventKind::Modify(
+            notify::event::ModifyKind::Data(notify::event::DataChange::Content),
+        ))
+        .add_path(source.clone());
+        let delivered_by = Instant::now() + Duration::from_secs(10);
+        while !state.submit_watch_event_for_tests(modified.clone()) {
+            assert!(
+                Instant::now() < delivered_by,
+                "the queue tick never started its scheduler"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             let (status_code, status) = request(&app, "GET", "/api/status", Value::Null).await;
             assert_eq!(status_code, 200, "edit {edit}: {status}");

@@ -342,8 +342,12 @@ impl StdinFence {
                 .then(|| self.read_total.load(SeqCst) + pending.max(0) as u64)
         };
         #[cfg(test)]
-        if let Some(hook) = self.after_sample.lock().unwrap().take() {
-            hook();
+        {
+            // Release the hook's lock first: a hook may sample again.
+            let hook = self.after_sample.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
         }
         sampled
     }
@@ -1246,9 +1250,13 @@ mod reply_gate_tests {
         }
         /// Run the gate for an active request "A".
         fn gate(&self) -> ReplyGate {
-            self.gate_on(&self.frames)
+            self.gate_on(&self.frames).0
         }
-        fn gate_on(&self, frames: &FrameReceiver) -> ReplyGate {
+        /// The gate's decision and the frame it deferred, if any.
+        fn gate_on(
+            &self,
+            frames: &FrameReceiver,
+        ) -> (ReplyGate, Option<(crate::mcp::wire::Frame, u64)>) {
             let mut buffer = McpInputBuffer {
                 workspace: &self.workspace,
                 queue: std::collections::VecDeque::new(),
@@ -1264,7 +1272,7 @@ mod reply_gate_tests {
             let (mut stream, _daemon) = UnixStream::pair().unwrap();
             let mut stdout = Vec::new();
             let mut eof = false;
-            reply_gate(
+            let gate = reply_gate(
                 &mut stream,
                 frames,
                 &mut buffer,
@@ -1272,7 +1280,8 @@ mod reply_gate_tests {
                 &mut eof,
                 Some(&json!("A")),
             )
-            .unwrap()
+            .unwrap();
+            (gate, buffer.deferred.take())
         }
     }
     impl Drop for Fixture {
@@ -1326,15 +1335,59 @@ mod reply_gate_tests {
     }
 
     #[test]
+    fn a_later_frame_queued_at_the_gate_is_deferred_unhandled() {
+        const LATER: &str = "{\"jsonrpc\":\"2.0\",\"id\":\"B\",\"method\":\"tools/list\"}\n";
+        for _ in 0..50 {
+            let fixture = Fixture::new();
+            // A real pre-decision frame is pending in the pipe.
+            fixture.write("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\n");
+            // Right after the decision offset is sampled, a later frame is
+            // written and fully delivered to the channel before the gate drains.
+            let fd = fixture.fds[1];
+            let fence = fixture.fence.clone();
+            let decided = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let sampled = decided.clone();
+            *fixture.fence.after_sample.lock().unwrap() = Some(Box::new(move || {
+                use std::sync::atomic::Ordering::SeqCst;
+                *sampled.lock().unwrap() = Some(fence.read_total.load(SeqCst));
+                assert_eq!(
+                    unsafe { libc::write(fd, LATER.as_ptr().cast(), LATER.len()) },
+                    LATER.len() as isize
+                );
+                let through = fence.written().unwrap();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !fence.settled(through) {
+                    assert!(Instant::now() < deadline, "later frame never delivered");
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }));
+            let (gate, deferred) = fixture.gate_on(&fixture.frames);
+            assert!(matches!(gate, ReplyGate::Write));
+            match deferred {
+                Some((crate::mcp::wire::Frame::Line(bytes), end)) => {
+                    assert_eq!(bytes, LATER.trim_end().as_bytes());
+                    let total = decided.lock().unwrap().unwrap();
+                    assert!(end > total, "the deferred frame ends after the decision");
+                }
+                other => panic!("the later frame was not deferred: {other:?}"),
+            }
+            // Nothing written after the decision was handled by the gate.
+            assert!(fixture.frames.try_recv().is_err());
+        }
+    }
+
+    #[test]
     fn later_input_cannot_stall_the_gate() {
         // Nothing was written before the decision, but a producer keeps the
         // frame channel permanently non-empty with later input. An unbounded
         // drain would never return; the gate must decide at once.
         let (sender, frames) = std::sync::mpsc::channel();
         let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (queued, first) = std::sync::mpsc::channel();
         let producer = {
             let stop = stop.clone();
             thread::spawn(move || {
+                let mut queued = Some(queued);
                 let line = b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}".to_vec();
                 while !stop.load(Ordering::Acquire) {
                     // Every frame ends after the empty decision offset.
@@ -1344,14 +1397,19 @@ mod reply_gate_tests {
                     {
                         break;
                     }
+                    if let Some(queued) = queued.take() {
+                        let _ = queued.send(());
+                    }
                 }
             })
         };
-        thread::sleep(Duration::from_millis(20));
+        // At least one later frame is queued before the gate runs.
+        first.recv_timeout(Duration::from_secs(5)).unwrap();
         let (done, decided) = std::sync::mpsc::channel();
         let gate = thread::spawn(move || {
             let fixture = Fixture::new();
-            let _ = done.send(matches!(fixture.gate_on(&frames), ReplyGate::Write));
+            let (gate, deferred) = fixture.gate_on(&frames);
+            let _ = done.send(matches!(gate, ReplyGate::Write) && deferred.is_some());
         });
         let outcome = decided.recv_timeout(Duration::from_secs(5));
         stop.store(true, Ordering::Release);
