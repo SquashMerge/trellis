@@ -517,7 +517,10 @@ async fn local_design_assets_preserve_same_origin_guards() {
 #[tokio::test]
 async fn live_control_corruption_returns_typed_503_and_hard_latches_clones() {
     for case in ["stats-source", "real-symbol", "input-classes"] {
-        let (dir, store, state, app) = setup();
+        // Without the background queue tick: the test checks the corruption
+        // latch as reads observe it, and the tick's own rebuild of the
+        // disposable index would otherwise clear the latch mid-test (#131).
+        let (dir, store, state, app) = setup_without_tick();
         let workspace = dir.path().join("workspace");
         std::fs::write(workspace.join("a.js"), "function go() { measured(); }\n").unwrap();
         let cancel = Arc::new(AtomicBool::new(false));
