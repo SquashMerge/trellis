@@ -174,16 +174,34 @@ function assertPinnedUrl(raw, pin) {
   assert.equal(url.searchParams.get("indexGeneration"),pin.indexGeneration);
   assert.equal(url.searchParams.get("indexRevision"),String(pin.indexRevision));
 }
-async function indexThroughApi(server, token, expected) {
+async function indexThroughApi(server, token, expected, changedPath, changedSource) {
   const accepted=await api(server.base,token,"POST",scoped(server.rootKey,"index"),{expectedRevision:expected});assert.equal(accepted.status,202,JSON.stringify(accepted.data));
   const deadline=Date.now()+20000;
+  let job;
   while(Date.now()<deadline){
-    const job=await api(server.base,token,"GET",scoped(server.rootKey,`jobs/${encodeURIComponent(accepted.data.id)}`));
+    job=await api(server.base,token,"GET",scoped(server.rootKey,`jobs/${encodeURIComponent(accepted.data.id)}`));
     assert.equal(job.status,200,JSON.stringify(job.data));
-    if(job.data.finishedAt!==null){assert.equal(job.data.state,"done",JSON.stringify(job.data));return job.data.revision;}
+    if(job.data.finishedAt!==null)break;
     await delay(25);
   }
-  throw new Error("index job did not complete within 20 seconds");
+  if(job?.data.finishedAt===null||job===undefined)throw new Error("index job did not complete within 20 seconds");
+  const current=await api(server.base,token,"GET",scoped(server.rootKey,"status"));assert.equal(current.status,200,JSON.stringify(current.data));
+  let pin;
+  if(job.data.state==="done"){
+    pin=job.data.revision;
+    assert.deepEqual(current.data.revision,pin,"completed job must select its returned pin");
+  }else{
+    // The watcher can publish the edited source first (#131). The stale explicit
+    // job must stay failed, and the selected newer pin must hold the edited bytes.
+    assert.equal(job.data.error?.code,"revision_conflict",JSON.stringify(job.data));
+    pin=current.data.revision;
+  }
+  assert.equal(pin.indexGeneration,expected.indexGeneration);
+  assert.ok(pin.indexRevision>expected.indexRevision,`no newer selected head: ${JSON.stringify(job.data)}; current=${JSON.stringify(current.data)}`);
+  const source=await api(server.base,token,"GET",scoped(server.rootKey,`source${pinSuffix(pin)}&path=${encodeURIComponent(changedPath)}`));
+  assert.equal(source.status,200,JSON.stringify(source.data));
+  assert.equal(source.data.file.text,changedSource,"attested changed source at selected pin");
+  return pin;
 }
 async function seedId(server, token, name) {
   const symbols=await api(server.base,token,"GET",scoped(server.rootKey,`symbols?q=${encodeURIComponent(name)}`));assert.equal(symbols.status,200,JSON.stringify(symbols.data));
@@ -304,7 +322,7 @@ for (const kind of ["view","note"]) test(`real browser ${kind} save, edit, stale
   const dbs=findNamed(paths.temp,"workspace.db");assert.equal(dbs.length,1,JSON.stringify(dbs));const dbPath=dbs[0];
   const anchorBefore=rawJsonProperty(readPayload(dbPath,kind,id),"anchor");assert.ok(anchorBefore?.startsWith("{"),anchorBefore);
   const staleRow=row(page,kind,id);assert.equal(await staleRow.getByRole("button",{name:"Load",exact:true}).isEnabled(),true);
-  writeFileSync(paths.source,SOURCE_Q);const Q=await indexThroughApi(server,paths.token,P);assert.equal(Q.indexGeneration,P.indexGeneration);assert.equal(Q.indexRevision,P.indexRevision+1);
+  writeFileSync(paths.source,SOURCE_Q);const Q=await indexThroughApi(server,paths.token,P,basename(paths.source),SOURCE_Q);
   assert.equal(await seedId(server,paths.token,"seed"),seed,"header edit must retain the original ordinal declaration ID");
   baseline=requests.filter(request=>new URL(request.url).pathname===browserPath(page,"query")).length;
   const staleRequestPromise=page.waitForRequest(request=>request.method()==="POST"&&new URL(request.url()).pathname===browserPath(page,"query")&&new URL(request.url()).searchParams.has("indexGeneration"));

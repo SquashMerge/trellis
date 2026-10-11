@@ -281,6 +281,121 @@ struct McpInputBuffer<'a> {
     active_id: Option<serde_json::Value>,
     active_key: Option<crate::mcp::wire::IdKey>,
     cancelled_active: bool,
+    stdin: std::sync::Arc<StdinFence>,
+}
+
+/// Lets the relay prove that every byte the client wrote before a reply was
+/// read has reached the frame channel (#127). The reader parks in `poll` only
+/// with an empty read buffer, after sending every complete frame.
+#[derive(Default)]
+struct StdinFence {
+    parked: std::sync::atomic::AtomicBool,
+    wakes: std::sync::atomic::AtomicU64,
+    closed: std::sync::atomic::AtomicBool,
+}
+
+impl StdinFence {
+    /// True when the reader is parked with no unread input. A descriptor that
+    /// cannot report pending bytes cannot be fenced and is treated as quiet.
+    fn quiescent(&self, fd: std::os::fd::RawFd) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.closed.load(SeqCst) {
+            return true;
+        }
+        let wakes = self.wakes.load(SeqCst);
+        if !self.parked.load(SeqCst) {
+            return false;
+        }
+        let mut pending: libc::c_int = 0;
+        if unsafe { libc::ioctl(fd, libc::FIONREAD, &mut pending) } != 0 {
+            return true;
+        }
+        pending == 0 && self.parked.load(SeqCst) && self.wakes.load(SeqCst) == wakes
+    }
+}
+
+/// Unbuffered reads of one descriptor that publish when they wait for input.
+struct FencedReader {
+    fd: std::os::fd::RawFd,
+    fence: std::sync::Arc<StdinFence>,
+}
+
+impl io::Read for FencedReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut ready = libc::pollfd {
+            fd: self.fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        self.fence.parked.store(true, SeqCst);
+        let polled = loop {
+            let rc = unsafe { libc::poll(&mut ready, 1, -1) };
+            if rc < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            break rc;
+        };
+        self.fence.wakes.fetch_add(1, SeqCst);
+        self.fence.parked.store(false, SeqCst);
+        if polled < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        loop {
+            let n = unsafe { libc::read(self.fd, buf.as_mut_ptr().cast(), buf.len()) };
+            if n >= 0 {
+                return Ok(n as usize);
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+}
+
+/// Spawn the bounded frame reader for one descriptor.
+fn spawn_frame_reader(
+    fd: std::os::fd::RawFd,
+) -> io::Result<(
+    std::sync::mpsc::Receiver<crate::mcp::wire::Frame>,
+    std::sync::Arc<StdinFence>,
+)> {
+    use crate::mcp::wire::{self, Frame};
+    let fence = std::sync::Arc::new(StdinFence::default());
+    let (sender, receiver) = std::sync::mpsc::sync_channel::<Frame>(16);
+    let reader_fence = fence.clone();
+    thread::Builder::new()
+        .name("mcp-stdin-relay".into())
+        .spawn(move || {
+            let mut reader = io::BufReader::new(FencedReader {
+                fd,
+                fence: reader_fence.clone(),
+            });
+            loop {
+                match wire::read_frame(&mut reader) {
+                    Ok(Frame::Eof) => {
+                        let _ = sender.send(Frame::Eof);
+                        break;
+                    }
+                    Ok(frame) => {
+                        if sender.send(frame).is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        use std::io::Write;
+                        let _ = writeln!(io::stderr(), "MCP stdin read failed: {error}");
+                        let _ = sender.send(Frame::Eof);
+                        break;
+                    }
+                }
+            }
+            reader_fence
+                .closed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        })?;
+    Ok((receiver, fence))
 }
 
 /// A failed attach has no socket to receive cancellation. Consume ready stdin first.
@@ -312,33 +427,9 @@ pub fn relay_stdio(
     mut reconnect: impl FnMut() -> io::Result<UnixStream>,
 ) -> io::Result<()> {
     use crate::mcp::wire::{self, Frame};
-    use std::io::{BufReader, Write};
-    use std::sync::mpsc;
+    use std::io::Write;
     let mut current = Some(attach_mcp(stream, workspace)?);
-    let (sender, receiver) = mpsc::sync_channel::<Frame>(16);
-    thread::Builder::new()
-        .name("mcp-stdin-relay".into())
-        .spawn(move || {
-            let mut reader = BufReader::new(io::stdin());
-            loop {
-                match wire::read_frame(&mut reader) {
-                    Ok(Frame::Eof) => {
-                        let _ = sender.send(Frame::Eof);
-                        break;
-                    }
-                    Ok(frame) => {
-                        if sender.send(frame).is_err() {
-                            break;
-                        }
-                    }
-                    Err(error) => {
-                        eprintln!("MCP stdin read failed: {error}");
-                        let _ = sender.send(Frame::Eof);
-                        break;
-                    }
-                }
-            }
-        })?;
+    let (receiver, stdin_fence) = spawn_frame_reader(0)?;
     let mut buffer = McpInputBuffer {
         workspace,
         queue: std::collections::VecDeque::new(),
@@ -347,6 +438,7 @@ pub fn relay_stdio(
         active_id: None,
         active_key: None,
         cancelled_active: false,
+        stdin: stdin_fence,
     };
     let mut receive_bytes = Vec::new();
     let mut stdout = io::stdout().lock();
@@ -881,6 +973,24 @@ fn read_mcp_line(
             receive_bytes.extend_from_slice(&chunk[take..]);
             let reply: serde_json::Value = serde_json::from_slice(&line)
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            // A cancel the client wrote before this reply existed must win,
+            // even if the stdin reader has not delivered it yet (#127).
+            let quiet_by = Instant::now() + Duration::from_secs(1);
+            while !buffer.stdin.quiescent(0) && Instant::now() < quiet_by {
+                drain_mcp_input(
+                    Some(stream),
+                    receiver,
+                    buffer,
+                    stdout,
+                    eof,
+                    expected_id,
+                    &mut canceled,
+                )?;
+                if *eof || canceled {
+                    return Ok(None);
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
             drain_mcp_input(
                 Some(stream),
                 receiver,
@@ -895,6 +1005,50 @@ fn read_mcp_line(
             }
             return Ok(Some(reply));
         }
+    }
+}
+
+#[cfg(test)]
+mod stdin_fence_tests {
+    use super::*;
+    use crate::mcp::wire::Frame;
+
+    #[test]
+    fn quiescent_reader_has_delivered_every_written_frame() {
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (frames, fence) = spawn_frame_reader(fds[0]).unwrap();
+        for n in 0..50 {
+            let line = format!("{{\"n\":{n}}}\n");
+            assert_eq!(
+                unsafe { libc::write(fds[1], line.as_ptr().cast(), line.len()) },
+                line.len() as isize
+            );
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !fence.quiescent(fds[0]) {
+                assert!(Instant::now() < deadline, "reader never parked");
+                thread::sleep(Duration::from_millis(1));
+            }
+            // Quiescence is the proof: the frame must already be in the channel.
+            match frames.try_recv() {
+                Ok(Frame::Line(bytes)) => assert_eq!(bytes, line.trim_end().as_bytes()),
+                other => panic!("frame {n} not delivered at quiescence: {other:?}"),
+            }
+        }
+        unsafe { libc::close(fds[1]) };
+        assert!(matches!(
+            frames.recv_timeout(Duration::from_secs(5)),
+            Ok(Frame::Eof)
+        ));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !fence.quiescent(fds[0]) {
+            assert!(
+                Instant::now() < deadline,
+                "closed reader must stay quiescent"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        unsafe { libc::close(fds[0]) };
     }
 }
 
