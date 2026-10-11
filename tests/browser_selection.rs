@@ -1813,7 +1813,9 @@ async fn browser_only_live_listener_releases_resources_then_exits_with_control_p
         .unwrap()
         .unwrap();
     assert!(provisioner.address().is_none());
-    assert!(tokio::net::TcpStream::connect(address).await.is_err());
+    // The joined serve task owned and dropped the TcpListener, so the port is
+    // released. Probing that nothing listens there races with any other
+    // process taking the freed port (#131).
 }
 
 #[tokio::test]
