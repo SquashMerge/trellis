@@ -570,14 +570,17 @@ async fn executable_daemon_is_socket_only_until_explicit_serve_and_registers_two
     let mut second_serve = detached(serve(&home, &second, address, &token_file));
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let value = authenticated()
-            .send()
-            .await
-            .unwrap()
-            .json::<Value>()
-            .await
-            .unwrap();
-        if value["checkouts"].as_array().unwrap().len() == 2 {
+        // A listing can exceed the 2 s client timeout while the second
+        // registration is busy under load; poll again until the deadline (#131).
+        let value = match authenticated().send().await {
+            Ok(response) => response.json::<Value>().await.unwrap(),
+            Err(error) if error.is_timeout() => Value::Null,
+            Err(error) => panic!("checkout listing failed: {error}"),
+        };
+        if value["checkouts"]
+            .as_array()
+            .is_some_and(|rows| rows.len() == 2)
+        {
             let roots: Vec<_> = value["checkouts"]
                 .as_array()
                 .unwrap()

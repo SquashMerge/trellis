@@ -1643,6 +1643,15 @@ mod tests {
         work.reconcile_due(&store, &owner, &daemon_options, &cancel, false)
             .unwrap();
         assert_eq!(work.options.max_file_bytes, 1024);
+        // A late OS notification for the write above can reach the new
+        // watcher during its first inventory; that run then correctly stays
+        // unaccounted and the next due run accounts it (#131).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while work.last_accounted_generation.is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            work.reconcile_due(&store, &owner, &daemon_options, &cancel, false)
+                .unwrap();
+        }
         assert!(
             work.last_accounted_generation.is_some(),
             "new option watcher must finish its first full inventory"
