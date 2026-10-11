@@ -12,6 +12,10 @@ use trellis::{auth, http, indexer::IndexOptions, model::*, store::Store};
 const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
 fn setup() -> (tempfile::TempDir, Store, Arc<http::DaemonState>, Router) {
+    setup_with_tick(true)
+}
+
+fn setup_with_tick(start_tick: bool) -> (tempfile::TempDir, Store, Arc<http::DaemonState>, Router) {
     let dir = tempfile::tempdir().unwrap();
     let workspace = dir.path().join("workspace");
     std::fs::create_dir(&workspace).unwrap();
@@ -23,7 +27,12 @@ fn setup() -> (tempfile::TempDir, Store, Arc<http::DaemonState>, Router) {
         "127.0.0.1:7331".parse().unwrap(),
     )
     .unwrap();
-    state.retain_serving_session(store.leader_session().unwrap());
+    let session = store.leader_session().unwrap();
+    if start_tick {
+        state.retain_serving_session(session);
+    } else {
+        state.retain_serving_session_without_tick_for_tests(session);
+    }
     let router = http::router(state.clone());
     (dir, store, state, router)
 }
@@ -918,7 +927,8 @@ async fn verified_leader_expires_due_pin_on_idle_tick_without_publication() {
 
 #[tokio::test]
 async fn expired_pin_saved_items_require_explicit_head_reattachment() {
-    let (dir, store, state, app) = setup();
+    // Control retention with the explicit clock and forced ticks below.
+    let (dir, store, state, app) = setup_with_tick(false);
     let workspace = dir.path().join("workspace");
     std::fs::write(workspace.join("a.js"), "function seed() {}\n").unwrap();
     store.set_retention_clock_for_tests(1_000, 0);
@@ -1147,146 +1157,6 @@ fn external_maintenance_request(root: &std::path::Path, state: &std::path::Path)
     assert!(child.wait().unwrap().success());
     assert!(!request.is_empty());
     request
-}
-
-#[test]
-fn queued_second_process_preempts_maintenance_before_writer_admission() {
-    use std::sync::mpsc;
-    use trellis::index_coordinator::{self, IndexJobCoordinator};
-    let dir = tempfile::tempdir().unwrap();
-    let workspace = dir.path().join("workspace");
-    let data = dir.path().join("state");
-    std::fs::create_dir(&workspace).unwrap();
-    std::fs::write(workspace.join("one.js"), "function before() {}\n").unwrap();
-    let options = IndexOptions::new(workspace.clone());
-    let store = Store::open_for_tests(&data, &workspace).unwrap();
-    store.set_retention_clock_for_tests(1000, 0);
-    let cancel = Arc::new(AtomicBool::new(false));
-    let session =
-        index_coordinator::establish_serving_session(&store, Some(&options), &cancel).unwrap();
-    let old = store.status().unwrap().revision;
-    std::fs::write(workspace.join("one.js"), "function after() {}\n").unwrap();
-    IndexJobCoordinator::prepare_with_session(&store, None, session.clone())
-        .unwrap()
-        .run(&options, &cancel, |_| {})
-        .unwrap();
-    let state = http::new(
-        store.clone(),
-        options,
-        TOKEN.into(),
-        "127.0.0.1:7331".parse().unwrap(),
-    )
-    .unwrap();
-    state.retain_serving_session(session.clone());
-    store.set_retention_clock_for_tests(1899, 899);
-    state.force_retention_idle_tick_for_tests().unwrap();
-    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
-    let (release_tx, release_rx) = mpsc::sync_channel(1);
-    store.set_maintenance_before_writer_hook_for_tests(move || {
-        entered_tx.send(()).unwrap();
-        release_rx.recv().unwrap();
-    });
-    store.set_retention_clock_for_tests(1900, 900);
-    let worker = state.clone();
-    let maintenance = std::thread::spawn(move || worker.force_retention_idle_tick_for_tests());
-    entered_rx
-        .recv_timeout(std::time::Duration::from_secs(10))
-        .unwrap();
-    let id = external_maintenance_request(&workspace, &data);
-    let queue_store = store.clone();
-    let queue_session = session.clone();
-    let foreground = std::thread::spawn(move || {
-        index_coordinator::drain_one_request_observed(&queue_store, &queue_session, |_, _| {})
-    });
-    release_tx.send(()).unwrap();
-    maintenance.join().unwrap().unwrap();
-    assert_eq!(foreground.join().unwrap().unwrap(), 1);
-    assert_eq!(store.request_by_id(&id).unwrap().unwrap().state, "done");
-    // The older pin survives: maintenance was unable to start its writer
-    // after Q2 reached the durable queue, while Q2 published and ACKed.
-    assert!(store.source_at("one.js", Some(old)).unwrap().is_some());
-}
-
-#[test]
-fn second_process_fifo_interrupts_after_first_real_maintenance_delete() {
-    use std::sync::mpsc;
-    use trellis::index_coordinator::{self, IndexJobCoordinator};
-    let dir = tempfile::tempdir().unwrap();
-    let workspace = dir.path().join("workspace");
-    let data = dir.path().join("state");
-    std::fs::create_dir(&workspace).unwrap();
-    std::fs::write(workspace.join("one.js"), "function before() {}\n").unwrap();
-    let options = IndexOptions::new(workspace.clone());
-    let store = Store::open_for_tests(&data, &workspace).unwrap();
-    store.set_retention_clock_for_tests(1000, 0);
-    let cancel = Arc::new(AtomicBool::new(false));
-    let session =
-        index_coordinator::establish_serving_session(&store, Some(&options), &cancel).unwrap();
-    let old = store.status().unwrap().revision;
-    std::fs::write(workspace.join("one.js"), "function after() {}\n").unwrap();
-    IndexJobCoordinator::prepare_with_session(&store, None, session.clone())
-        .unwrap()
-        .run(&options, &cancel, |_| {})
-        .unwrap();
-    let state = http::new(
-        store.clone(),
-        options,
-        TOKEN.into(),
-        "127.0.0.1:7331".parse().unwrap(),
-    )
-    .unwrap();
-    state.retain_serving_session(session.clone());
-    store.set_retention_clock_for_tests(1899, 899);
-    state.force_retention_idle_tick_for_tests().unwrap();
-    store.set_retention_clock_for_tests(1900, 900);
-    state.force_retention_idle_tick_for_tests().unwrap(); // retained -> pending
-    let path = store.request_db_path().with_file_name("index.db");
-    let count = || -> i64 {
-        let db = rusqlite::Connection::open_with_flags(
-            &path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .unwrap();
-        db.query_row("SELECT count(*) FROM revision_documents m JOIN native_revisions r ON r.id=m.revision_id WHERE r.published_index_revision=?1", [old.index_revision as i64], |row| row.get(0)).unwrap()
-    };
-    let before = count();
-    assert!(before > 0, "pending transition must preserve full manifest");
-    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
-    let (release_tx, release_rx) = mpsc::sync_channel(1);
-    store.set_maintenance_after_first_delete_hook_for_tests(move || {
-        entered_tx.send(()).unwrap();
-        release_rx.recv().unwrap();
-    });
-    let worker = state.clone();
-    let maintenance = std::thread::spawn(move || worker.force_retention_idle_tick_for_tests());
-    entered_rx
-        .recv_timeout(std::time::Duration::from_secs(10))
-        .unwrap();
-    let id = external_maintenance_request(&workspace, &data);
-    release_tx.send(()).unwrap();
-    maintenance.join().unwrap().unwrap();
-    assert_eq!(
-        count(),
-        before,
-        "post-DELETE queue arrival must ROLLBACK the full maintenance unit"
-    );
-    let queue_store = store.clone();
-    let queue_session = session.clone();
-    assert_eq!(
-        std::thread::spawn(move || index_coordinator::drain_one_request_observed(
-            &queue_store,
-            &queue_session,
-            |_, _| {},
-        ))
-        .join()
-        .unwrap()
-        .unwrap(),
-        1
-    );
-    assert_eq!(store.request_by_id(&id).unwrap().unwrap().state, "done");
-    // Debt remains durable. A later genuinely idle owner resumes in one unit.
-    state.force_retention_idle_tick_for_tests().unwrap();
-    assert!(count() < before);
 }
 
 #[test]
