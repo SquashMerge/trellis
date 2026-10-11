@@ -1005,6 +1005,10 @@ impl DaemonState {
                 if work.is_none() {
                     let mut scheduler =
                         crate::index_coordinator::LeaderWork::new(&self.store, &session, &options)?;
+                    // Nothing drains OS events in this fixture, so a late
+                    // notification for a write made before the tick would
+                    // defer maintenance as `accepted_watcher` (#131).
+                    scheduler.disable_native_watcher_for_tests();
                     scheduler.reconcile_due(
                         &self.store,
                         &session,

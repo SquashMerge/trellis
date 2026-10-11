@@ -1233,7 +1233,9 @@ async fn serve_arms_sigterm_before_banner_to_control_wait() {
     fs::create_dir(&home).unwrap();
     let root = checkout(temp.path(), "signal-window");
     let token = temp.path().join("token");
-    let address = free_address();
+    // Port 0: a probed free port can be taken by a concurrent test before
+    // serve binds it (#131). The banner reports the bound address.
+    let address: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let socket = fixture_socket_paths(&home).socket;
     let mut daemon_command = cli(&home);
     daemon_command.arg("daemon");
@@ -1264,7 +1266,7 @@ async fn serve_arms_sigterm_before_banner_to_control_wait() {
     loop {
         if fs::read_to_string(&log)
             .unwrap()
-            .contains(&format!("Trellis: http://{address}/"))
+            .contains("Trellis: http://127.0.0.1:")
         {
             break;
         }
