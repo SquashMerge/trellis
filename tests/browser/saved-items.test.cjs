@@ -232,6 +232,19 @@ async function selectSymbol(page, name) {
   await pick.click();await query;
 }
 const row = (page, kind, id) => page.locator(`li[data-saved-kind="${kind}"][data-saved-id="${id}"]`);
+// Bounded snapshot of a saved row and page notice for failure messages (#131).
+async function savedDiagnostics(page, kind, id) {
+  const quick = {timeout:1000};
+  const target = row(page,kind,id), load = target.getByRole("button",{name:"Load",exact:true});
+  const read = async probe => { try { return await probe(); } catch (error) { return `unavailable: ${error.message.split("\n")[0]}`; } };
+  return JSON.stringify({
+    rowVisible:await read(() => target.isVisible()),
+    rowText:await read(async () => (await target.textContent(quick))?.slice(0,300)),
+    loadEnabled:await read(() => load.isEnabled(quick)),
+    loadReason:await read(() => load.getAttribute("title",quick)),
+    notice:await read(async () => (await page.locator("#notice").textContent(quick))?.slice(0,300)),
+  });
+}
 function readPayload(dbPath, kind, id) {
   assert.ok(["view","note"].includes(kind));
   const db=new DatabaseSync(dbPath,{readOnly:true});
@@ -324,8 +337,15 @@ for (const kind of ["view","note"]) test(`real browser ${kind} save, edit, stale
   const staleRow=row(page,kind,id);assert.equal(await staleRow.getByRole("button",{name:"Load",exact:true}).isEnabled(),true);
   writeFileSync(paths.source,SOURCE_Q);const Q=await indexThroughApi(server,paths.token,P,basename(paths.source),SOURCE_Q);
   assert.equal(await seedId(server,paths.token,"seed"),seed,"header edit must retain the original ordinal declaration ID");
+  // The page may refresh its saved list while the new head settles, briefly
+  // disabling Load; wait until the stale row can be loaded again (#131).
+  const staleLoad=staleRow.getByRole("button",{name:"Load",exact:true});
+  for(const enabledBy=Date.now()+30000;!(await staleLoad.isEnabled({timeout:1000}).catch(()=>false));await delay(50)){
+    if(Date.now()>enabledBy)throw new Error(`stale Load never re-enabled: ${await savedDiagnostics(page,kind,id)}`);
+  }
   baseline=requests.filter(request=>new URL(request.url).pathname===browserPath(page,"query")).length;
-  const staleRequestPromise=page.waitForRequest(request=>request.method()==="POST"&&new URL(request.url()).pathname===browserPath(page,"query")&&new URL(request.url()).searchParams.has("indexGeneration"));
+  const staleRequestPromise=page.waitForRequest(request=>request.method()==="POST"&&new URL(request.url()).pathname===browserPath(page,"query")&&new URL(request.url()).searchParams.has("indexGeneration"))
+    .catch(async error=>{throw new Error(`${error.message}; after Load: ${await savedDiagnostics(page,kind,id)}`);});
   const staleResponsePromise=page.waitForResponse(response=>response.request().method()==="POST"&&new URL(response.url()).pathname===browserPath(page,"query")&&new URL(response.url()).searchParams.has("indexGeneration"));
   await staleRow.getByRole("button",{name:"Load",exact:true}).click();const staleRequest=await staleRequestPromise,staleResponse=await staleResponsePromise;
   assertPinnedUrl(staleRequest.url(),P);assert.equal(staleRequest.postDataJSON().seed,seed);assert.equal(staleResponse.status(),200);
