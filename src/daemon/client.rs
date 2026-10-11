@@ -419,6 +419,41 @@ fn discard_failed_mcp_result(
     Ok(*eof || canceled || buffer.cancelled_active)
 }
 
+/// The write boundary for a daemon reply (#127): a cancel the client wrote
+/// before this point must win, even if the stdin reader has not delivered it
+/// yet. Drain until the reader is provably quiet (parked with no unread
+/// bytes), then decide. Draining frees a reader blocked on a full channel, and
+/// EOF or an unfenceable descriptor is quiet, so this always terminates.
+fn reply_cancelled(
+    stream: &mut UnixStream,
+    receiver: &std::sync::mpsc::Receiver<crate::mcp::wire::Frame>,
+    buffer: &mut McpInputBuffer<'_>,
+    stdout: &mut impl std::io::Write,
+    eof: &mut bool,
+    active_id: Option<&serde_json::Value>,
+) -> io::Result<bool> {
+    let mut canceled = false;
+    loop {
+        let quiet = buffer.stdin.quiescent(0);
+        drain_mcp_input(
+            Some(&mut *stream),
+            receiver,
+            buffer,
+            stdout,
+            eof,
+            active_id,
+            &mut canceled,
+        )?;
+        if *eof || canceled || buffer.cancelled_active {
+            return Ok(true);
+        }
+        if quiet {
+            return Ok(false);
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
 /// One bounded stdin reader and one response writer survive daemon generations.
 /// Only an interrupted read can be replayed; unknown methods are never retried.
 pub fn relay_stdio(
@@ -627,6 +662,19 @@ pub fn relay_stdio(
                                 io::ErrorKind::InvalidData,
                                 "daemon MCP reply ID mismatch",
                             ));
+                        }
+                        crate::mcp::phase_hook("relay_before_write")?;
+                        if reply_cancelled(
+                            stream,
+                            &receiver,
+                            &mut buffer,
+                            &mut stdout,
+                            &mut eof,
+                            value.get("id"),
+                        )? {
+                            // The whole reply was read, so the stream stays at a
+                            // frame boundary; only the cancelled result is dropped.
+                            break;
                         }
                         wire::write_response(&mut stdout, &reply)?;
                         break;
@@ -973,24 +1021,6 @@ fn read_mcp_line(
             receive_bytes.extend_from_slice(&chunk[take..]);
             let reply: serde_json::Value = serde_json::from_slice(&line)
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-            // A cancel the client wrote before this reply existed must win,
-            // even if the stdin reader has not delivered it yet (#127).
-            let quiet_by = Instant::now() + Duration::from_secs(1);
-            while !buffer.stdin.quiescent(0) && Instant::now() < quiet_by {
-                drain_mcp_input(
-                    Some(stream),
-                    receiver,
-                    buffer,
-                    stdout,
-                    eof,
-                    expected_id,
-                    &mut canceled,
-                )?;
-                if *eof || canceled {
-                    return Ok(None);
-                }
-                thread::sleep(Duration::from_millis(1));
-            }
             drain_mcp_input(
                 Some(stream),
                 receiver,
