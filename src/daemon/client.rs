@@ -284,37 +284,41 @@ struct McpInputBuffer<'a> {
     stdin: std::sync::Arc<StdinFence>,
 }
 
-/// Lets the relay prove that every byte the client wrote before a reply was
-/// read has reached the frame channel (#127). The reader parks in `poll` only
-/// with an empty read buffer, after sending every complete frame.
+/// Lets the relay prove that every byte the client wrote before a decision
+/// point has reached the frame channel (#127). Each read and its byte count
+/// happen under `io`, so `read_total + FIONREAD` sampled under the same lock
+/// counts exactly the bytes written so far. `ready_through` is published each
+/// time the reader asks for more input, which `BufReader` does only after
+/// every complete frame before that offset has been sent.
 #[derive(Default)]
 struct StdinFence {
-    parked: std::sync::atomic::AtomicBool,
-    wakes: std::sync::atomic::AtomicU64,
+    io: std::sync::Mutex<()>,
+    read_total: std::sync::atomic::AtomicU64,
+    ready_through: std::sync::atomic::AtomicU64,
     closed: std::sync::atomic::AtomicBool,
 }
 
 impl StdinFence {
-    /// True when the reader is parked with no unread input. A descriptor that
-    /// cannot report pending bytes cannot be fenced and is treated as quiet.
-    fn quiescent(&self, fd: std::os::fd::RawFd) -> bool {
+    /// Bytes the client had written at this instant, or `None` when the
+    /// descriptor cannot report pending input and so cannot be fenced.
+    fn written(&self, fd: std::os::fd::RawFd) -> Option<u64> {
         use std::sync::atomic::Ordering::SeqCst;
-        if self.closed.load(SeqCst) {
-            return true;
-        }
-        let wakes = self.wakes.load(SeqCst);
-        if !self.parked.load(SeqCst) {
-            return false;
-        }
+        let _io = self.io.lock().unwrap();
         let mut pending: libc::c_int = 0;
         if unsafe { libc::ioctl(fd, libc::FIONREAD, &mut pending) } != 0 {
-            return true;
+            return None;
         }
-        pending == 0 && self.parked.load(SeqCst) && self.wakes.load(SeqCst) == wakes
+        Some(self.read_total.load(SeqCst) + pending.max(0) as u64)
+    }
+
+    /// Every complete frame within the first `offset` bytes has been sent.
+    fn delivered(&self, offset: u64) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.closed.load(SeqCst) || self.ready_through.load(SeqCst) >= offset
     }
 }
 
-/// Unbuffered reads of one descriptor that publish when they wait for input.
+/// Unbuffered reads of one descriptor that publish how far input is settled.
 struct FencedReader {
     fd: std::os::fd::RawFd,
     fence: std::sync::Arc<StdinFence>,
@@ -323,27 +327,29 @@ struct FencedReader {
 impl io::Read for FencedReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         use std::sync::atomic::Ordering::SeqCst;
+        self.fence
+            .ready_through
+            .store(self.fence.read_total.load(SeqCst), SeqCst);
         let mut ready = libc::pollfd {
             fd: self.fd,
             events: libc::POLLIN,
             revents: 0,
         };
-        self.fence.parked.store(true, SeqCst);
-        let polled = loop {
+        loop {
             let rc = unsafe { libc::poll(&mut ready, 1, -1) };
-            if rc < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-                continue;
+            if rc >= 0 {
+                break;
             }
-            break rc;
-        };
-        self.fence.wakes.fetch_add(1, SeqCst);
-        self.fence.parked.store(false, SeqCst);
-        if polled < 0 {
-            return Err(io::Error::last_os_error());
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
         }
+        let _io = self.fence.io.lock().unwrap();
         loop {
             let n = unsafe { libc::read(self.fd, buf.as_mut_ptr().cast(), buf.len()) };
             if n >= 0 {
+                self.fence.read_total.fetch_add(n as u64, SeqCst);
                 return Ok(n as usize);
             }
             let error = io::Error::last_os_error();
@@ -419,22 +425,32 @@ fn discard_failed_mcp_result(
     Ok(*eof || canceled || buffer.cancelled_active)
 }
 
-/// The write boundary for a daemon reply (#127): a cancel the client wrote
-/// before this point must win, even if the stdin reader has not delivered it
-/// yet. Drain until the reader is provably quiet (parked with no unread
-/// bytes), then decide. Draining frees a reader blocked on a full channel, and
-/// EOF or an unfenceable descriptor is quiet, so this always terminates.
-fn reply_cancelled(
+/// What the relay may do with a complete daemon reply.
+enum ReplyGate {
+    Write,
+    Cancelled,
+    /// Input before the decision point could not be settled in time.
+    Unknown,
+}
+
+/// The decision point for a daemon reply (#127). Every cancel the client had
+/// finished writing when this is called wins, even if the stdin reader has not
+/// delivered it yet. Input written later cannot extend the wait: only bytes
+/// before the sampled offset must settle. A cancel written after this point is
+/// concurrent with the reply, which MCP clients already tolerate.
+fn reply_gate(
     stream: &mut UnixStream,
     receiver: &std::sync::mpsc::Receiver<crate::mcp::wire::Frame>,
     buffer: &mut McpInputBuffer<'_>,
     stdout: &mut impl std::io::Write,
     eof: &mut bool,
     active_id: Option<&serde_json::Value>,
-) -> io::Result<bool> {
+) -> io::Result<ReplyGate> {
+    let written = buffer.stdin.written(0);
+    let deadline = Instant::now() + Duration::from_secs(10);
     let mut canceled = false;
     loop {
-        let quiet = buffer.stdin.quiescent(0);
+        let settled = written.is_none_or(|offset| buffer.stdin.delivered(offset));
         drain_mcp_input(
             Some(&mut *stream),
             receiver,
@@ -445,10 +461,13 @@ fn reply_cancelled(
             &mut canceled,
         )?;
         if *eof || canceled || buffer.cancelled_active {
-            return Ok(true);
+            return Ok(ReplyGate::Cancelled);
         }
-        if quiet {
-            return Ok(false);
+        if settled {
+            return Ok(ReplyGate::Write);
+        }
+        if Instant::now() >= deadline {
+            return Ok(ReplyGate::Unknown);
         }
         thread::sleep(Duration::from_millis(1));
     }
@@ -664,7 +683,9 @@ pub fn relay_stdio(
                             ));
                         }
                         crate::mcp::phase_hook("relay_before_write")?;
-                        if reply_cancelled(
+                        // The whole reply was read, so a dropped reply leaves the
+                        // stream at a frame boundary.
+                        match reply_gate(
                             stream,
                             &receiver,
                             &mut buffer,
@@ -672,11 +693,16 @@ pub fn relay_stdio(
                             &mut eof,
                             value.get("id"),
                         )? {
-                            // The whole reply was read, so the stream stays at a
-                            // frame boundary; only the cancelled result is dropped.
-                            break;
+                            ReplyGate::Write => {
+                                crate::mcp::phase_hook("relay_after_decision")?;
+                                wire::write_response(&mut stdout, &reply)?;
+                            }
+                            ReplyGate::Cancelled => {}
+                            ReplyGate::Unknown => wire::write_response(
+                                &mut stdout,
+                                &mcp_failure(&value, "outcome_unknown", workspace),
+                            )?,
                         }
-                        wire::write_response(&mut stdout, &reply)?;
                         break;
                     }
                     Ok(None) => {
@@ -1043,26 +1069,35 @@ mod stdin_fence_tests {
     use super::*;
     use crate::mcp::wire::Frame;
 
-    #[test]
-    fn quiescent_reader_has_delivered_every_written_frame() {
+    fn pipe() -> [libc::c_int; 2] {
         let mut fds = [0; 2];
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        fds
+    }
+    fn write_line(fd: libc::c_int, line: &str) {
+        assert_eq!(
+            unsafe { libc::write(fd, line.as_ptr().cast(), line.len()) },
+            line.len() as isize
+        );
+    }
+
+    #[test]
+    fn every_frame_written_before_the_decision_point_is_delivered() {
+        let fds = pipe();
         let (frames, fence) = spawn_frame_reader(fds[0]).unwrap();
         for n in 0..50 {
             let line = format!("{{\"n\":{n}}}\n");
-            assert_eq!(
-                unsafe { libc::write(fds[1], line.as_ptr().cast(), line.len()) },
-                line.len() as isize
-            );
+            write_line(fds[1], &line);
+            let written = fence.written(fds[0]).unwrap();
             let deadline = Instant::now() + Duration::from_secs(5);
-            while !fence.quiescent(fds[0]) {
-                assert!(Instant::now() < deadline, "reader never parked");
+            while !fence.delivered(written) {
+                assert!(Instant::now() < deadline, "input never settled");
                 thread::sleep(Duration::from_millis(1));
             }
-            // Quiescence is the proof: the frame must already be in the channel.
+            // Settled through the decision point: the frame is already sent.
             match frames.try_recv() {
                 Ok(Frame::Line(bytes)) => assert_eq!(bytes, line.trim_end().as_bytes()),
-                other => panic!("frame {n} not delivered at quiescence: {other:?}"),
+                other => panic!("frame {n} not delivered when settled: {other:?}"),
             }
         }
         unsafe { libc::close(fds[1]) };
@@ -1071,13 +1106,47 @@ mod stdin_fence_tests {
             Ok(Frame::Eof)
         ));
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !fence.quiescent(fds[0]) {
+        while !fence.delivered(u64::MAX) {
+            assert!(Instant::now() < deadline, "a closed reader is settled");
+            thread::sleep(Duration::from_millis(1));
+        }
+        unsafe { libc::close(fds[0]) };
+    }
+
+    #[test]
+    fn later_input_cannot_extend_the_wait() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let fds = pipe();
+        let (frames, fence) = spawn_frame_reader(fds[0]).unwrap();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let writer = {
+            let stop = stop.clone();
+            let fd = fds[1];
+            thread::spawn(move || {
+                while !stop.load(Ordering::Acquire) {
+                    write_line(fd, "{\"flood\":true}\n");
+                }
+            })
+        };
+        thread::sleep(Duration::from_millis(20));
+        let written = fence.written(fds[0]).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !fence.delivered(written) {
+            while frames.try_recv().is_ok() {}
             assert!(
                 Instant::now() < deadline,
-                "closed reader must stay quiescent"
+                "a continuous caller stalled the fence"
             );
             thread::sleep(Duration::from_millis(1));
         }
+        stop.store(true, Ordering::Release);
+        // Unblock a writer stuck on a full pipe, then let it see `stop`.
+        while !writer.is_finished() {
+            while frames.try_recv().is_ok() {}
+            thread::sleep(Duration::from_millis(1));
+        }
+        unsafe { libc::close(fds[1]) };
+        while !matches!(frames.recv(), Ok(Frame::Eof) | Err(_)) {}
         unsafe { libc::close(fds[0]) };
     }
 }

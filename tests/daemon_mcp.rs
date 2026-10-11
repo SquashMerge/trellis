@@ -1724,3 +1724,73 @@ fn cancel_after_relay_reads_reply_suppresses_that_reply() {
     assert_eq!(next["id"], "after", "cancelled reply was written: {next}");
     let _ = fs::remove_file(&phase_path);
 }
+
+/// #127's defined boundary: once the relay has settled every cancel written
+/// before its decision point and decided to write, a later cancel is concurrent
+/// with the reply. The reply is written once, the late cancel produces no
+/// output, and the session continues.
+#[test]
+fn cancel_after_the_relay_decides_cannot_recall_the_reply() {
+    use std::os::unix::net::UnixListener;
+    let home = tempfile::tempdir().unwrap();
+    let root = checkout(home.path());
+    let phase_path = PathBuf::from(format!(
+        "/tmp/trellis-127-decided-{}.sock",
+        rand::random::<u64>()
+    ));
+    let listener = UnixListener::bind(&phase_path).unwrap();
+    let mut peer = Peer::start_with_env(
+        home.path(),
+        &root,
+        &[
+            ("TRELLIS_TEST_MCP_PHASE", "relay_after_decision".as_ref()),
+            ("TRELLIS_TEST_MCP_PHASE_SOCKET", phase_path.as_os_str()),
+        ],
+    );
+    let meta = json!({
+        "io.modelcontextprotocol/protocolVersion":"2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities":{}
+    });
+    let send = |peer: &mut Peer, frame: Value| {
+        writeln!(peer.stdin.as_mut().unwrap(), "{frame}").unwrap();
+        peer.stdin.as_mut().unwrap().flush().unwrap();
+    };
+    let pause = |listener: &UnixListener| {
+        let (phase, _) = listener.accept().unwrap();
+        phase
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut stage = String::new();
+        BufReader::new(phase.try_clone().unwrap())
+            .read_line(&mut stage)
+            .unwrap();
+        assert_eq!(stage, "relay_after_decision\n");
+        phase
+    };
+    send(
+        &mut peer,
+        json!({"jsonrpc":"2.0","id":"late-A","method":"tools/call",
+            "params":{"name":"trellis_workspace_describe",
+                "arguments":{"schemaVersion":1},"_meta":meta}}),
+    );
+    let mut decided = pause(&listener);
+    send(
+        &mut peer,
+        json!({"jsonrpc":"2.0","method":"notifications/cancelled",
+            "params":{"requestId":"late-A"}}),
+    );
+    decided.write_all(b"x").unwrap();
+    let reply = peer.lines.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(reply["id"], "late-A", "{reply}");
+    send(
+        &mut peer,
+        json!({"jsonrpc":"2.0","id":"after","method":"tools/list","params":{"_meta":meta}}),
+    );
+    pause(&listener).write_all(b"x").unwrap();
+    let next = peer.lines.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(
+        next["id"], "after",
+        "the late cancel produced output: {next}"
+    );
+    let _ = fs::remove_file(&phase_path);
+}
