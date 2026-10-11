@@ -282,28 +282,34 @@ struct McpInputBuffer<'a> {
     active_key: Option<crate::mcp::wire::IdKey>,
     cancelled_active: bool,
     stdin: std::sync::Arc<StdinFence>,
-    /// Frames taken from the reader channel, in order.
-    received: u64,
-    /// While set, `drain_mcp_input` stops once `received` reaches it.
-    drain_limit: Option<u64>,
+    /// A frame taken from the channel but not yet handled; it precedes every
+    /// frame still in the channel.
+    deferred: Option<(crate::mcp::wire::Frame, u64)>,
+    /// While set, `drain_mcp_input` handles only frames whose bytes end at or
+    /// before this stdin offset and defers the first later one.
+    drain_through: Option<u64>,
 }
+
+/// Frames from the stdin reader, each with the stdin offset where it ends.
+type FrameReceiver = std::sync::mpsc::Receiver<(crate::mcp::wire::Frame, u64)>;
 
 /// Lets the relay prove that every byte the client wrote before a decision
 /// point has reached the frame channel (#127). Each read and its byte count
 /// happen under `io`, so `read_total + FIONREAD` sampled under the same lock
 /// counts exactly the bytes written so far. Each time the reader asks for more
 /// input, which `BufReader` does only after every complete frame before that
-/// offset has been sent, it publishes the frames sent and then the offset.
+/// offset has been sent, it publishes the offset as `ready_through`.
 struct StdinFence {
     fd: std::os::fd::RawFd,
     io: std::sync::Mutex<()>,
     read_total: std::sync::atomic::AtomicU64,
     ready_through: std::sync::atomic::AtomicU64,
-    sent: std::sync::atomic::AtomicU64,
-    frames_through: std::sync::atomic::AtomicU64,
     closed: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     fail_fionread: std::sync::atomic::AtomicBool,
+    /// Runs once, immediately after the decision offset is sampled.
+    #[cfg(test)]
+    after_sample: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl StdinFence {
@@ -313,11 +319,11 @@ impl StdinFence {
             io: std::sync::Mutex::new(()),
             read_total: Default::default(),
             ready_through: Default::default(),
-            sent: Default::default(),
-            frames_through: Default::default(),
             closed: Default::default(),
             #[cfg(test)]
             fail_fionread: Default::default(),
+            #[cfg(test)]
+            after_sample: Default::default(),
         }
     }
 
@@ -325,26 +331,27 @@ impl StdinFence {
     /// input cannot be measured and the decision therefore cannot be fenced.
     fn written(&self) -> Option<u64> {
         use std::sync::atomic::Ordering::SeqCst;
-        let _io = self.io.lock().unwrap();
+        let sampled = {
+            let _io = self.io.lock().unwrap();
+            let mut pending: libc::c_int = 0;
+            #[cfg(test)]
+            let failed = self.fail_fionread.load(SeqCst);
+            #[cfg(not(test))]
+            let failed = false;
+            (!failed && unsafe { libc::ioctl(self.fd, libc::FIONREAD, &mut pending) } == 0)
+                .then(|| self.read_total.load(SeqCst) + pending.max(0) as u64)
+        };
         #[cfg(test)]
-        if self.fail_fionread.load(SeqCst) {
-            return None;
+        if let Some(hook) = self.after_sample.lock().unwrap().take() {
+            hook();
         }
-        let mut pending: libc::c_int = 0;
-        if unsafe { libc::ioctl(self.fd, libc::FIONREAD, &mut pending) } != 0 {
-            return None;
-        }
-        Some(self.read_total.load(SeqCst) + pending.max(0) as u64)
+        sampled
     }
 
-    /// Once every complete frame within the first `offset` bytes has been
-    /// sent, the number of frames sent by then (possibly a few more).
-    fn settled_frames(&self, offset: u64) -> Option<u64> {
+    /// Every complete frame within the first `offset` bytes has been sent.
+    fn settled(&self, offset: u64) -> bool {
         use std::sync::atomic::Ordering::SeqCst;
-        if self.closed.load(SeqCst) {
-            return Some(self.sent.load(SeqCst));
-        }
-        (self.ready_through.load(SeqCst) >= offset).then(|| self.frames_through.load(SeqCst))
+        self.closed.load(SeqCst) || self.ready_through.load(SeqCst) >= offset
     }
 }
 
@@ -357,9 +364,6 @@ struct FencedReader {
 impl io::Read for FencedReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         use std::sync::atomic::Ordering::SeqCst;
-        self.fence
-            .frames_through
-            .store(self.fence.sent.load(SeqCst), SeqCst);
         self.fence
             .ready_through
             .store(self.fence.read_total.load(SeqCst), SeqCst);
@@ -393,16 +397,15 @@ impl io::Read for FencedReader {
     }
 }
 
-/// Spawn the bounded frame reader for one descriptor.
+/// Spawn the bounded frame reader for one descriptor. Each frame carries the
+/// stdin offset just past its last byte.
 fn spawn_frame_reader(
     fd: std::os::fd::RawFd,
-) -> io::Result<(
-    std::sync::mpsc::Receiver<crate::mcp::wire::Frame>,
-    std::sync::Arc<StdinFence>,
-)> {
+) -> io::Result<(FrameReceiver, std::sync::Arc<StdinFence>)> {
     use crate::mcp::wire::{self, Frame};
+    use std::sync::atomic::Ordering::SeqCst;
     let fence = std::sync::Arc::new(StdinFence::new(fd));
-    let (sender, receiver) = std::sync::mpsc::sync_channel::<Frame>(16);
+    let (sender, receiver) = std::sync::mpsc::sync_channel::<(Frame, u64)>(16);
     let reader_fence = fence.clone();
     thread::Builder::new()
         .name("mcp-stdin-relay".into())
@@ -412,45 +415,28 @@ fn spawn_frame_reader(
                 fence: reader_fence.clone(),
             });
             loop {
-                match wire::read_frame(&mut reader) {
-                    Ok(Frame::Eof) => {
-                        if sender.send(Frame::Eof).is_ok() {
-                            reader_fence
-                                .sent
-                                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        }
-                        break;
-                    }
-                    Ok(frame) => {
-                        if sender.send(frame).is_err() {
-                            break;
-                        }
-                        reader_fence
-                            .sent
-                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    }
+                let frame = match wire::read_frame(&mut reader) {
+                    Ok(frame) => frame,
                     Err(error) => {
                         use std::io::Write;
                         let _ = writeln!(io::stderr(), "MCP stdin read failed: {error}");
-                        if sender.send(Frame::Eof).is_ok() {
-                            reader_fence
-                                .sent
-                                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        }
-                        break;
+                        Frame::Eof
                     }
+                };
+                let end = reader_fence.read_total.load(SeqCst) - reader.buffer().len() as u64;
+                let last = matches!(frame, Frame::Eof);
+                if sender.send((frame, end)).is_err() || last {
+                    break;
                 }
             }
-            reader_fence
-                .closed
-                .store(true, std::sync::atomic::Ordering::SeqCst);
+            reader_fence.closed.store(true, SeqCst);
         })?;
     Ok((receiver, fence))
 }
 
 /// A failed attach has no socket to receive cancellation. Consume ready stdin first.
 fn discard_failed_mcp_result(
-    receiver: &std::sync::mpsc::Receiver<crate::mcp::wire::Frame>,
+    receiver: &FrameReceiver,
     buffer: &mut McpInputBuffer<'_>,
     stdout: &mut impl std::io::Write,
     eof: &mut bool,
@@ -477,15 +463,16 @@ enum ReplyGate {
     Unknown,
 }
 
-/// The decision point for a daemon reply (#127). Every cancel the client had
-/// finished writing when this is called wins, even if the stdin reader has not
-/// delivered it yet. Only frames sent before that input settled are processed
-/// before deciding, in bounded batches, so input written later cannot extend
-/// the wait (T00). A cancel written after this point is concurrent with the
-/// reply (owner ruling, docs/mcp-readonly-pilot-contract.md).
+/// The decision point for a daemon reply (#127, owner ruling in
+/// docs/mcp-readonly-pilot-contract.md). Only frames whose bytes the client had
+/// completely written when the decision offset is sampled can affect it: a
+/// cancel among them wins even if the stdin reader has not delivered it yet.
+/// The first later frame is deferred unhandled until after the reply, so a
+/// cancel written after the decision is concurrent and cannot suppress it, and
+/// later input cannot extend the wait (T00).
 fn reply_gate(
     stream: &mut UnixStream,
-    receiver: &std::sync::mpsc::Receiver<crate::mcp::wire::Frame>,
+    receiver: &FrameReceiver,
     buffer: &mut McpInputBuffer<'_>,
     stdout: &mut impl std::io::Write,
     eof: &mut bool,
@@ -497,8 +484,10 @@ fn reply_gate(
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut canceled = false;
     loop {
-        let settled = buffer.stdin.settled_frames(written);
-        buffer.drain_limit = Some(settled.unwrap_or(buffer.received + 64));
+        // Sampled first: frames within `written` sent before settling are then
+        // all in the channel for the drain below.
+        let settled = buffer.stdin.settled(written);
+        buffer.drain_through = Some(written);
         let drained = drain_mcp_input(
             Some(&mut *stream),
             receiver,
@@ -508,12 +497,13 @@ fn reply_gate(
             active_id,
             &mut canceled,
         );
-        buffer.drain_limit = None;
+        buffer.drain_through = None;
         drained?;
         if *eof || canceled || buffer.cancelled_active {
             return Ok(ReplyGate::Cancelled);
         }
-        if settled.is_some_and(|frames| buffer.received >= frames) {
+        // A deferred later frame proves every earlier frame was handled.
+        if settled || buffer.deferred.is_some() {
             return Ok(ReplyGate::Write);
         }
         if Instant::now() >= deadline {
@@ -543,8 +533,8 @@ pub fn relay_stdio(
         active_key: None,
         cancelled_active: false,
         stdin: stdin_fence,
-        received: 0,
-        drain_limit: None,
+        deferred: None,
+        drain_through: None,
     };
     let mut receive_bytes = Vec::new();
     let mut stdout = io::stdout().lock();
@@ -554,16 +544,12 @@ pub fn relay_stdio(
     loop {
         let frame = if let Some(frame) = buffer.queue.pop_front() {
             frame
+        } else if let Some((frame, _)) = buffer.deferred.take() {
+            frame
         } else if eof {
             break;
         } else {
-            match receiver.recv() {
-                Ok(frame) => {
-                    buffer.received += 1;
-                    frame
-                }
-                Err(_) => Frame::Eof,
-            }
+            receiver.recv().map_or(Frame::Eof, |(frame, _)| frame)
         };
         let line = match frame {
             Frame::Eof => break,
@@ -893,7 +879,7 @@ fn pending_duplicate(buffer: &McpInputBuffer<'_>, key: &crate::mcp::wire::IdKey)
 
 fn drain_mcp_input(
     mut stream: Option<&mut UnixStream>,
-    receiver: &std::sync::mpsc::Receiver<crate::mcp::wire::Frame>,
+    receiver: &FrameReceiver,
     buffer: &mut McpInputBuffer<'_>,
     stdout: &mut impl std::io::Write,
     eof: &mut bool,
@@ -904,16 +890,17 @@ fn drain_mcp_input(
     use std::io::Write;
     use std::sync::mpsc::TryRecvError;
     loop {
-        if buffer
-            .drain_limit
-            .is_some_and(|limit| buffer.received >= limit)
-        {
-            break;
-        }
-        let next = receiver.try_recv();
-        if next.is_ok() {
-            buffer.received += 1;
-        }
+        let next = match buffer.deferred.take() {
+            Some(entry) => Ok(entry),
+            None => receiver.try_recv(),
+        };
+        let next = match next {
+            Ok((frame, end)) if buffer.drain_through.is_some_and(|through| end > through) => {
+                buffer.deferred = Some((frame, end));
+                break;
+            }
+            other => other.map(|(frame, _)| frame),
+        };
         match next {
             Ok(Frame::Eof) => {
                 *eof = true;
@@ -1030,7 +1017,7 @@ fn drain_mcp_input(
 /// Read exactly one complete bounded reply, including when several arrive together.
 fn read_mcp_line(
     stream: &mut UnixStream,
-    receiver: &std::sync::mpsc::Receiver<crate::mcp::wire::Frame>,
+    receiver: &FrameReceiver,
     buffer: &mut McpInputBuffer<'_>,
     stdout: &mut impl std::io::Write,
     eof: &mut bool,
@@ -1158,23 +1145,23 @@ mod stdin_fence_tests {
             write_line(fds[1], &line);
             let written = fence.written().unwrap();
             let deadline = Instant::now() + Duration::from_secs(5);
-            while fence.settled_frames(written).is_none() {
+            while !fence.settled(written) {
                 assert!(Instant::now() < deadline, "input never settled");
                 thread::sleep(Duration::from_millis(1));
             }
             // Settled through the decision point: the frame is already sent.
             match frames.try_recv() {
-                Ok(Frame::Line(bytes)) => assert_eq!(bytes, line.trim_end().as_bytes()),
+                Ok((Frame::Line(bytes), _)) => assert_eq!(bytes, line.trim_end().as_bytes()),
                 other => panic!("frame {n} not delivered when settled: {other:?}"),
             }
         }
         unsafe { libc::close(fds[1]) };
         assert!(matches!(
             frames.recv_timeout(Duration::from_secs(5)),
-            Ok(Frame::Eof)
+            Ok((Frame::Eof, _))
         ));
         let deadline = Instant::now() + Duration::from_secs(5);
-        while fence.settled_frames(u64::MAX).is_none() {
+        while !fence.settled(u64::MAX) {
             assert!(Instant::now() < deadline, "a closed reader is settled");
             thread::sleep(Duration::from_millis(1));
         }
@@ -1199,7 +1186,7 @@ mod stdin_fence_tests {
         thread::sleep(Duration::from_millis(20));
         let written = fence.written().unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
-        while fence.settled_frames(written).is_none() {
+        while !fence.settled(written) {
             while frames.try_recv().is_ok() {}
             assert!(
                 Instant::now() < deadline,
@@ -1214,7 +1201,7 @@ mod stdin_fence_tests {
             thread::sleep(Duration::from_millis(1));
         }
         unsafe { libc::close(fds[1]) };
-        while !matches!(frames.recv(), Ok(Frame::Eof) | Err(_)) {}
+        while !matches!(frames.recv(), Ok((Frame::Eof, _)) | Err(_)) {}
         unsafe { libc::close(fds[0]) };
     }
 }
@@ -1229,7 +1216,7 @@ mod reply_gate_tests {
         _temp: tempfile::TempDir,
         workspace: crate::store::topology::WorkspaceIdentity,
         fds: [libc::c_int; 2],
-        frames: std::sync::mpsc::Receiver<crate::mcp::wire::Frame>,
+        frames: FrameReceiver,
         fence: std::sync::Arc<StdinFence>,
     }
     impl Fixture {
@@ -1261,10 +1248,7 @@ mod reply_gate_tests {
         fn gate(&self) -> ReplyGate {
             self.gate_on(&self.frames)
         }
-        fn gate_on(
-            &self,
-            frames: &std::sync::mpsc::Receiver<crate::mcp::wire::Frame>,
-        ) -> ReplyGate {
+        fn gate_on(&self, frames: &FrameReceiver) -> ReplyGate {
             let mut buffer = McpInputBuffer {
                 workspace: &self.workspace,
                 queue: std::collections::VecDeque::new(),
@@ -1274,8 +1258,8 @@ mod reply_gate_tests {
                 active_key: None,
                 cancelled_active: false,
                 stdin: self.fence.clone(),
-                received: 0,
-                drain_limit: None,
+                deferred: None,
+                drain_through: None,
             };
             let (mut stream, _daemon) = UnixStream::pair().unwrap();
             let mut stdout = Vec::new();
@@ -1293,10 +1277,16 @@ mod reply_gate_tests {
     }
     impl Drop for Fixture {
         fn drop(&mut self) {
-            unsafe {
-                libc::close(self.fds[1]);
-                libc::close(self.fds[0]);
+            // Close the write end first and let the reader reach EOF. Closing a
+            // descriptor its reader still polls would let a later fixture's
+            // pipe reuse the number and be read by this stale reader.
+            unsafe { libc::close(self.fds[1]) };
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !self.fence.closed.load(Ordering::SeqCst) && Instant::now() < deadline {
+                while self.frames.try_recv().is_ok() {}
+                thread::sleep(Duration::from_millis(1));
             }
+            unsafe { libc::close(self.fds[0]) };
         }
     }
     const CANCEL_A: &str = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":\"A\"}}\n";
@@ -1307,6 +1297,23 @@ mod reply_gate_tests {
             let fixture = Fixture::new();
             fixture.write(CANCEL_A);
             assert!(matches!(fixture.gate(), ReplyGate::Cancelled));
+        }
+    }
+
+    #[test]
+    fn a_cancel_written_just_after_the_decision_cannot_suppress_the_reply() {
+        for _ in 0..50 {
+            let fixture = Fixture::new();
+            // A complete non-cancel frame is pending at the decision point.
+            fixture.write("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\n");
+            let fd = fixture.fds[1];
+            *fixture.fence.after_sample.lock().unwrap() = Some(Box::new(move || {
+                assert_eq!(
+                    unsafe { libc::write(fd, CANCEL_A.as_ptr().cast(), CANCEL_A.len()) },
+                    CANCEL_A.len() as isize
+                );
+            }));
+            assert!(matches!(fixture.gate(), ReplyGate::Write));
         }
     }
 
@@ -1330,8 +1337,9 @@ mod reply_gate_tests {
             thread::spawn(move || {
                 let line = b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}".to_vec();
                 while !stop.load(Ordering::Acquire) {
+                    // Every frame ends after the empty decision offset.
                     if sender
-                        .send(crate::mcp::wire::Frame::Line(line.clone()))
+                        .send((crate::mcp::wire::Frame::Line(line.clone()), u64::MAX))
                         .is_err()
                     {
                         break;
