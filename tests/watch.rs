@@ -302,6 +302,9 @@ fn failed_capture_keeps_dirty_generation_for_successful_retry() {
     // pending signal, with no dependency on notify delivery or event timing.
     fs::write(&source, "function after() {}\n").unwrap();
     let mut work = LeaderWork::new(&store, &owner, &options).unwrap();
+    // A late OS notification for the write above would restart the debounce
+    // and postpone the retry below (#131); the initial full wake is internal.
+    work.disable_native_watcher_for_tests();
     std::thread::sleep(Duration::from_millis(350));
     let failed =
         work.reconcile_due_observed(&store, &owner, &options, &cancel, false, |captured, _| {

@@ -11,6 +11,15 @@ use trellis::{auth, http, indexer::IndexOptions, model::*, store::Store};
 const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
 fn setup() -> (tempfile::TempDir, Store, Arc<http::DaemonState>, Router) {
+    setup_with_tick(true)
+}
+/// Tests that drive maintenance with `force_retention_idle_tick_for_tests`
+/// run without the background queue tick. A concurrent tick holding the native
+/// stream or serving session makes the forced tick defer silently (#131).
+fn setup_without_tick() -> (tempfile::TempDir, Store, Arc<http::DaemonState>, Router) {
+    setup_with_tick(false)
+}
+fn setup_with_tick(tick: bool) -> (tempfile::TempDir, Store, Arc<http::DaemonState>, Router) {
     let dir = tempfile::tempdir().unwrap();
     let workspace = dir.path().join("workspace");
     std::fs::create_dir(&workspace).unwrap();
@@ -22,7 +31,11 @@ fn setup() -> (tempfile::TempDir, Store, Arc<http::DaemonState>, Router) {
         "127.0.0.1:7331".parse().unwrap(),
     )
     .unwrap();
-    state.retain_serving_session(store.leader_session().unwrap());
+    if tick {
+        state.retain_serving_session(store.leader_session().unwrap());
+    } else {
+        state.retain_serving_session_without_tick_for_tests(store.leader_session().unwrap());
+    }
     let router = http::router(state.clone());
     (dir, store, state, router)
 }
@@ -917,7 +930,7 @@ async fn verified_leader_expires_due_pin_on_idle_tick_without_publication() {
 
 #[tokio::test]
 async fn expired_pin_saved_items_require_explicit_head_reattachment() {
-    let (dir, store, state, app) = setup();
+    let (dir, store, state, app) = setup_without_tick();
     let workspace = dir.path().join("workspace");
     std::fs::write(workspace.join("a.js"), "function seed() {}\n").unwrap();
     store.set_retention_clock_for_tests(1_000, 0);
@@ -1176,7 +1189,7 @@ fn queued_second_process_preempts_maintenance_before_writer_admission() {
         "127.0.0.1:7331".parse().unwrap(),
     )
     .unwrap();
-    state.retain_serving_session(session.clone());
+    state.retain_serving_session_without_tick_for_tests(session.clone());
     store.set_retention_clock_for_tests(1899, 899);
     state.force_retention_idle_tick_for_tests().unwrap();
     let (entered_tx, entered_rx) = mpsc::sync_channel(1);
@@ -1234,7 +1247,7 @@ fn second_process_fifo_interrupts_after_first_real_maintenance_delete() {
         "127.0.0.1:7331".parse().unwrap(),
     )
     .unwrap();
-    state.retain_serving_session(session.clone());
+    state.retain_serving_session_without_tick_for_tests(session.clone());
     store.set_retention_clock_for_tests(1899, 899);
     state.force_retention_idle_tick_for_tests().unwrap();
     store.set_retention_clock_for_tests(1900, 900);
