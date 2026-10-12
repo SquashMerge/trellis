@@ -341,19 +341,19 @@ impl StdinFence {
             (!failed && unsafe { libc::ioctl(self.fd, libc::FIONREAD, &mut pending) } == 0).then(
                 || {
                     let total = self.read_total.load(SeqCst) + pending.max(0) as u64;
-                    // EOF carries no bytes. With nothing pending, a readable or
-                    // hung-up descriptor means the client has closed its input:
-                    // count it as one more unit, settled only once the reader
-                    // has delivered EOF.
+                    // EOF occupies its own position, one past the last byte. A
+                    // hung-up pipe means the client closed its input before this
+                    // decision, even with bytes still buffered (macOS and Linux
+                    // both report POLLHUP once no writer remains): include that
+                    // position, so the gate settles only after EOF is delivered.
                     let mut ready = libc::pollfd {
                         fd: self.fd,
                         events: libc::POLLIN,
                         revents: 0,
                     };
-                    let eof_pending = pending <= 0
-                        && unsafe { libc::poll(&mut ready, 1, 0) } > 0
-                        && ready.revents & (libc::POLLIN | libc::POLLHUP) != 0;
-                    total + u64::from(eof_pending)
+                    let closed = unsafe { libc::poll(&mut ready, 1, 0) } > 0
+                        && ready.revents & libc::POLLHUP != 0;
+                    total + u64::from(closed)
                 },
             )
         };
@@ -443,7 +443,10 @@ fn spawn_frame_reader(
                         Frame::Eof
                     }
                 };
-                let end = reader_fence.read_total.load(SeqCst) - reader.buffer().len() as u64;
+                let consumed = reader_fence.read_total.load(SeqCst) - reader.buffer().len() as u64;
+                // EOF sits one past the last byte, so it is inside a decision
+                // fence only when the client had closed before that decision.
+                let end = consumed + u64::from(matches!(frame, Frame::Eof));
                 let last = matches!(frame, Frame::Eof);
                 if sender.send((frame, end)).is_err() || last {
                     break;
@@ -1351,28 +1354,75 @@ mod reply_gate_tests {
         }
     }
 
+    /// Block until the read end reports that no writer remains.
+    fn wait_for_hangup(fd: libc::c_int) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut ready = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            if unsafe { libc::poll(&mut ready, 1, 0) } > 0 && ready.revents & libc::POLLHUP != 0 {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the closed write end never hung up"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     #[test]
     fn stdin_eof_before_the_decision_cancels_the_reply() {
         for _ in 0..50 {
             let mut fixture = Fixture::new();
-            // The client closes its input before the reply exists. Precondition:
-            // EOF is observable on the read end before the decision.
+            // The client closes its input before the reply exists.
             unsafe { libc::close(fixture.fds[1]) };
             fixture.fds[1] = -1;
-            let deadline = Instant::now() + Duration::from_secs(5);
-            loop {
-                let mut ready = libc::pollfd {
-                    fd: fixture.fds[0],
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                if unsafe { libc::poll(&mut ready, 1, 0) } > 0 {
-                    break;
-                }
-                assert!(Instant::now() < deadline, "EOF never became observable");
-                thread::sleep(Duration::from_millis(1));
-            }
+            wait_for_hangup(fixture.fds[0]);
             assert!(matches!(fixture.gate(), ReplyGate::Cancelled));
+        }
+    }
+
+    #[test]
+    fn stdin_eof_behind_buffered_frames_before_the_decision_cancels_the_reply() {
+        for _ in 0..50 {
+            let mut fixture = Fixture::new();
+            // A complete non-cancel frame is still buffered when the client
+            // closes its input, all before the reply exists.
+            fixture.write("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\n");
+            unsafe { libc::close(fixture.fds[1]) };
+            fixture.fds[1] = -1;
+            wait_for_hangup(fixture.fds[0]);
+            assert!(matches!(fixture.gate(), ReplyGate::Cancelled));
+        }
+    }
+
+    #[test]
+    fn stdin_eof_just_after_the_decision_cannot_suppress_the_reply() {
+        for _ in 0..50 {
+            let mut fixture = Fixture::new();
+            // Right after the decision is sampled the client closes its input,
+            // and the reader delivers that EOF before the gate drains.
+            let fd = fixture.fds[1];
+            let fence = fixture.fence.clone();
+            *fixture.fence.after_sample.lock().unwrap() = Some(Box::new(move || {
+                unsafe { libc::close(fd) };
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !fence.closed.load(std::sync::atomic::Ordering::SeqCst) {
+                    assert!(Instant::now() < deadline, "EOF never delivered");
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }));
+            let (gate, deferred) = fixture.gate_on(&fixture.frames);
+            fixture.fds[1] = -1;
+            assert!(matches!(gate, ReplyGate::Write));
+            assert!(
+                matches!(deferred, Some((crate::mcp::wire::Frame::Eof, _))),
+                "the post-decision EOF is deferred until after the reply"
+            );
         }
     }
 
