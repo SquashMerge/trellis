@@ -116,7 +116,10 @@ async function startDaemon(paths, expectedRevision) {
       child.once("error", rejectAddress);
       child.once("exit", (code, signal) => { if (!base) rejectAddress(new Error(`daemon exited before readiness (${code ?? signal}): ${stderr.replaceAll(paths.token,"[redacted]")}`)); });
     });
-    const timer = setTimeout(() => rejected(new Error(`daemon address timed out: ${stderr.replaceAll(paths.token,"[redacted]")}`)),10000);
+    // Serve connects to (or launches) the daemon before it prints this banner.
+    // The internal connect and reply bounds total 15s; concurrent verify lanes
+    // can delay the child beyond the old 10s fixture timer.
+    const timer = setTimeout(() => rejected(new Error(`daemon address timed out after 30s: pid=${child.pid} exit=${child.exitCode} signal=${child.signalCode} stderr=${stderr.replaceAll(paths.token,"[redacted]")}`)),30000);
     try { await address; } finally { clearTimeout(timer); }
     const deadline = Date.now()+10000;
     while (true) {

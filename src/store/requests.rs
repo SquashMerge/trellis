@@ -1,6 +1,6 @@
 //! Durable explicit indexing requests. Each operation has its own short-lived, protected connection.
 use super::Store;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use super::TestTerminalNotify;
 use crate::{
     indexer::{IndexOptions, ReconcileOptions},
@@ -1468,12 +1468,9 @@ impl Store {
     }
 
     /// Wake one in-process test after this exact accepted ID commits terminally.
-    #[cfg(test)]
-    pub(crate) fn notify_on_terminal_request_for_tests(
-        &self,
-        id: &str,
-        notify: Arc<tokio::sync::Notify>,
-    ) {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn notify_on_terminal_request_for_tests(&self, id: &str, notify: Arc<tokio::sync::Notify>) {
         *self.test_queue_terminal_notify.lock().unwrap() = Some(TestTerminalNotify {
             id: id.to_owned(),
             notify,
@@ -1618,7 +1615,7 @@ impl Store {
         let changed=tx.execute("UPDATE requests SET state=?1,result_generation=?2,result_revision=?3,error_code=?4,finished_at=?5 WHERE seq=?6 AND state='running' AND claim_incarnation=?7 AND root_device=?8 AND root_inode=?9",params![if code.is_some(){"failed"}else{"done"},generation,revision,code,now(),request.seq,session.incarnation().to_string(),self.identity.device.to_string(),self.identity.inode.to_string()])?;
         ensure!(changed == 1, "storage_busy: request claim changed");
         tx.commit()?;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         {
             let notify = {
                 let mut hook = self.test_queue_terminal_notify.lock().unwrap();

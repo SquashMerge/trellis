@@ -1506,6 +1506,19 @@ impl CheckoutRuntime {
     }
 
     #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn notify_on_terminal_request_for_tests(
+        &self,
+        id: &str,
+        notify: Arc<tokio::sync::Notify>,
+    ) -> anyhow::Result<()> {
+        self.resources()?
+            .store
+            .notify_on_terminal_request_for_tests(id, notify);
+        Ok(())
+    }
+
+    #[cfg(feature = "test-support")]
     pub fn set_after_claim_hook_for_tests(&self, hook: impl FnOnce() + Send + 'static) {
         if let Ok(resources) = self.resources() {
             resources.store.set_after_claim_hook_for_tests(hook);

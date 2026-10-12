@@ -3089,31 +3089,97 @@ async fn virgin_queue_use_lock_contention_retries_h_before_claiming_fifo() {
         .enqueue_request(&IndexOptions::new(root), None)
         .unwrap();
     assert_eq!(queued.state, "queued");
-    tokio::time::timeout(Duration::from_secs(10), async {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let terminal = Arc::new(tokio::sync::Notify::new());
+    runtime
+        .notify_on_terminal_request_for_tests(&queued.id, terminal.clone())
+        .unwrap();
+    let mut last_status = None;
+    let ready = tokio::time::timeout_at(deadline, async {
+        // The request may have committed between enqueue and registration.
+        // Otherwise wait for this ID's durable terminal COMMIT without a
+        // stream of protected status/queue SH reads competing with H's EX.
+        let mut finished = loop {
+            match store.request_by_id(&queued.id) {
+                Ok(Some(row)) => break row,
+                Err(error) if trellis::store::cli_read_retryable_contention(&error) => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                other => panic!("accepted virgin FIFO lookup failed: {other:?}"),
+            }
+        };
+        if finished.finished_at.is_none() {
+            terminal.notified().await;
+            finished = loop {
+                match store.request_by_id(&queued.id) {
+                    Ok(Some(row)) => break row,
+                    Err(error) if trellis::store::cli_read_retryable_contention(&error) => {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    other => panic!("terminal virgin FIFO lookup failed: {other:?}"),
+                }
+            };
+        }
+        assert_eq!(finished.state, "done", "{finished:?}");
+        assert!(finished.finished_at.is_some());
+        assert_eq!(finished.id, queued.id);
+        assert_eq!(finished.seq, queued.seq);
+        assert!(
+            finished.revision.unwrap().index_revision >= 2,
+            "FIFO request must commit after H"
+        );
         loop {
             let (code, _, status) =
                 selected_json(app.clone(), "GET", &format!("{prefix}/status"), Value::Null).await;
             if code == axum::http::StatusCode::OK && status["catchingUp"] == false {
-                let finished = store.request_by_id(&queued.id).unwrap().unwrap();
-                if finished.state == "done" {
-                    assert!(
-                        status["revision"]["indexRevision"].as_u64().unwrap() >= 2,
-                        "mandatory H must publish before FIFO completion: {status}"
-                    );
-                    assert_eq!(finished.id, queued.id);
-                    assert_eq!(finished.seq, queued.seq);
-                    assert!(
-                        finished.revision.unwrap().index_revision >= 2,
-                        "FIFO request must commit after H"
-                    );
-                    break;
-                }
+                assert!(
+                    status["revision"]["indexRevision"].as_u64().unwrap() >= 2,
+                    "mandatory H must publish before FIFO completion: {status}"
+                );
+                break;
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            last_status = Some((code, status));
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     })
-    .await
-    .expect("H and queued work did not become ready after SH release");
+    .await;
+    if ready.is_err() {
+        let at_deadline = store.request_by_id(&queued.id).map(|row| {
+            row.map(|row| {
+                (
+                    row.state,
+                    row.error_code,
+                    row.finished_at.is_some(),
+                    row.revision,
+                )
+            })
+        });
+        let head_at_deadline = store.status().map(|status| status.revision.index_revision);
+        let owner_valid = runtime
+            .browser_scheduler()
+            .ok()
+            .and_then(|scheduler| scheduler.checkout_serving_owner())
+            .is_some();
+        let error = runtime.reconciliation_error();
+        let retry_waiting = runtime.retry_waiting_for_tests();
+        let catching_up = runtime.catching_up();
+        // Failure-only: a late completion remains RED, but distinguishes a
+        // stuck worker from a reader-induced delay after polling stops.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let after_quiet = store.request_by_id(&queued.id).map(|row| {
+            row.map(|row| {
+                (
+                    row.state,
+                    row.error_code,
+                    row.finished_at.is_some(),
+                    row.revision,
+                )
+            })
+        });
+        panic!(
+            "H and queued work did not become ready after SH release: last_status={last_status:?}, at_deadline={at_deadline:?}, head_at_deadline={head_at_deadline:?}, owner_valid={owner_valid}, error={error:?}, retry_waiting={retry_waiting}, catching_up={catching_up}, after_quiet={after_quiet:?}"
+        );
+    }
     assert!(!runtime.catching_up());
 }
 

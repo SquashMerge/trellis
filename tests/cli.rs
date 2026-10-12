@@ -316,36 +316,45 @@ fn unchanged_serve_reuses_selected_versions_and_detects_selected_source_corrupti
         }
     }
     fn serve(root: &std::path::Path, home: &std::path::Path, log: &std::path::Path) -> Server {
-        // One daemon owns one browser bind for its lifetime. Each registration
-        // in this test must request that same address after the control exits.
-        static ADDRESS: std::sync::OnceLock<std::net::SocketAddr> = std::sync::OnceLock::new();
-        let address = *ADDRESS.get_or_init(|| {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            listener.local_addr().unwrap()
-        });
+        // One daemon owns the requested bind for its lifetime. Ask it to
+        // allocate the port instead of releasing a reserved free port first.
+        let requested_bind = "127.0.0.1:0";
         let child = command(root, home, "serve")
             .env("TRELLIS_TEST_DAEMON_PID_FILE", home.join("auto-daemon.pid"))
             .arg("--bind")
-            .arg(address.to_string())
+            .arg(requested_bind)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::from(fs::File::create(log).unwrap()))
             .spawn()
             .unwrap();
         let mut server = Server(child);
-        for _ in 0..150 {
-            if std::net::TcpStream::connect_timeout(&address, Duration::from_millis(20)).is_ok() {
-                assert!(home.join("auto-daemon.pid").exists());
-                return server;
+        // The CLI may spend 5s connecting and 10s awaiting the daemon reply
+        // before printing the bound address. The test still fails boundedly.
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let stderr = fs::read_to_string(log).unwrap();
+            if let Some(raw) = stderr
+                .lines()
+                .find_map(|line| line.strip_prefix("Trellis: http://")?.strip_suffix('/'))
+            {
+                let address: std::net::SocketAddr = raw.parse().expect("serve banner address");
+                assert!(address.ip().is_loopback() && address.port() != 0);
+                if std::net::TcpStream::connect_timeout(&address, Duration::from_millis(100))
+                    .is_ok()
+                {
+                    assert!(home.join("auto-daemon.pid").exists());
+                    return server;
+                }
             }
             if let Some(status) = server.0.try_wait().unwrap() {
-                panic!(
-                    "Serve exited {status}: {}",
-                    fs::read_to_string(log).unwrap()
-                );
+                panic!("Serve exited {status}: {stderr}");
             }
-            std::thread::sleep(Duration::from_millis(20));
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Serve not ready: {stderr}"
+            );
+            std::thread::sleep(Duration::from_millis(40));
         }
-        panic!("Serve not ready: {}", fs::read_to_string(log).unwrap());
     }
     fn pin_and_ids(db: &rusqlite::Connection) -> (i64, Vec<(i64, String, String, String)>) {
         let rev = db

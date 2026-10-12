@@ -146,13 +146,13 @@ async fn reattach_reports_catching_up_and_keeps_complete_head_until_h() {
     let runtime = registry.activate(&id.root_key).unwrap();
     assert!(runtime.catching_up(), "mandatory H has not run yet");
     ready(&runtime).await;
-    let (old, stale) = runtime.evidence_response().unwrap();
-    assert!(!stale);
+    // A watcher hint can arrive after ready() without invalidating this head.
+    let (old, _catching_up) = runtime.evidence_response().unwrap();
     let first = old.status().unwrap().revision;
     old.finish(()).unwrap();
     drop(old);
     registry.disconnect(1);
-    assert!(registry.release(&id.root_key).unwrap());
+    release_when_idle(&mut registry, &id.root_key).await;
     fs::write(
         checkout.join("a.js"),
         "function newHead() {}
@@ -207,7 +207,7 @@ async fn cli_symbols_and_export_use_the_admitted_prior_head_during_h() {
     let runtime = registry.activate(&id.root_key).unwrap();
     ready(&runtime).await;
     registry.disconnect(1);
-    assert!(registry.release(&id.root_key).unwrap());
+    release_when_idle(&mut registry, &id.root_key).await;
     fs::write(checkout.join("a.js"), "function newHead() {}\n").unwrap();
     registry.attach_launch(2, &id).unwrap();
     let resumed = registry.activate(&id.root_key).unwrap();
@@ -306,7 +306,7 @@ async fn replacement_settles_old_queue_before_h_then_claims_distinct_fifo_option
     let old_runtime = registry.activate(&old_id.root_key).unwrap();
     ready(&old_runtime).await;
     registry.disconnect(1);
-    assert!(registry.release(&old_id.root_key).unwrap());
+    release_when_idle(&mut registry, &old_id.root_key).await;
     let old_store = Store::open(topology.clone(), identity(&checkout)).unwrap();
     let old = old_store
         .enqueue_request(&trellis::indexer::IndexOptions::new(checkout.clone()), None)
@@ -602,7 +602,7 @@ async fn retained_registration_and_old_runtime_handle_hold_no_checkout_descripto
     assert!(file_descriptors(&index_db) > 0);
     assert!(file_descriptors(&requests_db) > 0);
     registry.disconnect(1);
-    assert!(registry.release(&key).unwrap());
+    release_when_idle(&mut registry, &key).await;
     assert!(!old.has_active_resources());
     assert!(
         old.evidence_response().is_err(),
@@ -698,7 +698,7 @@ async fn root_loss_fails_accepted_work_then_releases_old_runtime_handles() {
         .unwrap();
     assert_eq!((state.as_str(), error.as_str()), ("failed", "root_changed"));
     drop(db);
-    assert!(registry.release(&key).unwrap());
+    release_when_idle(&mut registry, &key).await;
     assert_eq!(
         registry.browser_identity(&key).unwrap().inode,
         replacement.inode
@@ -731,7 +731,7 @@ async fn root_loss_during_paused_reattach_h_waits_for_worker_then_releases() {
     let original = registry.activate(&key).unwrap();
     ready(&original).await;
     registry.disconnect(1);
-    assert!(registry.release(&key).unwrap());
+    release_when_idle(&mut registry, &key).await;
     registry.attach_launch(2, &id).unwrap();
     drop(id);
     let paused = registry.activate(&key).unwrap();
@@ -969,7 +969,7 @@ async fn replaced_path_cold_runtime_publishes_new_identity_not_old_head() {
     let prior = registry.activate(&old_id.root_key).unwrap();
     ready(&prior).await;
     registry.disconnect(1);
-    assert!(registry.release(&old_id.root_key).unwrap());
+    release_when_idle(&mut registry, &old_id.root_key).await;
     fs::rename(&checkout, &moved).unwrap();
     fs::create_dir(&checkout).unwrap();
     fs::write(
@@ -1132,7 +1132,7 @@ async fn browser_listing_and_discovery_do_not_reopen_released_sqlite_witnesses()
     let active = registry.activate(&other_id.root_key).unwrap();
     ready(&active).await;
     registry.disconnect(1);
-    assert!(registry.release(&key).unwrap());
+    release_when_idle(&mut registry, &key).await;
     assert_eq!(
         (file_descriptors(&index_db), file_descriptors(&request_db)),
         (0, 0)

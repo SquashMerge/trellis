@@ -214,7 +214,10 @@ impl Drop for Owned {
         let _ = self.0.wait();
     }
 }
-fn detached(mut command: Command) -> Owned {
+fn detached(command: Command) -> Owned {
+    detached_with_log(command).0
+}
+fn detached_with_log(mut command: Command) -> (Owned, std::path::PathBuf) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT_LOG: AtomicU64 = AtomicU64::new(1);
     let home = command
@@ -228,13 +231,12 @@ fn detached(mut command: Command) -> Owned {
         std::process::id(),
         NEXT_LOG.fetch_add(1, Ordering::Relaxed)
     ));
-    Owned(
-        command
-            .stdout(Stdio::null())
-            .stderr(Stdio::from(fs::File::create(log).unwrap()))
-            .spawn()
-            .unwrap(),
-    )
+    let child = command
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(fs::File::create(&log).unwrap()))
+        .spawn()
+        .unwrap();
+    (Owned(child), log)
 }
 fn free_address() -> SocketAddr {
     TcpListener::bind("127.0.0.1:0")
@@ -278,6 +280,34 @@ fn run(home: &Path, command: &str, root: &Path) -> Value {
     );
     serde_json::from_slice(&output.stdout).unwrap()
 }
+async fn serve_banner_address(child: &mut Child, log: &Path, home: &Path) -> SocketAddr {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let stderr = bounded_fixture_stderr(log);
+        if let Some(raw) = stderr
+            .lines()
+            .find_map(|line| line.strip_prefix("Trellis: http://")?.strip_suffix('/'))
+        {
+            let address: SocketAddr = raw
+                .parse()
+                .expect("serve banner must contain a socket address");
+            assert!(address.ip().is_loopback() && address.port() != 0);
+            return address;
+        }
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "serve exited before address banner: {}",
+            fixture_daemon_diagnostic(home, &fixture_socket_paths(home).socket)
+        );
+        assert!(
+            Instant::now() < deadline,
+            "serve address banner timed out: {}",
+            fixture_daemon_diagnostic(home, &fixture_socket_paths(home).socket)
+        );
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+}
+
 async fn ready(client: &reqwest::Client, address: SocketAddr, child: &mut Child, home: &Path) {
     let deadline = Instant::now() + Duration::from_secs(12);
     loop {
@@ -457,8 +487,7 @@ async fn executable_daemon_is_socket_only_until_explicit_serve_and_registers_two
     fs::create_dir(&home).unwrap();
     let first = checkout(temp.path(), "first");
     let second = checkout(temp.path(), "second");
-    let reserved = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = reserved.local_addr().unwrap();
+    let requested_bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let token_file = temp.path().join("token");
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
@@ -482,8 +511,7 @@ async fn executable_daemon_is_socket_only_until_explicit_serve_and_registers_two
         );
         tokio::time::sleep(Duration::from_millis(40)).await;
     }
-    // Keep the port reserved until explicit serve. A connect check after
-    // releasing it would race with other tests or processes that bind it.
+    // A socket-only daemon must not provision a browser token or listener.
     assert!(daemon.0.try_wait().unwrap().is_none());
     assert!(std::os::unix::net::UnixStream::connect(&socket).is_ok());
     assert!(
@@ -497,9 +525,12 @@ async fn executable_daemon_is_socket_only_until_explicit_serve_and_registers_two
         "second daemon displaced socket owner"
     );
     assert!(!token_file.exists());
-    drop(reserved);
 
-    let mut first_serve = detached(serve(&home, &first, address, &token_file));
+    // Let the daemon own port selection. Dropping a reserved free port before
+    // serve lets another parallel test bind it first.
+    let (mut first_serve, first_log) =
+        detached_with_log(serve(&home, &first, requested_bind, &token_file));
+    let address = serve_banner_address(&mut first_serve.0, &first_log, &home).await;
     ready(&client, address, &mut first_serve.0, &home).await;
     let token = fs::read_to_string(&token_file).unwrap();
     let url = format!("http://{address}/api/checkouts");
@@ -618,14 +649,13 @@ async fn executable_daemon_is_socket_only_until_explicit_serve_and_registers_two
         .unwrap();
     assert_eq!(wrong_origin.status(), reqwest::StatusCode::FORBIDDEN);
 
-    let conflicting_bind = free_address();
-    let output = serve(&home, &second, conflicting_bind, &token_file)
+    let output = serve(&home, &second, address, &token_file)
         .output()
         .unwrap();
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("bind conflicts"));
     let other_token = temp.path().join("other-token");
-    let output = serve(&home, &second, address, &other_token)
+    let output = serve(&home, &second, requested_bind, &other_token)
         .output()
         .unwrap();
     assert!(!output.status.success());
@@ -645,7 +675,7 @@ async fn executable_daemon_is_socket_only_until_explicit_serve_and_registers_two
         1
     );
 
-    let mut second_serve = detached(serve(&home, &second, address, &token_file));
+    let mut second_serve = detached(serve(&home, &second, requested_bind, &token_file));
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let value = authenticated()
@@ -687,7 +717,13 @@ async fn executable_daemon_is_socket_only_until_explicit_serve_and_registers_two
         assert!(Instant::now() < deadline, "second checkout not registered");
         tokio::time::sleep(Duration::from_millis(40)).await;
     }
-    let mut same_serve = detached(serve(&home, &first, address, &token_file));
+    let (mut same_serve, same_log) =
+        detached_with_log(serve(&home, &first, requested_bind, &token_file));
+    let same_address = serve_banner_address(&mut same_serve.0, &same_log, &home).await;
+    assert_eq!(
+        same_address, address,
+        "same registration changed the listener"
+    );
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         if same_serve.0.try_wait().unwrap().is_none() {
@@ -748,7 +784,7 @@ async fn executable_daemon_is_socket_only_until_explicit_serve_and_registers_two
     assert!(run(&home, "export", &first).is_object());
     // Index activated this checkout. A conflicting registration cannot replace
     // its options until the active checkout is released.
-    let mut conflict = serve(&home, &first, address, &token_file)
+    let mut conflict = serve(&home, &first, requested_bind, &token_file)
         .arg("--max-file-bytes")
         .arg("3145728")
         .stdout(Stdio::null())
