@@ -5616,6 +5616,7 @@ mod exceptional_recovery_tests {
         // Distinguish a blocked watcher inventory from a later FIFO retry.
         // A timed-out blocking tick continues after its Tokio join is dropped.
         let queue_phase = Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let watcher_returned = Arc::new(tokio::sync::Notify::new());
         {
             let phase = queue_phase.clone();
             fixture.state.test_queue_after_h_drain.set(move || {
@@ -5633,11 +5634,13 @@ mod exceptional_recovery_tests {
         }
         {
             let phase = queue_phase.clone();
+            let returned = watcher_returned.clone();
             fixture
                 .state
                 .test_queue_after_watcher_reconcile
                 .set(move || {
                     phase.store(3, Ordering::Release);
+                    returned.notify_one();
                 });
         }
         fixture
@@ -5712,22 +5715,40 @@ mod exceptional_recovery_tests {
             .await
             .expect("child output drain did not finish")
             .unwrap();
-        let timeout_result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            // The accepted ID signals only after its durable terminal COMMIT.
-            // Do not take repeated SH queue reads while the daemon needs EX.
-            q1_terminal.notified().await;
-            loop {
-                match fixture.store.request_by_id(&fixture.q1.id) {
-                    Ok(Some(row)) => break row,
-                    Err(error) if error.is::<crate::store::topology::StorageBusy>() => {
-                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        // The serial timer admits one FIFO row per turn, then reconciles the
+        // post-takeover watcher inventory before it may claim the next row.
+        // Bound those two independent stages separately. Both notifications
+        // come from existing transition hooks, not selected-status SH polling.
+        let watcher_returned_in_time = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            watcher_returned.notified(),
+        )
+        .await
+        .is_ok();
+        let timeout_result = if watcher_returned_in_time {
+            Some(
+                tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                    // The accepted ID signals only after its durable terminal COMMIT.
+                    // Do not take repeated SH queue reads while the daemon needs EX.
+                    q1_terminal.notified().await;
+                    loop {
+                        match fixture.store.request_by_id(&fixture.q1.id) {
+                            Ok(Some(row)) => break row,
+                            Err(error) if error.is::<crate::store::topology::StorageBusy>() => {
+                                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                            }
+                            other => {
+                                panic!("accepted Q1 lookup failed after terminal signal: {other:?}")
+                            }
+                        }
                     }
-                    other => panic!("accepted Q1 lookup failed after terminal signal: {other:?}"),
-                }
-            }
-        })
-        .await;
-        let observed = if let Ok(row) = timeout_result {
+                })
+                .await,
+            )
+        } else {
+            None
+        };
+        let observed = if let Some(Ok(row)) = timeout_result {
             row
         } else {
             let last_seen = fixture
@@ -5742,8 +5763,8 @@ mod exceptional_recovery_tests {
                 fixture.store.test_pending_completion_probe_for_tests(),
                 fixture.state.native_stream.try_lock().is_ok(),
             );
-            // Failure-only probe: preserve the original 10-second RED, but
-            // give the writer one quiet second without this test's SH poll.
+            // Failure-only probe: keep a missed watcher or Q1 deadline RED,
+            // then give the writer one quiet second without this test's SH poll.
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             let after_quiet = fixture
                 .store
@@ -5766,7 +5787,7 @@ mod exceptional_recovery_tests {
             let pending = fixture.state.pending_requests.lock().unwrap().clone();
             let completion = fixture.store.test_pending_completion_probe_for_tests();
             panic!(
-                "same accepted Q1 ID did not retry after external SH release: last_row={last_seen:?}, q2={q2:?}, pending_recovery={}, owner_valid={owner:?}, retry_ms={retry_ms:?}, pending_ids={pending:?}, at_deadline={at_deadline:?}, after_quiet={after_quiet:?}, queue_phase={} (0=pre-H, 1=after-H/Q, 2=watcher reconcile, 3=watcher returned), live_phase={} (1=stream, 2=drain, 3=after drain, 4=watcher reconcile, 5=after watcher), completion={completion:?}, tick_started={}, native_stream_free={}, index_revision={:?}",
+                "same accepted Q1 ID did not finish after watcher reconcile: watcher_returned_in_time={watcher_returned_in_time}, last_row={last_seen:?}, q2={q2:?}, pending_recovery={}, owner_valid={owner:?}, retry_ms={retry_ms:?}, pending_ids={pending:?}, at_deadline={at_deadline:?}, after_quiet={after_quiet:?}, queue_phase={} (0=pre-H, 1=after-H/Q, 2=watcher reconcile, 3=watcher returned), live_phase={} (1=stream, 2=drain, 3=after drain, 4=watcher reconcile, 5=after watcher), completion={completion:?}, tick_started={}, native_stream_free={}, index_revision={:?}",
                 fixture.store.is_recreate_pending(),
                 queue_phase.load(Ordering::Acquire),
                 fixture
