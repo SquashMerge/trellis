@@ -22,7 +22,7 @@ struct Fixture {
     store: Store,
     state: Arc<http::DaemonState>,
     app: Router,
-    session: Arc<trellis::store::topology::LeaderSession>,
+    session: Arc<trellis::store::topology::WriterSession>,
 }
 fn setup(enabled: bool) -> Fixture {
     let temp = tempfile::tempdir().unwrap();
@@ -44,6 +44,9 @@ fn setup(enabled: bool) -> Fixture {
     std::fs::write(library.join("std/src/lib.rs"), "// café\npub struct LibraryType;\nimpl LibraryType { pub fn method(&self) { hidden_call(); } }\npub enum Other { A }\n").unwrap();
     let store = crate::common::open_store(&temp.path().join("state"), &workspace).unwrap();
     assert!(store.status().is_err());
+    // Match daemon admission: publish the virgin queue before the writer's
+    // shared index-use session and first H, so a later request can be ACKed.
+    assert_eq!(store.settle_foreign_root_requests().unwrap(), 0);
     let cancel = Arc::new(AtomicBool::new(false));
     let (graph, native, capture) = index_workspace_bundle(
         &IndexOptions::new(workspace.clone()),
@@ -52,13 +55,13 @@ fn setup(enabled: bool) -> Fixture {
         |_| {},
     )
     .unwrap();
-    let session = store.leader_session().unwrap();
+    let session = store.writer_session_for_tests().unwrap();
     store
         .publish_native(
             &graph,
             &capture,
             &native,
-            session.leader_guard().unwrap(),
+            session.writer_guard().unwrap(),
             store.index_baseline().unwrap(),
             &cancel,
         )
@@ -267,7 +270,7 @@ async fn source_hash_and_workspace_revision_reject_stale_reads() {
         .store
         .publish(
             &Graph::default(),
-            fixture.session.leader_guard().unwrap(),
+            fixture.session.writer_guard().unwrap(),
             before,
             &Arc::new(AtomicBool::new(false)),
         )
@@ -292,7 +295,7 @@ async fn source_hash_and_workspace_revision_reject_stale_reads() {
             &graph,
             &capture,
             &native,
-            fixture.session.leader_guard().unwrap(),
+            fixture.session.writer_guard().unwrap(),
             before,
             &cancel,
         )
@@ -548,10 +551,10 @@ async fn workspace_generation_reuse() {
     ));
     drop(session);
     let exclusive = UseGuard::acquire_existing(&lock, true, true).unwrap();
+    // Simulate loss of disposable index evidence, not GC of the durable
+    // request queue: the same-root queue and its use lock remain in place.
     std::fs::remove_file(index.join("index.db")).unwrap();
-    std::fs::remove_file(index.join("leader.lock")).unwrap();
-    std::fs::remove_dir(index).unwrap();
-    exclusive.remove_last().unwrap();
+    drop(exclusive);
     let replacement =
         crate::common::open_store(&temp.path().join("state"), &temp.path().join("workspace"))
             .unwrap();
@@ -564,13 +567,13 @@ async fn workspace_generation_reuse() {
         |_| {},
     )
     .unwrap();
-    let replacement_session = replacement.leader_session().unwrap();
+    let replacement_session = replacement.writer_session_for_tests().unwrap();
     let fresh = replacement
         .publish_native(
             &graph,
             &capture,
             &native,
-            replacement_session.leader_guard().unwrap(),
+            replacement_session.writer_guard().unwrap(),
             replacement.index_baseline().unwrap(),
             &cancel,
         )

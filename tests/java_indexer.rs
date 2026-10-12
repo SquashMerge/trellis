@@ -1,11 +1,14 @@
 mod common;
+#[cfg(feature = "test-support")]
+use std::collections::BTreeSet;
 use std::{
-    collections::BTreeSet,
     fs,
     sync::{Arc, atomic::AtomicBool},
 };
+#[cfg(feature = "test-support")]
+use trellis::indexer::index_workspace_bundle;
 use trellis::{
-    indexer::{IndexOptions, index_workspace, index_workspace_bundle},
+    indexer::{IndexOptions, index_workspace},
     model::*,
 };
 fn run(o: &IndexOptions) -> Graph {
@@ -109,6 +112,7 @@ class Café {
     let graph_json = serde_json::to_string(&g).unwrap();
     assert!(!graph_json.contains("callbackArguments") && !graph_json.contains("candidateSymbols"));
 }
+#[cfg(feature = "test-support")]
 #[test]
 fn shared_start_call_ids_are_unique_and_publishable() {
     let dir = tempfile::tempdir().unwrap();
@@ -147,7 +151,7 @@ fn shared_start_call_ids_are_unique_and_publishable() {
             &bundle_graph,
             &capture,
             &native,
-            &store.leader().unwrap(),
+            &store.publication_for_tests().unwrap(),
             store.index_baseline().unwrap(),
             &Arc::new(AtomicBool::new(false)),
         )

@@ -32,6 +32,16 @@ async fn ready(runtime: &trellis::daemon::registry::CheckoutRuntime) {
     .unwrap_or_else(|_| panic!("H did not finish: {:?}", runtime.reconciliation_error()));
 }
 
+async fn release_when_idle(registry: &mut CheckoutRegistry, key: &str) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !registry.release(key).unwrap() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("checkout did not release after H and watcher quiescence");
+}
+
 #[tokio::test]
 async fn registration_does_not_open_a_store_and_active_checkouts_are_isolated() {
     let base = tempfile::tempdir().unwrap();
@@ -86,7 +96,7 @@ async fn registration_does_not_open_a_store_and_active_checkouts_are_isolated() 
 }
 
 #[tokio::test]
-async fn external_standalone_leader_keeps_daemon_a_follower() {
+async fn separate_store_writer_does_not_downgrade_daemon_read() {
     let base = tempfile::tempdir().unwrap();
     let checkout = base.path().join("work");
     fs::create_dir(&checkout).unwrap();
@@ -106,15 +116,19 @@ async fn external_standalone_leader_keeps_daemon_a_follower() {
         &cancel,
     )
     .unwrap();
-    assert!(leader.is_leader());
+    leader.verify().unwrap();
     let mut registry = CheckoutRegistry::with_roots(topology);
     registry.attach_launch(1, &id).unwrap();
     let runtime = registry.activate(&id.root_key).unwrap();
     ready(&runtime).await;
     assert!(leader.verify().is_ok());
-    assert!(runtime.is_follower());
+    let (response, catching_up) = runtime.evidence_response().unwrap();
+    assert!(!catching_up);
+    response.status().unwrap();
+    response.finish(()).unwrap();
 }
 
+#[cfg(feature = "test-support")]
 #[tokio::test]
 async fn reattach_reports_catching_up_and_keeps_complete_head_until_h() {
     let base = tempfile::tempdir().unwrap();
@@ -132,13 +146,13 @@ async fn reattach_reports_catching_up_and_keeps_complete_head_until_h() {
     let runtime = registry.activate(&id.root_key).unwrap();
     assert!(runtime.catching_up(), "mandatory H has not run yet");
     ready(&runtime).await;
-    let (old, stale) = runtime.evidence_response().unwrap();
-    assert!(!stale);
+    // A watcher hint can arrive after ready() without invalidating this head.
+    let (old, _catching_up) = runtime.evidence_response().unwrap();
     let first = old.status().unwrap().revision;
     old.finish(()).unwrap();
     drop(old);
     registry.disconnect(1);
-    assert!(registry.release(&id.root_key).unwrap());
+    release_when_idle(&mut registry, &id.root_key).await;
     fs::write(
         checkout.join("a.js"),
         "function newHead() {}
@@ -178,6 +192,61 @@ async fn reattach_reports_catching_up_and_keeps_complete_head_until_h() {
     let new_revision = current.status().unwrap().revision;
     assert!(new_revision.index_revision > first.index_revision);
     current.finish(()).unwrap();
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn cli_symbols_and_export_use_the_admitted_prior_head_during_h() {
+    let base = tempfile::tempdir().unwrap();
+    let checkout = base.path().join("work");
+    fs::create_dir(&checkout).unwrap();
+    fs::write(checkout.join("a.js"), "function oldHead() {}\n").unwrap();
+    let id = identity(&checkout);
+    let mut registry = CheckoutRegistry::with_roots(roots(base.path()));
+    registry.attach_launch(1, &id).unwrap();
+    let runtime = registry.activate(&id.root_key).unwrap();
+    ready(&runtime).await;
+    registry.disconnect(1);
+    release_when_idle(&mut registry, &id.root_key).await;
+    fs::write(checkout.join("a.js"), "function newHead() {}\n").unwrap();
+    registry.attach_launch(2, &id).unwrap();
+    let resumed = registry.activate(&id.root_key).unwrap();
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+    let resume_rx = std::sync::Mutex::new(resume_rx);
+    resumed.set_pre_h_hook_for_tests(std::sync::Arc::new(move || {
+        entered_tx.send(()).unwrap();
+        resume_rx.lock().unwrap().recv().unwrap();
+    }));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while entered_rx.try_recv().is_err() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("H did not pause");
+    let symbols = resumed.cli_symbols("oldHead", 10).unwrap();
+    assert_eq!(symbols["catchingUp"], true);
+    assert_eq!(symbols["data"]["items"].as_array().unwrap().len(), 1);
+    let export = resumed.cli_export().unwrap();
+    assert_eq!(export["catchingUp"], true);
+    assert!(
+        export["data"]["files"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("oldHead")
+    );
+    resume_tx.send(()).unwrap();
+    ready(&resumed).await;
+    let symbols = resumed.cli_symbols("newHead", 10).unwrap();
+    assert_eq!(symbols["catchingUp"], false);
+    assert_eq!(symbols["data"]["items"].as_array().unwrap().len(), 1);
+    assert!(
+        resumed.cli_export().unwrap()["data"]["files"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("newHead")
+    );
 }
 
 #[tokio::test]
@@ -223,6 +292,259 @@ async fn committed_queue_survives_runtime_restart() {
     );
 }
 
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn replacement_settles_old_queue_before_h_then_claims_distinct_fifo_options() {
+    let base = tempfile::tempdir().unwrap();
+    let checkout = base.path().join("work");
+    fs::create_dir(&checkout).unwrap();
+    fs::write(checkout.join("a.js"), "function oldRoot() {}\n").unwrap();
+    let old_id = identity(&checkout);
+    let topology = roots(base.path());
+    let mut registry = CheckoutRegistry::with_roots(topology.clone());
+    registry.attach_launch(1, &old_id).unwrap();
+    let old_runtime = registry.activate(&old_id.root_key).unwrap();
+    ready(&old_runtime).await;
+    registry.disconnect(1);
+    release_when_idle(&mut registry, &old_id.root_key).await;
+    let old_store = Store::open(topology.clone(), identity(&checkout)).unwrap();
+    let old = old_store
+        .enqueue_request(&trellis::indexer::IndexOptions::new(checkout.clone()), None)
+        .unwrap();
+    drop(old_store);
+    fs::rename(&checkout, base.path().join("moved")).unwrap();
+    fs::create_dir(&checkout).unwrap();
+    fs::write(
+        checkout.join("a.js"),
+        format!("function newRoot() {{}}\n{}", " ".repeat(6000)),
+    )
+    .unwrap();
+    let new_id = identity(&checkout);
+    let new_store = Store::open(topology.clone(), identity(&checkout)).unwrap();
+    let mut a_options = trellis::indexer::IndexOptions::new(checkout.clone());
+    a_options.max_file_bytes = 7000;
+    let mut b_options = a_options.clone();
+    b_options.max_file_bytes = 8192;
+    let a = new_store.enqueue_request(&a_options, None).unwrap();
+    let b = new_store.enqueue_request(&b_options, None).unwrap();
+    assert!(old.seq < a.seq && a.seq < b.seq);
+    registry.attach_launch(2, &new_id).unwrap();
+    let runtime = registry.activate(&new_id.root_key).unwrap();
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+    let resume_rx = std::sync::Mutex::new(resume_rx);
+    runtime.set_pre_h_hook_for_tests(std::sync::Arc::new(move || {
+        entered_tx.send(()).unwrap();
+        resume_rx.lock().unwrap().recv().unwrap();
+    }));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while entered_rx.try_recv().is_err() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("new-root H did not reach barrier");
+    let old_row = new_store
+        .request_any_root_for_tests(&old.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (old_row.state.as_str(), old_row.error_code.as_deref()),
+        ("failed", Some("root_changed"))
+    );
+    assert!(
+        old_row.finished_at.is_some(),
+        "old-root settlement must be durable before H"
+    );
+    for row in [&a, &b] {
+        let current = new_store.request_by_id(&row.id).unwrap().unwrap();
+        assert_eq!(current.state, "queued", "new-root claims must wait for H");
+    }
+    let (claim_tx, claim_rx) = std::sync::mpsc::sync_channel(1);
+    let (continue_tx, continue_rx) = std::sync::mpsc::sync_channel(1);
+    let continue_rx = std::sync::Mutex::new(continue_rx);
+    runtime.set_after_claim_hook_for_tests(move || {
+        claim_tx.send(()).unwrap();
+        continue_rx.lock().unwrap().recv().unwrap();
+    });
+    resume_tx.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while claim_rx.try_recv().is_err() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("first FIFO claim did not reach barrier");
+    let (published_h, _) = runtime
+        .evidence_response()
+        .expect("H must commit before A claim");
+    let (_, h_source) = published_h.source_at("a.js", None).unwrap().unwrap();
+    assert!(h_source.text.contains("newRoot"));
+    published_h.finish(()).unwrap();
+    drop(published_h);
+    assert_eq!(
+        new_store.request_by_id(&a.id).unwrap().unwrap().state,
+        "running"
+    );
+    assert_eq!(
+        new_store.request_by_id(&b.id).unwrap().unwrap().state,
+        "queued"
+    );
+    continue_tx.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if [&a, &b].iter().all(|row| {
+                new_store
+                    .request_by_id(&row.id)
+                    .unwrap()
+                    .unwrap()
+                    .finished_at
+                    .is_some()
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("FIFO A/B did not finish");
+    let a_row = new_store.request_by_id(&a.id).unwrap().unwrap();
+    let b_row = new_store.request_by_id(&b.id).unwrap().unwrap();
+    assert_eq!(
+        (a_row.state.as_str(), b_row.state.as_str()),
+        ("done", "done")
+    );
+    let a_pin = a_row.revision.unwrap();
+    let b_pin = b_row.revision.unwrap();
+    assert_eq!(a_pin.index_generation, b_pin.index_generation);
+    assert!(
+        a_pin.index_revision < b_pin.index_revision,
+        "FIFO ACK pins must differ"
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&a_row.options_json).unwrap()["maxFileBytes"],
+        7000
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&b_row.options_json).unwrap()["maxFileBytes"],
+        8192
+    );
+    let selected_store = Store::open(topology, identity(&checkout)).unwrap();
+    for pin in [a_pin, b_pin] {
+        assert!(
+            selected_store
+                .source_at("a.js", Some(pin))
+                .unwrap()
+                .unwrap()
+                .1
+                .text
+                .contains("newRoot")
+        );
+    }
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn ambiguous_root_settlement_blocks_h_and_fifo_until_queue_reread() {
+    let base = tempfile::tempdir().unwrap();
+    let checkout = base.path().join("work");
+    fs::create_dir(&checkout).unwrap();
+    fs::write(checkout.join("a.js"), "function oldRoot() {}\n").unwrap();
+    let old_id = identity(&checkout);
+    let topology = roots(base.path());
+    let old_store = Store::open(topology.clone(), old_id).unwrap();
+    let old = old_store
+        .enqueue_request(&trellis::indexer::IndexOptions::new(checkout.clone()), None)
+        .unwrap();
+    drop(old_store);
+    fs::rename(&checkout, base.path().join("moved")).unwrap();
+    fs::create_dir(&checkout).unwrap();
+    fs::write(checkout.join("a.js"), "function newRoot() {}\n").unwrap();
+    let new_id = identity(&checkout);
+    let new_store = Store::open(topology.clone(), identity(&checkout)).unwrap();
+    let accepted = new_store
+        .enqueue_request(&trellis::indexer::IndexOptions::new(checkout.clone()), None)
+        .unwrap();
+    let (ambiguous_tx, ambiguous_rx) = std::sync::mpsc::sync_channel(1);
+    let (confirm_tx, confirm_rx) = std::sync::mpsc::sync_channel(1);
+    let confirm_rx = std::sync::Mutex::new(confirm_rx);
+    new_store.set_ambiguous_settlement_hook_for_tests(move || {
+        ambiguous_tx.send(()).unwrap();
+        confirm_rx.lock().unwrap().recv().unwrap();
+    });
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(1, &new_id).unwrap();
+    let runtime = registry.activate(&new_id.root_key).unwrap();
+    let (h_tx, h_rx) = std::sync::mpsc::sync_channel(1);
+    runtime.set_pre_h_hook_for_tests(std::sync::Arc::new(move || {
+        h_tx.send(()).unwrap();
+    }));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while ambiguous_rx.try_recv().is_err() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("ambiguous COMMIT barrier not reached");
+    assert!(
+        h_rx.try_recv().is_err(),
+        "H began before queue COMMIT confirmation"
+    );
+    assert_eq!(
+        new_store
+            .request_by_id(&accepted.id)
+            .unwrap()
+            .unwrap()
+            .state,
+        "queued"
+    );
+    assert_eq!(
+        new_store
+            .request_any_root_for_tests(&old.id)
+            .unwrap()
+            .unwrap()
+            .error_code
+            .as_deref(),
+        Some("root_changed")
+    );
+    confirm_tx.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while h_rx.try_recv().is_err() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("H did not start after confirmed queue reread");
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            match new_store.request_by_id(&accepted.id) {
+                Ok(Some(row)) if row.finished_at.is_some() => break,
+                Ok(Some(_)) => {} // Accepted FIFO row still waits for H or its claim.
+                Err(error) if error.to_string().starts_with("storage_busy") => {
+                    // Nonblocking index-use admission is bounded while H owns EX.
+                }
+                other => panic!("unexpected accepted-row result during H: {other:?}"),
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("queued request did not complete after confirmed H");
+    let row = new_store.request_by_id(&accepted.id).unwrap().unwrap();
+    assert_eq!(row.state, "done");
+    let selected = Store::open(roots(base.path()), identity(&checkout)).unwrap();
+    let pin = row.revision.unwrap();
+    assert!(
+        selected
+            .source_at("a.js", Some(pin))
+            .unwrap()
+            .unwrap()
+            .1
+            .text
+            .contains("newRoot")
+    );
+}
+
 #[cfg(unix)]
 fn file_descriptors(path: &Path) -> usize {
     use std::os::unix::fs::MetadataExt;
@@ -253,7 +575,7 @@ async fn retained_registration_and_old_runtime_handle_hold_no_checkout_descripto
     let id = identity(&checkout);
     let key = id.root_key.clone();
     let topology = roots(base.path());
-    let lock_path = topology.leader_lock(&id);
+    let lock_path = topology.index_use_lock(&id);
     let index_db = topology.index_db(&id);
     let requests_db = topology.requests_db(&id);
     let mut registry = CheckoutRegistry::with_roots(topology);
@@ -275,12 +597,12 @@ async fn retained_registration_and_old_runtime_handle_hold_no_checkout_descripto
     assert!(file_descriptors(&checkout) > baseline);
     assert!(
         file_descriptors(&lock_path) > 0,
-        "active leader holds checkout lock"
+        "active Store holds checkout index-use lock"
     );
     assert!(file_descriptors(&index_db) > 0);
     assert!(file_descriptors(&requests_db) > 0);
     registry.disconnect(1);
-    assert!(registry.release(&key).unwrap());
+    release_when_idle(&mut registry, &key).await;
     assert!(!old.has_active_resources());
     assert!(
         old.evidence_response().is_err(),
@@ -304,146 +626,8 @@ async fn retained_registration_and_old_runtime_handle_hold_no_checkout_descripto
     let resumed = registry.activate(&key).unwrap();
     ready(&resumed).await;
     assert!(!old.has_active_resources());
-    let (response, catching_up) = resumed.evidence_response().unwrap();
-    assert!(!catching_up);
+    let (response, _) = resumed.evidence_response().unwrap();
     response.finish(()).unwrap();
-}
-
-#[tokio::test]
-async fn queued_follower_is_pending_even_after_client_disconnect() {
-    let base = tempfile::tempdir().unwrap();
-    let checkout = base.path().join("work");
-    fs::create_dir(&checkout).unwrap();
-    fs::write(checkout.join("a.js"), "function pendingWork() {}\n").unwrap();
-    let id = identity(&checkout);
-    let topology = roots(base.path());
-    let standalone = Store::open(topology.clone(), identity(&checkout)).unwrap();
-    let options = trellis::indexer::IndexOptions::new(checkout.clone());
-    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let leader =
-        trellis::index_coordinator::establish_serving_session(&standalone, Some(&options), &cancel)
-            .unwrap();
-    let mut registry = CheckoutRegistry::with_roots(topology);
-    registry.attach_launch(1, &id).unwrap();
-    let runtime = registry.activate(&id.root_key).unwrap();
-    ready(&runtime).await;
-    assert!(runtime.is_follower());
-    let row = standalone.enqueue_request(&options, None).unwrap();
-    assert_eq!(
-        standalone.request_by_id(&row.id).unwrap().unwrap().state,
-        "queued"
-    );
-    assert!(registry.refresh_pending_work(&id.root_key).unwrap());
-    registry.disconnect(1);
-    assert!(!registry.release(&id.root_key).unwrap());
-    assert!(leader.verify().is_ok());
-}
-
-#[tokio::test]
-async fn follower_takeover_marks_h_pending_and_next_reattach_admits_old_head() {
-    let base = tempfile::tempdir().unwrap();
-    let checkout = base.path().join("work");
-    fs::create_dir(&checkout).unwrap();
-    fs::write(checkout.join("a.js"), "function firstHead() {}\n").unwrap();
-    let id = identity(&checkout);
-    let topology = roots(base.path());
-    let standalone = Store::open(topology.clone(), identity(&checkout)).unwrap();
-    let options = trellis::indexer::IndexOptions::new(checkout.clone());
-    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let leader =
-        trellis::index_coordinator::establish_serving_session(&standalone, Some(&options), &cancel)
-            .unwrap();
-    let mut registry = CheckoutRegistry::with_roots(topology);
-    registry.attach_launch(1, &id).unwrap();
-    let runtime = registry.activate(&id.root_key).unwrap();
-    ready(&runtime).await;
-    assert!(runtime.is_follower());
-    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
-    let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
-    let resume_rx = std::sync::Mutex::new(resume_rx);
-    runtime.set_takeover_h_hook_for_tests(std::sync::Arc::new(move || {
-        entered_tx.send(()).unwrap();
-        resume_rx.lock().unwrap().recv().unwrap();
-    }));
-    fs::write(checkout.join("a.js"), "function takeoverHead() {}\n").unwrap();
-    let accepted = standalone.enqueue_request(&options, None).unwrap();
-    drop(leader);
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while entered_rx.try_recv().is_err() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("daemon did not elect after standalone released");
-    assert!(
-        runtime.catching_up(),
-        "the newly elected owner has not committed H"
-    );
-    assert!(
-        !runtime.is_follower(),
-        "invalid predecessor follower must not remain ready"
-    );
-    assert_eq!(
-        standalone
-            .request_by_id(&accepted.id)
-            .unwrap()
-            .unwrap()
-            .state,
-        "queued"
-    );
-    resume_tx.send(()).unwrap();
-    tokio::time::timeout(Duration::from_secs(15), async {
-        while runtime.is_follower()
-            || runtime.catching_up()
-            || standalone
-                .request_by_id(&accepted.id)
-                .unwrap()
-                .unwrap()
-                .finished_at
-                .is_none()
-        {
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    })
-    .await
-    .expect("new daemon leader did not finish H and FIFO");
-    let (current, flag) = runtime.evidence_response().unwrap();
-    assert!(!flag);
-    let established = current.status().unwrap().revision;
-    current.finish(()).unwrap();
-    drop(current);
-    registry.disconnect(1);
-    assert!(registry.release(&id.root_key).unwrap());
-    fs::write(checkout.join("a.js"), "function nextHead() {}\n").unwrap();
-    registry.attach_launch(2, &id).unwrap();
-    let next = registry.activate(&id.root_key).unwrap();
-    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
-    let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
-    let resume_rx = std::sync::Mutex::new(resume_rx);
-    next.set_pre_h_hook_for_tests(std::sync::Arc::new(move || {
-        entered_tx.send(()).unwrap();
-        resume_rx.lock().unwrap().recv().unwrap();
-    }));
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while entered_rx.try_recv().is_err() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("new daemon leader did not mint a reattach permit");
-    let (prior, flag) = next
-        .evidence_response()
-        .expect("takeover leader must mint pre-H permit");
-    assert!(flag);
-    assert_eq!(prior.status().unwrap().revision, established);
-    prior.finish(()).unwrap();
-    drop(prior);
-    resume_tx.send(()).unwrap();
-    ready(&next).await;
-    let (updated, flag) = next.evidence_response().unwrap();
-    assert!(!flag);
-    assert!(updated.status().unwrap().revision.index_revision > established.index_revision);
-    updated.finish(()).unwrap();
 }
 
 #[tokio::test]
@@ -457,7 +641,7 @@ async fn root_loss_fails_accepted_work_then_releases_old_runtime_handles() {
     let key = id.root_key.clone();
     let topology = roots(base.path());
     let db_path = topology.requests_db(&id);
-    let leader_path = topology.leader_lock(&id);
+    let leader_path = topology.index_use_lock(&id);
     let mut registry = CheckoutRegistry::with_roots(topology.clone());
     registry.attach_launch(1, &id).unwrap();
     drop(id);
@@ -496,7 +680,14 @@ async fn root_loss_fails_accepted_work_then_releases_old_runtime_handles() {
         }
     })
     .await
-    .expect("old-root queue did not reach a terminal result");
+    .unwrap_or_else(|error| {
+        let db = rusqlite::Connection::open(&db_path).unwrap();
+        let state: String = db.query_row("SELECT state FROM requests WHERE id=?1", [&row.id], |r| r.get(0)).unwrap();
+        panic!(
+            "old-root queue did not reach a terminal result: {error}; state={state}; H error: {:?}; owner={:?}",
+            old.reconciliation_error(), old.browser_scheduler().unwrap().root_loss_retirement_for_tests()
+        )
+    });
     let db = rusqlite::Connection::open(db_path).unwrap();
     let (state, error): (String, String) = db
         .query_row(
@@ -507,7 +698,7 @@ async fn root_loss_fails_accepted_work_then_releases_old_runtime_handles() {
         .unwrap();
     assert_eq!((state.as_str(), error.as_str()), ("failed", "root_changed"));
     drop(db);
-    assert!(registry.release(&key).unwrap());
+    release_when_idle(&mut registry, &key).await;
     assert_eq!(
         registry.browser_identity(&key).unwrap().inode,
         replacement.inode
@@ -520,9 +711,10 @@ async fn root_loss_fails_accepted_work_then_releases_old_runtime_handles() {
         }
     })
     .await
-    .expect("old runtime retained root/leader descriptors after release");
+    .expect("old runtime retained root/index-use descriptors after release");
 }
 
+#[cfg(feature = "test-support")]
 #[tokio::test]
 async fn root_loss_during_paused_reattach_h_waits_for_worker_then_releases() {
     let base = tempfile::tempdir().unwrap();
@@ -533,13 +725,13 @@ async fn root_loss_during_paused_reattach_h_waits_for_worker_then_releases() {
     let id = identity(&checkout);
     let key = id.root_key.clone();
     let topology = roots(base.path());
-    let leader_path = topology.leader_lock(&id);
+    let leader_path = topology.index_use_lock(&id);
     let mut registry = CheckoutRegistry::with_roots(topology);
     registry.attach_launch(1, &id).unwrap();
     let original = registry.activate(&key).unwrap();
     ready(&original).await;
     registry.disconnect(1);
-    assert!(registry.release(&key).unwrap());
+    release_when_idle(&mut registry, &key).await;
     registry.attach_launch(2, &id).unwrap();
     drop(id);
     let paused = registry.activate(&key).unwrap();
@@ -585,7 +777,6 @@ async fn root_loss_during_paused_reattach_h_waits_for_worker_then_releases() {
     );
     assert!(paused.has_active_resources());
     assert!(file_descriptors(&moved) > 0);
-    assert!(file_descriptors(&leader_path) > 0);
     resume_tx.send(()).unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {
         while !registry.release(&key).unwrap() {
@@ -602,7 +793,7 @@ async fn root_loss_during_paused_reattach_h_waits_for_worker_then_releases() {
         }
     })
     .await
-    .expect("paused H leaked old-root or leader descriptors");
+    .expect("paused H leaked old-root or index-use descriptors");
     assert_eq!(
         registry.browser_identity(&key).unwrap().inode,
         replacement.inode
@@ -630,7 +821,7 @@ async fn cold_activation_preserves_recorded_scip_option() {
     let owner =
         trellis::index_coordinator::establish_serving_session(&store, Some(&options), &cancel)
             .unwrap();
-    assert!(owner.is_leader());
+    owner.verify().unwrap();
     drop(owner);
     drop(store);
     let mut registry = CheckoutRegistry::with_roots(topology.clone());
@@ -646,7 +837,8 @@ async fn cold_activation_preserves_recorded_scip_option() {
     assert_eq!(observed.max_file_bytes, options.max_file_bytes);
 
     registry.disconnect(1);
-    assert!(registry.release(&id.root_key).unwrap());
+    release_when_idle(&mut registry, &id.root_key).await;
+    assert!(!runtime.has_active_resources());
     registry
         .register(
             &id,
@@ -667,7 +859,8 @@ async fn cold_activation_preserves_recorded_scip_option() {
     );
     assert!(default_selected.scip_path.is_none());
     registry.disconnect(2);
-    assert!(registry.release(&id.root_key).unwrap());
+    release_when_idle(&mut registry, &id.root_key).await;
+    assert!(!explicit_default.has_active_resources());
     registry
         .register(
             &id,
@@ -689,6 +882,7 @@ async fn cold_activation_preserves_recorded_scip_option() {
     );
 }
 
+#[cfg(feature = "test-support")]
 #[tokio::test]
 async fn failed_h_backs_off_and_empty_idle_checkout_can_release() {
     let base = tempfile::tempdir().unwrap();
@@ -717,6 +911,7 @@ async fn failed_h_backs_off_and_empty_idle_checkout_can_release() {
     assert!(!runtime.has_active_resources());
 }
 
+#[cfg(feature = "test-support")]
 #[tokio::test]
 async fn failed_h_backoff_never_releases_accepted_fifo_work() {
     let base = tempfile::tempdir().unwrap();
@@ -774,7 +969,7 @@ async fn replaced_path_cold_runtime_publishes_new_identity_not_old_head() {
     let prior = registry.activate(&old_id.root_key).unwrap();
     ready(&prior).await;
     registry.disconnect(1);
-    assert!(registry.release(&old_id.root_key).unwrap());
+    release_when_idle(&mut registry, &old_id.root_key).await;
     fs::rename(&checkout, &moved).unwrap();
     fs::create_dir(&checkout).unwrap();
     fs::write(
@@ -937,7 +1132,7 @@ async fn browser_listing_and_discovery_do_not_reopen_released_sqlite_witnesses()
     let active = registry.activate(&other_id.root_key).unwrap();
     ready(&active).await;
     registry.disconnect(1);
-    assert!(registry.release(&key).unwrap());
+    release_when_idle(&mut registry, &key).await;
     assert_eq!(
         (file_descriptors(&index_db), file_descriptors(&request_db)),
         (0, 0)
@@ -963,7 +1158,7 @@ async fn browser_listing_and_discovery_do_not_reopen_released_sqlite_witnesses()
         &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     )
     .unwrap();
-    assert!(owner.is_leader());
+    owner.verify().unwrap();
     let held = independent.evidence_response().unwrap();
     let _ = registry.browser_checkouts();
     assert!(
@@ -1183,335 +1378,141 @@ async fn serve_preflight_rejects_busy_replaced_root_before_creating_token() {
     assert!(old.evidence_response().is_err());
 }
 
-async fn root_loss_restricted_ex_case(owner_mode: u8) {
-    use std::sync::{Arc, atomic::AtomicU64};
-    use trellis::{http, index_coordinator::establish_serving_session, indexer::IndexOptions};
-    let base = tempfile::tempdir().unwrap();
-    let work = base.path().join("work");
-    let moved = base.path().join("moved");
-    fs::create_dir(&work).unwrap();
-    fs::write(work.join("a.js"), "function previous() {}\n").unwrap();
-    let id = identity(&work);
-    let topology = roots(base.path());
-    let requests_db = topology.requests_db(&id);
-    let store = Store::open(topology.clone(), identity(&work)).unwrap();
-    let options = IndexOptions::new(work.clone());
-    let first = establish_serving_session(
-        &store,
-        Some(&options),
-        &Arc::new(std::sync::atomic::AtomicBool::new(false)),
-    )
-    .unwrap();
-    let prior = store.evidence_response().unwrap();
-    let epoch = Arc::new(AtomicU64::new(1));
-    store.bind_runtime_epoch(epoch.clone());
-    store.remember_read_only_predecessor(&prior, epoch).unwrap();
-    drop(prior);
-    let stale_follower = store.follower_session().unwrap();
-    drop(first);
-    let restricted = store.leader_session().unwrap();
-    assert!(store.restricted_owner_associated());
-    let accepted = store.enqueue_request(&options, None).unwrap();
-    let state = http::new(
-        store.clone(),
-        options,
-        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
-        "127.0.0.1:7331".parse().unwrap(),
-    )
-    .unwrap();
-    if owner_mode == 1 {
-        state.retain_serving_session_without_tick_for_tests(restricted.clone());
-    } else if owner_mode == 2 {
-        // Retained stale follower must not shadow the separately live H EX.
-        state.retain_serving_session_without_tick_for_tests(stale_follower.clone());
-    }
-    // In modes 0 and 2 only the H worker owns EX. The weak association must
-    // let root loss borrow it until durable FIFO failure completes.
-    let h_worker_owner = (owner_mode != 1).then(|| restricted.clone());
-    drop(restricted);
-    fs::rename(&work, &moved).unwrap();
-    fs::create_dir(&work).unwrap();
-    state.force_root_transition_tick_for_tests().unwrap();
-    let db = rusqlite::Connection::open(requests_db).unwrap();
-    let (result, reason): (String, Option<String>) = db
-        .query_row(
-            "SELECT state,error_code FROM requests WHERE id=?1",
-            [&accepted.id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .unwrap();
-    assert_eq!(
-        (result.as_str(), reason.as_deref()),
-        ("failed", Some("root_changed"))
-    );
-    drop(db);
-    assert_eq!(
-        state.root_loss_retirement_for_tests(),
-        (false, false, false)
-    );
-    assert!(
-        !store.restricted_owner_associated(),
-        "root-loss retained old restricted EX"
-    );
-    drop(h_worker_owner);
-    fs::remove_dir(&work).unwrap();
-    fs::rename(&moved, &work).unwrap();
-    let fresh = topology
-        .leader(&id)
-        .expect("returned old root can acquire EX promptly");
-    assert!(fresh.verify().is_ok());
-}
-
+#[cfg(feature = "test-support")]
 #[tokio::test]
-async fn root_loss_drops_restricted_ex_before_old_path_returns() {
-    for mode in [0, 1, 2] {
-        root_loss_restricted_ex_case(mode).await;
-    }
-}
-
-async fn failed_metadata_root_fifo_case(block_fifo_write: bool) {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
-    };
-    use trellis::{http, index_coordinator::establish_serving_session, indexer::IndexOptions};
+async fn serve_waits_for_idle_cli_read_before_registering_and_reconciling() {
+    use trellis::daemon::BrowserProvisioner;
     let base = tempfile::tempdir().unwrap();
-    let work = base.path().join("work");
-    let moved = base.path().join("old-work");
-    fs::create_dir(&work).unwrap();
-    fs::write(work.join("a.js"), "function old() {}\n").unwrap();
-    let id = identity(&work);
-    let topology = roots(base.path());
-    let requests_db = topology.requests_db(&id);
-    let store = Store::open(topology.clone(), identity(&work)).unwrap();
-    let options = IndexOptions::new(work.clone());
-    let initial =
-        establish_serving_session(&store, Some(&options), &Arc::new(AtomicBool::new(false)))
+    let checkout = base.path().join("work");
+    fs::create_dir(&checkout).unwrap();
+    fs::write(checkout.join("a.js"), "function admitted() {}\n").unwrap();
+    let identity = identity(&checkout);
+    let key = identity.root_key.clone();
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(CheckoutRegistry::with_roots(
+        roots(base.path()),
+    )));
+    let old = {
+        let mut checked = registry.lock().await;
+        checked.attach_launch(41, &identity).unwrap();
+        checked.activate(&key).unwrap()
+    };
+    ready(&old).await;
+    let token = base.path().join("token");
+    let options = CheckoutOptions(serde_json::json!({"maxFileBytes": 4096}));
+    let mut conflicting = BrowserProvisioner::new();
+    let mut no_retry =
+        |stage| assert_ne!(stage, "retry_wait", "attached client is a true conflict");
+    let error = tokio::time::timeout(
+        Duration::from_secs(3),
+        conflicting.register_serve_with_hook(
+            &registry,
+            &identity,
+            options.clone(),
+            "127.0.0.1:0".parse().unwrap(),
+            &token,
+            Some(&mut no_retry),
+        ),
+    )
+    .await
+    .expect("true attached-client conflict must not wait")
+    .unwrap_err();
+    assert_eq!(error.to_string(), "registration_conflict");
+    assert!(!token.exists());
+    let (prior, _) = old.evidence_response().unwrap();
+    let prior_pin = prior.status().unwrap().revision;
+    prior.finish(()).unwrap();
+    drop(prior);
+    let (held_read, _) = old.evidence_response().unwrap();
+    registry.lock().await.disconnect(41);
+    // Keep the selected reader alive across the entire eight-second admission
+    // budget. A timed-out retry is typed busy and cannot mint a token or
+    // replace CLI-only options while the old Store still owns its handles.
+    let mut waiting = BrowserProvisioner::new();
+    let timeout_error = tokio::time::timeout(
+        Duration::from_secs(10),
+        waiting.register_serve(
+            &registry,
+            &identity,
+            options.clone(),
+            "127.0.0.1:0".parse().unwrap(),
+            &token,
+        ),
+    )
+    .await
+    .expect("CLI-only busy preflight exceeded its bounded retry deadline")
+    .unwrap_err();
+    assert_eq!(timeout_error.to_string(), "storage_busy");
+    assert!(old.has_active_resources());
+    assert!(registry.lock().await.registration(&key).is_none());
+    assert!(!token.exists(), "timed-out preflight must not mint a token");
+
+    let (retry_tx, retry_rx) = tokio::sync::oneshot::channel();
+    let registry_for_hook = registry.clone();
+    let old_for_hook = old.clone();
+    let mut provisioner = BrowserProvisioner::new();
+    let mut retry_tx = Some(retry_tx);
+    let mut hook = |stage| match stage {
+        "retry_wait" => {
+            assert!(
+                registry_for_hook.try_lock().is_ok(),
+                "busy retry must release the registry mutex before waiting"
+            );
+            if let Some(tx) = retry_tx.take() {
+                let _ = tx.send(());
+            }
+        }
+        "validated" => {
+            assert!(
+                registry_for_hook.try_lock().is_err(),
+                "validated registration must hold its mutex through token commit"
+            );
+            assert!(
+                !old_for_hook.has_active_resources(),
+                "old CLI resources must retire before serve changes options"
+            );
+        }
+        _ => {}
+    };
+    let serve = provisioner.register_serve_with_hook(
+        &registry,
+        &identity,
+        options.clone(),
+        "127.0.0.1:0".parse().unwrap(),
+        &token,
+        Some(&mut hook),
+    );
+    let control = async {
+        tokio::time::timeout(Duration::from_secs(2), retry_rx)
+            .await
+            .expect("CLI-only read did not produce a retry")
             .unwrap();
-    let prior = store.evidence_response().unwrap();
-    let epoch = Arc::new(AtomicU64::new(1));
-    store.bind_runtime_epoch(epoch.clone());
-    store.remember_read_only_predecessor(&prior, epoch).unwrap();
-    drop(prior);
-    drop(initial);
-    let accepted = store.enqueue_request(&options, None).unwrap();
-    let state = http::new(
-        store.clone(),
-        options,
-        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
-        "127.0.0.1:7332".parse().unwrap(),
-    )
-    .unwrap();
-    let entered = Arc::new(AtomicBool::new(false));
-    let mark = entered.clone();
-    let to_move = work.clone();
-    let destination = moved.clone();
-    store.set_leader_before_metadata_hook_for_tests(move || {
-        fs::rename(&to_move, &destination).unwrap();
-        fs::create_dir(&to_move).unwrap();
-        mark.store(true, Ordering::Release);
-    });
-    let external_writer = if block_fifo_write {
-        let db = rusqlite::Connection::open(&requests_db).unwrap();
-        db.execute_batch("BEGIN IMMEDIATE").unwrap();
-        Some(db)
-    } else {
-        None
+        assert!(old.has_active_resources());
+        assert!(registry.lock().await.registration(&key).is_none());
+        assert!(!token.exists(), "busy preflight must not create a token");
+        drop(held_read);
     };
-    assert!(
-        store.leader_session().is_err(),
-        "metadata admission must fail on root drift"
+    let (served, ()) = tokio::join!(
+        tokio::time::timeout(Duration::from_secs(10), serve),
+        control
     );
-    assert!(
-        entered.load(Ordering::Acquire),
-        "post-EX metadata hook never ran"
-    );
-    if let Some(db) = external_writer {
-        assert!(
-            store.orphan_root_loss_owner().is_some(),
-            "inconclusive write lost EX"
-        );
-        db.execute_batch("ROLLBACK").unwrap();
-    }
-    state.force_root_transition_tick_for_tests().unwrap();
-    let db = rusqlite::Connection::open(requests_db).unwrap();
-    let (result, reason): (String, String) = db
-        .query_row(
-            "SELECT state,error_code FROM requests WHERE id=?1",
-            [&accepted.id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
+    let address = served
+        .expect("serve did not retry after the selected read finished")
         .unwrap();
-    assert_eq!(
-        (result.as_str(), reason.as_str()),
-        ("failed", "root_changed")
-    );
-    drop(db);
-    assert!(!store.restricted_owner_associated());
-    assert!(store.orphan_root_loss_owner().is_none());
-    fs::remove_dir(&work).unwrap();
-    fs::rename(&moved, &work).unwrap();
-    let owner = topology
-        .leader(&id)
-        .expect("old EX retired after durable root loss");
-    assert!(owner.verify().is_ok());
-}
-
-#[tokio::test]
-async fn failed_metadata_admission_disposes_old_root_fifo_before_ex_release() {
-    failed_metadata_root_fifo_case(false).await;
-    failed_metadata_root_fifo_case(true).await;
-}
-
-#[tokio::test]
-async fn exceptional_recreate_releases_restricted_owner_before_ex_retry() {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64},
-    };
-    use trellis::{http, index_coordinator::establish_serving_session, indexer::IndexOptions};
-    let base = tempfile::tempdir().unwrap();
-    let work = base.path().join("work");
-    fs::create_dir(&work).unwrap();
-    fs::write(work.join("a.js"), "function source() {}\n").unwrap();
-    let topology = roots(base.path());
-    let id = identity(&work);
-    let requests_db = topology.requests_db(&id);
-    let index_db = topology.index_db(&id);
-    let store = Store::open(topology.clone(), identity(&work)).unwrap();
-    let options = IndexOptions::new(work.clone());
-    let first =
-        establish_serving_session(&store, Some(&options), &Arc::new(AtomicBool::new(false)))
+    assert!(address.ip().is_loopback());
+    assert!(token.exists());
+    assert!(!old.has_active_resources());
+    let current = {
+        let mut checked = registry.lock().await;
+        assert_eq!(checked.registration(&key), Some(&options));
+        checked
+            .browser_request_at(&identity, std::time::Instant::now())
             .unwrap();
-    let prior = store.evidence_response().unwrap();
-    let epoch = Arc::new(AtomicU64::new(1));
-    let permit = store.pre_h_read_permit(&prior, &first, epoch).unwrap();
-    drop(prior);
-    drop(first);
-    let restricted = store.leader_session().unwrap();
-    let accepted = store.enqueue_request(&options, None).unwrap();
-    // A real obsolete on-disk marker is classified at a new Store admission.
-    // Preserve only the H worker's weak restricted association across it.
-    let db = rusqlite::Connection::open(&index_db).unwrap();
-    db.execute_batch(
-        "PRAGMA ignore_check_constraints=ON; UPDATE index_metadata SET schema_version=7;",
-    )
-    .unwrap();
-    drop(db);
-    drop(store);
-    let recovering = Store::open(topology, identity(&work)).unwrap();
-    recovering.associate_restricted_owner_for_tests(&restricted, permit);
-    assert!(recovering.restricted_owner_associated());
-    let state = http::new(
-        recovering.clone(),
-        options,
-        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
-        "127.0.0.1:7333".parse().unwrap(),
-    )
-    .unwrap();
-    state.retain_serving_session_without_tick_for_tests(restricted.clone());
-    drop(restricted);
-    state
-        .force_root_transition_tick_for_tests()
-        .expect("exceptional recreate must finish");
-    assert!(
-        !recovering.restricted_owner_associated(),
-        "exceptional path kept pre-H read slot"
-    );
-    let replacement = state
-        .retained_serving_session()
-        .expect("EX retry must become serving owner");
-    assert!(replacement.is_leader());
-    replacement
-        .verify()
-        .expect("recreated EX must remain verified");
-    let db = rusqlite::Connection::open(requests_db).unwrap();
-    let row_state: String = db
-        .query_row(
-            "SELECT state FROM requests WHERE id=?1",
-            [&accepted.id],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert!(
-        matches!(row_state.as_str(), "done" | "failed"),
-        "FIFO row did not reach terminal state: {row_state}"
-    );
-}
-
-#[tokio::test]
-async fn queued_takeover_h_root_loss_fails_fifo_before_last_ex_drops() {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64},
+        checked.activate(&key).unwrap()
     };
-    use trellis::{http, index_coordinator::establish_serving_session, indexer::IndexOptions};
-    let base = tempfile::tempdir().unwrap();
-    let work = base.path().join("work");
-    let moved = base.path().join("old-work");
-    fs::create_dir(&work).unwrap();
-    fs::write(work.join("a.js"), "function initial() {}\n").unwrap();
-    let id = identity(&work);
-    let topology = roots(base.path());
-    let requests_db = topology.requests_db(&id);
-    let store = Store::open(topology.clone(), identity(&work)).unwrap();
-    let options = IndexOptions::new(work.clone());
-    let initial =
-        establish_serving_session(&store, Some(&options), &Arc::new(AtomicBool::new(false)))
-            .unwrap();
-    let prior = store.evidence_response().unwrap();
-    let epoch = Arc::new(AtomicU64::new(1));
-    store.bind_runtime_epoch(epoch.clone());
-    store.remember_read_only_predecessor(&prior, epoch).unwrap();
-    drop(prior);
-    drop(initial);
-    let accepted = store.enqueue_request(&options, None).unwrap();
-    let state = http::new(
-        store.clone(),
-        options,
-        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
-        "127.0.0.1:7334".parse().unwrap(),
-    )
-    .unwrap();
-    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
-    let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
-    let resume_rx = std::sync::Mutex::new(resume_rx);
-    state.set_checkout_takeover_h_hook_for_tests(Arc::new(move || {
-        entered_tx.send(()).unwrap();
-        resume_rx.lock().unwrap().recv().unwrap();
-    }));
-    let worker = state.clone();
-    let ticking = std::thread::spawn(move || worker.force_root_transition_tick_for_tests());
-    entered_rx
-        .recv_timeout(Duration::from_secs(10))
-        .expect("takeover never reached H hook");
-    assert!(
-        store.restricted_owner_associated(),
-        "new EX was not associated at H hook"
-    );
-    fs::rename(&work, &moved).unwrap();
-    fs::create_dir(&work).unwrap();
-    resume_tx.send(()).unwrap();
-    let _ = ticking.join().unwrap();
-    let db = rusqlite::Connection::open(requests_db).unwrap();
-    let (result, reason): (String, Option<String>) = db
-        .query_row(
-            "SELECT state,error_code FROM requests WHERE id=?1",
-            [&accepted.id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .unwrap();
-    assert_eq!(
-        (result.as_str(), reason.as_deref()),
-        ("failed", Some("root_changed"))
-    );
-    drop(db);
-    assert!(!store.restricted_owner_associated());
-    assert!(store.orphan_root_loss_owner().is_none());
-    fs::remove_dir(&work).unwrap();
-    fs::rename(&moved, &work).unwrap();
-    let fresh = topology
-        .leader(&id)
-        .expect("old EX retires only after FIFO root_changed");
-    assert!(fresh.verify().is_ok());
+    ready(&current).await;
+    let (selected, _) = current.evidence_response().unwrap();
+    assert!(selected.status().unwrap().revision.index_revision > prior_pin.index_revision);
+    let (_, source) = selected.source_at("a.js", None).unwrap().unwrap();
+    assert!(source.text.contains("admitted"));
+    selected.finish(()).unwrap();
 }

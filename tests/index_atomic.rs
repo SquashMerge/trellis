@@ -12,7 +12,7 @@ fn projection_fixture() -> (
     TempDir,
     Store,
     trellis::model::IndexPin,
-    std::sync::Arc<trellis::store::topology::LeaderSession>,
+    std::sync::Arc<trellis::store::topology::WriterSession>,
 ) {
     use std::sync::{Arc, atomic::AtomicBool};
     use trellis::{index_coordinator::IndexJobCoordinator, indexer::IndexOptions};
@@ -131,11 +131,8 @@ fn first_index_is_invisible_until_validated_and_synced() {
     assert!(!dir.join("index.db").exists());
     assert_eq!(staged_files(&dir), vec![staged.clone()]);
     assert!(fs::metadata(&staged).unwrap().len() > 0);
-    let rival = Store::open_for_tests(state.path(), workspace.path());
-    assert!(
-        rival.unwrap_err().to_string().starts_with("storage_busy:"),
-        "a concurrent first opener must not read an incomplete index"
-    );
+    // The daemon serializes first-writer activation. A second direct Store
+    // opener here would model an unsupported competing writer, not a read.
     release.send(()).unwrap();
     let store = opener.join().unwrap().unwrap();
     assert_eq!(store.index_baseline().unwrap().index_revision, 0);
@@ -233,13 +230,18 @@ fn preexisting_corrupt_index_is_not_reinitialized() {
     let before = fs::metadata(&index).unwrap();
     assert_eq!(before.len(), 0);
     let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
-    for refusal in [
+    #[allow(unused_mut)] // Test-only writer refusal is appended under test-support.
+    let mut refusals = vec![
         store.status().unwrap_err(),
         store.index_baseline().unwrap_err(),
+    ];
+    #[cfg(feature = "test-support")]
+    refusals.push(
         store
-            .leader()
-            .expect_err("exceptional format leader refusal"),
-    ] {
+            .publication_for_tests()
+            .expect_err("exceptional format writer refusal"),
+    );
+    for refusal in refusals {
         assert!(
             refusal
                 .to_string()
@@ -262,7 +264,16 @@ fn published_sqlite_header_with_missing_pages_refuses_reads_until_explicit_recov
     use trellis::{index_coordinator::reconcile_workspace, indexer::IndexOptions};
 
     let (state, workspace, store, old_pin, session) = projection_fixture();
+    // Queue bootstrap publishes under index-use EX. Retire this fixture's
+    // writer SH before accepting the pre-recovery request.
     drop(session);
+    // An accepted queue survives exceptional index recovery. Its file cannot
+    // disappear and be silently replaced while publication is retried.
+    let accepted = store
+        .enqueue_request(&IndexOptions::new(workspace.path().to_owned()), None)
+        .unwrap();
+    let queue = store.request_db_path();
+    let queue_inode = fs::metadata(&queue).unwrap().ino();
     drop(store);
     let dir = index_dir(state.path());
     let index = dir.join("index.db");
@@ -295,6 +306,12 @@ fn published_sqlite_header_with_missing_pages_refuses_reads_until_explicit_recov
     assert_eq!(fs::read(&index).unwrap(), old_bytes);
     assert_eq!(fs::metadata(&index).unwrap().ino(), old_inode);
     assert!(staged_files(&dir).is_empty());
+    assert_eq!(store.request_db_path(), queue);
+    assert_eq!(fs::metadata(&queue).unwrap().ino(), queue_inode);
+    assert_eq!(
+        store.request_by_id(&accepted.id).unwrap().unwrap().state,
+        "queued"
+    );
 
     let ready = Arc::new(AtomicBool::new(false));
     let (recovered, _session) = reconcile_workspace(&store, &options, &ready, |_| {}).unwrap();
@@ -308,6 +325,12 @@ fn published_sqlite_header_with_missing_pages_refuses_reads_until_explicit_recov
             .is_some()
     );
     assert!(staged_files(&dir).is_empty());
+    assert_eq!(store.request_db_path(), queue);
+    assert_eq!(fs::metadata(&queue).unwrap().ino(), queue_inode);
+    assert_eq!(
+        store.request_by_id(&accepted.id).unwrap().unwrap().state,
+        "queued"
+    );
 }
 
 #[test]
@@ -360,16 +383,9 @@ fn drift_refusal_preserves_populated_store_pair_and_graph() {
     let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
     let store = Store::open_for_tests(state.path(), root).unwrap();
     let graph = index_workspace(&options, &cancel, |_| {}).unwrap();
-    let leader = store.leader().unwrap();
-    let before = publish_bundle(
-        &store,
-        &graph,
-        root,
-        &leader,
-        store.index_baseline().unwrap(),
-        &cancel,
-    )
-    .unwrap();
+    let (before, _writer) =
+        trellis::index_coordinator::reconcile_workspace(&store, &options, &cancel, |_| {}).unwrap();
+    assert_eq!(store.graph().unwrap().files, graph.files);
     assert_eq!(before.index_revision, 1);
     let error = index_workspace(&options, &cancel, |progress| {
         if progress.phase == "parse" {
@@ -381,27 +397,6 @@ fn drift_refusal_preserves_populated_store_pair_and_graph() {
     let reopened = Store::open_for_tests(state.path(), root).unwrap();
     assert_eq!(reopened.status().unwrap().revision, before);
     assert_eq!(store.index_baseline().unwrap(), before);
-}
-
-fn publish_bundle(
-    store: &trellis::store::Store,
-    graph: &trellis::model::Graph,
-    workspace: &std::path::Path,
-    leader: &trellis::store::topology::LeaderGuard,
-    expected: trellis::model::IndexPin,
-    cancel: &trellis::model::CancelFlag,
-) -> anyhow::Result<trellis::model::IndexPin> {
-    let (indexed, native, capture) = trellis::indexer::index_workspace_bundle(
-        &trellis::indexer::IndexOptions::new(workspace.to_owned()),
-        store.root_id(),
-        cancel,
-        |_| {},
-    )?;
-    assert_eq!(
-        &indexed, graph,
-        "published graph must match captured source"
-    );
-    store.publish_native(&indexed, &capture, &native, leader, expected, cancel)
 }
 
 #[test]
@@ -692,31 +687,27 @@ fn sqlite_snapshot(
 ) -> Vec<(String, Vec<Vec<String>>)> {
     use rusqlite::types::Value;
     let db = rusqlite::Connection::open(path).unwrap();
-    let (generation, published_revision, incarnation): (String, i64, String) = db
+    let (generation, published_revision): (String, i64) = db
         .query_row(
-            "SELECT index_generation,index_revision,reconciled_incarnation FROM index_metadata",
+            "SELECT index_generation,index_revision FROM index_metadata",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
     assert!(uuid::Uuid::parse_str(&generation).is_ok());
-    assert!(uuid::Uuid::parse_str(&incarnation).is_ok());
     assert_eq!(pin.index_generation.to_string(), generation);
     if normalize_current_publication {
         assert_eq!(pin.index_revision as i64, published_revision);
     }
     let revision_id = format!("pin:v1:{}:{}", pin.index_generation, pin.index_revision);
-    let (header_incarnation, header_revision): (String, i64) = db
+    let header_revision: i64 = db
         .query_row(
-            "SELECT reconciled_incarnation,published_index_revision FROM native_revisions WHERE id=?1",
+            "SELECT published_index_revision FROM native_revisions WHERE id=?1",
             [&revision_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| row.get(0),
         )
         .unwrap();
     assert_eq!(header_revision, pin.index_revision as i64);
-    if normalize_current_publication {
-        assert_eq!(header_incarnation, incarnation);
-    }
     let violations: i64 = db
         .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
             row.get(0)
@@ -891,12 +882,10 @@ fn sqlite_snapshot(
             if table == "native_revisions" {
                 assert_eq!(rows.len(), 1);
                 assert_eq!(rows[0][0], format!("t:{revision_id}"));
-                assert_eq!(rows[0][8], format!("t:{header_incarnation}"));
-                assert_eq!(rows[0][14], format!("i:{}", pin.index_revision));
+                assert_eq!(rows[0][13], format!("i:{}", pin.index_revision));
                 if normalize_current_publication {
                     rows[0][0] = "t:<current-pin>".into();
-                    rows[0][8] = "t:<leader-incarnation>".into();
-                    rows[0][14] = "i:<current-revision>".into();
+                    rows[0][13] = "i:<current-revision>".into();
                 }
             } else if matches!(table.as_str(), "revision_capture_inputs" | "revision_documents") {
                 for row in &mut rows {
@@ -1013,7 +1002,7 @@ fn parse_error_retained_pin_matches_independent_cold_and_advisory_uses_exact_tok
     assert_eq!(compound.revision_id, coverage.revision_id);
 
     // A fresh independent full build shares the captured workspace root but not
-    // state or stored native/class/graph projections. Taking its leader lock can
+    // state or stored native/class/graph projections. Taking its writer guard can
     // retire the first store's public reader; collect those DTOs above first.
     let cold_state = tempfile::tempdir().unwrap();
     fs::set_permissions(cold_state.path(), fs::Permissions::from_mode(0o700)).unwrap();
@@ -1125,6 +1114,7 @@ fn new_producer_binding_refuses_unilateral_executable_header_and_binding_tamper(
     }
 }
 
+#[cfg(feature = "test-support")]
 #[test]
 fn additive_producer_binding_keeps_same_generation_legacy_pin_and_queue() {
     use std::sync::{Arc, atomic::AtomicBool};
@@ -1138,7 +1128,7 @@ fn additive_producer_binding_keeps_same_generation_legacy_pin_and_queue() {
     )
     .unwrap();
     let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
-    let session = store.leader_session().unwrap();
+    let session = store.writer_session_for_tests().unwrap();
     let options = IndexOptions::new(workspace.path().to_owned());
     let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
     let first = IndexJobCoordinator::prepare_with_session(&store, None, session.clone())
@@ -1146,6 +1136,9 @@ fn additive_producer_binding_keeps_same_generation_legacy_pin_and_queue() {
         .run(&options, &cancel, |_| {})
         .unwrap();
     let legacy_source = store.source_at("A.java", Some(first)).unwrap().unwrap().1;
+    // Publish the virgin queue without this fixture's writer SH, then resume
+    // the same-generation publication test with a fresh writer session.
+    drop(session);
     let _queued = store.enqueue_request(&options, None).unwrap();
     let db_path = index_dir(state.path()).join("index.db");
     let queue_path = index_dir(state.path()).join("requests.db");
@@ -1166,6 +1159,7 @@ fn additive_producer_binding_keeps_same_generation_legacy_pin_and_queue() {
         "class A { int method() { return 2; } }\n",
     )
     .unwrap();
+    let session = store.writer_session_for_tests().unwrap();
     let second = IndexJobCoordinator::prepare_with_session(&store, Some(first), session.clone())
         .unwrap()
         .run(&options, &cancel, |_| {})
@@ -1611,7 +1605,7 @@ fn reconcile_matches_fresh_full_snapshot_after_add_edit_delete_rename_and_ignore
     let options = IndexOptions::new(workspace.path().to_owned());
     let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
     let first_job = IndexJobCoordinator::prepare(&store, None).unwrap();
-    let leader_session = first_job.session();
+    let writer_session = first_job.session();
     let first = first_job.run(&options, &cancel, |_| {}).unwrap();
     let reconciled_path = index_dir(state.path()).join("index.db");
     let retained_first = sqlite_snapshot(&reconciled_path, first, false);
@@ -1653,7 +1647,7 @@ fn reconcile_matches_fresh_full_snapshot_after_add_edit_delete_rename_and_ignore
     )
     .unwrap();
     let second =
-        IndexJobCoordinator::prepare_with_session(&store, Some(first), leader_session.clone())
+        IndexJobCoordinator::prepare_with_session(&store, Some(first), writer_session.clone())
             .unwrap()
             .run(&options, &cancel, |_| {})
             .unwrap();
@@ -1833,6 +1827,7 @@ fn full_scan_detects_same_size_preserved_mtime_edit_through_persisted_ctime() {
     );
 }
 
+#[cfg(feature = "test-support")]
 #[test]
 fn extractor_and_typed_mismatch_rebuild_in_place_and_failed_rebuild_stays_closed() {
     use std::{
@@ -2023,11 +2018,11 @@ fn extractor_and_typed_mismatch_rebuild_in_place_and_failed_rebuild_stays_closed
     recovered = typed_recovered;
     assert_eq!(store.status().unwrap().revision, recovered);
 
-    // A newly acquired writer is a takeover until it completes publication.
+    // A newly acquired writer must complete H before it can serve reads.
     // The latch is shared by Store clones and remains closed after the guard drops.
     let clone = store.clone();
     drop(session);
-    drop(store.leader().unwrap());
+    drop(store.writer_session_for_tests().unwrap());
     assert!(store.status().is_err());
     assert!(clone.status().is_err());
     // A separately opened Store performs its own full recovery admission.
@@ -2133,13 +2128,18 @@ fn exceptional_format_is_typed_deferred_refusal_without_file_mutation() {
     let corrupt = fs::read(&path).unwrap();
 
     let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
-    for refusal in [
+    #[allow(unused_mut)] // Test-only writer refusal is appended under test-support.
+    let mut refusals = vec![
         store.status().unwrap_err(),
         store.index_baseline().unwrap_err(),
+    ];
+    #[cfg(feature = "test-support")]
+    refusals.push(
         store
-            .leader()
-            .expect_err("exceptional format leader refusal"),
-    ] {
+            .publication_for_tests()
+            .expect_err("exceptional format writer refusal"),
+    );
+    for refusal in refusals {
         let text = refusal.to_string();
         assert!(
             text.contains("exceptional index recovery deferred"),
@@ -3279,6 +3279,7 @@ fn same_source_new_scip_label_reuses_native_and_reprojects_presentation_at_pinne
     );
 }
 
+#[cfg(feature = "test-support")]
 #[test]
 fn captured_scip_document_cutoff_refuses_optional_java_python_and_javascript_labels() {
     use protobuf::Message;
@@ -3300,7 +3301,7 @@ fn captured_scip_document_cutoff_refuses_optional_java_python_and_javascript_lab
         fs::write(workspace.path().join(path), text).unwrap();
     }
     let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
-    let session = store.leader_session().unwrap();
+    let session = store.writer_session_for_tests().unwrap();
     let scip = state.path().join("cutoff.scip");
     let manifest = state.path().join("cutoff.json");
     let mut options = IndexOptions::new(workspace.path().to_owned());
@@ -3406,7 +3407,7 @@ fn captured_scip_document_cutoff_refuses_optional_java_python_and_javascript_lab
             &positive,
             &positive_capture,
             &positive_native,
-            session.leader_guard().unwrap(),
+            session.writer_guard().unwrap(),
             store.index_baseline().unwrap(),
             &cancel,
         )
@@ -3507,7 +3508,7 @@ fn captured_scip_document_cutoff_refuses_optional_java_python_and_javascript_lab
             &cutoff,
             &cutoff_capture,
             &cutoff_native,
-            session.leader_guard().unwrap(),
+            session.writer_guard().unwrap(),
             first_pin,
             &cancel,
         )

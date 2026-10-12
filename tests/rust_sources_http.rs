@@ -18,7 +18,7 @@ fn setup() -> (
     tempfile::TempDir,
     Store,
     Router,
-    Arc<trellis::store::topology::LeaderSession>,
+    Arc<trellis::store::topology::WriterSession>,
 ) {
     let temp = tempfile::tempdir().unwrap();
     let workspace = temp.path().join("workspace");
@@ -40,13 +40,13 @@ fn setup() -> (
         |_| {},
     )
     .unwrap();
-    let session = store.leader_session().unwrap();
+    let session = store.writer_session_for_tests().unwrap();
     store
         .publish_native(
             &graph,
             &capture,
             &native,
-            session.leader_guard().unwrap(),
+            session.writer_guard().unwrap(),
             store.index_baseline().unwrap(),
             &cancel,
         )

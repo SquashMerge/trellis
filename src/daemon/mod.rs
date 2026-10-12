@@ -310,7 +310,8 @@ impl BrowserProvisioner {
             .await
     }
 
-    /// Hook for deterministic boundary tests; invoked while registration holds its guard.
+    /// Hook for deterministic boundary tests. `retry_wait` (test-support only)
+    /// runs after dropping the registry guard; other stages run under it.
     #[doc(hidden)]
     pub async fn register_serve_with_hook(
         &mut self,
@@ -333,11 +334,33 @@ impl BrowserProvisioner {
             .file_name()
             .ok_or_else(|| anyhow::anyhow!("token file needs a name"))?;
         let token_path = parent.canonicalize()?.join(file);
-        // The held guard covers validation, binding, token creation and commit.
-        let mut checked = registry.lock().await;
-        checked
-            .can_register(identity, &options)
-            .map_err(|error| anyhow::anyhow!("{}", error.reason()))?;
+        // A CLI-only runtime may still be finishing H, a selected read, or
+        // accepted work. Wait only for that typed transient state, releasing
+        // the registry guard so the runtime can finish. A genuine conflicting
+        // registration or attached client remains an immediate refusal.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        let mut checked = loop {
+            let mut checked = registry.lock().await;
+            match checked.can_register(identity, &options) {
+                Ok(()) => break checked,
+                Err(registry::SelectionError::StorageBusy) => {
+                    drop(checked);
+                    if std::time::Instant::now() >= deadline {
+                        let checked = registry.lock().await;
+                        checked.abandon_cli_replacement(&identity.root_key);
+                        anyhow::bail!("{}", registry::SelectionError::StorageBusy.reason());
+                    }
+                    #[cfg(feature = "test-support")]
+                    if let Some(hook) = hook.as_mut() {
+                        hook("retry_wait");
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+                Err(error) => anyhow::bail!("{}", error.reason()),
+            }
+        };
+        // The same successful guard covers validation, binding, token creation
+        // and registration; no other attachment can win between these steps.
         if let Some(hook) = hook.as_mut() {
             hook("validated");
         }

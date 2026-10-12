@@ -2322,13 +2322,13 @@ mod cached_executable_digest_tests {
             from_capture(&capture, &root, store.root_id(), &cancel).unwrap(),
             native
         );
-        let session = store.leader_session().unwrap();
+        let session = store.writer_session().unwrap();
         let pin = store
             .publish_native(
                 &graph,
                 &capture,
                 &native,
-                session.leader_guard().unwrap(),
+                session.writer_guard().unwrap(),
                 store.index_baseline().unwrap(),
                 &cancel,
             )
@@ -2397,8 +2397,8 @@ mod cached_executable_digest_tests {
         )
         .unwrap();
         let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
-        let session = store.leader_session().unwrap();
-        let leader = session.leader_guard().unwrap();
+        let session = store.writer_session().unwrap();
+        let leader = session.writer_guard().unwrap();
         let cancel = Arc::new(AtomicBool::new(false));
         let options = IndexOptions::new(workspace.path().to_owned());
         let (graph, native, capture) =

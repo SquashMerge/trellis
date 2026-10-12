@@ -18,7 +18,7 @@ use trellis::{
     http,
     indexer::{IndexOptions, index_workspace},
     model::Graph,
-    store::{Store, topology::LeaderSession},
+    store::{Store, topology::WriterSession},
 };
 const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const CODE: &str = "function seed() { console.log('synthetic'); }";
@@ -27,7 +27,7 @@ struct Fixture {
     store: Store,
     graph: Graph,
     app: Router,
-    session: Arc<LeaderSession>,
+    session: Arc<WriterSession>,
     provider: Option<Arc<Acp>>,
     seed: String,
 }
@@ -48,12 +48,12 @@ impl Fixture {
             .id
             .clone();
         let store = crate::common::open_store(&dir.path().join("index"), &workspace).unwrap();
-        let session = store.leader_session().unwrap();
+        let session = store.writer_session_for_tests().unwrap();
         publish_bundle(
             &store,
             &graph,
             &workspace,
-            session.leader_guard().unwrap(),
+            session.writer_guard().unwrap(),
             trellis::model::IndexPin {
                 index_generation: store.index_baseline().unwrap().index_generation,
                 index_revision: 0,
@@ -144,7 +144,7 @@ impl Fixture {
             &self.store,
             &self.graph,
             &self.dir.path().join("workspace"),
-            self.session.leader_guard().unwrap(),
+            self.session.writer_guard().unwrap(),
             trellis::model::IndexPin {
                 index_generation,
                 index_revision: 1,
@@ -415,7 +415,7 @@ fn publish_bundle(
     store: &trellis::store::Store,
     graph: &trellis::model::Graph,
     workspace: &std::path::Path,
-    leader: &trellis::store::topology::LeaderGuard,
+    leader: &trellis::store::topology::WriterGuard,
     expected: trellis::model::IndexPin,
     cancel: &trellis::model::CancelFlag,
 ) -> anyhow::Result<trellis::model::IndexPin> {

@@ -64,7 +64,7 @@ async fn rust_methods_sequence_and_source_survive_live_file_removal() {
     let options = IndexOptions::new(workspace.clone());
     let cancel = Arc::new(AtomicBool::new(false));
     let store = crate::common::open_store(&temp.path().join("state"), &workspace).unwrap();
-    let (graph, native, capture) = index_workspace_bundle(
+    let (graph, _, _) = index_workspace_bundle(
         &IndexOptions::new(workspace.clone()),
         store.root_id(),
         &cancel,
@@ -84,18 +84,11 @@ async fn rust_methods_sequence_and_source_survive_live_file_removal() {
             .iter()
             .any(|f| f.path == "helper.js" && f.language == "javascript")
     );
-    let session = store.leader_session().unwrap();
-    store
-        .publish_native(
-            &graph,
-            &capture,
-            &native,
-            session.leader_guard().unwrap(),
-            store.index_baseline().unwrap(),
-            &cancel,
-        )
-        .unwrap();
-    let pin = store.status().unwrap().revision;
+    // The daemon stages its virgin queue before retaining writer SH, then
+    // commits the recorded-options H before it can accept the next browser Q.
+    let (pin, session) =
+        trellis::index_coordinator::reconcile_workspace(&store, &options, &cancel, |_| {}).unwrap();
+    assert_eq!(store.status().unwrap().revision, pin);
     let state = http::new(
         store.clone(),
         options,
@@ -219,6 +212,10 @@ async fn rust_methods_sequence_and_source_survive_live_file_removal() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn daemon_tick_keeps_pinned_and_current_source_available_across_fifty_edits() {
+    use notify::{
+        Event, EventKind,
+        event::{DataChange, ModifyKind},
+    };
     use std::time::{Duration, Instant};
     use trellis::index_coordinator;
 
@@ -247,7 +244,7 @@ async fn daemon_tick_keeps_pinned_and_current_source_available_across_fifty_edit
     )
     .unwrap();
     state.retain_serving_session(session);
-    let app = http::router(state);
+    let app = http::router(state.clone());
     let load_stop = StopLoad(Arc::new(AtomicBool::new(false)));
     let mut load_thread = None;
     for edit in 0..50 {
@@ -267,6 +264,21 @@ async fn daemon_tick_keeps_pinned_and_current_source_available_across_fifty_edit
         let previous = store.status().unwrap().revision;
         let text = format!("pub fn value() -> i32 {{ {edit} }}\n");
         std::fs::write(&source, &text).unwrap();
+        // Native OS delivery can coalesce same-size successive writes. Give
+        // this daemon-tick fixture one accepted hint through the real watcher
+        // ingress per edit, rather than depending on the OS callback deadline.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let hint = Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content)))
+                    .add_path(source.clone());
+                if state.submit_watch_event_for_tests(Ok(hint)) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("daemon watcher did not register");
         let deadline = Instant::now() + Duration::from_secs(8);
         loop {
             let (status_code, status) = request(&app, "GET", "/api/status", Value::Null).await;
@@ -284,6 +296,15 @@ async fn daemon_tick_keeps_pinned_and_current_source_available_across_fifty_edit
             assert_eq!(
                 pin_code, 200,
                 "edit {edit}, previous {previous:?}: {pinned}"
+            );
+            let prior_text = if edit == 0 {
+                "pub fn value() -> i32 { -1 }\n".to_owned()
+            } else {
+                format!("pub fn value() -> i32 {{ {} }}\n", edit - 1)
+            };
+            assert_eq!(
+                pinned["file"]["text"], prior_text,
+                "prior pin changed at edit {edit}"
             );
             let (current_code, current) =
                 request(&app, "GET", "/api/source?path=lib.rs", Value::Null).await;

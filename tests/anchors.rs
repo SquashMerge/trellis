@@ -480,6 +480,7 @@ fn invalid_document_revision_and_continuity_associations_fail_closed() {
     );
 }
 
+#[cfg(feature = "test-support")]
 #[test]
 fn capture_from_native_snapshot_includes_unnamed_and_ignores_live_source_edits() {
     use std::{
@@ -515,7 +516,7 @@ fn capture_from_native_snapshot_includes_unnamed_and_ignores_live_source_edits()
         .find(|row| row.name.is_none())
         .expect("fixture must expose an unnamed native declaration")
         .clone();
-    let leader = store.leader().unwrap();
+    let leader = store.publication_for_tests().unwrap();
     let pin = store
         .publish_native(
             &graph,
@@ -555,6 +556,7 @@ fn capture_from_native_snapshot_includes_unnamed_and_ignores_live_source_edits()
     );
 }
 
+#[cfg(feature = "test-support")]
 #[test]
 fn production_duplicate_cross_revision_is_never_inferred_unchanged() {
     use std::{
@@ -593,7 +595,7 @@ fn production_duplicate_cross_revision_is_never_inferred_unchanged() {
         .find(|row| row.name.as_deref() == Some("same") && row.key.ordinal == 0)
         .unwrap()
         .clone();
-    let leader = store.leader().unwrap();
+    let leader = store.publication_for_tests().unwrap();
     let first = store
         .publish_native(
             &graph,

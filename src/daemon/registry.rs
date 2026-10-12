@@ -1,15 +1,12 @@
 //! In-memory checkout admission. Retained entries never own checkout resources.
 use crate::store::{
-    PreHReadPermit, Store,
-    topology::{LeaderSession, TopologyRoots, WorkspaceIdentity},
+    Store,
+    topology::{TopologyRoots, WorkspaceIdentity, WriterSession},
 };
 use crate::{
-    http,
-    index_coordinator::{IndexJobCoordinator, establish_serving_session},
-    indexer::IndexOptions,
-    model::CancelFlag,
+    http, index_coordinator::establish_serving_session, indexer::IndexOptions, model::CancelFlag,
 };
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::{
     collections::{HashMap, HashSet},
     fs,
@@ -37,12 +34,14 @@ pub enum SelectionError {
     DifferentRepository,
     IdentityChanged,
     Unavailable,
+    StorageBusy,
     CheckoutCapacity,
     RegistrationConflict,
 }
 impl SelectionError {
     pub fn code(&self) -> &'static str {
         match self {
+            Self::StorageBusy => "storage_busy",
             Self::CheckoutCapacity => "checkout_capacity",
             Self::RegistrationConflict => "registration_conflict",
             _ => "workspace_selection_failed",
@@ -55,12 +54,16 @@ impl SelectionError {
             Self::DifferentRepository => "different_repository",
             Self::IdentityChanged => "identity_changed",
             Self::Unavailable => "unavailable",
+            Self::StorageBusy => "storage_busy",
             Self::CheckoutCapacity => "checkout_capacity",
             Self::RegistrationConflict => "registration_conflict",
         }
     }
     pub fn retryable(&self) -> bool {
-        matches!(self, Self::Unavailable | Self::CheckoutCapacity)
+        matches!(
+            self,
+            Self::Unavailable | Self::StorageBusy | Self::CheckoutCapacity
+        )
     }
 }
 
@@ -159,12 +162,14 @@ pub struct CheckoutRegistry {
     entries: HashMap<String, Entry>,
     roots: Option<TopologyRoots>,
     runtimes: HashMap<String, Arc<CheckoutRuntime>>,
-    idle_permits: HashMap<String, PreHReadPermit>,
-    idle_epochs: HashMap<String, Arc<AtomicU64>>,
     idle_exit_at: Option<Instant>,
     orphan_scan_cache: Option<(Instant, bool)>,
     orphan_scan_count: u64,
     clock_override: Option<Instant>,
+    #[cfg(feature = "test-support")]
+    test_after_due_release: Option<Box<dyn FnOnce() + Send>>,
+    #[cfg(all(test, feature = "test-support"))]
+    test_jev_endpoint: Option<String>,
 }
 
 impl Default for CheckoutRegistry {
@@ -183,13 +188,26 @@ impl CheckoutRegistry {
             entries: HashMap::new(),
             roots: None,
             runtimes: HashMap::new(),
-            idle_permits: HashMap::new(),
-            idle_epochs: HashMap::new(),
             idle_exit_at: Some(now + DAEMON_IDLE_DELAY),
             orphan_scan_cache: None,
             orphan_scan_count: 0,
             clock_override: None,
+            #[cfg(feature = "test-support")]
+            test_after_due_release: None,
+            #[cfg(all(test, feature = "test-support"))]
+            test_jev_endpoint: None,
         }
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn set_after_due_release_for_tests(&mut self, hook: impl FnOnce() + Send + 'static) {
+        self.test_after_due_release = Some(Box::new(hook));
+    }
+
+    #[cfg(all(test, feature = "test-support"))]
+    pub(crate) fn set_jev_endpoint_for_tests(&mut self, endpoint: String) {
+        self.test_jev_endpoint = Some(endpoint);
     }
 
     /// Supply isolated roots in fixtures. The default uses the user's normal
@@ -229,6 +247,10 @@ impl CheckoutRegistry {
             None => TopologyRoots::production()?,
         };
         let store = Store::open(roots, identity)?;
+        // Publish only a proved-virgin queue before this runtime is visible to
+        // selected status reads. Those reads otherwise compete with the EX
+        // stage needed before mandatory H can begin.
+        store.prepare_virgin_queue_before_activation()?;
         let config: BrowserOptions = entry
             .registration
             .as_ref()
@@ -253,12 +275,14 @@ impl CheckoutRegistry {
                     .jev_key
                     .or_else(|| std::env::var("JEV_KEY").ok())
                     .ok_or_else(|| anyhow::anyhow!("JEV_KEY must be configured"))?;
-                Some(Arc::new(crate::live_jev::LiveJev::open(
-                    &dir,
-                    key,
-                    cap,
-                    &options.workspace_root,
-                )?))
+                let live = crate::live_jev::LiveJev::open(&dir, key, cap, &options.workspace_root)?;
+                #[cfg(all(test, feature = "test-support"))]
+                let live = if let Some(endpoint) = &self.test_jev_endpoint {
+                    live.with_test_endpoint(endpoint.clone())
+                } else {
+                    live
+                };
+                Some(Arc::new(live))
             }
             _ => None,
         };
@@ -299,28 +323,16 @@ impl CheckoutRegistry {
                 rust_library: config.rust_library,
             }),
         )?;
-        let permit = self.idle_permits.remove(key);
-        let epoch = self
-            .idle_epochs
-            .remove(key)
-            .unwrap_or_else(|| Arc::new(AtomicU64::new(1)));
-        // Epoch binding exists even for cold H: a later independently verified
-        // publication can supply a predecessor without a selected read.
-        store.bind_runtime_epoch(epoch.clone());
-        if let Ok(read) = store.evidence_response() {
-            let _ = store.remember_read_only_predecessor(&read, epoch.clone());
-        }
         let runtime = Arc::new(CheckoutRuntime {
             resources: std::sync::Mutex::new(Some(Arc::new(ActiveResources { store, scheduler }))),
-            epoch,
             phase: std::sync::Mutex::new(RuntimePhase::Reconciling),
             active: AtomicBool::new(true),
             active_reads: Arc::new(AtomicUsize::new(0)),
             last_error: std::sync::Mutex::new(None),
             h_in_flight: AtomicBool::new(true),
             retry_waiting: AtomicBool::new(false),
+            #[cfg(feature = "test-support")]
             pre_h_hook: std::sync::Mutex::new(None),
-            release_permit_fault: AtomicBool::new(false),
         });
         #[cfg(feature = "test-support")]
         if let Some(reporter) = super::causal_witness::CausalWitness::from_env(key.to_owned()) {
@@ -330,12 +342,86 @@ impl CheckoutRegistry {
                 .set_causal_witness_runtime(reporter, Arc::downgrade(&runtime));
         }
         self.runtimes.insert(key.to_owned(), runtime.clone());
-        runtime.start(options, permit, explicit_options);
+        runtime.start(options, explicit_options);
         Ok(runtime)
     }
 
     pub fn runtime(&self, key: &str) -> Option<Arc<CheckoutRuntime>> {
         self.runtimes.get(key).cloned()
+    }
+
+    /// Serve may replace only an unattached CLI runtime. Do not call the
+    /// generic pending-work probe here: it takes watcher_work under the
+    /// registry mutex while a full inventory owns that lock.
+    fn release_cli_runtime(&mut self, key: &str) -> Result<bool, SelectionError> {
+        let runtime = self
+            .runtimes
+            .get(key)
+            .cloned()
+            .ok_or(SelectionError::Unavailable)?;
+        let resources = runtime
+            .resources()
+            .map_err(|_| SelectionError::Unavailable)?;
+        let eligible = || {
+            !runtime.h_in_flight.load(Ordering::Acquire)
+                && runtime.active_reads.load(Ordering::Acquire) == 0
+                && !CheckoutRuntime::queue_pending(&resources)
+        };
+        if self
+            .entries
+            .get(key)
+            .is_some_and(|entry| entry.external_work)
+            || !eligible()
+        {
+            resources.scheduler.reset_watcher_release();
+            return Ok(false);
+        }
+        let result = resources.scheduler.try_release_checkout_runtime_if(|| {
+            let mut phase = runtime.phase.lock().unwrap();
+            if !eligible() {
+                return false;
+            }
+            // Refresh only while the stream is quiescent. The old watcher is
+            // disposable: the replacement starts with a fresh full inventory.
+            CheckoutRuntime::refresh_phase(&mut phase, &resources);
+            runtime.active.store(false, Ordering::Release);
+            *phase = RuntimePhase::Reconciling;
+            true
+        });
+        match result {
+            Ok(true) => {
+                runtime.resources.lock().unwrap().take();
+                resources.store.retire_checkout_sqlite_witnesses();
+                drop(resources);
+                self.runtimes.remove(key);
+                let entry = self
+                    .entries
+                    .get_mut(key)
+                    .ok_or(SelectionError::Unavailable)?;
+                entry.pending_work = false;
+                entry.released = true;
+                Ok(true)
+            }
+            Ok(false) => {
+                resources.scheduler.reset_watcher_release();
+                Ok(false)
+            }
+            Err(_) => {
+                // Cooperative cancellation is limited to the derived watcher
+                // path; the next retry still verifies the durable FIFO head.
+                resources.scheduler.request_watcher_release();
+                Ok(false)
+            }
+        }
+    }
+
+    /// Give up the advisory cancellation when serve exhausts its deadline.
+    pub(crate) fn abandon_cli_replacement(&self, key: &str) {
+        if let Some(runtime) = self.runtimes.get(key)
+            && let Ok(resources) = runtime.resources()
+        {
+            resources.scheduler.reset_watcher_release();
+        }
     }
 
     /// The lifecycle owner calls this only after the idle deadline. A failed
@@ -352,31 +438,28 @@ impl CheckoutRegistry {
         {
             return Ok(false);
         }
-        let mut phase = runtime.phase.lock().unwrap();
-        CheckoutRuntime::refresh_phase(&mut phase, &resources);
-        if runtime.h_in_flight.load(Ordering::Acquire)
-            || (matches!(*phase, RuntimePhase::Transitional(_, _))
-                && !runtime.retry_waiting.load(Ordering::Acquire))
-            || runtime.active_reads.load(Ordering::Acquire) != 0
-        {
+        // The timer holds the registry guard too. If either worker lane is
+        // busy, defer retirement with every active capability intact.
+        let released = resources.scheduler.try_release_checkout_runtime_if(|| {
+            let mut phase = runtime.phase.lock().unwrap();
+            CheckoutRuntime::refresh_phase(&mut phase, &resources);
+            if runtime.h_in_flight.load(Ordering::Acquire)
+                || runtime.active_reads.load(Ordering::Acquire) != 0
+                || CheckoutRuntime::queue_pending(&resources)
+            {
+                return false;
+            }
+            runtime.active.store(false, Ordering::Release);
+            *phase = RuntimePhase::Reconciling;
+            true
+        });
+        if !matches!(released, Ok(true)) {
             return Ok(false);
         }
-        runtime.epoch.fetch_add(1, Ordering::AcqRel);
-        let permit = runtime.release_permit(&phase, &resources).ok().flatten();
-        runtime.active.store(false, Ordering::Release);
-        resources.store.notify_owner_validation_release();
-        resources.scheduler.release_checkout_runtime();
-        *phase = RuntimePhase::Reconciling;
         runtime.resources.lock().unwrap().take();
         resources.store.retire_checkout_sqlite_witnesses();
-        drop(phase);
         drop(resources);
         self.runtimes.remove(key);
-        if let Some(permit) = permit {
-            self.idle_epochs
-                .insert(key.to_owned(), runtime.epoch.clone());
-            self.idle_permits.insert(key.to_owned(), permit);
-        }
         Ok(true)
     }
 
@@ -726,8 +809,6 @@ impl CheckoutRegistry {
             return Err(SelectionError::IdentityChanged);
         }
         self.entries.remove(key);
-        self.idle_permits.remove(key);
-        self.idle_epochs.remove(key);
         Ok(())
     }
 
@@ -773,13 +854,21 @@ impl CheckoutRegistry {
         // An earlier CLI read/index may have activated the checkout with no
         // browser settings. Once its work drains, release that runtime before
         // registering serve-scoped providers and source roots.
-        if self.entries.get(&identity.root_key).is_some_and(|entry| {
+        let cli_only = self.entries.get(&identity.root_key).is_some_and(|entry| {
             entry.registration.is_none()
                 && entry.sessions.is_empty()
                 && entry.browser_until.is_none()
                 && self.runtimes.contains_key(&identity.root_key)
-        }) {
-            let _ = self.release(&identity.root_key)?;
+        });
+        if cli_only {
+            if !self.release_cli_runtime(&identity.root_key)? {
+                // H, a selected read, or an accepted FIFO head must finish.
+                return Err(SelectionError::StorageBusy);
+            }
+        } else {
+            // A new attachment can make an earlier retry ineligible. Do not
+            // leave its cancellation request armed on this retained runtime.
+            self.abandon_cli_replacement(&identity.root_key);
         }
         if let Some(entry) = self.entries.get(&identity.root_key)
             && entry.registration.as_ref() != Some(options)
@@ -1131,12 +1220,19 @@ impl CheckoutRegistry {
                 released.push(key);
             }
         }
+        #[cfg(feature = "test-support")]
+        if let Some(hook) = self.test_after_due_release.take() {
+            hook();
+        }
         let mut busy = false;
         for key in self.entries.keys().cloned().collect::<Vec<_>>() {
             busy |= self.refresh_pending_work(&key)?;
         }
         let candidate = self.idle_exit_at.is_some_and(|at| now >= at)
             && !busy
+            // Release may defer on H, a watcher, or an active read just before
+            // the later pending-work refresh observes that work finish.
+            && self.runtimes.is_empty()
             && self
                 .entries
                 .values()
@@ -1298,21 +1394,33 @@ struct ActiveResources {
 /// A failed H retains no claim authority; the worker retries while attached.
 pub struct CheckoutRuntime {
     resources: std::sync::Mutex<Option<Arc<ActiveResources>>>,
-    epoch: Arc<AtomicU64>,
     phase: std::sync::Mutex<RuntimePhase>,
     active: AtomicBool,
     active_reads: Arc<AtomicUsize>,
     last_error: std::sync::Mutex<Option<String>>,
     h_in_flight: AtomicBool,
     retry_waiting: AtomicBool,
+    #[cfg(feature = "test-support")]
     pre_h_hook: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
-    release_permit_fault: AtomicBool,
 }
 
 enum RuntimePhase {
     Reconciling,
-    Transitional(PreHReadPermit, Arc<LeaderSession>),
-    Ready(Arc<LeaderSession>),
+    Ready(Arc<WriterSession>),
+}
+
+/// A waiter does not change an accepted row on contention. Only direct,
+/// transient lock failures are retried or converted to a typed expiry.
+fn cli_index_contention(error: anyhow::Error, deadline: Instant) -> anyhow::Result<()> {
+    if !crate::store::transient_storage_contention(&error)
+        || !crate::store::cli_read_retryable_contention(&error)
+    {
+        return Err(error);
+    }
+    if Instant::now() >= deadline {
+        return Err(crate::store::topology::StorageBusy.into());
+    }
+    Ok(())
 }
 
 impl CheckoutRuntime {
@@ -1385,13 +1493,9 @@ impl CheckoutRuntime {
 
     pub fn cli_symbols(&self, search: &str, limit: usize) -> anyhow::Result<serde_json::Value> {
         anyhow::ensure!((1..=150).contains(&limit), "limit must be 1..150");
-        let resources = self.resources()?;
         let (response, catching_up) = self.evidence_response()?;
-        // Store::symbols_at performs selected-document attestation and a
-        // complete-revision fence. The runtime guard additionally fences H.
-        let selected = resources.store.symbols_at(search, limit);
+        let (revision, items) = response.symbols_at(search, limit)?;
         response.finish(())?;
-        let (revision, items) = selected?;
         Ok(serde_json::json!({"catchingUp": catching_up,
             "data": {"revision": revision, "items": items}}))
     }
@@ -1407,24 +1511,40 @@ impl CheckoutRuntime {
     }
 
     pub fn cli_export(&self) -> anyhow::Result<serde_json::Value> {
-        let resources = self.resources()?;
         let (response, catching_up) = self.evidence_response()?;
-        let graph = resources.store.graph();
-        response.finish(())?;
-        Ok(serde_json::json!({"catchingUp": catching_up, "data": graph?}))
+        let graph = response.graph()?;
+        Ok(serde_json::json!({"catchingUp": catching_up, "data": response.finish(graph)?}))
     }
 
     pub fn cli_index(&self, options: &IndexOptions) -> anyhow::Result<serde_json::Value> {
+        // Serialize acceptance with idle retirement. A caller may have cloned
+        // this runtime before serve entered the registry gate: it must not
+        // enqueue against resources the replacement has already retired.
+        let phase = self.phase.lock().unwrap();
+        anyhow::ensure!(
+            self.active.load(Ordering::Acquire),
+            "index_not_ready: checkout released"
+        );
         let resources = self.resources()?;
         // Durable acceptance is the single requests.db COMMIT. Only the
         // checkout scheduler may elect, reconcile and claim this row. A CLI
         // waiter never creates a second leader or re-enqueues an uncertain job.
         let accepted = resources.store.enqueue_request(options, None)?;
+        drop(phase);
+        let mut busy_deadline = Instant::now() + Duration::from_secs(30);
         loop {
-            let row = resources
-                .store
-                .request_by_id(&accepted.id)?
-                .ok_or_else(|| anyhow::anyhow!("storage_busy: accepted request disappeared"))?;
+            let row = match resources.store.request_by_id(&accepted.id) {
+                Ok(row) => {
+                    busy_deadline = Instant::now() + Duration::from_secs(30);
+                    row
+                }
+                Err(error) => {
+                    cli_index_contention(error, busy_deadline)?;
+                    std::thread::sleep(Duration::from_millis(20));
+                    continue;
+                }
+            }
+            .ok_or_else(|| anyhow::anyhow!("storage_busy: accepted request disappeared"))?;
             match row.state.as_str() {
                 "done" => {
                     let revision = row.revision.ok_or_else(|| {
@@ -1458,12 +1578,8 @@ impl CheckoutRuntime {
     }
 
     /// Reconcile a captured phase with the scheduler's current *verified*
-    /// serving owner. A stale follower cannot describe an in-progress takeover
-    /// as ready; the new leader appears only after mandatory H commits.
+    /// Only the daemon's committed H session can serve as the local writer.
     fn refresh_phase(phase: &mut RuntimePhase, resources: &ActiveResources) {
-        if matches!(phase, RuntimePhase::Transitional(_, _)) {
-            return;
-        }
         match resources.scheduler.checkout_serving_owner() {
             Some(owner) => {
                 if !matches!(phase, RuntimePhase::Ready(previous) if Arc::ptr_eq(previous, &owner))
@@ -1483,35 +1599,37 @@ impl CheckoutRuntime {
         }
     }
 
-    pub fn is_follower(&self) -> bool {
-        let Ok(resources) = self.resources() else {
-            return false;
-        };
-        let mut phase = self.phase.lock().unwrap();
-        Self::refresh_phase(&mut phase, &resources);
-        matches!(&*phase, RuntimePhase::Ready(session) if !session.is_leader())
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn notify_on_terminal_request_for_tests(
+        &self,
+        id: &str,
+        notify: Arc<tokio::sync::Notify>,
+    ) -> anyhow::Result<()> {
+        self.resources()?
+            .store
+            .notify_on_terminal_request_for_tests(id, notify);
+        Ok(())
     }
 
+    #[cfg(feature = "test-support")]
+    pub fn set_after_claim_hook_for_tests(&self, hook: impl FnOnce() + Send + 'static) {
+        if let Ok(resources) = self.resources() {
+            resources.store.set_after_claim_hook_for_tests(hook);
+        }
+    }
+
+    #[cfg(feature = "test-support")]
     #[doc(hidden)]
     pub fn set_pre_h_hook_for_tests(&self, hook: Arc<dyn Fn() + Send + Sync>) {
         *self.pre_h_hook.lock().unwrap() = Some(hook);
     }
 
+    #[cfg(feature = "test-support")]
     #[doc(hidden)]
-    pub fn set_leader_before_metadata_hook_for_tests(&self, hook: impl FnOnce() + Send + 'static) {
+    pub fn set_h_hook_for_tests(&self, hook: Arc<dyn Fn() + Send + Sync>) {
         if let Ok(resources) = self.resources() {
-            resources
-                .store
-                .set_leader_before_metadata_hook_for_tests(hook);
-        }
-    }
-
-    #[doc(hidden)]
-    pub fn set_takeover_h_hook_for_tests(&self, hook: Arc<dyn Fn() + Send + Sync>) {
-        if let Ok(resources) = self.resources() {
-            resources
-                .scheduler
-                .set_checkout_takeover_h_hook_for_tests(hook);
+            resources.scheduler.set_checkout_h_hook_for_tests(hook);
         }
     }
 
@@ -1524,33 +1642,53 @@ impl CheckoutRuntime {
         self.retry_waiting.load(Ordering::Acquire) && !self.h_in_flight.load(Ordering::Acquire)
     }
 
+    fn catching_up_in_phase(&self, phase: &RuntimePhase, resources: &ActiveResources) -> bool {
+        if self.h_in_flight.load(Ordering::Acquire) {
+            return true;
+        }
+        if resources.scheduler.checkout_root_loss_retired() {
+            return Self::queue_pending(resources);
+        }
+        !matches!(phase, RuntimePhase::Ready(_))
+            || resources.scheduler.checkout_watch_pending()
+            || Self::queue_pending(resources)
+    }
+
     pub fn catching_up(&self) -> bool {
         let Ok(resources) = self.resources() else {
             return true;
         };
         let mut phase = self.phase.lock().unwrap();
         Self::refresh_phase(&mut phase, &resources);
-        if self.h_in_flight.load(Ordering::Acquire) {
-            return true;
-        }
-        if resources.scheduler.checkout_root_loss_retired() {
-            return Self::queue_pending(&resources);
-        }
-        !matches!(*phase, RuntimePhase::Ready(_))
-            || resources.scheduler.checkout_watch_pending()
-            || Self::queue_pending(&resources)
+        self.catching_up_in_phase(&phase, &resources)
     }
 
-    /// Snapshot freshness and the read basis are sampled under the same phase
-    /// lock. The Store's own finish fence then validates the admitted revision.
+    /// Sample freshness and admit the selected prior head under one runtime gate.
+    /// A validated prior head admits reads, never durable mutations or work
+    /// scheduling. Only this runtime's committed daemon-local H grants that
+    /// authority; the advisory catchingUp flag is not an admission gate.
+    pub(crate) fn require_mutation_ready(&self) -> anyhow::Result<()> {
+        let mut phase = self.phase.lock().unwrap();
+        anyhow::ensure!(
+            self.active.load(Ordering::Acquire),
+            "index_not_ready: checkout released"
+        );
+        let resources = self.resources()?;
+        anyhow::ensure!(
+            !resources.store.root_path_replaced()?,
+            "root_changed: captured root lost"
+        );
+        Self::refresh_phase(&mut phase, &resources);
+        let RuntimePhase::Ready(session) = &*phase else {
+            return Err(crate::store::topology::IndexNotReady::new(
+                "mandatory reconciliation not committed",
+            )
+            .into());
+        };
+        resources.store.verify_committed_writer_claim(session)
+    }
+
     pub fn evidence_response(&self) -> anyhow::Result<(CheckoutEvidence, bool)> {
-        self.evidence_response_with_validation_wait(true)
-    }
-
-    fn evidence_response_with_validation_wait(
-        &self,
-        allow_wait: bool,
-    ) -> anyhow::Result<(CheckoutEvidence, bool)> {
         let mut phase = self.phase.lock().unwrap();
         anyhow::ensure!(
             self.active.load(Ordering::Acquire),
@@ -1558,66 +1696,8 @@ impl CheckoutRuntime {
         );
         let resources = self.resources()?;
         Self::refresh_phase(&mut phase, &resources);
-        let catching_up = self.h_in_flight.load(Ordering::Acquire)
-            || !matches!(*phase, RuntimePhase::Ready(_))
-            || resources.scheduler.checkout_watch_pending()
-            || Self::queue_pending(&resources);
-        let admitted = match &*phase {
-            RuntimePhase::Transitional(permit, leader) => resources
-                .store
-                .evidence_response_pre_h(permit, leader.clone()),
-            RuntimePhase::Reconciling | RuntimePhase::Ready(_) => {
-                resources.store.evidence_response()
-            }
-        };
-        let response = match admitted {
-            Ok(response) => response,
-            Err(error) => {
-                if !allow_wait
-                    || error
-                        .downcast_ref::<crate::store::topology::IndexNotReady>()
-                        .is_none()
-                    || !resources
-                        .store
-                        .has_read_only_predecessor_for_epoch(&self.epoch)
-                {
-                    return Err(error);
-                }
-                resources.store.verify_root()?;
-                let epoch = self.epoch.load(Ordering::Acquire);
-                // The gate begins before a new EX may write its incarnation.
-                // Do not hold phase/registry locks while it publishes proof.
-                drop(phase);
-                if !resources.store.restricted_owner_associated()
-                    && resources.store.owner_validation_pending()
-                    && !resources
-                        .store
-                        .wait_for_restricted_owner(Duration::from_secs(5))
-                {
-                    return Err(error);
-                }
-                anyhow::ensure!(
-                    self.active.load(Ordering::Acquire)
-                        && self.epoch.load(Ordering::Acquire) == epoch,
-                    "index_not_ready: checkout epoch changed"
-                );
-                resources.store.verify_root()?;
-                if let Ok(response) = resources.store.restricted_predecessor_read() {
-                    self.active_reads.fetch_add(1, Ordering::AcqRel);
-                    return Ok((
-                        CheckoutEvidence {
-                            response,
-                            reads: self.active_reads.clone(),
-                            selection: None,
-                        },
-                        true,
-                    ));
-                }
-                // Metadata may already be rebound by the time this task runs.
-                // One fresh strict admission then decides; never infer a head.
-                return self.evidence_response_with_validation_wait(false);
-            }
-        };
+        let catching_up = self.catching_up_in_phase(&phase, &resources);
+        let response = resources.store.evidence_response_daemon_local()?;
         self.active_reads.fetch_add(1, Ordering::AcqRel);
         Ok((
             CheckoutEvidence {
@@ -1644,48 +1724,15 @@ impl CheckoutRuntime {
         Ok((response, catching_up))
     }
 
-    #[doc(hidden)]
-    pub fn fail_next_release_permit_for_tests(&self) {
-        self.release_permit_fault.store(true, Ordering::Release);
-    }
-
-    fn release_permit(
-        &self,
-        phase: &RuntimePhase,
-        resources: &ActiveResources,
-    ) -> anyhow::Result<Option<PreHReadPermit>> {
-        let RuntimePhase::Ready(session) = phase else {
-            return Ok(None);
-        };
-        if self.release_permit_fault.swap(false, Ordering::AcqRel) {
-            anyhow::bail!("index_not_ready: no admissible prior head");
-        }
-        if !session.is_leader() {
-            return Ok(None);
-        }
-        let response = resources.store.evidence_response()?;
-        Ok(Some(resources.store.pre_h_read_permit(
-            &response,
-            session,
-            self.epoch.clone(),
-        )?))
-    }
-
-    fn start(
-        self: &Arc<Self>,
-        options: IndexOptions,
-        permit: Option<PreHReadPermit>,
-        explicit_options: bool,
-    ) {
+    fn start(self: &Arc<Self>, options: IndexOptions, explicit_options: bool) {
         let runtime = self.clone();
         tokio::spawn(async move {
             let mut backoff = Duration::from_millis(250);
             loop {
                 let worker = runtime.clone();
                 let options = options.clone();
-                let permit = permit.clone();
                 let outcome = tokio::task::spawn_blocking(move || {
-                    worker.reconcile(&options, permit, explicit_options)
+                    worker.reconcile(&options, explicit_options)
                 })
                 .await;
                 match outcome {
@@ -1698,25 +1745,11 @@ impl CheckoutRuntime {
                             break;
                         }
                         *runtime.phase.lock().unwrap() = RuntimePhase::Ready(session);
-                        if let Ok(resources) = runtime.resources()
-                            && let Ok(read) = resources.store.evidence_response()
-                            && let Ok(status) = read.status()
-                            && let Ok(status) = read.finish(status)
-                            && status.evidence_format.is_some()
-                            && status.revision.index_revision > 0
-                        {
-                            let _ = resources
-                                .store
-                                .remember_read_only_predecessor(&read, runtime.epoch.clone());
-                        }
                         *runtime.last_error.lock().unwrap() = None;
                         runtime.h_in_flight.store(false, Ordering::Release);
                         break;
                     }
                     result => {
-                        if let Ok(resources) = runtime.resources() {
-                            resources.store.revoke_restricted_predecessor();
-                        }
                         {
                             let mut failure = runtime.last_error.lock().unwrap();
                             if failure.is_none() {
@@ -1761,87 +1794,53 @@ impl CheckoutRuntime {
         if !resources.store.root_path_replaced().is_ok_and(|lost| lost) {
             return false;
         }
-        let mut phase = self.phase.lock().unwrap();
-        match &*phase {
-            RuntimePhase::Transitional(_, session) => {
-                if resources.store.fail_changed_root_requests(session).is_err() {
-                    return false;
-                }
-            }
-            _ if !matches!(resources.store.old_root_unfinished_request(), Ok(None)) => {
-                return false;
-            }
-            _ => {}
+        // A lost captured root never publishes H or claims again. The old
+        // queue remains a durable obligation until its terminal COMMIT is
+        // confirmed, independent of any former writer token.
+        if resources.store.fail_changed_root_requests().is_err() {
+            return false;
         }
-        *phase = RuntimePhase::Reconciling;
+        *self.phase.lock().unwrap() = RuntimePhase::Reconciling;
         true
     }
 
     fn reconcile(
         &self,
         options: &IndexOptions,
-        permit: Option<PreHReadPermit>,
         explicit_options: bool,
-    ) -> anyhow::Result<Arc<LeaderSession>> {
+    ) -> anyhow::Result<Arc<WriterSession>> {
         let resources = self.resources()?;
         let store = &resources.store;
-        let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
-        if let Some(permit) = permit {
-            let retained = match &*self.phase.lock().unwrap() {
-                RuntimePhase::Transitional(_, session) if session.verify().is_ok() => {
-                    Some(session.clone())
-                }
-                _ => None,
-            };
-            match retained
-                .map(Ok)
-                .unwrap_or_else(|| store.leader_for_idle_reattach(&permit))
-            {
-                Ok(session) => {
-                    *self.phase.lock().unwrap() =
-                        RuntimePhase::Transitional(permit, session.clone());
-                    if let Some(hook) = self.pre_h_hook.lock().unwrap().take() {
-                        hook();
-                    }
-                    store
-                        .fail_changed_root_requests(&session)
-                        .map_err(|e| anyhow::anyhow!("pre-H root requests: {e:#}"))?;
-                    let selected = if explicit_options {
-                        options.clone()
-                    } else {
-                        store
-                            .recorded_index_options()?
-                            .unwrap_or_else(|| options.clone())
-                    };
-                    IndexJobCoordinator::prepare_with_session(store, None, session.clone())
-                        .map_err(|e| anyhow::anyhow!("pre-H preparation: {e:#}"))?
-                        .run_serving(&selected, &cancel, |_| {})
-                        .map_err(|e| anyhow::anyhow!("pre-H publication: {e:#}"))?;
-                    session.verify()?;
-                    return Ok(session);
-                }
-                Err(error) if crate::store::transient_storage_contention(&error) => {
-                    // An external standalone owner wins. Never try the stale
-                    // permit as a follower or claim its queued requests.
-                    *self.phase.lock().unwrap() = RuntimePhase::Reconciling;
-                    return store.follower_session();
-                }
-                Err(_) => {
-                    *self.phase.lock().unwrap() = RuntimePhase::Reconciling;
-                }
-            }
-        }
+        anyhow::ensure!(
+            !store.root_path_replaced()?,
+            "root_changed: captured root lost"
+        );
+        store.settle_foreign_root_requests()?;
+        #[cfg(feature = "test-support")]
         if let Some(hook) = self.pre_h_hook.lock().unwrap().take() {
             hook();
         }
-        // Implicit CLI/MCP activation must not overwrite a published head's
-        // recorded SCIP, manifest or size options with daemon defaults.
-        // A different root inode at the same path must recreate its own index;
-        // the former checkout's recorded options are not authority for it.
-        let supplied = explicit_options
-            || store.is_recreate_pending()
-            || store.recorded_index_options()?.is_none();
-        establish_serving_session(store, supplied.then_some(options), &cancel)
+        let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+        let admitted_options = if store.is_recreate_pending() {
+            if explicit_options {
+                Some(options.clone())
+            } else {
+                // Corrupt RecreatePending needs accepted same-root options.
+                // RootReplaced has a verified new root: after old-root queue
+                // settlement, its explicit daemon defaults can start H when
+                // no accepted new-root head supplies options.
+                let head = store
+                    .earliest_unfinished_request()?
+                    .map(|request| request.options(Path::new(store.workspace_root())))
+                    .transpose()?;
+                head.or_else(|| store.is_root_replaced().then(|| options.clone()))
+            }
+        } else if explicit_options || store.recorded_index_options()?.is_none() {
+            Some(options.clone())
+        } else {
+            None
+        };
+        establish_serving_session(store, admitted_options.as_ref(), &cancel)
     }
 }
 
@@ -1957,7 +1956,68 @@ fn checkout_root(selected: &Path) -> Result<PathBuf, SelectionError> {
 #[cfg(test)]
 mod selection_tests {
     use super::*;
+    use anyhow::Context;
     use std::process::Command;
+
+    #[test]
+    fn cli_index_expired_contention_is_typed_and_keeps_accepted_row_pending() {
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let options = IndexOptions::new(workspace.path().to_owned());
+        let accepted = store.enqueue_request(&options, None).unwrap();
+        let before = store.request_by_id(&accepted.id).unwrap().unwrap();
+        assert_eq!(before.state, "queued");
+
+        let busy = || -> anyhow::Error {
+            rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                None,
+            )
+            .into()
+        };
+        let expired = Instant::now() - Duration::from_millis(1);
+        let error = cli_index_contention(busy(), expired).unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<crate::store::topology::StorageBusy>()
+                .is_some()
+        );
+        assert_eq!(error.to_string(), "storage_busy");
+        // Neither an invariant-busy string nor a guarded SQLite cause is retried.
+        let invariant = anyhow::anyhow!("storage_busy: cached claim changed");
+        assert_eq!(
+            cli_index_contention(invariant, expired)
+                .unwrap_err()
+                .to_string(),
+            "storage_busy: cached claim changed"
+        );
+        let guarded = Err::<(), _>(busy())
+            .context("root_changed: request root replaced")
+            .unwrap_err();
+        assert_eq!(
+            cli_index_contention(guarded, expired)
+                .unwrap_err()
+                .to_string(),
+            "root_changed: request root replaced"
+        );
+        let integrity = Err::<(), _>(busy())
+            .context("incompatible_index: selected integrity")
+            .unwrap_err();
+        assert_eq!(
+            cli_index_contention(integrity, expired)
+                .unwrap_err()
+                .to_string(),
+            "incompatible_index: selected integrity"
+        );
+
+        let after = store.request_by_id(&accepted.id).unwrap().unwrap();
+        assert_eq!(after.id, before.id);
+        assert_eq!(after.seq, before.seq);
+        assert_eq!(after.state, before.state);
+        assert_eq!(after.revision, before.revision);
+        assert_eq!(after.error_code, before.error_code);
+    }
 
     fn git(dir: &Path, args: &[&str]) {
         let status = Command::new("git")
@@ -1972,6 +2032,345 @@ mod selection_tests {
             .status()
             .unwrap();
         assert!(status.success(), "git {args:?}");
+    }
+
+    #[tokio::test]
+    async fn serve_cli_replacement_does_not_wait_under_registry_for_watcher_gate() {
+        use std::sync::mpsc;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("checkout");
+        git(temp.path(), &["init", "--quiet", root.to_str().unwrap()]);
+        let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+        let roots =
+            TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+        let mut registry = CheckoutRegistry::with_roots(roots);
+        let options = CheckoutOptions(serde_json::json!({"browseRoot": identity.root}));
+        registry.attach_launch(42, &identity).unwrap();
+        let runtime = registry.activate(&identity.root_key).unwrap();
+        registry.disconnect(42);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while runtime.h_in_flight.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let scheduler = runtime.browser_scheduler().unwrap();
+        let observed_scheduler = scheduler.clone();
+        let (held_tx, held_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            scheduler.hold_watcher_gate_for_tests(|| {
+                held_tx.send(()).unwrap();
+                resume_rx.recv().unwrap();
+            });
+        });
+        held_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        // H has completed: the purpose is the native stream/watcher gate.
+        let key = identity.root_key.clone();
+        let (done_tx, done_rx) = mpsc::channel();
+        let attempt = std::thread::spawn(move || {
+            let started = Instant::now();
+            let outcome = registry.can_register(&identity, &options);
+            done_tx
+                .send((started.elapsed(), outcome, registry, identity, options))
+                .unwrap();
+        });
+        let early = done_rx.recv_timeout(Duration::from_secs(1));
+        // Always release the hook before asserting, even on RED.
+        resume_tx.send(()).unwrap();
+        holder.join().unwrap();
+        let (elapsed, first, mut registry, identity, options) =
+            early.unwrap_or_else(|_| done_rx.recv_timeout(Duration::from_secs(10)).unwrap());
+        attempt.join().unwrap();
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "registry guard blocked for {elapsed:?}"
+        );
+        assert_eq!(first, Err(SelectionError::StorageBusy));
+        assert!(runtime.active.load(Ordering::Acquire));
+        assert!(runtime.has_active_resources());
+        assert!(!registry.entries[&key].released);
+        assert!(registry.entries[&key].registration.is_none());
+        assert!(observed_scheduler.watcher_release_requested_for_tests());
+        // A timed-out serve must leave this retained CLI watcher usable.
+        registry.abandon_cli_replacement(&key);
+        assert!(!observed_scheduler.watcher_release_requested_for_tests());
+        runtime.active_reads.fetch_add(1, Ordering::AcqRel);
+        assert_eq!(
+            registry.can_register(&identity, &options),
+            Err(SelectionError::StorageBusy)
+        );
+        assert!(!observed_scheduler.watcher_release_requested_for_tests());
+        runtime.active_reads.fetch_sub(1, Ordering::AcqRel);
+        // A completed watcher leaves the same CLI-only checkout releasable.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match registry.can_register(&identity, &options) {
+                Ok(()) => break,
+                Err(SelectionError::StorageBusy) if Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                outcome => panic!("idle replacement did not complete: {outcome:?}"),
+            }
+        }
+        assert!(!runtime.has_active_resources());
+    }
+
+    #[tokio::test]
+    async fn serve_cli_replacement_defers_maintenance_without_partial_stop() {
+        use std::sync::mpsc;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("checkout");
+        git(temp.path(), &["init", "--quiet", root.to_str().unwrap()]);
+        let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+        let roots =
+            TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+        let mut registry = CheckoutRegistry::with_roots(roots);
+        let options = CheckoutOptions(serde_json::json!({"browseRoot": identity.root}));
+        registry.attach_launch(46, &identity).unwrap();
+        let runtime = registry.activate(&identity.root_key).unwrap();
+        registry.disconnect(46);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while runtime.h_in_flight.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let scheduler = runtime.browser_scheduler().unwrap();
+        let (held_tx, held_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            scheduler.hold_maintenance_gate_for_tests(|| {
+                held_tx.send(()).unwrap();
+                resume_rx.recv().unwrap();
+            });
+        });
+        held_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let result = registry.can_register(&identity, &options);
+        assert_eq!(result, Err(SelectionError::StorageBusy));
+        assert!(runtime.active.load(Ordering::Acquire));
+        assert!(runtime.has_active_resources());
+        assert!(!registry.entries[&identity.root_key].released);
+        assert!(
+            !runtime
+                .browser_scheduler()
+                .unwrap()
+                .checkout_runtime_stopped_for_tests()
+        );
+        resume_tx.send(()).unwrap();
+        holder.join().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match registry.can_register(&identity, &options) {
+                Ok(()) => break,
+                Err(SelectionError::StorageBusy) if Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                outcome => panic!("maintenance release did not complete: {outcome:?}"),
+            }
+        }
+        assert!(!runtime.has_active_resources());
+    }
+
+    #[tokio::test]
+    async fn idle_tick_defers_watcher_lock_without_blocking_registry() {
+        use std::sync::mpsc;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("checkout");
+        git(temp.path(), &["init", "--quiet", root.to_str().unwrap()]);
+        let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+        let roots =
+            TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+        let mut registry = CheckoutRegistry::with_roots(roots);
+        registry.attach_launch(45, &identity).unwrap();
+        let runtime = registry.activate(&identity.root_key).unwrap();
+        registry.disconnect(45);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while runtime.h_in_flight.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let key = identity.root_key.clone();
+        let now = Instant::now();
+        registry.entries.get_mut(&key).unwrap().release_at = Some(now);
+        let scheduler = runtime.browser_scheduler().unwrap();
+        let (held_tx, held_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            scheduler.hold_watcher_gate_for_tests(|| {
+                held_tx.send(()).unwrap();
+                resume_rx.recv().unwrap();
+            });
+        });
+        held_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let (done_tx, done_rx) = mpsc::channel();
+        let tick = std::thread::spawn(move || {
+            let started = Instant::now();
+            let result = registry.advance(now);
+            done_tx.send((started.elapsed(), result, registry)).unwrap();
+        });
+        let early = done_rx.recv_timeout(Duration::from_secs(1));
+        resume_tx.send(()).unwrap();
+        holder.join().unwrap();
+        let (elapsed, result, registry) =
+            early.unwrap_or_else(|_| done_rx.recv_timeout(Duration::from_secs(10)).unwrap());
+        tick.join().unwrap();
+        result.unwrap();
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "idle tick blocked for {elapsed:?}"
+        );
+        assert!(runtime.active.load(Ordering::Acquire));
+        assert!(runtime.has_active_resources());
+        assert!(!registry.entries[&key].released);
+        assert!(
+            !runtime
+                .browser_scheduler()
+                .unwrap()
+                .watcher_release_requested_for_tests()
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_cli_replacement_preempts_real_watcher_tick_without_registry_wait() {
+        use std::sync::mpsc;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("checkout");
+        git(temp.path(), &["init", "--quiet", root.to_str().unwrap()]);
+        let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+        let roots =
+            TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+        let mut registry = CheckoutRegistry::with_roots(roots);
+        let options = CheckoutOptions(serde_json::json!({"browseRoot": identity.root}));
+        registry.attach_launch(44, &identity).unwrap();
+        let runtime = registry.activate(&identity.root_key).unwrap();
+        registry.disconnect(44);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while runtime.h_in_flight.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let scheduler = runtime.browser_scheduler().unwrap();
+        let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        scheduler.set_watcher_gate_hook_for_tests(move || {
+            let _ = held_tx.send(());
+            resume_rx.recv().unwrap();
+        });
+        tokio::time::timeout(Duration::from_secs(10), held_rx)
+            .await
+            .expect("real watcher tick did not reach the gate")
+            .unwrap();
+        let key = identity.root_key.clone();
+        let (done_tx, done_rx) = mpsc::channel();
+        let attempt = std::thread::spawn(move || {
+            let result = registry.can_register(&identity, &options);
+            done_tx.send((result, registry, identity, options)).unwrap();
+        });
+        let early = done_rx.recv_timeout(Duration::from_secs(1));
+        resume_tx.send(()).unwrap();
+        let (result, mut registry, identity, options) =
+            early.unwrap_or_else(|_| done_rx.recv_timeout(Duration::from_secs(10)).unwrap());
+        attempt.join().unwrap();
+        assert_eq!(result, Err(SelectionError::StorageBusy));
+        assert!(runtime.active.load(Ordering::Acquire));
+        assert!(runtime.has_active_resources());
+        assert!(!registry.entries[&key].released);
+        assert!(scheduler.watcher_release_requested_for_tests());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match registry.can_register(&identity, &options) {
+                Ok(()) => break,
+                Err(SelectionError::StorageBusy) if Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                outcome => panic!("real watcher did not yield to serve: {outcome:?}"),
+            }
+        }
+        assert!(!runtime.has_active_resources());
+    }
+
+    #[tokio::test]
+    async fn serve_cli_replacement_preserves_accepted_fifo_head() {
+        use std::sync::mpsc;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("checkout");
+        git(temp.path(), &["init", "--quiet", root.to_str().unwrap()]);
+        let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+        let roots =
+            TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+        let mut registry = CheckoutRegistry::with_roots(roots);
+        let options = CheckoutOptions(serde_json::json!({"browseRoot": identity.root}));
+        registry.attach_launch(43, &identity).unwrap();
+        let runtime = registry.activate(&identity.root_key).unwrap();
+        registry.disconnect(43);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while runtime.h_in_flight.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let resources = runtime.resources().unwrap();
+        let scheduler = resources.scheduler.clone();
+        let (held_tx, held_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            scheduler.hold_watcher_gate_for_tests(|| {
+                held_tx.send(()).unwrap();
+                resume_rx.recv().unwrap();
+            });
+        });
+        held_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let accepted = resources
+            .store
+            .enqueue_request(&IndexOptions::new(identity.root.clone()), None)
+            .unwrap();
+        assert_eq!(
+            registry.can_register(&identity, &options),
+            Err(SelectionError::StorageBusy)
+        );
+        assert!(runtime.active.load(Ordering::Acquire));
+        assert!(runtime.has_active_resources());
+        assert!(!resources.scheduler.watcher_release_requested_for_tests());
+        let queued = resources
+            .store
+            .request_by_id(&accepted.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(queued.state, "queued");
+        assert_eq!(queued.seq, accepted.seq);
+        resume_tx.send(()).unwrap();
+        holder.join().unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if resources
+                    .store
+                    .request_by_id(&accepted.id)
+                    .unwrap()
+                    .unwrap()
+                    .finished_at
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let terminal = resources
+            .store
+            .request_by_id(&accepted.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(terminal.state, "done");
     }
 
     #[tokio::test]
@@ -1995,14 +2394,14 @@ mod selection_tests {
         runtime.active_reads.fetch_add(1, Ordering::AcqRel);
         assert_eq!(
             registry.can_register(&identity, &options),
-            Err(SelectionError::RegistrationConflict)
+            Err(SelectionError::StorageBusy)
         );
         assert!(registry.runtimes.contains_key(&identity.root_key));
         runtime.active_reads.fetch_sub(1, Ordering::AcqRel);
         runtime.h_in_flight.store(true, Ordering::Release);
         assert_eq!(
             registry.can_register(&identity, &options),
-            Err(SelectionError::RegistrationConflict)
+            Err(SelectionError::StorageBusy)
         );
         assert!(registry.runtimes.contains_key(&identity.root_key));
         // A rejected call cannot install browser settings or change the writer.

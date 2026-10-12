@@ -1366,6 +1366,7 @@ async fn resolved_root_change_retains_headers_even_when_read_fence_fails() {
         let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
         let roots =
             TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+        let queue_path = roots.requests_db(&identity);
         let mut registry = CheckoutRegistry::with_roots(roots);
         registry
             .register(&identity, CheckoutOptions(serde_json::json!({})))
@@ -1390,17 +1391,37 @@ async fn resolved_root_change_retains_headers_even_when_read_fence_fails() {
                 .unwrap()
             }
         };
+        let mut last_code = None;
+        let mut last_error_code = None;
+        let mut saw_runtime = false;
+        let mut first_h_error = None;
+        let mut saw_retry_waiting = false;
         tokio::time::timeout(Duration::from_secs(20), async {
             loop {
                 let response = call(app.clone()).await;
+                last_code = Some(response.status());
                 if response.status() == axum::http::StatusCode::OK {
                     break;
+                }
+                last_error_code = to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .ok()
+                    .and_then(|body| serde_json::from_slice::<Value>(&body).ok())
+                    .and_then(|body| body["error"]["code"].as_str().map(str::to_owned));
+                let runtime = registry.lock().await.runtime(&identity.root_key);
+                saw_runtime |= runtime.is_some();
+                if let Some(runtime) = runtime {
+                    let waiting = runtime.retry_waiting_for_tests();
+                    saw_retry_waiting |= waiting;
+                    if first_h_error.is_none() {
+                        first_h_error = runtime.reconciliation_error().map(|error| (error, waiting));
+                    }
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         })
         .await
-        .unwrap();
+        .unwrap_or_else(|_| panic!("{stage}/{route_suffix} cold selected route did not become ready: {last_code:?}/{last_error_code:?}; runtime seen: {saw_runtime}; first H error/retry: {first_h_error:?}; saw retry waiting: {saw_retry_waiting}; queue exists: {}", queue_path.exists()));
         let changed = Arc::new(AtomicBool::new(false));
         let source = identity.root.clone();
         let destination = temp.path().join("moved");
@@ -1541,26 +1562,44 @@ async fn selected_question_preview_keeps_legacy_oversize_error() {
     registry
         .register(&identity, CheckoutOptions(serde_json::json!({})))
         .unwrap();
+    let registry = Arc::new(tokio::sync::Mutex::new(registry));
     let app = ProvisionedBrowser::new(
-        Arc::new(tokio::sync::Mutex::new(registry)),
+        registry.clone(),
         TOKEN.to_owned(),
         "127.0.0.1:7331".parse().unwrap(),
     )
     .unwrap()
     .router();
     let prefix = format!("/api/checkouts/{}", identity.root_key);
+    let mut last_status = None;
+    let mut first_h_error = None;
+    let mut saw_retry_waiting = false;
     let pin = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             let (status, _, value) =
                 selected_json(app.clone(), "GET", &format!("{prefix}/status"), Value::Null).await;
+            last_status = Some((status, value.clone()));
+            // Sample while H is still retrying. The first error can disappear
+            // after a successful retry, before the final timeout diagnostic.
+            if (status != axum::http::StatusCode::OK || value["catchingUp"] != false)
+                && let Some(runtime) = registry.lock().await.runtime(&identity.root_key)
+            {
+                let waiting = runtime.retry_waiting_for_tests();
+                saw_retry_waiting |= waiting;
+                if first_h_error.is_none() {
+                    first_h_error = runtime.reconciliation_error().map(|error| (error, waiting));
+                }
+            }
             if status == axum::http::StatusCode::OK && value["catchingUp"] == false {
                 break value["revision"].clone();
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
-    .await
-    .unwrap();
+    .await;
+    let pin = pin.unwrap_or_else(|_| {
+        panic!("cold selected preview status stayed not-ready: {last_status:?}; first H error/retry: {first_h_error:?}; saw retry waiting: {saw_retry_waiting}")
+    });
     let (status, _, symbols) = selected_json(
         app.clone(),
         "GET",
@@ -1762,7 +1801,7 @@ async fn browser_only_live_listener_releases_resources_then_exits_with_control_p
     let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
     let roots =
         TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
-    let index_lock = roots.leader_lock(&identity);
+    let index_lock = roots.index_use_lock(&identity);
     let registry = Arc::new(tokio::sync::Mutex::new(CheckoutRegistry::with_roots(roots)));
     let mut provisioner = BrowserProvisioner::new();
     let address = provisioner
@@ -1829,9 +1868,7 @@ async fn browser_only_live_listener_releases_resources_then_exits_with_control_p
     let after_request = std::time::Instant::now();
     let runtime = registry.lock().await.runtime(&identity.root_key).unwrap();
     assert!(runtime.has_active_resources());
-    assert!(!runtime.is_follower());
     assert!(open_descriptors(&index_lock) > 0);
-    let retained = open_descriptors(&index_lock);
     for route in ["/healthz", "/", "/api/checkouts", "/api/daemon/status"] {
         let request = client.get(format!("{base}{route}"));
         let response = if route.starts_with("/api/") {
@@ -1855,7 +1892,10 @@ async fn browser_only_live_listener_releases_resources_then_exits_with_control_p
     );
     checked.advance(std::time::Instant::now()).unwrap();
     assert!(runtime.has_active_resources());
-    assert_eq!(open_descriptors(&index_lock), retained);
+    assert!(
+        open_descriptors(&index_lock) > 0,
+        "active browser runtime must retain its index-use descriptor"
+    );
     checked.set_clock_override_for_tests(after_request + Duration::from_secs(30 * 60));
     checked.advance(std::time::Instant::now()).unwrap();
     drop(checked);
@@ -1898,6 +1938,7 @@ async fn browser_only_live_listener_releases_resources_then_exits_with_control_p
     assert!(tokio::net::TcpStream::connect(address).await.is_err());
 }
 
+#[cfg(feature = "test-support")]
 #[tokio::test]
 async fn cold_selected_native_read_is_not_ready_without_a_fabricated_basis() {
     use axum::{
@@ -1982,6 +2023,7 @@ async fn cold_selected_native_read_is_not_ready_without_a_fabricated_basis() {
     drop(runtime);
 }
 
+#[cfg(feature = "test-support")]
 #[tokio::test]
 async fn selected_status_serves_validated_pre_h_head_and_clears_freshness_after_h() {
     use axum::{
@@ -2976,6 +3018,172 @@ async fn production_browser_rejects_every_selector_free_checkout_route_without_a
     }
 }
 
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn virgin_queue_use_lock_contention_retries_h_before_claiming_fifo() {
+    use std::sync::Arc;
+    use trellis::{
+        daemon::registry::{CheckoutOptions, CheckoutRegistry},
+        http::ProvisionedBrowser,
+        indexer::IndexOptions,
+        store::{Store, topology::TopologyRoots},
+    };
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("checkout");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("core.js"), "function stable() {}\n").unwrap();
+    let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+    let roots =
+        TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+    // Store::open creates only the virgin revision-0 index, not the queue.
+    let store = Store::open(roots.clone(), identity.verified_clone_for_tests().unwrap()).unwrap();
+    let queue_path = roots.requests_db(&identity);
+    assert!(!queue_path.exists());
+    let use_lock = roots.index_use(&identity).unwrap();
+    let mut registry = CheckoutRegistry::with_roots(roots.clone());
+    registry
+        .register(&identity, CheckoutOptions(serde_json::json!({})))
+        .unwrap();
+    let registry = Arc::new(tokio::sync::Mutex::new(registry));
+    let app = ProvisionedBrowser::new(
+        registry.clone(),
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
+        "127.0.0.1:7331".parse().unwrap(),
+    )
+    .unwrap()
+    .router();
+    {
+        let mut checked = registry.lock().await;
+        checked
+            .browser_request_at(&identity, std::time::Instant::now())
+            .unwrap();
+        // Bootstrap now precedes publication. An outstanding SH prevents its
+        // EX lock, so activation must fail without exposing an H runtime or
+        // publishing a queue that could accept a FIFO request before H.
+        let error = match checked.activate(&identity.root_key) {
+            Ok(_) => panic!("virgin queue activation must not publish under SH contention"),
+            Err(error) => error,
+        };
+        assert_eq!(error.to_string(), "storage_busy", "{error:#}");
+        assert!(checked.runtime(&identity.root_key).is_none());
+    }
+    let prefix = format!("/api/checkouts/{}", identity.root_key);
+    let (code, _, blocked) =
+        selected_json(app.clone(), "GET", &format!("{prefix}/status"), Value::Null).await;
+    assert_eq!(code, axum::http::StatusCode::CONFLICT, "{blocked}");
+    assert_eq!(blocked["error"]["code"], "storage_busy");
+    assert!(registry.lock().await.runtime(&identity.root_key).is_none());
+    assert!(!queue_path.exists());
+    drop(use_lock);
+    let runtime = {
+        let mut checked = registry.lock().await;
+        checked.activate(&identity.root_key).unwrap()
+    };
+    assert!(registry.lock().await.runtime(&identity.root_key).is_some());
+    // Activation returns only after the staged queue is complete and readable
+    // as v1. The normal Store queue read also validates root identity and
+    // SQLite integrity; a bare existence check would miss a half-built queue.
+    assert!(queue_path.exists());
+    assert!(store.earliest_unfinished_request().unwrap().is_none());
+    let queued = store
+        .enqueue_request(&IndexOptions::new(root), None)
+        .unwrap();
+    assert_eq!(queued.state, "queued");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let terminal = Arc::new(tokio::sync::Notify::new());
+    runtime
+        .notify_on_terminal_request_for_tests(&queued.id, terminal.clone())
+        .unwrap();
+    let mut last_status = None;
+    let ready = tokio::time::timeout_at(deadline, async {
+        // The request may have committed between enqueue and registration.
+        // Otherwise wait for this ID's durable terminal COMMIT without a
+        // stream of protected status/queue SH reads competing with H's EX.
+        let mut finished = loop {
+            match store.request_by_id(&queued.id) {
+                Ok(Some(row)) => break row,
+                Err(error) if trellis::store::cli_read_retryable_contention(&error) => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                other => panic!("accepted virgin FIFO lookup failed: {other:?}"),
+            }
+        };
+        if finished.finished_at.is_none() {
+            terminal.notified().await;
+            finished = loop {
+                match store.request_by_id(&queued.id) {
+                    Ok(Some(row)) => break row,
+                    Err(error) if trellis::store::cli_read_retryable_contention(&error) => {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    other => panic!("terminal virgin FIFO lookup failed: {other:?}"),
+                }
+            };
+        }
+        assert_eq!(finished.state, "done", "{finished:?}");
+        assert!(finished.finished_at.is_some());
+        assert_eq!(finished.id, queued.id);
+        assert_eq!(finished.seq, queued.seq);
+        assert!(
+            finished.revision.unwrap().index_revision >= 2,
+            "FIFO request must commit after H"
+        );
+        loop {
+            let (code, _, status) =
+                selected_json(app.clone(), "GET", &format!("{prefix}/status"), Value::Null).await;
+            if code == axum::http::StatusCode::OK && status["catchingUp"] == false {
+                assert!(
+                    status["revision"]["indexRevision"].as_u64().unwrap() >= 2,
+                    "mandatory H must publish before FIFO completion: {status}"
+                );
+                break;
+            }
+            last_status = Some((code, status));
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    if ready.is_err() {
+        let at_deadline = store.request_by_id(&queued.id).map(|row| {
+            row.map(|row| {
+                (
+                    row.state,
+                    row.error_code,
+                    row.finished_at.is_some(),
+                    row.revision,
+                )
+            })
+        });
+        let head_at_deadline = store.status().map(|status| status.revision.index_revision);
+        let owner_valid = runtime
+            .browser_scheduler()
+            .ok()
+            .and_then(|scheduler| scheduler.checkout_serving_owner())
+            .is_some();
+        let error = runtime.reconciliation_error();
+        let retry_waiting = runtime.retry_waiting_for_tests();
+        let catching_up = runtime.catching_up();
+        // Failure-only: a late completion remains RED, but distinguishes a
+        // stuck worker from a reader-induced delay after polling stops.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let after_quiet = store.request_by_id(&queued.id).map(|row| {
+            row.map(|row| {
+                (
+                    row.state,
+                    row.error_code,
+                    row.finished_at.is_some(),
+                    row.revision,
+                )
+            })
+        });
+        panic!(
+            "H and queued work did not become ready after SH release: last_status={last_status:?}, at_deadline={at_deadline:?}, head_at_deadline={head_at_deadline:?}, owner_valid={owner_valid}, error={error:?}, retry_waiting={retry_waiting}, catching_up={catching_up}, after_quiet={after_quiet:?}"
+        );
+    }
+    assert!(!runtime.catching_up());
+}
+
+#[cfg(feature = "test-support")]
 #[tokio::test]
 async fn selected_reads_validated_predecessor_through_owner_handoff() {
     use std::sync::{Arc, Mutex, mpsc};
@@ -3005,6 +3213,10 @@ async fn selected_reads_validated_predecessor_through_owner_handoff() {
         &Arc::new(std::sync::atomic::AtomicBool::new(false)),
     )
     .unwrap();
+    let prior = serde_json::to_value(published.status().unwrap().revision).unwrap();
+    fs::write(root.join("core.js"), "function newHead() {}\n").unwrap();
+    let queued = published.enqueue_request(&options, None).unwrap();
+    drop(old_owner);
     let mut registry = CheckoutRegistry::with_roots(roots);
     registry
         .register(&identity, CheckoutOptions(serde_json::json!({})))
@@ -3024,63 +3236,33 @@ async fn selected_reads_validated_predecessor_through_owner_handoff() {
             .unwrap();
         checked.activate(&identity.root_key).unwrap()
     };
-    let prefix = format!("/api/checkouts/{}", identity.root_key);
-    let old = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            let (code, _, status) = selected_json(
-                browser.clone(),
-                "GET",
-                &format!("{prefix}/status"),
-                Value::Null,
-            )
-            .await;
-            if code == axum::http::StatusCode::OK && runtime.is_follower() {
-                break status;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .unwrap();
-    let prior = old["revision"].clone();
-    assert!(prior["indexRevision"].as_u64().unwrap() > 0);
-    let (lock_tx, lock_rx) = mpsc::sync_channel(1);
-    let (unlock_tx, unlock_rx) = mpsc::sync_channel(1);
-    let unlock_rx = Mutex::new(unlock_rx);
-    runtime.set_leader_before_metadata_hook_for_tests(move || {
-        lock_tx.send(()).unwrap();
-        unlock_rx.lock().unwrap().recv().unwrap();
-    });
-    let (h_tx, h_rx) = mpsc::sync_channel(1);
-    let (resume_tx, resume_rx) = mpsc::sync_channel(1);
-    let resume_rx = Mutex::new(resume_rx);
-    runtime.set_takeover_h_hook_for_tests(Arc::new(move || {
-        h_tx.send(()).unwrap();
-        resume_rx.lock().unwrap().recv().unwrap();
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let release_rx = Mutex::new(release_rx);
+    // Activation schedules reconciliation on Tokio. Set the hook before the
+    // first await so this runtime pauses before its mandatory local H.
+    runtime.set_pre_h_hook_for_tests(Arc::new(move || {
+        entered_tx.send(()).unwrap();
+        release_rx.lock().unwrap().recv().unwrap();
     }));
-    fs::write(root.join("core.js"), "function newHead() {}\n").unwrap();
-    let queued = published.enqueue_request(&options, None).unwrap();
-    drop(old_owner);
+    let prefix = format!("/api/checkouts/{}", identity.root_key);
     tokio::time::timeout(Duration::from_secs(10), async {
-        while lock_rx.try_recv().is_err() {
+        while entered_rx.try_recv().is_err() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("new owner never reached pre-validation boundary");
-    let pending_browser = browser.clone();
-    let files_path = format!("{prefix}/files");
-    let pending = tokio::spawn(async move {
-        selected_json(pending_browser, "GET", &files_path, Value::Null).await
-    });
-    // The owner remains paused *before* SQLite metadata validation. A proved
-    // predecessor must answer without waiting for that validation or H.
-    let (code, headers, files) = tokio::time::timeout(Duration::from_secs(2), pending)
-        .await
-        .expect("proved predecessor waited for metadata validation")
-        .unwrap();
+    .expect("daemon-local H did not reach pre-publication boundary");
+    let (code, headers, files) = selected_json(
+        browser.clone(),
+        "GET",
+        &format!("{prefix}/files"),
+        Value::Null,
+    )
+    .await;
     assert_eq!(code, axum::http::StatusCode::OK, "{files}");
     assert_eq!(headers["X-Trellis-Catching-Up"], "true");
+    assert_eq!(files["revision"], prior);
     assert!(files.to_string().contains("core.js"));
     let (mutation_code, _, mutation_body) = selected_json(
         browser.clone(),
@@ -3095,62 +3277,22 @@ async fn selected_reads_validated_predecessor_through_owner_handoff() {
         "{mutation_body}"
     );
     assert_eq!(mutation_body["error"]["code"], "index_not_ready");
-    let owner_paused_at = std::time::Instant::now();
-    tokio::time::sleep(Duration::from_millis(310)).await;
-    eprintln!(
-        "restricted predecessor served before owner validation; metadata held {:?}",
-        owner_paused_at.elapsed()
-    );
-    // This request ARRIVES after the old 250ms wait cap, while owner SQLite
-    // metadata validation is still blocked; it must not depend on that timer.
-    let (late_code, late_headers, late_status) = selected_json(
+    let (status_code, status_headers, status) = selected_json(
         browser.clone(),
         "GET",
         &format!("{prefix}/status"),
         Value::Null,
     )
     .await;
-    assert_eq!(late_code, axum::http::StatusCode::OK, "{late_status}");
-    assert_eq!(late_status["revision"], prior);
-    assert_eq!(late_headers["X-Trellis-Catching-Up"], "true");
-    let validation_released_at = std::time::Instant::now();
-    unlock_tx.send(()).unwrap();
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while h_rx.try_recv().is_err() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("new owner never reached pre-H boundary");
-    eprintln!(
-        "owner-validation release to H pause: {:?}",
-        validation_released_at.elapsed()
-    );
-    let (code, headers, tree) = selected_json(
-        browser.clone(),
-        "GET",
-        &format!("{prefix}/tree"),
-        Value::Null,
-    )
-    .await;
-    assert_eq!(code, axum::http::StatusCode::OK, "{tree}");
-    assert_eq!(headers["X-Trellis-Catching-Up"], "true");
-    let (code, _, paused) = selected_json(
-        browser.clone(),
-        "GET",
-        &format!("{prefix}/status"),
-        Value::Null,
-    )
-    .await;
-    assert_eq!(code, axum::http::StatusCode::OK, "{paused}");
-    assert_eq!(paused["revision"], prior);
-    assert_eq!(paused["catchingUp"], true);
+    assert_eq!(status_code, axum::http::StatusCode::OK, "{status}");
+    assert_eq!(status["revision"], prior);
+    assert_eq!(status_headers["X-Trellis-Catching-Up"], "true");
     assert_eq!(
         published.request_by_id(&queued.id).unwrap().unwrap().state,
         "queued",
-        "pre-H read authority cannot claim the accepted FIFO head"
+        "pre-H selected reads cannot claim accepted FIFO work"
     );
-    resume_tx.send(()).unwrap();
+    release_tx.send(()).unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let (code, _, status) = selected_json(
@@ -3163,7 +3305,8 @@ async fn selected_reads_validated_predecessor_through_owner_handoff() {
             if code == axum::http::StatusCode::OK && status["catchingUp"] == false {
                 assert!(
                     status["revision"]["indexRevision"].as_u64().unwrap()
-                        > prior["indexRevision"].as_u64().unwrap()
+                        >= prior["indexRevision"].as_u64().unwrap() + 2,
+                    "mandatory H must publish before queued work"
                 );
                 break;
             }
@@ -3171,5 +3314,10 @@ async fn selected_reads_validated_predecessor_through_owner_handoff() {
         }
     })
     .await
-    .expect("new H never published");
+    .expect("local H and accepted FIFO head did not finish");
+    let finished = published.request_by_id(&queued.id).unwrap().unwrap();
+    assert_eq!(
+        (finished.id.as_str(), finished.seq, finished.state.as_str()),
+        (queued.id.as_str(), queued.seq, "done")
+    );
 }

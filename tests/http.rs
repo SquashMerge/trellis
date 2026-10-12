@@ -15,11 +15,20 @@ fn setup() -> (tempfile::TempDir, Store, Arc<http::DaemonState>, Router) {
     setup_with_tick(true)
 }
 
+// Forced maintenance ticks need sole control of the serving session and native stream.
+// The background queue tick can otherwise defer a forced tick without an error (#131).
+fn setup_without_tick() -> (tempfile::TempDir, Store, Arc<http::DaemonState>, Router) {
+    setup_with_tick(false)
+}
+
 fn setup_with_tick(start_tick: bool) -> (tempfile::TempDir, Store, Arc<http::DaemonState>, Router) {
     let dir = tempfile::tempdir().unwrap();
     let workspace = dir.path().join("workspace");
     std::fs::create_dir(&workspace).unwrap();
     let store = crate::common::open_store(&dir.path().join("state"), &workspace).unwrap();
+    // Daemon admission publishes the virgin queue before retaining writer SH
+    // or starting H. Later HTTP requests may then commit under that SH.
+    assert_eq!(store.settle_foreign_root_requests().unwrap(), 0);
     let state = http::new(
         store.clone(),
         IndexOptions::new(workspace),
@@ -27,7 +36,7 @@ fn setup_with_tick(start_tick: bool) -> (tempfile::TempDir, Store, Arc<http::Dae
         "127.0.0.1:7331".parse().unwrap(),
     )
     .unwrap();
-    let session = store.leader_session().unwrap();
+    let session = store.writer_session_for_tests().unwrap();
     if start_tick {
         state.retain_serving_session(session);
     } else {
@@ -216,7 +225,7 @@ async fn source_is_snapshot_and_revision_checked() {
             state
                 .retained_serving_session()
                 .unwrap()
-                .leader_guard()
+                .writer_guard()
                 .unwrap(),
             store.index_baseline().unwrap(),
             &cancel,
@@ -274,7 +283,7 @@ async fn dependency_status_whole_response_fence() {
             state
                 .retained_serving_session()
                 .unwrap()
-                .leader_guard()
+                .writer_guard()
                 .unwrap(),
             store.index_baseline().unwrap(),
             &cancel,
@@ -326,7 +335,8 @@ async fn queued_request_is_durable_and_non_cancellable_during_lock_contention() 
     std::fs::create_dir(&root).unwrap();
     std::fs::write(root.join("one.js"), "function one() {}\n").unwrap();
     let store = Store::open_for_tests(&dir.path().join("state"), &root).unwrap();
-    let held = store.leader_session().unwrap();
+    assert_eq!(store.settle_foreign_root_requests().unwrap(), 0);
+    let held = store.writer_session_for_tests().unwrap();
     let state = http::new(
         store.clone(),
         IndexOptions::new(root),
@@ -534,7 +544,7 @@ async fn live_control_corruption_returns_typed_503_and_hard_latches_clones() {
                 state
                     .retained_serving_session()
                     .unwrap()
-                    .leader_guard()
+                    .writer_guard()
                     .unwrap(),
                 store.index_baseline().unwrap(),
                 &cancel,
@@ -676,7 +686,7 @@ async fn finished_index_job(app: &Router, id: &str) -> Value {
 
 #[tokio::test]
 async fn explicit_recovery_without_startup_owner_rejects_pin_then_installs_same_new_leader() {
-    let (_dir, store, state, app, index, roots, identity, old) =
+    let (_dir, store, state, app, index, _roots, identity, old) =
         corrupt_recovery_fixture(false, true);
     assert!(state.retained_serving_session().is_err());
     let bytes = std::fs::read(&index).unwrap();
@@ -698,18 +708,16 @@ async fn explicit_recovery_without_startup_owner_rejects_pin_then_installs_same_
         done["revision"]["indexGeneration"],
         json!(old)["indexGeneration"]
     );
-    assert!(state.retained_serving_session().unwrap().is_leader());
+    assert!(state.retained_serving_session().unwrap().verify().is_ok());
     assert_eq!(
         store.status().unwrap().revision,
         serde_json::from_value(done["revision"].clone()).unwrap()
     );
-    assert!(
-        roots
-            .leader(&identity)
-            .unwrap_err()
-            .to_string()
-            .contains("storage_busy")
-    );
+    state
+        .retained_serving_session()
+        .unwrap()
+        .belongs_to(&identity)
+        .unwrap();
     let (ready, status) = call(&app, "GET", "/api/status", Value::Null).await;
     assert_eq!(ready, StatusCode::OK);
     assert_eq!(status["revision"], done["revision"]);
@@ -781,14 +789,12 @@ async fn explicit_recovery_releases_only_daemon_old_owner_and_retries_after_fore
         done["revision"]["indexGeneration"],
         json!(old)["indexGeneration"]
     );
-    assert!(state.retained_serving_session().unwrap().is_leader());
-    assert!(
-        roots
-            .leader(&identity)
-            .unwrap_err()
-            .to_string()
-            .contains("storage_busy")
-    );
+    assert!(state.retained_serving_session().unwrap().verify().is_ok());
+    state
+        .retained_serving_session()
+        .unwrap()
+        .belongs_to(&identity)
+        .unwrap();
 }
 
 #[tokio::test]
@@ -815,7 +821,7 @@ async fn index_request_without_startup_session_takes_over_after_ack() {
         store.status().unwrap().revision,
         serde_json::from_value(done["revision"].clone()).unwrap()
     );
-    assert!(state.retained_serving_session().unwrap().is_leader());
+    assert!(state.retained_serving_session().unwrap().verify().is_ok());
 }
 
 #[tokio::test]
@@ -839,7 +845,7 @@ async fn released_matching_pin_is_typed_http_conflict_without_head_fallback() {
                 &graph,
                 &capture,
                 &native,
-                session.leader_guard().unwrap(),
+                session.writer_guard().unwrap(),
                 expected,
                 &cancel,
             )
@@ -850,7 +856,7 @@ async fn released_matching_pin_is_typed_http_conflict_without_head_fallback() {
     let head = publish(old);
     store.set_retention_clock_for_tests(1_900, 900);
     store
-        .release_revision(old, session.leader_guard().unwrap())
+        .release_revision(old, session.writer_guard().unwrap())
         .unwrap();
     let path = |pin: IndexPin| {
         format!(
@@ -875,7 +881,7 @@ async fn released_matching_pin_is_typed_http_conflict_without_head_fallback() {
 
 #[tokio::test]
 async fn verified_leader_expires_due_pin_on_idle_tick_without_publication() {
-    let (dir, store, state, app) = setup();
+    let (dir, store, state, app) = setup_without_tick();
     let workspace = dir.path().join("workspace");
     std::fs::write(workspace.join("a.js"), "function idle() {}\n").unwrap();
     store.set_retention_clock_for_tests(1_000, 0);
@@ -894,7 +900,7 @@ async fn verified_leader_expires_due_pin_on_idle_tick_without_publication() {
                 &graph,
                 &capture,
                 &native,
-                session.leader_guard().unwrap(),
+                session.writer_guard().unwrap(),
                 expected,
                 &cancel,
             )
@@ -928,7 +934,7 @@ async fn verified_leader_expires_due_pin_on_idle_tick_without_publication() {
 #[tokio::test]
 async fn expired_pin_saved_items_require_explicit_head_reattachment() {
     // Control retention with the explicit clock and forced ticks below.
-    let (dir, store, state, app) = setup_with_tick(false);
+    let (dir, store, state, app) = setup_without_tick();
     let workspace = dir.path().join("workspace");
     std::fs::write(workspace.join("a.js"), "function seed() {}\n").unwrap();
     store.set_retention_clock_for_tests(1_000, 0);
@@ -947,7 +953,7 @@ async fn expired_pin_saved_items_require_explicit_head_reattachment() {
                 &graph,
                 &capture,
                 &native,
-                session.leader_guard().unwrap(),
+                session.writer_guard().unwrap(),
                 expected,
                 &cancel,
             )
@@ -1069,7 +1075,8 @@ async fn expired_pin_saved_items_require_explicit_head_reattachment() {
 
 #[tokio::test]
 async fn browser_claimed_unchanged_publishes_new_manifest_before_done() {
-    let (dir, store, state, app) = setup();
+    // Manually publish the first H before POST starts the periodic queue tick.
+    let (dir, store, state, app) = setup_without_tick();
     std::fs::write(
         dir.path().join("workspace/a.js"),
         "function unchanged() {}\n",
@@ -1116,49 +1123,6 @@ async fn browser_claimed_unchanged_publishes_new_manifest_before_done() {
     );
 }
 
-/// A separate CLI-like process commits Q2 to durable requests.db. Its stdout
-/// is a barrier: the parent never releases maintenance before Q2 is accepted.
-#[test]
-#[ignore]
-fn maintenance_external_fifo_child() {
-    use std::io::Write;
-    let root = std::path::PathBuf::from(std::env::var_os("TRELLIS_MAINTENANCE_ROOT").unwrap());
-    let state = std::path::PathBuf::from(std::env::var_os("TRELLIS_MAINTENANCE_STATE").unwrap());
-    let store = Store::open_for_tests(&state, &root).unwrap();
-    let queued = store
-        .enqueue_request(&IndexOptions::new(root), None)
-        .unwrap();
-    println!("MAINTENANCE_REQUEST_ID={}", queued.id);
-    std::io::stdout().flush().unwrap();
-}
-
-fn external_maintenance_request(root: &std::path::Path, state: &std::path::Path) -> String {
-    use std::io::BufRead;
-    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--ignored",
-            "--exact",
-            "maintenance_external_fifo_child",
-            "--nocapture",
-        ])
-        .env("TRELLIS_MAINTENANCE_ROOT", root)
-        .env("TRELLIS_MAINTENANCE_STATE", state)
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let stdout = child.stdout.take().unwrap();
-    let mut request = String::new();
-    for line in std::io::BufReader::new(stdout).lines() {
-        let line = line.unwrap();
-        if let Some(id) = line.strip_prefix("MAINTENANCE_REQUEST_ID=") {
-            request = id.to_owned();
-        }
-    }
-    assert!(child.wait().unwrap().success());
-    assert!(!request.is_empty());
-    request
-}
-
 #[test]
 fn gc_queued_before_candidate_yields_and_daily_stamp_defers_rescan() {
     use trellis::store::topology::{GcStage, TopologyRoots, WorkspaceIdentity};
@@ -1169,6 +1133,8 @@ fn gc_queued_before_candidate_yields_and_daily_stamp_defers_rescan() {
     std::fs::create_dir(&current_root).unwrap();
     std::fs::create_dir(&candidate_root).unwrap();
     let current_store = Store::open_for_tests(&state, &current_root).unwrap();
+    // GC observes an existing durable queue, as a daemon would after admission.
+    assert_eq!(current_store.settle_foreign_root_requests().unwrap(), 0);
     let candidate_store = Store::open_for_tests(&state, &candidate_root).unwrap();
     let roots = TopologyRoots::isolated_for_tests(state.join("cache"), state.join("data"));
     let current = WorkspaceIdentity::discover(Some(&current_root), &current_root).unwrap();
@@ -1186,20 +1152,26 @@ fn gc_queued_before_candidate_yields_and_daily_stamp_defers_rescan() {
             [now - 31 * 86_400],
         )
         .unwrap();
-    let session = current_store.leader_session().unwrap();
+    let session = current_store.writer_session_for_tests().unwrap();
     let probe = current_store.open_maintenance_queue_probe().unwrap();
     let mut reached = 0;
     let mut hook = |stage| -> anyhow::Result<()> {
         if stage == GcStage::BeforeCandidate {
             reached += 1;
-            let _id = external_maintenance_request(&current_root, &state);
-            assert_ne!(probe.check(), trellis::store::MaintenanceQueueState::Clear);
+            let queued = current_store
+                .enqueue_request(&IndexOptions::new(current_root.clone()), None)
+                .unwrap();
+            assert_eq!(queued.state, "queued");
+            assert_eq!(
+                probe.check(),
+                trellis::store::MaintenanceQueueState::Pending
+            );
             anyhow::bail!("maintenance deferred for publication");
         }
         Ok(())
     };
     let error = roots
-        .automatic_gc_at_with_hook(&current, session.leader_guard().unwrap(), now, &mut hook)
+        .automatic_gc_at_with_hook(&current, session.writer_guard().unwrap(), now, &mut hook)
         .unwrap_err();
     assert!(error.to_string().contains("maintenance deferred"));
     assert_eq!(reached, 1);
@@ -1210,7 +1182,7 @@ fn gc_queued_before_candidate_yields_and_daily_stamp_defers_rescan() {
     let mut same_day = 0;
     assert_eq!(
         roots
-            .automatic_gc_at_with_hook(&current, session.leader_guard().unwrap(), now, &mut |_| {
+            .automatic_gc_at_with_hook(&current, session.writer_guard().unwrap(), now, &mut |_| {
                 same_day += 1;
                 Ok(())
             })
@@ -1221,7 +1193,7 @@ fn gc_queued_before_candidate_yields_and_daily_stamp_defers_rescan() {
     let mut next_day = 0;
     let next = roots.automatic_gc_at_with_hook(
         &current,
-        session.leader_guard().unwrap(),
+        session.writer_guard().unwrap(),
         now + 86_400,
         &mut |stage| {
             if stage == GcStage::BeforeCandidate {

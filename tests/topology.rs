@@ -396,291 +396,6 @@ fn exclusive_recovery_reader_child() {
 }
 
 #[test]
-fn exceptional_recovery_requires_closed_readers_and_retains_both_lock_inodes() {
-    use std::{
-        io::{BufRead, BufReader},
-        os::unix::fs::MetadataExt,
-    };
-    let (temp, roots) = common::fixture();
-    let work = root(temp.path());
-    let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
-    let old = roots.leader(&identity).unwrap();
-    let leader_path = roots.leader_lock(&identity);
-    let use_path = roots.index_use_lock(&identity);
-    let old_incarnation = old.incarnation;
-    let inode_of = |path: &Path| {
-        let meta = fs::metadata(path).unwrap();
-        (meta.dev(), meta.ino())
-    };
-    let leader_inode = inode_of(&leader_path);
-    let use_inode = inode_of(&use_path);
-    drop(old);
-
-    let mut child = Command::new(std::env::current_exe().unwrap())
-        .arg("--exact")
-        .arg("exclusive_recovery_reader_child")
-        .arg("--nocapture")
-        .env("TOPOLOGY_RECOVERY_READER", &use_path)
-        .stdout(Stdio::piped())
-        .stdin(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut reader = BufReader::new(child.stdout.take().unwrap());
-    loop {
-        let mut line = String::new();
-        assert_ne!(reader.read_line(&mut line).unwrap(), 0);
-        if line.contains("READER_READY") {
-            break;
-        }
-    }
-    let error = roots.index_use_exclusive_existing(&identity).unwrap_err();
-    assert!(error.to_string().contains("storage_busy"), "{error:#}");
-    assert_eq!(inode_of(&leader_path), leader_inode);
-    assert_eq!(inode_of(&use_path), use_inode);
-    assert_eq!(
-        fs::read(&leader_path).unwrap(),
-        old_incarnation.to_string().as_bytes()
-    );
-    child.stdin.take().unwrap().write_all(&[1]).unwrap();
-    assert!(child.wait().unwrap().success());
-
-    let unrelated = UseGuard::acquire_existing(&leader_path, true, true).unwrap();
-    let exclusive = roots.index_use_exclusive_existing(&identity).unwrap();
-    let error = roots
-        .leader_under_exclusive(&identity, exclusive)
-        .unwrap_err();
-    assert!(error.to_string().contains("storage_busy"), "{error:#}");
-    assert_eq!(
-        fs::read(&leader_path).unwrap(),
-        old_incarnation.to_string().as_bytes()
-    );
-    drop(unrelated);
-
-    let exclusive = roots.index_use_exclusive_existing(&identity).unwrap();
-    let mut leader = roots.leader_under_exclusive(&identity, exclusive).unwrap();
-    assert_ne!(leader.incarnation, old_incarnation);
-    assert_eq!(
-        fs::read(&leader_path).unwrap(),
-        leader.incarnation.to_string().as_bytes()
-    );
-    assert_eq!(inode_of(&leader_path), leader_inode);
-    assert_eq!(inode_of(&use_path), use_inode);
-    assert!(UseGuard::acquire_existing(&use_path, false, true).is_err());
-    leader.verify_exclusive_use(&use_path).unwrap();
-    leader.downgrade_use_to_shared().unwrap();
-    assert!(leader.verify_exclusive_use(&use_path).is_err());
-    leader.verify().unwrap();
-    let reader = UseGuard::acquire_existing(&use_path, false, true).unwrap();
-    drop(reader);
-    let mut after = Command::new(std::env::current_exe().unwrap())
-        .arg("--exact")
-        .arg("exclusive_recovery_reader_child")
-        .arg("--nocapture")
-        .env("TOPOLOGY_RECOVERY_READER", &use_path)
-        .stdout(Stdio::piped())
-        .stdin(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut after_reader = BufReader::new(after.stdout.take().unwrap());
-    loop {
-        let mut line = String::new();
-        assert_ne!(after_reader.read_line(&mut line).unwrap(), 0);
-        if line.contains("READER_READY") {
-            break;
-        }
-    }
-    assert!(roots.index_use_exclusive_existing(&identity).is_err());
-    assert!(
-        roots
-            .leader(&identity)
-            .unwrap_err()
-            .to_string()
-            .contains("storage_busy")
-    );
-    assert_eq!(inode_of(&leader_path), leader_inode);
-    assert_eq!(inode_of(&use_path), use_inode);
-    after.stdin.take().unwrap().write_all(&[1]).unwrap();
-    assert!(after.wait().unwrap().success());
-    drop(leader);
-    roots.leader(&identity).unwrap().verify().unwrap();
-}
-
-#[test]
-fn exceptional_leader_refuses_missing_or_unsafe_retained_path_without_creation() {
-    use std::os::unix::fs::symlink;
-    let (temp, roots) = common::fixture();
-    let work = root(temp.path());
-    let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
-    roots.prepare_index(&identity).unwrap();
-    assert!(roots.index_use_exclusive_existing(&identity).is_err());
-    assert!(!roots.index_use_lock(&identity).exists());
-    let leader = roots.leader(&identity).unwrap();
-    drop(leader);
-    let shared = roots.index_use_existing(&identity).unwrap();
-    let error = roots.leader_under_exclusive(&identity, shared).unwrap_err();
-    assert!(error.to_string().contains("unsafe_index"), "{error:#}");
-    let wrong_work = temp.path().join("wrong-work");
-    fs::create_dir(&wrong_work).unwrap();
-    let wrong = WorkspaceIdentity::discover(Some(&wrong_work), &wrong_work).unwrap();
-    let exclusive = roots.index_use_exclusive_existing(&identity).unwrap();
-    let error = roots.leader_under_exclusive(&wrong, exclusive).unwrap_err();
-    assert!(error.to_string().contains("unsafe_index"), "{error:#}");
-    let path = roots.leader_lock(&identity);
-    fs::remove_file(&path).unwrap();
-    let exclusive = roots.index_use_exclusive_existing(&identity).unwrap();
-    assert!(roots.leader_under_exclusive(&identity, exclusive).is_err());
-    assert!(!path.exists());
-    symlink(temp.path().join("other"), &path).unwrap();
-    let exclusive = roots.index_use_exclusive_existing(&identity).unwrap();
-    assert!(roots.leader_under_exclusive(&identity, exclusive).is_err());
-    assert!(
-        fs::symlink_metadata(&path)
-            .unwrap()
-            .file_type()
-            .is_symlink()
-    );
-}
-
-#[test]
-fn multiprocess_lock_protocol() {
-    let (temp, roots) = common::fixture();
-    let work = root(temp.path());
-    let id = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
-    let leader = roots.leader(&id).unwrap();
-    leader.verify().unwrap();
-    assert_eq!(
-        fs::read(roots.leader_lock(&id)).unwrap(),
-        leader.incarnation.to_string().as_bytes()
-    );
-    assert!(roots.leader(&id).is_err());
-    assert!(UseGuard::acquire(&roots.index_use_lock(&id), true, true).is_err());
-    drop(leader);
-    let next = roots.leader(&id).unwrap();
-    assert_ne!(
-        next.incarnation.to_string(),
-        "00000000-0000-0000-0000-000000000000"
-    );
-    drop(next);
-    let exclusive = UseGuard::acquire(&roots.index_use_lock(&id), true, true).unwrap();
-    exclusive.remove_last().unwrap();
-    assert!(!roots.index_use_lock(&id).exists());
-}
-
-#[test]
-fn leader_child() {
-    if let Some(path) = std::env::var_os("TOPOLOGY_LEADER_CHILD") {
-        let base = Path::new(&path);
-        let roots = trellis::store::topology::TopologyRoots::isolated_for_tests(
-            base.join("cache"),
-            base.join("data"),
-        );
-        let work = base.join("work");
-        let id = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
-        let guard = if std::env::var_os("TOPOLOGY_PAUSE_BEFORE_WRITE").is_some() {
-            roots
-                .leader_with_hooks(
-                    &id,
-                    || {
-                        println!("BEFORE_WRITE");
-                        std::io::stdout().flush().unwrap();
-                        let mut byte = [0];
-                        std::io::stdin().read_exact(&mut byte).unwrap();
-                        Ok(())
-                    },
-                    || Ok(()),
-                )
-                .unwrap()
-        } else {
-            roots.leader(&id).unwrap()
-        };
-        println!("READY={}", guard.incarnation);
-        std::io::stdout().flush().unwrap();
-        let mut byte = [0];
-        std::io::stdin().read_exact(&mut byte).unwrap();
-        guard.verify().unwrap();
-    }
-}
-#[test]
-fn suspended_leader_is_not_displaced() {
-    let (temp, roots) = common::fixture();
-    let work = root(temp.path());
-    let id = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
-    let mut child = Command::new(std::env::current_exe().unwrap())
-        .arg("--exact")
-        .arg("leader_child")
-        .arg("--nocapture")
-        .env("TOPOLOGY_LEADER_CHILD", temp.path())
-        .stdout(Stdio::piped())
-        .stdin(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut output = String::new();
-    use std::io::BufRead;
-    let mut reader = std::io::BufReader::new(child.stdout.take().unwrap());
-    loop {
-        let mut line = String::new();
-        assert_ne!(reader.read_line(&mut line).unwrap(), 0);
-        output.push_str(&line);
-        if line.contains("READY=") {
-            break;
-        }
-    }
-    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGSTOP) }, 0);
-    assert!(
-        roots
-            .leader(&id)
-            .unwrap_err()
-            .to_string()
-            .contains("storage_busy")
-    );
-    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGCONT) }, 0);
-    child.stdin.take().unwrap().write_all(&[1]).unwrap();
-    assert!(child.wait().unwrap().success());
-    let next = roots.leader(&id).unwrap();
-    assert!(!output.contains(&format!("READY={}", next.incarnation)));
-}
-#[test]
-fn pause_before_incarnation_and_sync_fault() {
-    let (temp, roots) = common::fixture();
-    let work = root(temp.path());
-    let id = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
-    let mut child = Command::new(std::env::current_exe().unwrap())
-        .arg("--exact")
-        .arg("leader_child")
-        .arg("--nocapture")
-        .env("TOPOLOGY_LEADER_CHILD", temp.path())
-        .env("TOPOLOGY_PAUSE_BEFORE_WRITE", "1")
-        .stdout(Stdio::piped())
-        .stdin(Stdio::piped())
-        .spawn()
-        .unwrap();
-    use std::io::BufRead;
-    let mut reader = std::io::BufReader::new(child.stdout.take().unwrap());
-    loop {
-        let mut line = String::new();
-        assert_ne!(reader.read_line(&mut line).unwrap(), 0);
-        if line.contains("BEFORE_WRITE") {
-            break;
-        }
-    }
-    assert_eq!(fs::read(roots.leader_lock(&id)).unwrap(), b"");
-    assert!(
-        roots
-            .leader(&id)
-            .unwrap_err()
-            .to_string()
-            .contains("storage_busy")
-    );
-    child.stdin.take().unwrap().write_all(&[1, 1]).unwrap();
-    assert!(child.wait().unwrap().success());
-    let error = roots
-        .leader_with_hooks(&id, || Ok(()), || anyhow::bail!("injected sync failure"))
-        .unwrap_err();
-    assert!(error.to_string().contains("incarnation_not_durable"));
-    roots.leader(&id).unwrap().verify().unwrap();
-}
-
-#[test]
 fn external_write_destinations() {
     let (temp, roots) = common::fixture();
     let work = root(temp.path());
@@ -818,7 +533,7 @@ fn shared_use_cannot_remove_last_and_live_holder_blocks_exclusive() {
 }
 
 #[test]
-fn stale_inode_waiters_reopen_before_success() {
+fn stale_use_inode_waiters_reopen_before_success() {
     use std::io::{BufRead, BufReader};
     let (temp, roots) = common::fixture();
     let work = root(temp.path());
@@ -854,35 +569,6 @@ fn stale_inode_waiters_reopen_before_success() {
     let mut rest = String::new();
     reader.read_to_string(&mut rest).unwrap();
     assert!(rest.contains("NEW_INODE_VERIFIED"), "{rest}");
-
-    // The leader opens its old inode while paused. Replace it before flock.
-    let mut child = Command::new(std::env::current_exe().unwrap())
-        .arg("--exact")
-        .arg("stale_leader_child")
-        .arg("--nocapture")
-        .env("TOPOLOGY_STALE_LEADER", temp.path())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut reader = BufReader::new(child.stdout.take().unwrap());
-    loop {
-        line.clear();
-        assert_ne!(reader.read_line(&mut line).unwrap(), 0);
-        if line.contains("LEADER_OLD_OPEN") {
-            break;
-        }
-    }
-    let leader_path = roots.leader_lock(&identity);
-    fs::remove_file(&leader_path).unwrap();
-    fs::write(&leader_path, "").unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(&leader_path, fs::Permissions::from_mode(0o600)).unwrap();
-    child.stdin.take().unwrap().write_all(&[1]).unwrap();
-    assert!(child.wait().unwrap().success());
-    let mut rest = String::new();
-    reader.read_to_string(&mut rest).unwrap();
-    assert!(rest.contains("LEADER_NEW_VERIFIED"), "{rest}");
 }
 
 #[test]
@@ -901,61 +587,6 @@ fn stale_use_child() {
         println!("NEW_INODE_VERIFIED");
     }
 }
-#[test]
-fn stale_leader_child() {
-    if let Some(path) = std::env::var_os("TOPOLOGY_STALE_LEADER") {
-        let base = Path::new(&path);
-        let roots = trellis::store::topology::TopologyRoots::isolated_for_tests(
-            base.join("cache"),
-            base.join("data"),
-        );
-        let work = base.join("work");
-        let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
-        let guard = roots
-            .leader_with_lock_hook(
-                &identity,
-                || {
-                    println!("LEADER_OLD_OPEN");
-                    std::io::stdout().flush()?;
-                    let mut byte = [0];
-                    std::io::stdin().read_exact(&mut byte)?;
-                    Ok(())
-                },
-                || Ok(()),
-                || Ok(()),
-            )
-            .unwrap();
-        guard.verify().unwrap();
-        println!("LEADER_NEW_VERIFIED");
-    }
-}
-
-#[test]
-fn verified_follower_requires_held_matching_leader_inode_and_incarnation() {
-    use std::sync::Arc;
-    let (temp, roots) = common::fixture();
-    let work = root(temp.path());
-    let identity = Arc::new(WorkspaceIdentity::discover(Some(&work), &work).unwrap());
-    let leader = roots.leader(&identity).unwrap();
-    let follower = roots.follower(identity.clone()).unwrap();
-    follower.verify(leader.incarnation).unwrap();
-
-    drop(leader);
-    let error = follower.verify(follower.incarnation).unwrap_err();
-    assert!(error.to_string().contains("index_not_ready"), "{error:#}");
-
-    let leader = roots.leader(&identity).unwrap();
-    let follower = roots.follower(identity.clone()).unwrap();
-    fs::write(
-        roots.leader_lock(&identity),
-        uuid::Uuid::new_v4().to_string(),
-    )
-    .unwrap();
-    let error = follower.verify(follower.incarnation).unwrap_err();
-    assert!(error.to_string().contains("incarnation"), "{error:#}");
-    drop(leader);
-}
-
 #[test]
 fn exclusive_deletion_waits_for_shared_process() {
     use std::io::{BufRead, BufReader};
@@ -1564,8 +1195,9 @@ fn index_delete_journal_no_wal() {
             .contains("index_not_ready")
     );
 }
+#[cfg(feature = "test-support")]
 #[test]
-fn leader_records_open_age_and_follower_preserves_it() {
+fn writer_records_open_age_and_reopen_preserves_it() {
     let base = tempfile::tempdir().unwrap();
     let work = root(base.path());
     let state = base.path().join("state");
@@ -1593,26 +1225,29 @@ fn leader_records_open_age_and_follower_preserves_it() {
             .to_string()
             .contains("index_not_ready")
     );
-    let leader = store.leader().unwrap();
+    let writer = store.publication_for_tests().unwrap();
     let age = read_age();
     assert!(age > 0);
-    drop(leader);
+    drop(writer);
     drop(store);
-    let follower = common::open_store(&state, &work).unwrap();
+    let reopened = common::open_store(&state, &work).unwrap();
     assert_eq!(read_age(), age);
-    assert_eq!(follower.index_baseline().unwrap(), baseline);
-    let leader = follower.leader().unwrap();
+    assert_eq!(reopened.index_baseline().unwrap(), baseline);
+    let writer = reopened.publication_for_tests().unwrap();
     assert!(read_age() >= age);
-    assert_eq!(follower.index_baseline().unwrap(), baseline);
-    drop(leader);
+    assert_eq!(reopened.index_baseline().unwrap(), baseline);
+    drop(writer);
 }
 
+#[cfg(feature = "test-support")]
 #[test]
 fn guard_drop_unlocks_even_when_fork_child_keeps_descriptor() {
     let (temp, roots) = common::fixture();
     let work = root(temp.path());
     let id = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
-    let guard = roots.leader(&id).unwrap();
+    let guard = roots
+        .writer(std::sync::Arc::new(id.verified_clone_for_tests().unwrap()))
+        .unwrap();
     let mut pipe = [0; 2];
     assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
     let child = unsafe { libc::fork() };
@@ -1627,7 +1262,9 @@ fn guard_drop_unlocks_even_when_fork_child_keeps_descriptor() {
     drop(guard);
     let exclusive = UseGuard::acquire_existing(&roots.index_use_lock(&id), true, true).unwrap();
     drop(exclusive);
-    let next = roots.leader(&id).unwrap();
+    let next = roots
+        .writer(std::sync::Arc::new(id.verified_clone_for_tests().unwrap()))
+        .unwrap();
     drop(next);
     unsafe { libc::close(pipe[1]) };
     let mut status = 0;
@@ -2934,14 +2571,15 @@ fn server_updates_recapture_after_confirmed_delete_and_reject_stale_raw_input() 
     );
 }
 
+#[cfg(feature = "test-support")]
 #[test]
 fn gc_report_accepts_current_v8_retention_extension_but_rejects_bad_inventory() {
     let (temp, roots) = common::fixture();
     let work = root(temp.path());
     let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
     let store = common::open_store(temp.path(), &work).unwrap();
-    let leader = store.leader().unwrap();
-    drop(leader);
+    let writer = store.publication_for_tests().unwrap();
+    drop(writer);
     drop(store);
     let db = rusqlite::Connection::open(roots.index_db(&identity)).unwrap();
     let now = 1_800_000_000_i64;
@@ -2966,6 +2604,7 @@ fn gc_report_accepts_current_v8_retention_extension_but_rejects_bad_inventory() 
     assert_eq!(inspect().reason, "recent_open");
 }
 
+#[cfg(feature = "test-support")]
 #[test]
 fn automatic_gc_reports_but_never_deletes_older_or_alternate_historical_indexes() {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -2989,9 +2628,15 @@ fn automatic_gc_reports_but_never_deletes_older_or_alternate_historical_indexes(
         let workspace = temp.path().join(name);
         fs::create_dir(&workspace).unwrap();
         let identity = WorkspaceIdentity::discover(Some(&workspace), &workspace).unwrap();
-        // Create the same private use/leader inodes as an actual old candidate,
+        // Create the private use-lock inode of an actual old candidate,
         // without opening a v9 Store that would retain the old index.db inode.
-        drop(roots.leader(&identity).unwrap());
+        drop(
+            roots
+                .writer(std::sync::Arc::new(
+                    identity.verified_clone_for_tests().unwrap(),
+                ))
+                .unwrap(),
+        );
         let path = roots.index_db(&identity);
         let db = rusqlite::Connection::open(&path).unwrap();
         db.execute_batch(ddl).unwrap();
@@ -3009,7 +2654,11 @@ fn automatic_gc_reports_but_never_deletes_older_or_alternate_historical_indexes(
     fs::create_dir(&current_root).unwrap();
     drop(common::open_store(temp.path(), &current_root).unwrap());
     let current = WorkspaceIdentity::discover(Some(&current_root), &current_root).unwrap();
-    let leader = roots.leader(&current).unwrap();
+    let writer = roots
+        .writer(std::sync::Arc::new(
+            current.verified_clone_for_tests().unwrap(),
+        ))
+        .unwrap();
     for (identity, _, _, _) in &candidates {
         let entry = roots
             .gc_report_at(now)
@@ -3020,7 +2669,7 @@ fn automatic_gc_reports_but_never_deletes_older_or_alternate_historical_indexes(
             .unwrap();
         assert_eq!((entry.status, entry.reason), ("eligible", "age_30_days"));
     }
-    assert_eq!(roots.automatic_gc_at(&current, &leader, now).unwrap(), 0);
+    assert_eq!(roots.automatic_gc_at(&current, &writer, now).unwrap(), 0);
     for (identity, path, inode, bytes) in candidates {
         assert_eq!(
             fs::metadata(&path).unwrap().ino(),
@@ -3038,23 +2687,40 @@ fn automatic_gc_reports_but_never_deletes_older_or_alternate_historical_indexes(
     }
 }
 
+#[cfg(feature = "test-support")]
 #[test]
 fn automatic_gc_only_eligible_exact_private_indexes() {
     let (temp, roots) = common::fixture();
     let old = root(temp.path());
     let old_id = WorkspaceIdentity::discover(Some(&old), &old).unwrap();
     drop(common::open_store(temp.path(), &old).unwrap());
-    drop(roots.leader(&old_id).unwrap());
+    drop(
+        roots
+            .writer(std::sync::Arc::new(
+                old_id.verified_clone_for_tests().unwrap(),
+            ))
+            .unwrap(),
+    );
     let recent = temp.path().join("recent");
     fs::create_dir(&recent).unwrap();
     let recent_id = WorkspaceIdentity::discover(Some(&recent), &recent).unwrap();
     drop(common::open_store(temp.path(), &recent).unwrap());
-    drop(roots.leader(&recent_id).unwrap());
+    drop(
+        roots
+            .writer(std::sync::Arc::new(
+                recent_id.verified_clone_for_tests().unwrap(),
+            ))
+            .unwrap(),
+    );
     let current = temp.path().join("current");
     fs::create_dir(&current).unwrap();
     let current_store = common::open_store(temp.path(), &current).unwrap();
     let current_id = WorkspaceIdentity::discover(Some(&current), &current).unwrap();
-    let leader = roots.leader(&current_id).unwrap();
+    let writer = roots
+        .writer(std::sync::Arc::new(
+            current_id.verified_clone_for_tests().unwrap(),
+        ))
+        .unwrap();
     let now = 1_800_000_000_i64;
     rusqlite::Connection::open(roots.index_db(&old_id))
         .unwrap()
@@ -3071,7 +2737,7 @@ fn automatic_gc_only_eligible_exact_private_indexes() {
         )
         .unwrap();
     let durable_before = gc_manifest(&roots.data);
-    assert_eq!(current_store.automatic_gc_at(&leader, now).unwrap(), 1);
+    assert_eq!(current_store.automatic_gc_at(&writer, now).unwrap(), 1);
     let stamp = roots.cache.join("gc-last-run");
     assert_eq!(fs::read_to_string(&stamp).unwrap(), format!("{now}\n"));
     use std::os::unix::fs::MetadataExt;
@@ -3081,19 +2747,19 @@ fn automatic_gc_only_eligible_exact_private_indexes() {
     assert!(roots.index_dir(&recent_id).exists(), "recent root remains");
     assert!(
         roots.index_dir(&current_id).exists(),
-        "leader's own root remains"
+        "current writer root remains"
     );
     assert_eq!(durable_before, gc_manifest(&roots.data));
     assert_eq!(
         current_store
-            .automatic_gc_at(&leader, now + 86_399)
+            .automatic_gc_at(&writer, now + 86_399)
             .unwrap(),
         0
     );
     assert!(roots.index_dir(&recent_id).exists());
     assert_eq!(
         current_store
-            .automatic_gc_at(&leader, now + 86_400)
+            .automatic_gc_at(&writer, now + 86_400)
             .unwrap(),
         1
     );
@@ -3103,13 +2769,18 @@ fn automatic_gc_only_eligible_exact_private_indexes() {
     );
 }
 
+#[cfg(feature = "test-support")]
 #[test]
 fn automatic_gc_rejects_unknown_shapes_busy_and_hot_files() {
     let (temp, roots) = common::fixture();
     let current = root(temp.path());
     let store = common::open_store(temp.path(), &current).unwrap();
     let current_id = WorkspaceIdentity::discover(Some(&current), &current).unwrap();
-    let leader = roots.leader(&current_id).unwrap();
+    let writer = roots
+        .writer(std::sync::Arc::new(
+            current_id.verified_clone_for_tests().unwrap(),
+        ))
+        .unwrap();
     let now = 1_800_000_000_i64;
     let mut held_locks = Vec::new();
     for (n, case) in [
@@ -3138,7 +2809,11 @@ fn automatic_gc_rejects_unknown_shapes_busy_and_hot_files() {
                 .unwrap();
         }
         drop(candidate);
-        drop(roots.leader(&id).unwrap());
+        drop(
+            roots
+                .writer(std::sync::Arc::new(id.verified_clone_for_tests().unwrap()))
+                .unwrap(),
+        );
         let index = roots.index_db(&id);
         rusqlite::Connection::open(&index)
             .unwrap()
@@ -3206,7 +2881,7 @@ fn automatic_gc_rejects_unknown_shapes_busy_and_hot_files() {
         }
         assert_eq!(
             store
-                .automatic_gc_at(&leader, now + n as i64 * 86_400)
+                .automatic_gc_at(&writer, now + n as i64 * 86_400)
                 .unwrap(),
             0,
             "{case}"
@@ -3226,20 +2901,31 @@ fn automatic_gc_rejects_unknown_shapes_busy_and_hot_files() {
     }
 }
 
+#[cfg(feature = "test-support")]
 #[test]
 fn automatic_gc_missing_or_replaced_root_is_alternate_eligibility() {
     let (temp, roots) = common::fixture();
     let current = root(temp.path());
     let store = common::open_store(temp.path(), &current).unwrap();
     let current_id = WorkspaceIdentity::discover(Some(&current), &current).unwrap();
-    let leader = roots.leader(&current_id).unwrap();
+    let writer = roots
+        .writer(std::sync::Arc::new(
+            current_id.verified_clone_for_tests().unwrap(),
+        ))
+        .unwrap();
     let mut candidates = Vec::new();
     for case in ["missing", "replaced"] {
         let path = temp.path().join(case);
         fs::create_dir(&path).unwrap();
         let identity = WorkspaceIdentity::discover(Some(&path), &path).unwrap();
         drop(common::open_store(temp.path(), &path).unwrap());
-        drop(roots.leader(&identity).unwrap());
+        drop(
+            roots
+                .writer(std::sync::Arc::new(
+                    identity.verified_clone_for_tests().unwrap(),
+                ))
+                .unwrap(),
+        );
         // Keep recent last_opened_at: lost root is an independent eligible case.
         fs::rename(&path, temp.path().join(format!("{case}-moved"))).unwrap();
         if case == "replaced" {
@@ -3251,32 +2937,38 @@ fn automatic_gc_missing_or_replaced_root_is_alternate_eligibility() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64;
-    assert_eq!(store.automatic_gc_at(&leader, now).unwrap(), 2);
+    assert_eq!(store.automatic_gc_at(&writer, now).unwrap(), 2);
     for identity in candidates {
         assert!(!roots.index_dir(&identity).exists());
         assert!(!roots.index_use_lock(&identity).exists());
     }
 }
 
+#[cfg(feature = "test-support")]
 #[test]
 fn automatic_gc_refuses_malformed_or_future_attempt_stamp() {
     let (temp, roots) = common::fixture();
     let work = root(temp.path());
     let store = common::open_store(temp.path(), &work).unwrap();
     let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
-    let leader = roots.leader(&identity).unwrap();
+    let writer = roots
+        .writer(std::sync::Arc::new(
+            identity.verified_clone_for_tests().unwrap(),
+        ))
+        .unwrap();
     let now = 1_800_000_000_i64;
-    assert_eq!(store.automatic_gc_at(&leader, now).unwrap(), 0);
+    assert_eq!(store.automatic_gc_at(&writer, now).unwrap(), 0);
     let stamp = roots.cache.join("gc-last-run");
     let original = fs::read(&stamp).unwrap();
-    assert!(store.automatic_gc_at(&leader, now - 1).is_err());
+    assert!(store.automatic_gc_at(&writer, now - 1).is_err());
     assert_eq!(fs::read(&stamp).unwrap(), original);
     fs::write(&stamp, b"broken\n").unwrap();
-    assert!(store.automatic_gc_at(&leader, now + 86_400).is_err());
+    assert!(store.automatic_gc_at(&writer, now + 86_400).is_err());
     assert_eq!(fs::read(&stamp).unwrap(), b"broken\n");
     assert!(roots.index_dir(&identity).exists());
 }
 
+#[cfg(feature = "test-support")]
 #[test]
 fn attempt2_gc_rechecks_current_root_at_final_unlink() {
     use trellis::store::topology::GcStage;
@@ -3284,12 +2976,22 @@ fn attempt2_gc_rechecks_current_root_at_final_unlink() {
     let current = root(temp.path());
     let store = common::open_store(temp.path(), &current).unwrap();
     let current_id = WorkspaceIdentity::discover(Some(&current), &current).unwrap();
-    let leader = roots.leader(&current_id).unwrap();
+    let writer = roots
+        .writer(std::sync::Arc::new(
+            current_id.verified_clone_for_tests().unwrap(),
+        ))
+        .unwrap();
     let old = temp.path().join("old");
     fs::create_dir(&old).unwrap();
     let old_id = WorkspaceIdentity::discover(Some(&old), &old).unwrap();
     drop(common::open_store(temp.path(), &old).unwrap());
-    drop(roots.leader(&old_id).unwrap());
+    drop(
+        roots
+            .writer(std::sync::Arc::new(
+                old_id.verified_clone_for_tests().unwrap(),
+            ))
+            .unwrap(),
+    );
     let now = 1_800_000_000_i64;
     let index = roots.index_db(&old_id);
     rusqlite::Connection::open(&index)
@@ -3302,7 +3004,7 @@ fn attempt2_gc_rechecks_current_root_at_final_unlink() {
     let before = fs::read(&index).unwrap();
     let candidate_before = gc_manifest(&roots.index_dir(&old_id));
     let mut calls = 0;
-    let result = roots.automatic_gc_at_with_hook(&current_id, &leader, now, &mut |stage| {
+    let result = roots.automatic_gc_at_with_hook(&current_id, &writer, now, &mut |stage| {
         if stage == GcStage::BeforeCandidateUnlink {
             calls += 1;
             fs::rename(&current, temp.path().join("moved-current"))?;
@@ -3321,64 +3023,29 @@ fn attempt2_gc_rechecks_current_root_at_final_unlink() {
     drop(store);
 }
 
-#[test]
-fn attempt2_gc_rechecks_current_leader_at_final_unlink() {
-    use trellis::store::topology::GcStage;
-    let (temp, roots) = common::fixture();
-    let current = root(temp.path());
-    drop(common::open_store(temp.path(), &current).unwrap());
-    let current_id = WorkspaceIdentity::discover(Some(&current), &current).unwrap();
-    let leader = roots.leader(&current_id).unwrap();
-    let old = temp.path().join("old");
-    fs::create_dir(&old).unwrap();
-    let old_id = WorkspaceIdentity::discover(Some(&old), &old).unwrap();
-    drop(common::open_store(temp.path(), &old).unwrap());
-    drop(roots.leader(&old_id).unwrap());
-    let now = 1_800_000_000_i64;
-    let index = roots.index_db(&old_id);
-    rusqlite::Connection::open(&index)
-        .unwrap()
-        .execute(
-            "UPDATE index_metadata SET last_opened_at=?1",
-            [now - 31 * 24 * 60 * 60],
-        )
-        .unwrap();
-    let before = fs::read(&index).unwrap();
-    let candidate_before = gc_manifest(&roots.index_dir(&old_id));
-    let mut calls = 0;
-    let result = roots.automatic_gc_at_with_hook(&current_id, &leader, now, &mut |stage| {
-        if stage == GcStage::BeforeCandidateUnlink {
-            calls += 1;
-            fs::rename(
-                roots.leader_lock(&current_id),
-                temp.path().join("retired-leader"),
-            )?;
-        }
-        Ok(())
-    });
-    assert_eq!(calls, 1);
-    assert!(result.is_err(), "replaced leader path must abort deletion");
-    assert_eq!(fs::read(&index).unwrap(), before);
-    assert_eq!(
-        gc_manifest(&roots.index_dir(&old_id)),
-        candidate_before,
-        "all candidate pathnames and bytes must remain untouched"
-    );
-    assert!(roots.index_use_lock(&old_id).exists());
-}
-
+#[cfg(feature = "test-support")]
 #[test]
 fn attempt2_gc_existing_empty_stamp_must_not_scan() {
     let (temp, roots) = common::fixture();
     let current = root(temp.path());
     drop(common::open_store(temp.path(), &current).unwrap());
     let current_id = WorkspaceIdentity::discover(Some(&current), &current).unwrap();
-    let leader = roots.leader(&current_id).unwrap();
+    let writer = roots
+        .writer(std::sync::Arc::new(
+            current_id.verified_clone_for_tests().unwrap(),
+        ))
+        .unwrap();
     let old = temp.path().join("old");
     fs::create_dir(&old).unwrap();
     let old_id = WorkspaceIdentity::discover(Some(&old), &old).unwrap();
     drop(common::open_store(temp.path(), &old).unwrap());
-    drop(roots.leader(&old_id).unwrap());
+    drop(
+        roots
+            .writer(std::sync::Arc::new(
+                old_id.verified_clone_for_tests().unwrap(),
+            ))
+            .unwrap(),
+    );
     let now = 1_800_000_000_i64;
     let index = roots.index_db(&old_id);
     rusqlite::Connection::open(&index)
@@ -3393,10 +3060,11 @@ fn attempt2_gc_existing_empty_stamp_must_not_scan() {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(&stamp, fs::Permissions::from_mode(0o600)).unwrap();
     let before = fs::read(&index).unwrap();
-    assert!(roots.automatic_gc_at(&current_id, &leader, now).is_err());
+    assert!(roots.automatic_gc_at(&current_id, &writer, now).is_err());
     assert_eq!(fs::read(&index).unwrap(), before);
 }
 
+#[cfg(feature = "test-support")]
 #[test]
 fn attempt2_gc_fault_before_stamp_rename_keeps_prior_fence() {
     use trellis::store::topology::GcStage;
@@ -3404,13 +3072,15 @@ fn attempt2_gc_fault_before_stamp_rename_keeps_prior_fence() {
     let work = root(temp.path());
     drop(common::open_store(temp.path(), &work).unwrap());
     let id = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
-    let leader = roots.leader(&id).unwrap();
+    let writer = roots
+        .writer(std::sync::Arc::new(id.verified_clone_for_tests().unwrap()))
+        .unwrap();
     let now = 1_800_000_000_i64;
-    assert_eq!(roots.automatic_gc_at(&id, &leader, now).unwrap(), 0);
+    assert_eq!(roots.automatic_gc_at(&id, &writer, now).unwrap(), 0);
     let stamp = roots.cache.join("gc-last-run");
     let before = fs::read(&stamp).unwrap();
     let mut called = false;
-    let error = roots.automatic_gc_at_with_hook(&id, &leader, now + 86_400, &mut |stage| {
+    let error = roots.automatic_gc_at_with_hook(&id, &writer, now + 86_400, &mut |stage| {
         if stage == GcStage::BeforeStampRename {
             called = true;
             anyhow::bail!("injected crash before atomic stamp rename");
@@ -3425,7 +3095,7 @@ fn attempt2_gc_fault_before_stamp_rename_keeps_prior_fence() {
         "crash must retain old daily fence"
     );
     assert_eq!(
-        roots.automatic_gc_at(&id, &leader, now + 86_399).unwrap(),
+        roots.automatic_gc_at(&id, &writer, now + 86_399).unwrap(),
         0
     );
 }

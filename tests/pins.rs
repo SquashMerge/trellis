@@ -2,7 +2,7 @@ mod common;
 use serde_json::json;
 use std::sync::{Arc, atomic::AtomicBool};
 use trellis::{
-    indexer::{IndexOptions, index_workspace, index_workspace_bundle},
+    indexer::{IndexOptions, index_workspace},
     model::{CancelFlag, IndexPin, ViewQuery},
     store::Store,
 };
@@ -28,15 +28,16 @@ fn fixture() -> (tempfile::TempDir, Store, trellis::model::Graph, String) {
     let store = crate::common::open_store(&temp.path().join("state"), &root).unwrap();
     (temp, store, graph, id)
 }
+#[cfg(feature = "test-support")]
 fn publish(
     store: &Store,
     graph: &trellis::model::Graph,
-    leader: &trellis::store::topology::LeaderGuard,
+    writer: &trellis::store::topology::WriterGuard,
     expected: IndexPin,
     root: &std::path::Path,
 ) -> IndexPin {
     let cancel = Arc::new(AtomicBool::new(false));
-    let (bundle_graph, native, capture) = index_workspace_bundle(
+    let (bundle_graph, native, capture) = trellis::indexer::index_workspace_bundle(
         &IndexOptions::new(root.to_owned()),
         store.root_id(),
         &cancel,
@@ -45,12 +46,23 @@ fn publish(
     .unwrap();
     assert_eq!(&bundle_graph, graph);
     store
-        .publish_native(&bundle_graph, &capture, &native, leader, expected, &cancel)
+        .publish_native(&bundle_graph, &capture, &native, writer, expected, &cancel)
         .unwrap()
 }
+fn index_once(store: &Store, root: &std::path::Path) -> IndexPin {
+    let (pin, _writer) = trellis::index_coordinator::reconcile_workspace(
+        store,
+        &IndexOptions::new(root.to_owned()),
+        &Arc::new(AtomicBool::new(false)),
+        |_| {},
+    )
+    .unwrap();
+    pin
+}
+
 #[test]
 fn pin_shape_and_status() {
-    let (temp, store, graph, _id) = fixture();
+    let (temp, store, _graph, _id) = fixture();
     let first = store.index_baseline().unwrap();
     assert!(store.status().is_err());
     assert_eq!(first.index_revision, 0);
@@ -80,30 +92,15 @@ fn pin_shape_and_status() {
             "{malformed}"
         );
     }
-    let session = store.leader_session().unwrap();
-    let next = publish(
-        &store,
-        &graph,
-        session.leader_guard().unwrap(),
-        first,
-        &temp.path().join("workspace"),
-    );
+    let next = index_once(&store, &temp.path().join("workspace"));
     assert_eq!(next.index_generation, first.index_generation); // A current v8 bootstrap keeps its generation.
     assert_eq!(next.index_revision, 1);
     assert_eq!(store.status().unwrap().revision, next);
 }
 #[test]
 fn store_pinned_read_matrix() {
-    let (temp, store, graph, id) = fixture();
-    let first = store.index_baseline().unwrap();
-    let session = store.leader_session().unwrap();
-    let pin = publish(
-        &store,
-        &graph,
-        session.leader_guard().unwrap(),
-        first,
-        &temp.path().join("workspace"),
-    );
+    let (temp, store, _graph, id) = fixture();
+    let pin = index_once(&store, &temp.path().join("workspace"));
     let stale = IndexPin {
         index_generation: pin.index_generation,
         index_revision: 0,
@@ -155,15 +152,8 @@ fn store_pinned_read_matrix() {
 }
 #[test]
 fn current_store_producer_matrix() {
-    let (temp, store, graph, id) = fixture();
-    let session = store.leader_session().unwrap();
-    let pin = publish(
-        &store,
-        &graph,
-        session.leader_guard().unwrap(),
-        store.index_baseline().unwrap(),
-        &temp.path().join("workspace"),
-    );
+    let (temp, store, _graph, id) = fixture();
+    let pin = index_once(&store, &temp.path().join("workspace"));
     assert_eq!(store.symbols_at("run", 10).unwrap().0, pin);
     let query: ViewQuery = serde_json::from_value(json!({"seed":id})).unwrap();
     assert_eq!(store.query_view(&query).unwrap().unwrap().revision, pin);
@@ -183,16 +173,9 @@ fn current_store_producer_matrix() {
 
 #[test]
 fn query_replay_pin_is_checked_in_target_snapshot() {
-    let (temp, store, graph, id) = fixture();
+    let (temp, store, _graph, id) = fixture();
     let root = temp.path().join("workspace");
-    let session = store.leader_session().unwrap();
-    let pin = publish(
-        &store,
-        &graph,
-        session.leader_guard().unwrap(),
-        store.index_baseline().unwrap(),
-        &root,
-    );
+    let pin = index_once(&store, &root);
     let query: ViewQuery = serde_json::from_value(json!({"seed":id})).unwrap();
 
     let at_pin = store
@@ -202,7 +185,7 @@ fn query_replay_pin_is_checked_in_target_snapshot() {
     assert_eq!(at_pin.revision, pin);
     assert_eq!(at_pin.nodes[0].id, query.seed);
 
-    let next = publish(&store, &graph, session.leader_guard().unwrap(), pin, &root);
+    let next = index_once(&store, &root);
     assert_ne!(next, pin);
     assert_eq!(
         store.query_view(&query).unwrap().unwrap().revision,
@@ -238,15 +221,16 @@ fn query_replay_pin_is_checked_in_target_snapshot() {
     assert_eq!(retained.nodes[0].id, query.seed);
 }
 
+#[cfg(feature = "test-support")]
 #[test]
 fn pair_recreation_cas() {
     let (temp, store, graph, _id) = fixture();
     let first = store.index_baseline().unwrap();
-    let old_session = store.leader_session().unwrap();
+    let old_session = store.publication_for_tests().unwrap();
     let old = publish(
         &store,
         &graph,
-        old_session.leader_guard().unwrap(),
+        &old_session,
         first,
         &temp.path().join("workspace"),
     );
@@ -262,9 +246,7 @@ fn pair_recreation_cas() {
     ));
     drop(old_session);
     drop(store);
-    for child in ["index.db", "leader.lock"] {
-        std::fs::remove_file(dir.join(child)).unwrap();
-    }
+    std::fs::remove_file(dir.join("index.db")).unwrap();
     std::fs::remove_dir(&dir).unwrap();
     std::fs::remove_file(use_lock).unwrap();
     let root = temp.path().join("workspace");
@@ -274,7 +256,7 @@ fn pair_recreation_cas() {
     assert_eq!(fresh.index_revision, 0);
     assert_ne!(fresh.index_generation, old.index_generation);
     let cancel = Arc::new(AtomicBool::new(false));
-    let (bundle_graph, native, capture) = index_workspace_bundle(
+    let (bundle_graph, native, capture) = trellis::indexer::index_workspace_bundle(
         &IndexOptions::new(root.clone()),
         recreated.root_id(),
         &cancel,
@@ -282,28 +264,21 @@ fn pair_recreation_cas() {
     )
     .unwrap();
     assert_eq!(graph, bundle_graph);
-    let replacement_session = recreated.leader_session().unwrap();
+    let replacement_session = recreated.publication_for_tests().unwrap();
     assert!(
         recreated
             .publish_native(
                 &bundle_graph,
                 &capture,
                 &native,
-                replacement_session.leader_guard().unwrap(),
+                &replacement_session,
                 first,
                 &cancel
             )
             .is_err()
     );
     assert_eq!(
-        publish(
-            &recreated,
-            &graph,
-            replacement_session.leader_guard().unwrap(),
-            fresh,
-            &root,
-        )
-        .index_revision,
+        publish(&recreated, &graph, &replacement_session, fresh, &root,).index_revision,
         1
     );
     assert!(recreated.source_at("Types.java", Some(old)).is_err());

@@ -70,7 +70,6 @@ pub fn assert_topology_fixture(
     }
     for path in [
         index.join("index.db"),
-        index.join("leader.lock"),
         indexes.join(format!(
             "{}.lock",
             index.file_name().unwrap().to_string_lossy()

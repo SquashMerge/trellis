@@ -1,4 +1,4 @@
-//! Queue rows are durable independently of the native index and only the held leader may claim.
+//! Queue rows are durable independently of the native index and daemon-local writer sessions claim them.
 use std::fs;
 use trellis::{
     indexer::IndexOptions,
@@ -6,7 +6,7 @@ use trellis::{
 };
 
 #[test]
-fn partially_created_queue_readers_report_busy_without_initializing_schema() {
+fn extant_v0_queue_readers_refuse_incompatible_without_initializing_schema() {
     use std::os::unix::fs::PermissionsExt;
     let state = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
@@ -24,8 +24,10 @@ fn partially_created_queue_readers_report_busy_without_initializing_schema() {
     ] {
         let error = result.unwrap_err();
         assert!(
-            error.to_string().contains("storage_busy"),
-            "first creator can have a version-0 file before committed schema: {error:#}"
+            error
+                .to_string()
+                .contains("incompatible_queue: schema version"),
+            "an extant version-0 queue cannot be mistaken for virgin: {error:#}"
         );
         assert_eq!(
             fs::read(&queue).unwrap(),
@@ -69,7 +71,47 @@ fn absent_queue_readers_are_existing_only_and_leave_home_bytes_unchanged() {
 }
 
 #[test]
-fn durable_fifo_and_incarnation_fence() {
+fn first_h_bootstraps_virgin_queue_but_published_missing_queue_is_refused() {
+    use std::sync::{Arc, atomic::AtomicBool};
+    let state = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    let queue = store.request_db_path();
+    assert!(!queue.exists(), "virgin revision-0 store has no queue yet");
+    let options = IndexOptions::new(workspace.path().to_owned());
+    let cancel = Arc::new(AtomicBool::new(false));
+    let session =
+        trellis::index_coordinator::establish_serving_session(&store, Some(&options), &cancel)
+            .unwrap();
+    assert_eq!(store.index_baseline().unwrap().index_revision, 1);
+    assert!(queue.is_file(), "first H must create the durable queue");
+    assert!(store.earliest_unfinished_request().unwrap().is_none());
+    drop(session);
+    drop(store);
+
+    // Once H published a head, a missing queue may contain lost accepted IDs.
+    // The next daemon instance must refuse H instead of creating a fresh queue.
+    fs::remove_file(&queue).unwrap();
+    let reopened = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    let index = queue.with_file_name("index.db");
+    let before = fs::read(&index).unwrap();
+    let error =
+        trellis::index_coordinator::establish_serving_session(&reopened, Some(&options), &cancel)
+            .unwrap_err();
+    assert!(
+        error.to_string().contains("incompatible_queue"),
+        "{error:#}"
+    );
+    assert!(
+        !queue.exists(),
+        "refusal must not replace the missing queue"
+    );
+    assert_eq!(fs::read(&index).unwrap(), before, "refusal must precede H");
+}
+
+#[test]
+fn durable_fifo_and_writer_session_fence() {
     let state = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
     fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
@@ -132,8 +174,7 @@ fn published_pin_before_completion_crash_child() {
     let proof = std::path::PathBuf::from(std::env::var("TRELLIS_TEST_CRASH_GAP_PROOF").unwrap());
     let store = Store::open_for_tests(std::path::Path::new(&state), &workspace).unwrap();
     let options = IndexOptions::new(workspace);
-    // The parent's committed H belongs to its old incarnation. This child
-    // must commit its own H before it may claim the durable running gap.
+    // A new daemon instance must commit H before it claims the durable running gap.
     let (_, owner) = trellis::index_coordinator::reconcile_workspace(
         &store,
         &options,
@@ -226,14 +267,14 @@ fn real_process_death_after_request_publish_reclaims_without_false_done() {
         "the crash cannot pretend the ACK finished"
     );
     assert!(unfinished.revision.is_none());
-    let (takeover, new_owner) = trellis::index_coordinator::reconcile_workspace(
+    let (recovered_h, new_owner) = trellis::index_coordinator::reconcile_workspace(
         &parent,
         &options,
         &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         |_| {},
     )
     .unwrap();
-    assert!(takeover.index_revision > after_commit.index_revision);
+    assert!(recovered_h.index_revision > after_commit.index_revision);
     assert_eq!(
         trellis::index_coordinator::drain_requests(&parent, &new_owner).unwrap(),
         1
@@ -241,13 +282,13 @@ fn real_process_death_after_request_publish_reclaims_without_false_done() {
     let done = parent.request_by_id(&accepted.id).unwrap().unwrap();
     assert_eq!(done.state, "done");
     assert!(
-        done.revision.unwrap().index_revision > takeover.index_revision,
+        done.revision.unwrap().index_revision > recovered_h.index_revision,
         "repeat-after-commit across process death is allowed, false earlier completion is not"
     );
 }
 
 #[test]
-fn new_leader_reclaims_running_head_before_later_queued_row() {
+fn daemon_restart_reclaims_running_head_before_later_queued_row() {
     let state = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
     fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
@@ -264,7 +305,7 @@ fn new_leader_reclaims_running_head_before_later_queued_row() {
     let running = original.claim_request(&old_owner).unwrap().unwrap();
     assert_eq!(running.id, first.id);
     assert_eq!(running.state, "running");
-    let old_incarnation = running.claim_incarnation.unwrap();
+    let old_claim = running.claim_incarnation.unwrap();
     let next = original.enqueue_request(&options, None).unwrap();
     assert!(
         original.claim_request(&old_owner).unwrap().is_none(),
@@ -287,73 +328,10 @@ fn new_leader_reclaims_running_head_before_later_queued_row() {
     let a = replacement.request_by_id(&first.id).unwrap().unwrap();
     let b = replacement.request_by_id(&next.id).unwrap().unwrap();
     assert_eq!((a.state.as_str(), b.state.as_str()), ("done", "done"));
-    assert_ne!(a.claim_incarnation.unwrap(), old_incarnation);
+    assert_ne!(a.claim_incarnation.unwrap(), old_claim);
     assert!(
         a.revision.unwrap().index_revision < b.revision.unwrap().index_revision,
         "reclaimed running head must publish before later queue admission"
-    );
-}
-
-#[test]
-fn cli_accepted_during_held_exceptional_owner_waits_until_recreation_completes() {
-    let state = tempfile::tempdir().unwrap();
-    let workspace = tempfile::tempdir().unwrap();
-    fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
-    let old = Store::open_for_tests(state.path(), workspace.path()).unwrap();
-    let options = IndexOptions::new(workspace.path().to_owned());
-    let (_, old_owner) = trellis::index_coordinator::reconcile_workspace(
-        &old,
-        &options,
-        &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        |_| {},
-    )
-    .unwrap();
-    let roots = trellis::store::topology::TopologyRoots::isolated_for_tests(
-        state.path().join("cache"),
-        state.path().join("data"),
-    );
-    let identity = trellis::store::topology::WorkspaceIdentity::discover(
-        Some(workspace.path()),
-        workspace.path(),
-    )
-    .unwrap();
-    fs::write(roots.index_db(&identity), b"bad sqlite index header").unwrap();
-    let waiting = Store::open_for_tests(state.path(), workspace.path()).unwrap();
-    assert!(
-        waiting.status().is_err(),
-        "corrupt index cannot present a ready head"
-    );
-    let (tx, rx) = std::sync::mpsc::channel();
-    let options_for_cli = options.clone();
-    let cli = std::thread::spawn(move || {
-        let result = trellis::index_coordinator::enqueue_and_wait(
-            &waiting,
-            &options_for_cli,
-            &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        )
-        .map(|(pin, _)| pin);
-        tx.send(result).unwrap();
-    });
-    assert!(
-        rx.recv_timeout(std::time::Duration::from_millis(80))
-            .is_err(),
-        "an accepted CLI request must not exit recovery_required while old owner holds EX"
-    );
-    let ack = old.current_request().unwrap().unwrap();
-    assert_eq!(
-        ack.state, "queued",
-        "CLI acknowledgement must already be durable"
-    );
-    drop(old_owner);
-    let pin = rx
-        .recv_timeout(std::time::Duration::from_secs(10))
-        .unwrap()
-        .unwrap();
-    cli.join().unwrap();
-    assert_eq!(old.request_by_id(&ack.id).unwrap().unwrap().state, "done");
-    assert_eq!(
-        pin.index_revision, 2,
-        "recreation and explicit claim need separate publications"
     );
 }
 
@@ -382,24 +360,30 @@ fn request_rejects_symlink_to_captured_workspace() {
 }
 
 #[test]
-fn first_cli_takeover_reconciles_then_claims_fifo_head() {
+fn first_daemon_activation_reconciles_then_claims_fifo_head() {
     let state = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
     fs::write(workspace.path().join("a.js"), "function seed() {}\n").unwrap();
     let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
     let options = IndexOptions::new(workspace.path().to_owned());
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let (pin, session) =
-        trellis::index_coordinator::enqueue_and_wait(&store, &options, &cancel).unwrap();
+    let accepted = store.enqueue_request(&options, None).unwrap();
+    let (h, session) =
+        trellis::index_coordinator::reconcile_workspace(&store, &options, &cancel, |_| {}).unwrap();
     assert_eq!(
-        pin.index_revision, 2,
-        "takeover and explicit claim need separate publications"
+        h.index_revision, 1,
+        "mandatory H commits before the first claim"
     );
-    assert!(session.is_leader());
-    assert_eq!(store.status().unwrap().revision, pin);
-    let head = store.current_request().unwrap().unwrap();
+    assert_eq!(store.current_request().unwrap().unwrap().state, "queued");
+    assert_eq!(
+        trellis::index_coordinator::drain_requests(&store, &session).unwrap(),
+        1
+    );
+    let head = store.request_by_id(&accepted.id).unwrap().unwrap();
+    let pin = head.revision.unwrap();
+    assert_eq!(pin.index_revision, h.index_revision + 1);
     assert_eq!(head.state, "done");
-    assert_eq!(head.revision, Some(pin));
+    assert_eq!(store.status().unwrap().revision, pin);
 }
 
 #[test]
@@ -534,8 +518,8 @@ fn old_holder_fails_queued_and_running_rows_after_root_is_moved() {
     .unwrap();
     assert_eq!(store.claim_request(&owner).unwrap().unwrap().id, first.id);
     fs::rename(&root, parent.path().join("old-workspace")).unwrap();
-    assert_eq!(store.fail_changed_root_requests(&owner).unwrap(), 2);
-    assert_eq!(store.fail_changed_root_requests(&owner).unwrap(), 0);
+    assert_eq!(store.fail_changed_root_requests().unwrap(), 2);
+    assert_eq!(store.fail_changed_root_requests().unwrap(), 0);
     let db = rusqlite::Connection::open(store.request_db_path()).unwrap();
     for id in [first.id, second.id] {
         let (state, code, finished): (String, String, String) = db
@@ -552,92 +536,51 @@ fn old_holder_fails_queued_and_running_rows_after_root_is_moved() {
 }
 
 #[test]
-fn replacement_root_can_accept_while_old_holder_is_live_then_recover_index_only() {
+fn replacement_activation_settles_old_root_before_h_and_new_fifo() {
     let state = tempfile::tempdir().unwrap();
     let parent = tempfile::tempdir().unwrap();
     let root = parent.path().join("workspace");
     fs::create_dir(&root).unwrap();
     fs::write(root.join("a.js"), "function oldName() {}\n").unwrap();
     let old = Store::open_for_tests(state.path(), &root).unwrap();
-    let first = old
+    let old_request = old
         .enqueue_request(&IndexOptions::new(root.clone()), None)
         .unwrap();
-    let old_owner = old.leader_session().unwrap();
+    drop(old);
     fs::rename(&root, parent.path().join("old-workspace")).unwrap();
     fs::create_dir(&root).unwrap();
     fs::write(root.join("a.js"), "function newName() {}\n").unwrap();
     let replacement = Store::open_for_tests(state.path(), &root).unwrap();
-    assert!(replacement.status().is_err());
-    assert!(
-        replacement.current_request().unwrap().is_none(),
-        "healthy replacement root must ignore the old root's newest job row"
-    );
     let options = IndexOptions::new(root.clone());
-    let second = replacement.enqueue_request(&options, None).unwrap();
-    assert_eq!(
-        replacement.current_request().unwrap().unwrap().id,
-        second.id
-    );
-    assert_ne!(first.root_inode, second.root_inode);
-    assert!(
-        replacement.leader_session().is_err(),
-        "old holder still fences new work"
-    );
-    drop(old_owner);
-    let identity =
-        trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root).unwrap();
-    let lock = state
-        .path()
-        .join("cache/indexes")
-        .join(format!("{}.lock", identity.root_key));
-    let independent_reader =
-        trellis::store::topology::UseGuard::acquire(&lock, false, false).unwrap();
-    let index_path = replacement.request_db_path().with_file_name("index.db");
-    let index_before = fs::read(&index_path).unwrap();
-    let requests_before = fs::read(replacement.request_db_path()).unwrap();
+    let new_request = replacement.enqueue_request(&options, None).unwrap();
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let error =
+    let (h, session) =
         trellis::index_coordinator::reconcile_workspace(&replacement, &options, &cancel, |_| {})
-            .unwrap_err();
-    assert!(error.to_string().contains("storage_busy"), "{error:#}");
-    assert_eq!(fs::read(&index_path).unwrap(), index_before);
-    assert_ne!(
-        fs::read(replacement.request_db_path()).unwrap(),
-        requests_before,
-        "root-loss-only failure was durable before EX BUSY"
-    );
+            .unwrap();
     let db = rusqlite::Connection::open(replacement.request_db_path()).unwrap();
-    let old_code: String = db
+    let (state, code): (String, String) = db
         .query_row(
-            "SELECT error_code FROM requests WHERE id=?1",
-            [&first.id],
-            |r| r.get(0),
+            "SELECT state,error_code FROM requests WHERE id=?1",
+            [&old_request.id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(old_code, "root_changed");
-    drop(db);
-    drop(independent_reader);
-    let (pin, session) =
-        trellis::index_coordinator::enqueue_and_wait(&replacement, &options, &cancel).unwrap();
-    assert!(session.is_leader());
+    assert_eq!((state.as_str(), code.as_str()), ("failed", "root_changed"));
     assert_eq!(
         replacement
-            .request_by_id(&second.id)
+            .request_by_id(&new_request.id)
             .unwrap()
             .unwrap()
             .state,
-        "done"
+        "queued"
     );
-    assert_eq!(replacement.status().unwrap().revision, pin);
-    let db = rusqlite::Connection::open(replacement.request_db_path()).unwrap();
-    let code: String = db
-        .query_row(
-            "SELECT error_code FROM requests WHERE id=?1",
-            [&first.id],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(code, "root_changed");
+    assert_eq!(
+        trellis::index_coordinator::drain_requests(&replacement, &session).unwrap(),
+        1
+    );
+    let done = replacement.request_by_id(&new_request.id).unwrap().unwrap();
+    assert_eq!(done.state, "done");
+    assert!(done.revision.unwrap().index_revision > h.index_revision);
 }
 
 #[test]
@@ -649,13 +592,12 @@ fn unchanged_root_with_changed_workspace_marker_cannot_fail_queue_rows() {
     let row = store
         .enqueue_request(&IndexOptions::new(root.path().to_owned()), None)
         .unwrap();
-    let owner = store.leader_session().unwrap();
     fs::write(
         root.path().join(".git/trellis/workspace-id"),
         uuid::Uuid::new_v4().to_string(),
     )
     .unwrap();
-    assert!(store.fail_changed_root_requests(&owner).is_err());
+    assert!(store.fail_changed_root_requests().is_err());
     let db = rusqlite::Connection::open(store.request_db_path()).unwrap();
     let state: String = db
         .query_row("SELECT state FROM requests WHERE id=?1", [&row.id], |r| {
@@ -673,6 +615,11 @@ fn replacement_rechecks_old_index_under_ex_before_any_rename() {
     let root = parent.path().join("workspace");
     fs::create_dir(&root).unwrap();
     let old = Store::open_for_tests(state.path(), &root).unwrap();
+    let accepted = old
+        .enqueue_request(&IndexOptions::new(root.clone()), None)
+        .unwrap();
+    let queue = old.request_db_path();
+    let queue_inode = fs::metadata(&queue).unwrap().ino();
     fs::rename(&root, parent.path().join("old-workspace")).unwrap();
     fs::create_dir(&root).unwrap();
     let replacement = Store::open_for_tests(state.path(), &root).unwrap();
@@ -698,6 +645,17 @@ fn replacement_rechecks_old_index_under_ex_before_any_rename() {
         "{error:#}"
     );
     assert_eq!(fs::read(&index).unwrap(), before);
+    assert_eq!(replacement.request_db_path(), queue);
+    assert_eq!(fs::metadata(&queue).unwrap().ino(), queue_inode);
+    let db = rusqlite::Connection::open(&queue).unwrap();
+    let (state, code): (String, String) = db
+        .query_row(
+            "SELECT state,error_code FROM requests WHERE id=?1",
+            [&accepted.id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((state.as_str(), code.as_str()), ("failed", "root_changed"));
     drop(old);
 }
 
@@ -754,7 +712,8 @@ fn replacement_refuses_foreign_index_marker_and_sidecars_without_queue_transitio
         let root = parent.path().join("workspace");
         fs::create_dir(&root).unwrap();
         let old = Store::open_for_tests(state.path(), &root).unwrap();
-        old.enqueue_request(&IndexOptions::new(root.clone()), None)
+        let accepted = old
+            .enqueue_request(&IndexOptions::new(root.clone()), None)
             .unwrap();
         fs::rename(&root, parent.path().join("old-workspace")).unwrap();
         fs::create_dir(&root).unwrap();
@@ -770,7 +729,8 @@ fn replacement_refuses_foreign_index_marker_and_sidecars_without_queue_transitio
             _ => fs::write(index.with_file_name("index.db-journal"), b"foreign").unwrap(),
         }
         let index_before = fs::read(&index).unwrap();
-        let queue_before = fs::read(replacement.request_db_path()).unwrap();
+        let queue = replacement.request_db_path();
+        let queue_inode = std::os::unix::fs::MetadataExt::ino(&fs::metadata(&queue).unwrap());
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         assert!(
             trellis::index_coordinator::reconcile_workspace(
@@ -783,9 +743,22 @@ fn replacement_refuses_foreign_index_marker_and_sidecars_without_queue_transitio
             "{foreign}"
         );
         assert_eq!(fs::read(&index).unwrap(), index_before, "{foreign}");
+        assert_eq!(replacement.request_db_path(), queue);
         assert_eq!(
-            fs::read(replacement.request_db_path()).unwrap(),
-            queue_before,
+            std::os::unix::fs::MetadataExt::ino(&fs::metadata(&queue).unwrap()),
+            queue_inode
+        );
+        let db = rusqlite::Connection::open(&queue).unwrap();
+        let (state, code): (String, String) = db
+            .query_row(
+                "SELECT state,error_code FROM requests WHERE id=?1",
+                [&accepted.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (state.as_str(), code.as_str()),
+            ("failed", "root_changed"),
             "{foreign}"
         );
         drop(old);
@@ -863,6 +836,7 @@ fn root_failure_commit_error_never_authorizes_index_swap() {
     fs::create_dir(&root).unwrap();
     let replacement = Store::open_for_tests(state.path(), &root).unwrap();
     let queue = replacement.request_db_path();
+    let queue_inode = std::os::unix::fs::MetadataExt::ino(&fs::metadata(&queue).unwrap());
     let index = queue.with_file_name("index.db");
     let db = rusqlite::Connection::open(&queue).unwrap();
     db.execute_batch("CREATE TABLE commit_parent(id INTEGER PRIMARY KEY); CREATE TABLE commit_failure(id INTEGER REFERENCES commit_parent(id) DEFERRABLE INITIALLY DEFERRED); CREATE TRIGGER fail_commit AFTER UPDATE ON requests WHEN NEW.error_code='root_changed' BEGIN INSERT INTO commit_failure(id) VALUES (1); END;").unwrap();
@@ -877,9 +851,17 @@ fn root_failure_commit_error_never_authorizes_index_swap() {
         |_| {},
     )
     .unwrap_err();
-    assert!(format!("{error:#}").contains("FOREIGN KEY"), "{error:#}");
+    assert!(
+        format!("{error:#}").contains("storage_busy: root settlement not confirmed"),
+        "{error:#}"
+    );
     assert_eq!(fs::read(&index).unwrap(), before_index);
     assert_eq!(fs::read(&queue).unwrap(), before_queue);
+    assert_eq!(replacement.request_db_path(), queue);
+    assert_eq!(
+        std::os::unix::fs::MetadataExt::ino(&fs::metadata(&queue).unwrap()),
+        queue_inode
+    );
     let db = rusqlite::Connection::open(&queue).unwrap();
     let state: String = db
         .query_row("SELECT state FROM requests WHERE id=?1", [&row.id], |r| {
@@ -899,7 +881,6 @@ fn live_old_holder_rejects_replaced_same_key_queue_inode() {
     store
         .enqueue_request(&IndexOptions::new(root.clone()), None)
         .unwrap();
-    let owner = store.leader_session().unwrap();
     let queue = store.request_db_path();
     let copy = queue.with_file_name("requests.db.tmp-copy");
     fs::copy(&queue, &copy).unwrap();
@@ -907,13 +888,13 @@ fn live_old_holder_rejects_replaced_same_key_queue_inode() {
     fs::rename(&root, parent.path().join("old-workspace")).unwrap();
     let index = queue.with_file_name("index.db");
     let before = fs::read(&index).unwrap();
-    let error = store.fail_changed_root_requests(&owner).unwrap_err();
+    let error = store.fail_changed_root_requests().unwrap_err();
     assert!(error.to_string().contains("inode replaced"), "{error:#}");
     assert_eq!(fs::read(&index).unwrap(), before);
 }
 
 #[test]
-fn replacement_follower_never_recreates_deleted_accepted_queue_on_enqueue() {
+fn replacement_writer_never_recreates_deleted_accepted_queue_on_enqueue() {
     let state = tempfile::tempdir().unwrap();
     let parent = tempfile::tempdir().unwrap();
     let root = parent.path().join("workspace");
@@ -921,7 +902,6 @@ fn replacement_follower_never_recreates_deleted_accepted_queue_on_enqueue() {
     let old = Store::open_for_tests(state.path(), &root).unwrap();
     old.enqueue_request(&IndexOptions::new(root.clone()), None)
         .unwrap();
-    let owner = old.leader_session().unwrap();
     fs::rename(&root, parent.path().join("old-workspace")).unwrap();
     fs::create_dir(&root).unwrap();
     let replacement = Store::open_for_tests(state.path(), &root).unwrap();
@@ -939,7 +919,6 @@ fn replacement_follower_never_recreates_deleted_accepted_queue_on_enqueue() {
         "replacement ACK must not create an empty queue"
     );
     assert_eq!(fs::read(&index).unwrap(), index_before);
-    drop(owner);
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     assert!(
         trellis::index_coordinator::reconcile_workspace(
@@ -1435,10 +1414,15 @@ fn maintenance_probe_external_child() {
     let workspace =
         std::path::Path::new(&std::env::var("TRELLIS_PROBE_WORKSPACE").unwrap()).to_path_buf();
     let store = Store::open_for_tests(&state, &workspace).unwrap();
-    if mode == "enqueue" {
-        store
-            .enqueue_request(&IndexOptions::new(workspace), None)
-            .unwrap();
+    if mode == "enqueue" || mode == "enqueue_busy" {
+        let result = store.enqueue_request(&IndexOptions::new(workspace), None);
+        if mode == "enqueue_busy" {
+            let error = result.expect_err("virgin queue publication cannot pass probe SH");
+            assert!(error.to_string().contains("storage_busy"), "{error:#}");
+            assert!(!store.request_db_path().exists());
+        } else {
+            result.unwrap();
+        }
     } else if mode == "exclusive" || mode == "wal" || mode == "journal" {
         let db = rusqlite::Connection::open(store.request_db_path()).unwrap();
         db.busy_timeout(std::time::Duration::ZERO).unwrap();
@@ -1483,7 +1467,7 @@ fn maintenance_probe_child(
 }
 
 #[test]
-fn maintenance_probe_virgin_appearance_and_v0_are_unknown() {
+fn maintenance_probe_virgin_blocks_first_publication_and_v0_is_unknown() {
     let state = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
     fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
@@ -1491,6 +1475,19 @@ fn maintenance_probe_virgin_appearance_and_v0_are_unknown() {
     let probe = store.open_maintenance_queue_probe().unwrap();
     assert!(matches!(probe, QueueProbeAdmission::AbsentVirgin(_)));
     assert_eq!(probe.check(), MaintenanceQueueState::Clear);
+    // The probe's index-use SH prevents the first queue's EX-protected
+    // publication. A separate process must report typed contention, not ACK.
+    let output = maintenance_probe_child("enqueue_busy", state.path(), workspace.path())
+        .wait_with_output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "external virgin refusal failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!store.request_db_path().exists());
+    assert_eq!(probe.check(), MaintenanceQueueState::Clear);
+    drop(probe);
     let output = maintenance_probe_child("enqueue", state.path(), workspace.path())
         .wait_with_output()
         .unwrap();
@@ -1499,8 +1496,6 @@ fn maintenance_probe_virgin_appearance_and_v0_are_unknown() {
         "external FIFO failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(probe.check(), MaintenanceQueueState::Unknown);
-    drop(probe);
     assert_eq!(
         store.open_maintenance_queue_probe().unwrap().check(),
         MaintenanceQueueState::Pending
