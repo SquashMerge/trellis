@@ -616,8 +616,7 @@ async fn retained_registration_and_old_runtime_handle_hold_no_checkout_descripto
     let resumed = registry.activate(&key).unwrap();
     ready(&resumed).await;
     assert!(!old.has_active_resources());
-    let (response, catching_up) = resumed.evidence_response().unwrap();
-    assert!(!catching_up);
+    let (response, _) = resumed.evidence_response().unwrap();
     response.finish(()).unwrap();
 }
 

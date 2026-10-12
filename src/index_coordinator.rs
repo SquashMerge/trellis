@@ -1726,14 +1726,14 @@ mod tests {
         let identity = WorkspaceIdentity::discover(Some(work.path()), work.path()).unwrap();
         let path = roots.index_db(&identity);
         let old = Store::open_for_tests(state.path(), work.path()).unwrap();
+        // Retain an accepted queue before exceptional index corruption begins.
+        let pending_row = old
+            .enqueue_request(&IndexOptions::new(work.path().to_owned()), None)
+            .unwrap();
         drop(old);
         fs::write(&path, b"not sqlite format header").unwrap();
         let original = fs::read(&path).unwrap();
         let pending = Store::open_for_tests(state.path(), work.path()).unwrap();
-        // A retained accepted queue exists before exceptional recovery begins.
-        let pending_row = pending
-            .enqueue_request(&IndexOptions::new(work.path().to_owned()), None)
-            .unwrap();
         let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
         let missing = establish_serving_session(&pending, None, &cancel).unwrap_err();
         assert!(

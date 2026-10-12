@@ -13,7 +13,7 @@ use std::{
     os::unix::fs::{FileExt, MetadataExt},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
 
@@ -455,6 +455,35 @@ fn attest_foreign_root_settlement(
     ))?;
     Ok(!foreign)
 }
+/// A normal error or unwind discards the private stage after its SQLite and
+/// raw file handles have closed. Process death may leave a harmless sibling.
+struct QueueBootstrapStage {
+    path: PathBuf,
+    published: bool,
+}
+impl Drop for QueueBootstrapStage {
+    fn drop(&mut self) {
+        if !self.published {
+            for path in [
+                self.path.with_file_name(format!(
+                    "{}-journal",
+                    self.path.file_name().unwrap().to_string_lossy()
+                )),
+                self.path.with_file_name(format!(
+                    "{}-wal",
+                    self.path.file_name().unwrap().to_string_lossy()
+                )),
+                self.path.with_file_name(format!(
+                    "{}-shm",
+                    self.path.file_name().unwrap().to_string_lossy()
+                )),
+                self.path.clone(),
+            ] {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+}
 impl Store {
     #[cfg(test)]
     pub(crate) fn set_queue_select_hook(&self, hook: impl FnOnce() + Send + 'static) {
@@ -580,17 +609,159 @@ impl Store {
         }
         Ok(QueueProbeAdmission::Ready(opened))
     }
+    /// Prepare a virgin queue before exposing a new checkout runtime to
+    /// selected reads. Otherwise repeated cold status reads can hold SH while
+    /// mandatory H tries to publish the queue under EX.
+    pub(crate) fn prepare_virgin_queue_before_activation(&self) -> Result<()> {
+        self.identity.verify()?;
+        let path = self.request_db_path();
+        match fs::symlink_metadata(&path) {
+            Ok(_) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        // Existing queues and prior heads retain the ordinary H settlement
+        // path, so validated prior-head reads remain available during H.
+        if !self.is_ready_disposition() || self.index_baseline()?.index_revision != 0 {
+            return Ok(());
+        }
+        ensure!(
+            self.request_file_witness.lock().unwrap().is_none(),
+            "incompatible_queue: previously observed requests.db disappeared"
+        );
+        // A sidecar without its main queue is not a virgin queue.
+        ensure!(
+            !queue_sidecar_exists(&path),
+            "incompatible_queue: missing requests.db has sidecars"
+        );
+        // request_connection itself drops SH before the nonblocking EX stage,
+        // then validates v1 and syncs both directories on the reopened inode.
+        let (guard, db) = self.request_connection()?;
+        drop(db);
+        drop(guard);
+        Ok(())
+    }
+
+    /// Publish only a complete queue. The index-use EX guard excludes GC and
+    /// every normal queue opener until the directory entry is durable.
+    fn bootstrap_missing_queue(
+        &self,
+        #[cfg(test)] before_publish: impl FnOnce(&Path) -> Result<()>,
+        #[cfg(test)] after_publish: impl FnOnce(&Path) -> Result<()>,
+    ) -> Result<()> {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        self.identity.verify()?;
+        ensure!(
+            self.is_ready_disposition(),
+            "incompatible_queue: missing queue outside Ready startup"
+        );
+        let exclusive = self.roots.index_use_exclusive_existing(&self.identity)?;
+        exclusive.verify()?;
+        self.identity.verify()?;
+        let path = self.request_db_path();
+        ensure!(
+            self.request_file_witness.lock().unwrap().is_none(),
+            "incompatible_queue: previously observed requests.db disappeared"
+        );
+        // A concurrent initializer may have published while we waited for EX.
+        match fs::symlink_metadata(&path) {
+            Ok(_) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let parent = path.parent().expect("queue has a parent directory");
+        // A crash orphan must not become an unknown entry in the candidate
+        // index directory: GC admits only index.db and requests.db there.
+        let stage = parent
+            .parent()
+            .expect("index has a parent directory")
+            .join(format!(
+                ".requests-{}-{}.stage",
+                self.identity.root_key,
+                Uuid::new_v4()
+            ));
+        let mut cleanup = QueueBootstrapStage {
+            path: stage.clone(),
+            published: false,
+        };
+        let staged_file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&stage)?;
+        // This private staging path is intentionally NOT registered in the
+        // process-wide SQLite witness table. Close SQLite before syncing, then
+        // close this separate raw FD before the inode becomes requests.db.
+        {
+            let mut db = Connection::open_with_flags(
+                &stage,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )?;
+            db.busy_timeout(std::time::Duration::from_secs(3))?;
+            db.execute_batch(
+                "PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON",
+            )?;
+            let tx = super::storage_result(
+                db.transaction_with_behavior(TransactionBehavior::Immediate),
+            )?;
+            super::storage_result(tx.execute_batch(SCHEMA))?;
+            super::storage_result(tx.execute(
+                "INSERT INTO queue_identity VALUES (1,?1,?2)",
+                params![self.workspace_root, self.identity.root_key],
+            ))?;
+            super::storage_result(tx.commit())?;
+        }
+        staged_file.sync_all()?;
+        drop(staged_file);
+        #[cfg(test)]
+        before_publish(&stage)?;
+        exclusive.verify()?;
+        self.identity.verify()?;
+        ensure!(
+            self.is_ready_disposition(),
+            "incompatible_queue: queue startup changed"
+        );
+        ensure!(
+            self.request_file_witness.lock().unwrap().is_none(),
+            "incompatible_queue: previously observed requests.db disappeared"
+        );
+        // rename is safe without a no-clobber primitive because all Trellis
+        // publishers and readers take this same index-use lock (T00).
+        match fs::symlink_metadata(&path) {
+            Ok(_) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        ensure!(
+            !queue_sidecar_exists(&stage),
+            "storage_busy: staged queue sidecar"
+        );
+        fs::rename(&stage, &path)?;
+        cleanup.published = true;
+        // Cross-directory publication must persist removal from the sibling
+        // stage directory as well as insertion into the candidate directory.
+        fs::File::open(stage.parent().expect("stage has a parent directory"))?.sync_all()?;
+        #[cfg(test)]
+        after_publish(&path)?;
+        fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    }
+
     fn request_connection(&self) -> Result<(UseGuard, super::ProtectedSqliteConnection)> {
         // A replacement-root caller must never recreate a missing queue
         // that might contain accepted old-root IDs.
-        self.request_connection_for_root_loss(false, self.is_root_replaced(), None)
+        self.request_connection_for_root_loss(false, self.is_root_replaced())
     }
     /// Read an already-admitted queue without creating requests.db or its schema.
     /// A vanished queue we previously observed is not equivalent to a virgin Ready index.
     fn existing_request_connection(
         &self,
     ) -> Result<Option<(UseGuard, super::ProtectedSqliteConnection)>> {
-        match self.request_connection_for_root_loss(false, true, None) {
+        match self.request_connection_for_root_loss(false, true) {
             Ok(pair) => Ok(Some(pair)),
             Err(error)
                 if error
@@ -610,7 +781,6 @@ impl Store {
         &self,
         old_root: bool,
         existing_only: bool,
-        verified_owner: Option<&WriterSession>,
     ) -> Result<(UseGuard, super::ProtectedSqliteConnection)> {
         // Root-loss paths keep their existing queue admission barriers.
         #[cfg(test)]
@@ -627,8 +797,37 @@ impl Store {
         // published: check the same atomic state while protected, before RW
         // open/create or SQLite journal recovery.
         let path = self.request_db_path();
+        // Never create the public inode before schema and identity are durable.
+        // Drop SH before taking EX: upgrading a live use guard can deadlock.
+        if !old_root && !existing_only {
+            match fs::symlink_metadata(&path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    drop(guard);
+                    #[cfg(test)]
+                    self.bootstrap_missing_queue(|_| Ok(()), |_| Ok(()))?;
+                    #[cfg(not(test))]
+                    self.bootstrap_missing_queue()?;
+                    return self
+                        .request_connection_for_root_loss(old_root, true)
+                        .map_err(|error| {
+                            if error
+                                .downcast_ref::<std::io::Error>()
+                                .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+                            {
+                                anyhow::anyhow!(
+                                    "incompatible_queue: published requests.db disappeared"
+                                )
+                            } else {
+                                error
+                            }
+                        });
+                }
+                Err(error) => return Err(error.into()),
+                Ok(_) => {}
+            }
+        }
         // The protected directory and file must remain private, regular and tied to the pathname.
-        let file = super::retained_sqlite_file(&path, true, !existing_only, false)?;
+        let file = super::retained_sqlite_file(&path, true, false, false)?;
         let metadata = file.metadata()?;
         let named = fs::symlink_metadata(&path)?;
         ensure!(
@@ -643,84 +842,21 @@ impl Store {
         // Only the local Arc is released. The process-wide check handle must
         // remain open while any SQLite connection may hold fcntl locks.
         drop(file);
-        let mut db = super::protected_sqlite_open(
+        let db = super::protected_sqlite_open(
             &path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
         db.busy_timeout(std::time::Duration::from_secs(3))?;
         db.execute_batch("PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON")?;
-        // A current queue read needs no reserved SQLite writer lock. The first opener
-        // alone enters IMMEDIATE, then rechecks after the lock to race safely with
-        // another process initializing the same private file. Even read-only callers
-        // still open SQLite normally (hot-journal recovery), validate user_version,
-        // root singleton and quick_check before interpreting any row.
+        // The public queue inode is published only after its complete staged
+        // transaction commits. Existing-only and normal callers open it under
+        // SH for hot-journal recovery, then validate v1, identity and integrity
+        // before interpreting any row; no bootstrap mutates a public v0 inode.
         let version: i64 =
             super::storage_result(db.pragma_query_value(None, "user_version", |r| r.get(0)))?;
-        if version == 0 {
-            // Ordinary existing-only readers never initialize a queue: they
-            // cannot prove whether a live first writer or a durable ACK owns
-            // this inode. Only the current-root Ready owner holding verified EX
-            // may recover an existing private virgin file before mandatory H.
-            ensure!(
-                !existing_only || verified_owner.is_some(),
-                "storage_busy: requests.db initialization in progress"
-            );
-            ensure!(
-                self.request_file_witness.lock().unwrap().is_none(),
-                "incompatible_queue: previously observed requests.db lost its schema"
-            );
-            if let Some(owner) = verified_owner {
-                ensure!(
-                    existing_only && !old_root && self.is_ready_disposition(),
-                    "storage_busy: only current Ready owner may recover virgin queue"
-                );
-                self.verify_writer_session(owner)?;
-            }
-            // IMMEDIATE waits at most the existing three-second SQLite busy
-            // timeout. A concurrent initializer can win; re-read while holding
-            // the writer lock instead of assuming an unlocked v0 is orphaned.
-            let tx = super::storage_result(
-                db.transaction_with_behavior(TransactionBehavior::Immediate),
-            )?;
-            if let Some(owner) = verified_owner {
-                self.verify_writer_session(owner)?;
-            }
-            let locked_version: i64 =
-                super::storage_result(tx.pragma_query_value(None, "user_version", |r| r.get(0)))?;
-            if locked_version == 0 {
-                let integrity: String =
-                    super::storage_result(tx.query_row("PRAGMA quick_check(1)", [], |r| r.get(0)))?;
-                ensure!(
-                    integrity == "ok",
-                    "incompatible_queue: virgin integrity check failed"
-                );
-                // Count ALL sqlite_master entries, not only user tables: an
-                // unexpected view/trigger/index or SQLite-owned object is not
-                // an empty queue and must never be overwritten as bootstrap.
-                let objects: i64 = super::storage_result(tx.query_row(
-                    "SELECT count(*) FROM sqlite_master",
-                    [],
-                    |r| r.get(0),
-                ))?;
-                ensure!(objects == 0, "incompatible_queue: unexpected virgin schema");
-                if let Some(owner) = verified_owner {
-                    self.verify_writer_session(owner)?;
-                }
-                super::storage_result(tx.execute_batch(SCHEMA))?;
-                super::storage_result(tx.execute(
-                    "INSERT INTO queue_identity VALUES (1,?1,?2)",
-                    params![self.workspace_root, self.identity.root_key],
-                ))?;
-            } else {
-                ensure!(locked_version == 1, "incompatible_queue: schema version");
-            }
-            if let Some(owner) = verified_owner {
-                self.verify_writer_session(owner)?;
-            }
-            super::storage_result(tx.commit())?;
-        } else {
-            ensure!(version == 1, "incompatible_queue: schema version");
-        }
+        // Even an empty v0 inode may be an accidentally truncated accepted
+        // queue. No caller, including a verified writer, can recover it safely.
+        ensure!(version == 1, "incompatible_queue: schema version");
         let identity: (String, String) = db.query_row(
             "SELECT root_spelling,root_key FROM queue_identity WHERE singleton=1",
             [],
@@ -747,6 +883,22 @@ impl Store {
             witness.is_none_or(|prior| prior == current_inode),
             "incompatible_queue: requests.db inode replaced"
         );
+        // A cross-directory rename may have succeeded while either source
+        // or destination sync failed. Persist both directories before the
+        // first ACK in this process. SH excludes candidate GC throughout.
+        if witness.is_none() {
+            let parent = path.parent().expect("queue has a parent directory");
+            fs::File::open(parent.parent().expect("index has a parent directory"))?.sync_all()?;
+            fs::File::open(parent)?.sync_all()?;
+            guard.verify()?;
+            let after_sync = fs::symlink_metadata(&path)?;
+            ensure!(
+                after_sync.is_file()
+                    && !after_sync.file_type().is_symlink()
+                    && (after_sync.dev(), after_sync.ino()) == current_inode,
+                "unsafe requests.db changed during directory sync"
+            );
+        }
         *witness = Some(current_inode);
         drop(witness);
         if !old_root {
@@ -755,6 +907,30 @@ impl Store {
         guard.verify()?;
         Ok((guard, db))
     }
+    fn request_connection_for_enqueue_until(
+        &self,
+        deadline: Instant,
+    ) -> Result<(UseGuard, super::ProtectedSqliteConnection)> {
+        loop {
+            match self.request_connection() {
+                Ok(pair) => return Ok(pair),
+                Err(error)
+                    if error.is::<super::topology::StorageBusy>()
+                        || matches!(error.downcast_ref::<rusqlite::Error>(),
+                            Some(rusqlite::Error::SqliteFailure(info, _))
+                                if matches!(info.code,
+                                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)) =>
+                {
+                    if Instant::now() >= deadline {
+                        return Err(super::topology::StorageBusy.into());
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     pub fn enqueue_request(
         &self,
         options: &IndexOptions,
@@ -805,7 +981,10 @@ impl Store {
         options.require_absolute_optional_inputs()?;
         let encoded = serde_json::to_string(&options)?;
         ensure!(encoded.len() <= 4096, "invalid request options length");
-        let (_guard, mut db) = self.request_connection()?;
+        // Retry only queue admission. No request has been inserted yet; once
+        // IMMEDIATE begins, even an ambiguous COMMIT must never be re-enqueued.
+        let (_guard, mut db) =
+            self.request_connection_for_enqueue_until(Instant::now() + Duration::from_secs(3))?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         after_write_lock();
         self.identity.verify()?;
@@ -891,7 +1070,7 @@ impl Store {
             self.identity.root_path_replaced()?,
             "root_changed: old root required"
         );
-        let (_guard, db) = match self.request_connection_for_root_loss(true, true, None) {
+        let (_guard, db) = match self.request_connection_for_root_loss(true, true) {
             Ok(pair) => pair,
             Err(error)
                 if error
@@ -977,7 +1156,7 @@ impl Store {
         let mut seen = Vec::<Request>::new();
         for attempt in 0..2 {
             let result = (|| -> Result<bool> {
-                let (_guard, mut db) = self.request_connection_for_root_loss(true, true, None)?;
+                let (_guard, mut db) = self.request_connection_for_root_loss(true, true)?;
                 let tx = super::storage_result(
                     db.transaction_with_behavior(TransactionBehavior::Immediate),
                 )?;
@@ -1018,7 +1197,7 @@ impl Store {
                 );
                 let committed = super::storage_result(tx.commit());
                 drop(db);
-                let (_guard, reread) = self.request_connection_for_root_loss(true, true, None)?;
+                let (_guard, reread) = self.request_connection_for_root_loss(true, true)?;
                 let confirmed = attest_prior_root_rows(&reread, &seen)?
                     && self.old_root_pending_in(&reread)? == 0;
                 if confirmed {
@@ -1084,7 +1263,7 @@ impl Store {
         for attempt_number in 0..2 {
             let attempt = (|| -> Result<bool> {
                 let (_guard, mut db) = self
-                    .request_connection_for_root_loss(false, true, None)
+                    .request_connection_for_root_loss(false, true)
                     .map_err(settlement_open_error)?;
                 let tx = super::storage_result(
                     db.transaction_with_behavior(TransactionBehavior::Immediate),
@@ -1134,7 +1313,7 @@ impl Store {
                     let _ = after_commit.take().map_or(Ok(()), |hook| hook());
                 }
                 let (_guard, reread) = self
-                    .request_connection_for_root_loss(false, true, None)
+                    .request_connection_for_root_loss(false, true)
                     .map_err(settlement_open_error)?;
                 let confirmed = attest_foreign_root_settlement(
                     &reread,
@@ -1566,16 +1745,23 @@ mod root_failure_tests {
         let root = tempfile::tempdir().unwrap();
         let store = Store::open_for_tests(state.path(), root.path()).unwrap();
         assert!(!store.request_db_path().exists());
-        let _owner = store.writer_session().unwrap();
-        // A daemon-local writer does not turn a ready startup into recovery.
+        let owner = store.writer_session().unwrap();
+        // EX bootstrap cannot upgrade the daemon's live SH writer guard.
         assert!(store.is_ready_disposition());
+        assert!(
+            store
+                .settle_foreign_root_requests()
+                .unwrap_err()
+                .is::<super::super::topology::StorageBusy>()
+        );
+        drop(owner);
         assert_eq!(store.settle_foreign_root_requests().unwrap(), 0);
         assert!(store.request_db_path().exists());
         assert!(store.current_request().unwrap().is_none());
     }
 
     #[test]
-    fn current_writer_refuses_virgin_version_with_unknown_view_without_replacing_inode() {
+    fn existing_v0_with_unknown_view_is_incompatible_even_for_writer() {
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
         let state = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
@@ -1605,13 +1791,10 @@ mod root_failure_tests {
         drop(db);
         let owner = store.writer_session().unwrap();
         let error = store
-            .request_connection_for_root_loss(false, true, Some(owner.as_ref()))
+            .request_connection_for_root_loss(false, true)
             .err()
             .expect("unknown virgin schema must not be initialized");
-        assert_eq!(
-            error.to_string(),
-            "incompatible_queue: unexpected virgin schema"
-        );
+        assert_eq!(error.to_string(), "incompatible_queue: schema version");
         drop(owner);
         let named = fs::symlink_metadata(&path).unwrap();
         assert_eq!(
@@ -1798,7 +1981,7 @@ mod foreign_root_settlement_tests {
     }
 
     #[test]
-    fn current_request_waits_for_existing_queue_initialization_without_creating_schema() {
+    fn current_request_rejects_existing_v0_without_creating_schema() {
         use std::os::unix::fs::OpenOptionsExt;
         let state = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
@@ -1812,25 +1995,17 @@ mod foreign_root_settlement_tests {
             .open(&path)
             .unwrap();
         let mut attempts = 0;
-        let row = store
+        let error = store
             .current_request_with_retry(std::time::Duration::from_secs(3), || {
                 attempts += 1;
-                let db = Connection::open(&path).unwrap();
-                db.execute_batch(SCHEMA).unwrap();
-                db.execute(
-                    "INSERT INTO queue_identity VALUES (1,?1,?2)",
-                    params![store.workspace_root, store.identity.root_key],
-                )
-                .unwrap();
             })
-            .unwrap();
-        assert!(row.is_none());
-        assert_eq!(attempts, 1);
-        assert!(store.current_request().unwrap().is_none());
+            .unwrap_err();
+        assert_eq!(error.to_string(), "incompatible_queue: schema version");
+        assert_eq!(attempts, 0);
     }
 
     #[test]
-    fn current_request_initialization_deadline_is_typed_and_does_not_initialize() {
+    fn current_request_v0_is_incompatible_even_at_retry_deadline() {
         use std::os::unix::fs::OpenOptionsExt;
         let state = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
@@ -1848,10 +2023,7 @@ mod foreign_root_settlement_tests {
                 panic!("no retry after deadline")
             })
             .unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "storage_busy: requests.db initialization in progress"
-        );
+        assert_eq!(error.to_string(), "incompatible_queue: schema version");
         let db = Connection::open(&path).unwrap();
         assert_eq!(
             db.pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
@@ -1862,6 +2034,299 @@ mod foreign_root_settlement_tests {
             .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
             .unwrap();
         assert_eq!(objects, 0);
+    }
+
+    #[test]
+    fn private_stage_fault_before_publish_leaves_main_absent_and_retries() {
+        let state = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+        let path = store.request_db_path();
+        let mut stage_path = None;
+        let failure = store
+            .bootstrap_missing_queue(
+                |stage| {
+                    let db = Connection::open_with_flags(
+                        stage,
+                        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                    )?;
+                    assert_eq!(
+                        db.pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))?,
+                        1
+                    );
+                    assert!(!path.exists());
+                    stage_path = Some(stage.to_owned());
+                    anyhow::bail!("injected error before queue publication")
+                },
+                |_| Ok(()),
+            )
+            .unwrap_err();
+        assert_eq!(
+            failure.to_string(),
+            "injected error before queue publication"
+        );
+        let stage = stage_path.unwrap();
+        assert!(
+            !stage.exists(),
+            "ordinary errors remove their private stage"
+        );
+        assert!(!path.exists());
+        assert!(
+            fs::read_dir(path.parent().unwrap()).unwrap().all(|entry| {
+                matches!(
+                    entry.unwrap().file_name().to_str(),
+                    Some("index.db" | "requests.db")
+                )
+            }),
+            "failed stage must not change candidate GC inventory"
+        );
+        assert_eq!(store.settle_foreign_root_requests().unwrap(), 0);
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn crashed_stage_orphan_sibling_does_not_change_candidate_gc_inventory() {
+        let state = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+        let queue = store.request_db_path();
+        let mut orphan = None;
+        let _ = store.bootstrap_missing_queue(
+            |stage| {
+                let sibling = stage.with_extension("crash-orphan");
+                fs::copy(stage, &sibling)?;
+                orphan = Some(sibling);
+                anyhow::bail!("simulate orphan from process death")
+            },
+            |_| Ok(()),
+        );
+        let orphan = orphan.unwrap();
+        assert!(orphan.exists());
+        assert_eq!(orphan.parent(), queue.parent().unwrap().parent());
+        assert!(!queue.exists());
+        assert!(fs::read_dir(queue.parent().unwrap()).unwrap().all(|entry| {
+            matches!(
+                entry.unwrap().file_name().to_str(),
+                Some("index.db" | "requests.db")
+            )
+        }));
+        assert_eq!(store.settle_foreign_root_requests().unwrap(), 0);
+    }
+
+    #[test]
+    fn publish_between_dir_syncs_reopens_v1_without_losing_witness_gate() {
+        let state = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+        let queue = store.request_db_path();
+        let error = store
+            .bootstrap_missing_queue(
+                |_| Ok(()),
+                |published| {
+                    assert_eq!(published, queue);
+                    anyhow::bail!("injected failure between source and destination sync")
+                },
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "injected failure between source and destination sync"
+        );
+        assert!(queue.exists(), "published v1 must not be discarded");
+        assert!(store.request_file_witness.lock().unwrap().is_none());
+        // Existing-only admission validates v1 and syncs both source and
+        // destination directories before setting its first process witness.
+        assert!(store.existing_request_connection().unwrap().is_some());
+        assert!(store.request_file_witness.lock().unwrap().is_some());
+        assert!(store.current_request().unwrap().is_none());
+    }
+
+    #[test]
+    fn published_stage_reopens_with_committed_identity() {
+        let state = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+        store
+            .bootstrap_missing_queue(|_| Ok(()), |_| Ok(()))
+            .unwrap();
+        let path = store.request_db_path();
+        let expected = (
+            store.workspace_root.clone(),
+            store.identity.root_key.clone(),
+        );
+        drop(store);
+        let db =
+            Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let identity: (String, String) = db
+            .query_row(
+                "SELECT root_spelling,root_key FROM queue_identity",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(identity, expected);
+        drop(db);
+        let reopened = Store::open_for_tests(state.path(), root.path()).unwrap();
+        assert!(reopened.current_request().unwrap().is_none());
+    }
+
+    #[test]
+    fn accepted_before_h_accidentally_truncated_v0_is_never_initialized() {
+        let state = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+        let accepted = store
+            .enqueue_request(&IndexOptions::new(root.path().to_owned()), None)
+            .unwrap();
+        assert!(!accepted.id.is_empty());
+        let path = store.request_db_path();
+        drop(store);
+        fs::write(&path, []).unwrap();
+        let reopened = Store::open_for_tests(state.path(), root.path()).unwrap();
+        let error = reopened.settle_foreign_root_requests().unwrap_err();
+        assert!(
+            error.to_string().contains("incompatible_queue"),
+            "{error:#}"
+        );
+        drop(reopened);
+        let db = Connection::open(&path).unwrap();
+        assert_eq!(
+            db.pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn concurrent_creator_cannot_publish_over_first_queue() {
+        use std::sync::mpsc;
+        let state = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+        let second = store.clone();
+        let (staged_tx, staged_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            second.bootstrap_missing_queue(
+                |_| {
+                    staged_tx.send(()).unwrap();
+                    resume_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    Ok(())
+                },
+                |_| Ok(()),
+            )
+        });
+        staged_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let main_absent = !store.request_db_path().exists();
+        let contender = store.bootstrap_missing_queue(|_| Ok(()), |_| Ok(()));
+        resume_tx.send(()).unwrap();
+        worker.join().unwrap().unwrap();
+        assert!(main_absent);
+        assert!(
+            contender
+                .unwrap_err()
+                .is::<super::super::topology::StorageBusy>()
+        );
+        let inode = fs::metadata(store.request_db_path()).unwrap().ino();
+        store
+            .bootstrap_missing_queue(|_| panic!("loser must reopen winner"), |_| Ok(()))
+            .unwrap();
+        assert_eq!(fs::metadata(store.request_db_path()).unwrap().ino(), inode);
+        assert!(store.current_request().unwrap().is_none());
+    }
+
+    #[test]
+    fn enqueue_waits_for_other_store_bootstrap_before_single_accept() {
+        use std::sync::mpsc;
+        let state = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let builder = Store::open_for_tests(state.path(), root.path()).unwrap();
+        let caller = Store::open_for_tests(state.path(), root.path()).unwrap();
+        let (staged_tx, staged_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let creator = std::thread::spawn(move || {
+            builder.bootstrap_missing_queue(
+                |_| {
+                    staged_tx.send(()).unwrap();
+                    resume_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    Ok(())
+                },
+                |_| Ok(()),
+            )
+        });
+        staged_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (retry_tx, retry_rx) = mpsc::channel();
+        let hook = caller.test_queue_before_shared_hook.clone();
+        caller.test_queue_before_shared_hook.set(move || {
+            hook.set(move || retry_tx.send(()).unwrap());
+        });
+        let options = IndexOptions::new(root.path().to_owned());
+        let queued = std::thread::spawn(move || caller.enqueue_request(&options, None));
+        // The second SH attempt proves the first one failed under builder EX.
+        let reached_retry = retry_rx.recv_timeout(Duration::from_secs(5));
+        // Release EX and join even when the expected retry signal was missed.
+        resume_tx.send(()).unwrap();
+        creator.join().unwrap().unwrap();
+        let accepted = queued.join().unwrap().unwrap();
+        reached_retry.unwrap();
+        let reopened = Store::open_for_tests(state.path(), root.path()).unwrap();
+        let (_guard, db) = reopened.request_connection().unwrap();
+        let count: i64 = db
+            .query_row("SELECT count(*) FROM requests", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(
+            reopened.request_by_id(&accepted.id).unwrap().unwrap().id,
+            accepted.id
+        );
+    }
+
+    #[test]
+    fn exhausted_preaccept_admission_returns_busy_without_row() {
+        use std::sync::mpsc;
+        let state = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let builder = Store::open_for_tests(state.path(), root.path()).unwrap();
+        let caller = Store::open_for_tests(state.path(), root.path()).unwrap();
+        let (staged_tx, staged_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let creator = std::thread::spawn(move || {
+            builder.bootstrap_missing_queue(
+                |_| {
+                    staged_tx.send(()).unwrap();
+                    resume_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    Ok(())
+                },
+                |_| Ok(()),
+            )
+        });
+        staged_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let error = caller
+            .request_connection_for_enqueue_until(Instant::now())
+            .err()
+            .unwrap();
+        assert!(error.is::<super::super::topology::StorageBusy>());
+        assert!(!caller.request_db_path().exists());
+        resume_tx.send(()).unwrap();
+        creator.join().unwrap().unwrap();
+        let (_guard, db) = caller.request_connection().unwrap();
+        let count: i64 = db
+            .query_row("SELECT count(*) FROM requests", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn root_replaced_missing_queue_does_not_publish() {
+        let state = tempfile::tempdir().unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("workspace");
+        fs::create_dir(&root).unwrap();
+        let store = Store::open_for_tests(state.path(), &root).unwrap();
+        fs::rename(&root, parent.path().join("old-workspace")).unwrap();
+        fs::create_dir(&root).unwrap();
+        assert!(store.request_connection().is_err());
+        assert!(!store.request_db_path().exists());
     }
 
     #[test]

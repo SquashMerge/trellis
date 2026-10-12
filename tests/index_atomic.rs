@@ -264,6 +264,9 @@ fn published_sqlite_header_with_missing_pages_refuses_reads_until_explicit_recov
     use trellis::{index_coordinator::reconcile_workspace, indexer::IndexOptions};
 
     let (state, workspace, store, old_pin, session) = projection_fixture();
+    // Queue bootstrap publishes under index-use EX. Retire this fixture's
+    // writer SH before accepting the pre-recovery request.
+    drop(session);
     // An accepted queue survives exceptional index recovery. Its file cannot
     // disappear and be silently replaced while publication is retried.
     let accepted = store
@@ -271,7 +274,6 @@ fn published_sqlite_header_with_missing_pages_refuses_reads_until_explicit_recov
         .unwrap();
     let queue = store.request_db_path();
     let queue_inode = fs::metadata(&queue).unwrap().ino();
-    drop(session);
     drop(store);
     let dir = index_dir(state.path());
     let index = dir.join("index.db");
@@ -1134,6 +1136,9 @@ fn additive_producer_binding_keeps_same_generation_legacy_pin_and_queue() {
         .run(&options, &cancel, |_| {})
         .unwrap();
     let legacy_source = store.source_at("A.java", Some(first)).unwrap().unwrap().1;
+    // Publish the virgin queue without this fixture's writer SH, then resume
+    // the same-generation publication test with a fresh writer session.
+    drop(session);
     let _queued = store.enqueue_request(&options, None).unwrap();
     let db_path = index_dir(state.path()).join("index.db");
     let queue_path = index_dir(state.path()).join("requests.db");
@@ -1154,6 +1159,7 @@ fn additive_producer_binding_keeps_same_generation_legacy_pin_and_queue() {
         "class A { int method() { return 2; } }\n",
     )
     .unwrap();
+    let session = store.writer_session_for_tests().unwrap();
     let second = IndexJobCoordinator::prepare_with_session(&store, Some(first), session.clone())
         .unwrap()
         .run(&options, &cancel, |_| {})

@@ -26,6 +26,9 @@ fn setup_with_tick(start_tick: bool) -> (tempfile::TempDir, Store, Arc<http::Dae
     let workspace = dir.path().join("workspace");
     std::fs::create_dir(&workspace).unwrap();
     let store = crate::common::open_store(&dir.path().join("state"), &workspace).unwrap();
+    // Daemon admission publishes the virgin queue before retaining writer SH
+    // or starting H. Later HTTP requests may then commit under that SH.
+    assert_eq!(store.settle_foreign_root_requests().unwrap(), 0);
     let state = http::new(
         store.clone(),
         IndexOptions::new(workspace),
@@ -332,6 +335,7 @@ async fn queued_request_is_durable_and_non_cancellable_during_lock_contention() 
     std::fs::create_dir(&root).unwrap();
     std::fs::write(root.join("one.js"), "function one() {}\n").unwrap();
     let store = Store::open_for_tests(&dir.path().join("state"), &root).unwrap();
+    assert_eq!(store.settle_foreign_root_requests().unwrap(), 0);
     let held = store.writer_session_for_tests().unwrap();
     let state = http::new(
         store.clone(),
@@ -1071,7 +1075,8 @@ async fn expired_pin_saved_items_require_explicit_head_reattachment() {
 
 #[tokio::test]
 async fn browser_claimed_unchanged_publishes_new_manifest_before_done() {
-    let (dir, store, state, app) = setup();
+    // Manually publish the first H before POST starts the periodic queue tick.
+    let (dir, store, state, app) = setup_without_tick();
     std::fs::write(
         dir.path().join("workspace/a.js"),
         "function unchanged() {}\n",
@@ -1118,49 +1123,6 @@ async fn browser_claimed_unchanged_publishes_new_manifest_before_done() {
     );
 }
 
-/// A separate CLI-like process commits Q2 to durable requests.db. Its stdout
-/// is a barrier: the parent never releases maintenance before Q2 is accepted.
-#[test]
-#[ignore]
-fn maintenance_external_fifo_child() {
-    use std::io::Write;
-    let root = std::path::PathBuf::from(std::env::var_os("TRELLIS_MAINTENANCE_ROOT").unwrap());
-    let state = std::path::PathBuf::from(std::env::var_os("TRELLIS_MAINTENANCE_STATE").unwrap());
-    let store = Store::open_for_tests(&state, &root).unwrap();
-    let queued = store
-        .enqueue_request(&IndexOptions::new(root), None)
-        .unwrap();
-    println!("MAINTENANCE_REQUEST_ID={}", queued.id);
-    std::io::stdout().flush().unwrap();
-}
-
-fn external_maintenance_request(root: &std::path::Path, state: &std::path::Path) -> String {
-    use std::io::BufRead;
-    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--ignored",
-            "--exact",
-            "maintenance_external_fifo_child",
-            "--nocapture",
-        ])
-        .env("TRELLIS_MAINTENANCE_ROOT", root)
-        .env("TRELLIS_MAINTENANCE_STATE", state)
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let stdout = child.stdout.take().unwrap();
-    let mut request = String::new();
-    for line in std::io::BufReader::new(stdout).lines() {
-        let line = line.unwrap();
-        if let Some(id) = line.strip_prefix("MAINTENANCE_REQUEST_ID=") {
-            request = id.to_owned();
-        }
-    }
-    assert!(child.wait().unwrap().success());
-    assert!(!request.is_empty());
-    request
-}
-
 #[test]
 fn gc_queued_before_candidate_yields_and_daily_stamp_defers_rescan() {
     use trellis::store::topology::{GcStage, TopologyRoots, WorkspaceIdentity};
@@ -1171,6 +1133,8 @@ fn gc_queued_before_candidate_yields_and_daily_stamp_defers_rescan() {
     std::fs::create_dir(&current_root).unwrap();
     std::fs::create_dir(&candidate_root).unwrap();
     let current_store = Store::open_for_tests(&state, &current_root).unwrap();
+    // GC observes an existing durable queue, as a daemon would after admission.
+    assert_eq!(current_store.settle_foreign_root_requests().unwrap(), 0);
     let candidate_store = Store::open_for_tests(&state, &candidate_root).unwrap();
     let roots = TopologyRoots::isolated_for_tests(state.join("cache"), state.join("data"));
     let current = WorkspaceIdentity::discover(Some(&current_root), &current_root).unwrap();
@@ -1194,8 +1158,14 @@ fn gc_queued_before_candidate_yields_and_daily_stamp_defers_rescan() {
     let mut hook = |stage| -> anyhow::Result<()> {
         if stage == GcStage::BeforeCandidate {
             reached += 1;
-            let _id = external_maintenance_request(&current_root, &state);
-            assert_ne!(probe.check(), trellis::store::MaintenanceQueueState::Clear);
+            let queued = current_store
+                .enqueue_request(&IndexOptions::new(current_root.clone()), None)
+                .unwrap();
+            assert_eq!(queued.state, "queued");
+            assert_eq!(
+                probe.check(),
+                trellis::store::MaintenanceQueueState::Pending
+            );
             anyhow::bail!("maintenance deferred for publication");
         }
         Ok(())

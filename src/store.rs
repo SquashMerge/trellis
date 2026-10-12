@@ -11302,6 +11302,26 @@ impl Store {
             self.read_graph_for(tx, &selected)
         })
     }
+    /// Simulate accidental same-pin damage while a test provider is paused. Use
+    /// the protected Store connection, not a second raw SQLite file handle.
+    #[cfg(all(test, feature = "test-support"))]
+    pub(crate) fn corrupt_selected_source_for_tests(
+        &self,
+        pin: IndexPin,
+        path: &str,
+    ) -> Result<()> {
+        let mut db = self.cache_write()?;
+        let tx = storage_result(db.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        let selected = self.read_revision_for(&tx, Some(pin), true)?;
+        let changed = storage_result(tx.execute(
+            "UPDATE document_versions SET source_bytes=zeroblob(length(source_bytes))              WHERE id=(SELECT m.document_version_id FROM revision_documents m              WHERE m.revision_id=?1 AND m.path=?2) AND length(source_bytes)>0",
+            params![selected.key, path],
+        ))?;
+        ensure!(changed == 1, "test fixture: selected source row missing");
+        self.identity.verify()?;
+        storage_result(tx.commit())
+    }
+
     /// Reauthenticate only a cached packet's selected evidence under one pin.
     /// Unrelated documents are not read; status still validates persisted capture inventory.
     pub fn validate_selected_view(&self, view: &ViewResult, sources: &[SourceFile]) -> Result<()> {
@@ -12870,9 +12890,9 @@ mod rebaseline_fault_tests {
                 &cancel,
             )
             .unwrap();
+        drop(owner);
         let request = store.enqueue_request(&options, Some(original)).unwrap();
         let index = store.roots.index_db(&store.identity);
-        drop(owner);
         drop(store);
         let db = Connection::open(&index).unwrap();
         db.execute_batch(

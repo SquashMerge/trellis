@@ -6,7 +6,7 @@ use trellis::{
 };
 
 #[test]
-fn partially_created_queue_readers_report_busy_without_initializing_schema() {
+fn extant_v0_queue_readers_refuse_incompatible_without_initializing_schema() {
     use std::os::unix::fs::PermissionsExt;
     let state = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
@@ -24,8 +24,10 @@ fn partially_created_queue_readers_report_busy_without_initializing_schema() {
     ] {
         let error = result.unwrap_err();
         assert!(
-            error.to_string().contains("storage_busy"),
-            "first creator can have a version-0 file before committed schema: {error:#}"
+            error
+                .to_string()
+                .contains("incompatible_queue: schema version"),
+            "an extant version-0 queue cannot be mistaken for virgin: {error:#}"
         );
         assert_eq!(
             fs::read(&queue).unwrap(),
@@ -1412,10 +1414,15 @@ fn maintenance_probe_external_child() {
     let workspace =
         std::path::Path::new(&std::env::var("TRELLIS_PROBE_WORKSPACE").unwrap()).to_path_buf();
     let store = Store::open_for_tests(&state, &workspace).unwrap();
-    if mode == "enqueue" {
-        store
-            .enqueue_request(&IndexOptions::new(workspace), None)
-            .unwrap();
+    if mode == "enqueue" || mode == "enqueue_busy" {
+        let result = store.enqueue_request(&IndexOptions::new(workspace), None);
+        if mode == "enqueue_busy" {
+            let error = result.expect_err("virgin queue publication cannot pass probe SH");
+            assert!(error.to_string().contains("storage_busy"), "{error:#}");
+            assert!(!store.request_db_path().exists());
+        } else {
+            result.unwrap();
+        }
     } else if mode == "exclusive" || mode == "wal" || mode == "journal" {
         let db = rusqlite::Connection::open(store.request_db_path()).unwrap();
         db.busy_timeout(std::time::Duration::ZERO).unwrap();
@@ -1460,7 +1467,7 @@ fn maintenance_probe_child(
 }
 
 #[test]
-fn maintenance_probe_virgin_appearance_and_v0_are_unknown() {
+fn maintenance_probe_virgin_blocks_first_publication_and_v0_is_unknown() {
     let state = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
     fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
@@ -1468,6 +1475,19 @@ fn maintenance_probe_virgin_appearance_and_v0_are_unknown() {
     let probe = store.open_maintenance_queue_probe().unwrap();
     assert!(matches!(probe, QueueProbeAdmission::AbsentVirgin(_)));
     assert_eq!(probe.check(), MaintenanceQueueState::Clear);
+    // The probe's index-use SH prevents the first queue's EX-protected
+    // publication. A separate process must report typed contention, not ACK.
+    let output = maintenance_probe_child("enqueue_busy", state.path(), workspace.path())
+        .wait_with_output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "external virgin refusal failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!store.request_db_path().exists());
+    assert_eq!(probe.check(), MaintenanceQueueState::Clear);
+    drop(probe);
     let output = maintenance_probe_child("enqueue", state.path(), workspace.path())
         .wait_with_output()
         .unwrap();
@@ -1476,8 +1496,6 @@ fn maintenance_probe_virgin_appearance_and_v0_are_unknown() {
         "external FIFO failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(probe.check(), MaintenanceQueueState::Unknown);
-    drop(probe);
     assert_eq!(
         store.open_maintenance_queue_probe().unwrap().check(),
         MaintenanceQueueState::Pending

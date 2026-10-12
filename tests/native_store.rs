@@ -2092,10 +2092,12 @@ fn prior_v8_additive_maintenance_keeps_inode_generation_and_unfinished_fifo() {
         &leader,
     )
     .unwrap();
+    // First queue publication requires index-use EX, so release the test
+    // writer guard before accepting the retained request.
+    drop(leader);
     let pending = store
         .enqueue_request(&IndexOptions::new(root.path().to_owned()), None)
         .unwrap();
-    drop(leader);
     drop(store);
     let identity =
         trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
@@ -2541,13 +2543,15 @@ fn failed_publication_after_additive_v8_upgrade_preserves_old_pin() {
         &leader,
     )
     .unwrap();
+    // Keep the accepted request after H, but retire the test writer guard
+    // before the virgin queue's EX-protected first publication.
+    drop(leader);
     let accepted = store
         .enqueue_request(&IndexOptions::new(root.path().to_owned()), Some(old))
         .unwrap();
     assert_eq!(accepted.state, "queued");
     let queue = store.request_db_path();
     let queue_inode = fs::metadata(&queue).unwrap().ino();
-    drop(leader);
     drop(store);
     let identity =
         trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())

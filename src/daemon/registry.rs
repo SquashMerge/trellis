@@ -166,6 +166,8 @@ pub struct CheckoutRegistry {
     orphan_scan_cache: Option<(Instant, bool)>,
     orphan_scan_count: u64,
     clock_override: Option<Instant>,
+    #[cfg(all(test, feature = "test-support"))]
+    test_jev_endpoint: Option<String>,
 }
 
 impl Default for CheckoutRegistry {
@@ -188,7 +190,14 @@ impl CheckoutRegistry {
             orphan_scan_cache: None,
             orphan_scan_count: 0,
             clock_override: None,
+            #[cfg(all(test, feature = "test-support"))]
+            test_jev_endpoint: None,
         }
+    }
+
+    #[cfg(all(test, feature = "test-support"))]
+    pub(crate) fn set_jev_endpoint_for_tests(&mut self, endpoint: String) {
+        self.test_jev_endpoint = Some(endpoint);
     }
 
     /// Supply isolated roots in fixtures. The default uses the user's normal
@@ -228,6 +237,10 @@ impl CheckoutRegistry {
             None => TopologyRoots::production()?,
         };
         let store = Store::open(roots, identity)?;
+        // Publish only a proved-virgin queue before this runtime is visible to
+        // selected status reads. Those reads otherwise compete with the EX
+        // stage needed before mandatory H can begin.
+        store.prepare_virgin_queue_before_activation()?;
         let config: BrowserOptions = entry
             .registration
             .as_ref()
@@ -252,12 +265,14 @@ impl CheckoutRegistry {
                     .jev_key
                     .or_else(|| std::env::var("JEV_KEY").ok())
                     .ok_or_else(|| anyhow::anyhow!("JEV_KEY must be configured"))?;
-                Some(Arc::new(crate::live_jev::LiveJev::open(
-                    &dir,
-                    key,
-                    cap,
-                    &options.workspace_root,
-                )?))
+                let live = crate::live_jev::LiveJev::open(&dir, key, cap, &options.workspace_root)?;
+                #[cfg(all(test, feature = "test-support"))]
+                let live = if let Some(endpoint) = &self.test_jev_endpoint {
+                    live.with_test_endpoint(endpoint.clone())
+                } else {
+                    live
+                };
+                Some(Arc::new(live))
             }
             _ => None,
         };

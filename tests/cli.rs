@@ -269,6 +269,42 @@ fn command(root: &std::path::Path, state: &std::path::Path, sub: &str) -> Comman
     c
 }
 
+// A spawned daemon can inherit the CLI's stdout/stderr descriptors. A failed
+// CLI must not wait for that descendant to close Command::output pipes.
+fn bounded_invalid_cli(
+    dir: &std::path::Path,
+    phase: &str,
+    command: &mut Command,
+) -> std::process::Output {
+    use std::process::{Output, Stdio};
+    use std::time::{Duration, Instant};
+    let stdout = dir.join(format!("invalid-{phase}.stdout"));
+    let stderr = dir.join(format!("invalid-{phase}.stderr"));
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(fs::File::create(&stdout).unwrap()))
+        .stderr(Stdio::from(fs::File::create(&stderr).unwrap()))
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("invalid phase={phase} CLI did not exit within 20 seconds");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    Output {
+        status,
+        stdout: fs::read(stdout).unwrap(),
+        stderr: fs::read(stderr).unwrap(),
+    }
+}
+
 #[test]
 fn unchanged_serve_reuses_selected_versions_and_detects_selected_source_corruption() {
     use std::{os::unix::fs::MetadataExt, time::Duration};
@@ -476,6 +512,14 @@ fn unchanged_serve_reuses_selected_versions_and_detects_selected_source_corrupti
         "{}",
         String::from_utf8_lossy(&published.stderr)
     );
+    let result: Value = serde_json::from_slice(&published.stdout).unwrap();
+    let published_rev = result["publishedRevision"]["indexRevision"]
+        .as_i64()
+        .unwrap();
+    assert!(
+        matches!(published_rev, 4 | 5),
+        "one Q publication, with at most one mandatory takeover H: {result}"
+    );
     let attached = command(&root, &home, "status").output().unwrap();
     assert!(
         attached.status.success(),
@@ -502,19 +546,31 @@ fn unchanged_serve_reuses_selected_versions_and_detects_selected_source_corrupti
     }
     let db = rusqlite::Connection::open(&dbpath).unwrap();
     let (r3, next_ids) = pin_and_ids(&db);
-    assert_eq!(r3, 4, "new bytes must FULL publish, never reuse old pin");
-    assert_eq!(next_ids.len(), 4);
-    assert_eq!(next_ids[0].1, next_ids[1].1);
+    assert_eq!(r3, published_rev, "completed Q must name the selected head");
+    assert_eq!(next_ids.len(), usize::try_from(r3).unwrap());
+    assert_eq!(
+        &next_ids[..ids.len()],
+        ids.as_slice(),
+        "retained prior pins changed"
+    );
+    let changed_ids = &next_ids[3];
     assert_ne!(
-        next_ids[1].1, next_ids[3].1,
+        ids[2].1, changed_ids.1,
         "same-length/mtime edit reused stale bytes"
     );
+    for current in next_ids.iter().skip(3) {
+        assert_eq!(
+            (&current.1, &current.2, &current.3),
+            (&changed_ids.1, &changed_ids.2, &changed_ids.3),
+            "takeover H and Q must select the same new immutable evidence"
+        );
+    }
     assert_eq!(next_ids[0].1, old_ids[0].1, "retained old pin changed");
     drop(db);
     drop(changed);
 
     let db = rusqlite::Connection::open(&dbpath).unwrap();
-    let selected_id = &next_ids[3].1;
+    let selected_id = &next_ids.last().unwrap().1;
     assert_eq!(
         db.execute(
             "UPDATE document_versions SET source_bytes=?1 WHERE id=?2",
@@ -539,7 +595,7 @@ fn unchanged_serve_reuses_selected_versions_and_detects_selected_source_corrupti
     let db = rusqlite::Connection::open(&dbpath).unwrap();
     assert_eq!(
         pin_and_ids(&db),
-        (4, next_ids.clone()),
+        (r3, next_ids.clone()),
         "corrupt selected source was republished"
     );
     let headers: i64 = db
@@ -552,7 +608,7 @@ fn unchanged_serve_reuses_selected_versions_and_detects_selected_source_corrupti
         .unwrap();
     assert_eq!(
         (headers, bindings),
-        (4, 4),
+        (r3, r3),
         "refused Serve installed partial metadata"
     );
     drop(db);
@@ -1276,27 +1332,40 @@ fn corrupt_read_activation_waits_for_accepted_cli_options_in_same_daemon() {
 
 #[tokio::test]
 async fn corrupted_daemon_startup_uses_configured_options_and_does_not_fallback_when_busy() {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
     use trellis::store::topology::UseGuard;
     const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("source");
     let home = temp.path().join("home");
+    let marker = home.join("auto-daemon.pid");
     fs::create_dir(&root).unwrap();
     fs::write(root.join("a.js"), "function a() {}\n").unwrap();
-    let initial = command(&root, &home, "index").output().unwrap();
-    assert!(initial.status.success());
+    let initial = command(&root, &home, "index")
+        .env("TRELLIS_TEST_DAEMON_PID_FILE", &marker)
+        .output()
+        .unwrap();
+    assert!(
+        initial.status.success(),
+        "{}",
+        String::from_utf8_lossy(&initial.stderr)
+    );
+    FixtureDaemon::new(&home).stop_attested().unwrap();
     let index = real_index_db(&home);
+    let dir = index.parent().unwrap();
+    let use_lock = dir.parent().unwrap().join(format!(
+        "{}.lock",
+        dir.file_name().unwrap().to_string_lossy()
+    ));
+    // Socket closure alone does not attest that the old daemon dropped its SH.
+    drop(UseGuard::acquire_existing_readonly_exclusive(&use_lock).unwrap());
     let url = "http://127.0.0.1:7331";
     // Open before corruption: Store::open would otherwise attempt recovery.
     let busy_legacy =
         LegacyClient::same_home_with_session(&root, &home, TOKEN, url, 3_145_728, false);
     fs::write(&index, b"broken sqlite index header").unwrap();
     let corrupt = fs::read(&index).unwrap();
-    let dir = index.parent().unwrap();
-    let use_lock = dir.parent().unwrap().join(format!(
-        "{}.lock",
-        dir.file_name().unwrap().to_string_lossy()
-    ));
     let reader = UseGuard::acquire_existing(&use_lock, false, true).unwrap();
     let busy = busy_legacy
         .get(format!("{url}/api/status"))
@@ -1309,25 +1378,100 @@ async fn corrupted_daemon_startup_uses_configured_options_and_does_not_fallback_
     assert_eq!(body["error"]["code"], "recovery_required");
     assert_eq!(fs::read(&index).unwrap(), corrupt);
     drop(busy_legacy);
-    // Keep this shared use guard while the CLI asks the live daemon to index.
-    // It prevents exceptional recreation from completing between the busy
-    // probe and the rejection assertion.
-    // The live daemon owns this checkout. An explicit CLI must not open a
-    // second Store as a corruption-recovery fallback while that owner is live.
-    let refused = command(&root, &home, "index")
+
+    // The CLI sends one durable request to the daemon; it cannot recover this
+    // corrupted index while the independent reader holds SH. Do not wait for
+    // its reply under SH: an accepted request is not a failed request.
+    let stdout_path = temp.path().join("blocked-index.stdout");
+    let stderr_path = temp.path().join("blocked-index.stderr");
+    let _daemon = FixtureDaemon::new(&home);
+    let mut child = command(&root, &home, "index")
+        .env("TRELLIS_TEST_DAEMON_PID_FILE", &marker)
         .arg("--max-file-bytes")
         .arg("3145728")
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(fs::File::create(&stdout_path).unwrap()))
+        .stderr(Stdio::from(fs::File::create(&stderr_path).unwrap()))
+        .spawn()
         .unwrap();
-    assert!(!refused.status.success());
-    assert!(refused.stdout.is_empty());
-    assert!(
-        String::from_utf8_lossy(&refused.stderr).contains("index_failed"),
-        "{}",
-        String::from_utf8_lossy(&refused.stderr)
-    );
+    let startup_deadline = Instant::now() + Duration::from_secs(10);
+    while !marker.exists() {
+        if child.try_wait().unwrap().is_some() || Instant::now() >= startup_deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("daemon-owned CLI exited or did not start while reader held SH");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(child.try_wait().unwrap().is_none());
+    assert!(fs::read(&stdout_path).unwrap().is_empty());
     assert_eq!(fs::read(&index).unwrap(), corrupt);
     drop(reader);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let exit = loop {
+        if let Some(exit) = child.try_wait().unwrap() {
+            break exit;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("daemon-owned CLI did not complete after SH release");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(
+        exit.success(),
+        "{}",
+        fs::read_to_string(&stderr_path).unwrap()
+    );
+    let result: Value = serde_json::from_slice(&fs::read(&stdout_path).unwrap()).unwrap();
+    assert_eq!(result["publishedRevision"], result["status"]["revision"]);
+    assert_ne!(fs::read(&index).unwrap(), corrupt);
+
+    _daemon.stop_attested().unwrap();
+    drop(UseGuard::acquire_existing_readonly_exclusive(&use_lock).unwrap());
+    let db = rusqlite::Connection::open(&index).unwrap();
+    let recorded: String = db
+        .query_row(
+            "SELECT reconcile_options FROM index_metadata WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&recorded).unwrap()["maxFileBytes"],
+        3_145_728
+    );
+    drop(db);
+    let queue = rusqlite::Connection::open(index.with_file_name("requests.db")).unwrap();
+    let count: i64 = queue
+        .query_row("SELECT count(*) FROM requests", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        count, 2,
+        "one initial and one daemon-owned accepted request"
+    );
+    let (state, options, generation, revision): (String, String, String, i64) = queue.query_row(
+        "SELECT state,options_json,result_generation,result_revision FROM requests ORDER BY seq DESC LIMIT 1",
+        [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+    ).unwrap();
+    assert_eq!(state, "done");
+    assert_eq!(
+        serde_json::from_str::<Value>(&options).unwrap()["maxFileBytes"],
+        3_145_728
+    );
+    assert_eq!(
+        generation,
+        result["publishedRevision"]["indexGeneration"]
+            .as_str()
+            .unwrap()
+    );
+    assert_eq!(
+        revision as u64,
+        result["publishedRevision"]["indexRevision"]
+            .as_u64()
+            .unwrap()
+    );
 }
 
 #[test]
@@ -1566,7 +1710,7 @@ fn acp_requires_complete_explicit_allowance_flags() {
     let source = temp.path().join("source");
     fs::create_dir(&source).unwrap();
     let state = temp.path().join("state");
-    for flags in [
+    for (case, flags) in [
         vec!["--acp-runner", "unused"],
         vec!["--acp-state-dir", "unused"],
         vec!["--acp-max-attempts", "1"],
@@ -1586,11 +1730,15 @@ fn acp_requires_complete_explicit_allowance_flags() {
             "--acp-max-attempts",
             "21",
         ],
-    ] {
-        let output = command(&source, &state, "serve")
-            .args(flags)
-            .output()
-            .unwrap();
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let output = bounded_invalid_cli(
+            temp.path(),
+            &format!("acp-{case}"),
+            command(&source, &state, "serve").args(flags),
+        );
         assert!(!output.status.success());
     }
     assert!(
@@ -1601,12 +1749,52 @@ fn acp_requires_complete_explicit_allowance_flags() {
 
 #[test]
 fn fixed_locations_and_removed_flag() {
+    use std::process::{Output, Stdio};
+    use std::time::{Duration, Instant};
+
+    // File-backed output cannot wait forever for a detached descendant to
+    // close an inherited pipe. Also bound a CLI that itself fails to exit.
+    fn bounded_cli(dir: &std::path::Path, phase: &str, cmd: &mut Command) -> Output {
+        let stdout = dir.join(format!("fixed-{phase}.stdout"));
+        let stderr = dir.join(format!("fixed-{phase}.stderr"));
+        let mut child = cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(fs::File::create(&stdout).unwrap()))
+            .stderr(Stdio::from(fs::File::create(&stderr).unwrap()))
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("fixed-locations phase={phase} CLI did not exit within 20 seconds");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        Output {
+            status,
+            stdout: fs::read(stdout).unwrap(),
+            stderr: fs::read(stderr).unwrap(),
+        }
+    }
+
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("workspace");
     let home = temp.path().join("home");
+    let daemon = FixtureDaemon::new(&home);
+    let marker = home.join("auto-daemon.pid");
+    let cli = |sub| {
+        let mut cmd = command(&root, &home, sub);
+        cmd.env("TRELLIS_TEST_DAEMON_PID_FILE", &marker);
+        cmd
+    };
     fs::create_dir(&root).unwrap();
     fs::write(root.join("a.js"), "function seed() {}").unwrap();
-    let absent = command(&root, &home, "status").output().unwrap();
+    let absent = bounded_cli(temp.path(), "status-absent", &mut cli("status"));
     assert!(
         absent.status.success(),
         "{}",
@@ -1614,7 +1802,7 @@ fn fixed_locations_and_removed_flag() {
     );
     let observed: Value = serde_json::from_slice(&absent.stdout).unwrap();
     assert!(observed["revision"]["indexRevision"].as_u64().unwrap() >= 1);
-    let status = command(&root, &home, "index").output().unwrap();
+    let status = bounded_cli(temp.path(), "index", &mut cli("index"));
     assert!(
         status.status.success(),
         "{}",
@@ -1643,20 +1831,23 @@ fn fixed_locations_and_removed_flag() {
     );
     assert!(!home.join("state/cache.db").exists());
     assert!(!home.join("state/workspace.db").exists());
-    let removed = command(&root, &home, "status")
+    let mut removed_command = cli("status");
+    removed_command
         .arg("--state-dir")
-        .arg(home.join("override"))
-        .output()
-        .unwrap();
+        .arg(home.join("override"));
+    let removed = bounded_cli(temp.path(), "removed-state-dir", &mut removed_command);
     assert!(!removed.status.success());
     assert!(String::from_utf8_lossy(&removed.stderr).contains("--state-dir"));
-    let final_status: Value =
-        serde_json::from_slice(&command(&root, &home, "status").output().unwrap().stdout).unwrap();
+    let final_status: Value = serde_json::from_slice(
+        &bounded_cli(temp.path(), "status-final", &mut cli("status")).stdout,
+    )
+    .unwrap();
     assert_eq!(
         final_status["revision"]["indexGeneration"],
         first["revision"]["indexGeneration"]
     );
     assert_eq!(final_status["revision"], first["revision"]);
+    daemon.stop_attested().unwrap();
 }
 #[test]
 fn cli_index_diagnostics_are_opt_in_without_changing_publication() {
@@ -1924,23 +2115,25 @@ fn external_destinations_are_rejected_before_git_marker_creation() {
     fs::create_dir(&root).unwrap();
     fs::create_dir(root.join(".git")).unwrap();
     let token = root.join("token");
-    let serve = isolated_command(&home)
-        .arg("serve")
-        .arg("--workspace")
-        .arg(&root)
-        .arg("--token-file")
-        .arg(&token)
-        .output()
-        .unwrap();
+    let serve = bounded_invalid_cli(
+        temp.path(),
+        "external-serve",
+        isolated_command(&home)
+            .arg("serve")
+            .arg("--workspace")
+            .arg(&root)
+            .arg("--token-file")
+            .arg(&token),
+    );
     assert!(!serve.status.success());
     assert!(!root.join(".git/trellis/workspace-id").exists());
     assert!(!token.exists());
     let output = root.join("graph.json");
-    let export = command(&root, &home, "export")
-        .arg("--output")
-        .arg(&output)
-        .output()
-        .unwrap();
+    let export = bounded_invalid_cli(
+        temp.path(),
+        "external-export",
+        command(&root, &home, "export").arg("--output").arg(&output),
+    );
     assert!(!export.status.success());
     assert!(!output.exists());
     assert!(!root.join(".git/trellis/workspace-id").exists());
@@ -3085,7 +3278,20 @@ def sink():
             |client: &reqwest::Client| client.get(format!("{url}/status")).bearer_auth(token);
         let post_start_status: Value = tokio::time::timeout(Duration::from_secs(20), async {
             loop {
-                let response = selected_status(&client).send().await.unwrap();
+                // The client deadline is shorter than a bounded SQLite busy
+                // wait. Retry only transport timeouts inside the outer H limit;
+                // every answered status still has to prove its selected pin.
+                let response = match selected_status(&client).send().await {
+                    Ok(response) => response,
+                    Err(error) if error.is_timeout() => {
+                        assert!(
+                            server.0.try_wait().unwrap().is_none(),
+                            "{name}: serve exited during selected status poll"
+                        );
+                        continue;
+                    }
+                    Err(error) => panic!("{name}: selected status request: {error}"),
+                };
                 if response.status().is_success() {
                     let status: Value = response.json().await.unwrap();
                     let revision = &status["revision"];
@@ -3982,6 +4188,120 @@ def sink():
             assert!(!export.to_string().contains("lexical-guess"), "{name}");
         }
     }
+}
+
+#[test]
+fn virgin_cli_activation_contention_expires_before_enqueue_and_new_index_succeeds() {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+    use trellis::store::{
+        Store,
+        topology::{TopologyRoots, UseGuard, WorkspaceIdentity},
+    };
+
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("source");
+    let home = temp.path().join("home");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("flow.js"), "function start() {}\n").unwrap();
+    let _daemon = FixtureDaemon::new(&home);
+    let (cache, data) = if cfg!(target_os = "macos") {
+        (
+            home.join("Library/Caches/dev.squashmerge.trellis"),
+            home.join("Library/Application Support/dev.squashmerge.trellis"),
+        )
+    } else {
+        (
+            home.join(".cache/trellis"),
+            home.join(".local/share/trellis"),
+        )
+    };
+    let roots = TopologyRoots::isolated_for_tests(cache, data);
+    let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+    let use_lock = roots.index_use_lock(&identity);
+    let store = Store::open(roots, identity).unwrap();
+    assert_eq!(store.index_baseline().unwrap().index_revision, 0);
+    let queue_path = store.request_db_path();
+    assert!(
+        !queue_path.exists(),
+        "fresh Ready index must have a virgin queue"
+    );
+    // Store must release every SQLite handle before another process contends on
+    // the index-use lock. SH blocks the virgin queue's mandatory EX publish.
+    drop(store);
+    let reader = UseGuard::acquire_existing_readonly(&use_lock).unwrap();
+    let stdout_path = temp.path().join("contended-index.stdout");
+    let stderr_path = temp.path().join("contended-index.stderr");
+    let marker = home.join("auto-daemon.pid");
+    let mut child = command(&root, &home, "index")
+        .env("TRELLIS_TEST_DAEMON_PID_FILE", &marker)
+        .stdout(Stdio::from(fs::File::create(&stdout_path).unwrap()))
+        .stderr(Stdio::from(fs::File::create(&stderr_path).unwrap()))
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("contended CLI index did not exit after its 5s read wait");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(!status.success(), "contended index unexpectedly succeeded");
+    assert!(
+        fs::read(&stdout_path).unwrap().is_empty(),
+        "failed index emitted an accepted ID"
+    );
+    let stderr = fs::read_to_string(&stderr_path).unwrap();
+    assert!(
+        stderr.contains("storage_busy: CLI read contention wait expired"),
+        "unexpected pre-acceptance error: {stderr}"
+    );
+    assert!(
+        !queue_path.exists(),
+        "a failed pre-acceptance index created requests.db"
+    );
+    drop(reader);
+
+    // This is a new CLI invocation, not a replay of an uncertain enqueue.
+    let fresh = command(&root, &home, "index")
+        .env("TRELLIS_TEST_DAEMON_PID_FILE", &marker)
+        .output()
+        .unwrap();
+    assert!(
+        fresh.status.success(),
+        "{}",
+        String::from_utf8_lossy(&fresh.stderr)
+    );
+    let result: Value = serde_json::from_slice(&fresh.stdout).unwrap();
+    assert_eq!(result["publishedRevision"], result["status"]["revision"]);
+    assert_eq!(result["publishedRevision"]["indexRevision"], 2);
+
+    // Raw SQLite reads may close descriptors on the live inode and drop its
+    // process locks. Attest daemon shutdown and released use lock first.
+    FixtureDaemon::new(&home).stop_attested().unwrap();
+    let _exclusive = UseGuard::acquire_existing_readonly_exclusive(&use_lock)
+        .expect("retired daemon retained the index-use lock");
+    let db = rusqlite::Connection::open_with_flags(
+        &queue_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let (count, distinct_ids, state, revision): (i64, i64, String, i64) = db
+        .query_row(
+            "SELECT count(*), count(DISTINCT id), min(state), min(result_revision) FROM requests",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (count, distinct_ids, state.as_str(), revision),
+        (1, 1, "done", 2)
+    );
 }
 
 #[test]

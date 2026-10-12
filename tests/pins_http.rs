@@ -34,8 +34,7 @@ fn fixture_with_state() -> (
     let options = IndexOptions::new(root.clone());
     let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
     let store = crate::common::open_store(&temp.path().join("state"), &root).unwrap();
-    let (graph, native, capture) =
-        index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+    let (graph, _, _) = index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
     let id = graph
         .nodes
         .iter()
@@ -44,18 +43,11 @@ fn fixture_with_state() -> (
         .id
         .clone();
     assert!(store.status().is_err());
-    let baseline = store.index_baseline().unwrap();
-    let session = store.writer_session_for_tests().unwrap();
-    store
-        .publish_native(
-            &graph,
-            &capture,
-            &native,
-            session.writer_guard().unwrap(),
-            baseline,
-            &cancel,
-        )
-        .unwrap();
+    // A serving fixture must stage its queue and commit the recorded-options H
+    // before the first browser Q. A raw publish is not daemon activation.
+    let (initial, session) =
+        trellis::index_coordinator::reconcile_workspace(&store, &options, &cancel, |_| {}).unwrap();
+    assert_eq!(initial.index_revision, 1);
     let state = http::new(
         store.clone(),
         options,
@@ -316,7 +308,16 @@ async fn required_endpoint_matrix() {
 }
 #[tokio::test]
 async fn index_admission_and_publication_pair() {
-    let (_temp, store, _graph, app, _id) = fixture();
+    let (_temp, store, _graph, state, app, _id) = fixture_with_state();
+    // The manually published fixture starts its first watcher inventory on
+    // retention. Settle that inventory before pinning Q's expected revision.
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while state.checkout_watch_pending() {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("initial watcher inventory did not settle");
     let pin = store.status().unwrap().revision;
     for bad in [json!(null), json!(1), json!({"indexRevision":1})] {
         assert_eq!(

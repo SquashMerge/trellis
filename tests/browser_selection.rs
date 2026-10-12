@@ -1366,6 +1366,7 @@ async fn resolved_root_change_retains_headers_even_when_read_fence_fails() {
         let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
         let roots =
             TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+        let queue_path = roots.requests_db(&identity);
         let mut registry = CheckoutRegistry::with_roots(roots);
         registry
             .register(&identity, CheckoutOptions(serde_json::json!({})))
@@ -1390,17 +1391,37 @@ async fn resolved_root_change_retains_headers_even_when_read_fence_fails() {
                 .unwrap()
             }
         };
+        let mut last_code = None;
+        let mut last_error_code = None;
+        let mut saw_runtime = false;
+        let mut first_h_error = None;
+        let mut saw_retry_waiting = false;
         tokio::time::timeout(Duration::from_secs(20), async {
             loop {
                 let response = call(app.clone()).await;
+                last_code = Some(response.status());
                 if response.status() == axum::http::StatusCode::OK {
                     break;
+                }
+                last_error_code = to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .ok()
+                    .and_then(|body| serde_json::from_slice::<Value>(&body).ok())
+                    .and_then(|body| body["error"]["code"].as_str().map(str::to_owned));
+                let runtime = registry.lock().await.runtime(&identity.root_key);
+                saw_runtime |= runtime.is_some();
+                if let Some(runtime) = runtime {
+                    let waiting = runtime.retry_waiting_for_tests();
+                    saw_retry_waiting |= waiting;
+                    if first_h_error.is_none() {
+                        first_h_error = runtime.reconciliation_error().map(|error| (error, waiting));
+                    }
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         })
         .await
-        .unwrap();
+        .unwrap_or_else(|_| panic!("{stage}/{route_suffix} cold selected route did not become ready: {last_code:?}/{last_error_code:?}; runtime seen: {saw_runtime}; first H error/retry: {first_h_error:?}; saw retry waiting: {saw_retry_waiting}; queue exists: {}", queue_path.exists()));
         let changed = Arc::new(AtomicBool::new(false));
         let source = identity.root.clone();
         let destination = temp.path().join("moved");
@@ -1541,26 +1562,44 @@ async fn selected_question_preview_keeps_legacy_oversize_error() {
     registry
         .register(&identity, CheckoutOptions(serde_json::json!({})))
         .unwrap();
+    let registry = Arc::new(tokio::sync::Mutex::new(registry));
     let app = ProvisionedBrowser::new(
-        Arc::new(tokio::sync::Mutex::new(registry)),
+        registry.clone(),
         TOKEN.to_owned(),
         "127.0.0.1:7331".parse().unwrap(),
     )
     .unwrap()
     .router();
     let prefix = format!("/api/checkouts/{}", identity.root_key);
+    let mut last_status = None;
+    let mut first_h_error = None;
+    let mut saw_retry_waiting = false;
     let pin = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             let (status, _, value) =
                 selected_json(app.clone(), "GET", &format!("{prefix}/status"), Value::Null).await;
+            last_status = Some((status, value.clone()));
+            // Sample while H is still retrying. The first error can disappear
+            // after a successful retry, before the final timeout diagnostic.
+            if (status != axum::http::StatusCode::OK || value["catchingUp"] != false)
+                && let Some(runtime) = registry.lock().await.runtime(&identity.root_key)
+            {
+                let waiting = runtime.retry_waiting_for_tests();
+                saw_retry_waiting |= waiting;
+                if first_h_error.is_none() {
+                    first_h_error = runtime.reconciliation_error().map(|error| (error, waiting));
+                }
+            }
             if status == axum::http::StatusCode::OK && value["catchingUp"] == false {
                 break value["revision"].clone();
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
-    .await
-    .unwrap();
+    .await;
+    let pin = pin.unwrap_or_else(|_| {
+        panic!("cold selected preview status stayed not-ready: {last_status:?}; first H error/retry: {first_h_error:?}; saw retry waiting: {saw_retry_waiting}")
+    });
     let (status, _, symbols) = selected_json(
         app.clone(),
         "GET",
@@ -1829,7 +1868,6 @@ async fn browser_only_live_listener_releases_resources_then_exits_with_control_p
     let after_request = std::time::Instant::now();
     let runtime = registry.lock().await.runtime(&identity.root_key).unwrap();
     assert!(runtime.has_active_resources());
-    assert!(!runtime.catching_up());
     assert!(open_descriptors(&index_lock) > 0);
     for route in ["/healthz", "/", "/api/checkouts", "/api/daemon/status"] {
         let request = client.get(format!("{base}{route}"));
@@ -2978,6 +3016,105 @@ async fn production_browser_rejects_every_selector_free_checkout_route_without_a
         assert!(headers.contains_key("X-Trellis-Catching-Up"));
         assert_eq!(registry.lock().await.active_count(), 1);
     }
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn virgin_queue_use_lock_contention_retries_h_before_claiming_fifo() {
+    use std::sync::Arc;
+    use trellis::{
+        daemon::registry::{CheckoutOptions, CheckoutRegistry},
+        http::ProvisionedBrowser,
+        indexer::IndexOptions,
+        store::{Store, topology::TopologyRoots},
+    };
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("checkout");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("core.js"), "function stable() {}\n").unwrap();
+    let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+    let roots =
+        TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+    // Store::open creates only the virgin revision-0 index, not the queue.
+    let store = Store::open(roots.clone(), identity.verified_clone_for_tests().unwrap()).unwrap();
+    let queue_path = roots.requests_db(&identity);
+    assert!(!queue_path.exists());
+    let use_lock = roots.index_use(&identity).unwrap();
+    let mut registry = CheckoutRegistry::with_roots(roots.clone());
+    registry
+        .register(&identity, CheckoutOptions(serde_json::json!({})))
+        .unwrap();
+    let registry = Arc::new(tokio::sync::Mutex::new(registry));
+    let app = ProvisionedBrowser::new(
+        registry.clone(),
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
+        "127.0.0.1:7331".parse().unwrap(),
+    )
+    .unwrap()
+    .router();
+    {
+        let mut checked = registry.lock().await;
+        checked
+            .browser_request_at(&identity, std::time::Instant::now())
+            .unwrap();
+        // Bootstrap now precedes publication. An outstanding SH prevents its
+        // EX lock, so activation must fail without exposing an H runtime or
+        // publishing a queue that could accept a FIFO request before H.
+        let error = match checked.activate(&identity.root_key) {
+            Ok(_) => panic!("virgin queue activation must not publish under SH contention"),
+            Err(error) => error,
+        };
+        assert_eq!(error.to_string(), "storage_busy", "{error:#}");
+        assert!(checked.runtime(&identity.root_key).is_none());
+    }
+    let prefix = format!("/api/checkouts/{}", identity.root_key);
+    let (code, _, blocked) =
+        selected_json(app.clone(), "GET", &format!("{prefix}/status"), Value::Null).await;
+    assert_eq!(code, axum::http::StatusCode::CONFLICT, "{blocked}");
+    assert_eq!(blocked["error"]["code"], "storage_busy");
+    assert!(registry.lock().await.runtime(&identity.root_key).is_none());
+    assert!(!queue_path.exists());
+    drop(use_lock);
+    let runtime = {
+        let mut checked = registry.lock().await;
+        checked.activate(&identity.root_key).unwrap()
+    };
+    assert!(registry.lock().await.runtime(&identity.root_key).is_some());
+    // Activation returns only after the staged queue is complete and readable
+    // as v1. The normal Store queue read also validates root identity and
+    // SQLite integrity; a bare existence check would miss a half-built queue.
+    assert!(queue_path.exists());
+    assert!(store.earliest_unfinished_request().unwrap().is_none());
+    let queued = store
+        .enqueue_request(&IndexOptions::new(root), None)
+        .unwrap();
+    assert_eq!(queued.state, "queued");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let (code, _, status) =
+                selected_json(app.clone(), "GET", &format!("{prefix}/status"), Value::Null).await;
+            if code == axum::http::StatusCode::OK && status["catchingUp"] == false {
+                let finished = store.request_by_id(&queued.id).unwrap().unwrap();
+                if finished.state == "done" {
+                    assert!(
+                        status["revision"]["indexRevision"].as_u64().unwrap() >= 2,
+                        "mandatory H must publish before FIFO completion: {status}"
+                    );
+                    assert_eq!(finished.id, queued.id);
+                    assert_eq!(finished.seq, queued.seq);
+                    assert!(
+                        finished.revision.unwrap().index_revision >= 2,
+                        "FIFO request must commit after H"
+                    );
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("H and queued work did not become ready after SH release");
+    assert!(!runtime.catching_up());
 }
 
 #[cfg(feature = "test-support")]

@@ -580,6 +580,19 @@ impl DaemonState {
         pending.unwrap_or_else(|| self.serving_session.lock().unwrap().is_some())
     }
 
+    /// A deterministic fixture can submit an accepted source hint through the
+    /// same bounded watcher ingress as notify, without relying on OS delivery.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn submit_watch_event_for_tests(&self, event: notify::Result<notify::Event>) -> bool {
+        let work = self.watcher_work.lock().unwrap();
+        let Some((_, scheduler)) = work.as_ref() else {
+            return false;
+        };
+        scheduler.submit_watch_event_for_tests(event);
+        true
+    }
+
     /// Offline snapshot fixtures opt out of the daemon's queue and maintenance ticks.
     /// See #111 for the separate read-during-reconciliation product fix.
     #[cfg(any(test, feature = "test-support"))]
@@ -5466,13 +5479,41 @@ mod exceptional_recovery_tests {
         // Advance the advisory retry deadline without sleeping. The held SH
         // had fenced EX; the durable row remains queued for this next tick.
         *state.recovery_retry_after.lock().unwrap() = None;
+        // A timed-out blocking tick keeps running after Tokio drops its join
+        // handle. Record its last completed phase before reporting a RED.
+        let retry_stage = Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let retry_started = Instant::now();
+        {
+            let stage = retry_stage.clone();
+            state.test_queue_after_stream.set(move || {
+                stage.store(1, Ordering::Release);
+            });
+        }
+        {
+            let stage = retry_stage.clone();
+            state.test_queue_after_pending_snapshot.set(move || {
+                stage.store(2, Ordering::Release);
+            });
+        }
+        {
+            let stage = retry_stage.clone();
+            state.test_queue_after_h_drain.set(move || {
+                stage.store(3, Ordering::Release);
+            });
+        }
         let worker = state.clone();
         tokio::time::timeout(
             std::time::Duration::from_secs(10),
             tokio::task::spawn_blocking(move || worker.queue_tick()),
         )
         .await
-        .expect("accepted request did not retry after foreign reader release")
+        .unwrap_or_else(|_| {
+            panic!(
+                "accepted request retry timed out at stage {} after {}ms (0=before stream, 1=stream, 2=pending snapshot, 3=after H and Q)",
+                retry_stage.load(Ordering::Acquire),
+                retry_started.elapsed().as_millis()
+            )
+        })
         .unwrap()
         .unwrap();
         let done = store.request_by_id(&request.id).unwrap().unwrap();
@@ -5588,19 +5629,13 @@ mod exceptional_recovery_tests {
                 .unwrap()
                 .contains(&fixture.q1.id)
         );
-        let db = rusqlite::Connection::open(&queue_path).unwrap();
+        // Use the protected queue read; closing a raw SQLite connection on a
+        // live queue inode would drop this process's unrelated SQLite locks.
         for (id, expected) in [(&fixture.q2.id, "running"), (&fixture.q1.id, "queued")] {
-            let (state, finished): (String, Option<String>) = db
-                .query_row(
-                    "SELECT state,finished_at FROM requests WHERE id=?1",
-                    [id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .unwrap();
-            assert_eq!(state, expected);
-            assert!(finished.is_none());
+            let row = fixture.store.request_by_id(id).unwrap().unwrap();
+            assert_eq!(row.state, expected);
+            assert!(row.finished_at.is_none());
         }
-        drop(db);
         child.0.stdin.take().unwrap().write_all(b"x").unwrap();
         let child_status = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
@@ -5636,9 +5671,26 @@ mod exceptional_recovery_tests {
         })
         .await;
         let observed = timeout_result.unwrap_or_else(|_| {
+            let q2 = fixture.store.request_by_id(&fixture.q2.id).map(|row| {
+                row.map(|row| (row.state, row.error_code, row.finished_at.is_some()))
+            });
+            let owner = fixture
+                .state
+                .retained_serving_session()
+                .map(|session| session.verify().is_ok());
+            let retry_ms = fixture
+                .state
+                .recovery_retry_after
+                .lock()
+                .unwrap()
+                .map(|at| at.saturating_duration_since(Instant::now()).as_millis());
+            let pending = fixture.state.pending_requests.lock().unwrap().clone();
             panic!(
-                "same accepted Q1 ID did not retry after external SH release: last_row={last_seen:?}, pending_recovery={}",
-                fixture.store.is_recreate_pending()
+                "same accepted Q1 ID did not retry after external SH release: last_row={last_seen:?}, q2={q2:?}, pending_recovery={}, owner_valid={owner:?}, retry_ms={retry_ms:?}, pending_ids={pending:?}, tick_started={}, native_stream_free={}, index_revision={:?}",
+                fixture.store.is_recreate_pending(),
+                fixture.state.queue_tick_started.load(Ordering::Acquire),
+                fixture.state.native_stream.try_lock().is_ok(),
+                fixture.store.status().map(|status| status.revision.index_revision)
             )
         });
         assert!(
@@ -6846,12 +6898,16 @@ async fn provisioned_core(
     let runtime = {
         let mut registry = browser.registry.lock().await;
         match registry.browser_request_at(&identity, Instant::now()) {
-            Ok(_) => registry.activate(&root_key).map_err(|_| {
-                ApiError(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "store_unavailable",
-                    "Storage is unavailable",
-                )
+            Ok(_) => registry.activate(&root_key).map_err(|error| {
+                if crate::store::transient_storage_contention(&error) {
+                    ApiError::from(error)
+                } else {
+                    ApiError(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "store_unavailable",
+                        "Storage is unavailable",
+                    )
+                }
             }),
             Err(SelectionError::CheckoutCapacity) => Err(ApiError(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -7059,6 +7115,7 @@ async fn selected_provider_preflight(
 async fn selected_provider_postflight(
     runtime: &Arc<crate::daemon::registry::CheckoutRuntime>,
     revision: IndexPin,
+    packet: Option<Arc<QuestionPacket>>,
 ) -> Result<(), ApiError> {
     let runtime = runtime.clone();
     tokio::task::spawn_blocking(move || {
@@ -7069,6 +7126,11 @@ async fn selected_provider_postflight(
             response.status()?.revision == revision,
             "revision conflict: provider basis changed"
         );
+        // The external call holds no SQLite snapshot. Reattest its original
+        // packet on a fresh selected snapshot, even when the provider failed.
+        if let Some(packet) = packet {
+            response.validate_selected_view(&packet.context, &packet.source_files)?;
+        }
         response.finish(())?;
         runtime.require_mutation_ready()
     })
@@ -7191,10 +7253,10 @@ async fn provisioned_core_answer(
             }
             // Check once more immediately before scheduling work. Once scheduled,
             // a later root or head change cannot undo the requested refresh.
-            selected_provider_postflight(runtime, revision).await?;
+            selected_provider_postflight(runtime, revision, None).await?;
             runtime.require_mutation_ready()?;
             state.start_dependency_index();
-            let mut response = match selected_provider_postflight(runtime, revision).await {
+            let mut response = match selected_provider_postflight(runtime, revision, None).await {
                 Ok(()) => (StatusCode::ACCEPTED, Json(json!({"state":"loading"}))).into_response(),
                 Err(error) => selected_mutation_error(error, "committed"),
             };
@@ -7234,9 +7296,11 @@ async fn provisioned_core_answer(
                     "Live Jev is disabled",
                 ))?;
                 // No await before the final current-head check or the provider call.
-                selected_provider_postflight(runtime, revision).await?;
+                selected_provider_postflight(runtime, revision, Some(packet.clone())).await?;
                 let result = provider.run(&packet).await;
-                if let Err(error) = selected_provider_postflight(runtime, revision).await {
+                if let Err(error) =
+                    selected_provider_postflight(runtime, revision, Some(packet.clone())).await
+                {
                     return Ok((selected_mutation_error(error, "unknown"), catching_up));
                 }
                 let response = match result {
@@ -7276,9 +7340,11 @@ async fn provisioned_core_answer(
                     "acp_disabled",
                     "Live ACP is disabled",
                 ))?;
-                selected_provider_postflight(runtime, revision).await?;
+                selected_provider_postflight(runtime, revision, Some(packet.clone())).await?;
                 let result = provider.run(&packet).await;
-                if let Err(error) = selected_provider_postflight(runtime, revision).await {
+                if let Err(error) =
+                    selected_provider_postflight(runtime, revision, Some(packet.clone())).await
+                {
                     return Ok((selected_mutation_error(error, "unknown"), catching_up));
                 }
                 let response = match result {
@@ -7933,5 +7999,249 @@ async fn provisioned_core_answer(
             Ok((response, runtime.catching_up()))
         }
         _ => Err(missing()),
+    }
+}
+
+#[cfg(all(test, feature = "test-support", unix))]
+mod selected_provider_postflight_tests {
+    use super::*;
+    use crate::{
+        daemon::registry::{CheckoutOptions, CheckoutRegistry},
+        store::topology::{TopologyRoots, WorkspaceIdentity},
+    };
+    use std::os::unix::fs::PermissionsExt;
+    use tower::ServiceExt;
+
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const SOURCE: &str = "function seed() { console.log('synthetic'); }";
+
+    async fn call(
+        app: &Router,
+        method: &str,
+        path: &str,
+        body: Value,
+    ) -> (StatusCode, axum::http::HeaderMap, Value) {
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header("host", "127.0.0.1:7331")
+                    .header("authorization", format!("Bearer {TOKEN}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes = to_bytes(response.into_body(), 2 * 1024 * 1024)
+            .await
+            .unwrap();
+        let body = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap()
+        };
+        (status, headers, body)
+    }
+
+    async fn selected_provider_case(kind: &'static str, outcome: &'static str, corrupt: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::write(workspace.join("a.js"), SOURCE).unwrap();
+        let identity = WorkspaceIdentity::discover(Some(&workspace), &workspace).unwrap();
+        let roots =
+            TopologyRoots::isolated_for_tests(dir.path().join("cache"), dir.path().join("data"));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut mock_server = None;
+        let registration = if kind == "jev" {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}/", listener.local_addr().unwrap());
+            let entered_mock = entered.clone();
+            let release_mock = release.clone();
+            let mock = Router::new().route("/", post(move |Json(request): Json<Value>| {
+                let entered = entered_mock.clone();
+                let release = release_mock.clone();
+                async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    if outcome == "failure" {
+                        return (StatusCode::BAD_REQUEST, Json(json!({"detail":{"error_type":"max_tokens_exceeded"}}))).into_response();
+                    }
+                    let answers: serde_json::Map<String, Value> = request["questions"].as_object().unwrap()
+                        .keys().map(|key| (key.clone(), json!({"type":"choice","choice":"essential","confidence":0.6,
+                            "probabilities":{"essential":0.7,"supporting":0.2,"incidental":0.1,"uncertain":0.0}}))).collect();
+                    Json(json!({"model":"jev-1.13.0","answers":answers,
+                        "usage":{"input_tokens":1,"output_tokens":1}})).into_response()
+                }
+            }));
+            mock_server = Some(tokio::spawn(async move {
+                axum::serve(listener, mock).await.unwrap();
+            }));
+            let mut registry = CheckoutRegistry::with_roots(roots);
+            registry.set_jev_endpoint_for_tests(endpoint);
+            let options = json!({"jevBudgetDir":dir.path().join("budget"),"jevBudgetCents":10,"jevKey":"synthetic"});
+            registry
+                .register(&identity, CheckoutOptions(options))
+                .unwrap();
+            registry
+        } else {
+            let runner = dir.path().join("runner");
+            std::fs::write(&runner, format!(
+                "#!/bin/sh\ncat >/dev/null\n: > '{}'\nsteps=0\nwhile [ ! -e '{}' ] && [ \"$steps\" -lt 600 ]; do sleep 0.02; steps=$((steps+1)); done\n[ -e '{}' ] || exit 2\ncat '{}'\n",
+                dir.path().join("entered").display(), dir.path().join("release").display(),
+                dir.path().join("release").display(), dir.path().join("response.json").display(),
+            )).unwrap();
+            std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let mut registry = CheckoutRegistry::with_roots(roots);
+            let options = json!({"acpRunner":runner,"acpStateDir":dir.path().join("acp-state"),"acpMaxAttempts":1});
+            registry
+                .register(&identity, CheckoutOptions(options))
+                .unwrap();
+            registry
+        };
+        let registry = Arc::new(tokio::sync::Mutex::new(registration));
+        let app = ProvisionedBrowser::new(
+            registry.clone(),
+            TOKEN.to_owned(),
+            "127.0.0.1:7331".parse().unwrap(),
+        )
+        .unwrap()
+        .router();
+        let prefix = format!("/api/checkouts/{}", identity.root_key);
+        let status = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let (code, _, status) =
+                    call(&app, "GET", &format!("{prefix}/status"), Value::Null).await;
+                if code == StatusCode::OK && status["catchingUp"] == false {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let (code, _, symbols) = call(
+            &app,
+            "GET",
+            &format!("{prefix}/symbols?q=seed"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{kind}: {symbols}");
+        let seed = symbols["items"][0]["id"].as_str().unwrap();
+        let (code, _, preview) = call(
+            &app,
+            "POST",
+            &format!("{prefix}/questions/preview"),
+            json!({"seed":seed,"question":"What is logged?","expectedRevision":status["revision"]}),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{kind}: {preview}");
+        let packet = preview["packet"]["packetId"].as_str().unwrap();
+        let pin: IndexPin = serde_json::from_value(status["revision"].clone()).unwrap();
+        if kind == "acp" {
+            let response = if outcome == "success" {
+                json!({"answer":{"packetId":packet,"summary":[{"text":"Logs synthetic.","citations":[{"path":"a.js","startLine":1,"endLine":1,"quote":SOURCE}]}],"branches":[],"limitations":[]},"estimatedUsd":0.01}).to_string()
+            } else {
+                "invalid provider result".to_owned()
+            };
+            std::fs::write(dir.path().join("response.json"), response).unwrap();
+        }
+        let action = if kind == "jev" {
+            "jev-run"
+        } else {
+            "acp-answer"
+        };
+        let task_app = app.clone();
+        let route = format!("{prefix}/questions/{packet}/{action}");
+        let request = tokio::spawn(async move { call(&task_app, "POST", &route, json!({})).await });
+        if kind == "jev" {
+            tokio::time::timeout(Duration::from_secs(10), entered.notified())
+                .await
+                .unwrap();
+        } else {
+            let marker = dir.path().join("entered");
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !marker.exists() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        if corrupt {
+            let runtime = registry.lock().await.runtime(&identity.root_key).unwrap();
+            let state = runtime.browser_scheduler().unwrap();
+            state
+                .store
+                .corrupt_selected_source_for_tests(pin, "a.js")
+                .unwrap();
+            assert_eq!(
+                std::fs::read_to_string(workspace.join("a.js")).unwrap(),
+                SOURCE,
+                "workspace bytes remain untouched and no new H is required"
+            );
+        }
+        if kind == "jev" {
+            release.notify_one();
+        } else {
+            std::fs::write(dir.path().join("release"), b"go\n").unwrap();
+        }
+        let (code, headers, body) = tokio::time::timeout(Duration::from_secs(10), request)
+            .await
+            .unwrap()
+            .unwrap();
+        if corrupt {
+            assert_eq!(
+                code,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{kind} {outcome}: {body}"
+            );
+            assert_eq!(
+                body["error"]["code"], "incompatible_index",
+                "{kind} {outcome}: {body}"
+            );
+            assert_eq!(
+                headers["X-Trellis-Mutation-Outcome"], "unknown",
+                "{kind} {outcome}"
+            );
+            assert!(
+                body.get("answer").is_none(),
+                "no stale selected answer may escape"
+            );
+        } else {
+            assert_eq!(
+                code,
+                StatusCode::OK,
+                "{kind} clean provider control: {body}"
+            );
+            assert_eq!(headers["X-Trellis-Mutation-Outcome"], "committed");
+            if kind == "jev" {
+                assert_eq!(body["view"]["selectionSource"], "liveJev", "{body}");
+            } else {
+                assert_eq!(body["answer"]["packetId"], packet, "{body}");
+            }
+        }
+        if let Some(server) = mock_server {
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn selected_jev_and_acp_postflight_reattest_stored_packet_on_success_and_failure() {
+        for kind in ["jev", "acp"] {
+            // A real successful provider result is the positive control for
+            // both post-await branches before testing the same-pin corruption.
+            selected_provider_case(kind, "success", false).await;
+            for outcome in ["success", "failure"] {
+                selected_provider_case(kind, outcome, true).await;
+            }
+        }
     }
 }

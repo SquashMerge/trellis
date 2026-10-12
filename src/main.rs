@@ -1004,13 +1004,29 @@ fn dispatch_connection(
         } else {
             identity.attach_marker()?
         };
-        let checkout = runtime.block_on(async {
-            let mut checked = registry.lock().await;
-            checked
-                .attach_launch(session, &identity)
-                .map_err(|e| anyhow::anyhow!("{}", e.reason()))?;
-            checked.activate(&identity.root_key)
-        })?;
+        // Virgin queue publication can contend with a short-lived index-use
+        // reader before any request ID has been accepted. Retry only that
+        // typed pre-acceptance admission; never replay an enqueue after COMMIT.
+        let activation_deadline = Instant::now() + CLI_READ_WAIT;
+        let checkout = loop {
+            let activated = runtime.block_on(async {
+                let mut checked = registry.lock().await;
+                checked
+                    .attach_launch(session, &identity)
+                    .map_err(|e| anyhow::anyhow!("{}", e.reason()))?;
+                checked.activate(&identity.root_key)
+            });
+            match activated {
+                Ok(checkout) => break checkout,
+                Err(error) if trellis::store::cli_read_retryable_contention(&error) => {
+                    if Instant::now() >= activation_deadline {
+                        return Err(trellis::store::cli_read_busy_expired());
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => return Err(error),
+            }
+        };
         let args = request.payload.get("args").context("missing args")?;
         let deadline = Instant::now() + CLI_READ_WAIT;
         loop {
