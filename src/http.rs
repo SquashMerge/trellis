@@ -236,6 +236,8 @@ pub struct DaemonState {
     jobs: Mutex<Jobs>,
     queue_tick_started: AtomicBool,
     checkout_runtime_stopped: AtomicBool,
+    // Only idle watcher inventory is preempted by a CLI-only serve replacement.
+    watcher_release_cancel: CancelFlag,
     #[cfg(feature = "test-support")]
     checkout_h_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     maintenance_tick_started: AtomicBool,
@@ -418,6 +420,7 @@ pub fn new_with_dependency_options(
         packets: Mutex::new(PacketCache::default()),
         queue_tick_started: AtomicBool::new(false),
         checkout_runtime_stopped: AtomicBool::new(false),
+        watcher_release_cancel: Arc::new(AtomicBool::new(false)),
         #[cfg(feature = "test-support")]
         checkout_h_hook: Mutex::new(None),
         maintenance_tick_started: AtomicBool::new(false),
@@ -545,12 +548,63 @@ impl DaemonState {
         }
         self.start_queue_tick();
     }
-    /// Stop the native stream before idle release; no queue worker may keep
-    /// the old writer or watcher alive after this returns.
-    pub fn release_checkout_runtime(&self) {
+    /// Ask only the disposable watcher inventory to yield for an eligible
+    /// CLI-only replacement. FIFO and mandatory H retain their own authority.
+    pub(crate) fn request_watcher_release(&self) {
+        self.watcher_release_cancel.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn reset_watcher_release(&self) {
+        self.watcher_release_cancel.store(false, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn watcher_release_requested_for_tests(&self) -> bool {
+        self.watcher_release_cancel.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn checkout_runtime_stopped_for_tests(&self) -> bool {
+        self.checkout_runtime_stopped.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_maintenance_gate_for_tests(&self, hold: impl FnOnce()) {
+        let _maintenance = self.maintenance_stream.lock().unwrap();
+        hold();
+    }
+
+    /// Hold both worker lanes before changing any retirement state. A busy
+    /// watcher or maintenance unit is a retry, not a half-retired runtime.
+    pub(crate) fn try_release_checkout_runtime_if(
+        &self,
+        ready: impl FnOnce() -> bool,
+    ) -> Result<bool, crate::store::topology::StorageBusy> {
+        let _stream = self
+            .native_stream
+            .try_lock()
+            .map_err(|_| crate::store::topology::StorageBusy)?;
+        let _maintenance = self
+            .maintenance_stream
+            .try_lock()
+            .map_err(|_| crate::store::topology::StorageBusy)?;
+        if !ready() {
+            return Ok(false);
+        }
         self.checkout_runtime_stopped.store(true, Ordering::Release);
+        self.watcher_release_cancel.store(true, Ordering::Release);
+        self.replace_serving_session(None);
+        Ok(true)
+    }
+
+    /// Offline CLI fixtures must drain worker lanes before inspecting SQLite.
+    /// Production registry release instead uses the nonblocking try-release gate.
+    #[doc(hidden)]
+    pub fn release_checkout_runtime_for_fixture(&self) {
         let _stream = self.native_stream.lock().unwrap();
         let _maintenance = self.maintenance_stream.lock().unwrap();
+        self.checkout_runtime_stopped.store(true, Ordering::Release);
+        self.watcher_release_cancel.store(true, Ordering::Release);
         self.replace_serving_session(None);
     }
 
@@ -574,22 +628,51 @@ impl DaemonState {
         *self.checkout_h_hook.lock().unwrap() = Some(hook);
     }
 
+    /// Pause the real queue tick after it acquires native_stream and
+    /// watcher_work, before its watcher reconciliation begins.
+    #[cfg(test)]
+    pub(crate) fn set_watcher_gate_hook_for_tests(&self, hook: impl FnOnce() + Send + 'static) {
+        self.test_queue_before_watcher_reconcile.set(hook);
+    }
+
+    /// Synchronize the native/watcher lock boundary in a registry race test.
+    #[cfg(test)]
+    pub(crate) fn hold_watcher_gate_for_tests(&self, hold: impl FnOnce()) {
+        let _stream = self.native_stream.lock().unwrap();
+        let _watcher = self.watcher_work.lock().unwrap();
+        hold();
+    }
+
     /// A pending watcher hint (including the periodic inventory deadline) keeps
     /// the selected checkout in the catching-up state until its tick acknowledges it.
     pub fn checkout_watch_pending(&self) -> bool {
+        // Reject an inventory already in flight before any SQLite options
+        // read: a publication may hold its write transaction for this span.
+        if self.watcher_work.try_lock().is_err() {
+            return true;
+        }
+        // Do not hold watcher_work across an index options read. Only the
+        // bounded in-memory intent check belongs inside that mutex.
+        let options = self
+            .store
+            .recorded_index_options()
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| self.options.clone());
         let pending = {
-            let work = self.watcher_work.lock().unwrap();
-            work.as_ref().map(|(_, scheduler)| {
-                let options = self
-                    .store
-                    .recorded_index_options()
-                    .ok()
-                    .flatten()
-                    .unwrap_or_else(|| self.options.clone());
-                scheduler.accepted_watch_intent(&options)
-            })
+            // A live inventory holds this mutex under native_stream. The
+            // registry must never wait for that work while holding its guard.
+            let Ok(work) = self.watcher_work.try_lock() else {
+                return true;
+            };
+            work.as_ref()
+                .map(|(_, scheduler)| scheduler.accepted_watch_intent(&options))
         };
-        pending.unwrap_or_else(|| self.serving_session.lock().unwrap().is_some())
+        pending.unwrap_or_else(|| {
+            self.serving_session
+                .try_lock()
+                .map_or(true, |held| held.is_some())
+        })
     }
 
     /// A deterministic fixture can submit an accepted source hint through the
@@ -1297,7 +1380,7 @@ impl DaemonState {
                             &self.store,
                             session,
                             &selected_options,
-                            &Arc::new(AtomicBool::new(false)),
+                            &self.watcher_release_cancel,
                             false,
                         )?;
                         #[cfg(test)]
@@ -5527,21 +5610,40 @@ mod exceptional_recovery_tests {
                 stage.store(3, Ordering::Release);
             });
         }
+        let retry_terminal = Arc::new(tokio::sync::Notify::new());
+        store.notify_on_terminal_request_for_tests(&request.id, retry_terminal.clone());
+        let watcher_returned = Arc::new(tokio::sync::Notify::new());
+        {
+            let returned = watcher_returned.clone();
+            state.test_queue_after_watcher_reconcile.set(move || {
+                returned.notify_one();
+            });
+        }
         let worker = state.clone();
+        let retry_tick = tokio::task::spawn_blocking(move || worker.queue_tick());
+        // The accepted ID signals only after its terminal queue COMMIT. The
+        // same tick may then spend a full inventory on the watcher while still
+        // holding the serial stream; bound those two stages separately.
         tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            tokio::task::spawn_blocking(move || worker.queue_tick()),
+            std::time::Duration::from_secs(30),
+            retry_terminal.notified(),
         )
         .await
-        .unwrap_or_else(|_| {
-            panic!(
-                "accepted request retry timed out at stage {} after {}ms (0=before stream, 1=stream, 2=pending snapshot, 3=after H and Q)",
-                retry_stage.load(Ordering::Acquire),
-                retry_started.elapsed().as_millis()
-            )
-        })
-        .unwrap()
-        .unwrap();
+        .expect("accepted request retry did not commit its terminal row");
+        tokio::time::timeout(std::time::Duration::from_secs(60), watcher_returned.notified())
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "accepted request watcher timed out at stage {} after {}ms (0=before stream, 1=stream, 2=pending snapshot, 3=after H and Q)",
+                    retry_stage.load(Ordering::Acquire),
+                    retry_started.elapsed().as_millis()
+                )
+            });
+        tokio::time::timeout(std::time::Duration::from_secs(10), retry_tick)
+            .await
+            .expect("accepted request retry tick did not leave stream after watcher")
+            .unwrap()
+            .unwrap();
         let done = store.request_by_id(&request.id).unwrap().unwrap();
         assert_eq!(done.state, "done");
         assert_eq!(done.revision.unwrap().index_revision, 2);
@@ -5892,10 +5994,29 @@ mod exceptional_recovery_tests {
         );
         assert_eq!(std::fs::read(&queue_path).unwrap(), queue_bytes);
         assert_eq!(std::fs::read(&fixture.index_path).unwrap(), corrupt_index);
+        let watcher_returned = Arc::new(tokio::sync::Notify::new());
+        {
+            let returned = watcher_returned.clone();
+            fixture
+                .state
+                .test_queue_after_watcher_reconcile
+                .set(move || {
+                    returned.notify_one();
+                });
+        }
         release_ex_tx.send(()).unwrap();
+        // The first timer worker keeps native_stream through its Q2 drain and
+        // full post-takeover watcher inventory. The injected tick is eligible
+        // for the stream only after that watcher returns.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            watcher_returned.notified(),
+        )
+        .await
+        .expect("timer watcher did not reconcile after EX");
         tokio::time::timeout(std::time::Duration::from_secs(10), after_rx)
             .await
-            .expect("injected tick never passed stream after EX")
+            .expect("injected tick never passed stream after watcher")
             .unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(10), injected)
             .await

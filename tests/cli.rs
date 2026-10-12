@@ -2647,7 +2647,7 @@ struct LegacyClient {
 impl Drop for LegacyClient {
     fn drop(&mut self) {
         self.state.cancel_active();
-        self.state.release_checkout_runtime();
+        self.state.release_checkout_runtime_for_fixture();
     }
 }
 impl LegacyClient {

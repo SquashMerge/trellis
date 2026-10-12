@@ -1424,7 +1424,7 @@ async fn serve_waits_for_idle_cli_read_before_registering_and_reconciling() {
     drop(prior);
     let (held_read, _) = old.evidence_response().unwrap();
     registry.lock().await.disconnect(41);
-    // Keep the selected reader alive across the entire two-second admission
+    // Keep the selected reader alive across the entire eight-second admission
     // budget. A timed-out retry is typed busy and cannot mint a token or
     // replace CLI-only options while the old Store still owns its handles.
     let mut waiting = BrowserProvisioner::new();

@@ -350,6 +350,80 @@ impl CheckoutRegistry {
         self.runtimes.get(key).cloned()
     }
 
+    /// Serve may replace only an unattached CLI runtime. Do not call the
+    /// generic pending-work probe here: it takes watcher_work under the
+    /// registry mutex while a full inventory owns that lock.
+    fn release_cli_runtime(&mut self, key: &str) -> Result<bool, SelectionError> {
+        let runtime = self
+            .runtimes
+            .get(key)
+            .cloned()
+            .ok_or(SelectionError::Unavailable)?;
+        let resources = runtime
+            .resources()
+            .map_err(|_| SelectionError::Unavailable)?;
+        let eligible = || {
+            !runtime.h_in_flight.load(Ordering::Acquire)
+                && runtime.active_reads.load(Ordering::Acquire) == 0
+                && !CheckoutRuntime::queue_pending(&resources)
+        };
+        if self
+            .entries
+            .get(key)
+            .is_some_and(|entry| entry.external_work)
+            || !eligible()
+        {
+            resources.scheduler.reset_watcher_release();
+            return Ok(false);
+        }
+        let result = resources.scheduler.try_release_checkout_runtime_if(|| {
+            let mut phase = runtime.phase.lock().unwrap();
+            if !eligible() {
+                return false;
+            }
+            // Refresh only while the stream is quiescent. The old watcher is
+            // disposable: the replacement starts with a fresh full inventory.
+            CheckoutRuntime::refresh_phase(&mut phase, &resources);
+            runtime.active.store(false, Ordering::Release);
+            *phase = RuntimePhase::Reconciling;
+            true
+        });
+        match result {
+            Ok(true) => {
+                runtime.resources.lock().unwrap().take();
+                resources.store.retire_checkout_sqlite_witnesses();
+                drop(resources);
+                self.runtimes.remove(key);
+                let entry = self
+                    .entries
+                    .get_mut(key)
+                    .ok_or(SelectionError::Unavailable)?;
+                entry.pending_work = false;
+                entry.released = true;
+                Ok(true)
+            }
+            Ok(false) => {
+                resources.scheduler.reset_watcher_release();
+                Ok(false)
+            }
+            Err(_) => {
+                // Cooperative cancellation is limited to the derived watcher
+                // path; the next retry still verifies the durable FIFO head.
+                resources.scheduler.request_watcher_release();
+                Ok(false)
+            }
+        }
+    }
+
+    /// Give up the advisory cancellation when serve exhausts its deadline.
+    pub(crate) fn abandon_cli_replacement(&self, key: &str) {
+        if let Some(runtime) = self.runtimes.get(key)
+            && let Ok(resources) = runtime.resources()
+        {
+            resources.scheduler.reset_watcher_release();
+        }
+    }
+
     /// The lifecycle owner calls this only after the idle deadline. A failed
     /// queue probe is busy, never evidence that it is safe to release a leader.
     fn release_runtime(&mut self, key: &str) -> anyhow::Result<bool> {
@@ -364,19 +438,26 @@ impl CheckoutRegistry {
         {
             return Ok(false);
         }
-        let mut phase = runtime.phase.lock().unwrap();
-        CheckoutRuntime::refresh_phase(&mut phase, &resources);
-        if runtime.h_in_flight.load(Ordering::Acquire)
-            || runtime.active_reads.load(Ordering::Acquire) != 0
-        {
+        // The timer holds the registry guard too. If either worker lane is
+        // busy, defer retirement with every active capability intact.
+        let released = resources.scheduler.try_release_checkout_runtime_if(|| {
+            let mut phase = runtime.phase.lock().unwrap();
+            CheckoutRuntime::refresh_phase(&mut phase, &resources);
+            if runtime.h_in_flight.load(Ordering::Acquire)
+                || runtime.active_reads.load(Ordering::Acquire) != 0
+                || CheckoutRuntime::queue_pending(&resources)
+            {
+                return false;
+            }
+            runtime.active.store(false, Ordering::Release);
+            *phase = RuntimePhase::Reconciling;
+            true
+        });
+        if !matches!(released, Ok(true)) {
             return Ok(false);
         }
-        runtime.active.store(false, Ordering::Release);
-        resources.scheduler.release_checkout_runtime();
-        *phase = RuntimePhase::Reconciling;
         runtime.resources.lock().unwrap().take();
         resources.store.retire_checkout_sqlite_witnesses();
-        drop(phase);
         drop(resources);
         self.runtimes.remove(key);
         Ok(true)
@@ -773,17 +854,21 @@ impl CheckoutRegistry {
         // An earlier CLI read/index may have activated the checkout with no
         // browser settings. Once its work drains, release that runtime before
         // registering serve-scoped providers and source roots.
-        if self.entries.get(&identity.root_key).is_some_and(|entry| {
+        let cli_only = self.entries.get(&identity.root_key).is_some_and(|entry| {
             entry.registration.is_none()
                 && entry.sessions.is_empty()
                 && entry.browser_until.is_none()
                 && self.runtimes.contains_key(&identity.root_key)
-        }) && !self.release(&identity.root_key)?
-        {
-            // A CLI-only runtime may still have an H, selected read, or queue
-            // operation in flight. It must retire before serve installs its
-            // options, but it is not a conflicting browser registration.
-            return Err(SelectionError::StorageBusy);
+        });
+        if cli_only {
+            if !self.release_cli_runtime(&identity.root_key)? {
+                // H, a selected read, or an accepted FIFO head must finish.
+                return Err(SelectionError::StorageBusy);
+            }
+        } else {
+            // A new attachment can make an earlier retry ineligible. Do not
+            // leave its cancellation request armed on this retained runtime.
+            self.abandon_cli_replacement(&identity.root_key);
         }
         if let Some(entry) = self.entries.get(&identity.root_key)
             && entry.registration.as_ref() != Some(options)
@@ -1432,11 +1517,20 @@ impl CheckoutRuntime {
     }
 
     pub fn cli_index(&self, options: &IndexOptions) -> anyhow::Result<serde_json::Value> {
+        // Serialize acceptance with idle retirement. A caller may have cloned
+        // this runtime before serve entered the registry gate: it must not
+        // enqueue against resources the replacement has already retired.
+        let phase = self.phase.lock().unwrap();
+        anyhow::ensure!(
+            self.active.load(Ordering::Acquire),
+            "index_not_ready: checkout released"
+        );
         let resources = self.resources()?;
         // Durable acceptance is the single requests.db COMMIT. Only the
         // checkout scheduler may elect, reconcile and claim this row. A CLI
         // waiter never creates a second leader or re-enqueues an uncertain job.
         let accepted = resources.store.enqueue_request(options, None)?;
+        drop(phase);
         let mut busy_deadline = Instant::now() + Duration::from_secs(30);
         loop {
             let row = match resources.store.request_by_id(&accepted.id) {
@@ -1938,6 +2032,345 @@ mod selection_tests {
             .status()
             .unwrap();
         assert!(status.success(), "git {args:?}");
+    }
+
+    #[tokio::test]
+    async fn serve_cli_replacement_does_not_wait_under_registry_for_watcher_gate() {
+        use std::sync::mpsc;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("checkout");
+        git(temp.path(), &["init", "--quiet", root.to_str().unwrap()]);
+        let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+        let roots =
+            TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+        let mut registry = CheckoutRegistry::with_roots(roots);
+        let options = CheckoutOptions(serde_json::json!({"browseRoot": identity.root}));
+        registry.attach_launch(42, &identity).unwrap();
+        let runtime = registry.activate(&identity.root_key).unwrap();
+        registry.disconnect(42);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while runtime.h_in_flight.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let scheduler = runtime.browser_scheduler().unwrap();
+        let observed_scheduler = scheduler.clone();
+        let (held_tx, held_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            scheduler.hold_watcher_gate_for_tests(|| {
+                held_tx.send(()).unwrap();
+                resume_rx.recv().unwrap();
+            });
+        });
+        held_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        // H has completed: the purpose is the native stream/watcher gate.
+        let key = identity.root_key.clone();
+        let (done_tx, done_rx) = mpsc::channel();
+        let attempt = std::thread::spawn(move || {
+            let started = Instant::now();
+            let outcome = registry.can_register(&identity, &options);
+            done_tx
+                .send((started.elapsed(), outcome, registry, identity, options))
+                .unwrap();
+        });
+        let early = done_rx.recv_timeout(Duration::from_secs(1));
+        // Always release the hook before asserting, even on RED.
+        resume_tx.send(()).unwrap();
+        holder.join().unwrap();
+        let (elapsed, first, mut registry, identity, options) =
+            early.unwrap_or_else(|_| done_rx.recv_timeout(Duration::from_secs(10)).unwrap());
+        attempt.join().unwrap();
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "registry guard blocked for {elapsed:?}"
+        );
+        assert_eq!(first, Err(SelectionError::StorageBusy));
+        assert!(runtime.active.load(Ordering::Acquire));
+        assert!(runtime.has_active_resources());
+        assert!(!registry.entries[&key].released);
+        assert!(registry.entries[&key].registration.is_none());
+        assert!(observed_scheduler.watcher_release_requested_for_tests());
+        // A timed-out serve must leave this retained CLI watcher usable.
+        registry.abandon_cli_replacement(&key);
+        assert!(!observed_scheduler.watcher_release_requested_for_tests());
+        runtime.active_reads.fetch_add(1, Ordering::AcqRel);
+        assert_eq!(
+            registry.can_register(&identity, &options),
+            Err(SelectionError::StorageBusy)
+        );
+        assert!(!observed_scheduler.watcher_release_requested_for_tests());
+        runtime.active_reads.fetch_sub(1, Ordering::AcqRel);
+        // A completed watcher leaves the same CLI-only checkout releasable.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match registry.can_register(&identity, &options) {
+                Ok(()) => break,
+                Err(SelectionError::StorageBusy) if Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                outcome => panic!("idle replacement did not complete: {outcome:?}"),
+            }
+        }
+        assert!(!runtime.has_active_resources());
+    }
+
+    #[tokio::test]
+    async fn serve_cli_replacement_defers_maintenance_without_partial_stop() {
+        use std::sync::mpsc;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("checkout");
+        git(temp.path(), &["init", "--quiet", root.to_str().unwrap()]);
+        let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+        let roots =
+            TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+        let mut registry = CheckoutRegistry::with_roots(roots);
+        let options = CheckoutOptions(serde_json::json!({"browseRoot": identity.root}));
+        registry.attach_launch(46, &identity).unwrap();
+        let runtime = registry.activate(&identity.root_key).unwrap();
+        registry.disconnect(46);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while runtime.h_in_flight.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let scheduler = runtime.browser_scheduler().unwrap();
+        let (held_tx, held_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            scheduler.hold_maintenance_gate_for_tests(|| {
+                held_tx.send(()).unwrap();
+                resume_rx.recv().unwrap();
+            });
+        });
+        held_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let result = registry.can_register(&identity, &options);
+        assert_eq!(result, Err(SelectionError::StorageBusy));
+        assert!(runtime.active.load(Ordering::Acquire));
+        assert!(runtime.has_active_resources());
+        assert!(!registry.entries[&identity.root_key].released);
+        assert!(
+            !runtime
+                .browser_scheduler()
+                .unwrap()
+                .checkout_runtime_stopped_for_tests()
+        );
+        resume_tx.send(()).unwrap();
+        holder.join().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match registry.can_register(&identity, &options) {
+                Ok(()) => break,
+                Err(SelectionError::StorageBusy) if Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                outcome => panic!("maintenance release did not complete: {outcome:?}"),
+            }
+        }
+        assert!(!runtime.has_active_resources());
+    }
+
+    #[tokio::test]
+    async fn idle_tick_defers_watcher_lock_without_blocking_registry() {
+        use std::sync::mpsc;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("checkout");
+        git(temp.path(), &["init", "--quiet", root.to_str().unwrap()]);
+        let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+        let roots =
+            TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+        let mut registry = CheckoutRegistry::with_roots(roots);
+        registry.attach_launch(45, &identity).unwrap();
+        let runtime = registry.activate(&identity.root_key).unwrap();
+        registry.disconnect(45);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while runtime.h_in_flight.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let key = identity.root_key.clone();
+        let now = Instant::now();
+        registry.entries.get_mut(&key).unwrap().release_at = Some(now);
+        let scheduler = runtime.browser_scheduler().unwrap();
+        let (held_tx, held_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            scheduler.hold_watcher_gate_for_tests(|| {
+                held_tx.send(()).unwrap();
+                resume_rx.recv().unwrap();
+            });
+        });
+        held_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let (done_tx, done_rx) = mpsc::channel();
+        let tick = std::thread::spawn(move || {
+            let started = Instant::now();
+            let result = registry.advance(now);
+            done_tx.send((started.elapsed(), result, registry)).unwrap();
+        });
+        let early = done_rx.recv_timeout(Duration::from_secs(1));
+        resume_tx.send(()).unwrap();
+        holder.join().unwrap();
+        let (elapsed, result, registry) =
+            early.unwrap_or_else(|_| done_rx.recv_timeout(Duration::from_secs(10)).unwrap());
+        tick.join().unwrap();
+        result.unwrap();
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "idle tick blocked for {elapsed:?}"
+        );
+        assert!(runtime.active.load(Ordering::Acquire));
+        assert!(runtime.has_active_resources());
+        assert!(!registry.entries[&key].released);
+        assert!(
+            !runtime
+                .browser_scheduler()
+                .unwrap()
+                .watcher_release_requested_for_tests()
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_cli_replacement_preempts_real_watcher_tick_without_registry_wait() {
+        use std::sync::mpsc;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("checkout");
+        git(temp.path(), &["init", "--quiet", root.to_str().unwrap()]);
+        let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+        let roots =
+            TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+        let mut registry = CheckoutRegistry::with_roots(roots);
+        let options = CheckoutOptions(serde_json::json!({"browseRoot": identity.root}));
+        registry.attach_launch(44, &identity).unwrap();
+        let runtime = registry.activate(&identity.root_key).unwrap();
+        registry.disconnect(44);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while runtime.h_in_flight.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let scheduler = runtime.browser_scheduler().unwrap();
+        let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        scheduler.set_watcher_gate_hook_for_tests(move || {
+            let _ = held_tx.send(());
+            resume_rx.recv().unwrap();
+        });
+        tokio::time::timeout(Duration::from_secs(10), held_rx)
+            .await
+            .expect("real watcher tick did not reach the gate")
+            .unwrap();
+        let key = identity.root_key.clone();
+        let (done_tx, done_rx) = mpsc::channel();
+        let attempt = std::thread::spawn(move || {
+            let result = registry.can_register(&identity, &options);
+            done_tx.send((result, registry, identity, options)).unwrap();
+        });
+        let early = done_rx.recv_timeout(Duration::from_secs(1));
+        resume_tx.send(()).unwrap();
+        let (result, mut registry, identity, options) =
+            early.unwrap_or_else(|_| done_rx.recv_timeout(Duration::from_secs(10)).unwrap());
+        attempt.join().unwrap();
+        assert_eq!(result, Err(SelectionError::StorageBusy));
+        assert!(runtime.active.load(Ordering::Acquire));
+        assert!(runtime.has_active_resources());
+        assert!(!registry.entries[&key].released);
+        assert!(scheduler.watcher_release_requested_for_tests());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match registry.can_register(&identity, &options) {
+                Ok(()) => break,
+                Err(SelectionError::StorageBusy) if Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                outcome => panic!("real watcher did not yield to serve: {outcome:?}"),
+            }
+        }
+        assert!(!runtime.has_active_resources());
+    }
+
+    #[tokio::test]
+    async fn serve_cli_replacement_preserves_accepted_fifo_head() {
+        use std::sync::mpsc;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("checkout");
+        git(temp.path(), &["init", "--quiet", root.to_str().unwrap()]);
+        let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+        let roots =
+            TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+        let mut registry = CheckoutRegistry::with_roots(roots);
+        let options = CheckoutOptions(serde_json::json!({"browseRoot": identity.root}));
+        registry.attach_launch(43, &identity).unwrap();
+        let runtime = registry.activate(&identity.root_key).unwrap();
+        registry.disconnect(43);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while runtime.h_in_flight.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let resources = runtime.resources().unwrap();
+        let scheduler = resources.scheduler.clone();
+        let (held_tx, held_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            scheduler.hold_watcher_gate_for_tests(|| {
+                held_tx.send(()).unwrap();
+                resume_rx.recv().unwrap();
+            });
+        });
+        held_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let accepted = resources
+            .store
+            .enqueue_request(&IndexOptions::new(identity.root.clone()), None)
+            .unwrap();
+        assert_eq!(
+            registry.can_register(&identity, &options),
+            Err(SelectionError::StorageBusy)
+        );
+        assert!(runtime.active.load(Ordering::Acquire));
+        assert!(runtime.has_active_resources());
+        assert!(!resources.scheduler.watcher_release_requested_for_tests());
+        let queued = resources
+            .store
+            .request_by_id(&accepted.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(queued.state, "queued");
+        assert_eq!(queued.seq, accepted.seq);
+        resume_tx.send(()).unwrap();
+        holder.join().unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if resources
+                    .store
+                    .request_by_id(&accepted.id)
+                    .unwrap()
+                    .unwrap()
+                    .finished_at
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let terminal = resources
+            .store
+            .request_by_id(&accepted.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(terminal.state, "done");
     }
 
     #[tokio::test]

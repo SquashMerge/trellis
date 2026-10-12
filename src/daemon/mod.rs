@@ -338,7 +338,7 @@ impl BrowserProvisioner {
         // accepted work. Wait only for that typed transient state, releasing
         // the registry guard so the runtime can finish. A genuine conflicting
         // registration or attached client remains an immediate refusal.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
         let mut checked = loop {
             let mut checked = registry.lock().await;
             match checked.can_register(identity, &options) {
@@ -346,6 +346,8 @@ impl BrowserProvisioner {
                 Err(registry::SelectionError::StorageBusy) => {
                     drop(checked);
                     if std::time::Instant::now() >= deadline {
+                        let checked = registry.lock().await;
+                        checked.abandon_cli_replacement(&identity.root_key);
                         anyhow::bail!("{}", registry::SelectionError::StorageBusy.reason());
                     }
                     #[cfg(feature = "test-support")]

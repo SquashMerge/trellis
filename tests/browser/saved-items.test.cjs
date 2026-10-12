@@ -3,9 +3,10 @@ const assert = require("node:assert/strict");
 const test = require("node:test");
 const { existsSync, chmodSync, copyFileSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, readdirSync, rmSync, writeFileSync } = require("node:fs");
 const { tmpdir } = require("node:os");
-const { basename, join, resolve, sep } = require("node:path");
+const { basename, dirname, join, resolve, sep } = require("node:path");
 const { spawn } = require("node:child_process");
-const { randomBytes } = require("node:crypto");
+const { createHash, randomBytes } = require("node:crypto");
+const { createConnection } = require("node:net");
 const { DatabaseSync } = require("node:sqlite");
 
 const browserRoot = process.env.PLAYWRIGHT_BROWSERS_PATH;
@@ -101,6 +102,28 @@ function findNamed(root, name, found = []) {
   }
   return found;
 }
+async function listenerDiagnostics(paths) {
+  const locks = [...findNamed(paths.home, "daemon.lock"), ...findNamed(paths.xdgData, "daemon.lock")];
+  return Promise.all(locks.map(async lock => {
+    const dataRoot = dirname(dirname(lock));
+    const normal = join(dirname(lock), "daemon.sock");
+    const uid = process.getuid();
+    const uidBytes = Buffer.alloc(4);
+    uidBytes.writeUInt32BE(uid);
+    const digest = createHash("sha256").update(Buffer.from(dataRoot)).update(uidBytes).digest("hex").slice(0,32);
+    const socketPath = Buffer.byteLength(normal) <= (process.platform === "darwin" ? 103 : 107)
+      ? normal : join("/tmp", `trellis-${uid}-${digest}`, "daemon.sock");
+    if (!existsSync(socketPath)) return {lock, socketPath, listener:"socket_absent"};
+    const listener = await new Promise(resolveListener => {
+      const socket = createConnection(socketPath);
+      socket.setTimeout(1000);
+      socket.once("connect", () => { socket.destroy(); resolveListener("connected"); });
+      socket.once("error", error => { socket.destroy(); resolveListener(error.code || error.message); });
+      socket.once("timeout", () => { socket.destroy(); resolveListener("timeout"); });
+    });
+    return {lock, socketPath, listener};
+  }));
+}
 async function startDaemon(paths, expectedRevision) {
   const child = spawn(binary, ["serve", "--workspace", paths.workspace, "--bind", "127.0.0.1:0", "--token-file", paths.tokenFile],
     {cwd:ROOT, env:paths.env, stdio:["ignore","ignore","pipe"]});
@@ -114,7 +137,14 @@ async function startDaemon(paths, expectedRevision) {
         if (match && !base) { base = match[1]; resolveAddress(base); }
       });
       child.once("error", rejectAddress);
-      child.once("exit", (code, signal) => { if (!base) rejectAddress(new Error(`daemon exited before readiness (${code ?? signal}): ${stderr.replaceAll(paths.token,"[redacted]")}`)); });
+      child.once("exit", async (code, signal) => {
+        if (!base) {
+          let listener;
+          try { listener = await listenerDiagnostics(paths); }
+          catch (error) { listener = `diagnostic_error:${error.code || error.message}`; }
+          rejectAddress(new Error(`daemon exited before readiness (${code ?? signal}): listener=${JSON.stringify(listener)} stderr=${stderr.replaceAll(paths.token,"[redacted]")}`));
+        }
+      });
     });
     // Serve connects to (or launches) the daemon before it prints this banner.
     // The internal connect and reply bounds total 15s; concurrent verify lanes
