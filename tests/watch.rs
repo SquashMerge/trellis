@@ -821,6 +821,58 @@ impl Drop for Server {
     }
 }
 
+// The fixture binds port 0 itself. Its own startup line publishes the bound
+// address; only then probe that child-owned port for TCP readiness. A reserved-
+// and-released port or a bare probe can find a different process instead.
+async fn legacy_fixture_address(
+    child: &mut std::process::Child,
+    stderr_path: &std::path::Path,
+    phase: &str,
+) -> std::net::SocketAddr {
+    use std::io::Read;
+
+    let deadline = Instant::now() + Duration::from_secs(12);
+    loop {
+        let mut stderr_bytes = Vec::new();
+        fs::File::open(stderr_path)
+            .unwrap()
+            .take(8192)
+            .read_to_end(&mut stderr_bytes)
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&stderr_bytes);
+        let published = stderr
+            .lines()
+            .find_map(|line| line.strip_prefix("Trellis: http://"))
+            .map(|url| {
+                let address: std::net::SocketAddr = url
+                    .strip_suffix('/')
+                    .expect("fixture startup URL must end in /")
+                    .parse()
+                    .expect("fixture startup URL must contain a socket address");
+                assert!(address.ip().is_loopback() && address.port() != 0);
+                address
+            });
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "{phase} fixture exited before its published port became ready; address={published:?} stderr={stderr:?}"
+        );
+        if let Some(address) = published
+            && std::net::TcpStream::connect_timeout(&address, Duration::from_millis(50)).is_ok()
+        {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "{phase} fixture exited during TCP readiness; address={address} stderr={stderr:?}"
+            );
+            return address;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{phase} fixture port did not become ready; address={published:?} stderr={stderr:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 #[tokio::test]
 async fn killed_leader_reconciles_lost_edits_before_serving() {
     use std::os::{
@@ -837,9 +889,6 @@ async fn killed_leader_reconciles_lost_edits_before_serving() {
     let token = home.join("token");
     fs::write(&token, TOKEN).unwrap();
     fs::set_permissions(&token, fs::Permissions::from_mode(0o600)).unwrap();
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
-    drop(listener);
     let first_log = temp.path().join("first-stderr.log");
     let first_stderr = fs::OpenOptions::new()
         .write(true)
@@ -847,26 +896,13 @@ async fn killed_leader_reconciles_lost_edits_before_serving() {
         .mode(0o600)
         .open(&first_log)
         .unwrap();
-    let server = legacy_http_fixture(&root, &home, address, &token, None)
+    let server = legacy_http_fixture(&root, &home, "127.0.0.1:0", &token, None)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::from(first_stderr))
         .spawn()
         .unwrap();
     let mut server = Server(server);
-    let deadline = Instant::now() + Duration::from_secs(12);
-    let mut ready = false;
-    while Instant::now() < deadline {
-        if std::net::TcpStream::connect_timeout(&address, Duration::from_millis(50)).is_ok() {
-            ready = true;
-            break;
-        }
-        assert!(
-            server.0.try_wait().unwrap().is_none(),
-            "daemon exited before readiness"
-        );
-        std::thread::sleep(Duration::from_millis(30));
-    }
-    assert!(ready, "daemon did not bind");
+    let _predecessor_addr = legacy_fixture_address(&mut server.0, &first_log, "predecessor").await;
     let first = cli(&root, &home, "status").output().unwrap();
     assert!(
         first.status.success(),
@@ -888,10 +924,7 @@ async fn killed_leader_reconciles_lost_edits_before_serving() {
     // A second REAL daemon, without a FIFO request, must reconcile the lost
     // edit before it binds its serving port. An explicit CLI index follows only
     // after the selected source is proved to be the successor's capture.
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let successor_addr = listener.local_addr().unwrap();
-    drop(listener);
-    // Capture startup admission errors: TCP bind alone does not prove that
+    // Capture startup admission errors: a published bind alone does not prove
     // establish_serving_session acquired a reconciled leader session.
     let successor_log = temp.path().join("successor-stderr.log");
     let successor_stderr = std::fs::OpenOptions::new()
@@ -900,26 +933,15 @@ async fn killed_leader_reconciles_lost_edits_before_serving() {
         .mode(0o600)
         .open(&successor_log)
         .unwrap();
-    let successor_process = legacy_http_fixture(&root, &home, successor_addr, &token, None)
+    let successor_process = legacy_http_fixture(&root, &home, "127.0.0.1:0", &token, None)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::from(successor_stderr))
         .spawn()
         .unwrap();
     let mut successor = Server(successor_process);
-    let deadline = Instant::now() + Duration::from_secs(12);
-    while std::net::TcpStream::connect_timeout(&successor_addr, Duration::from_millis(50)).is_err()
-    {
-        assert!(
-            Instant::now() < deadline,
-            "successor daemon did not serve after takeover"
-        );
-        assert!(
-            successor.0.try_wait().unwrap().is_none(),
-            "successor daemon exited"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    // A bound TCP listener is not an evidence-readiness signal. Only the
+    let successor_addr =
+        legacy_fixture_address(&mut successor.0, &successor_log, "successor").await;
+    // A published TCP listener is not an evidence-readiness signal. Only the
     // authenticated HTTP selected snapshot can prove that this daemon serves
     // H. A 503 index_not_ready is unserved and may be retried until the fixed
     // deadline; 200 with the predecessor pin fails immediately.
