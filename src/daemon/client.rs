@@ -307,6 +307,14 @@ struct StdinFence {
     closed: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     fail_fionread: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    fail_poll: std::sync::atomic::AtomicBool,
+    /// While set, the reader waits after `poll` wakes it, leaving input unread.
+    #[cfg(test)]
+    hold_reads: std::sync::atomic::AtomicBool,
+    /// Runs once between measuring pending bytes and checking for hang-up.
+    #[cfg(test)]
+    between_measures: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Runs once, immediately after the decision offset is sampled.
     #[cfg(test)]
     after_sample: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
@@ -323,39 +331,45 @@ impl StdinFence {
             #[cfg(test)]
             fail_fionread: Default::default(),
             #[cfg(test)]
+            fail_poll: Default::default(),
+            #[cfg(test)]
+            hold_reads: Default::default(),
+            #[cfg(test)]
+            between_measures: Default::default(),
+            #[cfg(test)]
             after_sample: Default::default(),
         }
     }
 
-    /// Bytes the client had written at this instant, or `None` when pending
-    /// input cannot be measured and the decision therefore cannot be fenced.
+    /// The decision offset: how far the client's input had reached, or `None`
+    /// when that cannot be measured, so the decision cannot be fenced.
+    ///
+    /// Under the reader's lock, measure pending bytes, then check for hang-up.
+    /// EOF occupies its own position, one past the last byte. Without hang-up,
+    /// the decision instant is the measurement. With hang-up (macOS and Linux
+    /// both report POLLHUP once no writer remains, even with bytes buffered),
+    /// the client closed before the check; a closed pipe cannot grow, so
+    /// measure again and fence EOF past every byte written before the close.
     fn written(&self) -> Option<u64> {
         use std::sync::atomic::Ordering::SeqCst;
         let sampled = {
             let _io = self.io.lock().unwrap();
-            let mut pending: libc::c_int = 0;
-            #[cfg(test)]
-            let failed = self.fail_fionread.load(SeqCst);
-            #[cfg(not(test))]
-            let failed = false;
-            (!failed && unsafe { libc::ioctl(self.fd, libc::FIONREAD, &mut pending) } == 0).then(
-                || {
-                    let total = self.read_total.load(SeqCst) + pending.max(0) as u64;
-                    // EOF occupies its own position, one past the last byte. A
-                    // hung-up pipe means the client closed its input before this
-                    // decision, even with bytes still buffered (macOS and Linux
-                    // both report POLLHUP once no writer remains): include that
-                    // position, so the gate settles only after EOF is delivered.
-                    let mut ready = libc::pollfd {
-                        fd: self.fd,
-                        events: libc::POLLIN,
-                        revents: 0,
-                    };
-                    let closed = unsafe { libc::poll(&mut ready, 1, 0) } > 0
-                        && ready.revents & libc::POLLHUP != 0;
-                    total + u64::from(closed)
-                },
-            )
+            (|| {
+                let pending = self.pending()?;
+                #[cfg(test)]
+                {
+                    let hook = self.between_measures.lock().unwrap().take();
+                    if let Some(hook) = hook {
+                        hook();
+                    }
+                }
+                let read = self.read_total.load(SeqCst);
+                if self.hung_up()? {
+                    Some(read + self.pending()? + 1)
+                } else {
+                    Some(read + pending)
+                }
+            })()
         };
         #[cfg(test)]
         {
@@ -366,6 +380,39 @@ impl StdinFence {
             }
         }
         sampled
+    }
+
+    /// Unread bytes in the pipe.
+    fn pending(&self) -> Option<u64> {
+        #[cfg(test)]
+        if self.fail_fionread.load(std::sync::atomic::Ordering::SeqCst) {
+            return None;
+        }
+        let mut pending: libc::c_int = 0;
+        (unsafe { libc::ioctl(self.fd, libc::FIONREAD, &mut pending) } == 0)
+            .then_some(pending.max(0) as u64)
+    }
+
+    /// Whether no writer remains. A failed check is unmeasurable, never "open".
+    fn hung_up(&self) -> Option<bool> {
+        #[cfg(test)]
+        if self.fail_poll.load(std::sync::atomic::Ordering::SeqCst) {
+            return None;
+        }
+        let mut ready = libc::pollfd {
+            fd: self.fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        loop {
+            let rc = unsafe { libc::poll(&mut ready, 1, 0) };
+            if rc >= 0 {
+                return Some(rc > 0 && ready.revents & libc::POLLHUP != 0);
+            }
+            if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                return None;
+            }
+        }
     }
 
     /// Every complete frame within the first `offset` bytes has been sent.
@@ -401,6 +448,10 @@ impl io::Read for FencedReader {
             if error.kind() != io::ErrorKind::Interrupted {
                 return Err(error);
             }
+        }
+        #[cfg(test)]
+        while self.fence.hold_reads.load(SeqCst) {
+            thread::sleep(Duration::from_millis(1));
         }
         let _io = self.fence.io.lock().unwrap();
         loop {
@@ -1388,16 +1439,71 @@ mod reply_gate_tests {
 
     #[test]
     fn stdin_eof_behind_buffered_frames_before_the_decision_cancels_the_reply() {
+        use std::sync::atomic::Ordering::SeqCst;
         for _ in 0..50 {
             let mut fixture = Fixture::new();
-            // A complete non-cancel frame is still buffered when the client
-            // closes its input, all before the reply exists.
+            // Hold the reader so the frame is provably still buffered when the
+            // decision is sampled, then close: all before the reply exists.
+            fixture.fence.hold_reads.store(true, SeqCst);
             fixture.write("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\n");
             unsafe { libc::close(fixture.fds[1]) };
             fixture.fds[1] = -1;
             wait_for_hangup(fixture.fds[0]);
+            assert!(
+                fixture.fence.pending().unwrap() > 0,
+                "precondition: bytes buffered"
+            );
+            let fence = fixture.fence.clone();
+            *fixture.fence.after_sample.lock().unwrap() = Some(Box::new(move || {
+                assert!(
+                    fence.pending().unwrap() > 0,
+                    "the sample saw buffered bytes"
+                );
+                fence.hold_reads.store(false, SeqCst);
+            }));
             assert!(matches!(fixture.gate(), ReplyGate::Cancelled));
         }
+    }
+
+    #[test]
+    fn a_write_and_close_between_the_two_measurements_counts_before_the_decision() {
+        use std::sync::atomic::Ordering::SeqCst;
+        for _ in 0..50 {
+            let mut fixture = Fixture::new();
+            fixture.fence.hold_reads.store(true, SeqCst);
+            // After pending bytes are measured and before hang-up is checked,
+            // the client writes a cancel for the active request and closes.
+            let (fd, read_fd) = (fixture.fds[1], fixture.fds[0]);
+            *fixture.fence.between_measures.lock().unwrap() = Some(Box::new(move || {
+                assert_eq!(
+                    unsafe { libc::write(fd, CANCEL_A.as_ptr().cast(), CANCEL_A.len()) },
+                    CANCEL_A.len() as isize
+                );
+                unsafe { libc::close(fd) };
+                // A process forked by a concurrent test can hold a copy of the
+                // write end until it execs; the close is only complete once
+                // the read end hangs up.
+                wait_for_hangup(read_fd);
+            }));
+            let fence = fixture.fence.clone();
+            *fixture.fence.after_sample.lock().unwrap() = Some(Box::new(move || {
+                fence.hold_reads.store(false, SeqCst);
+            }));
+            let gate = fixture.gate();
+            fixture.fds[1] = -1;
+            assert!(matches!(gate, ReplyGate::Cancelled));
+        }
+    }
+
+    #[test]
+    fn a_failed_hangup_check_is_an_unknown_outcome() {
+        let fixture = Fixture::new();
+        fixture.write(CANCEL_A);
+        fixture
+            .fence
+            .fail_poll
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(matches!(fixture.gate(), ReplyGate::Unknown));
     }
 
     #[test]
