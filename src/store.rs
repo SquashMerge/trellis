@@ -137,6 +137,12 @@ pub enum MaintenanceOutcome {
     Progress,
 }
 
+#[cfg(test)]
+struct TestTerminalNotify {
+    id: String,
+    notify: Arc<tokio::sync::Notify>,
+}
+
 #[derive(Clone)]
 pub struct Store {
     roots: topology::TopologyRoots,
@@ -165,6 +171,8 @@ pub struct Store {
     test_queue_before_shared_hook: Arc<TestOneShotHook>,
     #[cfg(test)]
     test_queue_select_hook: Arc<TestOneShotHook>,
+    #[cfg(test)]
+    test_queue_terminal_notify: Arc<Mutex<Option<TestTerminalNotify>>>,
     #[cfg(test)]
     test_exclusive_recovery_hook: Arc<TestOneShotHook>,
     #[cfg(test)]
@@ -5317,6 +5325,8 @@ impl Store {
             test_queue_before_shared_hook: Arc::new(TestOneShotHook::default()),
             #[cfg(test)]
             test_queue_select_hook: Arc::new(TestOneShotHook::default()),
+            #[cfg(test)]
+            test_queue_terminal_notify: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             test_exclusive_recovery_hook: Arc::new(TestOneShotHook::default()),
             #[cfg(test)]

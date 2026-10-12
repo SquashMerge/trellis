@@ -53,6 +53,84 @@ async fn ready(runtime: &trellis::daemon::registry::CheckoutRuntime) {
     .unwrap();
 }
 
+async fn await_idle_release(registry: &mut CheckoutRegistry, at: Instant, key: &str) {
+    let started = Instant::now();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let tick = registry.advance(at + started.elapsed()).unwrap();
+            if !tick.released.is_empty() {
+                assert_eq!(tick.released, vec![key.to_owned()]);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("checkout did not release after watcher quiescence");
+}
+
+async fn await_release_after_drain(registry: &mut CheckoutRegistry, at: Instant, key: &str) {
+    let started = Instant::now();
+    let mut released = false;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let tick = registry.advance(at + started.elapsed()).unwrap();
+            if !tick.released.is_empty() {
+                assert_eq!(tick.released, vec![key.to_owned()]);
+                assert!(!released, "checkout released more than once");
+                released = true;
+            }
+            if tick.exit {
+                assert!(released, "daemon exited before releasing the checkout");
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("idle release did not finish after FIFO drain and watcher quiescence");
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn idle_exit_waits_for_release_when_read_finishes_between_idle_probes() {
+    let (_base, id, mut registry, now) = fixture();
+    registry.attach_launch(1, &id).unwrap();
+    let runtime = registry.activate(&id.root_key).unwrap();
+    ready(&runtime).await;
+    let (response, _) = runtime.evidence_response().unwrap();
+    registry.disconnect_at(1, now);
+    let due = now + DAEMON_IDLE_DELAY;
+    let (probed_tx, probed_rx) = tokio::sync::oneshot::channel();
+    let (continue_tx, continue_rx) = std::sync::mpsc::channel();
+    registry.set_after_due_release_for_tests(move || {
+        let _ = probed_tx.send(());
+        let _ = continue_rx.recv();
+    });
+    let tick = tokio::task::spawn_blocking(move || {
+        let result = registry.advance(due).unwrap();
+        (registry, result)
+    });
+    tokio::time::timeout(Duration::from_secs(5), probed_rx)
+        .await
+        .expect("idle tick did not finish the due-release probe")
+        .unwrap();
+    assert!(runtime.has_active_resources());
+    response.finish(()).unwrap();
+    drop(response);
+    continue_tx.send(()).unwrap();
+    let (mut registry, first) = tokio::time::timeout(Duration::from_secs(5), tick)
+        .await
+        .expect("idle tick did not resume")
+        .unwrap();
+    assert!(first.released.is_empty(), "active read had fenced release");
+    assert!(!first.exit, "unreleased runtime must fence daemon exit");
+    assert!(runtime.has_active_resources());
+    await_idle_release(&mut registry, due, &id.root_key).await;
+    assert!(!runtime.has_active_resources());
+    assert!(registry.advance(due + Duration::from_secs(1)).unwrap().exit);
+}
+
 #[tokio::test]
 async fn lifecycle_driver_exits_when_startup_deadline_is_due() {
     let registry = std::sync::Arc::new(tokio::sync::Mutex::new(CheckoutRegistry::starting_at(
@@ -95,13 +173,12 @@ async fn browser_expiry_starts_a_separate_release_grace_and_exit_clock() {
             .released
             .is_empty()
     );
-    assert!(
-        registry
-            .advance(now + BROWSER_IDLE_DELAY + CHECKOUT_RELEASE_DELAY)
-            .unwrap()
-            .released
-            .contains(&id.root_key)
-    );
+    await_idle_release(
+        &mut registry,
+        now + BROWSER_IDLE_DELAY + CHECKOUT_RELEASE_DELAY,
+        &id.root_key,
+    )
+    .await;
     assert!(!runtime.has_active_resources());
     assert!(
         !registry
@@ -130,9 +207,8 @@ async fn browser_client_cannot_collide_with_session_and_late_tick_keeps_deadline
         .unwrap();
     assert_eq!(registry.idle_exit_deadline(), None);
     let late = now + BROWSER_IDLE_DELAY + DAEMON_IDLE_DELAY + Duration::from_secs(1);
-    let tick = registry.advance(late).unwrap();
-    assert_eq!(tick.released, vec![id.root_key.clone()]);
-    assert!(tick.exit);
+    await_release_after_drain(&mut registry, late, &id.root_key).await;
+    assert!(!runtime.has_active_resources());
     assert_eq!(
         registry.idle_exit_deadline(),
         Some(now + BROWSER_IDLE_DELAY + DAEMON_IDLE_DELAY)
@@ -164,13 +240,13 @@ async fn final_mcp_disconnect_after_unpolled_browser_expiry_starts_its_own_grace
             .released
             .is_empty()
     );
-    assert_eq!(
-        registry
-            .advance(disconnected + CHECKOUT_RELEASE_DELAY)
-            .unwrap()
-            .released,
-        vec![id.root_key.clone()]
-    );
+    await_idle_release(
+        &mut registry,
+        disconnected + CHECKOUT_RELEASE_DELAY,
+        &id.root_key,
+    )
+    .await;
+    assert!(!runtime.has_active_resources());
 }
 
 #[tokio::test]
@@ -217,13 +293,8 @@ async fn final_session_disconnect_and_later_attach_reset_deadlines() {
     assert_eq!(registry.idle_exit_deadline(), None);
     assert!(registry.advance(before).unwrap().released.is_empty());
     registry.disconnect_at(3, before);
-    assert!(
-        registry
-            .advance(before + CHECKOUT_RELEASE_DELAY)
-            .unwrap()
-            .released
-            .contains(&id.root_key)
-    );
+    await_idle_release(&mut registry, before + CHECKOUT_RELEASE_DELAY, &id.root_key).await;
+    assert!(!runtime.has_active_resources());
 }
 
 #[test]
@@ -254,9 +325,8 @@ async fn queued_or_inflight_work_defers_expired_deadlines_until_drain() {
     response.finish(()).unwrap();
     drop(response);
     registry.set_pending_work(&id.root_key, false).unwrap();
-    let tick = registry.advance(elapsed).unwrap();
-    assert_eq!(tick.released, vec![id.root_key.clone()]);
-    assert!(tick.exit);
+    await_release_after_drain(&mut registry, elapsed, &id.root_key).await;
+    assert!(!runtime.has_active_resources());
 }
 
 #[test]
@@ -379,13 +449,7 @@ async fn timed_release_closes_checkout_handles_and_reattach_runs_h() {
     assert!(open_descriptors(&id.root) > root_baseline);
     assert!(open_descriptors(&lock) > 0);
     registry.disconnect_at(1, now);
-    assert_eq!(
-        registry
-            .advance(now + CHECKOUT_RELEASE_DELAY)
-            .unwrap()
-            .released,
-        vec![id.root_key.clone()]
-    );
+    await_idle_release(&mut registry, now + CHECKOUT_RELEASE_DELAY, &id.root_key).await;
     assert!(!old.has_active_resources());
     tokio::time::timeout(Duration::from_secs(2), async {
         while open_descriptors(&id.root) != root_baseline || open_descriptors(&lock) != 0 {
@@ -422,13 +486,7 @@ async fn invalid_prior_head_does_not_pin_idle_resources_or_skip_reattach_h() {
         .join("requests.db");
     let queue_inode = fs::metadata(&queue).unwrap().ino();
     registry.disconnect_at(1, now);
-    assert_eq!(
-        registry
-            .advance(now + CHECKOUT_RELEASE_DELAY)
-            .unwrap()
-            .released,
-        vec![id.root_key.clone()]
-    );
+    await_idle_release(&mut registry, now + CHECKOUT_RELEASE_DELAY, &id.root_key).await;
     assert!(!old.has_active_resources());
     assert!(registry.advance(now + DAEMON_IDLE_DELAY).unwrap().exit);
     // The released daemon owns no live SQLite handle. Losing its disposable
@@ -640,9 +698,8 @@ async fn active_writer_and_protected_reader_overlap_orphan_idle_scan() {
     assert!(
         first_done.revision.unwrap().index_revision < second_done.revision.unwrap().index_revision
     );
-    let drained = registry.advance(now + DAEMON_IDLE_DELAY).unwrap();
-    assert_eq!(drained.released, vec![id.root_key.clone()]);
-    assert!(drained.exit);
+    await_release_after_drain(&mut registry, now + DAEMON_IDLE_DELAY, &id.root_key).await;
+    assert!(!runtime.has_active_resources());
 }
 
 #[tokio::test]
@@ -696,9 +753,8 @@ async fn committed_fifo_queue_keeps_both_expired_clocks_until_normal_daemon_drai
         second_revision.index_generation
     );
     assert!(first_revision.index_revision < second_revision.index_revision);
-    let drained = registry.advance(deadline).unwrap();
-    assert_eq!(drained.released, vec![id.root_key.clone()]);
-    assert!(drained.exit);
+    await_release_after_drain(&mut registry, deadline, &id.root_key).await;
+    assert!(!runtime.has_active_resources());
 }
 
 #[test]

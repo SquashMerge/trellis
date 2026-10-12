@@ -32,6 +32,16 @@ async fn ready(runtime: &trellis::daemon::registry::CheckoutRuntime) {
     .unwrap_or_else(|_| panic!("H did not finish: {:?}", runtime.reconciliation_error()));
 }
 
+async fn release_when_idle(registry: &mut CheckoutRegistry, key: &str) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !registry.release(key).unwrap() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("checkout did not release after H and watcher quiescence");
+}
+
 #[tokio::test]
 async fn registration_does_not_open_a_store_and_active_checkouts_are_isolated() {
     let base = tempfile::tempdir().unwrap();
@@ -827,7 +837,8 @@ async fn cold_activation_preserves_recorded_scip_option() {
     assert_eq!(observed.max_file_bytes, options.max_file_bytes);
 
     registry.disconnect(1);
-    assert!(registry.release(&id.root_key).unwrap());
+    release_when_idle(&mut registry, &id.root_key).await;
+    assert!(!runtime.has_active_resources());
     registry
         .register(
             &id,
@@ -848,7 +859,8 @@ async fn cold_activation_preserves_recorded_scip_option() {
     );
     assert!(default_selected.scip_path.is_none());
     registry.disconnect(2);
-    assert!(registry.release(&id.root_key).unwrap());
+    release_when_idle(&mut registry, &id.root_key).await;
+    assert!(!explicit_default.has_active_resources());
     registry
         .register(
             &id,

@@ -166,6 +166,8 @@ pub struct CheckoutRegistry {
     orphan_scan_cache: Option<(Instant, bool)>,
     orphan_scan_count: u64,
     clock_override: Option<Instant>,
+    #[cfg(feature = "test-support")]
+    test_after_due_release: Option<Box<dyn FnOnce() + Send>>,
     #[cfg(all(test, feature = "test-support"))]
     test_jev_endpoint: Option<String>,
 }
@@ -190,9 +192,17 @@ impl CheckoutRegistry {
             orphan_scan_cache: None,
             orphan_scan_count: 0,
             clock_override: None,
+            #[cfg(feature = "test-support")]
+            test_after_due_release: None,
             #[cfg(all(test, feature = "test-support"))]
             test_jev_endpoint: None,
         }
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn set_after_due_release_for_tests(&mut self, hook: impl FnOnce() + Send + 'static) {
+        self.test_after_due_release = Some(Box::new(hook));
     }
 
     #[cfg(all(test, feature = "test-support"))]
@@ -1125,12 +1135,19 @@ impl CheckoutRegistry {
                 released.push(key);
             }
         }
+        #[cfg(feature = "test-support")]
+        if let Some(hook) = self.test_after_due_release.take() {
+            hook();
+        }
         let mut busy = false;
         for key in self.entries.keys().cloned().collect::<Vec<_>>() {
             busy |= self.refresh_pending_work(&key)?;
         }
         let candidate = self.idle_exit_at.is_some_and(|at| now >= at)
             && !busy
+            // Release may defer on H, a watcher, or an active read just before
+            // the later pending-work refresh observes that work finish.
+            && self.runtimes.is_empty()
             && self
                 .entries
                 .values()

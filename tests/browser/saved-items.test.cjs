@@ -180,7 +180,26 @@ async function indexThroughApi(server, token, expected) {
   while(Date.now()<deadline){
     const job=await api(server.base,token,"GET",scoped(server.rootKey,`jobs/${encodeURIComponent(accepted.data.id)}`));
     assert.equal(job.status,200,JSON.stringify(job.data));
-    if(job.data.finishedAt!==null){assert.equal(job.data.state,"done",JSON.stringify(job.data));return job.data.revision;}
+    if(job.data.finishedAt!==null){
+      if(job.data.state==="done")return job.data.revision;
+      // The daemon watcher may have published this edit before the accepted
+      // expected-P request claimed. Never replay that terminal request.
+      assert.equal(job.data.error?.code,"revision_conflict",JSON.stringify(job.data));
+      while(Date.now()<deadline){
+        const current=await api(server.base,token,"GET",scoped(server.rootKey,"status"));
+        if(current.status===503&&["storage_busy","index_not_ready"].includes(current.data?.error?.code)){await delay(25);continue;}
+        assert.equal(current.status,200,JSON.stringify(current.data));
+        const pin=current.data.revision;
+        assert.equal(pin.indexGeneration,expected.indexGeneration);
+        assert.equal(pin.indexRevision,expected.indexRevision+1,"watcher must publish exactly Q");
+        const source=await api(server.base,token,"GET",scoped(server.rootKey,`source?path=flow.rs&indexGeneration=${encodeURIComponent(pin.indexGeneration)}&indexRevision=${pin.indexRevision}`));
+        if(source.status===503&&["storage_busy","index_not_ready"].includes(source.data?.error?.code)){await delay(25);continue;}
+        assert.equal(source.status,200,JSON.stringify(source.data));
+        assert.equal(source.data.file?.text,SOURCE_Q,"Q must contain the edited source");
+        return pin;
+      }
+      throw new Error("watcher did not expose Q after the terminal revision_conflict");
+    }
     await delay(25);
   }
   throw new Error("index job did not complete within 20 seconds");

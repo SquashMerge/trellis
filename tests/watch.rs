@@ -106,9 +106,16 @@ fn post_cutoff_hint_stays_pending_after_first_publication() {
     let owner =
         index_coordinator::establish_serving_session(&store, Some(&options), &cancel).unwrap();
     let mut work = WatcherWork::new(&store, &owner, &options).unwrap();
+    // This fixture tests cutoff accounting, not OS notification latency.
+    // Both hints enter the same bounded channel, without a late native event
+    // invalidating the first capture before its intended post-cutoff hint.
+    work.disable_native_watcher_for_tests();
     let before = store.status().unwrap().revision;
     fs::write(&source, "function middle() {}\n").unwrap();
-    std::thread::sleep(Duration::from_millis(350));
+    work.submit_watch_event_for_tests(Ok(Event::new(EventKind::Modify(ModifyKind::Data(
+        DataChange::Content,
+    )))
+    .add_path(source.clone())));
     let accounted = work
         .reconcile_due_with_cutoffs(
             &store,

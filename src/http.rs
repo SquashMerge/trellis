@@ -272,6 +272,12 @@ pub struct DaemonState {
     test_queue_after_pending_snapshot: crate::store::TestOneShotHook,
     #[cfg(test)]
     test_queue_after_h_drain: crate::store::TestOneShotHook,
+    #[cfg(test)]
+    test_queue_before_watcher_reconcile: crate::store::TestOneShotHook,
+    #[cfg(test)]
+    test_queue_after_watcher_reconcile: crate::store::TestOneShotHook,
+    #[cfg(test)]
+    test_queue_current_phase: std::sync::atomic::AtomicU8,
     packets: Mutex<PacketCache>,
     provider: Option<Arc<LiveJev>>,
     acp: Option<Arc<Acp>>,
@@ -443,6 +449,12 @@ pub fn new_with_dependency_options(
         test_queue_after_pending_snapshot: crate::store::TestOneShotHook::default(),
         #[cfg(test)]
         test_queue_after_h_drain: crate::store::TestOneShotHook::default(),
+        #[cfg(test)]
+        test_queue_before_watcher_reconcile: crate::store::TestOneShotHook::default(),
+        #[cfg(test)]
+        test_queue_after_watcher_reconcile: crate::store::TestOneShotHook::default(),
+        #[cfg(test)]
+        test_queue_current_phase: std::sync::atomic::AtomicU8::new(0),
         jobs: Mutex::new(Jobs {
             current: None,
             jobs: BTreeMap::new(),
@@ -1069,6 +1081,8 @@ impl DaemonState {
         #[cfg(test)]
         self.test_queue_before_stream.run();
         let _stream = self.native_stream.lock().unwrap();
+        #[cfg(test)]
+        self.test_queue_current_phase.store(1, Ordering::Release);
         if self.checkout_runtime_stopped.load(Ordering::Acquire) {
             return Ok(());
         }
@@ -1202,6 +1216,8 @@ impl DaemonState {
         if let Some(ref session) = retained
             && session.verify().is_ok()
         {
+            #[cfg(test)]
+            self.test_queue_current_phase.store(2, Ordering::Release);
             let processed = match crate::index_coordinator::drain_one_request_observed(
                 &self.store,
                 session,
@@ -1222,6 +1238,8 @@ impl DaemonState {
                     return Err(error);
                 }
             };
+            #[cfg(test)]
+            self.test_queue_current_phase.store(3, Ordering::Release);
             if processed > 0 {
                 *self.packets.lock().unwrap() = PacketCache::default();
                 self.start_dependency_index();
@@ -1271,6 +1289,10 @@ impl DaemonState {
                         *work = Some((Arc::downgrade(session), scheduler));
                     }
                     if let Some((_, scheduler)) = work.as_mut() {
+                        #[cfg(test)]
+                        self.test_queue_current_phase.store(4, Ordering::Release);
+                        #[cfg(test)]
+                        self.test_queue_before_watcher_reconcile.run();
                         let accounted = scheduler.reconcile_due(
                             &self.store,
                             session,
@@ -1278,6 +1300,10 @@ impl DaemonState {
                             &Arc::new(AtomicBool::new(false)),
                             false,
                         )?;
+                        #[cfg(test)]
+                        self.test_queue_current_phase.store(5, Ordering::Release);
+                        #[cfg(test)]
+                        self.test_queue_after_watcher_reconcile.run();
                         // ACK only a verified, acknowledged full inventory.
                         // Neither a failed FIFO probe nor a newer accepted hint
                         // can be called settled. The reporter only try_sends here.
@@ -5587,6 +5613,33 @@ mod exceptional_recovery_tests {
             let _ = selected_tx.send(());
             let _ = release_select_rx.recv();
         });
+        // Distinguish a blocked watcher inventory from a later FIFO retry.
+        // A timed-out blocking tick continues after its Tokio join is dropped.
+        let queue_phase = Arc::new(std::sync::atomic::AtomicU8::new(0));
+        {
+            let phase = queue_phase.clone();
+            fixture.state.test_queue_after_h_drain.set(move || {
+                phase.store(1, Ordering::Release);
+            });
+        }
+        {
+            let phase = queue_phase.clone();
+            fixture
+                .state
+                .test_queue_before_watcher_reconcile
+                .set(move || {
+                    phase.store(2, Ordering::Release);
+                });
+        }
+        {
+            let phase = queue_phase.clone();
+            fixture
+                .state
+                .test_queue_after_watcher_reconcile
+                .set(move || {
+                    phase.store(3, Ordering::Release);
+                });
+        }
         fixture
             .state
             .pending_requests
@@ -5636,6 +5689,10 @@ mod exceptional_recovery_tests {
             assert_eq!(row.state, expected);
             assert!(row.finished_at.is_none());
         }
+        let q1_terminal = Arc::new(tokio::sync::Notify::new());
+        fixture
+            .store
+            .notify_on_terminal_request_for_tests(&fixture.q1.id, q1_terminal.clone());
         child.0.stdin.take().unwrap().write_all(b"x").unwrap();
         let child_status = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
@@ -5655,25 +5712,47 @@ mod exceptional_recovery_tests {
             .await
             .expect("child output drain did not finish")
             .unwrap();
-        let mut last_seen = None;
         let timeout_result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            // The accepted ID signals only after its durable terminal COMMIT.
+            // Do not take repeated SH queue reads while the daemon needs EX.
+            q1_terminal.notified().await;
             loop {
                 match fixture.store.request_by_id(&fixture.q1.id) {
-                    Ok(Some(row)) if row.finished_at.is_some() => break row,
-                    Ok(Some(row)) => last_seen = Some((row.state, row.error_code)),
-                    Err(error) if error.is::<crate::store::topology::StorageBusy>() => {}
-                    other => panic!("accepted Q1 lookup failed during recovery: {other:?}"),
+                    Ok(Some(row)) => break row,
+                    Err(error) if error.is::<crate::store::topology::StorageBusy>() => {
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                    other => panic!("accepted Q1 lookup failed after terminal signal: {other:?}"),
                 }
-                // Let the daemon's nonblocking EX acquire the use lock; a
-                // tight SH SQLite poll can starve it under all-target load.
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
         })
         .await;
-        let observed = timeout_result.unwrap_or_else(|_| {
-            let q2 = fixture.store.request_by_id(&fixture.q2.id).map(|row| {
-                row.map(|row| (row.state, row.error_code, row.finished_at.is_some()))
-            });
+        let observed = if let Ok(row) = timeout_result {
+            row
+        } else {
+            let last_seen = fixture
+                .store
+                .request_by_id(&fixture.q1.id)
+                .map(|row| row.map(|row| (row.state, row.error_code, row.finished_at.is_some())));
+            let at_deadline = (
+                fixture
+                    .state
+                    .test_queue_current_phase
+                    .load(Ordering::Acquire),
+                fixture.store.test_pending_completion_probe_for_tests(),
+                fixture.state.native_stream.try_lock().is_ok(),
+            );
+            // Failure-only probe: preserve the original 10-second RED, but
+            // give the writer one quiet second without this test's SH poll.
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            let after_quiet = fixture
+                .store
+                .request_by_id(&fixture.q1.id)
+                .map(|row| row.map(|row| (row.state, row.finished_at.is_some(), row.revision)));
+            let q2 = fixture
+                .store
+                .request_by_id(&fixture.q2.id)
+                .map(|row| row.map(|row| (row.state, row.error_code, row.finished_at.is_some())));
             let owner = fixture
                 .state
                 .retained_serving_session()
@@ -5685,14 +5764,23 @@ mod exceptional_recovery_tests {
                 .unwrap()
                 .map(|at| at.saturating_duration_since(Instant::now()).as_millis());
             let pending = fixture.state.pending_requests.lock().unwrap().clone();
+            let completion = fixture.store.test_pending_completion_probe_for_tests();
             panic!(
-                "same accepted Q1 ID did not retry after external SH release: last_row={last_seen:?}, q2={q2:?}, pending_recovery={}, owner_valid={owner:?}, retry_ms={retry_ms:?}, pending_ids={pending:?}, tick_started={}, native_stream_free={}, index_revision={:?}",
+                "same accepted Q1 ID did not retry after external SH release: last_row={last_seen:?}, q2={q2:?}, pending_recovery={}, owner_valid={owner:?}, retry_ms={retry_ms:?}, pending_ids={pending:?}, at_deadline={at_deadline:?}, after_quiet={after_quiet:?}, queue_phase={} (0=pre-H, 1=after-H/Q, 2=watcher reconcile, 3=watcher returned), live_phase={} (1=stream, 2=drain, 3=after drain, 4=watcher reconcile, 5=after watcher), completion={completion:?}, tick_started={}, native_stream_free={}, index_revision={:?}",
                 fixture.store.is_recreate_pending(),
+                queue_phase.load(Ordering::Acquire),
+                fixture
+                    .state
+                    .test_queue_current_phase
+                    .load(Ordering::Acquire),
                 fixture.state.queue_tick_started.load(Ordering::Acquire),
                 fixture.state.native_stream.try_lock().is_ok(),
-                fixture.store.status().map(|status| status.revision.index_revision)
+                fixture
+                    .store
+                    .status()
+                    .map(|status| status.revision.index_revision)
             )
-        });
+        };
         assert!(
             observed.finished_at.is_some(),
             "same accepted Q1 ID did not retry after external SH release: row={}/{:?}, pending_recovery={}",

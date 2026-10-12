@@ -54,6 +54,7 @@ struct Fixture {
     pin: trellis::model::IndexPin,
     graph: Graph,
     app: Router,
+    state: Arc<http::DaemonState>,
     session: Arc<WriterSession>,
 }
 fn setup() -> Fixture {
@@ -134,7 +135,7 @@ fn setup() -> Fixture {
     )
     .unwrap();
     state.retain_serving_session(session.clone());
-    let app = http::router(state);
+    let app = http::router(state.clone());
     Fixture {
         temp,
         workspace,
@@ -143,6 +144,7 @@ fn setup() -> Fixture {
         store,
         graph,
         app,
+        state,
         session,
     }
 }
@@ -355,7 +357,23 @@ async fn cached_java_python_sequences_keep_measured_calls_after_source_deletion(
         };
         assert_eq!(prior_head.index_generation, f.pin.index_generation);
         assert!(prior_head.index_revision >= f.pin.index_revision);
-        std::fs::remove_file(f.workspace.join(path)).unwrap();
+        let deleted_path = f.workspace.join(path);
+        std::fs::remove_file(&deleted_path).unwrap();
+        // A deletion may be coalesced by the OS watcher under all-target load.
+        // Submit one accepted hint through the daemon's real watcher ingress.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let hint =
+                    notify::Event::new(notify::EventKind::Remove(notify::event::RemoveKind::File))
+                        .add_path(deleted_path.clone());
+                if f.state.submit_watch_event_for_tests(Ok(hint)) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("daemon watcher did not register for deletion");
         loop {
             match f.store.status() {
                 Ok(status) => {
