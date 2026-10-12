@@ -174,16 +174,34 @@ function assertPinnedUrl(raw, pin) {
   assert.equal(url.searchParams.get("indexGeneration"),pin.indexGeneration);
   assert.equal(url.searchParams.get("indexRevision"),String(pin.indexRevision));
 }
-async function indexThroughApi(server, token, expected) {
+async function indexThroughApi(server, token, expected, changedPath, changedSource) {
   const accepted=await api(server.base,token,"POST",scoped(server.rootKey,"index"),{expectedRevision:expected});assert.equal(accepted.status,202,JSON.stringify(accepted.data));
   const deadline=Date.now()+20000;
+  let job;
   while(Date.now()<deadline){
-    const job=await api(server.base,token,"GET",scoped(server.rootKey,`jobs/${encodeURIComponent(accepted.data.id)}`));
+    job=await api(server.base,token,"GET",scoped(server.rootKey,`jobs/${encodeURIComponent(accepted.data.id)}`));
     assert.equal(job.status,200,JSON.stringify(job.data));
-    if(job.data.finishedAt!==null){assert.equal(job.data.state,"done",JSON.stringify(job.data));return job.data.revision;}
+    if(job.data.finishedAt!==null)break;
     await delay(25);
   }
-  throw new Error("index job did not complete within 20 seconds");
+  if(job?.data.finishedAt===null||job===undefined)throw new Error("index job did not complete within 20 seconds");
+  const current=await api(server.base,token,"GET",scoped(server.rootKey,"status"));assert.equal(current.status,200,JSON.stringify(current.data));
+  let pin;
+  if(job.data.state==="done"){
+    pin=job.data.revision;
+    assert.deepEqual(current.data.revision,pin,"completed job must select its returned pin");
+  }else{
+    // The watcher can publish the edited source first (#131). The stale explicit
+    // job must stay failed, and the selected newer pin must hold the edited bytes.
+    assert.equal(job.data.error?.code,"revision_conflict",JSON.stringify(job.data));
+    pin=current.data.revision;
+  }
+  assert.equal(pin.indexGeneration,expected.indexGeneration);
+  assert.ok(pin.indexRevision>expected.indexRevision,`no newer selected head: ${JSON.stringify(job.data)}; current=${JSON.stringify(current.data)}`);
+  const source=await api(server.base,token,"GET",scoped(server.rootKey,`source${pinSuffix(pin)}&path=${encodeURIComponent(changedPath)}`));
+  assert.equal(source.status,200,JSON.stringify(source.data));
+  assert.equal(source.data.file.text,changedSource,"attested changed source at selected pin");
+  return pin;
 }
 async function seedId(server, token, name) {
   const symbols=await api(server.base,token,"GET",scoped(server.rootKey,`symbols?q=${encodeURIComponent(name)}`));assert.equal(symbols.status,200,JSON.stringify(symbols.data));
@@ -214,6 +232,20 @@ async function selectSymbol(page, name) {
   await pick.click();await query;
 }
 const row = (page, kind, id) => page.locator(`li[data-saved-kind="${kind}"][data-saved-id="${id}"]`);
+// Bounded snapshot of a saved row and page notice for failure messages (#131).
+async function savedDiagnostics(page, kind, id) {
+  const quick = {timeout:1000};
+  const target = row(page,kind,id), load = target.getByRole("button",{name:"Load",exact:true});
+  const read = async probe => { try { return await probe(); } catch (error) { return `unavailable: ${error.message.split("\n")[0]}`; } };
+  return JSON.stringify({
+    rowVisible:await read(() => target.isVisible()),
+    rowText:await read(async () => (await target.textContent(quick))?.slice(0,300)),
+    loadEnabled:await read(() => load.isEnabled(quick)),
+    loadReason:await read(() => load.getAttribute("title",quick)),
+    notice:await read(async () => (await page.locator("#notice").textContent(quick))?.slice(0,300)),
+    pageRevision:await read(() => page.evaluate(() => status?.revision ?? null)),
+  });
+}
 function readPayload(dbPath, kind, id) {
   assert.ok(["view","note"].includes(kind));
   const db=new DatabaseSync(dbPath,{readOnly:true});
@@ -263,6 +295,11 @@ for (const kind of ["view","note"]) test(`real browser ${kind} save, edit, stale
   browser=await chromium.launch({headless:true});context=await browser.newContext();page=await context.newPage();
   page.on("pageerror",error=>pageErrors.push(error));
   const requests=[];page.on("request",request=>requests.push({url:request.url(),method:request.method(),body:request.postDataJSON?.()}));
+  // The page's own in-flight API requests: one still open when head moves can
+  // observe the new head and re-render saved rows away from the stale pin (#131).
+  let pageApiInFlight=0;const isApi=request=>new URL(request.url()).pathname.startsWith("/api/");
+  page.on("request",request=>{if(isApi(request))pageApiInFlight++;});
+  for(const done of ["requestfinished","requestfailed"])page.on(done,request=>{if(isApi(request))pageApiInFlight--;});
   await connect(page,server,paths.token);
   const initialLists=requests.filter(request=>[browserPath(page,"views"),browserPath(page,"annotations")].includes(new URL(request.url).pathname));
   assert.equal(initialLists.length,2);for(const request of initialLists)assertPinnedUrl(request.url,P);
@@ -304,10 +341,23 @@ for (const kind of ["view","note"]) test(`real browser ${kind} save, edit, stale
   const dbs=findNamed(paths.temp,"workspace.db");assert.equal(dbs.length,1,JSON.stringify(dbs));const dbPath=dbs[0];
   const anchorBefore=rawJsonProperty(readPayload(dbPath,kind,id),"anchor");assert.ok(anchorBefore?.startsWith("{"),anchorBefore);
   const staleRow=row(page,kind,id);assert.equal(await staleRow.getByRole("button",{name:"Load",exact:true}).isEnabled(),true);
-  writeFileSync(paths.source,SOURCE_Q);const Q=await indexThroughApi(server,paths.token,P);assert.equal(Q.indexGeneration,P.indexGeneration);assert.equal(Q.indexRevision,P.indexRevision+1);
+  // Reach and hold the stale-P page state: let every page request finish
+  // before head moves. The page starts no requests of its own without a job.
+  for(const idleBy=Date.now()+30000,quiet={since:Date.now()};;await delay(25)){
+    if(pageApiInFlight>0)quiet.since=Date.now();else if(Date.now()-quiet.since>=300)break;
+    if(Date.now()>idleBy)throw new Error(`page never went idle before the edit: ${await savedDiagnostics(page,kind,id)}`);
+  }
+  writeFileSync(paths.source,SOURCE_Q);const Q=await indexThroughApi(server,paths.token,P,basename(paths.source),SOURCE_Q);
   assert.equal(await seedId(server,paths.token,"seed"),seed,"header edit must retain the original ordinal declaration ID");
+  // The page must still be at P with nothing in flight: that is the stale state
+  // under test. Anything else is reported, not waited out.
+  const pageRevision=await page.evaluate(()=>status?.revision??null);
+  assert.deepEqual(pageRevision,P,`page left the stale pin during indexing: ${await savedDiagnostics(page,kind,id)}`);
+  assert.equal(pageApiInFlight,0,`page request in flight after indexing: ${await savedDiagnostics(page,kind,id)}`);
+  assert.equal(await staleRow.getByRole("button",{name:"Load",exact:true}).isEnabled(),true,`stale Load disabled at P: ${await savedDiagnostics(page,kind,id)}`);
   baseline=requests.filter(request=>new URL(request.url).pathname===browserPath(page,"query")).length;
-  const staleRequestPromise=page.waitForRequest(request=>request.method()==="POST"&&new URL(request.url()).pathname===browserPath(page,"query")&&new URL(request.url()).searchParams.has("indexGeneration"));
+  const staleRequestPromise=page.waitForRequest(request=>request.method()==="POST"&&new URL(request.url()).pathname===browserPath(page,"query")&&new URL(request.url()).searchParams.has("indexGeneration"))
+    .catch(async error=>{throw new Error(`${error.message}; after Load: ${await savedDiagnostics(page,kind,id)}`);});
   const staleResponsePromise=page.waitForResponse(response=>response.request().method()==="POST"&&new URL(response.url()).pathname===browserPath(page,"query")&&new URL(response.url()).searchParams.has("indexGeneration"));
   await staleRow.getByRole("button",{name:"Load",exact:true}).click();const staleRequest=await staleRequestPromise,staleResponse=await staleResponsePromise;
   assertPinnedUrl(staleRequest.url(),P);assert.equal(staleRequest.postDataJSON().seed,seed);assert.equal(staleResponse.status(),200);

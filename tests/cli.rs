@@ -2853,7 +2853,13 @@ async fn start_saved_item_server(
     )
 }
 
-async fn real_index_job(client: &LegacyClient, url: &str, token: &str, expected: &Value) -> Value {
+async fn real_index_job(
+    client: &LegacyClient,
+    url: &str,
+    token: &str,
+    expected: &Value,
+    changed_source: &str,
+) -> Value {
     use std::time::Duration;
     let (status, accepted) = real_api(
         client,
@@ -2886,8 +2892,60 @@ async fn real_index_job(client: &LegacyClient, url: &str, token: &str, expected:
     })
     .await
     .expect("saved-item index job");
-    assert_eq!(completed["state"], "done", "{completed}");
-    completed["revision"].clone()
+    if completed["state"] == "done" {
+        let pin = completed["revision"].clone();
+        assert_eq!(pin["indexGeneration"], expected["indexGeneration"]);
+        assert!(
+            pin["indexRevision"].as_u64().unwrap() > expected["indexRevision"].as_u64().unwrap()
+        );
+        let (status, current) = real_api(
+            client,
+            url,
+            token,
+            reqwest::Method::GET,
+            "/api/status",
+            None,
+        )
+        .await;
+        assert_eq!(status, reqwest::StatusCode::OK, "{current}");
+        assert_eq!(
+            current["revision"], pin,
+            "completed job must select its returned pin"
+        );
+        return pin;
+    }
+    // The direct router's watcher can publish the edited source first. A stale
+    // explicit job must remain failed; prove that its replacement selected pin
+    // contains attested changed source bytes before using it below.
+    assert_eq!(
+        completed["error"]["code"], "revision_conflict",
+        "{completed}"
+    );
+    let (status, current) = real_api(
+        client,
+        url,
+        token,
+        reqwest::Method::GET,
+        "/api/status",
+        None,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK, "{current}");
+    let revision = &current["revision"];
+    assert_eq!(revision["indexGeneration"], expected["indexGeneration"]);
+    assert!(
+        revision["indexRevision"].as_u64().unwrap() > expected["indexRevision"].as_u64().unwrap(),
+        "failed job without a newer selected head: {completed}; current={current}"
+    );
+    let route = saved_pin_route("/api/source?path=flow.rs", revision);
+    let (status, source) = real_api(client, url, token, reqwest::Method::GET, &route, None).await;
+    assert_eq!(status, reqwest::StatusCode::OK, "{source}");
+    assert_eq!(source["revision"], *revision);
+    assert_eq!(
+        source["file"]["text"], changed_source,
+        "attested changed source at selected pin"
+    );
+    revision.clone()
 }
 
 fn saved_pin_route(route: &str, pin: &Value) -> String {
@@ -4278,6 +4336,14 @@ fn index_process_holds_leader_while_stdout_is_blocked() {
 
     let mut fds = [0; 2];
     assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    // Close-on-exec: processes spawned by concurrent tests must not inherit
+    // either end (#131). The child's stdout redirect is a fresh descriptor.
+    for fd in fds {
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+            0
+        );
+    }
     let mut reader = unsafe { File::from_raw_fd(fds[0]) };
     let mut writer = unsafe { File::from_raw_fd(fds[1]) };
     let flags = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) };
@@ -4667,17 +4733,11 @@ async fn saved_items_real_index_matrix() {
         Some(original_note_anchor.as_str())
     );
 
-    fs::write(
-        &source_path,
-        "fn seed(value: i64) { sink(); }\nfn sink() {}\nfn other() {}\n",
-    )
-    .unwrap();
-    let next = real_index_job(&client, &url, TOKEN, &pin).await;
+    let changed_source = "fn seed(value: i64) { sink(); }\nfn sink() {}\nfn other() {}\n";
+    fs::write(&source_path, changed_source).unwrap();
+    let next = real_index_job(&client, &url, TOKEN, &pin, changed_source).await;
     assert_eq!(next["indexGeneration"], pin["indexGeneration"]);
-    assert_eq!(
-        next["indexRevision"].as_u64().unwrap(),
-        pin["indexRevision"].as_u64().unwrap() + 1
-    );
+    assert!(next["indexRevision"].as_u64().unwrap() > pin["indexRevision"].as_u64().unwrap());
 
     let routes = [
         saved_pin_route("/api/views/real-view", &next),

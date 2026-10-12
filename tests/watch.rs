@@ -230,6 +230,9 @@ fn post_cutoff_hint_stays_pending_after_first_publication() {
     let owner =
         index_coordinator::establish_serving_session(&store, Some(&options), &cancel).unwrap();
     let mut work = LeaderWork::new(&store, &owner, &options).unwrap();
+    // The test submits its own hint; a late OS notification for the writes
+    // below would race the cutoff it controls (#131).
+    work.disable_native_watcher_for_tests();
     let before = store.status().unwrap().revision;
     fs::write(&source, "function middle() {}\n").unwrap();
     std::thread::sleep(Duration::from_millis(350));

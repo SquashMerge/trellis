@@ -1024,6 +1024,20 @@ impl DaemonState {
         self.maintenance_tick()
     }
 
+    /// Deliver a watcher event to the serving checkout's scheduler, as the OS
+    /// watcher would, without depending on OS notification latency. Returns
+    /// false until the queue tick has created the scheduler.
+    #[doc(hidden)]
+    pub fn submit_watch_event_for_tests(&self, event: notify::Event) -> bool {
+        match self.leader_work.lock().unwrap().as_ref() {
+            Some((_, scheduler)) => {
+                scheduler.submit_watch_event_for_tests(Ok(event));
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Drive the serial root-loss transition in a standalone fixture without
     /// conflating it with the independent low-priority maintenance lane.
     #[doc(hidden)]

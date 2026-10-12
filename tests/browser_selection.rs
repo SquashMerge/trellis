@@ -473,39 +473,6 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
             invalid_dir.json::<Value>().await.unwrap()["error"]["code"],
             "invalid_directory"
         );
-        let private = root.join("private");
-        fs::create_dir(&private).unwrap();
-        fs::set_permissions(&private, fs::Permissions::from_mode(0o000)).unwrap();
-        let forbidden_dir = tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let response = client
-                    .get(format!("{base}/api/checkouts/{key}/tree"))
-                    .query(&[("path", "private")])
-                    .bearer_auth(token)
-                    .send()
-                    .await
-                    .unwrap();
-                if response.status() != reqwest::StatusCode::SERVICE_UNAVAILABLE {
-                    break response;
-                }
-                let headers = response.headers().clone();
-                let error: Value = response.json().await.unwrap();
-                assert_eq!(
-                    headers["X-Trellis-Workspace"],
-                    verified_root.to_str().unwrap()
-                );
-                assert_eq!(error["error"]["code"], "index_not_ready", "{error}");
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("selected tree did not leave transient H admission");
-        assert_eq!(forbidden_dir.status(), reqwest::StatusCode::FORBIDDEN);
-        assert_eq!(
-            forbidden_dir.json::<Value>().await.unwrap()["error"]["code"],
-            "directory_forbidden"
-        );
-        fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
 
         let files = client
             .get(format!("{base}/api/checkouts/{key}/files"))
@@ -1069,6 +1036,45 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
         .unwrap();
     assert_eq!(invalid.status(), reqwest::StatusCode::BAD_REQUEST);
     assert!(!invalid.headers().contains_key("X-Trellis-Workspace"));
+    // Creating a directory changes a watched checkout: it starts catch-up and
+    // may publish a new revision. Run it after every revision-sensitive
+    // assertion above so none of them races that publication (#131).
+    for (key, root) in [(&a_key, &a), (&b_key, &b)] {
+        let verified_root = root.canonicalize().unwrap();
+        let private = root.join("private");
+        fs::create_dir(&private).unwrap();
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o000)).unwrap();
+        let forbidden_dir = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let response = client
+                    .get(format!("{base}/api/checkouts/{key}/tree"))
+                    .query(&[("path", "private")])
+                    .bearer_auth(token)
+                    .send()
+                    .await
+                    .unwrap();
+                if response.status() != reqwest::StatusCode::SERVICE_UNAVAILABLE {
+                    break response;
+                }
+                let headers = response.headers().clone();
+                let error: Value = response.json().await.unwrap();
+                assert_eq!(
+                    headers["X-Trellis-Workspace"],
+                    verified_root.to_str().unwrap()
+                );
+                assert_eq!(error["error"]["code"], "index_not_ready", "{error}");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("selected tree did not leave transient H admission");
+        assert_eq!(forbidden_dir.status(), reqwest::StatusCode::FORBIDDEN);
+        assert_eq!(
+            forbidden_dir.json::<Value>().await.unwrap()["error"]["code"],
+            "directory_forbidden"
+        );
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let changed = temp.path().join("moved-a");
     fs::rename(&a, &changed).unwrap();
     let drift = client
@@ -1813,7 +1819,9 @@ async fn browser_only_live_listener_releases_resources_then_exits_with_control_p
         .unwrap()
         .unwrap();
     assert!(provisioner.address().is_none());
-    assert!(tokio::net::TcpStream::connect(address).await.is_err());
+    // The joined serve task owned and dropped the TcpListener, so the port is
+    // released. Probing that nothing listens there races with any other
+    // process taking the freed port (#131).
 }
 
 #[tokio::test]
