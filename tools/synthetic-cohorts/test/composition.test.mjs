@@ -5,8 +5,13 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 
 const here = dirname(fileURLToPath(import.meta.url));
+// One helper target per checkout: concurrent runs in different checkouts must
+// not rebuild each other's tree-sitter outputs mid-read. CI pins it for caching.
+const compositionTarget = process.env.TRELLIS_COMPOSITION_TARGET ??
+  join(tmpdir(), `trellis-synthetic-composition-cargo-target-${createHash("sha256").update(here).digest("hex").slice(0, 12)}`);
 const generator = join(here, "..", "generate.mjs");
 const helper = join(here, "composition", "Cargo.toml");
 const policy = join(here, "..", "..", "..", "docs", "semantic-evidence", "cohorts-v1.json");
@@ -39,7 +44,7 @@ const sample = "small/java/Csmall0000.java";
 function checker(root, file) {
   const args = ["run", "--quiet", "--locked", "--manifest-path", helper, "--", root];
   if (file) args.push(file);
-  return spawnSync("cargo", args, { encoding: "utf8", timeout: 900000, maxBuffer: 4 * 1024 * 1024, env: { ...process.env, CARGO_TARGET_DIR: join(tmpdir(), "trellis-synthetic-composition-cargo-target") } });
+  return spawnSync("cargo", args, { encoding: "utf8", timeout: 900000, maxBuffer: 4 * 1024 * 1024, env: { ...process.env, CARGO_TARGET_DIR: compositionTarget } });
 }
 function outcome(result) { return result.stderr || result.stdout || result.error?.message || ""; }
 
