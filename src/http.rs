@@ -4129,6 +4129,7 @@ mod live_tests {
             let publisher = store.clone();
             let owner = session.clone();
             let stream_owner = state.clone();
+            let (stream_held, held) = tokio::sync::oneshot::channel();
             let publishing = tokio::task::spawn_blocking(move || {
                 // This synthetic writer bypasses the normal queue worker, so
                 // bind its expected-pin read and publish to the same native
@@ -4136,6 +4137,7 @@ mod live_tests {
                 // blocked independently; a leaked SQLite read transaction
                 // still prevents this single publication within the timeout.
                 let _stream = stream_owner.native_stream.lock().unwrap();
+                let _ = stream_held.send(());
                 let expected = publisher.status().unwrap().revision;
                 publisher.publish_native(
                     &updated,
@@ -4146,6 +4148,12 @@ mod live_tests {
                     &cancel,
                 )
             });
+            // The background watcher may hold the native stream for a while
+            // under load; only the publication itself is bounded below (#131).
+            tokio::time::timeout(std::time::Duration::from_secs(60), held)
+                .await
+                .expect("the background watcher never released the native stream")
+                .unwrap();
             // The provider is still blocked. This commit must not wait for a
             // SQLite read transaction held by the cached packet's outer fence.
             tokio::time::timeout(std::time::Duration::from_secs(5), publishing)
