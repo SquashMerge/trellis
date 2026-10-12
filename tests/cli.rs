@@ -4336,6 +4336,14 @@ fn index_process_holds_leader_while_stdout_is_blocked() {
 
     let mut fds = [0; 2];
     assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    // Close-on-exec: processes spawned by concurrent tests must not inherit
+    // either end (#131). The child's stdout redirect is a fresh descriptor.
+    for fd in fds {
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+            0
+        );
+    }
     let mut reader = unsafe { File::from_raw_fd(fds[0]) };
     let mut writer = unsafe { File::from_raw_fd(fds[1]) };
     let flags = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) };

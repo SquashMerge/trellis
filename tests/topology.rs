@@ -1615,6 +1615,14 @@ fn guard_drop_unlocks_even_when_fork_child_keeps_descriptor() {
     let guard = roots.leader(&id).unwrap();
     let mut pipe = [0; 2];
     assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+    // Close-on-exec: a process spawned by a concurrent test must not inherit
+    // the write end and hold off the child's EOF (#131). fork still shares it.
+    for fd in pipe {
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+            0
+        );
+    }
     let child = unsafe { libc::fork() };
     assert!(child >= 0);
     if child == 0 {
