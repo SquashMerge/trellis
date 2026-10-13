@@ -11,9 +11,13 @@ PLAYWRIGHT_BROWSERS_PATH=$(node tools/verify-env.mjs)
 export PLAYWRIGHT_BROWSERS_PATH
 
 rust() {
+  if ! cargo nextest --version >/dev/null 2>&1; then
+    echo "verify: cargo-nextest is required (brew install cargo-nextest, or cargo install cargo-nextest --locked)" >&2
+    exit 127
+  fi
   cargo fmt --all -- --check
   cargo clippy --locked --all-targets -- -D warnings
-  cargo test --locked --all-targets
+  cargo nextest run --locked --all-targets --no-fail-fast
 }
 semantic() {
   node tools/semantic-contract/test/run.mjs

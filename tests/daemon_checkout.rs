@@ -32,6 +32,16 @@ async fn ready(runtime: &trellis::daemon::registry::CheckoutRuntime) {
     .unwrap_or_else(|_| panic!("H did not finish: {:?}", runtime.reconciliation_error()));
 }
 
+async fn release_when_idle(registry: &mut CheckoutRegistry, key: &str) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !registry.release(key).unwrap() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("checkout did not release after H and watcher quiescence");
+}
+
 #[tokio::test]
 async fn registration_does_not_open_a_store_and_active_checkouts_are_isolated() {
     let base = tempfile::tempdir().unwrap();
@@ -138,7 +148,7 @@ async fn reattach_reports_catching_up_and_keeps_complete_head_until_h() {
     old.finish(()).unwrap();
     drop(old);
     registry.disconnect(1);
-    assert!(registry.release(&id.root_key).unwrap());
+    release_when_idle(&mut registry, &id.root_key).await;
     fs::write(
         checkout.join("a.js"),
         "function newHead() {}
@@ -280,7 +290,7 @@ async fn retained_registration_and_old_runtime_handle_hold_no_checkout_descripto
     assert!(file_descriptors(&index_db) > 0);
     assert!(file_descriptors(&requests_db) > 0);
     registry.disconnect(1);
-    assert!(registry.release(&key).unwrap());
+    release_when_idle(&mut registry, &key).await;
     assert!(!old.has_active_resources());
     assert!(
         old.evidence_response().is_err(),
@@ -413,7 +423,7 @@ async fn follower_takeover_marks_h_pending_and_next_reattach_admits_old_head() {
     current.finish(()).unwrap();
     drop(current);
     registry.disconnect(1);
-    assert!(registry.release(&id.root_key).unwrap());
+    release_when_idle(&mut registry, &id.root_key).await;
     fs::write(checkout.join("a.js"), "function nextHead() {}\n").unwrap();
     registry.attach_launch(2, &id).unwrap();
     let next = registry.activate(&id.root_key).unwrap();
@@ -507,7 +517,7 @@ async fn root_loss_fails_accepted_work_then_releases_old_runtime_handles() {
         .unwrap();
     assert_eq!((state.as_str(), error.as_str()), ("failed", "root_changed"));
     drop(db);
-    assert!(registry.release(&key).unwrap());
+    release_when_idle(&mut registry, &key).await;
     assert_eq!(
         registry.browser_identity(&key).unwrap().inode,
         replacement.inode
@@ -539,7 +549,7 @@ async fn root_loss_during_paused_reattach_h_waits_for_worker_then_releases() {
     let original = registry.activate(&key).unwrap();
     ready(&original).await;
     registry.disconnect(1);
-    assert!(registry.release(&key).unwrap());
+    release_when_idle(&mut registry, &key).await;
     registry.attach_launch(2, &id).unwrap();
     drop(id);
     let paused = registry.activate(&key).unwrap();
@@ -646,7 +656,7 @@ async fn cold_activation_preserves_recorded_scip_option() {
     assert_eq!(observed.max_file_bytes, options.max_file_bytes);
 
     registry.disconnect(1);
-    assert!(registry.release(&id.root_key).unwrap());
+    release_when_idle(&mut registry, &id.root_key).await;
     registry
         .register(
             &id,
@@ -667,7 +677,7 @@ async fn cold_activation_preserves_recorded_scip_option() {
     );
     assert!(default_selected.scip_path.is_none());
     registry.disconnect(2);
-    assert!(registry.release(&id.root_key).unwrap());
+    release_when_idle(&mut registry, &id.root_key).await;
     registry
         .register(
             &id,
@@ -774,7 +784,7 @@ async fn replaced_path_cold_runtime_publishes_new_identity_not_old_head() {
     let prior = registry.activate(&old_id.root_key).unwrap();
     ready(&prior).await;
     registry.disconnect(1);
-    assert!(registry.release(&old_id.root_key).unwrap());
+    release_when_idle(&mut registry, &old_id.root_key).await;
     fs::rename(&checkout, &moved).unwrap();
     fs::create_dir(&checkout).unwrap();
     fs::write(
@@ -937,7 +947,7 @@ async fn browser_listing_and_discovery_do_not_reopen_released_sqlite_witnesses()
     let active = registry.activate(&other_id.root_key).unwrap();
     ready(&active).await;
     registry.disconnect(1);
-    assert!(registry.release(&key).unwrap());
+    release_when_idle(&mut registry, &key).await;
     assert_eq!(
         (file_descriptors(&index_db), file_descriptors(&request_db)),
         (0, 0)
