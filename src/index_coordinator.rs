@@ -492,6 +492,11 @@ impl WatcherWork {
         self.last_accounted_pin
     }
 
+    /// Snapshot watcher health without consuming its pending event batch.
+    pub fn watcher_degraded(&self) -> bool {
+        self.watch.degraded()
+    }
+
     /// An accepted signal is visible at ingress, before debounce and before
     /// the native stream drains the bounded channel. A selected-options change
     /// has not registered a replacement watcher yet, so it is also intent.

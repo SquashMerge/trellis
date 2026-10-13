@@ -1,5 +1,6 @@
 //! SQLite snapshots and durable user data. Connections are never shared between threads.
 pub mod anchors;
+mod mcp_read;
 pub mod requests;
 pub mod topology;
 use crate::model::*;
@@ -149,6 +150,8 @@ pub struct Store {
     identity: Arc<topology::WorkspaceIdentity>,
     publication_gate: Arc<PublicationGate>,
     maintenance_busy_attempts: Arc<AtomicU64>,
+    #[cfg(feature = "test-support")]
+    mcp_read_busy_attempts: Arc<std::sync::atomic::AtomicUsize>,
     workspace_root: String,
     recovery_required: Arc<AtomicBool>,
     recovery_disposition: Arc<AtomicU8>,
@@ -5301,6 +5304,8 @@ impl Store {
             roots,
             identity: Arc::new(identity),
             maintenance_busy_attempts: Arc::new(AtomicU64::new(0)),
+            #[cfg(feature = "test-support")]
+            mcp_read_busy_attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             recovery_required: Arc::new(AtomicBool::new(false)),
             recovery_disposition: Arc::new(AtomicU8::new(RecoveryDisposition::Ready as u8)),
             obsolete_format_marker: Arc::new(Mutex::new(None)),

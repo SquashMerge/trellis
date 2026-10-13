@@ -1,4 +1,4 @@
-//! Closed application DTO validation and protocol-only, read-only unavailable projections.
+//! Closed application DTO validation and read-only tool envelopes.
 use super::{IdentityError, OpenedWorkspace, wire};
 use crate::daemon::registry::SelectionError;
 use serde_json::{Value, json};
@@ -200,13 +200,7 @@ pub fn failure(id: &Value, code: &str) -> Value {
       "currentBasis":null,"currentContentHash":null}})
 }
 pub fn describe(id: &Value, label: &str) -> Value {
-    json!({"schemaVersion":1,"requestId":id,"evidenceBasis":null,
-      "data":{"workspaceLabel":label,"indexState":"unavailable","progress":null,
-      "watcherDegraded":false,"languages":[],"toolVersion":1,"schemaVersion":1,
-      "limits":{"requestBytes":16384,"responseBytes":65536,"sourceBytes":16384,
-        "sourceLines":200,"defaultLimit":20,"maxLimit":50,"calleeTextBytes":1024,
-        "hintWorkMs":1000,"deadlineMs":5000,"concurrency":4}},
-      "warnings":[],"partial":true,"truncated":false,"truncationReason":null})
+    super::projection::describe(id, label, "unavailable", None, None, None, false)
 }
 pub fn attempted(value: &Value) -> Value {
     if let Some(path) = value.as_str() {
