@@ -44,8 +44,8 @@
       "evidenceBasis": null,
       "data": {
         "workspaceLabel": "$LABEL",
-        "indexState": "unavailable",
-        "progress": null,
+        "indexState": "indexing",
+        "progress": {"completed": 0, "total": null},
         "watcherDegraded": false,
         "languages": [],
         "toolVersion": 1,

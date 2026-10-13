@@ -187,7 +187,6 @@ fn details(code: &str) -> (&'static str, bool) {
         "deadline_exceeded" => ("Deadline exceeded", true),
         "root_changed" => ("Workspace root changed", false),
         "store_unavailable" => ("Store is unavailable", false),
-        "storage_busy" => ("Storage is busy", true),
         "checkout_capacity" => ("Checkout capacity reached", true),
         "daemon_unavailable" => ("Daemon is unavailable", true),
         "outcome_unknown" => ("Outcome unknown; inspect request status", false),
@@ -201,7 +200,7 @@ pub fn failure(id: &Value, code: &str) -> Value {
       "currentBasis":null,"currentContentHash":null}})
 }
 pub fn describe(id: &Value, label: &str) -> Value {
-    super::projection::describe(id, label, "unavailable", None, None, false)
+    super::projection::describe(id, label, "unavailable", None, None, None, false)
 }
 pub fn attempted(value: &Value) -> Value {
     if let Some(path) = value.as_str() {

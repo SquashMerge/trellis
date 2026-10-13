@@ -42,3 +42,38 @@ impl EvidenceResponse {
         Ok(counts)
     }
 }
+
+#[cfg(feature = "test-support")]
+impl Store {
+    /// Use the normal virgin v1 queue staging path before fixture publication.
+    pub fn mcp_prepare_virgin_queue_for_tests(&self) -> Result<()> {
+        self.prepare_virgin_queue_before_activation()
+    }
+
+    /// Fixture-only revision row setup for W1 projection tests. Uses Store's own
+    /// cached SQLite connection; never closes another FD on a live index inode.
+    pub fn mcp_set_coverage_for_tests(
+        &self,
+        writer: &topology::WriterGuard,
+        path: &str,
+        selected: bool,
+        state: &str,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            matches!(state, "complete" | "partial" | "failed" | "unsupported"),
+            "invalid fixture state"
+        );
+        writer.belongs_to(&self.identity)?;
+        self.identity.verify()?;
+        writer.verify()?;
+        let mut db = self.cache_write()?;
+        let tx = storage_result(db.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        let count = storage_result(tx.execute(
+            "UPDATE revision_documents SET coverage_selected=?1,coverage_state=?2,coverage_diagnostic=?3 WHERE revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND path=?4",
+            params![selected, state, (state != "complete").then_some("fixture incomplete coverage"), path],
+        ))?;
+        anyhow::ensure!(count == 1, "fixture document absent");
+        storage_result(tx.commit())?;
+        Ok(())
+    }
+}

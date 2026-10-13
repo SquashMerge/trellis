@@ -247,6 +247,9 @@ impl CheckoutRegistry {
             None => TopologyRoots::production()?,
         };
         let store = Store::open(roots, identity)?;
+        let initial_indexing = store
+            .index_baseline()
+            .is_ok_and(|pin| pin.index_revision == 0);
         // Publish only a proved-virgin queue before this runtime is visible to
         // selected status reads. Those reads otherwise compete with the EX
         // stage needed before mandatory H can begin.
@@ -330,6 +333,8 @@ impl CheckoutRegistry {
             active_reads: Arc::new(AtomicUsize::new(0)),
             last_error: std::sync::Mutex::new(None),
             h_in_flight: AtomicBool::new(true),
+            initial_indexing,
+            initial_capture_started: AtomicBool::new(false),
             retry_waiting: AtomicBool::new(false),
             #[cfg(feature = "test-support")]
             pre_h_hook: std::sync::Mutex::new(None),
@@ -1399,6 +1404,8 @@ pub struct CheckoutRuntime {
     active_reads: Arc<AtomicUsize>,
     last_error: std::sync::Mutex<Option<String>>,
     h_in_flight: AtomicBool,
+    initial_indexing: bool,
+    initial_capture_started: AtomicBool,
     retry_waiting: AtomicBool,
     #[cfg(feature = "test-support")]
     pre_h_hook: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
@@ -1699,20 +1706,31 @@ impl CheckoutRuntime {
     pub fn mcp_describe(
         &self,
         selected: Option<&SelectedCheckout>,
-    ) -> anyhow::Result<(Option<CheckoutEvidence>, bool, &'static str)> {
+    ) -> anyhow::Result<(
+        Option<CheckoutEvidence>,
+        bool,
+        &'static str,
+        Option<serde_json::Value>,
+    )> {
         let admitted = match selected {
             Some(selected) => self.evidence_for_selected(selected),
             None => self.evidence_response(),
         };
         match admitted {
-            Ok((response, catching_up)) => Ok((Some(response), catching_up, "ready")),
+            Ok((response, catching_up)) => Ok((Some(response), catching_up, "ready", None)),
             Err(error)
                 if error
                     .downcast_ref::<crate::store::topology::IndexNotReady>()
                     .is_some() =>
             {
                 let catching_up = self.catching_up();
-                Ok((None, catching_up, "reconciling"))
+                if self.initial_indexing {
+                    let progress = (!self.initial_capture_started.load(Ordering::Acquire))
+                        .then(|| serde_json::json!({"completed":0,"total":null}));
+                    Ok((None, catching_up, "indexing", progress))
+                } else {
+                    Ok((None, catching_up, "reconciling", None))
+                }
             }
             Err(error) => Err(error),
         }
@@ -1870,6 +1888,7 @@ impl CheckoutRuntime {
         } else {
             None
         };
+        self.initial_capture_started.store(true, Ordering::Release);
         establish_serving_session(store, admitted_options.as_ref(), &cancel)
     }
 }

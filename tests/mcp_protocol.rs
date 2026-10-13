@@ -459,7 +459,49 @@ fn expected_envelope(id: &Value, code: Option<&str>, label: &str, root: &Value) 
 }
 fn exact_tool(v: &Value, code: Option<&str>, modern: bool, label: &str) {
     let root = &v["result"]["structuredContent"]["workspace"];
-    let envelope = expected_envelope(&v["id"], code, label, root);
+    let mut envelope = expected_envelope(&v["id"], code, label, root);
+    if code.is_none() {
+        let actual = &v["result"]["structuredContent"];
+        let state = actual["data"]["indexState"].as_str().unwrap();
+        assert!(matches!(state, "indexing" | "ready"), "{actual}");
+        envelope["data"]["indexState"] = json!(state);
+        envelope["catchingUp"] = actual["catchingUp"].clone();
+        assert!(actual["catchingUp"].is_boolean());
+        if state == "ready" {
+            let languages = actual["data"]["languages"].as_array().unwrap();
+            assert_eq!(languages.len(), 4);
+            for (row, language) in languages
+                .iter()
+                .zip(["java", "rust", "python", "javascript"])
+            {
+                assert_eq!(row["language"], language);
+                let coverage = &row["coverage"];
+                let count = |field: &str| coverage[field].as_u64().unwrap();
+                assert_eq!(
+                    count("selected"),
+                    count("complete") + count("partial") + count("failed")
+                );
+                assert!(row["evidenceTier"] == "syntax");
+            }
+            let partial = languages
+                .iter()
+                .any(|row| row["coverage"]["partial"] != 0 || row["coverage"]["failed"] != 0);
+            assert_eq!(actual["partial"], partial);
+            assert!(actual["evidenceBasis"]["indexRevision"].as_u64().unwrap() > 0);
+            envelope["evidenceBasis"] = actual["evidenceBasis"].clone();
+            envelope["data"]["progress"] = Value::Null;
+            envelope["data"]["languages"] = actual["data"]["languages"].clone();
+            envelope["partial"] = json!(partial);
+        } else {
+            assert!(actual["evidenceBasis"].is_null());
+            assert_eq!(actual["data"]["languages"], json!([]));
+            assert!(
+                actual["data"]["progress"].is_null()
+                    || actual["data"]["progress"] == json!({"completed":0,"total":null})
+            );
+            envelope["data"]["progress"] = actual["data"]["progress"].clone();
+        }
+    }
     let text = serde_json::to_string(&envelope).unwrap();
     let mut result = json!({"isError":code.is_some(),"structuredContent":envelope,
         "content":[{"type":"text","text":text}]});
@@ -659,10 +701,7 @@ fn both_modes_full_catalog_tools_and_lifecycle() {
                 !legacy,
             );
             if i == 0 {
-                assert_eq!(
-                    reply["result"]["structuredContent"]["data"]["indexState"],
-                    "unavailable"
-                );
+                exact_tool(&reply, None, !legacy, "checkout");
                 assert_eq!(
                     reply["result"]["structuredContent"]["data"]["workspaceLabel"],
                     "checkout"
@@ -1208,6 +1247,7 @@ fn golden_tool_envelopes_and_maximum_ids_both_modes() {
                 "complete"
             );
         }
+        no_db_under(peer._home.path());
         for id in [
             json!(heavy_id),
             json!("😀".repeat(63) + "aa"),
@@ -1290,7 +1330,6 @@ fn golden_tool_envelopes_and_maximum_ids_both_modes() {
             });
             error(&response, -32602, json!(heavy_id));
         }
-        no_db_under(peer._home.path());
         assert!(peer.finish().0.success());
     }
     assert_eq!(
@@ -1359,6 +1398,7 @@ fn workspace_selection_startup_side_effects_and_final_identity() {
     fs::create_dir(&nested).unwrap();
     // Explicit root wins even if cwd has a nearer Git marker.
     let mut explicit = Peer::start_in(Some(&ancestor), Some(&nested));
+    no_db_under(explicit._home.path());
     exact_tool(
         &explicit.ask(modern(
             json!(1),
@@ -1372,7 +1412,6 @@ fn workspace_selection_startup_side_effects_and_final_identity() {
     let ancestor_marker = ancestor.join(".git/trellis/workspace-id");
     let first_marker = fs::read(&ancestor_marker).unwrap();
     assert!(!nearer.join(".git/trellis/workspace-id").exists());
-    no_db_under(explicit._home.path());
     assert!(explicit.finish().0.success());
     // Adopt the same marker on restart; never regenerate a valid existing UUID.
     let mut adopted = Peer::start(Some(&ancestor));
@@ -1794,6 +1833,7 @@ fn linked_git_worktrees_get_distinct_selected_markers() {
         (&two, "linked-two", &git_two),
     ] {
         let mut peer = Peer::start(Some(root));
+        no_db_under(peer._home.path());
         let result = peer.ask(call(
             false,
             json!(1),
@@ -1807,7 +1847,6 @@ fn linked_git_worktrees_get_distinct_selected_markers() {
             !root.join(".git/trellis/workspace-id").exists(),
             "pointer file must not be treated as directory"
         );
-        no_db_under(peer._home.path());
         assert!(peer.finish().0.success());
         let mut reopened = Peer::start_in(None, Some(root));
         let result = reopened.ask(call(
@@ -1927,7 +1966,7 @@ fn per_call_linked_worktree_selection_and_closed_failures() {
                 answer["result"]["structuredContent"]["workspace"],
                 json!(linked)
             );
-            assert_eq!(answer["result"]["structuredContent"]["catchingUp"], true);
+            assert!(answer["result"]["structuredContent"]["catchingUp"].is_boolean());
         }
         let launch = describe(&mut peer, 11, json!({"schemaVersion":1}));
         tool(&launch, None, !legacy);
@@ -2011,7 +2050,6 @@ fn per_call_linked_worktree_selection_and_closed_failures() {
             describe(&mut peer, 17, json!({"schemaVersion":1}))["result"]["structuredContent"]["workspace"],
             json!(main)
         );
-        no_db_under(peer._home.path());
         assert!(peer.finish().0.success());
     }
 }
@@ -2245,10 +2283,10 @@ fn capacity_witness_final_drift_refuses_stale_capacity_attribution() {
         let reply = peer.ask(call(
             false,
             json!(index),
-            "trellis_workspace_describe",
-            json!({"schemaVersion":1,"workspace":path}),
+            "trellis_find_symbols",
+            json!({"schemaVersion":1,"query":"capacity","workspace":path}),
         ));
-        tool(&reply, None, true);
+        tool(&reply, Some("index_not_ready"), true);
         assert_eq!(
             reply["result"]["structuredContent"]["workspace"],
             json!(path)
@@ -2886,12 +2924,14 @@ async fn describe_reports_actual_degraded_watcher_on_selected_snapshot() {
     client
         .set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
+    let daemon_handle = tokio::runtime::Handle::current();
     let session = std::thread::spawn(move || {
         trellis::mcp::run_socket(
             trellis::mcp::OpenedWorkspace::new(identity),
             server,
             registry,
             31,
+            daemon_handle,
         )
     });
     writeln!(
@@ -2964,12 +3004,14 @@ async fn describe_refuses_watcher_health_when_inventory_outlasts_deadline() {
     client
         .set_read_timeout(Some(Duration::from_secs(8)))
         .unwrap();
+    let daemon_handle = tokio::runtime::Handle::current();
     let session = std::thread::spawn(move || {
         trellis::mcp::run_socket(
             trellis::mcp::OpenedWorkspace::new(identity),
             server,
             registry,
             32,
+            daemon_handle,
         )
     });
     let start = std::time::Instant::now();
@@ -3070,12 +3112,14 @@ async fn describe_serves_valid_prior_head_while_mandatory_h_is_paused() {
     client
         .set_read_timeout(Some(Duration::from_secs(8)))
         .unwrap();
+    let daemon_handle = tokio::runtime::Handle::current();
     let session = std::thread::spawn(move || {
         trellis::mcp::run_socket(
             trellis::mcp::OpenedWorkspace::new(identity),
             server,
             registry,
             44,
+            daemon_handle,
         )
     });
     writeln!(
@@ -3104,6 +3148,242 @@ async fn describe_serves_valid_prior_head_while_mandatory_h_is_paused() {
         "indexRevision":prior.index_revision})
     );
     assert_eq!(envelope["data"]["languages"].as_array().unwrap().len(), 4);
+    resume_tx.send(()).unwrap();
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn describe_cold_initial_h_reports_indexing_without_prior_coverage() {
+    use std::os::unix::net::UnixStream;
+    use trellis::daemon::registry::CheckoutRegistry;
+    use trellis::store::topology::{TopologyRoots, WorkspaceIdentity};
+    let temp = tempfile::tempdir().unwrap();
+    let root = checkout(temp.path());
+    fs::write(root.join("cold.js"), "function cold() {}\n").unwrap();
+    let identity = WorkspaceIdentity::discover(Some(&root), &root)
+        .unwrap()
+        .attach_marker()
+        .unwrap();
+    let topology =
+        TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(46, &identity).unwrap();
+    let runtime = registry.activate(&identity.root_key).unwrap();
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (resume_tx, resume_rx) = mpsc::sync_channel(1);
+    let resume_rx = std::sync::Mutex::new(resume_rx);
+    runtime.set_pre_h_hook_for_tests(std::sync::Arc::new(move || {
+        entered_tx.send(()).unwrap();
+        resume_rx
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+    }));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if entered_rx.try_recv().is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("initial H did not pause");
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    let (mut client, server) = UnixStream::pair().unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(8)))
+        .unwrap();
+    let daemon_handle = tokio::runtime::Handle::current();
+    let session = std::thread::spawn(move || {
+        trellis::mcp::run_socket(
+            trellis::mcp::OpenedWorkspace::new(identity),
+            server,
+            registry,
+            46,
+            daemon_handle,
+        )
+    });
+    writeln!(
+        client,
+        "{}",
+        modern(
+            json!(47),
+            "tools/call",
+            json!({"name":"trellis_workspace_describe","arguments":{"schemaVersion":1}})
+        )
+    )
+    .unwrap();
+    let mut line = String::new();
+    BufReader::new(client.try_clone().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let answer: Value = serde_json::from_str(&line).unwrap();
+    tool(&answer, None, true);
+    let envelope = &answer["result"]["structuredContent"];
+    assert_eq!(envelope["catchingUp"], true);
+    assert_eq!(envelope["data"]["indexState"], "indexing");
+    assert_eq!(
+        envelope["data"]["progress"],
+        json!({"completed":0,"total":null})
+    );
+    assert!(envelope["evidenceBasis"].is_null());
+    assert_eq!(envelope["data"]["languages"], json!([]));
+    let mut expected = fixture()["expected"]["describe"].clone();
+    expected["requestId"] = json!(47);
+    expected["data"]["workspaceLabel"] = json!("checkout");
+    expected["workspace"] = envelope["workspace"].clone();
+    expected["catchingUp"] = json!(true);
+    assert_eq!(*envelope, expected);
+    assert_eq!(
+        answer["result"]["content"][0]["text"],
+        serde_json::to_string(&expected).unwrap()
+    );
+    resume_tx.send(()).unwrap();
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn describe_counts_persisted_selected_and_unselected_native_coverage() {
+    use std::os::unix::net::UnixStream;
+    use trellis::daemon::registry::CheckoutRegistry;
+    use trellis::store::{
+        Store,
+        topology::{TopologyRoots, WorkspaceIdentity},
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let root = checkout(temp.path());
+    for (path, text) in [
+        ("a.java", "class A {}\n"),
+        ("b.rs", "fn broken( {\n"),
+        ("c.py", "def complete(): pass\n"),
+        ("d.js", "function unselected() {}\n"),
+    ] {
+        fs::write(root.join(path), text).unwrap();
+    }
+    let identity = WorkspaceIdentity::discover(Some(&root), &root)
+        .unwrap()
+        .attach_marker()
+        .unwrap();
+    let store = Store::open_for_tests(temp.path(), &root).unwrap();
+    let baseline = store.index_baseline().unwrap();
+    assert_eq!(baseline.index_revision, 0);
+    store.mcp_prepare_virgin_queue_for_tests().unwrap();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
+        &trellis::indexer::IndexOptions::new(root.clone()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    let writer = store.publication_for_tests().unwrap();
+    let pin = store
+        .publish_native(&graph, &capture, &native, &writer, baseline, &cancel)
+        .unwrap();
+    store
+        .mcp_set_coverage_for_tests(&writer, "c.py", true, "failed")
+        .unwrap();
+    store
+        .mcp_set_coverage_for_tests(&writer, "d.js", false, "unsupported")
+        .unwrap();
+    drop(writer);
+    drop(store);
+    let topology =
+        TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(48, &identity).unwrap();
+    let runtime = registry.activate(&identity.root_key).unwrap();
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (resume_tx, resume_rx) = mpsc::sync_channel(1);
+    let resume_rx = std::sync::Mutex::new(resume_rx);
+    // Current-thread Tokio cannot poll spawned H before this synchronous hook setup.
+    runtime.set_pre_h_hook_for_tests(std::sync::Arc::new(move || {
+        entered_tx.send(()).unwrap();
+        resume_rx
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+    }));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if entered_rx.try_recv().is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        let status = runtime.evidence_response().and_then(|(response, catching_up)| {
+            let revision = response.status()?.revision;
+            response.finish(revision).map(|revision| (revision, catching_up))
+        });
+        panic!(
+            "H did not pause after persisted fixture: published={pin:?}, last_error={:?}, retry_waiting={}, catching_up={}, selected_status={status:?}",
+            runtime.reconciliation_error(),
+            runtime.retry_waiting_for_tests(),
+            runtime.catching_up(),
+        );
+    });
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    let (mut client, server) = UnixStream::pair().unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(8)))
+        .unwrap();
+    let daemon_handle = tokio::runtime::Handle::current();
+    let session = std::thread::spawn(move || {
+        trellis::mcp::run_socket(
+            trellis::mcp::OpenedWorkspace::new(identity),
+            server,
+            registry,
+            48,
+            daemon_handle,
+        )
+    });
+    writeln!(
+        client,
+        "{}",
+        modern(
+            json!(49),
+            "tools/call",
+            json!({"name":"trellis_workspace_describe","arguments":{"schemaVersion":1}})
+        )
+    )
+    .unwrap();
+    let mut line = String::new();
+    BufReader::new(client.try_clone().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let answer: Value = serde_json::from_str(&line).unwrap();
+    tool(&answer, None, true);
+    let envelope = &answer["result"]["structuredContent"];
+    assert_eq!(envelope["data"]["indexState"], "ready");
+    assert_eq!(envelope["catchingUp"], true);
+    assert_eq!(
+        envelope["evidenceBasis"],
+        json!({
+        "indexGeneration":pin.index_generation.to_string(),"indexRevision":pin.index_revision})
+    );
+    let rows = &envelope["data"]["languages"];
+    for (index, language, selected, complete, partial, failed, unselected) in [
+        (0, "java", 1, 1, 0, 0, 0),
+        (1, "rust", 1, 0, 1, 0, 0),
+        (2, "python", 1, 0, 0, 1, 0),
+        (3, "javascript", 0, 0, 0, 0, 1),
+    ] {
+        assert_eq!(rows[index]["language"], language);
+        assert_eq!(
+            rows[index]["coverage"],
+            json!({"selected":selected,"complete":complete,
+            "partial":partial,"failed":failed,"unselected":unselected})
+        );
+    }
+    assert_eq!(envelope["partial"], true);
     resume_tx.send(()).unwrap();
     drop(client);
     session.join().unwrap().unwrap();

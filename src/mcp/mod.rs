@@ -91,7 +91,7 @@ mod tests {
 /// Run the line-framed transport. The reader owns stdin; this coordinator alone owns stdout.
 /// Input already waiting in the bounded channel is applied before any queued outcome commits.
 pub fn run_stdio(workspace: OpenedWorkspace) -> std::io::Result<()> {
-    run_transport(workspace, std::io::stdin(), std::io::stdout(), None)
+    run_transport(workspace, std::io::stdin(), std::io::stdout(), None, None)
 }
 
 /// Run the same protocol coordinator on a daemon-owned session socket.
@@ -100,9 +100,16 @@ pub fn run_socket(
     stream: std::os::unix::net::UnixStream,
     registry: std::sync::Arc<tokio::sync::Mutex<crate::daemon::registry::CheckoutRegistry>>,
     session_id: u64,
+    daemon_handle: tokio::runtime::Handle,
 ) -> std::io::Result<()> {
     let reader = stream.try_clone()?;
-    run_transport(workspace, reader, stream, Some((registry, session_id)))
+    run_transport(
+        workspace,
+        reader,
+        stream,
+        Some((registry, session_id)),
+        Some(daemon_handle),
+    )
 }
 
 fn mcp_read_error(error: &anyhow::Error) -> &'static str {
@@ -110,7 +117,7 @@ fn mcp_read_error(error: &anyhow::Error) -> &'static str {
         .downcast_ref::<crate::store::topology::StorageBusy>()
         .is_some()
     {
-        return "storage_busy";
+        return "deadline_exceeded";
     }
     if error
         .downcast_ref::<crate::store::topology::IndexNotReady>()
@@ -123,6 +130,33 @@ fn mcp_read_error(error: &anyhow::Error) -> &'static str {
         "root_changed"
     } else {
         "store_unavailable"
+    }
+}
+
+fn admit_describe(
+    runtime: &crate::daemon::registry::CheckoutRuntime,
+    selected: Option<&crate::daemon::registry::SelectedCheckout>,
+    deadline: std::time::Instant,
+) -> anyhow::Result<(
+    Option<crate::daemon::registry::CheckoutEvidence>,
+    bool,
+    &'static str,
+    Option<serde_json::Value>,
+)> {
+    loop {
+        match runtime.mcp_describe(selected) {
+            Err(error)
+                if error
+                    .downcast_ref::<crate::store::topology::StorageBusy>()
+                    .is_some() =>
+            {
+                if std::time::Instant::now() >= deadline {
+                    anyhow::bail!("deadline_exceeded: MCP read admission was busy");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            answer => return answer,
+        }
     }
 }
 
@@ -176,6 +210,7 @@ fn run_transport(
         std::sync::Arc<tokio::sync::Mutex<crate::daemon::registry::CheckoutRegistry>>,
         u64,
     )>,
+    daemon_handle: Option<tokio::runtime::Handle>,
 ) -> std::io::Result<()> {
     use std::collections::VecDeque;
     use std::io::BufReader;
@@ -335,9 +370,29 @@ fn run_transport(
                                                 && let Some((registry, _)) = &registry
                                             {
                                                 let runtime = registry.blocking_lock().runtime(key);
-                                                if let Some(runtime) = runtime {
-                                                    match runtime.mcp_describe(selected.as_ref()) {
-                                                        Ok((Some(response), sampled, state)) => {
+                                                let activated = if let Some(runtime) = runtime {
+                                                    Ok(runtime)
+                                                } else if let Some(handle) = &daemon_handle {
+                                                    handle.block_on(async {
+                                                        registry.lock().await.activate(key)
+                                                    })
+                                                } else {
+                                                    Err(anyhow::anyhow!(
+                                                        "index_not_ready: checkout not activated"
+                                                    ))
+                                                };
+                                                if let Ok(runtime) = &activated {
+                                                    match admit_describe(
+                                                        runtime,
+                                                        selected.as_ref(),
+                                                        call_deadline,
+                                                    ) {
+                                                        Ok((
+                                                            Some(response),
+                                                            sampled,
+                                                            state,
+                                                            progress,
+                                                        )) => {
                                                             sampled_catching_up = sampled;
                                                             let data = (|| -> anyhow::Result<_> {
                                                                 let status = response.status()?;
@@ -353,6 +408,7 @@ fn run_transport(
                                                                         &admission.id,
                                                                         answering.label(),
                                                                         state,
+                                                                        progress,
                                                                         Some(counts),
                                                                         Some(serde_json::json!({
                                                                             "indexGeneration": status.revision.index_generation.to_string(),
@@ -367,12 +423,13 @@ fn run_transport(
                                                                 ),
                                                             };
                                                         }
-                                                        Ok((None, sampled, state)) => {
+                                                        Ok((None, sampled, state, progress)) => {
                                                             sampled_catching_up = sampled;
                                                             envelope = projection::describe(
                                                                 &admission.id,
                                                                 answering.label(),
                                                                 state,
+                                                                progress,
                                                                 None,
                                                                 None,
                                                                 false,
@@ -402,6 +459,11 @@ fn run_transport(
                                                         }
                                                         _ => {}
                                                     }
+                                                } else if let Err(error) = activated {
+                                                    envelope = tools::failure(
+                                                        &admission.id,
+                                                        mcp_read_error(&error),
+                                                    );
                                                 }
                                             }
                                             envelope["workspace"] =
@@ -575,5 +637,23 @@ mod impl_receive {
     pub(super) enum Outcome {
         Error(super::wire::ProtocolError),
         Request(super::session::Admission),
+    }
+}
+
+#[cfg(test)]
+mod w1_error_tests {
+    #[test]
+    fn typed_busy_projects_only_an_advertised_retryable_code() {
+        let error = anyhow::Error::new(crate::store::topology::StorageBusy);
+        let code = super::mcp_read_error(&error);
+        assert_eq!(code, "deadline_exceeded");
+        let catalog = super::catalog::list(true);
+        let codes = catalog["tools"][0]["outputSchema"]["$defs"]["ResolvedFailureCode"]["enum"]
+            .as_array()
+            .unwrap();
+        assert!(codes.iter().any(|item| item == code));
+        assert!(!codes.iter().any(|item| item == "storage_busy"));
+        let resolved = super::tools::failure(&serde_json::json!(1), code);
+        assert_eq!(resolved["error"]["retryable"], true);
     }
 }

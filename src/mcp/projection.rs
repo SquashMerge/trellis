@@ -5,6 +5,7 @@ pub fn describe(
     id: &Value,
     label: &str,
     state: &str,
+    progress: Option<Value>,
     counts: Option<[[u64; 5]; 4]>,
     basis: Option<Value>,
     degraded: bool,
@@ -19,7 +20,7 @@ pub fn describe(
         }).collect()
     });
     json!({"schemaVersion":1,"requestId":id,"evidenceBasis":basis,
-      "data":{"workspaceLabel":label,"indexState":state,"progress":null,
+      "data":{"workspaceLabel":label,"indexState":state,"progress":progress,
       "watcherDegraded":degraded,"languages":languages,"toolVersion":1,"schemaVersion":1,
       "limits":{"requestBytes":16384,"responseBytes":65536,"sourceBytes":16384,
         "sourceLines":200,"defaultLimit":20,"maxLimit":50,"calleeTextBytes":1024,
@@ -32,7 +33,7 @@ mod tests {
     use super::*;
     #[test]
     fn describe_closed_ready_and_missing_head() {
-        let empty = describe(&json!(1), "project", "reconciling", None, None, false);
+        let empty = describe(&json!(1), "project", "reconciling", None, None, None, false);
         assert!(empty["evidenceBasis"].is_null());
         assert_eq!(empty["data"]["languages"], json!([]));
         assert_eq!(empty["partial"], true);
@@ -43,6 +44,7 @@ mod tests {
             &json!(2),
             "project",
             "ready",
+            None,
             Some(rows),
             Some(basis.clone()),
             true,
