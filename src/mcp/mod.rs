@@ -120,7 +120,7 @@ fn catching_up(
 /// An opt-in, bounded fixture barrier at an actual coordinator boundary.
 /// Normal MCP calls do not connect to or wait for a test socket.
 #[cfg(feature = "test-support")]
-fn phase_hook(stage: &str) -> std::io::Result<()> {
+pub(crate) fn phase_hook(stage: &str) -> std::io::Result<()> {
     use std::io::{Read, Write};
     if std::env::var("TRELLIS_TEST_MCP_PHASE").ok().as_deref() != Some(stage) {
         return Ok(());
@@ -142,7 +142,7 @@ fn phase_hook(stage: &str) -> std::io::Result<()> {
 }
 
 #[cfg(not(feature = "test-support"))]
-fn phase_hook(_: &str) -> std::io::Result<()> {
+pub(crate) fn phase_hook(_: &str) -> std::io::Result<()> {
     Ok(())
 }
 

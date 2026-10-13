@@ -45,7 +45,9 @@ fn election_preserves_private_socket_and_only_holder_recovers_stale_socket() {
     let stale = UnixListener::bind(&paths.socket).unwrap();
     drop(stale);
     let next = SocketOwner::acquire(&paths).unwrap().unwrap();
-    assert_ne!(std::fs::metadata(&paths.socket).unwrap().ino(), inode);
+    // Inode numbers are recycled, so prove replacement by behavior: the stale
+    // socket file has no listener, while the new owner accepts (#131).
+    UnixStream::connect(&paths.socket).expect("new owner must replace the stale socket");
     drop(next);
     assert!(!paths.socket.exists());
 }

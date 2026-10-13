@@ -10,12 +10,20 @@ set -eu
 PLAYWRIGHT_BROWSERS_PATH=$(node tools/verify-env.mjs)
 export PLAYWRIGHT_BROWSERS_PATH
 
+# The production build is linted without test hooks. Tests run once, with
+# the test-support hooks compiled in, in their own target directory so the
+# two lanes build concurrently without sharing Cargo's build lock.
 rust() {
   cargo fmt --all -- --check
   cargo clippy --locked --all-targets -- -D warnings
-  cargo test --locked --all-targets
+}
+tests() {
+  if ! cargo nextest --version >/dev/null 2>&1; then
+    echo "verify: cargo-nextest is required (brew install cargo-nextest, or cargo install cargo-nextest --locked)" >&2
+    exit 127
+  fi
   CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target}-test-support" cargo clippy --locked --all-targets --features test-support -- -D warnings
-  CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target}-test-support" cargo test --locked --all-targets --features test-support
+  CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target}-test-support" cargo nextest run --locked --all-targets --no-fail-fast --features test-support
 }
 semantic() {
   node tools/semantic-contract/test/run.mjs
@@ -32,7 +40,7 @@ checks() {
   node --test tests/question-ui.test.cjs tests/browse-ui.test.cjs tests/sequence-ui.test.cjs tests/token-ui.test.cjs tests/external-source-ui.test.cjs tests/dependency-ui.test.cjs tests/shell-ui.test.cjs tests/classes-ui.test.cjs tests/navigation-ui.test.cjs
 }
 
-lanes="rust semantic cohorts checks"
+lanes="rust tests semantic cohorts checks"
 logs=$(mktemp -d "${TMPDIR:-/tmp}/trellis-verify.XXXXXX")
 trap 'rm -rf "$logs"' EXIT
 for lane in $lanes; do

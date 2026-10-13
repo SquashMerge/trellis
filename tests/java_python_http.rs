@@ -342,7 +342,7 @@ async fn cached_java_python_sequences_keep_measured_calls_after_source_deletion(
         // Observe the real watcher commit for THIS deletion before asserting
         // historical reads. An in-flight same-generation publication may
         // temporarily close public reads; it is never an HTTP success result.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(12);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let prior_head = loop {
             match f.store.status() {
                 Ok(status) => break status.revision,

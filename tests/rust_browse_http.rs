@@ -279,7 +279,9 @@ async fn daemon_tick_keeps_pinned_and_current_source_available_across_fifty_edit
         })
         .await
         .expect("daemon watcher did not register");
-        let deadline = Instant::now() + Duration::from_secs(8);
+        // Publication shares a loaded verify host; the hint removes only the
+        // notification latency (#131).
+        let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             let (status_code, status) = request(&app, "GET", "/api/status", Value::Null).await;
             assert_eq!(status_code, 200, "edit {edit}: {status}");

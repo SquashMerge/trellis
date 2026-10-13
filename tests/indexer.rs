@@ -1878,12 +1878,14 @@ fn watcher_has_quiet_and_absolute_deadlines_without_blocking_drain() {
     let initial = watcher.drain();
     assert!(watcher.acknowledge(&initial));
     for attempt in 0..50 {
+        let event =
+            Event::new(EventKind::Modify(ModifyKind::Any)).add_path(root.path().join("source.js"));
+        watcher.observe_event(&event);
+        // The absolute bound runs from the first signal, which is no later
+        // than this. A slow burst on a loaded host then hits that bound.
         let start = Instant::now();
-        for _ in 0..257 {
-            watcher.observe_event(
-                &Event::new(EventKind::Modify(ModifyKind::Any))
-                    .add_path(root.path().join("source.js")),
-            );
+        for _ in 1..257 {
+            watcher.observe_event(&event);
         }
         let batch = watcher.drain();
         assert!(

@@ -629,17 +629,33 @@ async fn executable_daemon_is_socket_only_until_explicit_serve_and_registers_two
         selected["workspaceRoot"],
         fs::canonicalize(&first).unwrap().to_str().unwrap()
     );
-    let jobs = client
-        .get(format!(
-            "http://{address}/api/checkouts/{first_key}/jobs/current"
-        ))
-        .bearer_auth(token.trim())
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(jobs.status(), reqwest::StatusCode::OK);
+    // The current-job read is typed contention while H or the watcher writes;
+    // retry only storage_busy and report any other refusal with its body.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let jobs = loop {
+        let jobs = client
+            .get(format!(
+                "http://{address}/api/checkouts/{first_key}/jobs/current"
+            ))
+            .bearer_auth(token.trim())
+            .send()
+            .await
+            .unwrap();
+        if jobs.status() != reqwest::StatusCode::CONFLICT || Instant::now() >= deadline {
+            break jobs;
+        }
+        let body: Value = jobs.json().await.unwrap();
+        assert_eq!(
+            body["error"]["code"], "storage_busy",
+            "current job refused: {body}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let status = jobs.status();
+    let body = jobs.text().await.unwrap();
+    assert_eq!(status, reqwest::StatusCode::OK, "current job: {body}");
     assert!(
-        jobs.json::<Value>().await.unwrap().is_null(),
+        serde_json::from_str::<Value>(&body).unwrap().is_null(),
         "old POST accepted a job"
     );
     let wrong_origin = authenticated()
@@ -678,14 +694,17 @@ async fn executable_daemon_is_socket_only_until_explicit_serve_and_registers_two
     let mut second_serve = detached(serve(&home, &second, requested_bind, &token_file));
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let value = authenticated()
-            .send()
-            .await
-            .unwrap()
-            .json::<Value>()
-            .await
-            .unwrap();
-        if value["checkouts"].as_array().unwrap().len() == 2 {
+        // A listing can exceed the 2 s client timeout while the second
+        // registration is busy under load; poll again until the deadline (#131).
+        let value = match authenticated().send().await {
+            Ok(response) => response.json::<Value>().await.unwrap(),
+            Err(error) if error.is_timeout() => Value::Null,
+            Err(error) => panic!("checkout listing failed: {error}"),
+        };
+        if value["checkouts"]
+            .as_array()
+            .is_some_and(|rows| rows.len() == 2)
+        {
             let roots: Vec<_> = value["checkouts"]
                 .as_array()
                 .unwrap()

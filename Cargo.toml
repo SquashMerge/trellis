@@ -49,6 +49,11 @@ http-body-util = "0.1"
 # debug assertions, overflow checks and debuginfo keep their dev defaults.
 # Dependencies (sqlite, tree-sitter grammars, sha2, serde_json, ...) build once
 # and are cached, so optimize them fully.
+[profile.dev]
+# Line tables keep file:line in panics and backtraces while cutting debug-build
+# compile and link time for the many test binaries (CI already builds this way).
+debug = "line-tables-only"
+
 [profile.dev.package."*"]
 opt-level = 3
 
