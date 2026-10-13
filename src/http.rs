@@ -636,11 +636,26 @@ impl DaemonState {
     }
 
     /// Synchronize the native/watcher lock boundary in a registry race test.
-    #[cfg(test)]
-    pub(crate) fn hold_watcher_gate_for_tests(&self, hold: impl FnOnce()) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn hold_watcher_gate_for_tests(&self, hold: impl FnOnce()) {
         let _stream = self.native_stream.lock().unwrap();
         let _watcher = self.watcher_work.lock().unwrap();
         hold();
+    }
+
+    /// Sample health after an inventory releases the watcher lock, without guessing.
+    pub fn checkout_watcher_degraded(&self, deadline: Instant) -> anyhow::Result<bool> {
+        loop {
+            if let Ok(work) = self.watcher_work.try_lock() {
+                return Ok(work
+                    .as_ref()
+                    .is_some_and(|(_, watcher)| watcher.watcher_degraded()));
+            }
+            if Instant::now() >= deadline {
+                anyhow::bail!("deadline_exceeded: watcher health was not sampled");
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     /// A pending watcher hint (including the periodic inventory deadline) keeps
@@ -4049,6 +4064,7 @@ mod live_tests {
             let publisher = store.clone();
             let owner = session.clone();
             let selected = IndexOptions::new(workspace.clone());
+            let prior = store.status().unwrap().revision;
             let publishing = tokio::task::spawn_blocking(move || {
                 crate::index_coordinator::IndexJobCoordinator::prepare_with_session(
                     &publisher, None, owner,
@@ -4057,7 +4073,6 @@ mod live_tests {
             });
             // H commits while the provider is blocked. A leaked SQLite read
             // snapshot would prevent this publication within the timeout.
-            let prior = store.status().unwrap().revision;
             let committed = tokio::time::timeout(std::time::Duration::from_secs(5), publishing)
                 .await
                 .unwrap()

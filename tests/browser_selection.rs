@@ -2121,14 +2121,22 @@ async fn selected_status_serves_validated_pre_h_head_and_clears_freshness_after_
         .await;
         assert_eq!(code, axum::http::StatusCode::OK, "{body}");
     }
-    let after_request = std::time::Instant::now();
-    {
-        let mut registry = registry.lock().await;
-        let released = registry
-            .advance(after_request + Duration::from_secs(30 * 60))
-            .unwrap();
-        assert_eq!(released.released, vec![identity.root_key.clone()]);
-    }
+    let release_at = std::time::Instant::now() + Duration::from_secs(30 * 60);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let released = {
+                let mut registry = registry.lock().await;
+                registry.advance(release_at).unwrap()
+            };
+            if !released.released.is_empty() {
+                assert_eq!(released.released, vec![identity.root_key.clone()]);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("selected checkout did not become releasable after worker quiescence");
     fs::write(root.join("core.js"), "function fresh_step() {}\n").unwrap();
     let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
     let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);

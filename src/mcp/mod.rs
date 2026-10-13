@@ -1,5 +1,6 @@
 //! Bounded read-only MCP protocol and single-connection stdio transport.
 pub mod catalog;
+mod projection;
 pub mod session;
 pub mod tools;
 pub mod wire;
@@ -102,6 +103,27 @@ pub fn run_socket(
 ) -> std::io::Result<()> {
     let reader = stream.try_clone()?;
     run_transport(workspace, reader, stream, Some((registry, session_id)))
+}
+
+fn mcp_read_error(error: &anyhow::Error) -> &'static str {
+    if error
+        .downcast_ref::<crate::store::topology::StorageBusy>()
+        .is_some()
+    {
+        return "storage_busy";
+    }
+    if error
+        .downcast_ref::<crate::store::topology::IndexNotReady>()
+        .is_some()
+    {
+        "index_not_ready"
+    } else if error.to_string().starts_with("deadline_exceeded:") {
+        "deadline_exceeded"
+    } else if error.to_string().starts_with("root_changed:") {
+        "root_changed"
+    } else {
+        "store_unavailable"
+    }
 }
 
 fn catching_up(
@@ -223,6 +245,7 @@ fn run_transport(
                 if session.pending(admission.token).is_none() {
                     continue;
                 }
+                let call_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
                 let modern = session.mode() == session::Mode::Modern;
                 let mut prepared_tool = None;
                 let mut capacity_witness = None;
@@ -305,12 +328,90 @@ fn run_transport(
                                                 modern,
                                                 answering,
                                             );
+                                            let mut sampled_catching_up = catching_up;
                                             let mut envelope =
                                                 tool.response["structuredContent"].clone();
-                                            envelope["catchingUp"] = serde_json::json!(catching_up);
+                                            if name == "trellis_workspace_describe"
+                                                && let Some((registry, _)) = &registry
+                                            {
+                                                let runtime = registry.blocking_lock().runtime(key);
+                                                if let Some(runtime) = runtime {
+                                                    match runtime.mcp_describe(selected.as_ref()) {
+                                                        Ok((Some(response), sampled, state)) => {
+                                                            sampled_catching_up = sampled;
+                                                            let data = (|| -> anyhow::Result<_> {
+                                                                let status = response.status()?;
+                                                                let counts = response
+                                                                    .mcp_language_counts()?;
+                                                                response.finish(())?;
+                                                                Ok((status, counts))
+                                                            })(
+                                                            );
+                                                            envelope = match data {
+                                                                Ok((status, counts)) => {
+                                                                    projection::describe(
+                                                                        &admission.id,
+                                                                        answering.label(),
+                                                                        state,
+                                                                        Some(counts),
+                                                                        Some(serde_json::json!({
+                                                                            "indexGeneration": status.revision.index_generation.to_string(),
+                                                                            "indexRevision": status.revision.index_revision
+                                                                        })),
+                                                                        false,
+                                                                    )
+                                                                }
+                                                                Err(error) => tools::failure(
+                                                                    &admission.id,
+                                                                    mcp_read_error(&error),
+                                                                ),
+                                                            };
+                                                        }
+                                                        Ok((None, sampled, state)) => {
+                                                            sampled_catching_up = sampled;
+                                                            envelope = projection::describe(
+                                                                &admission.id,
+                                                                answering.label(),
+                                                                state,
+                                                                None,
+                                                                None,
+                                                                false,
+                                                            );
+                                                        }
+                                                        Err(error) => {
+                                                            envelope = tools::failure(
+                                                                &admission.id,
+                                                                mcp_read_error(&error),
+                                                            );
+                                                        }
+                                                    }
+                                                    match runtime
+                                                        .mcp_watcher_degraded(call_deadline)
+                                                    {
+                                                        Ok(degraded)
+                                                            if envelope.get("data").is_some() =>
+                                                        {
+                                                            envelope["data"]["watcherDegraded"] =
+                                                                serde_json::json!(degraded);
+                                                        }
+                                                        Err(error) => {
+                                                            envelope = tools::failure(
+                                                                &admission.id,
+                                                                mcp_read_error(&error),
+                                                            )
+                                                        }
+                                                        _ => {}
+                                                    }
+                                                }
+                                            }
+                                            envelope["workspace"] =
+                                                serde_json::json!(answering.root());
+                                            envelope["catchingUp"] =
+                                                serde_json::json!(sampled_catching_up);
                                             tool.response = tools::result(envelope, modern);
                                             let result = tool.response.clone();
-                                            prepared_tool = Some((tool, selected, catching_up));
+                                            prepared_tool =
+                                                Some((tool, selected, sampled_catching_up));
                                             result
                                         }
                                     }

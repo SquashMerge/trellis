@@ -1688,6 +1688,36 @@ impl CheckoutRuntime {
         resources.store.verify_committed_writer_claim(session)
     }
 
+    /// Read watcher health within the caller's admission deadline.
+    pub fn mcp_watcher_degraded(&self, deadline: Instant) -> anyhow::Result<bool> {
+        self.resources()?
+            .scheduler
+            .checkout_watcher_degraded(deadline)
+    }
+
+    /// Admit W1 through the same selected response path; a missing head is not corruption.
+    pub fn mcp_describe(
+        &self,
+        selected: Option<&SelectedCheckout>,
+    ) -> anyhow::Result<(Option<CheckoutEvidence>, bool, &'static str)> {
+        let admitted = match selected {
+            Some(selected) => self.evidence_for_selected(selected),
+            None => self.evidence_response(),
+        };
+        match admitted {
+            Ok((response, catching_up)) => Ok((Some(response), catching_up, "ready")),
+            Err(error)
+                if error
+                    .downcast_ref::<crate::store::topology::IndexNotReady>()
+                    .is_some() =>
+            {
+                let catching_up = self.catching_up();
+                Ok((None, catching_up, "reconciling"))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     pub fn evidence_response(&self) -> anyhow::Result<(CheckoutEvidence, bool)> {
         let mut phase = self.phase.lock().unwrap();
         anyhow::ensure!(

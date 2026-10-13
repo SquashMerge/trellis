@@ -2435,6 +2435,11 @@ async fn catching_up_reports_pending_work_then_witnessed_readiness_on_same_check
     // This first true means pending work; without a phase witness it does not
     // distinguish mandatory H from a queued watcher hint.
     assert_eq!(first["result"]["structuredContent"]["catchingUp"], true);
+    assert!(first["result"]["structuredContent"]["evidenceBasis"].is_null());
+    assert_eq!(
+        first["result"]["structuredContent"]["data"]["languages"],
+        json!([])
+    );
     let root_key = trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root)
         .unwrap()
         .root_key;
@@ -2474,6 +2479,13 @@ async fn catching_up_reports_pending_work_then_witnessed_readiness_on_same_check
         selected
     );
     assert!(second["result"]["structuredContent"]["catchingUp"].is_boolean());
+    let described = &second["result"]["structuredContent"];
+    assert_eq!(described["data"]["indexState"], "ready");
+    assert_eq!(described["evidenceBasis"], *published);
+    assert_eq!(described["data"]["languages"].as_array().unwrap().len(), 4);
+    assert_eq!(described["data"]["languages"][0]["language"], "java");
+    assert_eq!(described["data"]["languages"][3]["language"], "javascript");
+    assert_eq!(described["partial"], false);
 
     // Future opt-in daemon hooks send one bounded JSON record per connection:
     // {kind,rootKey,streamId,streamSeq,lineageOrdinal,ownerIncarnation,
@@ -2812,4 +2824,287 @@ fn causal_witness_rejects_missing_or_duplicate_stream_event() {
     let missing =
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| state.observe(&gap, &pin)));
     assert!(missing.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn describe_reports_actual_degraded_watcher_on_selected_snapshot() {
+    use std::os::unix::net::UnixStream;
+    use trellis::daemon::registry::CheckoutRegistry;
+    use trellis::store::topology::{TopologyRoots, WorkspaceIdentity};
+    let temp = tempfile::tempdir().unwrap();
+    let root = checkout(temp.path());
+    fs::write(root.join("degraded.js"), "function preserved() {}\n").unwrap();
+    let identity = WorkspaceIdentity::discover(Some(&root), &root)
+        .unwrap()
+        .attach_marker()
+        .unwrap();
+    let topology =
+        TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(31, &identity).unwrap();
+    let runtime = registry.activate(&identity.root_key).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok((snapshot, _)) = runtime.evidence_response()
+                && snapshot.finish(()).is_ok()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("mandatory H did not publish");
+    let scheduler = runtime.browser_scheduler().unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if scheduler.submit_watch_event_for_tests(Err(notify::Error::generic(
+                "degraded watcher fixture",
+            ))) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("watcher was not installed after H");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if runtime
+                .mcp_watcher_degraded(std::time::Instant::now() + Duration::from_secs(5))
+                .unwrap_or(false)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("watcher did not observe the error");
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    let (mut client, server) = UnixStream::pair().unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let session = std::thread::spawn(move || {
+        trellis::mcp::run_socket(
+            trellis::mcp::OpenedWorkspace::new(identity),
+            server,
+            registry,
+            31,
+        )
+    });
+    writeln!(
+        client,
+        "{}",
+        modern(
+            json!(41),
+            "tools/call",
+            json!({"name":"trellis_workspace_describe","arguments":{"schemaVersion":1}})
+        )
+    )
+    .unwrap();
+    let mut line = String::new();
+    BufReader::new(client.try_clone().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let answer: Value = serde_json::from_str(&line).unwrap();
+    tool(&answer, None, true);
+    let envelope = &answer["result"]["structuredContent"];
+    assert_eq!(envelope["data"]["watcherDegraded"], true);
+    assert_eq!(envelope["data"]["indexState"], "ready");
+    assert!(envelope["evidenceBasis"]["indexRevision"].as_u64().unwrap() > 0);
+    assert_eq!(envelope["data"]["languages"].as_array().unwrap().len(), 4);
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn describe_refuses_watcher_health_when_inventory_outlasts_deadline() {
+    use std::os::unix::net::UnixStream;
+    use trellis::daemon::registry::CheckoutRegistry;
+    use trellis::store::topology::{TopologyRoots, WorkspaceIdentity};
+    let temp = tempfile::tempdir().unwrap();
+    let root = checkout(temp.path());
+    fs::write(root.join("a.js"), "function held() {}\n").unwrap();
+    let identity = WorkspaceIdentity::discover(Some(&root), &root)
+        .unwrap()
+        .attach_marker()
+        .unwrap();
+    let topology =
+        TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(32, &identity).unwrap();
+    let runtime = registry.activate(&identity.root_key).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok((response, catching_up)) = runtime.evidence_response()
+                && response.finish(()).is_ok()
+                && !catching_up
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("initial H did not finish");
+    let scheduler = runtime.browser_scheduler().unwrap();
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let holder = std::thread::spawn(move || {
+        scheduler.hold_watcher_gate_for_tests(|| {
+            entered_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        })
+    });
+    entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    let (mut client, server) = UnixStream::pair().unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(8)))
+        .unwrap();
+    let session = std::thread::spawn(move || {
+        trellis::mcp::run_socket(
+            trellis::mcp::OpenedWorkspace::new(identity),
+            server,
+            registry,
+            32,
+        )
+    });
+    let start = std::time::Instant::now();
+    writeln!(
+        client,
+        "{}",
+        modern(
+            json!(42),
+            "tools/call",
+            json!({"name":"trellis_workspace_describe","arguments":{"schemaVersion":1}})
+        )
+    )
+    .unwrap();
+    let mut line = String::new();
+    BufReader::new(client.try_clone().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let response: Value = serde_json::from_str(&line).unwrap();
+    tool(&response, Some("deadline_exceeded"), true);
+    assert!(
+        start.elapsed() <= Duration::from_secs(6),
+        "health wait exceeded call deadline"
+    );
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn describe_serves_valid_prior_head_while_mandatory_h_is_paused() {
+    use std::os::unix::net::UnixStream;
+    use trellis::daemon::registry::CheckoutRegistry;
+    use trellis::store::topology::{TopologyRoots, WorkspaceIdentity};
+    let temp = tempfile::tempdir().unwrap();
+    let root = checkout(temp.path());
+    fs::write(root.join("prior.js"), "function prior() {}\n").unwrap();
+    let identity = WorkspaceIdentity::discover(Some(&root), &root)
+        .unwrap()
+        .attach_marker()
+        .unwrap();
+    let topology =
+        TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(43, &identity).unwrap();
+    let runtime = registry.activate(&identity.root_key).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok((response, catching_up)) = runtime.evidence_response()
+                && response.finish(()).is_ok()
+                && !catching_up
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("initial H did not finish");
+    let (response, _) = runtime.evidence_response().unwrap();
+    let prior = response.status().unwrap().revision;
+    response.finish(()).unwrap();
+    drop(response);
+    registry.disconnect(43);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !registry.release(&identity.root_key).unwrap() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("checkout was not released");
+    fs::write(root.join("prior.js"), "function later() {}\n").unwrap();
+    registry.attach_launch(44, &identity).unwrap();
+    let resumed = registry.activate(&identity.root_key).unwrap();
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (resume_tx, resume_rx) = mpsc::sync_channel(1);
+    let resume_rx = std::sync::Mutex::new(resume_rx);
+    resumed.set_pre_h_hook_for_tests(std::sync::Arc::new(move || {
+        entered_tx.send(()).unwrap();
+        resume_rx
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+    }));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if entered_rx.try_recv().is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("H did not pause");
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    let (mut client, server) = UnixStream::pair().unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(8)))
+        .unwrap();
+    let session = std::thread::spawn(move || {
+        trellis::mcp::run_socket(
+            trellis::mcp::OpenedWorkspace::new(identity),
+            server,
+            registry,
+            44,
+        )
+    });
+    writeln!(
+        client,
+        "{}",
+        modern(
+            json!(45),
+            "tools/call",
+            json!({"name":"trellis_workspace_describe","arguments":{"schemaVersion":1}})
+        )
+    )
+    .unwrap();
+    let mut line = String::new();
+    BufReader::new(client.try_clone().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let answer: Value = serde_json::from_str(&line).unwrap();
+    tool(&answer, None, true);
+    let envelope = &answer["result"]["structuredContent"];
+    assert_eq!(envelope["catchingUp"], true);
+    assert_eq!(envelope["data"]["indexState"], "ready");
+    assert_eq!(
+        envelope["evidenceBasis"],
+        json!({
+        "indexGeneration":prior.index_generation.to_string(),
+        "indexRevision":prior.index_revision})
+    );
+    assert_eq!(envelope["data"]["languages"].as_array().unwrap().len(), 4);
+    resume_tx.send(()).unwrap();
+    drop(client);
+    session.join().unwrap().unwrap();
 }
