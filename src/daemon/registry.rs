@@ -1695,6 +1695,12 @@ impl CheckoutRuntime {
         resources.store.verify_committed_writer_claim(session)
     }
 
+    #[cfg(feature = "test-support")]
+    pub fn mcp_busy_reads_for_tests(&self, count: usize) -> anyhow::Result<()> {
+        self.resources()?.store.mcp_busy_reads_for_tests(count);
+        Ok(())
+    }
+
     /// Read watcher health within the caller's admission deadline.
     pub fn mcp_watcher_degraded(&self, deadline: Instant) -> anyhow::Result<bool> {
         self.resources()?

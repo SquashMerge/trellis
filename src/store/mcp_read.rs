@@ -3,6 +3,17 @@ use super::*;
 
 impl EvidenceResponse {
     pub fn mcp_language_counts(&self) -> Result<[[u64; 5]; 4]> {
+        #[cfg(feature = "test-support")]
+        if self
+            .store
+            .mcp_read_busy_attempts
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count > 0).then(|| count - 1)
+            })
+            .is_ok()
+        {
+            return Err(SqliteContention(()).into());
+        }
         let selected = self.store.read_revision_for(&self.db, None, true)?;
         let mut counts = [[0_u64; 5]; 4];
         let mut rows = self.db.prepare(
@@ -45,6 +56,11 @@ impl EvidenceResponse {
 
 #[cfg(feature = "test-support")]
 impl Store {
+    /// Inject direct typed SQLite contention after a W1 selected admission.
+    pub fn mcp_busy_reads_for_tests(&self, count: usize) {
+        self.mcp_read_busy_attempts.store(count, Ordering::Release);
+    }
+
     /// Use the normal virgin v1 queue staging path before fixture publication.
     pub fn mcp_prepare_virgin_queue_for_tests(&self) -> Result<()> {
         self.prepare_virgin_queue_before_activation()

@@ -3388,3 +3388,145 @@ async fn describe_counts_persisted_selected_and_unselected_native_coverage() {
     drop(client);
     session.join().unwrap().unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn describe_retries_direct_sqlite_contention_on_fresh_selected_snapshot() {
+    use std::os::unix::net::UnixStream;
+    use trellis::daemon::registry::CheckoutRegistry;
+    use trellis::store::topology::{TopologyRoots, WorkspaceIdentity};
+    let temp = tempfile::tempdir().unwrap();
+    let root = checkout(temp.path());
+    fs::write(root.join("busy.js"), "function stable() {}\n").unwrap();
+    let identity = WorkspaceIdentity::discover(Some(&root), &root)
+        .unwrap()
+        .attach_marker()
+        .unwrap();
+    let topology =
+        TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(50, &identity).unwrap();
+    let runtime = registry.activate(&identity.root_key).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok((response, catching_up)) = runtime.evidence_response()
+                && response.finish(()).is_ok()
+                && !catching_up
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("initial H did not settle");
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    let (mut client, server) = UnixStream::pair().unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(8)))
+        .unwrap();
+    let daemon_handle = tokio::runtime::Handle::current();
+    let session = std::thread::spawn(move || {
+        trellis::mcp::run_socket(
+            trellis::mcp::OpenedWorkspace::new(identity),
+            server,
+            registry,
+            50,
+            daemon_handle,
+        )
+    });
+    let describe = |client: &mut UnixStream, id: i64| {
+        writeln!(
+            client,
+            "{}",
+            modern(
+                json!(id),
+                "tools/call",
+                json!({"name":"trellis_workspace_describe","arguments":{"schemaVersion":1}})
+            )
+        )
+        .unwrap();
+        let mut line = String::new();
+        BufReader::new(client.try_clone().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        serde_json::from_str::<Value>(&line).unwrap()
+    };
+    runtime.mcp_busy_reads_for_tests(2).unwrap();
+    let recovered = describe(&mut client, 51);
+    tool(&recovered, None, true);
+    assert_eq!(
+        recovered["result"]["structuredContent"]["data"]["indexState"],
+        "ready"
+    );
+    assert_eq!(
+        recovered["result"]["structuredContent"]["data"]["languages"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
+    assert!(
+        recovered["result"]["structuredContent"]["evidenceBasis"]["indexRevision"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    runtime.mcp_busy_reads_for_tests(usize::MAX).unwrap();
+    let start = std::time::Instant::now();
+    let expired = describe(&mut client, 52);
+    tool(&expired, Some("deadline_exceeded"), true);
+    assert!(start.elapsed() <= Duration::from_secs(6));
+    let envelope = &expired["result"]["structuredContent"];
+    assert!(envelope.get("data").is_none());
+    assert_eq!(envelope["error"]["retryable"], true);
+    let codes = trellis::mcp::catalog::list(true)["tools"][0]["outputSchema"]["$defs"]["ResolvedFailureCode"]["enum"].as_array().unwrap().clone();
+    assert!(codes.contains(&envelope["error"]["code"]));
+    runtime.mcp_busy_reads_for_tests(0).unwrap();
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
+#[test]
+fn invalid_calls_and_non_w1_stubs_never_open_derived_databases() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = checkout(temp.path());
+    for legacy in [false, true] {
+        let mut peer = Peer::start(Some(&root));
+        if legacy {
+            ready_legacy(&mut peer);
+        } else {
+            assert_eq!(
+                peer.ask(modern(json!(1), "server/discover", json!({})))["result"]["resultType"],
+                "complete"
+            );
+        }
+        no_db_under(peer._home.path());
+        for (index, name) in fixture()["names"].as_array().unwrap().iter().enumerate() {
+            let invalid = peer.ask(call(
+                legacy,
+                json!(10 + index),
+                name.as_str().unwrap(),
+                json!({"schemaVersion":1,"unexpected":"reject"}),
+            ));
+            tool(&invalid, Some("invalid_request"), !legacy);
+            no_db_under(peer._home.path());
+        }
+        for (offset, name) in fixture()["names"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .skip(1)
+        {
+            let reply = peer.ask(call(
+                legacy,
+                json!(20 + offset),
+                name.as_str().unwrap(),
+                fixture()["validArguments"][offset].clone(),
+            ));
+            tool(&reply, Some("index_not_ready"), !legacy);
+            no_db_under(peer._home.path());
+        }
+        assert!(peer.finish().0.success());
+    }
+}

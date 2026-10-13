@@ -133,25 +133,43 @@ fn mcp_read_error(error: &anyhow::Error) -> &'static str {
     }
 }
 
-fn admit_describe(
+struct DescribedSnapshot {
+    data: Option<(crate::model::IndexStatus, [[u64; 5]; 4])>,
+    catching_up: bool,
+    state: &'static str,
+    progress: Option<serde_json::Value>,
+}
+
+/// Retry only direct Store contention. Every failed attempt drops its selected
+/// response; the one successful answer is materialized and finished in one snapshot.
+fn read_describe(
     runtime: &crate::daemon::registry::CheckoutRuntime,
     selected: Option<&crate::daemon::registry::SelectedCheckout>,
     deadline: std::time::Instant,
-) -> anyhow::Result<(
-    Option<crate::daemon::registry::CheckoutEvidence>,
-    bool,
-    &'static str,
-    Option<serde_json::Value>,
-)> {
+) -> anyhow::Result<DescribedSnapshot> {
     loop {
-        match runtime.mcp_describe(selected) {
-            Err(error)
-                if error
-                    .downcast_ref::<crate::store::topology::StorageBusy>()
-                    .is_some() =>
-            {
+        let attempt =
+            runtime
+                .mcp_describe(selected)
+                .and_then(|(response, catching_up, state, progress)| {
+                    let data = response
+                        .map(|response| {
+                            let status = response.status()?;
+                            let counts = response.mcp_language_counts()?;
+                            response.finish((status, counts))
+                        })
+                        .transpose()?;
+                    Ok(DescribedSnapshot {
+                        data,
+                        catching_up,
+                        state,
+                        progress,
+                    })
+                });
+        match attempt {
+            Err(error) if crate::store::cli_read_retryable_contention(&error) => {
                 if std::time::Instant::now() >= deadline {
-                    anyhow::bail!("deadline_exceeded: MCP read admission was busy");
+                    anyhow::bail!("deadline_exceeded: MCP selected read was busy");
                 }
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
@@ -382,48 +400,37 @@ fn run_transport(
                                                     ))
                                                 };
                                                 if let Ok(runtime) = &activated {
-                                                    match admit_describe(
+                                                    match read_describe(
                                                         runtime,
                                                         selected.as_ref(),
                                                         call_deadline,
                                                     ) {
-                                                        Ok((
-                                                            Some(response),
-                                                            sampled,
+                                                        Ok(DescribedSnapshot {
+                                                            data: Some((status, counts)),
+                                                            catching_up: sampled,
                                                             state,
                                                             progress,
-                                                        )) => {
+                                                        }) => {
                                                             sampled_catching_up = sampled;
-                                                            let data = (|| -> anyhow::Result<_> {
-                                                                let status = response.status()?;
-                                                                let counts = response
-                                                                    .mcp_language_counts()?;
-                                                                response.finish(())?;
-                                                                Ok((status, counts))
-                                                            })(
+                                                            envelope = projection::describe(
+                                                                &admission.id,
+                                                                answering.label(),
+                                                                state,
+                                                                progress,
+                                                                Some(counts),
+                                                                Some(serde_json::json!({
+                                                                    "indexGeneration": status.revision.index_generation.to_string(),
+                                                                    "indexRevision": status.revision.index_revision
+                                                                })),
+                                                                false,
                                                             );
-                                                            envelope = match data {
-                                                                Ok((status, counts)) => {
-                                                                    projection::describe(
-                                                                        &admission.id,
-                                                                        answering.label(),
-                                                                        state,
-                                                                        progress,
-                                                                        Some(counts),
-                                                                        Some(serde_json::json!({
-                                                                            "indexGeneration": status.revision.index_generation.to_string(),
-                                                                            "indexRevision": status.revision.index_revision
-                                                                        })),
-                                                                        false,
-                                                                    )
-                                                                }
-                                                                Err(error) => tools::failure(
-                                                                    &admission.id,
-                                                                    mcp_read_error(&error),
-                                                                ),
-                                                            };
                                                         }
-                                                        Ok((None, sampled, state, progress)) => {
+                                                        Ok(DescribedSnapshot {
+                                                            data: None,
+                                                            catching_up: sampled,
+                                                            state,
+                                                            progress,
+                                                        }) => {
                                                             sampled_catching_up = sampled;
                                                             envelope = projection::describe(
                                                                 &admission.id,
