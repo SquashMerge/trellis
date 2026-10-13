@@ -201,6 +201,34 @@ fn run(home: &Path, command: &str, root: &Path) -> Value {
     );
     serde_json::from_slice(&output.stdout).unwrap()
 }
+/// The address an ephemeral-port serve bound, from its stderr banner.
+async fn served_address(home: &Path, child: &mut Child) -> SocketAddr {
+    let deadline = Instant::now() + Duration::from_secs(12);
+    loop {
+        for entry in fs::read_dir(home).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            if !(name.starts_with("daemon-cli-child-") && name.ends_with(".stderr")) {
+                continue;
+            }
+            let log = fs::read_to_string(&path).unwrap_or_default();
+            if let Some(raw) = log
+                .lines()
+                .find_map(|line| line.strip_prefix("Trellis: http://")?.strip_suffix('/'))
+            {
+                return raw
+                    .parse()
+                    .expect("serve banner must contain a socket address");
+            }
+        }
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "serve process exited before its address banner"
+        );
+        assert!(Instant::now() < deadline, "serve address banner timed out");
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+}
 async fn ready(client: &reqwest::Client, address: SocketAddr, child: &mut Child) {
     let deadline = Instant::now() + Duration::from_secs(12);
     loop {
@@ -379,8 +407,10 @@ async fn executable_daemon_is_socket_only_until_explicit_serve_and_registers_two
     fs::create_dir(&home).unwrap();
     let first = checkout(temp.path(), "first");
     let second = checkout(temp.path(), "second");
-    let reserved = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = reserved.local_addr().unwrap();
+    // Every registration requests an ephemeral port: the daemon binds it and
+    // later registrations must repeat the same request. A probed free port
+    // could be taken by another process before serve binds it.
+    let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let token_file = temp.path().join("token");
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
@@ -404,8 +434,6 @@ async fn executable_daemon_is_socket_only_until_explicit_serve_and_registers_two
         );
         tokio::time::sleep(Duration::from_millis(40)).await;
     }
-    // Keep the port reserved until explicit serve. A connect check after
-    // releasing it would race with other tests or processes that bind it.
     assert!(daemon.0.try_wait().unwrap().is_none());
     assert!(std::os::unix::net::UnixStream::connect(&socket).is_ok());
     assert!(
@@ -419,9 +447,9 @@ async fn executable_daemon_is_socket_only_until_explicit_serve_and_registers_two
         "second daemon displaced socket owner"
     );
     assert!(!token_file.exists());
-    drop(reserved);
 
-    let mut first_serve = detached(serve(&home, &first, address, &token_file));
+    let mut first_serve = detached(serve(&home, &first, bind, &token_file));
+    let address = served_address(&home, &mut first_serve.0).await;
     ready(&client, address, &mut first_serve.0).await;
     let token = fs::read_to_string(&token_file).unwrap();
     let url = format!("http://{address}/api/checkouts");
@@ -520,17 +548,33 @@ async fn executable_daemon_is_socket_only_until_explicit_serve_and_registers_two
         selected["workspaceRoot"],
         fs::canonicalize(&first).unwrap().to_str().unwrap()
     );
-    let jobs = client
-        .get(format!(
-            "http://{address}/api/checkouts/{first_key}/jobs/current"
-        ))
-        .bearer_auth(token.trim())
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(jobs.status(), reqwest::StatusCode::OK);
+    // The current-job read is typed contention while H or the watcher writes;
+    // retry only storage_busy and report any other refusal with its body.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let jobs = loop {
+        let jobs = client
+            .get(format!(
+                "http://{address}/api/checkouts/{first_key}/jobs/current"
+            ))
+            .bearer_auth(token.trim())
+            .send()
+            .await
+            .unwrap();
+        if jobs.status() != reqwest::StatusCode::CONFLICT || Instant::now() >= deadline {
+            break jobs;
+        }
+        let body: Value = jobs.json().await.unwrap();
+        assert_eq!(
+            body["error"]["code"], "storage_busy",
+            "current job refused: {body}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let status = jobs.status();
+    let body = jobs.text().await.unwrap();
+    assert_eq!(status, reqwest::StatusCode::OK, "current job: {body}");
     assert!(
-        jobs.json::<Value>().await.unwrap().is_null(),
+        serde_json::from_str::<Value>(&body).unwrap().is_null(),
         "old POST accepted a job"
     );
     let wrong_origin = authenticated()
@@ -547,9 +591,7 @@ async fn executable_daemon_is_socket_only_until_explicit_serve_and_registers_two
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("bind conflicts"));
     let other_token = temp.path().join("other-token");
-    let output = serve(&home, &second, address, &other_token)
-        .output()
-        .unwrap();
+    let output = serve(&home, &second, bind, &other_token).output().unwrap();
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("token file conflicts"));
     assert!(!other_token.exists());
@@ -567,7 +609,7 @@ async fn executable_daemon_is_socket_only_until_explicit_serve_and_registers_two
         1
     );
 
-    let mut second_serve = detached(serve(&home, &second, address, &token_file));
+    let mut second_serve = detached(serve(&home, &second, bind, &token_file));
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         // A listing can exceed the 2 s client timeout while the second
@@ -612,7 +654,7 @@ async fn executable_daemon_is_socket_only_until_explicit_serve_and_registers_two
         assert!(Instant::now() < deadline, "second checkout not registered");
         tokio::time::sleep(Duration::from_millis(40)).await;
     }
-    let mut same_serve = detached(serve(&home, &first, address, &token_file));
+    let mut same_serve = detached(serve(&home, &first, bind, &token_file));
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         if same_serve.0.try_wait().unwrap().is_none() {
@@ -673,7 +715,7 @@ async fn executable_daemon_is_socket_only_until_explicit_serve_and_registers_two
     assert!(run(&home, "export", &first).is_object());
     // Index activated this checkout. A conflicting registration cannot replace
     // its options until the active checkout is released.
-    let mut conflict = serve(&home, &first, address, &token_file)
+    let mut conflict = serve(&home, &first, bind, &token_file)
         .arg("--max-file-bytes")
         .arg("3145728")
         .stdout(Stdio::null())

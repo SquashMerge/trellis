@@ -474,7 +474,9 @@ fn unchanged_serve_reuses_selected_versions_but_changed_bytes_and_corruption_do_
         "{}",
         String::from_utf8_lossy(&attached.stderr)
     );
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    // Restart, reconcile and watcher publication share a loaded verify host;
+    // a 10 s bound failed intermittently (#131). #122 replaces this test.
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
     while rusqlite::Connection::open(&dbpath)
         .map(|db| pin_and_ids(&db).0)
         .unwrap()
