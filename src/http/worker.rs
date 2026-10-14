@@ -593,10 +593,20 @@ impl DaemonState {
     /// (through any Store) cancels it. Otherwise one attempt at watcher
     /// intent up to the cutoff, then the `Closing` linearization and close.
     pub(super) fn run_retirement(&self) -> anyhow::Result<()> {
-        // A lost root's accepted requests are already settled; new-root work
-        // belongs to a fresh runtime.
-        let root_lost = self.store.root_path_replaced().unwrap_or(true);
-        if !root_lost && self.store.earliest_unfinished_request()?.is_some() {
+        #[cfg(feature = "test-support")]
+        {
+            let hook = self.retirement_entered_hook.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        // A root replaced since the step's own check takes the same path:
+        // settle its accepted rows, mark the loss, then close. A failed check
+        // is an ordinary step error, never taken as loss.
+        if self.store.root_path_replaced()? {
+            return self.close_for_root_loss();
+        }
+        if self.store.earliest_unfinished_request()?.is_some() {
             self.cancel_retirement(self.runtime.lock().unwrap());
             return Ok(());
         }
@@ -604,9 +614,7 @@ impl DaemonState {
         if let Some(hook) = self.retire_hook.lock().unwrap().take() {
             hook();
         }
-        if !root_lost {
-            self.reconcile_through_cutoff();
-        }
+        self.reconcile_through_cutoff();
         // The Closing linearization point: one compare-and-swap on the
         // queue's enqueue word sets its closing bit only if no enqueue
         // (through any Store) is in flight from before its transaction to
@@ -618,9 +626,7 @@ impl DaemonState {
             if !matches!(*state, RuntimeState::RetireRequested { .. }) {
                 return Ok(());
             }
-            if !root_lost
-                && (self.fifo_pending.load(Ordering::Acquire) || !self.store.try_begin_closing())
-            {
+            if self.fifo_pending.load(Ordering::Acquire) || !self.store.try_begin_closing() {
                 self.cancel_retirement(state);
                 return Ok(());
             }
@@ -631,6 +637,29 @@ impl DaemonState {
         };
         self.close(held);
         Ok(())
+    }
+
+    /// The captured root was lost (Decision 0009 §2): its accepted rows are
+    /// settled with a confirmed terminal COMMIT first, then the runtime is
+    /// marked root-lost and closes. Until that COMMIT succeeds it keeps its
+    /// resources. Recovery for the path runs on a fresh runtime.
+    pub(super) fn close_for_root_loss(&self) -> anyhow::Result<()> {
+        self.store.fail_changed_root_requests()?;
+        self.root_lost.store(true, Ordering::Release);
+        let held =
+            match std::mem::replace(&mut *self.runtime.lock().unwrap(), RuntimeState::Closing) {
+                RuntimeState::Ready(session) => Some(session),
+                RuntimeState::RetireRequested { session, .. } => session,
+                _ => None,
+            };
+        self.close(held);
+        Ok(())
+    }
+
+    /// Run `hook` on the worker as it enters retirement, before its root check.
+    #[cfg(feature = "test-support")]
+    pub fn set_retirement_entered_hook_for_tests(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.retirement_entered_hook.lock().unwrap() = Some(Box::new(hook));
     }
 
     /// A requested retirement found accepted work: the runtime stays live.

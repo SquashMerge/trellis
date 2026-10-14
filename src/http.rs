@@ -264,6 +264,8 @@ pub struct DaemonState {
     #[cfg(feature = "test-support")]
     retire_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(feature = "test-support")]
+    retirement_entered_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(feature = "test-support")]
     closing_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Runs as a maintenance unit begins, after its priority check passed.
     #[cfg(feature = "test-support")]
@@ -491,6 +493,8 @@ pub fn new_with_config(
         state_changed: std::sync::Condvar::new(),
         #[cfg(feature = "test-support")]
         retire_hook: Mutex::new(None),
+        #[cfg(feature = "test-support")]
+        retirement_entered_hook: Mutex::new(None),
         #[cfg(feature = "test-support")]
         closing_hook: Mutex::new(None),
         #[cfg(feature = "test-support")]
@@ -1172,20 +1176,7 @@ impl DaemonState {
         // until that COMMIT is confirmed the runtime keeps them and makes no
         // other progress.
         if self.store.root_path_replaced()? {
-            self.store.fail_changed_root_requests()?;
-            // Settled (Decision 0009 §2): close now. Recovery for the path
-            // runs on a fresh runtime, never on this one.
-            self.root_lost.store(true, Ordering::Release);
-            let held = match std::mem::replace(
-                &mut *self.runtime.lock().unwrap(),
-                RuntimeState::Closing,
-            ) {
-                RuntimeState::Ready(session) => Some(session),
-                RuntimeState::RetireRequested { session, .. } => session,
-                _ => None,
-            };
-            self.close(held);
-            return Ok(());
+            return self.close_for_root_loss();
         }
         // Retirement is due: the worker retires this runtime at this boundary
         // unless accepted FIFO work cancels it (Decision 0009 §5).

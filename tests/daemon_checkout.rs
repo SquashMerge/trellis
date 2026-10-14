@@ -2161,6 +2161,56 @@ async fn enqueue_from_another_store_before_closing_cancels_retirement() {
     assert!(runtime.has_active_resources());
 }
 
+/// Decision 0009 §2: a root replaced after the worker step's own root check,
+/// as retirement begins, still settles the old root's accepted rows with a
+/// terminal COMMIT and marks the loss before the runtime closes.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn root_replaced_as_retirement_begins_settles_before_closing() {
+    let base = tempfile::tempdir().unwrap();
+    let checkout = base.path().join("work");
+    fs::create_dir(&checkout).unwrap();
+    fs::write(checkout.join("a.js"), "function a() {}\n").unwrap();
+    let id = identity(&checkout);
+    let db_path = roots(base.path()).requests_db(&id);
+    let mut registry = CheckoutRegistry::with_roots(roots(base.path()));
+    let runtime = idle_detached(&mut registry, &id).await;
+    let scheduler = runtime.browser_scheduler().unwrap();
+    let enqueuer = Store::open(roots(base.path()), identity(&checkout)).unwrap();
+    let (row_tx, row_rx) = std::sync::mpsc::sync_channel(1);
+    let options = trellis::indexer::IndexOptions::new(checkout.clone());
+    let (work, moved) = (checkout.clone(), base.path().join("moved"));
+    // On the worker, past the step's root check: accept an old-root row,
+    // then replace the root before retirement checks it.
+    scheduler.set_retirement_entered_hook_for_tests(move || {
+        let row = enqueuer.enqueue_request(&options, None).unwrap();
+        fs::rename(&work, &moved).unwrap();
+        fs::create_dir(&work).unwrap();
+        fs::write(work.join("a.js"), "function replacement() {}\n").unwrap();
+        row_tx.send(row).unwrap();
+    });
+    assert!(!registry.release(&id.root_key).unwrap());
+    let row = tokio::task::spawn_blocking(move || row_rx.recv().unwrap())
+        .await
+        .unwrap();
+    retired(&scheduler).await;
+    // The old-root Store refuses reads once its root changed; read the queue.
+    let (state, error): (String, Option<String>) = rusqlite::Connection::open(&db_path)
+        .unwrap()
+        .query_row(
+            "SELECT state,error_code FROM requests WHERE id=?1",
+            [&row.id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (state.as_str(), error.as_deref()),
+        ("failed", Some("root_changed")),
+        "the old-root row was not settled before closing"
+    );
+    assert!(scheduler.checkout_root_loss_retired());
+}
+
 /// Decision 0009 §4: the index keeps its use lock until Closing completes, so
 /// GC cannot take it exclusively while the watcher and witnesses close.
 #[cfg(feature = "test-support")]
