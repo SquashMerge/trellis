@@ -160,7 +160,7 @@ impl DaemonState {
         *self.startup_hook.lock().unwrap() = Some(hook);
     }
 
-    /// Whether the queue tick should run startup reconciliation now. A
+    /// Whether the worker step should run startup reconciliation now. A
     /// standalone scheduler that was never asked to reconcile does so only
     /// when `work_pending` reports accepted work (`None`: undecided, retry).
     pub(super) fn startup_due(
@@ -385,12 +385,12 @@ const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
 
 impl DaemonState {
     /// Start this checkout's worker thread, or wake it if it is running. A
-    /// synchronous fixture without a Tokio runtime drives `queue_tick` itself.
+    /// synchronous fixture without a Tokio runtime drives `worker_step` itself.
     pub(super) fn start_worker(self: &Arc<Self>) {
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
-        if self.queue_tick_started.swap(true, Ordering::AcqRel) {
+        if self.worker_started.swap(true, Ordering::AcqRel) {
             self.inbox.wake();
             return;
         }
@@ -404,7 +404,7 @@ impl DaemonState {
                 worker_loop(weak, inbox)
             });
         if let Err(error) = spawned {
-            self.queue_tick_started.store(false, Ordering::Release);
+            self.worker_started.store(false, Ordering::Release);
             super::best_effort_queue_stderr(
                 std::io::stderr(),
                 format_args!("checkout worker failed to start: {error}\n"),
@@ -746,7 +746,7 @@ fn worker_loop(weak: std::sync::Weak<DaemonState>, inbox: Arc<WorkerInbox>) {
         if matches!(*state.runtime.lock().unwrap(), RuntimeState::Retired) {
             return;
         }
-        let step = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| state.queue_tick()));
+        let step = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| state.worker_step()));
         state.publish_fifo_pending();
         deadline = match step {
             Ok(Ok(())) => {
@@ -760,14 +760,14 @@ fn worker_loop(weak: std::sync::Weak<DaemonState>, inbox: Arc<WorkerInbox>) {
             Ok(Err(error)) => {
                 super::best_effort_queue_stderr(
                     std::io::stderr(),
-                    format_args!("queue tick failed: {error:#}\n"),
+                    format_args!("checkout worker step failed: {error:#}\n"),
                 );
                 Some(Instant::now() + STEP_RETRY)
             }
             Err(_) => {
                 super::best_effort_queue_stderr(
                     std::io::stderr(),
-                    format_args!("queue tick worker failed: panicked\n"),
+                    format_args!("checkout worker step failed: panicked\n"),
                 );
                 Some(Instant::now() + STEP_RETRY)
             }

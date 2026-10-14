@@ -3085,7 +3085,7 @@ async fn describe_reports_published_watcher_health_while_an_inventory_holds_the_
     let (entered_tx, entered_rx) = mpsc::sync_channel(1);
     let (release_tx, release_rx) = mpsc::sync_channel(1);
     let holder = std::thread::spawn(move || {
-        scheduler.hold_watcher_gate_for_tests(|| {
+        scheduler.hold_worker_step_for_tests(|| {
             entered_tx.send(()).unwrap();
             release_rx
                 .recv_timeout(trellis::testing::HANG_BACKSTOP)

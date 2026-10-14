@@ -498,7 +498,9 @@ async fn executable_daemon_is_socket_only_until_explicit_serve_and_registers_two
     let mut daemon = detached(daemon_command);
     let socket = fixture_socket_paths(&home).socket;
     let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
-    while !socket.exists() {
+    // The socket file appears at bind(), just before listen(): wait for a
+    // connection, not for the file.
+    while std::os::unix::net::UnixStream::connect(&socket).is_err() {
         assert!(
             daemon.0.try_wait().unwrap().is_none(),
             "daemon exited before socket bind: {}",
@@ -506,14 +508,13 @@ async fn executable_daemon_is_socket_only_until_explicit_serve_and_registers_two
         );
         assert!(
             Instant::now() < deadline,
-            "daemon socket was not created: {}",
+            "daemon socket was not listening: {}",
             fixture_daemon_diagnostic(&home, &socket)
         );
         tokio::time::sleep(Duration::from_millis(40)).await;
     }
     // A socket-only daemon must not provision a browser token or listener.
     assert!(daemon.0.try_wait().unwrap().is_none());
-    assert!(std::os::unix::net::UnixStream::connect(&socket).is_ok());
     assert!(
         !token_file.exists(),
         "socket-only startup provisioned a browser token"

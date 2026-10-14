@@ -279,7 +279,7 @@ pub struct DaemonState {
     #[cfg(feature = "test-support")]
     origins: Vec<String>,
     jobs: Mutex<Jobs>,
-    queue_tick_started: AtomicBool,
+    worker_started: AtomicBool,
     /// Watcher inventories run on the worker and are never cancelled from
     /// outside it (Decision 0009 §1).
     watcher_cancel: CancelFlag,
@@ -296,8 +296,9 @@ pub struct DaemonState {
     test_activation_head_busy_once: AtomicBool,
     pending_requests: Mutex<Vec<String>>,
     job_progress: Mutex<BTreeMap<String, IndexProgress>>,
-    native_stream: Mutex<()>,
-    maintenance_stream: Mutex<()>,
+    /// One worker step at a time. In production only the worker takes it; test
+    /// fixtures that drive steps by hand take it to serialize with the worker.
+    step_lock: Mutex<()>,
     watcher_work: Mutex<
         Option<(
             std::sync::Weak<crate::store::topology::WriterSession>,
@@ -520,7 +521,7 @@ pub fn new_with_config(
         config: std::sync::RwLock::new(Arc::new(config)),
         explicit_pending: Mutex::new(None),
         packets: Mutex::new(PacketCache::default()),
-        queue_tick_started: AtomicBool::new(false),
+        worker_started: AtomicBool::new(false),
         watcher_cancel: Arc::new(AtomicBool::new(false)),
         #[cfg(feature = "test-support")]
         startup_hook: Mutex::new(None),
@@ -534,8 +535,7 @@ pub fn new_with_config(
         test_activation_head_busy_once: AtomicBool::new(false),
         pending_requests: Mutex::new(Vec::new()),
         job_progress: Mutex::new(BTreeMap::new()),
-        native_stream: Mutex::new(()),
-        maintenance_stream: Mutex::new(()),
+        step_lock: Mutex::new(()),
         watcher_work: Mutex::new(None),
         causal_witness: Mutex::new(None),
         causal_runtime: Mutex::new(None),
@@ -578,7 +578,7 @@ impl DaemonState {
         *self.causal_runtime.lock().unwrap() = Some(runtime);
     }
 
-    /// Called only after queue_tick returned and released its native/work locks.
+    /// Called only after a worker step returned and released its locks.
     fn report_causal_h_ready(self: &Arc<Self>) {
         let runtime = self.causal_runtime.lock().unwrap().clone();
         if let Some(runtime) = runtime.and_then(|runtime| runtime.upgrade()) {
@@ -644,7 +644,7 @@ impl DaemonState {
         // Re-retention must not race an in-flight tick that sampled an old,
         // invalid holder and would replace this verified session afterward.
         {
-            let _stream = self.native_stream.lock().unwrap();
+            let _stream = self.step_lock.lock().unwrap();
             self.replace_serving_session(Some(session));
         }
         self.start_worker();
@@ -654,8 +654,7 @@ impl DaemonState {
     /// Production registry release instead uses the nonblocking try-release gate.
     #[doc(hidden)]
     pub fn release_checkout_runtime_for_fixture(&self) {
-        let _stream = self.native_stream.lock().unwrap();
-        let _maintenance = self.maintenance_stream.lock().unwrap();
+        let _stream = self.step_lock.lock().unwrap();
         self.set_runtime_state(RuntimeState::Retired);
         self.inbox.wake();
     }
@@ -676,10 +675,11 @@ impl DaemonState {
         matches!(*self.runtime.lock().unwrap(), RuntimeState::Retired)
     }
 
-    /// Synchronize the native/watcher lock boundary in a registry race test.
+    /// Hold what a worker step holds mid-inventory (the step and the watcher),
+    /// to show readers never wait for either.
     #[cfg(any(test, feature = "test-support"))]
-    pub fn hold_watcher_gate_for_tests(&self, hold: impl FnOnce()) {
-        let _stream = self.native_stream.lock().unwrap();
+    pub fn hold_worker_step_for_tests(&self, hold: impl FnOnce()) {
+        let _step = self.step_lock.lock().unwrap();
         let _watcher = self.watcher_work.lock().unwrap();
         hold();
     }
@@ -962,10 +962,6 @@ impl DaemonState {
         if self.retired() {
             return Ok(());
         }
-        let _lane = self.maintenance_stream.lock().unwrap();
-        if self.retired() {
-            return Ok(());
-        }
         use crate::store::MaintenanceOutcome;
         if self.retention_last_run.lock().unwrap().elapsed() < Duration::from_secs(60) {
             return Ok(());
@@ -978,7 +974,7 @@ impl DaemonState {
             return Ok(());
         };
         // Read selected options only outside a maintenance writer. A changed
-        // watcher/options binding is intent until native_stream replaces it.
+        // watcher/options binding is intent until the worker replaces it.
         let options = match self.store.recorded_index_options() {
             Ok(Some(options)) => options,
             Ok(None) => self.config().options.clone(),
@@ -1075,7 +1071,7 @@ impl DaemonState {
         // stream. Verify/ack its initial full watcher inventory before claiming
         // a genuine idle maintenance opportunity.
         {
-            let _stream = self.native_stream.lock().unwrap();
+            let _stream = self.step_lock.lock().unwrap();
             let session = self.runtime.lock().unwrap().session().cloned();
             if let Some(session) = session {
                 let options = self
@@ -1115,7 +1111,7 @@ impl DaemonState {
     /// conflating it with the independent low-priority maintenance lane.
     #[doc(hidden)]
     pub fn force_root_transition_tick_for_tests(self: &Arc<Self>) -> anyhow::Result<()> {
-        self.queue_tick()
+        self.worker_step()
     }
 
     /// Inspect the three mutually exclusive roles at a root-loss tick boundary.
@@ -1145,7 +1141,7 @@ impl DaemonState {
         }
     }
 
-    fn queue_tick(self: &Arc<Self>) -> anyhow::Result<()> {
+    fn worker_step(self: &Arc<Self>) -> anyhow::Result<()> {
         #[cfg(feature = "test-support")]
         let _held = self.worker_hold.read().unwrap();
         if self.retired() {
@@ -1153,7 +1149,7 @@ impl DaemonState {
         }
         #[cfg(test)]
         self.test_queue_before_stream.run();
-        let _stream = self.native_stream.lock().unwrap();
+        let _stream = self.step_lock.lock().unwrap();
         #[cfg(test)]
         self.test_queue_current_phase.store(1, Ordering::Release);
         if self.retired() {
@@ -3921,7 +3917,7 @@ mod serving_holder_tests {
             "127.0.0.1:7331".parse().unwrap(),
         )
         .unwrap();
-        state.queue_tick().unwrap();
+        state.worker_step().unwrap();
         let done = store.request_by_id(&queued.id).unwrap().unwrap();
         assert_eq!(done.state, "done");
         let pin = done.revision.unwrap();
@@ -3934,7 +3930,7 @@ mod serving_holder_tests {
                 .manifest_path,
             head.manifest_path
         );
-        state.queue_tick().unwrap();
+        state.worker_step().unwrap();
         assert_eq!(
             store.status().unwrap().revision,
             pin,
@@ -3970,12 +3966,12 @@ mod serving_holder_tests {
         let (done_tx, done_rx) = std::sync::mpsc::sync_channel(0);
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(0);
         state.test_queue_after_h_drain.set(move || {
-            // The terminal row is committed, but queue_tick has not returned.
+            // The terminal row is committed, but the worker step has not returned.
             done_tx.send(()).unwrap();
             release_rx.recv().unwrap();
         });
         let worker = state.clone();
-        let tick = std::thread::spawn(move || worker.queue_tick());
+        let tick = std::thread::spawn(move || worker.worker_step());
         done_rx
             .recv_timeout(crate::testing::HANG_BACKSTOP)
             .expect("takeover did not commit the accepted head");
@@ -4028,7 +4024,7 @@ mod serving_holder_tests {
             .lock()
             .unwrap()
             .push(accepted.id.clone());
-        state.queue_tick().unwrap();
+        state.worker_step().unwrap();
         let session = state.retained_serving_session().unwrap();
         store.verify_writer_session(&session).unwrap();
         let completed = store.request_by_id(&accepted.id).unwrap().unwrap();
@@ -4062,14 +4058,14 @@ mod serving_holder_tests {
             .unwrap()
             .push(request.id.clone());
         state.test_pending_read_failures.store(1, Ordering::Release);
-        state.queue_tick().unwrap();
+        state.worker_step().unwrap();
         assert_eq!(
             *state.pending_requests.lock().unwrap(),
             vec![request.id.clone()]
         );
         let completed = store.request_by_id(&request.id).unwrap().unwrap();
         assert_eq!(completed.state, "done");
-        state.queue_tick().unwrap();
+        state.worker_step().unwrap();
         assert!(state.pending_requests.lock().unwrap().is_empty());
         let done = store.request_by_id(&request.id).unwrap().unwrap();
         assert_eq!(done.revision, completed.revision);
@@ -4095,7 +4091,7 @@ mod serving_holder_tests {
         }
         best_effort_queue_stderr(
             ClosedPipe,
-            format_args!("queue tick failed: storage_busy\n"),
+            format_args!("checkout worker step failed: storage_busy\n"),
         );
         best_effort_queue_stderr(
             ClosedPipe,
@@ -4133,7 +4129,7 @@ mod serving_holder_tests {
         let accepted = store.enqueue_request(&options, None).unwrap();
         store.fail_next_live_publish_commit_busy();
         let retry_started = Instant::now();
-        state.queue_tick().unwrap();
+        state.worker_step().unwrap();
         let retry_finished = Instant::now();
         let scheduled_retry = *state.recovery_retry_after.lock().unwrap();
         assert!(
@@ -4159,13 +4155,13 @@ mod serving_holder_tests {
         drop(selected);
         *state.recovery_retry_after.lock().unwrap() =
             Some(Instant::now() + crate::testing::HANG_BACKSTOP);
-        state.queue_tick().unwrap();
+        state.worker_step().unwrap();
         assert_eq!(
             store.request_by_id(&accepted.id).unwrap().unwrap().state,
             "queued"
         );
         *state.recovery_retry_after.lock().unwrap() = None;
-        state.queue_tick().unwrap();
+        state.worker_step().unwrap();
         let done = store.request_by_id(&accepted.id).unwrap().unwrap();
         assert_eq!(done.state, "done");
         assert_eq!(done.seq, accepted.seq);
@@ -4211,7 +4207,7 @@ mod serving_holder_tests {
             .test_activation_head_busy_once
             .store(true, Ordering::Release);
         let started = Instant::now();
-        state.queue_tick().unwrap();
+        state.worker_step().unwrap();
         let finished = Instant::now();
         assert!(
             state
@@ -4245,13 +4241,13 @@ mod serving_holder_tests {
         // The immediate timer tick honors the backoff without claiming Q.
         *state.recovery_retry_after.lock().unwrap() =
             Some(Instant::now() + crate::testing::HANG_BACKSTOP);
-        state.queue_tick().unwrap();
+        state.worker_step().unwrap();
         assert_eq!(
             store.request_by_id(&accepted.id).unwrap().unwrap().state,
             "queued"
         );
         *state.recovery_retry_after.lock().unwrap() = None;
-        state.queue_tick().unwrap();
+        state.worker_step().unwrap();
         let done = store.request_by_id(&accepted.id).unwrap().unwrap();
         assert_eq!(
             (
@@ -4308,7 +4304,7 @@ mod serving_holder_tests {
         drop(owner);
         // Plain-string BUSY can be retried inside the same local writer tick.
         // Typed BUSY has its own test below for a mandatory-H backoff.
-        state.queue_tick().unwrap();
+        state.worker_step().unwrap();
         let after_busy = follower_store.request_by_id(&ack.id).unwrap().unwrap();
         assert_eq!(
             (
@@ -4327,7 +4323,7 @@ mod serving_holder_tests {
                 "pre-COMMIT BUSY cannot publish part of H or Q1"
             );
             *state.recovery_retry_after.lock().unwrap() = None;
-            state.queue_tick().unwrap();
+            state.worker_step().unwrap();
         }
         let done = follower_store.request_by_id(&ack.id).unwrap().unwrap();
         assert_eq!(
@@ -4424,7 +4420,7 @@ mod serving_holder_tests {
         assert!(large.len() > 128 && large.len() <= 512);
         fs::write(root.join("a.js"), large).unwrap();
         drop(old_owner);
-        let error = state.queue_tick().unwrap_err();
+        let error = state.worker_step().unwrap_err();
         assert!(format!("{error:#}").contains("unsafe or oversized input"));
         let row = store.request_by_id(&q1.id).unwrap().unwrap();
         assert_eq!(
@@ -4485,7 +4481,7 @@ mod serving_holder_tests {
         fs::write(&path, "function b() {}\n").unwrap();
         store.fail_next_live_publish_commit_typed_busy();
         drop(old_owner);
-        state.queue_tick().unwrap(); // RetryMandatory, not an ACK or retained owner.
+        state.worker_step().unwrap(); // RetryMandatory, not an ACK or retained owner.
         for (accepted, options) in [(&q1, &encoded_a), (&q2, &encoded_b)] {
             let row = store.request_by_id(&accepted.id).unwrap().unwrap();
             assert_eq!(
@@ -4513,7 +4509,7 @@ mod serving_holder_tests {
         // Only the advisory timer is advanced. Success requires a fresh H
         // publication and the same accepted FIFO rows, not elapsed time.
         *state.recovery_retry_after.lock().unwrap() = Some(Instant::now() - Duration::from_secs(1));
-        state.queue_tick().unwrap();
+        state.worker_step().unwrap();
         let first = store.request_by_id(&q1.id).unwrap().unwrap();
         let second = store.request_by_id(&q2.id).unwrap().unwrap();
         assert_eq!(
@@ -4539,7 +4535,7 @@ mod serving_holder_tests {
         assert!(q1_pin.index_revision > prior.index_revision + 1);
         assert_eq!(store.status().unwrap().revision, q1_pin);
         assert!(state.retained_serving_session().unwrap().verify().is_ok());
-        state.queue_tick().unwrap();
+        state.worker_step().unwrap();
         let finished_q1 = store.request_by_id(&q1.id).unwrap().unwrap();
         let finished_q2 = store.request_by_id(&q2.id).unwrap().unwrap();
         assert_eq!(
@@ -4599,7 +4595,7 @@ mod serving_holder_tests {
             .unwrap()
             .push(client.id.clone());
         drop(owner);
-        state.queue_tick().unwrap();
+        state.worker_step().unwrap();
         let done = follower_store.request_by_id(&client.id).unwrap().unwrap();
         assert_eq!(
             done.state, "done",
@@ -4625,7 +4621,7 @@ mod serving_holder_tests {
         )
         .unwrap();
         let accepted = store.enqueue_request(&options, None).unwrap();
-        state.queue_tick().unwrap();
+        state.worker_step().unwrap();
         assert_eq!(
             store.request_by_id(&accepted.id).unwrap().unwrap().state,
             "done"
@@ -4633,7 +4629,7 @@ mod serving_holder_tests {
         let next = store.enqueue_request(&options, None).unwrap();
         fs::rename(&root, tmp.path().join("former-workspace")).unwrap();
         fs::create_dir(&root).unwrap();
-        state.queue_tick().unwrap();
+        state.worker_step().unwrap();
         // Normal reads reject a replaced captured root. Inspect only the durable
         // request row to prove settlement survived loss of that root.
         let db = rusqlite::Connection::open(store.request_db_path()).unwrap();
@@ -4694,7 +4690,7 @@ mod serving_holder_tests {
         // Typed pre-COMMIT contention is deferred with a 250ms deadline;
         // inspect the scheduled bound before diagnostic reads can outlast it.
         let retry_started = Instant::now();
-        state.queue_tick().unwrap();
+        state.worker_step().unwrap();
         let retry_finished = Instant::now();
         let scheduled_retry = *state.recovery_retry_after.lock().unwrap();
         assert!(
@@ -4713,9 +4709,9 @@ mod serving_holder_tests {
         // retry branch open for the immediate-tick assertion without a clock race.
         *state.recovery_retry_after.lock().unwrap() =
             Some(Instant::now() + crate::testing::HANG_BACKSTOP);
-        state.queue_tick().unwrap();
+        state.worker_step().unwrap();
         *state.recovery_retry_after.lock().unwrap() = None;
-        state.queue_tick().unwrap();
+        state.worker_step().unwrap();
         let selected = follower_store.status().unwrap().revision;
         assert_eq!(selected.index_generation, old_pin.index_generation);
         assert!(selected.index_revision > old_pin.index_revision);
@@ -4792,7 +4788,7 @@ mod serving_holder_tests {
         drop(owner);
         let before_tick = Instant::now();
         let error = state
-            .queue_tick()
+            .worker_step()
             .expect_err("unreadable selected H must fail before Q1 claim");
         assert!(
             format!("{error:#}").contains("opening input:"),
@@ -4837,7 +4833,7 @@ mod serving_holder_tests {
         *state.recovery_retry_after.lock().unwrap() =
             Some(Instant::now() + crate::testing::HANG_BACKSTOP);
         for _ in 0..3 {
-            state.queue_tick().unwrap();
+            state.worker_step().unwrap();
         }
         assert_eq!(
             follower_store
@@ -4850,7 +4846,7 @@ mod serving_holder_tests {
         fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).unwrap();
         // Repair H's source, then advance ONLY the advisory retry timer.
         *state.recovery_retry_after.lock().unwrap() = Some(Instant::now() - Duration::from_secs(1));
-        state.queue_tick().unwrap();
+        state.worker_step().unwrap();
         let done = follower_store.request_by_id(&accepted.id).unwrap().unwrap();
         assert_eq!(
             (
@@ -4917,7 +4913,7 @@ mod exceptional_recovery_tests {
         )
         .unwrap();
         // These tests step the worker by hand: no background worker thread.
-        state.queue_tick_started.store(true, Ordering::Release);
+        state.worker_started.store(true, Ordering::Release);
         (tmp, store, state, roots, identity)
     }
 
@@ -4957,7 +4953,7 @@ mod exceptional_recovery_tests {
         )
         .unwrap();
         let started = Instant::now();
-        let error = state.queue_tick().unwrap_err();
+        let error = state.worker_step().unwrap_err();
         let finished = Instant::now();
         assert!(
             error.to_string().starts_with("recovery_required:"),
@@ -4982,7 +4978,7 @@ mod exceptional_recovery_tests {
         let damaged = std::fs::read(&index).unwrap();
         let q0 = store.current_request().unwrap().unwrap();
         assert_eq!(q0.state, "queued");
-        state.queue_tick().unwrap();
+        state.worker_step().unwrap();
         assert!(!store.is_recreate_pending());
         store
             .verify_writer_session(&state.retained_serving_session().unwrap())
@@ -4992,7 +4988,7 @@ mod exceptional_recovery_tests {
         let pin = done.revision.unwrap();
         assert_eq!(pin.index_revision, 2, "H r1 must precede Q0 r2");
         assert_ne!(std::fs::read(&index).unwrap(), damaged);
-        state.queue_tick().unwrap();
+        state.worker_step().unwrap();
         assert_eq!(store.status().unwrap().revision, pin);
     }
 
@@ -5007,7 +5003,7 @@ mod exceptional_recovery_tests {
         let q1 = store.request_by_id(&browser.id).unwrap().unwrap();
         assert!(q0.seq < q1.seq);
         assert_eq!(q1.state, "queued");
-        state.queue_tick().unwrap();
+        state.worker_step().unwrap();
         let first = store.request_by_id(&q0.id).unwrap().unwrap();
         let pending = store.request_by_id(&q1.id).unwrap().unwrap();
         assert_eq!(
@@ -5015,7 +5011,7 @@ mod exceptional_recovery_tests {
             ("done", "queued")
         );
         assert_eq!(first.revision.unwrap().index_revision, 2);
-        state.queue_tick().unwrap();
+        state.worker_step().unwrap();
         let second = store.request_by_id(&q1.id).unwrap().unwrap();
         assert_eq!(
             (second.id.as_str(), second.seq, second.state.as_str()),
@@ -5115,7 +5111,7 @@ mod exceptional_recovery_tests {
             "queued"
         );
         drop(reader);
-        state.queue_tick().unwrap();
+        state.worker_step().unwrap();
         let first = store.request_by_id(&q0.id).unwrap().unwrap();
         assert_eq!(first.state, "done");
         assert_eq!(
@@ -5126,14 +5122,14 @@ mod exceptional_recovery_tests {
             store.request_by_id(&q2.id).unwrap().unwrap().state,
             "queued"
         );
-        state.queue_tick().unwrap();
+        state.worker_step().unwrap();
         let browser_done = store.request_by_id(&q1.id).unwrap().unwrap();
         assert_eq!(browser_done.state, "done");
         assert_eq!(
             store.request_by_id(&q2.id).unwrap().unwrap().state,
             "queued"
         );
-        state.queue_tick().unwrap();
+        state.worker_step().unwrap();
         let cli_done = store.request_by_id(&q2.id).unwrap().unwrap();
         assert_eq!(
             (
@@ -5184,13 +5180,13 @@ mod exceptional_recovery_tests {
             "a separate CLI process cannot populate daemon-local pending_requests"
         );
         let original_queue = std::fs::read(store.request_db_path()).unwrap();
-        state.queue_tick().unwrap();
+        state.worker_step().unwrap();
         assert_eq!(store.request_by_id(&q0.id).unwrap().unwrap().state, "done");
         assert_eq!(
             store.request_by_id(&accepted.id).unwrap().unwrap().state,
             "queued"
         );
-        state.queue_tick().unwrap();
+        state.worker_step().unwrap();
         let row = store.request_by_id(&accepted.id).unwrap().unwrap();
         assert_eq!(
             (
@@ -5317,7 +5313,7 @@ mod exceptional_recovery_tests {
             release_rx.recv().unwrap();
         });
         let worker = state.clone();
-        let idle_tick = tokio::task::spawn_blocking(move || worker.queue_tick());
+        let idle_tick = tokio::task::spawn_blocking(move || worker.worker_step());
         tokio::time::timeout(crate::testing::HANG_BACKSTOP, entered_rx)
             .await
             .expect("idle tick did not snapshot empty pending list")
@@ -5347,7 +5343,7 @@ mod exceptional_recovery_tests {
         let worker = state.clone();
         tokio::time::timeout(
             crate::testing::HANG_BACKSTOP,
-            tokio::task::spawn_blocking(move || worker.queue_tick()),
+            tokio::task::spawn_blocking(move || worker.worker_step()),
         )
         .await
         .expect("recovery tick did not attempt protected EX")
@@ -5394,7 +5390,7 @@ mod exceptional_recovery_tests {
             });
         }
         let worker = state.clone();
-        let retry_tick = tokio::task::spawn_blocking(move || worker.queue_tick());
+        let retry_tick = tokio::task::spawn_blocking(move || worker.worker_step());
         // The accepted ID signals only after its terminal queue COMMIT. The
         // same tick may then spend a full inventory on the watcher while still
         // holding the serial stream; bound those two stages separately.
@@ -5535,7 +5531,7 @@ mod exceptional_recovery_tests {
         tokio::time::timeout(crate::testing::HANG_BACKSTOP, async {
             loop {
                 if fixture.state.retained_serving_session().is_err()
-                    && fixture.state.native_stream.try_lock().is_ok()
+                    && fixture.state.step_lock.try_lock().is_ok()
                 {
                     break;
                 }
@@ -5632,7 +5628,7 @@ mod exceptional_recovery_tests {
                     .test_queue_current_phase
                     .load(Ordering::Acquire),
                 fixture.store.test_pending_completion_probe_for_tests(),
-                fixture.state.native_stream.try_lock().is_ok(),
+                fixture.state.step_lock.try_lock().is_ok(),
             );
             // Failure-only probe: keep a missed watcher or Q1 deadline RED,
             // then give the writer one quiet second without this test's SH poll.
@@ -5658,15 +5654,15 @@ mod exceptional_recovery_tests {
             let pending = fixture.state.pending_requests.lock().unwrap().clone();
             let completion = fixture.store.test_pending_completion_probe_for_tests();
             panic!(
-                "same accepted Q1 ID did not finish after watcher reconcile: watcher_returned_in_time={watcher_returned_in_time}, last_row={last_seen:?}, q2={q2:?}, pending_recovery={}, owner_valid={owner:?}, retry_ms={retry_ms:?}, pending_ids={pending:?}, at_deadline={at_deadline:?}, after_quiet={after_quiet:?}, queue_phase={} (0=pre-H, 1=after-H/Q, 2=watcher reconcile, 3=watcher returned), live_phase={} (1=stream, 2=drain, 3=after drain, 4=watcher reconcile, 5=after watcher), completion={completion:?}, tick_started={}, native_stream_free={}, index_revision={:?}",
+                "same accepted Q1 ID did not finish after watcher reconcile: watcher_returned_in_time={watcher_returned_in_time}, last_row={last_seen:?}, q2={q2:?}, pending_recovery={}, owner_valid={owner:?}, retry_ms={retry_ms:?}, pending_ids={pending:?}, at_deadline={at_deadline:?}, after_quiet={after_quiet:?}, queue_phase={} (0=pre-H, 1=after-H/Q, 2=watcher reconcile, 3=watcher returned), live_phase={} (1=stream, 2=drain, 3=after drain, 4=watcher reconcile, 5=after watcher), completion={completion:?}, tick_started={}, step_lock_free={}, index_revision={:?}",
                 fixture.store.is_recreate_pending(),
                 queue_phase.load(Ordering::Acquire),
                 fixture
                     .state
                     .test_queue_current_phase
                     .load(Ordering::Acquire),
-                fixture.state.queue_tick_started.load(Ordering::Acquire),
-                fixture.state.native_stream.try_lock().is_ok(),
+                fixture.state.worker_started.load(Ordering::Acquire),
+                fixture.state.step_lock.try_lock().is_ok(),
                 fixture
                     .store
                     .status()
@@ -5719,7 +5715,7 @@ mod exceptional_recovery_tests {
             .unwrap();
         // This is the genuine daemon timer spawn_blocking worker, paused while
         // its short-lived request connection and shared use guard are both open.
-        assert!(fixture.state.native_stream.try_lock().is_err());
+        assert!(fixture.state.step_lock.try_lock().is_err());
         assert_eq!(std::fs::read(&queue_path).unwrap(), queue_bytes);
         assert_eq!(std::fs::read(&fixture.index_path).unwrap(), corrupt_index);
         release_select_tx.send(()).unwrap();
@@ -5732,7 +5728,7 @@ mod exceptional_recovery_tests {
             "old Arc must be dropped before EX"
         );
         assert!(
-            fixture.state.native_stream.try_lock().is_err(),
+            fixture.state.step_lock.try_lock().is_err(),
             "EX stays inside native stream"
         );
         assert_eq!(std::fs::read(&queue_path).unwrap(), queue_bytes);
@@ -5748,12 +5744,12 @@ mod exceptional_recovery_tests {
         // The production 20-ms timer awaits its first worker; this SECOND call
         // is deliberately injected on the SAME daemon to test the stream gate.
         let state = fixture.state.clone();
-        let injected = tokio::task::spawn_blocking(move || state.queue_tick());
+        let injected = tokio::task::spawn_blocking(move || state.worker_step());
         tokio::time::timeout(crate::testing::HANG_BACKSTOP, before_rx)
             .await
             .expect("injected same-daemon tick did not reach stream")
             .unwrap();
-        assert!(fixture.state.native_stream.try_lock().is_err());
+        assert!(fixture.state.step_lock.try_lock().is_err());
         assert!(
             matches!(
                 after_rx.try_recv(),
@@ -5774,7 +5770,7 @@ mod exceptional_recovery_tests {
                 });
         }
         release_ex_tx.send(()).unwrap();
-        // The first timer worker keeps native_stream through its Q2 drain and
+        // The first worker step keeps the step lock through its Q2 drain and
         // full post-takeover watcher inventory. The injected tick is eligible
         // for the stream only after that watcher returns.
         tokio::time::timeout(crate::testing::HANG_BACKSTOP, watcher_returned.notified())
@@ -5862,12 +5858,12 @@ mod exceptional_recovery_tests {
             "legacy job map must not own queued work"
         );
         async fn tick_one(state: Arc<DaemonState>, phase: &'static str) {
-            let work = tokio::task::spawn_blocking(move || state.queue_tick());
+            let work = tokio::task::spawn_blocking(move || state.worker_step());
             let result = tokio::time::timeout(crate::testing::HANG_BACKSTOP, work)
                 .await
-                .unwrap_or_else(|_| panic!("{phase}: queue_tick did not finish (hang)"))
-                .unwrap_or_else(|error| panic!("{phase}: queue_tick worker: {error}"));
-            result.unwrap_or_else(|error| panic!("{phase}: queue_tick failed: {error:#}"));
+                .unwrap_or_else(|_| panic!("{phase}: worker_step did not finish (hang)"))
+                .unwrap_or_else(|error| panic!("{phase}: worker_step thread: {error}"));
+            result.unwrap_or_else(|error| panic!("{phase}: worker_step failed: {error:#}"));
         }
         let first_queued = store.request_by_id(&ids[0]).unwrap().unwrap();
         let second_queued = store.request_by_id(&ids[1]).unwrap().unwrap();
