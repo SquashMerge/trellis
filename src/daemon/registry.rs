@@ -2087,6 +2087,29 @@ mod selection_tests {
         assert!(status.success(), "git {args:?}");
     }
 
+    /// H commits (`h_in_flight` clears) before the queue tick's first full
+    /// inventory runs on the native and watcher lanes. Fixtures that take those
+    /// lanes or enqueue FIFO work wait for this sampled quiescence first; a
+    /// timeout here is a real fixture RED.
+    async fn settled_after_first_inventory(runtime: &CheckoutRuntime) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let watch_pending = runtime
+                    .browser_scheduler()
+                    .map_or(true, |scheduler| scheduler.checkout_watch_pending());
+                if !runtime.h_in_flight.load(Ordering::Acquire)
+                    && !runtime.catching_up()
+                    && !watch_pending
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("H and the first watcher inventory did not settle");
+    }
+
     #[tokio::test]
     async fn serve_cli_replacement_does_not_wait_under_registry_for_watcher_gate() {
         use std::sync::mpsc;
@@ -2101,13 +2124,7 @@ mod selection_tests {
         registry.attach_launch(42, &identity).unwrap();
         let runtime = registry.activate(&identity.root_key).unwrap();
         registry.disconnect(42);
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while runtime.h_in_flight.load(Ordering::Acquire) {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .unwrap();
+        settled_after_first_inventory(&runtime).await;
         let scheduler = runtime.browser_scheduler().unwrap();
         let observed_scheduler = scheduler.clone();
         let (held_tx, held_rx) = mpsc::channel();
@@ -2184,13 +2201,7 @@ mod selection_tests {
         registry.attach_launch(46, &identity).unwrap();
         let runtime = registry.activate(&identity.root_key).unwrap();
         registry.disconnect(46);
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while runtime.h_in_flight.load(Ordering::Acquire) {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .unwrap();
+        settled_after_first_inventory(&runtime).await;
         let scheduler = runtime.browser_scheduler().unwrap();
         let (held_tx, held_rx) = mpsc::channel();
         let (resume_tx, resume_rx) = mpsc::channel();
@@ -2302,13 +2313,7 @@ mod selection_tests {
         registry.attach_launch(44, &identity).unwrap();
         let runtime = registry.activate(&identity.root_key).unwrap();
         registry.disconnect(44);
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while runtime.h_in_flight.load(Ordering::Acquire) {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .unwrap();
+        settled_after_first_inventory(&runtime).await;
         let scheduler = runtime.browser_scheduler().unwrap();
         let (held_tx, held_rx) = tokio::sync::oneshot::channel();
         let (resume_tx, resume_rx) = mpsc::channel();
@@ -2363,13 +2368,7 @@ mod selection_tests {
         registry.attach_launch(43, &identity).unwrap();
         let runtime = registry.activate(&identity.root_key).unwrap();
         registry.disconnect(43);
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while runtime.h_in_flight.load(Ordering::Acquire) {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .unwrap();
+        settled_after_first_inventory(&runtime).await;
         let resources = runtime.resources().unwrap();
         let scheduler = resources.scheduler.clone();
         let (held_tx, held_rx) = mpsc::channel();
