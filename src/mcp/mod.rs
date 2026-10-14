@@ -140,6 +140,10 @@ struct DescribedSnapshot {
     progress: Option<serde_json::Value>,
 }
 
+/// Every tool call is answered within this deadline; describe reports it as
+/// `limits.deadlineMs` (contract W1).
+pub const CALL_DEADLINE: std::time::Duration = std::time::Duration::from_millis(5000);
+
 /// Retry only direct Store contention. Every failed attempt drops its selected
 /// response; the one successful answer is materialized and finished in one snapshot.
 fn read_describe(
@@ -168,7 +172,7 @@ fn read_describe(
                 });
         match attempt {
             Err(error) if crate::store::cli_read_retryable_contention(&error) => {
-                if std::time::Instant::now() >= deadline {
+                if runtime.mcp_clock_now() >= deadline {
                     anyhow::bail!("deadline_exceeded: MCP selected read was busy");
                 }
                 std::thread::sleep(std::time::Duration::from_millis(1));
@@ -298,7 +302,7 @@ fn run_transport(
                 if session.pending(admission.token).is_none() {
                     continue;
                 }
-                let call_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let call_deadline = std::time::Instant::now() + CALL_DEADLINE;
                 let modern = session.mode() == session::Mode::Modern;
                 let mut prepared_tool = None;
                 let mut capacity_witness = None;

@@ -3474,12 +3474,13 @@ async fn describe_retries_direct_sqlite_contention_on_fresh_selected_snapshot() 
             .unwrap()
             > 0
     );
+    // Selected reads stay busy for good, so only the call deadline can end
+    // this call. Advance the checkout's MCP clock past it instead of waiting:
+    // a server that waited for the reads instead would hang here.
     runtime.mcp_busy_reads_for_tests(usize::MAX).unwrap();
-    let start = std::time::Instant::now();
+    runtime.advance_mcp_clock_for_tests(trellis::mcp::CALL_DEADLINE + Duration::from_secs(1));
     let expired = describe(&mut client, 52);
     tool(&expired, Some("deadline_exceeded"), true);
-    // deadline_exceeded proves the call deadline fired; this detects a hang.
-    assert!(start.elapsed() < trellis::testing::HANG_BACKSTOP);
     let envelope = &expired["result"]["structuredContent"];
     assert!(envelope.get("data").is_none());
     assert_eq!(envelope["error"]["retryable"], true);

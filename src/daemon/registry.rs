@@ -335,6 +335,8 @@ impl CheckoutRegistry {
             h_in_flight: AtomicBool::new(true),
             initial_indexing,
             initial_capture_started: AtomicBool::new(false),
+            #[cfg(feature = "test-support")]
+            mcp_clock_skew_ms: std::sync::atomic::AtomicU64::new(0),
             retry_waiting: AtomicBool::new(false),
             #[cfg(feature = "test-support")]
             pre_h_hook: std::sync::Mutex::new(None),
@@ -1407,6 +1409,10 @@ struct ActiveResources {
 /// One activated checkout has its own native stream and no process-global leader.
 /// A failed H retains no claim authority; the worker retries while attached.
 pub struct CheckoutRuntime {
+    /// Test-support virtual time added to this checkout's MCP call clock, so
+    /// a test can pass a call deadline without waiting real seconds.
+    #[cfg(feature = "test-support")]
+    mcp_clock_skew_ms: std::sync::atomic::AtomicU64,
     resources: std::sync::Mutex<Option<Arc<ActiveResources>>>,
     phase: std::sync::Mutex<RuntimePhase>,
     active: AtomicBool,
@@ -1702,6 +1708,24 @@ impl CheckoutRuntime {
             .into());
         };
         resources.store.verify_committed_writer_claim(session)
+    }
+
+    /// The clock MCP call deadlines are checked against: real time, plus any
+    /// virtual time a test has advanced on this checkout.
+    pub(crate) fn mcp_clock_now(&self) -> Instant {
+        #[cfg(feature = "test-support")]
+        let skew = Duration::from_millis(self.mcp_clock_skew_ms.load(Ordering::Acquire));
+        #[cfg(not(feature = "test-support"))]
+        let skew = Duration::ZERO;
+        Instant::now() + skew
+    }
+
+    /// Advance this checkout's MCP call clock without waiting real time.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn advance_mcp_clock_for_tests(&self, by: Duration) {
+        let millis = u64::try_from(by.as_millis()).unwrap_or(u64::MAX);
+        self.mcp_clock_skew_ms.fetch_add(millis, Ordering::AcqRel);
     }
 
     #[cfg(feature = "test-support")]
