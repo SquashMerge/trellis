@@ -13,6 +13,7 @@
   - the evidence contracts;
   - per-call workspace selection and idle timeouts (Decision 0007 §2–3).
 - **Compatibility:** none needed (pre-release).
+- **Amended by [Decision 0009](0009-checkout-worker.md):** one worker per checkout owns everything §1 assigns to the daemon, and serve registers in place instead of replacing a runtime. **Terminology:** "mandatory H" here is the worker's **startup reconciliation**; the rules are unchanged.
 
 ## Background
 
