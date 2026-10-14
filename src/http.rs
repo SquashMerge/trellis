@@ -41,9 +41,13 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 use subtle::ConstantTimeEq;
+
+mod worker;
+pub use worker::RuntimePhase;
+use worker::{RuntimeState, STARTUP_BACKOFF_FIRST};
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -215,7 +219,16 @@ impl MaintenanceTelemetry {
 
 pub struct DaemonState {
     store: Store,
-    serving_session: Mutex<Option<Arc<crate::store::topology::WriterSession>>>,
+    /// Decision 0009 §2: the checkout's one runtime state, shared by the worker
+    /// and every reader. `Ready` holds the only serving writer session.
+    runtime: Mutex<RuntimeState>,
+    /// The first error of the current startup reconciliation run, cleared when
+    /// a validated head commits.
+    startup_error: Mutex<Option<String>>,
+    /// The next failed startup reconciliation waits this long (doubling, capped).
+    startup_backoff: Mutex<Duration>,
+    /// Registered browser options were given explicitly and override recorded inputs.
+    explicit_options: AtomicBool,
     options: IndexOptions,
     browser: crate::file_tree::SourceDir,
     rust_sources: Vec<crate::rust_sources::Root>,
@@ -235,15 +248,16 @@ pub struct DaemonState {
     origins: Vec<String>,
     jobs: Mutex<Jobs>,
     queue_tick_started: AtomicBool,
-    checkout_runtime_stopped: AtomicBool,
     // Only idle watcher inventory is preempted by a CLI-only serve replacement.
     watcher_release_cancel: CancelFlag,
     #[cfg(feature = "test-support")]
-    checkout_h_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    startup_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Startup reconciliation captures begun, for the single-owner tests.
+    #[cfg(feature = "test-support")]
+    startup_captures: AtomicU64,
     maintenance_tick_started: AtomicBool,
     maintenance_telemetry: Mutex<MaintenanceTelemetry>,
     maintenance_error_limiter: Mutex<MaintenanceErrorLimiter>,
-    #[cfg(test)]
     #[cfg(test)]
     test_pending_read_failures: AtomicUsize,
     #[cfg(test)]
@@ -263,7 +277,6 @@ pub struct DaemonState {
     causal_lineage_ordinal: Arc<AtomicU64>,
     causal_h_reported: Mutex<Option<(uuid::Uuid, uuid::Uuid, u64)>>,
     recovery_retry_after: Mutex<Option<Instant>>,
-    idle_h_retry: AtomicBool,
     /// Watcher health, published by the current watcher through one flag that
     /// lives as long as this state. Readers never wait for watcher work.
     watcher_health: Arc<AtomicBool>,
@@ -388,7 +401,10 @@ pub fn new_with_dependency_options(
     let origins = hosts.iter().map(|h| format!("http://{h}")).collect();
     Ok(Arc::new(DaemonState {
         store,
-        serving_session: Mutex::new(None),
+        runtime: Mutex::new(RuntimeState::Activating),
+        startup_error: Mutex::new(None),
+        startup_backoff: Mutex::new(STARTUP_BACKOFF_FIRST),
+        explicit_options: AtomicBool::new(false),
         options: index_options,
         browser: crate::file_tree::SourceDir::open(&browse_root)?,
         rust_sources: crate::rust_sources::open_roots(source_roots)?,
@@ -422,14 +438,14 @@ pub fn new_with_dependency_options(
         acp,
         packets: Mutex::new(PacketCache::default()),
         queue_tick_started: AtomicBool::new(false),
-        checkout_runtime_stopped: AtomicBool::new(false),
         watcher_release_cancel: Arc::new(AtomicBool::new(false)),
         #[cfg(feature = "test-support")]
-        checkout_h_hook: Mutex::new(None),
+        startup_hook: Mutex::new(None),
+        #[cfg(feature = "test-support")]
+        startup_captures: AtomicU64::new(0),
         maintenance_tick_started: AtomicBool::new(false),
         maintenance_telemetry: Mutex::new(MaintenanceTelemetry::default()),
         maintenance_error_limiter: Mutex::new(MaintenanceErrorLimiter::default()),
-        #[cfg(test)]
         #[cfg(test)]
         test_pending_read_failures: AtomicUsize::new(0),
         #[cfg(test)]
@@ -444,7 +460,6 @@ pub fn new_with_dependency_options(
         causal_lineage_ordinal: Arc::new(AtomicU64::new(0)),
         causal_h_reported: Mutex::new(None),
         recovery_retry_after: Mutex::new(None),
-        idle_h_retry: AtomicBool::new(false),
         watcher_health: Arc::new(AtomicBool::new(false)),
         retention_last_run: Mutex::new(Instant::now()),
         gc_last_check: Mutex::new(Instant::now() - Duration::from_secs(3600)),
@@ -493,9 +508,9 @@ impl DaemonState {
         &self,
         session: &Arc<crate::store::topology::WriterSession>,
     ) -> Option<crate::daemon::causal_witness::Lineage> {
-        let serving = self.serving_session.lock().unwrap();
+        let serving = self.runtime.lock().unwrap();
         if !serving
-            .as_ref()
+            .session()
             .is_some_and(|owner| Arc::ptr_eq(owner, session))
         {
             return None;
@@ -569,7 +584,7 @@ impl DaemonState {
 
     #[cfg(test)]
     pub(crate) fn checkout_runtime_stopped_for_tests(&self) -> bool {
-        self.checkout_runtime_stopped.load(Ordering::Acquire)
+        self.retired()
     }
 
     #[cfg(test)]
@@ -582,7 +597,7 @@ impl DaemonState {
     /// watcher or maintenance unit is a retry, not a half-retired runtime.
     pub(crate) fn try_release_checkout_runtime_if(
         &self,
-        ready: impl FnOnce() -> bool,
+        ready: impl FnOnce(RuntimePhase) -> bool,
     ) -> Result<bool, crate::store::topology::StorageBusy> {
         let _stream = self
             .native_stream
@@ -592,12 +607,16 @@ impl DaemonState {
             .maintenance_stream
             .try_lock()
             .map_err(|_| crate::store::topology::StorageBusy)?;
-        if !ready() {
+        // Decide and retire under the state lock, so no lease or enqueue
+        // admitted under that lock can slip between the check and `Retired`.
+        let mut state = self.runtime.lock().unwrap();
+        if !ready(RuntimePhase::of(&state)) {
             return Ok(false);
         }
-        self.checkout_runtime_stopped.store(true, Ordering::Release);
         self.watcher_release_cancel.store(true, Ordering::Release);
-        self.replace_serving_session(None);
+        *state = RuntimeState::Retired;
+        *self.watcher_work.lock().unwrap() = None;
+        self.watcher_health.store(false, Ordering::Release);
         Ok(true)
     }
 
@@ -607,29 +626,24 @@ impl DaemonState {
     pub fn release_checkout_runtime_for_fixture(&self) {
         let _stream = self.native_stream.lock().unwrap();
         let _maintenance = self.maintenance_stream.lock().unwrap();
-        self.checkout_runtime_stopped.store(true, Ordering::Release);
         self.watcher_release_cancel.store(true, Ordering::Release);
-        self.replace_serving_session(None);
+        self.set_runtime_state(RuntimeState::Retired);
     }
 
     /// A daemon-local writer session is usable only after its H commits.
     /// A stale session cannot admit new claims or selected responses.
     pub fn checkout_serving_owner(&self) -> Option<Arc<crate::store::topology::WriterSession>> {
-        let owner = self.serving_session.lock().unwrap().clone()?;
+        let owner = self.runtime.lock().unwrap().session()?.clone();
         owner.verify().ok()?;
         Some(owner)
     }
 
     pub fn checkout_root_loss_retired(&self) -> bool {
-        self.store.root_path_replaced().is_ok_and(|lost| lost)
-            && self.serving_session.lock().unwrap().is_none()
+        matches!(*self.runtime.lock().unwrap(), RuntimeState::RootLost)
     }
 
-    /// Deterministically pause local activation before mandatory H.
-    #[cfg(feature = "test-support")]
-    #[doc(hidden)]
-    pub fn set_checkout_h_hook_for_tests(&self, hook: Arc<dyn Fn() + Send + Sync>) {
-        *self.checkout_h_hook.lock().unwrap() = Some(hook);
+    fn retired(&self) -> bool {
+        matches!(*self.runtime.lock().unwrap(), RuntimeState::Retired)
     }
 
     /// Pause the real queue tick after it acquires native_stream and
@@ -679,9 +693,9 @@ impl DaemonState {
                 .map(|(_, scheduler)| scheduler.accepted_watch_intent(&options))
         };
         pending.unwrap_or_else(|| {
-            self.serving_session
+            self.runtime
                 .try_lock()
-                .map_or(true, |held| held.is_some())
+                .map_or(true, |held| held.session().is_some())
         })
     }
 
@@ -708,19 +722,22 @@ impl DaemonState {
     ) {
         self.replace_serving_session(Some(session));
     }
-    /// A failed initial H has no serving capability and no watcher yet. The
-    /// empty-queue retry must be armed *before* starting the tick; otherwise an
-    /// alive daemon binds HTTP but cannot discover a repaired checkout without
-    /// an explicit request. Back off from the already-failed startup attempt.
-    pub fn retry_failed_serving_startup(self: &Arc<Self>) {
-        self.idle_h_retry.store(true, Ordering::Release);
-        *self.recovery_retry_after.lock().unwrap() =
-            Some(Instant::now() + Duration::from_millis(250));
-        self.start_queue_tick();
-    }
+    /// Losing the serving session sends the runtime back to startup
+    /// reconciliation (Decision 0009 §2); gaining one makes it Ready.
     fn replace_serving_session(&self, next: Option<Arc<crate::store::topology::WriterSession>>) {
-        let mut current = self.serving_session.lock().unwrap();
-        let changed = match (&*current, &next) {
+        self.set_runtime_state(match next {
+            Some(session) => RuntimeState::Ready(session),
+            None => RuntimeState::Reconciling {
+                attempts: 0,
+                waiting: false,
+            },
+        });
+    }
+
+    /// The watcher belongs to one serving session: any session change drops it.
+    fn set_runtime_state(&self, next: RuntimeState) {
+        let mut current = self.runtime.lock().unwrap();
+        let changed = match (current.session(), next.session()) {
             (Some(old), Some(next)) => !Arc::ptr_eq(old, next),
             (None, None) => false,
             _ => true,
@@ -834,9 +851,9 @@ impl DaemonState {
         if self.store.has_recorded_completion(session).unwrap_or(true) {
             return Some("terminal_ack");
         }
-        if self.serving_session.try_lock().map_or(true, |current| {
+        if self.runtime.try_lock().map_or(true, |current| {
             !current
-                .as_ref()
+                .session()
                 .is_some_and(|owner| Arc::ptr_eq(owner, session))
         }) {
             return Some("session_replaced");
@@ -1008,11 +1025,11 @@ impl DaemonState {
     }
 
     fn maintenance_tick(&self) -> anyhow::Result<()> {
-        if self.checkout_runtime_stopped.load(Ordering::Acquire) {
+        if self.retired() {
             return Ok(());
         }
         let _lane = self.maintenance_stream.lock().unwrap();
-        if self.checkout_runtime_stopped.load(Ordering::Acquire) {
+        if self.retired() {
             return Ok(());
         }
         use crate::store::MaintenanceOutcome;
@@ -1020,10 +1037,10 @@ impl DaemonState {
             return Ok(());
         }
         let session = self
-            .serving_session
+            .runtime
             .try_lock()
             .ok()
-            .and_then(|held| held.clone());
+            .and_then(|held| held.session().cloned());
         let Some(session) = session else {
             return Ok(());
         };
@@ -1122,7 +1139,7 @@ impl DaemonState {
         // a genuine idle maintenance opportunity.
         {
             let _stream = self.native_stream.lock().unwrap();
-            let session = self.serving_session.lock().unwrap().clone();
+            let session = self.runtime.lock().unwrap().session().cloned();
             if let Some(session) = session {
                 let options = self
                     .store
@@ -1165,14 +1182,31 @@ impl DaemonState {
     #[doc(hidden)]
     pub fn root_loss_retirement_for_tests(&self) -> (bool, bool, bool) {
         (
-            self.serving_session.lock().unwrap().is_some(),
+            self.runtime.lock().unwrap().session().is_some(),
             self.watcher_work.lock().unwrap().is_some(),
             false,
         )
     }
 
+    /// Whether accepted work is waiting for a standalone scheduler that was
+    /// never asked to reconcile. Typed contention defers the decision.
+    fn durable_work_pending(&self, pending_local: bool) -> anyhow::Result<Option<bool>> {
+        if pending_local {
+            return Ok(Some(true));
+        }
+        match self.startup_head() {
+            Ok(head) => Ok(Some(head.is_some())),
+            Err(error) if crate::store::transient_storage_contention(&error) => {
+                *self.recovery_retry_after.lock().unwrap() =
+                    Some(Instant::now() + Duration::from_millis(250));
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     fn queue_tick(self: &Arc<Self>) -> anyhow::Result<()> {
-        if self.checkout_runtime_stopped.load(Ordering::Acquire) {
+        if self.retired() {
             return Ok(());
         }
         #[cfg(test)]
@@ -1180,21 +1214,23 @@ impl DaemonState {
         let _stream = self.native_stream.lock().unwrap();
         #[cfg(test)]
         self.test_queue_current_phase.store(1, Ordering::Release);
-        if self.checkout_runtime_stopped.load(Ordering::Acquire) {
+        if self.retired() {
             return Ok(());
         }
         #[cfg(test)]
         self.test_queue_after_stream.run();
         // A lost captured root has no claim or publication authority. Resolve
-        // its accepted queue rows before releasing local scheduler resources.
+        // its accepted queue rows before releasing local scheduler resources;
+        // until that COMMIT is confirmed the runtime keeps them and makes no
+        // other progress.
         if self.store.root_path_replaced()? {
             self.store.fail_changed_root_requests()?;
-            self.replace_serving_session(None);
+            self.set_runtime_state(RuntimeState::RootLost);
             return Ok(());
         }
         // A previously serving writer cannot claim against a damaged index.
-        // Retire its local work before the protected exceptional H path runs.
-        if self.store.is_recreate_pending() {
+        // Retire its local work; startup reconciliation recreates it.
+        if self.store.is_recreate_pending() && self.runtime.lock().unwrap().session().is_some() {
             self.replace_serving_session(None);
         }
         if self
@@ -1226,90 +1262,17 @@ impl DaemonState {
         drop(pending);
         #[cfg(test)]
         self.test_queue_after_pending_snapshot.run();
-        let retry_h = self.idle_h_retry.load(Ordering::Acquire);
-        let durable_pending = if !pending_local && !retry_h {
-            self.store.earliest_unfinished_request()?.is_some()
-        } else {
-            false
-        };
-        if self.serving_session.lock().unwrap().is_none() {
-            if !pending_local
-                && !durable_pending
-                && !retry_h
-                && !self.store.is_root_replaced()
-                && !self.store.is_recreate_pending()
-            {
+        // Startup reconciliation is the worker's first item: FIFO waits for it.
+        if self.runtime.lock().unwrap().session().is_none() {
+            if !self.startup_due(|| self.durable_work_pending(pending_local))? {
                 return Ok(());
             }
-            #[cfg(test)]
-            let head = if self
-                .test_activation_head_busy_once
-                .swap(false, Ordering::AcqRel)
-            {
-                Err(crate::store::topology::StorageBusy.into())
-            } else {
-                self.store.earliest_unfinished_request()
-            };
-            #[cfg(not(test))]
-            let head = self.store.earliest_unfinished_request();
-            let head_options = match head {
-                Ok(head) => head
-                    .map(|head| head.options(std::path::Path::new(self.store.workspace_root())))
-                    .transpose()?,
-                Err(error) => {
-                    if crate::store::transient_storage_contention(&error) {
-                        *self.recovery_retry_after.lock().unwrap() =
-                            Some(Instant::now() + Duration::from_millis(250));
-                        return Ok(());
-                    }
-                    return Err(error);
-                }
-            };
-            // An index requiring exceptional recreation has no trusted
-            // recorded options. Without a verified FIFO head, daemon defaults
-            // cannot establish the missing request's provenance.
-            if self.store.is_recreate_pending()
-                && !self.store.is_root_replaced()
-                && head_options.is_none()
-            {
-                *self.recovery_retry_after.lock().unwrap() =
-                    Some(Instant::now() + Duration::from_millis(500));
-                anyhow::bail!("recovery_required: no accepted index options for exceptional H");
-            }
-            let recorded = if self.store.is_recreate_pending() {
-                None
-            } else {
-                self.store.recorded_index_options()?
-            };
-            let selected_options = recorded
-                .or(head_options)
-                .unwrap_or_else(|| self.options.clone());
-            #[cfg(feature = "test-support")]
-            if let Some(hook) = self.checkout_h_hook.lock().unwrap().take() {
-                hook();
-            }
-            match crate::index_coordinator::establish_serving_session(
-                &self.store,
-                Some(&selected_options),
-                &Arc::new(AtomicBool::new(false)),
-            ) {
-                Ok(session) => {
-                    self.replace_serving_session(Some(session));
-                    self.idle_h_retry.store(false, Ordering::Release);
-                    *self.recovery_retry_after.lock().unwrap() = None;
-                }
-                Err(error) => {
-                    let busy = crate::store::transient_storage_contention(&error);
-                    *self.recovery_retry_after.lock().unwrap() =
-                        Some(Instant::now() + Duration::from_millis(if busy { 250 } else { 500 }));
-                    if busy {
-                        return Ok(());
-                    }
-                    return Err(error);
-                }
+            self.run_startup_reconciliation()?;
+            if self.runtime.lock().unwrap().session().is_none() {
+                return Ok(());
             }
         }
-        let retained = self.serving_session.lock().unwrap().clone();
+        let retained = self.runtime.lock().unwrap().session().cloned();
         if let Some(ref session) = retained
             && session.verify().is_ok()
         {
@@ -1433,10 +1396,11 @@ impl DaemonState {
     pub fn retained_serving_session(
         &self,
     ) -> anyhow::Result<Arc<crate::store::topology::WriterSession>> {
-        self.serving_session
+        self.runtime
             .lock()
             .unwrap()
-            .clone()
+            .session()
+            .cloned()
             .context("index_not_ready: no verified daemon serving session")
     }
 
@@ -2670,13 +2634,6 @@ async fn status(
 struct IndexRequest {
     expected_revision: Option<IndexPin>,
 }
-fn now() -> String {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .to_string()
-}
 impl From<crate::store::requests::Request> for IndexJob {
     fn from(row: crate::store::requests::Request) -> Self {
         let error = row
@@ -2726,189 +2683,6 @@ async fn start_index(
     *s.recovery_retry_after.lock().unwrap() = None;
     s.start_queue_tick();
     Ok((StatusCode::ACCEPTED, Json(job)))
-}
-// Exceptional recovery has no decodable prior pin. Reserve the only job and detach
-// any old daemon owner atomically, then drop that owner before the worker tries EX.
-// An unrelated protected reader remains in control of BUSY; no retry is implicit.
-#[allow(dead_code)]
-fn start_exceptional_index(s: Arc<DaemonState>) -> Result<(StatusCode, Json<IndexJob>), ApiError> {
-    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
-    let job = IndexJob {
-        id: uuid::Uuid::new_v4().to_string(),
-        state: "running".into(),
-        progress: IndexProgress::default(),
-        revision: None,
-        error: None,
-        submitted_at: now(),
-        started_at: Some(now()),
-        finished_at: None,
-    };
-    let old_owner = {
-        let mut jobs = s.jobs.lock().unwrap();
-        if jobs
-            .current
-            .as_ref()
-            .and_then(|id| jobs.jobs.get(id))
-            .is_some_and(|j| j.finished_at.is_none())
-        {
-            return Err(ApiError(
-                StatusCode::CONFLICT,
-                "job_active",
-                "An index job is already active",
-            ));
-        }
-        if !s.store.is_recreate_pending() {
-            return Err(ApiError(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "index_not_ready",
-                "Exceptional recovery disposition changed; retry explicit indexing",
-            ));
-        }
-        // All admission paths touching both locks use jobs -> serving_session.
-        let old_owner = s.serving_session.lock().unwrap().take();
-        jobs.current = Some(job.id.clone());
-        jobs.cancel = cancel.clone();
-        jobs.jobs.insert(job.id.clone(), job.clone());
-        old_owner
-    };
-    drop(old_owner);
-    let id = job.id.clone();
-    tokio::spawn(async move {
-        let worker = s.clone();
-        let worker_id = id.clone();
-        let worker_cancel = cancel.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            crate::index_coordinator::reconcile_workspace(
-                &worker.store,
-                &worker.options,
-                &worker_cancel,
-                |p| {
-                    if let Some(j) = worker.jobs.lock().unwrap().jobs.get_mut(&worker_id) {
-                        j.progress = p;
-                    }
-                },
-            )
-        })
-        .await;
-        let outcome = match result {
-            Ok(result) => result,
-            Err(_) => Err(anyhow::anyhow!("index worker failed")),
-        };
-        finish_exceptional_index_job(&s, &id, outcome, &cancel, |_| {});
-    });
-    Ok((StatusCode::ACCEPTED, Json(job)))
-}
-
-// A successful worker keeps its writer guard inside the returned Arc even across
-// spawn_blocking handoff. Validation and any test barrier run while that Arc lives.
-// Install it before completing the job; never publish a success without an owner.
-#[allow(dead_code)]
-fn finish_exceptional_index_job(
-    s: &Arc<DaemonState>,
-    id: &str,
-    result: anyhow::Result<(IndexPin, Arc<crate::store::topology::WriterSession>)>,
-    cancel: &CancelFlag,
-    before_install: impl FnOnce(&Arc<crate::store::topology::WriterSession>),
-) {
-    let result = result.and_then(|(pin, session)| {
-        s.store.verify_writer_session(&session)?;
-        anyhow::ensure!(
-            s.store.status()?.revision == pin,
-            "revision conflict: exceptional recovery pin changed before owner installation"
-        );
-        before_install(&session);
-        s.store.verify_writer_session(&session)?;
-        Ok((pin, session))
-    });
-    let mut abandoned = None;
-    let mut jobs = s.jobs.lock().unwrap();
-    let mut serving = s.serving_session.lock().unwrap();
-    let job = jobs
-        .jobs
-        .get_mut(id)
-        .expect("started exceptional index job");
-    let published = match result {
-        Ok((_pin, session)) if serving.is_some() => {
-            abandoned = Some(session);
-            job.state = "failed".into();
-            job.error = Some(json!({"code":"index_failed","message":"Index job failed"}));
-            false
-        }
-        Ok((pin, session)) => {
-            // A late cancellation cannot undo durable activation. Retain the
-            // verified owner and report the committed revision as completed.
-            *serving = Some(session);
-            job.revision = Some(pin);
-            job.state = "done".into();
-            true
-        }
-        Err(error) if cancel.load(Ordering::Acquire) => {
-            let _ = error;
-            job.state = "failed".into();
-            job.error = Some(json!({"code":"index_failed","message":"Index job failed"}));
-            false
-        }
-        Err(error) => {
-            job.state = "failed".into();
-            let code = if error.to_string().starts_with("revision conflict") {
-                "revision_conflict"
-            } else if error.to_string().starts_with("storage_busy") {
-                "storage_busy"
-            } else {
-                "index_failed"
-            };
-            job.error = Some(json!({"code":code,"message":"Index job failed"}));
-            false
-        }
-    };
-    job.finished_at = Some(now());
-    drop(serving);
-    drop(jobs);
-    drop(abandoned);
-    if published {
-        *s.packets.lock().unwrap() = PacketCache::default();
-        s.start_dependency_index();
-        s.start_queue_tick();
-    }
-}
-
-// A failed publication cannot release cached packet ownership. Only a committed
-// revision transition clears packets; old barriers still block their public reads.
-#[allow(dead_code)]
-fn finish_index_job(
-    s: &Arc<DaemonState>,
-    id: &str,
-    result: anyhow::Result<IndexPin>,
-    cancel: &CancelFlag,
-) {
-    let mut jobs = s.jobs.lock().unwrap();
-    let job = jobs.jobs.get_mut(id).expect("started index job");
-    match result {
-        Ok(revision) => {
-            job.state = "completed".into();
-            job.revision = Some(revision);
-        }
-        Err(error) if cancel.load(Ordering::Acquire) => {
-            let _ = error;
-            job.state = "cancelled".into();
-        }
-        Err(error) => {
-            job.state = "failed".into();
-            let code = if error.to_string().starts_with("revision conflict") {
-                "revision_conflict"
-            } else {
-                "index_failed"
-            };
-            job.error = Some(json!({"code":code,"message":"Index job failed"}));
-        }
-    }
-    job.finished_at = Some(now());
-    let completed = job.state == "completed";
-    drop(jobs);
-    if completed {
-        *s.packets.lock().unwrap() = PacketCache::default();
-        s.start_dependency_index();
-    }
 }
 // The exceptional index-only recovery worker predates requests.db. Until the
 // root/recovery slice moves it into the queue, its current ID remains readable
@@ -4473,7 +4247,7 @@ mod serving_holder_tests {
             "typed FIFO head-read BUSY must schedule the 250ms retry"
         );
         assert!(
-            state.serving_session.lock().unwrap().is_none(),
+            state.runtime.lock().unwrap().session().is_none(),
             "H must not start with unknown head"
         );
         assert_eq!(store.index_baseline().unwrap(), old_pin);
@@ -4936,9 +4710,12 @@ mod serving_holder_tests {
         // partially committed selected revision.
         follower_store.fail_next_live_publish_commit_typed_busy();
         drop(owner);
-        // An explicit idle reconciliation intent admits a local writer even
-        // without a queued request; a bare timer tick has no reason to start H.
-        state.idle_h_retry.store(true, Ordering::Release);
+        // A due startup reconciliation admits a local writer even without a
+        // queued request; a bare timer tick has no reason to start one.
+        *state.runtime.lock().unwrap() = RuntimeState::Reconciling {
+            attempts: 0,
+            waiting: false,
+        };
         // Typed pre-COMMIT contention is deferred with a 250ms deadline;
         // inspect the scheduled bound before diagnostic reads can outlast it.
         let retry_started = Instant::now();
@@ -4969,10 +4746,10 @@ mod serving_holder_tests {
         assert!(selected.index_revision > old_pin.index_revision);
         assert!(
             state
-                .serving_session
+                .runtime
                 .lock()
                 .unwrap()
-                .as_ref()
+                .session()
                 .unwrap()
                 .verify()
                 .is_ok()
@@ -5216,7 +4993,7 @@ mod exceptional_recovery_tests {
                 .unwrap()
                 .is_some_and(|at| { at >= started && at <= finished + Duration::from_millis(500) })
         );
-        assert!(state.serving_session.lock().unwrap().is_none());
+        assert!(state.runtime.lock().unwrap().session().is_none());
         assert!(store.current_request().unwrap().is_none());
         assert_eq!(std::fs::read(index).unwrap(), damaged);
     }
@@ -5549,7 +5326,7 @@ mod exceptional_recovery_tests {
         .unwrap();
         // Own the old serving SH without starting the periodic timer. Drive the
         // exact empty-snapshot race with one explicitly paused tick instead.
-        *state.serving_session.lock().unwrap() = Some(old_owner);
+        *state.runtime.lock().unwrap() = RuntimeState::Ready(old_owner);
         let reader = roots.index_use_existing(&identity).unwrap();
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -6284,127 +6061,6 @@ mod exceptional_recovery_tests {
         .unwrap();
         assert_eq!(store.request_by_id(&a.id).unwrap().unwrap().state, "done");
         assert_eq!(store.request_by_id(&b.id).unwrap().unwrap().state, "done");
-    }
-
-    #[tokio::test]
-    async fn writer_session_is_valid_across_worker_result_and_atomic_install() {
-        let (_tmp, store, state, _roots, _identity) = fixture();
-        let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
-        let options = state.options.clone();
-        let id = uuid::Uuid::new_v4().to_string();
-        {
-            let mut jobs = state.jobs.lock().unwrap();
-            jobs.current = Some(id.clone());
-            jobs.cancel = cancel.clone();
-            jobs.jobs.insert(
-                id.clone(),
-                IndexJob {
-                    id: id.clone(),
-                    state: "running".into(),
-                    progress: IndexProgress::default(),
-                    revision: None,
-                    error: None,
-                    submitted_at: now(),
-                    started_at: Some(now()),
-                    finished_at: None,
-                },
-            );
-        }
-        let result =
-            crate::index_coordinator::reconcile_workspace(&store, &options, &cancel, |_| {})
-                .unwrap();
-        let pin = result.0;
-        let before = &state;
-        finish_exceptional_index_job(&state, &id, Ok(result), &cancel, |session| {
-            assert!(session.verify().is_ok());
-            assert!(before.retained_serving_session().is_err());
-            store.verify_writer_session(session).unwrap();
-            assert_eq!(store.status().unwrap().revision, pin);
-        });
-        assert_eq!(state.jobs.lock().unwrap().jobs[&id].state, "done");
-        assert_eq!(state.jobs.lock().unwrap().jobs[&id].revision, Some(pin));
-        assert!(state.retained_serving_session().unwrap().verify().is_ok());
-        store
-            .verify_writer_session(&state.retained_serving_session().unwrap())
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn cancellation_after_durable_recovery_reports_completed_with_new_owner() {
-        let (_tmp, store, state, _roots, _identity) = fixture();
-        let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
-        let id = uuid::Uuid::new_v4().to_string();
-        {
-            let mut jobs = state.jobs.lock().unwrap();
-            jobs.current = Some(id.clone());
-            jobs.cancel = cancel.clone();
-            jobs.jobs.insert(
-                id.clone(),
-                IndexJob {
-                    id: id.clone(),
-                    state: "running".into(),
-                    progress: IndexProgress::default(),
-                    revision: None,
-                    error: None,
-                    submitted_at: now(),
-                    started_at: Some(now()),
-                    finished_at: None,
-                },
-            );
-        }
-        let result =
-            crate::index_coordinator::reconcile_workspace(&store, &state.options, &cancel, |_| {})
-                .unwrap();
-        let pin = result.0;
-        cancel.store(true, Ordering::Release);
-        finish_exceptional_index_job(&state, &id, Ok(result), &cancel, |_| {});
-        let job = state.jobs.lock().unwrap().jobs[&id].clone();
-        assert_eq!(job.state, "done");
-        assert_eq!(job.revision, Some(pin));
-        assert!(state.retained_serving_session().unwrap().verify().is_ok());
-        assert_eq!(store.status().unwrap().revision, pin);
-        store
-            .verify_writer_session(&state.retained_serving_session().unwrap())
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn failed_worker_never_installs_owner_or_reports_completed() {
-        let (_tmp, store, state, roots, identity) = fixture();
-        let before = std::fs::read(roots.index_db(&identity)).unwrap();
-        let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
-        let id = uuid::Uuid::new_v4().to_string();
-        {
-            let mut jobs = state.jobs.lock().unwrap();
-            jobs.current = Some(id.clone());
-            jobs.jobs.insert(
-                id.clone(),
-                IndexJob {
-                    id: id.clone(),
-                    state: "running".into(),
-                    progress: IndexProgress::default(),
-                    revision: None,
-                    error: None,
-                    submitted_at: now(),
-                    started_at: Some(now()),
-                    finished_at: None,
-                },
-            );
-        }
-        // The Store's own fault tests cover actual post-rename failures. Here
-        // exercise the HTTP handoff for their error result: no false success.
-        finish_exceptional_index_job(
-            &state,
-            &id,
-            Err(anyhow::anyhow!("after rename fsync failed")),
-            &cancel,
-            |_| panic!("failed worker cannot cross install barrier"),
-        );
-        assert_eq!(state.jobs.lock().unwrap().jobs[&id].state, "failed");
-        assert!(state.jobs.lock().unwrap().jobs[&id].revision.is_none());
-        assert!(state.retained_serving_session().is_err());
-        assert!(store.evidence_response().is_err());
-        assert_eq!(std::fs::read(roots.index_db(&identity)).unwrap(), before);
     }
 }
 

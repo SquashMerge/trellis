@@ -3187,7 +3187,7 @@ async fn describe_serves_valid_prior_head_while_mandatory_h_is_paused() {
     let (entered_tx, entered_rx) = mpsc::sync_channel(1);
     let (resume_tx, resume_rx) = mpsc::sync_channel(1);
     let resume_rx = std::sync::Mutex::new(resume_rx);
-    resumed.set_pre_h_hook_for_tests(std::sync::Arc::new(move || {
+    resumed.set_startup_hook_for_tests(std::sync::Arc::new(move || {
         entered_tx.send(()).unwrap();
         resume_rx
             .lock()
@@ -3271,7 +3271,7 @@ async fn describe_cold_initial_h_reports_indexing_without_prior_coverage() {
     let (entered_tx, entered_rx) = mpsc::sync_channel(1);
     let (resume_tx, resume_rx) = mpsc::sync_channel(1);
     let resume_rx = std::sync::Mutex::new(resume_rx);
-    runtime.set_pre_h_hook_for_tests(std::sync::Arc::new(move || {
+    runtime.set_startup_hook_for_tests(std::sync::Arc::new(move || {
         entered_tx.send(()).unwrap();
         resume_rx
             .lock()
@@ -3399,7 +3399,7 @@ async fn describe_counts_persisted_selected_and_unselected_native_coverage() {
     let (resume_tx, resume_rx) = mpsc::sync_channel(1);
     let resume_rx = std::sync::Mutex::new(resume_rx);
     // Current-thread Tokio cannot poll spawned H before this synchronous hook setup.
-    runtime.set_pre_h_hook_for_tests(std::sync::Arc::new(move || {
+    runtime.set_startup_hook_for_tests(std::sync::Arc::new(move || {
         entered_tx.send(()).unwrap();
         resume_rx
             .lock()

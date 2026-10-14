@@ -1983,7 +1983,7 @@ async fn cold_selected_native_read_is_not_ready_without_a_fabricated_basis() {
             .browser_request_at(&identity, std::time::Instant::now())
             .unwrap();
         let runtime = registry.activate(&identity.root_key).unwrap();
-        runtime.set_pre_h_hook_for_tests(Arc::new(move || {
+        runtime.set_startup_hook_for_tests(Arc::new(move || {
             entered_tx.send(()).unwrap();
             resume_rx.lock().unwrap().recv().unwrap();
         }));
@@ -2147,7 +2147,7 @@ async fn selected_status_serves_validated_pre_h_head_and_clears_freshness_after_
             .browser_request_at(&identity, std::time::Instant::now())
             .unwrap();
         let runtime = registry.activate(&identity.root_key).unwrap();
-        runtime.set_pre_h_hook_for_tests(Arc::new(move || {
+        runtime.set_startup_hook_for_tests(Arc::new(move || {
             entered_tx.send(()).unwrap();
             resume_rx.lock().unwrap().recv().unwrap();
         }));
@@ -3252,7 +3252,7 @@ async fn selected_reads_validated_predecessor_through_owner_handoff() {
     let release_rx = Mutex::new(release_rx);
     // Activation schedules reconciliation on Tokio. Set the hook before the
     // first await so this runtime pauses before its mandatory local H.
-    runtime.set_pre_h_hook_for_tests(Arc::new(move || {
+    runtime.set_startup_hook_for_tests(Arc::new(move || {
         entered_tx.send(()).unwrap();
         release_rx.lock().unwrap().recv().unwrap();
     }));

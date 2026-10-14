@@ -44,13 +44,13 @@ No handler, registry operation or test path publishes, claims or reconciles outs
 
 `Activating → Reconciling{attempt} → Ready(session) → RetireRequested{cutoff} → Closing → Retired`
 
-`RootLost{settled}` is reachable from `Reconciling`, `Ready` and `RetireRequested`.
+`RootLost` is reachable from `Reconciling`, `Ready` and `RetireRequested`.
 
 **Readers in each state:**
 
 | State | Reads | New work |
 | --- | --- | --- |
-| `Activating` | `index_not_ready` until the queue is open | Enqueue accepted durably; claimed only after startup reconciliation |
+| `Activating` | `index_not_ready` until the queue is open | Enqueue accepted durably; claimed only after startup reconciliation. A daemon runtime leaves this state at activation. A standalone test scheduler, which has no registry, starts startup reconciliation when work is accepted |
 | `Reconciling` | Last validated head, `catchingUp:true`; `index_not_ready` if there is none | Enqueued; FIFO held |
 | `Ready` | Current validated head | Claimed in FIFO order |
 | `RetireRequested` | Last validated head | Reattach, a new read lease, or an enqueue cancels the retirement (§5) |
@@ -69,9 +69,8 @@ No handler, registry operation or test path publishes, claims or reconciles outs
 | `RetireRequested → Ready` | registry or enqueue gate | Reattach, a new read lease, or an enqueue; atomic under the state lock (§5) |
 | `RetireRequested → Closing` | worker | Linearization point: the cutoff work is done and irreversible close begins |
 | `Closing → Retired` | worker | Watcher, session, SQLite witnesses and use locks closed |
-| `Reconciling`/`Ready`/`RetireRequested` → `RootLost{settled:false}` | worker | The root is missing, or the path now has a different `(device, inode)` |
-| `RootLost{false} → RootLost{true}` | worker | The old-root settlement COMMIT is confirmed. After an ambiguous outcome (busy, I/O error at COMMIT), the worker re-reads the queue until the terminal rows are confirmed, and makes no other progress meanwhile |
-| `RootLost{true} → Closing` | worker | Immediately after settlement |
+| `Reconciling`/`Ready`/`RetireRequested` → `RootLost` | worker | The root is missing, or the path now has a different `(device, inode)`, **and** the old-root settlement COMMIT is confirmed. Until then the runtime stays in its state, keeps its session and watcher, and makes no other progress. Its reads already fail `root_changed` at the root check. After an ambiguous outcome (busy, I/O error at COMMIT), the worker retries settlement at each boundary until a re-read confirms the terminal rows |
+| `RootLost → Closing` | worker | Immediately after settlement |
 | `Retired` → removed | registry | On the worker's `Retired` event |
 
 **Recovery from a live root replacement** (Decision 0008 §3) completes through a **fresh runtime**. The old runtime settles its old-root requests, then closes. The next attach or durable enqueue for the path activates the replacement root as a new runtime. That runtime repeats Decision 0008 §3 from the queue open: settle any remaining foreign-root rows, run startup reconciliation, then claim FIFO. A runtime is never re-pointed at a different root.

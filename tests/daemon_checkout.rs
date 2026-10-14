@@ -164,7 +164,7 @@ async fn reattach_reports_catching_up_and_keeps_complete_head_until_h() {
     let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
     let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
     let resume_rx = std::sync::Mutex::new(resume_rx);
-    resumed.set_pre_h_hook_for_tests(std::sync::Arc::new(move || {
+    resumed.set_startup_hook_for_tests(std::sync::Arc::new(move || {
         entered_tx.send(()).unwrap();
         resume_rx.lock().unwrap().recv().unwrap();
     }));
@@ -214,7 +214,7 @@ async fn cli_symbols_and_export_use_the_admitted_prior_head_during_h() {
     let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
     let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
     let resume_rx = std::sync::Mutex::new(resume_rx);
-    resumed.set_pre_h_hook_for_tests(std::sync::Arc::new(move || {
+    resumed.set_startup_hook_for_tests(std::sync::Arc::new(move || {
         entered_tx.send(()).unwrap();
         resume_rx.lock().unwrap().recv().unwrap();
     }));
@@ -333,7 +333,7 @@ async fn replacement_settles_old_queue_before_h_then_claims_distinct_fifo_option
     let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
     let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
     let resume_rx = std::sync::Mutex::new(resume_rx);
-    runtime.set_pre_h_hook_for_tests(std::sync::Arc::new(move || {
+    runtime.set_startup_hook_for_tests(std::sync::Arc::new(move || {
         entered_tx.send(()).unwrap();
         resume_rx.lock().unwrap().recv().unwrap();
     }));
@@ -476,7 +476,7 @@ async fn ambiguous_root_settlement_blocks_h_and_fifo_until_queue_reread() {
     registry.attach_launch(1, &new_id).unwrap();
     let runtime = registry.activate(&new_id.root_key).unwrap();
     let (h_tx, h_rx) = std::sync::mpsc::sync_channel(1);
-    runtime.set_pre_h_hook_for_tests(std::sync::Arc::new(move || {
+    runtime.set_startup_hook_for_tests(std::sync::Arc::new(move || {
         h_tx.send(()).unwrap();
     }));
     tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
@@ -738,7 +738,7 @@ async fn root_loss_during_paused_reattach_h_waits_for_worker_then_releases() {
     let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
     let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
     let resume_rx = std::sync::Mutex::new(resume_rx);
-    paused.set_pre_h_hook_for_tests(std::sync::Arc::new(move || {
+    paused.set_startup_hook_for_tests(std::sync::Arc::new(move || {
         entered_tx.send(()).unwrap();
         resume_rx.lock().unwrap().recv().unwrap();
     }));
@@ -892,7 +892,7 @@ async fn failed_h_backs_off_and_empty_idle_checkout_can_release() {
     let mut registry = CheckoutRegistry::with_roots(roots(base.path()));
     registry.attach_launch(1, &id).unwrap();
     let runtime = registry.activate(&id.root_key).unwrap();
-    runtime.set_pre_h_hook_for_tests(std::sync::Arc::new(|| panic!("injected H failure")));
+    runtime.set_startup_hook_for_tests(std::sync::Arc::new(|| panic!("injected H failure")));
     tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         while runtime.reconciliation_error().is_none() {
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -926,7 +926,7 @@ async fn failed_h_backoff_never_releases_accepted_fifo_work() {
     let mut registry = CheckoutRegistry::with_roots(topology);
     registry.attach_launch(1, &id).unwrap();
     let runtime = registry.activate(&id.root_key).unwrap();
-    runtime.set_pre_h_hook_for_tests(std::sync::Arc::new(|| panic!("injected queued H failure")));
+    runtime.set_startup_hook_for_tests(std::sync::Arc::new(|| panic!("injected queued H failure")));
     tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         while runtime.reconciliation_error().is_none() || !runtime.retry_waiting_for_tests() {
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -1517,4 +1517,66 @@ async fn serve_waits_for_idle_cli_read_before_registering_and_reconciling() {
     let (_, source) = selected.source_at("a.js", None).unwrap().unwrap();
     assert!(source.text.contains("admitted"));
     selected.finish(()).unwrap();
+}
+
+/// Inventory item 6 (Decision 0009 §1): the worker is the only owner of startup
+/// reconciliation. Work accepted while it is paused waits for it and never
+/// starts a second reconciliation.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn work_accepted_during_startup_reconciliation_never_starts_a_second_one() {
+    let base = tempfile::tempdir().unwrap();
+    let checkout = base.path().join("work");
+    fs::create_dir(&checkout).unwrap();
+    fs::write(checkout.join("a.js"), "function first() {}\n").unwrap();
+    let id = identity(&checkout);
+    let mut registry = CheckoutRegistry::with_roots(roots(base.path()));
+    registry.attach_launch(1, &id).unwrap();
+    let runtime = registry.activate(&id.root_key).unwrap();
+    let scheduler = runtime.browser_scheduler().unwrap();
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let resume_rx = std::sync::Mutex::new(resume_rx);
+    runtime.set_startup_hook_for_tests(std::sync::Arc::new(move || {
+        entered_tx.send(()).unwrap();
+        // A dropped sender (test failure) ends the hold; it never times out.
+        let _ = resume_rx.lock().unwrap().recv();
+    }));
+    let entered = tokio::task::spawn_blocking(move || entered_rx.recv());
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, entered)
+        .await
+        .expect("startup reconciliation did not reach its hook")
+        .unwrap()
+        .unwrap();
+    // Accept explicit work while startup reconciliation is held.
+    let indexer = runtime.clone();
+    let options = trellis::indexer::IndexOptions::new(checkout.clone());
+    let index = tokio::task::spawn_blocking(move || indexer.cli_index(&options));
+    let queued = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        loop {
+            if let Ok(Some(row)) = Store::open(roots(base.path()), identity(&checkout))
+                .unwrap()
+                .current_request()
+            {
+                break row;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("index request was not accepted");
+    assert_eq!(queued.state, "queued", "no claim before startup commits");
+    assert_eq!(scheduler.startup_captures_for_tests(), 0);
+    resume_tx.send(()).unwrap();
+    let answer = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, index)
+        .await
+        .expect("index request did not complete")
+        .unwrap()
+        .unwrap();
+    assert!(answer["publishedRevision"].is_object());
+    assert_eq!(
+        scheduler.startup_captures_for_tests(),
+        1,
+        "exactly one startup reconciliation ran"
+    );
 }

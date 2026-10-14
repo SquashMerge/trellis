@@ -504,7 +504,7 @@ async fn invalid_prior_head_does_not_pin_idle_resources_or_skip_reattach_h() {
     let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
     let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
     let resume_rx = std::sync::Mutex::new(resume_rx);
-    resumed.set_pre_h_hook_for_tests(std::sync::Arc::new(move || {
+    resumed.set_startup_hook_for_tests(std::sync::Arc::new(move || {
         entered_tx.send(()).unwrap();
         resume_rx.lock().unwrap().recv().unwrap();
     }));
@@ -591,7 +591,7 @@ async fn active_writer_and_protected_reader_overlap_orphan_idle_scan() {
     let (h_entered_tx, h_entered_rx) = std::sync::mpsc::sync_channel(1);
     let (h_resume_tx, h_resume_rx) = std::sync::mpsc::sync_channel(1);
     let h_resume_rx = std::sync::Mutex::new(h_resume_rx);
-    runtime.set_pre_h_hook_for_tests(std::sync::Arc::new(move || {
+    runtime.set_startup_hook_for_tests(std::sync::Arc::new(move || {
         h_entered_tx.send(()).unwrap();
         h_resume_rx.lock().unwrap().recv().unwrap();
     }));
