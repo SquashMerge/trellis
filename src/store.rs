@@ -59,11 +59,14 @@ impl RetentionClock {
 }
 
 // A single process/root gate serializes maintenance with the entire publication
-// lifetime, including terminal ACK. Independent Store instances share the gate.
-#[derive(Debug, Default)]
+// lifetime, including terminal ACK. Independent Store instances share the gate,
+// and through it the queue's in-process signals (Decision 0009 §8).
+#[derive(Default)]
 struct PublicationGate {
     state: Mutex<GateState>,
     changed: Condvar,
+    /// Checkout workers to wake after any Store instance commits an enqueue.
+    queue_wakers: Mutex<Vec<std::sync::Weak<dyn Fn() + Send + Sync>>>,
     #[cfg(feature = "test-support")]
     test_ambiguous_settlement_once: AtomicBool,
     #[cfg(feature = "test-support")]
@@ -80,6 +83,23 @@ pub enum PublicationWaitReason {
     None,
     Maintenance,
     Publisher,
+}
+impl std::fmt::Debug for PublicationGate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PublicationGate").finish_non_exhaustive()
+    }
+}
+impl PublicationGate {
+    fn wake_queue(&self) {
+        let wakers: Vec<_> = {
+            let mut wakers = self.queue_wakers.lock().unwrap();
+            wakers.retain(|waker| waker.strong_count() > 0);
+            wakers.iter().filter_map(std::sync::Weak::upgrade).collect()
+        };
+        for wake in wakers {
+            wake();
+        }
+    }
 }
 #[must_use]
 #[derive(Debug)]
@@ -5034,6 +5054,20 @@ fn native_index_unavailable(error: &anyhow::Error) -> bool {
     error.downcast_ref::<topology::IndexNotReady>().is_some()
 }
 impl Store {
+    /// Wake `waker` after every enqueue COMMIT on this checkout's queue, by any
+    /// Store instance in this process. Held weakly: dropping it unregisters.
+    pub fn register_queue_waker(&self, waker: &Arc<dyn Fn() + Send + Sync>) {
+        self.publication_gate
+            .queue_wakers
+            .lock()
+            .unwrap()
+            .push(Arc::downgrade(waker));
+    }
+
+    pub(crate) fn wake_queue_workers(&self) {
+        self.publication_gate.wake_queue();
+    }
+
     /// The waiting count is registered before waiting, giving new publications
     /// priority over the next maintenance unit. The permit is owned across ACK.
     pub fn enter_publication(

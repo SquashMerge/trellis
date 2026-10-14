@@ -72,12 +72,6 @@ impl DaemonState {
         RuntimePhase::of(&self.runtime.lock().unwrap())
     }
 
-    /// Run `f` under the runtime state lock. Registry admission (read leases,
-    /// enqueue, release) linearizes with the worker's transitions here.
-    pub(crate) fn with_runtime_state<T>(&self, f: impl FnOnce(&mut RuntimeState) -> T) -> T {
-        f(&mut self.runtime.lock().unwrap())
-    }
-
     /// Begin mandatory startup reconciliation for a daemon checkout runtime.
     /// `explicit` registered options override the recorded index inputs.
     pub(crate) fn begin_startup_reconciliation(self: &Arc<Self>, explicit: bool) {
@@ -91,7 +85,7 @@ impl DaemonState {
                 };
             }
         }
-        self.start_queue_tick();
+        self.start_worker();
     }
 
     /// Make startup reconciliation due again, as a lost session would.
@@ -107,6 +101,30 @@ impl DaemonState {
     #[doc(hidden)]
     pub fn startup_captures_for_tests(&self) -> u64 {
         self.startup_captures.load(Ordering::Acquire)
+    }
+
+    /// Push the current watcher's periodic inventory out of reach (see
+    /// `WatcherWork::delay_periodic_inventory_for_tests`). False without a watcher.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn delay_periodic_inventory_for_tests(&self) -> bool {
+        let mut work = self.watcher_work.lock().unwrap();
+        let Some((_, watcher)) = work.as_mut() else {
+            return false;
+        };
+        watcher.delay_periodic_inventory_for_tests();
+        drop(work);
+        // Make the worker recompute its sleep deadline from the delayed inventory.
+        self.inbox.wake();
+        true
+    }
+
+    /// The worker's deadline while it is blocked with no wake pending
+    /// (`Some(None)`: no deadline); `None` while it is running a step.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn worker_asleep_until_for_tests(&self) -> Option<Option<Instant>> {
+        *self.inbox.asleep.lock().unwrap()
     }
 
     pub fn startup_error(&self) -> Option<String> {
@@ -233,6 +251,7 @@ impl DaemonState {
                 *self.startup_error.lock().unwrap() = None;
                 *self.startup_backoff.lock().unwrap() = STARTUP_BACKOFF_FIRST;
                 *self.recovery_retry_after.lock().unwrap() = None;
+                self.step_progress.store(true, Ordering::Release);
                 Ok(())
             }
             Err(error) => {
@@ -261,5 +280,230 @@ impl DaemonState {
                 }
             }
         }
+    }
+}
+
+/// The worker's inbox (Decision 0009 §8): a sticky wake flag under a condition
+/// variable. Setting it cannot fail, so wakes coalesce but are never lost; the
+/// worker re-reads durable state after every wake.
+#[derive(Default)]
+pub(super) struct WorkerInbox {
+    wake: std::sync::Mutex<bool>,
+    changed: std::sync::Condvar,
+    shutdown: AtomicBool,
+    /// While the worker is blocked with no wake pending: its deadline.
+    #[cfg(feature = "test-support")]
+    asleep: std::sync::Mutex<Option<Option<Instant>>>,
+}
+
+impl WorkerInbox {
+    pub(super) fn wake(&self) {
+        *self.wake.lock().unwrap() = true;
+        self.changed.notify_one();
+    }
+
+    pub(super) fn shut_down(&self) {
+        self.shutdown.store(true, Ordering::Release);
+        self.wake();
+    }
+
+    /// Block until woken or `deadline` passes (`None`: until woken).
+    fn wait(&self, deadline: Option<Instant>) {
+        let mut woken = self.wake.lock().unwrap();
+        #[cfg(feature = "test-support")]
+        if !*woken {
+            *self.asleep.lock().unwrap() = Some(deadline);
+        }
+        while !*woken && !self.shutdown.load(Ordering::Acquire) {
+            match deadline {
+                None => woken = self.changed.wait(woken).unwrap(),
+                Some(deadline) => {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        break;
+                    }
+                    woken = self.changed.wait_timeout(woken, deadline - now).unwrap().0;
+                }
+            }
+        }
+        #[cfg(feature = "test-support")]
+        {
+            *self.asleep.lock().unwrap() = None;
+        }
+        *woken = false;
+    }
+}
+
+/// What a reader may know about watcher intent without the watcher's lock:
+/// the live ingress generation, the generation last acknowledged by a
+/// verified capture, and any other pending intent the worker computed.
+pub(super) struct WatchStatus {
+    pub(super) generation: Arc<std::sync::atomic::AtomicU64>,
+    pub(super) acknowledged: u64,
+    pub(super) other_intent: bool,
+}
+
+/// A failed or panicked step is retried after this delay.
+const STEP_RETRY: Duration = Duration::from_millis(250);
+
+impl DaemonState {
+    /// Start this checkout's worker thread, or wake it if it is running. A
+    /// synchronous fixture without a Tokio runtime drives `queue_tick` itself.
+    pub(super) fn start_worker(self: &Arc<Self>) {
+        self.start_maintenance_tick();
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        if self.queue_tick_started.swap(true, Ordering::AcqRel) {
+            self.inbox.wake();
+            return;
+        }
+        let weak = Arc::downgrade(self);
+        let inbox = self.inbox.clone();
+        let spawned = std::thread::Builder::new()
+            .name("trellis-checkout-worker".into())
+            .spawn(move || {
+                // Steps start async helpers (dependency indexing) on the daemon runtime.
+                let _runtime = runtime.enter();
+                worker_loop(weak, inbox)
+            });
+        if let Err(error) = spawned {
+            self.queue_tick_started.store(false, Ordering::Release);
+            super::best_effort_queue_stderr(
+                std::io::stderr(),
+                format_args!("checkout worker failed to start: {error}\n"),
+            );
+        }
+    }
+
+    /// When the worker next has work, if nothing wakes it first.
+    fn next_wake(&self) -> Option<Instant> {
+        let now = Instant::now();
+        if self.step_progress.swap(false, Ordering::AcqRel) {
+            return Some(now);
+        }
+        if let Some(retry) = *self.recovery_retry_after.lock().unwrap()
+            && retry > now
+        {
+            return Some(retry);
+        }
+        match &*self.runtime.lock().unwrap() {
+            RuntimeState::Activating | RuntimeState::RootLost | RuntimeState::Retired => {
+                return None;
+            }
+            RuntimeState::Reconciling { .. } => return Some(now),
+            RuntimeState::Ready(_) => {}
+        }
+        // An accepted head that made no progress (and set no deferral) is
+        // retried rather than left until the next inventory.
+        if !matches!(self.store.earliest_unfinished_request(), Ok(None)) {
+            return Some(now + STEP_RETRY);
+        }
+        match &*self.watcher_work.lock().unwrap() {
+            Some((_, watcher)) => Some(watcher.next_due()),
+            None => Some(now),
+        }
+    }
+
+    /// Accept one index request durably and wake the worker. The only enqueue
+    /// path for browser and CLI requests (#138 item 23). A newly accepted
+    /// request starts its own attempt at once, overriding an earlier deferral.
+    pub(crate) fn enqueue_index(
+        &self,
+        options: &IndexOptions,
+        expected: Option<crate::model::IndexPin>,
+    ) -> anyhow::Result<crate::store::requests::Request> {
+        let lease = self.admission_lease()?;
+        let row = self.store.enqueue_request(options, expected)?;
+        drop(lease);
+        self.pending_requests.lock().unwrap().push(row.id.clone());
+        *self.recovery_retry_after.lock().unwrap() = None;
+        self.inbox.wake();
+        Ok(row)
+    }
+
+    /// Take an admission lease unless the runtime is retired. Release declines
+    /// while a lease is held, and both decide under the runtime state lock.
+    pub(crate) fn admission_lease(&self) -> anyhow::Result<AdmissionLease> {
+        let state = self.runtime.lock().unwrap();
+        anyhow::ensure!(
+            !matches!(*state, RuntimeState::Retired),
+            "index_not_ready: checkout released"
+        );
+        self.leases.fetch_add(1, Ordering::AcqRel);
+        Ok(AdmissionLease(self.leases.clone()))
+    }
+
+    pub(crate) fn leases(&self) -> usize {
+        self.leases.load(Ordering::Acquire)
+    }
+
+    /// Publish the watcher's status after the worker changed it.
+    pub(super) fn publish_watch_status(
+        &self,
+        watcher: &crate::index_coordinator::WatcherWork,
+        options: &IndexOptions,
+    ) {
+        *self.watch_status.lock().unwrap() = Some(WatchStatus {
+            generation: watcher.generation_handle(),
+            acknowledged: watcher.acknowledged_generation(),
+            other_intent: watcher.intent_besides_generation(options),
+        });
+    }
+}
+
+/// A read or enqueue admission held against release.
+pub struct AdmissionLease(Arc<std::sync::atomic::AtomicUsize>);
+
+impl AdmissionLease {
+    /// Keep the lease for the life of an evidence response, which releases it.
+    pub(crate) fn into_counter(self) -> Arc<std::sync::atomic::AtomicUsize> {
+        let counter = self.0.clone();
+        std::mem::forget(self);
+        counter
+    }
+}
+
+impl Drop for AdmissionLease {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn worker_loop(weak: std::sync::Weak<DaemonState>, inbox: Arc<WorkerInbox>) {
+    let mut deadline = Some(Instant::now());
+    loop {
+        inbox.wait(deadline);
+        if inbox.shutdown.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(state) = weak.upgrade() else {
+            return;
+        };
+        if matches!(*state.runtime.lock().unwrap(), RuntimeState::Retired) {
+            return;
+        }
+        let step = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| state.queue_tick()));
+        deadline = match step {
+            Ok(Ok(())) => {
+                // The witness reads phase only after the step released its locks.
+                state.report_causal_h_ready();
+                state.next_wake()
+            }
+            Ok(Err(error)) => {
+                super::best_effort_queue_stderr(
+                    std::io::stderr(),
+                    format_args!("queue tick failed: {error:#}\n"),
+                );
+                Some(Instant::now() + STEP_RETRY)
+            }
+            Err(_) => {
+                super::best_effort_queue_stderr(
+                    std::io::stderr(),
+                    format_args!("queue tick worker failed: panicked\n"),
+                );
+                Some(Instant::now() + STEP_RETRY)
+            }
+        };
     }
 }

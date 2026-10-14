@@ -229,6 +229,15 @@ pub struct DaemonState {
     startup_backoff: Mutex<Duration>,
     /// Registered browser options were given explicitly and override recorded inputs.
     explicit_options: AtomicBool,
+    /// The worker's wake inbox, and the waker registered with the queue and watcher.
+    inbox: Arc<worker::WorkerInbox>,
+    queue_waker: Arc<dyn Fn() + Send + Sync>,
+    /// The last step made progress, so more work may be ready at once.
+    step_progress: AtomicBool,
+    /// Published watcher intent; readers never take the watcher's lock.
+    watch_status: Mutex<Option<worker::WatchStatus>>,
+    /// Read and enqueue admission leases held against release.
+    leases: Arc<std::sync::atomic::AtomicUsize>,
     options: IndexOptions,
     browser: crate::file_tree::SourceDir,
     rust_sources: Vec<crate::rust_sources::Root>,
@@ -300,6 +309,13 @@ pub struct DaemonState {
     provider: Option<Arc<LiveJev>>,
     acp: Option<Arc<Acp>>,
 }
+impl Drop for DaemonState {
+    /// A lossless shutdown: an idle worker waiting without a deadline exits.
+    fn drop(&mut self) {
+        self.inbox.shut_down();
+    }
+}
+
 /// Diagnostic logging must never kill the durable queue worker if the
 /// launching parent closed its stderr pipe after the server banner.
 fn best_effort_queue_stderr(mut output: impl std::io::Write, args: std::fmt::Arguments<'_>) {
@@ -399,8 +415,19 @@ pub fn new_with_dependency_options(
     let hosts = vec![address.to_string(), format!("localhost:{}", address.port())];
     #[cfg(feature = "test-support")]
     let origins = hosts.iter().map(|h| format!("http://{h}")).collect();
+    let inbox = Arc::new(worker::WorkerInbox::default());
+    let queue_waker: Arc<dyn Fn() + Send + Sync> = {
+        let inbox = inbox.clone();
+        Arc::new(move || inbox.wake())
+    };
+    store.register_queue_waker(&queue_waker);
     Ok(Arc::new(DaemonState {
         store,
+        inbox,
+        queue_waker,
+        step_progress: AtomicBool::new(false),
+        watch_status: Mutex::new(None),
+        leases: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         runtime: Mutex::new(RuntimeState::Activating),
         startup_error: Mutex::new(None),
         startup_backoff: Mutex::new(STARTUP_BACKOFF_FIRST),
@@ -565,7 +592,7 @@ impl DaemonState {
             let _stream = self.native_stream.lock().unwrap();
             self.replace_serving_session(Some(session));
         }
-        self.start_queue_tick();
+        self.start_worker();
     }
     /// Ask only the disposable watcher inventory to yield for an eligible
     /// CLI-only replacement. FIFO and mandatory H retain their own authority.
@@ -616,7 +643,11 @@ impl DaemonState {
         self.watcher_release_cancel.store(true, Ordering::Release);
         *state = RuntimeState::Retired;
         *self.watcher_work.lock().unwrap() = None;
+        *self.watch_status.lock().unwrap() = None;
         self.watcher_health.store(false, Ordering::Release);
+        drop(state);
+        // The worker sees `Retired` at its next wake and exits.
+        self.inbox.wake();
         Ok(true)
     }
 
@@ -628,6 +659,7 @@ impl DaemonState {
         let _maintenance = self.maintenance_stream.lock().unwrap();
         self.watcher_release_cancel.store(true, Ordering::Release);
         self.set_runtime_state(RuntimeState::Retired);
+        self.inbox.wake();
     }
 
     /// A daemon-local writer session is usable only after its H commits.
@@ -668,35 +700,18 @@ impl DaemonState {
     }
 
     /// A pending watcher hint (including the periodic inventory deadline) keeps
-    /// the selected checkout in the catching-up state until its tick acknowledges it.
+    /// the selected checkout in the catching-up state until the worker
+    /// acknowledges it. Reads the published status only (#138 item 2): ingress
+    /// increments the live generation before the worker drains it.
     pub fn checkout_watch_pending(&self) -> bool {
-        // Reject an inventory already in flight before any SQLite options
-        // read: a publication may hold its write transaction for this span.
-        if self.watcher_work.try_lock().is_err() {
-            return true;
+        match &*self.watch_status.lock().unwrap() {
+            Some(status) => {
+                status.other_intent
+                    || status.generation.load(Ordering::SeqCst) != status.acknowledged
+            }
+            // A serving session's first watcher has not run its full inventory.
+            None => self.runtime.lock().unwrap().session().is_some(),
         }
-        // Do not hold watcher_work across an index options read. Only the
-        // bounded in-memory intent check belongs inside that mutex.
-        let options = self
-            .store
-            .recorded_index_options()
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| self.options.clone());
-        let pending = {
-            // A live inventory holds this mutex under native_stream. The
-            // registry must never wait for that work while holding its guard.
-            let Ok(work) = self.watcher_work.try_lock() else {
-                return true;
-            };
-            work.as_ref()
-                .map(|(_, scheduler)| scheduler.accepted_watch_intent(&options))
-        };
-        pending.unwrap_or_else(|| {
-            self.runtime
-                .try_lock()
-                .map_or(true, |held| held.session().is_some())
-        })
     }
 
     /// A deterministic fixture can submit an accepted source hint through the
@@ -745,51 +760,11 @@ impl DaemonState {
         if changed {
             let mut work = self.watcher_work.lock().unwrap();
             *work = None;
+            *self.watch_status.lock().unwrap() = None;
             // The replaced watcher is gone; a new one publishes its own state.
             self.watcher_health.store(false, Ordering::Release);
         }
         *current = next;
-    }
-    /// The local writer checks the durable queue at idle and retries typed contention.
-    fn start_queue_tick(self: &Arc<Self>) {
-        self.start_maintenance_tick();
-        // A synchronous fixture may retain an owner without starting a daemon runtime.
-        // Do not consume the start flag until a Tokio executor can own the tick.
-        if tokio::runtime::Handle::try_current().is_err() {
-            return;
-        }
-        if self.queue_tick_started.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        let weak = Arc::downgrade(self);
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_millis(20));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                interval.tick().await;
-                let Some(state) = weak.upgrade() else {
-                    break;
-                };
-                let worker = state.clone();
-                let result = tokio::task::spawn_blocking(move || worker.queue_tick()).await;
-                // The witness may read phase only after queue_tick released the
-                // native stream, watcher mutex and any SQLite statement.
-                if result.as_ref().is_ok_and(|outcome| outcome.is_ok()) {
-                    state.report_causal_h_ready();
-                }
-                match result {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => best_effort_queue_stderr(
-                        std::io::stderr(),
-                        format_args!("queue tick failed: {error:#}\n"),
-                    ),
-                    Err(error) => best_effort_queue_stderr(
-                        std::io::stderr(),
-                        format_args!("queue tick worker failed: {error:#}\n"),
-                    ),
-                }
-            }
-        });
     }
     /// One independent, verified-owner, low-priority lane. It never holds the
     /// serial native stream or a watcher mutex across a Store writer unit.
@@ -1156,13 +1131,16 @@ impl DaemonState {
                     // A late OS event from before this forced fixture tick must
                     // not defer pin expiration as accepted watcher work (#131).
                     scheduler.disable_native_watcher_for_tests();
-                    scheduler.reconcile_due(
+                    scheduler.set_waker(self.queue_waker.clone());
+                    let reconciled = scheduler.reconcile_due(
                         &self.store,
                         &session,
                         &options,
                         &Arc::new(AtomicBool::new(false)),
                         true,
-                    )?;
+                    );
+                    self.publish_watch_status(&scheduler, &options);
+                    reconciled?;
                     *work = Some((Arc::downgrade(&session), scheduler));
                 }
             }
@@ -1303,6 +1281,7 @@ impl DaemonState {
             if processed > 0 {
                 *self.packets.lock().unwrap() = PacketCache::default();
                 self.start_dependency_index();
+                self.step_progress.store(true, Ordering::Release);
             }
             #[cfg(test)]
             self.test_queue_after_h_drain.run();
@@ -1347,6 +1326,8 @@ impl DaemonState {
                                 self.causal_lineage_ordinal.clone(),
                             );
                         }
+                        scheduler.set_waker(self.queue_waker.clone());
+                        self.publish_watch_status(&scheduler, &selected_options);
                         *work = Some((Arc::downgrade(session), scheduler));
                     }
                     if let Some((_, scheduler)) = work.as_mut() {
@@ -1354,13 +1335,15 @@ impl DaemonState {
                         self.test_queue_current_phase.store(4, Ordering::Release);
                         #[cfg(test)]
                         self.test_queue_before_watcher_reconcile.run();
-                        let accounted = scheduler.reconcile_due(
+                        let reconciled = scheduler.reconcile_due(
                             &self.store,
                             session,
                             &selected_options,
                             &self.watcher_release_cancel,
                             false,
-                        )?;
+                        );
+                        self.publish_watch_status(scheduler, &selected_options);
+                        let accounted = reconciled?;
                         #[cfg(test)]
                         self.test_queue_current_phase.store(5, Ordering::Release);
                         #[cfg(test)]
@@ -2670,18 +2653,15 @@ async fn start_index(
         )));
     }
     let options = s.options.clone();
-    let row = db(s.clone(), move |store| {
-        store.enqueue_request(&options, request.expected_revision)
+    let scheduler = s.clone();
+    let row = db(s.clone(), move |_| {
+        scheduler.enqueue_index(&options, request.expected_revision)
     })
     .await?;
     let job = IndexJob::from(row);
     // A later durable admission supersedes the legacy exceptional display slot.
     s.jobs.lock().unwrap().current = None;
-    s.pending_requests.lock().unwrap().push(job.id.clone());
-    // A newly durable browser ACK starts its own attempt immediately, even if
-    // an earlier exceptional storage probe was backed off.
-    *s.recovery_retry_after.lock().unwrap() = None;
-    s.start_queue_tick();
+    s.start_worker();
     Ok((StatusCode::ACCEPTED, Json(job)))
 }
 // The exceptional index-only recovery worker predates requests.db. Until the
@@ -4941,6 +4921,8 @@ mod exceptional_recovery_tests {
             "127.0.0.1:7331".parse().unwrap(),
         )
         .unwrap();
+        // These tests step the worker by hand: no background worker thread.
+        state.queue_tick_started.store(true, Ordering::Release);
         (tmp, store, state, roots, identity)
     }
 
@@ -5841,9 +5823,9 @@ mod exceptional_recovery_tests {
     async fn concurrent_posts_queue_two_requests_across_exceptional_recovery() {
         use tower::ServiceExt;
         let (_tmp, store, state, _roots, _identity) = fixture();
-        // Keep this fixture's daemon timer and maintenance lane inert until
-        // both POSTs are durably admitted. Drive one FIFO head per explicit tick.
-        assert!(!state.queue_tick_started.swap(true, Ordering::AcqRel));
+        // Keep this fixture's maintenance lane inert until both POSTs are
+        // durably admitted (the fixture has no worker thread). Drive one FIFO
+        // head per explicit step.
         assert!(!state.maintenance_tick_started.swap(true, Ordering::AcqRel));
         let q0 = store.current_request().unwrap().unwrap();
         assert_eq!(q0.state, "queued");

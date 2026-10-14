@@ -430,7 +430,11 @@ pub struct WatcherWork {
     witness_ordinal: u64,
     witness_ordinal_source: Option<Arc<std::sync::atomic::AtomicU64>>,
     witness_reported_generation: Option<u64>,
+    /// The owning worker's wake, installed on every watcher this owner creates.
+    waker: Option<crate::watch::Waker>,
 }
+
+const PERIODIC_INVENTORY: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl WatcherWork {
     /// Construct only after the daemon commits mandatory H.
@@ -476,7 +480,64 @@ impl WatcherWork {
             witness_ordinal: 0,
             witness_ordinal_source: None,
             witness_reported_generation: None,
+            waker: None,
         })
+    }
+
+    /// Wake `waker` after every accepted signal, on this and every later watcher.
+    pub fn set_waker(&mut self, waker: crate::watch::Waker) {
+        self.watch.set_waker(waker.clone());
+        self.waker = Some(waker);
+    }
+
+    /// The current watcher's live ingress generation (replaced with the watcher).
+    pub fn generation_handle(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        self.watch.generation_handle()
+    }
+
+    pub fn acknowledged_generation(&self) -> u64 {
+        self.watch.acknowledged_generation()
+    }
+
+    /// `accepted_watch_intent` without the ingress-generation comparison, which
+    /// readers make themselves against the live generation.
+    pub fn intent_besides_generation(&self, options: &IndexOptions) -> bool {
+        let now = std::time::Instant::now();
+        let periodic_ready = now.duration_since(self.last_inventory) >= PERIODIC_INVENTORY
+            && !self.retry_after.is_some_and(|deadline| deadline > now);
+        self.options_differ(options) || self.watch.full_intent() || periodic_ready
+    }
+
+    fn options_differ(&self, options: &IndexOptions) -> bool {
+        self.options.workspace_root != options.workspace_root
+            || self.options.scip_path != options.scip_path
+            || self.options.manifest_path != options.manifest_path
+            || self.options.max_file_bytes != options.max_file_bytes
+    }
+
+    /// When `reconcile_due` next has work: a failed run's retry delay, else the
+    /// debounce deadline of accepted signals, else the periodic inventory.
+    /// Signals still in the ingress channel wake the worker themselves.
+    pub fn next_due(&self) -> std::time::Instant {
+        if let Some(retry) = self.retry_after
+            && retry > std::time::Instant::now()
+        {
+            return retry;
+        }
+        let periodic = self.last_inventory + PERIODIC_INVENTORY;
+        let accounted = self.watch.degraded()
+            && self.last_accounted_generation
+                == Some(
+                    self.watch
+                        .generation_handle()
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                );
+        if accounted {
+            return periodic;
+        }
+        self.watch
+            .next_deadline()
+            .map_or(periodic, |deadline| deadline.min(periodic))
     }
 
     /// Bind the optional fixture reporter only after this verified owner installs
@@ -526,15 +587,9 @@ impl WatcherWork {
         // must not starve maintenance during the 60s inventory idle interval.
         // Once the inventory is due, it gets the same retry eligibility as
         // reconcile_due and takes priority before maintenance admission.
-        let periodic_ready = now.duration_since(self.last_inventory)
-            >= std::time::Duration::from_secs(60)
+        let periodic_ready = now.duration_since(self.last_inventory) >= PERIODIC_INVENTORY
             && !self.retry_after.is_some_and(|deadline| deadline > now);
-        self.options.workspace_root != options.workspace_root
-            || self.options.scip_path != options.scip_path
-            || self.options.manifest_path != options.manifest_path
-            || self.options.max_file_bytes != options.max_file_bytes
-            || self.watch.accepted_unacked()
-            || periodic_ready
+        self.options_differ(options) || self.watch.accepted_unacked() || periodic_ready
     }
 
     #[doc(hidden)]
@@ -563,6 +618,13 @@ impl WatcherWork {
         );
         assert!(self.watch.degraded());
         self.last_accounted_generation = Some(self.watch.drain().generation);
+    }
+
+    /// Push the periodic inventory out of a test's reach, so only a wake can
+    /// make the worker reconcile. The next completed inventory resets it.
+    #[doc(hidden)]
+    pub fn delay_periodic_inventory_for_tests(&mut self) {
+        self.last_inventory = std::time::Instant::now() + std::time::Duration::from_secs(3600);
     }
 
     /// Advance only the inventory deadline in a test. The next ordinary tick
@@ -618,17 +680,16 @@ impl WatcherWork {
         // The durable FIFO head may have different selected inputs from this
         // daemon's defaults. Keep its watcher until a new watcher has registered
         // for the new options; its full wake then closes the transition gap.
-        if self.options.workspace_root != options.workspace_root
-            || self.options.scip_path != options.scip_path
-            || self.options.manifest_path != options.manifest_path
-            || self.options.max_file_bytes != options.max_file_bytes
-        {
+        if self.options_differ(options) {
             let next = crate::watch::WatchSignals::publishing(
                 options.workspace_root.clone(),
                 options.scip_path.clone(),
                 options.manifest_path.clone(),
                 self.health.clone(),
             );
+            if let Some(waker) = &self.waker {
+                next.set_waker(waker.clone());
+            }
             self.watch = next;
             self.options = options.clone();
             self.last_accounted_generation = None;
@@ -640,8 +701,7 @@ impl WatcherWork {
             }
         }
         let now = std::time::Instant::now();
-        let periodic =
-            now.duration_since(self.last_inventory) >= std::time::Duration::from_secs(60);
+        let periodic = now.duration_since(self.last_inventory) >= PERIODIC_INVENTORY;
         let batch = self.watch.drain();
         // Observe each new generation before its capture can acknowledge it.
         // The queue tick holds watcher_work across this call; the bounded

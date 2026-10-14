@@ -998,6 +998,8 @@ impl Store {
         let seq = tx.last_insert_rowid();
         after_insert();
         tx.commit()?;
+        // The row is durable: wake the checkout's worker, which re-reads the queue.
+        self.wake_queue_workers();
         self.identity.verify()?;
         // Return the exact accepted row constructed under the INSERT transaction.
         // The local writer may claim immediately after COMMIT; reading it back would race

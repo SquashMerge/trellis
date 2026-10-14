@@ -330,7 +330,6 @@ impl CheckoutRegistry {
                 store,
                 scheduler: scheduler.clone(),
             }))),
-            active_reads: Arc::new(AtomicUsize::new(0)),
             initial_indexing,
             #[cfg(feature = "test-support")]
             mcp_clock_skew_ms: std::sync::atomic::AtomicU64::new(0),
@@ -367,7 +366,7 @@ impl CheckoutRegistry {
             .map_err(|_| SelectionError::Unavailable)?;
         let eligible = |phase: RuntimePhase| {
             !startup_running(phase)
-                && runtime.active_reads.load(Ordering::Acquire) == 0
+                && resources.scheduler.leases() == 0
                 && !CheckoutRuntime::queue_pending(&resources, phase)
         };
         if self
@@ -439,7 +438,7 @@ impl CheckoutRegistry {
         let phase = resources.scheduler.runtime_phase();
         if startup_running(phase)
             || (runtime.catching_up() && !startup_waiting(phase))
-            || runtime.active_reads.load(Ordering::Acquire) != 0
+            || resources.scheduler.leases() != 0
             || CheckoutRuntime::queue_pending(&resources, phase)
         {
             return Ok(false);
@@ -450,7 +449,7 @@ impl CheckoutRegistry {
             .scheduler
             .try_release_checkout_runtime_if(|phase| {
                 !startup_running(phase)
-                    && runtime.active_reads.load(Ordering::Acquire) == 0
+                    && resources.scheduler.leases() == 0
                     && !CheckoutRuntime::queue_pending(&resources, phase)
             });
         if !matches!(released, Ok(true)) {
@@ -1058,7 +1057,7 @@ impl CheckoutRegistry {
                         .map_err(|_| SelectionError::Unavailable)?;
                     let phase = resources.scheduler.runtime_phase();
                     (runtime.catching_up() && !startup_waiting(phase))
-                        || runtime.active_reads.load(Ordering::Acquire) != 0
+                        || resources.scheduler.leases() != 0
                         || CheckoutRuntime::queue_pending(&resources, phase)
                 }
                 None => {
@@ -1403,9 +1402,6 @@ pub struct CheckoutRuntime {
     #[cfg(feature = "test-support")]
     mcp_read_hook: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
     resources: std::sync::Mutex<Option<Arc<ActiveResources>>>,
-    /// Read and admission leases. Release declines while any is held; each
-    /// is taken under the runtime state lock, so none starts after `Retired`.
-    active_reads: Arc<AtomicUsize>,
     initial_indexing: bool,
 }
 
@@ -1420,15 +1416,6 @@ fn startup_running(phase: RuntimePhase) -> bool {
 /// A failed startup reconciliation is waiting out its backoff.
 fn startup_waiting(phase: RuntimePhase) -> bool {
     matches!(phase, RuntimePhase::Reconciling { waiting: true, .. })
-}
-
-/// An admission lease: release declines while it is held.
-struct AdmissionLease(Arc<AtomicUsize>);
-
-impl Drop for AdmissionLease {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
-    }
 }
 
 /// A waiter does not change an accepted row on contention. Only direct,
@@ -1537,12 +1524,11 @@ impl CheckoutRuntime {
         // Serialize acceptance with idle retirement. A caller may have cloned
         // this runtime before serve entered the registry gate: it must not
         // enqueue against resources the replacement has already retired.
-        let (resources, lease) = self.admission_lease()?;
+        let resources = self.resources()?;
         // Durable acceptance is the single requests.db COMMIT. Only the
         // checkout worker may reconcile and claim this row. A CLI waiter
         // never creates a second writer or re-enqueues an uncertain job.
-        let accepted = resources.store.enqueue_request(options, None)?;
-        drop(lease);
+        let accepted = resources.scheduler.enqueue_index(options, None)?;
         let mut busy_deadline = Instant::now() + Duration::from_secs(30);
         loop {
             let row = match resources.store.request_by_id(&accepted.id) {
@@ -1587,21 +1573,6 @@ impl CheckoutRuntime {
     /// A retained runtime handle cannot keep the released Store or watcher alive.
     pub fn has_active_resources(&self) -> bool {
         self.resources.lock().unwrap().is_some()
-    }
-
-    /// Take an admission lease unless the runtime is retired. Release declines
-    /// while a lease is held, and both decide under the runtime state lock.
-    fn admission_lease(&self) -> anyhow::Result<(Arc<ActiveResources>, AdmissionLease)> {
-        let resources = self.resources()?;
-        let lease = resources.scheduler.with_runtime_state(|state| {
-            anyhow::ensure!(
-                RuntimePhase::of(state) != RuntimePhase::Retired,
-                "index_not_ready: checkout released"
-            );
-            self.active_reads.fetch_add(1, Ordering::AcqRel);
-            Ok(AdmissionLease(self.active_reads.clone()))
-        })?;
-        Ok((resources, lease))
     }
 
     fn queue_pending(resources: &ActiveResources, phase: RuntimePhase) -> bool {
@@ -1784,15 +1755,15 @@ impl CheckoutRuntime {
     }
 
     pub fn evidence_response(&self) -> anyhow::Result<(CheckoutEvidence, bool)> {
-        let (resources, lease) = self.admission_lease()?;
+        let resources = self.resources()?;
+        let lease = resources.scheduler.admission_lease()?;
         let catching_up = Self::catching_up_in(&resources, resources.scheduler.runtime_phase());
         let response = resources.store.evidence_response_daemon_local()?;
-        // The lease becomes the evidence's read hold, released when it drops.
-        std::mem::forget(lease);
         Ok((
             CheckoutEvidence {
                 response,
-                reads: self.active_reads.clone(),
+                // The lease becomes the evidence's read hold, released on drop.
+                reads: lease.into_counter(),
                 selection: None,
             },
             catching_up,
@@ -2154,13 +2125,17 @@ mod selection_tests {
         // A timed-out serve must leave this retained CLI watcher usable.
         registry.abandon_cli_replacement(&key);
         assert!(!observed_scheduler.watcher_release_requested_for_tests());
-        runtime.active_reads.fetch_add(1, Ordering::AcqRel);
+        let read_lease = runtime
+            .browser_scheduler()
+            .unwrap()
+            .admission_lease()
+            .unwrap();
         assert_eq!(
             registry.can_register(&identity, &options),
             Err(SelectionError::StorageBusy)
         );
         assert!(!observed_scheduler.watcher_release_requested_for_tests());
-        runtime.active_reads.fetch_sub(1, Ordering::AcqRel);
+        drop(read_lease);
         // A completed watcher leaves the same CLI-only checkout releasable.
         let deadline = Instant::now() + crate::testing::HANG_BACKSTOP;
         loop {
@@ -2430,13 +2405,17 @@ mod selection_tests {
         );
         assert!(registry.runtimes.contains_key(&identity.root_key));
         registry.disconnect(41);
-        runtime.active_reads.fetch_add(1, Ordering::AcqRel);
+        let read_lease = runtime
+            .browser_scheduler()
+            .unwrap()
+            .admission_lease()
+            .unwrap();
         assert_eq!(
             registry.can_register(&identity, &options),
             Err(SelectionError::StorageBusy)
         );
         assert!(registry.runtimes.contains_key(&identity.root_key));
-        runtime.active_reads.fetch_sub(1, Ordering::AcqRel);
+        drop(read_lease);
         runtime
             .browser_scheduler()
             .unwrap()

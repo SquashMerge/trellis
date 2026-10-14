@@ -1580,3 +1580,106 @@ async fn work_accepted_during_startup_reconciliation_never_starts_a_second_one()
         "exactly one startup reconciliation ran"
     );
 }
+
+/// A settled, idle checkout whose periodic inventory is out of reach: from here
+/// only a wake can make its worker do anything (#138 items 1, 9 and 10).
+#[cfg(feature = "test-support")]
+async fn idle_without_periodic_inventory(
+    registry: &mut CheckoutRegistry,
+    id: &WorkspaceIdentity,
+) -> std::sync::Arc<trellis::daemon::registry::CheckoutRuntime> {
+    registry.attach_launch(1, id).unwrap();
+    let runtime = registry.activate(&id.root_key).unwrap();
+    ready(&runtime).await;
+    let scheduler = runtime.browser_scheduler().unwrap();
+    assert!(scheduler.delay_periodic_inventory_for_tests());
+    // Synchronize on the worker blocking with no wake pending and no deadline
+    // within reach of this test.
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        loop {
+            if let Some(deadline) = scheduler.worker_asleep_until_for_tests()
+                && deadline.is_none_or(|at| {
+                    at > std::time::Instant::now() + trellis::testing::HANG_BACKSTOP * 2
+                })
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("worker did not go idle");
+    runtime
+}
+
+/// Decision 0009 §8: a durable enqueue through any Store instance wakes the idle
+/// worker; it never waits for a poll or the periodic inventory.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn enqueue_from_another_store_wakes_the_idle_worker() {
+    let base = tempfile::tempdir().unwrap();
+    let checkout = base.path().join("work");
+    fs::create_dir(&checkout).unwrap();
+    fs::write(checkout.join("a.js"), "function a() {}\n").unwrap();
+    let id = identity(&checkout);
+    let mut registry = CheckoutRegistry::with_roots(roots(base.path()));
+    let _runtime = idle_without_periodic_inventory(&mut registry, &id).await;
+    let other = Store::open(roots(base.path()), identity(&checkout)).unwrap();
+    let accepted = other
+        .enqueue_request(&trellis::indexer::IndexOptions::new(checkout.clone()), None)
+        .unwrap();
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        while other
+            .request_by_id(&accepted.id)
+            .unwrap()
+            .unwrap()
+            .finished_at
+            .is_none()
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("enqueue did not wake the idle worker");
+    assert_eq!(
+        other.request_by_id(&accepted.id).unwrap().unwrap().state,
+        "done"
+    );
+}
+
+/// Decision 0009 §8: watcher ingress wakes the idle worker, which reconciles the
+/// change at its debounce deadline, not at the next periodic inventory.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn watcher_signal_wakes_the_idle_worker() {
+    let base = tempfile::tempdir().unwrap();
+    let checkout = base.path().join("work");
+    fs::create_dir(&checkout).unwrap();
+    fs::write(checkout.join("a.js"), "function before() {}\n").unwrap();
+    let id = identity(&checkout);
+    let mut registry = CheckoutRegistry::with_roots(roots(base.path()));
+    let runtime = idle_without_periodic_inventory(&mut registry, &id).await;
+    let scheduler = runtime.browser_scheduler().unwrap();
+    fs::write(checkout.join("a.js"), "function after() {}\n").unwrap();
+    // The same bounded ingress as the OS callback (which may also deliver).
+    assert!(
+        scheduler.submit_watch_event_for_tests(Ok(notify::Event::new(notify::EventKind::Modify(
+            notify::event::ModifyKind::Any
+        ))
+        .add_path(checkout.join("a.js"))))
+    );
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        loop {
+            if let Ok((response, _)) = runtime.evidence_response() {
+                let source = response.source_at("a.js", None).unwrap().unwrap().1;
+                response.finish(()).unwrap();
+                if source.text.contains("after") {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("watcher signal did not wake the idle worker");
+}

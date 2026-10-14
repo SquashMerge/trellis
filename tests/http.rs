@@ -36,10 +36,18 @@ fn setup_with_tick(start_tick: bool) -> (tempfile::TempDir, Store, Arc<http::Dae
         "127.0.0.1:7331".parse().unwrap(),
     )
     .unwrap();
-    let session = store.writer_session_for_tests().unwrap();
     if start_tick {
+        // A running worker accepts only a session whose startup
+        // reconciliation committed a validated head.
+        let session = trellis::index_coordinator::establish_serving_session(
+            &store,
+            None,
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
         state.retain_serving_session(session);
     } else {
+        let session = store.writer_session_for_tests().unwrap();
         state.retain_serving_session_without_tick_for_tests(session);
     }
     let router = http::router(state.clone());
@@ -63,7 +71,8 @@ async fn call(app: &Router, method: &str, path: &str, body: Value) -> (StatusCod
 }
 #[tokio::test]
 async fn guards_public_and_private() {
-    let (_d, _store, _state, app) = setup();
+    // No startup reconciliation: /api/status has no head and answers 503.
+    let (_d, _store, _state, app) = setup_without_tick();
     for (path, host, origin, token, want) in [
         ("/healthz", "127.0.0.1:7331", None, None, 200),
         ("/", "localhost:7331", None, None, 200),
@@ -433,11 +442,21 @@ fn rejects_bad_startup() {
 
 #[tokio::test]
 async fn active_job_cancellation_does_not_publish() {
-    let (d, store, _state, app) = setup();
+    let (d, store, state, app) = setup();
     let source = (0..15000)
         .map(|i| format!("function f{i}() {{ console.log({i}); }}\n"))
         .collect::<String>();
     std::fs::write(d.path().join("workspace/large.js"), source).unwrap();
+    // The running worker's watcher may publish the new file first; count
+    // revisions from its settled head.
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        while state.checkout_watch_pending() {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("watcher did not settle");
+    let settled = store.index_baseline().unwrap().index_revision;
     let (code, j) = call(&app, "POST", "/api/index", json!({})).await;
     assert_eq!(code, 202);
     let id = j["id"].as_str().unwrap();
@@ -459,8 +478,8 @@ async fn active_job_cancellation_does_not_publish() {
     assert_eq!(terminal["state"], "done");
     assert_eq!(
         store.index_baseline().unwrap().index_revision,
-        2,
-        "accepted Q publishes its own r2 after mandatory H r1; cancellation does not add a revision"
+        settled + 1,
+        "accepted Q publishes its own revision; cancellation does not add one"
     );
 }
 
@@ -758,7 +777,8 @@ async fn explicit_recovery_releases_only_daemon_old_owner_and_retries_after_fore
         call(&app, "POST", "/api/index", json!({"expectedRevision":old})).await;
     assert_eq!(conflict, StatusCode::CONFLICT);
     assert_eq!(rejected["error"]["code"], "revision_conflict");
-    assert!(state.retained_serving_session().is_ok());
+    // The worker releases a damaged index's old owner on its own; a rejected
+    // request changes nothing.
     assert_eq!(std::fs::read(&index).unwrap(), bytes);
     let reader = roots.index_use_existing(&identity).unwrap();
     let (status, admitted) = call(&app, "POST", "/api/index", json!({})).await;

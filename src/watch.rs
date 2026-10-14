@@ -20,6 +20,10 @@ const MAX_DIRTY_PATHS: usize = 256;
 const QUIET: Duration = Duration::from_millis(75);
 const MAX_WAIT: Duration = Duration::from_millis(250);
 
+/// Wakes the checkout worker. Called after ingress records its generation, so a
+/// wake can coalesce but never carries state the worker would not re-read.
+pub type Waker = Arc<dyn Fn() + Send + Sync>;
+
 /// A generation can be cleared only after the corresponding capture was verified and published.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DirtyBatch {
@@ -34,10 +38,12 @@ struct Signal {
 }
 
 // Both the real notify callback and deterministic injected events use this exact ingress.
+#[allow(clippy::too_many_arguments)]
 fn submit(
     sender: &SyncSender<Signal>,
     generation: &AtomicU64,
     overflow: &AtomicBool,
+    waker: &std::sync::OnceLock<Waker>,
     root: &Path,
     selected: &BTreeSet<PathBuf>,
     executable: Option<&Path>,
@@ -57,6 +63,9 @@ fn submit(
         .is_err()
     {
         overflow.store(true, Ordering::SeqCst);
+    }
+    if let Some(wake) = waker.get() {
+        wake();
     }
 }
 
@@ -170,6 +179,8 @@ pub struct WatchSignals {
     /// Published copy of `degraded` for lock-free health reads. A watcher
     /// owner shares one flag across every replacement watcher it creates.
     health: Arc<AtomicBool>,
+    /// Set once by the owning worker; ingress wakes it after each signal.
+    waker: Arc<std::sync::OnceLock<Waker>>,
 }
 
 impl WatchSignals {
@@ -241,11 +252,14 @@ impl WatchSignals {
             })
             .collect::<BTreeSet<_>>();
         let callback_executable = std::env::current_exe().ok();
+        let waker = Arc::new(std::sync::OnceLock::new());
+        let callback_waker = Arc::clone(&waker);
         let callback = move |event| {
             submit(
                 &callback_sender,
                 &callback_generation,
                 &callback_overflow,
+                &callback_waker,
                 &callback_root,
                 &callback_selected,
                 callback_executable.as_deref(),
@@ -293,7 +307,30 @@ impl WatchSignals {
             urgent: true,
             degraded,
             health,
+            waker,
         }
+    }
+
+    /// Wake `waker` after every accepted signal from now on.
+    pub fn set_waker(&self, waker: Waker) {
+        let _ = self.waker.set(waker);
+    }
+
+    /// The live ingress generation, incremented before any wake. A reader
+    /// compares it with the acknowledged generation without taking a lock.
+    pub fn generation_handle(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.generation)
+    }
+
+    pub fn acknowledged_generation(&self) -> u64 {
+        self.acknowledged_generation
+    }
+
+    /// Ingress intent other than an unacknowledged generation: the initial or
+    /// forced full inventory, unless a verified capture already accounted for
+    /// this degraded watcher's generation.
+    pub fn full_intent(&self) -> bool {
+        !self.degraded && (self.pending.full || self.urgent)
     }
 
     /// This is set synchronously at ingress, before debounce or a channel drain.
@@ -338,6 +375,7 @@ impl WatchSignals {
             &self.sender,
             &self.generation,
             &self.overflow,
+            &self.waker,
             &self.root,
             &self.captured_inputs,
             self.executable.as_deref(),
