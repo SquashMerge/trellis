@@ -3975,6 +3975,7 @@ async fn a_call_expires_from_its_read_while_the_coordinator_is_held() {
     let hooks = trellis::mcp::TransportHooksForTests {
         frame_read: Some(frame_read),
         send_decision: Some(send_decision),
+        ..Default::default()
     };
     let (mut client, mut reader, session) =
         hooked_session(&identity, &registry, 81, Some(deadline), hooks);
@@ -4040,21 +4041,52 @@ async fn a_deadline_after_read_admission_keeps_the_resolved_shape() {
     session.join().unwrap().unwrap();
 }
 
-/// Decision 0009 §7: a cancel received while the final root check runs still
-/// suppresses that call's unsent result.
+/// #127 at the daemon (Decision 0009 §7): a cancel the reader completed
+/// before the send decision, but has not yet published, still suppresses the
+/// unsent result: the decision waits for it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_cancel_during_the_final_check_suppresses_the_result() {
+async fn a_cancel_completed_before_the_decision_wins_even_if_unpublished() {
     let temp = tempfile::tempdir().unwrap();
     let (identity, registry, _runtime) = ready_registry(temp.path(), 83).await;
     let (send_decision, entered, release) = hold_send_decision(1);
-    let (frame_read, read) = frames_read();
+    // The reader holds the second frame (the cancel) after completing and
+    // counting it, before publishing it.
+    let (reader_held_tx, reader_held) = std::sync::mpsc::sync_channel(1);
+    let (publish_tx, publish_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let publish_rx = std::sync::Mutex::new(publish_rx);
+    let frames = std::sync::atomic::AtomicUsize::new(0);
+    let frame_read: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
+        if frames.fetch_add(1, std::sync::atomic::Ordering::AcqRel) == 1 {
+            let _ = reader_held_tx.send(());
+            let _ = publish_rx.lock().unwrap().recv();
+        }
+    });
+    let (waiting_tx, waiting) = std::sync::mpsc::sync_channel(4);
+    let settle_waiting: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
+        let _ = waiting_tx.try_send(());
+    });
     let hooks = trellis::mcp::TransportHooksForTests {
         frame_read: Some(frame_read),
         send_decision: Some(send_decision),
+        settle_waiting: Some(settle_waiting),
+        ..Default::default()
     };
-    let (mut client, mut reader, session) = hooked_session(&identity, &registry, 83, None, hooks);
+    let (mut client, reader, session) = hooked_session(&identity, &registry, 83, None, hooks);
+    let replies = {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut reader = reader;
+        std::thread::spawn(move || {
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+                let _ = tx.send(serde_json::from_str::<Value>(&line).unwrap());
+            }
+        });
+        rx
+    };
     writeln!(client, "{}", describe_call(1)).unwrap();
-    read.recv_timeout(trellis::testing::HANG_BACKSTOP).unwrap();
     entered
         .recv_timeout(trellis::testing::HANG_BACKSTOP)
         .expect("call 1 did not reach its send decision");
@@ -4064,11 +4096,135 @@ async fn a_cancel_during_the_final_check_suppresses_the_result() {
         json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}})
     )
     .unwrap();
-    read.recv_timeout(trellis::testing::HANG_BACKSTOP).unwrap();
+    reader_held
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .expect("the reader did not complete the cancel");
     release.send(()).unwrap();
+    // The decision must wait for the completed cancel: it is never answered.
+    let deadline = std::time::Instant::now() + trellis::testing::HANG_BACKSTOP;
+    loop {
+        if waiting.try_recv().is_ok() {
+            break;
+        }
+        if let Ok(reply) = replies.try_recv() {
+            panic!("decided without the completed cancel: {reply}");
+        }
+        assert!(std::time::Instant::now() < deadline, "no decision");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    publish_tx.send(()).unwrap();
     writeln!(client, "{}", modern(json!(2), "tools/list", json!({}))).unwrap();
-    let next = next_reply(&mut reader);
+    let next = replies
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .unwrap();
     assert_eq!(next["id"], 2, "the cancelled call was answered: {next}");
+    // The reply thread holds a clone: end input explicitly.
+    client.shutdown(std::net::Shutdown::Both).unwrap();
+    session.join().unwrap().unwrap();
+}
+
+/// Decision 0009 §7: requests beyond the connection's bounds are refused at
+/// once, application validation first: an invalid call stays
+/// invalid_request; a fifth valid call gets too_many_requests; a 17th
+/// outstanding non-call request gets -32000 too_many_requests.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn over_bound_requests_are_refused_after_validation() {
+    let temp = tempfile::tempdir().unwrap();
+    let (identity, registry, runtime) = ready_registry(temp.path(), 84).await;
+    let (send_decision, entered, release) = hold_send_decision(1);
+    let hooks = trellis::mcp::TransportHooksForTests {
+        send_decision: Some(send_decision),
+        ..Default::default()
+    };
+    let (mut client, mut reader, session) = hooked_session(&identity, &registry, 84, None, hooks);
+    writeln!(client, "{}", describe_call(1)).unwrap();
+    entered
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .expect("call 1 did not reach its send decision");
+    // Held reads keep calls 2..5 outstanding once dispatched.
+    let gate = ReadGate::default();
+    runtime.set_mcp_read_gate_for_tests(gate.hook());
+    let mut burst = String::new();
+    for id in 2..=5 {
+        burst.push_str(&format!("{}\n", describe_call(id)));
+    }
+    burst.push_str(&format!(
+        "{}\n",
+        modern(
+            json!(6),
+            "tools/call",
+            json!({"name":"trellis_workspace_describe","arguments":{}})
+        )
+    ));
+    burst.push_str(&format!("{}\n", describe_call(7)));
+    for id in 101..=117 {
+        burst.push_str(&format!("{}\n", modern(json!(id), "tools/list", json!({}))));
+    }
+    client.write_all(burst.as_bytes()).unwrap();
+    release.send(()).unwrap();
+    let mut seen = std::collections::BTreeMap::new();
+    while !(seen.contains_key("6") && seen.contains_key("7") && seen.contains_key("117")) {
+        let reply = next_reply(&mut reader);
+        seen.insert(reply["id"].to_string(), reply);
+    }
+    gate.open();
+    let invalid = &seen["6"]["result"]["structuredContent"];
+    assert_eq!(
+        invalid["error"]["code"], "invalid_request",
+        "validation lost to capacity: {invalid}"
+    );
+    let fifth = &seen["7"]["result"]["structuredContent"];
+    assert_eq!(fifth["error"]["code"], "too_many_requests", "{fifth}");
+    let seventeenth = &seen["117"];
+    assert_eq!(seventeenth["error"]["code"], -32000, "{seventeenth}");
+    assert_eq!(seventeenth["error"]["data"]["code"], "too_many_requests");
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
+/// Decision 0009 §7: an immediate call outcome still unsent at the deadline
+/// answers deadline_exceeded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_immediate_outcome_unsent_at_the_deadline_expires() {
+    let temp = tempfile::tempdir().unwrap();
+    let (identity, registry, _runtime) = ready_registry(temp.path(), 85).await;
+    let deadline = Duration::from_millis(300);
+    let (frame_read, read) = frames_read();
+    let (entered_tx, entered) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let release_rx = std::sync::Mutex::new(release_rx);
+    let hooks = trellis::mcp::TransportHooksForTests {
+        frame_read: Some(frame_read),
+        immediate_decision: Some(std::sync::Arc::new(move |_: &Value| {
+            let _ = entered_tx.send(());
+            let _ = release_rx.lock().unwrap().recv();
+        })),
+        ..Default::default()
+    };
+    let (mut client, mut reader, session) =
+        hooked_session(&identity, &registry, 85, Some(deadline), hooks);
+    writeln!(
+        client,
+        "{}",
+        modern(
+            json!(1),
+            "tools/call",
+            json!({"name":"trellis_workspace_describe","arguments":{}})
+        )
+    )
+    .unwrap();
+    let accepted = read.recv_timeout(trellis::testing::HANG_BACKSTOP).unwrap();
+    entered
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .unwrap();
+    tokio::time::sleep_until((accepted + deadline).into()).await;
+    release_tx.send(()).unwrap();
+    let reply = next_reply(&mut reader);
+    assert_eq!(
+        reply["result"]["structuredContent"]["error"]["code"], "deadline_exceeded",
+        "an unsent outcome survived its deadline: {reply}"
+    );
     drop(reader);
     drop(client);
     session.join().unwrap().unwrap();
