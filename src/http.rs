@@ -278,6 +278,10 @@ pub struct DaemonState {
     #[cfg(test)]
     test_queue_release_yield: crate::store::TestOneShotHook,
     #[cfg(test)]
+    test_maintenance_before_lane: crate::store::TestOneShotHook,
+    #[cfg(test)]
+    test_maintenance_admitted: crate::store::TestOneShotHook,
+    #[cfg(test)]
     test_queue_after_stream: crate::store::TestOneShotHook,
     #[cfg(test)]
     test_queue_after_pending_snapshot: crate::store::TestOneShotHook,
@@ -459,6 +463,10 @@ pub fn new_with_dependency_options(
         test_queue_before_stream: crate::store::TestOneShotHook::default(),
         #[cfg(test)]
         test_queue_release_yield: crate::store::TestOneShotHook::default(),
+        #[cfg(test)]
+        test_maintenance_before_lane: crate::store::TestOneShotHook::default(),
+        #[cfg(test)]
+        test_maintenance_admitted: crate::store::TestOneShotHook::default(),
         #[cfg(test)]
         test_queue_after_stream: crate::store::TestOneShotHook::default(),
         #[cfg(test)]
@@ -879,6 +887,10 @@ impl DaemonState {
         session: &Arc<crate::store::topology::WriterSession>,
         options: &IndexOptions,
     ) -> Option<&'static str> {
+        // In-flight maintenance yields to a pending release at its next check.
+        if self.release_requested.load(Ordering::Acquire) {
+            return Some("release_requested");
+        }
         if self.native_stream.try_lock().is_err() {
             return Some("native_stream");
         }
@@ -1074,10 +1086,18 @@ impl DaemonState {
         {
             return Ok(());
         }
+        #[cfg(test)]
+        self.test_maintenance_before_lane.run();
         let _lane = self.maintenance_stream.lock().unwrap();
-        if self.checkout_runtime_stopped.load(Ordering::Acquire) {
+        // A release may have been requested while this tick waited for its
+        // lane; maintenance is the lowest priority and yields to it.
+        if self.checkout_runtime_stopped.load(Ordering::Acquire)
+            || self.release_requested.load(Ordering::Acquire)
+        {
             return Ok(());
         }
+        #[cfg(test)]
+        self.test_maintenance_admitted.run();
         use crate::store::MaintenanceOutcome;
         if self.retention_last_run.lock().unwrap().elapsed() < Duration::from_secs(60) {
             return Ok(());
@@ -6920,6 +6940,87 @@ mod dependency_lifecycle_tests {
         let generation = state.dependencies.lock().unwrap().generation;
         state.publish_dependency_index(generation, &active, Ok(catalog("after-shutdown", pin1)));
         assert!(state.catalog_snapshot(pin1).is_none());
+    }
+}
+
+#[cfg(test)]
+mod release_maintenance_priority_tests {
+    use super::*;
+
+    fn fixture() -> (
+        tempfile::TempDir,
+        Arc<DaemonState>,
+        Arc<crate::store::topology::WriterSession>,
+        IndexOptions,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::write(workspace.join("a.js"), "function a() {}\n").unwrap();
+        let options = IndexOptions::new(workspace.clone());
+        let store = Store::open_for_tests(&dir.path().join("state"), &workspace).unwrap();
+        let (_, session) = crate::index_coordinator::reconcile_workspace(
+            &store,
+            &options,
+            &Arc::new(AtomicBool::new(false)),
+            |_| {},
+        )
+        .unwrap();
+        let state = new(
+            store,
+            options.clone(),
+            "0123456789abcdef".repeat(4),
+            "127.0.0.1:7331".parse().unwrap(),
+        )
+        .unwrap();
+        (dir, state, session, options)
+    }
+
+    /// A release requested while a maintenance tick waits for its lane wins:
+    /// the tick re-checks after acquiring the lane and does no maintenance.
+    #[test]
+    fn maintenance_waiting_for_its_lane_yields_to_a_release_requested_meanwhile() {
+        let (_dir, state, _session, _options) = fixture();
+        let requester = state.clone();
+        state.test_maintenance_before_lane.set(move || {
+            requester.release_requested.store(true, Ordering::Release);
+        });
+        let admitted = Arc::new(AtomicBool::new(false));
+        let witness = admitted.clone();
+        state.test_maintenance_admitted.set(move || {
+            witness.store(true, Ordering::Release);
+        });
+        state.maintenance_tick().unwrap();
+        assert!(
+            !admitted.load(Ordering::Acquire),
+            "maintenance ran ahead of a release requested while it waited"
+        );
+    }
+
+    /// Without a pending release the same tick is admitted, so the test above
+    /// distinguishes the re-check from an unconditional early return.
+    #[test]
+    fn maintenance_tick_is_admitted_without_a_pending_release() {
+        let (_dir, state, _session, _options) = fixture();
+        let admitted = Arc::new(AtomicBool::new(false));
+        let witness = admitted.clone();
+        state.test_maintenance_admitted.set(move || {
+            witness.store(true, Ordering::Release);
+        });
+        state.maintenance_tick().unwrap();
+        assert!(admitted.load(Ordering::Acquire));
+    }
+
+    /// In-flight maintenance yields to a pending release at its next
+    /// cooperative priority check.
+    #[test]
+    fn cooperative_maintenance_check_reports_a_pending_release() {
+        let (_dir, state, session, options) = fixture();
+        state.release_requested.store(true, Ordering::Release);
+        assert_eq!(
+            state.maintenance_priority_reason(&session, &options),
+            Some("release_requested")
+        );
     }
 }
 
