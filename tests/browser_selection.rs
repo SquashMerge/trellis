@@ -2028,7 +2028,7 @@ async fn cold_selected_native_read_is_not_ready_without_a_fabricated_basis() {
 
 #[cfg(feature = "test-support")]
 #[tokio::test]
-async fn selected_status_serves_validated_pre_h_head_and_clears_freshness_after_h() {
+async fn selected_status_serves_validated_pre_startup_head_and_clears_freshness_after_startup() {
     use axum::{
         body::{Body, to_bytes},
         http::Request,
@@ -3032,7 +3032,7 @@ async fn production_browser_rejects_every_selector_free_checkout_route_without_a
 
 #[cfg(feature = "test-support")]
 #[tokio::test]
-async fn virgin_queue_use_lock_contention_retries_h_before_claiming_fifo() {
+async fn virgin_queue_use_lock_contention_retries_startup_before_claiming_fifo() {
     use std::sync::Arc;
     use trellis::{
         daemon::registry::{CheckoutOptions, CheckoutRegistry},

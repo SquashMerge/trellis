@@ -2245,7 +2245,7 @@ mod foreign_root_settlement_tests {
     }
 
     #[test]
-    fn accepted_before_h_accidentally_truncated_v0_is_never_initialized() {
+    fn accepted_before_startup_accidentally_truncated_v0_is_never_initialized() {
         let state = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
         let store = Store::open_for_tests(state.path(), root.path()).unwrap();
@@ -2416,7 +2416,7 @@ mod foreign_root_settlement_tests {
     }
 
     #[test]
-    fn missing_virgin_queue_bootstraps_empty_queue_before_first_h() {
+    fn missing_virgin_queue_bootstraps_empty_queue_before_first_startup() {
         let state = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
         let store = Store::open_for_tests(state.path(), root.path()).unwrap();

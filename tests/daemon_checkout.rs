@@ -130,7 +130,7 @@ async fn separate_store_writer_does_not_downgrade_daemon_read() {
 
 #[cfg(feature = "test-support")]
 #[tokio::test]
-async fn reattach_reports_catching_up_and_keeps_complete_head_until_h() {
+async fn reattach_reports_catching_up_and_keeps_complete_head_until_startup() {
     let base = tempfile::tempdir().unwrap();
     let checkout = base.path().join("work");
     fs::create_dir(&checkout).unwrap();
@@ -199,7 +199,7 @@ async fn reattach_reports_catching_up_and_keeps_complete_head_until_h() {
 
 #[cfg(feature = "test-support")]
 #[tokio::test]
-async fn cli_symbols_and_export_use_the_admitted_prior_head_during_h() {
+async fn cli_symbols_and_export_use_the_admitted_prior_head_during_startup() {
     let base = tempfile::tempdir().unwrap();
     let checkout = base.path().join("work");
     fs::create_dir(&checkout).unwrap();
@@ -297,7 +297,7 @@ async fn committed_queue_survives_runtime_restart() {
 
 #[cfg(feature = "test-support")]
 #[tokio::test]
-async fn replacement_settles_old_queue_before_h_then_claims_distinct_fifo_options() {
+async fn replacement_settles_old_queue_before_startup_then_claims_distinct_fifo_options() {
     let base = tempfile::tempdir().unwrap();
     let checkout = base.path().join("work");
     fs::create_dir(&checkout).unwrap();
@@ -448,7 +448,7 @@ async fn replacement_settles_old_queue_before_h_then_claims_distinct_fifo_option
 
 #[cfg(feature = "test-support")]
 #[tokio::test]
-async fn ambiguous_root_settlement_blocks_h_and_fifo_until_queue_reread() {
+async fn ambiguous_root_settlement_blocks_startup_and_fifo_until_queue_reread() {
     let base = tempfile::tempdir().unwrap();
     let checkout = base.path().join("work");
     fs::create_dir(&checkout).unwrap();
@@ -727,7 +727,7 @@ async fn root_loss_fails_accepted_work_then_releases_old_runtime_handles() {
 
 #[cfg(feature = "test-support")]
 #[tokio::test]
-async fn root_loss_during_paused_reattach_h_waits_for_worker_then_releases() {
+async fn root_loss_during_paused_reattach_startup_waits_for_worker_then_releases() {
     let base = tempfile::tempdir().unwrap();
     let checkout = base.path().join("work");
     let moved = base.path().join("moved");
@@ -895,7 +895,7 @@ async fn cold_activation_preserves_recorded_scip_option() {
 
 #[cfg(feature = "test-support")]
 #[tokio::test]
-async fn failed_h_backs_off_and_empty_idle_checkout_can_release() {
+async fn failed_startup_backs_off_and_empty_idle_checkout_can_release() {
     let base = tempfile::tempdir().unwrap();
     let checkout = base.path().join("work");
     fs::create_dir(&checkout).unwrap();
@@ -926,7 +926,7 @@ async fn failed_h_backs_off_and_empty_idle_checkout_can_release() {
 
 #[cfg(feature = "test-support")]
 #[tokio::test]
-async fn failed_h_backoff_never_releases_accepted_fifo_work() {
+async fn failed_startup_backoff_never_releases_accepted_fifo_work() {
     let base = tempfile::tempdir().unwrap();
     let checkout = base.path().join("work");
     fs::create_dir(&checkout).unwrap();
@@ -2028,6 +2028,52 @@ async fn retired(scheduler: &trellis::http::DaemonState) {
     })
     .await
     .expect("runtime did not retire");
+}
+
+/// Root loss detected before the replacement is tried (inotify's usual
+/// order): a stale browser lease no longer blocks the replacement, but a read
+/// still in flight on the old root does, until it finishes.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn detected_root_loss_with_a_held_read_fences_browser_replacement() {
+    let base = tempfile::tempdir().unwrap();
+    let checkout = base.path().join("work");
+    fs::create_dir(&checkout).unwrap();
+    fs::write(checkout.join("a.js"), "function oldBrowser() {}\n").unwrap();
+    let old_id = identity(&checkout);
+    let key = old_id.root_key.clone();
+    let now = std::time::Instant::now();
+    let mut registry = CheckoutRegistry::with_roots_at(roots(base.path()), now);
+    registry
+        .register(&old_id, CheckoutOptions(serde_json::json!({})))
+        .unwrap();
+    registry.browser_request_at(&old_id, now).unwrap();
+    let old = registry.activate(&key).unwrap();
+    ready(&old).await;
+    let scheduler = old.browser_scheduler().unwrap();
+    let (held, _) = old.evidence_response().unwrap();
+    fs::rename(&checkout, base.path().join("old")).unwrap();
+    fs::create_dir(&checkout).unwrap();
+    fs::write(checkout.join("a.js"), "function newBrowser() {}\n").unwrap();
+    assert!(
+        scheduler.submit_watch_event_for_tests(Ok(notify::Event::new(notify::EventKind::Remove(
+            notify::event::RemoveKind::Any
+        ))))
+    );
+    retired(&scheduler).await;
+    assert!(
+        registry.browser_identity(&key).is_err(),
+        "a held old-root read fences replacement"
+    );
+    drop(held);
+    let discovered = registry
+        .browser_identity(&key)
+        .expect("the stale browser lease does not block a replacement root");
+    let new_id = identity(&checkout);
+    assert_eq!(
+        (discovered.device, discovered.inode),
+        (new_id.device, new_id.inode)
+    );
 }
 
 /// Decision 0009 §2: after old-root settlement the runtime closes at once,

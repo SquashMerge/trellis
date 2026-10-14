@@ -436,7 +436,7 @@ fn open_descriptors(path: &Path) -> usize {
 }
 
 #[tokio::test]
-async fn timed_release_closes_checkout_handles_and_reattach_runs_h() {
+async fn timed_release_closes_checkout_handles_and_reattach_runs_startup() {
     let (base, id, mut registry, now) = fixture();
     let root_baseline = open_descriptors(&id.root);
     let lock = base
@@ -473,7 +473,7 @@ async fn timed_release_closes_checkout_handles_and_reattach_runs_h() {
 
 #[cfg(feature = "test-support")]
 #[tokio::test]
-async fn invalid_prior_head_does_not_pin_idle_resources_or_skip_reattach_h() {
+async fn invalid_prior_head_does_not_pin_idle_resources_or_skip_reattach_startup() {
     use std::os::unix::fs::MetadataExt;
     let (_base, id, mut registry, now) = fixture();
     registry.attach_launch(1, &id).unwrap();

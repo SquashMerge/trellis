@@ -71,7 +71,7 @@ fn absent_queue_readers_are_existing_only_and_leave_home_bytes_unchanged() {
 }
 
 #[test]
-fn first_h_bootstraps_virgin_queue_but_published_missing_queue_is_refused() {
+fn first_startup_bootstraps_virgin_queue_but_published_missing_queue_is_refused() {
     use std::sync::{Arc, atomic::AtomicBool};
     let state = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
@@ -539,7 +539,7 @@ fn old_holder_fails_queued_and_running_rows_after_root_is_moved() {
 }
 
 #[test]
-fn replacement_activation_settles_old_root_before_h_and_new_fifo() {
+fn replacement_activation_settles_old_root_before_startup_and_new_fifo() {
     let state = tempfile::tempdir().unwrap();
     let parent = tempfile::tempdir().unwrap();
     let root = parent.path().join("workspace");

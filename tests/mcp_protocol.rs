@@ -2759,7 +2759,7 @@ fn causal_fixture_event(
 }
 
 #[test]
-fn causal_witness_ignores_late_retired_epoch_and_requires_successor_h() {
+fn causal_witness_ignores_late_retired_epoch_and_requires_successor_startup() {
     let stream = uuid::Uuid::new_v4();
     let owner = uuid::Uuid::new_v4();
     let old = uuid::Uuid::new_v4();
@@ -3147,7 +3147,7 @@ async fn describe_reports_published_watcher_health_while_an_inventory_holds_the_
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn describe_serves_valid_prior_head_while_mandatory_h_is_paused() {
+async fn describe_serves_valid_prior_head_while_startup_reconciliation_is_paused() {
     use std::os::unix::net::UnixStream;
     use trellis::daemon::registry::CheckoutRegistry;
     use trellis::store::topology::{TopologyRoots, WorkspaceIdentity};
@@ -3259,7 +3259,7 @@ async fn describe_serves_valid_prior_head_while_mandatory_h_is_paused() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn describe_cold_initial_h_reports_indexing_without_prior_coverage() {
+async fn describe_cold_initial_startup_reports_indexing_without_prior_coverage() {
     use std::os::unix::net::UnixStream;
     use trellis::daemon::registry::CheckoutRegistry;
     use trellis::store::topology::{TopologyRoots, WorkspaceIdentity};

@@ -788,7 +788,16 @@ impl CheckoutRegistry {
         // root_changed), so they do not keep the replacement from attaching;
         // the new entry starts without them.
         if self.root_lost_runtime(key) {
-            if !self.verified_replacement(identity)
+            // A read still in flight holds the old root's index files, which
+            // the replacement would recreate: it fences replacement here as it
+            // fences release.
+            let reading = self.runtimes.get(key).is_some_and(|runtime| {
+                runtime
+                    .resources()
+                    .is_ok_and(|resources| resources.scheduler.leases() != 0)
+            });
+            if reading
+                || !self.verified_replacement(identity)
                 || (self.runtimes.contains_key(key) && !self.wait_runtime_retired(key))
             {
                 return Err(SelectionError::IdentityChanged);

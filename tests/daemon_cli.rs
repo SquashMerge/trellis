@@ -1349,7 +1349,7 @@ async fn bounded_cli_capture_reaps_stalled_child() {
 /// One real daemon/serve cold startup reconciliation per private HOME; no prior daemon session can
 /// supply a warm head or make an omitted CLI option look explicit.
 #[tokio::test]
-async fn cold_serve_h_preserves_implicit_scip_and_honors_explicit_default_cap() {
+async fn cold_serve_startup_preserves_implicit_scip_and_honors_explicit_default_cap() {
     use protobuf::Message;
     use sha2::{Digest, Sha256};
     use std::os::unix::net::UnixStream;
