@@ -2908,10 +2908,7 @@ async fn describe_reports_actual_degraded_watcher_on_selected_snapshot() {
     .expect("watcher was not installed after H");
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            if runtime
-                .mcp_watcher_degraded(std::time::Instant::now() + Duration::from_secs(5))
-                .unwrap_or(false)
-            {
+            if runtime.mcp_watcher_degraded().unwrap_or(false) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -2960,7 +2957,7 @@ async fn describe_reports_actual_degraded_watcher_on_selected_snapshot() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn describe_refuses_watcher_health_when_inventory_outlasts_deadline() {
+async fn describe_reports_published_watcher_health_while_an_inventory_holds_the_watcher() {
     use std::os::unix::net::UnixStream;
     use trellis::daemon::registry::CheckoutRegistry;
     use trellis::store::topology::{TopologyRoots, WorkspaceIdentity};
@@ -3030,12 +3027,19 @@ async fn describe_refuses_watcher_health_when_inventory_outlasts_deadline() {
         .read_line(&mut line)
         .unwrap();
     let response: Value = serde_json::from_str(&line).unwrap();
-    tool(&response, Some("deadline_exceeded"), true);
-    assert!(
-        start.elapsed() <= Duration::from_secs(6),
-        "health wait exceeded call deadline"
-    );
+    // Health is published, not sampled under the watcher lock: an inventory
+    // in flight neither delays describe nor turns its success into a refusal.
+    let elapsed = start.elapsed();
     release_tx.send(()).unwrap();
+    tool(&response, None, true);
+    assert_eq!(
+        response["result"]["structuredContent"]["data"]["watcherDegraded"], false,
+        "{response}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "describe waited {elapsed:?} for an inventory in flight"
+    );
     holder.join().unwrap();
     drop(client);
     session.join().unwrap().unwrap();

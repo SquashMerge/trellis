@@ -1701,11 +1701,9 @@ impl CheckoutRuntime {
         Ok(())
     }
 
-    /// Read watcher health within the caller's admission deadline.
-    pub fn mcp_watcher_degraded(&self, deadline: Instant) -> anyhow::Result<bool> {
-        self.resources()?
-            .scheduler
-            .checkout_watcher_degraded(deadline)
+    /// Read the published watcher health; it never waits for an inventory.
+    pub fn mcp_watcher_degraded(&self) -> anyhow::Result<bool> {
+        Ok(self.resources()?.scheduler.checkout_watcher_degraded())
     }
 
     /// Admit W1 through the same selected response path; a missing head is not corruption.

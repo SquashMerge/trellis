@@ -449,9 +449,7 @@ fn run_transport(
                                                             );
                                                         }
                                                     }
-                                                    match runtime
-                                                        .mcp_watcher_degraded(call_deadline)
-                                                    {
+                                                    match runtime.mcp_watcher_degraded() {
                                                         Ok(degraded)
                                                             if envelope.get("data").is_some() =>
                                                         {

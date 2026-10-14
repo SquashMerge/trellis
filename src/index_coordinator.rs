@@ -417,6 +417,8 @@ impl std::error::Error for CutoffChanged {}
 /// This is an in-memory scheduler, not a second request queue.
 pub struct WatcherWork {
     watch: crate::watch::WatchSignals,
+    /// Shared with every watcher this owner creates; read without its lock.
+    health: Arc<std::sync::atomic::AtomicBool>,
     last_inventory: std::time::Instant,
     retry_after: Option<std::time::Instant>,
     last_accounted_generation: Option<u64>,
@@ -437,13 +439,31 @@ impl WatcherWork {
         session: &Arc<WriterSession>,
         options: &IndexOptions,
     ) -> Result<Self> {
+        Self::publishing(
+            store,
+            session,
+            options,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+    }
+
+    /// Like `new`, publishing watcher health through the owner's `health` flag
+    /// for lock-free reads. Every replacement watcher shares the same flag.
+    pub fn publishing(
+        store: &Store,
+        session: &Arc<WriterSession>,
+        options: &IndexOptions,
+        health: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<Self> {
         store.verify_writer_session(session)?;
-        let watch = crate::watch::WatchSignals::new(
+        let watch = crate::watch::WatchSignals::publishing(
             options.workspace_root.clone(),
             options.scip_path.clone(),
             options.manifest_path.clone(),
+            health.clone(),
         );
         Ok(Self {
+            health,
             watch,
             last_inventory: std::time::Instant::now(),
             retry_after: None,
@@ -535,7 +555,12 @@ impl WatcherWork {
     #[doc(hidden)]
     pub fn suppress_watch_signals_for_tests(&mut self, absent_watch_root: std::path::PathBuf) {
         assert!(!absent_watch_root.exists());
-        self.watch = crate::watch::WatchSignals::new(absent_watch_root, None, None);
+        self.watch = crate::watch::WatchSignals::publishing(
+            absent_watch_root,
+            None,
+            None,
+            self.health.clone(),
+        );
         assert!(self.watch.degraded());
         self.last_accounted_generation = Some(self.watch.drain().generation);
     }
@@ -598,10 +623,11 @@ impl WatcherWork {
             || self.options.manifest_path != options.manifest_path
             || self.options.max_file_bytes != options.max_file_bytes
         {
-            let next = crate::watch::WatchSignals::new(
+            let next = crate::watch::WatchSignals::publishing(
                 options.workspace_root.clone(),
                 options.scip_path.clone(),
                 options.manifest_path.clone(),
+                self.health.clone(),
             );
             self.watch = next;
             self.options = options.clone();
@@ -1339,7 +1365,12 @@ mod tests {
         // inventory, but an accounted idle generation must not veto maintenance.
         let absent_watch_root = workspace.path().join("absent_watch_root");
         assert!(!absent_watch_root.exists());
-        work.watch = crate::watch::WatchSignals::new(absent_watch_root, None, None);
+        work.watch = crate::watch::WatchSignals::publishing(
+            absent_watch_root,
+            None,
+            None,
+            work.health.clone(),
+        );
         assert!(work.watch.degraded());
         assert!(work.accepted_watch_intent(&options));
         assert!(

@@ -167,6 +167,9 @@ pub struct WatchSignals {
     last_signal: Option<Instant>,
     urgent: bool,
     degraded: bool,
+    /// Published copy of `degraded` for lock-free health reads. A watcher
+    /// owner shares one flag across every replacement watcher it creates.
+    health: Arc<AtomicBool>,
 }
 
 impl WatchSignals {
@@ -175,7 +178,22 @@ impl WatchSignals {
     /// outside this root; their paths still demand a full input reconciliation.
     /// The adapter does not elect a leader or retry registration on its own.
     pub fn new(root: PathBuf, scip_path: Option<PathBuf>, manifest_path: Option<PathBuf>) -> Self {
-        Self::construct(root, scip_path, manifest_path, true)
+        Self::publishing(
+            root,
+            scip_path,
+            manifest_path,
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    /// A native watcher whose health is also published through `health`.
+    pub fn publishing(
+        root: PathBuf,
+        scip_path: Option<PathBuf>,
+        manifest_path: Option<PathBuf>,
+        health: Arc<AtomicBool>,
+    ) -> Self {
+        Self::construct(root, scip_path, manifest_path, true, health)
     }
 
     /// Fixture-only ingress with no asynchronous OS backend. Synthetic events
@@ -186,7 +204,13 @@ impl WatchSignals {
         scip_path: Option<PathBuf>,
         manifest_path: Option<PathBuf>,
     ) -> Self {
-        Self::construct(root, scip_path, manifest_path, false)
+        Self::construct(
+            root,
+            scip_path,
+            manifest_path,
+            false,
+            Arc::new(AtomicBool::new(false)),
+        )
     }
 
     fn construct(
@@ -194,6 +218,7 @@ impl WatchSignals {
         scip_path: Option<PathBuf>,
         manifest_path: Option<PathBuf>,
         native: bool,
+        health: Arc<AtomicBool>,
     ) -> Self {
         // Preserve short bursts beyond one bounded drain without treating a
         // repeated path as lost input. Actual channel overflow still forces full.
@@ -236,6 +261,7 @@ impl WatchSignals {
             })
             .and_then(Result::ok);
         let degraded = native && watcher.is_none();
+        health.store(degraded, Ordering::Release);
         let captured_inputs = [scip_path, manifest_path]
             .into_iter()
             .flatten()
@@ -266,6 +292,7 @@ impl WatchSignals {
             last_signal: None,
             urgent: true,
             degraded,
+            health,
         }
     }
 
@@ -394,6 +421,7 @@ impl WatchSignals {
 
     fn fail(&mut self) {
         self.degraded = true;
+        self.health.store(true, Ordering::Release);
         self.pending.full = true;
         self.urgent = true;
         self.watcher = None;

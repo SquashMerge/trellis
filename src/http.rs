@@ -264,6 +264,9 @@ pub struct DaemonState {
     causal_h_reported: Mutex<Option<(uuid::Uuid, uuid::Uuid, u64)>>,
     recovery_retry_after: Mutex<Option<Instant>>,
     idle_h_retry: AtomicBool,
+    /// Watcher health, published by the current watcher through one flag that
+    /// lives as long as this state. Readers never wait for watcher work.
+    watcher_health: Arc<AtomicBool>,
     retention_last_run: Mutex<Instant>,
     gc_last_check: Mutex<Instant>,
     #[cfg(test)]
@@ -442,6 +445,7 @@ pub fn new_with_dependency_options(
         causal_h_reported: Mutex::new(None),
         recovery_retry_after: Mutex::new(None),
         idle_h_retry: AtomicBool::new(false),
+        watcher_health: Arc::new(AtomicBool::new(false)),
         retention_last_run: Mutex::new(Instant::now()),
         gc_last_check: Mutex::new(Instant::now() - Duration::from_secs(3600)),
         #[cfg(test)]
@@ -643,19 +647,10 @@ impl DaemonState {
         hold();
     }
 
-    /// Sample health after an inventory releases the watcher lock, without guessing.
-    pub fn checkout_watcher_degraded(&self, deadline: Instant) -> anyhow::Result<bool> {
-        loop {
-            if let Ok(work) = self.watcher_work.try_lock() {
-                return Ok(work
-                    .as_ref()
-                    .is_some_and(|(_, watcher)| watcher.watcher_degraded()));
-            }
-            if Instant::now() >= deadline {
-                anyhow::bail!("deadline_exceeded: watcher health was not sampled");
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
+    /// Watcher health as the current watcher published it. A sticky flag, not
+    /// a sample: an inventory in flight never delays or refuses this read.
+    pub fn checkout_watcher_degraded(&self) -> bool {
+        self.watcher_health.load(Ordering::Acquire)
     }
 
     /// A pending watcher hint (including the periodic inventory deadline) keeps
@@ -731,7 +726,10 @@ impl DaemonState {
             _ => true,
         };
         if changed {
-            *self.watcher_work.lock().unwrap() = None;
+            let mut work = self.watcher_work.lock().unwrap();
+            *work = None;
+            // The replaced watcher is gone; a new one publishes its own state.
+            self.watcher_health.store(false, Ordering::Release);
         }
         *current = next;
     }
@@ -1132,10 +1130,11 @@ impl DaemonState {
                     .unwrap_or_else(|| self.options.clone());
                 let mut work = self.watcher_work.lock().unwrap();
                 if work.is_none() {
-                    let mut scheduler = crate::index_coordinator::WatcherWork::new(
+                    let mut scheduler = crate::index_coordinator::WatcherWork::publishing(
                         &self.store,
                         &session,
                         &options,
+                        self.watcher_health.clone(),
                     )?;
                     // A late OS event from before this forced fixture tick must
                     // not defer pin expiration as accepted watcher work (#131).
@@ -1372,10 +1371,11 @@ impl DaemonState {
                             .upgrade()
                             .is_some_and(|owner| Arc::ptr_eq(&owner, session))
                     }) {
-                        let mut scheduler = crate::index_coordinator::WatcherWork::new(
+                        let mut scheduler = crate::index_coordinator::WatcherWork::publishing(
                             &self.store,
                             session,
                             &selected_options,
+                            self.watcher_health.clone(),
                         )?;
                         if let Some(reporter) = self.causal_witness.lock().unwrap().clone() {
                             scheduler.attach_causal_witness(
