@@ -26,9 +26,6 @@ pub(crate) enum RuntimeState {
     Reconciling { attempts: u32, waiting: bool },
     /// A validated head committed; this session is the only writer.
     Ready(Arc<WriterSession>),
-    /// The captured root is missing or replaced, and its accepted requests are
-    /// confirmed terminal. Old-root evidence is never served.
-    RootLost,
     /// Release is due (Decision 0009 §5). The worker makes one attempt at
     /// watcher intent up to `cutoff` (the generation when release was
     /// accepted), then closes. A lease or an enqueue cancels it before
@@ -74,7 +71,6 @@ pub enum RuntimePhase {
     Activating,
     Reconciling { started: bool, waiting: bool },
     Ready,
-    RootLost,
     RetireRequested,
     Closing,
     Retired,
@@ -89,7 +85,6 @@ impl RuntimePhase {
                 waiting: *waiting,
             },
             RuntimeState::Ready(_) => RuntimePhase::Ready,
-            RuntimeState::RootLost => RuntimePhase::RootLost,
             RuntimeState::RetireRequested { .. } => RuntimePhase::RetireRequested,
             RuntimeState::Closing => RuntimePhase::Closing,
             RuntimeState::Retired => RuntimePhase::Retired,
@@ -172,7 +167,6 @@ impl DaemonState {
             RuntimeState::Reconciling { .. } => return Ok(true),
             RuntimeState::Activating => {}
             RuntimeState::Ready(_)
-            | RuntimeState::RootLost
             | RuntimeState::RetireRequested { .. }
             | RuntimeState::Closing
             | RuntimeState::Retired => {
@@ -427,10 +421,7 @@ impl DaemonState {
             return Some(retry);
         }
         match &*self.runtime.lock().unwrap() {
-            RuntimeState::Activating
-            | RuntimeState::RootLost
-            | RuntimeState::Closing
-            | RuntimeState::Retired => {
+            RuntimeState::Activating | RuntimeState::Closing | RuntimeState::Retired => {
                 return None;
             }
             RuntimeState::Reconciling { .. } | RuntimeState::RetireRequested { .. } => {
@@ -472,7 +463,6 @@ impl DaemonState {
         let pending = match &*self.runtime.lock().unwrap() {
             // Nothing is claimed on a retired runtime; never reopen its queue.
             RuntimeState::Closing | RuntimeState::Retired => false,
-            RuntimeState::RootLost => !matches!(self.store.old_root_unfinished_request(), Ok(None)),
             _ => !matches!(self.store.earliest_unfinished_request(), Ok(None)),
         };
         let was = self.fifo_pending.swap(pending, Ordering::AcqRel);
@@ -540,6 +530,9 @@ impl DaemonState {
         let mut state = self.runtime.lock().unwrap();
         match &*state {
             RuntimeState::Closing | RuntimeState::Retired => {
+                if self.root_lost.load(Ordering::Acquire) {
+                    anyhow::bail!("root_changed: captured root lost");
+                }
                 anyhow::bail!("index_not_ready: checkout released")
             }
             RuntimeState::RetireRequested { session, .. } => {
@@ -575,9 +568,7 @@ impl DaemonState {
             }
             RuntimeState::Reconciling { waiting: false, .. } => return RetireOutcome::Declined,
             RuntimeState::Ready(session) => Some(session.clone()),
-            RuntimeState::Activating
-            | RuntimeState::Reconciling { waiting: true, .. }
-            | RuntimeState::RootLost => None,
+            RuntimeState::Activating | RuntimeState::Reconciling { waiting: true, .. } => None,
         };
         if self.leases.load(Ordering::Acquire) != 0
             || self.fifo_pending.load(Ordering::Acquire)
@@ -606,34 +597,57 @@ impl DaemonState {
         // belongs to a fresh runtime.
         let root_lost = self.store.root_path_replaced().unwrap_or(true);
         if !root_lost && self.store.earliest_unfinished_request()?.is_some() {
-            let mut state = self.runtime.lock().unwrap();
-            if let RuntimeState::RetireRequested { session, .. } = &*state {
-                *state = match session {
-                    Some(session) => RuntimeState::Ready(session.clone()),
-                    None => RuntimeState::Reconciling {
-                        attempts: 0,
-                        waiting: false,
-                    },
-                };
-            }
-            drop(state);
-            self.note_state_change();
-            self.step_progress.store(true, Ordering::Release);
+            self.cancel_retirement(self.runtime.lock().unwrap());
             return Ok(());
         }
-        self.reconcile_through_cutoff();
         #[cfg(feature = "test-support")]
         if let Some(hook) = self.retire_hook.lock().unwrap().take() {
             hook();
         }
-        {
+        if !root_lost {
+            self.reconcile_through_cutoff();
+        }
+        // The Closing linearization point. A lease cancelled the request
+        // already; an enqueue COMMIT through any Store since the FIFO check
+        // above set `fifo_pending` (its queue waker runs after the COMMIT).
+        let held = {
             let mut state = self.runtime.lock().unwrap();
             if !matches!(*state, RuntimeState::RetireRequested { .. }) {
-                // Cancelled by a lease or an enqueue: resources stay live.
                 return Ok(());
             }
-            *state = RuntimeState::Closing;
+            if !root_lost && self.fifo_pending.load(Ordering::Acquire) {
+                self.cancel_retirement(state);
+                return Ok(());
+            }
+            match std::mem::replace(&mut *state, RuntimeState::Closing) {
+                RuntimeState::RetireRequested { session, .. } => session,
+                _ => None,
+            }
+        };
+        self.close(held);
+        Ok(())
+    }
+
+    /// A requested retirement found accepted work: the runtime stays live.
+    fn cancel_retirement(&self, mut state: std::sync::MutexGuard<'_, RuntimeState>) {
+        if let RuntimeState::RetireRequested { session, .. } = &*state {
+            *state = match session {
+                Some(session) => RuntimeState::Ready(session.clone()),
+                None => RuntimeState::Reconciling {
+                    attempts: 0,
+                    waiting: false,
+                },
+            };
         }
+        drop(state);
+        self.note_state_change();
+        self.step_progress.store(true, Ordering::Release);
+    }
+
+    /// Close a runtime already in `Closing`. The writer session (and its
+    /// index-use guard) is held until the watcher and SQLite witnesses are
+    /// closed, so GC never sees the index unused mid-close.
+    pub(super) fn close(&self, held: Option<Arc<WriterSession>>) {
         self.note_state_change();
         *self.watch_status.lock().unwrap() = None;
         *self.watcher_work.lock().unwrap() = None;
@@ -643,17 +657,17 @@ impl DaemonState {
             hook();
         }
         self.store.retire_checkout_sqlite_witnesses();
+        drop(held);
         *self.runtime.lock().unwrap() = RuntimeState::Retired;
         self.note_state_change();
         if let Some(lifecycle) = self.lifecycle.get() {
             lifecycle();
         }
-        Ok(())
     }
 
     /// One attempt at accepted watcher intent up to the cutoff. Its outcome
-    /// never blocks retirement: changes it misses are captured by the next
-    /// activation's mandatory startup reconciliation.
+    /// never blocks retirement: changes it misses, or that arrive after the
+    /// cutoff, are captured by the next activation's startup reconciliation.
     fn reconcile_through_cutoff(&self) {
         let (cutoff, session) = match &*self.runtime.lock().unwrap() {
             RuntimeState::RetireRequested {
@@ -675,7 +689,13 @@ impl DaemonState {
         {
             return;
         }
-        let _ = watcher.reconcile_due(&self.store, &session, &options, &self.watcher_cancel, true);
+        let _ = watcher.reconcile_through_cutoff(
+            &self.store,
+            &session,
+            &options,
+            &self.watcher_cancel,
+            cutoff,
+        );
     }
 
     /// Wait until this runtime is `Retired` (or `timeout` passes). Close is

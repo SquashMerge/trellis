@@ -255,6 +255,8 @@ pub struct DaemonState {
     fifo_pending: Arc<AtomicBool>,
     /// The registry's lifecycle wake (Decision 0009 §5).
     lifecycle: Arc<std::sync::OnceLock<Arc<dyn Fn() + Send + Sync>>>,
+    /// The runtime closed because its captured root was lost.
+    root_lost: AtomicBool,
     /// Every runtime state transition bumps this and signals `state_changed`.
     state_version: AtomicU64,
     state_changed: std::sync::Condvar,
@@ -484,6 +486,7 @@ pub fn new_with_config(
         leases: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         fifo_pending,
         lifecycle: Arc::new(std::sync::OnceLock::new()),
+        root_lost: AtomicBool::new(false),
         state_version: AtomicU64::new(0),
         state_changed: std::sync::Condvar::new(),
         #[cfg(feature = "test-support")]
@@ -670,7 +673,7 @@ impl DaemonState {
     }
 
     pub fn checkout_root_loss_retired(&self) -> bool {
-        matches!(*self.runtime.lock().unwrap(), RuntimeState::RootLost)
+        self.root_lost.load(Ordering::Acquire)
     }
 
     fn retired(&self) -> bool {
@@ -764,6 +767,7 @@ impl DaemonState {
     /// Run one maintenance unit on the worker thread, after its higher-priority
     /// step (Decision 0009 §4), and report a failure at a bounded rate.
     pub(super) fn run_maintenance_unit(&self) {
+        let _step = self.step_lock.lock().unwrap();
         let failure = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.maintenance_tick()
         })) {
@@ -1108,6 +1112,8 @@ impl DaemonState {
             }
         }
         *self.retention_last_run.lock().unwrap() = Instant::now() - Duration::from_secs(60);
+        // The worker is the only writer (Decision 0009 §1): serialize with it.
+        let _step = self.step_lock.lock().unwrap();
         self.maintenance_tick()
     }
 
@@ -1167,14 +1173,18 @@ impl DaemonState {
         // other progress.
         if self.store.root_path_replaced()? {
             self.store.fail_changed_root_requests()?;
-            if matches!(
-                *self.runtime.lock().unwrap(),
-                RuntimeState::RetireRequested { .. }
+            // Settled (Decision 0009 §2): close now. Recovery for the path
+            // runs on a fresh runtime, never on this one.
+            self.root_lost.store(true, Ordering::Release);
+            let held = match std::mem::replace(
+                &mut *self.runtime.lock().unwrap(),
+                RuntimeState::Closing,
             ) {
-                // Settled: a requested retirement proceeds without its session.
-                return self.run_retirement();
-            }
-            self.set_runtime_state(RuntimeState::RootLost);
+                RuntimeState::Ready(session) => Some(session),
+                RuntimeState::RetireRequested { session, .. } => session,
+                _ => None,
+            };
+            self.close(held);
             return Ok(());
         }
         // Retirement is due: the worker retires this runtime at this boundary
@@ -6879,6 +6889,9 @@ async fn selected_evidence_map<T: Send + 'static>(
     let runtime = runtime.clone();
     tokio::task::spawn_blocking(move || {
         let (response, catching_up) = runtime.evidence_response()?;
+        if let Some(hook) = &hook {
+            hook("before_work");
+        }
         let result = work(&response)?;
         if let Some(hook) = hook {
             hook("before_read_finish");
@@ -6906,6 +6919,9 @@ async fn selected_provider_read<T: Send + 'static>(
     let runtime = runtime.clone();
     tokio::task::spawn_blocking(move || {
         let (response, catching_up) = runtime.evidence_response().map_err(ApiError::from)?;
+        if let Some(hook) = &hook {
+            hook("before_work");
+        }
         let value = work(&response)?;
         if let Some(hook) = hook {
             hook("before_read_finish");
@@ -7110,9 +7126,11 @@ async fn provisioned_core_answer(
                 return Err(invalid());
             }
             let state = runtime.browser_scheduler()?;
+            // One configuration version for the whole request (Decision 0009 §6).
+            let config = state.config();
             let (_, revision, catching_up) =
                 selected_provider_preflight(runtime, hook, None).await?;
-            if state.config().dependency_options.is_none() {
+            if config.dependency_options.is_none() {
                 return Err(ApiError(
                     StatusCode::CONFLICT,
                     "dependencies_disabled",
@@ -7161,11 +7179,13 @@ async fn provisioned_core_answer(
                 }
             }
             let state = runtime.browser_scheduler()?;
+            // One configuration version for the whole request (Decision 0009 §6).
+            let config = state.config();
             let (packet, revision, catching_up) =
                 selected_provider_preflight(runtime, hook, Some(id.to_owned())).await?;
             let packet = packet.unwrap();
             if jev {
-                let provider = state.config().provider.clone().ok_or(ApiError(
+                let provider = config.provider.clone().ok_or(ApiError(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "jev_disabled",
                     "Live Jev is disabled",
@@ -7210,7 +7230,7 @@ async fn provisioned_core_answer(
                     .insert("X-Trellis-Mutation-Outcome", outcome.parse().unwrap());
                 Ok((response, catching_up))
             } else {
-                let provider = state.config().acp.clone().ok_or(ApiError(
+                let provider = config.acp.clone().ok_or(ApiError(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "acp_disabled",
                     "Live ACP is disabled",
@@ -7248,15 +7268,17 @@ async fn provisioned_core_answer(
                 return Err(invalid());
             }
             let state = runtime.browser_scheduler()?;
+            // One configuration version for the whole request (Decision 0009 §6).
+            let config = state.config();
             let jev = suffix == "jev/status";
             let (value, catching_up) = selected_provider_read(runtime, hook, move |_| {
                 if jev {
-                    match &state.config().provider {
+                    match &config.provider {
                         Some(provider) => Ok(json!({"enabled":true,"budget":provider.budget().map_err(ApiError::from)?})),
                         None => Ok(json!({"enabled":false,"budget":null})),
                     }
                 } else {
-                    match &state.config().acp {
+                    match &config.acp {
                         Some(provider) => Ok(json!({"enabled":true,"status":provider.status().map_err(acp_error)?})),
                         None => Ok(json!({"enabled":false,"status":null})),
                     }
@@ -7361,8 +7383,10 @@ async fn provisioned_core_answer(
                 return Err(invalid());
             }
             let state = runtime.browser_scheduler()?;
+            // One configuration version for the whole request (Decision 0009 §6).
+            let config = state.config();
             let (payload, catching_up) = selected_provider_read(runtime, hook, move |_| {
-                Ok(json!({"roots":state.config().rust_sources.iter().map(|r| json!({"id":r.label,"label":r.label,
+                Ok(json!({"roots":config.rust_sources.iter().map(|r| json!({"id":r.label,"label":r.label,
                     "path":r.directory.root.to_string_lossy()})).collect::<Vec<_>>() }))
             }).await?;
             Ok((Json(payload).into_response(), catching_up))
@@ -7376,9 +7400,10 @@ async fn provisioned_core_answer(
                 return Err(browse_invalid());
             }
             let state = runtime.browser_scheduler()?;
+            // One configuration version for the whole request (Decision 0009 §6).
+            let config = state.config();
             let (page, catching_up) = selected_provider_read(runtime, hook, move |r| {
                 let revision = r.status().map_err(ApiError::from)?.revision;
-                let config = state.config();
                 let root = config
                     .rust_sources
                     .iter()
@@ -7410,8 +7435,9 @@ async fn provisioned_core_answer(
                 return Err(browse_invalid());
             }
             let state = runtime.browser_scheduler()?;
+            // One configuration version for the whole request (Decision 0009 §6).
+            let config = state.config();
             let (file, catching_up) = selected_provider_read(runtime, hook, move |_| {
-                let config = state.config();
                 let root = config
                     .rust_sources
                     .iter()
@@ -7455,19 +7481,20 @@ async fn provisioned_core_answer(
                 return Err(browse_invalid());
             }
             let state = runtime.browser_scheduler()?;
+            // One configuration version for the whole request (Decision 0009 §6).
+            let config = state.config();
             let (page, catching_up) = selected_evidence(runtime, hook, move |response| {
-                let (mut items, next_offset, truncated) = state
-                    .config()
+                let (mut items, next_offset, truncated) = config
                     .browser
                     .list(&q.path, q.offset, q.limit)
                     .map_err(BrowseDirectoryError)?;
                 let (revision, indexed_workspace) =
-                    response.tree_metadata(&state.config().browser.root, &mut items)?;
+                    response.tree_metadata(&config.browser.root, &mut items)?;
                 for item in items
                     .iter_mut()
                     .filter(|item| item.kind == "file" && item.indexed_path.is_none())
                 {
-                    let absolute = state.config().browser.root.join(&item.path);
+                    let absolute = config.browser.root.join(&item.path);
                     let reason = if !absolute.starts_with(&indexed_workspace) {
                         "Outside indexed workspace"
                     } else {
@@ -7482,7 +7509,7 @@ async fn provisioned_core_answer(
                     item.unindexed_reason = Some(reason.into());
                 }
                 Ok(crate::file_tree::Page {
-                    root: state.config().browser.root.to_string_lossy().into_owned(),
+                    root: config.browser.root.to_string_lossy().into_owned(),
                     indexed_workspace,
                     path: q.path,
                     revision,

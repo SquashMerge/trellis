@@ -103,7 +103,7 @@ Units are never preempted mid-way. Accepted work is never cancelled to make room
 
 **When a release is due** (Decision 0007 §3 policy), the registry asks the worker to retire. The request is **declined**, and the runtime stays `Ready`, while any of these hold:
 - a FIFO row is queued or running;
-- startup reconciliation or old-root settlement is pending;
+- startup reconciliation is running (not when a failed attempt is waiting out its backoff: an idle checkout whose startup keeps failing may retire, and the next client starts over), or old-root settlement is pending;
 - a read lease is held.
 
 Accepted FIFO work and its Q2→watcher→Q1 gate are never skipped.
@@ -230,6 +230,12 @@ A watcher event therefore wakes the worker immediately, and the worker computes 
 The owner approved this record on 2026-10-14 **for provisional implementation**: C1–C9 in PR #139 may be built against it, and it is ratified when #139 merges. No separate decision-only merge is required.
 
 Implementation may show that a rule needs to change. The change is then made to this record in the same PR, called out in the PR, and approved by the owner before merge. Implementation never silently departs from the text.
+
+**Amendments approved by the owner (2026-10-14):**
+- **§2 (C1):** a lost root keeps its resources until old-root settlement is confirmed, then closes.
+- **§§4–5 (C3):** retirement makes one attempt at watcher intent up to the cutoff, and its outcome never holds the retirement. The attempt never captures or acknowledges a generation after the cutoff.
+- **§6 (C5):** the provisioning mutex serializes registrations, and the configuration is built under the registry guard, as at activation.
+- **§5:** retirement declines while startup reconciliation runs, but not while a failed attempt waits out its backoff.
 
 ## Consequences
 

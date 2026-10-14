@@ -1991,3 +1991,273 @@ async fn read_waiter_wakes_when_startup_reconciliation_commits() {
     );
     ready(&runtime).await;
 }
+
+/// Hold the worker at its next step on a separate thread (a guard cannot be
+/// held across an await); dropping the returned sender releases it.
+#[cfg(feature = "test-support")]
+async fn hold_worker(
+    scheduler: std::sync::Arc<trellis::http::DaemonState>,
+) -> (std::sync::mpsc::SyncSender<()>, std::thread::JoinHandle<()>) {
+    let (held_tx, held_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let holder = std::thread::spawn(move || {
+        let _held = scheduler.hold_worker_for_tests();
+        held_tx.send(()).unwrap();
+        let _ = release_rx.recv();
+    });
+    entered(held_rx, "worker hold").await;
+    (release_tx, holder)
+}
+
+/// Wait until a runtime is fully retired.
+#[cfg(feature = "test-support")]
+async fn retired(scheduler: &trellis::http::DaemonState) {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        while scheduler.runtime_phase() != trellis::http::RuntimePhase::Retired {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("runtime did not retire");
+}
+
+/// Decision 0009 §2: after old-root settlement the runtime closes at once,
+/// even with a client attached; its reads never serve old-root evidence, and
+/// the path gets a fresh runtime for the replacement root.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn settled_root_loss_closes_with_a_client_attached() {
+    let base = tempfile::tempdir().unwrap();
+    let checkout = base.path().join("work");
+    fs::create_dir(&checkout).unwrap();
+    fs::write(checkout.join("a.js"), "function oldRoot() {}\n").unwrap();
+    let old_id = identity(&checkout);
+    let mut registry = CheckoutRegistry::with_roots(roots(base.path()));
+    registry.attach_launch(1, &old_id).unwrap();
+    let old = registry.activate(&old_id.root_key).unwrap();
+    ready(&old).await;
+    let scheduler = old.browser_scheduler().unwrap();
+    fs::rename(&checkout, base.path().join("moved")).unwrap();
+    fs::create_dir(&checkout).unwrap();
+    fs::write(checkout.join("a.js"), "function newRoot() {}\n").unwrap();
+    // A watcher signal wakes the worker, which observes the loss.
+    assert!(
+        scheduler.submit_watch_event_for_tests(Ok(notify::Event::new(notify::EventKind::Remove(
+            notify::event::RemoveKind::Any
+        ))))
+    );
+    retired(&scheduler).await;
+    let refused = old
+        .evidence_response()
+        .err()
+        .expect("old root serves nothing");
+    assert!(refused.to_string().contains("root_changed"), "{refused:#}");
+    registry.disconnect(1);
+    let new_id = identity(&checkout);
+    registry.attach_launch(2, &new_id).unwrap();
+    let fresh = registry.activate(&new_id.root_key).unwrap();
+    assert!(!std::sync::Arc::ptr_eq(&fresh, &old));
+    ready(&fresh).await;
+    let (read, _) = fresh.evidence_response().unwrap();
+    let (_, source) = read.source_at("a.js", None).unwrap().unwrap();
+    assert!(source.text.contains("newRoot"));
+    read.finish(()).unwrap();
+}
+
+/// Decision 0009 §5: an enqueue COMMIT through another Store after
+/// retirement's FIFO check, before Closing, cancels the retirement.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn enqueue_from_another_store_before_closing_cancels_retirement() {
+    let base = tempfile::tempdir().unwrap();
+    let checkout = base.path().join("work");
+    fs::create_dir(&checkout).unwrap();
+    fs::write(checkout.join("a.js"), "function a() {}\n").unwrap();
+    let id = identity(&checkout);
+    let mut registry = CheckoutRegistry::with_roots(roots(base.path()));
+    let runtime = idle_detached(&mut registry, &id).await;
+    let scheduler = runtime.browser_scheduler().unwrap();
+    let store = Store::open(roots(base.path()), identity(&checkout)).unwrap();
+    let (row_tx, row_rx) = std::sync::mpsc::sync_channel(1);
+    let enqueuer = store.clone();
+    let options = trellis::indexer::IndexOptions::new(checkout.clone());
+    scheduler.set_retire_hook_for_tests(move || {
+        row_tx
+            .send(enqueuer.enqueue_request(&options, None).unwrap())
+            .unwrap();
+    });
+    assert!(!registry.release(&id.root_key).unwrap());
+    let row = tokio::task::spawn_blocking(move || row_rx.recv().unwrap())
+        .await
+        .unwrap();
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        while store.request_by_id(&row.id).unwrap().unwrap().state != "done" {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the accepted row was stranded by retirement");
+    assert!(runtime.has_active_resources());
+}
+
+/// Decision 0009 §4: the index keeps its use lock until Closing completes, so
+/// GC cannot take it exclusively while the watcher and witnesses close.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn closing_runtime_keeps_index_use_until_closed() {
+    let base = tempfile::tempdir().unwrap();
+    let checkout = base.path().join("work");
+    fs::create_dir(&checkout).unwrap();
+    fs::write(checkout.join("a.js"), "function a() {}\n").unwrap();
+    let id = identity(&checkout);
+    let topology = roots(base.path());
+    let mut registry = CheckoutRegistry::with_roots(topology.clone());
+    let runtime = idle_detached(&mut registry, &id).await;
+    let scheduler = runtime.browser_scheduler().unwrap();
+    let (seen_tx, seen_rx) = std::sync::mpsc::sync_channel(1);
+    let probe_roots = topology.clone();
+    let probe_id = identity(&checkout);
+    scheduler.set_closing_hook_for_tests(move || {
+        let exclusive = probe_roots.index_use_exclusive_existing(&probe_id).is_ok();
+        seen_tx.send(exclusive).unwrap();
+    });
+    drop(runtime);
+    assert!(!registry.release(&id.root_key).unwrap());
+    let exclusive = tokio::task::spawn_blocking(move || seen_rx.recv().unwrap())
+        .await
+        .unwrap();
+    assert!(!exclusive, "GC could take the index exclusively mid-close");
+    retired(&scheduler).await;
+}
+
+/// Decision 0009 §5 (owner-approved one attempt): a change accepted after the
+/// cutoff, before the attempt, is neither captured nor acknowledged by it.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn retirement_attempt_never_captures_past_its_cutoff() {
+    let base = tempfile::tempdir().unwrap();
+    let checkout = base.path().join("work");
+    fs::create_dir(&checkout).unwrap();
+    fs::write(checkout.join("a.js"), "function a() {}\n").unwrap();
+    let id = identity(&checkout);
+    let mut registry = CheckoutRegistry::with_roots(roots(base.path()));
+    let runtime = idle_detached(&mut registry, &id).await;
+    let scheduler = runtime.browser_scheduler().unwrap();
+    // Intent pending at the cutoff, so the attempt has work to do.
+    let (release_worker, holder) = hold_worker(scheduler.clone()).await;
+    fs::write(checkout.join("a.js"), "function a2() {}\n").unwrap();
+    assert!(
+        scheduler.submit_watch_event_for_tests(Ok(notify::Event::new(notify::EventKind::Modify(
+            notify::event::ModifyKind::Any
+        ))
+        .add_path(checkout.join("a.js"))))
+    );
+    assert!(!registry.release(&id.root_key).unwrap());
+    let late_path = checkout.join("late.js");
+    let late_scheduler = scheduler.clone();
+    scheduler.set_retire_hook_for_tests(move || {
+        fs::write(&late_path, "function late() {}\n").unwrap();
+        assert!(
+            late_scheduler.submit_watch_event_for_tests(Ok(notify::Event::new(
+                notify::EventKind::Create(notify::event::CreateKind::File)
+            )
+            .add_path(late_path.clone())))
+        );
+    });
+    release_worker.send(()).unwrap();
+    holder.join().unwrap();
+    retired(&scheduler).await;
+    drop(runtime);
+    let store = Store::open(roots(base.path()), identity(&checkout)).unwrap();
+    assert!(
+        store.source_at("late.js", None).unwrap().is_none(),
+        "the retirement attempt captured a change after its cutoff"
+    );
+}
+
+/// Decision 0009 §6: with no live runtime, serve still builds the whole
+/// configuration before acknowledging; one that cannot build is refused.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn serve_without_a_live_runtime_refuses_an_unbuildable_configuration() {
+    use trellis::daemon::BrowserProvisioner;
+    let base = tempfile::tempdir().unwrap();
+    let checkout = base.path().join("work");
+    fs::create_dir(&checkout).unwrap();
+    let identity = identity(&checkout);
+    let key = identity.root_key.clone();
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(CheckoutRegistry::with_roots(
+        roots(base.path()),
+    )));
+    let read_only = base.path().join("read-only");
+    fs::create_dir(&read_only).unwrap();
+    fs::set_permissions(
+        &read_only,
+        std::os::unix::fs::PermissionsExt::from_mode(0o500),
+    )
+    .unwrap();
+    let token = base.path().join("token");
+    let refused = BrowserProvisioner::new()
+        .register_serve(
+            &registry,
+            &identity,
+            CheckoutOptions(serde_json::json!({
+                "jevBudgetDir": read_only.join("budget"),
+                "jevBudgetCents": 100,
+                "jevKey": "test-key",
+            })),
+            "127.0.0.1:0".parse().unwrap(),
+            &token,
+        )
+        .await;
+    fs::set_permissions(
+        &read_only,
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
+    assert!(
+        refused.is_err(),
+        "an unbuildable configuration was acknowledged"
+    );
+    assert!(registry.lock().await.registration(&key).is_none());
+    assert!(!token.exists());
+}
+
+/// Decision 0009 §8: a completion COMMIT that is durable but reported as an
+/// error is confirmed later by a re-read, and that confirmation wakes the
+/// index waiter.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn ambiguous_completion_confirmed_later_wakes_the_index_waiter() {
+    let base = tempfile::tempdir().unwrap();
+    let checkout = base.path().join("work");
+    fs::create_dir(&checkout).unwrap();
+    fs::write(checkout.join("a.js"), "function a() {}\n").unwrap();
+    let id = identity(&checkout);
+    let mut registry = CheckoutRegistry::with_roots(roots(base.path()));
+    registry.attach_launch(1, &id).unwrap();
+    let runtime = registry.activate(&id.root_key).unwrap();
+    ready(&runtime).await;
+    let scheduler = runtime.browser_scheduler().unwrap();
+    let store = Store::open(roots(base.path()), identity(&checkout)).unwrap();
+    runtime.fail_next_completion_after_commit_for_tests();
+    let (release_worker, holder) = hold_worker(scheduler).await;
+    let indexer = runtime.clone();
+    let options = trellis::indexer::IndexOptions::new(checkout.clone());
+    let index = tokio::task::spawn_blocking(move || indexer.cli_index(&options));
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        while store.current_request().unwrap().is_none() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("request was not accepted");
+    release_worker.send(()).unwrap();
+    holder.join().unwrap();
+    let answer = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, index)
+        .await
+        .expect("the waiter was stranded by an ambiguous completion COMMIT")
+        .unwrap()
+        .unwrap();
+    assert!(answer["publishedRevision"].is_object());
+}

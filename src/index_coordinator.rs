@@ -432,7 +432,19 @@ pub struct WatcherWork {
     witness_reported_generation: Option<u64>,
     /// The owning worker's wake, installed on every watcher this owner creates.
     waker: Option<crate::watch::Waker>,
+    /// Set only for retirement's attempt: the batch must be exactly this generation.
+    generation_limit: Option<u64>,
 }
+
+/// The retirement attempt found ingress past its cutoff: it captures nothing.
+#[derive(Debug)]
+pub struct PastCutoff;
+impl std::fmt::Display for PastCutoff {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("watcher ingress passed the retirement cutoff")
+    }
+}
+impl std::error::Error for PastCutoff {}
 
 const PERIODIC_INVENTORY: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -481,7 +493,29 @@ impl WatcherWork {
             witness_ordinal_source: None,
             witness_reported_generation: None,
             waker: None,
+            generation_limit: None,
         })
+    }
+
+    /// Retirement's one attempt (Decision 0009 §5): reconcile only while the
+    /// accepted generation is still `cutoff`. A later signal, before or during
+    /// the capture, abandons it, so nothing after the cutoff is captured or
+    /// acknowledged.
+    pub fn reconcile_through_cutoff(
+        &mut self,
+        store: &Store,
+        session: &Arc<WriterSession>,
+        options: &IndexOptions,
+        cancel: &CancelFlag,
+        cutoff: u64,
+    ) -> Result<bool> {
+        if self.options_differ(options) {
+            return Err(PastCutoff.into());
+        }
+        self.generation_limit = Some(cutoff);
+        let outcome = self.reconcile_due(store, session, options, cancel, true);
+        self.generation_limit = None;
+        outcome
     }
 
     /// Wake `waker` after every accepted signal, on this and every later watcher.
@@ -703,6 +737,14 @@ impl WatcherWork {
         let now = std::time::Instant::now();
         let periodic = now.duration_since(self.last_inventory) >= PERIODIC_INVENTORY;
         let batch = self.watch.drain();
+        // Retirement's attempt never captures past its cutoff; the capture's
+        // own generation fence then keeps the batch at exactly the cutoff.
+        if self
+            .generation_limit
+            .is_some_and(|limit| batch.generation != limit)
+        {
+            return Err(PastCutoff.into());
+        }
         // Observe each new generation before its capture can acknowledge it.
         // The queue tick holds watcher_work across this call; the bounded
         // reporter only try_sends and never opens a socket on this path.

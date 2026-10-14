@@ -836,8 +836,8 @@ impl CheckoutRegistry {
     }
 
     /// The configuration a registration publishes to a live runtime, built in
-    /// full before anything is bound or registered. None when no live runtime
-    /// needs it (activation builds it later) or nothing changes.
+    /// full before anything is bound or registered. None when nothing changes
+    /// or no runtime is live (activation builds it again from the registration).
     pub(crate) fn registration_config(
         &self,
         identity: &WorkspaceIdentity,
@@ -848,11 +848,13 @@ impl CheckoutRegistry {
             .entries
             .get(key)
             .is_some_and(|entry| entry.registration.as_ref() == Some(options))
-            || self.runtime(key).is_none()
         {
             return Ok(None);
         }
-        self.browser_config(&identity.root, Some(options)).map(Some)
+        // Always built, so a configuration that cannot build is refused before
+        // any acknowledgement; published only to a live runtime.
+        let config = self.browser_config(&identity.root, Some(options))?;
+        Ok(self.runtime(key).is_some().then_some(config))
     }
 
     /// Record a registration and publish its configuration to a live runtime
@@ -1601,8 +1603,8 @@ impl CheckoutRuntime {
         self.resources.lock().unwrap().is_some()
     }
 
-    fn queue_pending(resources: &ActiveResources, phase: RuntimePhase) -> bool {
-        if phase == RuntimePhase::RootLost {
+    fn queue_pending(resources: &ActiveResources) -> bool {
+        if resources.scheduler.checkout_root_loss_retired() {
             !matches!(resources.store.old_root_unfinished_request(), Ok(None))
         } else {
             !matches!(resources.store.earliest_unfinished_request(), Ok(None))
@@ -1620,6 +1622,17 @@ impl CheckoutRuntime {
             .store
             .notify_on_terminal_request_for_tests(id, notify);
         Ok(())
+    }
+
+    /// Make this checkout's next completion COMMIT durable but report an error.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn fail_next_completion_after_commit_for_tests(&self) {
+        if let Ok(resources) = self.resources() {
+            resources
+                .store
+                .fail_next_completion_after_commit_for_tests();
+        }
     }
 
     #[cfg(feature = "test-support")]
@@ -1669,10 +1682,8 @@ impl CheckoutRuntime {
     /// Advisory status only (Decision 0009 §3); never an admission decision.
     fn catching_up_in(resources: &ActiveResources, phase: RuntimePhase) -> bool {
         match phase {
-            RuntimePhase::RootLost => Self::queue_pending(resources, phase),
             RuntimePhase::Ready => {
-                resources.scheduler.checkout_watch_pending()
-                    || Self::queue_pending(resources, phase)
+                resources.scheduler.checkout_watch_pending() || Self::queue_pending(resources)
             }
             _ => true,
         }

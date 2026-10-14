@@ -214,6 +214,8 @@ pub struct Store {
     test_queue_select_hook: Arc<TestOneShotHook>,
     #[cfg(any(test, feature = "test-support"))]
     test_queue_terminal_notify: Arc<Mutex<Option<TestTerminalNotify>>>,
+    #[cfg(feature = "test-support")]
+    test_ambiguous_completion_once: Arc<AtomicBool>,
     #[cfg(test)]
     test_exclusive_recovery_hook: Arc<TestOneShotHook>,
     #[cfg(test)]
@@ -5414,6 +5416,8 @@ impl Store {
             test_queue_select_hook: Arc::new(TestOneShotHook::default()),
             #[cfg(any(test, feature = "test-support"))]
             test_queue_terminal_notify: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "test-support")]
+            test_ambiguous_completion_once: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             test_exclusive_recovery_hook: Arc::new(TestOneShotHook::default()),
             #[cfg(test)]

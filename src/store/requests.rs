@@ -1475,6 +1475,15 @@ impl Store {
         Ok(())
     }
 
+    /// Make the next completion COMMIT durable but report an error, as an
+    /// ambiguous COMMIT does, before any waiter is signalled.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn fail_next_completion_after_commit_for_tests(&self) {
+        self.test_ambiguous_completion_once
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
     /// Wake one in-process test after this exact accepted ID commits terminally.
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
@@ -1542,6 +1551,8 @@ impl Store {
                 "revision conflict: cached completion differs from durable terminal"
             );
             *slot = None;
+            // An earlier ambiguous COMMIT is confirmed only now: wake waiters.
+            self.notify_terminal_waiters();
             return Ok(true);
         }
         ensure!(
@@ -1568,6 +1579,8 @@ impl Store {
                     pending.outcome.matches_terminal(&reread),
                     "revision conflict: cached completion differs from durable terminal"
                 );
+                // The ambiguous COMMIT is confirmed by this reread: wake waiters.
+                self.notify_terminal_waiters();
             } else {
                 return Err(error);
             }
@@ -1623,6 +1636,13 @@ impl Store {
         let changed=tx.execute("UPDATE requests SET state=?1,result_generation=?2,result_revision=?3,error_code=?4,finished_at=?5 WHERE seq=?6 AND state='running' AND claim_incarnation=?7 AND root_device=?8 AND root_inode=?9",params![if code.is_some(){"failed"}else{"done"},generation,revision,code,now(),request.seq,session.incarnation().to_string(),self.identity.device.to_string(),self.identity.inode.to_string()])?;
         ensure!(changed == 1, "storage_busy: request claim changed");
         tx.commit()?;
+        #[cfg(feature = "test-support")]
+        if self
+            .test_ambiguous_completion_once
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            anyhow::bail!("storage_busy: injected ambiguous completion COMMIT");
+        }
         self.notify_terminal_waiters();
         #[cfg(any(test, feature = "test-support"))]
         {
