@@ -2454,3 +2454,48 @@ async fn explicit_serve_options_apply_once() {
         "the watcher reverted to the earlier serve options"
     );
 }
+
+/// Decision 0009 §5 (owner-approved): an enqueue through another Store that
+/// starts after Closing does not stop the close; it is durable and runs at
+/// the checkout's next activation.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn enqueue_after_closing_runs_at_next_activation() {
+    let base = tempfile::tempdir().unwrap();
+    let checkout = base.path().join("work");
+    fs::create_dir(&checkout).unwrap();
+    fs::write(checkout.join("a.js"), "function a() {}\n").unwrap();
+    let id = identity(&checkout);
+    let mut registry = CheckoutRegistry::with_roots(roots(base.path()));
+    let runtime = idle_detached(&mut registry, &id).await;
+    let scheduler = runtime.browser_scheduler().unwrap();
+    let store = Store::open(roots(base.path()), identity(&checkout)).unwrap();
+    let (row_tx, row_rx) = std::sync::mpsc::sync_channel(1);
+    let enqueuer = store.clone();
+    let options = trellis::indexer::IndexOptions::new(checkout.clone());
+    scheduler.set_closing_hook_for_tests(move || {
+        row_tx
+            .send(enqueuer.enqueue_request(&options, None).unwrap())
+            .unwrap();
+    });
+    assert!(!registry.release(&id.root_key).unwrap());
+    let row = tokio::task::spawn_blocking(move || row_rx.recv().unwrap())
+        .await
+        .unwrap();
+    retired(&scheduler).await;
+    assert_eq!(
+        store.request_by_id(&row.id).unwrap().unwrap().state,
+        "queued"
+    );
+    release_when_idle(&mut registry, &id.root_key).await;
+    registry.attach_launch(2, &id).unwrap();
+    let fresh = registry.activate(&id.root_key).unwrap();
+    assert!(!std::sync::Arc::ptr_eq(&fresh, &runtime));
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        while store.request_by_id(&row.id).unwrap().unwrap().state != "done" {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the durable row did not run at the next activation");
+}

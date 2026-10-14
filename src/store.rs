@@ -67,10 +67,12 @@ struct PublicationGate {
     changed: Condvar,
     /// Checkout workers to wake after any Store instance commits an enqueue.
     queue_wakers: Mutex<Vec<std::sync::Weak<dyn Fn() + Send + Sync>>>,
-    /// Enqueues between their start and their wake (Decision 0009 §5): a
-    /// retirement that sees one cancels, so a COMMIT cannot be overtaken by
-    /// Closing before its wake runs.
-    enqueues_in_flight: std::sync::atomic::AtomicUsize,
+    /// Enqueues between their start and their wake, plus `CLOSING` while a
+    /// runtime for this queue is closing (Decision 0009 §5). Retirement sets
+    /// `CLOSING` only if no enqueue is in flight, in one compare-and-swap:
+    /// every enqueue either counts before that instant (and the retirement
+    /// cancels) or starts after it (and waits for the next activation).
+    enqueue_word: std::sync::atomic::AtomicUsize,
     #[cfg(feature = "test-support")]
     test_after_enqueue_commit: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// `state.waiting`, published for lock-free maintenance checks (#138
@@ -125,12 +127,15 @@ impl PublicationGate {
         }
     }
 }
+/// The closing bit of a queue's enqueue word; the rest counts enqueues.
+const CLOSING: usize = 1 << (usize::BITS - 1);
+
 /// An enqueue counted as in flight on its queue's gate.
 pub(crate) struct EnqueueInFlight(Arc<PublicationGate>);
 impl Drop for EnqueueInFlight {
     fn drop(&mut self) {
         self.0
-            .enqueues_in_flight
+            .enqueue_word
             .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
 }
@@ -5106,17 +5111,31 @@ impl Store {
         self.publication_gate.wake_queue();
     }
 
-    /// Enqueues on this queue that have started and not yet woken workers.
-    pub(crate) fn enqueues_in_flight(&self) -> usize {
+    /// Retirement's linearization point: mark this queue's runtime closing,
+    /// only if no enqueue is in flight (one atomic step).
+    pub(crate) fn try_begin_closing(&self) -> bool {
         self.publication_gate
-            .enqueues_in_flight
-            .load(std::sync::atomic::Ordering::Acquire)
+            .enqueue_word
+            .compare_exchange(
+                0,
+                CLOSING,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// The closing runtime has retired; a fresh one may activate.
+    pub(crate) fn end_closing(&self) {
+        self.publication_gate
+            .enqueue_word
+            .fetch_and(!CLOSING, std::sync::atomic::Ordering::AcqRel);
     }
 
     /// Count an enqueue as in flight until the returned guard drops.
     pub(crate) fn enqueue_in_flight(&self) -> EnqueueInFlight {
         self.publication_gate
-            .enqueues_in_flight
+            .enqueue_word
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         EnqueueInFlight(Arc::clone(&self.publication_gate))
     }

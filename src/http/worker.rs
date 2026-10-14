@@ -607,20 +607,19 @@ impl DaemonState {
         if !root_lost {
             self.reconcile_through_cutoff();
         }
-        // The Closing linearization point. A lease cancelled the request
-        // already. An enqueue through any Store is counted in flight from
-        // before its transaction until after its wake; one in flight, or one
-        // whose wake set `fifo_pending` since the FIFO check above, cancels.
-        // An enqueue that starts after this point waits, durably, for the
-        // next activation.
+        // The Closing linearization point: one compare-and-swap on the
+        // queue's enqueue word sets its closing bit only if no enqueue
+        // (through any Store) is in flight from before its transaction to
+        // after its wake. One in flight, or a wake that set `fifo_pending`
+        // since the FIFO check above, cancels. An enqueue that starts after
+        // the swap waits, durably, for the next activation.
         let held = {
             let mut state = self.runtime.lock().unwrap();
             if !matches!(*state, RuntimeState::RetireRequested { .. }) {
                 return Ok(());
             }
             if !root_lost
-                && (self.fifo_pending.load(Ordering::Acquire)
-                    || self.store.enqueues_in_flight() != 0)
+                && (self.fifo_pending.load(Ordering::Acquire) || !self.store.try_begin_closing())
             {
                 self.cancel_retirement(state);
                 return Ok(());
@@ -664,6 +663,7 @@ impl DaemonState {
         }
         self.store.retire_checkout_sqlite_witnesses();
         drop(held);
+        self.store.end_closing();
         *self.runtime.lock().unwrap() = RuntimeState::Retired;
         self.note_state_change();
         if let Some(lifecycle) = self.lifecycle.get() {
