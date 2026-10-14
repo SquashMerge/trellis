@@ -418,7 +418,7 @@ impl std::error::Error for CutoffChanged {}
 pub struct WatcherWork {
     watch: crate::watch::WatchSignals,
     /// Shared with every watcher this owner creates; read without its lock.
-    health: Arc<std::sync::atomic::AtomicBool>,
+    health: Arc<crate::watch::WatcherHealth>,
     last_inventory: std::time::Instant,
     retry_after: Option<std::time::Instant>,
     last_accounted_generation: Option<u64>,
@@ -459,7 +459,7 @@ impl WatcherWork {
             store,
             session,
             options,
-            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(crate::watch::WatcherHealth::default()),
         )
     }
 
@@ -469,7 +469,7 @@ impl WatcherWork {
         store: &Store,
         session: &Arc<WriterSession>,
         options: &IndexOptions,
-        health: Arc<std::sync::atomic::AtomicBool>,
+        health: Arc<crate::watch::WatcherHealth>,
     ) -> Result<Self> {
         store.verify_writer_session(session)?;
         let watch = crate::watch::WatchSignals::publishing(

@@ -656,7 +656,7 @@ impl DaemonState {
         self.note_state_change();
         *self.watch_status.lock().unwrap() = None;
         *self.watcher_work.lock().unwrap() = None;
-        self.watcher_health.store(false, Ordering::Release);
+        self.watcher_health.reset();
         #[cfg(feature = "test-support")]
         if let Some(hook) = self.closing_hook.lock().unwrap().take() {
             hook();

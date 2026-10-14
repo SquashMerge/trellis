@@ -5231,11 +5231,9 @@ impl Store {
                 gate.changed.notify_all();
                 return Err(SqliteContention(()).into());
             }
-            state = gate
-                .changed
-                .wait_timeout(state, remaining.min(Duration::from_millis(25)))
-                .unwrap()
-                .0;
+            // Woken when a permit is released (#138 item 14); no caller cancels
+            // a gate wait from outside, so cancellation is checked per wake.
+            state = gate.changed.wait_timeout(state, remaining).unwrap().0;
         }
     }
 

@@ -4,10 +4,7 @@ use serde::Serialize;
 use std::{
     net::SocketAddr,
     path::PathBuf,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, atomic::Ordering},
     time::{Duration, Instant},
 };
 use trellis::{
@@ -776,7 +773,6 @@ async fn run_daemon() -> Result<()> {
     let registry = Arc::new(tokio::sync::Mutex::new(registry::CheckoutRegistry::new()));
     let browser = Arc::new(tokio::sync::Mutex::new(daemon::BrowserProvisioner::new()));
     let next_session = Arc::new(std::sync::atomic::AtomicU64::new(1));
-    let stopping = Arc::new(AtomicBool::new(false));
     let (browser_shutdown, _) = tokio::sync::watch::channel(false);
     let idle = daemon::run_idle_lifecycle(registry.clone());
     tokio::pin!(idle);
@@ -820,15 +816,13 @@ async fn run_daemon() -> Result<()> {
                 let registry = registry.clone();
                 let browser = browser.clone();
                 let id = next_session.fetch_add(1, Ordering::Relaxed);
-                let stopping = stopping.clone();
                 let browser_shutdown = browser_shutdown.clone();
                 tokio::task::spawn_blocking(move || {
-                    let _ = dispatch_connection(stream, id, registry, browser, stopping, browser_shutdown);
+                    let _ = dispatch_connection(stream, id, registry, browser, browser_shutdown);
                 });
             }
         }
     }
-    stopping.store(true, Ordering::Release);
     let _ = browser_shutdown.send(true);
     drop(listener);
     drop(owner);
@@ -868,7 +862,6 @@ fn dispatch_connection(
     session: u64,
     registry: Arc<tokio::sync::Mutex<registry::CheckoutRegistry>>,
     browser: Arc<tokio::sync::Mutex<daemon::BrowserProvisioner>>,
-    stopping: Arc<AtomicBool>,
     browser_shutdown: tokio::sync::watch::Sender<bool>,
 ) -> Result<()> {
     let runtime = tokio::runtime::Handle::current();
@@ -1125,20 +1118,26 @@ fn dispatch_connection(
     };
     write_daemon_reply(&mut stream, &reply)?;
     if serve {
-        // This control connection only observes the daemon process lifetime.
-        stream.set_read_timeout(Some(Duration::from_millis(250)))?;
+        // This control connection only observes the daemon process lifetime:
+        // it ends when the client closes it or the daemon stops, signalled by
+        // the shutdown channel instead of a polled flag (#138 item 21).
+        let closer = stream.try_clone()?;
+        let mut shutdown = browser_shutdown.subscribe();
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel::<()>();
+        let watcher = runtime.spawn(async move {
+            tokio::select! {
+                _ = shutdown.wait_for(|stopped| *stopped) => {
+                    let _ = closer.shutdown(std::net::Shutdown::Both);
+                }
+                _ = closed_rx => {}
+            }
+        });
+        stream.set_read_timeout(None)?;
         let mut one = [0u8; 1];
         use std::io::Read;
-        while !stopping.load(Ordering::Acquire) {
-            match stream.read(&mut one) {
-                Ok(0) => break,
-                Ok(_) => (),
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::WouldBlock
-                        || error.kind() == std::io::ErrorKind::TimedOut => {}
-                Err(_) => break,
-            }
-        }
+        while matches!(stream.read(&mut one), Ok(n) if n > 0) {}
+        let _ = closed_tx.send(());
+        let _ = runtime.block_on(watcher);
     }
     Ok(())
 }

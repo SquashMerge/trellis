@@ -315,7 +315,7 @@ pub struct DaemonState {
     recovery_retry_after: Mutex<Option<Instant>>,
     /// Watcher health, published by the current watcher through one flag that
     /// lives as long as this state. Readers never wait for watcher work.
-    watcher_health: Arc<AtomicBool>,
+    watcher_health: Arc<crate::watch::WatcherHealth>,
     retention_last_run: Mutex<Instant>,
     gc_last_check: Mutex<Instant>,
     #[cfg(test)]
@@ -547,7 +547,7 @@ pub fn new_with_config(
         causal_lineage_ordinal: Arc::new(AtomicU64::new(0)),
         causal_h_reported: Mutex::new(None),
         recovery_retry_after: Mutex::new(None),
-        watcher_health: Arc::new(AtomicBool::new(false)),
+        watcher_health: Arc::new(crate::watch::WatcherHealth::default()),
         retention_last_run: Mutex::new(Instant::now()),
         gc_last_check: Mutex::new(Instant::now() - Duration::from_secs(3600)),
         #[cfg(test)]
@@ -692,7 +692,7 @@ impl DaemonState {
     /// Watcher health as the current watcher published it. A sticky flag, not
     /// a sample: an inventory in flight never delays or refuses this read.
     pub fn checkout_watcher_degraded(&self) -> bool {
-        self.watcher_health.load(Ordering::Acquire)
+        self.watcher_health.degraded()
     }
 
     /// A pending watcher hint (including the periodic inventory deadline) keeps
@@ -758,7 +758,7 @@ impl DaemonState {
             *work = None;
             *self.watch_status.lock().unwrap() = None;
             // The replaced watcher is gone; a new one publishes its own state.
-            self.watcher_health.store(false, Ordering::Release);
+            self.watcher_health.reset();
         }
         *current = next;
         drop(current);

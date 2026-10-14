@@ -20,6 +20,38 @@ const MAX_DIRTY_PATHS: usize = 256;
 const QUIET: Duration = Duration::from_millis(75);
 const MAX_WAIT: Duration = Duration::from_millis(250);
 
+/// Watcher health shared by every watcher one owner creates, read without a
+/// lock. Each watcher reports under its own epoch, so a callback from a
+/// replaced watcher can never mark the current one degraded (#138 item 22).
+#[derive(Debug, Default)]
+pub struct WatcherHealth {
+    degraded: AtomicBool,
+    epoch: AtomicU64,
+}
+
+impl WatcherHealth {
+    pub fn degraded(&self) -> bool {
+        self.degraded.load(Ordering::Acquire)
+    }
+
+    /// Start a new watcher's epoch; reports from earlier watchers are ignored.
+    fn begin_epoch(&self) -> u64 {
+        self.epoch.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    fn report(&self, epoch: u64, degraded: bool) {
+        if self.epoch.load(Ordering::Acquire) == epoch {
+            self.degraded.store(degraded, Ordering::Release);
+        }
+    }
+
+    /// The owner dropped its watcher: healthy until a new one reports.
+    pub fn reset(&self) {
+        self.epoch.fetch_add(1, Ordering::AcqRel);
+        self.degraded.store(false, Ordering::Release);
+    }
+}
+
 /// Wakes the checkout worker. Called after ingress records its generation, so a
 /// wake can coalesce but never carries state the worker would not re-read.
 pub type Waker = Arc<dyn Fn() + Send + Sync>;
@@ -176,9 +208,10 @@ pub struct WatchSignals {
     last_signal: Option<Instant>,
     urgent: bool,
     degraded: bool,
-    /// Published copy of `degraded` for lock-free health reads. A watcher
-    /// owner shares one flag across every replacement watcher it creates.
-    health: Arc<AtomicBool>,
+    /// Published copy of `degraded` for lock-free health reads, shared across
+    /// every replacement watcher; this watcher reports under `epoch`.
+    health: Arc<WatcherHealth>,
+    epoch: u64,
     /// Set once by the owning worker; ingress wakes it after each signal.
     waker: Arc<std::sync::OnceLock<Waker>>,
 }
@@ -193,7 +226,7 @@ impl WatchSignals {
             root,
             scip_path,
             manifest_path,
-            Arc::new(AtomicBool::new(false)),
+            Arc::new(WatcherHealth::default()),
         )
     }
 
@@ -202,7 +235,7 @@ impl WatchSignals {
         root: PathBuf,
         scip_path: Option<PathBuf>,
         manifest_path: Option<PathBuf>,
-        health: Arc<AtomicBool>,
+        health: Arc<WatcherHealth>,
     ) -> Self {
         Self::construct(root, scip_path, manifest_path, true, health)
     }
@@ -220,7 +253,7 @@ impl WatchSignals {
             scip_path,
             manifest_path,
             false,
-            Arc::new(AtomicBool::new(false)),
+            Arc::new(WatcherHealth::default()),
         )
     }
 
@@ -229,7 +262,7 @@ impl WatchSignals {
         scip_path: Option<PathBuf>,
         manifest_path: Option<PathBuf>,
         native: bool,
-        health: Arc<AtomicBool>,
+        health: Arc<WatcherHealth>,
     ) -> Self {
         // Preserve short bursts beyond one bounded drain without treating a
         // repeated path as lost input. Actual channel overflow still forces full.
@@ -254,7 +287,13 @@ impl WatchSignals {
         let callback_executable = std::env::current_exe().ok();
         let waker = Arc::new(std::sync::OnceLock::new());
         let callback_waker = Arc::clone(&waker);
-        let callback = move |event| {
+        let epoch = health.begin_epoch();
+        let callback_health = Arc::clone(&health);
+        let callback = move |event: notify::Result<Event>| {
+            // A watcher error is published at once, not when the worker drains.
+            if event.is_err() {
+                callback_health.report(epoch, true);
+            }
             submit(
                 &callback_sender,
                 &callback_generation,
@@ -275,7 +314,7 @@ impl WatchSignals {
             })
             .and_then(Result::ok);
         let degraded = native && watcher.is_none();
-        health.store(degraded, Ordering::Release);
+        health.report(epoch, degraded);
         let captured_inputs = [scip_path, manifest_path]
             .into_iter()
             .flatten()
@@ -307,6 +346,7 @@ impl WatchSignals {
             urgent: true,
             degraded,
             health,
+            epoch,
             waker,
         }
     }
@@ -459,7 +499,7 @@ impl WatchSignals {
 
     fn fail(&mut self) {
         self.degraded = true;
-        self.health.store(true, Ordering::Release);
+        self.health.report(self.epoch, true);
         self.pending.full = true;
         self.urgent = true;
         self.watcher = None;
@@ -610,5 +650,27 @@ mod ingress_tests {
             &BTreeSet::new(),
             Some(&executable)
         ));
+    }
+}
+
+#[cfg(test)]
+mod health_epoch_tests {
+    use super::*;
+
+    /// #138 item 22: a report from a replaced watcher never changes the
+    /// current watcher's published health.
+    #[test]
+    fn a_replaced_watcher_cannot_mark_the_current_one_degraded() {
+        let health = WatcherHealth::default();
+        let replaced = health.begin_epoch();
+        let current = health.begin_epoch();
+        health.report(replaced, true);
+        assert!(!health.degraded());
+        health.report(current, true);
+        assert!(health.degraded());
+        health.reset();
+        assert!(!health.degraded());
+        health.report(current, true);
+        assert!(!health.degraded(), "a reset ends the current epoch too");
     }
 }
