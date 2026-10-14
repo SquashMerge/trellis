@@ -1844,7 +1844,9 @@ fn relay_answers_at_its_deadline_and_drops_the_late_reply() {
     let mut peer = Peer::start_with_env(
         home.path(),
         &root,
-        &[("TRELLIS_TEST_MCP_RELAY_DEADLINE_MS", "300".as_ref())],
+        // Long enough that a loaded daemon reaches the hold before the relay
+        // decides; the relay must not cancel the call before it is held.
+        &[("TRELLIS_TEST_MCP_RELAY_DEADLINE_MS", "2000".as_ref())],
     );
     let meta = json!({
         "io.modelcontextprotocol/protocolVersion":"2026-07-28",
@@ -1901,4 +1903,237 @@ fn relay_answers_at_its_deadline_and_drops_the_late_reply() {
     daemon.kill().unwrap();
     daemon.wait().unwrap();
     fs::remove_file(&phase_path).unwrap();
+}
+
+/// A daemon whose MCP connections pause at `stage` (when set), the phase
+/// listener, and its socket path.
+fn phase_daemon(
+    home: &Path,
+    stage: Option<&str>,
+) -> (
+    std::process::Child,
+    std::os::unix::net::UnixListener,
+    PathBuf,
+) {
+    let phase_path = PathBuf::from(format!(
+        "/tmp/trellis-138-relay-{}.sock",
+        rand::random::<u64>()
+    ));
+    let listener = std::os::unix::net::UnixListener::bind(&phase_path).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_trellis"));
+    command
+        .arg("daemon")
+        .env("HOME", home)
+        .env("XDG_CACHE_HOME", home.join("cache"))
+        .env("XDG_DATA_HOME", home.join("data"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Some(stage) = stage {
+        command
+            .env("TRELLIS_TEST_MCP_PHASE", stage)
+            .env("TRELLIS_TEST_MCP_PHASE_SOCKET", &phase_path);
+    }
+    let daemon = command.spawn().unwrap();
+    let _ = socket_ready(home);
+    (daemon, listener, phase_path)
+}
+
+/// Accept one paused phase connection and check its stage.
+fn paused_at(
+    listener: &std::os::unix::net::UnixListener,
+    stage: &str,
+) -> std::os::unix::net::UnixStream {
+    let (phase, _) = listener.accept().unwrap();
+    phase
+        .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
+        .unwrap();
+    let mut seen = String::new();
+    BufReader::new(phase.try_clone().unwrap())
+        .read_line(&mut seen)
+        .unwrap();
+    assert_eq!(seen, format!("{stage}\n"));
+    phase
+}
+
+fn describe_frame(id: Value) -> Value {
+    json!({"jsonrpc":"2.0","id":id,"method":"tools/call",
+        "params":{"name":"trellis_workspace_describe","arguments":{"schemaVersion":1},
+            "_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities":{}}}})
+}
+
+fn finish_peer(mut peer: Peer, mut daemon: std::process::Child, phase_path: &Path) {
+    peer.finish_unreaped();
+    unsafe { libc::kill(-(peer.child.id() as libc::pid_t), libc::SIGKILL) };
+    let _ = peer.child.wait();
+    peer.reaped = true;
+    daemon.kill().unwrap();
+    daemon.wait().unwrap();
+    let _ = fs::remove_file(phase_path);
+}
+
+/// Decision 0009 §7: the relay decides by each call's own acceptance + 5 s.
+/// Held while writing call A's reply past A's deadline, it answers A
+/// deadline_exceeded instead of the late success; call B, read meanwhile,
+/// expired before it could be forwarded and is decided without the daemon.
+#[test]
+fn relay_decides_by_acceptance_even_when_held_past_the_deadline() {
+    let home = tempfile::tempdir().unwrap();
+    let root = checkout(home.path());
+    let (daemon, listener, phase_path) = phase_daemon(home.path(), None);
+    let deadline = Duration::from_millis(2000);
+    let mut peer = Peer::start_with_env(
+        home.path(),
+        &root,
+        &[
+            ("TRELLIS_TEST_MCP_RELAY_DEADLINE_MS", "2000".as_ref()),
+            ("TRELLIS_TEST_MCP_PHASE", "relay_before_write".as_ref()),
+            ("TRELLIS_TEST_MCP_PHASE_SOCKET", phase_path.as_os_str()),
+        ],
+    );
+    writeln!(
+        peer.stdin.as_mut().unwrap(),
+        "{}",
+        describe_frame(json!("A"))
+    )
+    .unwrap();
+    // The daemon answered A; the relay is held before deciding it.
+    let mut held = paused_at(&listener, "relay_before_write");
+    let written_b = Instant::now();
+    writeln!(
+        peer.stdin.as_mut().unwrap(),
+        "{}",
+        describe_frame(json!("B"))
+    )
+    .unwrap();
+    // Past A's deadline (A was accepted before the hold) and past B's,
+    // allowing B's stdin read ample time to complete.
+    std::thread::sleep(
+        (written_b + deadline + Duration::from_millis(700))
+            .saturating_duration_since(Instant::now()),
+    );
+    held.write_all(b"x").unwrap();
+    for id in ["A", "B"] {
+        let reply = peer
+            .lines
+            .recv_timeout(trellis::testing::HANG_BACKSTOP)
+            .unwrap();
+        assert_eq!(reply["id"], id, "{reply}");
+        let envelope = &reply["result"]["structuredContent"];
+        assert_eq!(envelope["error"]["code"], "deadline_exceeded", "{reply}");
+        assert!(envelope.get("workspace").is_none(), "{reply}");
+    }
+    finish_peer(peer, daemon, &phase_path);
+}
+
+/// #127 per ID: an immediate refusal (the fifth call) is a decided outcome
+/// too, so a cancel the client wrote before it suppresses it.
+#[test]
+fn a_cancel_written_with_a_fifth_call_suppresses_its_refusal() {
+    let home = tempfile::tempdir().unwrap();
+    let root = checkout(home.path());
+    let (daemon, listener, phase_path) = phase_daemon(home.path(), Some("launch_final"));
+    let mut peer = Peer::start(home.path(), &root);
+    for id in 1..=4 {
+        writeln!(
+            peer.stdin.as_mut().unwrap(),
+            "{}",
+            describe_frame(json!(id))
+        )
+        .unwrap();
+    }
+    // Four calls are outstanding while the daemon holds the first.
+    let first = paused_at(&listener, "launch_final");
+    let burst = format!(
+        "{}\n{}\n",
+        describe_frame(json!(5)),
+        json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":5}})
+    );
+    peer.stdin
+        .as_mut()
+        .unwrap()
+        .write_all(burst.as_bytes())
+        .unwrap();
+    let mut holds = vec![first];
+    let mut answered = Vec::new();
+    while answered.len() < 4 {
+        for mut hold in holds.drain(..) {
+            hold.write_all(b"x").unwrap();
+        }
+        let reply = peer
+            .lines
+            .recv_timeout(trellis::testing::HANG_BACKSTOP)
+            .unwrap();
+        assert_ne!(reply["id"], 5, "the cancelled refusal was written: {reply}");
+        assert!(
+            reply["result"]["structuredContent"]["data"].is_object(),
+            "{reply}"
+        );
+        answered.push(reply["id"].as_i64().unwrap());
+        if answered.len() < 4 {
+            holds.push(paused_at(&listener, "launch_final"));
+        }
+    }
+    answered.sort_unstable();
+    assert_eq!(answered, vec![1, 2, 3, 4]);
+    assert!(
+        peer.lines.recv_timeout(Duration::from_millis(300)).is_err(),
+        "a reply for the cancelled fifth call"
+    );
+    finish_peer(peer, daemon, &phase_path);
+}
+
+/// Decision 0009 §7: after the relay answers a call at its deadline and the
+/// client reuses the ID for a new call while the daemon's old worker is
+/// still running, the new call is admitted and answered; the old worker's
+/// late outcome never reaches the client.
+#[test]
+fn a_reused_call_id_is_answered_while_the_old_worker_still_runs() {
+    let home = tempfile::tempdir().unwrap();
+    let root = checkout(home.path());
+    let (daemon, listener, phase_path) = phase_daemon(home.path(), Some("call_worker"));
+    let mut peer = Peer::start_with_env(
+        home.path(),
+        &root,
+        &[("TRELLIS_TEST_MCP_RELAY_DEADLINE_MS", "2000".as_ref())],
+    );
+    writeln!(
+        peer.stdin.as_mut().unwrap(),
+        "{}",
+        describe_frame(json!("A"))
+    )
+    .unwrap();
+    let mut old_worker = paused_at(&listener, "call_worker");
+    let expired = peer
+        .lines
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .unwrap();
+    assert_eq!(expired["id"], "A", "{expired}");
+    assert_eq!(
+        expired["result"]["structuredContent"]["error"]["code"], "deadline_exceeded",
+        "{expired}"
+    );
+    writeln!(
+        peer.stdin.as_mut().unwrap(),
+        "{}",
+        describe_frame(json!("A"))
+    )
+    .unwrap();
+    paused_at(&listener, "call_worker").write_all(b"x").unwrap();
+    let reused = peer
+        .lines
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .unwrap();
+    assert_eq!(reused["id"], "A", "{reused}");
+    assert!(
+        reused["result"]["structuredContent"]["data"].is_object(),
+        "the reused call was refused or decided by the old one: {reused}"
+    );
+    old_worker.write_all(b"x").unwrap();
+    assert!(
+        peer.lines.recv_timeout(Duration::from_millis(300)).is_err(),
+        "the old worker's outcome reached the client"
+    );
+    finish_peer(peer, daemon, &phase_path);
 }

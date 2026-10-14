@@ -427,6 +427,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
         cancel,
         resolved,
     } = ctx;
+    phase_hook("call_worker")?;
     let selection = arguments
         .as_ref()
         .and_then(|v| v.as_object())

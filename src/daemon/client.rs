@@ -277,7 +277,8 @@ fn protocol_event(
 
 struct McpInputBuffer<'a> {
     workspace: &'a crate::store::topology::WorkspaceIdentity,
-    queue: std::collections::VecDeque<crate::mcp::wire::Frame>,
+    /// Frames taken from the channel for later, each with its acceptance.
+    queue: std::collections::VecDeque<(crate::mcp::wire::Frame, Instant)>,
     cancelled_queued: Vec<serde_json::Value>,
     mode: crate::mcp::session::Mode,
     active_id: Option<serde_json::Value>,
@@ -286,7 +287,7 @@ struct McpInputBuffer<'a> {
     stdin: std::sync::Arc<StdinFence>,
     /// A frame taken from the channel but not yet handled; it precedes every
     /// frame still in the channel.
-    deferred: Option<(crate::mcp::wire::Frame, u64)>,
+    deferred: Option<(crate::mcp::wire::Frame, u64, Instant)>,
     /// While set, `drain_mcp_input` handles only frames whose bytes end at or
     /// before this stdin offset and defers the first later one.
     drain_through: Option<u64>,
@@ -297,8 +298,9 @@ struct McpInputBuffer<'a> {
     outstanding: Vec<crate::mcp::wire::IdKey>,
 }
 
-/// Frames from the stdin reader, each with the stdin offset where it ends.
-type FrameReceiver = std::sync::mpsc::Receiver<(crate::mcp::wire::Frame, u64)>;
+/// Frames from the stdin reader, each with the stdin offset where it ends and
+/// the instant the reader completed it (protocol acceptance, Decision 0009 §7).
+type FrameReceiver = std::sync::mpsc::Receiver<(crate::mcp::wire::Frame, u64, Instant)>;
 
 /// Lets the relay prove that every byte the client wrote before a decision
 /// point has reached the frame channel (#127). Each read and its byte count
@@ -525,7 +527,7 @@ fn spawn_ringing_frame_reader(
     use crate::mcp::wire::{self, Frame};
     use std::sync::atomic::Ordering::SeqCst;
     let fence = std::sync::Arc::new(StdinFence::new(fd));
-    let (sender, receiver) = std::sync::mpsc::sync_channel::<(Frame, u64)>(16);
+    let (sender, receiver) = std::sync::mpsc::sync_channel::<(Frame, u64, Instant)>(16);
     let reader_fence = fence.clone();
     thread::Builder::new()
         .name("mcp-stdin-relay".into())
@@ -543,12 +545,13 @@ fn spawn_ringing_frame_reader(
                         Frame::Eof
                     }
                 };
+                let accepted = Instant::now();
                 let consumed = reader_fence.read_total.load(SeqCst) - reader.buffer().len() as u64;
                 // EOF sits one past the last byte, so it is inside a decision
                 // fence only when the client had closed before that decision.
                 let end = consumed + u64::from(matches!(frame, Frame::Eof));
                 let last = matches!(frame, Frame::Eof);
-                let sent = sender.send((frame, end));
+                let sent = sender.send((frame, end, accepted));
                 if let Some(doorbell) = &doorbell {
                     doorbell.ring();
                 }
@@ -559,27 +562,6 @@ fn spawn_ringing_frame_reader(
             reader_fence.closed.store(true, SeqCst);
         })?;
     Ok((receiver, fence))
-}
-
-/// A failed attach has no socket to receive cancellation. Consume ready stdin first.
-fn discard_failed_mcp_result(
-    receiver: &FrameReceiver,
-    buffer: &mut McpInputBuffer<'_>,
-    stdout: &mut impl std::io::Write,
-    eof: &mut bool,
-    active_id: Option<&serde_json::Value>,
-) -> io::Result<bool> {
-    let mut canceled = false;
-    drain_mcp_input(
-        None,
-        receiver,
-        buffer,
-        stdout,
-        eof,
-        active_id,
-        &mut canceled,
-    )?;
-    Ok(*eof || canceled || buffer.cancelled_active)
 }
 
 /// What the relay may do with a complete daemon reply.
@@ -597,18 +579,22 @@ enum ReplyGate {
 /// The first later frame is deferred unhandled until after the reply, so a
 /// cancel written after the decision is concurrent and cannot suppress it, and
 /// later input cannot extend the wait (T00).
+///
+/// Settling ends by `bound`: a call's own deadline (acceptance + 5 s), or the
+/// reply bound for other requests. Input not settled by then makes the outcome
+/// `outcome_unknown`.
 fn reply_gate(
-    stream: &mut UnixStream,
     receiver: &FrameReceiver,
     buffer: &mut McpInputBuffer<'_>,
     stdout: &mut impl std::io::Write,
     eof: &mut bool,
     active_id: Option<&serde_json::Value>,
+    bound: Instant,
 ) -> io::Result<ReplyGate> {
     let Some(written) = buffer.stdin.written() else {
         return Ok(ReplyGate::Unknown);
     };
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = bound;
     let mut canceled = false;
     loop {
         // Sampled first: frames within `written` sent before settling are then
@@ -616,7 +602,7 @@ fn reply_gate(
         let settled = buffer.stdin.settled(written);
         buffer.drain_through = Some(written);
         let drained = drain_mcp_input(
-            Some(&mut *stream),
+            None,
             receiver,
             buffer,
             stdout,
@@ -626,7 +612,10 @@ fn reply_gate(
         );
         buffer.drain_through = None;
         drained?;
-        if *eof || canceled || buffer.cancelled_active {
+        // A cancel for this ID that an earlier pass drained also counts.
+        let pending_cancel =
+            active_id.is_some_and(|id| buffer.cancels.iter().any(|cancel| cancel == id));
+        if *eof || canceled || pending_cancel || buffer.cancelled_active {
             return Ok(ReplyGate::Cancelled);
         }
         // A deferred later frame proves every earlier frame was handled.
@@ -637,6 +626,37 @@ fn reply_gate(
             return Ok(ReplyGate::Unknown);
         }
         thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// Decide one outcome for `value`'s ID at the #127 decision point: written if
+/// no cancel or end of input settled before it, `outcome_unknown` if input
+/// could not be settled by `bound`.
+fn decide(
+    receiver: &FrameReceiver,
+    buffer: &mut McpInputBuffer<'_>,
+    stdout: &mut impl std::io::Write,
+    eof: &mut bool,
+    value: &serde_json::Value,
+    bound: Instant,
+    response: &serde_json::Value,
+) -> io::Result<()> {
+    match reply_gate(receiver, buffer, stdout, eof, value.get("id"), bound)? {
+        ReplyGate::Write => crate::mcp::wire::write_response(stdout, response),
+        ReplyGate::Cancelled => Ok(()),
+        ReplyGate::Unknown => crate::mcp::wire::write_response(
+            stdout,
+            &mcp_failure(value, "outcome_unknown", buffer.workspace),
+        ),
+    }
+}
+
+/// The settling bound for deciding `request`'s outcome now.
+fn decision_bound(request: &Forwarded) -> Instant {
+    if request.call {
+        request.deadline
+    } else {
+        Instant::now() + RELAY_REPLY_BOUND
     }
 }
 
@@ -890,6 +910,9 @@ pub fn relay_stdio(
             match reply {
                 Ok((SETUP_RELAY_ID, _)) => {}
                 Ok((relay, line)) => {
+                    // Cancels drained since (by another decision) drop their
+                    // requests first, so a cancelled reply is never written.
+                    settle_cancels(&mut buffer, &mut forwarded, &mut daemon);
                     let Some(request) = forwarded.remove(&relay) else {
                         // Decided at its deadline or cancelled: never written.
                         continue;
@@ -907,16 +930,26 @@ pub fn relay_stdio(
                         ));
                     }
                     crate::mcp::phase_hook("relay_before_write")?;
-                    let stream = &mut daemon.as_mut().expect("reply's connection").stream;
+                    // A call's reply that arrives after its deadline is not
+                    // written: the relay's decision is deadline_exceeded.
+                    let late = request.call && Instant::now() >= request.deadline;
                     let gate = reply_gate(
-                        stream,
                         &receiver,
                         &mut buffer,
                         &mut stdout,
                         &mut eof,
                         request.value.get("id"),
+                        decision_bound(&request),
                     )?;
                     match gate {
+                        ReplyGate::Write if late => wire::write_response(
+                            &mut stdout,
+                            &relay_admission_failure(
+                                &request.value,
+                                "deadline_exceeded",
+                                workspace,
+                            ),
+                        )?,
                         ReplyGate::Write => {
                             crate::mcp::phase_hook("relay_after_decision")?;
                             // The daemon's exact line, under the client's ID.
@@ -961,16 +994,15 @@ pub fn relay_stdio(
                                 continue;
                             }
                         }
-                        let discard = discard_failed_mcp_result(
-                            &receiver,
-                            &mut buffer,
-                            &mut stdout,
-                            &mut eof,
-                            request.value.get("id"),
-                        )?;
-                        if !discard && request.value.get("id").is_some() {
-                            wire::write_response(
+                        if request.value.get("id").is_some() {
+                            let bound = decision_bound(&request);
+                            decide(
+                                &receiver,
+                                &mut buffer,
                                 &mut stdout,
+                                &mut eof,
+                                &request.value,
+                                bound,
                                 &mcp_failure(&request.value, "daemon_unavailable", workspace),
                             )?;
                         }
@@ -998,43 +1030,27 @@ pub fn relay_stdio(
                 if let Some(lost) = daemon.take() {
                     let _ = lost.stream.shutdown(std::net::Shutdown::Both);
                 }
-                let discard = discard_failed_mcp_result(
+                decide(
                     &receiver,
                     &mut buffer,
                     &mut stdout,
                     &mut eof,
-                    request.value.get("id"),
+                    &request.value,
+                    Instant::now() + RELAY_REPLY_BOUND,
+                    &mcp_failure(&request.value, "daemon_unavailable", workspace),
                 )?;
-                if !discard {
-                    wire::write_response(
-                        &mut stdout,
-                        &mcp_failure(&request.value, "daemon_unavailable", workspace),
-                    )?;
-                }
                 continue;
             }
-            let gate = match daemon.as_mut() {
-                Some(connection) => reply_gate(
-                    &mut connection.stream,
-                    &receiver,
-                    &mut buffer,
-                    &mut stdout,
-                    &mut eof,
-                    request.value.get("id"),
-                )?,
-                None => ReplyGate::Unknown,
-            };
-            match gate {
-                ReplyGate::Write => wire::write_response(
-                    &mut stdout,
-                    &relay_admission_failure(&request.value, "deadline_exceeded", workspace),
-                )?,
-                ReplyGate::Cancelled => {}
-                ReplyGate::Unknown => wire::write_response(
-                    &mut stdout,
-                    &mcp_failure(&request.value, "outcome_unknown", workspace),
-                )?,
-            }
+            // The call's own deadline: settling ends by it.
+            decide(
+                &receiver,
+                &mut buffer,
+                &mut stdout,
+                &mut eof,
+                &request.value,
+                request.deadline,
+                &relay_admission_failure(&request.value, "deadline_exceeded", workspace),
+            )?;
             // Stop the daemon's worker; a late reply is dropped here.
             if let (Some(connection), Some(id)) = (daemon.as_mut(), request.value.get("id")) {
                 let cancel = serde_json::json!({"jsonrpc":"2.0",
@@ -1047,14 +1063,17 @@ pub fn relay_stdio(
         }
 
         // One stdin frame at a time.
-        let next = if let Some(frame) = buffer.queue.pop_front() {
-            Some(frame)
-        } else if let Some((frame, _)) = buffer.deferred.take() {
-            Some(frame)
+        let next = if let Some(queued) = buffer.queue.pop_front() {
+            Some(queued)
+        } else if let Some((frame, _, accepted)) = buffer.deferred.take() {
+            Some((frame, accepted))
         } else {
-            receiver.try_recv().ok().map(|(frame, _)| frame)
+            receiver
+                .try_recv()
+                .ok()
+                .map(|(frame, _, accepted)| (frame, accepted))
         };
-        let Some(frame) = next else {
+        let Some((frame, accepted)) = next else {
             if eof {
                 break;
             }
@@ -1147,21 +1166,44 @@ pub fn relay_stdio(
             legacy_ready = true;
         }
         let call = method == "tools/call";
+        // From the relay's protocol acceptance: when stdin completed the frame.
+        let deadline = accepted
+            + if call {
+                call_deadline
+            } else {
+                RELAY_REPLY_BOUND
+            };
         if has_id {
             let calls = forwarded.values().filter(|request| request.call).count();
-            if call && calls >= RELAY_OUTSTANDING_CALLS {
-                wire::write_response(
+            let refusal = if call && calls >= RELAY_OUTSTANDING_CALLS {
+                Some(relay_admission_failure(
+                    &value,
+                    "too_many_requests",
+                    workspace,
+                ))
+            } else if !call && forwarded.len() - calls >= RELAY_OUTSTANDING_REQUESTS {
+                Some(
+                    serde_json::json!({"jsonrpc":"2.0","id":value["id"],"error":{
+                    "code":-32000,"message":"Relay queue is full",
+                    "data":{"code":"too_many_requests"}}}),
+                )
+            } else {
+                None
+            };
+            if let Some(refusal) = refusal {
+                let bound = if call {
+                    deadline
+                } else {
+                    Instant::now() + RELAY_REPLY_BOUND
+                };
+                decide(
+                    &receiver,
+                    &mut buffer,
                     &mut stdout,
-                    &relay_admission_failure(&value, "too_many_requests", workspace),
-                )?;
-                continue;
-            }
-            if !call && forwarded.len() - calls >= RELAY_OUTSTANDING_REQUESTS {
-                wire::write_response(
-                    &mut stdout,
-                    &serde_json::json!({"jsonrpc":"2.0","id":value["id"],"error":{
-                        "code":-32000,"message":"Relay queue is full",
-                        "data":{"code":"too_many_requests"}}}),
+                    &mut eof,
+                    &value,
+                    bound,
+                    &refusal,
                 )?;
                 continue;
             }
@@ -1173,12 +1215,7 @@ pub fn relay_stdio(
             line,
             key,
             call,
-            deadline: Instant::now()
-                + if call {
-                    call_deadline
-                } else {
-                    RELAY_REPLY_BOUND
-                },
+            deadline,
             retried: false,
         };
         // A completed handshake is replayed only before later requests.
@@ -1202,6 +1239,19 @@ pub fn relay_stdio(
         if eof || (cancelled && request.value.get("id").is_some()) {
             // End of input cancels outstanding work; a cancelled request is
             // never sent.
+            continue;
+        }
+        if call && has_id && Instant::now() >= request.deadline {
+            // Its deadline passed before it could be forwarded.
+            decide(
+                &receiver,
+                &mut buffer,
+                &mut stdout,
+                &mut eof,
+                &request.value,
+                request.deadline,
+                &relay_admission_failure(&request.value, "deadline_exceeded", workspace),
+            )?;
             continue;
         }
         // One reconnect attempt per request: a failed attach is final.
@@ -1238,19 +1288,16 @@ pub fn relay_stdio(
                 continue;
             }
         }
-        let discard = discard_failed_mcp_result(
+        let bound = decision_bound(&request);
+        decide(
             &receiver,
             &mut buffer,
             &mut stdout,
             &mut eof,
-            request.value.get("id"),
+            &request.value,
+            bound,
+            &mcp_failure(&request.value, "daemon_unavailable", workspace),
         )?;
-        if !discard {
-            wire::write_response(
-                &mut stdout,
-                &mcp_failure(&request.value, "daemon_unavailable", workspace),
-            )?;
-        }
     }
     if let Some(connection) = daemon {
         let _ = connection.stream.shutdown(std::net::Shutdown::Write);
@@ -1323,7 +1370,7 @@ fn pending_duplicate(buffer: &McpInputBuffer<'_>, key: &crate::mcp::wire::IdKey)
     use crate::mcp::wire::{self, Frame};
     (!buffer.cancelled_active && buffer.active_key.as_ref() == Some(key))
         || buffer.outstanding.contains(key)
-        || buffer.queue.iter().any(|queued| {
+        || buffer.queue.iter().any(|(queued, _)| {
             matches!(queued,
             Frame::Line(line) if wire::decode(Frame::Line(line.clone()))
                 .ok().flatten().is_some_and(|item|
@@ -1351,18 +1398,20 @@ fn drain_mcp_input(
             None => receiver.try_recv(),
         };
         let next = match next {
-            Ok((frame, end)) if buffer.drain_through.is_some_and(|through| end > through) => {
-                buffer.deferred = Some((frame, end));
+            Ok((frame, end, accepted))
+                if buffer.drain_through.is_some_and(|through| end > through) =>
+            {
+                buffer.deferred = Some((frame, end, accepted));
                 break;
             }
-            other => other.map(|(frame, _)| frame),
+            other => other.map(|(frame, _, accepted)| (frame, accepted)),
         };
         match next {
-            Ok(Frame::Eof) => {
+            Ok((Frame::Eof, _)) => {
                 *eof = true;
                 return Ok(());
             }
-            Ok(frame) => {
+            Ok((frame, accepted)) => {
                 if let Some(id) = cancellation_id(&frame) {
                     let _ = &mut stream;
                     if active_id == Some(&id) {
@@ -1370,7 +1419,7 @@ fn drain_mcp_input(
                         *canceled = true;
                     } else if buffer.active_id.as_ref() == Some(&id) {
                         buffer.cancelled_active = true;
-                    } else if buffer.queue.iter().any(|frame| {
+                    } else if buffer.queue.iter().any(|(frame, _)| {
                         matches!(frame,
                         Frame::Line(line) if wire::decode(Frame::Line(line.clone())).ok()
                             .flatten().and_then(|request| request.id).as_ref() == Some(&id))
@@ -1397,7 +1446,7 @@ fn drain_mcp_input(
                             &wire::ProtocolError::new(-32600, id).response(),
                         )?;
                     } else {
-                        buffer.queue.push_back(frame);
+                        buffer.queue.push_back((frame, accepted));
                     }
                 } else {
                     // A finite relay cannot admit this frame for daemon selection.
@@ -1507,14 +1556,14 @@ mod stdin_fence_tests {
             }
             // Settled through the decision point: the frame is already sent.
             match frames.try_recv() {
-                Ok((Frame::Line(bytes), _)) => assert_eq!(bytes, line.trim_end().as_bytes()),
+                Ok((Frame::Line(bytes), _, _)) => assert_eq!(bytes, line.trim_end().as_bytes()),
                 other => panic!("frame {n} not delivered when settled: {other:?}"),
             }
         }
         unsafe { libc::close(fds[1]) };
         assert!(matches!(
             frames.recv_timeout(crate::testing::HANG_BACKSTOP),
-            Ok((Frame::Eof, _))
+            Ok((Frame::Eof, _, _))
         ));
         let deadline = Instant::now() + crate::testing::HANG_BACKSTOP;
         while !fence.settled(u64::MAX) {
@@ -1557,7 +1606,7 @@ mod stdin_fence_tests {
             thread::sleep(Duration::from_millis(1));
         }
         unsafe { libc::close(fds[1]) };
-        while !matches!(frames.recv(), Ok((Frame::Eof, _)) | Err(_)) {}
+        while !matches!(frames.recv(), Ok((Frame::Eof, _, _)) | Err(_)) {}
         unsafe { libc::close(fds[0]) };
     }
 }
@@ -1607,7 +1656,15 @@ mod reply_gate_tests {
         fn gate_on(
             &self,
             frames: &FrameReceiver,
-        ) -> (ReplyGate, Option<(crate::mcp::wire::Frame, u64)>) {
+        ) -> (ReplyGate, Option<(crate::mcp::wire::Frame, u64, Instant)>) {
+            self.gate_until(frames, Instant::now() + RELAY_REPLY_BOUND)
+        }
+        /// As `gate_on`, settling only until `bound`.
+        fn gate_until(
+            &self,
+            frames: &FrameReceiver,
+            bound: Instant,
+        ) -> (ReplyGate, Option<(crate::mcp::wire::Frame, u64, Instant)>) {
             let mut buffer = McpInputBuffer {
                 workspace: &self.workspace,
                 queue: std::collections::VecDeque::new(),
@@ -1622,16 +1679,15 @@ mod reply_gate_tests {
                 cancels: Vec::new(),
                 outstanding: Vec::new(),
             };
-            let (mut stream, _daemon) = UnixStream::pair().unwrap();
             let mut stdout = Vec::new();
             let mut eof = false;
             let gate = reply_gate(
-                &mut stream,
                 frames,
                 &mut buffer,
                 &mut stdout,
                 &mut eof,
                 Some(&json!("A")),
+                bound,
             )
             .unwrap();
             (gate, buffer.deferred.take())
@@ -1654,6 +1710,34 @@ mod reply_gate_tests {
         }
     }
     const CANCEL_A: &str = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":\"A\"}}\n";
+
+    /// Decision 0009 §7: a call's settling ends by its own deadline. Input
+    /// the stdin reader has not delivered by then makes the outcome
+    /// outcome_unknown at that bound, not a later decision.
+    #[test]
+    fn settling_ends_by_the_calls_bound() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let fixture = Fixture::new();
+        // A complete frame the reader is held from delivering.
+        fixture.fence.hold_reads.store(true, SeqCst);
+        fixture.write("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\n");
+        let bound = Instant::now() + Duration::from_millis(200);
+        // Released only well after the bound, or once the gate decided, so a
+        // gate that settles past its bound would see the frame and write.
+        let (decided_tx, decided_rx) = std::sync::mpsc::channel::<()>();
+        let fence = fixture.fence.clone();
+        let releaser = thread::spawn(move || {
+            let _ = decided_rx.recv_timeout(Duration::from_secs(3));
+            fence.hold_reads.store(false, SeqCst);
+        });
+        let (gate, _) = fixture.gate_until(&fixture.frames, bound);
+        let _ = decided_tx.send(());
+        releaser.join().unwrap();
+        assert!(
+            matches!(gate, ReplyGate::Unknown),
+            "the gate settled past its bound"
+        );
+    }
 
     #[test]
     fn a_cancel_written_before_the_decision_wins_even_if_unread() {
@@ -1802,7 +1886,7 @@ mod reply_gate_tests {
             fixture.fds[1] = -1;
             assert!(matches!(gate, ReplyGate::Write));
             assert!(
-                matches!(deferred, Some((crate::mcp::wire::Frame::Eof, _))),
+                matches!(deferred, Some((crate::mcp::wire::Frame::Eof, _, _))),
                 "the post-decision EOF is deferred until after the reply"
             );
         }
@@ -1846,7 +1930,7 @@ mod reply_gate_tests {
             let (gate, deferred) = fixture.gate_on(&fixture.frames);
             assert!(matches!(gate, ReplyGate::Write));
             match deferred {
-                Some((crate::mcp::wire::Frame::Line(bytes), end)) => {
+                Some((crate::mcp::wire::Frame::Line(bytes), end, _)) => {
                     assert_eq!(bytes, LATER.trim_end().as_bytes());
                     let total = decided.lock().unwrap().unwrap();
                     assert!(end > total, "the deferred frame ends after the decision");
@@ -1874,7 +1958,11 @@ mod reply_gate_tests {
                 while !stop.load(Ordering::Acquire) {
                     // Every frame ends after the empty decision offset.
                     if sender
-                        .send((crate::mcp::wire::Frame::Line(line.clone()), u64::MAX))
+                        .send((
+                            crate::mcp::wire::Frame::Line(line.clone()),
+                            u64::MAX,
+                            Instant::now(),
+                        ))
                         .is_err()
                     {
                         break;
