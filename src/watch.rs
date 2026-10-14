@@ -23,32 +23,83 @@ const MAX_WAIT: Duration = Duration::from_millis(250);
 /// Watcher health shared by every watcher one owner creates, read without a
 /// lock. Each watcher reports under its own epoch, so a callback from a
 /// replaced watcher can never mark the current one degraded (#138 item 22).
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct WatcherHealth {
-    degraded: AtomicBool,
-    epoch: AtomicU64,
+    /// `epoch << 1 | degraded`: the epoch check and the health update are one
+    /// compare-and-swap, so a report from a replaced watcher can never land
+    /// after a new epoch began.
+    state: AtomicU64,
+    #[cfg(test)]
+    after_load: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+impl std::fmt::Debug for WatcherHealth {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WatcherHealth")
+            .field("degraded", &self.degraded())
+            .finish()
+    }
 }
 
 impl WatcherHealth {
     pub fn degraded(&self) -> bool {
-        self.degraded.load(Ordering::Acquire)
+        self.state.load(Ordering::Acquire) & 1 == 1
     }
 
-    /// Start a new watcher's epoch; reports from earlier watchers are ignored.
+    /// Start a new watcher's epoch, healthy; reports from earlier watchers are
+    /// ignored from here on.
     fn begin_epoch(&self) -> u64 {
-        self.epoch.fetch_add(1, Ordering::AcqRel) + 1
+        let mut current = self.state.load(Ordering::Acquire);
+        loop {
+            let epoch = (current >> 1) + 1;
+            match self.state.compare_exchange_weak(
+                current,
+                epoch << 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return epoch,
+                Err(actual) => current = actual,
+            }
+        }
     }
 
+    /// Report as of `epoch`; ignored once a later epoch has begun.
     fn report(&self, epoch: u64, degraded: bool) {
-        if self.epoch.load(Ordering::Acquire) == epoch {
-            self.degraded.store(degraded, Ordering::Release);
+        let mut current = self.state.load(Ordering::Acquire);
+        #[cfg(test)]
+        {
+            let hook = self.after_load.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        while current >> 1 == epoch {
+            match self.state.compare_exchange_weak(
+                current,
+                epoch << 1 | u64::from(degraded),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    /// What setup found, published after the callback is installed. The epoch
+    /// began healthy and setup only adds degradation, so an error the callback
+    /// already published is never cleared.
+    fn publish_setup(&self, epoch: u64, degraded: bool) {
+        if degraded {
+            self.report(epoch, true);
         }
     }
 
     /// The owner dropped its watcher: healthy until a new one reports.
     pub fn reset(&self) {
-        self.epoch.fetch_add(1, Ordering::AcqRel);
-        self.degraded.store(false, Ordering::Release);
+        self.begin_epoch();
     }
 }
 
@@ -314,7 +365,7 @@ impl WatchSignals {
             })
             .and_then(Result::ok);
         let degraded = native && watcher.is_none();
-        health.report(epoch, degraded);
+        health.publish_setup(epoch, degraded);
         let captured_inputs = [scip_path, manifest_path]
             .into_iter()
             .flatten()
@@ -672,5 +723,39 @@ mod health_epoch_tests {
         assert!(!health.degraded());
         health.report(current, true);
         assert!(!health.degraded(), "a reset ends the current epoch too");
+    }
+
+    /// A stale report paused after reading the epoch, resumed after the
+    /// replacement began and reported healthy, changes nothing.
+    #[test]
+    fn a_stale_report_paused_across_replacement_is_dropped() {
+        let health = Arc::new(WatcherHealth::default());
+        let old = health.begin_epoch();
+        let (paused_tx, paused_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
+        *health.after_load.lock().unwrap() = Some(Box::new(move || {
+            paused_tx.send(()).unwrap();
+            resume_rx.recv().unwrap();
+        }));
+        let stale = {
+            let health = Arc::clone(&health);
+            std::thread::spawn(move || health.report(old, true))
+        };
+        paused_rx.recv().unwrap();
+        let current = health.begin_epoch();
+        health.report(current, false);
+        resume_tx.send(()).unwrap();
+        stale.join().unwrap();
+        assert!(!health.degraded(), "the replaced watcher's error leaked");
+    }
+
+    /// An error the callback publishes during setup survives setup.
+    #[test]
+    fn a_setup_error_from_the_callback_is_not_cleared() {
+        let health = WatcherHealth::default();
+        let epoch = health.begin_epoch();
+        health.report(epoch, true); // the OS callback, mid-setup
+        health.publish_setup(epoch, false);
+        assert!(health.degraded());
     }
 }
