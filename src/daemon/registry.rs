@@ -239,9 +239,6 @@ impl CheckoutRegistry {
             "checkout not attached"
         );
         if let Some(runtime) = self.runtimes.get(key) {
-            if let Ok(resources) = runtime.resources() {
-                resources.scheduler.withdraw_release_request();
-            }
             return Ok(runtime.clone());
         }
         let identity = entry.identity.rediscover()?;
@@ -382,7 +379,6 @@ impl CheckoutRegistry {
             || !eligible()
         {
             resources.scheduler.reset_watcher_release();
-            resources.scheduler.withdraw_release_request();
             return Ok(false);
         }
         let result = resources.scheduler.try_release_checkout_runtime_if(|| {
@@ -449,30 +445,21 @@ impl CheckoutRegistry {
             return Ok(true);
         };
         let resources = runtime.resources()?;
-        // No accepted watcher intent may be retired; a lost root's watcher is inert.
-        let watch_pending = |resources: &ActiveResources| {
-            !resources.scheduler.checkout_root_loss_retired()
-                && resources.scheduler.checkout_watch_pending()
-        };
         if runtime.h_in_flight.load(Ordering::Acquire)
             || (runtime.catching_up() && !runtime.retry_waiting.load(Ordering::Acquire))
             || runtime.active_reads.load(Ordering::Acquire) != 0
             || CheckoutRuntime::queue_pending(&resources)
-            || watch_pending(&resources)
         {
-            resources.scheduler.withdraw_release_request();
             return Ok(false);
         }
         // The timer holds the registry guard too. If either worker lane is
-        // busy, defer retirement with every active capability intact; the busy
-        // lane records the request and idle ticks yield to it.
+        // busy, defer retirement with every active capability intact.
         let released = resources.scheduler.try_release_checkout_runtime_if(|| {
             let mut phase = runtime.phase.lock().unwrap();
             CheckoutRuntime::refresh_phase(&mut phase, &resources);
             if runtime.h_in_flight.load(Ordering::Acquire)
                 || runtime.active_reads.load(Ordering::Acquire) != 0
                 || CheckoutRuntime::queue_pending(&resources)
-                || watch_pending(&resources)
             {
                 return false;
             }
@@ -1108,10 +1095,6 @@ impl CheckoutRegistry {
         self.refresh_pending_work(key)?;
         let entry = self.entries.get(key).ok_or(SelectionError::Unavailable)?;
         if !entry.sessions.is_empty() || entry.browser_until.is_some() || entry.pending_work {
-            // A declined release withdraws any request, so idle work resumes.
-            if let Some(Ok(resources)) = self.runtimes.get(key).map(|runtime| runtime.resources()) {
-                resources.scheduler.withdraw_release_request();
-            }
             return Ok(false);
         }
         if !self
@@ -2136,294 +2119,6 @@ mod selection_tests {
         .expect("H and the first watcher inventory did not settle");
     }
 
-    /// Activate one checkout, wait for H and its first inventory, and make
-    /// its release due.
-    async fn due_release_fixture(
-        temp: &std::path::Path,
-        session: u64,
-    ) -> (CheckoutRegistry, WorkspaceIdentity, Arc<CheckoutRuntime>) {
-        let root = temp.join("checkout");
-        git(temp, &["init", "--quiet", root.to_str().unwrap()]);
-        std::fs::write(root.join("ready.js"), "function ready() {}\n").unwrap();
-        let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
-        let roots = TopologyRoots::isolated_for_tests(temp.join("cache"), temp.join("data"));
-        let mut registry = CheckoutRegistry::with_roots(roots);
-        registry.attach_launch(session, &identity).unwrap();
-        let runtime = registry.activate(&identity.root_key).unwrap();
-        tokio::time::timeout(crate::testing::HANG_BACKSTOP, async {
-            loop {
-                if let Ok((response, catching_up)) = runtime.evidence_response()
-                    && response.finish(()).is_ok()
-                    && !catching_up
-                    && !runtime
-                        .browser_scheduler()
-                        .unwrap()
-                        .checkout_watch_pending()
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("initial H and inventory did not settle");
-        registry.disconnect_at(session, Instant::now() - CHECKOUT_RELEASE_DELAY);
-        (registry, identity, runtime)
-    }
-
-    /// Hold the native lane on another thread, as an in-flight tick would.
-    fn hold_native_lane(
-        scheduler: Arc<http::DaemonState>,
-    ) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
-        let (held_tx, held_rx) = std::sync::mpsc::channel();
-        let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
-        let holder = std::thread::spawn(move || {
-            scheduler.hold_native_lane_for_tests(|| {
-                held_tx.send(()).unwrap();
-                let _ = resume_rx.recv_timeout(crate::testing::HANG_BACKSTOP);
-            });
-        });
-        held_rx.recv_timeout(crate::testing::HANG_BACKSTOP).unwrap();
-        (resume_tx, holder)
-    }
-
-    async fn release_within(registry: &mut CheckoutRegistry, key: &str, bound: Duration) {
-        tokio::time::timeout(bound, async {
-            while !registry
-                .advance(Instant::now())
-                .unwrap()
-                .released
-                .contains(&key.to_owned())
-            {
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-        })
-        .await
-        .expect("due release did not complete");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn busy_release_is_requested_and_idle_ticks_yield_until_it_succeeds() {
-        let temp = tempfile::tempdir().unwrap();
-        let (mut registry, identity, runtime) = due_release_fixture(temp.path(), 61).await;
-        let key = identity.root_key.clone();
-        let scheduler = runtime.browser_scheduler().unwrap();
-        let (resume, holder) = hold_native_lane(scheduler.clone());
-        assert!(
-            registry
-                .advance(Instant::now())
-                .unwrap()
-                .released
-                .is_empty()
-        );
-        assert!(scheduler.release_requested_for_tests());
-        assert!(runtime.has_active_resources());
-        let (yielded_tx, yielded_rx) = std::sync::mpsc::channel();
-        scheduler.set_release_yield_hook_for_tests(move || {
-            let _ = yielded_tx.send(());
-        });
-        resume.send(()).unwrap();
-        holder.join().unwrap();
-        // The next real idle tick yields both lanes instead of re-entering.
-        yielded_rx
-            .recv_timeout(crate::testing::HANG_BACKSTOP)
-            .expect("an idle tick re-entered the native lane ahead of the release");
-        assert!(scheduler.release_requested_for_tests());
-        release_within(&mut registry, &key, crate::testing::HANG_BACKSTOP).await;
-        assert!(!runtime.has_active_resources());
-        assert!(!scheduler.release_requested_for_tests());
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn accepted_fifo_runs_before_a_pending_release() {
-        let temp = tempfile::tempdir().unwrap();
-        let (mut registry, identity, runtime) = due_release_fixture(temp.path(), 62).await;
-        let key = identity.root_key.clone();
-        let scheduler = runtime.browser_scheduler().unwrap();
-        let store = runtime.resources().unwrap().store.clone();
-        let (resume, holder) = hold_native_lane(scheduler.clone());
-        assert!(
-            registry
-                .advance(Instant::now())
-                .unwrap()
-                .released
-                .is_empty()
-        );
-        assert!(scheduler.release_requested_for_tests());
-        let accepted = store
-            .enqueue_request(&IndexOptions::new(identity.root.clone()), None)
-            .unwrap();
-        // Accepted work withdraws the request; the row keeps its ID.
-        assert!(
-            registry
-                .advance(Instant::now())
-                .unwrap()
-                .released
-                .is_empty()
-        );
-        assert!(!scheduler.release_requested_for_tests());
-        resume.send(()).unwrap();
-        holder.join().unwrap();
-        tokio::time::timeout(crate::testing::HANG_BACKSTOP, async {
-            while store
-                .request_by_id(&accepted.id)
-                .ok()
-                .flatten()
-                .is_none_or(|row| row.finished_at.is_none())
-            {
-                assert!(runtime.has_active_resources(), "released before FIFO");
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("accepted FIFO row did not finish");
-        assert_eq!(
-            store.request_by_id(&accepted.id).unwrap().unwrap().state,
-            "done"
-        );
-        release_within(&mut registry, &key, crate::testing::HANG_BACKSTOP).await;
-        assert!(!runtime.has_active_resources());
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn in_flight_watcher_work_declines_release_without_requesting_it() {
-        let temp = tempfile::tempdir().unwrap();
-        let (mut registry, _identity, runtime) = due_release_fixture(temp.path(), 63).await;
-        let scheduler = runtime.browser_scheduler().unwrap();
-        let held = scheduler.clone();
-        let (held_tx, held_rx) = std::sync::mpsc::channel();
-        let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
-        let holder = std::thread::spawn(move || {
-            held.hold_watcher_gate_for_tests(|| {
-                held_tx.send(()).unwrap();
-                let _ = resume_rx.recv_timeout(crate::testing::HANG_BACKSTOP);
-            });
-        });
-        held_rx.recv_timeout(crate::testing::HANG_BACKSTOP).unwrap();
-        let outcome = registry.advance(Instant::now()).unwrap();
-        resume_tx.send(()).unwrap();
-        holder.join().unwrap();
-        assert!(outcome.released.is_empty());
-        assert!(!scheduler.release_requested_for_tests());
-        assert!(runtime.has_active_resources());
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn reattach_withdraws_a_pending_release() {
-        let temp = tempfile::tempdir().unwrap();
-        let (mut registry, identity, runtime) = due_release_fixture(temp.path(), 64).await;
-        let key = identity.root_key.clone();
-        let scheduler = runtime.browser_scheduler().unwrap();
-        let (resume, holder) = hold_native_lane(scheduler.clone());
-        assert!(
-            registry
-                .advance(Instant::now())
-                .unwrap()
-                .released
-                .is_empty()
-        );
-        assert!(scheduler.release_requested_for_tests());
-        registry.attach_launch(65, &identity).unwrap();
-        let again = registry.activate(&key).unwrap();
-        assert!(Arc::ptr_eq(&again, &runtime));
-        assert!(!scheduler.release_requested_for_tests());
-        resume.send(()).unwrap();
-        holder.join().unwrap();
-        assert!(
-            registry
-                .advance(Instant::now())
-                .unwrap()
-                .released
-                .is_empty()
-        );
-        assert!(runtime.has_active_resources());
-    }
-
-    /// Serve's CLI replacement must not compete with idle ticks for the lanes:
-    /// once a busy retry requests the release, the next real idle tick yields
-    /// and the following retry retires the runtime and registers.
-    #[cfg(feature = "test-support")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn serve_replacement_wins_the_lanes_through_the_idle_tick_yield() {
-        use std::sync::mpsc;
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("checkout");
-        git(temp.path(), &["init", "--quiet", root.to_str().unwrap()]);
-        let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
-        let key = identity.root_key.clone();
-        let roots =
-            TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
-        let mut registry = CheckoutRegistry::with_roots(roots);
-        let options = CheckoutOptions(serde_json::json!({"browseRoot": identity.root}));
-        registry.attach_launch(49, &identity).unwrap();
-        let runtime = registry.activate(&key).unwrap();
-        registry.disconnect(49);
-        settled_after_first_inventory(&runtime).await;
-        let scheduler = runtime.browser_scheduler().unwrap();
-        // An in-flight tick holds the native lane, so the first retry is busy.
-        let held = scheduler.clone();
-        let (held_tx, held_rx) = mpsc::channel();
-        let (resume_tx, resume_rx) = mpsc::channel::<()>();
-        let holder = std::thread::spawn(move || {
-            held.hold_native_lane_for_tests(|| {
-                held_tx.send(()).unwrap();
-                let _ = resume_rx.recv_timeout(crate::testing::HANG_BACKSTOP);
-            });
-        });
-        held_rx.recv_timeout(crate::testing::HANG_BACKSTOP).unwrap();
-        let registry = Arc::new(tokio::sync::Mutex::new(registry));
-        let token = temp.path().join("token");
-        let mut provisioner = crate::daemon::BrowserProvisioner::new();
-        let yielded = Arc::new(AtomicBool::new(false));
-        let mut resume_tx = Some(resume_tx);
-        let observed = scheduler.clone();
-        let saw_yield = yielded.clone();
-        let mut hook = move |stage: &'static str| {
-            if stage == "retry_wait"
-                && let Some(resume) = resume_tx.take()
-            {
-                // The busy retry requested the release. Arm the yield hook, end
-                // the in-flight tick, and let serve retry only after a real idle
-                // tick has yielded the lanes to the pending release.
-                assert!(observed.release_requested_for_tests());
-                let (tx, rx) = mpsc::channel();
-                observed.set_release_yield_hook_for_tests(move || {
-                    let _ = tx.send(());
-                });
-                resume.send(()).unwrap();
-                rx.recv_timeout(crate::testing::HANG_BACKSTOP)
-                    .expect("no idle tick yielded to the pending release");
-                saw_yield.store(true, Ordering::Release);
-            }
-        };
-        let address = tokio::time::timeout(
-            crate::testing::HANG_BACKSTOP,
-            provisioner.register_serve_with_hook(
-                &registry,
-                &identity,
-                options,
-                "127.0.0.1:0".parse().unwrap(),
-                &token,
-                Some(&mut hook),
-            ),
-        )
-        .await
-        .expect("serve registration hung")
-        .expect("serve registration failed");
-        holder.join().unwrap();
-        assert!(address.ip().is_loopback());
-        assert!(
-            yielded.load(Ordering::Acquire),
-            "serve registered before the busy retry path ran"
-        );
-        assert!(
-            !runtime.has_active_resources(),
-            "the CLI runtime was not retired"
-        );
-        assert!(!scheduler.release_requested_for_tests());
-        assert!(token.exists());
-    }
-
     /// A serve registration future dropped while waiting on a busy CLI
     /// replacement must not leave that runtime's watcher release armed.
     #[cfg(feature = "test-support")]
@@ -2458,20 +2153,17 @@ mod selection_tests {
         let registry = Arc::new(tokio::sync::Mutex::new(registry));
         let token = temp.path().join("token");
         let mut provisioner = crate::daemon::BrowserProvisioner::new();
-        let (waiting_tx, waiting_rx) = tokio::sync::oneshot::channel::<(bool, bool)>();
+        let (waiting_tx, waiting_rx) = tokio::sync::oneshot::channel::<bool>();
         let mut waiting_tx = Some(waiting_tx);
         let observed = scheduler.clone();
         let mut hook = move |stage: &'static str| {
             if stage == "retry_wait"
                 && let Some(tx) = waiting_tx.take()
             {
-                let _ = tx.send((
-                    observed.watcher_release_requested_for_tests(),
-                    observed.release_requested_for_tests(),
-                ));
+                let _ = tx.send(observed.watcher_release_requested_for_tests());
             }
         };
-        let (armed_at_wait, requested_at_wait) = tokio::select! {
+        let armed_at_wait = tokio::select! {
             result = provisioner.register_serve_with_hook(
                 &registry,
                 &identity,
@@ -2484,7 +2176,6 @@ mod selection_tests {
         };
         // The registration future has been dropped at its retry wait.
         let reset = !scheduler.watcher_release_requested_for_tests();
-        let withdrawn = !scheduler.release_requested_for_tests();
         let still_active = runtime.active.load(Ordering::Acquire) && runtime.has_active_resources();
         resume_tx.send(()).unwrap();
         holder.join().unwrap();
@@ -2495,14 +2186,6 @@ mod selection_tests {
         assert!(
             reset,
             "a dropped registration left the watcher release armed"
-        );
-        assert!(
-            requested_at_wait,
-            "the busy retry did not request the release"
-        );
-        assert!(
-            withdrawn,
-            "a dropped registration left idle work yielding to its release"
         );
         assert!(still_active, "the retained CLI runtime was changed");
         let checked = registry.lock().await;

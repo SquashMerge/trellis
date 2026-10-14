@@ -294,7 +294,6 @@ impl ArmedWatcherRelease {
         }
         if let Some(previous) = std::mem::replace(&mut self.0, scheduler) {
             previous.reset_watcher_release();
-            previous.withdraw_release_request();
         }
     }
 }
@@ -303,9 +302,6 @@ impl Drop for ArmedWatcherRelease {
     fn drop(&mut self) {
         if let Some(scheduler) = self.0.take() {
             scheduler.reset_watcher_release();
-            // A busy retry also requested the release; withdraw it so idle
-            // work and maintenance stop yielding to a release nobody awaits.
-            scheduler.withdraw_release_request();
         }
     }
 }
