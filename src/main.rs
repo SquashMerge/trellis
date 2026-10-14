@@ -702,7 +702,11 @@ async fn serve_via_daemon(args: &ServeArgs) -> Result<()> {
     let socket = socket_path()?;
     let mut stream = client::connect_or_start(&socket, start_daemon, Duration::from_secs(5))
         .map_err(|_| anyhow::anyhow!("daemon_unavailable"))?;
-    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    // Serve may wait for this checkout's accepted work before replacing its
+    // runtime. Read past that wait so the daemon's typed reply always arrives.
+    stream.set_read_timeout(Some(
+        trellis::daemon::SERVE_REPLACEMENT_WAIT + Duration::from_secs(10),
+    ))?;
     protocol::write_frame(
         &mut stream,
         &daemon_request(
@@ -713,6 +717,9 @@ async fn serve_via_daemon(args: &ServeArgs) -> Result<()> {
             }),
         ),
     )?;
+    if !reply_ready_within(&stream, Duration::from_secs(2)) {
+        eprintln!("Trellis: waiting for this checkout's current index work to finish...");
+    }
     let reply: protocol::Reply = protocol::read_frame(&mut stream)
         .map_err(|_| anyhow::anyhow!("outcome_unknown: inspect daemon listener status"))?;
     let address = checked_reply(reply)?;
@@ -1137,4 +1144,17 @@ fn write_daemon_reply(
         }
     }
     Ok(())
+}
+
+/// Whether the daemon's reply is readable within `wait`, without consuming it.
+fn reply_ready_within(stream: &std::os::unix::net::UnixStream, wait: Duration) -> bool {
+    use std::os::fd::AsRawFd;
+    let mut poll = libc::pollfd {
+        fd: stream.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let millis = libc::c_int::try_from(wait.as_millis()).unwrap_or(libc::c_int::MAX);
+    // A failed or interrupted poll only skips the progress note.
+    (unsafe { libc::poll(&mut poll, 1, millis) }) > 0
 }

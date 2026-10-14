@@ -268,6 +268,13 @@ impl Default for BrowserProvisioner {
     }
 }
 
+/// How long serve waits for a CLI-activated runtime to finish its accepted
+/// work (H, FIFO, a read) before replacing it. Accepted work is never cut
+/// short, and under load an index can take several seconds; this bound only
+/// turns a stuck runtime into a typed storage_busy. #138 removes the wait by
+/// applying serve's registration in place at the worker's next boundary.
+pub const SERVE_REPLACEMENT_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// The advisory watcher-release request a busy CLI-replacement retry arms on
 /// one runtime's scheduler. Reset synchronously on every exit from serve
 /// registration, including a dropped future. It holds the exact scheduler
@@ -370,7 +377,7 @@ impl BrowserProvisioner {
         // accepted work. Wait only for that typed transient state, releasing
         // the registry guard so the runtime can finish. A genuine conflicting
         // registration or attached client remains an immediate refusal.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        let deadline = std::time::Instant::now() + SERVE_REPLACEMENT_WAIT;
         // A busy retry may arm the runtime's advisory watcher release. The
         // guard resets it on every exit: success, timeout, a later non-busy
         // error, or this future being dropped.

@@ -34,6 +34,9 @@ function assertSelectedBrowserRequests(requests, rootKey) {
 let binary, suiteBinaryDir;
 
 const delay = ms => new Promise(resolveDelay => setTimeout(resolveDelay, ms));
+// Functional tests assert correctness, not speed: bounds only detect hangs
+// (matches trellis::testing::HANG_BACKSTOP, above serve's replacement wait).
+const HANG_BACKSTOP_MS = 120000;
 function run(command, args, {cwd = ROOT, env = process.env, timeout = 180000} = {}) {
   return new Promise((resolveRun, reject) => {
     const child = spawn(command, args, {cwd, env, stdio:["ignore", "pipe", "pipe"]});
@@ -149,9 +152,9 @@ async function startDaemon(paths, expectedRevision) {
     // Serve connects to (or launches) the daemon before it prints this banner.
     // The internal connect and reply bounds total 15s; concurrent verify lanes
     // can delay the child beyond the old 10s fixture timer.
-    const timer = setTimeout(() => rejected(new Error(`daemon address timed out after 30s: pid=${child.pid} exit=${child.exitCode} signal=${child.signalCode} stderr=${stderr.replaceAll(paths.token,"[redacted]")}`)),30000);
+    const timer = setTimeout(() => rejected(new Error(`daemon address hung: pid=${child.pid} exit=${child.exitCode} signal=${child.signalCode} stderr=${stderr.replaceAll(paths.token,"[redacted]")}`)),HANG_BACKSTOP_MS);
     try { await address; } finally { clearTimeout(timer); }
-    const deadline = Date.now()+10000;
+    const deadline = Date.now()+HANG_BACKSTOP_MS;
     while (true) {
       try { const health=await fetch(`${base}/healthz`,{signal:AbortSignal.timeout(1000)}); if(health.ok) break; } catch {}
       if(Date.now()>deadline) throw new Error(`daemon health timed out: ${stderr.replaceAll(paths.token,"[redacted]")}`);
