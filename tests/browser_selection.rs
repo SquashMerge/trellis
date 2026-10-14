@@ -1987,8 +1987,7 @@ async fn cold_selected_native_read_is_not_ready_without_a_fabricated_basis() {
             entered_tx.send(()).unwrap();
             resume_rx.lock().unwrap().recv().unwrap();
         }));
-        let runtime = registry.activate(&identity.root_key).unwrap();
-        runtime
+        registry.activate(&identity.root_key).unwrap()
     };
     tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         while entered_rx.try_recv().is_err() {
@@ -2151,8 +2150,7 @@ async fn selected_status_serves_validated_pre_startup_head_and_clears_freshness_
             entered_tx.send(()).unwrap();
             resume_rx.lock().unwrap().recv().unwrap();
         }));
-        let runtime = registry.activate(&identity.root_key).unwrap();
-        runtime
+        registry.activate(&identity.root_key).unwrap()
     };
     tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         while entered_rx.try_recv().is_err() {
