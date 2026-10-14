@@ -105,7 +105,14 @@ mod tests {
 /// Run the line-framed transport. The reader owns stdin; this coordinator alone owns stdout.
 /// Input already waiting in the bounded channel is applied before any queued outcome commits.
 pub fn run_stdio(workspace: OpenedWorkspace) -> std::io::Result<()> {
-    run_transport(workspace, std::io::stdin(), std::io::stdout(), None, None)
+    run_transport(
+        workspace,
+        std::io::stdin(),
+        std::io::stdout(),
+        None,
+        None,
+        false,
+    )
 }
 
 /// Run the same protocol coordinator on a daemon-owned session socket.
@@ -123,6 +130,27 @@ pub fn run_socket(
         stream,
         Some((registry, session_id)),
         Some(daemon_handle),
+        false,
+    )
+}
+
+/// The daemon side of `trellis mcp`'s relay (Decision 0009 §7): every frame
+/// and reply carries the relay's own ID before the unchanged MCP line.
+pub fn run_relayed_socket(
+    workspace: OpenedWorkspace,
+    stream: std::os::unix::net::UnixStream,
+    registry: std::sync::Arc<tokio::sync::Mutex<crate::daemon::registry::CheckoutRegistry>>,
+    session_id: u64,
+    daemon_handle: tokio::runtime::Handle,
+) -> std::io::Result<()> {
+    let reader = stream.try_clone()?;
+    run_transport(
+        workspace,
+        reader,
+        stream,
+        Some((registry, session_id)),
+        Some(daemon_handle),
+        true,
     )
 }
 
@@ -283,7 +311,8 @@ type Registry = Option<(
 )>;
 
 enum Input {
-    Frame(wire::Frame),
+    /// A frame, and its relay ID on the relayed transport.
+    Frame(wire::Frame, Option<u64>),
     Done(u64, std::io::Result<CallOutcome>),
 }
 
@@ -314,6 +343,7 @@ type Resolved = std::sync::Arc<std::sync::Mutex<Option<(std::path::PathBuf, bool
 
 struct InFlight {
     id: serde_json::Value,
+    relay: Option<u64>,
     modern: bool,
     deadline: std::time::Instant,
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -572,6 +602,7 @@ fn run_transport(
     output: impl std::io::Write,
     registry: Registry,
     daemon_handle: Option<tokio::runtime::Handle>,
+    relayed: bool,
 ) -> std::io::Result<()> {
     use std::collections::{HashMap, VecDeque};
     use std::io::BufReader;
@@ -584,19 +615,24 @@ fn run_transport(
         .spawn(move || {
             let mut reader = BufReader::new(input);
             loop {
-                match wire::read_frame(&mut reader) {
-                    Ok(wire::Frame::Eof) => {
-                        let _ = reader_sender.send(Input::Frame(wire::Frame::Eof));
+                let read = if relayed {
+                    wire::read_relayed_frame(&mut reader)
+                } else {
+                    wire::read_frame(&mut reader).map(|frame| (None, frame))
+                };
+                match read {
+                    Ok((_, wire::Frame::Eof)) => {
+                        let _ = reader_sender.send(Input::Frame(wire::Frame::Eof, None));
                         break;
                     }
-                    Ok(frame) => {
-                        if reader_sender.send(Input::Frame(frame)).is_err() {
+                    Ok((relay, frame)) => {
+                        if reader_sender.send(Input::Frame(frame, relay)).is_err() {
                             break;
                         }
                     }
                     Err(error) => {
                         eprintln!("MCP stdin read failed: {error}");
-                        let _ = reader_sender.send(Input::Frame(wire::Frame::Eof));
+                        let _ = reader_sender.send(Input::Frame(wire::Frame::Eof, None));
                         break;
                     }
                 }
@@ -615,8 +651,8 @@ fn run_transport(
      -> bool {
         loop {
             match receiver.try_recv() {
-                Ok(Input::Frame(frame)) => {
-                    if receive(frame, session, outcomes) {
+                Ok(Input::Frame(frame, relay)) => {
+                    if receive(frame, relay, session, outcomes) {
                         return true;
                     }
                 }
@@ -667,8 +703,8 @@ fn run_transport(
                 },
             };
             match event {
-                Some(Input::Frame(frame)) => {
-                    if receive(frame, &mut session, &mut outcomes) {
+                Some(Input::Frame(frame, relay)) => {
+                    if receive(frame, relay, &mut session, &mut outcomes) {
                         cancel_dropped(&session, &mut in_flight);
                         return Ok(());
                     }
@@ -706,7 +742,7 @@ fn run_transport(
             if let Some(prepared) = session.prepare(token, response)
                 && let Some(value) = session.commit(prepared)
             {
-                wire::write_response(&mut writer, &value)?;
+                wire::write_relayed_response(&mut writer, call.relay, &value)?;
             }
         }
         // Finished calls: the send decision.
@@ -782,17 +818,17 @@ fn run_transport(
             if let Some(prepared) = session.prepare(token, response)
                 && let Some(value) = session.commit(prepared)
             {
-                wire::write_response(&mut writer, &value)?;
+                wire::write_relayed_response(&mut writer, call.relay, &value)?;
             }
         }
         let Some(outcome) = outcomes.pop_front() else {
             continue;
         };
         match outcome {
-            impl_receive::Outcome::Error(error) => {
-                wire::write_response(&mut writer, &error.response())?
+            impl_receive::Outcome::Error(error, relay) => {
+                wire::write_relayed_response(&mut writer, relay, &error.response())?
             }
-            impl_receive::Outcome::Request(admission, accepted) => {
+            impl_receive::Outcome::Request(admission, accepted, relay) => {
                 // Cancellation may have invalidated the token while its outcome waited.
                 if session.pending(admission.token).is_none() {
                     continue;
@@ -864,6 +900,7 @@ fn run_transport(
                                         token,
                                         InFlight {
                                             id: admission.id.clone(),
+                                            relay,
                                             modern,
                                             deadline,
                                             cancel,
@@ -914,7 +951,7 @@ fn run_transport(
                     return Ok(());
                 }
                 if let Some(value) = session.commit(prepared) {
-                    wire::write_response(&mut writer, &value)?;
+                    wire::write_relayed_response(&mut writer, relay, &value)?;
                 }
             }
         }
@@ -923,6 +960,7 @@ fn run_transport(
 
 fn receive(
     frame: wire::Frame,
+    relay: Option<u64>,
     session: &mut session::Session,
     outcomes: &mut std::collections::VecDeque<impl_receive::Outcome>,
 ) -> bool {
@@ -931,16 +969,18 @@ fn receive(
         return true;
     }
     match wire::decode(frame) {
-        Err(error) => outcomes.push_back(impl_receive::Outcome::Error(error)),
+        Err(error) => outcomes.push_back(impl_receive::Outcome::Error(error, relay)),
         Ok(None) => {
             session.eof();
             return true;
         }
         Ok(Some(request)) => match session.accept(request, catalog::known) {
-            session::Event::Error(error) => outcomes.push_back(impl_receive::Outcome::Error(error)),
+            session::Event::Error(error) => {
+                outcomes.push_back(impl_receive::Outcome::Error(error, relay))
+            }
             // The call's deadline starts at protocol acceptance (Decision 0009 §7).
             session::Event::Admitted(admission) => outcomes.push_back(
-                impl_receive::Outcome::Request(admission, std::time::Instant::now()),
+                impl_receive::Outcome::Request(admission, std::time::Instant::now(), relay),
             ),
             session::Event::Ignore => (),
         },
@@ -949,9 +989,10 @@ fn receive(
 }
 mod impl_receive {
     pub(super) enum Outcome {
-        Error(super::wire::ProtocolError),
-        /// An admitted request and the instant it was accepted.
-        Request(super::session::Admission, std::time::Instant),
+        /// A protocol error, and the relay ID of its frame on the relayed transport.
+        Error(super::wire::ProtocolError, Option<u64>),
+        /// An admitted request, the instant it was accepted, and its relay ID.
+        Request(super::session::Admission, std::time::Instant, Option<u64>),
     }
 }
 

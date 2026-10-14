@@ -875,6 +875,11 @@ fn dispatch_connection(
     stream.set_read_timeout(Some(Duration::from_secs(15)))?;
     let request: protocol::Request = protocol::read_frame(&mut stream)?;
     if request.operation == "mcp" {
+        let relayed = request
+            .payload
+            .get("relay")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
         let result = (|| -> Result<mcp::OpenedWorkspace> {
             let root: PathBuf = serde_json::from_value(
                 request
@@ -928,13 +933,25 @@ fn dispatch_connection(
                 stream
                     .set_read_timeout(None)
                     .and_then(|()| {
-                        mcp::run_socket(
-                            workspace,
-                            stream,
-                            registry.clone(),
-                            session,
-                            runtime.clone(),
-                        )
+                        // `trellis mcp`'s relay frames each line with its own
+                        // relay ID (Decision 0009 §7).
+                        if relayed {
+                            mcp::run_relayed_socket(
+                                workspace,
+                                stream,
+                                registry.clone(),
+                                session,
+                                runtime.clone(),
+                            )
+                        } else {
+                            mcp::run_socket(
+                                workspace,
+                                stream,
+                                registry.clone(),
+                                session,
+                                runtime.clone(),
+                            )
+                        }
                     })
                     .map_err(anyhow::Error::from)
             }

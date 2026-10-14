@@ -14,6 +14,60 @@ pub enum Frame {
     Eof,
 }
 pub fn read_frame(reader: &mut impl BufRead) -> io::Result<Frame> {
+    read_capped_frame(reader, REQUEST_BYTES)
+}
+
+/// The relay's own ID before each frame on the relayed daemon transport
+/// (Decision 0009 §7): `<relay id> <frame>`. It routes replies; the frame
+/// itself, with the client's ID, is forwarded byte for byte.
+const RELAY_PREFIX_BYTES: usize = 21;
+
+/// Read one relayed frame and its relay ID.
+pub fn read_relayed_frame(reader: &mut impl BufRead) -> io::Result<(Option<u64>, Frame)> {
+    match read_capped_frame(reader, REQUEST_BYTES + RELAY_PREFIX_BYTES)? {
+        Frame::Line(bytes) => {
+            let (relay, line) = split_relay_prefix(&bytes)?;
+            Ok((
+                Some(relay),
+                if line.len() > REQUEST_BYTES {
+                    Frame::Oversized
+                } else {
+                    Frame::Line(line.to_vec())
+                },
+            ))
+        }
+        frame => Ok((None, frame)),
+    }
+}
+
+/// Split `<relay id> <rest>` into the relay ID and the rest.
+pub fn split_relay_prefix(bytes: &[u8]) -> io::Result<(u64, &[u8])> {
+    let space = bytes
+        .iter()
+        .position(|&b| b == b' ')
+        .filter(|&at| at > 0 && at < RELAY_PREFIX_BYTES)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing relay prefix"))?;
+    let relay = std::str::from_utf8(&bytes[..space])
+        .ok()
+        .filter(|digits| digits.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|digits| digits.parse().ok())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid relay prefix"))?;
+    Ok((relay, &bytes[space + 1..]))
+}
+
+/// Write one response, prefixed with its relay ID on the relayed transport.
+pub fn write_relayed_response(
+    writer: &mut impl Write,
+    relay: Option<u64>,
+    response: &Value,
+) -> io::Result<()> {
+    if let Some(relay) = relay {
+        write!(writer, "{relay} ")?;
+    }
+    write_response(writer, response)
+}
+
+fn read_capped_frame(reader: &mut impl BufRead, cap: usize) -> io::Result<Frame> {
     let mut bytes = Vec::new();
     let mut oversized = false;
     loop {
@@ -24,7 +78,7 @@ pub fn read_frame(reader: &mut impl BufRead) -> io::Result<Frame> {
         let end = available.iter().position(|&b| b == b'\n');
         let n = end.unwrap_or(available.len());
         if !oversized {
-            let keep = (REQUEST_BYTES.saturating_sub(bytes.len())).min(n);
+            let keep = (cap.saturating_sub(bytes.len())).min(n);
             bytes.extend_from_slice(&available[..keep]);
             oversized = keep < n;
         }
