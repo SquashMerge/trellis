@@ -1325,7 +1325,7 @@ mod tests {
         let mut work = WatcherWork::new(&store, &owner, &head_options).unwrap();
         let mut daemon_options = head_options.clone();
         daemon_options.max_file_bytes = 1024;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + crate::testing::HANG_BACKSTOP;
         while work.last_accounted_generation.is_none() {
             // Native watcher ingress can invalidate the cutoff of this first
             // inventory. Retry the normal tick until the replacement full wake

@@ -2973,7 +2973,7 @@ async fn describe_reports_published_watcher_health_while_an_inventory_holds_the_
     let mut registry = CheckoutRegistry::with_roots(topology);
     registry.attach_launch(32, &identity).unwrap();
     let runtime = registry.activate(&identity.root_key).unwrap();
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             if let Ok((response, catching_up)) = runtime.evidence_response()
                 && response.finish(()).is_ok()
@@ -2992,14 +2992,18 @@ async fn describe_reports_published_watcher_health_while_an_inventory_holds_the_
     let holder = std::thread::spawn(move || {
         scheduler.hold_watcher_gate_for_tests(|| {
             entered_tx.send(()).unwrap();
-            release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            release_rx
+                .recv_timeout(trellis::testing::HANG_BACKSTOP)
+                .unwrap();
         })
     });
-    entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    entered_rx
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .unwrap();
     let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
     let (mut client, server) = UnixStream::pair().unwrap();
     client
-        .set_read_timeout(Some(Duration::from_secs(8)))
+        .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
         .unwrap();
     let daemon_handle = tokio::runtime::Handle::current();
     let session = std::thread::spawn(move || {
@@ -3011,7 +3015,6 @@ async fn describe_reports_published_watcher_health_while_an_inventory_holds_the_
             daemon_handle,
         )
     });
-    let start = std::time::Instant::now();
     writeln!(
         client,
         "{}",
@@ -3027,18 +3030,14 @@ async fn describe_reports_published_watcher_health_while_an_inventory_holds_the_
         .read_line(&mut line)
         .unwrap();
     let response: Value = serde_json::from_str(&line).unwrap();
-    // Health is published, not sampled under the watcher lock: an inventory
-    // in flight neither delays describe nor turns its success into a refusal.
-    let elapsed = start.elapsed();
+    // Health is published, not sampled under the watcher lock. Describe
+    // answers while the gate is still held, so it never waited for the
+    // inventory; success, not a deadline refusal, proves it.
     release_tx.send(()).unwrap();
     tool(&response, None, true);
     assert_eq!(
         response["result"]["structuredContent"]["data"]["watcherDegraded"], false,
         "{response}"
-    );
-    assert!(
-        elapsed < Duration::from_secs(2),
-        "describe waited {elapsed:?} for an inventory in flight"
     );
     holder.join().unwrap();
     drop(client);
@@ -3062,7 +3061,7 @@ async fn describe_serves_valid_prior_head_while_mandatory_h_is_paused() {
     let mut registry = CheckoutRegistry::with_roots(topology);
     registry.attach_launch(43, &identity).unwrap();
     let runtime = registry.activate(&identity.root_key).unwrap();
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             if let Ok((response, catching_up)) = runtime.evidence_response()
                 && response.finish(()).is_ok()
@@ -3410,7 +3409,7 @@ async fn describe_retries_direct_sqlite_contention_on_fresh_selected_snapshot() 
     let mut registry = CheckoutRegistry::with_roots(topology);
     registry.attach_launch(50, &identity).unwrap();
     let runtime = registry.activate(&identity.root_key).unwrap();
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             if let Ok((response, catching_up)) = runtime.evidence_response()
                 && response.finish(()).is_ok()

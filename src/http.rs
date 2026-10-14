@@ -5559,7 +5559,7 @@ mod exceptional_recovery_tests {
         });
         let worker = state.clone();
         let idle_tick = tokio::task::spawn_blocking(move || worker.queue_tick());
-        tokio::time::timeout(std::time::Duration::from_secs(5), entered_rx)
+        tokio::time::timeout(crate::testing::HANG_BACKSTOP, entered_rx)
             .await
             .expect("idle tick did not snapshot empty pending list")
             .unwrap();
@@ -5570,7 +5570,7 @@ mod exceptional_recovery_tests {
             .unwrap()
             .push(request.id.clone());
         release_tx.send(()).unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(5), idle_tick)
+        tokio::time::timeout(crate::testing::HANG_BACKSTOP, idle_tick)
             .await
             .expect("idle tick did not leave the snapshot barrier")
             .unwrap()
@@ -5587,7 +5587,7 @@ mod exceptional_recovery_tests {
         );
         let worker = state.clone();
         tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            crate::testing::HANG_BACKSTOP,
             tokio::task::spawn_blocking(move || worker.queue_tick()),
         )
         .await
@@ -5639,13 +5639,10 @@ mod exceptional_recovery_tests {
         // The accepted ID signals only after its terminal queue COMMIT. The
         // same tick may then spend a full inventory on the watcher while still
         // holding the serial stream; bound those two stages separately.
-        tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            retry_terminal.notified(),
-        )
-        .await
-        .expect("accepted request retry did not commit its terminal row");
-        tokio::time::timeout(std::time::Duration::from_secs(60), watcher_returned.notified())
+        tokio::time::timeout(crate::testing::HANG_BACKSTOP, retry_terminal.notified())
+            .await
+            .expect("accepted request retry did not commit its terminal row");
+        tokio::time::timeout(crate::testing::HANG_BACKSTOP, watcher_returned.notified())
             .await
             .unwrap_or_else(|_| {
                 panic!(
@@ -5654,7 +5651,7 @@ mod exceptional_recovery_tests {
                     retry_started.elapsed().as_millis()
                 )
             });
-        tokio::time::timeout(std::time::Duration::from_secs(10), retry_tick)
+        tokio::time::timeout(crate::testing::HANG_BACKSTOP, retry_tick)
             .await
             .expect("accepted request retry tick did not leave stream after watcher")
             .unwrap()
@@ -5720,7 +5717,7 @@ mod exceptional_recovery_tests {
             }
             assert!(ready.is_none(), "reader exited before SH_READY");
         });
-        tokio::time::timeout(std::time::Duration::from_secs(5), ready_rx)
+        tokio::time::timeout(crate::testing::HANG_BACKSTOP, ready_rx)
             .await
             .expect("independent SH reader did not start")
             .unwrap();
@@ -5769,14 +5766,14 @@ mod exceptional_recovery_tests {
         fixture
             .state
             .retain_serving_session(fixture.old_owner.take().unwrap());
-        tokio::time::timeout(std::time::Duration::from_secs(5), selected_rx)
+        tokio::time::timeout(crate::testing::HANG_BACKSTOP, selected_rx)
             .await
             .expect("20-ms timer did not pause in protected SELECT")
             .unwrap();
         assert_eq!(std::fs::read(&queue_path).unwrap(), queue_bytes);
         assert_eq!(std::fs::read(&fixture.index_path).unwrap(), corrupt_index);
         release_select_tx.send(()).unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::time::timeout(crate::testing::HANG_BACKSTOP, async {
             loop {
                 if fixture.state.retained_serving_session().is_err()
                     && fixture.state.native_stream.try_lock().is_ok()
@@ -5814,7 +5811,7 @@ mod exceptional_recovery_tests {
             .store
             .notify_on_terminal_request_for_tests(&fixture.q1.id, q1_terminal.clone());
         child.0.stdin.take().unwrap().write_all(b"x").unwrap();
-        let child_status = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let child_status = tokio::time::timeout(crate::testing::HANG_BACKSTOP, async {
             loop {
                 if let Some(status) = child.0.try_wait().unwrap() {
                     break status;
@@ -5828,7 +5825,7 @@ mod exceptional_recovery_tests {
             child_status.success(),
             "independent SH reader exited unsuccessfully"
         );
-        tokio::time::timeout(std::time::Duration::from_secs(5), drain)
+        tokio::time::timeout(crate::testing::HANG_BACKSTOP, drain)
             .await
             .expect("child output drain did not finish")
             .unwrap();
@@ -5836,15 +5833,13 @@ mod exceptional_recovery_tests {
         // post-takeover watcher inventory before it may claim the next row.
         // Bound those two independent stages separately. Both notifications
         // come from existing transition hooks, not selected-status SH polling.
-        let watcher_returned_in_time = tokio::time::timeout(
-            std::time::Duration::from_secs(60),
-            watcher_returned.notified(),
-        )
-        .await
-        .is_ok();
+        let watcher_returned_in_time =
+            tokio::time::timeout(crate::testing::HANG_BACKSTOP, watcher_returned.notified())
+                .await
+                .is_ok();
         let timeout_result = if watcher_returned_in_time {
             Some(
-                tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                tokio::time::timeout(crate::testing::HANG_BACKSTOP, async {
                     // The accepted ID signals only after its durable terminal COMMIT.
                     // Do not take repeated SH queue reads while the daemon needs EX.
                     q1_terminal.notified().await;
@@ -5959,7 +5954,7 @@ mod exceptional_recovery_tests {
         fixture
             .state
             .retain_serving_session(fixture.old_owner.take().unwrap());
-        tokio::time::timeout(std::time::Duration::from_secs(5), selected_rx)
+        tokio::time::timeout(crate::testing::HANG_BACKSTOP, selected_rx)
             .await
             .expect("20-ms timer did not reach protected SELECT")
             .unwrap();
@@ -5969,7 +5964,7 @@ mod exceptional_recovery_tests {
         assert_eq!(std::fs::read(&queue_path).unwrap(), queue_bytes);
         assert_eq!(std::fs::read(&fixture.index_path).unwrap(), corrupt_index);
         release_select_tx.send(()).unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(5), exclusive_rx)
+        tokio::time::timeout(crate::testing::HANG_BACKSTOP, exclusive_rx)
             .await
             .expect("timer recovery did not acquire fresh EX")
             .unwrap();
@@ -5995,7 +5990,7 @@ mod exceptional_recovery_tests {
         // is deliberately injected on the SAME daemon to test the stream gate.
         let state = fixture.state.clone();
         let injected = tokio::task::spawn_blocking(move || state.queue_tick());
-        tokio::time::timeout(std::time::Duration::from_secs(5), before_rx)
+        tokio::time::timeout(crate::testing::HANG_BACKSTOP, before_rx)
             .await
             .expect("injected same-daemon tick did not reach stream")
             .unwrap();
@@ -6023,23 +6018,20 @@ mod exceptional_recovery_tests {
         // The first timer worker keeps native_stream through its Q2 drain and
         // full post-takeover watcher inventory. The injected tick is eligible
         // for the stream only after that watcher returns.
-        tokio::time::timeout(
-            std::time::Duration::from_secs(60),
-            watcher_returned.notified(),
-        )
-        .await
-        .expect("timer watcher did not reconcile after EX");
-        tokio::time::timeout(std::time::Duration::from_secs(10), after_rx)
+        tokio::time::timeout(crate::testing::HANG_BACKSTOP, watcher_returned.notified())
+            .await
+            .expect("timer watcher did not reconcile after EX");
+        tokio::time::timeout(crate::testing::HANG_BACKSTOP, after_rx)
             .await
             .expect("injected tick never passed stream after watcher")
             .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(10), injected)
+        tokio::time::timeout(crate::testing::HANG_BACKSTOP, injected)
             .await
             .expect("injected same-daemon tick did not finish")
             .unwrap()
             .unwrap();
         let mut last_seen = None;
-        let timeout_result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let timeout_result = tokio::time::timeout(crate::testing::HANG_BACKSTOP, async {
             loop {
                 match fixture.store.request_by_id(&fixture.q1.id) {
                     Ok(Some(row)) if row.finished_at.is_some() => break row,
@@ -6112,9 +6104,9 @@ mod exceptional_recovery_tests {
         );
         async fn tick_one(state: Arc<DaemonState>, phase: &'static str) {
             let work = tokio::task::spawn_blocking(move || state.queue_tick());
-            let result = tokio::time::timeout(std::time::Duration::from_secs(10), work)
+            let result = tokio::time::timeout(crate::testing::HANG_BACKSTOP, work)
                 .await
-                .unwrap_or_else(|_| panic!("{phase}: queue_tick did not finish within 10 seconds"))
+                .unwrap_or_else(|_| panic!("{phase}: queue_tick did not finish (hang)"))
                 .unwrap_or_else(|error| panic!("{phase}: queue_tick worker: {error}"));
             result.unwrap_or_else(|error| panic!("{phase}: queue_tick failed: {error:#}"));
         }
@@ -6274,7 +6266,7 @@ mod exceptional_recovery_tests {
         let b = store.request_by_id(&second.0.id).unwrap().unwrap();
         assert!(a.seq < b.seq);
         assert_eq!(store.current_request().unwrap().unwrap().id, b.id);
-        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        tokio::time::timeout(crate::testing::HANG_BACKSTOP, async {
             loop {
                 if store
                     .request_by_id(&second.0.id)

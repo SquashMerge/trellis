@@ -528,7 +528,7 @@ async fn invalid_prior_head_does_not_pin_idle_resources_or_skip_reattach_h() {
         "{error:#}"
     );
     resume_tx.send(()).unwrap();
-    let recovered = tokio::time::timeout(Duration::from_secs(5), async {
+    let recovered = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             if let Ok((response, catching_up)) = resumed.evidence_response() {
                 let finished = response.finish(()).is_ok();

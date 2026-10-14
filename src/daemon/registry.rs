@@ -2101,7 +2101,7 @@ mod selection_tests {
     /// lanes or enqueue FIFO work wait for this sampled quiescence first; a
     /// timeout here is a real fixture RED.
     async fn settled_after_first_inventory(runtime: &CheckoutRuntime) {
-        tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::time::timeout(crate::testing::HANG_BACKSTOP, async {
             loop {
                 let watch_pending = runtime
                     .browser_scheduler()
@@ -2146,10 +2146,10 @@ mod selection_tests {
         let holder = std::thread::spawn(move || {
             held.hold_watcher_gate_for_tests(|| {
                 held_tx.send(()).unwrap();
-                let _ = resume_rx.recv_timeout(Duration::from_secs(30));
+                let _ = resume_rx.recv_timeout(crate::testing::HANG_BACKSTOP);
             });
         });
-        held_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        held_rx.recv_timeout(crate::testing::HANG_BACKSTOP).unwrap();
         let registry = Arc::new(tokio::sync::Mutex::new(registry));
         let token = temp.path().join("token");
         let mut provisioner = crate::daemon::BrowserProvisioner::new();
@@ -2219,7 +2219,7 @@ mod selection_tests {
                 resume_rx.recv().unwrap();
             });
         });
-        held_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        held_rx.recv_timeout(crate::testing::HANG_BACKSTOP).unwrap();
         // H has completed: the purpose is the native stream/watcher gate.
         let key = identity.root_key.clone();
         let (done_tx, done_rx) = mpsc::channel();
@@ -2230,17 +2230,15 @@ mod selection_tests {
                 .send((started.elapsed(), outcome, registry, identity, options))
                 .unwrap();
         });
-        let early = done_rx.recv_timeout(Duration::from_secs(1));
+        // Non-blocking is proven structurally: the call must return while the
+        // lane is still held; a blocked call could only return after release.
+        let early = done_rx.recv_timeout(crate::testing::HANG_BACKSTOP);
         // Always release the hook before asserting, even on RED.
         resume_tx.send(()).unwrap();
         holder.join().unwrap();
-        let (elapsed, first, mut registry, identity, options) =
-            early.unwrap_or_else(|_| done_rx.recv_timeout(Duration::from_secs(10)).unwrap());
+        let (_, first, mut registry, identity, options) =
+            early.expect("registry guard waited for the held watcher gate");
         attempt.join().unwrap();
-        assert!(
-            elapsed < Duration::from_secs(1),
-            "registry guard blocked for {elapsed:?}"
-        );
         assert_eq!(first, Err(SelectionError::StorageBusy));
         assert!(runtime.active.load(Ordering::Acquire));
         assert!(runtime.has_active_resources());
@@ -2258,7 +2256,7 @@ mod selection_tests {
         assert!(!observed_scheduler.watcher_release_requested_for_tests());
         runtime.active_reads.fetch_sub(1, Ordering::AcqRel);
         // A completed watcher leaves the same CLI-only checkout releasable.
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + crate::testing::HANG_BACKSTOP;
         loop {
             match registry.can_register(&identity, &options) {
                 Ok(()) => break,
@@ -2295,7 +2293,7 @@ mod selection_tests {
                 resume_rx.recv().unwrap();
             });
         });
-        held_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        held_rx.recv_timeout(crate::testing::HANG_BACKSTOP).unwrap();
         let result = registry.can_register(&identity, &options);
         assert_eq!(result, Err(SelectionError::StorageBusy));
         assert!(runtime.active.load(Ordering::Acquire));
@@ -2309,7 +2307,7 @@ mod selection_tests {
         );
         resume_tx.send(()).unwrap();
         holder.join().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + crate::testing::HANG_BACKSTOP;
         loop {
             match registry.can_register(&identity, &options) {
                 Ok(()) => break,
@@ -2335,7 +2333,7 @@ mod selection_tests {
         registry.attach_launch(45, &identity).unwrap();
         let runtime = registry.activate(&identity.root_key).unwrap();
         registry.disconnect(45);
-        tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::time::timeout(crate::testing::HANG_BACKSTOP, async {
             while runtime.h_in_flight.load(Ordering::Acquire) {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
@@ -2354,24 +2352,21 @@ mod selection_tests {
                 resume_rx.recv().unwrap();
             });
         });
-        held_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        held_rx.recv_timeout(crate::testing::HANG_BACKSTOP).unwrap();
         let (done_tx, done_rx) = mpsc::channel();
         let tick = std::thread::spawn(move || {
             let started = Instant::now();
             let result = registry.advance(now);
             done_tx.send((started.elapsed(), result, registry)).unwrap();
         });
-        let early = done_rx.recv_timeout(Duration::from_secs(1));
+        // Non-blocking is proven structurally: the call must return while the
+        // lane is still held; a blocked call could only return after release.
+        let early = done_rx.recv_timeout(crate::testing::HANG_BACKSTOP);
         resume_tx.send(()).unwrap();
         holder.join().unwrap();
-        let (elapsed, result, registry) =
-            early.unwrap_or_else(|_| done_rx.recv_timeout(Duration::from_secs(10)).unwrap());
+        let (_, result, registry) = early.expect("idle tick waited for the held maintenance lane");
         tick.join().unwrap();
         result.unwrap();
-        assert!(
-            elapsed < Duration::from_secs(1),
-            "idle tick blocked for {elapsed:?}"
-        );
         assert!(runtime.active.load(Ordering::Acquire));
         assert!(runtime.has_active_resources());
         assert!(!registry.entries[&key].released);
@@ -2405,7 +2400,7 @@ mod selection_tests {
             let _ = held_tx.send(());
             resume_rx.recv().unwrap();
         });
-        tokio::time::timeout(Duration::from_secs(10), held_rx)
+        tokio::time::timeout(crate::testing::HANG_BACKSTOP, held_rx)
             .await
             .expect("real watcher tick did not reach the gate")
             .unwrap();
@@ -2415,17 +2410,19 @@ mod selection_tests {
             let result = registry.can_register(&identity, &options);
             done_tx.send((result, registry, identity, options)).unwrap();
         });
-        let early = done_rx.recv_timeout(Duration::from_secs(1));
+        // Non-blocking is proven structurally: the call must return while the
+        // lane is still held; a blocked call could only return after release.
+        let early = done_rx.recv_timeout(crate::testing::HANG_BACKSTOP);
         resume_tx.send(()).unwrap();
         let (result, mut registry, identity, options) =
-            early.unwrap_or_else(|_| done_rx.recv_timeout(Duration::from_secs(10)).unwrap());
+            early.expect("registry guard waited for the held real watcher tick");
         attempt.join().unwrap();
         assert_eq!(result, Err(SelectionError::StorageBusy));
         assert!(runtime.active.load(Ordering::Acquire));
         assert!(runtime.has_active_resources());
         assert!(!registry.entries[&key].released);
         assert!(scheduler.watcher_release_requested_for_tests());
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + crate::testing::HANG_BACKSTOP;
         loop {
             match registry.can_register(&identity, &options) {
                 Ok(()) => break,
@@ -2463,7 +2460,7 @@ mod selection_tests {
                 resume_rx.recv().unwrap();
             });
         });
-        held_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        held_rx.recv_timeout(crate::testing::HANG_BACKSTOP).unwrap();
         let accepted = resources
             .store
             .enqueue_request(&IndexOptions::new(identity.root.clone()), None)
@@ -2484,7 +2481,7 @@ mod selection_tests {
         assert_eq!(queued.seq, accepted.seq);
         resume_tx.send(()).unwrap();
         holder.join().unwrap();
-        tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::time::timeout(crate::testing::HANG_BACKSTOP, async {
             loop {
                 if resources
                     .store
