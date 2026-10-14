@@ -120,6 +120,10 @@ Accepted FIFO work and its Q2→watcher→Q1 gate are never skipped.
 
 A half-closed runtime is never revived.
 
+An enqueue through any `Store` counts as in flight from before its transaction until after its wake, so one that committed before `Closing` cancels the retirement even if its wake has not run. An enqueue that starts after `Closing` is durable and waits for the checkout's next activation. In-process clients always enqueue through the runtime's admission gate, which refuses from `Closing` on, so this applies only to direct `Store` use.
+
+A runtime closed for root loss does not keep a verified replacement root from attaching, even while its stale clients stay connected. They keep getting `root_changed`.
+
 **Changes after the cutoff are disposable.** This runtime doesn't reconcile them, and doesn't acknowledge them. Any later activation runs mandatory startup reconciliation, which captures them. So retirement completes under continuous file churn, and nothing accepted is lost.
 
 **Serve never retires a runtime** (§6).

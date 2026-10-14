@@ -233,7 +233,7 @@ pub struct DaemonState {
     config: std::sync::RwLock<Arc<BrowserConfig>>,
     /// Explicit index options a new configuration brought, applied by the
     /// worker's next full watcher inventory and then recorded.
-    explicit_pending: Mutex<Option<IndexOptions>>,
+    explicit_pending: Mutex<Option<Arc<IndexOptions>>>,
     /// The worker's wake inbox. The queue waker, registered with every Store
     /// for this root, also marks FIFO work pending at the enqueue COMMIT; the
     /// watch waker only wakes.
@@ -1295,7 +1295,7 @@ impl DaemonState {
                 // once, by the next full inventory (Decision 0009 §6).
                 let explicit = self.explicit_pending.lock().unwrap().clone();
                 let selected_options = match &explicit {
-                    Some(options) => options.clone(),
+                    Some(options) => IndexOptions::clone(options),
                     None => self
                         .store
                         .recorded_index_options()?
@@ -1339,6 +1339,17 @@ impl DaemonState {
                         );
                         self.publish_watch_status(scheduler, &selected_options);
                         let accounted = reconciled?;
+                        // Explicit options are applied once: after a verified
+                        // inventory under them, the recorded head selects again.
+                        if accounted && let Some(applied) = &explicit {
+                            let mut pending = self.explicit_pending.lock().unwrap();
+                            if pending
+                                .as_ref()
+                                .is_some_and(|current| Arc::ptr_eq(current, applied))
+                            {
+                                *pending = None;
+                            }
+                        }
                         #[cfg(test)]
                         self.test_queue_current_phase.store(5, Ordering::Release);
                         #[cfg(test)]
@@ -1385,11 +1396,25 @@ impl DaemonState {
     /// Start a replacement generation without doing filesystem or database work on the caller.
     /// A previous generation can finish, but can never publish over its replacement.
     pub fn start_dependency_index(self: &Arc<Self>) {
-        if self.config().dependency_options.is_none() {
-            return;
-        }
-        if !self.dependencies.lock().unwrap().request_build() {
-            return;
+        let config = self.config();
+        self.start_dependency_index_for(&config);
+    }
+
+    /// Schedule a catalog build if `config` is still the current version and
+    /// enables the catalog. The check and the schedule share the catalog lock
+    /// with a configuration swap's reset, so they cannot interleave with it.
+    pub(crate) fn start_dependency_index_for(
+        self: &Arc<Self>,
+        config: &Arc<BrowserConfig>,
+    ) -> bool {
+        {
+            let mut index = self.dependencies.lock().unwrap();
+            if !Arc::ptr_eq(&self.config(), config) || config.dependency_options.is_none() {
+                return false;
+            }
+            if !index.request_build() {
+                return !index.stopped;
+            }
         }
         let state = self.clone();
         tokio::spawn(async move {
@@ -1441,6 +1466,7 @@ impl DaemonState {
                 // can launch catalog work, and its previous blocking worker has exited.
             }
         });
+        true
     }
     fn publish_dependency_index(
         &self,
@@ -7148,7 +7174,15 @@ async fn provisioned_core_answer(
             // a later root or head change cannot undo the requested refresh.
             selected_provider_postflight(runtime, revision, None).await?;
             runtime.require_mutation_ready()?;
-            state.start_dependency_index();
+            // Scheduled only for the configuration version this request
+            // checked; a registration in between refuses it.
+            if !state.start_dependency_index_for(&config) {
+                return Err(ApiError(
+                    StatusCode::CONFLICT,
+                    "configuration_changed",
+                    "The checkout configuration changed; retry the refresh",
+                ));
+            }
             let mut response = match selected_provider_postflight(runtime, revision, None).await {
                 Ok(()) => (StatusCode::ACCEPTED, Json(json!({"state":"loading"}))).into_response(),
                 Err(error) => selected_mutation_error(error, "committed"),

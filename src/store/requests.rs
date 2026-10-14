@@ -966,6 +966,8 @@ impl Store {
         after_write_lock: impl FnOnce(),
         after_insert: impl FnOnce(),
     ) -> Result<Request> {
+        // In flight from before the transaction until after the wake.
+        let _in_flight = self.enqueue_in_flight();
         self.identity.verify()?;
         let selected = std::fs::symlink_metadata(&options.workspace_root)?;
         ensure!(
@@ -998,6 +1000,8 @@ impl Store {
         let seq = tx.last_insert_rowid();
         after_insert();
         tx.commit()?;
+        #[cfg(feature = "test-support")]
+        self.run_after_enqueue_commit_hook();
         // The row is durable: wake the checkout's worker, which re-reads the queue.
         self.wake_queue_workers();
         self.identity.verify()?;

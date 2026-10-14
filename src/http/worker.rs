@@ -608,14 +608,20 @@ impl DaemonState {
             self.reconcile_through_cutoff();
         }
         // The Closing linearization point. A lease cancelled the request
-        // already; an enqueue COMMIT through any Store since the FIFO check
-        // above set `fifo_pending` (its queue waker runs after the COMMIT).
+        // already. An enqueue through any Store is counted in flight from
+        // before its transaction until after its wake; one in flight, or one
+        // whose wake set `fifo_pending` since the FIFO check above, cancels.
+        // An enqueue that starts after this point waits, durably, for the
+        // next activation.
         let held = {
             let mut state = self.runtime.lock().unwrap();
             if !matches!(*state, RuntimeState::RetireRequested { .. }) {
                 return Ok(());
             }
-            if !root_lost && self.fifo_pending.load(Ordering::Acquire) {
+            if !root_lost
+                && (self.fifo_pending.load(Ordering::Acquire)
+                    || self.store.enqueues_in_flight() != 0)
+            {
                 self.cancel_retirement(state);
                 return Ok(());
             }

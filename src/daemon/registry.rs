@@ -157,6 +157,9 @@ struct Entry {
     external_work: bool,
     browser_until: Option<Instant>,
     release_at: Option<Instant>,
+    /// This entry's runtime closed because its root was lost: a verified
+    /// replacement root may take the path even with stale clients attached.
+    root_lost: bool,
 }
 
 pub struct CheckoutRegistry {
@@ -297,6 +300,7 @@ impl CheckoutRegistry {
                 store,
                 scheduler: scheduler.clone(),
             }))),
+            root_lost: std::sync::atomic::AtomicBool::new(false),
             initial_indexing,
             #[cfg(feature = "test-support")]
             mcp_clock_skew_ms: std::sync::atomic::AtomicU64::new(0),
@@ -419,7 +423,20 @@ impl CheckoutRegistry {
 
     /// Drop a retired runtime's handles and forget it.
     fn finish_retired(&mut self, key: &str) {
+        if self.root_lost_runtime(key)
+            && let Some(entry) = self.entries.get_mut(key)
+        {
+            entry.root_lost = true;
+        }
         if let Some(runtime) = self.runtimes.remove(key) {
+            if runtime
+                .resources()
+                .is_ok_and(|resources| resources.scheduler.checkout_root_loss_retired())
+            {
+                runtime
+                    .root_lost
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
             runtime.resources.lock().unwrap().take();
         }
     }
@@ -499,6 +516,7 @@ impl CheckoutRegistry {
                 external_work: false,
                 browser_until: None,
                 release_at: None,
+                root_lost: false,
             },
         );
     }
@@ -763,6 +781,20 @@ impl CheckoutRegistry {
         if entry.identity.matches(identity) {
             return Ok(());
         }
+        // A runtime closed for root loss (Decision 0009 §2) has settled the old
+        // root's requests. Its stale clients cannot use it (they get
+        // root_changed), so they do not keep the replacement from attaching;
+        // the new entry starts without them.
+        if self.root_lost_runtime(key) {
+            if !self.verified_replacement(identity)
+                || (self.runtimes.contains_key(key) && !self.wait_runtime_retired(key))
+            {
+                return Err(SelectionError::IdentityChanged);
+            }
+            self.finish_retired(key);
+            self.entries.remove(key);
+            return Ok(());
+        }
         if !self.can_retire_replaced(identity) {
             return Err(SelectionError::IdentityChanged);
         }
@@ -773,6 +805,16 @@ impl CheckoutRegistry {
         }
         self.entries.remove(key);
         Ok(())
+    }
+
+    /// The checkout's runtime closed (or is closing) because its root was lost.
+    fn root_lost_runtime(&self, key: &str) -> bool {
+        self.entries.get(key).is_some_and(|entry| entry.root_lost)
+            || self.runtimes.get(key).is_some_and(|runtime| {
+                runtime
+                    .resources()
+                    .is_ok_and(|resources| resources.scheduler.checkout_root_loss_retired())
+            })
     }
 
     fn can_retire_replaced(&self, identity: &WorkspaceIdentity) -> bool {
@@ -789,8 +831,15 @@ impl CheckoutRegistry {
         {
             return false;
         }
-        // Verify a *new* identity independently: rediscovering old metadata
-        // deliberately rejects the changed record_id after `git init`.
+        self.verified_replacement(identity)
+    }
+
+    /// Verify a *new* identity independently: rediscovering old metadata
+    /// deliberately rejects the changed record_id after `git init`.
+    fn verified_replacement(&self, identity: &WorkspaceIdentity) -> bool {
+        let Some(entry) = self.entries.get(&identity.root_key) else {
+            return true;
+        };
         WorkspaceIdentity::discover_unattached(Some(&identity.root), &identity.root)
             .and_then(WorkspaceIdentity::attach_existing_marker_readonly)
             .is_ok_and(|found| {
@@ -835,26 +884,24 @@ impl CheckoutRegistry {
             && (!entry.released || entry.pending_work || !entry.sessions.is_empty())
     }
 
-    /// The configuration a registration publishes to a live runtime, built in
-    /// full before anything is bound or registered. None when nothing changes
-    /// or no runtime is live (activation builds it again from the registration).
+    /// The configuration a registration publishes to a live runtime, always
+    /// built in full before anything is bound or registered. None when it
+    /// changes nothing or no runtime is live (activation builds it again).
     pub(crate) fn registration_config(
         &self,
         identity: &WorkspaceIdentity,
         options: &CheckoutOptions,
     ) -> anyhow::Result<Option<http::BrowserConfig>> {
         let key = &identity.root_key;
-        if self
+        // Always built, even for a repeated or already-recorded registration,
+        // so a configuration that cannot build is refused before any
+        // acknowledgement. Published only when it changes a live runtime.
+        let config = self.browser_config(&identity.root, Some(options))?;
+        let unchanged = self
             .entries
             .get(key)
-            .is_some_and(|entry| entry.registration.as_ref() == Some(options))
-        {
-            return Ok(None);
-        }
-        // Always built, so a configuration that cannot build is refused before
-        // any acknowledgement; published only to a live runtime.
-        let config = self.browser_config(&identity.root, Some(options))?;
-        Ok(self.runtime(key).is_some().then_some(config))
+            .is_some_and(|entry| entry.registration.as_ref() == Some(options));
+        Ok((!unchanged && self.runtime(key).is_some()).then_some(config))
     }
 
     /// Record a registration and publish its configuration to a live runtime
@@ -911,6 +958,7 @@ impl CheckoutRegistry {
                 external_work: false,
                 browser_until: None,
                 release_at: None,
+                root_lost: false,
             },
         );
         Ok(())
@@ -1144,6 +1192,7 @@ impl CheckoutRegistry {
                 external_work: false,
                 browser_until: None,
                 release_at: None,
+                root_lost: false,
             },
         );
         self.idle_exit_at = None;
@@ -1428,6 +1477,8 @@ pub struct CheckoutRuntime {
     #[cfg(feature = "test-support")]
     mcp_read_hook: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
     resources: std::sync::Mutex<Option<Arc<ActiveResources>>>,
+    /// Released because its root was lost: a stale handle answers root_changed.
+    root_lost: std::sync::atomic::AtomicBool,
     initial_indexing: bool,
 }
 
@@ -1465,7 +1516,13 @@ impl CheckoutRuntime {
             .unwrap()
             .as_ref()
             .cloned()
-            .ok_or_else(|| anyhow::anyhow!("index_not_ready: checkout released"))
+            .ok_or_else(|| {
+                if self.root_lost.load(std::sync::atomic::Ordering::Acquire) {
+                    anyhow::anyhow!("root_changed: captured root lost")
+                } else {
+                    anyhow::anyhow!("index_not_ready: checkout released")
+                }
+            })
     }
 
     pub fn browser_scheduler(&self) -> anyhow::Result<Arc<http::DaemonState>> {
@@ -2112,6 +2169,7 @@ mod selection_tests {
                     external_work: false,
                     browser_until: None,
                     release_at: None,
+                    root_lost: false,
                 },
             );
         }

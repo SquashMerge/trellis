@@ -3429,3 +3429,88 @@ async fn browser_request_pins_one_configuration_version() {
         "{page}"
     );
 }
+
+/// Decision 0009 §6: a dependency refresh schedules only for the configuration
+/// version it checked; a registration during its preflight refuses it.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn dependency_refresh_is_fenced_to_its_configuration_version() {
+    use std::sync::Arc;
+    use trellis::{
+        daemon::{
+            BrowserProvisioner,
+            registry::{CheckoutOptions, CheckoutRegistry},
+        },
+        http::ProvisionedBrowser,
+        store::topology::TopologyRoots,
+    };
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("checkout");
+    fs::create_dir_all(root.join("sub")).unwrap();
+    fs::write(root.join("core.js"), "function core() {}\n").unwrap();
+    let identity = WorkspaceIdentity::discover(Some(&root), &root)
+        .unwrap()
+        .attach_marker()
+        .unwrap();
+    let roots =
+        TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+    let registry = Arc::new(tokio::sync::Mutex::new(CheckoutRegistry::with_roots(roots)));
+    let runtime = {
+        let mut checked = registry.lock().await;
+        checked.attach_launch(7, &identity).unwrap();
+        checked.activate(&identity.root_key).unwrap()
+    };
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        loop {
+            if let Ok((response, catching_up)) = runtime.evidence_response()
+                && response.finish(()).is_ok()
+                && !catching_up
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let browser = ProvisionedBrowser::new(
+        registry.clone(),
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
+        "127.0.0.1:7331".parse().unwrap(),
+    )
+    .unwrap();
+    let swapped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hook_swapped = swapped.clone();
+    let hook_registry = registry.clone();
+    let hook_identity = WorkspaceIdentity::discover(Some(&root), &root)
+        .unwrap()
+        .attach_marker()
+        .unwrap();
+    let token = temp.path().join("token");
+    let browse = root.join("sub");
+    let handle = tokio::runtime::Handle::current();
+    browser.set_selected_response_hook_for_tests(Arc::new(move |at| {
+        if at == "before_mutation" && !hook_swapped.swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            handle
+                .block_on(BrowserProvisioner::new().register_serve(
+                    &hook_registry,
+                    &hook_identity,
+                    CheckoutOptions(serde_json::json!({"browseRoot": browse})),
+                    "127.0.0.1:0".parse().unwrap(),
+                    &token,
+                ))
+                .unwrap();
+        }
+    }));
+    let (status, _, value) = selected_json(
+        browser.router(),
+        "POST",
+        &format!("/api/checkouts/{}/dependencies/refresh", identity.root_key),
+        serde_json::json!({}),
+    )
+    .await;
+    assert!(swapped.load(std::sync::atomic::Ordering::Acquire));
+    assert_eq!(status, axum::http::StatusCode::CONFLICT, "{value}");
+    assert_eq!(value["error"]["code"], "configuration_changed");
+}

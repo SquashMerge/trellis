@@ -55,28 +55,25 @@ impl super::DaemonState {
     /// are applied by the worker's next full watcher inventory, and the
     /// dependency catalog rebuilds for the new catalog options.
     pub(crate) fn apply_config(self: &Arc<Self>, config: BrowserConfig) {
-        let explicit = config.explicit_options.then(|| config.options.clone());
-        *self.config.write().unwrap() = Arc::new(config);
+        let explicit = config
+            .explicit_options
+            .then(|| Arc::new(config.options.clone()));
+        let enabled = config.dependency_options.is_some();
+        {
+            // Swap and reset the catalog under its lock, so a refresh that
+            // checked the old version cannot schedule against the new one.
+            let mut index = self.dependencies.lock().unwrap();
+            *self.config.write().unwrap() = Arc::new(config);
+            index
+                .cancel
+                .store(true, std::sync::atomic::Ordering::Release);
+            index.cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            index.generation += 1;
+            index.catalog = None;
+            index.warnings.clear();
+            index.state = if enabled { "loading" } else { "disabled" };
+        }
         *self.explicit_pending.lock().unwrap() = explicit;
-        self.restart_dependency_index();
         self.inbox.wake();
-    }
-}
-
-impl super::DaemonState {
-    /// A new configuration replaces the catalog generation: no catalog built
-    /// under the old one is published, and the next build (after a
-    /// publication or an explicit rebuild) uses the new catalog options.
-    fn restart_dependency_index(&self) {
-        let enabled = self.config().dependency_options.is_some();
-        let mut index = self.dependencies.lock().unwrap();
-        index
-            .cancel
-            .store(true, std::sync::atomic::Ordering::Release);
-        index.cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        index.generation += 1;
-        index.catalog = None;
-        index.warnings.clear();
-        index.state = if enabled { "loading" } else { "disabled" };
     }
 }

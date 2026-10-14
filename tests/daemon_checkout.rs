@@ -2052,7 +2052,7 @@ async fn settled_root_loss_closes_with_a_client_attached() {
         .err()
         .expect("old root serves nothing");
     assert!(refused.to_string().contains("root_changed"), "{refused:#}");
-    registry.disconnect(1);
+    // The stale client stays attached; the replacement root attaches anyway.
     let new_id = identity(&checkout);
     registry.attach_launch(2, &new_id).unwrap();
     let fresh = registry.activate(&new_id.root_key).unwrap();
@@ -2062,6 +2062,12 @@ async fn settled_root_loss_closes_with_a_client_attached() {
     let (_, source) = read.source_at("a.js", None).unwrap().unwrap();
     assert!(source.text.contains("newRoot"));
     read.finish(()).unwrap();
+    // The stale handle still serves no old-root evidence.
+    assert!(
+        old.evidence_response()
+            .err()
+            .is_some_and(|error| error.to_string().contains("root_changed"))
+    );
 }
 
 /// Decision 0009 §5: an enqueue COMMIT through another Store after
@@ -2260,4 +2266,191 @@ async fn ambiguous_completion_confirmed_later_wakes_the_index_waiter() {
         .unwrap()
         .unwrap();
     assert!(answer["publishedRevision"].is_object());
+}
+
+/// Decision 0009 §5: an enqueue that has COMMITted but not yet run its wake
+/// when retirement reaches Closing still cancels the retirement.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn enqueue_committed_before_its_wake_cancels_retirement() {
+    let base = tempfile::tempdir().unwrap();
+    let checkout = base.path().join("work");
+    fs::create_dir(&checkout).unwrap();
+    fs::write(checkout.join("a.js"), "function a() {}\n").unwrap();
+    let id = identity(&checkout);
+    let mut registry = CheckoutRegistry::with_roots(roots(base.path()));
+    let runtime = idle_detached(&mut registry, &id).await;
+    let scheduler = runtime.browser_scheduler().unwrap();
+    let store = Store::open(roots(base.path()), identity(&checkout)).unwrap();
+    let (committed_tx, committed_rx) = std::sync::mpsc::sync_channel(1);
+    let (wake_tx, wake_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    store.set_after_enqueue_commit_hook_for_tests(move || {
+        committed_tx.send(()).unwrap();
+        let _ = wake_rx.recv();
+    });
+    let (row_tx, row_rx) = std::sync::mpsc::sync_channel(1);
+    let enqueuer = store.clone();
+    let options = trellis::indexer::IndexOptions::new(checkout.clone());
+    scheduler.set_retire_hook_for_tests(move || {
+        // COMMIT now, after the FIFO check; the wake waits past Closing.
+        std::thread::spawn(move || {
+            row_tx
+                .send(enqueuer.enqueue_request(&options, None).unwrap())
+                .unwrap();
+        });
+        committed_rx.recv().unwrap();
+    });
+    assert!(!registry.release(&id.root_key).unwrap());
+    // Once the worker's next step is free, it has passed its Closing gate.
+    let (release_worker, holder) = hold_worker(scheduler.clone()).await;
+    release_worker.send(()).unwrap();
+    holder.join().unwrap();
+    wake_tx.send(()).unwrap();
+    let row = tokio::task::spawn_blocking(move || row_rx.recv().unwrap())
+        .await
+        .unwrap();
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        while store.request_by_id(&row.id).unwrap().unwrap().state != "done" {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("a committed row was stranded by retirement");
+    assert!(runtime.has_active_resources());
+}
+
+/// Decision 0009 §6: a serve whose options are already recorded still builds
+/// the configuration before acknowledging.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn serve_with_already_recorded_options_still_builds() {
+    use trellis::daemon::BrowserProvisioner;
+    let base = tempfile::tempdir().unwrap();
+    let checkout = base.path().join("work");
+    fs::create_dir(&checkout).unwrap();
+    let identity = identity(&checkout);
+    let read_only = base.path().join("read-only");
+    fs::create_dir(&read_only).unwrap();
+    fs::set_permissions(
+        &read_only,
+        std::os::unix::fs::PermissionsExt::from_mode(0o500),
+    )
+    .unwrap();
+    let options = CheckoutOptions(serde_json::json!({
+        "jevBudgetDir": read_only.join("budget"),
+        "jevBudgetCents": 100,
+        "jevKey": "test-key",
+    }));
+    let mut registry = CheckoutRegistry::with_roots(roots(base.path()));
+    registry.register(&identity, options.clone()).unwrap();
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    let token = base.path().join("token");
+    let refused = BrowserProvisioner::new()
+        .register_serve(
+            &registry,
+            &identity,
+            options,
+            "127.0.0.1:0".parse().unwrap(),
+            &token,
+        )
+        .await;
+    fs::set_permissions(
+        &read_only,
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
+    assert!(
+        refused.is_err(),
+        "an unbuildable configuration was acknowledged"
+    );
+    assert!(!token.exists());
+}
+
+/// Decision 0009 §6: explicit serve options are applied once. After their
+/// full inventory, a FIFO request with other options becomes the recorded
+/// head, and later watcher inventories follow it, not the serve options.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn explicit_serve_options_apply_once() {
+    use trellis::daemon::BrowserProvisioner;
+    let base = tempfile::tempdir().unwrap();
+    let checkout = base.path().join("work");
+    fs::create_dir(&checkout).unwrap();
+    fs::write(checkout.join("a.js"), "function a() {}\n").unwrap();
+    let identity = identity(&checkout);
+    let key = identity.root_key.clone();
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(CheckoutRegistry::with_roots(
+        roots(base.path()),
+    )));
+    let runtime = {
+        let mut checked = registry.lock().await;
+        checked.attach_launch(41, &identity).unwrap();
+        checked.activate(&key).unwrap()
+    };
+    ready(&runtime).await;
+    let scheduler = runtime.browser_scheduler().unwrap();
+    let store = Store::open(roots(base.path()), crate::identity(&checkout)).unwrap();
+    let recorded = |bytes: u64| {
+        let store = store.clone();
+        async move {
+            tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+                while !store
+                    .recorded_index_options()
+                    .unwrap()
+                    .is_some_and(|options| options.max_file_bytes == bytes)
+                {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("recorded options never became {bytes}"));
+        }
+    };
+    BrowserProvisioner::new()
+        .register_serve(
+            &registry,
+            &identity,
+            CheckoutOptions(serde_json::json!({"maxFileBytes": 4096})),
+            "127.0.0.1:0".parse().unwrap(),
+            &base.path().join("token"),
+        )
+        .await
+        .unwrap();
+    recorded(4096).await;
+    let mut fifo = trellis::indexer::IndexOptions::new(checkout.clone());
+    fifo.max_file_bytes = 8192;
+    let row = store.enqueue_request(&fifo, None).unwrap();
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        while store.request_by_id(&row.id).unwrap().unwrap().state != "done" {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    recorded(8192).await;
+    // A later watcher inventory follows the recorded head.
+    fs::write(checkout.join("b.js"), "function b() {}\n").unwrap();
+    assert!(
+        scheduler.submit_watch_event_for_tests(Ok(notify::Event::new(notify::EventKind::Create(
+            notify::event::CreateKind::File
+        ))
+        .add_path(checkout.join("b.js"))))
+    );
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        while store.source_at("b.js", None).unwrap().is_none() || scheduler.checkout_watch_pending()
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the watcher did not publish b.js");
+    assert_eq!(
+        store
+            .recorded_index_options()
+            .unwrap()
+            .unwrap()
+            .max_file_bytes,
+        8192,
+        "the watcher reverted to the earlier serve options"
+    );
 }
