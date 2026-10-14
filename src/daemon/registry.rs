@@ -420,6 +420,15 @@ impl CheckoutRegistry {
         }
     }
 
+    /// The scheduler a busy CLI replacement retry may have armed, so the
+    /// caller can reset that exact runtime's advisory request later.
+    pub(crate) fn cli_replacement_scheduler(&self, key: &str) -> Option<Arc<http::DaemonState>> {
+        self.runtimes
+            .get(key)
+            .and_then(|runtime| runtime.resources().ok())
+            .map(|resources| resources.scheduler.clone())
+    }
+
     /// Give up the advisory cancellation when serve exhausts its deadline.
     pub(crate) fn abandon_cli_replacement(&self, key: &str) {
         if let Some(runtime) = self.runtimes.get(key)
@@ -2108,6 +2117,81 @@ mod selection_tests {
         })
         .await
         .expect("H and the first watcher inventory did not settle");
+    }
+
+    /// A serve registration future dropped while waiting on a busy CLI
+    /// replacement must not leave that runtime's watcher release armed.
+    #[cfg(feature = "test-support")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropped_serve_registration_resets_its_watcher_release_request() {
+        use std::sync::mpsc;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("checkout");
+        git(temp.path(), &["init", "--quiet", root.to_str().unwrap()]);
+        let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+        let key = identity.root_key.clone();
+        let roots =
+            TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+        let mut registry = CheckoutRegistry::with_roots(roots);
+        let options = CheckoutOptions(serde_json::json!({"browseRoot": identity.root}));
+        registry.attach_launch(48, &identity).unwrap();
+        let runtime = registry.activate(&key).unwrap();
+        registry.disconnect(48);
+        settled_after_first_inventory(&runtime).await;
+        let scheduler = runtime.browser_scheduler().unwrap();
+        // Hold the worker lanes so the CLI replacement retry is busy.
+        let held = scheduler.clone();
+        let (held_tx, held_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            held.hold_watcher_gate_for_tests(|| {
+                held_tx.send(()).unwrap();
+                let _ = resume_rx.recv_timeout(Duration::from_secs(30));
+            });
+        });
+        held_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let registry = Arc::new(tokio::sync::Mutex::new(registry));
+        let token = temp.path().join("token");
+        let mut provisioner = crate::daemon::BrowserProvisioner::new();
+        let (waiting_tx, waiting_rx) = tokio::sync::oneshot::channel::<bool>();
+        let mut waiting_tx = Some(waiting_tx);
+        let observed = scheduler.clone();
+        let mut hook = move |stage: &'static str| {
+            if stage == "retry_wait"
+                && let Some(tx) = waiting_tx.take()
+            {
+                let _ = tx.send(observed.watcher_release_requested_for_tests());
+            }
+        };
+        let armed_at_wait = tokio::select! {
+            result = provisioner.register_serve_with_hook(
+                &registry,
+                &identity,
+                options,
+                "127.0.0.1:0".parse().unwrap(),
+                &token,
+                Some(&mut hook),
+            ) => panic!("registration finished while the lanes were held: {result:?}"),
+            armed = waiting_rx => armed.unwrap(),
+        };
+        // The registration future has been dropped at its retry wait.
+        let reset = !scheduler.watcher_release_requested_for_tests();
+        let still_active = runtime.active.load(Ordering::Acquire) && runtime.has_active_resources();
+        resume_tx.send(()).unwrap();
+        holder.join().unwrap();
+        assert!(
+            armed_at_wait,
+            "the busy retry did not arm the watcher release"
+        );
+        assert!(
+            reset,
+            "a dropped registration left the watcher release armed"
+        );
+        assert!(still_active, "the retained CLI runtime was changed");
+        let checked = registry.lock().await;
+        assert!(checked.entries[&key].registration.is_none());
+        assert!(!checked.entries[&key].released);
+        assert!(!token.exists(), "a dropped registration created a token");
     }
 
     #[tokio::test]

@@ -268,6 +268,34 @@ impl Default for BrowserProvisioner {
     }
 }
 
+/// The advisory watcher-release request a busy CLI-replacement retry arms on
+/// one runtime's scheduler. Reset synchronously on every exit from serve
+/// registration, including a dropped future. It holds the exact scheduler
+/// that was armed and never looks up a successor runtime by root key.
+#[derive(Default)]
+struct ArmedWatcherRelease(Option<std::sync::Arc<crate::http::DaemonState>>);
+
+impl ArmedWatcherRelease {
+    fn retain(&mut self, scheduler: Option<std::sync::Arc<crate::http::DaemonState>>) {
+        if let (Some(held), Some(next)) = (&self.0, &scheduler)
+            && std::sync::Arc::ptr_eq(held, next)
+        {
+            return;
+        }
+        if let Some(previous) = std::mem::replace(&mut self.0, scheduler) {
+            previous.reset_watcher_release();
+        }
+    }
+}
+
+impl Drop for ArmedWatcherRelease {
+    fn drop(&mut self) {
+        if let Some(scheduler) = self.0.take() {
+            scheduler.reset_watcher_release();
+        }
+    }
+}
+
 impl BrowserProvisioner {
     pub fn new() -> Self {
         Self {
@@ -339,15 +367,18 @@ impl BrowserProvisioner {
         // the registry guard so the runtime can finish. A genuine conflicting
         // registration or attached client remains an immediate refusal.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        // A busy retry may arm the runtime's advisory watcher release. The
+        // guard resets it on every exit: success, timeout, a later non-busy
+        // error, or this future being dropped.
+        let mut armed = ArmedWatcherRelease::default();
         let mut checked = loop {
             let mut checked = registry.lock().await;
             match checked.can_register(identity, &options) {
                 Ok(()) => break checked,
                 Err(registry::SelectionError::StorageBusy) => {
+                    armed.retain(checked.cli_replacement_scheduler(&identity.root_key));
                     drop(checked);
                     if std::time::Instant::now() >= deadline {
-                        let checked = registry.lock().await;
-                        checked.abandon_cli_replacement(&identity.root_key);
                         anyhow::bail!("{}", registry::SelectionError::StorageBusy.reason());
                     }
                     #[cfg(feature = "test-support")]
@@ -359,6 +390,7 @@ impl BrowserProvisioner {
                 Err(error) => anyhow::bail!("{}", error.reason()),
             }
         };
+        drop(armed);
         // The same successful guard covers validation, binding, token creation
         // and registration; no other attachment can win between these steps.
         if let Some(hook) = hook.as_mut() {
