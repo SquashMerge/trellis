@@ -3734,6 +3734,20 @@ fn socket_session(
     BufReader<std::os::unix::net::UnixStream>,
     std::thread::JoinHandle<std::io::Result<()>>,
 ) {
+    hooked_session(identity, registry, session, deadline, Default::default())
+}
+
+fn hooked_session(
+    identity: &trellis::store::topology::WorkspaceIdentity,
+    registry: &std::sync::Arc<tokio::sync::Mutex<trellis::daemon::registry::CheckoutRegistry>>,
+    session: u64,
+    deadline: Option<Duration>,
+    hooks: trellis::mcp::TransportHooksForTests,
+) -> (
+    std::os::unix::net::UnixStream,
+    BufReader<std::os::unix::net::UnixStream>,
+    std::thread::JoinHandle<std::io::Result<()>>,
+) {
     let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
     client
         .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
@@ -3747,6 +3761,7 @@ fn socket_session(
     if let Some(deadline) = deadline {
         workspace = workspace.with_call_deadline_for_tests(deadline);
     }
+    let workspace = workspace.with_transport_hooks_for_tests(hooks);
     let registry = registry.clone();
     let handle = tokio::runtime::Handle::current();
     let thread = std::thread::spawn(move || {
@@ -3907,6 +3922,153 @@ async fn cancelled_call_writes_nothing_and_its_worker_exits() {
         reader.read_line(&mut stray).is_err(),
         "the cancelled call wrote: {stray}"
     );
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
+/// A one-shot pause for one call ID at the coordinator's send decision.
+fn hold_send_decision(
+    id: i64,
+) -> (
+    trellis::mcp::CallHookForTests,
+    std::sync::mpsc::Receiver<()>,
+    std::sync::mpsc::SyncSender<()>,
+) {
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let release_rx = std::sync::Mutex::new(release_rx);
+    let hook = std::sync::Arc::new(move |call: &Value| {
+        if call.as_i64() == Some(id) {
+            let _ = entered_tx.send(());
+            // A dropped sender (test failure) ends the hold.
+            let _ = release_rx.lock().unwrap().recv();
+        }
+    });
+    (hook, entered_rx, release_tx)
+}
+
+/// Signals each frame the connection's reader completes.
+fn frames_read() -> (
+    std::sync::Arc<dyn Fn() + Send + Sync>,
+    std::sync::mpsc::Receiver<std::time::Instant>,
+) {
+    let (read_tx, read_rx) = std::sync::mpsc::channel();
+    let read_tx = std::sync::Mutex::new(read_tx);
+    let hook = std::sync::Arc::new(move || {
+        let _ = read_tx.lock().unwrap().send(std::time::Instant::now());
+    });
+    (hook, read_rx)
+}
+
+/// Decision 0009 §7: a call's deadline starts when its frame is read, even if
+/// the coordinator is held deciding an earlier call; a call that expired
+/// meanwhile answers deadline_exceeded (pre-resolution shape), and the held
+/// call's own decision rechecks its deadline after the final check.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_call_expires_from_its_read_while_the_coordinator_is_held() {
+    let temp = tempfile::tempdir().unwrap();
+    let (identity, registry, _runtime) = ready_registry(temp.path(), 81).await;
+    let (send_decision, entered, release) = hold_send_decision(1);
+    let (frame_read, read) = frames_read();
+    let deadline = Duration::from_millis(300);
+    let hooks = trellis::mcp::TransportHooksForTests {
+        frame_read: Some(frame_read),
+        send_decision: Some(send_decision),
+    };
+    let (mut client, mut reader, session) =
+        hooked_session(&identity, &registry, 81, Some(deadline), hooks);
+    writeln!(client, "{}", describe_call(1)).unwrap();
+    read.recv_timeout(trellis::testing::HANG_BACKSTOP).unwrap();
+    entered
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .expect("call 1 did not reach its send decision");
+    writeln!(client, "{}", describe_call(2)).unwrap();
+    let accepted = read.recv_timeout(trellis::testing::HANG_BACKSTOP).unwrap();
+    // Wait out call 2's own deadline (measured from its read) while held.
+    tokio::time::sleep_until((accepted + deadline).into()).await;
+    release.send(()).unwrap();
+    for id in [1, 2] {
+        let reply = next_reply(&mut reader);
+        assert_eq!(reply["id"], id, "{reply}");
+        let envelope = &reply["result"]["structuredContent"];
+        assert_eq!(envelope["error"]["code"], "deadline_exceeded", "{reply}");
+        if id == 2 {
+            assert!(
+                envelope["error"]["attemptedWorkspace"].is_object(),
+                "{reply}"
+            );
+            assert!(envelope.get("workspace").is_none(), "{reply}");
+        }
+    }
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
+/// Decision 0009 §7: once read admission sampled catchingUp, a deadline
+/// answer keeps the resolved shape.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_deadline_after_read_admission_keeps_the_resolved_shape() {
+    let temp = tempfile::tempdir().unwrap();
+    let (identity, registry, runtime) = ready_registry(temp.path(), 82).await;
+    let gate = ReadGate::default();
+    runtime.set_mcp_admitted_gate_for_tests(gate.hook());
+    let (mut client, mut reader, session) =
+        socket_session(&identity, &registry, 82, Some(Duration::from_millis(300)));
+    writeln!(client, "{}", describe_call(1)).unwrap();
+    let waiter = gate.clone();
+    tokio::task::spawn_blocking(move || waiter.await_held(1))
+        .await
+        .unwrap();
+    let reply = next_reply(&mut reader);
+    gate.open();
+    let envelope = &reply["result"]["structuredContent"];
+    assert_eq!(envelope["error"]["code"], "deadline_exceeded", "{reply}");
+    assert_eq!(
+        envelope["workspace"],
+        json!(identity.root),
+        "post-admission deadline lost its resolved shape: {reply}"
+    );
+    assert!(envelope["catchingUp"].is_boolean(), "{reply}");
+    assert!(
+        envelope["error"].get("attemptedWorkspace").is_none(),
+        "{reply}"
+    );
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
+/// Decision 0009 §7: a cancel received while the final root check runs still
+/// suppresses that call's unsent result.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancel_during_the_final_check_suppresses_the_result() {
+    let temp = tempfile::tempdir().unwrap();
+    let (identity, registry, _runtime) = ready_registry(temp.path(), 83).await;
+    let (send_decision, entered, release) = hold_send_decision(1);
+    let (frame_read, read) = frames_read();
+    let hooks = trellis::mcp::TransportHooksForTests {
+        frame_read: Some(frame_read),
+        send_decision: Some(send_decision),
+    };
+    let (mut client, mut reader, session) = hooked_session(&identity, &registry, 83, None, hooks);
+    writeln!(client, "{}", describe_call(1)).unwrap();
+    read.recv_timeout(trellis::testing::HANG_BACKSTOP).unwrap();
+    entered
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .expect("call 1 did not reach its send decision");
+    writeln!(
+        client,
+        "{}",
+        json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}})
+    )
+    .unwrap();
+    read.recv_timeout(trellis::testing::HANG_BACKSTOP).unwrap();
+    release.send(()).unwrap();
+    writeln!(client, "{}", modern(json!(2), "tools/list", json!({}))).unwrap();
+    let next = next_reply(&mut reader);
+    assert_eq!(next["id"], 2, "the cancelled call was answered: {next}");
     drop(reader);
     drop(client);
     session.join().unwrap().unwrap();
