@@ -240,6 +240,7 @@ Implementation may show that a rule needs to change. The change is then made to 
 - **§§4–5 (C3):** retirement makes one attempt at watcher intent up to the cutoff, and its outcome never holds the retirement. The attempt never captures or acknowledges a generation after the cutoff.
 - **§6 (C5):** the provisioning mutex serializes registrations, and the configuration is built under the registry guard, as at activation.
 - **§5:** retirement declines while startup reconciliation runs, but not while a failed attempt waits out its backoff.
+- **§5:** an enqueue that starts after `Closing` is durable and waits for the next activation; a stale client of a lost root does not block a verified replacement root.
 
 ## Consequences
 
