@@ -160,6 +160,9 @@ struct Entry {
     /// This entry's runtime closed because its root was lost: a verified
     /// replacement root may take the path even with stale clients attached.
     root_lost: bool,
+    /// The lost root's admission leases, kept after its runtime is dropped:
+    /// a read still in flight fences replacement until it finishes.
+    lost_reads: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 pub struct CheckoutRegistry {
@@ -444,10 +447,20 @@ impl CheckoutRegistry {
 
     /// Drop a retired runtime's handles and forget it.
     fn finish_retired(&mut self, key: &str) {
+        let reads = self.runtimes.get(key).and_then(|runtime| {
+            runtime
+                .resources()
+                .ok()
+                .map(|resources| resources.scheduler.lease_count())
+        });
         if self.root_lost_runtime(key)
             && let Some(entry) = self.entries.get_mut(key)
         {
             entry.root_lost = true;
+            // Every path that drops a root-lost runtime keeps its read fence.
+            if reads.is_some() {
+                entry.lost_reads = reads;
+            }
         }
         if let Some(runtime) = self.runtimes.remove(key) {
             if runtime
@@ -538,6 +551,7 @@ impl CheckoutRegistry {
                 browser_until: None,
                 release_at: None,
                 root_lost: false,
+                lost_reads: None,
             },
         );
     }
@@ -563,6 +577,10 @@ impl CheckoutRegistry {
             let replaced_available = !old_verified
                 && entry.released
                 && !self.runtimes.contains_key(key)
+                && entry
+                    .lost_reads
+                    .as_ref()
+                    .is_none_or(|reads| reads.load(std::sync::atomic::Ordering::Acquire) == 0)
                 && WorkspaceIdentity::discover_unattached(
                     Some(&entry.identity.root),
                     &entry.identity.root,
@@ -814,6 +832,11 @@ impl CheckoutRegistry {
                 runtime
                     .resources()
                     .is_ok_and(|resources| resources.scheduler.leases() != 0)
+            }) || self.entries.get(key).is_some_and(|entry| {
+                entry
+                    .lost_reads
+                    .as_ref()
+                    .is_some_and(|reads| reads.load(std::sync::atomic::Ordering::Acquire) != 0)
             });
             if reading
                 || !self.verified_replacement(identity)
@@ -989,6 +1012,7 @@ impl CheckoutRegistry {
                 browser_until: None,
                 release_at: None,
                 root_lost: false,
+                lost_reads: None,
             },
         );
         Ok(())
@@ -1223,6 +1247,7 @@ impl CheckoutRegistry {
                 browser_until: None,
                 release_at: None,
                 root_lost: false,
+                lost_reads: None,
             },
         );
         self.idle_exit_at = None;
@@ -2232,6 +2257,7 @@ mod selection_tests {
                     browser_until: None,
                     release_at: None,
                     root_lost: false,
+                    lost_reads: None,
                 },
             );
         }

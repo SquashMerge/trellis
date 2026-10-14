@@ -2076,6 +2076,64 @@ async fn detected_root_loss_with_a_held_read_fences_browser_replacement() {
     );
 }
 
+/// A stale client's activation after root-loss retirement drops the old
+/// runtime, but not its read fence: a read admitted before the loss still
+/// blocks a replacement root until it finishes.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn a_stale_activation_keeps_the_held_read_fence() {
+    let base = tempfile::tempdir().unwrap();
+    let checkout = base.path().join("work");
+    fs::create_dir(&checkout).unwrap();
+    fs::write(checkout.join("a.js"), "function oldBrowser() {}\n").unwrap();
+    let old_id = identity(&checkout);
+    let key = old_id.root_key.clone();
+    let now = std::time::Instant::now();
+    let mut registry = CheckoutRegistry::with_roots_at(roots(base.path()), now);
+    registry
+        .register(&old_id, CheckoutOptions(serde_json::json!({})))
+        .unwrap();
+    registry.browser_request_at(&old_id, now).unwrap();
+    let old = registry.activate(&key).unwrap();
+    ready(&old).await;
+    let scheduler = old.browser_scheduler().unwrap();
+    let (held, _) = old.evidence_response().unwrap();
+    fs::rename(&checkout, base.path().join("old")).unwrap();
+    fs::create_dir(&checkout).unwrap();
+    fs::write(checkout.join("a.js"), "function newBrowser() {}\n").unwrap();
+    assert!(
+        scheduler.submit_watch_event_for_tests(Ok(notify::Event::new(notify::EventKind::Remove(
+            notify::event::RemoveKind::Any
+        ))))
+    );
+    retired(&scheduler).await;
+    // The stale browser client activates again: the retired runtime is
+    // dropped (the activation itself cannot succeed on the lost root).
+    let _ = registry.activate(&key);
+    assert!(
+        registry.browser_identity(&key).is_err(),
+        "the held old-root read no longer fences replacement"
+    );
+    assert_ne!(
+        registry
+            .browser_checkouts()
+            .iter()
+            .find(|row| row["rootKey"] == key)
+            .unwrap()["state"],
+        "available",
+        "a replacement is listed while the old read is held"
+    );
+    drop(held);
+    let discovered = registry
+        .browser_identity(&key)
+        .expect("the replacement attaches once the read finished");
+    let new_id = identity(&checkout);
+    assert_eq!(
+        (discovered.device, discovered.inode),
+        (new_id.device, new_id.inode)
+    );
+}
+
 /// Decision 0009 §2: after old-root settlement the runtime closes at once,
 /// even with a client attached; its reads never serve old-root evidence, and
 /// the path gets a fresh runtime for the replacement root.

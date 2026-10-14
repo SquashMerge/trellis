@@ -797,6 +797,12 @@ impl DaemonState {
         self.leases.load(Ordering::Acquire)
     }
 
+    /// The live count of admission leases, which outlives the runtime: a read
+    /// admitted before close holds its lease until it finishes.
+    pub(crate) fn lease_count(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+        Arc::clone(&self.leases)
+    }
+
     /// Publish the watcher's status after the worker changed it.
     pub(super) fn publish_watch_status(
         &self,
