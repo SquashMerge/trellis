@@ -289,14 +289,20 @@ pub fn live_call_workers_for_tests() -> usize {
 struct WorkerPermit;
 impl WorkerPermit {
     fn acquire() -> Option<Self> {
-        CALL_WORKERS
-            .fetch_update(
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
-                |live| (live < MAX_CALL_WORKERS).then_some(live + 1),
-            )
-            .ok()
-            .map(|_| WorkerPermit)
+        use std::sync::atomic::Ordering;
+        let mut live = CALL_WORKERS.load(Ordering::Acquire);
+        while live < MAX_CALL_WORKERS {
+            match CALL_WORKERS.compare_exchange_weak(
+                live,
+                live + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(WorkerPermit),
+                Err(current) => live = current,
+            }
+        }
+        None
     }
 }
 impl Drop for WorkerPermit {
