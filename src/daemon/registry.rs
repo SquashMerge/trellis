@@ -1555,12 +1555,16 @@ impl CheckoutRuntime {
         let accepted = resources.scheduler.enqueue_index(options, None)?;
         let mut busy_deadline = Instant::now() + Duration::from_secs(30);
         loop {
+            // Record the terminal-commit count before re-reading, so a COMMIT
+            // between the read and the wait is never missed (Decision 0009 §8).
+            let seen = resources.store.terminal_generation();
             let row = match resources.store.request_by_id(&accepted.id) {
                 Ok(row) => {
                     busy_deadline = Instant::now() + Duration::from_secs(30);
                     row
                 }
                 Err(error) => {
+                    // Typed, bounded retry against SQLite contention only.
                     cli_index_contention(error, busy_deadline)?;
                     std::thread::sleep(Duration::from_millis(20));
                     continue;
@@ -1586,9 +1590,7 @@ impl CheckoutRuntime {
                     row.error_code.as_deref().unwrap_or("store_unavailable"),
                     accepted.id
                 ),
-                "queued" | "running" => {
-                    std::thread::sleep(Duration::from_millis(20));
-                }
+                "queued" | "running" => resources.store.wait_terminal_change(seen),
                 _ => anyhow::bail!("store_unavailable: invalid request state"),
             }
         }
@@ -1642,6 +1644,20 @@ impl CheckoutRuntime {
         self.resources()
             .ok()
             .and_then(|resources| resources.scheduler.startup_error())
+    }
+
+    /// The runtime state version a reader records before retrying a read.
+    pub fn state_version(&self) -> u64 {
+        self.resources()
+            .map_or(0, |resources| resources.scheduler.state_version())
+    }
+
+    /// Wait for the runtime state to change after `seen` (startup
+    /// reconciliation progressing, for example), at most `timeout`.
+    pub fn wait_state_change(&self, seen: u64, timeout: Duration) {
+        if let Ok(resources) = self.resources() {
+            resources.scheduler.wait_state_change(seen, timeout);
+        }
     }
 
     #[doc(hidden)]

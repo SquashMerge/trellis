@@ -113,6 +113,7 @@ impl DaemonState {
                 };
             }
         }
+        self.note_state_change();
         self.start_worker();
     }
 
@@ -263,6 +264,7 @@ impl DaemonState {
                 waiting: false,
             };
         }
+        self.note_state_change();
         let outcome =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.startup_attempt()))
                 .unwrap_or_else(|panic| {
@@ -303,6 +305,7 @@ impl DaemonState {
                 {
                     *waiting = true;
                 }
+                self.note_state_change();
                 if crate::store::transient_storage_contention(&error) {
                     Ok(())
                 } else {
@@ -547,6 +550,8 @@ impl DaemonState {
                         waiting: false,
                     },
                 };
+                self.state_version.fetch_add(1, Ordering::AcqRel);
+                self.state_changed.notify_all();
                 self.inbox.wake();
             }
             _ => {}
@@ -588,6 +593,7 @@ impl DaemonState {
             .map(|status| status.generation.load(Ordering::SeqCst));
         *state = RuntimeState::RetireRequested { cutoff, session };
         drop(state);
+        self.note_state_change();
         self.inbox.wake();
         RetireOutcome::Requested
     }
@@ -610,6 +616,8 @@ impl DaemonState {
                     },
                 };
             }
+            drop(state);
+            self.note_state_change();
             self.step_progress.store(true, Ordering::Release);
             return Ok(());
         }
@@ -626,6 +634,7 @@ impl DaemonState {
             }
             *state = RuntimeState::Closing;
         }
+        self.note_state_change();
         *self.watch_status.lock().unwrap() = None;
         *self.watcher_work.lock().unwrap() = None;
         self.watcher_health.store(false, Ordering::Release);
@@ -635,7 +644,7 @@ impl DaemonState {
         }
         self.store.retire_checkout_sqlite_witnesses();
         *self.runtime.lock().unwrap() = RuntimeState::Retired;
-        self.retired_changed.notify_all();
+        self.note_state_change();
         if let Some(lifecycle) = self.lifecycle.get() {
             lifecycle();
         }
@@ -680,12 +689,43 @@ impl DaemonState {
                 return false;
             }
             state = self
-                .retired_changed
+                .state_changed
                 .wait_timeout(state, deadline - now)
                 .unwrap()
                 .0;
         }
         true
+    }
+
+    /// Bump the state version and wake state waiters (read readiness, close).
+    pub(super) fn note_state_change(&self) {
+        // Under the state lock, so a waiter that checked the version cannot
+        // miss this notification.
+        let _state = self.runtime.lock().unwrap();
+        self.state_version.fetch_add(1, Ordering::AcqRel);
+        self.state_changed.notify_all();
+    }
+
+    /// The runtime state version a waiter records before re-checking.
+    pub fn state_version(&self) -> u64 {
+        self.state_version.load(Ordering::Acquire)
+    }
+
+    /// Wait until the runtime state changes after `seen`, or `timeout` passes.
+    pub fn wait_state_change(&self, seen: u64, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        let mut state = self.runtime.lock().unwrap();
+        while self.state_version.load(Ordering::Acquire) == seen {
+            let now = Instant::now();
+            if now >= deadline {
+                return;
+            }
+            state = self
+                .state_changed
+                .wait_timeout(state, deadline - now)
+                .unwrap()
+                .0;
+        }
     }
 
     /// Register the registry's lifecycle wake, signalled on retirement, when

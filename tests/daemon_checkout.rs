@@ -1908,3 +1908,86 @@ async fn maintenance_never_runs_ahead_of_accepted_fifo_work() {
     assert!(!unfinished, "maintenance began before accepted FIFO work");
     assert_eq!(store.request_by_id(&row.id).unwrap().unwrap().state, "done");
 }
+
+/// Decision 0009 §8: an index waiter records the terminal-commit count, re-reads
+/// its row and sleeps until a confirmed terminal COMMIT, never polling.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn cli_index_wakes_on_its_terminal_commit() {
+    let base = tempfile::tempdir().unwrap();
+    let checkout = base.path().join("work");
+    fs::create_dir(&checkout).unwrap();
+    fs::write(checkout.join("a.js"), "function a() {}\n").unwrap();
+    let id = identity(&checkout);
+    let mut registry = CheckoutRegistry::with_roots(roots(base.path()));
+    registry.attach_launch(1, &id).unwrap();
+    let runtime = registry.activate(&id.root_key).unwrap();
+    ready(&runtime).await;
+    let scheduler = runtime.browser_scheduler().unwrap();
+    // The request is accepted while the worker is held, so the waiter is
+    // already asleep on the terminal count when the worker completes it.
+    let (held_tx, held_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let holder = std::thread::spawn(move || {
+        let _held = scheduler.hold_worker_for_tests();
+        held_tx.send(()).unwrap();
+        let _ = release_rx.recv();
+    });
+    entered(held_rx, "worker hold").await;
+    let indexer = runtime.clone();
+    let options = trellis::indexer::IndexOptions::new(checkout.clone());
+    let index = tokio::task::spawn_blocking(move || indexer.cli_index(&options));
+    let store = Store::open(roots(base.path()), identity(&checkout)).unwrap();
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        while store.current_request().unwrap().is_none() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("request was not accepted");
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
+    let answer = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, index)
+        .await
+        .expect("index waiter was not woken by its terminal commit")
+        .unwrap()
+        .unwrap();
+    assert!(answer["publishedRevision"].is_object());
+}
+
+/// #138 item 16: a reader waiting for startup reconciliation is woken by the
+/// runtime state change when it commits, not by a poll.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn read_waiter_wakes_when_startup_reconciliation_commits() {
+    let base = tempfile::tempdir().unwrap();
+    let checkout = base.path().join("work");
+    fs::create_dir(&checkout).unwrap();
+    fs::write(checkout.join("a.js"), "function a() {}\n").unwrap();
+    let id = identity(&checkout);
+    let mut registry = CheckoutRegistry::with_roots(roots(base.path()));
+    registry.attach_launch(1, &id).unwrap();
+    let runtime = registry.activate(&id.root_key).unwrap();
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let resume_rx = std::sync::Mutex::new(resume_rx);
+    runtime.set_startup_hook_for_tests(std::sync::Arc::new(move || {
+        entered_tx.send(()).unwrap();
+        let _ = resume_rx.lock().unwrap().recv();
+    }));
+    entered(entered_rx, "startup reconciliation").await;
+    let seen = runtime.state_version();
+    let waiter = runtime.clone();
+    let woken = tokio::task::spawn_blocking(move || {
+        waiter.wait_state_change(seen, trellis::testing::HANG_BACKSTOP * 2);
+        waiter.state_version() != seen
+    });
+    resume_tx.send(()).unwrap();
+    assert!(
+        tokio::time::timeout(trellis::testing::HANG_BACKSTOP, woken)
+            .await
+            .expect("state waiter was not woken")
+            .unwrap()
+    );
+    ready(&runtime).await;
+}

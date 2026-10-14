@@ -1204,6 +1204,9 @@ impl Store {
                 let (_guard, reread) = self.request_connection_for_root_loss(true, true)?;
                 let confirmed = attest_prior_root_rows(&reread, &seen)?
                     && self.old_root_pending_in(&reread)? == 0;
+                if confirmed && !seen.is_empty() {
+                    self.notify_terminal_waiters();
+                }
                 if confirmed {
                     ensure!(
                         self.identity.root_path_replaced()?,
@@ -1326,6 +1329,9 @@ impl Store {
                     &self.identity.device.to_string(),
                     &self.identity.inode.to_string(),
                 )? && attest_prior_root_rows(&reread, &seen)?;
+                if confirmed && !affected.is_empty() {
+                    self.notify_terminal_waiters();
+                }
                 if confirmed {
                     self.identity.verify()?;
                 }
@@ -1617,6 +1623,7 @@ impl Store {
         let changed=tx.execute("UPDATE requests SET state=?1,result_generation=?2,result_revision=?3,error_code=?4,finished_at=?5 WHERE seq=?6 AND state='running' AND claim_incarnation=?7 AND root_device=?8 AND root_inode=?9",params![if code.is_some(){"failed"}else{"done"},generation,revision,code,now(),request.seq,session.incarnation().to_string(),self.identity.device.to_string(),self.identity.inode.to_string()])?;
         ensure!(changed == 1, "storage_busy: request claim changed");
         tx.commit()?;
+        self.notify_terminal_waiters();
         #[cfg(any(test, feature = "test-support"))]
         {
             let notify = {

@@ -255,8 +255,9 @@ pub struct DaemonState {
     fifo_pending: Arc<AtomicBool>,
     /// The registry's lifecycle wake (Decision 0009 §5).
     lifecycle: Arc<std::sync::OnceLock<Arc<dyn Fn() + Send + Sync>>>,
-    /// Signalled when the runtime becomes `Retired`.
-    retired_changed: std::sync::Condvar,
+    /// Every runtime state transition bumps this and signals `state_changed`.
+    state_version: AtomicU64,
+    state_changed: std::sync::Condvar,
     /// Pause retirement before its `Closing` linearization point, and after it.
     #[cfg(feature = "test-support")]
     retire_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
@@ -483,7 +484,8 @@ pub fn new_with_config(
         leases: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         fifo_pending,
         lifecycle: Arc::new(std::sync::OnceLock::new()),
-        retired_changed: std::sync::Condvar::new(),
+        state_version: AtomicU64::new(0),
+        state_changed: std::sync::Condvar::new(),
         #[cfg(feature = "test-support")]
         retire_hook: Mutex::new(None),
         #[cfg(feature = "test-support")]
@@ -756,6 +758,8 @@ impl DaemonState {
             self.watcher_health.store(false, Ordering::Release);
         }
         *current = next;
+        drop(current);
+        self.note_state_change();
     }
     /// Run one maintenance unit on the worker thread, after its higher-priority
     /// step (Decision 0009 §4), and report a failure at a bounded rate.

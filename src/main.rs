@@ -1040,6 +1040,9 @@ fn dispatch_connection(
         let args = request.payload.get("args").context("missing args")?;
         let deadline = Instant::now() + CLI_READ_WAIT;
         loop {
+            // Recorded before the read: a state change between the read and
+            // the wait below is never missed.
+            let state_version = checkout.state_version();
             let selected = match request.operation.as_str() {
                 "status" => checkout.cli_status(),
                 "symbols" => checkout.cli_symbols(
@@ -1082,7 +1085,12 @@ fn dispatch_connection(
                     .is_some_and(|error| error.to_string().starts_with("index_not_ready:"))
                 && Instant::now() < deadline
             {
-                std::thread::sleep(Duration::from_millis(20));
+                // Wait for startup reconciliation to progress, not a poll (#138
+                // item 16).
+                checkout.wait_state_change(
+                    state_version,
+                    deadline.saturating_duration_since(Instant::now()),
+                );
                 continue;
             }
             break selected;

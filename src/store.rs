@@ -70,6 +70,11 @@ struct PublicationGate {
     /// `state.waiting`, published for lock-free maintenance checks (#138
     /// item 12): a briefly held state lock never reads as a waiting publisher.
     waiting_published: std::sync::atomic::AtomicUsize,
+    /// Confirmed terminal request COMMITs on this queue, by any Store instance
+    /// (Decision 0009 §8). A waiter records it, re-reads its row, and waits
+    /// for it to change; requests.db stays the only record of outcomes.
+    terminal_commits: Mutex<u64>,
+    terminal_changed: Condvar,
     #[cfg(feature = "test-support")]
     test_ambiguous_settlement_once: AtomicBool,
     #[cfg(feature = "test-support")]
@@ -96,6 +101,11 @@ impl PublicationGate {
     fn publish_waiting(&self, state: &GateState) {
         self.waiting_published
             .store(state.waiting, std::sync::atomic::Ordering::Release);
+    }
+
+    fn notify_terminal(&self) {
+        *self.terminal_commits.lock().unwrap() += 1;
+        self.terminal_changed.notify_all();
     }
 
     fn wake_queue(&self) {
@@ -5077,6 +5087,27 @@ impl Store {
 
     pub(crate) fn wake_queue_workers(&self) {
         self.publication_gate.wake_queue();
+    }
+
+    /// Signal waiters after a confirmed terminal request COMMIT.
+    pub(crate) fn notify_terminal_waiters(&self) {
+        self.publication_gate.notify_terminal();
+    }
+
+    /// The terminal-commit count to record before re-reading a request row.
+    pub fn terminal_generation(&self) -> u64 {
+        *self.publication_gate.terminal_commits.lock().unwrap()
+    }
+
+    /// Block until a terminal COMMIT after `seen`; then re-read the row.
+    pub fn wait_terminal_change(&self, seen: u64) {
+        let gate = &self.publication_gate;
+        let commits = gate.terminal_commits.lock().unwrap();
+        drop(
+            gate.terminal_changed
+                .wait_while(commits, |current| *current == seen)
+                .unwrap(),
+        );
     }
 
     /// The waiting count is registered before waiting, giving new publications
