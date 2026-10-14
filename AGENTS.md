@@ -37,6 +37,14 @@ Races between Trellis's own processes are in scope as ordinary faults. Fix them 
 - **Contention is typed and retried.** It becomes `storage_busy` with a bounded wait and retry. It is never a raw SQLite error, and never a failed or undone request. A terminal request row never moves backwards.
 - **No panicking `eprintln!` in long-running daemon loops.** Use writes that ignore errors, so a closed stderr can't stop the loop.
 
+### In-process coordination: owners and signals
+
+For new or changed daemon coordination, prefer one owner for each mutable workflow. Callers submit work and observe published state; preserve the ratified H, FIFO and watcher order. Use signals for in-process completion and hooks for test ordering. A timeout is a liveness backstop, not proof of completion.
+
+A failed `try_lock` permits conservative deferral and typed retry, but proves nothing about pending work or its owner. Recheck decisions at the owning transition; do not act on an incoherent combination of sampled flags. Do not await an actor while holding a registry or other lock that actor needs.
+
+Clean up operation-scoped requests on every exit, including dropped futures, without clearing a successor's state. Keep periodic reconciliation and bounded external-contention retries. Explain any new polling or `try_lock`-based cross-component decision that cannot use an owner-published signal.
+
 ## Building and testing proportionately
 
 - Build the simplest design that meets the acceptance criteria, and no mechanism beyond them.
