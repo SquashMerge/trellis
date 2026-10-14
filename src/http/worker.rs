@@ -133,17 +133,19 @@ impl DaemonState {
         self.startup_captures.load(Ordering::Acquire)
     }
 
-    /// Push the current watcher's periodic inventory out of reach (see
-    /// `WatcherWork::delay_periodic_inventory_for_tests`). False without a watcher.
+    /// Push all timed work out of reach: the watcher's periodic inventory
+    /// (see `WatcherWork::delay_periodic_inventory_for_tests`) and maintenance.
+    /// False without a watcher.
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
-    pub fn delay_periodic_inventory_for_tests(&self) -> bool {
+    pub fn delay_timed_work_for_tests(&self) -> bool {
         let mut work = self.watcher_work.lock().unwrap();
         let Some((_, watcher)) = work.as_mut() else {
             return false;
         };
         watcher.delay_periodic_inventory_for_tests();
         drop(work);
+        *self.retention_last_run.lock().unwrap() = Instant::now() + Duration::from_secs(3600);
         // Make the worker recompute its sleep deadline from the delayed inventory.
         self.inbox.wake();
         true
@@ -336,6 +338,11 @@ impl WorkerInbox {
         self.changed.notify_one();
     }
 
+    /// A wake arrived that the worker has not consumed yet: newer work.
+    pub(super) fn wake_pending(&self) -> bool {
+        *self.wake.lock().unwrap()
+    }
+
     pub(super) fn shut_down(&self) {
         self.shutdown.store(true, Ordering::Release);
         self.wake();
@@ -379,12 +386,13 @@ pub(super) struct WatchStatus {
 
 /// A failed or panicked step is retried after this delay.
 const STEP_RETRY: Duration = Duration::from_millis(250);
+/// Retention runs at most this often while idle (a deferral shortens it).
+const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
 
 impl DaemonState {
     /// Start this checkout's worker thread, or wake it if it is running. A
     /// synchronous fixture without a Tokio runtime drives `queue_tick` itself.
     pub(super) fn start_worker(self: &Arc<Self>) {
-        self.start_maintenance_tick();
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
@@ -438,10 +446,26 @@ impl DaemonState {
         if self.fifo_pending.load(Ordering::Acquire) {
             return Some(now + STEP_RETRY);
         }
-        match &*self.watcher_work.lock().unwrap() {
-            Some((_, watcher)) => Some(watcher.next_due()),
-            None => Some(now),
-        }
+        let watcher_due = match &*self.watcher_work.lock().unwrap() {
+            Some((_, watcher)) => watcher.next_due(),
+            None => now,
+        };
+        Some(watcher_due.min(self.maintenance_due_at()))
+    }
+
+    /// The next retention unit is due 60 s after the last idle one, or soon
+    /// after a deferral (the unit sets this clock).
+    fn maintenance_due_at(&self) -> Instant {
+        *self.retention_last_run.lock().unwrap() + MAINTENANCE_INTERVAL
+    }
+
+    /// Maintenance is the lowest class (Decision 0009 §4): it runs only when
+    /// the step made no progress, no wake is pending and its unit is due.
+    fn maintenance_ready(&self) -> bool {
+        !self.step_progress.load(Ordering::Acquire)
+            && !self.inbox.wake_pending()
+            && matches!(*self.runtime.lock().unwrap(), RuntimeState::Ready(_))
+            && Instant::now() >= self.maintenance_due_at()
     }
 
     /// Publish whether accepted FIFO work remains (an unreadable queue counts
@@ -468,6 +492,14 @@ impl DaemonState {
     #[doc(hidden)]
     pub fn hold_worker_for_tests(&self) -> std::sync::RwLockWriteGuard<'_, ()> {
         self.worker_hold.write().unwrap()
+    }
+
+    /// Make the next retention unit due now, and run `hook` as it begins.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn on_next_maintenance_unit_for_tests(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.maintenance_hook.lock().unwrap() = Some(Box::new(hook));
+        *self.retention_last_run.lock().unwrap() = Instant::now() - MAINTENANCE_INTERVAL;
     }
 
     /// Hold retirement just before its `Closing` linearization point.
@@ -733,6 +765,9 @@ fn worker_loop(weak: std::sync::Weak<DaemonState>, inbox: Arc<WorkerInbox>) {
             Ok(Ok(())) => {
                 // The witness reads phase only after the step released its locks.
                 state.report_causal_h_ready();
+                if state.maintenance_ready() {
+                    state.run_maintenance_unit();
+                }
                 state.next_wake()
             }
             Ok(Err(error)) => {

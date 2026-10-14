@@ -1598,7 +1598,7 @@ async fn idle_without_periodic_inventory(
     let runtime = registry.activate(&id.root_key).unwrap();
     ready(&runtime).await;
     let scheduler = runtime.browser_scheduler().unwrap();
-    assert!(scheduler.delay_periodic_inventory_for_tests());
+    assert!(scheduler.delay_timed_work_for_tests());
     // Synchronize on the worker blocking with no wake pending and no deadline
     // within reach of this test.
     tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
@@ -1863,4 +1863,45 @@ async fn closing_runtime_is_never_revived() {
     assert!(!std::sync::Arc::ptr_eq(&fresh, &runtime));
     assert!(!runtime.has_active_resources());
     ready(&fresh).await;
+}
+
+/// Maintenance is the lowest class (Decision 0009 §4): with a unit due and a
+/// FIFO row accepted, the row completes before the unit begins.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn maintenance_never_runs_ahead_of_accepted_fifo_work() {
+    let base = tempfile::tempdir().unwrap();
+    let checkout = base.path().join("work");
+    fs::create_dir(&checkout).unwrap();
+    fs::write(checkout.join("a.js"), "function a() {}\n").unwrap();
+    let id = identity(&checkout);
+    let mut registry = CheckoutRegistry::with_roots(roots(base.path()));
+    registry.attach_launch(1, &id).unwrap();
+    let runtime = registry.activate(&id.root_key).unwrap();
+    ready(&runtime).await;
+    let scheduler = runtime.browser_scheduler().unwrap();
+    let store = Store::open(roots(base.path()), identity(&checkout)).unwrap();
+    // Hold the worker, make a unit due, then accept a row: both are pending
+    // when the worker next runs.
+    let held = scheduler.hold_worker_for_tests();
+    let (seen_tx, seen_rx) = std::sync::mpsc::sync_channel(1);
+    let observer = Store::open(roots(base.path()), identity(&checkout)).unwrap();
+    scheduler.on_next_maintenance_unit_for_tests(move || {
+        let unfinished = observer.earliest_unfinished_request().unwrap().is_some();
+        seen_tx.send(unfinished).unwrap();
+    });
+    let row = store
+        .enqueue_request(&trellis::indexer::IndexOptions::new(checkout.clone()), None)
+        .unwrap();
+    drop(held);
+    let unfinished = tokio::time::timeout(
+        trellis::testing::HANG_BACKSTOP,
+        tokio::task::spawn_blocking(move || seen_rx.recv()),
+    )
+    .await
+    .expect("no maintenance unit ran")
+    .unwrap()
+    .unwrap();
+    assert!(!unfinished, "maintenance began before accepted FIFO work");
+    assert_eq!(store.request_by_id(&row.id).unwrap().unwrap().state, "done");
 }

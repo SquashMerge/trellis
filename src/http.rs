@@ -257,6 +257,9 @@ pub struct DaemonState {
     retire_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(feature = "test-support")]
     closing_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs as a maintenance unit begins, after its priority check passed.
+    #[cfg(feature = "test-support")]
+    maintenance_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     options: IndexOptions,
     browser: crate::file_tree::SourceDir,
     rust_sources: Vec<crate::rust_sources::Root>,
@@ -283,7 +286,6 @@ pub struct DaemonState {
     /// Startup reconciliation captures begun, for the single-owner tests.
     #[cfg(feature = "test-support")]
     startup_captures: AtomicU64,
-    maintenance_tick_started: AtomicBool,
     maintenance_telemetry: Mutex<MaintenanceTelemetry>,
     maintenance_error_limiter: Mutex<MaintenanceErrorLimiter>,
     #[cfg(test)]
@@ -466,6 +468,8 @@ pub fn new_with_dependency_options(
         retire_hook: Mutex::new(None),
         #[cfg(feature = "test-support")]
         closing_hook: Mutex::new(None),
+        #[cfg(feature = "test-support")]
+        maintenance_hook: Mutex::new(None),
         runtime: Mutex::new(RuntimeState::Activating),
         startup_error: Mutex::new(None),
         startup_backoff: Mutex::new(STARTUP_BACKOFF_FIRST),
@@ -508,7 +512,6 @@ pub fn new_with_dependency_options(
         startup_hook: Mutex::new(None),
         #[cfg(feature = "test-support")]
         startup_captures: AtomicU64::new(0),
-        maintenance_tick_started: AtomicBool::new(false),
         maintenance_telemetry: Mutex::new(MaintenanceTelemetry::default()),
         maintenance_error_limiter: Mutex::new(MaintenanceErrorLimiter::default()),
         #[cfg(test)]
@@ -804,90 +807,58 @@ impl DaemonState {
         }
         *current = next;
     }
-    /// One independent, verified-owner, low-priority lane. It never holds the
-    /// serial native stream or a watcher mutex across a Store writer unit.
-    fn start_maintenance_tick(self: &Arc<Self>) {
-        if tokio::runtime::Handle::try_current().is_err()
-            || self.maintenance_tick_started.swap(true, Ordering::AcqRel)
+    /// Run one maintenance unit on the worker thread, after its higher-priority
+    /// step (Decision 0009 §4), and report a failure at a bounded rate.
+    pub(super) fn run_maintenance_unit(&self) {
+        let failure = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.maintenance_tick()
+        })) {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(maintenance_error_class(&error)),
+            Err(_) => Some(("worker_join", 0)),
+        };
+        if let Some((category, code)) = failure
+            && self
+                .maintenance_error_limiter
+                .lock()
+                .unwrap()
+                .permit(Instant::now())
         {
-            return;
+            let notice = maintenance_error_notice(category, code);
+            best_effort_queue_stderr(std::io::stderr(), format_args!("{notice}"));
         }
-        let weak = Arc::downgrade(self);
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(20));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                interval.tick().await;
-                let Some(state) = weak.upgrade() else {
-                    break;
-                };
-                let worker = state.clone();
-                let failure =
-                    match tokio::task::spawn_blocking(move || worker.maintenance_tick()).await {
-                        Ok(Ok(())) => None,
-                        Ok(Err(error)) => Some(maintenance_error_class(&error)),
-                        Err(_) => Some(("worker_join", 0)),
-                    };
-                if let Some((category, code)) = failure {
-                    let permitted = state
-                        .maintenance_error_limiter
-                        .lock()
-                        .unwrap()
-                        .permit(Instant::now());
-                    if permitted {
-                        let notice = maintenance_error_notice(category, code);
-                        best_effort_queue_stderr(std::io::stderr(), format_args!("{notice}"));
-                    }
-                }
-            }
-        });
     }
 
+    /// Why maintenance must yield now, from the worker's own published state
+    /// (#138 item 3): it runs on the worker thread, so no lock is probed.
     fn maintenance_priority_reason(
         &self,
         session: &Arc<crate::store::topology::WriterSession>,
-        options: &IndexOptions,
+        _options: &IndexOptions,
     ) -> Option<&'static str> {
-        if self.native_stream.try_lock().is_err() {
-            return Some("native_stream");
+        if self.inbox.wake_pending() {
+            return Some("wake_pending");
         }
         if self.store.root_path_replaced().unwrap_or(true) || session.verify().is_err() {
             return Some("root_or_writer");
         }
-        if self
-            .pending_requests
-            .try_lock()
-            .map_or(true, |pending| !pending.is_empty())
+        if self.fifo_pending.load(Ordering::Acquire)
+            || !self.pending_requests.lock().unwrap().is_empty()
         {
             return Some("local_fifo");
         }
         if self.store.has_recorded_completion(session).unwrap_or(true) {
             return Some("terminal_ack");
         }
-        if self.runtime.try_lock().map_or(true, |current| {
-            !current
-                .session()
-                .is_some_and(|owner| Arc::ptr_eq(owner, session))
-        }) {
+        if !matches!(&*self.runtime.lock().unwrap(),
+            RuntimeState::Ready(owner) if Arc::ptr_eq(owner, session))
+        {
             return Some("session_replaced");
         }
-        match self.watcher_work.try_lock() {
-            Ok(work) => match work.as_ref() {
-                Some((owner, scheduler))
-                    if owner
-                        .upgrade()
-                        .is_some_and(|owner| Arc::ptr_eq(&owner, session)) =>
-                {
-                    if scheduler.accepted_watch_intent(options) {
-                        Some("accepted_watcher")
-                    } else {
-                        None
-                    }
-                }
-                _ => Some("watcher_replaced"),
-            },
-            Err(_) => Some("watcher_busy"),
+        if self.checkout_watch_pending() {
+            return Some("accepted_watcher");
         }
+        None
     }
 
     fn maintenance_priority(
@@ -1049,11 +1020,10 @@ impl DaemonState {
         if self.retention_last_run.lock().unwrap().elapsed() < Duration::from_secs(60) {
             return Ok(());
         }
-        let session = self
-            .runtime
-            .try_lock()
-            .ok()
-            .and_then(|held| held.session().cloned());
+        let session = match &*self.runtime.lock().unwrap() {
+            RuntimeState::Ready(session) => Some(session.clone()),
+            _ => None,
+        };
         let Some(session) = session else {
             return Ok(());
         };
@@ -1079,6 +1049,10 @@ impl DaemonState {
                 self.maintenance_oldest_age(&session).0
             ),
         );
+        #[cfg(feature = "test-support")]
+        if let Some(hook) = self.maintenance_hook.lock().unwrap().take() {
+            hook();
+        }
         let result =
             crate::index_coordinator::cooperative_maintenance_unit(&self.store, &session, || {
                 self.maintenance_priority(&session, &options)
@@ -5878,10 +5852,8 @@ mod exceptional_recovery_tests {
     async fn concurrent_posts_queue_two_requests_across_exceptional_recovery() {
         use tower::ServiceExt;
         let (_tmp, store, state, _roots, _identity) = fixture();
-        // Keep this fixture's maintenance lane inert until both POSTs are
-        // durably admitted (the fixture has no worker thread). Drive one FIFO
-        // head per explicit step.
-        assert!(!state.maintenance_tick_started.swap(true, Ordering::AcqRel));
+        // The fixture has no worker thread (and so no maintenance): drive one
+        // FIFO head per explicit step.
         let q0 = store.current_request().unwrap().unwrap();
         assert_eq!(q0.state, "queued");
         let expected_options =

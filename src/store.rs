@@ -67,6 +67,9 @@ struct PublicationGate {
     changed: Condvar,
     /// Checkout workers to wake after any Store instance commits an enqueue.
     queue_wakers: Mutex<Vec<std::sync::Weak<dyn Fn() + Send + Sync>>>,
+    /// `state.waiting`, published for lock-free maintenance checks (#138
+    /// item 12): a briefly held state lock never reads as a waiting publisher.
+    waiting_published: std::sync::atomic::AtomicUsize,
     #[cfg(feature = "test-support")]
     test_ambiguous_settlement_once: AtomicBool,
     #[cfg(feature = "test-support")]
@@ -90,6 +93,11 @@ impl std::fmt::Debug for PublicationGate {
     }
 }
 impl PublicationGate {
+    fn publish_waiting(&self, state: &GateState) {
+        self.waiting_published
+            .store(state.waiting, std::sync::atomic::Ordering::Release);
+    }
+
     fn wake_queue(&self) {
         let wakers: Vec<_> = {
             let mut wakers = self.queue_wakers.lock().unwrap();
@@ -1623,10 +1631,9 @@ struct MaintenanceProgress<'a> {
 impl MaintenanceProgress<'_> {
     fn check(&self) -> bool {
         self.gate
-            .state
-            .try_lock()
-            .map(|state| state.waiting == 0)
-            .unwrap_or(false)
+            .waiting_published
+            .load(std::sync::atomic::Ordering::Acquire)
+            == 0
     }
 }
 unsafe extern "C" fn maintenance_progress_callback(arg: *mut std::ffi::c_void) -> libc::c_int {
@@ -1683,7 +1690,11 @@ mod maintenance_progress_ffi_tests {
         let handler = install_maintenance_progress(&db, &progress);
         let tx = db.transaction().unwrap();
         tx.execute("DELETE FROM rows WHERE id<=300", []).unwrap();
-        gate.state.lock().unwrap().waiting = 1;
+        {
+            let mut state = gate.state.lock().unwrap();
+            state.waiting = 1;
+            gate.publish_waiting(&state);
+        }
         let interrupted = tx.execute("DELETE FROM rows WHERE id>300", []).unwrap_err();
         assert!(matches!(
             interrupted,
@@ -5081,14 +5092,17 @@ impl Store {
         let mut state = gate.state.lock().unwrap();
         let mut wait_reason = PublicationWaitReason::None;
         state.waiting += 1;
+        gate.publish_waiting(&state);
         loop {
             if cancel.load(Ordering::Acquire) {
                 state.waiting -= 1;
+                gate.publish_waiting(&state);
                 gate.changed.notify_all();
                 anyhow::bail!("index publication cancelled");
             }
             if !state.active {
                 state.waiting -= 1;
+                gate.publish_waiting(&state);
                 state.active = true;
                 state.maintenance = false;
                 return Ok(PublishPermit {
@@ -5107,6 +5121,7 @@ impl Store {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 state.waiting -= 1;
+                gate.publish_waiting(&state);
                 gate.changed.notify_all();
                 return Err(SqliteContention(()).into());
             }
@@ -5120,7 +5135,9 @@ impl Store {
 
     pub fn maintenance_try_enter(&self) -> Option<MaintenancePermit> {
         let gate = &self.publication_gate;
-        let mut state = gate.state.try_lock().ok()?;
+        // An O(1) section: wait for the lock rather than reading a briefly
+        // held one as busy (#138 item 13).
+        let mut state = gate.state.lock().unwrap();
         if state.active || state.waiting != 0 {
             return None;
         }
