@@ -838,6 +838,7 @@ fn worker_loop(weak: std::sync::Weak<DaemonState>, inbox: Arc<WorkerInbox>) {
     let mut deadline = Some(Instant::now());
     loop {
         inbox.wait(deadline);
+        crate::index_coordinator::diagnostic_marker("-", "worker_wake", "");
         if inbox.shutdown.load(Ordering::Acquire) {
             return;
         }

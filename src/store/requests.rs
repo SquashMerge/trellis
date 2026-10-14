@@ -1002,6 +1002,7 @@ impl Store {
         tx.commit()?;
         #[cfg(feature = "test-support")]
         self.run_after_enqueue_commit_hook();
+        crate::index_coordinator::diagnostic_marker("-", "request_enqueued", &format!("id={id}"));
         // The row is durable: wake the checkout's worker, which re-reads the queue.
         self.wake_queue_workers();
         self.identity.verify()?;
@@ -1380,6 +1381,11 @@ impl Store {
             read,
         )?;
         tx.commit()?;
+        crate::index_coordinator::diagnostic_marker(
+            "-",
+            "request_claimed",
+            &format!("id={}", claimed.id),
+        );
         Ok(Some(claimed))
     }
     /// Resolve an operational publish BUSY before retrying an accepted claim.
@@ -1647,6 +1653,11 @@ impl Store {
         {
             anyhow::bail!("storage_busy: injected ambiguous completion COMMIT");
         }
+        crate::index_coordinator::diagnostic_marker(
+            "-",
+            "request_terminal",
+            &format!("id={} failed={}", request.id, code.is_some()),
+        );
         self.notify_terminal_waiters();
         #[cfg(any(test, feature = "test-support"))]
         {

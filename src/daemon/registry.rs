@@ -1710,7 +1710,19 @@ impl CheckoutRuntime {
                     row.error_code.as_deref().unwrap_or("store_unavailable"),
                     accepted.id
                 ),
-                "queued" | "running" => resources.store.wait_terminal_change(seen),
+                "queued" | "running" => {
+                    crate::index_coordinator::diagnostic_marker(
+                        "-",
+                        "cli_index_wait",
+                        &format!("id={} state={} seen={seen}", accepted.id, row.state),
+                    );
+                    resources.store.wait_terminal_change(seen);
+                    crate::index_coordinator::diagnostic_marker(
+                        "-",
+                        "cli_index_woke",
+                        &format!("id={}", accepted.id),
+                    );
+                }
                 _ => anyhow::bail!("store_unavailable: invalid request state"),
             }
         }

@@ -440,6 +440,16 @@ fn start_daemon() -> std::io::Result<client::StartOutcome> {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+    // A fixture may keep an auto-started daemon's diagnostics.
+    #[cfg(feature = "test-support")]
+    if let Some(path) = std::env::var_os("TRELLIS_TEST_DAEMON_STDERR") {
+        command.stderr(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)?,
+        );
+    }
     // The daemon must outlive the first CLI/MCP client's process group/session.
     // setsid is async-signal-safe: no allocation or lock is taken in the child.
     unsafe {

@@ -1081,12 +1081,16 @@ fn concurrent_cold_cli_indexes_share_one_daemon_and_keep_fifo_results() {
     fs::create_dir(&home).unwrap();
     let root = checkout(temp.path(), "concurrent");
     let marker = home.join("elected.pid");
+    // Kept so an intermittent no-reply hang can be diagnosed from the log.
+    let daemon_log = home.join("daemon.stderr");
     let start = || {
         cli(&home)
             .arg("index")
             .arg("--workspace")
             .arg(&root)
             .env("TRELLIS_TEST_DAEMON_PID_FILE", &marker)
+            .env("TRELLIS_INDEX_DIAGNOSTICS", "1")
+            .env("TRELLIS_TEST_DAEMON_STDERR", &daemon_log)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -1098,8 +1102,9 @@ fn concurrent_cold_cli_indexes_share_one_daemon_and_keep_fifo_results() {
         let output = child.wait_with_output().unwrap();
         assert!(
             output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
+            "{}\ndaemon diagnostics:\n{}",
+            String::from_utf8_lossy(&output.stderr),
+            fs::read_to_string(&daemon_log).unwrap_or_default()
         );
         let response: Value = serde_json::from_slice(&output.stdout).unwrap();
         // status is the checkout's current head, sampled after this request

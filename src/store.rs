@@ -5167,6 +5167,11 @@ impl Store {
     /// Signal waiters after a confirmed terminal request COMMIT.
     pub(crate) fn notify_terminal_waiters(&self) {
         self.publication_gate.notify_terminal();
+        crate::index_coordinator::diagnostic_marker(
+            "-",
+            "terminal_notify",
+            &format!("generation={}", self.terminal_generation()),
+        );
     }
 
     /// The terminal-commit count to record before re-reading a request row.
