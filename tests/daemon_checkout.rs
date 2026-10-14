@@ -1403,7 +1403,7 @@ async fn serve_waits_for_idle_cli_read_before_registering_and_reconciling() {
     let mut no_retry =
         |stage| assert_ne!(stage, "retry_wait", "attached client is a true conflict");
     let error = tokio::time::timeout(
-        Duration::from_secs(3),
+        trellis::testing::HANG_BACKSTOP,
         conflicting.register_serve_with_hook(
             &registry,
             &identity,
@@ -1424,12 +1424,14 @@ async fn serve_waits_for_idle_cli_read_before_registering_and_reconciling() {
     drop(prior);
     let (held_read, _) = old.evidence_response().unwrap();
     registry.lock().await.disconnect(41);
-    // Keep the selected reader alive across the entire eight-second admission
-    // budget. A timed-out retry is typed busy and cannot mint a token or
-    // replace CLI-only options while the old Store still owns its handles.
+    // Keep the selected reader alive across the entire admission budget,
+    // shortened here so the test exercises its expiry without real seconds.
+    // A timed-out retry is typed busy and cannot mint a token or replace
+    // CLI-only options while the old Store still owns its handles.
     let mut waiting = BrowserProvisioner::new();
+    waiting.set_replacement_wait_for_tests(Duration::from_millis(500));
     let timeout_error = tokio::time::timeout(
-        Duration::from_secs(10),
+        trellis::testing::HANG_BACKSTOP,
         waiting.register_serve(
             &registry,
             &identity,

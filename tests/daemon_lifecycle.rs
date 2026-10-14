@@ -137,7 +137,7 @@ async fn lifecycle_driver_exits_when_startup_deadline_is_due() {
         Instant::now() - DAEMON_IDLE_DELAY,
     )));
     tokio::time::timeout(
-        Duration::from_secs(1),
+        trellis::testing::HANG_BACKSTOP,
         trellis::daemon::run_idle_lifecycle(registry),
     )
     .await

@@ -569,7 +569,7 @@ fn phase_barrier(listener: &std::os::unix::net::UnixListener, stage: &str, mutat
     };
     stream.set_nonblocking(false).unwrap();
     stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
+        .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
         .unwrap();
     let mut line = String::new();
     BufReader::new(stream.try_clone().unwrap())
@@ -2919,7 +2919,7 @@ async fn describe_reports_actual_degraded_watcher_on_selected_snapshot() {
     let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
     let (mut client, server) = UnixStream::pair().unwrap();
     client
-        .set_read_timeout(Some(Duration::from_secs(10)))
+        .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
         .unwrap();
     let daemon_handle = tokio::runtime::Handle::current();
     let session = std::thread::spawn(move || {
@@ -3113,7 +3113,7 @@ async fn describe_serves_valid_prior_head_while_mandatory_h_is_paused() {
     let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
     let (mut client, server) = UnixStream::pair().unwrap();
     client
-        .set_read_timeout(Some(Duration::from_secs(8)))
+        .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
         .unwrap();
     let daemon_handle = tokio::runtime::Handle::current();
     let session = std::thread::spawn(move || {
@@ -3197,7 +3197,7 @@ async fn describe_cold_initial_h_reports_indexing_without_prior_coverage() {
     let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
     let (mut client, server) = UnixStream::pair().unwrap();
     client
-        .set_read_timeout(Some(Duration::from_secs(8)))
+        .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
         .unwrap();
     let daemon_handle = tokio::runtime::Handle::current();
     let session = std::thread::spawn(move || {
@@ -3336,7 +3336,7 @@ async fn describe_counts_persisted_selected_and_unselected_native_coverage() {
     let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
     let (mut client, server) = UnixStream::pair().unwrap();
     client
-        .set_read_timeout(Some(Duration::from_secs(8)))
+        .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
         .unwrap();
     let daemon_handle = tokio::runtime::Handle::current();
     let session = std::thread::spawn(move || {
@@ -3425,7 +3425,7 @@ async fn describe_retries_direct_sqlite_contention_on_fresh_selected_snapshot() 
     let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
     let (mut client, server) = UnixStream::pair().unwrap();
     client
-        .set_read_timeout(Some(Duration::from_secs(8)))
+        .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
         .unwrap();
     let daemon_handle = tokio::runtime::Handle::current();
     let session = std::thread::spawn(move || {

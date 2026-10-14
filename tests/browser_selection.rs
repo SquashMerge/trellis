@@ -1819,7 +1819,7 @@ async fn browser_only_live_listener_releases_resources_then_exits_with_control_p
     // closes the dispatch-owned serve control connection on daemon exit.
     let (mut serve_control, daemon_control) = std::os::unix::net::UnixStream::pair().unwrap();
     serve_control
-        .set_read_timeout(Some(Duration::from_secs(30)))
+        .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
         .unwrap();
     let serve_exit = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
         use std::io::Read;

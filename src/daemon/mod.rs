@@ -258,6 +258,9 @@ pub struct BrowserProvisioner {
     token_path: Option<PathBuf>,
     token_inode: Option<(u64, u64)>,
     token: Option<String>,
+    /// SERVE_REPLACEMENT_WAIT in production; tests that exercise its expiry
+    /// shorten it rather than wait real seconds.
+    replacement_wait: std::time::Duration,
     effective_address: Option<std::net::SocketAddr>,
     closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
@@ -316,9 +319,17 @@ impl BrowserProvisioner {
             token_path: None,
             token_inode: None,
             token: None,
+            replacement_wait: SERVE_REPLACEMENT_WAIT,
             effective_address: None,
             closed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// Exercise the replacement wait's typed expiry without real seconds.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn set_replacement_wait_for_tests(&mut self, wait: std::time::Duration) {
+        self.replacement_wait = wait;
     }
 
     pub fn address(&self) -> Option<std::net::SocketAddr> {
@@ -377,7 +388,7 @@ impl BrowserProvisioner {
         // accepted work. Wait only for that typed transient state, releasing
         // the registry guard so the runtime can finish. A genuine conflicting
         // registration or attached client remains an immediate refusal.
-        let deadline = std::time::Instant::now() + SERVE_REPLACEMENT_WAIT;
+        let deadline = std::time::Instant::now() + self.replacement_wait;
         // A busy retry may arm the runtime's advisory watcher release. The
         // guard resets it on every exit: success, timeout, a later non-busy
         // error, or this future being dropped.

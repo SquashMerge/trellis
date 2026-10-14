@@ -365,7 +365,7 @@ fn concurrent_clients_share_single_socket_and_survive_bad_private_frame() {
     assert_eq!(reply["id"], "after-cancel");
     let mut invalid = UnixStream::connect(&socket).unwrap();
     invalid
-        .set_read_timeout(Some(Duration::from_secs(2)))
+        .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
         .unwrap();
     invalid
         .write_all(&((protocol::MAX_FRAME as u32) + 1).to_be_bytes())
@@ -614,7 +614,7 @@ fn cancellation_precedes_invalid_queue_and_sixteen_follow_ons() {
         .unwrap();
         let (mut phase, _) = listener.accept().unwrap();
         phase
-            .set_read_timeout(Some(Duration::from_secs(10)))
+            .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
             .unwrap();
         let mut stage = String::new();
         BufReader::new(phase.try_clone().unwrap())
@@ -834,7 +834,7 @@ fn duplicate_within_bounded_pending_queue_is_rejected_before_first_completes() {
     .unwrap();
     let (mut phase, _) = listener.accept().unwrap();
     phase
-        .set_read_timeout(Some(Duration::from_secs(10)))
+        .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
         .unwrap();
     let mut stage = String::new();
     BufReader::new(phase.try_clone().unwrap())
@@ -935,7 +935,7 @@ fn stdin_eof_cancels_in_flight_call_without_stdout() {
     .unwrap();
     let (mut phase, _) = listener.accept().unwrap();
     phase
-        .set_read_timeout(Some(Duration::from_secs(10)))
+        .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
         .unwrap();
     let mut stage = String::new();
     BufReader::new(phase.try_clone().unwrap())
@@ -997,7 +997,7 @@ fn canceled_read_is_not_replayed_after_daemon_death() {
     .unwrap();
     let (phase, _) = listener.accept().unwrap();
     phase
-        .set_read_timeout(Some(Duration::from_secs(10)))
+        .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
         .unwrap();
     let mut stage = String::new();
     BufReader::new(phase.try_clone().unwrap())
@@ -1105,7 +1105,7 @@ fn check_legacy_synthetic_reattach_cancel(cancel_id: u64, fail_setup: bool) {
     let fake = std::thread::spawn(move || {
         let (mut socket, _) = listener.accept().unwrap();
         socket
-            .set_read_timeout(Some(Duration::from_secs(10)))
+            .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
             .unwrap();
         let attach: protocol::Request = protocol::read_frame(&mut socket).unwrap();
         assert_eq!(attach.operation, "mcp");
@@ -1351,7 +1351,7 @@ fn failed_reattach_drains_pending_cancel_and_stdin_eof_before_failure() {
         let fake = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             stream
-                .set_read_timeout(Some(Duration::from_secs(10)))
+                .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
                 .unwrap();
             let attach: protocol::Request = protocol::read_frame(&mut stream).unwrap();
             assert_eq!(attach.operation, "mcp");
@@ -1482,7 +1482,7 @@ fn partial_daemon_reply_is_typed_and_never_reaches_stdout() {
     let fake = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
+            .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
             .unwrap();
         let attach: protocol::Request = protocol::read_frame(&mut stream).unwrap();
         assert_eq!(attach.operation, "mcp");
@@ -1575,7 +1575,7 @@ fn partial_daemon_reply_is_typed_and_never_reaches_stdout() {
     let failed_attach = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
+            .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
             .unwrap();
         let attach: protocol::Request = protocol::read_frame(&mut stream).unwrap();
         assert_eq!(attach.operation, "mcp");
@@ -1741,7 +1741,7 @@ fn cancel_after_relay_reads_reply_suppresses_that_reply() {
     let pause = |listener: &UnixListener| {
         let (phase, _) = listener.accept().unwrap();
         phase
-            .set_read_timeout(Some(Duration::from_secs(10)))
+            .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
             .unwrap();
         let mut stage = String::new();
         BufReader::new(phase.try_clone().unwrap())
@@ -1810,7 +1810,7 @@ fn cancel_after_the_relay_decides_cannot_recall_the_reply() {
     let pause = |listener: &UnixListener| {
         let (phase, _) = listener.accept().unwrap();
         phase
-            .set_read_timeout(Some(Duration::from_secs(10)))
+            .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
             .unwrap();
         let mut stage = String::new();
         BufReader::new(phase.try_clone().unwrap())
