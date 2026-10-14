@@ -1983,11 +1983,11 @@ async fn cold_selected_native_read_is_not_ready_without_a_fabricated_basis() {
         registry
             .browser_request_at(&identity, std::time::Instant::now())
             .unwrap();
-        let runtime = registry.activate(&identity.root_key).unwrap();
-        runtime.set_startup_hook_for_tests(Arc::new(move || {
+        registry.set_next_startup_hook_for_tests(Arc::new(move || {
             entered_tx.send(()).unwrap();
             resume_rx.lock().unwrap().recv().unwrap();
         }));
+        let runtime = registry.activate(&identity.root_key).unwrap();
         runtime
     };
     tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
@@ -2147,11 +2147,11 @@ async fn selected_status_serves_validated_pre_startup_head_and_clears_freshness_
         registry
             .browser_request_at(&identity, std::time::Instant::now())
             .unwrap();
-        let runtime = registry.activate(&identity.root_key).unwrap();
-        runtime.set_startup_hook_for_tests(Arc::new(move || {
+        registry.set_next_startup_hook_for_tests(Arc::new(move || {
             entered_tx.send(()).unwrap();
             resume_rx.lock().unwrap().recv().unwrap();
         }));
+        let runtime = registry.activate(&identity.root_key).unwrap();
         runtime
     };
     tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
@@ -3241,22 +3241,22 @@ async fn selected_reads_validated_predecessor_through_owner_handoff() {
     )
     .unwrap()
     .router();
-    let runtime = {
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let release_rx = Mutex::new(release_rx);
+    let _runtime = {
         let mut checked = registry.lock().await;
         checked
             .browser_request_at(&identity, std::time::Instant::now())
             .unwrap();
+        // Installed before the worker starts, so this runtime pauses before
+        // its mandatory local startup reconciliation.
+        checked.set_next_startup_hook_for_tests(Arc::new(move || {
+            entered_tx.send(()).unwrap();
+            release_rx.lock().unwrap().recv().unwrap();
+        }));
         checked.activate(&identity.root_key).unwrap()
     };
-    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
-    let (release_tx, release_rx) = mpsc::sync_channel(1);
-    let release_rx = Mutex::new(release_rx);
-    // Activation schedules reconciliation on Tokio. Set the hook before the
-    // first await so this runtime pauses before its mandatory local startup reconciliation.
-    runtime.set_startup_hook_for_tests(Arc::new(move || {
-        entered_tx.send(()).unwrap();
-        release_rx.lock().unwrap().recv().unwrap();
-    }));
     let prefix = format!("/api/checkouts/{}", identity.root_key);
     tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         while entered_rx.try_recv().is_err() {

@@ -175,6 +175,8 @@ pub struct CheckoutRegistry {
     lifecycle: Arc<tokio::sync::Notify>,
     #[cfg(feature = "test-support")]
     test_after_due_release: Option<Box<dyn FnOnce() + Send>>,
+    #[cfg(feature = "test-support")]
+    test_next_startup_hook: Option<Arc<dyn Fn() + Send + Sync>>,
     #[cfg(all(test, feature = "test-support"))]
     test_jev_endpoint: Option<String>,
 }
@@ -202,9 +204,19 @@ impl CheckoutRegistry {
             lifecycle: Arc::new(tokio::sync::Notify::new()),
             #[cfg(feature = "test-support")]
             test_after_due_release: None,
+            #[cfg(feature = "test-support")]
+            test_next_startup_hook: None,
             #[cfg(all(test, feature = "test-support"))]
             test_jev_endpoint: None,
         }
+    }
+
+    /// Pause the next activation's startup reconciliation, installed before
+    /// its worker starts.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn set_next_startup_hook_for_tests(&mut self, hook: Arc<dyn Fn() + Send + Sync>) {
+        self.test_next_startup_hook = Some(hook);
     }
 
     #[cfg(feature = "test-support")]
@@ -319,6 +331,11 @@ impl CheckoutRegistry {
         self.runtimes.insert(key.to_owned(), runtime.clone());
         let lifecycle = self.lifecycle.clone();
         scheduler.set_lifecycle_wake(Arc::new(move || lifecycle.notify_one()));
+        // Installed before startup begins, so the worker cannot pass it first.
+        #[cfg(feature = "test-support")]
+        if let Some(hook) = self.test_next_startup_hook.take() {
+            scheduler.set_startup_hook_for_tests(hook);
+        }
         scheduler.begin_startup_reconciliation();
         Ok(runtime)
     }

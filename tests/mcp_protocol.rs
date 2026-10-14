@@ -3190,11 +3190,10 @@ async fn describe_serves_valid_prior_head_while_startup_reconciliation_is_paused
     .expect("checkout was not released");
     fs::write(root.join("prior.js"), "function later() {}\n").unwrap();
     registry.attach_launch(44, &identity).unwrap();
-    let resumed = registry.activate(&identity.root_key).unwrap();
     let (entered_tx, entered_rx) = mpsc::sync_channel(1);
     let (resume_tx, resume_rx) = mpsc::sync_channel(1);
     let resume_rx = std::sync::Mutex::new(resume_rx);
-    resumed.set_startup_hook_for_tests(std::sync::Arc::new(move || {
+    registry.set_next_startup_hook_for_tests(std::sync::Arc::new(move || {
         entered_tx.send(()).unwrap();
         resume_rx
             .lock()
@@ -3202,6 +3201,7 @@ async fn describe_serves_valid_prior_head_while_startup_reconciliation_is_paused
             .recv_timeout(trellis::testing::HANG_BACKSTOP)
             .unwrap();
     }));
+    let _resumed = registry.activate(&identity.root_key).unwrap();
     tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             if entered_rx.try_recv().is_ok() {
@@ -3274,11 +3274,10 @@ async fn describe_cold_initial_startup_reports_indexing_without_prior_coverage()
         TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
     let mut registry = CheckoutRegistry::with_roots(topology);
     registry.attach_launch(46, &identity).unwrap();
-    let runtime = registry.activate(&identity.root_key).unwrap();
     let (entered_tx, entered_rx) = mpsc::sync_channel(1);
     let (resume_tx, resume_rx) = mpsc::sync_channel(1);
     let resume_rx = std::sync::Mutex::new(resume_rx);
-    runtime.set_startup_hook_for_tests(std::sync::Arc::new(move || {
+    registry.set_next_startup_hook_for_tests(std::sync::Arc::new(move || {
         entered_tx.send(()).unwrap();
         resume_rx
             .lock()
@@ -3286,6 +3285,7 @@ async fn describe_cold_initial_startup_reports_indexing_without_prior_coverage()
             .recv_timeout(trellis::testing::HANG_BACKSTOP)
             .unwrap();
     }));
+    let _runtime = registry.activate(&identity.root_key).unwrap();
     tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             if entered_rx.try_recv().is_ok() {
@@ -3401,12 +3401,11 @@ async fn describe_counts_persisted_selected_and_unselected_native_coverage() {
         TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
     let mut registry = CheckoutRegistry::with_roots(topology);
     registry.attach_launch(48, &identity).unwrap();
-    let runtime = registry.activate(&identity.root_key).unwrap();
     let (entered_tx, entered_rx) = mpsc::sync_channel(1);
     let (resume_tx, resume_rx) = mpsc::sync_channel(1);
     let resume_rx = std::sync::Mutex::new(resume_rx);
-    // Current-thread Tokio cannot poll spawned startup reconciliation before this synchronous hook setup.
-    runtime.set_startup_hook_for_tests(std::sync::Arc::new(move || {
+    // Installed before activation starts the worker, so startup cannot pass it first.
+    registry.set_next_startup_hook_for_tests(std::sync::Arc::new(move || {
         entered_tx.send(()).unwrap();
         resume_rx
             .lock()
@@ -3414,6 +3413,7 @@ async fn describe_counts_persisted_selected_and_unselected_native_coverage() {
             .recv_timeout(trellis::testing::HANG_BACKSTOP)
             .unwrap();
     }));
+    let runtime = registry.activate(&identity.root_key).unwrap();
     tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             if entered_rx.try_recv().is_ok() {

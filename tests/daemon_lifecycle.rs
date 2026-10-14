@@ -500,14 +500,14 @@ async fn invalid_prior_head_does_not_pin_idle_resources_or_skip_reattach_startup
     )
     .unwrap();
     registry.attach_launch(2, &id).unwrap();
-    let resumed = registry.activate(&id.root_key).unwrap();
     let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
     let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
     let resume_rx = std::sync::Mutex::new(resume_rx);
-    resumed.set_startup_hook_for_tests(std::sync::Arc::new(move || {
+    registry.set_next_startup_hook_for_tests(std::sync::Arc::new(move || {
         entered_tx.send(()).unwrap();
         resume_rx.lock().unwrap().recv().unwrap();
     }));
+    let resumed = registry.activate(&id.root_key).unwrap();
     tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         while entered_rx.try_recv().is_err() {
             tokio::task::yield_now().await;
@@ -585,16 +585,16 @@ async fn active_writer_and_protected_reader_overlap_orphan_idle_scan() {
     assert_eq!(reader.check(), MaintenanceQueueState::Pending);
 
     registry.attach_launch(1, &id).unwrap();
-    let runtime = registry.activate(&id.root_key).unwrap();
-    // startup reconciliation must not claim the accepted row before the contention scan. Install
-    // the hook before yielding to the spawned reconciliation worker.
+    // startup reconciliation must not claim the accepted row before the contention scan. The
+    // hook is installed before activation starts the worker.
     let (h_entered_tx, h_entered_rx) = std::sync::mpsc::sync_channel(1);
     let (h_resume_tx, h_resume_rx) = std::sync::mpsc::sync_channel(1);
     let h_resume_rx = std::sync::Mutex::new(h_resume_rx);
-    runtime.set_startup_hook_for_tests(std::sync::Arc::new(move || {
+    registry.set_next_startup_hook_for_tests(std::sync::Arc::new(move || {
         h_entered_tx.send(()).unwrap();
         h_resume_rx.lock().unwrap().recv().unwrap();
     }));
+    let runtime = registry.activate(&id.root_key).unwrap();
     tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         while h_entered_rx.try_recv().is_err() {
             tokio::task::yield_now().await;

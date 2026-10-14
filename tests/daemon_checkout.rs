@@ -163,14 +163,14 @@ async fn reattach_reports_catching_up_and_keeps_complete_head_until_startup() {
     )
     .unwrap();
     registry.attach_launch(2, &id).unwrap();
-    let resumed = registry.activate(&id.root_key).unwrap();
     let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
     let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
     let resume_rx = std::sync::Mutex::new(resume_rx);
-    resumed.set_startup_hook_for_tests(std::sync::Arc::new(move || {
+    registry.set_next_startup_hook_for_tests(std::sync::Arc::new(move || {
         entered_tx.send(()).unwrap();
         resume_rx.lock().unwrap().recv().unwrap();
     }));
+    let resumed = registry.activate(&id.root_key).unwrap();
     tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         while entered_rx.try_recv().is_err() {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -213,14 +213,14 @@ async fn cli_symbols_and_export_use_the_admitted_prior_head_during_startup() {
     release_when_idle(&mut registry, &id.root_key).await;
     fs::write(checkout.join("a.js"), "function newHead() {}\n").unwrap();
     registry.attach_launch(2, &id).unwrap();
-    let resumed = registry.activate(&id.root_key).unwrap();
     let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
     let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
     let resume_rx = std::sync::Mutex::new(resume_rx);
-    resumed.set_startup_hook_for_tests(std::sync::Arc::new(move || {
+    registry.set_next_startup_hook_for_tests(std::sync::Arc::new(move || {
         entered_tx.send(()).unwrap();
         resume_rx.lock().unwrap().recv().unwrap();
     }));
+    let resumed = registry.activate(&id.root_key).unwrap();
     tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         while entered_rx.try_recv().is_err() {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -332,14 +332,14 @@ async fn replacement_settles_old_queue_before_startup_then_claims_distinct_fifo_
     let b = new_store.enqueue_request(&b_options, None).unwrap();
     assert!(old.seq < a.seq && a.seq < b.seq);
     registry.attach_launch(2, &new_id).unwrap();
-    let runtime = registry.activate(&new_id.root_key).unwrap();
     let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
     let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
     let resume_rx = std::sync::Mutex::new(resume_rx);
-    runtime.set_startup_hook_for_tests(std::sync::Arc::new(move || {
+    registry.set_next_startup_hook_for_tests(std::sync::Arc::new(move || {
         entered_tx.send(()).unwrap();
         resume_rx.lock().unwrap().recv().unwrap();
     }));
+    let runtime = registry.activate(&new_id.root_key).unwrap();
     tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         while entered_rx.try_recv().is_err() {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -477,11 +477,11 @@ async fn ambiguous_root_settlement_blocks_startup_and_fifo_until_queue_reread() 
     });
     let mut registry = CheckoutRegistry::with_roots(topology);
     registry.attach_launch(1, &new_id).unwrap();
-    let runtime = registry.activate(&new_id.root_key).unwrap();
     let (h_tx, h_rx) = std::sync::mpsc::sync_channel(1);
-    runtime.set_startup_hook_for_tests(std::sync::Arc::new(move || {
+    registry.set_next_startup_hook_for_tests(std::sync::Arc::new(move || {
         h_tx.send(()).unwrap();
     }));
+    let _runtime = registry.activate(&new_id.root_key).unwrap();
     tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         while ambiguous_rx.try_recv().is_err() {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -745,14 +745,14 @@ async fn root_loss_during_paused_reattach_startup_waits_for_worker_then_releases
     release_when_idle(&mut registry, &key).await;
     registry.attach_launch(2, &id).unwrap();
     drop(id);
-    let paused = registry.activate(&key).unwrap();
     let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
     let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
     let resume_rx = std::sync::Mutex::new(resume_rx);
-    paused.set_startup_hook_for_tests(std::sync::Arc::new(move || {
+    registry.set_next_startup_hook_for_tests(std::sync::Arc::new(move || {
         entered_tx.send(()).unwrap();
         resume_rx.lock().unwrap().recv().unwrap();
     }));
+    let paused = registry.activate(&key).unwrap();
     tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         while entered_rx.try_recv().is_err() {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -902,10 +902,10 @@ async fn failed_startup_backs_off_and_empty_idle_checkout_can_release() {
     let id = identity(&checkout);
     let mut registry = CheckoutRegistry::with_roots(roots(base.path()));
     registry.attach_launch(1, &id).unwrap();
-    let runtime = registry.activate(&id.root_key).unwrap();
-    runtime.set_startup_hook_for_tests(std::sync::Arc::new(|| {
+    registry.set_next_startup_hook_for_tests(std::sync::Arc::new(|| {
         panic!("injected startup reconciliation failure")
     }));
+    let runtime = registry.activate(&id.root_key).unwrap();
     tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         while runtime.reconciliation_error().is_none() {
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -938,10 +938,10 @@ async fn failed_startup_backoff_never_releases_accepted_fifo_work() {
         .unwrap();
     let mut registry = CheckoutRegistry::with_roots(topology);
     registry.attach_launch(1, &id).unwrap();
-    let runtime = registry.activate(&id.root_key).unwrap();
-    runtime.set_startup_hook_for_tests(std::sync::Arc::new(|| {
+    registry.set_next_startup_hook_for_tests(std::sync::Arc::new(|| {
         panic!("injected queued startup reconciliation failure")
     }));
+    let runtime = registry.activate(&id.root_key).unwrap();
     tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         while runtime.reconciliation_error().is_none() || !runtime.retry_waiting_for_tests() {
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -1550,16 +1550,16 @@ async fn work_accepted_during_startup_reconciliation_never_starts_a_second_one()
     let id = identity(&checkout);
     let mut registry = CheckoutRegistry::with_roots(roots(base.path()));
     registry.attach_launch(1, &id).unwrap();
-    let runtime = registry.activate(&id.root_key).unwrap();
-    let scheduler = runtime.browser_scheduler().unwrap();
     let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
     let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel::<()>(1);
     let resume_rx = std::sync::Mutex::new(resume_rx);
-    runtime.set_startup_hook_for_tests(std::sync::Arc::new(move || {
+    registry.set_next_startup_hook_for_tests(std::sync::Arc::new(move || {
         entered_tx.send(()).unwrap();
         // A dropped sender (test failure) ends the hold; it never times out.
         let _ = resume_rx.lock().unwrap().recv();
     }));
+    let runtime = registry.activate(&id.root_key).unwrap();
+    let scheduler = runtime.browser_scheduler().unwrap();
     let entered = tokio::task::spawn_blocking(move || entered_rx.recv());
     tokio::time::timeout(trellis::testing::HANG_BACKSTOP, entered)
         .await
@@ -1976,14 +1976,14 @@ async fn read_waiter_wakes_when_startup_reconciliation_commits() {
     let id = identity(&checkout);
     let mut registry = CheckoutRegistry::with_roots(roots(base.path()));
     registry.attach_launch(1, &id).unwrap();
-    let runtime = registry.activate(&id.root_key).unwrap();
     let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
     let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel::<()>(1);
     let resume_rx = std::sync::Mutex::new(resume_rx);
-    runtime.set_startup_hook_for_tests(std::sync::Arc::new(move || {
+    registry.set_next_startup_hook_for_tests(std::sync::Arc::new(move || {
         entered_tx.send(()).unwrap();
         let _ = resume_rx.lock().unwrap().recv();
     }));
+    let runtime = registry.activate(&id.root_key).unwrap();
     entered(entered_rx, "startup reconciliation").await;
     let seen = runtime.state_version();
     let waiter = runtime.clone();
