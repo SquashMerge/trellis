@@ -1384,145 +1384,148 @@ async fn serve_preflight_rejects_busy_replaced_root_before_creating_token() {
     assert!(old.evidence_response().is_err());
 }
 
+/// Decision 0009 §6: `serve` registers on a CLI-activated runtime in place,
+/// without waiting for its accepted index. That request keeps its own
+/// options; later work uses the new configuration; the runtime is not replaced.
 #[cfg(feature = "test-support")]
 #[tokio::test]
-async fn serve_waits_for_idle_cli_read_before_registering_and_reconciling() {
+async fn serve_registers_in_place_while_an_accepted_index_runs() {
     use trellis::daemon::BrowserProvisioner;
     let base = tempfile::tempdir().unwrap();
     let checkout = base.path().join("work");
     fs::create_dir(&checkout).unwrap();
-    fs::write(checkout.join("a.js"), "function admitted() {}\n").unwrap();
+    fs::write(checkout.join("a.js"), "function a() {}\n").unwrap();
     let identity = identity(&checkout);
     let key = identity.root_key.clone();
     let registry = std::sync::Arc::new(tokio::sync::Mutex::new(CheckoutRegistry::with_roots(
         roots(base.path()),
     )));
-    let old = {
+    let runtime = {
         let mut checked = registry.lock().await;
         checked.attach_launch(41, &identity).unwrap();
         checked.activate(&key).unwrap()
     };
-    ready(&old).await;
-    let token = base.path().join("token");
-    let options = CheckoutOptions(serde_json::json!({"maxFileBytes": 4096}));
-    let mut conflicting = BrowserProvisioner::new();
-    let mut no_retry =
-        |stage| assert_ne!(stage, "retry_wait", "attached client is a true conflict");
-    let error = tokio::time::timeout(
-        trellis::testing::HANG_BACKSTOP,
-        conflicting.register_serve_with_hook(
-            &registry,
-            &identity,
-            options.clone(),
-            "127.0.0.1:0".parse().unwrap(),
-            &token,
-            Some(&mut no_retry),
-        ),
-    )
-    .await
-    .expect("true attached-client conflict must not wait")
-    .unwrap_err();
-    assert_eq!(error.to_string(), "registration_conflict");
-    assert!(!token.exists());
-    let (prior, _) = old.evidence_response().unwrap();
-    let prior_pin = prior.status().unwrap().revision;
-    prior.finish(()).unwrap();
-    drop(prior);
-    let (held_read, _) = old.evidence_response().unwrap();
-    registry.lock().await.disconnect(41);
-    // Keep the selected reader alive across the entire admission budget,
-    // shortened here so the test exercises its expiry without real seconds.
-    // A timed-out retry is typed busy and cannot mint a token or replace
-    // CLI-only options while the old Store still owns its handles.
-    let mut waiting = BrowserProvisioner::new();
-    waiting.set_replacement_wait_for_tests(Duration::from_millis(500));
-    let timeout_error = tokio::time::timeout(
-        trellis::testing::HANG_BACKSTOP,
-        waiting.register_serve(
-            &registry,
-            &identity,
-            options.clone(),
-            "127.0.0.1:0".parse().unwrap(),
-            &token,
-        ),
-    )
-    .await
-    .expect("CLI-only busy preflight exceeded its bounded retry deadline")
-    .unwrap_err();
-    assert_eq!(timeout_error.to_string(), "storage_busy");
-    assert!(old.has_active_resources());
-    assert!(registry.lock().await.registration(&key).is_none());
-    assert!(!token.exists(), "timed-out preflight must not mint a token");
-
-    let (retry_tx, retry_rx) = tokio::sync::oneshot::channel();
-    let registry_for_hook = registry.clone();
-    let old_for_hook = old.clone();
-    let mut provisioner = BrowserProvisioner::new();
-    let mut retry_tx = Some(retry_tx);
-    let mut hook = |stage| match stage {
-        "retry_wait" => {
-            assert!(
-                registry_for_hook.try_lock().is_ok(),
-                "busy retry must release the registry mutex before waiting"
-            );
-            if let Some(tx) = retry_tx.take() {
-                let _ = tx.send(());
-            }
-        }
-        "validated" => {
-            assert!(
-                registry_for_hook.try_lock().is_err(),
-                "validated registration must hold its mutex through token commit"
-            );
-            assert!(
-                !old_for_hook.has_active_resources(),
-                "old CLI resources must retire before serve changes options"
-            );
-        }
-        _ => {}
-    };
-    let serve = provisioner.register_serve_with_hook(
-        &registry,
-        &identity,
-        options.clone(),
-        "127.0.0.1:0".parse().unwrap(),
-        &token,
-        Some(&mut hook),
-    );
-    let control = async {
-        tokio::time::timeout(trellis::testing::HANG_BACKSTOP, retry_rx)
-            .await
-            .expect("CLI-only read did not produce a retry")
-            .unwrap();
-        assert!(old.has_active_resources());
-        assert!(registry.lock().await.registration(&key).is_none());
-        assert!(!token.exists(), "busy preflight must not create a token");
-        drop(held_read);
-    };
-    let (served, ()) = tokio::join!(
-        tokio::time::timeout(trellis::testing::HANG_BACKSTOP, serve),
-        control
-    );
-    let address = served
-        .expect("serve did not retry after the selected read finished")
+    ready(&runtime).await;
+    let scheduler = runtime.browser_scheduler().unwrap();
+    let (claimed_tx, claimed_rx) = std::sync::mpsc::sync_channel(1);
+    let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    runtime.set_after_claim_hook_for_tests(move || {
+        claimed_tx.send(()).unwrap();
+        let _ = resume_rx.recv();
+    });
+    let store = Store::open(roots(base.path()), crate::identity(&checkout)).unwrap();
+    let accepted = store
+        .enqueue_request(&trellis::indexer::IndexOptions::new(checkout.clone()), None)
         .unwrap();
-    assert!(address.ip().is_loopback());
-    assert!(token.exists());
-    assert!(!old.has_active_resources());
-    let current = {
+    entered(claimed_rx, "accepted index claim").await;
+    // The index is held mid-drain: serve completes anyway.
+    let options = CheckoutOptions(serde_json::json!({"maxFileBytes": 4096}));
+    let mut provisioner = BrowserProvisioner::new();
+    tokio::time::timeout(
+        trellis::testing::HANG_BACKSTOP,
+        provisioner.register_serve(
+            &registry,
+            &identity,
+            options.clone(),
+            "127.0.0.1:0".parse().unwrap(),
+            &base.path().join("token"),
+        ),
+    )
+    .await
+    .expect("serve waited for accepted index work")
+    .unwrap();
+    assert_eq!(registry.lock().await.registration(&key), Some(&options));
+    assert_eq!(scheduler.config().options.max_file_bytes, 4096);
+    assert!(std::sync::Arc::ptr_eq(
+        &registry.lock().await.runtime(&key).unwrap(),
+        &runtime
+    ));
+    // Reads continue while the index is held.
+    let (read, _) = runtime.evidence_response().unwrap();
+    read.finish(()).unwrap();
+    drop(read);
+    resume_tx.send(()).unwrap();
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        loop {
+            if store.request_by_id(&accepted.id).unwrap().unwrap().state == "done"
+                && store
+                    .recorded_index_options()
+                    .unwrap()
+                    .is_some_and(|recorded| recorded.max_file_bytes == 4096)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("accepted index and the new options did not both apply");
+    let row = store.request_by_id(&accepted.id).unwrap().unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&row.options_json).unwrap()["maxFileBytes"],
+        2_097_152,
+        "the accepted request keeps the options recorded with it"
+    );
+}
+
+/// Decision 0009 §6: a configuration that fails to build refuses the
+/// registration and publishes nothing; the previous configuration stays.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn failed_serve_configuration_publishes_nothing() {
+    use trellis::daemon::BrowserProvisioner;
+    let base = tempfile::tempdir().unwrap();
+    let checkout = base.path().join("work");
+    fs::create_dir(&checkout).unwrap();
+    fs::write(checkout.join("a.js"), "function a() {}\n").unwrap();
+    let identity = identity(&checkout);
+    let key = identity.root_key.clone();
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(CheckoutRegistry::with_roots(
+        roots(base.path()),
+    )));
+    let runtime = {
         let mut checked = registry.lock().await;
-        assert_eq!(checked.registration(&key), Some(&options));
-        checked
-            .browser_request_at(&identity, std::time::Instant::now())
-            .unwrap();
+        checked.attach_launch(41, &identity).unwrap();
         checked.activate(&key).unwrap()
     };
-    ready(&current).await;
-    let (selected, _) = current.evidence_response().unwrap();
-    assert!(selected.status().unwrap().revision.index_revision > prior_pin.index_revision);
-    let (_, source) = selected.source_at("a.js", None).unwrap().unwrap();
-    assert!(source.text.contains("admitted"));
-    selected.finish(()).unwrap();
+    ready(&runtime).await;
+    let scheduler = runtime.browser_scheduler().unwrap();
+    // A not-yet-created Jev budget passes validation; building it fails
+    // because its parent directory is read-only.
+    let read_only = base.path().join("read-only");
+    fs::create_dir(&read_only).unwrap();
+    std::fs::set_permissions(
+        &read_only,
+        std::os::unix::fs::PermissionsExt::from_mode(0o500),
+    )
+    .unwrap();
+    let options = CheckoutOptions(serde_json::json!({
+        "maxFileBytes": 4096,
+        "jevBudgetDir": read_only.join("budget"),
+        "jevBudgetCents": 100,
+        "jevKey": "test-key",
+    }));
+    let token = base.path().join("token");
+    let error = BrowserProvisioner::new()
+        .register_serve(
+            &registry,
+            &identity,
+            options,
+            "127.0.0.1:0".parse().unwrap(),
+            &token,
+        )
+        .await
+        .expect_err("an unbuildable configuration must not register");
+    assert!(!error.to_string().is_empty());
+    assert!(registry.lock().await.registration(&key).is_none());
+    assert_eq!(scheduler.config().options.max_file_bytes, 2_097_152);
+    assert!(scheduler.config().provider.is_none());
+    assert!(!token.exists(), "a refused registration mints no token");
+    std::fs::set_permissions(
+        &read_only,
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
 }
 
 /// Inventory item 6 (Decision 0009 §1): the worker is the only owner of startup

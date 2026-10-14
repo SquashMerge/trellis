@@ -279,20 +279,63 @@ impl CheckoutRegistry {
         // selected status reads. Those reads otherwise compete with the EX
         // stage needed before mandatory H can begin.
         store.prepare_virgin_queue_before_activation()?;
-        let config: BrowserOptions = entry
-            .registration
-            .as_ref()
+        let config = self.browser_config(&entry.identity.root, entry.registration.as_ref())?;
+        // Browser registration remains inert until activation. The scheduler's
+        // internal token/address are not bound or exposed by browser provisioning.
+        let scheduler = http::new_with_config(
+            store.clone(),
+            config,
+            format!(
+                "{}{}",
+                uuid::Uuid::new_v4().simple(),
+                uuid::Uuid::new_v4().simple()
+            ),
+            "127.0.0.1:1".parse()?,
+        )?;
+        let runtime = Arc::new(CheckoutRuntime {
+            resources: std::sync::Mutex::new(Some(Arc::new(ActiveResources {
+                store,
+                scheduler: scheduler.clone(),
+            }))),
+            initial_indexing,
+            #[cfg(feature = "test-support")]
+            mcp_clock_skew_ms: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(feature = "test-support")]
+            mcp_read_hook: std::sync::Mutex::new(None),
+        });
+        #[cfg(feature = "test-support")]
+        if let Some(reporter) = super::causal_witness::CausalWitness::from_env(key.to_owned()) {
+            runtime
+                .resources()?
+                .scheduler
+                .set_causal_witness_runtime(reporter, Arc::downgrade(&runtime));
+        }
+        self.runtimes.insert(key.to_owned(), runtime.clone());
+        let lifecycle = self.lifecycle.clone();
+        scheduler.set_lifecycle_wake(Arc::new(move || lifecycle.notify_one()));
+        scheduler.begin_startup_reconciliation();
+        Ok(runtime)
+    }
+
+    /// Build a checkout's whole browser configuration from its registration
+    /// (daemon defaults without one), or fail without a partial value.
+    pub(crate) fn browser_config(
+        &self,
+        root: &Path,
+        registration: Option<&CheckoutOptions>,
+    ) -> anyhow::Result<http::BrowserConfig> {
+        let config: BrowserOptions = registration
             .map(|registered| serde_json::from_value(registered.0.clone()))
             .transpose()?
             .unwrap_or_default();
-        let mut options = IndexOptions::new(entry.identity.root.clone());
+        let mut options = IndexOptions::new(root.to_owned());
         options.scip_path = config.scip;
         options.manifest_path = config.manifest;
         options.max_file_bytes = config.max_file_bytes;
         // The raw registration preserves option presence. A supplied default
         // value (or an explicit null for an optional input) is still explicit;
         // comparing values would silently reuse an earlier checkout's inputs.
-        let explicit_options = entry.registration.as_ref().is_some_and(|registered| {
+        let explicit_options = registration.is_some_and(|registered| {
             ["scip", "manifest", "maxFileBytes"]
                 .iter()
                 .any(|key| registered.0.get(*key).is_some())
@@ -329,51 +372,21 @@ impl CheckoutRegistry {
             }
             _ => None,
         };
-        // Browser registration remains inert until activation. The scheduler's
-        // internal token/address are not bound or exposed by browser provisioning.
-        let scheduler = http::new_with_dependency_options(
-            store.clone(),
-            options.clone(),
-            format!(
-                "{}{}",
-                uuid::Uuid::new_v4().simple(),
-                uuid::Uuid::new_v4().simple()
-            ),
-            "127.0.0.1:1".parse()?,
-            provider,
-            acp,
-            config
-                .browse_root
-                .unwrap_or_else(|| options.workspace_root.clone()),
+        let browse_root = config
+            .browse_root
+            .unwrap_or_else(|| options.workspace_root.clone());
+        http::BrowserConfig::build(
+            options,
+            explicit_options,
+            &browse_root,
             config.rust_source_roots,
             Some(crate::dependencies::CatalogOptions {
                 cargo_home: config.cargo_home,
                 rust_library: config.rust_library,
             }),
-        )?;
-        let runtime = Arc::new(CheckoutRuntime {
-            resources: std::sync::Mutex::new(Some(Arc::new(ActiveResources {
-                store,
-                scheduler: scheduler.clone(),
-            }))),
-            initial_indexing,
-            #[cfg(feature = "test-support")]
-            mcp_clock_skew_ms: std::sync::atomic::AtomicU64::new(0),
-            #[cfg(feature = "test-support")]
-            mcp_read_hook: std::sync::Mutex::new(None),
-        });
-        #[cfg(feature = "test-support")]
-        if let Some(reporter) = super::causal_witness::CausalWitness::from_env(key.to_owned()) {
-            runtime
-                .resources()?
-                .scheduler
-                .set_causal_witness_runtime(reporter, Arc::downgrade(&runtime));
-        }
-        self.runtimes.insert(key.to_owned(), runtime.clone());
-        let lifecycle = self.lifecycle.clone();
-        scheduler.set_lifecycle_wake(Arc::new(move || lifecycle.notify_one()));
-        scheduler.begin_startup_reconciliation(explicit_options);
-        Ok(runtime)
+            provider,
+            acp,
+        )
     }
 
     /// An active runtime. One that is closing or retired is not returned: the
@@ -408,82 +421,6 @@ impl CheckoutRegistry {
     fn finish_retired(&mut self, key: &str) {
         if let Some(runtime) = self.runtimes.remove(key) {
             runtime.resources.lock().unwrap().take();
-        }
-    }
-
-    /// Serve may replace only an unattached CLI runtime. Do not call the
-    /// generic pending-work probe here: it takes watcher_work under the
-    /// registry mutex while a full inventory owns that lock.
-    fn release_cli_runtime(&mut self, key: &str) -> Result<bool, SelectionError> {
-        let runtime = self
-            .runtimes
-            .get(key)
-            .cloned()
-            .ok_or(SelectionError::Unavailable)?;
-        let resources = runtime
-            .resources()
-            .map_err(|_| SelectionError::Unavailable)?;
-        let eligible = |phase: RuntimePhase| {
-            !startup_running(phase)
-                && resources.scheduler.leases() == 0
-                && !CheckoutRuntime::queue_pending(&resources, phase)
-        };
-        if self
-            .entries
-            .get(key)
-            .is_some_and(|entry| entry.external_work)
-            || !eligible(resources.scheduler.runtime_phase())
-        {
-            resources.scheduler.reset_watcher_release();
-            return Ok(false);
-        }
-        // The old watcher is disposable: the replacement starts with a fresh
-        // full inventory.
-        let result = resources
-            .scheduler
-            .try_release_checkout_runtime_if(eligible);
-        match result {
-            Ok(true) => {
-                runtime.resources.lock().unwrap().take();
-                resources.store.retire_checkout_sqlite_witnesses();
-                drop(resources);
-                self.runtimes.remove(key);
-                let entry = self
-                    .entries
-                    .get_mut(key)
-                    .ok_or(SelectionError::Unavailable)?;
-                entry.pending_work = false;
-                entry.released = true;
-                Ok(true)
-            }
-            Ok(false) => {
-                resources.scheduler.reset_watcher_release();
-                Ok(false)
-            }
-            Err(_) => {
-                // Cooperative cancellation is limited to the derived watcher
-                // path; the next retry still verifies the durable FIFO head.
-                resources.scheduler.request_watcher_release();
-                Ok(false)
-            }
-        }
-    }
-
-    /// The scheduler a busy CLI replacement retry may have armed, so the
-    /// caller can reset that exact runtime's advisory request later.
-    pub(crate) fn cli_replacement_scheduler(&self, key: &str) -> Option<Arc<http::DaemonState>> {
-        self.runtimes
-            .get(key)
-            .and_then(|runtime| runtime.resources().ok())
-            .map(|resources| resources.scheduler.clone())
-    }
-
-    /// Give up the advisory cancellation when serve exhausts its deadline.
-    pub(crate) fn abandon_cli_replacement(&self, key: &str) {
-        if let Some(runtime) = self.runtimes.get(key)
-            && let Ok(resources) = runtime.resources()
-        {
-            resources.scheduler.reset_watcher_release();
         }
     }
 
@@ -877,36 +814,67 @@ impl CheckoutRegistry {
             .map_err(|_| SelectionError::IdentityChanged)?;
         Self::validate_browser_options(identity, options)?;
         self.retire_replaced(identity)?;
-        // An earlier CLI read/index may have activated the checkout with no
-        // browser settings. Once its work drains, release that runtime before
-        // registering serve-scoped providers and source roots.
-        let cli_only = self.entries.get(&identity.root_key).is_some_and(|entry| {
-            entry.registration.is_none()
-                && entry.sessions.is_empty()
-                && entry.browser_until.is_none()
-                && self.runtimes.contains_key(&identity.root_key)
-        });
-        if cli_only {
-            if !self.release_cli_runtime(&identity.root_key)? {
-                // H, a selected read, or an accepted FIFO head must finish.
-                return Err(SelectionError::StorageBusy);
-            }
-        } else {
-            // A new attachment can make an earlier retry ineligible. Do not
-            // leave its cancellation request armed on this retained runtime.
-            self.abandon_cli_replacement(&identity.root_key);
-        }
-        if let Some(entry) = self.entries.get(&identity.root_key)
-            && entry.registration.as_ref() != Some(options)
-            && (entry.registration.is_some() || self.runtimes.contains_key(&identity.root_key))
-            && (!entry.released || entry.pending_work || !entry.sessions.is_empty())
+        if self
+            .entries
+            .get(&identity.root_key)
+            .is_some_and(|entry| Self::registration_conflicts(entry, options))
         {
             return Err(SelectionError::RegistrationConflict);
         }
         Ok(())
     }
 
-    /// A repeat is idempotent. Replacement is possible only after release.
+    /// A checkout without a registration takes one in place, even while its
+    /// runtime runs (Decision 0009 §6). A different existing registration
+    /// conflicts until its checkout is released and idle.
+    fn registration_conflicts(entry: &Entry, options: &CheckoutOptions) -> bool {
+        entry
+            .registration
+            .as_ref()
+            .is_some_and(|registered| registered != options)
+            && (!entry.released || entry.pending_work || !entry.sessions.is_empty())
+    }
+
+    /// The configuration a registration publishes to a live runtime, built in
+    /// full before anything is bound or registered. None when no live runtime
+    /// needs it (activation builds it later) or nothing changes.
+    pub(crate) fn registration_config(
+        &self,
+        identity: &WorkspaceIdentity,
+        options: &CheckoutOptions,
+    ) -> anyhow::Result<Option<http::BrowserConfig>> {
+        let key = &identity.root_key;
+        if self
+            .entries
+            .get(key)
+            .is_some_and(|entry| entry.registration.as_ref() == Some(options))
+            || self.runtime(key).is_none()
+        {
+            return Ok(None);
+        }
+        self.browser_config(&identity.root, Some(options)).map(Some)
+    }
+
+    /// Record a registration and publish its configuration to a live runtime
+    /// in one step under the registry guard. A conflict publishes nothing.
+    pub(crate) fn register_in_place(
+        &mut self,
+        identity: &WorkspaceIdentity,
+        options: CheckoutOptions,
+        config: Option<http::BrowserConfig>,
+    ) -> anyhow::Result<()> {
+        self.register(identity, options)
+            .map_err(|error| anyhow::anyhow!("{}", error.reason()))?;
+        if let Some(config) = config
+            && let Some(runtime) = self.runtime(&identity.root_key)
+        {
+            runtime.resources()?.scheduler.apply_config(config);
+        }
+        Ok(())
+    }
+
+    /// A repeat is idempotent. A different registration replaces an existing
+    /// one only after release; a checkout without one takes it in place.
     pub fn register(
         &mut self,
         identity: &WorkspaceIdentity,
@@ -924,9 +892,7 @@ impl CheckoutRegistry {
             if entry.registration.as_ref() == Some(&options) {
                 return Ok(());
             }
-            if (entry.registration.is_some() || self.runtimes.contains_key(key))
-                && (!entry.released || entry.pending_work || !entry.sessions.is_empty())
-            {
+            if Self::registration_conflicts(entry, &options) {
                 return Err(SelectionError::RegistrationConflict);
             }
             entry.registration = Some(options);
@@ -2035,459 +2001,6 @@ mod selection_tests {
             .status()
             .unwrap();
         assert!(status.success(), "git {args:?}");
-    }
-
-    /// Startup reconciliation commits before the queue tick's first full
-    /// inventory runs on the native and watcher lanes. Fixtures that take those
-    /// lanes or enqueue FIFO work wait for this sampled quiescence first; a
-    /// timeout here is a real fixture RED.
-    async fn settled_after_first_inventory(runtime: &CheckoutRuntime) {
-        tokio::time::timeout(crate::testing::HANG_BACKSTOP, async {
-            loop {
-                let watch_pending = runtime
-                    .browser_scheduler()
-                    .map_or(true, |scheduler| scheduler.checkout_watch_pending());
-                if !runtime.catching_up() && !watch_pending {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("H and the first watcher inventory did not settle");
-    }
-
-    /// A serve registration future dropped while waiting on a busy CLI
-    /// replacement must not leave that runtime's watcher release armed.
-    #[cfg(feature = "test-support")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn dropped_serve_registration_resets_its_watcher_release_request() {
-        use std::sync::mpsc;
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("checkout");
-        git(temp.path(), &["init", "--quiet", root.to_str().unwrap()]);
-        let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
-        let key = identity.root_key.clone();
-        let roots =
-            TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
-        let mut registry = CheckoutRegistry::with_roots(roots);
-        let options = CheckoutOptions(serde_json::json!({"browseRoot": identity.root}));
-        registry.attach_launch(48, &identity).unwrap();
-        let runtime = registry.activate(&key).unwrap();
-        registry.disconnect(48);
-        settled_after_first_inventory(&runtime).await;
-        let scheduler = runtime.browser_scheduler().unwrap();
-        // Hold the worker lanes so the CLI replacement retry is busy.
-        let held = scheduler.clone();
-        let (held_tx, held_rx) = mpsc::channel();
-        let (resume_tx, resume_rx) = mpsc::channel::<()>();
-        let holder = std::thread::spawn(move || {
-            held.hold_watcher_gate_for_tests(|| {
-                held_tx.send(()).unwrap();
-                let _ = resume_rx.recv_timeout(crate::testing::HANG_BACKSTOP);
-            });
-        });
-        held_rx.recv_timeout(crate::testing::HANG_BACKSTOP).unwrap();
-        let registry = Arc::new(tokio::sync::Mutex::new(registry));
-        let token = temp.path().join("token");
-        let mut provisioner = crate::daemon::BrowserProvisioner::new();
-        let (waiting_tx, waiting_rx) = tokio::sync::oneshot::channel::<bool>();
-        let mut waiting_tx = Some(waiting_tx);
-        let observed = scheduler.clone();
-        let mut hook = move |stage: &'static str| {
-            if stage == "retry_wait"
-                && let Some(tx) = waiting_tx.take()
-            {
-                let _ = tx.send(observed.watcher_release_requested_for_tests());
-            }
-        };
-        let armed_at_wait = tokio::select! {
-            result = provisioner.register_serve_with_hook(
-                &registry,
-                &identity,
-                options,
-                "127.0.0.1:0".parse().unwrap(),
-                &token,
-                Some(&mut hook),
-            ) => panic!("registration finished while the lanes were held: {result:?}"),
-            armed = waiting_rx => armed.unwrap(),
-        };
-        // The registration future has been dropped at its retry wait.
-        let reset = !scheduler.watcher_release_requested_for_tests();
-        let still_active = runtime.has_active_resources();
-        resume_tx.send(()).unwrap();
-        holder.join().unwrap();
-        assert!(
-            armed_at_wait,
-            "the busy retry did not arm the watcher release"
-        );
-        assert!(
-            reset,
-            "a dropped registration left the watcher release armed"
-        );
-        assert!(still_active, "the retained CLI runtime was changed");
-        let checked = registry.lock().await;
-        assert!(checked.entries[&key].registration.is_none());
-        assert!(!checked.entries[&key].released);
-        assert!(!token.exists(), "a dropped registration created a token");
-    }
-
-    #[tokio::test]
-    async fn serve_cli_replacement_does_not_wait_under_registry_for_watcher_gate() {
-        use std::sync::mpsc;
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("checkout");
-        git(temp.path(), &["init", "--quiet", root.to_str().unwrap()]);
-        let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
-        let roots =
-            TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
-        let mut registry = CheckoutRegistry::with_roots(roots);
-        let options = CheckoutOptions(serde_json::json!({"browseRoot": identity.root}));
-        registry.attach_launch(42, &identity).unwrap();
-        let runtime = registry.activate(&identity.root_key).unwrap();
-        registry.disconnect(42);
-        settled_after_first_inventory(&runtime).await;
-        let scheduler = runtime.browser_scheduler().unwrap();
-        let observed_scheduler = scheduler.clone();
-        let (held_tx, held_rx) = mpsc::channel();
-        let (resume_tx, resume_rx) = mpsc::channel();
-        let holder = std::thread::spawn(move || {
-            scheduler.hold_watcher_gate_for_tests(|| {
-                held_tx.send(()).unwrap();
-                resume_rx.recv().unwrap();
-            });
-        });
-        held_rx.recv_timeout(crate::testing::HANG_BACKSTOP).unwrap();
-        // H has completed: the purpose is the native stream/watcher gate.
-        let key = identity.root_key.clone();
-        let (done_tx, done_rx) = mpsc::channel();
-        let attempt = std::thread::spawn(move || {
-            let started = Instant::now();
-            let outcome = registry.can_register(&identity, &options);
-            done_tx
-                .send((started.elapsed(), outcome, registry, identity, options))
-                .unwrap();
-        });
-        // Non-blocking is proven structurally: the call must return while the
-        // lane is still held; a blocked call could only return after release.
-        let early = done_rx.recv_timeout(crate::testing::HANG_BACKSTOP);
-        // Always release the hook before asserting, even on RED.
-        resume_tx.send(()).unwrap();
-        holder.join().unwrap();
-        let (_, first, mut registry, identity, options) =
-            early.expect("registry guard waited for the held watcher gate");
-        attempt.join().unwrap();
-        assert_eq!(first, Err(SelectionError::StorageBusy));
-        assert!(runtime.has_active_resources());
-        assert!(runtime.has_active_resources());
-        assert!(!registry.entries[&key].released);
-        assert!(registry.entries[&key].registration.is_none());
-        assert!(observed_scheduler.watcher_release_requested_for_tests());
-        // A timed-out serve must leave this retained CLI watcher usable.
-        registry.abandon_cli_replacement(&key);
-        assert!(!observed_scheduler.watcher_release_requested_for_tests());
-        let read_lease = runtime
-            .browser_scheduler()
-            .unwrap()
-            .admission_lease()
-            .unwrap();
-        assert_eq!(
-            registry.can_register(&identity, &options),
-            Err(SelectionError::StorageBusy)
-        );
-        assert!(!observed_scheduler.watcher_release_requested_for_tests());
-        drop(read_lease);
-        // A completed watcher leaves the same CLI-only checkout releasable.
-        let deadline = Instant::now() + crate::testing::HANG_BACKSTOP;
-        loop {
-            match registry.can_register(&identity, &options) {
-                Ok(()) => break,
-                Err(SelectionError::StorageBusy) if Instant::now() < deadline => {
-                    tokio::time::sleep(Duration::from_millis(25)).await;
-                }
-                outcome => panic!("idle replacement did not complete: {outcome:?}"),
-            }
-        }
-        assert!(!runtime.has_active_resources());
-    }
-
-    #[tokio::test]
-    async fn serve_cli_replacement_defers_maintenance_without_partial_stop() {
-        use std::sync::mpsc;
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("checkout");
-        git(temp.path(), &["init", "--quiet", root.to_str().unwrap()]);
-        let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
-        let roots =
-            TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
-        let mut registry = CheckoutRegistry::with_roots(roots);
-        let options = CheckoutOptions(serde_json::json!({"browseRoot": identity.root}));
-        registry.attach_launch(46, &identity).unwrap();
-        let runtime = registry.activate(&identity.root_key).unwrap();
-        registry.disconnect(46);
-        settled_after_first_inventory(&runtime).await;
-        let scheduler = runtime.browser_scheduler().unwrap();
-        let (held_tx, held_rx) = mpsc::channel();
-        let (resume_tx, resume_rx) = mpsc::channel();
-        let holder = std::thread::spawn(move || {
-            scheduler.hold_maintenance_gate_for_tests(|| {
-                held_tx.send(()).unwrap();
-                resume_rx.recv().unwrap();
-            });
-        });
-        held_rx.recv_timeout(crate::testing::HANG_BACKSTOP).unwrap();
-        let result = registry.can_register(&identity, &options);
-        assert_eq!(result, Err(SelectionError::StorageBusy));
-        assert!(runtime.has_active_resources());
-        assert!(runtime.has_active_resources());
-        assert!(!registry.entries[&identity.root_key].released);
-        assert!(
-            !runtime
-                .browser_scheduler()
-                .unwrap()
-                .checkout_runtime_stopped_for_tests()
-        );
-        resume_tx.send(()).unwrap();
-        holder.join().unwrap();
-        let deadline = Instant::now() + crate::testing::HANG_BACKSTOP;
-        loop {
-            match registry.can_register(&identity, &options) {
-                Ok(()) => break,
-                Err(SelectionError::StorageBusy) if Instant::now() < deadline => {
-                    tokio::time::sleep(Duration::from_millis(25)).await;
-                }
-                outcome => panic!("maintenance release did not complete: {outcome:?}"),
-            }
-        }
-        assert!(!runtime.has_active_resources());
-    }
-
-    #[tokio::test]
-    async fn idle_tick_defers_watcher_lock_without_blocking_registry() {
-        use std::sync::mpsc;
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("checkout");
-        git(temp.path(), &["init", "--quiet", root.to_str().unwrap()]);
-        let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
-        let roots =
-            TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
-        let mut registry = CheckoutRegistry::with_roots(roots);
-        registry.attach_launch(45, &identity).unwrap();
-        let runtime = registry.activate(&identity.root_key).unwrap();
-        registry.disconnect(45);
-        tokio::time::timeout(crate::testing::HANG_BACKSTOP, async {
-            while startup_running(runtime.browser_scheduler().unwrap().runtime_phase()) {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .unwrap();
-        let key = identity.root_key.clone();
-        let now = Instant::now();
-        registry.entries.get_mut(&key).unwrap().release_at = Some(now);
-        let scheduler = runtime.browser_scheduler().unwrap();
-        let (held_tx, held_rx) = mpsc::channel();
-        let (resume_tx, resume_rx) = mpsc::channel();
-        let holder = std::thread::spawn(move || {
-            scheduler.hold_watcher_gate_for_tests(|| {
-                held_tx.send(()).unwrap();
-                resume_rx.recv().unwrap();
-            });
-        });
-        held_rx.recv_timeout(crate::testing::HANG_BACKSTOP).unwrap();
-        let (done_tx, done_rx) = mpsc::channel();
-        let tick = std::thread::spawn(move || {
-            let started = Instant::now();
-            let result = registry.advance(now);
-            done_tx.send((started.elapsed(), result, registry)).unwrap();
-        });
-        // Non-blocking is proven structurally: the call must return while the
-        // lane is still held; a blocked call could only return after release.
-        let early = done_rx.recv_timeout(crate::testing::HANG_BACKSTOP);
-        resume_tx.send(()).unwrap();
-        holder.join().unwrap();
-        let (_, result, registry) = early.expect("idle tick waited for the held maintenance lane");
-        tick.join().unwrap();
-        result.unwrap();
-        assert!(runtime.has_active_resources());
-        assert!(runtime.has_active_resources());
-        assert!(!registry.entries[&key].released);
-        assert!(
-            !runtime
-                .browser_scheduler()
-                .unwrap()
-                .watcher_release_requested_for_tests()
-        );
-    }
-
-    #[tokio::test]
-    async fn serve_cli_replacement_preempts_real_watcher_tick_without_registry_wait() {
-        use std::sync::mpsc;
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("checkout");
-        git(temp.path(), &["init", "--quiet", root.to_str().unwrap()]);
-        let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
-        let roots =
-            TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
-        let mut registry = CheckoutRegistry::with_roots(roots);
-        let options = CheckoutOptions(serde_json::json!({"browseRoot": identity.root}));
-        registry.attach_launch(44, &identity).unwrap();
-        let runtime = registry.activate(&identity.root_key).unwrap();
-        registry.disconnect(44);
-        settled_after_first_inventory(&runtime).await;
-        let scheduler = runtime.browser_scheduler().unwrap();
-        let (held_tx, held_rx) = tokio::sync::oneshot::channel();
-        let (resume_tx, resume_rx) = mpsc::channel();
-        scheduler.set_watcher_gate_hook_for_tests(move || {
-            let _ = held_tx.send(());
-            resume_rx.recv().unwrap();
-        });
-        tokio::time::timeout(crate::testing::HANG_BACKSTOP, held_rx)
-            .await
-            .expect("real watcher tick did not reach the gate")
-            .unwrap();
-        let key = identity.root_key.clone();
-        let (done_tx, done_rx) = mpsc::channel();
-        let attempt = std::thread::spawn(move || {
-            let result = registry.can_register(&identity, &options);
-            done_tx.send((result, registry, identity, options)).unwrap();
-        });
-        // Non-blocking is proven structurally: the call must return while the
-        // lane is still held; a blocked call could only return after release.
-        let early = done_rx.recv_timeout(crate::testing::HANG_BACKSTOP);
-        resume_tx.send(()).unwrap();
-        let (result, mut registry, identity, options) =
-            early.expect("registry guard waited for the held real watcher tick");
-        attempt.join().unwrap();
-        assert_eq!(result, Err(SelectionError::StorageBusy));
-        assert!(runtime.has_active_resources());
-        assert!(runtime.has_active_resources());
-        assert!(!registry.entries[&key].released);
-        assert!(scheduler.watcher_release_requested_for_tests());
-        let deadline = Instant::now() + crate::testing::HANG_BACKSTOP;
-        loop {
-            match registry.can_register(&identity, &options) {
-                Ok(()) => break,
-                Err(SelectionError::StorageBusy) if Instant::now() < deadline => {
-                    tokio::time::sleep(Duration::from_millis(25)).await;
-                }
-                outcome => panic!("real watcher did not yield to serve: {outcome:?}"),
-            }
-        }
-        assert!(!runtime.has_active_resources());
-    }
-
-    #[tokio::test]
-    async fn serve_cli_replacement_preserves_accepted_fifo_head() {
-        use std::sync::mpsc;
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("checkout");
-        git(temp.path(), &["init", "--quiet", root.to_str().unwrap()]);
-        let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
-        let roots =
-            TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
-        let mut registry = CheckoutRegistry::with_roots(roots);
-        let options = CheckoutOptions(serde_json::json!({"browseRoot": identity.root}));
-        registry.attach_launch(43, &identity).unwrap();
-        let runtime = registry.activate(&identity.root_key).unwrap();
-        registry.disconnect(43);
-        settled_after_first_inventory(&runtime).await;
-        let resources = runtime.resources().unwrap();
-        let scheduler = resources.scheduler.clone();
-        let (held_tx, held_rx) = mpsc::channel();
-        let (resume_tx, resume_rx) = mpsc::channel();
-        let holder = std::thread::spawn(move || {
-            scheduler.hold_watcher_gate_for_tests(|| {
-                held_tx.send(()).unwrap();
-                resume_rx.recv().unwrap();
-            });
-        });
-        held_rx.recv_timeout(crate::testing::HANG_BACKSTOP).unwrap();
-        let accepted = resources
-            .store
-            .enqueue_request(&IndexOptions::new(identity.root.clone()), None)
-            .unwrap();
-        assert_eq!(
-            registry.can_register(&identity, &options),
-            Err(SelectionError::StorageBusy)
-        );
-        assert!(runtime.has_active_resources());
-        assert!(runtime.has_active_resources());
-        assert!(!resources.scheduler.watcher_release_requested_for_tests());
-        let queued = resources
-            .store
-            .request_by_id(&accepted.id)
-            .unwrap()
-            .unwrap();
-        assert_eq!(queued.state, "queued");
-        assert_eq!(queued.seq, accepted.seq);
-        resume_tx.send(()).unwrap();
-        holder.join().unwrap();
-        tokio::time::timeout(crate::testing::HANG_BACKSTOP, async {
-            loop {
-                if resources
-                    .store
-                    .request_by_id(&accepted.id)
-                    .unwrap()
-                    .unwrap()
-                    .finished_at
-                    .is_some()
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .unwrap();
-        let terminal = resources
-            .store
-            .request_by_id(&accepted.id)
-            .unwrap()
-            .unwrap();
-        assert_eq!(terminal.state, "done");
-    }
-
-    #[tokio::test]
-    async fn serve_registration_cannot_replace_busy_cli_runtime() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("checkout");
-        git(temp.path(), &["init", "--quiet", root.to_str().unwrap()]);
-        let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
-        let roots =
-            TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
-        let mut registry = CheckoutRegistry::with_roots(roots);
-        let options = CheckoutOptions(serde_json::json!({"browseRoot": identity.root}));
-        registry.attach_launch(41, &identity).unwrap();
-        let runtime = registry.activate(&identity.root_key).unwrap();
-        assert_eq!(
-            registry.can_register(&identity, &options),
-            Err(SelectionError::RegistrationConflict)
-        );
-        assert!(registry.runtimes.contains_key(&identity.root_key));
-        registry.disconnect(41);
-        let read_lease = runtime
-            .browser_scheduler()
-            .unwrap()
-            .admission_lease()
-            .unwrap();
-        assert_eq!(
-            registry.can_register(&identity, &options),
-            Err(SelectionError::StorageBusy)
-        );
-        assert!(registry.runtimes.contains_key(&identity.root_key));
-        drop(read_lease);
-        runtime
-            .browser_scheduler()
-            .unwrap()
-            .mark_startup_due_for_tests();
-        assert_eq!(
-            registry.can_register(&identity, &options),
-            Err(SelectionError::StorageBusy)
-        );
-        assert!(registry.runtimes.contains_key(&identity.root_key));
-        // A rejected call cannot install browser settings or change the writer.
-        assert!(registry.entries[&identity.root_key].registration.is_none());
     }
 
     #[test]

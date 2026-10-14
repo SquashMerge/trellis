@@ -270,9 +270,6 @@ pub struct BrowserProvisioner {
     token_path: Option<PathBuf>,
     token_inode: Option<(u64, u64)>,
     token: Option<String>,
-    /// SERVE_REPLACEMENT_WAIT in production; tests that exercise its expiry
-    /// shorten it rather than wait real seconds.
-    replacement_wait: std::time::Duration,
     effective_address: Option<std::net::SocketAddr>,
     closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
@@ -280,41 +277,6 @@ pub struct BrowserProvisioner {
 impl Default for BrowserProvisioner {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-/// How long serve waits for a CLI-activated runtime to finish its accepted
-/// work (H, FIFO, a read) before replacing it. Accepted work is never cut
-/// short, and under load an index can take several seconds; this bound only
-/// turns a stuck runtime into a typed storage_busy. #138 removes the wait by
-/// applying serve's registration in place at the worker's next boundary.
-pub const SERVE_REPLACEMENT_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
-
-/// The advisory watcher-release request a busy CLI-replacement retry arms on
-/// one runtime's scheduler. Reset synchronously on every exit from serve
-/// registration, including a dropped future. It holds the exact scheduler
-/// that was armed and never looks up a successor runtime by root key.
-#[derive(Default)]
-struct ArmedWatcherRelease(Option<std::sync::Arc<crate::http::DaemonState>>);
-
-impl ArmedWatcherRelease {
-    fn retain(&mut self, scheduler: Option<std::sync::Arc<crate::http::DaemonState>>) {
-        if let (Some(held), Some(next)) = (&self.0, &scheduler)
-            && std::sync::Arc::ptr_eq(held, next)
-        {
-            return;
-        }
-        if let Some(previous) = std::mem::replace(&mut self.0, scheduler) {
-            previous.reset_watcher_release();
-        }
-    }
-}
-
-impl Drop for ArmedWatcherRelease {
-    fn drop(&mut self) {
-        if let Some(scheduler) = self.0.take() {
-            scheduler.reset_watcher_release();
-        }
     }
 }
 
@@ -327,17 +289,9 @@ impl BrowserProvisioner {
             token_path: None,
             token_inode: None,
             token: None,
-            replacement_wait: SERVE_REPLACEMENT_WAIT,
             effective_address: None,
             closed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
-    }
-
-    /// Exercise the replacement wait's typed expiry without real seconds.
-    #[cfg(feature = "test-support")]
-    #[doc(hidden)]
-    pub fn set_replacement_wait_for_tests(&mut self, wait: std::time::Duration) {
-        self.replacement_wait = wait;
     }
 
     pub fn address(&self) -> Option<std::net::SocketAddr> {
@@ -368,8 +322,8 @@ impl BrowserProvisioner {
             .await
     }
 
-    /// Hook for deterministic boundary tests. `retry_wait` (test-support only)
-    /// runs after dropping the registry guard; other stages run under it.
+    /// Hook for deterministic boundary tests; every stage runs under the
+    /// registry guard.
     #[doc(hidden)]
     pub async fn register_serve_with_hook(
         &mut self,
@@ -392,35 +346,16 @@ impl BrowserProvisioner {
             .file_name()
             .ok_or_else(|| anyhow::anyhow!("token file needs a name"))?;
         let token_path = parent.canonicalize()?.join(file);
-        // A CLI-only runtime may still be finishing H, a selected read, or
-        // accepted work. Wait only for that typed transient state, releasing
-        // the registry guard so the runtime can finish. A genuine conflicting
-        // registration or attached client remains an immediate refusal.
-        let deadline = std::time::Instant::now() + self.replacement_wait;
-        // A busy retry may arm the runtime's advisory watcher release. The
-        // guard resets it on every exit: success, timeout, a later non-busy
-        // error, or this future being dropped.
-        let mut armed = ArmedWatcherRelease::default();
-        let mut checked = loop {
-            let mut checked = registry.lock().await;
-            match checked.can_register(identity, &options) {
-                Ok(()) => break checked,
-                Err(registry::SelectionError::StorageBusy) => {
-                    armed.retain(checked.cli_replacement_scheduler(&identity.root_key));
-                    drop(checked);
-                    if std::time::Instant::now() >= deadline {
-                        anyhow::bail!("{}", registry::SelectionError::StorageBusy.reason());
-                    }
-                    #[cfg(feature = "test-support")]
-                    if let Some(hook) = hook.as_mut() {
-                        hook("retry_wait");
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-                }
-                Err(error) => anyhow::bail!("{}", error.reason()),
-            }
-        };
-        drop(armed);
+        // One guard covers the conflict check, the configuration build, binding,
+        // token creation and the in-place publication (Decision 0009 §6). The
+        // daemon's provisioning mutex serializes serve registrations, so no
+        // other registration can win between these steps. Nothing waits for a
+        // checkout's index work.
+        let mut checked = registry.lock().await;
+        checked
+            .can_register(identity, &options)
+            .map_err(|error| anyhow::anyhow!("{}", error.reason()))?;
+        let config = checked.registration_config(identity, &options)?;
         // The same successful guard covers validation, binding, token creation
         // and registration; no other attachment can win between these steps.
         if let Some(hook) = hook.as_mut() {
@@ -449,9 +384,7 @@ impl BrowserProvisioner {
                 self.token.as_ref() == Some(&token),
                 "serve token contents changed"
             );
-            checked
-                .register(identity, options)
-                .map_err(|error| anyhow::anyhow!("{}", error.reason()))?;
+            checked.register_in_place(identity, options, config)?;
             return self
                 .address()
                 .ok_or_else(|| anyhow::anyhow!("browser listener closed"));
@@ -466,9 +399,7 @@ impl BrowserProvisioner {
         check_token_path(&token_path, inode)?;
         let browser =
             crate::http::ProvisionedBrowser::new(registry.clone(), token.clone(), address)?;
-        checked
-            .register(identity, options)
-            .map_err(|error| anyhow::anyhow!("{}", error.reason()))?;
+        checked.register_in_place(identity, options, config)?;
         self.listener = Some(listener);
         self.effective_address = Some(address);
         self.browser = Some(browser);

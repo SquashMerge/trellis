@@ -419,36 +419,19 @@ fn unchanged_serve_reuses_selected_versions_and_detects_selected_source_corrupti
 
     let first_log = temp.path().join("serve-unchanged.log");
     let leader = serve(&root, &home, &first_log);
-    // Serve registration is inert. A CLI attachment elects the checkout and
-    // performs mandatory H against the selected persisted head.
+    // Serve registers in place on the running checkout (Decision 0009 §6): no
+    // replacement runtime and no new startup reconciliation, so an unchanged
+    // workspace publishes nothing.
     let attached = command(&root, &home, "status").output().unwrap();
     assert!(
         attached.status.success(),
         "{}",
         String::from_utf8_lossy(&attached.stderr)
     );
-    let deadline = std::time::Instant::now() + trellis::testing::HANG_BACKSTOP;
-    while rusqlite::Connection::open(&dbpath)
-        .map(|db| pin_and_ids(&db).0)
-        .unwrap()
-        < 3
-    {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "mandatory H did not publish"
-        );
-        let attached = command(&root, &home, "status").output().unwrap();
-        assert!(
-            attached.status.success(),
-            "{}",
-            String::from_utf8_lossy(&attached.stderr)
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
     let db = rusqlite::Connection::open(&dbpath).unwrap();
     let (r2, ids) = pin_and_ids(&db);
-    assert_eq!(r2, 3, "new header+manifest pin required");
-    assert_eq!(ids.len(), 3);
+    assert_eq!(r2, 2, "unchanged serve publishes no new pin");
+    assert_eq!(ids.len(), 2);
     assert_eq!(
         (&ids[0].1, &ids[0].2, &ids[0].3),
         (&ids[1].1, &ids[1].2, &ids[1].3)
@@ -476,7 +459,7 @@ fn unchanged_serve_reuses_selected_versions_and_detects_selected_source_corrupti
     );
     assert_eq!(
         serde_json::from_slice::<Value>(&status.stdout).unwrap()["revision"]["indexRevision"],
-        3
+        2
     );
     drop(db);
     drop(leader);
@@ -526,8 +509,8 @@ fn unchanged_serve_reuses_selected_versions_and_detects_selected_source_corrupti
         .as_i64()
         .unwrap();
     assert!(
-        matches!(published_rev, 4 | 5),
-        "one Q publication, with at most one mandatory takeover H: {result}"
+        matches!(published_rev, 3 | 4),
+        "one Q publication, with at most one watcher publication of the edit: {result}"
     );
     let attached = command(&root, &home, "status").output().unwrap();
     assert!(
@@ -541,7 +524,7 @@ fn unchanged_serve_reuses_selected_versions_and_detects_selected_source_corrupti
     while rusqlite::Connection::open(&dbpath)
         .map(|db| pin_and_ids(&db).0)
         .unwrap()
-        < 4
+        < published_rev
     {
         assert!(
             std::time::Instant::now() < deadline,
@@ -564,16 +547,17 @@ fn unchanged_serve_reuses_selected_versions_and_detects_selected_source_corrupti
         ids.as_slice(),
         "retained prior pins changed"
     );
-    let changed_ids = &next_ids[3];
+    let changed_ids = &next_ids[ids.len()];
     assert_ne!(
-        ids[2].1, changed_ids.1,
+        ids.last().unwrap().1,
+        changed_ids.1,
         "same-length/mtime edit reused stale bytes"
     );
-    for current in next_ids.iter().skip(3) {
+    for current in next_ids.iter().skip(ids.len()) {
         assert_eq!(
             (&current.1, &current.2, &current.3),
             (&changed_ids.1, &changed_ids.2, &changed_ids.3),
-            "takeover H and Q must select the same new immutable evidence"
+            "the watcher and Q must select the same new immutable evidence"
         );
     }
     assert_eq!(next_ids[0].1, old_ids[0].1, "retained old pin changed");

@@ -45,7 +45,9 @@ use std::{
 };
 use subtle::ConstantTimeEq;
 
+mod config;
 mod worker;
+pub use config::BrowserConfig;
 pub use worker::{AdmissionLease, RetireOutcome, RuntimePhase};
 use worker::{RuntimeState, STARTUP_BACKOFF_FIRST};
 
@@ -227,8 +229,11 @@ pub struct DaemonState {
     startup_error: Mutex<Option<String>>,
     /// The next failed startup reconciliation waits this long (doubling, capped).
     startup_backoff: Mutex<Duration>,
-    /// Registered browser options were given explicitly and override recorded inputs.
-    explicit_options: AtomicBool,
+    /// The current browser configuration (Decision 0009 §6), replaced whole.
+    config: std::sync::RwLock<Arc<BrowserConfig>>,
+    /// Explicit index options a new configuration brought, applied by the
+    /// worker's next full watcher inventory and then recorded.
+    explicit_pending: Mutex<Option<IndexOptions>>,
     /// The worker's wake inbox. The queue waker, registered with every Store
     /// for this root, also marks FIFO work pending at the enqueue COMMIT; the
     /// watch waker only wakes.
@@ -260,10 +265,6 @@ pub struct DaemonState {
     /// Runs as a maintenance unit begins, after its priority check passed.
     #[cfg(feature = "test-support")]
     maintenance_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
-    options: IndexOptions,
-    browser: crate::file_tree::SourceDir,
-    rust_sources: Vec<crate::rust_sources::Root>,
-    dependency_options: Option<CatalogOptions>,
     dependencies: Mutex<DependencyIndex>,
     #[cfg(all(test, feature = "test-support"))]
     dependency_capture_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
@@ -279,8 +280,9 @@ pub struct DaemonState {
     origins: Vec<String>,
     jobs: Mutex<Jobs>,
     queue_tick_started: AtomicBool,
-    // Only idle watcher inventory is preempted by a CLI-only serve replacement.
-    watcher_release_cancel: CancelFlag,
+    /// Watcher inventories run on the worker and are never cancelled from
+    /// outside it (Decision 0009 §1).
+    watcher_cancel: CancelFlag,
     #[cfg(feature = "test-support")]
     startup_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Startup reconciliation captures begun, for the single-owner tests.
@@ -327,8 +329,6 @@ pub struct DaemonState {
     #[cfg(test)]
     test_queue_current_phase: std::sync::atomic::AtomicU8,
     packets: Mutex<PacketCache>,
-    provider: Option<Arc<LiveJev>>,
-    acp: Option<Arc<Acp>>,
 }
 impl Drop for DaemonState {
     /// A lossless shutdown: an idle worker waiting without a deadline exits.
@@ -427,6 +427,25 @@ pub fn new_with_dependency_options(
     source_roots: Vec<(String, std::path::PathBuf)>,
     catalog_options: Option<CatalogOptions>,
 ) -> anyhow::Result<Arc<DaemonState>> {
+    let config = BrowserConfig::build(
+        index_options,
+        false,
+        &browse_root,
+        source_roots,
+        catalog_options,
+        jev,
+        acp,
+    )?;
+    new_with_config(store, config, token, address)
+}
+
+/// A checkout scheduler with a prebuilt browser configuration.
+pub fn new_with_config(
+    store: Store,
+    config: BrowserConfig,
+    token: String,
+    address: SocketAddr,
+) -> anyhow::Result<Arc<DaemonState>> {
     anyhow::ensure!(
         address.ip().is_loopback() && address.port() != 0,
         "daemon requires a bound loopback address"
@@ -473,16 +492,12 @@ pub fn new_with_dependency_options(
         runtime: Mutex::new(RuntimeState::Activating),
         startup_error: Mutex::new(None),
         startup_backoff: Mutex::new(STARTUP_BACKOFF_FIRST),
-        explicit_options: AtomicBool::new(false),
-        options: index_options,
-        browser: crate::file_tree::SourceDir::open(&browse_root)?,
-        rust_sources: crate::rust_sources::open_roots(source_roots)?,
         dependencies: Mutex::new(DependencyIndex {
             generation: 0,
             cancel: Arc::new(AtomicBool::new(false)),
             stopped: false,
             worker_running: false,
-            state: if catalog_options.is_some() {
+            state: if config.dependency_options.is_some() {
                 "loading"
             } else {
                 "disabled"
@@ -496,18 +511,17 @@ pub fn new_with_dependency_options(
         outer_fence_hook: Mutex::new(None),
         #[cfg(all(test, feature = "test-support"))]
         preview_finish_hook: Mutex::new(None),
-        dependency_options: catalog_options,
         #[cfg(feature = "test-support")]
         token,
         #[cfg(feature = "test-support")]
         hosts,
         #[cfg(feature = "test-support")]
         origins,
-        provider: jev,
-        acp,
+        config: std::sync::RwLock::new(Arc::new(config)),
+        explicit_pending: Mutex::new(None),
         packets: Mutex::new(PacketCache::default()),
         queue_tick_started: AtomicBool::new(false),
-        watcher_release_cancel: Arc::new(AtomicBool::new(false)),
+        watcher_cancel: Arc::new(AtomicBool::new(false)),
         #[cfg(feature = "test-support")]
         startup_hook: Mutex::new(None),
         #[cfg(feature = "test-support")]
@@ -635,62 +649,6 @@ impl DaemonState {
         }
         self.start_worker();
     }
-    /// Ask only the disposable watcher inventory to yield for an eligible
-    /// CLI-only replacement. FIFO and mandatory H retain their own authority.
-    pub(crate) fn request_watcher_release(&self) {
-        self.watcher_release_cancel.store(true, Ordering::Release);
-    }
-
-    pub(crate) fn reset_watcher_release(&self) {
-        self.watcher_release_cancel.store(false, Ordering::Release);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn watcher_release_requested_for_tests(&self) -> bool {
-        self.watcher_release_cancel.load(Ordering::Acquire)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn checkout_runtime_stopped_for_tests(&self) -> bool {
-        self.retired()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn hold_maintenance_gate_for_tests(&self, hold: impl FnOnce()) {
-        let _maintenance = self.maintenance_stream.lock().unwrap();
-        hold();
-    }
-
-    /// Hold both worker lanes before changing any retirement state. A busy
-    /// watcher or maintenance unit is a retry, not a half-retired runtime.
-    pub(crate) fn try_release_checkout_runtime_if(
-        &self,
-        ready: impl FnOnce(RuntimePhase) -> bool,
-    ) -> Result<bool, crate::store::topology::StorageBusy> {
-        let _stream = self
-            .native_stream
-            .try_lock()
-            .map_err(|_| crate::store::topology::StorageBusy)?;
-        let _maintenance = self
-            .maintenance_stream
-            .try_lock()
-            .map_err(|_| crate::store::topology::StorageBusy)?;
-        // Decide and retire under the state lock, so no lease or enqueue
-        // admitted under that lock can slip between the check and `Retired`.
-        let mut state = self.runtime.lock().unwrap();
-        if !ready(RuntimePhase::of(&state)) {
-            return Ok(false);
-        }
-        self.watcher_release_cancel.store(true, Ordering::Release);
-        *state = RuntimeState::Retired;
-        *self.watcher_work.lock().unwrap() = None;
-        *self.watch_status.lock().unwrap() = None;
-        self.watcher_health.store(false, Ordering::Release);
-        drop(state);
-        // The worker sees `Retired` at its next wake and exits.
-        self.inbox.wake();
-        Ok(true)
-    }
 
     /// Offline CLI fixtures must drain worker lanes before inspecting SQLite.
     /// Production registry release instead uses the nonblocking try-release gate.
@@ -698,7 +656,6 @@ impl DaemonState {
     pub fn release_checkout_runtime_for_fixture(&self) {
         let _stream = self.native_stream.lock().unwrap();
         let _maintenance = self.maintenance_stream.lock().unwrap();
-        self.watcher_release_cancel.store(true, Ordering::Release);
         self.set_runtime_state(RuntimeState::Retired);
         self.inbox.wake();
     }
@@ -717,13 +674,6 @@ impl DaemonState {
 
     fn retired(&self) -> bool {
         matches!(*self.runtime.lock().unwrap(), RuntimeState::Retired)
-    }
-
-    /// Pause the real queue tick after it acquires native_stream and
-    /// watcher_work, before its watcher reconciliation begins.
-    #[cfg(test)]
-    pub(crate) fn set_watcher_gate_hook_for_tests(&self, hook: impl FnOnce() + Send + 'static) {
-        self.test_queue_before_watcher_reconcile.set(hook);
     }
 
     /// Synchronize the native/watcher lock boundary in a registry race test.
@@ -1031,7 +981,7 @@ impl DaemonState {
         // watcher/options binding is intent until native_stream replaces it.
         let options = match self.store.recorded_index_options() {
             Ok(Some(options)) => options,
-            Ok(None) => self.options.clone(),
+            Ok(None) => self.config().options.clone(),
             Err(_) => return Ok(()),
         };
         if let Some(reason) = self.maintenance_priority_reason(&session, &options) {
@@ -1131,7 +1081,7 @@ impl DaemonState {
                 let options = self
                     .store
                     .recorded_index_options()?
-                    .unwrap_or_else(|| self.options.clone());
+                    .unwrap_or_else(|| self.config().options.clone());
                 let mut work = self.watcher_work.lock().unwrap();
                 if work.is_none() {
                     let mut scheduler = crate::index_coordinator::WatcherWork::publishing(
@@ -1330,11 +1280,17 @@ impl DaemonState {
                 && !self.store.has_recorded_completion(session)?
             {
                 // The idle watcher follows the selected head's persisted inputs.
-                // Daemon defaults cannot silently supersede a FIFO head's options.
-                let selected_options = self
-                    .store
-                    .recorded_index_options()?
-                    .unwrap_or_else(|| self.options.clone());
+                // Daemon defaults cannot silently supersede a FIFO head's options;
+                // explicit options a new `serve` registration brought are applied
+                // once, by the next full inventory (Decision 0009 §6).
+                let explicit = self.explicit_pending.lock().unwrap().clone();
+                let selected_options = match &explicit {
+                    Some(options) => options.clone(),
+                    None => self
+                        .store
+                        .recorded_index_options()?
+                        .unwrap_or_else(|| self.config().options.clone()),
+                };
                 {
                     let mut work = self.watcher_work.lock().unwrap();
                     if !work.as_ref().is_some_and(|(owner, _)| {
@@ -1368,7 +1324,7 @@ impl DaemonState {
                             &self.store,
                             session,
                             &selected_options,
-                            &self.watcher_release_cancel,
+                            &self.watcher_cancel,
                             false,
                         );
                         self.publish_watch_status(scheduler, &selected_options);
@@ -1419,9 +1375,9 @@ impl DaemonState {
     /// Start a replacement generation without doing filesystem or database work on the caller.
     /// A previous generation can finish, but can never publish over its replacement.
     pub fn start_dependency_index(self: &Arc<Self>) {
-        let Some(options) = self.dependency_options.clone() else {
+        if self.config().dependency_options.is_none() {
             return;
-        };
+        }
         if !self.dependencies.lock().unwrap().request_build() {
             return;
         }
@@ -1438,12 +1394,18 @@ impl DaemonState {
                 };
                 let worker = state.clone();
                 let worker_cancel = cancel.clone();
-                let options = options.clone();
                 let result = tokio::task::spawn_blocking(move || {
                     let result = (|| {
+                        // Each generation builds with the configuration current
+                        // when it starts; a replaced one bumps the generation.
+                        let config = worker.config();
+                        let options = config
+                            .dependency_options
+                            .clone()
+                            .ok_or_else(|| anyhow::anyhow!("dependency catalog disabled"))?;
                         let revision = worker.store.status()?.revision;
                         Catalog::build(
-                            &worker.options.workspace_root,
+                            &config.options.workspace_root,
                             revision,
                             &options,
                             &worker_cancel,
@@ -1520,13 +1482,13 @@ impl DaemonState {
             dependencies.cancel.store(true, Ordering::Release);
             dependencies.generation += 1;
             dependencies.catalog = None;
-            if self.dependency_options.is_some() {
+            if self.config().dependency_options.is_some() {
                 dependencies.state = "failed";
                 dependencies.warnings =
                     vec!["Dependency indexing cancelled during shutdown".into()];
             }
         }
-        if let Some(acp) = &self.acp {
+        if let Some(acp) = self.config().acp.clone() {
             acp.cancel_all();
         }
         self.jobs
@@ -2102,7 +2064,7 @@ async fn dependency_refresh(
     if !body.as_object().is_some_and(|object| object.is_empty()) {
         return Err(invalid());
     }
-    if s.dependency_options.is_none() {
+    if s.config().dependency_options.is_none() {
         return Err(ApiError(
             StatusCode::CONFLICT,
             "dependencies_disabled",
@@ -2223,7 +2185,7 @@ async fn dependency_source(
 #[cfg(feature = "test-support")]
 async fn rust_source_roots(State(s): State<Arc<DaemonState>>) -> Json<Value> {
     Json(
-        json!({"roots": s.rust_sources.iter().map(|r| json!({"id": r.label, "label": r.label, "path": r.directory.root.to_string_lossy()})).collect::<Vec<_>>()}),
+        json!({"roots": s.config().rust_sources.iter().map(|r| json!({"id": r.label, "label": r.label, "path": r.directory.root.to_string_lossy()})).collect::<Vec<_>>()}),
     )
 }
 #[derive(Deserialize)]
@@ -2286,7 +2248,8 @@ async fn rust_source_tree(
     }
     let revision = db(s.clone(), |s| s.status()).await?.revision;
     tokio::task::spawn_blocking(move || {
-        let root = s
+        let config = s.config();
+        let root = config
             .rust_sources
             .iter()
             .find(|r| r.label == q.root)
@@ -2324,7 +2287,8 @@ async fn rust_source_file(
         return Err(browse_invalid());
     }
     tokio::task::spawn_blocking(move || {
-        let root = s
+        let config = s.config();
+        let root = config
             .rust_sources
             .iter()
             .find(|r| r.label == q.root)
@@ -2403,16 +2367,18 @@ async fn tree(
     }
     tokio::task::spawn_blocking(move || {
         s.store.verify_root()?;
-        let (mut items, next_offset, truncated) = s
+        let config = s.config();
+        let (mut items, next_offset, truncated) = config
             .browser
             .list(&q.path, q.offset, q.limit)
             .map_err(|e| browse_directory_error(&e))?;
-        let (revision, indexed_workspace) = s.store.tree_metadata(&s.browser.root, &mut items)?;
+        let (revision, indexed_workspace) =
+            s.store.tree_metadata(&config.browser.root, &mut items)?;
         for item in items
             .iter_mut()
             .filter(|e| e.kind == "file" && e.indexed_path.is_none())
         {
-            let absolute = s.browser.root.join(&item.path);
+            let absolute = config.browser.root.join(&item.path);
             let reason = if !absolute.starts_with(&indexed_workspace) {
                 "Outside indexed workspace"
             } else {
@@ -2431,7 +2397,7 @@ async fn tree(
         }
         s.store.verify_root()?;
         Ok(Json(crate::file_tree::Page {
-            root: s.browser.root.to_string_lossy().into_owned(),
+            root: config.browser.root.to_string_lossy().into_owned(),
             indexed_workspace,
             path: q.path,
             revision,
@@ -2681,7 +2647,7 @@ async fn start_index(
             "revision conflict: exceptional recovery has no decodable prior pin"
         )));
     }
-    let options = s.options.clone();
+    let options = s.config().options.clone();
     let scheduler = s.clone();
     let row = db(s.clone(), move |_| {
         scheduler.enqueue_index(&options, request.expected_revision)
@@ -3152,7 +3118,7 @@ async fn question_selection(
 // Status only reads the local ledger. No endpoint other than jev-run contacts Jev.
 #[cfg(feature = "test-support")]
 async fn acp_status(State(s): State<Arc<DaemonState>>) -> Result<Json<Value>, ApiError> {
-    let Some(provider) = s.acp.clone() else {
+    let Some(provider) = s.config().acp.clone() else {
         return Ok(Json(json!({"enabled":false,"status":null})));
     };
     let status = tokio::task::spawn_blocking(move || provider.status())
@@ -3212,7 +3178,7 @@ async fn question_answer(
         return Err(invalid());
     }
     db(s.clone(), |store| store.status().map(|_| ())).await?;
-    let provider = s.acp.clone().ok_or(ApiError(
+    let provider = s.config().acp.clone().ok_or(ApiError(
         StatusCode::SERVICE_UNAVAILABLE,
         "acp_disabled",
         "Live ACP is disabled",
@@ -3248,7 +3214,7 @@ async fn question_answer(
 
 #[cfg(feature = "test-support")]
 async fn jev_status(State(s): State<Arc<DaemonState>>) -> Result<Json<Value>, ApiError> {
-    let Some(provider) = s.provider.clone() else {
+    let Some(provider) = s.config().provider.clone() else {
         return Ok(Json(json!({"enabled":false,"budget":null})));
     };
     let budget = db(s, move |_| provider.budget()).await?;
@@ -3305,7 +3271,7 @@ async fn question_run(
     if !body.is_empty() && body.as_ref() != b"{}" {
         return Err(invalid());
     }
-    let provider = s.provider.clone().ok_or(ApiError(
+    let provider = s.config().provider.clone().ok_or(ApiError(
         StatusCode::SERVICE_UNAVAILABLE,
         "jev_disabled",
         "Live Jev is disabled",
@@ -5133,9 +5099,12 @@ mod exceptional_recovery_tests {
             .unwrap();
         assert_eq!(status, StatusCode::ACCEPTED);
         let q1 = store.request_by_id(&browser.id).unwrap().unwrap();
-        let cli = Store::open_for_tests(&_tmp.path().join("state"), &state.options.workspace_root)
-            .unwrap();
-        let q2 = cli.enqueue_request(&state.options, None).unwrap();
+        let cli = Store::open_for_tests(
+            &_tmp.path().join("state"),
+            &state.config().options.workspace_root,
+        )
+        .unwrap();
+        let q2 = cli.enqueue_request(&state.config().options, None).unwrap();
         assert!(q0.seq < q1.seq && q1.seq < q2.seq);
         assert_eq!(
             store.request_by_id(&q1.id).unwrap().unwrap().state,
@@ -5207,7 +5176,9 @@ mod exceptional_recovery_tests {
     async fn cli_accepted_exceptional_request_without_local_pending_id_must_be_driven() {
         let (_tmp, store, state, _roots, _identity) = fixture();
         let q0 = store.current_request().unwrap().unwrap();
-        let accepted = store.enqueue_request(&state.options, None).unwrap();
+        let accepted = store
+            .enqueue_request(&state.config().options, None)
+            .unwrap();
         assert!(
             state.pending_requests.lock().unwrap().is_empty(),
             "a separate CLI process cannot populate daemon-local pending_requests"
@@ -5856,8 +5827,10 @@ mod exceptional_recovery_tests {
         // FIFO head per explicit step.
         let q0 = store.current_request().unwrap().unwrap();
         assert_eq!(q0.state, "queued");
-        let expected_options =
-            serde_json::to_string(&crate::indexer::ReconcileOptions::from(&state.options)).unwrap();
+        let expected_options = serde_json::to_string(&crate::indexer::ReconcileOptions::from(
+            &state.config().options,
+        ))
+        .unwrap();
         assert_eq!(q0.options_json, expected_options);
         let app = router(state.clone());
         let mut ids = Vec::new();
@@ -7139,7 +7112,7 @@ async fn provisioned_core_answer(
             let state = runtime.browser_scheduler()?;
             let (_, revision, catching_up) =
                 selected_provider_preflight(runtime, hook, None).await?;
-            if state.dependency_options.is_none() {
+            if state.config().dependency_options.is_none() {
                 return Err(ApiError(
                     StatusCode::CONFLICT,
                     "dependencies_disabled",
@@ -7192,7 +7165,7 @@ async fn provisioned_core_answer(
                 selected_provider_preflight(runtime, hook, Some(id.to_owned())).await?;
             let packet = packet.unwrap();
             if jev {
-                let provider = state.provider.clone().ok_or(ApiError(
+                let provider = state.config().provider.clone().ok_or(ApiError(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "jev_disabled",
                     "Live Jev is disabled",
@@ -7237,7 +7210,7 @@ async fn provisioned_core_answer(
                     .insert("X-Trellis-Mutation-Outcome", outcome.parse().unwrap());
                 Ok((response, catching_up))
             } else {
-                let provider = state.acp.clone().ok_or(ApiError(
+                let provider = state.config().acp.clone().ok_or(ApiError(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "acp_disabled",
                     "Live ACP is disabled",
@@ -7278,12 +7251,12 @@ async fn provisioned_core_answer(
             let jev = suffix == "jev/status";
             let (value, catching_up) = selected_provider_read(runtime, hook, move |_| {
                 if jev {
-                    match &state.provider {
+                    match &state.config().provider {
                         Some(provider) => Ok(json!({"enabled":true,"budget":provider.budget().map_err(ApiError::from)?})),
                         None => Ok(json!({"enabled":false,"budget":null})),
                     }
                 } else {
-                    match &state.acp {
+                    match &state.config().acp {
                         Some(provider) => Ok(json!({"enabled":true,"status":provider.status().map_err(acp_error)?})),
                         None => Ok(json!({"enabled":false,"status":null})),
                     }
@@ -7389,7 +7362,7 @@ async fn provisioned_core_answer(
             }
             let state = runtime.browser_scheduler()?;
             let (payload, catching_up) = selected_provider_read(runtime, hook, move |_| {
-                Ok(json!({"roots":state.rust_sources.iter().map(|r| json!({"id":r.label,"label":r.label,
+                Ok(json!({"roots":state.config().rust_sources.iter().map(|r| json!({"id":r.label,"label":r.label,
                     "path":r.directory.root.to_string_lossy()})).collect::<Vec<_>>() }))
             }).await?;
             Ok((Json(payload).into_response(), catching_up))
@@ -7405,7 +7378,8 @@ async fn provisioned_core_answer(
             let state = runtime.browser_scheduler()?;
             let (page, catching_up) = selected_provider_read(runtime, hook, move |r| {
                 let revision = r.status().map_err(ApiError::from)?.revision;
-                let root = state
+                let config = state.config();
+                let root = config
                     .rust_sources
                     .iter()
                     .find(|root| root.label == q.root)
@@ -7437,7 +7411,8 @@ async fn provisioned_core_answer(
             }
             let state = runtime.browser_scheduler()?;
             let (file, catching_up) = selected_provider_read(runtime, hook, move |_| {
-                let root = state
+                let config = state.config();
+                let root = config
                     .rust_sources
                     .iter()
                     .find(|root| root.label == q.root)
@@ -7482,16 +7457,17 @@ async fn provisioned_core_answer(
             let state = runtime.browser_scheduler()?;
             let (page, catching_up) = selected_evidence(runtime, hook, move |response| {
                 let (mut items, next_offset, truncated) = state
+                    .config()
                     .browser
                     .list(&q.path, q.offset, q.limit)
                     .map_err(BrowseDirectoryError)?;
                 let (revision, indexed_workspace) =
-                    response.tree_metadata(&state.browser.root, &mut items)?;
+                    response.tree_metadata(&state.config().browser.root, &mut items)?;
                 for item in items
                     .iter_mut()
                     .filter(|item| item.kind == "file" && item.indexed_path.is_none())
                 {
-                    let absolute = state.browser.root.join(&item.path);
+                    let absolute = state.config().browser.root.join(&item.path);
                     let reason = if !absolute.starts_with(&indexed_workspace) {
                         "Outside indexed workspace"
                     } else {
@@ -7506,7 +7482,7 @@ async fn provisioned_core_answer(
                     item.unindexed_reason = Some(reason.into());
                 }
                 Ok(crate::file_tree::Page {
-                    root: state.browser.root.to_string_lossy().into_owned(),
+                    root: state.config().browser.root.to_string_lossy().into_owned(),
                     indexed_workspace,
                     path: q.path,
                     revision,

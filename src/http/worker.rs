@@ -103,9 +103,7 @@ impl DaemonState {
     }
 
     /// Begin mandatory startup reconciliation for a daemon checkout runtime.
-    /// `explicit` registered options override the recorded index inputs.
-    pub(crate) fn begin_startup_reconciliation(self: &Arc<Self>, explicit: bool) {
-        self.explicit_options.store(explicit, Ordering::Release);
+    pub(crate) fn begin_startup_reconciliation(self: &Arc<Self>) {
         {
             let mut state = self.runtime.lock().unwrap();
             if matches!(*state, RuntimeState::Activating) {
@@ -116,15 +114,6 @@ impl DaemonState {
             }
         }
         self.start_worker();
-    }
-
-    /// Make startup reconciliation due again, as a lost session would.
-    #[cfg(test)]
-    pub(crate) fn mark_startup_due_for_tests(&self) {
-        *self.runtime.lock().unwrap() = RuntimeState::Reconciling {
-            attempts: 1,
-            waiting: false,
-        };
     }
 
     #[cfg(feature = "test-support")]
@@ -200,7 +189,8 @@ impl DaemonState {
     /// daemon defaults. A recreate without trusted inputs needs the FIFO
     /// head's options (or, for a replaced root, the defaults).
     fn startup_options(&self) -> anyhow::Result<Option<IndexOptions>> {
-        let explicit = self.explicit_options.load(Ordering::Acquire);
+        let config = self.config();
+        let explicit = config.explicit_options;
         // The FIFO head is read first, even when unused: a typed failure to
         // read it defers this attempt rather than reconciling around it.
         let head = self
@@ -209,16 +199,20 @@ impl DaemonState {
             .transpose()?;
         if self.store.is_recreate_pending() {
             if explicit {
-                return Ok(Some(self.options.clone()));
+                return Ok(Some(config.options.clone()));
             }
-            return Ok(head.or_else(|| self.store.is_root_replaced().then(|| self.options.clone())));
+            return Ok(head.or_else(|| {
+                self.store
+                    .is_root_replaced()
+                    .then(|| config.options.clone())
+            }));
         }
         if explicit {
-            return Ok(Some(self.options.clone()));
+            return Ok(Some(config.options.clone()));
         }
         Ok(Some(match self.store.recorded_index_options()? {
             Some(recorded) => recorded,
-            None => head.unwrap_or_else(|| self.options.clone()),
+            None => head.unwrap_or_else(|| config.options.clone()),
         }))
     }
 
@@ -635,7 +629,6 @@ impl DaemonState {
         *self.watch_status.lock().unwrap() = None;
         *self.watcher_work.lock().unwrap() = None;
         self.watcher_health.store(false, Ordering::Release);
-        self.watcher_release_cancel.store(true, Ordering::Release);
         #[cfg(feature = "test-support")]
         if let Some(hook) = self.closing_hook.lock().unwrap().take() {
             hook();
@@ -661,7 +654,7 @@ impl DaemonState {
             _ => return,
         };
         let options = match self.store.recorded_index_options() {
-            Ok(options) => options.unwrap_or_else(|| self.options.clone()),
+            Ok(options) => options.unwrap_or_else(|| self.config().options.clone()),
             Err(_) => return,
         };
         let mut work = self.watcher_work.lock().unwrap();
@@ -673,13 +666,7 @@ impl DaemonState {
         {
             return;
         }
-        let _ = watcher.reconcile_due(
-            &self.store,
-            &session,
-            &options,
-            &self.watcher_release_cancel,
-            true,
-        );
+        let _ = watcher.reconcile_due(&self.store, &session, &options, &self.watcher_cancel, true);
     }
 
     /// Wait until this runtime is `Retired` (or `timeout` passes). Close is

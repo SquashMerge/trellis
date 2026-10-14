@@ -328,13 +328,15 @@ for (const kind of ["view","note"]) test(`real browser ${kind} save, edit, stale
   t.after(async()=>{try{await context?.close();}catch{}try{await browser?.close();}catch{}await stopDaemon(server);rmSync(paths.temp,{recursive:true,force:true,maxRetries:10,retryDelay:100});});
   const indexed=await run(binary,["index","--workspace",paths.workspace],{env:paths.env,timeout:30000});
   const initialPin=JSON.parse(indexed.stdout).status.revision;
-  server=await startDaemon(paths,initialPin.indexRevision+1);
+  // Serve registers in place on the indexed checkout (Decision 0009 §6): no
+  // new startup reconciliation, so the indexed pin stays the head.
+  server=await startDaemon(paths,initialPin.indexRevision);
   const servingStatus=await api(server.base,paths.token,"GET",scoped(server.rootKey,"status"));
   assert.equal(servingStatus.status,200,JSON.stringify(servingStatus.data));
   const originalRootKey=server.rootKey;
   const P=servingStatus.data.revision;
   assert.equal(P.indexGeneration,initialPin.indexGeneration);
-  assert.equal(P.indexRevision,initialPin.indexRevision+1);
+  assert.equal(P.indexRevision,initialPin.indexRevision);
   let wrongToken; do { wrongToken = randomBytes(32).toString("hex"); } while (wrongToken === paths.token);
   const denied = await fetch(`${server.base}${scoped(server.rootKey,"views")}`, {signal:AbortSignal.timeout(8000),
     headers:{Origin:server.base,Authorization:`Bearer ${wrongToken}`}});
