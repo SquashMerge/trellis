@@ -1226,7 +1226,7 @@ mod stdin_fence_tests {
             let line = format!("{{\"n\":{n}}}\n");
             write_line(fds[1], &line);
             let written = fence.written().unwrap();
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + crate::testing::HANG_BACKSTOP;
             while !fence.settled(written) {
                 assert!(Instant::now() < deadline, "input never settled");
                 thread::sleep(Duration::from_millis(1));
@@ -1239,10 +1239,10 @@ mod stdin_fence_tests {
         }
         unsafe { libc::close(fds[1]) };
         assert!(matches!(
-            frames.recv_timeout(Duration::from_secs(5)),
+            frames.recv_timeout(crate::testing::HANG_BACKSTOP),
             Ok((Frame::Eof, _))
         ));
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + crate::testing::HANG_BACKSTOP;
         while !fence.settled(u64::MAX) {
             assert!(Instant::now() < deadline, "a closed reader is settled");
             thread::sleep(Duration::from_millis(1));
@@ -1267,7 +1267,7 @@ mod stdin_fence_tests {
         };
         thread::sleep(Duration::from_millis(20));
         let written = fence.written().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + crate::testing::HANG_BACKSTOP;
         while !fence.settled(written) {
             while frames.try_recv().is_ok() {}
             assert!(
@@ -1369,7 +1369,7 @@ mod reply_gate_tests {
             if self.fds[1] >= 0 {
                 unsafe { libc::close(self.fds[1]) };
             }
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + crate::testing::HANG_BACKSTOP;
             while !self.fence.closed.load(Ordering::SeqCst) && Instant::now() < deadline {
                 while self.frames.try_recv().is_ok() {}
                 thread::sleep(Duration::from_millis(1));
@@ -1407,7 +1407,7 @@ mod reply_gate_tests {
 
     /// Block until the read end reports that no writer remains.
     fn wait_for_hangup(fd: libc::c_int) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + crate::testing::HANG_BACKSTOP;
         loop {
             let mut ready = libc::pollfd {
                 fd,
@@ -1516,7 +1516,7 @@ mod reply_gate_tests {
             let fence = fixture.fence.clone();
             *fixture.fence.after_sample.lock().unwrap() = Some(Box::new(move || {
                 unsafe { libc::close(fd) };
-                let deadline = Instant::now() + Duration::from_secs(5);
+                let deadline = Instant::now() + crate::testing::HANG_BACKSTOP;
                 while !fence.closed.load(std::sync::atomic::Ordering::SeqCst) {
                     assert!(Instant::now() < deadline, "EOF never delivered");
                     thread::sleep(Duration::from_millis(1));
@@ -1561,7 +1561,7 @@ mod reply_gate_tests {
                     LATER.len() as isize
                 );
                 let through = fence.written().unwrap();
-                let deadline = Instant::now() + Duration::from_secs(5);
+                let deadline = Instant::now() + crate::testing::HANG_BACKSTOP;
                 while !fence.settled(through) {
                     assert!(Instant::now() < deadline, "later frame never delivered");
                     thread::sleep(Duration::from_millis(1));
@@ -1610,14 +1610,14 @@ mod reply_gate_tests {
             })
         };
         // At least one later frame is queued before the gate runs.
-        first.recv_timeout(Duration::from_secs(5)).unwrap();
+        first.recv_timeout(crate::testing::HANG_BACKSTOP).unwrap();
         let (done, decided) = std::sync::mpsc::channel();
         let gate = thread::spawn(move || {
             let fixture = Fixture::new();
             let (gate, deferred) = fixture.gate_on(&frames);
             let _ = done.send(matches!(gate, ReplyGate::Write) && deferred.is_some());
         });
-        let outcome = decided.recv_timeout(Duration::from_secs(5));
+        let outcome = decided.recv_timeout(crate::testing::HANG_BACKSTOP);
         stop.store(true, Ordering::Release);
         producer.join().unwrap();
         assert_eq!(outcome, Ok(true), "later input stalled the reply gate");

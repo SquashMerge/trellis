@@ -29,7 +29,6 @@ pub mod native_ids;
 pub mod navigation;
 mod rust_sources;
 pub mod store;
-#[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub mod testing;
 pub mod watch;

@@ -17,7 +17,7 @@ fn roots(state: &Path) -> TopologyRoots {
     TopologyRoots::isolated_for_tests(state.join("cache"), state.join("data"))
 }
 async fn ready(runtime: &trellis::daemon::registry::CheckoutRuntime) {
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             if let Ok((response, catching_up)) = runtime.evidence_response() {
                 let finished = response.finish(()).is_ok();
@@ -33,7 +33,7 @@ async fn ready(runtime: &trellis::daemon::registry::CheckoutRuntime) {
 }
 
 async fn release_when_idle(registry: &mut CheckoutRegistry, key: &str) {
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         while !registry.release(key).unwrap() {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
@@ -168,7 +168,7 @@ async fn reattach_reports_catching_up_and_keeps_complete_head_until_h() {
         entered_tx.send(()).unwrap();
         resume_rx.lock().unwrap().recv().unwrap();
     }));
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         while entered_rx.try_recv().is_err() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -218,7 +218,7 @@ async fn cli_symbols_and_export_use_the_admitted_prior_head_during_h() {
         entered_tx.send(()).unwrap();
         resume_rx.lock().unwrap().recv().unwrap();
     }));
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         while entered_rx.try_recv().is_err() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -270,7 +270,7 @@ async fn committed_queue_survives_runtime_restart() {
     restarted.attach_launch(1, &id).unwrap();
     let _runtime = restarted.activate(&id.root_key).unwrap();
     let observed = Store::open(topology, identity(&checkout)).unwrap();
-    tokio::time::timeout(Duration::from_secs(20), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             if observed
                 .request_by_id(&accepted.id)
@@ -337,7 +337,7 @@ async fn replacement_settles_old_queue_before_h_then_claims_distinct_fifo_option
         entered_tx.send(()).unwrap();
         resume_rx.lock().unwrap().recv().unwrap();
     }));
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         while entered_rx.try_recv().is_err() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -368,7 +368,7 @@ async fn replacement_settles_old_queue_before_h_then_claims_distinct_fifo_option
         continue_rx.lock().unwrap().recv().unwrap();
     });
     resume_tx.send(()).unwrap();
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         while claim_rx.try_recv().is_err() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -391,7 +391,7 @@ async fn replacement_settles_old_queue_before_h_then_claims_distinct_fifo_option
         "queued"
     );
     continue_tx.send(()).unwrap();
-    tokio::time::timeout(Duration::from_secs(20), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             if [&a, &b].iter().all(|row| {
                 new_store
@@ -479,7 +479,7 @@ async fn ambiguous_root_settlement_blocks_h_and_fifo_until_queue_reread() {
     runtime.set_pre_h_hook_for_tests(std::sync::Arc::new(move || {
         h_tx.send(()).unwrap();
     }));
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         while ambiguous_rx.try_recv().is_err() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -508,14 +508,14 @@ async fn ambiguous_root_settlement_blocks_h_and_fifo_until_queue_reread() {
         Some("root_changed")
     );
     confirm_tx.send(()).unwrap();
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         while h_rx.try_recv().is_err() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
     .expect("H did not start after confirmed queue reread");
-    tokio::time::timeout(Duration::from_secs(20), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             match new_store.request_by_id(&accepted.id) {
                 Ok(Some(row)) if row.finished_at.is_some() => break,
@@ -608,7 +608,7 @@ async fn retained_registration_and_old_runtime_handle_hold_no_checkout_descripto
         old.evidence_response().is_err(),
         "released handles cannot answer"
     );
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         while file_descriptors(&checkout) != baseline
             || file_descriptors(&lock_path) != 0
             || file_descriptors(&index_db) != 0
@@ -674,7 +674,7 @@ async fn root_loss_fails_accepted_work_then_releases_old_runtime_handles() {
         "unavailable",
         "accepted FIFO row prevents replacement listing"
     );
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         while registry.refresh_pending_work(&key).unwrap() {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
@@ -705,7 +705,7 @@ async fn root_loss_fails_accepted_work_then_releases_old_runtime_handles() {
     );
     assert!(!old.has_active_resources());
     assert!(old.evidence_response().is_err());
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         while file_descriptors(&moved) != 0 || file_descriptors(&leader_path) != 0 {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -742,7 +742,7 @@ async fn root_loss_during_paused_reattach_h_waits_for_worker_then_releases() {
         entered_tx.send(()).unwrap();
         resume_rx.lock().unwrap().recv().unwrap();
     }));
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         while entered_rx.try_recv().is_err() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -778,7 +778,7 @@ async fn root_loss_during_paused_reattach_h_waits_for_worker_then_releases() {
     assert!(paused.has_active_resources());
     assert!(file_descriptors(&moved) > 0);
     resume_tx.send(()).unwrap();
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         while !registry.release(&key).unwrap() {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
@@ -787,7 +787,7 @@ async fn root_loss_during_paused_reattach_h_waits_for_worker_then_releases() {
     .expect("root-lost H did not retire and release");
     assert!(!paused.has_active_resources());
     assert!(paused.evidence_response().is_err());
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         while file_descriptors(&moved) != 0 || file_descriptors(&leader_path) != 0 {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -893,7 +893,7 @@ async fn failed_h_backs_off_and_empty_idle_checkout_can_release() {
     registry.attach_launch(1, &id).unwrap();
     let runtime = registry.activate(&id.root_key).unwrap();
     runtime.set_pre_h_hook_for_tests(std::sync::Arc::new(|| panic!("injected H failure")));
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         while runtime.reconciliation_error().is_none() {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -927,7 +927,7 @@ async fn failed_h_backoff_never_releases_accepted_fifo_work() {
     registry.attach_launch(1, &id).unwrap();
     let runtime = registry.activate(&id.root_key).unwrap();
     runtime.set_pre_h_hook_for_tests(std::sync::Arc::new(|| panic!("injected queued H failure")));
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         while runtime.reconciliation_error().is_none() || !runtime.retry_waiting_for_tests() {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -1056,7 +1056,7 @@ async fn browser_identity_retires_replaced_root_after_lease_and_reads_finish() {
         "held read must keep listing unavailable"
     );
     drop(held);
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             if registry.advance(due).unwrap().released.contains(&key) {
                 break;
@@ -1336,7 +1336,7 @@ async fn serve_preflight_rejects_busy_replaced_root_before_creating_token() {
             .is_err()
     );
     assert!(!token.exists());
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         while !registry.lock().await.release(&key).unwrap() {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
@@ -1482,7 +1482,7 @@ async fn serve_waits_for_idle_cli_read_before_registering_and_reconciling() {
         Some(&mut hook),
     );
     let control = async {
-        tokio::time::timeout(Duration::from_secs(2), retry_rx)
+        tokio::time::timeout(trellis::testing::HANG_BACKSTOP, retry_rx)
             .await
             .expect("CLI-only read did not produce a retry")
             .unwrap();
@@ -1492,7 +1492,7 @@ async fn serve_waits_for_idle_cli_read_before_registering_and_reconciling() {
         drop(held_read);
     };
     let (served, ()) = tokio::join!(
-        tokio::time::timeout(Duration::from_secs(10), serve),
+        tokio::time::timeout(trellis::testing::HANG_BACKSTOP, serve),
         control
     );
     let address = served

@@ -112,7 +112,7 @@ async fn request(app: &Router, method: &str, path: &str, body: &str) -> (u16, Va
     (status, serde_json::from_slice(&bytes).unwrap())
 }
 async fn ready(app: &Router) -> Value {
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             let (status, body) = request(app, "GET", "/api/dependencies", "").await;
             assert_eq!(status, 200);
@@ -481,7 +481,7 @@ async fn successful_workspace_index_automatically_rebuilds_catalog() {
         request(&fixture.app, "POST", "/api/index", "{}").await.0,
         202
     );
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             let (_, job) = request(&fixture.app, "GET", "/api/jobs/current", "").await;
             if job["state"] == "done" {

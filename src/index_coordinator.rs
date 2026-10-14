@@ -1079,7 +1079,7 @@ mod tests {
     #[test]
     fn acquired_leader_cannot_claim_its_own_row_at_precommit_capture_pause() {
         use crate::store::topology::IndexNotReady;
-        use std::{sync::mpsc, time::Duration};
+        use std::sync::mpsc;
         let state = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
         fs::write(workspace.path().join("a.js"), "function old() {}\n").unwrap();
@@ -1103,11 +1103,15 @@ mod tests {
                     |_| {},
                     |_| {
                         paused_tx.send(()).unwrap();
-                        release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                        release_rx
+                            .recv_timeout(crate::testing::HANG_BACKSTOP)
+                            .unwrap();
                     },
                 )
             });
-            paused_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            paused_rx
+                .recv_timeout(crate::testing::HANG_BACKSTOP)
+                .unwrap();
             session.verify().unwrap();
             let precommit = store.claim_request(&session).unwrap_err();
             assert!(
@@ -1410,7 +1414,7 @@ mod tests {
         // Due periodic inventory is real work, but retry_after prevents its
         // maintenance veto until the retry deadline has elapsed.
         work.last_inventory -= std::time::Duration::from_secs(60);
-        work.retry_after = Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
+        work.retry_after = Some(std::time::Instant::now() + crate::testing::HANG_BACKSTOP);
         assert!(!work.accepted_watch_intent(&options));
         assert!(
             !work

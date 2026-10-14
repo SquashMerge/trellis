@@ -4049,7 +4049,7 @@ mod live_tests {
             return;
         }
         let run = tokio::spawn(app.oneshot(request(&path, json!({}))));
-        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+        tokio::time::timeout(crate::testing::HANG_BACKSTOP, entered.notified())
             .await
             .unwrap();
         if change_snapshot {
@@ -4073,7 +4073,7 @@ mod live_tests {
             });
             // H commits while the provider is blocked. A leaked SQLite read
             // snapshot would prevent this publication within the timeout.
-            let committed = tokio::time::timeout(std::time::Duration::from_secs(5), publishing)
+            let committed = tokio::time::timeout(crate::testing::HANG_BACKSTOP, publishing)
                 .await
                 .unwrap()
                 .unwrap()
@@ -4082,7 +4082,7 @@ mod live_tests {
             assert!(committed.index_revision > prior.index_revision);
         }
         release.notify_one();
-        let response = tokio::time::timeout(std::time::Duration::from_secs(5), run)
+        let response = tokio::time::timeout(crate::testing::HANG_BACKSTOP, run)
             .await
             .unwrap()
             .unwrap()
@@ -4228,7 +4228,7 @@ mod serving_holder_tests {
         let worker = state.clone();
         let tick = std::thread::spawn(move || worker.queue_tick());
         done_rx
-            .recv_timeout(Duration::from_secs(30))
+            .recv_timeout(crate::testing::HANG_BACKSTOP)
             .expect("takeover did not commit the accepted head");
         let observed_row = store.request_by_id(&accepted.id);
         let observed_status = store.status();
@@ -4409,7 +4409,7 @@ mod serving_holder_tests {
         selected.finish(()).unwrap();
         drop(selected);
         *state.recovery_retry_after.lock().unwrap() =
-            Some(Instant::now() + Duration::from_secs(10));
+            Some(Instant::now() + crate::testing::HANG_BACKSTOP);
         state.queue_tick().unwrap();
         assert_eq!(
             store.request_by_id(&accepted.id).unwrap().unwrap().state,
@@ -4495,7 +4495,7 @@ mod serving_holder_tests {
         assert!(queued.finished_at.is_none() && queued.revision.is_none());
         // The immediate timer tick honors the backoff without claiming Q.
         *state.recovery_retry_after.lock().unwrap() =
-            Some(Instant::now() + Duration::from_secs(10));
+            Some(Instant::now() + crate::testing::HANG_BACKSTOP);
         state.queue_tick().unwrap();
         assert_eq!(
             store.request_by_id(&accepted.id).unwrap().unwrap().state,
@@ -4960,7 +4960,7 @@ mod serving_holder_tests {
         // The reads above may run beyond 250ms under CI load. Hold the same
         // retry branch open for the immediate-tick assertion without a clock race.
         *state.recovery_retry_after.lock().unwrap() =
-            Some(Instant::now() + Duration::from_secs(10));
+            Some(Instant::now() + crate::testing::HANG_BACKSTOP);
         state.queue_tick().unwrap();
         *state.recovery_retry_after.lock().unwrap() = None;
         state.queue_tick().unwrap();
@@ -5083,7 +5083,7 @@ mod serving_holder_tests {
         // Pin the advisory deadline beyond these immediate calls so CPU load
         // cannot turn a bounded-rate assertion into elapsed-time flakiness.
         *state.recovery_retry_after.lock().unwrap() =
-            Some(Instant::now() + Duration::from_secs(10));
+            Some(Instant::now() + crate::testing::HANG_BACKSTOP);
         for _ in 0..3 {
             state.queue_tick().unwrap();
         }
@@ -6610,7 +6610,7 @@ mod normal_post_capture_cancellation_tests {
         assert_eq!(pair_snapshot(&index), before);
         assert_eq!(store.request_by_id(id).unwrap().unwrap().state, "queued");
         drop(owner);
-        let completed = tokio::time::timeout(Duration::from_secs(15), async {
+        let completed = tokio::time::timeout(crate::testing::HANG_BACKSTOP, async {
             loop {
                 let (code, row) = api(&app, token, "GET", &format!("/api/jobs/{id}"), None).await;
                 assert_eq!(code, StatusCode::OK, "{row}");
@@ -8351,7 +8351,7 @@ mod selected_provider_postflight_tests {
         .unwrap()
         .router();
         let prefix = format!("/api/checkouts/{}", identity.root_key);
-        let status = tokio::time::timeout(Duration::from_secs(20), async {
+        let status = tokio::time::timeout(crate::testing::HANG_BACKSTOP, async {
             loop {
                 let (code, _, status) =
                     call(&app, "GET", &format!("{prefix}/status"), Value::Null).await;
@@ -8399,12 +8399,12 @@ mod selected_provider_postflight_tests {
         let route = format!("{prefix}/questions/{packet}/{action}");
         let request = tokio::spawn(async move { call(&task_app, "POST", &route, json!({})).await });
         if kind == "jev" {
-            tokio::time::timeout(Duration::from_secs(10), entered.notified())
+            tokio::time::timeout(crate::testing::HANG_BACKSTOP, entered.notified())
                 .await
                 .unwrap();
         } else {
             let marker = dir.path().join("entered");
-            tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::time::timeout(crate::testing::HANG_BACKSTOP, async {
                 while !marker.exists() {
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
@@ -8430,7 +8430,7 @@ mod selected_provider_postflight_tests {
         } else {
             std::fs::write(dir.path().join("release"), b"go\n").unwrap();
         }
-        let (code, headers, body) = tokio::time::timeout(Duration::from_secs(10), request)
+        let (code, headers, body) = tokio::time::timeout(crate::testing::HANG_BACKSTOP, request)
             .await
             .unwrap()
             .unwrap();

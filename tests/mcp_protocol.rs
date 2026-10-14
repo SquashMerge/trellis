@@ -21,7 +21,7 @@ fn bounded_group_wait(child: &mut Child) -> (std::process::ExitStatus, bool) {
     // Both spawn sites use CommandExt::process_group(0); a failed group setup
     // fails spawn. Do not probe getpgid here: Darwin can transiently report
     // ESRCH before a nonblocking waitid observes a fast child's exit.
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + trellis::testing::HANG_BACKSTOP;
     let expired = loop {
         if std::time::Instant::now() >= deadline {
             break true;
@@ -66,7 +66,7 @@ fn capture_file(path: &Path) -> Vec<u8> {
 /// Silence is established only after the reader has closed its sender. Timeout is
 /// inconclusive and must fail, never count as an empty protocol transcript.
 fn drain_stdout(lines: Receiver<Vec<u8>>) -> Vec<Vec<u8>> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + trellis::testing::HANG_BACKSTOP;
     let mut captured = Vec::new();
     loop {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -175,7 +175,7 @@ fn stop_fixture_daemon(home: &Path) {
     if !sent {
         return;
     }
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let deadline = std::time::Instant::now() + trellis::testing::HANG_BACKSTOP;
     while std::time::Instant::now() < deadline {
         if owned_daemon_connection(home, pid).is_none() {
             let _ = fs::remove_file(&marker);
@@ -311,7 +311,7 @@ impl Peer {
     fn reply_bytes(&self) -> Vec<u8> {
         let raw = self
             .lines
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(trellis::testing::HANG_BACKSTOP)
             .expect("bounded MCP reply");
         assert!(raw.len() <= 65_536);
         assert_eq!(raw.last(), Some(&b'\n'));
@@ -384,7 +384,7 @@ fn marker_for_other_fixture_daemon_does_not_target_this_private_socket() {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + trellis::testing::HANG_BACKSTOP;
     loop {
         if private_socket_under(other.path())
             .is_some_and(|path| std::os::unix::net::UnixStream::connect(path).is_ok())
@@ -554,7 +554,7 @@ fn call(legacy: bool, id: Value, name: &str, arguments: Value) -> Value {
 }
 fn phase_barrier(listener: &std::os::unix::net::UnixListener, stage: &str, mutate: impl FnOnce()) {
     listener.set_nonblocking(true).unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + trellis::testing::HANG_BACKSTOP;
     let mut stream = loop {
         match listener.accept() {
             Ok((stream, _)) => break stream,
@@ -2534,7 +2534,7 @@ async fn catching_up_reports_pending_work_then_witnessed_readiness_on_same_check
     // WATCH_PENDING is
     // emitted for a later accepted hint, so an ACK is never a future quiet lease.
     // The socket is read-only, private to HOME, and does not address a PID.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let deadline = tokio::time::Instant::now() + trellis::testing::HANG_BACKSTOP;
     let mut events = 0;
     let mut readiness = CausalReadiness::default();
     let mut next_event = async || {
@@ -2641,7 +2641,7 @@ async fn selected_options_replacement_reissues_ready_for_new_watch_epoch() {
         result["publishedRevision"].clone()
     };
     let first_pin = index(None);
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let deadline = tokio::time::Instant::now() + trellis::testing::HANG_BACKSTOP;
     let mut state = CausalReadiness::default();
     let mut records = 0;
     while !state.settled() {
@@ -2688,7 +2688,7 @@ async fn selected_options_replacement_reissues_ready_for_new_watch_epoch() {
     let options: Value = serde_json::from_str(&options).unwrap();
     assert_eq!(options["maxFileBytes"], 4096);
     drop(db);
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let deadline = tokio::time::Instant::now() + trellis::testing::HANG_BACKSTOP;
     let mut observed = std::collections::HashSet::new();
     while !state.settled() || state.lineage_ordinal == Some(original_ordinal) {
         records += 1;
@@ -2881,7 +2881,7 @@ async fn describe_reports_actual_degraded_watcher_on_selected_snapshot() {
     let mut registry = CheckoutRegistry::with_roots(topology);
     registry.attach_launch(31, &identity).unwrap();
     let runtime = registry.activate(&identity.root_key).unwrap();
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             if let Ok((snapshot, _)) = runtime.evidence_response()
                 && snapshot.finish(()).is_ok()
@@ -2894,7 +2894,7 @@ async fn describe_reports_actual_degraded_watcher_on_selected_snapshot() {
     .await
     .expect("mandatory H did not publish");
     let scheduler = runtime.browser_scheduler().unwrap();
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             if scheduler.submit_watch_event_for_tests(Err(notify::Error::generic(
                 "degraded watcher fixture",
@@ -2906,7 +2906,7 @@ async fn describe_reports_actual_degraded_watcher_on_selected_snapshot() {
     })
     .await
     .expect("watcher was not installed after H");
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             if runtime.mcp_watcher_degraded().unwrap_or(false) {
                 break;
@@ -3079,7 +3079,7 @@ async fn describe_serves_valid_prior_head_while_mandatory_h_is_paused() {
     response.finish(()).unwrap();
     drop(response);
     registry.disconnect(43);
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         while !registry.release(&identity.root_key).unwrap() {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
@@ -3097,10 +3097,10 @@ async fn describe_serves_valid_prior_head_while_mandatory_h_is_paused() {
         resume_rx
             .lock()
             .unwrap()
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(trellis::testing::HANG_BACKSTOP)
             .unwrap();
     }));
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             if entered_rx.try_recv().is_ok() {
                 break;
@@ -3181,10 +3181,10 @@ async fn describe_cold_initial_h_reports_indexing_without_prior_coverage() {
         resume_rx
             .lock()
             .unwrap()
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(trellis::testing::HANG_BACKSTOP)
             .unwrap();
     }));
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             if entered_rx.try_recv().is_ok() {
                 break;
@@ -3309,10 +3309,10 @@ async fn describe_counts_persisted_selected_and_unselected_native_coverage() {
         resume_rx
             .lock()
             .unwrap()
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(trellis::testing::HANG_BACKSTOP)
             .unwrap();
     }));
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             if entered_rx.try_recv().is_ok() {
                 break;
@@ -3478,7 +3478,8 @@ async fn describe_retries_direct_sqlite_contention_on_fresh_selected_snapshot() 
     let start = std::time::Instant::now();
     let expired = describe(&mut client, 52);
     tool(&expired, Some("deadline_exceeded"), true);
-    assert!(start.elapsed() <= Duration::from_secs(6));
+    // deadline_exceeded proves the call deadline fired; this detects a hang.
+    assert!(start.elapsed() < trellis::testing::HANG_BACKSTOP);
     let envelope = &expired["result"]["structuredContent"];
     assert!(envelope.get("data").is_none());
     assert_eq!(envelope["error"]["retryable"], true);

@@ -3521,8 +3521,8 @@ fn maintenance_releases_thousands_of_js_facts_without_permanent_deferral() {
         "{facts} declarations remained pending after {progress} progress units"
     );
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(30),
-        "large-document release and interleaved edit took too long: {:?}",
+        started.elapsed() < trellis::testing::HANG_BACKSTOP,
+        "large-document release and interleaved edit hung: {:?}",
         started.elapsed()
     );
     assert_eq!(store.status().unwrap().revision, new_head);

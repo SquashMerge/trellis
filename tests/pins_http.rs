@@ -311,7 +311,7 @@ async fn index_admission_and_publication_pair() {
     let (_temp, store, _graph, state, app, _id) = fixture_with_state();
     // The manually published fixture starts its first watcher inventory on
     // retention. Settle that inventory before pinning Q's expected revision.
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         while state.checkout_watch_pending() {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
@@ -341,7 +341,7 @@ async fn index_admission_and_publication_pair() {
     assert_eq!(code, 202, "{stale_job}");
     assert_eq!(stale_job["state"], "queued");
     let stale_id = stale_job["id"].as_str().unwrap();
-    let failed = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+    let failed = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             let (_, row) = call(&app, "GET", &format!("/api/jobs/{stale_id}"), Value::Null).await;
             if !row["finishedAt"].is_null() {
@@ -359,7 +359,7 @@ async fn index_admission_and_publication_pair() {
     assert_eq!(code, 202, "{job}");
     assert!(job["revision"].is_null());
     let id = job["id"].as_str().unwrap();
-    let completed = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+    let completed = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             let (_, result) = call(&app, "GET", &format!("/api/jobs/{id}"), Value::Null).await;
             if !result["finishedAt"].is_null() {
@@ -468,7 +468,7 @@ async fn active_and_hot_journal_keep_pinned_http_safe() {
     drop(state);
     // The queue ticker's in-flight blocking worker may still own the old state.
     // Wait for actual owner release, never a guessed delay or a relaxed fence.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let deadline = std::time::Instant::now() + trellis::testing::HANG_BACKSTOP;
     while retired.upgrade().is_some() {
         assert!(
             std::time::Instant::now() < deadline,

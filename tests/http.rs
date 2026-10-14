@@ -181,7 +181,7 @@ async fn validation_and_limit() {
     assert_eq!(code, 202, "{accepted}");
     assert_eq!(accepted["state"], "queued");
     let stale_id = accepted["id"].as_str().unwrap();
-    let failed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    let failed = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             let (_, row) = call(&app, "GET", &format!("/api/jobs/{stale_id}"), Value::Null).await;
             if !row["finishedAt"].is_null() {
@@ -302,7 +302,7 @@ async fn jobs_publish_and_cancel() {
     let (code, job) = call(&app, "POST", "/api/index", json!({})).await;
     assert_eq!(code, 202);
     let id = job["id"].as_str().unwrap();
-    let completed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    let completed = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             let (_, j) = call(&app, "GET", &format!("/api/jobs/{id}"), Value::Null).await;
             if !j["finishedAt"].is_null() {
@@ -360,7 +360,7 @@ async fn queued_request_is_durable_and_non_cancellable_during_lock_contention() 
     assert_eq!(rejected["error"]["code"], "request_not_cancellable");
     assert_eq!(store.request_by_id(id).unwrap().unwrap().state, "queued");
     drop(held);
-    let done = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    let done = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             let (code, row) = call(&app, "GET", &format!("/api/jobs/{id}"), Value::Null).await;
             assert_eq!(code, StatusCode::OK, "{row}");
@@ -445,7 +445,7 @@ async fn active_job_cancellation_does_not_publish() {
     assert_eq!(code, 409);
     // The 15k-function index runs beside other verifier lanes in CI. This is a
     // bounded completion guard, not an index-latency requirement.
-    let terminal = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+    let terminal = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             let (_, j) = call(&app, "GET", &format!("/api/jobs/{id}"), Value::Null).await;
             if !j["finishedAt"].is_null() {
@@ -674,7 +674,7 @@ fn corrupt_recovery_fixture(
 
 async fn finished_index_job(app: &Router, id: &str) -> Value {
     // Keep a finite CI progress guard without hot-polling the queue worker.
-    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             let (_, job) = call(app, "GET", &format!("/api/jobs/{id}"), Value::Null).await;
             if !job["finishedAt"].is_null() {
@@ -767,7 +767,7 @@ async fn explicit_recovery_releases_only_daemon_old_owner_and_retries_after_fore
     let queue = store.request_db_path();
     let accepted_bytes = std::fs::read(&queue).unwrap();
     // Poll at the queue tick cadence; CI may schedule its blocking worker late.
-    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         while state.retained_serving_session().is_ok() {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
@@ -1095,7 +1095,7 @@ async fn browser_claimed_unchanged_publishes_new_manifest_before_done() {
     let (code, queued) = call(&app, "POST", "/api/index", json!({})).await;
     assert_eq!(code, StatusCode::ACCEPTED, "{queued}");
     let id = queued["id"].as_str().unwrap();
-    let completed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    let completed = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             let (_, row) = call(&app, "GET", &format!("/api/jobs/{id}"), Value::Null).await;
             if !row["finishedAt"].is_null() {

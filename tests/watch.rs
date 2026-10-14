@@ -25,7 +25,7 @@ fn leader_reconciles_edit_without_explicit_request() {
     let before = store.status().unwrap().revision;
     let mut work = WatcherWork::new(&store, &session, &options).unwrap();
     fs::write(&source, "function after() { return 2; }\n").unwrap();
-    let until = Instant::now() + Duration::from_secs(8);
+    let until = Instant::now() + trellis::testing::HANG_BACKSTOP;
     while Instant::now() < until && store.status().unwrap().revision == before {
         work.reconcile_due(&store, &session, &options, &cancel, false)
             .unwrap();
@@ -78,7 +78,7 @@ fn delayed_snapshot_does_not_publish_after_pre_cutoff_edit() {
         "a pre-cutoff hint must reject the delayed snapshot"
     );
     assert_eq!(store.status().unwrap().revision, prior);
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
     while store.status().unwrap().revision == prior && Instant::now() < deadline {
         work.reconcile_due(&store, &owner, &options, &cancel, true)
             .unwrap();
@@ -150,7 +150,7 @@ fn post_cutoff_hint_stays_pending_after_first_publication() {
             .text,
         "function middle() {}\n"
     );
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
     while store.status().unwrap().revision == middle && Instant::now() < deadline {
         work.reconcile_due(&store, &owner, &options, &cancel, true)
             .unwrap();
@@ -303,7 +303,7 @@ fn edits_creates_renames_atomic_saves_and_deletes_match_cold_full() {
             "step {step}: delayed capture cannot account for a new hint"
         );
         assert_eq!(store.status().unwrap().revision, prior);
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
         while store.status().unwrap().revision == prior && Instant::now() < deadline {
             work.reconcile_due(&store, &owner, &options, &cancel, true)
                 .unwrap();
@@ -516,7 +516,7 @@ fn daemon_watcher_keeps_cli_file_cap_and_selected_export_after_edit() {
         .as_u64()
         .unwrap();
     fs::write(&source, "function after() { return 2; }\n").unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
     loop {
         let current = cli(&root, &home, "status").output().unwrap();
         assert!(
@@ -636,7 +636,7 @@ fn periodic_inventory_recovers_unhinted_source_and_absent_ignore_input() {
         "with lost signals an ordinary pre-periodic tick cannot see the edit"
     );
     // The full inventory, not a watcher hint, discovers both changes.
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
     while store.status().unwrap().revision == before && Instant::now() < deadline {
         work.force_periodic_inventory_for_tests();
         work.reconcile_due(&store, &owner, &options, &cancel, false)
@@ -981,7 +981,9 @@ fn accepted_watcher_intent_before_debounce_preempts_writer_unit() {
                 .accepted_watch_intent(&worker_options)
         })
     });
-    entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    entered_rx
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .unwrap();
     fs::write(&source, "function changed() {}\n").unwrap();
     let event = Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content)))
         .add_path(source.clone());

@@ -38,7 +38,7 @@ fn fixture() -> (
     (base, id, registry, now)
 }
 async fn ready(runtime: &trellis::daemon::registry::CheckoutRuntime) {
-    tokio::time::timeout(Duration::from_secs(20), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             if let Ok((response, catching_up)) = runtime.evidence_response() {
                 let finished = response.finish(()).is_ok();
@@ -55,7 +55,7 @@ async fn ready(runtime: &trellis::daemon::registry::CheckoutRuntime) {
 
 async fn await_idle_release(registry: &mut CheckoutRegistry, at: Instant, key: &str) {
     let started = Instant::now();
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             let tick = registry.advance(at + started.elapsed()).unwrap();
             if !tick.released.is_empty() {
@@ -72,7 +72,7 @@ async fn await_idle_release(registry: &mut CheckoutRegistry, at: Instant, key: &
 async fn await_release_after_drain(registry: &mut CheckoutRegistry, at: Instant, key: &str) {
     let started = Instant::now();
     let mut released = false;
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             let tick = registry.advance(at + started.elapsed()).unwrap();
             if !tick.released.is_empty() {
@@ -111,7 +111,7 @@ async fn idle_exit_waits_for_release_when_read_finishes_between_idle_probes() {
         let result = registry.advance(due).unwrap();
         (registry, result)
     });
-    tokio::time::timeout(Duration::from_secs(5), probed_rx)
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, probed_rx)
         .await
         .expect("idle tick did not finish the due-release probe")
         .unwrap();
@@ -119,7 +119,7 @@ async fn idle_exit_waits_for_release_when_read_finishes_between_idle_probes() {
     response.finish(()).unwrap();
     drop(response);
     continue_tx.send(()).unwrap();
-    let (mut registry, first) = tokio::time::timeout(Duration::from_secs(5), tick)
+    let (mut registry, first) = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, tick)
         .await
         .expect("idle tick did not resume")
         .unwrap();
@@ -451,7 +451,7 @@ async fn timed_release_closes_checkout_handles_and_reattach_runs_h() {
     registry.disconnect_at(1, now);
     await_idle_release(&mut registry, now + CHECKOUT_RELEASE_DELAY, &id.root_key).await;
     assert!(!old.has_active_resources());
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         while open_descriptors(&id.root) != root_baseline || open_descriptors(&lock) != 0 {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -508,7 +508,7 @@ async fn invalid_prior_head_does_not_pin_idle_resources_or_skip_reattach_h() {
         entered_tx.send(()).unwrap();
         resume_rx.lock().unwrap().recv().unwrap();
     }));
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         while entered_rx.try_recv().is_err() {
             tokio::task::yield_now().await;
         }
@@ -595,7 +595,7 @@ async fn active_writer_and_protected_reader_overlap_orphan_idle_scan() {
         h_entered_tx.send(()).unwrap();
         h_resume_rx.lock().unwrap().recv().unwrap();
     }));
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         while h_entered_rx.try_recv().is_err() {
             tokio::task::yield_now().await;
         }
@@ -616,7 +616,7 @@ async fn active_writer_and_protected_reader_overlap_orphan_idle_scan() {
             writer_resume_rx.recv().unwrap();
         })
     });
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         while writer_entered_rx.try_recv().is_err() {
             tokio::task::yield_now().await;
         }
@@ -674,7 +674,7 @@ async fn active_writer_and_protected_reader_overlap_orphan_idle_scan() {
     );
     drop(reader);
     h_resume_tx.send(()).unwrap();
-    tokio::time::timeout(Duration::from_secs(20), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             let a = store.request_by_id(&first.id).unwrap().unwrap();
             let b = store.request_by_id(&second.id).unwrap().unwrap();
@@ -729,7 +729,7 @@ async fn committed_fifo_queue_keeps_both_expired_clocks_until_normal_daemon_drai
     assert!(busy.released.is_empty());
     assert!(!busy.exit);
     assert!(runtime.has_active_resources());
-    tokio::time::timeout(Duration::from_secs(20), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             let a = store.request_by_id(&first.id).unwrap().unwrap();
             let b = store.request_by_id(&second.id).unwrap().unwrap();

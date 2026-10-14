@@ -298,7 +298,7 @@ async fn stale_success_and_failure_are_rejected_after_process() {
             .await
             .unwrap();
         assert_eq!(
-            tokio::time::timeout(std::time::Duration::from_secs(5), run)
+            tokio::time::timeout(trellis::testing::HANG_BACKSTOP, run)
                 .await
                 .unwrap()
                 .unwrap()

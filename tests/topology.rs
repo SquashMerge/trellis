@@ -516,7 +516,7 @@ fn shared_use_cannot_remove_last_and_live_holder_blocks_exclusive() {
     shared.verify().unwrap();
     drop(shared);
     // Parallel process fixtures may briefly inherit a test lock during spawn.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + trellis::testing::HANG_BACKSTOP;
     let exclusive = loop {
         match UseGuard::acquire(&path, true, true) {
             Ok(guard) => break guard,

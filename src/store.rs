@@ -11997,7 +11997,7 @@ mod selected_manifest_query_plan_tests {
         let options = IndexOptions::new(work.path().to_owned());
         let worker = std::thread::spawn(move || h.run(&options, &abort, |_| {}));
         arrived_rx
-            .recv_timeout(std::time::Duration::from_secs(20))
+            .recv_timeout(crate::testing::HANG_BACKSTOP)
             .expect("reconciliation did not reach the writer-transaction barrier");
         let selected = reopened.evidence_response_daemon_local().unwrap();
         let during = selected.status().unwrap();
@@ -12079,7 +12079,7 @@ mod selected_manifest_query_plan_tests {
             .unwrap();
         let publisher = std::thread::spawn(move || job.run(&options, &cancel, |_| {}));
         arrived_rx
-            .recv_timeout(std::time::Duration::from_secs(20))
+            .recv_timeout(crate::testing::HANG_BACKSTOP)
             .expect("publication did not reach the writer-transaction barrier");
         let during_status = store.status();
         let during_pinned = store.source_at("A.java", Some(first));
@@ -13528,7 +13528,7 @@ mod rebaseline_fault_tests {
                         .send(())
                         .context("failed to signal BeforeCommit stage")?;
                     release_rx
-                        .recv_timeout(Duration::from_secs(30))
+                        .recv_timeout(crate::testing::HANG_BACKSTOP)
                         .context("bounded BeforeCommit release timed out")?;
                     Ok(())
                 },
@@ -13539,7 +13539,7 @@ mod rebaseline_fault_tests {
             release: Some(release_tx),
             worker: Some(worker),
         };
-        if let Err(wait) = entered_rx.recv_timeout(Duration::from_secs(30)) {
+        if let Err(wait) = entered_rx.recv_timeout(crate::testing::HANG_BACKSTOP) {
             let detail = if guard.worker.as_ref().is_some_and(JoinHandle::is_finished) {
                 worker_outcome(guard.worker.take().unwrap().join())
             } else {
@@ -13783,7 +13783,7 @@ mod rebaseline_fault_tests {
                     validate_paired_metadata(tx,worker_store.root_id(),PairedManifestScope::Full)?;
                     validate_paired_rows(tx)?;
                     entered_tx.send(()).context("cannot signal staged BeforeCommit")?;
-                    release_rx.recv_timeout(Duration::from_secs(30))
+                    release_rx.recv_timeout(crate::testing::HANG_BACKSTOP)
                         .context("bounded BeforeCommit release timed out")?;
                     Ok(())
                 },

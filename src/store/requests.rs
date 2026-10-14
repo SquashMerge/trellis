@@ -2251,13 +2251,17 @@ mod foreign_root_settlement_tests {
             second.bootstrap_missing_queue(
                 |_| {
                     staged_tx.send(()).unwrap();
-                    resume_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    resume_rx
+                        .recv_timeout(crate::testing::HANG_BACKSTOP)
+                        .unwrap();
                     Ok(())
                 },
                 |_| Ok(()),
             )
         });
-        staged_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        staged_rx
+            .recv_timeout(crate::testing::HANG_BACKSTOP)
+            .unwrap();
         let main_absent = !store.request_db_path().exists();
         let contender = store.bootstrap_missing_queue(|_| Ok(()), |_| Ok(()));
         resume_tx.send(()).unwrap();
@@ -2289,13 +2293,17 @@ mod foreign_root_settlement_tests {
             builder.bootstrap_missing_queue(
                 |_| {
                     staged_tx.send(()).unwrap();
-                    resume_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    resume_rx
+                        .recv_timeout(crate::testing::HANG_BACKSTOP)
+                        .unwrap();
                     Ok(())
                 },
                 |_| Ok(()),
             )
         });
-        staged_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        staged_rx
+            .recv_timeout(crate::testing::HANG_BACKSTOP)
+            .unwrap();
         let (retry_tx, retry_rx) = mpsc::channel();
         let hook = caller.test_queue_before_shared_hook.clone();
         caller.test_queue_before_shared_hook.set(move || {
@@ -2304,7 +2312,7 @@ mod foreign_root_settlement_tests {
         let options = IndexOptions::new(root.path().to_owned());
         let queued = std::thread::spawn(move || caller.enqueue_request(&options, None));
         // The second SH attempt proves the first one failed under builder EX.
-        let reached_retry = retry_rx.recv_timeout(Duration::from_secs(5));
+        let reached_retry = retry_rx.recv_timeout(crate::testing::HANG_BACKSTOP);
         // Release EX and join even when the expected retry signal was missed.
         resume_tx.send(()).unwrap();
         creator.join().unwrap().unwrap();
@@ -2335,13 +2343,17 @@ mod foreign_root_settlement_tests {
             builder.bootstrap_missing_queue(
                 |_| {
                     staged_tx.send(()).unwrap();
-                    resume_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    resume_rx
+                        .recv_timeout(crate::testing::HANG_BACKSTOP)
+                        .unwrap();
                     Ok(())
                 },
                 |_| Ok(()),
             )
         });
-        staged_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        staged_rx
+            .recv_timeout(crate::testing::HANG_BACKSTOP)
+            .unwrap();
         let error = caller
             .request_connection_for_enqueue_until(Instant::now())
             .err()

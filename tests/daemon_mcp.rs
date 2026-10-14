@@ -68,14 +68,16 @@ impl Peer {
             json!({"jsonrpc":"2.0","id":id,"method":method,"params":params})
         )
         .unwrap();
-        self.lines.recv_timeout(Duration::from_secs(10)).unwrap()
+        self.lines
+            .recv_timeout(trellis::testing::HANG_BACKSTOP)
+            .unwrap()
     }
     // Preserve the leader PID until its client group has stopped.
     // The auto-started daemon is in another session and is cleaned up in Drop.
     fn finish_unreaped(&mut self) {
         self.stdin.take();
         let pid = self.child.id() as libc::pid_t;
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
         loop {
             let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
             let rc = unsafe {
@@ -175,7 +177,7 @@ fn stop_fixture_daemon(home: &Path) {
     if !sent {
         return;
     }
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
     while Instant::now() < deadline {
         if owned_daemon_connection(home, pid).is_none() {
             let _ = fs::remove_file(&marker);
@@ -204,7 +206,7 @@ fn socket_under(home: &Path) -> Option<PathBuf> {
     None
 }
 fn socket_ready(home: &Path) -> PathBuf {
-    let until = Instant::now() + Duration::from_secs(10);
+    let until = Instant::now() + trellis::testing::HANG_BACKSTOP;
     loop {
         if let Some(path) = socket_under(home)
             && UnixStream::connect(&path).is_ok()
@@ -349,10 +351,16 @@ fn concurrent_clients_share_single_socket_and_survive_bad_private_frame() {
         .unwrap()
         .write_all(burst.as_bytes())
         .unwrap();
-    let mut reply = first.lines.recv_timeout(Duration::from_secs(10)).unwrap();
+    let mut reply = first
+        .lines
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .unwrap();
     if reply["id"] == "cancelled" {
         assert_eq!(reply["result"]["isError"], true);
-        reply = first.lines.recv_timeout(Duration::from_secs(10)).unwrap();
+        reply = first
+            .lines
+            .recv_timeout(trellis::testing::HANG_BACKSTOP)
+            .unwrap();
     }
     assert_eq!(reply["id"], "after-cancel");
     let mut invalid = UnixStream::connect(&socket).unwrap();
@@ -661,7 +669,10 @@ fn cancellation_precedes_invalid_queue_and_sixteen_follow_ons() {
         if count >= 18 {
             // The daemon is held at A: overflow replies must come from the thin relay.
             for id in [116, 117] {
-                let overflow = peer.lines.recv_timeout(Duration::from_secs(10)).unwrap();
+                let overflow = peer
+                    .lines
+                    .recv_timeout(trellis::testing::HANG_BACKSTOP)
+                    .unwrap();
                 assert_eq!(overflow["id"], id, "{overflow}");
                 assert_eq!(overflow["result"]["isError"], true, "{overflow}");
                 let envelope = &overflow["result"]["structuredContent"];
@@ -697,7 +708,10 @@ fn cancellation_precedes_invalid_queue_and_sixteen_follow_ons() {
                     (122, -32602),
                     (123, -32022),
                 ] {
-                    let refused = peer.lines.recv_timeout(Duration::from_secs(10)).unwrap();
+                    let refused = peer
+                        .lines
+                        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+                        .unwrap();
                     assert_eq!(refused["id"], id, "{refused}");
                     assert_eq!(refused["error"]["code"], code, "{refused}");
                     assert!(refused.get("result").is_none(), "{refused}");
@@ -709,7 +723,10 @@ fn cancellation_precedes_invalid_queue_and_sixteen_follow_ons() {
                     }
                 }
                 if count >= 25 {
-                    let duplicate = peer.lines.recv_timeout(Duration::from_secs(10)).unwrap();
+                    let duplicate = peer
+                        .lines
+                        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+                        .unwrap();
                     assert_eq!(duplicate["id"], 8, "{duplicate}");
                     if count == 25 {
                         assert_eq!(duplicate["error"]["code"], -32600, "{duplicate}");
@@ -722,7 +739,10 @@ fn cancellation_precedes_invalid_queue_and_sixteen_follow_ons() {
                             duplicate["result"]["structuredContent"]["error"]["reason"],
                             "unavailable"
                         );
-                        let extra = peer.lines.recv_timeout(Duration::from_secs(10)).unwrap();
+                        let extra = peer
+                            .lines
+                            .recv_timeout(trellis::testing::HANG_BACKSTOP)
+                            .unwrap();
                         assert_eq!(extra["id"], 125, "{extra}");
                         assert_eq!(extra["error"]["code"], -32000, "{extra}");
                     }
@@ -731,10 +751,16 @@ fn cancellation_precedes_invalid_queue_and_sixteen_follow_ons() {
         }
         phase.write_all(b"x").unwrap();
         if count == 1 {
-            let invalid = peer.lines.recv_timeout(Duration::from_secs(10)).unwrap();
+            let invalid = peer
+                .lines
+                .recv_timeout(trellis::testing::HANG_BACKSTOP)
+                .unwrap();
             assert_eq!(invalid["id"], Value::Null, "{invalid}");
             assert_eq!(invalid["error"]["code"], -32700, "{invalid}");
-            let oversized = peer.lines.recv_timeout(Duration::from_secs(10)).unwrap();
+            let oversized = peer
+                .lines
+                .recv_timeout(trellis::testing::HANG_BACKSTOP)
+                .unwrap();
             assert_eq!(oversized["id"], Value::Null, "{oversized}");
             assert_eq!(oversized["error"]["code"], -32600, "{oversized}");
         }
@@ -742,7 +768,10 @@ fn cancellation_precedes_invalid_queue_and_sixteen_follow_ons() {
             if count == 26 && n == 8 {
                 continue;
             }
-            let reply = peer.lines.recv_timeout(Duration::from_secs(10)).unwrap();
+            let reply = peer
+                .lines
+                .recv_timeout(trellis::testing::HANG_BACKSTOP)
+                .unwrap();
             assert_eq!(
                 reply["id"],
                 if count >= 25 && n == 8 { 8 } else { 100 + n },
@@ -828,7 +857,7 @@ fn duplicate_within_bounded_pending_queue_is_rejected_before_first_completes() {
         .unwrap();
     let duplicate = peer
         .lines
-        .recv_timeout(Duration::from_secs(3))
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
         .expect("second queued ID8 must be rejected before A is released");
     assert_eq!(duplicate["id"], 8, "{duplicate}");
     assert_eq!(duplicate["error"]["code"], -32600, "{duplicate}");
@@ -843,11 +872,17 @@ fn duplicate_within_bounded_pending_queue_is_rejected_before_first_completes() {
     )
     .unwrap();
     // B can finish after A's cancellation while the old daemon hook stays held.
-    let first = peer.lines.recv_timeout(Duration::from_secs(10)).unwrap();
+    let first = peer
+        .lines
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .unwrap();
     assert_eq!(first["id"], 8, "{first}");
     assert!(first["result"].is_object(), "{first}");
     phase.write_all(b"x").unwrap();
-    let next = peer.lines.recv_timeout(Duration::from_secs(10)).unwrap();
+    let next = peer
+        .lines
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .unwrap();
     assert_eq!(next["id"], 9, "{next}");
     assert!(next["result"].is_object(), "{next}");
     let reused = peer.ask(8, "tools/list", meta);
@@ -1075,7 +1110,9 @@ fn check_legacy_synthetic_reattach_cancel(cancel_id: u64, fail_setup: bool) {
         let attach: protocol::Request = protocol::read_frame(&mut socket).unwrap();
         assert_eq!(attach.operation, "mcp");
         connected_tx.send(()).unwrap();
-        release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        release_rx
+            .recv_timeout(trellis::testing::HANG_BACKSTOP)
+            .unwrap();
         protocol::write_frame(
             &mut socket,
             &protocol::Reply {
@@ -1161,7 +1198,9 @@ fn check_legacy_synthetic_reattach_cancel(cancel_id: u64, fail_setup: bool) {
         })
     )
     .unwrap();
-    connected_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    connected_rx
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .unwrap();
     writeln!(
         peer.stdin.as_mut().unwrap(),
         "{}",
@@ -1181,7 +1220,10 @@ fn check_legacy_synthetic_reattach_cancel(cancel_id: u64, fail_setup: bool) {
             "canceled pending ID5 produced stdout"
         );
     } else {
-        let list = peer.lines.recv_timeout(Duration::from_secs(10)).unwrap();
+        let list = peer
+            .lines
+            .recv_timeout(trellis::testing::HANG_BACKSTOP)
+            .unwrap();
         assert_eq!(list["id"], 5, "{list}");
         assert!(list["result"]["tools"].is_array(), "{list}");
     }
@@ -1314,7 +1356,9 @@ fn failed_reattach_drains_pending_cancel_and_stdin_eof_before_failure() {
             let attach: protocol::Request = protocol::read_frame(&mut stream).unwrap();
             assert_eq!(attach.operation, "mcp");
             entered_tx.send(()).unwrap();
-            release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            release_rx
+                .recv_timeout(trellis::testing::HANG_BACKSTOP)
+                .unwrap();
             protocol::write_frame(
                 &mut stream,
                 &protocol::Reply {
@@ -1332,7 +1376,9 @@ fn failed_reattach_drains_pending_cancel_and_stdin_eof_before_failure() {
                 "arguments":{"schemaVersion":1},"_meta":meta["_meta"]}})
         )
         .unwrap();
-        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        entered_rx
+            .recv_timeout(trellis::testing::HANG_BACKSTOP)
+            .unwrap();
         if close_stdin {
             peer.stdin.take();
         } else {
@@ -1501,7 +1547,7 @@ fn partial_daemon_reply_is_typed_and_never_reaches_stdout() {
         }
     });
     let first = lines
-        .recv_timeout(Duration::from_secs(10))
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
         .expect("typed interrupted result while stdin open");
     let response: Value = serde_json::from_slice(&first).unwrap();
     assert_eq!(response["id"], 1);
@@ -1555,7 +1601,8 @@ fn partial_daemon_reply_is_typed_and_never_reaches_stdout() {
     )
     .unwrap();
     let selected: Value =
-        serde_json::from_slice(&lines.recv_timeout(Duration::from_secs(10)).unwrap()).unwrap();
+        serde_json::from_slice(&lines.recv_timeout(trellis::testing::HANG_BACKSTOP).unwrap())
+            .unwrap();
     assert_eq!(selected["id"], 2);
     assert_eq!(selected["result"]["isError"], true, "{selected}");
     let envelope = &selected["result"]["structuredContent"];
@@ -1618,7 +1665,8 @@ fn partial_daemon_reply_is_typed_and_never_reaches_stdout() {
         )
         .unwrap();
         let rejected: Value =
-            serde_json::from_slice(&lines.recv_timeout(Duration::from_secs(10)).unwrap()).unwrap();
+            serde_json::from_slice(&lines.recv_timeout(trellis::testing::HANG_BACKSTOP).unwrap())
+                .unwrap();
         assert_eq!(rejected["id"], id, "{rejected}");
         assert_eq!(rejected["error"]["code"], code, "{rejected}");
         assert!(rejected.get("result").is_none(), "{rejected}");
@@ -1627,7 +1675,7 @@ fn partial_daemon_reply_is_typed_and_never_reaches_stdout() {
         }
     }
     child.stdin.take();
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
     let status = loop {
         if let Some(status) = child.try_wait().unwrap() {
             break status;
@@ -1721,7 +1769,10 @@ fn cancel_after_relay_reads_reply_suppresses_that_reply() {
         json!({"jsonrpc":"2.0","id":"after","method":"tools/list","params":{"_meta":meta}}),
     );
     pause(&listener).write_all(b"x").unwrap();
-    let next = peer.lines.recv_timeout(Duration::from_secs(10)).unwrap();
+    let next = peer
+        .lines
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .unwrap();
     assert_eq!(next["id"], "after", "cancelled reply was written: {next}");
     let _ = fs::remove_file(&phase_path);
 }
@@ -1781,14 +1832,20 @@ fn cancel_after_the_relay_decides_cannot_recall_the_reply() {
             "params":{"requestId":"late-A"}}),
     );
     decided.write_all(b"x").unwrap();
-    let reply = peer.lines.recv_timeout(Duration::from_secs(10)).unwrap();
+    let reply = peer
+        .lines
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .unwrap();
     assert_eq!(reply["id"], "late-A", "{reply}");
     send(
         &mut peer,
         json!({"jsonrpc":"2.0","id":"after","method":"tools/list","params":{"_meta":meta}}),
     );
     pause(&listener).write_all(b"x").unwrap();
-    let next = peer.lines.recv_timeout(Duration::from_secs(10)).unwrap();
+    let next = peer
+        .lines
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .unwrap();
     assert_eq!(
         next["id"], "after",
         "the late cancel produced output: {next}"

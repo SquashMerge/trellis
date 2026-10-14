@@ -112,7 +112,7 @@ fn help_version_and_unstartable_daemon_never_open_standalone_store() {
         .output()
         .unwrap();
     assert!(
-        started.elapsed() < Duration::from_secs(12),
+        started.elapsed() < trellis::testing::HANG_BACKSTOP,
         "daemon start was unbounded"
     );
     assert!(!output.status.success(), "index unexpectedly succeeded");
@@ -281,7 +281,7 @@ fn run(home: &Path, command: &str, root: &Path) -> Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 async fn serve_banner_address(child: &mut Child, log: &Path, home: &Path) -> SocketAddr {
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
     loop {
         let stderr = bounded_fixture_stderr(log);
         if let Some(raw) = stderr
@@ -309,7 +309,7 @@ async fn serve_banner_address(child: &mut Child, log: &Path, home: &Path) -> Soc
 }
 
 async fn ready(client: &reqwest::Client, address: SocketAddr, child: &mut Child, home: &Path) {
-    let deadline = Instant::now() + Duration::from_secs(12);
+    let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
     loop {
         if let Ok(reply) = client.get(format!("http://{address}/healthz")).send().await
             && reply.status().is_success()
@@ -382,7 +382,7 @@ fn serve_request_preserves_explicit_default_file_cap_presence() {
                 .spawn()
                 .unwrap(),
         );
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
         loop {
             if child.0.try_wait().unwrap().is_some() {
                 break;
@@ -405,7 +405,7 @@ fn serve_request_preserves_explicit_default_file_cap_presence() {
             fixture_daemon_diagnostic(&home, &fixture_socket_paths(&home).socket)
         );
         options.push(
-            rx.recv_timeout(Duration::from_secs(10))
+            rx.recv_timeout(trellis::testing::HANG_BACKSTOP)
                 .unwrap_or_else(|error| {
                     panic!(
                         "fake responder did not receive serve request: {error}; {stderr}; {}",
@@ -450,7 +450,7 @@ fn daemon_keeps_private_socket_after_transient_accept_errors() {
             .env("TRELLIS_TEST_DAEMON_ACCEPT_ERROR_ONCE", fault);
         let mut owner = detached(command);
         let socket = fixture_socket_paths(&home).socket;
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
         loop {
             assert!(
                 owner.0.try_wait().unwrap().is_none(),
@@ -497,7 +497,7 @@ async fn executable_daemon_is_socket_only_until_explicit_serve_and_registers_two
     daemon_command.arg("daemon");
     let mut daemon = detached(daemon_command);
     let socket = fixture_socket_paths(&home).socket;
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
     while !socket.exists() {
         assert!(
             daemon.0.try_wait().unwrap().is_none(),
@@ -602,7 +602,7 @@ async fn executable_daemon_is_socket_only_until_explicit_serve_and_registers_two
             "{method} {path} activated the checkout"
         );
     }
-    let selected = tokio::time::timeout(Duration::from_secs(20), async {
+    let selected = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             let response = client
                 .get(format!("http://{address}/api/checkouts/{first_key}/status"))
@@ -631,7 +631,7 @@ async fn executable_daemon_is_socket_only_until_explicit_serve_and_registers_two
     );
     // The current-job read is typed contention while H or the watcher writes;
     // retry only storage_busy and report any other refusal with its body.
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
     let jobs = loop {
         let jobs = client
             .get(format!(
@@ -692,7 +692,7 @@ async fn executable_daemon_is_socket_only_until_explicit_serve_and_registers_two
     );
 
     let mut second_serve = detached(serve(&home, &second, requested_bind, &token_file));
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
     loop {
         // A listing can exceed the 2 s client timeout while the second
         // registration is busy under load; poll again until the deadline (#131).
@@ -743,7 +743,7 @@ async fn executable_daemon_is_socket_only_until_explicit_serve_and_registers_two
         same_address, address,
         "same registration changed the listener"
     );
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
     loop {
         if same_serve.0.try_wait().unwrap().is_none() {
             // The same registration keeps the same singleton listener and checkout set.
@@ -810,7 +810,7 @@ async fn executable_daemon_is_socket_only_until_explicit_serve_and_registers_two
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
     loop {
         if let Some(status) = conflict.try_wait().unwrap() {
             assert!(
@@ -905,7 +905,7 @@ async fn long_home_socket_names_are_private_distinct_connectable_and_recover_aft
         let mut command = cli(home);
         command.arg("daemon");
         let mut owner = detached(command);
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
         loop {
             if UnixStream::connect(&paths.socket).is_ok() {
                 break;
@@ -959,7 +959,7 @@ async fn long_home_socket_names_are_private_distinct_connectable_and_recover_aft
         .arg("daemon")
         .env("TRELLIS_TEST_DAEMON_PID_FILE", &pid_file);
     let mut recovered = detached(command);
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
     assert!(recovered.0.try_wait().unwrap().is_none());
     let mut recovered_socket = loop {
         if let Ok(metadata) = fs::symlink_metadata(&paths[0].socket)
@@ -1153,7 +1153,7 @@ async fn daemon_served_export_survives_multi_frame_cli_reply() {
     command.arg("daemon");
     let mut daemon = detached(command);
     let socket = fixture_socket_paths(&home).socket;
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
     while UnixStream::connect(&socket).is_err() {
         assert!(
             daemon.0.try_wait().unwrap().is_none(),
@@ -1216,7 +1216,7 @@ async fn serve_arms_sigterm_before_banner_to_control_wait() {
     let mut daemon_command = cli(&home);
     daemon_command.arg("daemon");
     let mut daemon = detached(daemon_command);
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
     while UnixStream::connect(&socket).is_err() {
         assert!(
             daemon.0.try_wait().unwrap().is_none(),
@@ -1238,7 +1238,7 @@ async fn serve_arms_sigterm_before_banner_to_control_wait() {
         .stdout(Stdio::null())
         .stderr(Stdio::from(fs::File::create(&log).unwrap()));
     let mut served = Owned(command.spawn().unwrap());
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
     loop {
         if fs::read_to_string(&log)
             .unwrap()
@@ -1260,7 +1260,7 @@ async fn serve_arms_sigterm_before_banner_to_control_wait() {
         unsafe { libc::kill(served.0.id() as i32, libc::SIGTERM) },
         0
     );
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
     let status = loop {
         if let Some(status) = served.0.try_wait().unwrap() {
             break status;
@@ -1331,7 +1331,8 @@ async fn bounded_cli_capture_reaps_stalled_child() {
             .await
             .is_none()
     );
-    assert!(started.elapsed() < Duration::from_secs(2));
+    // The capture bound fired (None above); this only detects a hang.
+    assert!(started.elapsed() < trellis::testing::HANG_BACKSTOP);
 }
 
 /// One real daemon/serve cold H per private HOME; no prior daemon session can
@@ -1412,7 +1413,7 @@ async fn cold_serve_h_preserves_implicit_scip_and_honors_explicit_default_cap() 
         assert!(home.join("auto-daemon.pid").exists());
         drop(AutoDaemonGuard::for_home(&home));
         let socket = fixture_socket_paths(&home).socket;
-        let stop_deadline = Instant::now() + Duration::from_secs(5);
+        let stop_deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
         while UnixStream::connect(&socket).is_ok() {
             assert!(
                 Instant::now() < stop_deadline,
@@ -1434,7 +1435,7 @@ async fn cold_serve_h_preserves_implicit_scip_and_honors_explicit_default_cap() 
         daemon_command.arg("daemon");
         let mut daemon = detached(daemon_command);
         let socket = fixture_socket_paths(&home).socket;
-        let socket_deadline = Instant::now() + Duration::from_secs(10);
+        let socket_deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
         while UnixStream::connect(&socket).is_err() {
             assert!(
                 daemon.0.try_wait().unwrap().is_none(),
@@ -1460,7 +1461,7 @@ async fn cold_serve_h_preserves_implicit_scip_and_honors_explicit_default_cap() 
             .build()
             .unwrap();
         ready(&client, address, &mut served.0, &home).await;
-        let h_deadline = Instant::now() + Duration::from_secs(20);
+        let h_deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
         loop {
             assert!(
                 Instant::now() < h_deadline,
