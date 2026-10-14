@@ -212,7 +212,7 @@ function assertPinnedUrl(raw, pin) {
 }
 async function indexThroughApi(server, token, expected, changedPath, changedSource) {
   const accepted=await api(server.base,token,"POST",scoped(server.rootKey,"index"),{expectedRevision:expected});assert.equal(accepted.status,202,JSON.stringify(accepted.data));
-  const deadline=Date.now()+20000;
+  const deadline=Date.now()+HANG_BACKSTOP_MS;
   let job;
   while(Date.now()<deadline){
     job=await api(server.base,token,"GET",scoped(server.rootKey,`jobs/${encodeURIComponent(accepted.data.id)}`));
@@ -220,7 +220,7 @@ async function indexThroughApi(server, token, expected, changedPath, changedSour
     if(job.data.finishedAt!==null)break;
     await delay(25);
   }
-  if(job?.data.finishedAt===null||job===undefined)throw new Error("index job did not complete within 20 seconds");
+  if(job?.data.finishedAt===null||job===undefined)throw new Error("index job did not complete within the hang backstop");
   // A finished job can briefly leave the checkout catching up or contended.
   let current;
   while(true){
