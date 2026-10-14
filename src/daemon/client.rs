@@ -296,6 +296,18 @@ struct McpInputBuffer<'a> {
     cancels: Vec<serde_json::Value>,
     /// IDs of requests forwarded to the daemon and not yet decided.
     outstanding: Vec<crate::mcp::wire::IdKey>,
+    /// Refusals of frames beyond the full queue, decided only after a fenced
+    /// settling pass so a cancel written before them still wins (#127).
+    refusals: Vec<PendingRefusal>,
+}
+
+/// A refusal waiting for its #127 decision.
+struct PendingRefusal {
+    /// The refused request, with its ID.
+    value: serde_json::Value,
+    response: serde_json::Value,
+    /// Settling ends by this: the call's own deadline, else the reply bound.
+    bound: Instant,
 }
 
 /// Frames from the stdin reader, each with the stdin offset where it ends and
@@ -651,6 +663,33 @@ fn decide(
     }
 }
 
+/// Decide every pending refusal at one #127 decision point: settle input
+/// written before it (a cancel drained meanwhile removes its refusal), then
+/// write the rest, or `outcome_unknown` if input could not settle by the
+/// earliest bound. End of input cancels them all.
+fn flush_refusals(
+    receiver: &FrameReceiver,
+    buffer: &mut McpInputBuffer<'_>,
+    stdout: &mut impl std::io::Write,
+    eof: &mut bool,
+) -> io::Result<()> {
+    let Some(bound) = buffer.refusals.iter().map(|refusal| refusal.bound).min() else {
+        return Ok(());
+    };
+    let gate = reply_gate(receiver, buffer, stdout, eof, None, bound)?;
+    for refusal in std::mem::take(&mut buffer.refusals) {
+        match gate {
+            ReplyGate::Write => crate::mcp::wire::write_response(stdout, &refusal.response)?,
+            ReplyGate::Cancelled => {}
+            ReplyGate::Unknown => crate::mcp::wire::write_response(
+                stdout,
+                &mcp_failure(&refusal.value, "outcome_unknown", buffer.workspace),
+            )?,
+        }
+    }
+    Ok(())
+}
+
 /// The settling bound for deciding `request`'s outcome now.
 fn decision_bound(request: &Forwarded) -> Instant {
     if request.call {
@@ -848,6 +887,7 @@ pub fn relay_stdio(
         drain_through: None,
         cancels: Vec::new(),
         outstanding: Vec::new(),
+        refusals: Vec::new(),
     };
     let mut stdout = io::stdout().lock();
     let mut forwarded: BTreeMap<u64, Forwarded> = BTreeMap::new();
@@ -902,6 +942,7 @@ pub fn relay_stdio(
     };
 
     loop {
+        flush_refusals(&receiver, &mut buffer, &mut stdout, &mut eof)?;
         // Daemon replies and broken connections.
         while let Ok((reply_generation, reply)) = replies.try_recv() {
             if daemon.as_ref().map(|d| d.generation) != Some(reply_generation) {
@@ -932,7 +973,6 @@ pub fn relay_stdio(
                     crate::mcp::phase_hook("relay_before_write")?;
                     // A call's reply that arrives after its deadline is not
                     // written: the relay's decision is deadline_exceeded.
-                    let late = request.call && Instant::now() >= request.deadline;
                     let gate = reply_gate(
                         &receiver,
                         &mut buffer,
@@ -941,6 +981,10 @@ pub fn relay_stdio(
                         request.value.get("id"),
                         decision_bound(&request),
                     )?;
+                    crate::mcp::phase_hook("relay_after_settle")?;
+                    // The send decision: a call's deadline is checked after
+                    // settling, so settling past it never yields success.
+                    let late = request.call && Instant::now() >= request.deadline;
                     match gate {
                         ReplyGate::Write if late => wire::write_response(
                             &mut stdout,
@@ -1414,6 +1458,15 @@ fn drain_mcp_input(
             Ok((frame, accepted)) => {
                 if let Some(id) = cancellation_id(&frame) {
                     let _ = &mut stream;
+                    if let Some(at) = buffer
+                        .refusals
+                        .iter()
+                        .position(|refusal| refusal.value.get("id") == Some(&id))
+                    {
+                        // A cancel for a pending refusal suppresses it.
+                        buffer.refusals.remove(at);
+                        continue;
+                    }
                     if active_id == Some(&id) {
                         // Decided per reply: never a sticky connection flag.
                         *canceled = true;
@@ -1455,8 +1508,14 @@ fn drain_mcp_input(
                         Frame::Line(line) => serde_json::from_slice::<serde_json::Value>(line).ok(),
                         _ => None,
                     };
+                    let refused = decoded.clone();
+                    let mut call = false;
                     let response = match wire::decode(frame) {
-                        Err(error) => Some(error.response()),
+                        Err(error) => {
+                            // No request ID: nothing a cancel could name.
+                            wire::write_response(stdout, &error.response())?;
+                            None
+                        }
                         Ok(Some(request)) if request.id.is_some() => {
                             let id = request.id.clone().expect("checked ID");
                             let duplicate = request
@@ -1485,6 +1544,7 @@ fn drain_mcp_input(
                                             crate::mcp::session::Action::Call { .. }
                                         ) =>
                                     {
+                                        call = true;
                                         let mut value = decoded.expect("decoded MCP request");
                                         value["id"] = id;
                                         Some(relay_admission_failure(
@@ -1505,8 +1565,18 @@ fn drain_mcp_input(
                         }
                         _ => None,
                     };
-                    if let Some(response) = response {
-                        wire::write_response(stdout, &response)?;
+                    if let (Some(response), Some(mut value)) = (response, refused) {
+                        value["id"] = response["id"].clone();
+                        let bound = if call {
+                            accepted + relay_call_deadline()
+                        } else {
+                            Instant::now() + RELAY_REPLY_BOUND
+                        };
+                        buffer.refusals.push(PendingRefusal {
+                            value,
+                            response,
+                            bound,
+                        });
                     }
                 }
             }
@@ -1678,6 +1748,7 @@ mod reply_gate_tests {
                 drain_through: None,
                 cancels: Vec::new(),
                 outstanding: Vec::new(),
+                refusals: Vec::new(),
             };
             let mut stdout = Vec::new();
             let mut eof = false;
@@ -1710,6 +1781,65 @@ mod reply_gate_tests {
         }
     }
     const CANCEL_A: &str = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":\"A\"}}\n";
+
+    /// #127 per ID: a frame beyond the full queue is refused only at a fenced
+    /// decision, so a cancel the client wrote right after it suppresses the
+    /// refusal; without one the refusal is written.
+    #[test]
+    fn a_queue_overflow_refusal_waits_for_its_cancel() {
+        for cancel in [true, false] {
+            let fixture = Fixture::new();
+            let mut burst = String::new();
+            for id in 1..=16 {
+                burst.push_str(&format!(
+                    "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"tools/list\",\"params\":{{}}}}\n"
+                ));
+            }
+            burst.push_str(
+                "{\"jsonrpc\":\"2.0\",\"id\":\"X\",\"method\":\"tools/list\",\"params\":{}}\n",
+            );
+            if cancel {
+                burst.push_str("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":\"X\"}}\n");
+            }
+            fixture.write(&burst);
+            let mut buffer = McpInputBuffer {
+                workspace: &fixture.workspace,
+                queue: std::collections::VecDeque::new(),
+                cancelled_queued: Vec::new(),
+                mode: crate::mcp::session::Mode::Unselected,
+                active_id: None,
+                active_key: None,
+                cancelled_active: false,
+                stdin: fixture.fence.clone(),
+                deferred: None,
+                drain_through: None,
+                cancels: Vec::new(),
+                outstanding: Vec::new(),
+                refusals: Vec::new(),
+            };
+            let mut stdout = Vec::new();
+            let mut eof = false;
+            // Settle everything written so far: the queue fills, X overflows.
+            let gate = reply_gate(
+                &fixture.frames,
+                &mut buffer,
+                &mut stdout,
+                &mut eof,
+                None,
+                Instant::now() + RELAY_REPLY_BOUND,
+            )
+            .unwrap();
+            assert!(matches!(gate, ReplyGate::Write));
+            assert_eq!(buffer.queue.len(), 16);
+            flush_refusals(&fixture.frames, &mut buffer, &mut stdout, &mut eof).unwrap();
+            let written = String::from_utf8(stdout).unwrap();
+            assert_eq!(
+                written.contains("\"X\""),
+                !cancel,
+                "cancel={cancel}: {written}"
+            );
+        }
+    }
 
     /// Decision 0009 §7: a call's settling ends by its own deadline. Input
     /// the stdin reader has not delivered by then makes the outcome

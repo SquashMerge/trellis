@@ -2137,3 +2137,47 @@ fn a_reused_call_id_is_answered_while_the_old_worker_still_runs() {
     );
     finish_peer(peer, daemon, &phase_path);
 }
+
+/// Decision 0009 §7: the relay checks a call's deadline at its send
+/// decision, after settling input. A timely daemon reply whose settling ends
+/// past the deadline is answered deadline_exceeded, not the success.
+#[test]
+fn a_reply_settled_past_the_deadline_is_not_a_success() {
+    let home = tempfile::tempdir().unwrap();
+    let root = checkout(home.path());
+    let (daemon, listener, phase_path) = phase_daemon(home.path(), None);
+    let mut peer = Peer::start_with_env(
+        home.path(),
+        &root,
+        &[
+            ("TRELLIS_TEST_MCP_RELAY_DEADLINE_MS", "2000".as_ref()),
+            ("TRELLIS_TEST_MCP_PHASE", "relay_after_settle".as_ref()),
+            ("TRELLIS_TEST_MCP_PHASE_SOCKET", phase_path.as_os_str()),
+        ],
+    );
+    let written = Instant::now();
+    writeln!(
+        peer.stdin.as_mut().unwrap(),
+        "{}",
+        describe_frame(json!("A"))
+    )
+    .unwrap();
+    // The daemon answered in time and the relay settled; held before the
+    // send decision until A's deadline (from its acceptance) has passed.
+    let mut held = paused_at(&listener, "relay_after_settle");
+    std::thread::sleep(
+        (written + Duration::from_millis(2000) + Duration::from_millis(500))
+            .saturating_duration_since(Instant::now()),
+    );
+    held.write_all(b"x").unwrap();
+    let reply = peer
+        .lines
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .unwrap();
+    assert_eq!(reply["id"], "A", "{reply}");
+    assert_eq!(
+        reply["result"]["structuredContent"]["error"]["code"], "deadline_exceeded",
+        "a success was sent past its deadline: {reply}"
+    );
+    finish_peer(peer, daemon, &phase_path);
+}
