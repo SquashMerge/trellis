@@ -1101,9 +1101,19 @@ fn concurrent_cold_cli_indexes_share_one_daemon_and_keep_fifo_results() {
             String::from_utf8_lossy(&output.stderr)
         );
         let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+        // status is the checkout's current head, sampled after this request
+        // published. The other concurrent request (FIFO-after) may already
+        // have published too, so status is at or after this revision.
+        let published = &response["publishedRevision"];
+        let current = &response["status"]["revision"];
         assert_eq!(
-            response["publishedRevision"],
-            response["status"]["revision"]
+            current["indexGeneration"], published["indexGeneration"],
+            "{response}"
+        );
+        assert!(
+            current["indexRevision"].as_u64().unwrap()
+                >= published["indexRevision"].as_u64().unwrap(),
+            "{response}"
         );
     }
     let elected: u32 = fs::read_to_string(&marker).unwrap().parse().unwrap();
