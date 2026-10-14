@@ -306,6 +306,8 @@ impl CheckoutRegistry {
             mcp_clock_skew_ms: std::sync::atomic::AtomicU64::new(0),
             #[cfg(feature = "test-support")]
             mcp_read_hook: std::sync::Mutex::new(None),
+            #[cfg(feature = "test-support")]
+            mcp_read_gate: std::sync::Mutex::new(None),
         });
         #[cfg(feature = "test-support")]
         if let Some(reporter) = super::causal_witness::CausalWitness::from_env(key.to_owned()) {
@@ -1476,6 +1478,9 @@ pub struct CheckoutRuntime {
     /// Test-support hold point at the start of the next MCP selected read.
     #[cfg(feature = "test-support")]
     mcp_read_hook: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Test-support gate run at the start of every MCP selected read.
+    #[cfg(feature = "test-support")]
+    mcp_read_gate: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     resources: std::sync::Mutex<Option<Arc<ActiveResources>>>,
     /// Released because its root was lost: a stale handle answers root_changed.
     root_lost: std::sync::atomic::AtomicBool,
@@ -1797,8 +1802,19 @@ impl CheckoutRuntime {
         *self.mcp_read_hook.lock().unwrap() = Some(Box::new(hook));
     }
 
+    /// Run `gate` at the start of every MCP selected read on this checkout.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn set_mcp_read_gate_for_tests(&self, gate: Arc<dyn Fn() + Send + Sync>) {
+        *self.mcp_read_gate.lock().unwrap() = Some(gate);
+    }
+
     #[cfg(feature = "test-support")]
     pub(crate) fn run_mcp_read_hook_for_tests(&self) {
+        let gate = self.mcp_read_gate.lock().unwrap().clone();
+        if let Some(gate) = gate {
+            gate();
+        }
         let hook = self.mcp_read_hook.lock().unwrap().take();
         if let Some(hook) = hook {
             hook();

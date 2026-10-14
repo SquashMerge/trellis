@@ -158,57 +158,6 @@ struct DescribedSnapshot {
 /// `limits.deadlineMs` (contract W1).
 pub const CALL_DEADLINE: std::time::Duration = std::time::Duration::from_millis(5000);
 
-type DescribeParts = (anyhow::Result<DescribedSnapshot>, anyhow::Result<bool>);
-
-/// Activation, the selected read and published watcher health for one admitted
-/// describe call, bounded by its deadline. The connection waits only until the
-/// deadline: past it the call answers deadline_exceeded at once, the worker is
-/// cancelled cooperatively, and its late result is discarded.
-fn describe_within(
-    registry: &std::sync::Arc<tokio::sync::Mutex<crate::daemon::registry::CheckoutRegistry>>,
-    key: &str,
-    selected: Option<&crate::daemon::registry::SelectedCheckout>,
-    daemon_handle: Option<&tokio::runtime::Handle>,
-    deadline: std::time::Instant,
-) -> anyhow::Result<DescribeParts> {
-    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let (done_tx, done_rx) = std::sync::mpsc::channel();
-    let registry = registry.clone();
-    let key = key.to_owned();
-    let selected = selected.cloned();
-    let handle = daemon_handle.cloned();
-    let worker_cancel = cancel.clone();
-    std::thread::spawn(move || {
-        let outcome = (|| -> anyhow::Result<DescribeParts> {
-            let existing = registry.blocking_lock().runtime(&key);
-            let runtime = match existing {
-                Some(runtime) => runtime,
-                None => match &handle {
-                    Some(handle) => {
-                        handle.block_on(async { registry.lock().await.activate(&key) })?
-                    }
-                    None => anyhow::bail!("index_not_ready: checkout not activated"),
-                },
-            };
-            let read = read_describe(&runtime, selected.as_ref(), deadline, &worker_cancel);
-            Ok((read, runtime.mcp_watcher_degraded()))
-        })();
-        // A call that reached its deadline has dropped the receiver; the late
-        // result is discarded here and never written to the client.
-        let _ = done_tx.send(outcome);
-    });
-    match done_rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
-        Ok(outcome) => outcome,
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            cancel.store(true, std::sync::atomic::Ordering::Release);
-            anyhow::bail!("deadline_exceeded: MCP call reached its deadline")
-        }
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            anyhow::bail!("store_unavailable: MCP describe worker stopped")
-        }
-    }
-}
-
 /// Retry only direct Store contention. Every failed attempt drops its selected
 /// response; the one successful answer is materialized and finished in one snapshot.
 fn read_describe(
@@ -295,20 +244,341 @@ pub(crate) fn phase_hook(_: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Call workers alive across all connections, each holding a permit until
+/// its thread exits, even after its call was decided (Decision 0009 §7).
+static CALL_WORKERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+const MAX_CALL_WORKERS: usize = 16;
+/// Outstanding calls per connection: a fifth is refused without queueing.
+const MAX_CONNECTION_CALLS: usize = 4;
+
+/// Call workers alive in this process, for tests of the worker budget.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn live_call_workers_for_tests() -> usize {
+    CALL_WORKERS.load(std::sync::atomic::Ordering::Acquire)
+}
+
+struct WorkerPermit;
+impl WorkerPermit {
+    fn acquire() -> Option<Self> {
+        CALL_WORKERS
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |live| (live < MAX_CALL_WORKERS).then_some(live + 1),
+            )
+            .ok()
+            .map(|_| WorkerPermit)
+    }
+}
+impl Drop for WorkerPermit {
+    fn drop(&mut self) {
+        CALL_WORKERS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+type Registry = Option<(
+    std::sync::Arc<tokio::sync::Mutex<crate::daemon::registry::CheckoutRegistry>>,
+    u64,
+)>;
+
+enum Input {
+    Frame(wire::Frame),
+    Done(u64, std::io::Result<CallOutcome>),
+}
+
+/// A worker's finished call: the tool result and the fences the send decision
+/// rechecks.
+struct CallOutcome {
+    result: serde_json::Value,
+    finals: Finals,
+}
+enum Finals {
+    /// Invalid application fields or a selection failure: nothing to recheck.
+    None,
+    Launch {
+        catching_up: bool,
+    },
+    Selected {
+        witness: crate::daemon::registry::SelectedCheckout,
+        catching_up: bool,
+    },
+    Capacity {
+        witness: crate::daemon::registry::SelectedCheckout,
+        catching_up: bool,
+    },
+}
+
+/// The answering root and `catchingUp`, once read admission sampled it.
+type Resolved = std::sync::Arc<std::sync::Mutex<Option<(std::path::PathBuf, bool)>>>;
+
+struct InFlight {
+    id: serde_json::Value,
+    modern: bool,
+    deadline: std::time::Instant,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    resolved: Resolved,
+    attempted: serde_json::Value,
+}
+
+struct CallContext {
+    workspace: std::sync::Arc<OpenedWorkspace>,
+    registry: Registry,
+    daemon_handle: Option<tokio::runtime::Handle>,
+    id: serde_json::Value,
+    modern: bool,
+    name: String,
+    arguments: Option<serde_json::Value>,
+    deadline: std::time::Instant,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    resolved: Resolved,
+}
+
+/// One admitted call, run whole on its worker: selection, readiness, the
+/// read and the response. The connection decides whether to send it.
+fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
+    let CallContext {
+        workspace,
+        registry,
+        daemon_handle,
+        id,
+        modern,
+        name,
+        arguments,
+        deadline,
+        cancel,
+        resolved,
+    } = ctx;
+    let selection = arguments
+        .as_ref()
+        .and_then(|v| v.as_object())
+        .and_then(|o| o.get("workspace"));
+    let selected = if let Some((registry, session_id)) = &registry {
+        match selection.and_then(serde_json::Value::as_str) {
+            Some(path) => registry
+                .blocking_lock()
+                .select(
+                    *session_id,
+                    workspace.identity(),
+                    std::path::Path::new(path),
+                )
+                .map(Some),
+            None => workspace
+                .check()
+                .map(|_| None)
+                .map_err(|_| crate::daemon::registry::SelectionError::IdentityChanged),
+        }
+    } else {
+        workspace
+            .check()
+            .map(|_| None)
+            .map_err(|_| crate::daemon::registry::SelectionError::IdentityChanged)
+    };
+    match selected {
+        Ok(selected) => {
+            if selected.is_some() {
+                phase_hook("selected_clone")?;
+            }
+            let key = selected
+                .as_ref()
+                .map_or(&workspace.identity.root_key, |w| &w.identity.root_key);
+            let catching_up = catching_up(&registry, key);
+            let selected_workspace = selected
+                .as_ref()
+                .map(|w| w.identity.verified_clone().map(OpenedWorkspace::new));
+            let selected_workspace = match selected_workspace.transpose() {
+                Err(_) => {
+                    let root = selected
+                        .as_ref()
+                        .map_or(workspace.root(), |witness| witness.identity.root.as_path());
+                    return Ok(CallOutcome {
+                        result: tools::resolved_root_changed(&id, root, catching_up, modern),
+                        finals: Finals::None,
+                    });
+                }
+                Ok(selected_workspace) => selected_workspace,
+            };
+            let answering = selected_workspace.as_ref().unwrap_or(&workspace);
+            let mut tool = tools::prepare(&name, arguments.as_ref(), &id, modern, answering);
+            let mut sampled_catching_up = catching_up;
+            let mut envelope = tool.response["structuredContent"].clone();
+            if name == "trellis_workspace_describe"
+                && let Some((registry, _)) = &registry
+            {
+                match describe(
+                    registry,
+                    key,
+                    selected.as_ref(),
+                    daemon_handle.as_ref(),
+                    deadline,
+                    &cancel,
+                ) {
+                    Ok((read, degraded)) => {
+                        match read {
+                            Ok(DescribedSnapshot {
+                                data: Some((status, counts)),
+                                catching_up: sampled,
+                                state,
+                                progress,
+                            }) => {
+                                sampled_catching_up = sampled;
+                                envelope = projection::describe(
+                                    &id,
+                                    answering.label(),
+                                    state,
+                                    progress,
+                                    Some(counts),
+                                    Some(serde_json::json!({
+                                        "indexGeneration": status.revision.index_generation.to_string(),
+                                        "indexRevision": status.revision.index_revision
+                                    })),
+                                    false,
+                                );
+                            }
+                            Ok(DescribedSnapshot {
+                                data: None,
+                                catching_up: sampled,
+                                state,
+                                progress,
+                            }) => {
+                                sampled_catching_up = sampled;
+                                envelope = projection::describe(
+                                    &id,
+                                    answering.label(),
+                                    state,
+                                    progress,
+                                    None,
+                                    None,
+                                    false,
+                                );
+                            }
+                            Err(error) => {
+                                envelope = tools::failure(&id, mcp_read_error(&error));
+                            }
+                        }
+                        match degraded {
+                            Ok(degraded) if envelope.get("data").is_some() => {
+                                envelope["data"]["watcherDegraded"] = serde_json::json!(degraded);
+                            }
+                            Err(error) => envelope = tools::failure(&id, mcp_read_error(&error)),
+                            _ => {}
+                        }
+                    }
+                    Err(error) => {
+                        envelope = tools::failure(&id, mcp_read_error(&error));
+                    }
+                }
+            }
+            *resolved.lock().unwrap() = Some((answering.root().to_owned(), sampled_catching_up));
+            envelope["workspace"] = serde_json::json!(answering.root());
+            envelope["catchingUp"] = serde_json::json!(sampled_catching_up);
+            tool.response = tools::result(envelope, modern);
+            let finals = match selected {
+                Some(witness) => Finals::Selected {
+                    witness,
+                    catching_up: sampled_catching_up,
+                },
+                None => Finals::Launch {
+                    catching_up: sampled_catching_up,
+                },
+            };
+            Ok(CallOutcome {
+                result: tool.response,
+                finals,
+            })
+        }
+        Err(crate::daemon::registry::SelectionError::CheckoutCapacity) => {
+            let Some(path) = selection.and_then(serde_json::Value::as_str) else {
+                unreachable!("validated capacity requires explicit selection")
+            };
+            let checked_capacity = {
+                let guard = registry
+                    .as_ref()
+                    .expect("daemon registry required")
+                    .0
+                    .blocking_lock();
+                guard.capacity_witness(workspace.identity(), std::path::Path::new(path))
+            };
+            match checked_capacity {
+                Ok(witness) => {
+                    let catching_up = catching_up(&registry, &witness.identity.root_key);
+                    *resolved.lock().unwrap() = Some((witness.identity.root.clone(), catching_up));
+                    let result = tools::result(
+                        tools::attributed_root(
+                            tools::failure(&id, "checkout_capacity"),
+                            &witness.identity.root,
+                            catching_up,
+                        ),
+                        modern,
+                    );
+                    Ok(CallOutcome {
+                        result,
+                        finals: Finals::Capacity {
+                            witness,
+                            catching_up,
+                        },
+                    })
+                }
+                Err(error) => Ok(CallOutcome {
+                    result: tools::result(
+                        tools::selection_failure(&id, error, &serde_json::json!(path)),
+                        modern,
+                    ),
+                    finals: Finals::None,
+                }),
+            }
+        }
+        Err(error) => {
+            let attempted = selection
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!(workspace.root()));
+            Ok(CallOutcome {
+                result: tools::result(tools::selection_failure(&id, error, &attempted), modern),
+                finals: Finals::None,
+            })
+        }
+    }
+}
+
+/// Activation, the selected read and published watcher health for one
+/// describe call, on the call's own worker.
+fn describe(
+    registry: &std::sync::Arc<tokio::sync::Mutex<crate::daemon::registry::CheckoutRegistry>>,
+    key: &str,
+    selected: Option<&crate::daemon::registry::SelectedCheckout>,
+    daemon_handle: Option<&tokio::runtime::Handle>,
+    deadline: std::time::Instant,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> anyhow::Result<(anyhow::Result<DescribedSnapshot>, anyhow::Result<bool>)> {
+    let existing = registry.blocking_lock().runtime(key);
+    let runtime = match existing {
+        Some(runtime) => runtime,
+        None => match daemon_handle {
+            Some(handle) => handle.block_on(async { registry.lock().await.activate(key) })?,
+            None => anyhow::bail!("index_not_ready: checkout not activated"),
+        },
+    };
+    let read = read_describe(&runtime, selected, deadline, cancel);
+    Ok((read, runtime.mcp_watcher_degraded()))
+}
+
+/// The connection coordinator (Decision 0009 §7). It alone owns the output.
+/// It admits calls as they arrive, runs each on a bounded worker, and decides
+/// each outcome at the earliest of its result and its deadline, after settling
+/// all input already received (so a cancellation wins over an unsent result).
 fn run_transport(
     workspace: OpenedWorkspace,
     input: impl std::io::Read + Send + 'static,
     output: impl std::io::Write,
-    registry: Option<(
-        std::sync::Arc<tokio::sync::Mutex<crate::daemon::registry::CheckoutRegistry>>,
-        u64,
-    )>,
+    registry: Registry,
     daemon_handle: Option<tokio::runtime::Handle>,
 ) -> std::io::Result<()> {
-    use std::collections::VecDeque;
+    use std::collections::{HashMap, VecDeque};
     use std::io::BufReader;
-    use std::sync::mpsc::{self, TryRecvError};
-    let (sender, receiver) = mpsc::sync_channel::<wire::Frame>(16);
+    use std::sync::mpsc::{self, RecvTimeoutError, TryRecvError};
+    let workspace = std::sync::Arc::new(workspace);
+    let (sender, receiver) = mpsc::sync_channel::<Input>(32);
+    let reader_sender = sender.clone();
     std::thread::Builder::new()
         .name("mcp-stdin".into())
         .spawn(move || {
@@ -316,17 +586,17 @@ fn run_transport(
             loop {
                 match wire::read_frame(&mut reader) {
                     Ok(wire::Frame::Eof) => {
-                        let _ = sender.send(wire::Frame::Eof);
+                        let _ = reader_sender.send(Input::Frame(wire::Frame::Eof));
                         break;
                     }
                     Ok(frame) => {
-                        if sender.send(frame).is_err() {
+                        if reader_sender.send(Input::Frame(frame)).is_err() {
                             break;
                         }
                     }
                     Err(error) => {
                         eprintln!("MCP stdin read failed: {error}");
-                        let _ = sender.send(wire::Frame::Eof);
+                        let _ = reader_sender.send(Input::Frame(wire::Frame::Eof));
                         break;
                     }
                 }
@@ -334,31 +604,185 @@ fn run_transport(
         })?;
     let mut session = session::Session::new();
     let mut outcomes = VecDeque::new();
+    let mut completed: VecDeque<(u64, std::io::Result<CallOutcome>)> = VecDeque::new();
+    let mut in_flight: HashMap<u64, InFlight> = HashMap::new();
     let mut writer = output;
-    loop {
-        // A blocked coordinator waits for one input event. Once there is pending work,
-        // observe all input currently waiting before committing even the first result.
-        if outcomes.is_empty() {
-            let Ok(frame) = receiver.recv() else {
-                session.eof();
-                break;
-            };
-            if receive(frame, &mut session, &mut outcomes) {
-                break;
-            }
-        }
+    // Settle every input already received. Returns true at end of input.
+    let settle = |receiver: &mpsc::Receiver<Input>,
+                  session: &mut session::Session,
+                  outcomes: &mut VecDeque<impl_receive::Outcome>,
+                  completed: &mut VecDeque<(u64, std::io::Result<CallOutcome>)>|
+     -> bool {
         loop {
             match receiver.try_recv() {
-                Ok(frame) => {
+                Ok(Input::Frame(frame)) => {
+                    if receive(frame, session, outcomes) {
+                        return true;
+                    }
+                }
+                Ok(Input::Done(token, outcome)) => completed.push_back((token, outcome)),
+                Err(TryRecvError::Empty) => return false,
+                Err(TryRecvError::Disconnected) => {
+                    session.eof();
+                    return true;
+                }
+            }
+        }
+    };
+    // A cancelled or ended call stops its worker cooperatively.
+    let cancel_dropped = |session: &session::Session, in_flight: &mut HashMap<u64, InFlight>| {
+        in_flight.retain(|token, call| {
+            let pending = session.pending(*token).is_some();
+            if !pending {
+                call.cancel
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+            pending
+        });
+    };
+    loop {
+        if outcomes.is_empty() && completed.is_empty() {
+            let next = in_flight.values().map(|call| call.deadline).min();
+            let event = match next {
+                Some(deadline) => {
+                    match receiver
+                        .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                    {
+                        Ok(event) => Some(event),
+                        Err(RecvTimeoutError::Timeout) => None,
+                        Err(RecvTimeoutError::Disconnected) => {
+                            session.eof();
+                            cancel_dropped(&session, &mut in_flight);
+                            return Ok(());
+                        }
+                    }
+                }
+                None => match receiver.recv() {
+                    Ok(event) => Some(event),
+                    Err(_) => {
+                        session.eof();
+                        cancel_dropped(&session, &mut in_flight);
+                        return Ok(());
+                    }
+                },
+            };
+            match event {
+                Some(Input::Frame(frame)) => {
                     if receive(frame, &mut session, &mut outcomes) {
+                        cancel_dropped(&session, &mut in_flight);
                         return Ok(());
                     }
                 }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    session.eof();
-                    return Ok(());
+                Some(Input::Done(token, outcome)) => completed.push_back((token, outcome)),
+                None => {}
+            }
+        }
+        if settle(&receiver, &mut session, &mut outcomes, &mut completed) {
+            cancel_dropped(&session, &mut in_flight);
+            return Ok(());
+        }
+        cancel_dropped(&session, &mut in_flight);
+        // Calls past their deadline answer deadline_exceeded now.
+        let now = std::time::Instant::now();
+        let expired: Vec<u64> = in_flight
+            .iter()
+            .filter(|(_, call)| call.deadline <= now)
+            .map(|(token, _)| *token)
+            .collect();
+        for token in expired {
+            let call = in_flight.remove(&token).expect("expired call");
+            call.cancel
+                .store(true, std::sync::atomic::Ordering::Release);
+            let envelope = match &*call.resolved.lock().unwrap() {
+                Some((root, catching_up)) => tools::attributed_root(
+                    tools::failure(&call.id, "deadline_exceeded"),
+                    root,
+                    *catching_up,
+                ),
+                None => tools::admission_failure(&call.id, "deadline_exceeded", &call.attempted),
+            };
+            let response = serde_json::json!({"jsonrpc":"2.0","id":call.id,
+                "result":tools::result(envelope, call.modern)});
+            if let Some(prepared) = session.prepare(token, response)
+                && let Some(value) = session.commit(prepared)
+            {
+                wire::write_response(&mut writer, &value)?;
+            }
+        }
+        // Finished calls: the send decision.
+        while let Some((token, outcome)) = completed.pop_front() {
+            if settle(&receiver, &mut session, &mut outcomes, &mut completed) {
+                cancel_dropped(&session, &mut in_flight);
+                return Ok(());
+            }
+            cancel_dropped(&session, &mut in_flight);
+            let Some(call) = in_flight.remove(&token) else {
+                // Already decided at its deadline, or cancelled.
+                continue;
+            };
+            let outcome = outcome?;
+            let mut result = outcome.result;
+            if std::time::Instant::now() >= call.deadline {
+                let envelope = match &*call.resolved.lock().unwrap() {
+                    Some((root, catching_up)) => tools::attributed_root(
+                        tools::failure(&call.id, "deadline_exceeded"),
+                        root,
+                        *catching_up,
+                    ),
+                    None => {
+                        tools::admission_failure(&call.id, "deadline_exceeded", &call.attempted)
+                    }
+                };
+                result = tools::result(envelope, call.modern);
+            } else {
+                match &outcome.finals {
+                    Finals::None => {}
+                    Finals::Launch { catching_up } => {
+                        phase_hook("launch_final")?;
+                        if workspace.check().is_err() {
+                            result = tools::resolved_root_changed(
+                                &call.id,
+                                workspace.root(),
+                                *catching_up,
+                                call.modern,
+                            );
+                        }
+                    }
+                    Finals::Selected {
+                        witness,
+                        catching_up,
+                    } => {
+                        phase_hook("selected_final")?;
+                        if witness.before_answer().is_err() {
+                            result = tools::resolved_root_changed(
+                                &call.id,
+                                &witness.identity.root,
+                                *catching_up,
+                                call.modern,
+                            );
+                        }
+                    }
+                    Finals::Capacity {
+                        witness,
+                        catching_up,
+                    } => {
+                        phase_hook("capacity_final")?;
+                        if witness.before_answer().is_err() {
+                            result = tools::resolved_root_changed(
+                                &call.id,
+                                &witness.identity.root,
+                                *catching_up,
+                                call.modern,
+                            );
+                        }
+                    }
                 }
+            }
+            let response = serde_json::json!({"jsonrpc":"2.0","id":call.id,"result":result});
+            if let Some(prepared) = session.prepare(token, response)
+                && let Some(value) = session.commit(prepared)
+            {
+                wire::write_response(&mut writer, &value)?;
             }
         }
         let Some(outcome) = outcomes.pop_front() else {
@@ -368,26 +792,29 @@ fn run_transport(
             impl_receive::Outcome::Error(error) => {
                 wire::write_response(&mut writer, &error.response())?
             }
-            impl_receive::Outcome::Request(admission) => {
+            impl_receive::Outcome::Request(admission, accepted) => {
                 // Cancellation may have invalidated the token while its outcome waited.
                 if session.pending(admission.token).is_none() {
                     continue;
                 }
-                let call_deadline = std::time::Instant::now() + workspace.call_deadline;
                 let modern = session.mode() == session::Mode::Modern;
-                let mut prepared_tool = None;
-                let mut capacity_witness = None;
-                let result = match &admission.action {
-                    session::Action::Discover => catalog::discover(workspace.build_version()),
-                    session::Action::Initialize => catalog::initialize(workspace.build_version()),
-                    session::Action::List => catalog::list(modern),
+                let immediate = match &admission.action {
+                    session::Action::Discover => Some(catalog::discover(workspace.build_version())),
+                    session::Action::Initialize => {
+                        Some(catalog::initialize(workspace.build_version()))
+                    }
+                    session::Action::List => Some(catalog::list(modern)),
+                    session::Action::Unknown => None,
                     session::Action::Call { name, arguments } => {
                         let selection = arguments
                             .as_ref()
                             .and_then(|v| v.as_object())
                             .and_then(|o| o.get("workspace"));
-                        let valid = tools::validate(name, arguments.as_ref()).is_ok();
-                        if !valid {
+                        let attempted = selection
+                            .cloned()
+                            .unwrap_or_else(|| serde_json::json!(workspace.root()));
+                        if tools::validate(name, arguments.as_ref()).is_err() {
+                            // Application validation precedes capacity.
                             let tool = tools::prepare(
                                 name,
                                 arguments.as_ref(),
@@ -395,284 +822,96 @@ fn run_transport(
                                 modern,
                                 &workspace,
                             );
-                            let result = tool.response.clone();
-                            prepared_tool = Some((tool, None, false));
-                            result
-                        } else {
-                            let selected = if let Some((registry, session_id)) = &registry {
-                                match selection.and_then(serde_json::Value::as_str) {
-                                    Some(path) => registry
-                                        .blocking_lock()
-                                        .select(
-                                            *session_id,
-                                            workspace.identity(),
-                                            std::path::Path::new(path),
-                                        )
-                                        .map(Some),
-                                    None => workspace.check().map(|_| None).map_err(|_| {
-                                        crate::daemon::registry::SelectionError::IdentityChanged
-                                    }),
-                                }
-                            } else {
-                                workspace.check().map(|_| None).map_err(|_| {
-                                    crate::daemon::registry::SelectionError::IdentityChanged
-                                })
+                            Some(tool.response)
+                        } else if in_flight.len() >= MAX_CONNECTION_CALLS {
+                            Some(tools::result(
+                                tools::admission_failure(
+                                    &admission.id,
+                                    "too_many_requests",
+                                    &attempted,
+                                ),
+                                modern,
+                            ))
+                        } else if let Some(permit) = WorkerPermit::acquire() {
+                            let cancel =
+                                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                            let resolved: Resolved = Default::default();
+                            let deadline = accepted + workspace.call_deadline;
+                            let context = CallContext {
+                                workspace: workspace.clone(),
+                                registry: registry.clone(),
+                                daemon_handle: daemon_handle.clone(),
+                                id: admission.id.clone(),
+                                modern,
+                                name: name.clone(),
+                                arguments: arguments.clone(),
+                                deadline,
+                                cancel: cancel.clone(),
+                                resolved: resolved.clone(),
                             };
-                            match selected {
-                                Ok(selected) => {
-                                    if selected.is_some() {
-                                        phase_hook("selected_clone")?;
-                                    }
-                                    let key = selected
-                                        .as_ref()
-                                        .map_or(&workspace.identity.root_key, |w| {
-                                            &w.identity.root_key
-                                        });
-                                    let catching_up = catching_up(&registry, key);
-                                    let selected_workspace = selected.as_ref().map(|w| {
-                                        w.identity.verified_clone().map(OpenedWorkspace::new)
-                                    });
-                                    match selected_workspace.transpose() {
-                                        Err(_) => {
-                                            let root = selected
-                                                .as_ref()
-                                                .map_or(workspace.root(), |witness| {
-                                                    witness.identity.root.as_path()
-                                                });
-                                            tools::resolved_root_changed(
-                                                &admission.id,
-                                                root,
-                                                catching_up,
-                                                modern,
-                                            )
-                                        }
-                                        Ok(selected_workspace) => {
-                                            let answering =
-                                                selected_workspace.as_ref().unwrap_or(&workspace);
-                                            let mut tool = tools::prepare(
-                                                name,
-                                                arguments.as_ref(),
-                                                &admission.id,
-                                                modern,
-                                                answering,
-                                            );
-                                            let mut sampled_catching_up = catching_up;
-                                            let mut envelope =
-                                                tool.response["structuredContent"].clone();
-                                            if name == "trellis_workspace_describe"
-                                                && let Some((registry, _)) = &registry
-                                            {
-                                                match describe_within(
-                                                    registry,
-                                                    key,
-                                                    selected.as_ref(),
-                                                    daemon_handle.as_ref(),
-                                                    call_deadline,
-                                                ) {
-                                                    Ok((read, degraded)) => {
-                                                        match read {
-                                                            Ok(DescribedSnapshot {
-                                                                data: Some((status, counts)),
-                                                                catching_up: sampled,
-                                                                state,
-                                                                progress,
-                                                            }) => {
-                                                                sampled_catching_up = sampled;
-                                                                envelope = projection::describe(
-                                                                    &admission.id,
-                                                                    answering.label(),
-                                                                    state,
-                                                                    progress,
-                                                                    Some(counts),
-                                                                    Some(serde_json::json!({
-                                                                        "indexGeneration": status.revision.index_generation.to_string(),
-                                                                        "indexRevision": status.revision.index_revision
-                                                                    })),
-                                                                    false,
-                                                                );
-                                                            }
-                                                            Ok(DescribedSnapshot {
-                                                                data: None,
-                                                                catching_up: sampled,
-                                                                state,
-                                                                progress,
-                                                            }) => {
-                                                                sampled_catching_up = sampled;
-                                                                envelope = projection::describe(
-                                                                    &admission.id,
-                                                                    answering.label(),
-                                                                    state,
-                                                                    progress,
-                                                                    None,
-                                                                    None,
-                                                                    false,
-                                                                );
-                                                            }
-                                                            Err(error) => {
-                                                                envelope = tools::failure(
-                                                                    &admission.id,
-                                                                    mcp_read_error(&error),
-                                                                );
-                                                            }
-                                                        }
-                                                        match degraded {
-                                                            Ok(degraded)
-                                                                if envelope
-                                                                    .get("data")
-                                                                    .is_some() =>
-                                                            {
-                                                                envelope["data"]["watcherDegraded"] =
-                                                                    serde_json::json!(degraded);
-                                                            }
-                                                            Err(error) => {
-                                                                envelope = tools::failure(
-                                                                    &admission.id,
-                                                                    mcp_read_error(&error),
-                                                                )
-                                                            }
-                                                            _ => {}
-                                                        }
-                                                    }
-                                                    Err(error) => {
-                                                        envelope = tools::failure(
-                                                            &admission.id,
-                                                            mcp_read_error(&error),
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                            envelope["workspace"] =
-                                                serde_json::json!(answering.root());
-                                            envelope["catchingUp"] =
-                                                serde_json::json!(sampled_catching_up);
-                                            tool.response = tools::result(envelope, modern);
-                                            let result = tool.response.clone();
-                                            prepared_tool =
-                                                Some((tool, selected, sampled_catching_up));
-                                            result
-                                        }
-                                    }
-                                }
-                                Err(crate::daemon::registry::SelectionError::CheckoutCapacity) => {
-                                    let Some(path) = selection.and_then(serde_json::Value::as_str)
-                                    else {
-                                        unreachable!(
-                                            "validated capacity requires explicit selection"
-                                        )
-                                    };
-                                    let checked_capacity = {
-                                        let guard = registry
-                                            .as_ref()
-                                            .expect("daemon registry required")
-                                            .0
-                                            .blocking_lock();
-                                        guard.capacity_witness(
-                                            workspace.identity(),
-                                            std::path::Path::new(path),
-                                        )
-                                    };
-                                    match checked_capacity {
-                                        Ok(witness) => {
-                                            let catching_up =
-                                                catching_up(&registry, &witness.identity.root_key);
-                                            let response = tools::result(
-                                                tools::attributed_root(
-                                                    tools::failure(
-                                                        &admission.id,
-                                                        "checkout_capacity",
-                                                    ),
-                                                    &witness.identity.root,
-                                                    catching_up,
-                                                ),
-                                                modern,
-                                            );
-                                            capacity_witness = Some((witness, catching_up));
-                                            response
-                                        }
-                                        Err(error) => tools::result(
-                                            tools::selection_failure(
-                                                &admission.id,
-                                                error,
-                                                &serde_json::json!(path),
-                                            ),
+                            let done = sender.clone();
+                            let token = admission.token;
+                            let spawned = std::thread::Builder::new()
+                                .name("mcp-call".into())
+                                .spawn(move || {
+                                    let _permit = permit;
+                                    let outcome = run_call(context);
+                                    let _ = done.send(Input::Done(token, outcome));
+                                });
+                            match spawned {
+                                Ok(_) => {
+                                    in_flight.insert(
+                                        token,
+                                        InFlight {
+                                            id: admission.id.clone(),
                                             modern,
-                                        ),
-                                    }
+                                            deadline,
+                                            cancel,
+                                            resolved,
+                                            attempted,
+                                        },
+                                    );
+                                    None
                                 }
-                                Err(error) => {
-                                    let attempted = selection
-                                        .cloned()
-                                        .unwrap_or_else(|| serde_json::json!(workspace.root()));
-                                    tools::result(
-                                        tools::selection_failure(&admission.id, error, &attempted),
-                                        modern,
-                                    )
-                                }
+                                // The permit went with the failed closure.
+                                Err(_) => Some(tools::result(
+                                    tools::admission_failure(
+                                        &admission.id,
+                                        "too_many_requests",
+                                        &attempted,
+                                    ),
+                                    modern,
+                                )),
                             }
+                        } else {
+                            Some(tools::result(
+                                tools::admission_failure(
+                                    &admission.id,
+                                    "too_many_requests",
+                                    &attempted,
+                                ),
+                                modern,
+                            ))
                         }
                     }
-                    session::Action::Unknown => {
+                };
+                let response = match (&admission.action, immediate) {
+                    (session::Action::Unknown, _) => {
                         wire::ProtocolError::new(-32601, admission.id.clone()).response()
                     }
+                    (_, Some(result)) => {
+                        serde_json::json!({"jsonrpc":"2.0","id":admission.id,"result":result})
+                    }
+                    // Dispatched to a worker; decided later.
+                    (_, None) => continue,
                 };
-                let response = if matches!(admission.action, session::Action::Unknown) {
-                    result
-                } else {
-                    serde_json::json!({"jsonrpc":"2.0","id":admission.id,"result":result})
-                };
-                let Some(mut prepared) = session.prepare(admission.token, response) else {
+                let Some(prepared) = session.prepare(admission.token, response) else {
                     continue;
                 };
                 // A final nonblocking input pass takes precedence over the unsent result.
-                loop {
-                    match receiver.try_recv() {
-                        Ok(frame) => {
-                            if receive(frame, &mut session, &mut outcomes) {
-                                return Ok(());
-                            }
-                        }
-                        Err(TryRecvError::Empty) => break,
-                        Err(TryRecvError::Disconnected) => {
-                            session.eof();
-                            return Ok(());
-                        }
-                    }
-                }
-                if let Some((mut tool, selected, catching_up)) = prepared_tool {
-                    if tool.valid_arguments {
-                        phase_hook(if selected.is_some() {
-                            "selected_final"
-                        } else {
-                            "launch_final"
-                        })?;
-                        let changed = selected.as_ref().map_or_else(
-                            || workspace.check().is_err(),
-                            |witness| witness.before_answer().is_err(),
-                        );
-                        if changed {
-                            let root = selected.as_ref().map_or(workspace.root(), |witness| {
-                                witness.identity.root.as_path()
-                            });
-                            tool.response = tools::resolved_root_changed(
-                                &admission.id,
-                                root,
-                                catching_up,
-                                modern,
-                            );
-                        }
-                    }
-                    prepared.response["result"] = tool.response;
-                }
-                if let Some((witness, catching_up)) = capacity_witness {
-                    phase_hook("capacity_final")?;
-                    if witness.before_answer().is_err() {
-                        prepared.response["result"] = tools::resolved_root_changed(
-                            &admission.id,
-                            &witness.identity.root,
-                            catching_up,
-                            modern,
-                        );
-                    }
+                if settle(&receiver, &mut session, &mut outcomes, &mut completed) {
+                    cancel_dropped(&session, &mut in_flight);
+                    return Ok(());
                 }
                 if let Some(value) = session.commit(prepared) {
                     wire::write_response(&mut writer, &value)?;
@@ -680,7 +919,6 @@ fn run_transport(
             }
         }
     }
-    Ok(())
 }
 
 fn receive(
@@ -700,9 +938,10 @@ fn receive(
         }
         Ok(Some(request)) => match session.accept(request, catalog::known) {
             session::Event::Error(error) => outcomes.push_back(impl_receive::Outcome::Error(error)),
-            session::Event::Admitted(admission) => {
-                outcomes.push_back(impl_receive::Outcome::Request(admission))
-            }
+            // The call's deadline starts at protocol acceptance (Decision 0009 §7).
+            session::Event::Admitted(admission) => outcomes.push_back(
+                impl_receive::Outcome::Request(admission, std::time::Instant::now()),
+            ),
             session::Event::Ignore => (),
         },
     }
@@ -711,7 +950,8 @@ fn receive(
 mod impl_receive {
     pub(super) enum Outcome {
         Error(super::wire::ProtocolError),
-        Request(super::session::Admission),
+        /// An admitted request and the instant it was accepted.
+        Request(super::session::Admission, std::time::Instant),
     }
 }
 

@@ -2994,7 +2994,9 @@ async fn describe_replies_at_its_deadline_while_the_read_is_still_running() {
     let (release_tx, release_rx) = mpsc::sync_channel::<()>(1);
     runtime.set_mcp_read_hook_for_tests(move || {
         entered_tx.send(()).unwrap();
-        let _ = release_rx.recv_timeout(trellis::testing::HANG_BACKSTOP);
+        // Held until released, or until the test ends and drops the sender:
+        // never released by a timer.
+        let _ = release_rx.recv();
     });
     let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
     let (mut client, server) = UnixStream::pair().unwrap();
@@ -3629,4 +3631,278 @@ fn invalid_calls_and_non_w1_stubs_never_open_derived_databases() {
         }
         assert!(peer.finish().0.success());
     }
+}
+
+/// A read gate that holds every MCP selected read until opened.
+#[derive(Clone, Default)]
+struct ReadGate(std::sync::Arc<(std::sync::Mutex<(usize, bool)>, std::sync::Condvar)>);
+impl ReadGate {
+    fn hook(&self) -> std::sync::Arc<dyn Fn() + Send + Sync> {
+        let gate = self.clone();
+        std::sync::Arc::new(move || {
+            let (state, changed) = &*gate.0;
+            let mut held = state.lock().unwrap();
+            held.0 += 1;
+            changed.notify_all();
+            while !held.1 {
+                held = changed.wait(held).unwrap();
+            }
+        })
+    }
+    /// Wait (bounded only by the hang backstop) until `count` reads are held.
+    fn await_held(&self, count: usize) {
+        let (state, changed) = &*self.0;
+        let held = state.lock().unwrap();
+        let (held, timeout) = changed
+            .wait_timeout_while(held, trellis::testing::HANG_BACKSTOP, |held| held.0 < count)
+            .unwrap();
+        assert!(!timeout.timed_out(), "only {} reads were held", held.0);
+    }
+    fn open(&self) {
+        let (state, changed) = &*self.0;
+        state.lock().unwrap().1 = true;
+        changed.notify_all();
+    }
+}
+impl Drop for ReadGate {
+    fn drop(&mut self) {
+        // Never strand held readers when a test fails.
+        if std::sync::Arc::strong_count(&self.0) == 1 {
+            self.open();
+        }
+    }
+}
+
+/// An activated, settled checkout and its daemon registry.
+async fn ready_registry(
+    temp: &Path,
+    session: u64,
+) -> (
+    trellis::store::topology::WorkspaceIdentity,
+    std::sync::Arc<tokio::sync::Mutex<trellis::daemon::registry::CheckoutRegistry>>,
+    std::sync::Arc<trellis::daemon::registry::CheckoutRuntime>,
+) {
+    use trellis::daemon::registry::CheckoutRegistry;
+    use trellis::store::topology::{TopologyRoots, WorkspaceIdentity};
+    let root = checkout(temp);
+    fs::write(root.join("a.js"), "function held() {}\n").unwrap();
+    let identity = WorkspaceIdentity::discover(Some(&root), &root)
+        .unwrap()
+        .attach_marker()
+        .unwrap();
+    let topology = TopologyRoots::isolated_for_tests(temp.join("cache"), temp.join("data"));
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(session, &identity).unwrap();
+    let runtime = registry.activate(&identity.root_key).unwrap();
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        loop {
+            if let Ok((response, catching_up)) = runtime.evidence_response()
+                && response.finish(()).is_ok()
+                && !catching_up
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("startup reconciliation did not finish");
+    let identity = WorkspaceIdentity::discover(Some(&root), &root)
+        .unwrap()
+        .attach_marker()
+        .unwrap();
+    (
+        identity,
+        std::sync::Arc::new(tokio::sync::Mutex::new(registry)),
+        runtime,
+    )
+}
+
+/// One daemon-socket MCP connection served on a thread.
+fn socket_session(
+    identity: &trellis::store::topology::WorkspaceIdentity,
+    registry: &std::sync::Arc<tokio::sync::Mutex<trellis::daemon::registry::CheckoutRegistry>>,
+    session: u64,
+    deadline: Option<Duration>,
+) -> (
+    std::os::unix::net::UnixStream,
+    BufReader<std::os::unix::net::UnixStream>,
+    std::thread::JoinHandle<std::io::Result<()>>,
+) {
+    let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+    client
+        .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
+        .unwrap();
+    let mut workspace = trellis::mcp::OpenedWorkspace::new(
+        trellis::store::topology::WorkspaceIdentity::discover(Some(&identity.root), &identity.root)
+            .unwrap()
+            .attach_marker()
+            .unwrap(),
+    );
+    if let Some(deadline) = deadline {
+        workspace = workspace.with_call_deadline_for_tests(deadline);
+    }
+    let registry = registry.clone();
+    let handle = tokio::runtime::Handle::current();
+    let thread = std::thread::spawn(move || {
+        trellis::mcp::run_socket(workspace, server, registry, session, handle)
+    });
+    let reader = BufReader::new(client.try_clone().unwrap());
+    (client, reader, thread)
+}
+
+fn describe_call(id: i64) -> Value {
+    modern(
+        json!(id),
+        "tools/call",
+        json!({"name":"trellis_workspace_describe","arguments":{"schemaVersion":1}}),
+    )
+}
+
+fn next_reply(reader: &mut BufReader<std::os::unix::net::UnixStream>) -> Value {
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    serde_json::from_str(&line).unwrap()
+}
+
+/// Decision 0009 §7: four admitted calls on a connection run at once; a fifth
+/// is refused at once, without queueing, in the pre-resolution shape.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn four_calls_run_concurrently_and_a_fifth_is_refused() {
+    let temp = tempfile::tempdir().unwrap();
+    let (identity, registry, runtime) = ready_registry(temp.path(), 71).await;
+    let gate = ReadGate::default();
+    runtime.set_mcp_read_gate_for_tests(gate.hook());
+    let (mut client, mut reader, session) = socket_session(&identity, &registry, 71, None);
+    for id in 1..=4 {
+        writeln!(client, "{}", describe_call(id)).unwrap();
+    }
+    let waiter = gate.clone();
+    tokio::task::spawn_blocking(move || waiter.await_held(4))
+        .await
+        .unwrap();
+    writeln!(client, "{}", describe_call(5)).unwrap();
+    let refused = next_reply(&mut reader);
+    assert_eq!(refused["id"], 5, "{refused}");
+    let envelope = &refused["result"]["structuredContent"];
+    assert_eq!(envelope["error"]["code"], "too_many_requests", "{refused}");
+    assert_eq!(envelope["error"]["retryable"], true);
+    assert_eq!(envelope["error"]["attemptedWorkspace"]["kind"], "path");
+    assert!(envelope.get("workspace").is_none() && envelope.get("catchingUp").is_none());
+    gate.open();
+    let mut answered: Vec<i64> = (0..4)
+        .map(|_| {
+            let reply = next_reply(&mut reader);
+            tool(&reply, None, true);
+            reply["id"].as_i64().unwrap()
+        })
+        .collect();
+    answered.sort_unstable();
+    assert_eq!(answered, vec![1, 2, 3, 4]);
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
+/// Decision 0009 §7: a call worker keeps its permit until its thread exits,
+/// even after its call answered deadline_exceeded, across connections; the
+/// daemon-wide budget then refuses new calls until workers finish.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn timed_out_workers_keep_their_permits_across_connections() {
+    let temp = tempfile::tempdir().unwrap();
+    let (identity, registry, runtime) = ready_registry(temp.path(), 72).await;
+    let gate = ReadGate::default();
+    runtime.set_mcp_read_gate_for_tests(gate.hook());
+    let mut connections = Vec::new();
+    for connection in 0..4 {
+        let (mut client, mut reader, session) =
+            socket_session(&identity, &registry, 72, Some(Duration::from_millis(300)));
+        for call in 0..4 {
+            writeln!(client, "{}", describe_call(connection * 10 + call)).unwrap();
+        }
+        for _ in 0..4 {
+            let reply = next_reply(&mut reader);
+            assert_eq!(
+                reply["result"]["structuredContent"]["error"]["code"], "deadline_exceeded",
+                "{reply}"
+            );
+        }
+        connections.push((client, reader, session));
+    }
+    let waiter = gate.clone();
+    tokio::task::spawn_blocking(move || waiter.await_held(16))
+        .await
+        .unwrap();
+    assert_eq!(trellis::mcp::live_call_workers_for_tests(), 16);
+    // A new connection: every permit is still held by a timed-out worker.
+    let (mut client, mut reader, session) = socket_session(&identity, &registry, 72, None);
+    writeln!(client, "{}", describe_call(99)).unwrap();
+    let refused = next_reply(&mut reader);
+    assert_eq!(
+        refused["result"]["structuredContent"]["error"]["code"], "too_many_requests",
+        "{refused}"
+    );
+    gate.open();
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        while trellis::mcp::live_call_workers_for_tests() != 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("timed-out workers did not exit");
+    writeln!(client, "{}", describe_call(100)).unwrap();
+    tool(&next_reply(&mut reader), None, true);
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+    for (client, reader, session) in connections {
+        drop(reader);
+        drop(client);
+        session.join().unwrap().unwrap();
+    }
+}
+
+/// Decision 0009 §7: a cancelled call writes nothing and its worker exits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_call_writes_nothing_and_its_worker_exits() {
+    let temp = tempfile::tempdir().unwrap();
+    let (identity, registry, runtime) = ready_registry(temp.path(), 73).await;
+    let gate = ReadGate::default();
+    runtime.set_mcp_read_gate_for_tests(gate.hook());
+    let (mut client, mut reader, session) = socket_session(&identity, &registry, 73, None);
+    writeln!(client, "{}", describe_call(1)).unwrap();
+    let waiter = gate.clone();
+    tokio::task::spawn_blocking(move || waiter.await_held(1))
+        .await
+        .unwrap();
+    writeln!(
+        client,
+        "{}",
+        json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}})
+    )
+    .unwrap();
+    // A later call is answered, so the cancellation has been settled.
+    let tools_list = modern(json!(2), "tools/list", json!({}));
+    writeln!(client, "{tools_list}").unwrap();
+    let listed = next_reply(&mut reader);
+    assert_eq!(listed["id"], 2, "the cancelled call answered: {listed}");
+    gate.open();
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        while trellis::mcp::live_call_workers_for_tests() != 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the cancelled worker did not exit");
+    client
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    let mut stray = String::new();
+    assert!(
+        reader.read_line(&mut stray).is_err(),
+        "the cancelled call wrote: {stray}"
+    );
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
 }
