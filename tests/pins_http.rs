@@ -43,7 +43,7 @@ fn fixture_with_state() -> (
         .id
         .clone();
     assert!(store.status().is_err());
-    // A serving fixture must stage its queue and commit the recorded-options H
+    // A serving fixture must stage its queue and commit the recorded-options startup reconciliation
     // before the first browser Q. A raw publish is not daemon activation.
     let (initial, session) =
         trellis::index_coordinator::reconcile_workspace(&store, &options, &cancel, |_| {}).unwrap();
@@ -502,7 +502,7 @@ async fn active_and_hot_journal_keep_pinned_http_safe() {
     assert_eq!(body["error"]["code"], "storage_busy");
     assert!(
         state.retained_serving_session().is_err(),
-        "exclusive index use prevents a daemon-local H before journal recovery"
+        "exclusive index use prevents a daemon-local startup reconciliation before journal recovery"
     );
     assert_eq!(
         before,

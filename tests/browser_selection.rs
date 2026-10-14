@@ -445,8 +445,8 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
         let status: Value = status.json().await.unwrap();
         assert_eq!(status["workspaceRoot"], verified_root.to_str().unwrap());
         // TODO(runtime-recovery): prior-head admission must make this read
-        // immediately available during H, as the preceding status was 200.
-        // Until that slice lands, only a typed cold/H index_not_ready may wait.
+        // immediately available during startup reconciliation, as the preceding status was 200.
+        // Until that slice lands, only a typed cold/startup reconciliation index_not_ready may wait.
         let jev = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
             loop {
                 let response = client
@@ -484,7 +484,7 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
             status["catchingUp"].as_bool().unwrap().to_string(),
             status_header
         );
-        // This test checks stable selected routes, not the prior-head/H gap.
+        // This test checks stable selected routes, not the prior-head/startup reconciliation gap.
         // Wait for this checkout's daemon-owned reconciliation before asserting
         // application errors such as directory_missing.
         tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
@@ -1143,7 +1143,7 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
             }
         })
         .await
-        .expect("selected tree did not leave transient H admission");
+        .expect("selected tree did not leave transient startup reconciliation admission");
         assert_eq!(forbidden_dir.status(), reqwest::StatusCode::FORBIDDEN);
         assert_eq!(
             forbidden_dir.json::<Value>().await.unwrap()["error"]["code"],
@@ -1394,7 +1394,7 @@ async fn resolved_root_change_retains_headers_even_when_read_fence_fails() {
         let mut last_code = None;
         let mut last_error_code = None;
         let mut saw_runtime = false;
-        let mut first_h_error = None;
+        let mut first_startup_error = None;
         let mut saw_retry_waiting = false;
         tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
             loop {
@@ -1413,15 +1413,15 @@ async fn resolved_root_change_retains_headers_even_when_read_fence_fails() {
                 if let Some(runtime) = runtime {
                     let waiting = runtime.retry_waiting_for_tests();
                     saw_retry_waiting |= waiting;
-                    if first_h_error.is_none() {
-                        first_h_error = runtime.reconciliation_error().map(|error| (error, waiting));
+                    if first_startup_error.is_none() {
+                        first_startup_error = runtime.reconciliation_error().map(|error| (error, waiting));
                     }
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         })
         .await
-        .unwrap_or_else(|_| panic!("{stage}/{route_suffix} cold selected route did not become ready: {last_code:?}/{last_error_code:?}; runtime seen: {saw_runtime}; first H error/retry: {first_h_error:?}; saw retry waiting: {saw_retry_waiting}; queue exists: {}", queue_path.exists()));
+        .unwrap_or_else(|_| panic!("{stage}/{route_suffix} cold selected route did not become ready: {last_code:?}/{last_error_code:?}; runtime seen: {saw_runtime}; first startup reconciliation error/retry: {first_startup_error:?}; saw retry waiting: {saw_retry_waiting}; queue exists: {}", queue_path.exists()));
         let changed = Arc::new(AtomicBool::new(false));
         let source = identity.root.clone();
         let destination = temp.path().join("moved");
@@ -1572,22 +1572,23 @@ async fn selected_question_preview_keeps_legacy_oversize_error() {
     .router();
     let prefix = format!("/api/checkouts/{}", identity.root_key);
     let mut last_status = None;
-    let mut first_h_error = None;
+    let mut first_startup_error = None;
     let mut saw_retry_waiting = false;
     let pin = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             let (status, _, value) =
                 selected_json(app.clone(), "GET", &format!("{prefix}/status"), Value::Null).await;
             last_status = Some((status, value.clone()));
-            // Sample while H is still retrying. The first error can disappear
+            // Sample while startup reconciliation is still retrying. The first error can disappear
             // after a successful retry, before the final timeout diagnostic.
             if (status != axum::http::StatusCode::OK || value["catchingUp"] != false)
                 && let Some(runtime) = registry.lock().await.runtime(&identity.root_key)
             {
                 let waiting = runtime.retry_waiting_for_tests();
                 saw_retry_waiting |= waiting;
-                if first_h_error.is_none() {
-                    first_h_error = runtime.reconciliation_error().map(|error| (error, waiting));
+                if first_startup_error.is_none() {
+                    first_startup_error =
+                        runtime.reconciliation_error().map(|error| (error, waiting));
                 }
             }
             if status == axum::http::StatusCode::OK && value["catchingUp"] == false {
@@ -1598,7 +1599,7 @@ async fn selected_question_preview_keeps_legacy_oversize_error() {
     })
     .await;
     let pin = pin.unwrap_or_else(|_| {
-        panic!("cold selected preview status stayed not-ready: {last_status:?}; first H error/retry: {first_h_error:?}; saw retry waiting: {saw_retry_waiting}")
+        panic!("cold selected preview status stayed not-ready: {last_status:?}; first startup reconciliation error/retry: {first_startup_error:?}; saw retry waiting: {saw_retry_waiting}")
     });
     let (status, _, symbols) = selected_json(
         app.clone(),
@@ -3069,8 +3070,8 @@ async fn virgin_queue_use_lock_contention_retries_h_before_claiming_fifo() {
             .browser_request_at(&identity, std::time::Instant::now())
             .unwrap();
         // Bootstrap now precedes publication. An outstanding SH prevents its
-        // EX lock, so activation must fail without exposing an H runtime or
-        // publishing a queue that could accept a FIFO request before H.
+        // EX lock, so activation must fail without exposing an startup reconciliation runtime or
+        // publishing a queue that could accept a FIFO request before startup reconciliation.
         let error = match checked.activate(&identity.root_key) {
             Ok(_) => panic!("virgin queue activation must not publish under SH contention"),
             Err(error) => error,
@@ -3109,7 +3110,7 @@ async fn virgin_queue_use_lock_contention_retries_h_before_claiming_fifo() {
     let ready = tokio::time::timeout_at(deadline, async {
         // The request may have committed between enqueue and registration.
         // Otherwise wait for this ID's durable terminal COMMIT without a
-        // stream of protected status/queue SH reads competing with H's EX.
+        // stream of protected status/queue SH reads competing with startup reconciliation's EX.
         let mut finished = loop {
             match store.request_by_id(&queued.id) {
                 Ok(Some(row)) => break row,
@@ -3145,7 +3146,7 @@ async fn virgin_queue_use_lock_contention_retries_h_before_claiming_fifo() {
             if code == axum::http::StatusCode::OK && status["catchingUp"] == false {
                 assert!(
                     status["revision"]["indexRevision"].as_u64().unwrap() >= 2,
-                    "mandatory H must publish before FIFO completion: {status}"
+                    "mandatory startup reconciliation must publish before FIFO completion: {status}"
                 );
                 break;
             }
@@ -3251,7 +3252,7 @@ async fn selected_reads_validated_predecessor_through_owner_handoff() {
     let (release_tx, release_rx) = mpsc::sync_channel(1);
     let release_rx = Mutex::new(release_rx);
     // Activation schedules reconciliation on Tokio. Set the hook before the
-    // first await so this runtime pauses before its mandatory local H.
+    // first await so this runtime pauses before its mandatory local startup reconciliation.
     runtime.set_startup_hook_for_tests(Arc::new(move || {
         entered_tx.send(()).unwrap();
         release_rx.lock().unwrap().recv().unwrap();
@@ -3263,7 +3264,7 @@ async fn selected_reads_validated_predecessor_through_owner_handoff() {
         }
     })
     .await
-    .expect("daemon-local H did not reach pre-publication boundary");
+    .expect("daemon-local startup reconciliation did not reach pre-publication boundary");
     let (code, headers, files) = selected_json(
         browser.clone(),
         "GET",
@@ -3301,7 +3302,7 @@ async fn selected_reads_validated_predecessor_through_owner_handoff() {
     assert_eq!(
         published.request_by_id(&queued.id).unwrap().unwrap().state,
         "queued",
-        "pre-H selected reads cannot claim accepted FIFO work"
+        "pre-startup reconciliation selected reads cannot claim accepted FIFO work"
     );
     release_tx.send(()).unwrap();
     tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
@@ -3317,7 +3318,7 @@ async fn selected_reads_validated_predecessor_through_owner_handoff() {
                 assert!(
                     status["revision"]["indexRevision"].as_u64().unwrap()
                         >= prior["indexRevision"].as_u64().unwrap() + 2,
-                    "mandatory H must publish before queued work"
+                    "mandatory startup reconciliation must publish before queued work"
                 );
                 break;
             }
@@ -3325,7 +3326,7 @@ async fn selected_reads_validated_predecessor_through_owner_handoff() {
         }
     })
     .await
-    .expect("local H and accepted FIFO head did not finish");
+    .expect("local startup reconciliation and accepted FIFO head did not finish");
     let finished = published.request_by_id(&queued.id).unwrap().unwrap();
     assert_eq!(
         (finished.id.as_str(), finished.seq, finished.state.as_str()),

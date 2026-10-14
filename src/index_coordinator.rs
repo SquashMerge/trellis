@@ -449,7 +449,7 @@ impl std::error::Error for PastCutoff {}
 const PERIODIC_INVENTORY: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl WatcherWork {
-    /// Construct only after the daemon commits mandatory H.
+    /// Construct only after the daemon commits mandatory startup reconciliation.
     pub fn new(
         store: &Store,
         session: &Arc<WriterSession>,
@@ -766,7 +766,7 @@ impl WatcherWork {
         {
             return Ok(false);
         }
-        // The first post-registration full inventory closes the H/watch gap.
+        // The first post-registration full inventory closes the startup/watch gap.
         // An identical selected capture needs no gratuitous new revision.
         let outcome: Result<PublishPermit> = (|| {
             let publication =
@@ -834,7 +834,7 @@ impl WatcherWork {
                 } else {
                     self.last_accounted_pin = None;
                     // A concurrent event is not part of this selected capture.
-                    // Keep it dirty for the next local H and full inventory.
+                    // Keep it dirty for the next local startup reconciliation and full inventory.
                     self.watch.require_full();
                 }
                 drop(publication);
@@ -866,7 +866,7 @@ pub fn reconcile_workspace(
     progress: impl Fn(IndexProgress) + Sync,
 ) -> Result<(IndexPin, Arc<WriterSession>)> {
     // Explicit daemon indexing obeys the same queue-recovery barrier as
-    // activation: confirm old-root terminal rows before ANY H publication.
+    // activation: confirm old-root terminal rows before ANY startup reconciliation publication.
     store.settle_foreign_root_requests()?;
     if store.is_recreate_pending() {
         return store.recreate_pending_writer_session(options, cancel);
@@ -1033,7 +1033,7 @@ fn drain_requests_observed_with_cancel(
             // An invalidated capture cannot publish. A failed busy COMMIT can
             // be ambiguous. For either one, authenticate the claim and exact
             // unchanged pin before returning the SAME seq to queued. A changed
-            // pin stays running for the next validated H, never an
+            // pin stays running for the next validated startup reconciliation, never an
             // invented terminal ACK or a duplicate native publication.
             let before = match before_publish {
                 Some(pin) => pin,
@@ -1130,7 +1130,7 @@ pub fn cooperative_maintenance_unit(
 }
 
 /// A checkout's daemon-local writer confirms old-root queue settlement, then
-/// commits mandatory H before its scheduler may claim FIFO requests.
+/// commits mandatory startup reconciliation before its scheduler may claim FIFO requests.
 pub fn establish_serving_session(
     store: &Store,
     explicit_options: Option<&IndexOptions>,
@@ -1218,7 +1218,7 @@ mod tests {
             let precommit = store.claim_request(&session).unwrap_err();
             assert!(
                 precommit.downcast_ref::<IndexNotReady>().is_some(),
-                "an acquired EX without its own committed H cannot claim: {precommit:#}"
+                "an acquired EX without its own committed startup reconciliation cannot claim: {precommit:#}"
             );
             let row = store.request_by_id(&own.id).unwrap().unwrap();
             assert_eq!(row.state, "queued");
@@ -1974,7 +1974,7 @@ mod tests {
         assert_eq!(ops, expected(&files));
         assert_eq!(store.index_baseline().unwrap(), first);
         // Cancellation before COMMIT must not close the validated prior head
-        // to daemon-local reads while this Store still awaits its new H.
+        // to daemon-local reads while this Store still awaits its new startup reconciliation.
         let prior = store.evidence_response_daemon_local().unwrap();
         assert_eq!(prior.status().unwrap().revision, first);
         assert_eq!(

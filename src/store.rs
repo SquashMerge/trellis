@@ -244,7 +244,7 @@ pub struct Store {
     test_queue_post_commit_failures: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
     test_publish_commit_busy_once: Arc<AtomicBool>,
-    // Distinct direct typed SQLite BUSY fixture for mandatory H retries.
+    // Distinct direct typed SQLite BUSY fixture for mandatory startup reconciliation retries.
     // The older plain-string hook remains unchanged for classifier tests.
     #[cfg(test)]
     test_publish_commit_typed_busy_once: Arc<AtomicBool>,
@@ -870,7 +870,7 @@ impl EvidenceResponse {
     }
     /// Ordinary reads release the snapshot before slow response assembly.
     /// A transitional exact-pin fence retains its predecessor snapshot; T03
-    /// releases it after materialization so H may commit before finish.
+    /// releases it after materialization so startup reconciliation may commit before finish.
     pub fn into_fence(self, policy: EvidenceFencePolicy) -> EvidenceFence {
         let Self { store, db, fence } = self;
         let snapshot_valid = fence.verify(&store, Some(&db)).is_ok();
@@ -6242,7 +6242,7 @@ impl Store {
         self.writer()
     }
 
-    /// Exercise daemon-local H and FIFO in isolated integration fixtures.
+    /// Exercise daemon-local startup reconciliation and FIFO in isolated integration fixtures.
     #[cfg(feature = "test-support")]
     pub fn writer_session_for_tests(&self) -> Result<Arc<topology::WriterSession>> {
         self.writer_session()
@@ -6250,7 +6250,7 @@ impl Store {
 
     pub(crate) fn writer_session(&self) -> Result<Arc<topology::WriterSession>> {
         let writer = self.writer()?;
-        // H must commit and attest a selected head before this local session
+        // startup reconciliation must commit and attest a selected head before this local session
         // may claim a durable request. Reads admit the validated prior head.
         self.recovery_required.store(true, Ordering::Release);
         Ok(Arc::new(topology::WriterSession::writer(writer)))
@@ -6687,11 +6687,11 @@ impl Store {
     fn read_status(&self, db: &Connection) -> Result<IndexStatus> {
         self.read_status_for(db, false)
     }
-    fn read_status_for(&self, db: &Connection, pre_h: bool) -> Result<IndexStatus> {
-        let status = if pre_h {
+    fn read_status_for(&self, db: &Connection, pre_startup: bool) -> Result<IndexStatus> {
+        let status = if pre_startup {
             self.verify_metadata_root(db)
                 .map_err(|error| self.report_live_read_failure(error))?;
-            // H may keep a valid prior head readable, but a selected document
+            // startup reconciliation may keep a valid prior head readable, but a selected document
             // already proved corrupt cannot be admitted by that same path.
             if self.disposition() == RecoveryDisposition::Rebuild {
                 anyhow::bail!(
@@ -9266,9 +9266,9 @@ impl Store {
         &self,
         db: &Connection,
         expected: Option<IndexPin>,
-        pre_h: bool,
+        pre_startup: bool,
     ) -> Result<ReadRevision> {
-        let head = self.read_status_for(db, pre_h)?.revision;
+        let head = self.read_status_for(db, pre_startup)?.revision;
         let pin = expected.unwrap_or(head);
         ensure!(
             pin.index_generation == head.index_generation
@@ -10725,9 +10725,10 @@ impl Store {
         &self,
         tx: &Connection,
         request: &crate::navigation::NavigationRequest,
-        pre_h: bool,
+        pre_startup: bool,
     ) -> Result<crate::navigation::NavigationResult> {
-        let selected = self.read_revision_for(tx, Some(request.expected_revision()), pre_h)?;
+        let selected =
+            self.read_revision_for(tx, Some(request.expected_revision()), pre_startup)?;
         let revision = selected.pin;
         // Navigation's source selector counts lines from the stored source BLOB,
         // and its member selector reads versioned class/node rows. Before either
@@ -10816,7 +10817,7 @@ impl Store {
         query: &str,
         expected: Option<IndexPin>,
         pagination: (usize, usize),
-        pre_h: bool,
+        pre_startup: bool,
     ) -> Result<crate::class_diagram::ClassPage> {
         use crate::class_diagram::ClassPage;
         let (offset, limit) = pagination;
@@ -10840,7 +10841,7 @@ impl Store {
                 InvalidRequest("Choose a workspace-relative class source path.")
             );
         }
-        let selected_revision = self.read_revision_for(tx, expected, pre_h)?;
+        let selected_revision = self.read_revision_for(tx, expected, pre_startup)?;
         let revision = selected_revision.pin;
         let (mut warnings, truncated) = class_metadata(tx, &selected_revision)
             .map_err(|error| self.report_selected_failure(selected_integrity(error)))?;
@@ -10942,10 +10943,10 @@ impl Store {
         &self,
         tx: &Connection,
         request: &crate::class_diagram::ClassDiagramRequest,
-        pre_h: bool,
+        pre_startup: bool,
     ) -> Result<crate::class_diagram::ClassDiagram> {
         use crate::class_diagram::{self, InvalidRequest};
-        let selected = self.read_revision_for(tx, Some(request.expected_revision), pre_h)?;
+        let selected = self.read_revision_for(tx, Some(request.expected_revision), pre_startup)?;
         let revision = selected.pin;
         let (warnings, truncated) = class_metadata(tx, &selected)
             .map_err(|error| self.report_selected_failure(selected_integrity(error)))?;
@@ -10993,9 +10994,9 @@ impl Store {
         tx: &Connection,
         query: &str,
         limit: usize,
-        pre_h: bool,
+        pre_startup: bool,
     ) -> Result<(IndexPin, Vec<Symbol>)> {
-        let selected = self.read_revision_for(tx, None, pre_h)?;
+        let selected = self.read_revision_for(tx, None, pre_startup)?;
         let revision = selected.pin;
         let selected_paths: BTreeSet<String> = tx.prepare("SELECT n.path FROM graph_nodes n JOIN revision_documents m ON m.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND m.graph_projection_id=n.projection_id WHERE instr(lower(n.name),lower(?1)) > 0 OR instr(lower(n.id),lower(?1)) > 0 ORDER BY CASE WHEN lower(n.name)=lower(?1) THEN 0 WHEN instr(lower(n.name),lower(?1))=1 THEN 1 ELSE 2 END,n.name,n.id LIMIT ?2")?
             .query_map(params![query,limit.min(150) as i64],|r|r.get::<_,String>(0))?
@@ -11035,9 +11036,9 @@ impl Store {
         tx: &Connection,
         id: &str,
         expected_revision: Option<IndexPin>,
-        pre_h: bool,
+        pre_startup: bool,
     ) -> Result<Option<(IndexPin, Symbol)>> {
-        let selected = self.read_revision_for(tx, expected_revision, pre_h)?;
+        let selected = self.read_revision_for(tx, expected_revision, pre_startup)?;
         let revision = selected.pin;
         let selected_path: Option<String> = tx
                 .query_row("SELECT n.path FROM graph_nodes n JOIN revision_documents m ON m.revision_id=?2 AND m.graph_projection_id=n.projection_id WHERE n.id=?1", params![id, selected.key], |r| r.get(0))
@@ -11214,9 +11215,9 @@ impl Store {
         tx: &Connection,
         root: &Path,
         items: &mut [crate::file_tree::Entry],
-        pre_h: bool,
+        pre_startup: bool,
     ) -> Result<(IndexPin, String, TreeOverlays)> {
-        let revision = self.read_status_for(tx, pre_h)?.revision;
+        let revision = self.read_status_for(tx, pre_startup)?.revision;
         let workspace = Path::new(&self.workspace_root);
         let mut valid_stmt = tx.prepare(
                 "SELECT NOT EXISTS(SELECT 1 FROM graph_nodes n WHERE n.projection_id=m.graph_projection_id AND json_valid(n.payload)=0) FROM revision_documents m JOIN index_metadata active_manifest ON active_manifest.singleton=1 AND m.revision_id='pin:v1:'||active_manifest.index_generation||':'||active_manifest.index_revision WHERE m.path=?1",
@@ -11273,9 +11274,9 @@ impl Store {
         expected: Option<IndexPin>,
         offset: usize,
         limit: usize,
-        pre_h: bool,
+        pre_startup: bool,
     ) -> Result<serde_json::Value> {
-        let selected = self.read_revision_for(tx, expected, pre_h)?;
+        let selected = self.read_revision_for(tx, expected, pre_startup)?;
         let revision = selected.pin;
         let mut stmt = tx.prepare(
             "SELECT m.path,d.language,m.graph_projection_id FROM revision_documents m
@@ -11316,9 +11317,9 @@ impl Store {
         tx: &Connection,
         path: &str,
         expected: Option<IndexPin>,
-        pre_h: bool,
+        pre_startup: bool,
     ) -> Result<Option<serde_json::Value>> {
-        let selected = self.read_revision_for(tx, expected, pre_h)?;
+        let selected = self.read_revision_for(tx, expected, pre_startup)?;
         let revision = selected.pin;
         let projection_id: Option<String> = tx
             .query_row(
@@ -11365,9 +11366,9 @@ impl Store {
         seed: &str,
         expected: IndexPin,
         show_all: bool,
-        pre_h: bool,
+        pre_startup: bool,
     ) -> Result<Option<crate::behavior::SequenceView>> {
-        let selected_revision = self.read_revision_for(tx, Some(expected), pre_h)?;
+        let selected_revision = self.read_revision_for(tx, Some(expected), pre_startup)?;
         let revision = selected_revision.pin;
         let selected: Option<(String, String)> = tx
             .query_row(
@@ -11589,9 +11590,9 @@ impl Store {
         tx: &Connection,
         query: &ViewQuery,
         expected_pin: Option<&IndexPin>,
-        pre_h: bool,
+        pre_startup: bool,
     ) -> Result<Option<ViewResult>> {
-        let selected = self.read_revision_for(tx, expected_pin.copied(), pre_h)?;
+        let selected = self.read_revision_for(tx, expected_pin.copied(), pre_startup)?;
         let revision = selected.pin;
         let selected_path: Option<String> = tx
             .query_row("SELECT n.path FROM graph_nodes n JOIN revision_documents m ON m.revision_id=?2 AND m.graph_projection_id=n.projection_id WHERE n.id=?1", params![query.seed, selected.key], |r| {
@@ -11678,9 +11679,9 @@ impl Store {
         db: &Connection,
         store: &Self,
         target: &str,
-        pre_h: bool,
+        pre_startup: bool,
     ) -> Result<DurableAnchor> {
-        let revision = store.read_revision_for(db, None, pre_h)?;
+        let revision = store.read_revision_for(db, None, pre_startup)?;
         let selected: Option<(String, String)> = db
             .query_row(
                 "SELECT m.language,m.path FROM native_version_declarations d
@@ -11771,9 +11772,9 @@ impl Store {
         store: &Self,
         view: SavedViewRecord,
         pin: Option<IndexPin>,
-        pre_h: bool,
+        pre_startup: bool,
     ) -> Result<SavedViewState> {
-        let selected = store.read_revision_for(db, pin, pre_h)?;
+        let selected = store.read_revision_for(db, pin, pre_startup)?;
         let ids: BTreeSet<&String> = std::iter::once(&view.query.seed)
             .chain(view.pins.keys())
             .chain(view.hidden.iter())
@@ -11917,9 +11918,9 @@ impl Store {
         store: &Self,
         annotation: AnnotationRecord,
         pin: Option<IndexPin>,
-        pre_h: bool,
+        pre_startup: bool,
     ) -> Result<AnnotationState> {
-        let selected = store.read_revision_for(db, pin, pre_h)?;
+        let selected = store.read_revision_for(db, pin, pre_startup)?;
         let attachment =
             Self::anchor_attachment(db, store, annotation.anchor.as_deref(), &selected)?;
         let orphaned = attachment

@@ -45,7 +45,7 @@ fn setup(enabled: bool) -> Fixture {
     let store = crate::common::open_store(&temp.path().join("state"), &workspace).unwrap();
     assert!(store.status().is_err());
     // Match daemon admission: publish the virgin queue before the writer's
-    // shared index-use session and first H, so a later request can be ACKed.
+    // shared index-use session and first startup reconciliation, so a later request can be ACKed.
     assert_eq!(store.settle_foreign_root_requests().unwrap(), 0);
     let cancel = Arc::new(AtomicBool::new(false));
     let (graph, native, capture) = index_workspace_bundle(

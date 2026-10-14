@@ -952,7 +952,7 @@ fn durable_orphans_after_cancelled_reconciliation_but_not_current_native_header_
             .to_string()
             .contains("index_not_ready")
     );
-    // A canceled H keeps public status latched, but daemon-local selected
+    // A canceled startup reconciliation keeps public status latched, but daemon-local selected
     // evidence can still resolve the validated prior head and saved record.
     let selected = store.evidence_response_daemon_local().unwrap();
     let orphan = selected.saved_view_at("takeover", None).unwrap().unwrap();

@@ -85,7 +85,7 @@ async fn rust_methods_sequence_and_source_survive_live_file_removal() {
             .any(|f| f.path == "helper.js" && f.language == "javascript")
     );
     // The daemon stages its virgin queue before retaining writer SH, then
-    // commits the recorded-options H before it can accept the next browser Q.
+    // commits the recorded-options startup reconciliation before it can accept the next browser Q.
     let (pin, session) =
         trellis::index_coordinator::reconcile_workspace(&store, &options, &cancel, |_| {}).unwrap();
     assert_eq!(store.status().unwrap().revision, pin);

@@ -490,7 +490,7 @@ async fn invalid_prior_head_does_not_pin_idle_resources_or_skip_reattach_h() {
     assert!(!old.has_active_resources());
     assert!(registry.advance(now + DAEMON_IDLE_DELAY).unwrap().exit);
     // The released daemon owns no live SQLite handle. Losing its disposable
-    // index.db requires a new H, with no validated predecessor to select.
+    // index.db requires a new startup reconciliation, with no validated predecessor to select.
     fs::remove_file(
         _base
             .path()
@@ -514,7 +514,7 @@ async fn invalid_prior_head_does_not_pin_idle_resources_or_skip_reattach_h() {
         }
     })
     .await
-    .expect("mandatory H did not reach pause");
+    .expect("mandatory startup reconciliation did not reach pause");
     assert!(resumed.catching_up());
     // Err carries no CheckoutEvidence, so there is no admitted basis to report.
     let error = match resumed.evidence_response() {
@@ -586,7 +586,7 @@ async fn active_writer_and_protected_reader_overlap_orphan_idle_scan() {
 
     registry.attach_launch(1, &id).unwrap();
     let runtime = registry.activate(&id.root_key).unwrap();
-    // H must not claim the accepted row before the contention scan. Install
+    // startup reconciliation must not claim the accepted row before the contention scan. Install
     // the hook before yielding to the spawned reconciliation worker.
     let (h_entered_tx, h_entered_rx) = std::sync::mpsc::sync_channel(1);
     let (h_resume_tx, h_resume_rx) = std::sync::mpsc::sync_channel(1);
@@ -601,7 +601,7 @@ async fn active_writer_and_protected_reader_overlap_orphan_idle_scan() {
         }
     })
     .await
-    .expect("mandatory H did not reach pause");
+    .expect("mandatory startup reconciliation did not reach pause");
     assert_eq!(
         store.request_by_id(&first.id).unwrap().unwrap().state,
         "queued"

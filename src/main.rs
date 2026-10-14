@@ -1086,7 +1086,7 @@ fn dispatch_connection(
                 }
                 _ => anyhow::bail!("unknown daemon operation"),
             };
-            // Mandatory H may be running when a CLI read first attaches.
+            // Mandatory startup reconciliation may be running when a CLI read first attaches.
             // This only repeats read-only calls; index is never replayed.
             if request.operation != "index"
                 && selected

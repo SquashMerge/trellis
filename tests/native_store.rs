@@ -2543,7 +2543,7 @@ fn failed_publication_after_additive_v8_upgrade_preserves_old_pin() {
         &leader,
     )
     .unwrap();
-    // Keep the accepted request after H, but retire the test writer guard
+    // Keep the accepted request after startup reconciliation, but retire the test writer guard
     // before the virgin queue's EX-protected first publication.
     drop(leader);
     let accepted = store

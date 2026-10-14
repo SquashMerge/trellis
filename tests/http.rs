@@ -27,7 +27,7 @@ fn setup_with_tick(start_tick: bool) -> (tempfile::TempDir, Store, Arc<http::Dae
     std::fs::create_dir(&workspace).unwrap();
     let store = crate::common::open_store(&dir.path().join("state"), &workspace).unwrap();
     // Daemon admission publishes the virgin queue before retaining writer SH
-    // or starting H. Later HTTP requests may then commit under that SH.
+    // or starting startup reconciliation. Later HTTP requests may then commit under that SH.
     assert_eq!(store.settle_foreign_root_requests().unwrap(), 0);
     let state = http::new(
         store.clone(),
@@ -326,14 +326,14 @@ async fn jobs_publish_and_cancel() {
     assert_eq!(
         store.status().unwrap().revision.index_revision,
         2,
-        "mandatory H r1 precedes accepted Q r2 DONE"
+        "mandatory startup reconciliation r1 precedes accepted Q r2 DONE"
     );
     let (_, cancelled) = call(&app, "POST", &format!("/api/jobs/{id}/cancel"), Value::Null).await;
     assert_eq!(cancelled["state"], "done");
     assert_eq!(
         store.status().unwrap().revision.index_revision,
         2,
-        "mandatory H r1 precedes accepted Q r2 DONE"
+        "mandatory startup reconciliation r1 precedes accepted Q r2 DONE"
     );
     state.cancel_active();
 }
@@ -1098,7 +1098,7 @@ async fn expired_pin_saved_items_require_explicit_head_reattachment() {
 
 #[tokio::test]
 async fn browser_claimed_unchanged_publishes_new_manifest_before_done() {
-    // Manually publish the first H before POST starts the periodic queue tick.
+    // Manually publish the first startup reconciliation before POST starts the periodic queue tick.
     let (dir, store, state, app) = setup_without_tick();
     std::fs::write(
         dir.path().join("workspace/a.js"),

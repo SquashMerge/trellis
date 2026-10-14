@@ -280,7 +280,7 @@ impl CheckoutRegistry {
             .is_ok_and(|pin| pin.index_revision == 0);
         // Publish only a proved-virgin queue before this runtime is visible to
         // selected status reads. Those reads otherwise compete with the EX
-        // stage needed before mandatory H can begin.
+        // stage needed before mandatory startup reconciliation can begin.
         store.prepare_virgin_queue_before_activation()?;
         let config = self.browser_config(&entry.identity.root, entry.registration.as_ref())?;
         // Browser registration remains inert until activation. The scheduler's
@@ -853,7 +853,7 @@ impl CheckoutRegistry {
 
     /// The provisioning caller holds the registry guard across this preflight
     /// and its later token commit. Retire a replaced old runtime *before* token
-    /// creation: a read-only snapshot could pass during H retry backoff, then
+    /// creation: a read-only snapshot could pass during startup reconciliation retry backoff, then
     /// lose to a worker re-arm and fail registration after minting a token.
     pub fn can_register(
         &mut self,
@@ -1290,7 +1290,7 @@ impl CheckoutRegistry {
         }
         let candidate = self.idle_exit_at.is_some_and(|at| now >= at)
             && !busy
-            // Release may defer on H, a watcher, or an active read just before
+            // Release may defer on startup reconciliation, a watcher, or an active read just before
             // the later pending-work refresh observes that work finish.
             && self.runtimes.is_empty()
             && self
@@ -1535,9 +1535,9 @@ impl CheckoutRuntime {
     }
 
     /// Invoked through a weak edge AFTER a queue tick releases all stream and
-    /// watcher locks. This is a snapshot of the current verified H owner, not a
-    /// claim that H ran again when a serving watcher gets a new epoch.
-    pub(crate) fn report_causal_h_ready(&self, scheduler: &Arc<http::DaemonState>) {
+    /// watcher locks. This is a snapshot of the current verified startup reconciliation owner, not a
+    /// claim that startup reconciliation ran again when a serving watcher gets a new epoch.
+    pub(crate) fn report_causal_startup_ready(&self, scheduler: &Arc<http::DaemonState>) {
         let Some(owner) = scheduler.checkout_serving_owner() else {
             return;
         };
@@ -1551,7 +1551,7 @@ impl CheckoutRuntime {
             return;
         };
         if lineage.owner_incarnation != owner.incarnation()
-            || scheduler.causal_h_already_reported(lineage)
+            || scheduler.causal_startup_already_reported(lineage)
             || owner.verify().is_err()
         {
             return;
@@ -1570,7 +1570,7 @@ impl CheckoutRuntime {
                     && current.ordinal == lineage.ordinal
             })
         {
-            scheduler.emit_causal_h_ready_once(lineage, pin);
+            scheduler.emit_causal_startup_ready_once(lineage, pin);
         }
     }
 
@@ -1761,7 +1761,7 @@ impl CheckoutRuntime {
 
     /// Sample freshness and admit the selected prior head under one runtime gate.
     /// A validated prior head admits reads, never durable mutations or work
-    /// scheduling. Only this runtime's committed daemon-local H grants that
+    /// scheduling. Only this runtime's committed daemon-local startup reconciliation grants that
     /// authority; the advisory catchingUp flag is not an admission gate.
     pub(crate) fn require_mutation_ready(&self) -> anyhow::Result<()> {
         let resources = self.resources()?;

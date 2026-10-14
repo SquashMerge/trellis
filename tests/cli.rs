@@ -577,7 +577,7 @@ fn unchanged_serve_reuses_selected_versions_and_detects_selected_source_corrupti
     drop(db);
     let corrupt_log = temp.path().join("serve-corrupt.log");
     let rejected = serve(&root, &home, &corrupt_log);
-    // Attachment starts H; a selected read must still refuse the damaged head.
+    // Attachment starts startup reconciliation; a selected read must still refuse the damaged head.
     let corrupt_selected = command(&root, &home, "symbols").output().unwrap();
     assert!(
         !corrupt_selected.status.success(),
@@ -2681,7 +2681,7 @@ impl LegacyClient {
         let address = url.strip_prefix("http://").unwrap().parse().unwrap();
         let state = http::new(store.clone(), options.clone(), token.to_owned(), address).unwrap();
         if retain_session {
-            // A daemon-local writer must commit H before selected reads or
+            // A daemon-local writer must commit startup reconciliation before selected reads or
             // FIFO claims. The legacy router fixture models only that session.
             let cancel: trellis::model::CancelFlag =
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -3275,7 +3275,7 @@ def sink():
             tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
                 loop {
                     // The client deadline is shorter than a bounded SQLite busy
-                    // wait. Retry only transport timeouts inside the outer H limit;
+                    // wait. Retry only transport timeouts inside the outer startup reconciliation limit;
                     // every answered status still has to prove its selected pin.
                     let response = match selected_status(&client).send().await {
                         Ok(response) => response,
@@ -3293,7 +3293,7 @@ def sink():
                         let revision = &status["revision"];
                         assert_eq!(
                             revision["indexGeneration"], old_pin["indexGeneration"],
-                            "{name}: unexpected generation during H: {status}"
+                            "{name}: unexpected generation during startup reconciliation: {status}"
                         );
                         let current = revision["indexRevision"]
                             .as_u64()
@@ -3305,7 +3305,7 @@ def sink():
                         if current == previous {
                             assert!(
                                 catching_up,
-                                "{name}: prior head without pending mandatory H: {status}"
+                                "{name}: prior head without pending mandatory startup reconciliation: {status}"
                             );
                         } else {
                             assert!(
@@ -3336,7 +3336,7 @@ def sink():
         assert!(
             post_start_pin["indexRevision"].as_u64().unwrap()
                 > old_pin["indexRevision"].as_u64().unwrap(),
-            "{name}: mandatory H committed"
+            "{name}: mandatory startup reconciliation committed"
         );
         let follower_status: Value =
             serde_json::from_slice(&command(&root, &home, "status").output().unwrap().stdout)
@@ -4406,7 +4406,7 @@ async fn saved_items_real_index_matrix() {
     assert_eq!(status, reqwest::StatusCode::OK, "{serving_status}");
     let pin = serving_status["revision"].clone();
     assert_eq!(pin["indexGeneration"], initial_pin["indexGeneration"]);
-    // The direct router may commit mandatory H after the daemon exits.
+    // The direct router may commit mandatory startup reconciliation after the daemon exits.
     assert!(
         pin["indexRevision"].as_u64().unwrap() >= initial_pin["indexRevision"].as_u64().unwrap()
     );
@@ -4843,7 +4843,7 @@ async fn saved_items_real_index_matrix() {
     assert_eq!(status, reqwest::StatusCode::OK, "{reopened_status}");
     let reopened_pin = reopened_status["revision"].clone();
     assert_eq!(reopened_pin["indexGeneration"], next["indexGeneration"]);
-    // Reopening the direct router may publish mandatory H again.
+    // Reopening the direct router may publish mandatory startup reconciliation again.
     assert!(
         reopened_pin["indexRevision"].as_u64().unwrap() >= next["indexRevision"].as_u64().unwrap()
     );

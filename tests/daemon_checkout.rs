@@ -39,7 +39,7 @@ async fn release_when_idle(registry: &mut CheckoutRegistry, key: &str) {
         }
     })
     .await
-    .expect("checkout did not release after H and watcher quiescence");
+    .expect("checkout did not release after startup reconciliation and watcher quiescence");
 }
 
 #[tokio::test]
@@ -144,7 +144,10 @@ async fn reattach_reports_catching_up_and_keeps_complete_head_until_h() {
     let mut registry = CheckoutRegistry::with_roots(roots(base.path()));
     registry.attach_launch(1, &id).unwrap();
     let runtime = registry.activate(&id.root_key).unwrap();
-    assert!(runtime.catching_up(), "mandatory H has not run yet");
+    assert!(
+        runtime.catching_up(),
+        "mandatory startup reconciliation has not run yet"
+    );
     ready(&runtime).await;
     // A watcher hint can arrive after ready() without invalidating this head.
     let (old, _catching_up) = runtime.evidence_response().unwrap();
@@ -174,11 +177,11 @@ async fn reattach_reports_catching_up_and_keeps_complete_head_until_h() {
         }
     })
     .await
-    .expect("pre-H worker did not reach pause");
+    .expect("pre-startup reconciliation worker did not reach pause");
     assert!(resumed.catching_up());
     let (prior, catching_up) = resumed
         .evidence_response()
-        .expect("validated old head while H paused");
+        .expect("validated old head while startup reconciliation paused");
     assert!(catching_up);
     assert_eq!(prior.status().unwrap().revision, first);
     let (_, old_source) = prior.source_at("a.js", None).unwrap().unwrap();
@@ -343,7 +346,7 @@ async fn replacement_settles_old_queue_before_h_then_claims_distinct_fifo_option
         }
     })
     .await
-    .expect("new-root H did not reach barrier");
+    .expect("new-root startup reconciliation did not reach barrier");
     let old_row = new_store
         .request_any_root_for_tests(&old.id)
         .unwrap()
@@ -519,11 +522,13 @@ async fn ambiguous_root_settlement_blocks_h_and_fifo_until_queue_reread() {
         loop {
             match new_store.request_by_id(&accepted.id) {
                 Ok(Some(row)) if row.finished_at.is_some() => break,
-                Ok(Some(_)) => {} // Accepted FIFO row still waits for H or its claim.
+                Ok(Some(_)) => {} // Accepted FIFO row still waits for startup reconciliation or its claim.
                 Err(error) if error.to_string().starts_with("storage_busy") => {
-                    // Nonblocking index-use admission is bounded while H owns EX.
+                    // Nonblocking index-use admission is bounded while startup reconciliation owns EX.
                 }
-                other => panic!("unexpected accepted-row result during H: {other:?}"),
+                other => panic!(
+                    "unexpected accepted-row result during startup reconciliation: {other:?}"
+                ),
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
@@ -690,7 +695,7 @@ async fn root_loss_fails_accepted_work_then_releases_old_runtime_handles() {
         let db = rusqlite::Connection::open(&db_path).unwrap();
         let state: String = db.query_row("SELECT state FROM requests WHERE id=?1", [&row.id], |r| r.get(0)).unwrap();
         panic!(
-            "old-root queue did not reach a terminal result: {error}; state={state}; H error: {:?}; owner={:?}",
+            "old-root queue did not reach a terminal result: {error}; state={state}; startup reconciliation error: {:?}; owner={:?}",
             old.reconciliation_error(), old.browser_scheduler().unwrap().root_loss_retirement_for_tests()
         )
     });
@@ -754,7 +759,7 @@ async fn root_loss_during_paused_reattach_h_waits_for_worker_then_releases() {
         }
     })
     .await
-    .expect("idle reattach did not elect before H pause");
+    .expect("idle reattach did not elect before startup reconciliation pause");
     fs::rename(&checkout, &moved).unwrap();
     fs::create_dir(&checkout).unwrap();
     fs::write(checkout.join("a.js"), "function replacement() {}\n").unwrap();
@@ -762,7 +767,7 @@ async fn root_loss_during_paused_reattach_h_waits_for_worker_then_releases() {
     registry.disconnect(2);
     assert!(
         registry.browser_identity(&key).is_err(),
-        "paused H keeps old incarnation even after client disconnect"
+        "paused startup reconciliation keeps old incarnation even after client disconnect"
     );
     assert_eq!(
         registry
@@ -771,15 +776,15 @@ async fn root_loss_during_paused_reattach_h_waits_for_worker_then_releases() {
             .find(|row| row["rootKey"] == key)
             .unwrap()["state"],
         "unavailable",
-        "paused H prevents replacement listing"
+        "paused startup reconciliation prevents replacement listing"
     );
     assert!(
         paused.catching_up(),
-        "paused H is pending despite an empty old-root queue"
+        "paused startup reconciliation is pending despite an empty old-root queue"
     );
     assert!(
         !registry.release(&key).unwrap(),
-        "live H owner must block idle release"
+        "live startup reconciliation owner must block idle release"
     );
     assert!(paused.has_active_resources());
     assert!(file_descriptors(&moved) > 0);
@@ -790,7 +795,7 @@ async fn root_loss_during_paused_reattach_h_waits_for_worker_then_releases() {
         }
     })
     .await
-    .expect("root-lost H did not retire and release");
+    .expect("root-lost startup reconciliation did not retire and release");
     assert!(!paused.has_active_resources());
     assert!(paused.evidence_response().is_err());
     tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
@@ -799,7 +804,7 @@ async fn root_loss_during_paused_reattach_h_waits_for_worker_then_releases() {
         }
     })
     .await
-    .expect("paused H leaked old-root or index-use descriptors");
+    .expect("paused startup reconciliation leaked old-root or index-use descriptors");
     assert_eq!(
         registry.browser_identity(&key).unwrap().inode,
         replacement.inode
@@ -898,7 +903,9 @@ async fn failed_h_backs_off_and_empty_idle_checkout_can_release() {
     let mut registry = CheckoutRegistry::with_roots(roots(base.path()));
     registry.attach_launch(1, &id).unwrap();
     let runtime = registry.activate(&id.root_key).unwrap();
-    runtime.set_startup_hook_for_tests(std::sync::Arc::new(|| panic!("injected H failure")));
+    runtime.set_startup_hook_for_tests(std::sync::Arc::new(|| {
+        panic!("injected startup reconciliation failure")
+    }));
     tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         while runtime.reconciliation_error().is_none() {
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -913,7 +920,7 @@ async fn failed_h_backs_off_and_empty_idle_checkout_can_release() {
         }
     })
     .await
-    .expect("idle failed H may release during backoff");
+    .expect("idle failed startup reconciliation may release during backoff");
     assert!(!runtime.has_active_resources());
 }
 
@@ -932,7 +939,9 @@ async fn failed_h_backoff_never_releases_accepted_fifo_work() {
     let mut registry = CheckoutRegistry::with_roots(topology);
     registry.attach_launch(1, &id).unwrap();
     let runtime = registry.activate(&id.root_key).unwrap();
-    runtime.set_startup_hook_for_tests(std::sync::Arc::new(|| panic!("injected queued H failure")));
+    runtime.set_startup_hook_for_tests(std::sync::Arc::new(|| {
+        panic!("injected queued startup reconciliation failure")
+    }));
     tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         while runtime.reconciliation_error().is_none() || !runtime.retry_waiting_for_tests() {
             tokio::time::sleep(Duration::from_millis(5)).await;

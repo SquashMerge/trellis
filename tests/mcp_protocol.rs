@@ -2329,7 +2329,7 @@ async fn next_causal_event(
     use tokio::io::AsyncReadExt;
     let (socket, _) = tokio::time::timeout_at(deadline, listener.accept())
         .await
-        .expect("daemon did not emit a causal H/watch witness")
+        .expect("daemon did not emit a causal startup/watch witness")
         .unwrap();
     let mut bytes = Vec::new();
     tokio::time::timeout_at(deadline, socket.take(513).read_to_end(&mut bytes))
@@ -2439,7 +2439,7 @@ impl CausalReadiness {
                     self.announced_generations.contains(&generation),
                     "ACK without same-lineage WATCH_PENDING for its generation"
                 );
-                // CLI row completion is not H/watch settlement. Earlier H ACKs
+                // CLI row completion is not startup/watch settlement. Earlier startup reconciliation ACKs
                 // may be observed, but only the accepted CLI pin binds this ACK.
                 if event["pin"] == *published {
                     self.acked = Some(self.acked.map_or(generation, |prior| prior.max(generation)));
@@ -2471,7 +2471,7 @@ async fn catching_up_reports_pending_work_then_witnessed_readiness_on_same_check
     ));
     tool(&first, None, true);
     // This first true means pending work; without a phase witness it does not
-    // distinguish mandatory H from a queued watcher hint.
+    // distinguish mandatory startup reconciliation from a queued watcher hint.
     assert_eq!(first["result"]["structuredContent"]["catchingUp"], true);
     assert!(first["result"]["structuredContent"]["evidenceBasis"].is_null());
     assert_eq!(
@@ -2502,7 +2502,7 @@ async fn catching_up_reports_pending_work_then_witnessed_readiness_on_same_check
     assert!(published["indexRevision"].is_u64());
 
     // A completed CLI queue row pins a publication, not the daemon's mandatory
-    // H or its watcher inventory. The same Peer must keep its launch selection,
+    // startup reconciliation or its watcher inventory. The same Peer must keep its launch selection,
     // but a second tool call may still report catchingUp=true.
     let second = peer.ask(call(
         false,
@@ -2529,7 +2529,7 @@ async fn catching_up_reports_pending_work_then_witnessed_readiness_on_same_check
     // {kind,rootKey,streamId,streamSeq,lineageOrdinal,ownerIncarnation,
     //  watchEpoch,pin,watchGeneration,queueEmpty}. A single FIFO writer sends
     // one complete event per connection. Any missing/duplicate sequence fails.
-    // H_READY follows verified owner installation AND phase Ready/H=false.
+    // H_READY follows verified owner installation AND phase Ready/startup reconciliation=false.
     // WATCH_ACK follows full inventory acknowledgment with no unfinished FIFO.
     // WATCH_PENDING is
     // emitted for a later accepted hint, so an ACK is never a future quiet lease.
@@ -2544,8 +2544,8 @@ async fn catching_up_reports_pending_work_then_witnessed_readiness_on_same_check
         assert_eq!(event["rootKey"], root_key, "foreign causal witness");
         event
     };
-    // H and ACK must be from the SAME verified owner and watch epoch. If a
-    // successor takes over, discard the former generation and require new H.
+    // startup reconciliation and ACK must be from the SAME verified owner and watch epoch. If a
+    // successor takes over, discard the former generation and require new startup reconciliation.
     while !readiness.settled() {
         readiness.observe(&next_event().await, published);
     }
@@ -2577,7 +2577,9 @@ async fn catching_up_reports_pending_work_then_witnessed_readiness_on_same_check
             id < 5,
             "new watcher hints exceeded the bounded transition budget"
         );
-        let prior_ordinal = readiness.lineage_ordinal.expect("correlated H/ACK lineage");
+        let prior_ordinal = readiness
+            .lineage_ordinal
+            .expect("correlated startup reconciliation/ACK lineage");
         let prior_ack = readiness.acked.expect("CLI-pinned watcher ACK");
         let mut witnessed_later = false;
         loop {
@@ -2588,7 +2590,7 @@ async fn catching_up_reports_pending_work_then_witnessed_readiness_on_same_check
                 && event["watchGeneration"].as_u64().expect("watch generation") > prior_ack;
             let current = readiness.observe(&event, published);
             // Old-epoch deliveries still consume streamSeq but cannot replace
-            // a newer H witness or count as a new reason to retry.
+            // a newer startup reconciliation witness or count as a new reason to retry.
             if current && (ordinal > prior_ordinal || later_hint) {
                 witnessed_later = true;
             }
@@ -2602,7 +2604,7 @@ async fn catching_up_reports_pending_work_then_witnessed_readiness_on_same_check
 
 /// Drive a real same-owner selected-options change through the daemon FIFO.
 /// The fresh H_READY is a Ready snapshot for the replacement watcher; it does
-/// not claim that mandatory H reran when the accepted CLI index changed inputs.
+/// not claim that mandatory startup reconciliation reran when the accepted CLI index changed inputs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn selected_options_replacement_reissues_ready_for_new_watch_epoch() {
     let temp = tempfile::tempdir().unwrap();
@@ -2700,7 +2702,7 @@ async fn selected_options_replacement_reissues_ready_for_new_watch_epoch() {
         if ordinal > original_ordinal {
             assert_eq!(
                 lineage.0, original.0,
-                "option changes retain the same H owner"
+                "option changes retain the same startup reconciliation owner"
             );
             assert_ne!(
                 lineage.1, original.1,
@@ -2712,7 +2714,7 @@ async fn selected_options_replacement_reissues_ready_for_new_watch_epoch() {
     }
     assert!(
         observed.contains("H_READY"),
-        "new epoch needs its own H-ready snapshot"
+        "new epoch needs its own startup reconciliation-ready snapshot"
     );
     assert!(
         observed.contains("WATCH_PENDING"),
@@ -2783,7 +2785,7 @@ fn causal_witness_ignores_late_retired_epoch_and_requires_successor_h() {
     ));
     assert!(!state.settled());
     // An old epoch arrives after the new event. It consumes the stream sequence
-    // but cannot reset the new epoch or certify readiness with stale H/ACK.
+    // but cannot reset the new epoch or certify readiness with stale startup reconciliation/ACK.
     assert!(!state.observe(
         &causal_fixture_event(stream, 5, 1, owner, old, "WATCH_ACK", &pin, 2),
         &pin
@@ -2793,7 +2795,10 @@ fn causal_witness_ignores_late_retired_epoch_and_requires_successor_h() {
         &causal_fixture_event(stream, 6, 2, owner, next, "WATCH_ACK", &pin, 1),
         &pin
     ));
-    assert!(!state.settled(), "ACK without successor H is insufficient");
+    assert!(
+        !state.settled(),
+        "ACK without successor startup reconciliation is insufficient"
+    );
     assert!(state.observe(
         &causal_fixture_event(stream, 7, 2, owner, next, "H_READY", &pin, 1),
         &pin
@@ -2892,7 +2897,7 @@ async fn describe_reports_actual_degraded_watcher_on_selected_snapshot() {
         }
     })
     .await
-    .expect("mandatory H did not publish");
+    .expect("mandatory startup reconciliation did not publish");
     let scheduler = runtime.browser_scheduler().unwrap();
     tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
@@ -2988,7 +2993,7 @@ async fn describe_replies_at_its_deadline_while_the_read_is_still_running() {
         }
     })
     .await
-    .expect("initial H did not finish");
+    .expect("initial startup reconciliation did not finish");
     // Hold the next selected read once it has started.
     let (entered_tx, entered_rx) = mpsc::sync_channel(1);
     let (release_tx, release_rx) = mpsc::sync_channel::<()>(1);
@@ -3082,7 +3087,7 @@ async fn describe_reports_published_watcher_health_while_an_inventory_holds_the_
         }
     })
     .await
-    .expect("initial H did not finish");
+    .expect("initial startup reconciliation did not finish");
     let scheduler = runtime.browser_scheduler().unwrap();
     let (entered_tx, entered_rx) = mpsc::sync_channel(1);
     let (release_tx, release_rx) = mpsc::sync_channel(1);
@@ -3170,7 +3175,7 @@ async fn describe_serves_valid_prior_head_while_mandatory_h_is_paused() {
         }
     })
     .await
-    .expect("initial H did not finish");
+    .expect("initial startup reconciliation did not finish");
     let (response, _) = runtime.evidence_response().unwrap();
     let prior = response.status().unwrap().revision;
     response.finish(()).unwrap();
@@ -3290,7 +3295,7 @@ async fn describe_cold_initial_h_reports_indexing_without_prior_coverage() {
         }
     })
     .await
-    .expect("initial H did not pause");
+    .expect("initial startup reconciliation did not pause");
     let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
     let (mut client, server) = UnixStream::pair().unwrap();
     client
@@ -3400,7 +3405,7 @@ async fn describe_counts_persisted_selected_and_unselected_native_coverage() {
     let (entered_tx, entered_rx) = mpsc::sync_channel(1);
     let (resume_tx, resume_rx) = mpsc::sync_channel(1);
     let resume_rx = std::sync::Mutex::new(resume_rx);
-    // Current-thread Tokio cannot poll spawned H before this synchronous hook setup.
+    // Current-thread Tokio cannot poll spawned startup reconciliation before this synchronous hook setup.
     runtime.set_startup_hook_for_tests(std::sync::Arc::new(move || {
         entered_tx.send(()).unwrap();
         resume_rx
@@ -3518,7 +3523,7 @@ async fn describe_retries_direct_sqlite_contention_on_fresh_selected_snapshot() 
         }
     })
     .await
-    .expect("initial H did not settle");
+    .expect("initial startup reconciliation did not settle");
     let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
     let (mut client, server) = UnixStream::pair().unwrap();
     client

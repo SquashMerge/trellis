@@ -613,7 +613,7 @@ impl Store {
     }
     /// Prepare a virgin queue before exposing a new checkout runtime to
     /// selected reads. Otherwise repeated cold status reads can hold SH while
-    /// mandatory H tries to publish the queue under EX.
+    /// mandatory startup reconciliation tries to publish the queue under EX.
     pub(crate) fn prepare_virgin_queue_before_activation(&self) -> Result<()> {
         self.identity.verify()?;
         let path = self.request_db_path();
@@ -622,8 +622,8 @@ impl Store {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
-        // Existing queues and prior heads retain the ordinary H settlement
-        // path, so validated prior-head reads remain available during H.
+        // Existing queues and prior heads retain the ordinary startup reconciliation settlement
+        // path, so validated prior-head reads remain available during startup reconciliation.
         if !self.is_ready_disposition() || self.index_baseline()?.index_revision != 0 {
             return Ok(());
         }
@@ -1241,7 +1241,7 @@ impl Store {
             |row| row.get(0),
         ))
     }
-    /// Settle every accepted foreign-root row before the new root's H or FIFO claim.
+    /// Settle every accepted foreign-root row before the new root's startup reconciliation or FIFO claim.
     /// The caller serializes checkout writers. Opening the existing queue first lets
     /// SQLite recover a hot journal before deciding which rows were accepted.
     pub fn settle_foreign_root_requests(&self) -> Result<usize> {
@@ -1255,7 +1255,7 @@ impl Store {
         let path = self.request_db_path();
         if matches!(fs::symlink_metadata(&path), Err(ref error) if error.kind() == std::io::ErrorKind::NotFound)
         {
-            // A new daemon creates its queue before first H. After a published
+            // A new daemon creates its queue before first startup reconciliation. After a published
             // head, absence is corruption: accepted IDs could have been lost.
             ensure!(
                 self.is_ready_disposition()
@@ -1270,7 +1270,7 @@ impl Store {
         let mut after_commit = Some(after_commit);
         let mut seen = Vec::<Request>::new();
         // Each protected open has SQLite's three-second busy timeout. Two
-        // attempts bound contention; never start H or claim on uncertain rows.
+        // attempts bound contention; never start startup reconciliation or claim on uncertain rows.
         for attempt_number in 0..2 {
             let attempt = (|| -> Result<bool> {
                 let (_guard, mut db) = self
@@ -1358,7 +1358,7 @@ impl Store {
 
     pub fn claim_request(&self, session: &WriterSession) -> Result<Option<Request>> {
         // EX ownership alone is not authority to claim. The same incarnation
-        // must first commit and attest its selected post-acquisition H.
+        // must first commit and attest its selected post-acquisition startup reconciliation.
         self.verify_committed_writer_claim(session)?;
         let (_guard, mut db) = self.request_connection()?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;

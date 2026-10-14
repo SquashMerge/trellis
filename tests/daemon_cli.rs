@@ -630,7 +630,7 @@ async fn executable_daemon_is_socket_only_until_explicit_serve_and_registers_two
         selected["workspaceRoot"],
         fs::canonicalize(&first).unwrap().to_str().unwrap()
     );
-    // The current-job read is typed contention while H or the watcher writes;
+    // The current-job read is typed contention while startup reconciliation or the watcher writes;
     // retry only storage_busy and report any other refusal with its body.
     let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
     let jobs = loop {
@@ -1346,7 +1346,7 @@ async fn bounded_cli_capture_reaps_stalled_child() {
     assert!(started.elapsed() < trellis::testing::HANG_BACKSTOP);
 }
 
-/// One real daemon/serve cold H per private HOME; no prior daemon session can
+/// One real daemon/serve cold startup reconciliation per private HOME; no prior daemon session can
 /// supply a warm head or make an omitted CLI option look explicit.
 #[tokio::test]
 async fn cold_serve_h_preserves_implicit_scip_and_honors_explicit_default_cap() {
@@ -1419,7 +1419,7 @@ async fn cold_serve_h_preserves_implicit_scip_and_honors_explicit_default_cap() 
         assert_eq!(before["scipPath"], scip_path.to_str().unwrap());
         assert_eq!(before["manifestPath"], manifest_path.to_str().unwrap());
         // The prior CLI elected this daemon. End that fixture instance before
-        // changing the checkout, so serve tests a cold H instead of racing
+        // changing the checkout, so serve tests a cold startup reconciliation instead of racing
         // registration against an active CLI writer.
         assert!(home.join("auto-daemon.pid").exists());
         drop(AutoDaemonGuard::for_home(&home));
@@ -1432,7 +1432,7 @@ async fn cold_serve_h_preserves_implicit_scip_and_honors_explicit_default_cap() 
             );
             std::thread::sleep(Duration::from_millis(20));
         }
-        // A second file forces H while the original SCIP input/hash remains
+        // A second file forces startup reconciliation while the original SCIP input/hash remains
         // valid and can still decorate the unchanged `f` declaration.
         fs::write(
             root.join("new.js"),
@@ -1476,7 +1476,7 @@ async fn cold_serve_h_preserves_implicit_scip_and_honors_explicit_default_cap() 
         loop {
             assert!(
                 Instant::now() < h_deadline,
-                "cold H did not publish a revision after {prior_revision}"
+                "cold startup reconciliation did not publish a revision after {prior_revision}"
             );
             let mut command = cli(&home);
             command.arg("status").arg("--workspace").arg(&root);
@@ -1507,14 +1507,14 @@ async fn cold_serve_h_preserves_implicit_scip_and_honors_explicit_default_cap() 
             );
             assert!(
                 Instant::now() < h_deadline,
-                "cold H did not publish revision after {prior_revision}: {diagnostic}"
+                "cold startup reconciliation did not publish revision after {prior_revision}: {diagnostic}"
             );
             tokio::time::sleep(Duration::from_millis(40)).await;
         }
         let (after, revision) = recorded();
         assert!(
             revision > prior_revision,
-            "banner/status alone cannot satisfy H proof"
+            "banner/status alone cannot satisfy startup reconciliation proof"
         );
         if explicit_default {
             assert_eq!(after["maxFileBytes"], 2_097_152);
@@ -1531,7 +1531,7 @@ async fn cold_serve_h_preserves_implicit_scip_and_honors_explicit_default_cap() 
             assert_eq!(after["scipPath"], scip_path.to_str().unwrap());
             assert_eq!(after["manifestPath"], manifest_path.to_str().unwrap());
         }
-        // The unchanged `f` source and matching manifest must let H apply the
+        // The unchanged `f` source and matching manifest must let startup reconciliation apply the
         // recorded SCIP presentation, not merely keep a path string in storage.
         let mut export = cli(&home);
         export.arg("export").arg("--workspace").arg(&root);
@@ -1558,7 +1558,7 @@ async fn cold_serve_h_preserves_implicit_scip_and_honors_explicit_default_cap() 
         } else {
             assert_eq!(
                 symbol["displayLabel"], scip_label,
-                "implicit serve did not apply recorded SCIP to H publication"
+                "implicit serve did not apply recorded SCIP to startup reconciliation publication"
             );
         }
     }
