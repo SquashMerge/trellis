@@ -337,6 +337,8 @@ impl CheckoutRegistry {
             initial_capture_started: AtomicBool::new(false),
             #[cfg(feature = "test-support")]
             mcp_clock_skew_ms: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(feature = "test-support")]
+            mcp_read_hook: std::sync::Mutex::new(None),
             retry_waiting: AtomicBool::new(false),
             #[cfg(feature = "test-support")]
             pre_h_hook: std::sync::Mutex::new(None),
@@ -1413,6 +1415,9 @@ pub struct CheckoutRuntime {
     /// a test can pass a call deadline without waiting real seconds.
     #[cfg(feature = "test-support")]
     mcp_clock_skew_ms: std::sync::atomic::AtomicU64,
+    /// Test-support hold point at the start of the next MCP selected read.
+    #[cfg(feature = "test-support")]
+    mcp_read_hook: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
     resources: std::sync::Mutex<Option<Arc<ActiveResources>>>,
     phase: std::sync::Mutex<RuntimePhase>,
     active: AtomicBool,
@@ -1718,6 +1723,21 @@ impl CheckoutRuntime {
         #[cfg(not(feature = "test-support"))]
         let skew = Duration::ZERO;
         Instant::now() + skew
+    }
+
+    /// Hold this checkout's next MCP selected read until `hook` returns.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn set_mcp_read_hook_for_tests(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.mcp_read_hook.lock().unwrap() = Some(Box::new(hook));
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn run_mcp_read_hook_for_tests(&self) {
+        let hook = self.mcp_read_hook.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 
     /// Advance this checkout's MCP call clock without waiting real time.

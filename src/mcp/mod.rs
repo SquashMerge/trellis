@@ -13,6 +13,8 @@ use std::os::unix::fs::MetadataExt;
 pub struct OpenedWorkspace {
     identity: WorkspaceIdentity,
     label: String,
+    /// CALL_DEADLINE, or a shorter test-support deadline for this connection.
+    call_deadline: std::time::Duration,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IdentityError {
@@ -27,7 +29,19 @@ impl OpenedWorkspace {
             .map(|name| name.to_str().expect("canonical root is UTF-8").to_owned())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "workspace".into());
-        Self { identity, label }
+        Self {
+            identity,
+            label,
+            call_deadline: CALL_DEADLINE,
+        }
+    }
+    /// Shorten this connection's call deadline so a test exercises it
+    /// without waiting real seconds.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn with_call_deadline_for_tests(mut self, deadline: std::time::Duration) -> Self {
+        self.call_deadline = deadline;
+        self
     }
     pub fn label(&self) -> &str {
         &self.label
@@ -144,14 +158,71 @@ struct DescribedSnapshot {
 /// `limits.deadlineMs` (contract W1).
 pub const CALL_DEADLINE: std::time::Duration = std::time::Duration::from_millis(5000);
 
+type DescribeParts = (anyhow::Result<DescribedSnapshot>, anyhow::Result<bool>);
+
+/// Activation, the selected read and published watcher health for one admitted
+/// describe call, bounded by its deadline. The connection waits only until the
+/// deadline: past it the call answers deadline_exceeded at once, the worker is
+/// cancelled cooperatively, and its late result is discarded.
+fn describe_within(
+    registry: &std::sync::Arc<tokio::sync::Mutex<crate::daemon::registry::CheckoutRegistry>>,
+    key: &str,
+    selected: Option<&crate::daemon::registry::SelectedCheckout>,
+    daemon_handle: Option<&tokio::runtime::Handle>,
+    deadline: std::time::Instant,
+) -> anyhow::Result<DescribeParts> {
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let registry = registry.clone();
+    let key = key.to_owned();
+    let selected = selected.cloned();
+    let handle = daemon_handle.cloned();
+    let worker_cancel = cancel.clone();
+    std::thread::spawn(move || {
+        let outcome = (|| -> anyhow::Result<DescribeParts> {
+            let existing = registry.blocking_lock().runtime(&key);
+            let runtime = match existing {
+                Some(runtime) => runtime,
+                None => match &handle {
+                    Some(handle) => {
+                        handle.block_on(async { registry.lock().await.activate(&key) })?
+                    }
+                    None => anyhow::bail!("index_not_ready: checkout not activated"),
+                },
+            };
+            let read = read_describe(&runtime, selected.as_ref(), deadline, &worker_cancel);
+            Ok((read, runtime.mcp_watcher_degraded()))
+        })();
+        // A call that reached its deadline has dropped the receiver; the late
+        // result is discarded here and never written to the client.
+        let _ = done_tx.send(outcome);
+    });
+    match done_rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+        Ok(outcome) => outcome,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            cancel.store(true, std::sync::atomic::Ordering::Release);
+            anyhow::bail!("deadline_exceeded: MCP call reached its deadline")
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            anyhow::bail!("store_unavailable: MCP describe worker stopped")
+        }
+    }
+}
+
 /// Retry only direct Store contention. Every failed attempt drops its selected
 /// response; the one successful answer is materialized and finished in one snapshot.
 fn read_describe(
     runtime: &crate::daemon::registry::CheckoutRuntime,
     selected: Option<&crate::daemon::registry::SelectedCheckout>,
     deadline: std::time::Instant,
+    cancel: &std::sync::atomic::AtomicBool,
 ) -> anyhow::Result<DescribedSnapshot> {
+    #[cfg(feature = "test-support")]
+    runtime.run_mcp_read_hook_for_tests();
     loop {
+        if cancel.load(std::sync::atomic::Ordering::Acquire) {
+            anyhow::bail!("deadline_exceeded: MCP call reached its deadline");
+        }
         let attempt =
             runtime
                 .mcp_describe(selected)
@@ -302,7 +373,7 @@ fn run_transport(
                 if session.pending(admission.token).is_none() {
                     continue;
                 }
-                let call_deadline = std::time::Instant::now() + CALL_DEADLINE;
+                let call_deadline = std::time::Instant::now() + workspace.call_deadline;
                 let modern = session.mode() == session::Mode::Modern;
                 let mut prepared_tool = None;
                 let mut capacity_witness = None;
@@ -391,88 +462,83 @@ fn run_transport(
                                             if name == "trellis_workspace_describe"
                                                 && let Some((registry, _)) = &registry
                                             {
-                                                let runtime = registry.blocking_lock().runtime(key);
-                                                let activated = if let Some(runtime) = runtime {
-                                                    Ok(runtime)
-                                                } else if let Some(handle) = &daemon_handle {
-                                                    handle.block_on(async {
-                                                        registry.lock().await.activate(key)
-                                                    })
-                                                } else {
-                                                    Err(anyhow::anyhow!(
-                                                        "index_not_ready: checkout not activated"
-                                                    ))
-                                                };
-                                                if let Ok(runtime) = &activated {
-                                                    match read_describe(
-                                                        runtime,
-                                                        selected.as_ref(),
-                                                        call_deadline,
-                                                    ) {
-                                                        Ok(DescribedSnapshot {
-                                                            data: Some((status, counts)),
-                                                            catching_up: sampled,
-                                                            state,
-                                                            progress,
-                                                        }) => {
-                                                            sampled_catching_up = sampled;
-                                                            envelope = projection::describe(
-                                                                &admission.id,
-                                                                answering.label(),
+                                                match describe_within(
+                                                    registry,
+                                                    key,
+                                                    selected.as_ref(),
+                                                    daemon_handle.as_ref(),
+                                                    call_deadline,
+                                                ) {
+                                                    Ok((read, degraded)) => {
+                                                        match read {
+                                                            Ok(DescribedSnapshot {
+                                                                data: Some((status, counts)),
+                                                                catching_up: sampled,
                                                                 state,
                                                                 progress,
-                                                                Some(counts),
-                                                                Some(serde_json::json!({
-                                                                    "indexGeneration": status.revision.index_generation.to_string(),
-                                                                    "indexRevision": status.revision.index_revision
-                                                                })),
-                                                                false,
-                                                            );
-                                                        }
-                                                        Ok(DescribedSnapshot {
-                                                            data: None,
-                                                            catching_up: sampled,
-                                                            state,
-                                                            progress,
-                                                        }) => {
-                                                            sampled_catching_up = sampled;
-                                                            envelope = projection::describe(
-                                                                &admission.id,
-                                                                answering.label(),
+                                                            }) => {
+                                                                sampled_catching_up = sampled;
+                                                                envelope = projection::describe(
+                                                                    &admission.id,
+                                                                    answering.label(),
+                                                                    state,
+                                                                    progress,
+                                                                    Some(counts),
+                                                                    Some(serde_json::json!({
+                                                                        "indexGeneration": status.revision.index_generation.to_string(),
+                                                                        "indexRevision": status.revision.index_revision
+                                                                    })),
+                                                                    false,
+                                                                );
+                                                            }
+                                                            Ok(DescribedSnapshot {
+                                                                data: None,
+                                                                catching_up: sampled,
                                                                 state,
                                                                 progress,
-                                                                None,
-                                                                None,
-                                                                false,
-                                                            );
+                                                            }) => {
+                                                                sampled_catching_up = sampled;
+                                                                envelope = projection::describe(
+                                                                    &admission.id,
+                                                                    answering.label(),
+                                                                    state,
+                                                                    progress,
+                                                                    None,
+                                                                    None,
+                                                                    false,
+                                                                );
+                                                            }
+                                                            Err(error) => {
+                                                                envelope = tools::failure(
+                                                                    &admission.id,
+                                                                    mcp_read_error(&error),
+                                                                );
+                                                            }
                                                         }
-                                                        Err(error) => {
-                                                            envelope = tools::failure(
-                                                                &admission.id,
-                                                                mcp_read_error(&error),
-                                                            );
+                                                        match degraded {
+                                                            Ok(degraded)
+                                                                if envelope
+                                                                    .get("data")
+                                                                    .is_some() =>
+                                                            {
+                                                                envelope["data"]["watcherDegraded"] =
+                                                                    serde_json::json!(degraded);
+                                                            }
+                                                            Err(error) => {
+                                                                envelope = tools::failure(
+                                                                    &admission.id,
+                                                                    mcp_read_error(&error),
+                                                                )
+                                                            }
+                                                            _ => {}
                                                         }
                                                     }
-                                                    match runtime.mcp_watcher_degraded() {
-                                                        Ok(degraded)
-                                                            if envelope.get("data").is_some() =>
-                                                        {
-                                                            envelope["data"]["watcherDegraded"] =
-                                                                serde_json::json!(degraded);
-                                                        }
-                                                        Err(error) => {
-                                                            envelope = tools::failure(
-                                                                &admission.id,
-                                                                mcp_read_error(&error),
-                                                            )
-                                                        }
-                                                        _ => {}
+                                                    Err(error) => {
+                                                        envelope = tools::failure(
+                                                            &admission.id,
+                                                            mcp_read_error(&error),
+                                                        );
                                                     }
-                                                } else if let Err(error) = activated {
-                                                    envelope = tools::failure(
-                                                        &admission.id,
-                                                        mcp_read_error(&error),
-                                                    );
                                                 }
                                             }
                                             envelope["workspace"] =

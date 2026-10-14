@@ -2956,6 +2956,101 @@ async fn describe_reports_actual_degraded_watcher_on_selected_snapshot() {
     session.join().unwrap().unwrap();
 }
 
+/// The call deadline bounds the reply, measured from admission. A selected
+/// read still running at the deadline gets `deadline_exceeded` then, from the
+/// call's timer, and its late successful result is discarded, never written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn describe_replies_at_its_deadline_while_the_read_is_still_running() {
+    use std::os::unix::net::UnixStream;
+    use trellis::daemon::registry::CheckoutRegistry;
+    use trellis::store::topology::{TopologyRoots, WorkspaceIdentity};
+    let temp = tempfile::tempdir().unwrap();
+    let root = checkout(temp.path());
+    fs::write(root.join("a.js"), "function slow() {}\n").unwrap();
+    let identity = WorkspaceIdentity::discover(Some(&root), &root)
+        .unwrap()
+        .attach_marker()
+        .unwrap();
+    let topology =
+        TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(34, &identity).unwrap();
+    let runtime = registry.activate(&identity.root_key).unwrap();
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        loop {
+            if let Ok((response, catching_up)) = runtime.evidence_response()
+                && response.finish(()).is_ok()
+                && !catching_up
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("initial H did not finish");
+    // Hold the next selected read once it has started.
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel::<()>(1);
+    runtime.set_mcp_read_hook_for_tests(move || {
+        entered_tx.send(()).unwrap();
+        let _ = release_rx.recv_timeout(trellis::testing::HANG_BACKSTOP);
+    });
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    let (mut client, server) = UnixStream::pair().unwrap();
+    client
+        .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
+        .unwrap();
+    let daemon_handle = tokio::runtime::Handle::current();
+    let session = std::thread::spawn(move || {
+        trellis::mcp::run_socket(
+            trellis::mcp::OpenedWorkspace::new(identity)
+                .with_call_deadline_for_tests(Duration::from_millis(300)),
+            server,
+            registry,
+            34,
+            daemon_handle,
+        )
+    });
+    writeln!(
+        client,
+        "{}",
+        modern(
+            json!(61),
+            "tools/call",
+            json!({"name":"trellis_workspace_describe","arguments":{"schemaVersion":1}})
+        )
+    )
+    .unwrap();
+    entered_rx
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .expect("the selected read never started");
+    let mut reader = BufReader::new(client.try_clone().unwrap());
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    // The read is still held, so only the call's timer can have answered.
+    let response: Value = serde_json::from_str(&line).unwrap();
+    release_tx.send(()).unwrap();
+    tool(&response, Some("deadline_exceeded"), true);
+    assert_eq!(
+        response["result"]["structuredContent"]["error"]["retryable"],
+        true
+    );
+    // The released read now succeeds in the background; its result must not
+    // reach the client.
+    client
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    let mut stray = String::new();
+    assert!(
+        reader.read_line(&mut stray).is_err(),
+        "late result was written after the deadline reply: {stray}"
+    );
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn describe_reports_published_watcher_health_while_an_inventory_holds_the_watcher() {
     use std::os::unix::net::UnixStream;
