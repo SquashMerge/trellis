@@ -5,7 +5,6 @@ use crate::store::{
     topology::{TopologyRoots, WorkspaceIdentity},
 };
 use crate::{http, indexer::IndexOptions};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{
     collections::{HashMap, HashSet},
     fs,
@@ -19,6 +18,9 @@ pub const MAX_ACTIVE_CHECKOUTS: usize = 64;
 pub const BROWSER_IDLE_DELAY: Duration = Duration::from_secs(15 * 60);
 pub const CHECKOUT_RELEASE_DELAY: Duration = Duration::from_secs(15 * 60);
 pub const DAEMON_IDLE_DELAY: Duration = Duration::from_secs(30 * 60);
+/// A closing runtime finishes bounded local work (watcher, session, witness
+/// handles); activation waits this long for it before reporting not ready.
+const RETIRED_WAIT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct LifecycleTick {
@@ -165,6 +167,9 @@ pub struct CheckoutRegistry {
     orphan_scan_cache: Option<(Instant, bool)>,
     orphan_scan_count: u64,
     clock_override: Option<Instant>,
+    /// Wakes the lifecycle owner: clients came or went, a runtime retired,
+    /// accepted work drained or the last lease was released (Decision 0009 §5).
+    lifecycle: Arc<tokio::sync::Notify>,
     #[cfg(feature = "test-support")]
     test_after_due_release: Option<Box<dyn FnOnce() + Send>>,
     #[cfg(all(test, feature = "test-support"))]
@@ -191,6 +196,7 @@ impl CheckoutRegistry {
             orphan_scan_cache: None,
             orphan_scan_count: 0,
             clock_override: None,
+            lifecycle: Arc::new(tokio::sync::Notify::new()),
             #[cfg(feature = "test-support")]
             test_after_due_release: None,
             #[cfg(all(test, feature = "test-support"))]
@@ -237,9 +243,29 @@ impl CheckoutRegistry {
             !entry.released && (!entry.sessions.is_empty() || entry.browser_until.is_some()),
             "checkout not attached"
         );
-        if let Some(runtime) = self.runtimes.get(key) {
-            return Ok(runtime.clone());
+        if let Some(runtime) = self.runtimes.get(key).cloned() {
+            let scheduler = runtime.resources()?.scheduler.clone();
+            match scheduler.runtime_phase() {
+                RuntimePhase::Closing | RuntimePhase::Retired => {
+                    // A half-closed runtime is never revived: wait for its
+                    // bounded close, then activate a fresh one.
+                    anyhow::ensure!(
+                        scheduler.wait_retired(RETIRED_WAIT),
+                        "index_not_ready: checkout is closing"
+                    );
+                    self.finish_retired(key);
+                }
+                // Reattach cancels a requested retirement.
+                _ => {
+                    drop(scheduler.admission_lease()?);
+                    return Ok(runtime);
+                }
+            }
         }
+        let entry = self
+            .entries
+            .get(key)
+            .ok_or_else(|| anyhow::anyhow!("checkout not attached"))?;
         let identity = entry.identity.rediscover()?;
         let roots = match &self.roots {
             Some(roots) => roots.clone(),
@@ -344,12 +370,45 @@ impl CheckoutRegistry {
                 .set_causal_witness_runtime(reporter, Arc::downgrade(&runtime));
         }
         self.runtimes.insert(key.to_owned(), runtime.clone());
+        let lifecycle = self.lifecycle.clone();
+        scheduler.set_lifecycle_wake(Arc::new(move || lifecycle.notify_one()));
         scheduler.begin_startup_reconciliation(explicit_options);
         Ok(runtime)
     }
 
+    /// An active runtime. One that is closing or retired is not returned: the
+    /// caller activates a fresh one.
     pub fn runtime(&self, key: &str) -> Option<Arc<CheckoutRuntime>> {
-        self.runtimes.get(key).cloned()
+        self.runtimes.get(key).cloned().filter(|runtime| {
+            runtime.resources().is_ok_and(|resources| {
+                !matches!(
+                    resources.scheduler.runtime_phase(),
+                    RuntimePhase::Closing | RuntimePhase::Retired
+                )
+            })
+        })
+    }
+
+    /// The lifecycle owner waits on this between deadlines.
+    pub fn lifecycle_signal(&self) -> Arc<tokio::sync::Notify> {
+        self.lifecycle.clone()
+    }
+
+    /// Wait for a runtime whose retirement was requested to finish closing.
+    fn wait_runtime_retired(&self, key: &str) -> bool {
+        self.runtimes.get(key).is_some_and(|runtime| {
+            runtime.resources().is_ok_and(|resources| {
+                resources.scheduler.runtime_phase() != RuntimePhase::Ready
+                    && resources.scheduler.wait_retired(RETIRED_WAIT)
+            })
+        })
+    }
+
+    /// Drop a retired runtime's handles and forget it.
+    fn finish_retired(&mut self, key: &str) {
+        if let Some(runtime) = self.runtimes.remove(key) {
+            runtime.resources.lock().unwrap().take();
+        }
     }
 
     /// Serve may replace only an unattached CLI runtime. Do not call the
@@ -426,40 +485,6 @@ impl CheckoutRegistry {
         {
             resources.scheduler.reset_watcher_release();
         }
-    }
-
-    /// The lifecycle owner calls this only after the idle deadline. A failed
-    /// queue probe is busy, never evidence that it is safe to release a leader.
-    fn release_runtime(&mut self, key: &str) -> anyhow::Result<bool> {
-        let Some(runtime) = self.runtimes.get(key).cloned() else {
-            return Ok(true);
-        };
-        let resources = runtime.resources()?;
-        let phase = resources.scheduler.runtime_phase();
-        if startup_running(phase)
-            || (runtime.catching_up() && !startup_waiting(phase))
-            || resources.scheduler.leases() != 0
-            || CheckoutRuntime::queue_pending(&resources, phase)
-        {
-            return Ok(false);
-        }
-        // The timer holds the registry guard too. If either worker lane is
-        // busy, defer retirement with every active capability intact.
-        let released = resources
-            .scheduler
-            .try_release_checkout_runtime_if(|phase| {
-                !startup_running(phase)
-                    && resources.scheduler.leases() == 0
-                    && !CheckoutRuntime::queue_pending(&resources, phase)
-            });
-        if !matches!(released, Ok(true)) {
-            return Ok(false);
-        }
-        runtime.resources.lock().unwrap().take();
-        resources.store.retire_checkout_sqlite_witnesses();
-        drop(resources);
-        self.runtimes.remove(key);
-        Ok(true)
     }
 
     pub fn known_roots(&self) -> Vec<(String, PathBuf)> {
@@ -804,7 +829,9 @@ impl CheckoutRegistry {
         if !self.can_retire_replaced(identity) {
             return Err(SelectionError::IdentityChanged);
         }
-        if !self.release(key)? {
+        // The new root's caller is waiting: let the worker finish its bounded
+        // close of the replaced runtime now.
+        if !self.release(key)? && !(self.wait_runtime_retired(key) && self.release(key)?) {
             return Err(SelectionError::IdentityChanged);
         }
         self.entries.remove(key);
@@ -1055,10 +1082,11 @@ impl CheckoutRegistry {
                     let resources = runtime
                         .resources()
                         .map_err(|_| SelectionError::Unavailable)?;
-                    let phase = resources.scheduler.runtime_phase();
-                    (runtime.catching_up() && !startup_waiting(phase))
+                    // Published state only; no SQLite under the registry lock.
+                    // Watcher intent never holds a checkout (Decision 0009 §5).
+                    startup_running(resources.scheduler.runtime_phase())
                         || resources.scheduler.leases() != 0
-                        || CheckoutRuntime::queue_pending(&resources, phase)
+                        || resources.scheduler.fifo_pending()
                 }
                 None => {
                     return Ok(self
@@ -1077,17 +1105,25 @@ impl CheckoutRegistry {
 
     /// Release is a separate lifecycle decision, never implied by disconnect.
     /// The lifecycle owner calls this only after the idle delay.
+    /// Returns true once the checkout is released. A live runtime is asked to
+    /// retire; its worker retires it at a boundary (Decision 0009 §5) and
+    /// wakes the lifecycle, which calls this again to finish.
     pub fn release(&mut self, key: &str) -> Result<bool, SelectionError> {
         self.refresh_pending_work(key)?;
         let entry = self.entries.get(key).ok_or(SelectionError::Unavailable)?;
         if !entry.sessions.is_empty() || entry.browser_until.is_some() || entry.pending_work {
             return Ok(false);
         }
-        if !self
-            .release_runtime(key)
-            .map_err(|_| SelectionError::Unavailable)?
-        {
-            return Ok(false);
+        if let Some(runtime) = self.runtimes.get(key) {
+            let resources = runtime
+                .resources()
+                .map_err(|_| SelectionError::Unavailable)?;
+            match resources.scheduler.request_retire(|_| true) {
+                http::RetireOutcome::Retired => self.finish_retired(key),
+                http::RetireOutcome::Declined | http::RetireOutcome::Requested => {
+                    return Ok(false);
+                }
+            }
         }
         self.entries.get_mut(key).unwrap().released = true;
         Ok(true)
@@ -1118,6 +1154,7 @@ impl CheckoutRegistry {
             entry.release_at = None;
             entry.released = false;
             self.idle_exit_at = None;
+            self.lifecycle.notify_one();
             return Ok(checked);
         }
         if at_capacity {
@@ -1167,6 +1204,7 @@ impl CheckoutRegistry {
         if !disconnected {
             return;
         }
+        self.lifecycle.notify_one();
         if self
             .entries
             .values()
@@ -1190,6 +1228,7 @@ impl CheckoutRegistry {
         entry.browser_until = Some(now + BROWSER_IDLE_DELAY);
         entry.release_at = None;
         self.idle_exit_at = None;
+        self.lifecycle.notify_one();
         Ok(attached)
     }
 
@@ -1198,6 +1237,8 @@ impl CheckoutRegistry {
     #[doc(hidden)]
     pub fn set_clock_override_for_tests(&mut self, now: Instant) {
         self.clock_override = Some(now);
+        // Virtual time moved: the lifecycle owner re-evaluates its deadlines.
+        self.lifecycle.notify_one();
     }
 
     /// Advance deterministic lifecycle clocks. Busy resources keep their original
@@ -1295,6 +1336,27 @@ impl CheckoutRegistry {
         self.idle_exit_at
     }
 
+    /// The next lifecycle deadline still ahead of `now`. A deadline already
+    /// passed is pending on work, a lease or a retirement, and each of those
+    /// signals the lifecycle when it changes.
+    pub fn next_lifecycle_deadline(&self, now: Instant) -> Option<Instant> {
+        // Under a test clock, virtual deadlines are not real-time sleeps: the
+        // test moves the clock, which signals the lifecycle.
+        if self.clock_override.is_some() {
+            return None;
+        }
+        self.entries
+            .values()
+            .flat_map(|entry| [entry.release_at, entry.browser_until])
+            .chain([
+                self.idle_exit_at,
+                self.orphan_scan_cache.map(|(until, _)| until),
+            ])
+            .flatten()
+            .filter(|at| *at > now)
+            .min()
+    }
+
     fn update_exit_deadline(&mut self, now: Instant) {
         if self
             .entries
@@ -1352,7 +1414,8 @@ impl std::ops::Deref for SelectedCheckout {
 /// revision checks; idle release cannot drop its owner before this guard drops.
 pub struct CheckoutEvidence {
     response: crate::store::EvidenceResponse,
-    reads: Arc<AtomicUsize>,
+    /// Held against release until this evidence drops.
+    _lease: http::AdmissionLease,
     selection: Option<SelectedCheckout>,
 }
 impl CheckoutEvidence {
@@ -1375,11 +1438,6 @@ impl std::ops::Deref for CheckoutEvidence {
     type Target = crate::store::EvidenceResponse;
     fn deref(&self) -> &Self::Target {
         &self.response
-    }
-}
-impl Drop for CheckoutEvidence {
-    fn drop(&mut self) {
-        self.reads.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -1673,7 +1731,10 @@ impl CheckoutRuntime {
     /// virtual time a test has advanced on this checkout.
     pub(crate) fn mcp_clock_now(&self) -> Instant {
         #[cfg(feature = "test-support")]
-        let skew = Duration::from_millis(self.mcp_clock_skew_ms.load(Ordering::Acquire));
+        let skew = Duration::from_millis(
+            self.mcp_clock_skew_ms
+                .load(std::sync::atomic::Ordering::Acquire),
+        );
         #[cfg(not(feature = "test-support"))]
         let skew = Duration::ZERO;
         Instant::now() + skew
@@ -1699,7 +1760,8 @@ impl CheckoutRuntime {
     #[doc(hidden)]
     pub fn advance_mcp_clock_for_tests(&self, by: Duration) {
         let millis = u64::try_from(by.as_millis()).unwrap_or(u64::MAX);
-        self.mcp_clock_skew_ms.fetch_add(millis, Ordering::AcqRel);
+        self.mcp_clock_skew_ms
+            .fetch_add(millis, std::sync::atomic::Ordering::AcqRel);
     }
 
     #[cfg(feature = "test-support")]
@@ -1762,8 +1824,7 @@ impl CheckoutRuntime {
         Ok((
             CheckoutEvidence {
                 response,
-                // The lease becomes the evidence's read hold, released on drop.
-                reads: lease.into_counter(),
+                _lease: lease,
                 selection: None,
             },
             catching_up,

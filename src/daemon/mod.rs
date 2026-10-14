@@ -205,17 +205,29 @@ impl Drop for SocketOwner {
 pub async fn run_idle_lifecycle(
     registry: std::sync::Arc<tokio::sync::Mutex<registry::CheckoutRegistry>>,
 ) -> Result<(), registry::SelectionError> {
-    let mut ticks = tokio::time::interval(std::time::Duration::from_millis(250));
-    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Event-driven (Decision 0009 §5): sleep until the next policy deadline
+    // unless a client change, a retirement, drained work or a released lease
+    // signals first. A signal sent while advancing is kept as a permit.
+    let signal = registry.lock().await.lifecycle_signal();
     loop {
-        ticks.tick().await;
-        if registry
-            .lock()
-            .await
-            .advance(std::time::Instant::now())?
-            .exit
-        {
+        let now = std::time::Instant::now();
+        let tick = {
+            let mut registry = registry.lock().await;
+            let tick = registry.advance(now)?;
+            (tick.exit, registry.next_lifecycle_deadline(now))
+        };
+        let (exit, deadline) = tick;
+        if exit {
             return Ok(());
+        }
+        match deadline {
+            Some(deadline) => {
+                tokio::select! {
+                    () = signal.notified() => {}
+                    () = tokio::time::sleep_until(deadline.into()) => {}
+                }
+            }
+            None => signal.notified().await,
         }
     }
 }

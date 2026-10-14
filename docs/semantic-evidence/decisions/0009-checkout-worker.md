@@ -91,7 +91,7 @@ The snapshot replaces lock probing as information. It never replaces the checks 
 The worker runs one unit at a time. Before each unit, it picks the highest class that has work:
 1. **Startup reconciliation**, while `Reconciling`. Old-root settlement while `RootLost`. FIFO is held until a validated head commits.
 2. **Accepted FIFO and watcher work**, interleaved exactly as today: one FIFO row, then the watcher gate. Watcher work runs when the FIFO is empty or a row just completed.
-   - **In `RetireRequested`**, only watcher intent **through the cutoff** is in this class. Changes after the cutoff don't outrank retirement and can't delay it.
+   - **In `RetireRequested`**, watcher intent **through the cutoff** gets one attempt before retirement (§5). Changes after the cutoff don't outrank retirement and can't delay it.
 3. **Retirement**, while `RetireRequested`.
 4. **Maintenance and GC**, chunked. Each unit yields at its next safe point when a higher class has work; it reads the worker's own pending flags and the publication gate's published waiting count. GC of other, inactive checkouts' indexes is a maintenance unit too. Its eligibility and use-lock protection are unchanged: a runtime's index keeps its use lock until that runtime has finished `Closing`.
 
@@ -109,7 +109,7 @@ Units are never preempted mid-way. Accepted work is never cancelled to make room
 Accepted FIFO work and its Q2→watcher→Q1 gate are never skipped.
 
 **When accepted**, under the state lock, the worker stamps the **cutoff**: the watcher's accepted generation at that moment. It then:
-1. finishes watcher work up to the cutoff;
+1. makes one forced attempt at watcher intent up to the cutoff, if any is unacknowledged. Its outcome, including a capture invalidated by later changes, never holds the retirement: the next activation's startup reconciliation captures whatever it missed;
 2. takes the state lock again, and enters `Closing` only if the state is still `RetireRequested`;
 3. closes the watcher, the session, the SQLite witnesses and the use locks;
 4. publishes `Retired`.

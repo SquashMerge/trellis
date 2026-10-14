@@ -29,6 +29,17 @@ pub(crate) enum RuntimeState {
     /// The captured root is missing or replaced, and its accepted requests are
     /// confirmed terminal. Old-root evidence is never served.
     RootLost,
+    /// Release is due (Decision 0009 §5). The worker makes one attempt at
+    /// watcher intent up to `cutoff` (the generation when release was
+    /// accepted), then closes. A lease or an enqueue cancels it before
+    /// `Closing`; reads keep the validated head meanwhile.
+    RetireRequested {
+        cutoff: Option<u64>,
+        session: Option<Arc<WriterSession>>,
+    },
+    /// The worker is closing the watcher, session and witnesses. Nothing is
+    /// admitted on this runtime from here on; callers wait for `Retired`.
+    Closing,
     /// Released. No further work, reads or claims on this runtime.
     Retired,
 }
@@ -36,10 +47,25 @@ pub(crate) enum RuntimeState {
 impl RuntimeState {
     pub(crate) fn session(&self) -> Option<&Arc<WriterSession>> {
         match self {
-            RuntimeState::Ready(session) => Some(session),
+            RuntimeState::Ready(session)
+            | RuntimeState::RetireRequested {
+                session: Some(session),
+                ..
+            } => Some(session),
             _ => None,
         }
     }
+}
+
+/// The outcome of asking a runtime to retire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetireOutcome {
+    /// Work, a lease or startup reconciliation keeps the runtime active.
+    Declined,
+    /// The worker will retire it (or is closing it).
+    Requested,
+    /// Fully retired; the registry may remove it.
+    Retired,
 }
 
 /// Status a reader may show; never an admission decision (Decision 0009 §3).
@@ -49,6 +75,8 @@ pub enum RuntimePhase {
     Reconciling { started: bool, waiting: bool },
     Ready,
     RootLost,
+    RetireRequested,
+    Closing,
     Retired,
 }
 
@@ -62,13 +90,15 @@ impl RuntimePhase {
             },
             RuntimeState::Ready(_) => RuntimePhase::Ready,
             RuntimeState::RootLost => RuntimePhase::RootLost,
+            RuntimeState::RetireRequested { .. } => RuntimePhase::RetireRequested,
+            RuntimeState::Closing => RuntimePhase::Closing,
             RuntimeState::Retired => RuntimePhase::Retired,
         }
     }
 }
 
 impl DaemonState {
-    pub(crate) fn runtime_phase(&self) -> RuntimePhase {
+    pub fn runtime_phase(&self) -> RuntimePhase {
         RuntimePhase::of(&self.runtime.lock().unwrap())
     }
 
@@ -149,7 +179,11 @@ impl DaemonState {
         match &*self.runtime.lock().unwrap() {
             RuntimeState::Reconciling { .. } => return Ok(true),
             RuntimeState::Activating => {}
-            RuntimeState::Ready(_) | RuntimeState::RootLost | RuntimeState::Retired => {
+            RuntimeState::Ready(_)
+            | RuntimeState::RootLost
+            | RuntimeState::RetireRequested { .. }
+            | RuntimeState::Closing
+            | RuntimeState::Retired => {
                 return Ok(false);
             }
         }
@@ -388,21 +422,66 @@ impl DaemonState {
             return Some(retry);
         }
         match &*self.runtime.lock().unwrap() {
-            RuntimeState::Activating | RuntimeState::RootLost | RuntimeState::Retired => {
+            RuntimeState::Activating
+            | RuntimeState::RootLost
+            | RuntimeState::Closing
+            | RuntimeState::Retired => {
                 return None;
             }
-            RuntimeState::Reconciling { .. } => return Some(now),
+            RuntimeState::Reconciling { .. } | RuntimeState::RetireRequested { .. } => {
+                return Some(now);
+            }
             RuntimeState::Ready(_) => {}
         }
         // An accepted head that made no progress (and set no deferral) is
         // retried rather than left until the next inventory.
-        if !matches!(self.store.earliest_unfinished_request(), Ok(None)) {
+        if self.fifo_pending.load(Ordering::Acquire) {
             return Some(now + STEP_RETRY);
         }
         match &*self.watcher_work.lock().unwrap() {
             Some((_, watcher)) => Some(watcher.next_due()),
             None => Some(now),
         }
+    }
+
+    /// Publish whether accepted FIFO work remains (an unreadable queue counts
+    /// as pending). When it drains, wake the lifecycle: a declined release
+    /// may now proceed.
+    fn publish_fifo_pending(&self) {
+        let pending = match &*self.runtime.lock().unwrap() {
+            // Nothing is claimed on a retired runtime; never reopen its queue.
+            RuntimeState::Closing | RuntimeState::Retired => false,
+            RuntimeState::RootLost => !matches!(self.store.old_root_unfinished_request(), Ok(None)),
+            _ => !matches!(self.store.earliest_unfinished_request(), Ok(None)),
+        };
+        let was = self.fifo_pending.swap(pending, Ordering::AcqRel);
+        if was
+            && !pending
+            && let Some(lifecycle) = self.lifecycle.get()
+        {
+            lifecycle();
+        }
+    }
+
+    /// Hold the worker at the start of its next step until the guard drops.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn hold_worker_for_tests(&self) -> std::sync::RwLockWriteGuard<'_, ()> {
+        self.worker_hold.write().unwrap()
+    }
+
+    /// Hold retirement just before its `Closing` linearization point.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn set_retire_hook_for_tests(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.retire_hook.lock().unwrap() = Some(Box::new(hook));
+    }
+
+    /// Hold retirement after `Closing`, before `Retired`.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn set_closing_hook_for_tests(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.closing_hook.lock().unwrap() = Some(Box::new(hook));
     }
 
     /// Accept one index request durably and wake the worker. The only enqueue
@@ -415,6 +494,7 @@ impl DaemonState {
     ) -> anyhow::Result<crate::store::requests::Request> {
         let lease = self.admission_lease()?;
         let row = self.store.enqueue_request(options, expected)?;
+        self.fifo_pending.store(true, Ordering::Release);
         drop(lease);
         self.pending_requests.lock().unwrap().push(row.id.clone());
         *self.recovery_retry_after.lock().unwrap() = None;
@@ -424,14 +504,179 @@ impl DaemonState {
 
     /// Take an admission lease unless the runtime is retired. Release declines
     /// while a lease is held, and both decide under the runtime state lock.
+    /// A lease taken while retirement is requested cancels it (Decision 0009
+    /// §5): the runtime returns to its prior state with its resources live.
+    /// From `Closing` on, nothing is admitted here; use a fresh runtime.
     pub(crate) fn admission_lease(&self) -> anyhow::Result<AdmissionLease> {
-        let state = self.runtime.lock().unwrap();
-        anyhow::ensure!(
-            !matches!(*state, RuntimeState::Retired),
-            "index_not_ready: checkout released"
-        );
+        let mut state = self.runtime.lock().unwrap();
+        match &*state {
+            RuntimeState::Closing | RuntimeState::Retired => {
+                anyhow::bail!("index_not_ready: checkout released")
+            }
+            RuntimeState::RetireRequested { session, .. } => {
+                *state = match session {
+                    Some(session) => RuntimeState::Ready(session.clone()),
+                    None => RuntimeState::Reconciling {
+                        attempts: 0,
+                        waiting: false,
+                    },
+                };
+                self.inbox.wake();
+            }
+            _ => {}
+        }
         self.leases.fetch_add(1, Ordering::AcqRel);
-        Ok(AdmissionLease(self.leases.clone()))
+        Ok(AdmissionLease {
+            count: self.leases.clone(),
+            lifecycle: self.lifecycle.clone(),
+        })
+    }
+
+    /// Ask the worker to retire this runtime. `idle` decides, under the state
+    /// lock, whether nothing keeps it active (Decision 0009 §5). Startup
+    /// reconciliation in progress, a lease or accepted FIFO work declines.
+    pub(crate) fn request_retire(&self, idle: impl FnOnce(RuntimePhase) -> bool) -> RetireOutcome {
+        let mut state = self.runtime.lock().unwrap();
+        let session = match &*state {
+            RuntimeState::Retired => return RetireOutcome::Retired,
+            RuntimeState::Closing | RuntimeState::RetireRequested { .. } => {
+                return RetireOutcome::Requested;
+            }
+            RuntimeState::Reconciling { waiting: false, .. } => return RetireOutcome::Declined,
+            RuntimeState::Ready(session) => Some(session.clone()),
+            RuntimeState::Activating
+            | RuntimeState::Reconciling { waiting: true, .. }
+            | RuntimeState::RootLost => None,
+        };
+        if self.leases.load(Ordering::Acquire) != 0
+            || self.fifo_pending.load(Ordering::Acquire)
+            || !idle(RuntimePhase::of(&state))
+        {
+            return RetireOutcome::Declined;
+        }
+        let cutoff = self
+            .watch_status
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|status| status.generation.load(Ordering::SeqCst));
+        *state = RuntimeState::RetireRequested { cutoff, session };
+        drop(state);
+        self.inbox.wake();
+        RetireOutcome::Requested
+    }
+
+    /// The worker's retirement step. A FIFO row accepted around the request
+    /// (through any Store) cancels it. Otherwise one attempt at watcher
+    /// intent up to the cutoff, then the `Closing` linearization and close.
+    pub(super) fn run_retirement(&self) -> anyhow::Result<()> {
+        // A lost root's accepted requests are already settled; new-root work
+        // belongs to a fresh runtime.
+        let root_lost = self.store.root_path_replaced().unwrap_or(true);
+        if !root_lost && self.store.earliest_unfinished_request()?.is_some() {
+            let mut state = self.runtime.lock().unwrap();
+            if let RuntimeState::RetireRequested { session, .. } = &*state {
+                *state = match session {
+                    Some(session) => RuntimeState::Ready(session.clone()),
+                    None => RuntimeState::Reconciling {
+                        attempts: 0,
+                        waiting: false,
+                    },
+                };
+            }
+            self.step_progress.store(true, Ordering::Release);
+            return Ok(());
+        }
+        self.reconcile_through_cutoff();
+        #[cfg(feature = "test-support")]
+        if let Some(hook) = self.retire_hook.lock().unwrap().take() {
+            hook();
+        }
+        {
+            let mut state = self.runtime.lock().unwrap();
+            if !matches!(*state, RuntimeState::RetireRequested { .. }) {
+                // Cancelled by a lease or an enqueue: resources stay live.
+                return Ok(());
+            }
+            *state = RuntimeState::Closing;
+        }
+        *self.watch_status.lock().unwrap() = None;
+        *self.watcher_work.lock().unwrap() = None;
+        self.watcher_health.store(false, Ordering::Release);
+        self.watcher_release_cancel.store(true, Ordering::Release);
+        #[cfg(feature = "test-support")]
+        if let Some(hook) = self.closing_hook.lock().unwrap().take() {
+            hook();
+        }
+        self.store.retire_checkout_sqlite_witnesses();
+        *self.runtime.lock().unwrap() = RuntimeState::Retired;
+        self.retired_changed.notify_all();
+        if let Some(lifecycle) = self.lifecycle.get() {
+            lifecycle();
+        }
+        Ok(())
+    }
+
+    /// One attempt at accepted watcher intent up to the cutoff. Its outcome
+    /// never blocks retirement: changes it misses are captured by the next
+    /// activation's mandatory startup reconciliation.
+    fn reconcile_through_cutoff(&self) {
+        let (cutoff, session) = match &*self.runtime.lock().unwrap() {
+            RuntimeState::RetireRequested {
+                cutoff: Some(cutoff),
+                session: Some(session),
+            } => (*cutoff, session.clone()),
+            _ => return,
+        };
+        let options = match self.store.recorded_index_options() {
+            Ok(options) => options.unwrap_or_else(|| self.options.clone()),
+            Err(_) => return,
+        };
+        let mut work = self.watcher_work.lock().unwrap();
+        let Some((_, watcher)) = work.as_mut() else {
+            return;
+        };
+        if watcher.acknowledged_generation() >= cutoff
+            && !watcher.intent_besides_generation(&options)
+        {
+            return;
+        }
+        let _ = watcher.reconcile_due(
+            &self.store,
+            &session,
+            &options,
+            &self.watcher_release_cancel,
+            true,
+        );
+    }
+
+    /// Wait until this runtime is `Retired` (or `timeout` passes). Close is
+    /// bounded local work: watcher, session and witness handles.
+    pub(crate) fn wait_retired(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut state = self.runtime.lock().unwrap();
+        while !matches!(*state, RuntimeState::Retired) {
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            state = self
+                .retired_changed
+                .wait_timeout(state, deadline - now)
+                .unwrap()
+                .0;
+        }
+        true
+    }
+
+    /// Register the registry's lifecycle wake, signalled on retirement, when
+    /// accepted FIFO work drains and when the last lease is released.
+    pub(crate) fn set_lifecycle_wake(&self, wake: Arc<dyn Fn() + Send + Sync>) {
+        let _ = self.lifecycle.set(wake);
+    }
+
+    pub(crate) fn fifo_pending(&self) -> bool {
+        self.fifo_pending.load(Ordering::Acquire)
     }
 
     pub(crate) fn leases(&self) -> usize {
@@ -452,21 +697,20 @@ impl DaemonState {
     }
 }
 
-/// A read or enqueue admission held against release.
-pub struct AdmissionLease(Arc<std::sync::atomic::AtomicUsize>);
-
-impl AdmissionLease {
-    /// Keep the lease for the life of an evidence response, which releases it.
-    pub(crate) fn into_counter(self) -> Arc<std::sync::atomic::AtomicUsize> {
-        let counter = self.0.clone();
-        std::mem::forget(self);
-        counter
-    }
+/// A read or enqueue admission held against release. Dropping the last one
+/// wakes the lifecycle, which may now release an idle checkout.
+pub struct AdmissionLease {
+    count: Arc<std::sync::atomic::AtomicUsize>,
+    lifecycle: Arc<std::sync::OnceLock<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl Drop for AdmissionLease {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
+        if self.count.fetch_sub(1, Ordering::AcqRel) == 1
+            && let Some(lifecycle) = self.lifecycle.get()
+        {
+            lifecycle();
+        }
     }
 }
 
@@ -484,6 +728,7 @@ fn worker_loop(weak: std::sync::Weak<DaemonState>, inbox: Arc<WorkerInbox>) {
             return;
         }
         let step = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| state.queue_tick()));
+        state.publish_fifo_pending();
         deadline = match step {
             Ok(Ok(())) => {
                 // The witness reads phase only after the step released its locks.

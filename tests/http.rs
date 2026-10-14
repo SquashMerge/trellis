@@ -214,7 +214,7 @@ async fn validation_and_limit() {
 }
 #[tokio::test]
 async fn source_is_snapshot_and_revision_checked() {
-    let (_d, store, state, app) = setup();
+    let (_d, store, state, app) = setup_without_tick();
     let workspace = _d.path().join("workspace");
     std::fs::write(workspace.join("a.js"), "cached secret-free source").unwrap();
     let cancel = Arc::new(AtomicBool::new(false));
@@ -277,7 +277,7 @@ async fn source_is_snapshot_and_revision_checked() {
 }
 #[tokio::test]
 async fn dependency_status_whole_response_fence() {
-    let (dir, store, state, app) = setup();
+    let (dir, store, state, app) = setup_without_tick();
     std::fs::write(dir.path().join("workspace/a.js"), "function go() {}\n").unwrap();
     let options = IndexOptions::new(dir.path().join("workspace"));
     let cancel = Arc::new(AtomicBool::new(false));
@@ -849,7 +849,7 @@ async fn index_request_without_startup_session_takes_over_after_ack() {
 
 #[tokio::test]
 async fn released_matching_pin_is_typed_http_conflict_without_head_fallback() {
-    let (dir, store, state, app) = setup();
+    let (dir, store, state, app) = setup_without_tick();
     let workspace = dir.path().join("workspace");
     store.set_retention_clock_for_tests(1_000, 0);
     std::fs::write(workspace.join("a.js"), "function before() {}\n").unwrap();

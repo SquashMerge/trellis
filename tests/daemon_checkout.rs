@@ -630,6 +630,7 @@ async fn retained_registration_and_old_runtime_handle_hold_no_checkout_descripto
     response.finish(()).unwrap();
 }
 
+#[cfg(feature = "test-support")]
 #[tokio::test]
 async fn root_loss_fails_accepted_work_then_releases_old_runtime_handles() {
     let base = tempfile::tempdir().unwrap();
@@ -647,6 +648,9 @@ async fn root_loss_fails_accepted_work_then_releases_old_runtime_handles() {
     drop(id);
     let old = registry.activate(&key).unwrap();
     ready(&old).await;
+    // The row is still accepted, not yet claimed, when the root moves.
+    let scheduler = old.browser_scheduler().unwrap();
+    let held = scheduler.hold_worker_for_tests();
     let store = Store::open(topology, identity(&checkout)).unwrap();
     let row = store
         .enqueue_request(&trellis::indexer::IndexOptions::new(checkout.clone()), None)
@@ -674,6 +678,8 @@ async fn root_loss_fails_accepted_work_then_releases_old_runtime_handles() {
         "unavailable",
         "accepted FIFO row prevents replacement listing"
     );
+    drop(held);
+    drop(scheduler);
     tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         while registry.refresh_pending_work(&key).unwrap() {
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -1682,4 +1688,179 @@ async fn watcher_signal_wakes_the_idle_worker() {
     })
     .await
     .expect("watcher signal did not wake the idle worker");
+}
+
+/// A settled checkout with no clients: ready to be released.
+#[cfg(feature = "test-support")]
+async fn idle_detached(
+    registry: &mut CheckoutRegistry,
+    id: &WorkspaceIdentity,
+) -> std::sync::Arc<trellis::daemon::registry::CheckoutRuntime> {
+    registry.attach_launch(1, id).unwrap();
+    let runtime = registry.activate(&id.root_key).unwrap();
+    ready(&runtime).await;
+    registry.disconnect(1);
+    runtime
+}
+
+/// Wait for a test hook on the worker thread without blocking the runtime.
+#[cfg(feature = "test-support")]
+async fn entered(rx: std::sync::mpsc::Receiver<()>, what: &str) {
+    tokio::time::timeout(
+        trellis::testing::HANG_BACKSTOP,
+        tokio::task::spawn_blocking(move || rx.recv()),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("{what} not reached"))
+    .unwrap()
+    .unwrap();
+}
+
+/// Decision 0009 §5: release stamps a watcher cutoff. Changes accepted after
+/// it never hold the retirement; the next activation reconciles them.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn release_is_not_held_by_watcher_changes_after_its_cutoff() {
+    let base = tempfile::tempdir().unwrap();
+    let checkout = base.path().join("work");
+    fs::create_dir(&checkout).unwrap();
+    fs::write(checkout.join("a.js"), "function a() {}\n").unwrap();
+    let id = identity(&checkout);
+    let mut registry = CheckoutRegistry::with_roots(roots(base.path()));
+    let runtime = idle_detached(&mut registry, &id).await;
+    let scheduler = runtime.browser_scheduler().unwrap();
+    let (held_tx, held_rx) = std::sync::mpsc::sync_channel(1);
+    let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    scheduler.set_retire_hook_for_tests(move || {
+        held_tx.send(()).unwrap();
+        let _ = resume_rx.recv();
+    });
+    assert!(!registry.release(&id.root_key).unwrap());
+    entered(held_rx, "retirement hook").await;
+    // Changes after the cutoff, while the retirement is held.
+    fs::write(checkout.join("late.js"), "function late() {}\n").unwrap();
+    assert!(
+        scheduler.submit_watch_event_for_tests(Ok(notify::Event::new(notify::EventKind::Create(
+            notify::event::CreateKind::File
+        ))
+        .add_path(checkout.join("late.js"))))
+    );
+    assert!(scheduler.checkout_watch_pending());
+    resume_tx.send(()).unwrap();
+    release_when_idle(&mut registry, &id.root_key).await;
+    assert!(!runtime.has_active_resources());
+}
+
+/// Accepted FIFO work is never skipped: a row queued while another runs keeps
+/// the checkout until it completes (Decision 0009 §5).
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn release_waits_for_accepted_fifo_work() {
+    let base = tempfile::tempdir().unwrap();
+    let checkout = base.path().join("work");
+    fs::create_dir(&checkout).unwrap();
+    fs::write(checkout.join("a.js"), "function a() {}\n").unwrap();
+    let id = identity(&checkout);
+    let mut registry = CheckoutRegistry::with_roots(roots(base.path()));
+    let runtime = idle_detached(&mut registry, &id).await;
+    let (claimed_tx, claimed_rx) = std::sync::mpsc::sync_channel(1);
+    let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    runtime.set_after_claim_hook_for_tests(move || {
+        claimed_tx.send(()).unwrap();
+        let _ = resume_rx.recv();
+    });
+    let store = Store::open(roots(base.path()), identity(&checkout)).unwrap();
+    let options = trellis::indexer::IndexOptions::new(checkout.clone());
+    let first = store.enqueue_request(&options, None).unwrap();
+    entered(claimed_rx, "first claim").await;
+    let second = store.enqueue_request(&options, None).unwrap();
+    assert!(
+        !registry.release(&id.root_key).unwrap(),
+        "accepted FIFO work keeps the checkout"
+    );
+    resume_tx.send(()).unwrap();
+    release_when_idle(&mut registry, &id.root_key).await;
+    for row in [first, second] {
+        assert_eq!(store.request_by_id(&row.id).unwrap().unwrap().state, "done");
+    }
+}
+
+/// A lease taken while retirement is requested cancels it with the runtime's
+/// resources still live (Decision 0009 §5).
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn read_lease_cancels_requested_retirement() {
+    use trellis::http::RuntimePhase;
+    let base = tempfile::tempdir().unwrap();
+    let checkout = base.path().join("work");
+    fs::create_dir(&checkout).unwrap();
+    fs::write(checkout.join("a.js"), "function a() {}\n").unwrap();
+    let id = identity(&checkout);
+    let mut registry = CheckoutRegistry::with_roots(roots(base.path()));
+    let runtime = idle_detached(&mut registry, &id).await;
+    let scheduler = runtime.browser_scheduler().unwrap();
+    let (held_tx, held_rx) = std::sync::mpsc::sync_channel(1);
+    let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    scheduler.set_retire_hook_for_tests(move || {
+        held_tx.send(()).unwrap();
+        let _ = resume_rx.recv();
+    });
+    assert!(!registry.release(&id.root_key).unwrap());
+    entered(held_rx, "retirement hook").await;
+    assert_eq!(scheduler.runtime_phase(), RuntimePhase::RetireRequested);
+    // A read during the requested retirement is served from the live head.
+    let (read, _) = runtime.evidence_response().unwrap();
+    assert!(read.source_at("a.js", None).unwrap().is_some());
+    read.finish(()).unwrap();
+    drop(read);
+    assert_eq!(scheduler.runtime_phase(), RuntimePhase::Ready);
+    resume_tx.send(()).unwrap();
+    // The worker abandons the cancelled retirement and goes idle.
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        while scheduler.worker_asleep_until_for_tests().is_none() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(scheduler.runtime_phase(), RuntimePhase::Ready);
+    assert!(runtime.has_active_resources());
+    assert!(runtime.evidence_response().is_ok());
+}
+
+/// From `Closing` on nothing is admitted on the old runtime; a reattach waits
+/// for `Retired` and gets a fresh runtime (Decision 0009 §5).
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn closing_runtime_is_never_revived() {
+    use trellis::http::RuntimePhase;
+    let base = tempfile::tempdir().unwrap();
+    let checkout = base.path().join("work");
+    fs::create_dir(&checkout).unwrap();
+    fs::write(checkout.join("a.js"), "function a() {}\n").unwrap();
+    let id = identity(&checkout);
+    let mut registry = CheckoutRegistry::with_roots(roots(base.path()));
+    let runtime = idle_detached(&mut registry, &id).await;
+    let scheduler = runtime.browser_scheduler().unwrap();
+    let (held_tx, held_rx) = std::sync::mpsc::sync_channel(1);
+    let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    scheduler.set_closing_hook_for_tests(move || {
+        held_tx.send(()).unwrap();
+        let _ = resume_rx.recv();
+    });
+    assert!(!registry.release(&id.root_key).unwrap());
+    entered(held_rx, "closing hook").await;
+    assert_eq!(scheduler.runtime_phase(), RuntimePhase::Closing);
+    let refused = runtime
+        .evidence_response()
+        .err()
+        .expect("closing admits nothing");
+    assert!(refused.to_string().contains("released"), "{refused:#}");
+    assert_eq!(scheduler.runtime_phase(), RuntimePhase::Closing);
+    resume_tx.send(()).unwrap();
+    registry.attach_launch(2, &id).unwrap();
+    let fresh = registry.activate(&id.root_key).unwrap();
+    assert!(!std::sync::Arc::ptr_eq(&fresh, &runtime));
+    assert!(!runtime.has_active_resources());
+    ready(&fresh).await;
 }

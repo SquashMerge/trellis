@@ -46,7 +46,7 @@ use std::{
 use subtle::ConstantTimeEq;
 
 mod worker;
-pub use worker::RuntimePhase;
+pub use worker::{AdmissionLease, RetireOutcome, RuntimePhase};
 use worker::{RuntimeState, STARTUP_BACKOFF_FIRST};
 
 #[derive(Clone, Serialize)]
@@ -229,15 +229,34 @@ pub struct DaemonState {
     startup_backoff: Mutex<Duration>,
     /// Registered browser options were given explicitly and override recorded inputs.
     explicit_options: AtomicBool,
-    /// The worker's wake inbox, and the waker registered with the queue and watcher.
+    /// The worker's wake inbox. The queue waker, registered with every Store
+    /// for this root, also marks FIFO work pending at the enqueue COMMIT; the
+    /// watch waker only wakes.
     inbox: Arc<worker::WorkerInbox>,
-    queue_waker: Arc<dyn Fn() + Send + Sync>,
+    /// Owned here; the Store registry holds it weakly.
+    _queue_waker: Arc<dyn Fn() + Send + Sync>,
+    watch_waker: Arc<dyn Fn() + Send + Sync>,
+    /// Hold the worker at the start of its next step.
+    #[cfg(feature = "test-support")]
+    worker_hold: std::sync::RwLock<()>,
     /// The last step made progress, so more work may be ready at once.
     step_progress: AtomicBool,
     /// Published watcher intent; readers never take the watcher's lock.
     watch_status: Mutex<Option<worker::WatchStatus>>,
     /// Read and enqueue admission leases held against release.
     leases: Arc<std::sync::atomic::AtomicUsize>,
+    /// Published by the worker after each step (and set by the enqueue gate):
+    /// accepted FIFO work keeps the runtime from retiring.
+    fifo_pending: Arc<AtomicBool>,
+    /// The registry's lifecycle wake (Decision 0009 §5).
+    lifecycle: Arc<std::sync::OnceLock<Arc<dyn Fn() + Send + Sync>>>,
+    /// Signalled when the runtime becomes `Retired`.
+    retired_changed: std::sync::Condvar,
+    /// Pause retirement before its `Closing` linearization point, and after it.
+    #[cfg(feature = "test-support")]
+    retire_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(feature = "test-support")]
+    closing_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     options: IndexOptions,
     browser: crate::file_tree::SourceDir,
     rust_sources: Vec<crate::rust_sources::Root>,
@@ -416,7 +435,16 @@ pub fn new_with_dependency_options(
     #[cfg(feature = "test-support")]
     let origins = hosts.iter().map(|h| format!("http://{h}")).collect();
     let inbox = Arc::new(worker::WorkerInbox::default());
+    let fifo_pending = Arc::new(AtomicBool::new(false));
     let queue_waker: Arc<dyn Fn() + Send + Sync> = {
+        let inbox = inbox.clone();
+        let fifo_pending = fifo_pending.clone();
+        Arc::new(move || {
+            fifo_pending.store(true, Ordering::Release);
+            inbox.wake();
+        })
+    };
+    let watch_waker: Arc<dyn Fn() + Send + Sync> = {
         let inbox = inbox.clone();
         Arc::new(move || inbox.wake())
     };
@@ -424,10 +452,20 @@ pub fn new_with_dependency_options(
     Ok(Arc::new(DaemonState {
         store,
         inbox,
-        queue_waker,
+        _queue_waker: queue_waker,
+        watch_waker,
+        #[cfg(feature = "test-support")]
+        worker_hold: std::sync::RwLock::new(()),
         step_progress: AtomicBool::new(false),
         watch_status: Mutex::new(None),
         leases: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        fifo_pending,
+        lifecycle: Arc::new(std::sync::OnceLock::new()),
+        retired_changed: std::sync::Condvar::new(),
+        #[cfg(feature = "test-support")]
+        retire_hook: Mutex::new(None),
+        #[cfg(feature = "test-support")]
+        closing_hook: Mutex::new(None),
         runtime: Mutex::new(RuntimeState::Activating),
         startup_error: Mutex::new(None),
         startup_backoff: Mutex::new(STARTUP_BACKOFF_FIRST),
@@ -1131,7 +1169,7 @@ impl DaemonState {
                     // A late OS event from before this forced fixture tick must
                     // not defer pin expiration as accepted watcher work (#131).
                     scheduler.disable_native_watcher_for_tests();
-                    scheduler.set_waker(self.queue_waker.clone());
+                    scheduler.set_waker(self.watch_waker.clone());
                     let reconciled = scheduler.reconcile_due(
                         &self.store,
                         &session,
@@ -1184,6 +1222,8 @@ impl DaemonState {
     }
 
     fn queue_tick(self: &Arc<Self>) -> anyhow::Result<()> {
+        #[cfg(feature = "test-support")]
+        let _held = self.worker_hold.read().unwrap();
         if self.retired() {
             return Ok(());
         }
@@ -1203,8 +1243,23 @@ impl DaemonState {
         // other progress.
         if self.store.root_path_replaced()? {
             self.store.fail_changed_root_requests()?;
+            if matches!(
+                *self.runtime.lock().unwrap(),
+                RuntimeState::RetireRequested { .. }
+            ) {
+                // Settled: a requested retirement proceeds without its session.
+                return self.run_retirement();
+            }
             self.set_runtime_state(RuntimeState::RootLost);
             return Ok(());
+        }
+        // Retirement is due: the worker retires this runtime at this boundary
+        // unless accepted FIFO work cancels it (Decision 0009 §5).
+        if matches!(
+            *self.runtime.lock().unwrap(),
+            RuntimeState::RetireRequested { .. }
+        ) {
+            return self.run_retirement();
         }
         // A previously serving writer cannot claim against a damaged index.
         // Retire its local work; startup reconciliation recreates it.
@@ -1326,7 +1381,7 @@ impl DaemonState {
                                 self.causal_lineage_ordinal.clone(),
                             );
                         }
-                        scheduler.set_waker(self.queue_waker.clone());
+                        scheduler.set_waker(self.watch_waker.clone());
                         self.publish_watch_status(&scheduler, &selected_options);
                         *work = Some((Arc::downgrade(session), scheduler));
                     }
