@@ -702,6 +702,7 @@ async fn active_writer_and_protected_reader_overlap_orphan_idle_scan() {
     assert!(!runtime.has_active_resources());
 }
 
+#[cfg(feature = "test-support")]
 #[tokio::test]
 async fn committed_fifo_queue_keeps_both_expired_clocks_until_normal_daemon_drain() {
     let (base, id, mut registry, now) = fixture();
@@ -712,9 +713,25 @@ async fn committed_fifo_queue_keeps_both_expired_clocks_until_normal_daemon_drai
         TopologyRoots::isolated_for_tests(base.path().join("cache"), base.path().join("data"));
     let store = trellis::store::Store::open(roots, identity(&id.root)).unwrap();
     let options = trellis::indexer::IndexOptions::new(id.root.clone());
+    // The live worker claims the first request as soon as it is committed:
+    // hold it there, so the committed queue is observed before it drains.
+    let (claim_tx, claim_rx) = std::sync::mpsc::sync_channel(1);
+    let (continue_tx, continue_rx) = std::sync::mpsc::sync_channel(1);
+    let continue_rx = std::sync::Mutex::new(continue_rx);
+    runtime.set_after_claim_hook_for_tests(move || {
+        claim_tx.send(()).unwrap();
+        continue_rx.lock().unwrap().recv().unwrap();
+    });
     let first = store.enqueue_request(&options, None).unwrap();
     let second = store.enqueue_request(&options, None).unwrap();
     assert!(first.seq < second.seq);
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        while claim_rx.try_recv().is_err() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("first FIFO claim did not reach barrier");
     assert_eq!(
         store.earliest_unfinished_request().unwrap().unwrap().id,
         first.id
@@ -729,6 +746,7 @@ async fn committed_fifo_queue_keeps_both_expired_clocks_until_normal_daemon_drai
     assert!(busy.released.is_empty());
     assert!(!busy.exit);
     assert!(runtime.has_active_resources());
+    continue_tx.send(()).unwrap();
     tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             let a = store.request_by_id(&first.id).unwrap().unwrap();
