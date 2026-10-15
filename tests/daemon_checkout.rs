@@ -1285,6 +1285,7 @@ fn browser_listing_does_not_offer_ambiguous_same_inode_git_transition() {
     );
 }
 
+#[cfg(feature = "test-support")]
 #[tokio::test]
 async fn serve_preflight_rejects_busy_replaced_root_before_creating_token() {
     use trellis::daemon::BrowserProvisioner;
@@ -1307,6 +1308,10 @@ async fn serve_preflight_rejects_busy_replaced_root_before_creating_token() {
     };
     ready(&old).await;
     let (held_read, _) = old.evidence_response().unwrap();
+    // The worker notices the loss only after the checks below. Otherwise the
+    // root-loss rule (a stale client never blocks a verified replacement
+    // once no read is held) applies instead, as inotify can make it on Linux.
+    let (release_worker, holder) = hold_worker(old.browser_scheduler().unwrap()).await;
     fs::rename(&checkout, &moved).unwrap();
     fs::create_dir(&checkout).unwrap();
     fs::write(checkout.join("a.js"), "function newOwner() {}\n").unwrap();
@@ -1351,6 +1356,8 @@ async fn serve_preflight_rejects_busy_replaced_root_before_creating_token() {
             .is_err()
     );
     assert!(!token.exists());
+    release_worker.send(()).unwrap();
+    holder.join().unwrap();
     tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         while !registry.lock().await.release(&key).unwrap() {
             tokio::time::sleep(Duration::from_millis(25)).await;

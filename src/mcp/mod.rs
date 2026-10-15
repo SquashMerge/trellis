@@ -794,6 +794,29 @@ fn run_transport(
     daemon_handle: Option<tokio::runtime::Handle>,
     relayed: bool,
 ) -> std::io::Result<()> {
+    // A client that hangs up while replies are still being written ends the
+    // session; that is not a failure.
+    match coordinate(workspace, input, output, registry, daemon_handle, relayed) {
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+            ) =>
+        {
+            Ok(())
+        }
+        other => other,
+    }
+}
+
+fn coordinate(
+    workspace: OpenedWorkspace,
+    input: impl std::io::Read + Send + 'static,
+    output: impl std::io::Write,
+    registry: Registry,
+    daemon_handle: Option<tokio::runtime::Handle>,
+    relayed: bool,
+) -> std::io::Result<()> {
     use std::collections::{HashMap, VecDeque};
     use std::io::BufReader;
     use std::time::Instant;
