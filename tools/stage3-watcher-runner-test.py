@@ -256,6 +256,62 @@ class PhaseProcesses(unittest.TestCase):
         self.assertIsNone(stray.poll(), "stop signalled a process it did not start")
 
 
+class StatusReads(unittest.TestCase):
+    """Baseline setup retries a stalled or failing status; timed polling never
+    does. A stand-in replaces the status command."""
+
+    def setUp(self):
+        self.calls = []
+        saved = (RUNNER.command, RUNNER.SETUP_TIMEOUT_S)
+        self.addCleanup(lambda: (setattr(RUNNER, "command", saved[0]),
+                                 setattr(RUNNER, "SETUP_TIMEOUT_S", saved[1])))
+        self.home = Path(tempfile.mkdtemp(prefix="s3status"))
+        self.addCleanup(lambda: subprocess.run(["rm", "-rf", "--", str(self.home)]))
+
+    def fake(self, outcomes):
+        # outcomes: "timeout" | "error" | a revision number, consumed in order;
+        # the last one repeats.
+        def command(argv, *, env=None, timeout=30):
+            self.calls.append(timeout)
+            outcome = outcomes[min(len(self.calls), len(outcomes)) - 1]
+            if outcome == "timeout":
+                raise subprocess.TimeoutExpired(argv, timeout)
+            if outcome == "error":
+                raise subprocess.CalledProcessError(1, argv, "", "Error: index_not_ready: reindex required")
+            out = json.dumps({"revision": {"indexGeneration": "g", "indexRevision": outcome}})
+            return subprocess.CompletedProcess(argv, 0, out, "")
+        RUNNER.command = command
+
+    def test_a_baseline_status_timeout_is_retried_within_setup(self):
+        self.fake(["timeout", "error", 1])
+        pin, _, attempts = RUNNER.baseline_status(self.home, self.home)
+        self.assertEqual(pin["indexRevision"], 1)
+        self.assertEqual([a["outcome"].split(":")[0] for a in attempts], ["timeout", "exit 1", "ok"])
+
+    def test_baseline_setup_gives_up_at_its_deadline(self):
+        RUNNER.SETUP_TIMEOUT_S = 0.5
+        self.fake(["error"])
+        started = time.monotonic()
+        with self.assertRaises(RUNNER.Invalid):
+            RUNNER.baseline_status(self.home, self.home)
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertTrue(all(t <= 0.5 for t in self.calls), self.calls)
+
+    def test_a_timed_sample_never_uses_the_setup_retry(self):
+        for outcome in ("timeout", "error"):
+            with self.subTest(outcome=outcome):
+                self.calls.clear()
+                RUNNER.SETUP_TIMEOUT_S = 1800
+                self.fake([outcome])
+                started = time.monotonic()
+                with self.assertRaises(RUNNER.PollFailure) as raised:
+                    RUNNER.wait_selected(self.home, self.home, {"indexGeneration": "g", "indexRevision": 1},
+                                         time.monotonic_ns(), timeout_s=0.3)
+                self.assertLess(time.monotonic() - started, 5, "a timed sample waited on the setup retry")
+                self.assertTrue(all(t <= 0.3 for t in self.calls), self.calls)
+                self.assertTrue(all("error" in p for p in raised.exception.polls))
+
+
 class CloseOut(unittest.TestCase):
     def test_a_failed_teardown_still_restores_handlers_and_summarizes(self):
         class Failing:

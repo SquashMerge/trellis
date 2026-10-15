@@ -411,18 +411,36 @@ def election_free(home):
             os.close(descriptor)
     return True
 
-def status(workspace, home):
-    # serve announces readiness before the first H publishes. Baseline setup
-    # (untimed) waits for the first published head; sample polling is unchanged.
+STATUS_CALL_S = 15
+
+def read_status(workspace, home, timeout_s=STATUS_CALL_S):
+    # One status call, no retry. Raises CalledProcessError, TimeoutExpired or
+    # a decode/validation error; the timed sample polling uses only this.
+    result = command([BINARY, "status", "--workspace", workspace], env=env_for(home), timeout=timeout_s)
+    return pin_of(json.loads(result.stdout)), result.stdout
+
+def baseline_status(workspace, home):
+    # Untimed baseline setup only: serve announces readiness before the first
+    # head publishes, and a cold publication can stall a status call or make it
+    # fail with a typed error. Retry both until one monotonic setup deadline,
+    # each call bounded by min(15 s, the time left). Returns the attempts too,
+    # so the setup record keeps them.
     deadline = time.monotonic() + SETUP_TIMEOUT_S
+    attempts = []
     while True:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise Invalid(f"baseline status not ready within {SETUP_TIMEOUT_S}s; attempts={attempts[-5:]}")
+        began = time.monotonic()
         try:
-            result = command([BINARY, "status", "--workspace", workspace], env=env_for(home), timeout=15)
-            return pin_of(json.loads(result.stdout)), result.stdout
-        except subprocess.CalledProcessError:
-            if time.monotonic() >= deadline:
-                raise
-            time.sleep(1)
+            pin, raw = read_status(workspace, home, timeout_s=min(STATUS_CALL_S, left))
+            attempts.append({"seconds": round(time.monotonic() - began, 3), "outcome": "ok"})
+            return pin, raw, attempts
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            outcome = ("timeout" if isinstance(exc, subprocess.TimeoutExpired)
+                       else f"exit {exc.returncode}: {(exc.stderr or '').strip()[-200:]}")
+            attempts.append({"seconds": round(time.monotonic() - began, 3), "outcome": outcome})
+        time.sleep(max(0, min(1, deadline - time.monotonic())))
 
 WITNESS_FIELDS = {"epoch": int, "native": bool, "degraded": bool, "degradations": int}
 
@@ -460,7 +478,9 @@ def wait_selected(workspace, home, previous, write_done_ns, timeout_s=SAMPLE_TIM
     while time.monotonic() < deadline:
         began = time.monotonic_ns()
         try:
-            pin, raw = status(workspace, home)
+            # One call, never the setup retry; bounded by the sample's budget.
+            pin, raw = read_status(workspace, home,
+                                   timeout_s=max(0.001, min(STATUS_CALL_S, deadline - time.monotonic())))
             ended = time.monotonic_ns()
             entry = {"start_ns": began, "return_ns": ended, "pin": pin, "status_sha256": sha(raw.encode())}
             polls.append(entry)
@@ -530,13 +550,14 @@ def measure(args):
                 active = Daemon(scratch, size, workspace, home)
                 active.start()
                 active.ready()
-                previous, baseline_json = status(workspace, home)
+                previous, baseline_json, setup_attempts = baseline_status(workspace, home)
                 baseline = selected_check(home, previous, size)
                 append(log, "setup", size=size, serve_pid=active.proc.pid, serve_argv=active.argv,
                        serve_stderr=str(active.stderr_path), daemon_pid=active.daemon.pid,
                        daemon_stderr=str(active.daemon_stderr_path), url=active.url,
                        baseline_pin=previous, baseline_status_sha256=sha(baseline_json.encode()),
-                       baseline_selected=baseline, cold_setup_timing="excluded")
+                       baseline_selected=baseline, cold_setup_timing="excluded",
+                       setup_status_attempts=setup_attempts)
                 # Untimed setup: the current watcher's native setup publishes
                 # shortly after its epoch begins.
                 watching = watcher_witness(workspace, home)
@@ -611,13 +632,14 @@ def measure(args):
             active = Daemon(scratch, "fallback", workspace, home)
             active.start()
             active.ready()
-            prior, baseline_json = status(workspace, home)
+            prior, baseline_json, setup_attempts = baseline_status(workspace, home)
             baseline = selected_check(home, prior, "medium")
             append(log, "setup", size="fallback-medium", serve_pid=active.proc.pid,
                    serve_argv=active.argv, serve_stderr=str(active.stderr_path),
                    daemon_pid=active.daemon.pid, daemon_stderr=str(active.daemon_stderr_path), url=active.url,
                    baseline_pin=prior, baseline_status_sha256=sha(baseline_json.encode()),
-                   baseline_selected=baseline, cold_setup_timing="excluded")
+                   baseline_selected=baseline, cold_setup_timing="excluded",
+                   setup_status_attempts=setup_attempts)
             path = workspace / "python/Cmedium0000.py"
             before = path.read_bytes()
             needle = b"def f0(): return 1"
@@ -653,7 +675,7 @@ def measure(args):
                 active = Daemon(scratch, "cold-oracle", workspace, cold_home)
                 active.start()
                 active.ready()
-                cold_pin, cold_json = status(workspace, cold_home)
+                cold_pin, cold_json, cold_attempts = baseline_status(workspace, cold_home)
                 cold_selected_ns = time.monotonic_ns()
                 fallback["independent_cold_start_ns"] = cold_start_ns
                 fallback["independent_cold_first_status_return_ns"] = cold_selected_ns
@@ -662,6 +684,7 @@ def measure(args):
                 fallback["independent_cold_selected"] = selected_check(cold_home, cold_pin, "medium",
                     ("python/Cmedium0000.py", "python", after))
                 fallback["independent_cold_status_sha256"] = sha(cold_json.encode())
+                fallback["independent_cold_status_attempts"] = cold_attempts
                 fallback["warm_digest"] = parity_digest(home, pin)
                 fallback["cold_digest"] = parity_digest(cold_home, cold_pin)
                 need(fallback["warm_digest"] == fallback["cold_digest"], "FULL fallback vs cold native/graph/class parity failed")
