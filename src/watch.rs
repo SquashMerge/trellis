@@ -265,89 +265,98 @@ fn read_only(kind: EventKind) -> bool {
     )
 }
 
-/// Native watchers held across the process, active or tearing down
-/// (Decision 0009 §§2, 5, as amended 2026-10-15). A slot is reserved before a
-/// native watcher is created and freed only when its teardown returns, so a
-/// native stop that is lost (notify's macOS FSEvents stop can never return)
-/// strands at most the watchers that hold slots.
-static NATIVE_WATCHERS: AtomicUsize = AtomicUsize::new(0);
-/// Watchers released whose native teardown has not finished.
-static STRANDED_WATCHERS: AtomicUsize = AtomicUsize::new(0);
-/// One slot per active checkout, plus 4 for replacement and stuck teardown.
-/// At the limit no new native watcher is created: the checkout reports
-/// degraded health and relies on periodic inventory.
+/// One per active checkout, plus 4 for replacement and stuck teardown.
 pub const MAX_NATIVE_WATCHERS: usize = crate::daemon::registry::MAX_ACTIVE_CHECKOUTS + 4;
 
-/// Test-only: a smaller native-watcher budget (0 keeps the default).
-#[cfg(test)]
-static TEST_NATIVE_BUDGET: AtomicUsize = AtomicUsize::new(0);
-
-fn native_budget() -> usize {
+/// The native-watcher budget (Decision 0009 §§2, 5, as amended 2026-10-15).
+/// A slot is reserved before a native watcher is created and freed only when
+/// its teardown returns, so a native stop that is lost (notify's macOS
+/// FSEvents stop can never return) strands at most the watchers that hold
+/// slots. At the limit no new native watcher is created: the checkout reports
+/// degraded health and relies on periodic inventory. The daemon uses one
+/// process-wide budget; a test uses its own.
+pub struct NativeBudget {
+    limit: usize,
+    /// Native watchers holding a slot: active, or released and tearing down.
+    held: AtomicUsize,
+    /// Released watchers whose native teardown has not finished.
+    stranded: AtomicUsize,
+    /// Test-only: reapers wait on this before they drop, to stand in for a
+    /// lost stop.
     #[cfg(test)]
-    {
-        let budget = TEST_NATIVE_BUDGET.load(Ordering::Acquire);
-        if budget != 0 {
-            return budget;
+    hold_reapers: std::sync::Mutex<Option<ReaperGate>>,
+}
+
+impl NativeBudget {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            held: AtomicUsize::new(0),
+            stranded: AtomicUsize::new(0),
+            #[cfg(test)]
+            hold_reapers: std::sync::Mutex::new(None),
         }
     }
-    MAX_NATIVE_WATCHERS
-}
 
-/// Reserve a native-watcher slot, if the budget allows one.
-fn reserve_native() -> bool {
-    let mut held = NATIVE_WATCHERS.load(Ordering::Acquire);
-    while held < native_budget() {
-        match NATIVE_WATCHERS.compare_exchange_weak(
-            held,
-            held + 1,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => return true,
-            Err(current) => held = current,
-        }
+    /// The daemon's process-wide budget.
+    fn global() -> Arc<Self> {
+        static GLOBAL: std::sync::OnceLock<Arc<NativeBudget>> = std::sync::OnceLock::new();
+        Arc::clone(GLOBAL.get_or_init(|| Arc::new(NativeBudget::new(MAX_NATIVE_WATCHERS))))
     }
-    false
+
+    /// Reserve a slot, if the budget allows one.
+    fn reserve(&self) -> bool {
+        let mut held = self.held.load(Ordering::Acquire);
+        while held < self.limit {
+            match self.held.compare_exchange_weak(
+                held,
+                held + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(current) => held = current,
+            }
+        }
+        false
+    }
+
+    fn free(&self) {
+        self.held.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    /// Native watchers holding a slot: active, or released and tearing down.
+    pub fn held(&self) -> usize {
+        self.held.load(Ordering::Acquire)
+    }
+
+    /// Released watchers whose native teardown has not finished.
+    pub fn stranded(&self) -> usize {
+        self.stranded.load(Ordering::Acquire)
+    }
 }
 
-fn free_native() {
-    NATIVE_WATCHERS.fetch_sub(1, Ordering::AcqRel);
-}
-
-/// Native watchers holding a slot: active, or released and tearing down.
-pub fn native_watchers() -> usize {
-    NATIVE_WATCHERS.load(Ordering::Acquire)
-}
-
-/// Released watchers whose native teardown has not finished.
-pub fn stranded_watchers() -> usize {
-    STRANDED_WATCHERS.load(Ordering::Acquire)
-}
+/// Test-only gate a reaper waits on before it drops its watcher.
+#[cfg(test)]
+type ReaperGate = Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>;
 
 /// A one-shot test hook.
 #[cfg(test)]
 type TestHook = Arc<std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>>;
 
-/// Test-only gate a reaper waits on before it drops its watcher.
-#[cfg(test)]
-type ReaperGate = std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>;
-
-/// Test-only: hold reapers before they drop, to stand in for a lost stop.
-#[cfg(test)]
-static HOLD_REAPERS: std::sync::Mutex<Option<ReaperGate>> = std::sync::Mutex::new(None);
-
 /// Hand a native watcher to a reaper. It counts as stranded, and keeps its
-/// slot, until its drop returns; if no reaper thread can start it is leaked
-/// and stays counted.
-fn release_watcher(watcher: Option<RecommendedWatcher>) {
+/// slot in `budget`, until its drop returns; if no reaper thread can start it
+/// is leaked and stays counted.
+fn release_watcher(budget: &Arc<NativeBudget>, watcher: Option<RecommendedWatcher>) {
     let Some(watcher) = watcher else {
         return;
     };
-    STRANDED_WATCHERS.fetch_add(1, Ordering::AcqRel);
-    let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(watcher)));
-    let reaped = std::sync::Arc::clone(&slot);
+    budget.stranded.fetch_add(1, Ordering::AcqRel);
+    let slot = Arc::new(std::sync::Mutex::new(Some(watcher)));
+    let reaped = Arc::clone(&slot);
+    let reaper_budget = Arc::clone(budget);
     #[cfg(test)]
-    let hold = HOLD_REAPERS.lock().unwrap().clone();
+    let hold = budget.hold_reapers.lock().unwrap().clone();
     let spawned = std::thread::Builder::new()
         .name("notify-reaper".into())
         .spawn(move || {
@@ -360,8 +369,8 @@ fn release_watcher(watcher: Option<RecommendedWatcher>) {
                 }
             }
             drop(reaped.lock().unwrap().take());
-            STRANDED_WATCHERS.fetch_sub(1, Ordering::AcqRel);
-            free_native();
+            reaper_budget.stranded.fetch_sub(1, Ordering::AcqRel);
+            reaper_budget.free();
         });
     if spawned.is_err()
         && let Some(watcher) = slot.lock().unwrap().take()
@@ -401,6 +410,8 @@ pub struct WatchSignals {
     /// Cleared when the native watcher is released: its callbacks then do
     /// nothing (no health, no events, no wakes).
     live: Arc<std::sync::Mutex<bool>>,
+    /// The budget this watcher's native slot belongs to.
+    budget: Arc<NativeBudget>,
     /// The native callback, for tests to deliver events directly.
     #[cfg(test)]
     callback: Arc<dyn Fn(notify::Result<Event>) + Send + Sync>,
@@ -462,6 +473,24 @@ impl WatchSignals {
         manifest_path: Option<PathBuf>,
         native: bool,
         health: Arc<WatcherHealth>,
+    ) -> Self {
+        Self::construct_in(
+            root,
+            scip_path,
+            manifest_path,
+            native,
+            health,
+            NativeBudget::global(),
+        )
+    }
+
+    fn construct_in(
+        root: PathBuf,
+        scip_path: Option<PathBuf>,
+        manifest_path: Option<PathBuf>,
+        native: bool,
+        health: Arc<WatcherHealth>,
+        budget: Arc<NativeBudget>,
     ) -> Self {
         // Preserve short bursts beyond one bounded drain without treating a
         // repeated path as lost input. Actual channel overflow still forces full.
@@ -546,7 +575,7 @@ impl WatchSignals {
         // A native watcher first reserves its slot; past the budget none is
         // created and the checkout runs degraded.
         let native_callback = Arc::clone(&callback);
-        let watcher = (native && reserve_native())
+        let watcher = (native && budget.reserve())
             .then(
                 || match notify::recommended_watcher(move |event| native_callback(event)) {
                     Ok(mut watcher) => match watcher.watch(&root, RecursiveMode::Recursive) {
@@ -557,12 +586,12 @@ impl WatchSignals {
                             *live
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner) = false;
-                            release_watcher(Some(watcher));
+                            release_watcher(&budget, Some(watcher));
                             None
                         }
                     },
                     Err(_) => {
-                        free_native();
+                        budget.free();
                         None
                     }
                 },
@@ -604,6 +633,7 @@ impl WatchSignals {
             epoch,
             waker,
             live,
+            budget,
             #[cfg(test)]
             callback,
             #[cfg(test)]
@@ -638,7 +668,7 @@ impl WatchSignals {
         };
         *live = false;
         drop(live);
-        release_watcher(self.watcher.take());
+        release_watcher(&self.budget, self.watcher.take());
     }
 
     /// Wake `waker` after every accepted signal from now on.
@@ -1003,50 +1033,47 @@ mod health_epoch_tests {
 mod reaper_tests {
     use super::*;
 
-    /// Exclusive use of the process-wide test settings (native budget, reaper
-    /// gate), reset when dropped so no other test inherits them.
-    struct Globals {
-        gate: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
-        _serial: std::sync::MutexGuard<'static, ()>,
-    }
-    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    impl Globals {
-        /// Hold every reaper until `open`; `budget` 0 keeps the default.
-        fn hold(budget: usize) -> Self {
-            let serial = SERIAL
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
-            *HOLD_REAPERS.lock().unwrap() = Some(Arc::clone(&gate));
-            TEST_NATIVE_BUDGET.store(budget, Ordering::Release);
-            Self {
-                gate,
-                _serial: serial,
-            }
+    /// A test's own native-watcher budget, with its reapers held until
+    /// `open`; nothing it counts is shared with other tests.
+    struct Budget(Arc<NativeBudget>);
+    impl Budget {
+        fn held(limit: usize) -> Self {
+            let budget = Arc::new(NativeBudget::new(limit));
+            *budget.hold_reapers.lock().unwrap() = Some(Arc::new((
+                std::sync::Mutex::new(false),
+                std::sync::Condvar::new(),
+            )));
+            Self(budget)
         }
         fn open(&self) {
-            *HOLD_REAPERS.lock().unwrap() = None;
-            *self.gate.0.lock().unwrap() = true;
-            self.gate.1.notify_all();
+            if let Some(gate) = self.0.hold_reapers.lock().unwrap().take() {
+                *gate.0.lock().unwrap() = true;
+                gate.1.notify_all();
+            }
         }
-        /// Wait until no native watcher holds a slot.
+        /// Wait until no native watcher holds a slot in this budget.
         fn drained(&self) {
             let deadline = Instant::now() + crate::testing::HANG_BACKSTOP;
-            while native_watchers() != 0 {
+            while self.0.held() != 0 {
                 assert!(Instant::now() < deadline, "reapers never finished");
                 std::thread::sleep(Duration::from_millis(1));
             }
         }
-    }
-    impl Drop for Globals {
-        fn drop(&mut self) {
-            self.open();
-            TEST_NATIVE_BUDGET.store(0, Ordering::Release);
+        fn signals(&self, root: &Path, health: &Arc<WatcherHealth>) -> WatchSignals {
+            WatchSignals::construct_in(
+                root.to_path_buf(),
+                None,
+                None,
+                true,
+                Arc::clone(health),
+                Arc::clone(&self.0),
+            )
         }
     }
-
-    fn signals(root: &Path, health: &Arc<WatcherHealth>) -> WatchSignals {
-        WatchSignals::construct(root.to_path_buf(), None, None, true, Arc::clone(health))
+    impl Drop for Budget {
+        fn drop(&mut self) {
+            self.open();
+        }
     }
 
     fn hook(run: impl FnOnce() + Send + 'static) -> Option<Box<dyn FnOnce() + Send>> {
@@ -1060,19 +1087,19 @@ mod reaper_tests {
     #[test]
     fn the_native_budget_counts_active_and_stranded_watchers() {
         let temp = tempfile::tempdir().unwrap();
-        let globals = Globals::hold(3);
+        let budget = Budget::held(3);
         let health = || Arc::new(WatcherHealth::default());
-        let first = signals(temp.path(), &health());
-        let second = signals(temp.path(), &health());
+        let first = budget.signals(temp.path(), &health());
+        let second = budget.signals(temp.path(), &health());
         assert!(first.watcher.is_some() && second.watcher.is_some());
         // A replacement: the new watcher exists before the old is released.
-        let replacement = signals(temp.path(), &health());
+        let replacement = budget.signals(temp.path(), &health());
         assert!(replacement.watcher.is_some());
         drop(first);
-        assert_eq!((native_watchers(), stranded_watchers()), (3, 1));
+        assert_eq!((budget.0.held(), budget.0.stranded()), (3, 1));
         // The stuck teardown still holds its slot: no fourth native watcher.
         let limited_health = health();
-        let limited = signals(temp.path(), &limited_health);
+        let limited = budget.signals(temp.path(), &limited_health);
         assert!(
             limited.watcher.is_none(),
             "a native watcher past the budget"
@@ -1081,11 +1108,13 @@ mod reaper_tests {
         drop(limited);
         drop(second);
         drop(replacement);
-        assert!(stranded_watchers() <= 3, "more stranded than the budget");
-        globals.open();
-        globals.drained();
-        let resumed = signals(temp.path(), &health());
+        assert!(budget.0.stranded() <= 3, "more stranded than the budget");
+        budget.open();
+        budget.drained();
+        let resumed = budget.signals(temp.path(), &health());
         assert!(resumed.watcher.is_some());
+        drop(resumed);
+        budget.drained();
     }
 
     /// Decision 0009 §5 (amended): a release waits for a callback that is
@@ -1215,18 +1244,18 @@ mod reaper_tests {
     fn a_failed_watcher_setup_is_torn_down_by_a_reaper() {
         let temp = tempfile::tempdir().unwrap();
         let missing = temp.path().join("missing");
-        let globals = Globals::hold(0);
+        let budget = Budget::held(MAX_NATIVE_WATCHERS);
         let health = Arc::new(WatcherHealth::default());
-        let failed = signals(&missing, &health);
+        let failed = budget.signals(&missing, &health);
         assert!(failed.watcher.is_none());
         assert!(health.degraded());
         assert_eq!(
-            stranded_watchers(),
-            1,
+            (budget.0.stranded(), budget.0.held()),
+            (1, 1),
             "the failed watcher was dropped on the constructing thread"
         );
         drop(failed);
-        globals.open();
-        globals.drained();
+        budget.open();
+        budget.drained();
     }
 }
