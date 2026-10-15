@@ -11,6 +11,10 @@ Usage (reference host, quiet slot; scratch must be an absent directory outside t
   python3 tools/stage3-watcher-runner.py --measure --scratch <dir> --exclusive-slot-authorization "<who/when>"
   python3 tools/stage3-watcher-runner.py --summarize --events <dir>/watcher-events.jsonl
 Gate: medium p95 <= 2 s, large p95 <= 5 s, 20 valid samples each, fallback parity.
+Healthy native watching only (owner ruling 2026-10-15, Decision 0009 §5): a series
+whose watcher reports degraded (before it or after any sample) is invalid, never
+trimmed; the run stops and the series must be restarted when watching is healthy.
+Degraded mode (no native watcher: periodic 60 s inventory) has no latency gate.
 """
 import argparse
 import hashlib
@@ -25,6 +29,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from urllib.request import urlopen
 
@@ -331,6 +336,41 @@ def status(workspace, home):
                 raise
             time.sleep(1)
 
+def watcher_degraded(workspace, home):
+    # The daemon's own published watcher health, read through one MCP
+    # describe call. Unknown health counts as degraded: it cannot prove the
+    # series measured healthy native watching.
+    call = {"jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":"trellis_workspace_describe","arguments":{"schemaVersion":1},
+                      "_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28",
+                               "io.modelcontextprotocol/clientCapabilities":{}}}}
+    # End of input cancels outstanding requests, so stdin stays open until
+    # the reply is read.
+    proc = subprocess.Popen([str(BINARY), "mcp", "--workspace", str(workspace)], cwd=REPO,
+                            env=env_for(home), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, text=True)
+    timer = threading.Timer(30, proc.kill)
+    timer.start()
+    try:
+        proc.stdin.write(json.dumps(call) + "\n")
+        proc.stdin.flush()
+        reply = json.loads(proc.stdout.readline())
+        degraded = reply["result"]["structuredContent"]["data"]["watcherDegraded"]
+        return degraded is not False
+    except (OSError, ValueError, KeyError, TypeError):
+        return True
+    finally:
+        timer.cancel()
+        try:
+            proc.stdin.close()
+        except OSError:
+            pass
+        proc.wait(timeout=30)
+
+def series_invalid(log, size, reason, sample_index=None):
+    append(log, "series_invalid", size=size, sample_index=sample_index, reason=reason)
+    raise RuntimeError(f"{size} series invalid: {reason}; restart it when watching is healthy")
+
 def wait_selected(workspace, home, previous, write_done_ns, timeout_s=SAMPLE_TIMEOUT_S):
     polls = []
     deadline = time.monotonic() + timeout_s
@@ -412,6 +452,8 @@ def measure(args):
                        daemon_stderr=str(active.stderr_path), url=active.url,
                        baseline_pin=previous, baseline_status_sha256=sha(baseline_json.encode()),
                        baseline_selected=baseline, cold_setup_timing="excluded")
+                if watcher_degraded(workspace, home):
+                    series_invalid(log, size, "watcher degraded before the series")
                 edited = set()
                 for n in range(20):
                     language, relative, kind = planned_edit(size, n)
@@ -454,7 +496,10 @@ def measure(args):
                         sample["failure"] = f"{type(exc).__name__}: {exc}"
                         append(log, "sample", **sample)
                         raise
+                    sample["watcher_degraded_after"] = watcher_degraded(workspace, home)
                     append(log, "sample", **sample)
+                    if sample["watcher_degraded_after"]:
+                        series_invalid(log, size, "watcher degraded during the series", n + 1)
                 active.stop()
                 active = None
             # Fallback is a distinct untouched medium workspace and independent setup.
@@ -546,6 +591,7 @@ def measure(args):
 def summarize_records(records):
     series = {}
     failures = [r for r in records if r["type"] == "failure"]
+    invalid = [r for r in records if r["type"] == "series_invalid"]
     for size in ("medium", "large"):
         samples = [r for r in records if r["type"] == "sample" and r.get("size") == size]
         ordered = [planned_edit(size, n)[1] for n in range(20)]
@@ -565,7 +611,8 @@ def summarize_records(records):
                                           for r in samples if not r.get("valid")]}
     fallbacks = [r for r in records if r["type"] == "fallback"]
     local_gate = (len(records) > 0 and records[0]["type"] == "run_header"
-                  and not failures and all(r["pass_gate"] for r in series.values()))
+                  and not failures and not invalid
+                  and all(r["pass_gate"] for r in series.values()))
     fallback_parity = (len(fallbacks) == 1 and fallbacks[0].get("valid") is True
                        and fallbacks[0].get("parity") is True
                        and fallbacks[0].get("mode_expected") == "full"
@@ -584,6 +631,8 @@ def summarize_records(records):
             "fallback_latency_limit_seconds":None, "fallback_mode_expected":"full",
             "fallback_mode_directly_observed":False, "fallback_mode_note":MODE_NOTE,
             "failures":[r.get("message") for r in failures],
+            "invalid_series":[{"size":r.get("size"), "sample_index":r.get("sample_index"),
+                               "reason":r.get("reason")} for r in invalid],
             "local_watcher_latency_gate_pass":local_gate,
             "pass_gate":bool(local_gate and fallback_parity), "owner_review_required":True,
             "note":"Only the local series has latency thresholds. Fallback timing and same-root cold parity are report-only indirect mode evidence; no CLI index samples counted. Owner reviews raw logs before Gate 3."}
