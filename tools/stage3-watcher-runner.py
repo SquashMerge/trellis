@@ -419,27 +419,36 @@ def read_status(workspace, home, timeout_s=STATUS_CALL_S):
     result = command([BINARY, "status", "--workspace", workspace], env=env_for(home), timeout=timeout_s)
     return pin_of(json.loads(result.stdout)), result.stdout
 
-def baseline_status(workspace, home):
+def baseline_status(workspace, home, log, phase):
     # Untimed baseline setup only: serve announces readiness before the first
     # head publishes, and a cold publication can stall a status call or make it
     # fail with a typed error. Retry both until one monotonic setup deadline,
-    # each call bounded by min(15 s, the time left). Returns the attempts too,
-    # so the setup record keeps them.
+    # each call bounded by min(15 s, the time left). Each attempt is journaled
+    # as it finishes (setup_status_attempt), whatever happens next; the
+    # attempts are also returned for the setup record's summary.
     deadline = time.monotonic() + SETUP_TIMEOUT_S
     attempts = []
+    def record(began, outcome):
+        attempt = {"attempt": len(attempts) + 1, "seconds": round(time.monotonic() - began, 3), "outcome": outcome}
+        attempts.append(attempt)
+        append(log, "setup_status_attempt", phase=phase, **attempt)
     while True:
         left = deadline - time.monotonic()
         if left <= 0:
-            raise Invalid(f"baseline status not ready within {SETUP_TIMEOUT_S}s; attempts={attempts[-5:]}")
+            raise Invalid(f"{phase} baseline status not ready within {SETUP_TIMEOUT_S}s after "
+                          f"{len(attempts)} attempts (each journaled as setup_status_attempt)")
         began = time.monotonic()
         try:
             pin, raw = read_status(workspace, home, timeout_s=min(STATUS_CALL_S, left))
-            attempts.append({"seconds": round(time.monotonic() - began, 3), "outcome": "ok"})
-            return pin, raw, attempts
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-            outcome = ("timeout" if isinstance(exc, subprocess.TimeoutExpired)
-                       else f"exit {exc.returncode}: {(exc.stderr or '').strip()[-200:]}")
-            attempts.append({"seconds": round(time.monotonic() - began, 3), "outcome": outcome})
+            record(began, "timeout" if isinstance(exc, subprocess.TimeoutExpired)
+                   else f"exit {exc.returncode}: {(exc.stderr or '').strip()[-200:]}")
+        except BaseException as exc:
+            record(began, f"{type(exc).__name__}: {str(exc)[:200]}")
+            raise
+        else:
+            record(began, "ok")
+            return pin, raw, attempts
         time.sleep(max(0, min(1, deadline - time.monotonic())))
 
 WITNESS_FIELDS = {"epoch": int, "native": bool, "degraded": bool, "degradations": int}
@@ -550,7 +559,7 @@ def measure(args):
                 active = Daemon(scratch, size, workspace, home)
                 active.start()
                 active.ready()
-                previous, baseline_json, setup_attempts = baseline_status(workspace, home)
+                previous, baseline_json, setup_attempts = baseline_status(workspace, home, log, size)
                 baseline = selected_check(home, previous, size)
                 append(log, "setup", size=size, serve_pid=active.proc.pid, serve_argv=active.argv,
                        serve_stderr=str(active.stderr_path), daemon_pid=active.daemon.pid,
@@ -632,7 +641,7 @@ def measure(args):
             active = Daemon(scratch, "fallback", workspace, home)
             active.start()
             active.ready()
-            prior, baseline_json, setup_attempts = baseline_status(workspace, home)
+            prior, baseline_json, setup_attempts = baseline_status(workspace, home, log, "fallback-medium")
             baseline = selected_check(home, prior, "medium")
             append(log, "setup", size="fallback-medium", serve_pid=active.proc.pid,
                    serve_argv=active.argv, serve_stderr=str(active.stderr_path),
@@ -675,7 +684,7 @@ def measure(args):
                 active = Daemon(scratch, "cold-oracle", workspace, cold_home)
                 active.start()
                 active.ready()
-                cold_pin, cold_json, cold_attempts = baseline_status(workspace, cold_home)
+                cold_pin, cold_json, cold_attempts = baseline_status(workspace, cold_home, log, "cold-oracle")
                 cold_selected_ns = time.monotonic_ns()
                 fallback["independent_cold_start_ns"] = cold_start_ns
                 fallback["independent_cold_first_status_return_ns"] = cold_selected_ns

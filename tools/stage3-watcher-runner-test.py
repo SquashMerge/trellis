@@ -282,20 +282,59 @@ class StatusReads(unittest.TestCase):
             return subprocess.CompletedProcess(argv, 0, out, "")
         RUNNER.command = command
 
+    def journal(self):
+        path = self.home / "events.jsonl"
+        log = path.open("a")
+        self.addCleanup(log.close)
+        return path, log
+
+    def attempts_in(self, path):
+        return [json.loads(line) for line in path.read_text().splitlines()
+                if json.loads(line)["type"] == "setup_status_attempt"]
+
     def test_a_baseline_status_timeout_is_retried_within_setup(self):
         self.fake(["timeout", "error", 1])
-        pin, _, attempts = RUNNER.baseline_status(self.home, self.home)
+        path, log = self.journal()
+        pin, _, attempts = RUNNER.baseline_status(self.home, self.home, log, "medium")
         self.assertEqual(pin["indexRevision"], 1)
         self.assertEqual([a["outcome"].split(":")[0] for a in attempts], ["timeout", "exit 1", "ok"])
+        journaled = self.attempts_in(path)
+        self.assertEqual([(r["phase"], r["attempt"], r["outcome"].split(":")[0]) for r in journaled],
+                         [("medium", 1, "timeout"), ("medium", 2, "exit 1"), ("medium", 3, "ok")])
 
-    def test_baseline_setup_gives_up_at_its_deadline(self):
+    def test_baseline_setup_gives_up_at_its_deadline_with_every_attempt_journaled(self):
         RUNNER.SETUP_TIMEOUT_S = 0.5
         self.fake(["error"])
+        path, log = self.journal()
         started = time.monotonic()
         with self.assertRaises(RUNNER.Invalid):
-            RUNNER.baseline_status(self.home, self.home)
+            RUNNER.baseline_status(self.home, self.home, log, "large")
         self.assertLess(time.monotonic() - started, 5)
         self.assertTrue(all(t <= 0.5 for t in self.calls), self.calls)
+        journaled = self.attempts_in(path)
+        self.assertEqual(len(journaled), len(self.calls), "an attempt was not journaled")
+        self.assertEqual([r["attempt"] for r in journaled], list(range(1, len(self.calls) + 1)))
+
+    def test_attempts_survive_a_failed_selection_after_a_successful_baseline(self):
+        # The attempts are in the journal before baseline_status returns, so a
+        # later selected_check failure cannot lose them.
+        self.fake(["timeout", 1])
+        path, log = self.journal()
+        with self.assertRaises(RUNNER.Invalid):
+            RUNNER.baseline_status(self.home, self.home, log, "fallback-medium")
+            raise RUNNER.Invalid("selected native fact floor failed")
+        self.assertEqual([r["outcome"] for r in self.attempts_in(path)], ["timeout", "ok"])
+
+    def test_an_interrupted_attempt_is_journaled(self):
+        def interrupted(argv, *, env=None, timeout=30):
+            raise RUNNER.Interrupted("signal 2 interrupted measurement")
+        RUNNER.command = interrupted
+        path, log = self.journal()
+        with self.assertRaises(RUNNER.Interrupted):
+            RUNNER.baseline_status(self.home, self.home, log, "cold-oracle")
+        [only] = self.attempts_in(path)
+        self.assertEqual(only["phase"], "cold-oracle")
+        self.assertTrue(only["outcome"].startswith("Interrupted"))
 
     def test_a_timed_sample_never_uses_the_setup_retry(self):
         for outcome in ("timeout", "error"):
