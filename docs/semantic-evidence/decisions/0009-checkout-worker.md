@@ -114,7 +114,7 @@ Accepted FIFO work and its Q2→watcher→Q1 gate are never skipped.
 3. releases the watcher, then closes the session, the SQLite witnesses and the use locks;
 4. publishes `Retired`.
 
-**Releasing a watcher** (amended 2026-10-15). A released watcher has no authority over the checkout: its callbacks do nothing from that moment (no health, no events, no wakes). Its native teardown runs on a background reaper, because a native library's shutdown is not relied on to complete: notify's macOS FSEvents stop can be lost and never return. A watcher counts as stranded from release until its teardown returns. At most **4** may be stranded per daemon; at that limit no new native watcher is created, and a checkout without one reports degraded watcher health and finds changes through the periodic full inventory (60 s). A watcher whose setup fails is released the same way. The service level of that degraded mode, relative to the Stage 3 watcher latency gate, is not yet ruled.
+**Releasing a watcher** (amended 2026-10-15). A released watcher has no authority over the checkout: once the release returns, its callbacks do nothing (no health, no events, no wakes); a callback already past its check when the release starts finishes first. Its native teardown runs on a background reaper, because a native library's shutdown is not relied on to complete: notify's macOS FSEvents stop can be lost and never return. Every native watcher holds a slot from before its creation until its teardown returns, active or not, including one whose setup failed, so a lost stop strands at most the watchers that hold slots. At most **68** slots exist per daemon, so **up to 68 watchers can be stranded** if every teardown hangs; there is no separate limit of 4 stranded (one per active checkout, 64, plus 4 for replacement and stuck teardown); at that limit no new native watcher is created, and a checkout without one reports degraded watcher health and finds changes through the periodic full inventory (60 s). A watcher whose setup fails is released the same way. The service level of that degraded mode, relative to the Stage 3 watcher latency gate, is not yet ruled.
 
 **Linearization.** Reattach, a new read lease and a durable enqueue all take the same state lock:
 - **Before `Closing`:** they cancel the retirement, the runtime returns to `Ready`, and its resources are still live.
@@ -245,7 +245,8 @@ Implementation may show that a rule needs to change. The change is then made to 
 - **§5:** an enqueue that starts after `Closing` is durable and waits for the next activation; a stale client of a lost root does not block a verified replacement root.
 
 **Amendment approved by the owner (2026-10-15):**
-- **§§2, 5:** `Retired` requires the watcher to be released, not its native teardown finished. A released watcher has no authority (its callbacks are inert); teardown runs on tracked reapers, at most 4 stranded per daemon, past which checkouts run degraded on periodic inventory. Open: the degraded mode's service level relative to the Stage 3 gate.
+- **§§2, 5:** `Retired` requires the watcher to be released, not its native teardown finished. A released watcher has no authority (its callbacks are inert once the release returns); teardown runs on tracked reapers. Open: the degraded mode's service level relative to the Stage 3 gate.
+- **§5 (same day, after review):** the bound is a budget of native-watcher slots held from creation until teardown returns, at most 68 per daemon (64 active checkouts plus 4), replacing "at most 4 stranded", which counting only released watchers could not enforce: up to 68 can now be stranded if every teardown hangs. A release waits for a callback already in flight.
 
 ## Consequences
 

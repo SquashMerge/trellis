@@ -243,20 +243,69 @@ fn read_only(kind: EventKind) -> bool {
     )
 }
 
-/// Native watchers handed off but whose teardown has not finished, across
-/// the process (Decision 0009 §§2, 5, as amended 2026-10-15). A released
-/// watcher has no authority: its callbacks are inert at once. Its native
-/// teardown runs on a reaper; notify's macOS FSEvents stop can be lost and
-/// never return, which then strands that reaper.
+/// Native watchers held across the process, active or tearing down
+/// (Decision 0009 §§2, 5, as amended 2026-10-15). A slot is reserved before a
+/// native watcher is created and freed only when its teardown returns, so a
+/// native stop that is lost (notify's macOS FSEvents stop can never return)
+/// strands at most the watchers that hold slots.
+static NATIVE_WATCHERS: AtomicUsize = AtomicUsize::new(0);
+/// Watchers released whose native teardown has not finished.
 static STRANDED_WATCHERS: AtomicUsize = AtomicUsize::new(0);
-/// At this many stranded watchers no new native watcher is created: the
-/// checkout reports degraded health and relies on periodic inventory.
-pub const MAX_STRANDED_WATCHERS: usize = 4;
+/// One slot per active checkout, plus 4 for replacement and stuck teardown.
+/// At the limit no new native watcher is created: the checkout reports
+/// degraded health and relies on periodic inventory.
+pub const MAX_NATIVE_WATCHERS: usize = crate::daemon::registry::MAX_ACTIVE_CHECKOUTS + 4;
 
-/// Watchers handed off whose native teardown has not finished.
+/// Test-only: a smaller native-watcher budget (0 keeps the default).
+#[cfg(test)]
+static TEST_NATIVE_BUDGET: AtomicUsize = AtomicUsize::new(0);
+
+fn native_budget() -> usize {
+    #[cfg(test)]
+    {
+        let budget = TEST_NATIVE_BUDGET.load(Ordering::Acquire);
+        if budget != 0 {
+            return budget;
+        }
+    }
+    MAX_NATIVE_WATCHERS
+}
+
+/// Reserve a native-watcher slot, if the budget allows one.
+fn reserve_native() -> bool {
+    let mut held = NATIVE_WATCHERS.load(Ordering::Acquire);
+    while held < native_budget() {
+        match NATIVE_WATCHERS.compare_exchange_weak(
+            held,
+            held + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return true,
+            Err(current) => held = current,
+        }
+    }
+    false
+}
+
+fn free_native() {
+    NATIVE_WATCHERS.fetch_sub(1, Ordering::AcqRel);
+}
+
+/// Native watchers holding a slot: active, or released and tearing down.
+pub fn native_watchers() -> usize {
+    NATIVE_WATCHERS.load(Ordering::Acquire)
+}
+
+/// Released watchers whose native teardown has not finished.
 pub fn stranded_watchers() -> usize {
     STRANDED_WATCHERS.load(Ordering::Acquire)
 }
+
+/// Test-only: run once in a callback, after its liveness check.
+#[cfg(test)]
+static PAUSE_CALLBACK: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>> =
+    std::sync::Mutex::new(None);
 
 /// Test-only gate a reaper waits on before it drops its watcher.
 #[cfg(test)]
@@ -266,8 +315,9 @@ type ReaperGate = std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>;
 #[cfg(test)]
 static HOLD_REAPERS: std::sync::Mutex<Option<ReaperGate>> = std::sync::Mutex::new(None);
 
-/// Hand a native watcher to a reaper. It counts as stranded until its drop
-/// returns; if no reaper thread can start it is leaked and stays counted.
+/// Hand a native watcher to a reaper. It counts as stranded, and keeps its
+/// slot, until its drop returns; if no reaper thread can start it is leaked
+/// and stays counted.
 fn release_watcher(watcher: Option<RecommendedWatcher>) {
     let Some(watcher) = watcher else {
         return;
@@ -290,6 +340,7 @@ fn release_watcher(watcher: Option<RecommendedWatcher>) {
             }
             drop(reaped.lock().unwrap().take());
             STRANDED_WATCHERS.fetch_sub(1, Ordering::AcqRel);
+            free_native();
         });
     if spawned.is_err()
         && let Some(watcher) = slot.lock().unwrap().take()
@@ -328,7 +379,10 @@ pub struct WatchSignals {
     waker: Arc<std::sync::OnceLock<Waker>>,
     /// Cleared when the native watcher is released: its callbacks then do
     /// nothing (no health, no events, no wakes).
-    live: Arc<AtomicBool>,
+    live: Arc<std::sync::Mutex<bool>>,
+    /// The native callback, for tests to deliver events directly.
+    #[cfg(test)]
+    callback: Arc<dyn Fn(notify::Result<Event>) + Send + Sync>,
 }
 
 impl WatchSignals {
@@ -404,12 +458,24 @@ impl WatchSignals {
         let callback_waker = Arc::clone(&waker);
         let epoch = health.begin_epoch();
         let callback_health = Arc::clone(&health);
-        let live = Arc::new(AtomicBool::new(true));
+        let live = Arc::new(std::sync::Mutex::new(true));
         let callback_live = Arc::clone(&live);
-        let callback = move |event: notify::Result<Event>| {
-            // A released watcher has no authority over the checkout.
-            if !callback_live.load(Ordering::Acquire) {
+        let callback = Arc::new(move |event: notify::Result<Event>| {
+            // A released watcher has no authority over the checkout. The
+            // guard is held through health, event and wake, so a release
+            // waits for a callback already past this check.
+            let live = callback_live
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !*live {
                 return;
+            }
+            #[cfg(test)]
+            {
+                let pause = PAUSE_CALLBACK.lock().unwrap().take();
+                if let Some(pause) = pause {
+                    pause();
+                }
             }
             // A watcher error is published at once, not when the worker drains.
             if event.is_err() {
@@ -425,22 +491,31 @@ impl WatchSignals {
                 callback_executable.as_deref(),
                 event,
             );
-        };
-        // With too many stranded watchers, no new native one is created.
-        let allowed = stranded_watchers() < MAX_STRANDED_WATCHERS;
-        let watcher = (native && allowed)
-            .then(|| match notify::recommended_watcher(callback) {
-                Ok(mut watcher) => match watcher.watch(&root, RecursiveMode::Recursive) {
-                    Ok(()) => Some(watcher),
+        });
+        // A native watcher first reserves its slot; past the budget none is
+        // created and the checkout runs degraded.
+        let native_callback = Arc::clone(&callback);
+        let watcher = (native && reserve_native())
+            .then(
+                || match notify::recommended_watcher(move |event| native_callback(event)) {
+                    Ok(mut watcher) => match watcher.watch(&root, RecursiveMode::Recursive) {
+                        Ok(()) => Some(watcher),
+                        Err(_) => {
+                            // A failed setup is torn down off this thread too;
+                            // it keeps its slot until that teardown returns.
+                            *live
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) = false;
+                            release_watcher(Some(watcher));
+                            None
+                        }
+                    },
                     Err(_) => {
-                        // A failed setup is torn down off this thread too.
-                        live.store(false, Ordering::Release);
-                        release_watcher(Some(watcher));
+                        free_native();
                         None
                     }
                 },
-                Err(_) => None,
-            })
+            )
             .flatten();
         let degraded = native && watcher.is_none();
         health.publish_setup(epoch, degraded);
@@ -478,13 +553,19 @@ impl WatchSignals {
             epoch,
             waker,
             live,
+            #[cfg(test)]
+            callback,
         }
     }
 
-    /// Release the native watcher: its callbacks become inert at once and its
-    /// teardown runs on a reaper (Decision 0009 §§2, 5).
+    /// Release the native watcher: once this returns its callbacks do nothing
+    /// (a callback already past its check finishes first), and its teardown
+    /// runs on a reaper (Decision 0009 §§2, 5).
     fn release_native(&mut self) {
-        self.live.store(false, Ordering::Release);
+        *self
+            .live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = false;
         release_watcher(self.watcher.take());
     }
 
@@ -867,36 +948,108 @@ mod reaper_tests {
         WatchSignals::construct(root.to_path_buf(), None, None, true, Arc::clone(health))
     }
 
-    /// Decision 0009 §§2, 5 (amended): at MAX_STRANDED_WATCHERS no new native
-    /// watcher is created; the checkout reports degraded and relies on
-    /// periodic inventory. Once teardown finishes, native watching resumes.
+    /// Decision 0009 §§2, 5 (amended): a native watcher holds its slot from
+    /// creation until its teardown returns, so stuck teardowns can never
+    /// exceed the budget, even across a replacement that creates the new
+    /// watcher before releasing the old. At the budget a checkout degrades.
     #[test]
-    fn at_the_stranded_limit_a_checkout_degrades_without_a_native_watcher() {
+    fn the_native_budget_counts_active_and_stranded_watchers() {
         let temp = tempfile::tempdir().unwrap();
+        TEST_NATIVE_BUDGET.store(3, Ordering::Release);
         let gate = hold_reapers();
-        for _ in 0..MAX_STRANDED_WATCHERS {
-            let health = Arc::new(WatcherHealth::default());
-            let released = signals(temp.path(), &health);
-            assert!(released.watcher.is_some());
-            drop(released);
-        }
-        assert_eq!(stranded_watchers(), MAX_STRANDED_WATCHERS);
-        let health = Arc::new(WatcherHealth::default());
-        let limited = signals(temp.path(), &health);
-        assert!(limited.watcher.is_none(), "a native watcher past the limit");
-        assert!(limited.degraded);
-        assert!(health.degraded(), "the limit is not visible as degraded");
+        let health = || Arc::new(WatcherHealth::default());
+        let first = signals(temp.path(), &health());
+        let second = signals(temp.path(), &health());
+        assert!(first.watcher.is_some() && second.watcher.is_some());
+        // A replacement: the new watcher exists before the old is released.
+        let replacement = signals(temp.path(), &health());
+        assert!(replacement.watcher.is_some());
+        drop(first);
+        assert_eq!((native_watchers(), stranded_watchers()), (3, 1));
+        // The stuck teardown still holds its slot: no fourth native watcher.
+        let limited_health = health();
+        let limited = signals(temp.path(), &limited_health);
+        assert!(
+            limited.watcher.is_none(),
+            "a native watcher past the budget"
+        );
+        assert!(limited_health.degraded());
         drop(limited);
+        drop(second);
+        drop(replacement);
+        assert!(stranded_watchers() <= 3, "more stranded than the budget");
         open(&gate);
         let deadline = Instant::now() + crate::testing::HANG_BACKSTOP;
-        while stranded_watchers() != 0 {
+        while native_watchers() != 0 {
             assert!(Instant::now() < deadline, "reapers never finished");
             std::thread::sleep(Duration::from_millis(1));
         }
-        let health = Arc::new(WatcherHealth::default());
-        let resumed = signals(temp.path(), &health);
+        let resumed = signals(temp.path(), &health());
         assert!(resumed.watcher.is_some());
-        assert!(!health.degraded());
+    }
+
+    /// Decision 0009 §5 (amended): once a release returns, the released
+    /// watcher's callbacks do nothing. A callback already past its liveness
+    /// check finishes before the release returns.
+    #[test]
+    fn a_release_waits_for_an_in_flight_callback_and_silences_later_ones() {
+        let temp = tempfile::tempdir().unwrap();
+        let health = Arc::new(WatcherHealth::default());
+        let watched = WatchSignals::construct(
+            temp.path().to_path_buf(),
+            None,
+            None,
+            false,
+            Arc::clone(&health),
+        );
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&wakes);
+        watched.set_waker(Arc::new(move || {
+            counted.fetch_add(1, Ordering::AcqRel);
+        }));
+        let callback = Arc::clone(&watched.callback);
+        let event = || {
+            Ok(
+                Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
+                    .add_path(temp.path().join("a.js")),
+            )
+        };
+        let (paused_tx, paused) = std::sync::mpsc::sync_channel(1);
+        let (resume_tx, resume) = std::sync::mpsc::sync_channel::<()>(1);
+        *PAUSE_CALLBACK.lock().unwrap() = Some(Box::new(move || {
+            paused_tx.send(()).unwrap();
+            let _ = resume.recv();
+        }));
+        let in_flight = {
+            let callback = Arc::clone(&callback);
+            let event = event();
+            std::thread::spawn(move || callback(event))
+        };
+        paused.recv().unwrap();
+        let released = Arc::new(AtomicBool::new(false));
+        let releasing = {
+            let released = Arc::clone(&released);
+            std::thread::spawn(move || {
+                drop(watched);
+                released.store(true, Ordering::Release);
+            })
+        };
+        std::thread::sleep(Duration::from_millis(200));
+        let returned_early = released.load(Ordering::Acquire);
+        resume_tx.send(()).unwrap();
+        in_flight.join().unwrap();
+        releasing.join().unwrap();
+        assert!(
+            !returned_early,
+            "release returned while a callback was still acting"
+        );
+        let before = wakes.load(Ordering::Acquire);
+        callback(event());
+        assert_eq!(
+            wakes.load(Ordering::Acquire),
+            before,
+            "a released watcher's callback woke the worker"
+        );
     }
 
     /// A watcher whose setup fails is torn down by a reaper, never on the
