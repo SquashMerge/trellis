@@ -433,7 +433,8 @@ fn tool(v: &Value, code: Option<&str>, modern: bool) {
     );
     assert_eq!(envelope["requestId"], v["id"]);
     if let Some(code) = code {
-        assert_eq!(envelope["error"]["code"], code);
+        // The whole reply, so an unexpected code shows its reason.
+        assert_eq!(envelope["error"]["code"], code, "{v}");
     }
 }
 fn expected_envelope(id: &Value, code: Option<&str>, label: &str, root: &Value) -> Value {
