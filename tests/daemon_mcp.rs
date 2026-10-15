@@ -588,7 +588,13 @@ fn legacy_mcp_reconnect_restores_handshake_without_new_client() {
 #[test]
 fn cancellation_precedes_invalid_queue_and_sixteen_follow_ons() {
     use std::os::unix::net::UnixListener;
-    for variant in ["protocol", "requests", "calls", "duplicate"] {
+    for variant in [
+        "protocol",
+        "requests",
+        "calls",
+        "duplicate",
+        "duplicate-cancel",
+    ] {
         let home = tempfile::tempdir().unwrap();
         let root = checkout(home.path());
         let phase_path = PathBuf::from(format!(
@@ -648,6 +654,10 @@ fn cancellation_precedes_invalid_queue_and_sixteen_follow_ons() {
             }
             "requests" => (100..118).for_each(|id| push(list(id).to_string())),
             "calls" => (200..204).for_each(|id| push(call(json!(id)).to_string())),
+            "duplicate" => {
+                push(list(8).to_string());
+                push(list(8).to_string());
+            }
             _ => {
                 push(list(8).to_string());
                 push(list(8).to_string());
@@ -712,11 +722,13 @@ fn cancellation_precedes_invalid_queue_and_sixteen_follow_ons() {
                 )
                 .unwrap();
             }
-            _ => {
+            "duplicate" => {
                 let duplicate = next();
                 assert_eq!(duplicate["id"], 8, "{duplicate}");
                 assert_eq!(duplicate["error"]["code"], -32600, "{duplicate}");
             }
+            // The cancel removes the original and its duplicate refusal.
+            _ => {}
         }
         held.write_all(b"x").unwrap();
         match variant {
@@ -739,7 +751,14 @@ fn cancellation_precedes_invalid_queue_and_sixteen_follow_ons() {
                 assert_eq!(answered, vec![200, 201, 202]);
             }
             "duplicate" => {
-                // The cancelled first ID8 is suppressed; its reuse answers.
+                // The original ID8 is answered once the daemon is released.
+                let original = next();
+                assert_eq!(original["id"], 8, "{original}");
+                assert!(original["result"].is_object(), "{original}");
+            }
+            "duplicate-cancel" => {
+                // The cancelled first ID8 and its duplicate are suppressed;
+                // its reuse answers.
                 let reused = next();
                 assert_eq!(reused["id"], 8, "{reused}");
                 assert!(reused["result"].is_object(), "{reused}");
@@ -1146,10 +1165,15 @@ fn check_legacy_synthetic_reattach_cancel(cancel_id: u64, fail_setup: bool) {
                 .count(),
             1
         );
-        if cancel_id == 5 {
+        if cancel_id == 5
+            && let Some(list) = steps.iter().position(|step| step == "tools/list")
+        {
+            // Decision 0009 §7 (no relay-local queue): a request may reach
+            // the daemon before its cancel is read, but the cancel follows it
+            // and the client sees nothing.
             assert!(
-                !steps.contains(&"tools/list".to_owned()),
-                "canceled ID5 reached daemon: {steps:?}"
+                steps[list..].contains(&"notifications/cancelled".to_owned()),
+                "canceled ID5 reached the daemon without its cancel: {steps:?}"
             );
         }
     });

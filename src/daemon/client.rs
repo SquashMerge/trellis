@@ -275,41 +275,6 @@ fn protocol_event(
     (event, session.mode())
 }
 
-struct McpInputBuffer<'a> {
-    workspace: &'a crate::store::topology::WorkspaceIdentity,
-    /// Frames taken from the channel for later, each with its acceptance.
-    queue: std::collections::VecDeque<(crate::mcp::wire::Frame, Instant)>,
-    cancelled_queued: Vec<serde_json::Value>,
-    mode: crate::mcp::session::Mode,
-    active_id: Option<serde_json::Value>,
-    active_key: Option<crate::mcp::wire::IdKey>,
-    cancelled_active: bool,
-    stdin: std::sync::Arc<StdinFence>,
-    /// A frame taken from the channel but not yet handled; it precedes every
-    /// frame still in the channel.
-    deferred: Option<(crate::mcp::wire::Frame, u64, Instant)>,
-    /// While set, `drain_mcp_input` handles only frames whose bytes end at or
-    /// before this stdin offset and defers the first later one.
-    drain_through: Option<u64>,
-    /// Cancellations drained for requests already forwarded to the daemon; the
-    /// relay loop settles them (Decision 0009 §7).
-    cancels: Vec<serde_json::Value>,
-    /// IDs of requests forwarded to the daemon and not yet decided.
-    outstanding: Vec<crate::mcp::wire::IdKey>,
-    /// Refusals of frames beyond the full queue, decided only after a fenced
-    /// settling pass so a cancel written before them still wins (#127).
-    refusals: Vec<PendingRefusal>,
-}
-
-/// A refusal waiting for its #127 decision.
-struct PendingRefusal {
-    /// The refused request, with its ID.
-    value: serde_json::Value,
-    response: serde_json::Value,
-    /// Settling ends by this: the call's own deadline, else the reply bound.
-    bound: Instant,
-}
-
 /// Frames from the stdin reader, each with the stdin offset where it ends and
 /// the instant the reader completed it (protocol acceptance, Decision 0009 §7).
 type FrameReceiver = std::sync::mpsc::Receiver<(crate::mcp::wire::Frame, u64, Instant)>;
@@ -576,129 +541,6 @@ fn spawn_ringing_frame_reader(
     Ok((receiver, fence))
 }
 
-/// What the relay may do with a complete daemon reply.
-enum ReplyGate {
-    Write,
-    Cancelled,
-    /// Input before the decision point could not be settled in time.
-    Unknown,
-}
-
-/// The decision point for a daemon reply (#127, owner ruling in
-/// docs/mcp-readonly-pilot-contract.md). Only frames whose bytes the client had
-/// completely written when the decision offset is sampled can affect it: a
-/// cancel among them wins even if the stdin reader has not delivered it yet.
-/// The first later frame is deferred unhandled until after the reply, so a
-/// cancel written after the decision is concurrent and cannot suppress it, and
-/// later input cannot extend the wait (T00).
-///
-/// Settling ends by `bound`: a call's own deadline (acceptance + 5 s), or the
-/// reply bound for other requests. Input not settled by then makes the outcome
-/// `outcome_unknown`.
-fn reply_gate(
-    receiver: &FrameReceiver,
-    buffer: &mut McpInputBuffer<'_>,
-    stdout: &mut impl std::io::Write,
-    eof: &mut bool,
-    active_id: Option<&serde_json::Value>,
-    bound: Instant,
-) -> io::Result<ReplyGate> {
-    let Some(written) = buffer.stdin.written() else {
-        return Ok(ReplyGate::Unknown);
-    };
-    let deadline = bound;
-    let mut canceled = false;
-    loop {
-        // Sampled first: frames within `written` sent before settling are then
-        // all in the channel for the drain below.
-        let settled = buffer.stdin.settled(written);
-        buffer.drain_through = Some(written);
-        let drained = drain_mcp_input(
-            None,
-            receiver,
-            buffer,
-            stdout,
-            eof,
-            active_id,
-            &mut canceled,
-        );
-        buffer.drain_through = None;
-        drained?;
-        // A cancel for this ID that an earlier pass drained also counts.
-        let pending_cancel =
-            active_id.is_some_and(|id| buffer.cancels.iter().any(|cancel| cancel == id));
-        if *eof || canceled || pending_cancel || buffer.cancelled_active {
-            return Ok(ReplyGate::Cancelled);
-        }
-        // A deferred later frame proves every earlier frame was handled.
-        if settled || buffer.deferred.is_some() {
-            return Ok(ReplyGate::Write);
-        }
-        if Instant::now() >= deadline {
-            return Ok(ReplyGate::Unknown);
-        }
-        thread::sleep(Duration::from_millis(1));
-    }
-}
-
-/// Decide one outcome for `value`'s ID at the #127 decision point: written if
-/// no cancel or end of input settled before it, `outcome_unknown` if input
-/// could not be settled by `bound`.
-fn decide(
-    receiver: &FrameReceiver,
-    buffer: &mut McpInputBuffer<'_>,
-    stdout: &mut impl std::io::Write,
-    eof: &mut bool,
-    value: &serde_json::Value,
-    bound: Instant,
-    response: &serde_json::Value,
-) -> io::Result<()> {
-    match reply_gate(receiver, buffer, stdout, eof, value.get("id"), bound)? {
-        ReplyGate::Write => crate::mcp::wire::write_response(stdout, response),
-        ReplyGate::Cancelled => Ok(()),
-        ReplyGate::Unknown => crate::mcp::wire::write_response(
-            stdout,
-            &mcp_failure(value, "outcome_unknown", buffer.workspace),
-        ),
-    }
-}
-
-/// Decide every pending refusal at one #127 decision point: settle input
-/// written before it (a cancel drained meanwhile removes its refusal), then
-/// write the rest, or `outcome_unknown` if input could not settle by the
-/// earliest bound. End of input cancels them all.
-fn flush_refusals(
-    receiver: &FrameReceiver,
-    buffer: &mut McpInputBuffer<'_>,
-    stdout: &mut impl std::io::Write,
-    eof: &mut bool,
-) -> io::Result<()> {
-    let Some(bound) = buffer.refusals.iter().map(|refusal| refusal.bound).min() else {
-        return Ok(());
-    };
-    let gate = reply_gate(receiver, buffer, stdout, eof, None, bound)?;
-    for refusal in std::mem::take(&mut buffer.refusals) {
-        match gate {
-            ReplyGate::Write => crate::mcp::wire::write_response(stdout, &refusal.response)?,
-            ReplyGate::Cancelled => {}
-            ReplyGate::Unknown => crate::mcp::wire::write_response(
-                stdout,
-                &mcp_failure(&refusal.value, "outcome_unknown", buffer.workspace),
-            )?,
-        }
-    }
-    Ok(())
-}
-
-/// The settling bound for deciding `request`'s outcome now.
-fn decision_bound(request: &Forwarded) -> Instant {
-    if request.call {
-        request.deadline
-    } else {
-        Instant::now() + RELAY_REPLY_BOUND
-    }
-}
-
 /// A request forwarded to the daemon under the relay's own ID and not yet
 /// decided (Decision 0009 §7).
 struct Forwarded {
@@ -713,6 +555,8 @@ struct Forwarded {
     deadline: Instant,
     /// An interrupted read is replayed once, never more.
     retried: bool,
+    /// Its outcome is waiting for a fence: a late daemon reply is dropped.
+    due: bool,
 }
 
 /// One daemon connection generation: replies from it carry its number.
@@ -851,66 +695,137 @@ fn relay_admission_failure(
         crate::mcp::tools::admission_failure(&id, code, &attempted), modern)})
 }
 
-/// The relay between the agent's stdio and the daemon (Decision 0009 §7). It
-/// forwards each request at once under its own relay ID, decides each
-/// outcome per client ID at the #127 decision point, owns the strict
-/// client-facing call deadline, and replays an interrupted read once.
-pub fn relay_stdio(
-    stream: UnixStream,
-    workspace: &crate::store::topology::WorkspaceIdentity,
-    mut reconnect: impl FnMut() -> io::Result<UnixStream>,
-) -> io::Result<()> {
-    use crate::mcp::wire::{self, Frame};
-    use std::collections::BTreeMap;
-    use std::io::Write;
-    let doorbell = std::sync::Arc::new(Doorbell::default());
-    let (receiver, stdin_fence) = spawn_ringing_frame_reader(0, Some(doorbell.clone()))?;
-    let (reply_sender, replies) = std::sync::mpsc::channel::<DaemonReply>();
-    let mut generation = 0u64;
-    let open = |stream: io::Result<UnixStream>, generation: u64| -> io::Result<DaemonConnection> {
-        let stream = attach_mcp(stream?, workspace)?;
-        stream.set_read_timeout(None)?;
-        spawn_reply_reader(&stream, generation, reply_sender.clone(), doorbell.clone())?;
-        Ok(DaemonConnection { stream, generation })
-    };
-    let mut daemon = Some(open(Ok(stream), generation)?);
-    let mut buffer = McpInputBuffer {
-        workspace,
-        queue: std::collections::VecDeque::new(),
-        cancelled_queued: Vec::new(),
-        mode: crate::mcp::session::Mode::Unselected,
-        active_id: None,
-        active_key: None,
-        cancelled_active: false,
-        stdin: stdin_fence,
-        deferred: None,
-        drain_through: None,
-        cancels: Vec::new(),
-        outstanding: Vec::new(),
-        refusals: Vec::new(),
-    };
-    let mut stdout = io::stdout().lock();
-    let mut forwarded: BTreeMap<u64, Forwarded> = BTreeMap::new();
-    let mut next_relay = SETUP_RELAY_ID + 1;
-    let mut legacy_init: Option<Vec<u8>> = None;
-    let mut legacy_ready = false;
-    let mut eof = false;
-    let call_deadline = relay_call_deadline();
+/// What a fence established about the client's input (#127, Decision 0009 §7).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Fence {
+    /// Every frame the client completed before the decision was handled.
+    Settled,
+    /// That input could not be handled by the earliest bound, or could not be
+    /// measured: no unseen cancel is claimed settled.
+    Unknown,
+}
 
-    // Write one frame under a relay ID, (re)connecting first if needed. A
-    // new connection after a completed legacy handshake replays it.
-    let mut send = |daemon: &mut Option<DaemonConnection>,
-                    generation: &mut u64,
-                    legacy: (Option<&Vec<u8>>, bool),
-                    relay: u64,
-                    line: &[u8]|
-     -> bool {
-        if daemon.is_none() {
-            *generation += 1;
-            let Ok(mut connection) = open(reconnect(), *generation) else {
+/// The outcome a due decision would write.
+enum DueOutcome {
+    /// The daemon's exact reply line, under the client's ID.
+    Reply(Vec<u8>),
+    /// A response the relay decided itself.
+    Response(serde_json::Value),
+    /// The relay's own deadline passed without a daemon reply.
+    Expired,
+}
+
+/// An ID-bearing outcome waiting for its fence. It keeps only what its
+/// decision needs, not the request, so many can be held cheaply.
+struct Due {
+    /// The client's ID.
+    id: serde_json::Value,
+    /// For a call: the deadline_exceeded answer, decided up front.
+    expired: Option<serde_json::Value>,
+    outcome: DueOutcome,
+    /// A call's original deadline, from its acceptance.
+    deadline: Option<Instant>,
+    /// Settling for this outcome ends by this.
+    bound: Instant,
+    /// The forwarded request this decides.
+    relay: Option<u64>,
+}
+
+/// Outcomes held for a fence. With this many due, the relay reads no more
+/// input until they are decided; any it cannot settle by its bound becomes
+/// outcome_unknown. Each is small, and this covers every frame a 64 KiB pipe
+/// can hold before a fence samples it, so the cap binds only on larger
+/// buffers (memory stays bounded under continuous input).
+const MAX_DUE: usize = 2048;
+
+/// The relay between the agent's stdio and the daemon (Decision 0009 §7).
+///
+/// Ownership: the stdin reader owns framing; this loop owns everything else.
+/// It holds at most one frame read past the last fence, the forwarded
+/// requests (4 live calls and 16 live non-calls), and the due outcomes.
+/// Frames are handled one at a time in arrival order: calls are forwarded as
+/// they arrive and non-call requests in order. No ID-bearing outcome is
+/// written while handling a frame; every one is decided at a fence, which
+/// first handles every frame the client completed before it, then decides
+/// each outcome: cancelled -> its original deadline -> written.
+struct Relay<'a, W: std::io::Write> {
+    workspace: &'a crate::store::topology::WorkspaceIdentity,
+    receiver: &'a FrameReceiver,
+    stdin: std::sync::Arc<StdinFence>,
+    /// The first frame read past the last fence; it is handled next.
+    held: Option<(crate::mcp::wire::Frame, u64, Instant)>,
+    forwarded: std::collections::BTreeMap<u64, Forwarded>,
+    due: std::collections::VecDeque<Due>,
+    mode: crate::mcp::session::Mode,
+    eof: bool,
+    stdout: W,
+    daemon: Option<DaemonConnection>,
+    generation: u64,
+    connect: Box<dyn FnMut(u64) -> io::Result<DaemonConnection> + 'a>,
+    legacy_init: Option<Vec<u8>>,
+    legacy_ready: bool,
+    next_relay: u64,
+    call_deadline: Duration,
+}
+
+impl<W: std::io::Write> Relay<'_, W> {
+    fn next_frame(&mut self) -> Option<(crate::mcp::wire::Frame, u64, Instant)> {
+        self.held.take().or_else(|| self.receiver.try_recv().ok())
+    }
+
+    /// The earliest instant the loop must act without new input.
+    fn next_deadline(&self) -> Option<Instant> {
+        self.forwarded
+            .values()
+            .filter(|request| !request.due)
+            .map(|request| request.deadline)
+            .min()
+    }
+
+    fn write(&mut self, response: &serde_json::Value) -> io::Result<()> {
+        crate::mcp::wire::write_response(&mut self.stdout, response)
+    }
+
+    /// A due outcome for `value`'s ID.
+    fn due_for(
+        &self,
+        value: &serde_json::Value,
+        outcome: DueOutcome,
+        deadline: Option<Instant>,
+        relay: Option<u64>,
+    ) -> Due {
+        Due {
+            id: value.get("id").cloned().unwrap_or_default(),
+            expired: deadline
+                .map(|_| relay_admission_failure(value, "deadline_exceeded", self.workspace)),
+            outcome,
+            deadline,
+            bound: deadline.unwrap_or_else(|| Instant::now() + RELAY_REPLY_BOUND),
+            relay,
+        }
+    }
+
+    /// Queue an outcome for `value`'s ID to be decided at the next fence.
+    fn due_response(
+        &mut self,
+        value: serde_json::Value,
+        response: serde_json::Value,
+        deadline: Option<Instant>,
+    ) {
+        let due = self.due_for(&value, DueOutcome::Response(response), deadline, None);
+        self.due.push_back(due);
+    }
+
+    /// Write one frame under a relay ID, (re)connecting first if needed. A new
+    /// connection after a completed legacy handshake replays it first.
+    fn send(&mut self, relay: u64, line: &[u8], legacy: bool) -> bool {
+        use std::io::Write;
+        if self.daemon.is_none() {
+            self.generation += 1;
+            let Ok(mut connection) = (self.connect)(self.generation) else {
                 return false;
             };
-            if let (Some(init), true) = legacy {
+            if let (Some(init), true) = (&self.legacy_init, legacy && self.legacy_ready) {
                 let mut setup = format!("{SETUP_RELAY_ID} ").into_bytes();
                 setup.extend_from_slice(init);
                 setup.extend_from_slice(b"\n");
@@ -922,44 +837,210 @@ pub fn relay_stdio(
                     return false;
                 }
             }
-            *daemon = Some(connection);
+            self.daemon = Some(connection);
         }
-        let connection = daemon.as_mut().expect("connected");
-        if line.is_empty() {
-            // Connect only.
-            return true;
-        }
+        let connection = self.daemon.as_mut().expect("connected");
         let mut framed = format!("{relay} ").into_bytes();
         framed.extend_from_slice(line);
         framed.push(b'\n');
         if connection.stream.write_all(&framed).is_err() {
-            if let Some(lost) = daemon.take() {
+            if let Some(lost) = self.daemon.take() {
                 let _ = lost.stream.shutdown(std::net::Shutdown::Both);
             }
             return false;
         }
         true
-    };
+    }
 
-    loop {
-        flush_refusals(&receiver, &mut buffer, &mut stdout, &mut eof)?;
-        // Daemon replies and broken connections.
-        while let Ok((reply_generation, reply)) = replies.try_recv() {
-            if daemon.as_ref().map(|d| d.generation) != Some(reply_generation) {
+    /// Tell the daemon a request was cancelled, so it stops its worker.
+    fn cancel_on_daemon(&mut self, id: &serde_json::Value) {
+        use std::io::Write;
+        if let Some(connection) = self.daemon.as_mut() {
+            let cancel = serde_json::json!({"jsonrpc":"2.0",
+                "method":"notifications/cancelled","params":{"requestId":id}});
+            let _ = connection
+                .stream
+                .write_all(format!("{SETUP_RELAY_ID} {cancel}\n").as_bytes());
+        }
+    }
+
+    /// A cancel removes everything live under its ID: forwarded requests and
+    /// every due outcome, including a duplicate-ID refusal.
+    fn cancel(&mut self, id: &serde_json::Value) {
+        self.forwarded
+            .retain(|_, request| request.value.get("id") != Some(id));
+        self.due.retain(|due| &due.id != id);
+        self.cancel_on_daemon(id);
+    }
+
+    /// Whether an ID is outstanding: forwarded, or waiting for its decision.
+    fn outstanding(&self, key: &crate::mcp::wire::IdKey, id: Option<&serde_json::Value>) -> bool {
+        self.forwarded
+            .values()
+            .any(|request| request.key.as_ref() == Some(key))
+            || self.due.iter().any(|due| Some(&due.id) == id)
+    }
+
+    /// Handle one frame. Only an outcome with no ID is written here.
+    fn handle(&mut self, frame: crate::mcp::wire::Frame, accepted: Instant) -> io::Result<()> {
+        use crate::mcp::{session, wire};
+        let line = match frame {
+            wire::Frame::Eof => {
+                self.eof = true;
+                return Ok(());
+            }
+            wire::Frame::Oversized => {
+                return self
+                    .write(&wire::ProtocolError::new(-32600, serde_json::Value::Null).response());
+            }
+            wire::Frame::Line(line) => line,
+        };
+        if let Some(id) = cancellation_id(&wire::Frame::Line(line.clone())) {
+            self.cancel(&id);
+            return Ok(());
+        }
+        let request = match wire::decode(wire::Frame::Line(line.clone())) {
+            Ok(Some(request)) => request,
+            Ok(None) => return Ok(()),
+            Err(error) => {
+                let response = error.response();
+                if response["id"].is_null() {
+                    return self.write(&response);
+                }
+                // An ID-bearing protocol error is an outcome for that ID.
+                let value = serde_json::json!({"id": response["id"]});
+                self.due_response(value, response, None);
+                return Ok(());
+            }
+        };
+        let mut value: serde_json::Value = serde_json::from_slice(&line).expect("decoded MCP line");
+        if let Some(id) = request.id.clone() {
+            value["id"] = id;
+        }
+        let key = request.key.clone();
+        let method = value
+            .get("method")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_owned();
+        let has_id = value.get("id").is_some();
+        if let Some(key) = &key
+            && self.outstanding(key, value.get("id"))
+        {
+            // An outstanding ID cannot be reused.
+            let response = wire::ProtocolError::new(-32600, value["id"].clone()).response();
+            self.due_response(value, response, None);
+            return Ok(());
+        }
+        let (event, mode) = protocol_event(request, self.mode);
+        self.mode = mode;
+        match event {
+            session::Event::Error(error) => {
+                let response = error.response();
+                if has_id {
+                    self.due_response(value, response, None);
+                    return Ok(());
+                }
+                return self.write(&response);
+            }
+            session::Event::Admitted(admission)
+                if matches!(admission.action, session::Action::Unknown) =>
+            {
+                let response = wire::ProtocolError::new(-32601, admission.id).response();
+                self.due_response(value, response, None);
+                return Ok(());
+            }
+            _ => (),
+        }
+        if method == "initialize" && has_id {
+            self.legacy_init = Some(line.clone());
+            self.legacy_ready = false;
+        }
+        if method == "notifications/initialized" && mode == session::Mode::LegacyReady {
+            self.legacy_ready = true;
+        }
+        let call = method == "tools/call";
+        let deadline = call.then(|| accepted + self.call_deadline);
+        if has_id {
+            let calls = self
+                .forwarded
+                .values()
+                .filter(|request| request.call)
+                .count();
+            if call && calls >= RELAY_OUTSTANDING_CALLS {
+                // Validation precedes capacity (relay_admission_failure).
+                let response = relay_admission_failure(&value, "too_many_requests", self.workspace);
+                self.due_response(value, response, deadline);
+                return Ok(());
+            }
+            if !call && self.forwarded.len() - calls >= RELAY_OUTSTANDING_REQUESTS {
+                let response = serde_json::json!({"jsonrpc":"2.0","id":value["id"],"error":{
+                    "code":-32000,"message":"Relay queue is full",
+                    "data":{"code":"too_many_requests"}}});
+                self.due_response(value, response, None);
+                return Ok(());
+            }
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                // Its deadline passed before it could be forwarded.
+                let response = relay_admission_failure(&value, "deadline_exceeded", self.workspace);
+                self.due_response(value, response, deadline);
+                return Ok(());
+            }
+        }
+        let relay = self.next_relay;
+        self.next_relay += 1;
+        // A completed handshake is replayed only before later requests.
+        let legacy = method != "initialize";
+        let connected = self.daemon.is_some();
+        let mut sent = self.send(relay, &line, legacy);
+        if !sent && connected {
+            // The connection broke on write: the request was not delivered,
+            // so it is tried once on a new connection.
+            sent = self.send(relay, &line, legacy);
+        }
+        if !has_id {
+            // A notification: nothing to decide.
+            return Ok(());
+        }
+        if sent {
+            self.forwarded.insert(
+                relay,
+                Forwarded {
+                    value,
+                    line,
+                    key,
+                    call,
+                    deadline: deadline.unwrap_or_else(|| Instant::now() + RELAY_REPLY_BOUND),
+                    retried: !connected,
+                    due: false,
+                },
+            );
+        } else {
+            let response = mcp_failure(&value, "daemon_unavailable", self.workspace);
+            self.due_response(value, response, deadline);
+        }
+        Ok(())
+    }
+
+    /// Take daemon replies and a broken connection into due outcomes.
+    fn collect_replies(
+        &mut self,
+        replies: &std::sync::mpsc::Receiver<DaemonReply>,
+    ) -> io::Result<()> {
+        while let Ok((generation, reply)) = replies.try_recv() {
+            if self.daemon.as_ref().map(|d| d.generation) != Some(generation) {
                 continue;
             }
             match reply {
                 Ok((SETUP_RELAY_ID, _)) => {}
                 Ok((relay, line)) => {
-                    // Cancels drained since (by another decision) drop their
-                    // requests first, so a cancelled reply is never written.
-                    settle_cancels(&mut buffer, &mut forwarded, &mut daemon);
-                    let Some(request) = forwarded.remove(&relay) else {
-                        // Decided at its deadline or cancelled: never written.
+                    let Some(request) = self.forwarded.get_mut(&relay) else {
+                        // Cancelled: never written.
                         continue;
                     };
-                    if let Some(key) = &request.key {
-                        buffer.outstanding.retain(|held| held != key);
+                    if request.due {
+                        // Decided at its deadline: a late reply is dropped.
+                        continue;
                     }
                     let id_matches = serde_json::from_slice::<serde_json::Value>(&line)
                         .ok()
@@ -970,414 +1051,284 @@ pub fn relay_stdio(
                             "daemon MCP reply ID mismatch",
                         ));
                     }
+                    request.due = true;
+                    let deadline = request.call.then_some(request.deadline);
+                    let value = request.value.clone();
+                    let due = self.due_for(&value, DueOutcome::Reply(line), deadline, Some(relay));
                     crate::mcp::phase_hook("relay_before_write")?;
-                    // A call's reply that arrives after its deadline is not
-                    // written: the relay's decision is deadline_exceeded.
-                    let gate = reply_gate(
-                        &receiver,
-                        &mut buffer,
-                        &mut stdout,
-                        &mut eof,
-                        request.value.get("id"),
-                        decision_bound(&request),
-                    )?;
+                    self.due.push_back(due);
+                }
+                Err(error) => {
+                    // Never replay a truncated reply's request or one already
+                    // replayed; nothing is replayed after end of input.
+                    let partial = error.kind() == io::ErrorKind::InvalidData;
+                    if let Some(lost) = self.daemon.take() {
+                        let _ = lost.stream.shutdown(std::net::Shutdown::Both);
+                    }
+                    let waiting: Vec<u64> = self
+                        .forwarded
+                        .iter()
+                        .filter(|(_, request)| !request.due)
+                        .map(|(relay, _)| *relay)
+                        .collect();
+                    for relay in waiting {
+                        let (line, retried, method_initialize) = {
+                            let request = &self.forwarded[&relay];
+                            (
+                                request.line.clone(),
+                                request.retried,
+                                request.value.get("method").and_then(|v| v.as_str())
+                                    == Some("initialize"),
+                            )
+                        };
+                        if !partial
+                            && !retried
+                            && !self.eof
+                            && self.send(relay, &line, !method_initialize)
+                        {
+                            self.forwarded.get_mut(&relay).expect("forwarded").retried = true;
+                            continue;
+                        }
+                        let request = self.forwarded.get_mut(&relay).expect("forwarded");
+                        request.due = true;
+                        let deadline = request.call.then_some(request.deadline);
+                        let value = request.value.clone();
+                        let response = mcp_failure(&value, "daemon_unavailable", self.workspace);
+                        let due = self.due_for(
+                            &value,
+                            DueOutcome::Response(response),
+                            deadline,
+                            Some(relay),
+                        );
+                        self.due.push_back(due);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Calls past the strict client-facing deadline, and non-call replies
+    /// overdue from the daemon, become due outcomes.
+    fn overdue(&mut self) {
+        let now = Instant::now();
+        let late: Vec<u64> = self
+            .forwarded
+            .iter()
+            .filter(|(_, request)| !request.due && request.deadline <= now)
+            .map(|(relay, _)| *relay)
+            .collect();
+        for relay in late {
+            let request = self.forwarded.get_mut(&relay).expect("forwarded");
+            request.due = true;
+            let value = request.value.clone();
+            let due = if request.call {
+                let deadline = request.deadline;
+                self.due_for(&value, DueOutcome::Expired, Some(deadline), Some(relay))
+            } else {
+                // A non-call reply is overdue: the connection is broken.
+                if let Some(lost) = self.daemon.take() {
+                    let _ = lost.stream.shutdown(std::net::Shutdown::Both);
+                }
+                let response = mcp_failure(&value, "daemon_unavailable", self.workspace);
+                self.due_for(&value, DueOutcome::Response(response), None, Some(relay))
+            };
+            self.due.push_back(due);
+        }
+    }
+
+    /// The decision point (#127): handle every frame the client completed
+    /// before now, deferring the first later one. Ends by the earliest due
+    /// bound. With MAX_DUE outcomes due no more input is read, so a fence
+    /// that cannot settle before its bound reports Unknown.
+    fn fence(&mut self) -> io::Result<Fence> {
+        let bound = self
+            .due
+            .iter()
+            .map(|due| due.bound)
+            .min()
+            .unwrap_or_else(|| Instant::now() + RELAY_REPLY_BOUND);
+        let Some(written) = self.stdin.written() else {
+            return Ok(Fence::Unknown);
+        };
+        loop {
+            // Sampled first: frames within `written` sent before this pass
+            // are then all in the channel for it.
+            let settled = self.stdin.settled(written);
+            let mut later = false;
+            let mut exhausted = false;
+            while self.due.len() < MAX_DUE {
+                match self.next_frame() {
+                    Some((frame, end, accepted)) if end > written => {
+                        self.held = Some((frame, end, accepted));
+                        later = true;
+                        break;
+                    }
+                    Some((frame, _, accepted)) => {
+                        self.handle(frame, accepted)?;
+                        if self.eof {
+                            return Ok(Fence::Settled);
+                        }
+                    }
+                    None => {
+                        exhausted = true;
+                        break;
+                    }
+                }
+            }
+            // A deferred later frame proves every earlier frame was handled.
+            if later || (settled && exhausted) {
+                return Ok(Fence::Settled);
+            }
+            if Instant::now() >= bound {
+                return Ok(Fence::Unknown);
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Decide the due outcomes after a fence: end of input cancels them all;
+    /// an unsettled fence makes those at their bound outcome_unknown (the rest
+    /// wait for the next fence); otherwise cancelled -> deadline -> written.
+    fn decide(&mut self, fence: Fence) -> io::Result<()> {
+        let now = Instant::now();
+        for due in std::mem::take(&mut self.due) {
+            if self.eof {
+                if let Some(relay) = due.relay {
+                    self.forwarded.remove(&relay);
+                }
+                continue;
+            }
+            if fence == Fence::Unknown && due.bound > now {
+                self.due.push_back(due);
+                continue;
+            }
+            if let Some(relay) = due.relay {
+                self.forwarded.remove(&relay);
+            }
+            if fence == Fence::Unknown {
+                let unknown = mcp_failure(
+                    &serde_json::json!({"id": due.id}),
+                    "outcome_unknown",
+                    self.workspace,
+                );
+                self.write(&unknown)?;
+                continue;
+            }
+            match due.outcome {
+                DueOutcome::Reply(line) => {
                     crate::mcp::phase_hook("relay_after_settle")?;
                     // The send decision: a call's deadline is checked after
                     // settling, so settling past it never yields success.
-                    let late = request.call && Instant::now() >= request.deadline;
-                    match gate {
-                        ReplyGate::Write if late => wire::write_response(
-                            &mut stdout,
-                            &relay_admission_failure(
-                                &request.value,
-                                "deadline_exceeded",
-                                workspace,
-                            ),
-                        )?,
-                        ReplyGate::Write => {
-                            crate::mcp::phase_hook("relay_after_decision")?;
-                            // The daemon's exact line, under the client's ID.
-                            let mut out = line;
-                            out.push(b'\n');
-                            stdout.write_all(&out)?;
-                            stdout.flush()?;
-                        }
-                        ReplyGate::Cancelled => {}
-                        ReplyGate::Unknown => wire::write_response(
-                            &mut stdout,
-                            &mcp_failure(&request.value, "outcome_unknown", workspace),
-                        )?,
+                    let late = due
+                        .deadline
+                        .is_some_and(|deadline| Instant::now() >= deadline);
+                    if let (true, Some(expired)) = (late, &due.expired) {
+                        self.write(expired)?;
+                    } else {
+                        crate::mcp::phase_hook("relay_after_decision")?;
+                        // The daemon's exact line, under the client's ID.
+                        let mut out = line;
+                        out.push(b'\n');
+                        self.stdout.write_all(&out)?;
+                        self.stdout.flush()?;
                     }
                 }
-                Err(error) => {
-                    // The connection broke: settle every forwarded request.
-                    let partial = error.kind() == io::ErrorKind::InvalidData;
-                    if let Some(lost) = daemon.take() {
-                        let _ = lost.stream.shutdown(std::net::Shutdown::Both);
-                    }
-                    let lost: Vec<(u64, Forwarded)> =
-                        std::mem::take(&mut forwarded).into_iter().collect();
-                    buffer.outstanding.clear();
-                    for (relay, mut request) in lost {
-                        // Never replay a truncated reply's request or one
-                        // already replayed; never write for a cancelled one.
-                        let replay = !partial && !request.retried && !eof;
-                        if replay {
-                            request.retried = true;
-                            if send(
-                                &mut daemon,
-                                &mut generation,
-                                (legacy_init.as_ref(), legacy_ready),
-                                relay,
-                                &request.line,
-                            ) {
-                                if let Some(key) = &request.key {
-                                    buffer.outstanding.push(key.clone());
-                                }
-                                forwarded.insert(relay, request);
-                                continue;
-                            }
-                        }
-                        if request.value.get("id").is_some() {
-                            let bound = decision_bound(&request);
-                            decide(
-                                &receiver,
-                                &mut buffer,
-                                &mut stdout,
-                                &mut eof,
-                                &request.value,
-                                bound,
-                                &mcp_failure(&request.value, "daemon_unavailable", workspace),
-                            )?;
-                        }
+                DueOutcome::Response(response) => {
+                    let late = due
+                        .deadline
+                        .is_some_and(|deadline| Instant::now() >= deadline);
+                    match (late, &due.expired) {
+                        (true, Some(expired)) => self.write(expired)?,
+                        _ => self.write(&response)?,
                     }
                 }
-            }
-            settle_cancels(&mut buffer, &mut forwarded, &mut daemon);
-        }
-
-        // Calls past the strict client-facing deadline, and daemon replies
-        // overdue for other requests.
-        let now = Instant::now();
-        let overdue: Vec<u64> = forwarded
-            .iter()
-            .filter(|(_, request)| request.deadline <= now)
-            .map(|(relay, _)| *relay)
-            .collect();
-        for relay in overdue {
-            let request = forwarded.remove(&relay).expect("overdue request");
-            if let Some(key) = &request.key {
-                buffer.outstanding.retain(|held| held != key);
-            }
-            if !request.call {
-                // A non-call reply is overdue: treat the connection as broken.
-                if let Some(lost) = daemon.take() {
-                    let _ = lost.stream.shutdown(std::net::Shutdown::Both);
+                DueOutcome::Expired => {
+                    if let Some(expired) = &due.expired {
+                        self.write(expired)?;
+                    }
+                    // Stop the daemon's worker; its late reply is dropped.
+                    let id = due.id.clone();
+                    self.cancel_on_daemon(&id);
                 }
-                decide(
-                    &receiver,
-                    &mut buffer,
-                    &mut stdout,
-                    &mut eof,
-                    &request.value,
-                    Instant::now() + RELAY_REPLY_BOUND,
-                    &mcp_failure(&request.value, "daemon_unavailable", workspace),
-                )?;
-                continue;
-            }
-            // The call's own deadline: settling ends by it.
-            decide(
-                &receiver,
-                &mut buffer,
-                &mut stdout,
-                &mut eof,
-                &request.value,
-                request.deadline,
-                &relay_admission_failure(&request.value, "deadline_exceeded", workspace),
-            )?;
-            // Stop the daemon's worker; a late reply is dropped here.
-            if let (Some(connection), Some(id)) = (daemon.as_mut(), request.value.get("id")) {
-                let cancel = serde_json::json!({"jsonrpc":"2.0",
-                    "method":"notifications/cancelled","params":{"requestId":id}});
-                let _ = connection
-                    .stream
-                    .write_all(format!("{SETUP_RELAY_ID} {cancel}\n").as_bytes());
-            }
-            settle_cancels(&mut buffer, &mut forwarded, &mut daemon);
-        }
-
-        // One stdin frame at a time.
-        let next = if let Some(queued) = buffer.queue.pop_front() {
-            Some(queued)
-        } else if let Some((frame, _, accepted)) = buffer.deferred.take() {
-            Some((frame, accepted))
-        } else {
-            receiver
-                .try_recv()
-                .ok()
-                .map(|(frame, _, accepted)| (frame, accepted))
-        };
-        let Some((frame, accepted)) = next else {
-            if eof {
-                break;
-            }
-            doorbell.wait(forwarded.values().map(|request| request.deadline).min());
-            continue;
-        };
-        let line = match frame {
-            Frame::Eof => {
-                eof = true;
-                continue;
-            }
-            Frame::Oversized => {
-                wire::write_response(
-                    &mut stdout,
-                    &wire::ProtocolError::new(-32600, serde_json::Value::Null).response(),
-                )?;
-                continue;
-            }
-            Frame::Line(line) => line,
-        };
-        if cancellation_id(&Frame::Line(line.clone())).is_some() {
-            // A cancel for a forwarded request goes to the daemon; one for a
-            // locally queued request drops it.
-            let id = cancellation_id(&Frame::Line(line.clone())).expect("checked cancel");
-            buffer.cancels.push(id);
-            settle_cancels(&mut buffer, &mut forwarded, &mut daemon);
-            continue;
-        }
-        let admitted = match wire::decode(Frame::Line(line.clone())) {
-            Ok(Some(request)) => request,
-            Ok(None) => continue,
-            Err(error) => {
-                wire::write_response(&mut stdout, &error.response())?;
-                continue;
-            }
-        };
-        let mut value: serde_json::Value = serde_json::from_slice(&line).expect("decoded MCP line");
-        if let Some(id) = admitted.id.clone() {
-            value["id"] = id;
-        }
-        let key = admitted.key.clone();
-        let method = value
-            .get("method")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_owned();
-        let has_id = value.get("id").is_some();
-        if has_id
-            && let Some(at) = buffer
-                .cancelled_queued
-                .iter()
-                .position(|id| Some(id) == value.get("id"))
-        {
-            buffer.cancelled_queued.remove(at);
-            continue;
-        }
-        if let Some(key) = &key
-            && buffer.outstanding.contains(key)
-        {
-            // An outstanding ID cannot be reused.
-            wire::write_response(
-                &mut stdout,
-                &wire::ProtocolError::new(-32600, value["id"].clone()).response(),
-            )?;
-            continue;
-        }
-        let (event, mode) = protocol_event(admitted, buffer.mode);
-        buffer.mode = mode;
-        match event {
-            crate::mcp::session::Event::Error(error) => {
-                wire::write_response(&mut stdout, &error.response())?;
-                continue;
-            }
-            crate::mcp::session::Event::Admitted(admission)
-                if matches!(admission.action, crate::mcp::session::Action::Unknown) =>
-            {
-                wire::write_response(
-                    &mut stdout,
-                    &wire::ProtocolError::new(-32601, admission.id).response(),
-                )?;
-                continue;
-            }
-            _ => (),
-        }
-        if method == "initialize" && has_id {
-            legacy_init = Some(line.clone());
-            legacy_ready = false;
-        }
-        if method == "notifications/initialized" && mode == crate::mcp::session::Mode::LegacyReady {
-            legacy_ready = true;
-        }
-        let call = method == "tools/call";
-        // From the relay's protocol acceptance: when stdin completed the frame.
-        let deadline = accepted
-            + if call {
-                call_deadline
-            } else {
-                RELAY_REPLY_BOUND
-            };
-        if has_id {
-            let calls = forwarded.values().filter(|request| request.call).count();
-            let refusal = if call && calls >= RELAY_OUTSTANDING_CALLS {
-                Some(relay_admission_failure(
-                    &value,
-                    "too_many_requests",
-                    workspace,
-                ))
-            } else if !call && forwarded.len() - calls >= RELAY_OUTSTANDING_REQUESTS {
-                Some(
-                    serde_json::json!({"jsonrpc":"2.0","id":value["id"],"error":{
-                    "code":-32000,"message":"Relay queue is full",
-                    "data":{"code":"too_many_requests"}}}),
-                )
-            } else {
-                None
-            };
-            if let Some(refusal) = refusal {
-                let bound = if call {
-                    deadline
-                } else {
-                    Instant::now() + RELAY_REPLY_BOUND
-                };
-                decide(
-                    &receiver,
-                    &mut buffer,
-                    &mut stdout,
-                    &mut eof,
-                    &value,
-                    bound,
-                    &refusal,
-                )?;
-                continue;
             }
         }
-        let relay = next_relay;
-        next_relay += 1;
-        let request = Forwarded {
-            value,
-            line,
-            key,
-            call,
-            deadline,
-            retried: false,
-        };
-        // A completed handshake is replayed only before later requests.
-        let legacy = (legacy_init.as_ref(), legacy_ready && method != "initialize");
-        // Connect first (a reconnect may take a while), then settle input
-        // that arrived meanwhile: a cancel already written drops this request
-        // before it reaches the daemon.
-        let connected =
-            daemon.is_some() || send(&mut daemon, &mut generation, legacy, SETUP_RELAY_ID, b"");
-        let mut cancelled = false;
-        drain_mcp_input(
-            None,
-            &receiver,
-            &mut buffer,
-            &mut stdout,
-            &mut eof,
-            request.value.get("id"),
-            &mut cancelled,
-        )?;
-        settle_cancels(&mut buffer, &mut forwarded, &mut daemon);
-        if eof || (cancelled && request.value.get("id").is_some()) {
-            // End of input cancels outstanding work; a cancelled request is
-            // never sent.
-            continue;
-        }
-        if call && has_id && Instant::now() >= request.deadline {
-            // Its deadline passed before it could be forwarded.
-            decide(
-                &receiver,
-                &mut buffer,
-                &mut stdout,
-                &mut eof,
-                &request.value,
-                request.deadline,
-                &relay_admission_failure(&request.value, "deadline_exceeded", workspace),
-            )?;
-            continue;
-        }
-        // One reconnect attempt per request: a failed attach is final.
-        let sent = connected && send(&mut daemon, &mut generation, legacy, relay, &request.line);
-        if request.value.get("id").is_none() {
-            // A notification: nothing to decide.
-            continue;
-        }
-        if sent {
-            if let Some(key) = &request.key {
-                buffer.outstanding.push(key.clone());
-            }
-            forwarded.insert(relay, request);
-            continue;
-        }
-        // Could not reach the daemon: never replay a request that may have
-        // been delivered; a read that certainly was not is retried once.
-        let mut request = request;
-        if connected && !request.retried {
-            // The connection broke on write: the request was not delivered,
-            // so it is retried once on a new connection.
-            request.retried = true;
-            if send(
-                &mut daemon,
-                &mut generation,
-                (legacy_init.as_ref(), legacy_ready && method != "initialize"),
-                relay,
-                &request.line,
-            ) {
-                if let Some(key) = &request.key {
-                    buffer.outstanding.push(key.clone());
-                }
-                forwarded.insert(relay, request);
-                continue;
-            }
-        }
-        let bound = decision_bound(&request);
-        decide(
-            &receiver,
-            &mut buffer,
-            &mut stdout,
-            &mut eof,
-            &request.value,
-            bound,
-            &mcp_failure(&request.value, "daemon_unavailable", workspace),
-        )?;
+        Ok(())
     }
-    if let Some(connection) = daemon {
+
+    /// One turn of the loop: decide what is due at a fence, else handle the
+    /// next frame. Returns false when there is nothing to do but wait.
+    fn turn(&mut self) -> io::Result<bool> {
+        self.overdue();
+        if !self.due.is_empty() {
+            let fence = self.fence()?;
+            self.decide(fence)?;
+            return Ok(true);
+        }
+        match self.next_frame() {
+            Some((frame, _, accepted)) => {
+                self.handle(frame, accepted)?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+}
+
+/// The relay between the agent's stdio and the daemon (Decision 0009 §7). It
+/// forwards each request at once under its own relay ID, decides each outcome
+/// per client ID at a #127 fence, owns the strict client-facing call deadline,
+/// and replays an interrupted read once.
+pub fn relay_stdio(
+    stream: UnixStream,
+    workspace: &crate::store::topology::WorkspaceIdentity,
+    mut reconnect: impl FnMut() -> io::Result<UnixStream>,
+) -> io::Result<()> {
+    let doorbell = std::sync::Arc::new(Doorbell::default());
+    let (receiver, stdin) = spawn_ringing_frame_reader(0, Some(doorbell.clone()))?;
+    let (reply_sender, replies) = std::sync::mpsc::channel::<DaemonReply>();
+    let open = {
+        let doorbell = doorbell.clone();
+        move |stream: io::Result<UnixStream>, generation: u64| -> io::Result<DaemonConnection> {
+            let stream = attach_mcp(stream?, workspace)?;
+            stream.set_read_timeout(None)?;
+            spawn_reply_reader(&stream, generation, reply_sender.clone(), doorbell.clone())?;
+            Ok(DaemonConnection { stream, generation })
+        }
+    };
+    let first = open(Ok(stream), 0)?;
+    let mut relay = Relay {
+        workspace,
+        receiver: &receiver,
+        stdin,
+        held: None,
+        forwarded: Default::default(),
+        due: Default::default(),
+        mode: crate::mcp::session::Mode::Unselected,
+        eof: false,
+        stdout: io::stdout().lock(),
+        daemon: Some(first),
+        generation: 0,
+        connect: Box::new(move |generation| open(reconnect(), generation)),
+        legacy_init: None,
+        legacy_ready: false,
+        next_relay: SETUP_RELAY_ID + 1,
+        call_deadline: relay_call_deadline(),
+    };
+    loop {
+        relay.collect_replies(&replies)?;
+        let progressed = relay.turn()?;
+        if relay.eof && relay.due.is_empty() {
+            break;
+        }
+        if !progressed {
+            doorbell.wait(relay.next_deadline());
+        }
+    }
+    if let Some(connection) = relay.daemon.take() {
         let _ = connection.stream.shutdown(std::net::Shutdown::Write);
     }
     Ok(())
-}
-
-/// Settle cancellations drained from stdin: a forwarded request is dropped
-/// here, and the daemon is told so it stops the request's worker.
-fn settle_cancels(
-    buffer: &mut McpInputBuffer<'_>,
-    forwarded: &mut std::collections::BTreeMap<u64, Forwarded>,
-    daemon: &mut Option<DaemonConnection>,
-) {
-    use std::io::Write;
-    for id in std::mem::take(&mut buffer.cancels) {
-        let matched: Vec<u64> = forwarded
-            .iter()
-            .filter(|(_, request)| request.value.get("id") == Some(&id))
-            .map(|(relay, _)| *relay)
-            .collect();
-        for relay in matched {
-            if let Some(request) = forwarded.remove(&relay)
-                && let Some(key) = &request.key
-            {
-                buffer.outstanding.retain(|held| held != key);
-            }
-        }
-        if let Some(connection) = daemon.as_mut() {
-            let cancel = serde_json::json!({"jsonrpc":"2.0",
-                "method":"notifications/cancelled","params":{"requestId":id}});
-            let _ = connection
-                .stream
-                .write_all(format!("{SETUP_RELAY_ID} {cancel}\n").as_bytes());
-        }
-    }
 }
 
 fn cancellation_id(frame: &crate::mcp::wire::Frame) -> Option<serde_json::Value> {
@@ -1406,184 +1357,6 @@ fn cancellation_id(frame: &crate::mcp::wire::Frame) -> Option<serde_json::Value>
         }
         _ => None,
     }
-}
-
-/// Check all ready input before committing a reply. Once the buffer.queue is full,
-/// reject excess admissions explicitly; never let them hide a later cancellation.
-fn pending_duplicate(buffer: &McpInputBuffer<'_>, key: &crate::mcp::wire::IdKey) -> bool {
-    use crate::mcp::wire::{self, Frame};
-    (!buffer.cancelled_active && buffer.active_key.as_ref() == Some(key))
-        || buffer.outstanding.contains(key)
-        || buffer.queue.iter().any(|(queued, _)| {
-            matches!(queued,
-            Frame::Line(line) if wire::decode(Frame::Line(line.clone()))
-                .ok().flatten().is_some_and(|item|
-                    item.key.as_ref() == Some(key)
-                    && item.id.as_ref().is_some_and(|id|
-                        !buffer.cancelled_queued.contains(id))))
-        })
-}
-
-fn drain_mcp_input(
-    mut stream: Option<&mut UnixStream>,
-    receiver: &FrameReceiver,
-    buffer: &mut McpInputBuffer<'_>,
-    stdout: &mut impl std::io::Write,
-    eof: &mut bool,
-    active_id: Option<&serde_json::Value>,
-    canceled: &mut bool,
-) -> io::Result<()> {
-    use crate::mcp::wire::{self, Frame};
-
-    use std::sync::mpsc::TryRecvError;
-    loop {
-        let next = match buffer.deferred.take() {
-            Some(entry) => Ok(entry),
-            None => receiver.try_recv(),
-        };
-        let next = match next {
-            Ok((frame, end, accepted))
-                if buffer.drain_through.is_some_and(|through| end > through) =>
-            {
-                buffer.deferred = Some((frame, end, accepted));
-                break;
-            }
-            other => other.map(|(frame, _, accepted)| (frame, accepted)),
-        };
-        match next {
-            Ok((Frame::Eof, _)) => {
-                *eof = true;
-                return Ok(());
-            }
-            Ok((frame, accepted)) => {
-                if let Some(id) = cancellation_id(&frame) {
-                    let _ = &mut stream;
-                    if let Some(at) = buffer
-                        .refusals
-                        .iter()
-                        .position(|refusal| refusal.value.get("id") == Some(&id))
-                    {
-                        // A cancel for a pending refusal suppresses it.
-                        buffer.refusals.remove(at);
-                        continue;
-                    }
-                    if active_id == Some(&id) {
-                        // Decided per reply: never a sticky connection flag.
-                        *canceled = true;
-                    } else if buffer.active_id.as_ref() == Some(&id) {
-                        buffer.cancelled_active = true;
-                    } else if buffer.queue.iter().any(|(frame, _)| {
-                        matches!(frame,
-                        Frame::Line(line) if wire::decode(Frame::Line(line.clone())).ok()
-                            .flatten().and_then(|request| request.id).as_ref() == Some(&id))
-                    }) && !buffer.cancelled_queued.contains(&id)
-                    {
-                        buffer.cancelled_queued.push(id);
-                        continue;
-                    }
-                    // The relay loop forwards it to the daemon for any
-                    // forwarded request, including the one being decided.
-                    buffer.cancels.push(id);
-                } else if buffer.queue.len() < 16 {
-                    let duplicate = match &frame {
-                        Frame::Line(line) => wire::decode(Frame::Line(line.clone()))
-                            .ok()
-                            .flatten()
-                            .and_then(|request| request.key.map(|key| (key, request.id)))
-                            .filter(|(key, _)| pending_duplicate(buffer, key)),
-                        _ => None,
-                    };
-                    if let Some((_, Some(id))) = duplicate {
-                        wire::write_response(
-                            stdout,
-                            &wire::ProtocolError::new(-32600, id).response(),
-                        )?;
-                    } else {
-                        buffer.queue.push_back((frame, accepted));
-                    }
-                } else {
-                    // A finite relay cannot admit this frame for daemon selection.
-                    // Decode before refusal so known tools retain their closed DTO shape.
-                    let decoded = match &frame {
-                        Frame::Line(line) => serde_json::from_slice::<serde_json::Value>(line).ok(),
-                        _ => None,
-                    };
-                    let refused = decoded.clone();
-                    let mut call = false;
-                    let response = match wire::decode(frame) {
-                        Err(error) => {
-                            // No request ID: nothing a cancel could name.
-                            wire::write_response(stdout, &error.response())?;
-                            None
-                        }
-                        Ok(Some(request)) if request.id.is_some() => {
-                            let id = request.id.clone().expect("checked ID");
-                            let duplicate = request
-                                .key
-                                .as_ref()
-                                .is_some_and(|key| pending_duplicate(buffer, key));
-                            if duplicate {
-                                Some(wire::ProtocolError::new(-32600, id).response())
-                            } else {
-                                let (event, _) = protocol_event(request, buffer.mode);
-                                match event {
-                                    crate::mcp::session::Event::Error(error) => {
-                                        Some(error.response())
-                                    }
-                                    crate::mcp::session::Event::Admitted(admission)
-                                        if matches!(
-                                            admission.action,
-                                            crate::mcp::session::Action::Unknown
-                                        ) =>
-                                    {
-                                        Some(wire::ProtocolError::new(-32601, id).response())
-                                    }
-                                    crate::mcp::session::Event::Admitted(admission)
-                                        if matches!(
-                                            admission.action,
-                                            crate::mcp::session::Action::Call { .. }
-                                        ) =>
-                                    {
-                                        call = true;
-                                        let mut value = decoded.expect("decoded MCP request");
-                                        value["id"] = id;
-                                        Some(relay_admission_failure(
-                                            &value,
-                                            "too_many_requests",
-                                            buffer.workspace,
-                                        ))
-                                    }
-                                    crate::mcp::session::Event::Admitted(_) => {
-                                        Some(serde_json::json!({
-                                        "jsonrpc":"2.0","id":id,"error":{
-                                            "code":-32000,"message":"Relay queue is full",
-                                            "data":{"code":"too_many_requests"}}}))
-                                    }
-                                    crate::mcp::session::Event::Ignore => None,
-                                }
-                            }
-                        }
-                        _ => None,
-                    };
-                    if let (Some(response), Some(mut value)) = (response, refused) {
-                        value["id"] = response["id"].clone();
-                        let bound = if call {
-                            accepted + relay_call_deadline()
-                        } else {
-                            Instant::now() + RELAY_REPLY_BOUND
-                        };
-                        buffer.refusals.push(PendingRefusal {
-                            value,
-                            response,
-                            bound,
-                        });
-                    }
-                }
-            }
-            Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1718,7 +1491,28 @@ mod reply_gate_tests {
                 line.len() as isize
             );
         }
-        /// Run the gate for an active request "A".
+        /// A relay with no daemon over `frames`.
+        fn relay_on<'a>(&'a self, frames: &'a FrameReceiver) -> Relay<'a, Vec<u8>> {
+            Relay {
+                workspace: &self.workspace,
+                receiver: frames,
+                stdin: self.fence.clone(),
+                held: None,
+                forwarded: Default::default(),
+                due: Default::default(),
+                mode: crate::mcp::session::Mode::Unselected,
+                eof: false,
+                stdout: Vec::new(),
+                daemon: None,
+                generation: 0,
+                connect: Box::new(|_| Err(io::Error::other("no daemon in this fixture"))),
+                legacy_init: None,
+                legacy_ready: false,
+                next_relay: 1,
+                call_deadline: crate::mcp::CALL_DEADLINE,
+            }
+        }
+        /// Run the fence for a forwarded request "A" whose reply is due.
         fn gate(&self) -> ReplyGate {
             self.gate_on(&self.frames).0
         }
@@ -1735,34 +1529,45 @@ mod reply_gate_tests {
             frames: &FrameReceiver,
             bound: Instant,
         ) -> (ReplyGate, Option<(crate::mcp::wire::Frame, u64, Instant)>) {
-            let mut buffer = McpInputBuffer {
-                workspace: &self.workspace,
-                queue: std::collections::VecDeque::new(),
-                cancelled_queued: Vec::new(),
-                mode: crate::mcp::session::Mode::Unselected,
-                active_id: Some(json!("A")),
-                active_key: None,
-                cancelled_active: false,
-                stdin: self.fence.clone(),
-                deferred: None,
-                drain_through: None,
-                cancels: Vec::new(),
-                outstanding: Vec::new(),
-                refusals: Vec::new(),
+            let mut relay = self.relay_on(frames);
+            let value = json!({"jsonrpc":"2.0","id":"A","method":"tools/list"});
+            relay.forwarded.insert(
+                1,
+                Forwarded {
+                    value: value.clone(),
+                    line: Vec::new(),
+                    key: Some(crate::mcp::wire::IdKey::String("A".into())),
+                    call: false,
+                    deadline: bound,
+                    retried: true,
+                    due: true,
+                },
+            );
+            let mut due = relay.due_for(
+                &value,
+                DueOutcome::Reply(b"{\"jsonrpc\":\"2.0\",\"id\":\"A\",\"result\":{}}".to_vec()),
+                None,
+                Some(1),
+            );
+            due.bound = bound;
+            relay.due.push_back(due);
+            let fence = relay.fence().unwrap();
+            let gate = if relay.eof || !relay.due.iter().any(|due| due.id == "A") {
+                ReplyGate::Cancelled
+            } else if fence == Fence::Unknown {
+                ReplyGate::Unknown
+            } else {
+                ReplyGate::Write
             };
-            let mut stdout = Vec::new();
-            let mut eof = false;
-            let gate = reply_gate(
-                frames,
-                &mut buffer,
-                &mut stdout,
-                &mut eof,
-                Some(&json!("A")),
-                bound,
-            )
-            .unwrap();
-            (gate, buffer.deferred.take())
+            (gate, relay.held.take())
         }
+    }
+    /// What the fence allows for the due reply to "A".
+    #[derive(Debug)]
+    enum ReplyGate {
+        Write,
+        Cancelled,
+        Unknown,
     }
     impl Drop for Fixture {
         fn drop(&mut self) {
@@ -1782,61 +1587,176 @@ mod reply_gate_tests {
     }
     const CANCEL_A: &str = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":\"A\"}}\n";
 
-    /// #127 per ID: a frame beyond the full queue is refused only at a fenced
-    /// decision, so a cancel the client wrote right after it suppresses the
-    /// refusal; without one the refusal is written.
-    #[test]
-    fn a_queue_overflow_refusal_waits_for_its_cancel() {
-        for cancel in [true, false] {
-            let fixture = Fixture::new();
-            let mut burst = String::new();
-            for id in 1..=16 {
-                burst.push_str(&format!(
-                    "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"tools/list\",\"params\":{{}}}}\n"
-                ));
-            }
-            burst.push_str(
-                "{\"jsonrpc\":\"2.0\",\"id\":\"X\",\"method\":\"tools/list\",\"params\":{}}\n",
+    /// Run a no-daemon relay over everything written until it is decided.
+    fn run_to_quiet(relay: &mut Relay<'_, Vec<u8>>) {
+        let deadline = Instant::now() + crate::testing::HANG_BACKSTOP;
+        loop {
+            let progressed = relay.turn().unwrap();
+            assert!(
+                relay.due.len() <= MAX_DUE,
+                "due outcomes exceeded their bound"
             );
-            if cancel {
-                burst.push_str("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":\"X\"}}\n");
+            if !progressed
+                && relay.due.is_empty()
+                && relay.stdin.settled(relay.stdin.written().unwrap())
+            {
+                break;
             }
-            fixture.write(&burst);
-            let mut buffer = McpInputBuffer {
-                workspace: &fixture.workspace,
-                queue: std::collections::VecDeque::new(),
-                cancelled_queued: Vec::new(),
-                mode: crate::mcp::session::Mode::Unselected,
-                active_id: None,
-                active_key: None,
-                cancelled_active: false,
-                stdin: fixture.fence.clone(),
-                deferred: None,
-                drain_through: None,
-                cancels: Vec::new(),
-                outstanding: Vec::new(),
-                refusals: Vec::new(),
-            };
-            let mut stdout = Vec::new();
-            let mut eof = false;
-            // Settle everything written so far: the queue fills, X overflows.
-            let gate = reply_gate(
-                &fixture.frames,
-                &mut buffer,
-                &mut stdout,
-                &mut eof,
-                None,
-                Instant::now() + RELAY_REPLY_BOUND,
-            )
-            .unwrap();
-            assert!(matches!(gate, ReplyGate::Write));
-            assert_eq!(buffer.queue.len(), 16);
-            flush_refusals(&fixture.frames, &mut buffer, &mut stdout, &mut eof).unwrap();
-            let written = String::from_utf8(stdout).unwrap();
+            assert!(Instant::now() < deadline, "the relay never settled");
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn list(id: &str) -> String {
+        format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"tools/list\",\"params\":{{}}}}\n")
+    }
+
+    /// #127 per ID: a cancel written behind more frames than the input
+    /// channel holds still reaches its request's outcome before that outcome
+    /// is decided.
+    #[test]
+    fn a_cancel_behind_a_full_input_buffer_suppresses_its_outcome() {
+        let fixture = Fixture::new();
+        let mut burst = list("\"X\"");
+        for id in 1..=40 {
+            burst.push_str(&list(&id.to_string()));
+        }
+        burst.push_str("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":\"X\"}}\n");
+        fixture.write(&burst);
+        let mut relay = fixture.relay_on(&fixture.frames);
+        run_to_quiet(&mut relay);
+        let written = String::from_utf8(std::mem::take(&mut relay.stdout)).unwrap();
+        assert_eq!(written.lines().count(), 40, "{written}");
+        assert!(
+            !written.contains("\"X\""),
+            "the cancelled outcome was written: {written}"
+        );
+    }
+
+    /// A cancel removes everything live under its ID: a duplicate-ID refusal
+    /// and the original forwarded request.
+    #[test]
+    fn a_cancel_removes_the_original_and_its_duplicate() {
+        let fixture = Fixture::new();
+        fixture.write(&format!(
+            "{}{}",
+            list("8"),
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":8}}\n"
+        ));
+        let mut relay = fixture.relay_on(&fixture.frames);
+        let value = json!({"jsonrpc":"2.0","id":8,"method":"tools/list"});
+        relay.forwarded.insert(
+            1,
+            Forwarded {
+                value,
+                line: Vec::new(),
+                key: Some(crate::mcp::wire::IdKey::Integer(8)),
+                call: false,
+                deadline: Instant::now() + RELAY_REPLY_BOUND,
+                retried: true,
+                due: false,
+            },
+        );
+        run_to_quiet(&mut relay);
+        assert!(
+            relay.forwarded.is_empty(),
+            "the original survived its cancel"
+        );
+        let written = String::from_utf8(std::mem::take(&mut relay.stdout)).unwrap();
+        assert!(written.is_empty(), "{written}");
+    }
+
+    /// Continuous input cannot hold a due outcome past its fence: the fence
+    /// handles only what was written before it.
+    #[test]
+    fn continuous_input_cannot_hold_a_due_reply() {
+        let fixture = Fixture::new();
+        let fd = fixture.fds[1];
+        // Non-blocking, so the writer can stop even when nothing drains the
+        // pipe after the gate returns.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0
+        );
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let writing = stop.clone();
+        let writer = thread::spawn(move || {
+            let line = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\n";
+            let mut pending = line;
+            while !writing.load(Ordering::Acquire) {
+                let n = unsafe { libc::write(fd, pending.as_ptr().cast(), pending.len()) };
+                if n < 0 {
+                    if io::Error::last_os_error().kind() != io::ErrorKind::WouldBlock {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                    continue;
+                }
+                // Keep frames whole: finish a partly written line first.
+                pending = &pending[n as usize..];
+                if pending.is_empty() {
+                    pending = line;
+                }
+            }
+            // Complete any partial frame so the reader never sees a torn one.
+            while !pending.is_empty() && pending.len() != line.len() {
+                let n = unsafe { libc::write(fd, pending.as_ptr().cast(), pending.len()) };
+                if n > 0 {
+                    pending = &pending[n as usize..];
+                } else {
+                    break;
+                }
+            }
+        });
+        thread::sleep(Duration::from_millis(20));
+        let (gate, _) = fixture.gate_until(
+            &fixture.frames,
+            Instant::now() + crate::testing::HANG_BACKSTOP,
+        );
+        stop.store(true, Ordering::Release);
+        writer.join().unwrap();
+        assert!(matches!(gate, ReplyGate::Write), "{gate:?}");
+    }
+
+    /// A flood of invalid calls with no daemon is answered invalid_request,
+    /// with due outcomes bounded throughout.
+    #[test]
+    fn an_invalid_call_flood_stays_bounded() {
+        let fixture = Fixture::new();
+        let mut burst = String::new();
+        for id in 1..=300 {
+            burst.push_str(&format!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"tools/call\",\"params\":{{\"name\":\"trellis_workspace_describe\",\"arguments\":{{}},\"_meta\":{{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\",\"io.modelcontextprotocol/clientCapabilities\":{{}}}}}}}}\n"
+            ));
+        }
+        let fd = fixture.fds[1];
+        let writer = thread::spawn(move || {
+            let mut written = 0;
+            while written < burst.len() {
+                let n = unsafe {
+                    libc::write(fd, burst[written..].as_ptr().cast(), burst.len() - written)
+                };
+                assert!(n > 0);
+                written += n as usize;
+            }
+        });
+        let mut relay = fixture.relay_on(&fixture.frames);
+        let deadline = Instant::now() + crate::testing::HANG_BACKSTOP;
+        while String::from_utf8_lossy(&relay.stdout).lines().count() < 300 {
+            relay.turn().unwrap();
+            assert!(relay.due.len() <= MAX_DUE);
+            assert!(Instant::now() < deadline, "the flood was not answered");
+        }
+        writer.join().unwrap();
+        for line in String::from_utf8(std::mem::take(&mut relay.stdout))
+            .unwrap()
+            .lines()
+        {
+            let reply: serde_json::Value = serde_json::from_str(line).unwrap();
             assert_eq!(
-                written.contains("\"X\""),
-                !cancel,
-                "cancel={cancel}: {written}"
+                reply["result"]["structuredContent"]["error"]["code"], "invalid_request",
+                "{reply}"
             );
         }
     }
