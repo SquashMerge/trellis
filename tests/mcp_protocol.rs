@@ -4419,10 +4419,8 @@ async fn continuous_invalid_calls_stay_bounded_and_a_due_reply_is_decided() {
     drop(reader);
     drop(client);
     // Replies to flood requests may still be unwritten when the client goes:
-    // the session then ends on a broken pipe, which is not a failure here.
-    if let Err(error) = session.join().unwrap() {
-        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe, "{error}");
-    }
+    // a hang-up ends the session cleanly.
+    session.join().unwrap().unwrap();
 }
 
 /// A finished call's result never waits for the client's input: with the
@@ -4483,4 +4481,45 @@ async fn a_worker_result_never_waits_for_client_input() {
     client.shutdown(std::net::Shutdown::Both).unwrap();
     drop(reader);
     session.join().unwrap().unwrap();
+}
+
+/// A client that hangs up while its reply is being written ends the session
+/// cleanly (Ok): the write after the decision meets a closed peer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_client_hang_up_ends_the_session_cleanly() {
+    let temp = tempfile::tempdir().unwrap();
+    let (identity, registry, _runtime) = ready_registry(temp.path(), 90).await;
+    let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let marked = finished.clone();
+    let (at_write_tx, at_write) = std::sync::mpsc::sync_channel(1);
+    let (closed_tx, closed_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let closed_rx = std::sync::Mutex::new(closed_rx);
+    let hooks = trellis::mcp::TransportHooksForTests {
+        send_decision: Some(std::sync::Arc::new(move |_: &Value| {
+            marked.store(true, std::sync::atomic::Ordering::Release);
+        })),
+        // After the fence that decides call 1, before its reply is written.
+        fence_handled: Some(std::sync::Arc::new(move |_| {
+            if finished.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                let _ = at_write_tx.send(());
+                let _ = closed_rx.lock().unwrap().recv();
+            }
+        })),
+        ..Default::default()
+    };
+    let (mut client, reader, session) = hooked_session(&identity, &registry, 90, None, hooks);
+    writeln!(client, "{}", describe_call(1)).unwrap();
+    at_write
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .expect("call 1 was never decided");
+    drop(reader);
+    drop(client);
+    closed_tx.send(()).unwrap();
+    let ended = tokio::task::spawn_blocking(move || session.join().unwrap())
+        .await
+        .unwrap();
+    assert!(
+        ended.is_ok(),
+        "a client hang-up failed the session: {ended:?}"
+    );
 }

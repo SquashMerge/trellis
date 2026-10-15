@@ -766,6 +766,8 @@ struct Relay<'a, W: std::io::Write> {
     legacy_ready: bool,
     next_relay: u64,
     call_deadline: Duration,
+    /// MAX_DUE; a fixture may set a smaller cap to reach it.
+    max_due: usize,
 }
 
 impl<W: std::io::Write> Relay<'_, W> {
@@ -1157,7 +1159,7 @@ impl<W: std::io::Write> Relay<'_, W> {
             let settled = self.stdin.settled(written);
             let mut later = false;
             let mut exhausted = false;
-            while self.due.len() < MAX_DUE {
+            while self.due.len() < self.max_due {
                 match self.next_frame() {
                     Some((frame, end, accepted)) if end > written => {
                         self.held = Some((frame, end, accepted));
@@ -1314,6 +1316,7 @@ pub fn relay_stdio(
         legacy_ready: false,
         next_relay: SETUP_RELAY_ID + 1,
         call_deadline: relay_call_deadline(),
+        max_due: MAX_DUE,
     };
     loop {
         relay.collect_replies(&replies)?;
@@ -1510,6 +1513,7 @@ mod reply_gate_tests {
                 legacy_ready: false,
                 next_relay: 1,
                 call_deadline: crate::mcp::CALL_DEADLINE,
+                max_due: MAX_DUE,
             }
         }
         /// Run the fence for a forwarded request "A" whose reply is due.
@@ -1591,15 +1595,15 @@ mod reply_gate_tests {
     fn run_to_quiet(relay: &mut Relay<'_, Vec<u8>>) {
         let deadline = Instant::now() + crate::testing::HANG_BACKSTOP;
         loop {
+            // Sampled before the turn: a turn that then finds nothing proves
+            // every frame written so far was handled.
+            let settled = relay.stdin.settled(relay.stdin.written().unwrap());
             let progressed = relay.turn().unwrap();
             assert!(
                 relay.due.len() <= MAX_DUE,
                 "due outcomes exceeded their bound"
             );
-            if !progressed
-                && relay.due.is_empty()
-                && relay.stdin.settled(relay.stdin.written().unwrap())
-            {
+            if !progressed && relay.due.is_empty() && settled {
                 break;
             }
             assert!(Instant::now() < deadline, "the relay never settled");
@@ -1717,6 +1721,35 @@ mod reply_gate_tests {
         stop.store(true, Ordering::Release);
         writer.join().unwrap();
         assert!(matches!(gate, ReplyGate::Write), "{gate:?}");
+    }
+
+    /// With the due cap full, the relay reads no more input; outcomes the
+    /// fence cannot settle by their bound become outcome_unknown, so memory
+    /// and decisions stay bounded.
+    #[test]
+    fn a_full_due_cap_pauses_input_and_ends_in_outcome_unknown() {
+        let fixture = Fixture::new();
+        let mut burst = String::new();
+        for id in 1..=6 {
+            burst.push_str(&format!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"tools/call\",\"params\":{{\"name\":\"trellis_workspace_describe\",\"arguments\":{{\"schemaVersion\":1}},\"_meta\":{{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\",\"io.modelcontextprotocol/clientCapabilities\":{{}}}}}}}}\n"
+            ));
+        }
+        fixture.write(&burst);
+        let mut relay = fixture.relay_on(&fixture.frames);
+        relay.max_due = 4;
+        relay.call_deadline = Duration::from_millis(300);
+        let deadline = Instant::now() + crate::testing::HANG_BACKSTOP;
+        while String::from_utf8_lossy(&relay.stdout).lines().count() < 6 {
+            relay.turn().unwrap();
+            assert!(relay.due.len() <= 4, "due outcomes grew past the cap");
+            assert!(Instant::now() < deadline, "the relay never decided");
+        }
+        let written = String::from_utf8(std::mem::take(&mut relay.stdout)).unwrap();
+        assert!(
+            written.contains("outcome_unknown"),
+            "a full cap claimed it settled unread input: {written}"
+        );
     }
 
     /// A flood of invalid calls with no daemon is answered invalid_request,
