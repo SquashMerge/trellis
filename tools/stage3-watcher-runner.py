@@ -291,6 +291,24 @@ def edit_bytes(raw, language, kind):
 class Daemon:
     def __init__(self, scratch, label, workspace, home):
         self.workspace, self.home = workspace, home
+        # The daemon is started here, before serve attaches to it, so its own
+        # diagnostics (the watcher health witness) are captured: a daemon that
+        # serve auto-starts discards its stderr.
+        self.witness_path = scratch / f"{label}-trellis-daemon.stderr.log"
+        self.witness = open(self.witness_path, "wb", buffering=0)
+        daemon_env = env_for(home)
+        daemon_env["TRELLIS_INDEX_DIAGNOSTICS"] = "1"
+        self.daemon = subprocess.Popen([str(BINARY), "daemon"], cwd=REPO, env=daemon_env,
+                                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                       stderr=self.witness, start_new_session=True)
+        # Wait until this daemon listens (it then holds the election), so the
+        # serve below attaches to it rather than starting another daemon. The
+        # socket can live outside HOME (a long data root), so ask the OS.
+        deadline = time.monotonic() + SETUP_TIMEOUT_S
+        while not self.listening():
+            need(self.daemon.poll() is None, "trellis daemon exited before listening")
+            need(time.monotonic() < deadline, "trellis daemon did not start listening")
+            time.sleep(.05)
         self.stderr_path = scratch / f"{label}-daemon.stderr.log"
         self.stderr = open(self.stderr_path, "wb", buffering=0)
         self.argv = [str(BINARY), "serve", "--workspace", str(workspace), "--bind", "127.0.0.1:0",
@@ -298,6 +316,11 @@ class Daemon:
         self.proc = subprocess.Popen(self.argv, cwd=REPO, env=env_for(home),
                                      stdout=subprocess.DEVNULL, stderr=self.stderr, start_new_session=True)
         self.url = None
+    def listening(self):
+        result = subprocess.run(["lsof", "-a", "-p", str(self.daemon.pid), "-U", "-Fn"],
+                                capture_output=True, text=True)
+        return any(line.startswith("n") and line.endswith("daemon.sock")
+                   for line in result.stdout.splitlines())
     def ready(self):
         deadline = time.monotonic() + SETUP_TIMEOUT_S
         while time.monotonic() < deadline:
@@ -314,14 +337,58 @@ class Daemon:
             time.sleep(.05)
         raise Invalid("serve readiness deadline exceeded")
     def stop(self):
-        if self.proc.poll() is None:
-            self.proc.terminate()
-            try:
-                self.proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
-                self.proc.wait(timeout=5)
+        for proc in (self.proc, self.daemon):
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=5)
         self.stderr.close()
+        self.witness.close()
+
+WITNESS_EVENTS = re.compile(r"event=(watcher_epoch|watcher_degraded) detail=(.*?) marker_lost=(\d+)")
+ANY_MARKER = re.compile(r" event=\S+ detail=.*? marker_lost=(\d+)")
+
+def witness_since(path, offset):
+    # The daemon's monotonic watcher-health witness after `offset`: each new
+    # watcher epoch (and whether it is native), each degraded transition, and
+    # any diagnostic markers the daemon lost. Only complete lines are read.
+    data = path.read_bytes()
+    end = data.rfind(b"\n", offset) + 1
+    if end <= offset:
+        return {"epochs": [], "degraded": [], "lost": 0, "markers": 0}, offset
+    epochs, degraded, lost, markers = [], [], 0, 0
+    for line in data[offset:end].decode(errors="replace").splitlines():
+        any_marker = ANY_MARKER.search(line)
+        if any_marker:
+            markers += 1
+            lost += int(any_marker.group(1))
+        match = WITNESS_EVENTS.search(line)
+        if not match:
+            continue
+        fields = dict(part.split("=", 1) for part in match.group(2).split() if "=" in part)
+        if match.group(1) == "watcher_epoch":
+            epochs.append({"epoch": int(fields["epoch"]), "native": fields.get("native") == "true"})
+        else:
+            degraded.append(int(fields["epoch"]))
+    return {"epochs": epochs, "degraded": degraded, "lost": lost, "markers": markers}, end
+
+def healthy_epoch(path):
+    # Before a series: the current watcher epoch must be native and never
+    # degraded. Returns (epoch, witness offset to read from next).
+    deadline = time.monotonic() + SETUP_TIMEOUT_S
+    while True:
+        witness, offset = witness_since(path, 0)
+        if witness["epochs"]:
+            current = witness["epochs"][-1]
+            need(witness["lost"] == 0, "daemon lost diagnostic markers before the series")
+            need(current["native"], "current watcher has no native watcher")
+            need(current["epoch"] not in witness["degraded"], "current watcher epoch degraded")
+            return current["epoch"], offset
+        need(time.monotonic() < deadline, "no watcher epoch witness before the series")
+        time.sleep(.05)
 
 def status(workspace, home):
     # serve announces readiness before the first H publishes. Baseline setup
@@ -440,6 +507,7 @@ def measure(args):
                    fallback_status_timeout_seconds=FALLBACK_TIMEOUT_S,
                    corpus_manifest=str(PINNED), corpus_manifest_sha256=MANIFEST_SHA,
                    mode_note=MODE_NOTE, mode_directly_observed=False,
+                   daemon_diagnostics="on: the daemon's watcher health witness is read per sample",
                    script_sha256=file_sha(Path(__file__)))
             for size in ("medium", "large"):
                 workspace = scratch / f"{size}-workspace"
@@ -454,6 +522,12 @@ def measure(args):
                        baseline_selected=baseline, cold_setup_timing="excluded")
                 if watcher_degraded(workspace, home):
                     series_invalid(log, size, "watcher degraded before the series")
+                try:
+                    epoch, witness_offset = healthy_epoch(active.witness_path)
+                except Invalid as exc:
+                    series_invalid(log, size, f"no healthy native watcher before the series: {exc}")
+                append(log, "series_watcher", size=size, watcher_epoch=epoch, native=True,
+                       witness_log=str(active.witness_path))
                 edited = set()
                 for n in range(20):
                     language, relative, kind = planned_edit(size, n)
@@ -497,9 +571,17 @@ def measure(args):
                         append(log, "sample", **sample)
                         raise
                     sample["watcher_degraded_after"] = watcher_degraded(workspace, home)
+                    witness, witness_offset = witness_since(active.witness_path, witness_offset)
+                    sample["watcher_witness"] = {"epoch": epoch, **witness}
+                    # Any new epoch, degraded transition or lost marker since
+                    # the series began means watching may not have stayed
+                    # healthy, even if the health bit is healthy again now.
+                    sample["watcher_witness_ok"] = (not witness["epochs"] and not witness["degraded"]
+                                                    and witness["lost"] == 0)
                     append(log, "sample", **sample)
-                    if sample["watcher_degraded_after"]:
-                        series_invalid(log, size, "watcher degraded during the series", n + 1)
+                    if sample["watcher_degraded_after"] or not sample["watcher_witness_ok"]:
+                        series_invalid(log, size, "watcher not continuously healthy during the series",
+                                       n + 1)
                 active.stop()
                 active = None
             # Fallback is a distinct untouched medium workspace and independent setup.
@@ -595,7 +677,13 @@ def summarize_records(records):
     for size in ("medium", "large"):
         samples = [r for r in records if r["type"] == "sample" and r.get("size") == size]
         ordered = [planned_edit(size, n)[1] for n in range(20)]
-        complete = (len(samples) == 20 and [r["path"] for r in samples] == ordered
+        baseline = [r for r in records if r["type"] == "series_watcher" and r.get("size") == size]
+        # Healthy native watching must be proven for the series and for every
+        # sample; a sample without the proof does not count (owner ruling).
+        healthy = (len(baseline) == 1 and baseline[0].get("native") is True
+                   and all(r.get("watcher_degraded_after") is False
+                           and r.get("watcher_witness_ok") is True for r in samples))
+        complete = (len(samples) == 20 and [r["path"] for r in samples] == ordered and healthy
                     and all(r.get("valid") is True and r.get("mode_expected") == "local"
                             and r.get("mode_note") == MODE_NOTE
                             and r.get("mode_directly_observed") is False for r in samples))
@@ -603,6 +691,7 @@ def summarize_records(records):
         p95 = sorted(times)[18] if complete else None
         limit = 2 if size == "medium" else 5
         series[size] = {"count":len(samples), "valid":sum(r.get("valid") is True for r in samples),
+                        "healthy_watching_proven":healthy,
                         "raw_latencies_seconds":times, "p95_nearest_rank_seconds":p95,
                         "limit_seconds":limit, "pass_gate":bool(complete and p95 <= limit),
                         "mode_expected":"local", "mode_note":MODE_NOTE,

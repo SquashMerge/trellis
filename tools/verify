@@ -33,6 +33,7 @@ cohorts() {
 }
 checks() {
   node --test runtime/acp/runner.test.mjs
+  python3 tools/stage3-watcher-runner-test.py
   node --test tests/factory-config.test.cjs
   node tests/browser/saved-items.test.cjs
   node docs/semantic-evidence/check-policy.mjs

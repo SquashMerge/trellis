@@ -82,7 +82,18 @@ impl WatcherHealth {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return,
+                Ok(_) => {
+                    if degraded && current & 1 == 0 {
+                        // A monotonic witness for measurement: the health
+                        // bit alone can return to healthy unseen.
+                        crate::index_coordinator::diagnostic_marker(
+                            "-",
+                            "watcher_degraded",
+                            &format!("epoch={epoch}"),
+                        );
+                    }
+                    return;
+                }
                 Err(actual) => current = actual,
             }
         }
@@ -598,6 +609,13 @@ impl WatchSignals {
             )
             .flatten();
         let degraded = native && watcher.is_none();
+        // A monotonic witness for measurement: each watcher's epoch, and
+        // whether it has a native watcher.
+        crate::index_coordinator::diagnostic_marker(
+            "-",
+            "watcher_epoch",
+            &format!("epoch={epoch} native={}", watcher.is_some()),
+        );
         health.publish_setup(epoch, degraded);
         let captured_inputs = [scip_path, manifest_path]
             .into_iter()
