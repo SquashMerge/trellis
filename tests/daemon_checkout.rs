@@ -2055,11 +2055,11 @@ async fn detected_root_loss_with_a_held_read_fences_browser_replacement() {
     fs::rename(&checkout, base.path().join("old")).unwrap();
     fs::create_dir(&checkout).unwrap();
     fs::write(checkout.join("a.js"), "function newBrowser() {}\n").unwrap();
-    assert!(
-        scheduler.submit_watch_event_for_tests(Ok(notify::Event::new(notify::EventKind::Remove(
-            notify::event::RemoveKind::Any
-        ))))
-    );
+    // Either the OS watcher or this synthetic event reports the loss first;
+    // if the watcher already retired, the event has nowhere to go.
+    let _ = scheduler.submit_watch_event_for_tests(Ok(notify::Event::new(
+        notify::EventKind::Remove(notify::event::RemoveKind::Any),
+    )));
     retired(&scheduler).await;
     assert!(
         registry.browser_identity(&key).is_err(),
@@ -2101,11 +2101,11 @@ async fn a_stale_activation_keeps_the_held_read_fence() {
     fs::rename(&checkout, base.path().join("old")).unwrap();
     fs::create_dir(&checkout).unwrap();
     fs::write(checkout.join("a.js"), "function newBrowser() {}\n").unwrap();
-    assert!(
-        scheduler.submit_watch_event_for_tests(Ok(notify::Event::new(notify::EventKind::Remove(
-            notify::event::RemoveKind::Any
-        ))))
-    );
+    // Either the OS watcher or this synthetic event reports the loss first;
+    // if the watcher already retired, the event has nowhere to go.
+    let _ = scheduler.submit_watch_event_for_tests(Ok(notify::Event::new(
+        notify::EventKind::Remove(notify::event::RemoveKind::Any),
+    )));
     retired(&scheduler).await;
     // The stale browser client activates again: the retired runtime is
     // dropped (the activation itself cannot succeed on the lost root).
@@ -2154,11 +2154,11 @@ async fn settled_root_loss_closes_with_a_client_attached() {
     fs::create_dir(&checkout).unwrap();
     fs::write(checkout.join("a.js"), "function newRoot() {}\n").unwrap();
     // A watcher signal wakes the worker, which observes the loss.
-    assert!(
-        scheduler.submit_watch_event_for_tests(Ok(notify::Event::new(notify::EventKind::Remove(
-            notify::event::RemoveKind::Any
-        ))))
-    );
+    // Either the OS watcher or this synthetic event reports the loss first;
+    // if the watcher already retired, the event has nowhere to go.
+    let _ = scheduler.submit_watch_event_for_tests(Ok(notify::Event::new(
+        notify::EventKind::Remove(notify::event::RemoveKind::Any),
+    )));
     retired(&scheduler).await;
     let refused = old
         .evidence_response()
