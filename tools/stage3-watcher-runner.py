@@ -321,6 +321,50 @@ class Daemon:
                 self.proc.kill()
                 self.proc.wait(timeout=5)
         self.stderr.close()
+        # serve starts the daemon detached; it must not outlive its phase.
+        stop_daemons(self.home)
+
+def lock_holders(lock):
+    try:
+        result = subprocess.run(["lsof", "-t", str(lock)], capture_output=True, text=True, timeout=10)
+    except subprocess.TimeoutExpired:
+        raise Invalid(f"lsof did not answer for {lock}")
+    return {int(pid) for pid in result.stdout.split()}
+
+def alive(pid):
+    # A zombie has exited: it holds no lock and does no work.
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True, timeout=10)
+    return state.stdout.strip()[:1] not in ("", "Z")
+
+def stop_daemons(home, grace_s=20):
+    # Stop every Trellis daemon elected for this private HOME: the holders of
+    # its daemon.lock, which lives only under HOME. Fails if one survives, so
+    # a phase never starts beside its predecessor's daemon.
+    for lock in home.rglob("daemon.lock"):
+        holders = lock_holders(lock)
+        for pid in holders:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        deadline = time.monotonic() + grace_s
+        while any(alive(pid) for pid in holders) and time.monotonic() < deadline:
+            time.sleep(.05)
+        for pid in holders:
+            if alive(pid):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        deadline = time.monotonic() + 5
+        while any(alive(pid) for pid in holders) and time.monotonic() < deadline:
+            time.sleep(.05)
+        need(not any(alive(pid) for pid in holders) and not lock_holders(lock),
+             f"daemon for {home} did not stop")
 
 def status(workspace, home):
     # serve announces readiness before the first H publishes. Baseline setup

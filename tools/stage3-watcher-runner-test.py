@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """Offline checks of the Stage 3 runner's summary gate and health witness.
 
-Never launches Trellis: it imports the runner and feeds it records.
+Never launches Trellis: it imports the runner and feeds it records, or a
+stand-in daemon that holds a private HOME's daemon lock.
 """
 import copy
 import importlib.util
+import subprocess
+import sys
+import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -81,6 +86,47 @@ class Witness(unittest.TestCase):
         self.assertFalse(RUNNER.stayed_healthy(HEALTHY, None))
         not_native = dict(HEALTHY, native=False)
         self.assertFalse(RUNNER.stayed_healthy(not_native, dict(not_native)))
+
+
+FAKE_DAEMON = """
+import fcntl, signal, sys, time
+if sys.argv[2] == "ignore-term":
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+lock = open(sys.argv[1], "w")
+fcntl.flock(lock, fcntl.LOCK_EX)
+print("held", flush=True)
+while True:
+    time.sleep(1)
+"""
+
+
+class DaemonCleanup(unittest.TestCase):
+    def daemon(self, home, mode):
+        lock = home / "Library/Application Support/dev.squashmerge.trellis/run/daemon.lock"
+        lock.parent.mkdir(parents=True)
+        proc = subprocess.Popen([sys.executable, "-c", FAKE_DAEMON, str(lock), mode],
+                                stdout=subprocess.PIPE, text=True, start_new_session=True)
+        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        self.assertEqual(proc.stdout.readline().strip(), "held")
+        return proc
+
+    def test_the_daemon_a_phase_started_is_stopped(self):
+        with tempfile.TemporaryDirectory() as temp:
+            proc = self.daemon(Path(temp), "plain")
+            RUNNER.stop_daemons(Path(temp))
+            self.assertIsNotNone(proc.wait(timeout=5))
+
+    def test_a_daemon_ignoring_sigterm_is_killed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            proc = self.daemon(Path(temp), "ignore-term")
+            started = time.monotonic()
+            RUNNER.stop_daemons(Path(temp), grace_s=0.5)
+            self.assertEqual(proc.wait(timeout=5), -9)
+            self.assertLess(time.monotonic() - started, 30)
+
+    def test_a_home_without_a_daemon_is_a_no_op(self):
+        with tempfile.TemporaryDirectory() as temp:
+            RUNNER.stop_daemons(Path(temp))
 
 
 if __name__ == "__main__":
