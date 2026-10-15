@@ -296,7 +296,7 @@ async function savedDiagnostics(page, kind, id) {
 }
 function readPayload(dbPath, kind, id) {
   assert.ok(["view","note"].includes(kind));
-  const db=new DatabaseSync(dbPath,{readOnly:true});
+  const db=openDb(dbPath,{readOnly:true});
   try {
     const version=db.prepare("PRAGMA user_version").get().user_version;assert.equal(version,1);
     const table=kind==="view"?"views":"annotations";
@@ -315,8 +315,16 @@ function rawJsonProperty(payload, key) {
   }
   return payload.slice(start,at).trim();
 }
+// The user-level daemon outlives serve and may still be writing the store when
+// the test reads or writes it directly: wait on a lock (bounded by the hang
+// backstop) instead of failing with SQLITE_BUSY.
+function openDb(dbPath, options={}) {
+  const db=new DatabaseSync(dbPath,options);
+  db.exec(`PRAGMA busy_timeout=${HANG_BACKSTOP_MS}`);
+  return db;
+}
 function insertLegacy(dbPath, kind, id, seed) {
-  const db=new DatabaseSync(dbPath);
+  const db=openDb(dbPath);
   try {
     if(kind==="view") db.prepare("INSERT INTO views(id,payload) VALUES(?,?)").run(id,JSON.stringify({id,title:"Legacy view",query:{seed},pins:{},hidden:[]}));
     else db.prepare("INSERT INTO annotations(id,node_id,payload) VALUES(?,?,?)").run(id,seed,JSON.stringify({id,nodeId:seed,body:"Legacy body"}));
