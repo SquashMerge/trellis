@@ -331,7 +331,9 @@ class Daemon:
                                     capture_output=True, text=True, timeout=10)
         except (subprocess.TimeoutExpired, OSError):
             return False
-        return any(line.startswith("n") and line.endswith("daemon.sock") for line in result.stdout.splitlines())
+        # Linux lsof appends " type=STREAM" to a socket's name; macOS does not.
+        names = [line[1:].split(" type=")[0] for line in result.stdout.splitlines() if line.startswith("n")]
+        return any(name.endswith("/daemon.sock") for name in names)
 
     def ready(self):
         deadline = time.monotonic() + SETUP_TIMEOUT_S
