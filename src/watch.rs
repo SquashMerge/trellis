@@ -243,6 +243,33 @@ fn read_only(kind: EventKind) -> bool {
     )
 }
 
+/// Drop a native watcher off the caller's thread. notify's macOS FSEvents
+/// watcher stops its run loop and then joins the run-loop thread; when the
+/// stop is lost in a race the join never returns. Dropping on a detached
+/// thread means that leaks one idle thread instead of wedging the checkout
+/// worker (or any owner). If no thread can be started, the watcher is leaked.
+fn release_watcher(watcher: Option<RecommendedWatcher>) {
+    let Some(watcher) = watcher else {
+        return;
+    };
+    let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(watcher)));
+    let reaped = std::sync::Arc::clone(&slot);
+    let spawned = std::thread::Builder::new()
+        .name("notify-reaper".into())
+        .spawn(move || drop(reaped.lock().unwrap().take()));
+    if spawned.is_err()
+        && let Some(watcher) = slot.lock().unwrap().take()
+    {
+        std::mem::forget(watcher);
+    }
+}
+
+impl Drop for WatchSignals {
+    fn drop(&mut self) {
+        release_watcher(self.watcher.take());
+    }
+}
+
 /// Owned by the elected leader, never by a reader or a second durable work queue.
 pub struct WatchSignals {
     root: PathBuf,
@@ -445,7 +472,7 @@ impl WatchSignals {
     /// exact bounded synthetic ingress, generation and acknowledgment logic.
     #[doc(hidden)]
     pub fn disable_native_watcher_for_tests(&mut self) {
-        self.watcher = None;
+        release_watcher(self.watcher.take());
     }
 
     pub fn watching(&self) -> bool {
@@ -553,7 +580,7 @@ impl WatchSignals {
         self.health.report(self.epoch, true);
         self.pending.full = true;
         self.urgent = true;
-        self.watcher = None;
+        release_watcher(self.watcher.take());
     }
 
     /// Direct feed for the leader's wider event loop. The normal notify callback
