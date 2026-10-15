@@ -161,6 +161,59 @@ class PhaseProcesses(unittest.TestCase):
         self.assertEqual(phase.daemon.returncode, -9)
         self.assertTrue(RUNNER.election_free(self.home))
 
+    def test_an_interrupt_during_the_graceful_wait_still_kills_and_reaps(self):
+        # A measurement signal raises Interrupted inside the daemon's graceful
+        # wait; injected deterministically at that wait.
+        self.mode("ignore-term")
+        phase = self.phase()
+        phase.start(listen_timeout_s=30)
+        wait = phase.daemon.wait
+        calls = []
+        def interrupted_once(*args, **kwargs):
+            calls.append(kwargs.get("timeout"))
+            if len(calls) == 1:
+                raise RUNNER.Interrupted("signal 15 interrupted measurement")
+            return wait(*args, **kwargs)
+        phase.daemon.wait = interrupted_once
+        with self.assertRaises(RUNNER.Interrupted):
+            phase.stop()
+        self.assertEqual(phase.daemon.returncode, -9, "the TERM-ignoring daemon kept running")
+        self.assertTrue(RUNNER.election_free(self.home))
+
+    def test_an_interrupted_teardown_is_journaled_as_a_failure(self):
+        self.mode("ignore-term")
+        phase = self.phase()
+        phase.start(listen_timeout_s=30)
+        wait = phase.daemon.wait
+        state = {"first": True}
+        def interrupted_once(*args, **kwargs):
+            if state.pop("first", False):
+                raise RUNNER.Interrupted("signal 2 interrupted measurement")
+            return wait(*args, **kwargs)
+        phase.daemon.wait = interrupted_once
+        events = self.temp / "events.jsonl"
+        with events.open("x") as log:
+            with self.assertRaises(RUNNER.Interrupted):
+                RUNNER.close_out(log, events, phase, {})
+        rows = [json.loads(line) for line in events.read_text().splitlines()]
+        self.assertEqual([r["type"] for r in rows], ["failure", "summary"])
+        self.assertFalse(rows[-1]["pass_gate"])
+        self.assertIsNotNone(phase.daemon.returncode)
+
+    def test_a_failed_close_still_closes_the_other_log_and_checks_the_election(self):
+        phase = self.phase()
+        phase.start(listen_timeout_s=30)
+        real_close = phase.stderr.close
+        def failing_close():
+            real_close()
+            raise OSError("close failed")
+        phase.stderr.close = failing_close
+        with self.assertRaises(OSError):
+            phase.stop()
+        self.assertTrue(phase.daemon_stderr.closed)
+        self.assertIsNotNone(phase.daemon.returncode)
+        self.assertTrue(RUNNER.election_free(self.home))
+
     def test_a_failed_start_is_still_stopped(self):
         for mode in ("exit-early", "never-listen"):
             with self.subTest(mode=mode):

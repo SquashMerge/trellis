@@ -362,7 +362,10 @@ class Daemon:
                     errors.append(exc)
         for handle in (self.stderr, self.daemon_stderr):
             if handle is not None:
-                handle.close()
+                try:
+                    handle.close()
+                except BaseException as exc:
+                    errors.append(exc)
         try:
             need(election_free(self.home), f"a daemon still holds the election for {self.home}")
         except BaseException as exc:
@@ -372,13 +375,24 @@ class Daemon:
 
 def stop_child(proc, grace_s):
     # A child is reaped here, so its PID is never reused before the signal.
-    if proc.poll() is None:
+    # If the graceful wait is interrupted (a measurement signal raises inside
+    # it), the child is still killed and reaped before the interrupt is
+    # raised: SIGKILL cannot be ignored, so that wait is bounded.
+    if proc.poll() is not None:
+        return
+    interrupted = None
+    try:
         proc.terminate()
-        try:
-            proc.wait(timeout=grace_s)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=10)
+        proc.wait(timeout=grace_s)
+    except subprocess.TimeoutExpired:
+        pass
+    except BaseException as exc:
+        interrupted = exc
+    if proc.poll() is None:
+        proc.kill()
+        proc.wait(timeout=10)
+    if interrupted is not None:
+        raise interrupted
 
 def election_free(home):
     # True only if this process can take every daemon lock under the private
