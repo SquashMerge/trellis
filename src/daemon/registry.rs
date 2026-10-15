@@ -1636,6 +1636,7 @@ impl CheckoutRuntime {
         let (response, catching_up) = self.evidence_response()?;
         let mut status = response.status()?;
         status.catching_up = catching_up;
+        status.watcher = Some(self.resources()?.scheduler.checkout_watcher_witness());
         Ok(serde_json::to_value(response.finish(status)?)?)
     }
 

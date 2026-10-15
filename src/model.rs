@@ -222,6 +222,9 @@ pub struct IndexStatus {
     pub evidence_format: Option<String>,
     pub stats: IndexStats,
     pub diagnostics: Vec<Diagnostic>,
+    /// The daemon's watcher-health witness for this checkout, on CLI status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watcher: Option<crate::watch::WatcherWitness>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

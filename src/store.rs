@@ -6657,6 +6657,7 @@ impl Store {
             diagnostics: serde_json::from_str(&row.9)?,
             evidence_format: (row.0 == i64::from(DATABASE_SCHEMA_VERSION) && row.6 > 0)
                 .then(|| EVIDENCE_FORMAT.to_owned()),
+            watcher: None,
         })
     }
     fn ensure_public_read_ready(&self) -> Result<()> {

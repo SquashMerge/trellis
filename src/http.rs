@@ -699,6 +699,11 @@ impl DaemonState {
         self.watcher_health.degraded()
     }
 
+    /// One coherent watcher-health witness, for measurement.
+    pub fn checkout_watcher_witness(&self) -> crate::watch::WatcherWitness {
+        self.watcher_health.witness()
+    }
+
     /// A pending watcher hint (including the periodic inventory deadline) keeps
     /// the selected checkout in the catching-up state until the worker
     /// acknowledges it. Reads the published status only (#138 item 2): ingress

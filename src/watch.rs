@@ -25,12 +25,30 @@ const MAX_WAIT: Duration = Duration::from_millis(250);
 /// replaced watcher can never mark the current one degraded (#138 item 22).
 #[derive(Default)]
 pub struct WatcherHealth {
-    /// `epoch << 1 | degraded`: the epoch check and the health update are one
-    /// compare-and-swap, so a report from a replaced watcher can never land
-    /// after a new epoch began.
+    /// `epoch << 2 | native << 1 | degraded`: the epoch check and the health
+    /// update are one compare-and-swap, so a report from a replaced watcher
+    /// can never land after a new epoch began.
     state: AtomicU64,
+    /// Transitions to degraded, across all epochs. Counted before the
+    /// transition is published, so a reader that sees the transition (or any
+    /// later state) also sees its count; a count whose transition then loses
+    /// to a new epoch only over-reports.
+    degradations: AtomicU64,
     #[cfg(test)]
     after_load: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+/// One coherent reading of watcher health, for measurement (Decision 0009
+/// §5): watching stayed healthy between two readings only if they are equal
+/// and the first is native and not degraded. The current bit alone can
+/// return to healthy unseen, with a new epoch or between readings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WatcherWitness {
+    pub epoch: u64,
+    pub native: bool,
+    pub degraded: bool,
+    pub degradations: u64,
 }
 
 impl std::fmt::Debug for WatcherHealth {
@@ -47,15 +65,28 @@ impl WatcherHealth {
         self.state.load(Ordering::Acquire) & 1 == 1
     }
 
-    /// Start a new watcher's epoch, healthy; reports from earlier watchers are
-    /// ignored from here on.
+    /// The state, then the count: every state change is a release
+    /// read-modify-write, so the count of any transition visible in the state
+    /// is visible too.
+    pub fn witness(&self) -> WatcherWitness {
+        let state = self.state.load(Ordering::Acquire);
+        WatcherWitness {
+            epoch: state >> 2,
+            native: state & 2 != 0,
+            degraded: state & 1 != 0,
+            degradations: self.degradations.load(Ordering::Acquire),
+        }
+    }
+
+    /// Start a new watcher's epoch, healthy and not yet native; reports from
+    /// earlier watchers are ignored from here on.
     fn begin_epoch(&self) -> u64 {
         let mut current = self.state.load(Ordering::Acquire);
         loop {
-            let epoch = (current >> 1) + 1;
+            let epoch = (current >> 2) + 1;
             match self.state.compare_exchange_weak(
                 current,
-                epoch << 1,
+                epoch << 2,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
@@ -65,8 +96,8 @@ impl WatcherHealth {
         }
     }
 
-    /// Report as of `epoch`; ignored once a later epoch has begun.
-    fn report(&self, epoch: u64, degraded: bool) {
+    /// Set `bits` as of `epoch`; ignored once a later epoch has begun.
+    fn set(&self, epoch: u64, bits: u64) {
         let mut current = self.state.load(Ordering::Acquire);
         #[cfg(test)]
         {
@@ -75,36 +106,39 @@ impl WatcherHealth {
                 hook();
             }
         }
-        while current >> 1 == epoch {
+        let mut counted = false;
+        while current >> 2 == epoch && current & bits != bits {
+            if bits & 1 == 1 && current & 1 == 0 && !counted {
+                self.degradations.fetch_add(1, Ordering::AcqRel);
+                counted = true;
+            }
             match self.state.compare_exchange_weak(
                 current,
-                epoch << 1 | u64::from(degraded),
+                current | bits,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => {
-                    if degraded && current & 1 == 0 {
-                        // A monotonic witness for measurement: the health
-                        // bit alone can return to healthy unseen.
-                        crate::index_coordinator::diagnostic_marker(
-                            "-",
-                            "watcher_degraded",
-                            &format!("epoch={epoch}"),
-                        );
-                    }
-                    return;
-                }
+                Ok(_) => return,
                 Err(actual) => current = actual,
             }
         }
     }
 
+    /// Report the watcher of `epoch` degraded. Degradation is sticky for the
+    /// epoch.
+    fn degrade(&self, epoch: u64) {
+        self.set(epoch, 1);
+    }
+
     /// What setup found, published after the callback is installed. The epoch
-    /// began healthy and setup only adds degradation, so an error the callback
+    /// began healthy and setup only adds to it, so an error the callback
     /// already published is never cleared.
-    fn publish_setup(&self, epoch: u64, degraded: bool) {
+    fn publish_setup(&self, epoch: u64, native: bool, degraded: bool) {
+        if native {
+            self.set(epoch, 2);
+        }
         if degraded {
-            self.report(epoch, true);
+            self.degrade(epoch);
         }
     }
 
@@ -571,7 +605,7 @@ impl WatchSignals {
             }
             // A watcher error is published at once, not when the worker drains.
             if event.is_err() {
-                callback_health.report(epoch, true);
+                callback_health.degrade(epoch);
             }
             if relevant {
                 accept(
@@ -609,14 +643,7 @@ impl WatchSignals {
             )
             .flatten();
         let degraded = native && watcher.is_none();
-        // A monotonic witness for measurement: each watcher's epoch, and
-        // whether it has a native watcher.
-        crate::index_coordinator::diagnostic_marker(
-            "-",
-            "watcher_epoch",
-            &format!("epoch={epoch} native={}", watcher.is_some()),
-        );
-        health.publish_setup(epoch, degraded);
+        health.publish_setup(epoch, watcher.is_some(), degraded);
         let captured_inputs = [scip_path, manifest_path]
             .into_iter()
             .flatten()
@@ -837,7 +864,7 @@ impl WatchSignals {
 
     fn fail(&mut self) {
         self.degraded = true;
-        self.health.report(self.epoch, true);
+        self.health.degrade(self.epoch);
         self.pending.full = true;
         self.urgent = true;
         self.release_native();
@@ -1002,13 +1029,13 @@ mod health_epoch_tests {
         let health = WatcherHealth::default();
         let replaced = health.begin_epoch();
         let current = health.begin_epoch();
-        health.report(replaced, true);
+        health.degrade(replaced);
         assert!(!health.degraded());
-        health.report(current, true);
+        health.degrade(current);
         assert!(health.degraded());
         health.reset();
         assert!(!health.degraded());
-        health.report(current, true);
+        health.degrade(current);
         assert!(!health.degraded(), "a reset ends the current epoch too");
     }
 
@@ -1026,11 +1053,10 @@ mod health_epoch_tests {
         }));
         let stale = {
             let health = Arc::clone(&health);
-            std::thread::spawn(move || health.report(old, true))
+            std::thread::spawn(move || health.degrade(old))
         };
         paused_rx.recv().unwrap();
-        let current = health.begin_epoch();
-        health.report(current, false);
+        health.begin_epoch();
         resume_tx.send(()).unwrap();
         stale.join().unwrap();
         assert!(!health.degraded(), "the replaced watcher's error leaked");
@@ -1041,9 +1067,43 @@ mod health_epoch_tests {
     fn a_setup_error_from_the_callback_is_not_cleared() {
         let health = WatcherHealth::default();
         let epoch = health.begin_epoch();
-        health.report(epoch, true); // the OS callback, mid-setup
-        health.publish_setup(epoch, false);
+        health.degrade(epoch); // the OS callback, mid-setup
+        health.publish_setup(epoch, true, false);
         assert!(health.degraded());
+    }
+
+    /// A degradation that health no longer shows, because a new epoch began
+    /// or not, is still visible in the witness.
+    #[test]
+    fn the_witness_keeps_a_degradation_the_health_bit_lost() {
+        let health = WatcherHealth::default();
+        let epoch = health.begin_epoch();
+        health.publish_setup(epoch, true, false);
+        let baseline = health.witness();
+        assert!(baseline.native && !baseline.degraded);
+        assert_eq!(health.witness(), baseline, "an unchanged reading");
+        health.degrade(epoch);
+        let replacement = health.begin_epoch();
+        health.publish_setup(replacement, true, false);
+        let after = health.witness();
+        assert!(
+            after.native && !after.degraded,
+            "health looks healthy again"
+        );
+        assert_eq!(after.degradations, baseline.degradations + 1);
+        assert_ne!(after, baseline);
+    }
+
+    /// A new epoch is not native until its setup publishes a native watcher.
+    #[test]
+    fn a_new_epoch_is_not_native_until_setup_publishes() {
+        let health = WatcherHealth::default();
+        let epoch = health.begin_epoch();
+        assert!(!health.witness().native);
+        health.publish_setup(epoch, false, false);
+        assert!(!health.witness().native);
+        health.publish_setup(epoch, true, false);
+        assert!(health.witness().native);
     }
 }
 

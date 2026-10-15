@@ -854,6 +854,19 @@ fn cold_cli_commands_start_and_reuse_daemon() {
     );
     let status = run(&home, "status", &root);
     assert!(status["revision"]["indexRevision"].as_u64().unwrap() >= 1);
+    // Daemon status carries the watcher-health witness (Decision 0009 §5),
+    // native once the current watcher's setup publishes.
+    let until = Instant::now() + trellis::testing::HANG_BACKSTOP;
+    let mut status = status;
+    while status["watcher"]["native"] != true {
+        assert!(Instant::now() < until, "no native watcher: {status}");
+        std::thread::sleep(Duration::from_millis(20));
+        status = run(&home, "status", &root);
+    }
+    let witness = &status["watcher"];
+    assert!(witness["epoch"].as_u64().unwrap() >= 1, "{status}");
+    assert_eq!(witness["degraded"], false, "{status}");
+    assert_eq!(witness["degradations"], 0, "{status}");
     let symbols = cli(&home)
         .arg("symbols")
         .arg("--workspace")
