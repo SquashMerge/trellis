@@ -68,7 +68,7 @@ No handler, registry operation or test path publishes, claims or reconciles outs
 | `Ready → RetireRequested{cutoff}` | registry, then worker | Release due (§5), and not declined |
 | `RetireRequested → Ready` | registry or enqueue gate | Reattach, a new read lease, or an enqueue; atomic under the state lock (§5) |
 | `RetireRequested → Closing` | worker | Linearization point: the cutoff work is done and irreversible close begins |
-| `Closing → Retired` | worker | Watcher, session, SQLite witnesses and use locks closed |
+| `Closing → Retired` | worker | Watcher released (no authority; native teardown may still run, see §5), session, SQLite witnesses and use locks closed |
 | `Reconciling`/`Ready`/`RetireRequested` → `RootLost` | worker | The root is missing, or the path now has a different `(device, inode)`, **and** the old-root settlement COMMIT is confirmed. Until then the runtime stays in its state, keeps its session and watcher, and makes no other progress. Its reads already fail `root_changed` at the root check. After an ambiguous outcome (busy, I/O error at COMMIT), the worker retries settlement at each boundary until a re-read confirms the terminal rows |
 | `RootLost → Closing` | worker | Immediately after settlement |
 | `Retired` → removed | registry | On the worker's `Retired` event |
@@ -111,8 +111,10 @@ Accepted FIFO work and its Q2→watcher→Q1 gate are never skipped.
 **When accepted**, under the state lock, the worker stamps the **cutoff**: the watcher's accepted generation at that moment. It then:
 1. makes one forced attempt at watcher intent up to the cutoff, if any is unacknowledged. Its outcome, including a capture invalidated by later changes, never holds the retirement: the next activation's startup reconciliation captures whatever it missed;
 2. takes the state lock again, and enters `Closing` only if the state is still `RetireRequested`;
-3. closes the watcher, the session, the SQLite witnesses and the use locks;
+3. releases the watcher, then closes the session, the SQLite witnesses and the use locks;
 4. publishes `Retired`.
+
+**Releasing a watcher** (amended 2026-10-15). A released watcher has no authority over the checkout: its callbacks do nothing from that moment (no health, no events, no wakes). Its native teardown runs on a background reaper, because a native library's shutdown is not relied on to complete: notify's macOS FSEvents stop can be lost and never return. A watcher counts as stranded from release until its teardown returns. At most **4** may be stranded per daemon; at that limit no new native watcher is created, and a checkout without one reports degraded watcher health and finds changes through the periodic full inventory (60 s). A watcher whose setup fails is released the same way. The service level of that degraded mode, relative to the Stage 3 watcher latency gate, is not yet ruled.
 
 **Linearization.** Reattach, a new read lease and a durable enqueue all take the same state lock:
 - **Before `Closing`:** they cancel the retirement, the runtime returns to `Ready`, and its resources are still live.
@@ -241,6 +243,9 @@ Implementation may show that a rule needs to change. The change is then made to 
 - **§6 (C5):** the provisioning mutex serializes registrations, and the configuration is built under the registry guard, as at activation.
 - **§5:** retirement declines while startup reconciliation runs, but not while a failed attempt waits out its backoff.
 - **§5:** an enqueue that starts after `Closing` is durable and waits for the next activation; a stale client of a lost root does not block a verified replacement root.
+
+**Amendment approved by the owner (2026-10-15):**
+- **§§2, 5:** `Retired` requires the watcher to be released, not its native teardown finished. A released watcher has no authority (its callbacks are inert); teardown runs on tracked reapers, at most 4 stranded per daemon, past which checkouts run degraded on periodic inventory. Open: the degraded mode's service level relative to the Stage 3 gate.
 
 ## Consequences
 

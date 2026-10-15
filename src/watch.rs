@@ -10,7 +10,7 @@ use std::{
     path::{Component, Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc::{self, Receiver, SyncSender, TryRecvError},
     },
     time::{Duration, Instant},
@@ -243,20 +243,54 @@ fn read_only(kind: EventKind) -> bool {
     )
 }
 
-/// Drop a native watcher off the caller's thread. notify's macOS FSEvents
-/// watcher stops its run loop and then joins the run-loop thread; when the
-/// stop is lost in a race the join never returns. Dropping on a detached
-/// thread means that leaks one idle thread instead of wedging the checkout
-/// worker (or any owner). If no thread can be started, the watcher is leaked.
+/// Native watchers handed off but whose teardown has not finished, across
+/// the process (Decision 0009 §§2, 5, as amended 2026-10-15). A released
+/// watcher has no authority: its callbacks are inert at once. Its native
+/// teardown runs on a reaper; notify's macOS FSEvents stop can be lost and
+/// never return, which then strands that reaper.
+static STRANDED_WATCHERS: AtomicUsize = AtomicUsize::new(0);
+/// At this many stranded watchers no new native watcher is created: the
+/// checkout reports degraded health and relies on periodic inventory.
+pub const MAX_STRANDED_WATCHERS: usize = 4;
+
+/// Watchers handed off whose native teardown has not finished.
+pub fn stranded_watchers() -> usize {
+    STRANDED_WATCHERS.load(Ordering::Acquire)
+}
+
+/// Test-only gate a reaper waits on before it drops its watcher.
+#[cfg(test)]
+type ReaperGate = std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>;
+
+/// Test-only: hold reapers before they drop, to stand in for a lost stop.
+#[cfg(test)]
+static HOLD_REAPERS: std::sync::Mutex<Option<ReaperGate>> = std::sync::Mutex::new(None);
+
+/// Hand a native watcher to a reaper. It counts as stranded until its drop
+/// returns; if no reaper thread can start it is leaked and stays counted.
 fn release_watcher(watcher: Option<RecommendedWatcher>) {
     let Some(watcher) = watcher else {
         return;
     };
+    STRANDED_WATCHERS.fetch_add(1, Ordering::AcqRel);
     let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(watcher)));
     let reaped = std::sync::Arc::clone(&slot);
+    #[cfg(test)]
+    let hold = HOLD_REAPERS.lock().unwrap().clone();
     let spawned = std::thread::Builder::new()
         .name("notify-reaper".into())
-        .spawn(move || drop(reaped.lock().unwrap().take()));
+        .spawn(move || {
+            #[cfg(test)]
+            if let Some(hold) = hold {
+                let (released, changed) = &*hold;
+                let mut released = released.lock().unwrap();
+                while !*released {
+                    released = changed.wait(released).unwrap();
+                }
+            }
+            drop(reaped.lock().unwrap().take());
+            STRANDED_WATCHERS.fetch_sub(1, Ordering::AcqRel);
+        });
     if spawned.is_err()
         && let Some(watcher) = slot.lock().unwrap().take()
     {
@@ -266,7 +300,7 @@ fn release_watcher(watcher: Option<RecommendedWatcher>) {
 
 impl Drop for WatchSignals {
     fn drop(&mut self) {
-        release_watcher(self.watcher.take());
+        self.release_native();
     }
 }
 
@@ -292,6 +326,9 @@ pub struct WatchSignals {
     epoch: u64,
     /// Set once by the owning worker; ingress wakes it after each signal.
     waker: Arc<std::sync::OnceLock<Waker>>,
+    /// Cleared when the native watcher is released: its callbacks then do
+    /// nothing (no health, no events, no wakes).
+    live: Arc<AtomicBool>,
 }
 
 impl WatchSignals {
@@ -367,7 +404,13 @@ impl WatchSignals {
         let callback_waker = Arc::clone(&waker);
         let epoch = health.begin_epoch();
         let callback_health = Arc::clone(&health);
+        let live = Arc::new(AtomicBool::new(true));
+        let callback_live = Arc::clone(&live);
         let callback = move |event: notify::Result<Event>| {
+            // A released watcher has no authority over the checkout.
+            if !callback_live.load(Ordering::Acquire) {
+                return;
+            }
             // A watcher error is published at once, not when the worker drains.
             if event.is_err() {
                 callback_health.report(epoch, true);
@@ -383,14 +426,22 @@ impl WatchSignals {
                 event,
             );
         };
-        let watcher = native
-            .then(|| {
-                notify::recommended_watcher(callback).and_then(|mut watcher| {
-                    watcher.watch(&root, RecursiveMode::Recursive)?;
-                    Ok(watcher)
-                })
+        // With too many stranded watchers, no new native one is created.
+        let allowed = stranded_watchers() < MAX_STRANDED_WATCHERS;
+        let watcher = (native && allowed)
+            .then(|| match notify::recommended_watcher(callback) {
+                Ok(mut watcher) => match watcher.watch(&root, RecursiveMode::Recursive) {
+                    Ok(()) => Some(watcher),
+                    Err(_) => {
+                        // A failed setup is torn down off this thread too.
+                        live.store(false, Ordering::Release);
+                        release_watcher(Some(watcher));
+                        None
+                    }
+                },
+                Err(_) => None,
             })
-            .and_then(Result::ok);
+            .flatten();
         let degraded = native && watcher.is_none();
         health.publish_setup(epoch, degraded);
         let captured_inputs = [scip_path, manifest_path]
@@ -426,7 +477,15 @@ impl WatchSignals {
             health,
             epoch,
             waker,
+            live,
         }
+    }
+
+    /// Release the native watcher: its callbacks become inert at once and its
+    /// teardown runs on a reaper (Decision 0009 §§2, 5).
+    fn release_native(&mut self) {
+        self.live.store(false, Ordering::Release);
+        release_watcher(self.watcher.take());
     }
 
     /// Wake `waker` after every accepted signal from now on.
@@ -472,7 +531,7 @@ impl WatchSignals {
     /// exact bounded synthetic ingress, generation and acknowledgment logic.
     #[doc(hidden)]
     pub fn disable_native_watcher_for_tests(&mut self) {
-        release_watcher(self.watcher.take());
+        self.release_native();
     }
 
     pub fn watching(&self) -> bool {
@@ -580,7 +639,7 @@ impl WatchSignals {
         self.health.report(self.epoch, true);
         self.pending.full = true;
         self.urgent = true;
-        release_watcher(self.watcher.take());
+        self.release_native();
     }
 
     /// Direct feed for the leader's wider event loop. The normal notify callback
@@ -784,5 +843,78 @@ mod health_epoch_tests {
         health.report(epoch, true); // the OS callback, mid-setup
         health.publish_setup(epoch, false);
         assert!(health.degraded());
+    }
+}
+
+#[cfg(test)]
+mod reaper_tests {
+    use super::*;
+
+    /// Hold every reaper until the returned gate opens.
+    fn hold_reapers() -> Arc<(std::sync::Mutex<bool>, std::sync::Condvar)> {
+        let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        *HOLD_REAPERS.lock().unwrap() = Some(Arc::clone(&gate));
+        gate
+    }
+
+    fn open(gate: &(std::sync::Mutex<bool>, std::sync::Condvar)) {
+        *HOLD_REAPERS.lock().unwrap() = None;
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+    }
+
+    fn signals(root: &Path, health: &Arc<WatcherHealth>) -> WatchSignals {
+        WatchSignals::construct(root.to_path_buf(), None, None, true, Arc::clone(health))
+    }
+
+    /// Decision 0009 §§2, 5 (amended): at MAX_STRANDED_WATCHERS no new native
+    /// watcher is created; the checkout reports degraded and relies on
+    /// periodic inventory. Once teardown finishes, native watching resumes.
+    #[test]
+    fn at_the_stranded_limit_a_checkout_degrades_without_a_native_watcher() {
+        let temp = tempfile::tempdir().unwrap();
+        let gate = hold_reapers();
+        for _ in 0..MAX_STRANDED_WATCHERS {
+            let health = Arc::new(WatcherHealth::default());
+            let released = signals(temp.path(), &health);
+            assert!(released.watcher.is_some());
+            drop(released);
+        }
+        assert_eq!(stranded_watchers(), MAX_STRANDED_WATCHERS);
+        let health = Arc::new(WatcherHealth::default());
+        let limited = signals(temp.path(), &health);
+        assert!(limited.watcher.is_none(), "a native watcher past the limit");
+        assert!(limited.degraded);
+        assert!(health.degraded(), "the limit is not visible as degraded");
+        drop(limited);
+        open(&gate);
+        let deadline = Instant::now() + crate::testing::HANG_BACKSTOP;
+        while stranded_watchers() != 0 {
+            assert!(Instant::now() < deadline, "reapers never finished");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let health = Arc::new(WatcherHealth::default());
+        let resumed = signals(temp.path(), &health);
+        assert!(resumed.watcher.is_some());
+        assert!(!health.degraded());
+    }
+
+    /// A watcher whose setup fails is torn down by a reaper, never on the
+    /// constructing (checkout worker) thread.
+    #[test]
+    fn a_failed_watcher_setup_is_torn_down_by_a_reaper() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing");
+        let gate = hold_reapers();
+        let health = Arc::new(WatcherHealth::default());
+        let failed = signals(&missing, &health);
+        assert!(failed.watcher.is_none());
+        assert!(health.degraded());
+        assert_eq!(
+            stranded_watchers(),
+            1,
+            "the failed watcher was dropped on the constructing thread"
+        );
+        open(&gate);
     }
 }
