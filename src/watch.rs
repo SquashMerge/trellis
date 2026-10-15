@@ -132,11 +132,33 @@ fn submit(
     executable: Option<&Path>,
     event: notify::Result<Event>,
 ) {
-    if event.as_ref().is_ok_and(|event| {
-        read_only(event.kind) || certainly_excluded(event, root, selected, executable)
-    }) {
-        return;
+    if relevant(&event, root, selected, executable) {
+        accept(sender, generation, overflow, waker, event);
     }
+}
+
+/// Whether an event can affect the checkout. This may read file metadata, so
+/// a callback runs it before taking its liveness lock.
+fn relevant(
+    event: &notify::Result<Event>,
+    root: &Path,
+    selected: &BTreeSet<PathBuf>,
+    executable: Option<&Path>,
+) -> bool {
+    !event.as_ref().is_ok_and(|event| {
+        read_only(event.kind) || certainly_excluded(event, root, selected, executable)
+    })
+}
+
+/// Accept an event: bump the generation, queue it, wake the worker. Only short,
+/// non-blocking steps, so a callback may do this under its liveness lock.
+fn accept(
+    sender: &SyncSender<Signal>,
+    generation: &AtomicU64,
+    overflow: &AtomicBool,
+    waker: &std::sync::OnceLock<Waker>,
+    event: notify::Result<Event>,
+) {
     generation.fetch_add(1, Ordering::SeqCst);
     if sender
         .try_send(Signal {
@@ -302,10 +324,9 @@ pub fn stranded_watchers() -> usize {
     STRANDED_WATCHERS.load(Ordering::Acquire)
 }
 
-/// Test-only: run once in a callback, after its liveness check.
+/// A one-shot test hook.
 #[cfg(test)]
-static PAUSE_CALLBACK: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>> =
-    std::sync::Mutex::new(None);
+type TestHook = Arc<std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>>;
 
 /// Test-only gate a reaper waits on before it drops its watcher.
 #[cfg(test)]
@@ -383,6 +404,15 @@ pub struct WatchSignals {
     /// The native callback, for tests to deliver events directly.
     #[cfg(test)]
     callback: Arc<dyn Fn(notify::Result<Event>) + Send + Sync>,
+    /// Test-only: run once in this watcher's callback, under its lock.
+    #[cfg(test)]
+    pause_callback: TestHook,
+    /// Test-only: run once in this watcher's callback, while classifying.
+    #[cfg(test)]
+    pause_classify: TestHook,
+    /// Test-only: run once when a release finds a callback holding the lock.
+    #[cfg(test)]
+    release_waiting: TestHook,
 }
 
 impl WatchSignals {
@@ -460,10 +490,32 @@ impl WatchSignals {
         let callback_health = Arc::clone(&health);
         let live = Arc::new(std::sync::Mutex::new(true));
         let callback_live = Arc::clone(&live);
+        #[cfg(test)]
+        let pause_callback: TestHook = Default::default();
+        #[cfg(test)]
+        let callback_pause = Arc::clone(&pause_callback);
+        #[cfg(test)]
+        let pause_classify: TestHook = Default::default();
+        #[cfg(test)]
+        let classify_pause = Arc::clone(&pause_classify);
         let callback = Arc::new(move |event: notify::Result<Event>| {
+            // Classification may read file metadata: never under the lock.
+            #[cfg(test)]
+            {
+                let pause = classify_pause.lock().unwrap().take();
+                if let Some(pause) = pause {
+                    pause();
+                }
+            }
+            let relevant = relevant(
+                &event,
+                &callback_root,
+                &callback_selected,
+                callback_executable.as_deref(),
+            );
             // A released watcher has no authority over the checkout. The
-            // guard is held through health, event and wake, so a release
-            // waits for a callback already past this check.
+            // lock is held only through the short effects below, so a
+            // release waits for a callback already past this check.
             let live = callback_live
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -472,7 +524,7 @@ impl WatchSignals {
             }
             #[cfg(test)]
             {
-                let pause = PAUSE_CALLBACK.lock().unwrap().take();
+                let pause = callback_pause.lock().unwrap().take();
                 if let Some(pause) = pause {
                     pause();
                 }
@@ -481,16 +533,15 @@ impl WatchSignals {
             if event.is_err() {
                 callback_health.report(epoch, true);
             }
-            submit(
-                &callback_sender,
-                &callback_generation,
-                &callback_overflow,
-                &callback_waker,
-                &callback_root,
-                &callback_selected,
-                callback_executable.as_deref(),
-                event,
-            );
+            if relevant {
+                accept(
+                    &callback_sender,
+                    &callback_generation,
+                    &callback_overflow,
+                    &callback_waker,
+                    event,
+                );
+            }
         });
         // A native watcher first reserves its slot; past the budget none is
         // created and the checkout runs degraded.
@@ -555,6 +606,12 @@ impl WatchSignals {
             live,
             #[cfg(test)]
             callback,
+            #[cfg(test)]
+            pause_callback,
+            #[cfg(test)]
+            pause_classify,
+            #[cfg(test)]
+            release_waiting: Default::default(),
         }
     }
 
@@ -562,10 +619,25 @@ impl WatchSignals {
     /// (a callback already past its check finishes first), and its teardown
     /// runs on a reaper (Decision 0009 §§2, 5).
     fn release_native(&mut self) {
-        *self
-            .live
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = false;
+        let mut live = match self.live.try_lock() {
+            Ok(live) => live,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                // A callback is applying its effects: wait for it.
+                #[cfg(test)]
+                {
+                    let hook = self.release_waiting.lock().unwrap().take();
+                    if let Some(hook) = hook {
+                        hook();
+                    }
+                }
+                self.live
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+            }
+        };
+        *live = false;
+        drop(live);
         release_watcher(self.watcher.take());
     }
 
@@ -931,21 +1003,54 @@ mod health_epoch_tests {
 mod reaper_tests {
     use super::*;
 
-    /// Hold every reaper until the returned gate opens.
-    fn hold_reapers() -> Arc<(std::sync::Mutex<bool>, std::sync::Condvar)> {
-        let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
-        *HOLD_REAPERS.lock().unwrap() = Some(Arc::clone(&gate));
-        gate
+    /// Exclusive use of the process-wide test settings (native budget, reaper
+    /// gate), reset when dropped so no other test inherits them.
+    struct Globals {
+        gate: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+        _serial: std::sync::MutexGuard<'static, ()>,
     }
-
-    fn open(gate: &(std::sync::Mutex<bool>, std::sync::Condvar)) {
-        *HOLD_REAPERS.lock().unwrap() = None;
-        *gate.0.lock().unwrap() = true;
-        gate.1.notify_all();
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    impl Globals {
+        /// Hold every reaper until `open`; `budget` 0 keeps the default.
+        fn hold(budget: usize) -> Self {
+            let serial = SERIAL
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+            *HOLD_REAPERS.lock().unwrap() = Some(Arc::clone(&gate));
+            TEST_NATIVE_BUDGET.store(budget, Ordering::Release);
+            Self {
+                gate,
+                _serial: serial,
+            }
+        }
+        fn open(&self) {
+            *HOLD_REAPERS.lock().unwrap() = None;
+            *self.gate.0.lock().unwrap() = true;
+            self.gate.1.notify_all();
+        }
+        /// Wait until no native watcher holds a slot.
+        fn drained(&self) {
+            let deadline = Instant::now() + crate::testing::HANG_BACKSTOP;
+            while native_watchers() != 0 {
+                assert!(Instant::now() < deadline, "reapers never finished");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+    impl Drop for Globals {
+        fn drop(&mut self) {
+            self.open();
+            TEST_NATIVE_BUDGET.store(0, Ordering::Release);
+        }
     }
 
     fn signals(root: &Path, health: &Arc<WatcherHealth>) -> WatchSignals {
         WatchSignals::construct(root.to_path_buf(), None, None, true, Arc::clone(health))
+    }
+
+    fn hook(run: impl FnOnce() + Send + 'static) -> Option<Box<dyn FnOnce() + Send>> {
+        Some(Box::new(run))
     }
 
     /// Decision 0009 §§2, 5 (amended): a native watcher holds its slot from
@@ -955,8 +1060,7 @@ mod reaper_tests {
     #[test]
     fn the_native_budget_counts_active_and_stranded_watchers() {
         let temp = tempfile::tempdir().unwrap();
-        TEST_NATIVE_BUDGET.store(3, Ordering::Release);
-        let gate = hold_reapers();
+        let globals = Globals::hold(3);
         let health = || Arc::new(WatcherHealth::default());
         let first = signals(temp.path(), &health());
         let second = signals(temp.path(), &health());
@@ -978,19 +1082,16 @@ mod reaper_tests {
         drop(second);
         drop(replacement);
         assert!(stranded_watchers() <= 3, "more stranded than the budget");
-        open(&gate);
-        let deadline = Instant::now() + crate::testing::HANG_BACKSTOP;
-        while native_watchers() != 0 {
-            assert!(Instant::now() < deadline, "reapers never finished");
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        globals.open();
+        globals.drained();
         let resumed = signals(temp.path(), &health());
         assert!(resumed.watcher.is_some());
     }
 
-    /// Decision 0009 §5 (amended): once a release returns, the released
-    /// watcher's callbacks do nothing. A callback already past its liveness
-    /// check finishes before the release returns.
+    /// Decision 0009 §5 (amended): a release waits for a callback that is
+    /// applying its effects, and afterwards callbacks do nothing. The release
+    /// is shown blocked on that callback (its waiting hook runs only when the
+    /// lock is held), not inferred from timing.
     #[test]
     fn a_release_waits_for_an_in_flight_callback_and_silences_later_ones() {
         let temp = tempfile::tempdir().unwrap();
@@ -1016,39 +1117,95 @@ mod reaper_tests {
         };
         let (paused_tx, paused) = std::sync::mpsc::sync_channel(1);
         let (resume_tx, resume) = std::sync::mpsc::sync_channel::<()>(1);
-        *PAUSE_CALLBACK.lock().unwrap() = Some(Box::new(move || {
+        *watched.pause_callback.lock().unwrap() = hook(move || {
             paused_tx.send(()).unwrap();
             let _ = resume.recv();
-        }));
+        });
+        let (waiting_tx, waiting) = std::sync::mpsc::sync_channel(1);
+        *watched.release_waiting.lock().unwrap() = hook(move || {
+            waiting_tx.send(()).unwrap();
+        });
         let in_flight = {
             let callback = Arc::clone(&callback);
             let event = event();
             std::thread::spawn(move || callback(event))
         };
-        paused.recv().unwrap();
-        let released = Arc::new(AtomicBool::new(false));
-        let releasing = {
-            let released = Arc::clone(&released);
-            std::thread::spawn(move || {
-                drop(watched);
-                released.store(true, Ordering::Release);
-            })
-        };
-        std::thread::sleep(Duration::from_millis(200));
-        let returned_early = released.load(Ordering::Acquire);
+        paused
+            .recv_timeout(crate::testing::HANG_BACKSTOP)
+            .expect("the callback never reached its effects");
+        let releasing = std::thread::spawn(move || drop(watched));
+        waiting
+            .recv_timeout(crate::testing::HANG_BACKSTOP)
+            .expect("the release did not wait for the in-flight callback");
         resume_tx.send(()).unwrap();
         in_flight.join().unwrap();
         releasing.join().unwrap();
-        assert!(
-            !returned_early,
-            "release returned while a callback was still acting"
-        );
-        let before = wakes.load(Ordering::Acquire);
+        assert_eq!(wakes.load(Ordering::Acquire), 1, "the in-flight wake");
         callback(event());
         assert_eq!(
             wakes.load(Ordering::Acquire),
-            before,
+            1,
             "a released watcher's callback woke the worker"
+        );
+    }
+
+    /// Classification (which may read file metadata) runs outside the lock:
+    /// a release is not held up by a callback still classifying, and that
+    /// callback then does nothing.
+    #[test]
+    fn a_release_is_not_held_by_a_callback_still_classifying() {
+        let temp = tempfile::tempdir().unwrap();
+        let watched = WatchSignals::construct(
+            temp.path().to_path_buf(),
+            None,
+            None,
+            false,
+            Arc::new(WatcherHealth::default()),
+        );
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&wakes);
+        watched.set_waker(Arc::new(move || {
+            counted.fetch_add(1, Ordering::AcqRel);
+        }));
+        let callback = Arc::clone(&watched.callback);
+        let (paused_tx, paused) = std::sync::mpsc::sync_channel(1);
+        let (resume_tx, resume) = std::sync::mpsc::sync_channel::<()>(1);
+        *watched.pause_classify.lock().unwrap() = hook(move || {
+            paused_tx.send(()).unwrap();
+            let _ = resume.recv();
+        });
+        // Either the release waits on the callback, or it finishes.
+        let (outcome_tx, outcome) = std::sync::mpsc::channel();
+        let waiting_tx = outcome_tx.clone();
+        *watched.release_waiting.lock().unwrap() = hook(move || {
+            let _ = waiting_tx.send("waited");
+        });
+        let classifying = {
+            let callback = Arc::clone(&callback);
+            let event = Ok(
+                Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
+                    .add_path(temp.path().join("a.js")),
+            );
+            std::thread::spawn(move || callback(event))
+        };
+        paused
+            .recv_timeout(crate::testing::HANG_BACKSTOP)
+            .expect("the callback never classified");
+        let releasing = std::thread::spawn(move || {
+            drop(watched);
+            let _ = outcome_tx.send("released");
+        });
+        let first = outcome
+            .recv_timeout(crate::testing::HANG_BACKSTOP)
+            .expect("the release neither waited nor finished");
+        resume_tx.send(()).unwrap();
+        classifying.join().unwrap();
+        releasing.join().unwrap();
+        assert_eq!(first, "released", "the release waited on classification");
+        assert_eq!(
+            wakes.load(Ordering::Acquire),
+            0,
+            "a callback classified before release acted after it"
         );
     }
 
@@ -1058,7 +1215,7 @@ mod reaper_tests {
     fn a_failed_watcher_setup_is_torn_down_by_a_reaper() {
         let temp = tempfile::tempdir().unwrap();
         let missing = temp.path().join("missing");
-        let gate = hold_reapers();
+        let globals = Globals::hold(0);
         let health = Arc::new(WatcherHealth::default());
         let failed = signals(&missing, &health);
         assert!(failed.watcher.is_none());
@@ -1068,6 +1225,8 @@ mod reaper_tests {
             1,
             "the failed watcher was dropped on the constructing thread"
         );
-        open(&gate);
+        drop(failed);
+        globals.open();
+        globals.drained();
     }
 }
