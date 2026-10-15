@@ -17,6 +17,7 @@ trimmed; the run stops and the series must be restarted when watching is healthy
 Degraded mode (no native watcher: periodic 60 s inventory) has no latency gate.
 """
 import argparse
+import fcntl
 import hashlib
 import json
 import math
@@ -288,18 +289,54 @@ def edit_bytes(raw, language, kind):
     return raw[:first] + replacement + raw[first+len(old):], old.decode(), replacement.decode()
 
 class Daemon:
+    """One phase's Trellis daemon and serve, both children of this runner.
+
+    The runner starts the daemon itself and starts serve only once that daemon
+    listens, so serve attaches to it instead of starting a detached one. As
+    children, neither PID can be reused until it is reaped here, so stop()
+    signals exactly these processes. Construction has no side effects: assign
+    the object first, then start(), so a failed start is still stopped."""
+    GRACE_S = 20
+
     def __init__(self, scratch, label, workspace, home):
         self.workspace, self.home = workspace, home
-        self.stderr_path = scratch / f"{label}-daemon.stderr.log"
-        self.stderr = open(self.stderr_path, "wb", buffering=0)
+        self.stderr_path = scratch / f"{label}-serve.stderr.log"
+        self.daemon_stderr_path = scratch / f"{label}-daemon.stderr.log"
         self.argv = [str(BINARY), "serve", "--workspace", str(workspace), "--bind", "127.0.0.1:0",
                      "--token-file", str(scratch / f"{label}-token")]
-        self.proc = subprocess.Popen(self.argv, cwd=REPO, env=env_for(home),
-                                     stdout=subprocess.DEVNULL, stderr=self.stderr, start_new_session=True)
+        self.daemon = self.proc = None
+        self.daemon_stderr = self.stderr = None
         self.url = None
+
+    def start(self, listen_timeout_s=SETUP_TIMEOUT_S):
+        env = env_for(self.home)
+        self.daemon_stderr = open(self.daemon_stderr_path, "wb", buffering=0)
+        self.daemon = subprocess.Popen([str(BINARY), "daemon"], cwd=REPO, env=env, stdin=subprocess.DEVNULL,
+                                       stdout=subprocess.DEVNULL, stderr=self.daemon_stderr,
+                                       start_new_session=True)
+        deadline = time.monotonic() + listen_timeout_s
+        while not self.listening():
+            need(self.daemon.poll() is None, "runner's daemon exited before listening")
+            need(time.monotonic() < deadline, "runner's daemon did not start listening")
+            time.sleep(.05)
+        self.stderr = open(self.stderr_path, "wb", buffering=0)
+        self.proc = subprocess.Popen(self.argv, cwd=REPO, env=env, stdout=subprocess.DEVNULL,
+                                     stderr=self.stderr, start_new_session=True)
+
+    def listening(self):
+        # The daemon binds its socket only after it holds the election. An lsof
+        # that fails or hangs reads as "not yet", which the deadline bounds.
+        try:
+            result = subprocess.run(["lsof", "-a", "-p", str(self.daemon.pid), "-U", "-Fn"],
+                                    capture_output=True, text=True, timeout=10)
+        except (subprocess.TimeoutExpired, OSError):
+            return False
+        return any(line.startswith("n") and line.endswith("daemon.sock") for line in result.stdout.splitlines())
+
     def ready(self):
         deadline = time.monotonic() + SETUP_TIMEOUT_S
         while time.monotonic() < deadline:
+            need(self.daemon.poll() is None, "runner's daemon exited")
             need(self.proc.poll() is None, f"serve exited: {self.stderr_path.read_text(errors='replace')[-3000:]}")
             match = re.search(r"Trellis: (http://127\.0\.0\.1:\d+)/", self.stderr_path.read_text(errors="replace"))
             if match:
@@ -312,59 +349,51 @@ class Daemon:
                     pass
             time.sleep(.05)
         raise Invalid("serve readiness deadline exceeded")
+
     def stop(self):
-        if self.proc.poll() is None:
-            self.proc.terminate()
-            try:
-                self.proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
-                self.proc.wait(timeout=5)
-        self.stderr.close()
-        # serve starts the daemon detached; it must not outlive its phase.
-        stop_daemons(self.home)
-
-def lock_holders(lock):
-    try:
-        result = subprocess.run(["lsof", "-t", str(lock)], capture_output=True, text=True, timeout=10)
-    except subprocess.TimeoutExpired:
-        raise Invalid(f"lsof did not answer for {lock}")
-    return {int(pid) for pid in result.stdout.split()}
-
-def alive(pid):
-    # A zombie has exited: it holds no lock and does no work.
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True, timeout=10)
-    return state.stdout.strip()[:1] not in ("", "Z")
-
-def stop_daemons(home, grace_s=20):
-    # Stop every Trellis daemon elected for this private HOME: the holders of
-    # its daemon.lock, which lives only under HOME. Fails if one survives, so
-    # a phase never starts beside its predecessor's daemon.
-    for lock in home.rglob("daemon.lock"):
-        holders = lock_holders(lock)
-        for pid in holders:
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-        deadline = time.monotonic() + grace_s
-        while any(alive(pid) for pid in holders) and time.monotonic() < deadline:
-            time.sleep(.05)
-        for pid in holders:
-            if alive(pid):
+        # Every step runs even if an earlier one fails or is interrupted; the
+        # first error is raised at the end. Idempotent.
+        errors = []
+        for proc in (self.proc, self.daemon):
+            if proc is not None:
                 try:
-                    os.kill(pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-        deadline = time.monotonic() + 5
-        while any(alive(pid) for pid in holders) and time.monotonic() < deadline:
-            time.sleep(.05)
-        need(not any(alive(pid) for pid in holders) and not lock_holders(lock),
-             f"daemon for {home} did not stop")
+                    stop_child(proc, self.GRACE_S)
+                except BaseException as exc:
+                    errors.append(exc)
+        for handle in (self.stderr, self.daemon_stderr):
+            if handle is not None:
+                handle.close()
+        try:
+            need(election_free(self.home), f"a daemon still holds the election for {self.home}")
+        except BaseException as exc:
+            errors.append(exc)
+        if errors:
+            raise errors[0]
+
+def stop_child(proc, grace_s):
+    # A child is reaped here, so its PID is never reused before the signal.
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=grace_s)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=10)
+
+def election_free(home):
+    # True only if this process can take every daemon lock under the private
+    # HOME: no daemon, ours or one serve started, still holds it.
+    for lock in home.rglob("daemon.lock"):
+        descriptor = os.open(lock, os.O_RDONLY)
+        try:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return False
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+    return True
 
 def status(workspace, home):
     # serve announces readiness before the first H publishes. Baseline setup
@@ -483,11 +512,13 @@ def measure(args):
                 workspace = scratch / f"{size}-workspace"
                 home = scratch / f"{size}-private-home"
                 active = Daemon(scratch, size, workspace, home)
+                active.start()
                 active.ready()
                 previous, baseline_json = status(workspace, home)
                 baseline = selected_check(home, previous, size)
-                append(log, "setup", size=size, daemon_pid=active.proc.pid, daemon_argv=active.argv,
-                       daemon_stderr=str(active.stderr_path), url=active.url,
+                append(log, "setup", size=size, serve_pid=active.proc.pid, serve_argv=active.argv,
+                       serve_stderr=str(active.stderr_path), daemon_pid=active.daemon.pid,
+                       daemon_stderr=str(active.daemon_stderr_path), url=active.url,
                        baseline_pin=previous, baseline_status_sha256=sha(baseline_json.encode()),
                        baseline_selected=baseline, cold_setup_timing="excluded")
                 # Untimed setup: the current watcher's native setup publishes
@@ -534,6 +565,7 @@ def measure(args):
                                                          1000 if size == "medium" else 10000)
                         need(path.read_bytes() == after, "source changed during selected checks")
                         need(active.proc.poll() is None, "serve died during watcher sample")
+                        need(active.daemon.poll() is None, "runner's daemon died during watcher sample")
                         sample["valid"] = True
                         previous = pin
                     except BaseException as exc:
@@ -561,11 +593,13 @@ def measure(args):
             workspace = scratch / "fallback-workspace"
             home = scratch / "fallback-private-home"
             active = Daemon(scratch, "fallback", workspace, home)
+            active.start()
             active.ready()
             prior, baseline_json = status(workspace, home)
             baseline = selected_check(home, prior, "medium")
-            append(log, "setup", size="fallback-medium", daemon_pid=active.proc.pid,
-                   daemon_argv=active.argv, daemon_stderr=str(active.stderr_path), url=active.url,
+            append(log, "setup", size="fallback-medium", serve_pid=active.proc.pid,
+                   serve_argv=active.argv, serve_stderr=str(active.stderr_path),
+                   daemon_pid=active.daemon.pid, daemon_stderr=str(active.daemon_stderr_path), url=active.url,
                    baseline_pin=prior, baseline_status_sha256=sha(baseline_json.encode()),
                    baseline_selected=baseline, cold_setup_timing="excluded")
             path = workspace / "python/Cmedium0000.py"
@@ -593,6 +627,7 @@ def measure(args):
                                 selected=selected_check(home, pin, "medium", ("python/Cmedium0000.py", "python", after)))
                 need(path.read_bytes() == after, "fallback source changed unexpectedly")
                 need(active.proc.poll() is None, "serve died during fallback")
+                need(active.daemon.poll() is None, "runner's daemon died during fallback")
                 active.stop()
                 active = None
                 # An independent cold watcher-driven Serve on SAME root, different private index state;
@@ -600,6 +635,7 @@ def measure(args):
                 cold_home = scratch / "cold-private-home"
                 cold_start_ns = time.monotonic_ns()
                 active = Daemon(scratch, "cold-oracle", workspace, cold_home)
+                active.start()
                 active.ready()
                 cold_pin, cold_json = status(workspace, cold_home)
                 cold_selected_ns = time.monotonic_ns()
@@ -631,17 +667,34 @@ def measure(args):
                    note="partial samples retained, never replace or drop")
             raise
         finally:
-            if active is not None:
-                active.stop()
-            for sig, previous in old_handlers.items():
-                signal.signal(sig, previous)
-            # Even interrupted runs have an explicit conservative summary.
-            try:
-                records = [json.loads(line) for line in events.read_text().splitlines()]
-                append(log, "summary", **summarize_records(records))
-            except Exception as exc:
-                append(log, "summary", pass_gate=False, error=f"summarizer failed: {exc}")
+            close_out(log, events, active, old_handlers)
     print(json.dumps({"events": str(events), "sha256": file_sha(events)}, sort_keys=True))
+
+def close_out(log, events, active, old_handlers):
+    # Teardown, handler restoration and the summary each run even if an
+    # earlier one fails. A teardown failure is journaled as a failure (so the
+    # gate fails) and raised after the summary.
+    teardown = None
+    if active is not None:
+        try:
+            active.stop()
+        except BaseException as exc:
+            teardown = exc
+            try:
+                append(log, "failure", message=f"teardown: {type(exc).__name__}: {exc}",
+                       note="phase processes may remain; never replace or drop")
+            except Exception:
+                pass
+    for sig, previous in old_handlers.items():
+        signal.signal(sig, previous)
+    # Even interrupted runs have an explicit conservative summary.
+    try:
+        records = [json.loads(line) for line in events.read_text().splitlines()]
+        append(log, "summary", **summarize_records(records))
+    except Exception as exc:
+        append(log, "summary", pass_gate=False, error=f"summarizer failed: {exc}")
+    if teardown is not None:
+        raise teardown
 
 def summarize_records(records):
     series = {}

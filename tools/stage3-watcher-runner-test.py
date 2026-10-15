@@ -6,6 +6,9 @@ stand-in daemon that holds a private HOME's daemon lock.
 """
 import copy
 import importlib.util
+import json
+import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -88,45 +91,134 @@ class Witness(unittest.TestCase):
         self.assertFalse(RUNNER.stayed_healthy(not_native, dict(not_native)))
 
 
-FAKE_DAEMON = """
-import fcntl, signal, sys, time
-if sys.argv[2] == "ignore-term":
-    signal.signal(signal.SIGTERM, signal.SIG_IGN)
-lock = open(sys.argv[1], "w")
-fcntl.flock(lock, fcntl.LOCK_EX)
-print("held", flush=True)
+FAKE_TRELLIS = """#!/usr/bin/env python3
+import fcntl, os, signal, socket, sys, time
+mode = os.environ.get("FAKE_MODE", "")
+if sys.argv[1] == "daemon":
+    if mode == "exit-early":
+        sys.exit(3)
+    if mode == "ignore-term":
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    run = os.path.join(os.environ["HOME"], "run")
+    os.makedirs(run, exist_ok=True)
+    lock = os.open(os.path.join(run, "daemon.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    if mode != "never-listen":
+        path = os.path.join(run, "daemon.sock")
+        if os.path.exists(path):
+            os.unlink(path)  # the elected daemon replaces a stale socket
+        listener = socket.socket(socket.AF_UNIX)
+        listener.bind(path)
+        listener.listen()
 while True:
     time.sleep(1)
 """
 
 
-class DaemonCleanup(unittest.TestCase):
-    def daemon(self, home, mode):
-        lock = home / "Library/Application Support/dev.squashmerge.trellis/run/daemon.lock"
-        lock.parent.mkdir(parents=True)
-        proc = subprocess.Popen([sys.executable, "-c", FAKE_DAEMON, str(lock), mode],
-                                stdout=subprocess.PIPE, text=True, start_new_session=True)
-        self.addCleanup(lambda: proc.poll() is None and proc.kill())
-        self.assertEqual(proc.stdout.readline().strip(), "held")
-        return proc
+class PhaseProcesses(unittest.TestCase):
+    """Daemon start/stop against a stand-in trellis binary."""
 
-    def test_the_daemon_a_phase_started_is_stopped(self):
-        with tempfile.TemporaryDirectory() as temp:
-            proc = self.daemon(Path(temp), "plain")
-            RUNNER.stop_daemons(Path(temp))
-            self.assertIsNotNone(proc.wait(timeout=5))
+    def setUp(self):
+        self.temp = Path(tempfile.mkdtemp(prefix="s3", dir="/tmp"))
+        self.addCleanup(lambda: subprocess.run(["rm", "-rf", "--", str(self.temp)]))
+        fake = self.temp / "trellis"
+        fake.write_text(FAKE_TRELLIS)
+        fake.chmod(0o755)
+        saved = RUNNER.BINARY
+        RUNNER.BINARY = fake
+        self.addCleanup(lambda: setattr(RUNNER, "BINARY", saved))
+        self.home = self.temp / "home"
+        self.home.mkdir()
+        self.mode("")
+
+    def mode(self, mode):
+        saved = os.environ.get("FAKE_MODE")
+        os.environ["FAKE_MODE"] = mode
+        self.addCleanup(lambda: os.environ.__setitem__("FAKE_MODE", saved) if saved is not None
+                        else os.environ.pop("FAKE_MODE", None))
+
+    def phase(self):
+        phase = RUNNER.Daemon(self.temp, "t", self.temp, self.home)
+        phase.GRACE_S = 0.5
+        self.addCleanup(lambda: [p.kill() for p in (phase.proc, phase.daemon) if p and p.poll() is None])
+        return phase
+
+    def test_a_phase_stops_its_own_daemon_and_serve(self):
+        phase = self.phase()
+        phase.start(listen_timeout_s=30)
+        self.assertFalse(RUNNER.election_free(self.home))
+        phase.stop()
+        self.assertIsNotNone(phase.daemon.returncode)
+        self.assertIsNotNone(phase.proc.returncode)
+        self.assertTrue(RUNNER.election_free(self.home))
+        phase.stop()  # idempotent
 
     def test_a_daemon_ignoring_sigterm_is_killed(self):
-        with tempfile.TemporaryDirectory() as temp:
-            proc = self.daemon(Path(temp), "ignore-term")
-            started = time.monotonic()
-            RUNNER.stop_daemons(Path(temp), grace_s=0.5)
-            self.assertEqual(proc.wait(timeout=5), -9)
-            self.assertLess(time.monotonic() - started, 30)
+        self.mode("ignore-term")
+        phase = self.phase()
+        phase.start(listen_timeout_s=30)
+        phase.stop()
+        self.assertEqual(phase.daemon.returncode, -9)
+        self.assertTrue(RUNNER.election_free(self.home))
 
-    def test_a_home_without_a_daemon_is_a_no_op(self):
+    def test_a_failed_start_is_still_stopped(self):
+        for mode in ("exit-early", "never-listen"):
+            with self.subTest(mode=mode):
+                self.mode(mode)
+                phase = self.phase()
+                with self.assertRaises(RUNNER.Invalid):
+                    phase.start(listen_timeout_s=1)
+                self.assertIsNone(phase.proc, "serve started beside a daemon that never listened")
+                phase.stop()
+                self.assertIsNotNone(phase.daemon.returncode)
+                self.assertTrue(phase.daemon_stderr.closed)
+
+    def test_an_unavailable_lsof_fails_closed(self):
+        real = RUNNER.subprocess.run
+        def broken(argv, *args, **kwargs):
+            if argv[0] == "lsof":
+                raise subprocess.TimeoutExpired(argv, 10)
+            return real(argv, *args, **kwargs)
+        RUNNER.subprocess.run = broken
+        self.addCleanup(lambda: setattr(RUNNER.subprocess, "run", real))
+        phase = self.phase()
+        with self.assertRaises(RUNNER.Invalid):
+            phase.start(listen_timeout_s=1)
+        self.assertIsNone(phase.proc)
+        phase.stop()
+
+    def test_a_daemon_this_phase_did_not_start_fails_the_stop_and_is_left_alone(self):
+        phase = self.phase()
+        phase.start(listen_timeout_s=30)
+        phase.stop()
+        stray = subprocess.Popen([str(RUNNER.BINARY), "daemon"], env=dict(os.environ, HOME=str(self.home)),
+                                 start_new_session=True)
+        self.addCleanup(lambda: stray.poll() is None and (stray.kill(), stray.wait()))
+        deadline = time.monotonic() + 30
+        while RUNNER.election_free(self.home):
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(.05)
+        with self.assertRaises(RUNNER.Invalid):
+            phase.stop()
+        self.assertIsNone(stray.poll(), "stop signalled a process it did not start")
+
+
+class CloseOut(unittest.TestCase):
+    def test_a_failed_teardown_still_restores_handlers_and_summarizes(self):
+        class Failing:
+            def stop(self):
+                raise RUNNER.Invalid("teardown failed")
         with tempfile.TemporaryDirectory() as temp:
-            RUNNER.stop_daemons(Path(temp))
+            events = Path(temp) / "events.jsonl"
+            previous = signal.getsignal(signal.SIGUSR1)
+            signal.signal(signal.SIGUSR1, lambda *_: None)
+            with events.open("x") as log:
+                with self.assertRaises(RUNNER.Invalid):
+                    RUNNER.close_out(log, events, Failing(), {signal.SIGUSR1: previous})
+            self.assertEqual(signal.getsignal(signal.SIGUSR1), previous)
+            rows = [json.loads(line) for line in events.read_text().splitlines()]
+            self.assertEqual([r["type"] for r in rows], ["failure", "summary"])
+            self.assertFalse(rows[-1]["pass_gate"])
 
 
 if __name__ == "__main__":
