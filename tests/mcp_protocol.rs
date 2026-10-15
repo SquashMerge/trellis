@@ -4118,8 +4118,9 @@ async fn a_cancel_completed_before_the_decision_wins_even_if_unpublished() {
         .recv_timeout(trellis::testing::HANG_BACKSTOP)
         .unwrap();
     assert_eq!(next["id"], 2, "the cancelled call was answered: {next}");
-    // The reply thread holds a clone: end input explicitly.
+    // The reply thread holds a clone: end input explicitly, then close ours.
     client.shutdown(std::net::Shutdown::Both).unwrap();
+    drop(client);
     session.join().unwrap().unwrap();
 }
 
@@ -4478,8 +4479,10 @@ async fn a_worker_result_never_waits_for_client_input() {
         let reply = next_reply(&mut reader);
         seen.insert(reply["id"].as_i64().unwrap());
     }
-    client.shutdown(std::net::Shutdown::Both).unwrap();
+    // Close every client handle: replies still being written then fail at
+    // once. A shutdown alone need not unblock a full macOS socket buffer.
     drop(reader);
+    drop(client);
     session.join().unwrap().unwrap();
 }
 
