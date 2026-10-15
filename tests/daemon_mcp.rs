@@ -2059,6 +2059,21 @@ fn a_cancel_written_with_a_fifth_call_suppresses_its_refusal() {
     let root = checkout(home.path());
     let (daemon, listener, phase_path) = phase_daemon(home.path(), Some("launch_final"));
     let mut peer = Peer::start(home.path(), &root);
+    // Activate the checkout in this session first: the four timed calls must
+    // not also race a cold activation against their deadline.
+    writeln!(peer.stdin.as_mut().unwrap(), "{}", describe_frame(json!(0))).unwrap();
+    paused_at(&listener, "launch_final")
+        .write_all(b"x")
+        .unwrap();
+    let warm = peer
+        .lines
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .unwrap();
+    assert_eq!(warm["id"], 0, "{warm}");
+    assert!(
+        warm["result"]["structuredContent"]["data"].is_object(),
+        "{warm}"
+    );
     for id in 1..=4 {
         writeln!(
             peer.stdin.as_mut().unwrap(),
@@ -2079,12 +2094,19 @@ fn a_cancel_written_with_a_fifth_call_suppresses_its_refusal() {
         .unwrap()
         .write_all(burst.as_bytes())
         .unwrap();
-    let mut holds = vec![first];
+    // Only the first hold matters: the burst arrives while the relay has four
+    // live calls. Later pauses are released at once, so the remaining calls
+    // are not serialized through this thread against their deadlines.
+    let later = listener.try_clone().unwrap();
+    let releaser = std::thread::spawn(move || {
+        for _ in 0..3 {
+            paused_at(&later, "launch_final").write_all(b"x").unwrap();
+        }
+    });
+    let mut first = first;
+    first.write_all(b"x").unwrap();
     let mut answered = Vec::new();
     while answered.len() < 4 {
-        for mut hold in holds.drain(..) {
-            hold.write_all(b"x").unwrap();
-        }
         let reply = peer
             .lines
             .recv_timeout(trellis::testing::HANG_BACKSTOP)
@@ -2095,10 +2117,8 @@ fn a_cancel_written_with_a_fifth_call_suppresses_its_refusal() {
             "{reply}"
         );
         answered.push(reply["id"].as_i64().unwrap());
-        if answered.len() < 4 {
-            holds.push(paused_at(&listener, "launch_final"));
-        }
     }
+    releaser.join().unwrap();
     answered.sort_unstable();
     assert_eq!(answered, vec![1, 2, 3, 4]);
     assert!(
