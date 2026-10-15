@@ -34,9 +34,13 @@ pub struct TransportHooksForTests {
     /// On the coordinator, when a decision waits for a frame completed before
     /// it but not yet published.
     pub settle_waiting: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
-    /// On the coordinator, before the final input pass of an immediate call
-    /// outcome (validation or capacity); given the call's ID.
+    /// On the coordinator, before the fence that precedes a call's
+    /// immediate decision (dispatch, validation or capacity); given its ID.
     pub immediate_decision: Option<CallHookForTests>,
+    /// After each fence, with the number of requests awaiting decision.
+    pub fence_handled: Option<std::sync::Arc<dyn Fn(usize) + Send + Sync>>,
+    /// On a call worker, once its result has been handed to the coordinator.
+    pub worker_done: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
     /// On the coordinator, at a finished call's send decision after its final
     /// root check, before the last input pass; given the call's ID.
     pub send_decision: Option<CallHookForTests>,
@@ -657,15 +661,38 @@ fn describe(
 /// Outstanding non-call requests per connection; more are refused at once
 /// (Decision 0009 §7, as for the relay).
 const MAX_CONNECTION_REQUESTS: usize = 16;
-/// Protocol errors held before they are written within the settling pass.
-const MAX_QUEUED_ERRORS: usize = 16;
 
 /// The coordinator's input: worker completions, and frames in input order,
 /// each numbered by the reader when complete. A decision settles every frame
 /// completed before it, waiting for one the reader counted but has not yet
 /// published, and no frame completed after it.
+/// At most this many frames published and not yet taken by the coordinator.
+const INPUT_WINDOW: usize = 32;
+
+/// The reader's frame window. Worker results share the coordinator's channel
+/// but never wait on it, so a client that keeps writing cannot starve them.
+#[derive(Default)]
+struct FrameWindow {
+    published: std::sync::Mutex<usize>,
+    taken: std::sync::Condvar,
+}
+impl FrameWindow {
+    fn acquire(&self) {
+        let mut published = self.published.lock().unwrap();
+        while *published >= INPUT_WINDOW {
+            published = self.taken.wait(published).unwrap();
+        }
+        *published += 1;
+    }
+    fn release(&self) {
+        *self.published.lock().unwrap() -= 1;
+        self.taken.notify_one();
+    }
+}
+
 struct Inbox {
     receiver: std::sync::mpsc::Receiver<Input>,
+    window: std::sync::Arc<FrameWindow>,
     /// Frames the reader has completed.
     completed: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Frames received from the channel.
@@ -715,6 +742,7 @@ impl Inbox {
             }
             Input::Frame(frame, relay, accepted, seq) => {
                 self.received = seq;
+                self.window.release();
                 Some(Input::Frame(frame, relay, accepted, seq))
             }
             input => Some(input),
@@ -747,6 +775,7 @@ impl Inbox {
         };
         if let Input::Frame(_, _, _, seq) = &input {
             self.received = *seq;
+            self.window.release();
         }
         Some(input)
     }
@@ -769,8 +798,10 @@ fn run_transport(
     use std::io::BufReader;
     use std::time::Instant;
     let workspace = std::sync::Arc::new(workspace);
-    let (sender, receiver) = std::sync::mpsc::sync_channel::<Input>(32);
+    let (sender, receiver) = std::sync::mpsc::channel::<Input>();
     let reader_sender = sender.clone();
+    let window = std::sync::Arc::new(FrameWindow::default());
+    let reader_window = window.clone();
     #[cfg(feature = "test-support")]
     let frame_read = workspace.hooks.frame_read.clone();
     let completed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -793,6 +824,7 @@ fn run_transport(
                 let seq = counter.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
                 match read {
                     Ok((_, wire::Frame::Eof)) => {
+                        reader_window.acquire();
                         let _ =
                             reader_sender.send(Input::Frame(wire::Frame::Eof, None, accepted, seq));
                         break;
@@ -802,6 +834,7 @@ fn run_transport(
                         if let Some(hook) = &frame_read {
                             hook();
                         }
+                        reader_window.acquire();
                         if reader_sender
                             .send(Input::Frame(frame, relay, accepted, seq))
                             .is_err()
@@ -813,6 +846,7 @@ fn run_transport(
                         use std::io::Write;
                         let _ =
                             writeln!(std::io::stderr().lock(), "MCP stdin read failed: {error}");
+                        reader_window.acquire();
                         let _ =
                             reader_sender.send(Input::Frame(wire::Frame::Eof, None, accepted, seq));
                         break;
@@ -822,6 +856,7 @@ fn run_transport(
         })?;
     let mut inbox = Inbox {
         receiver,
+        window,
         completed,
         received: 0,
         later: None,
@@ -830,45 +865,34 @@ fn run_transport(
         waiting_hook: workspace.hooks.settle_waiting.clone(),
     };
     let mut session = session::Session::new();
-    let mut outcomes = VecDeque::new();
     let mut completed: VecDeque<(u64, std::io::Result<CallOutcome>)> = VecDeque::new();
     let mut in_flight: HashMap<u64, InFlight> = HashMap::new();
     let mut writer = output;
-    // The decision point: settle every frame completed before now. Returns
-    // true at end of input. A request beyond the connection's bounds (16
-    // non-call requests, 4 calls counting those running) is refused, and
-    // excess protocol errors are written; both are committed only after the
-    // pass, so a cancel completed before the decision still wins.
-    let settle = |inbox: &mut Inbox,
-                  session: &mut session::Session,
-                  outcomes: &mut VecDeque<impl_receive::Outcome>,
-                  completed: &mut VecDeque<(u64, std::io::Result<CallOutcome>)>,
-                  running: usize,
-                  writer: &mut dyn std::io::Write|
-     -> std::io::Result<bool> {
+    // One fence pass (Decision 0009 §7): handle every frame completed before
+    // now, in order. A cancel removes its ID's pending admission; a request
+    // joins `arrivals`, decided after a later fence; a worker result joins
+    // `completed`. Nothing is written here. Returns true at end of input.
+    let fence = |inbox: &mut Inbox,
+                 session: &mut session::Session,
+                 arrivals: &mut VecDeque<impl_receive::Outcome>,
+                 completed: &mut VecDeque<(u64, std::io::Result<CallOutcome>)>|
+     -> bool {
         let until = inbox.decision();
-        let mut refused = Vec::new();
         while let Some(input) = inbox.settled(until) {
             match input {
                 Input::Frame(frame, relay, accepted, _) => {
-                    if receive(frame, relay, accepted, session, outcomes) {
-                        return Ok(true);
-                    }
-                    if over_bounds(outcomes, running) {
-                        refused.push(outcomes.pop_back().expect("just queued"));
+                    if receive(frame, relay, accepted, session, arrivals) {
+                        return true;
                     }
                 }
                 Input::Done(token, outcome) => completed.push_back((token, outcome)),
             }
         }
-        for outcome in refused {
-            refuse_queued(outcome, session, &workspace, writer)?;
-        }
         if inbox.ended {
             session.eof();
-            return Ok(true);
+            return true;
         }
-        Ok(false)
+        false
     };
     // A cancelled or ended call stops its worker cooperatively.
     let cancel_dropped = |session: &session::Session, in_flight: &mut HashMap<u64, InFlight>| {
@@ -892,12 +916,14 @@ fn run_transport(
         };
         tools::result(envelope, call.modern)
     };
+    // Requests handled at the last fence and not yet decided.
+    let mut arrivals: VecDeque<impl_receive::Outcome> = VecDeque::new();
     loop {
-        if outcomes.is_empty() && completed.is_empty() {
+        if arrivals.is_empty() && completed.is_empty() {
             let next = in_flight.values().map(|call| call.deadline).min();
             match inbox.wait(next) {
                 Some(Input::Frame(frame, relay, accepted, _)) => {
-                    if receive(frame, relay, accepted, &mut session, &mut outcomes) {
+                    if receive(frame, relay, accepted, &mut session, &mut arrivals) {
                         cancel_dropped(&session, &mut in_flight);
                         return Ok(());
                     }
@@ -911,68 +937,11 @@ fn run_transport(
                 None => {}
             }
         }
-        if settle(
-            &mut inbox,
-            &mut session,
-            &mut outcomes,
-            &mut completed,
-            in_flight.len(),
-            &mut writer,
-        )? {
-            cancel_dropped(&session, &mut in_flight);
-            return Ok(());
-        }
-        cancel_dropped(&session, &mut in_flight);
-        // Calls past their deadline answer deadline_exceeded now, each after
-        // its own input pass so an earlier cancel still wins.
-        let now = Instant::now();
-        let mut expired: Vec<u64> = in_flight
-            .iter()
-            .filter(|(_, call)| call.deadline <= now)
-            .map(|(token, _)| *token)
-            .collect();
-        expired.sort_unstable();
-        for token in expired {
-            if settle(
-                &mut inbox,
-                &mut session,
-                &mut outcomes,
-                &mut completed,
-                in_flight.len(),
-                &mut writer,
-            )? {
-                cancel_dropped(&session, &mut in_flight);
-                return Ok(());
-            }
-            cancel_dropped(&session, &mut in_flight);
-            let Some(call) = in_flight.remove(&token) else {
-                continue;
-            };
-            call.cancel
-                .store(true, std::sync::atomic::Ordering::Release);
-            let response = serde_json::json!({"jsonrpc":"2.0","id":call.id,
-                "result":deadline_answer(&call)});
-            if let Some(prepared) = session.prepare(token, response)
-                && let Some(value) = session.commit(prepared)
-            {
-                wire::write_relayed_response(&mut writer, call.relay, &value)?;
-            }
-        }
-        // Finished calls: the send decision.
+        // Blocking steps come before the fence: each finished call's final
+        // root check, and the test pause points.
+        let mut finished = Vec::new();
         while let Some((token, outcome)) = completed.pop_front() {
-            if settle(
-                &mut inbox,
-                &mut session,
-                &mut outcomes,
-                &mut completed,
-                in_flight.len(),
-                &mut writer,
-            )? {
-                cancel_dropped(&session, &mut in_flight);
-                return Ok(());
-            }
-            cancel_dropped(&session, &mut in_flight);
-            let Some(call) = in_flight.remove(&token) else {
+            let Some(call) = in_flight.get(&token) else {
                 // Already decided at its deadline, or cancelled.
                 continue;
             };
@@ -1026,251 +995,223 @@ fn run_transport(
             if let Some(hook) = &workspace.hooks.send_decision {
                 hook(&call.id);
             }
-            // The final root check may block: settle input received by now
-            // (a cancel wins), then recheck the deadline, then decide.
-            if settle(
-                &mut inbox,
-                &mut session,
-                &mut outcomes,
-                &mut completed,
-                in_flight.len(),
-                &mut writer,
-            )? {
-                call.cancel
-                    .store(true, std::sync::atomic::Ordering::Release);
-                cancel_dropped(&session, &mut in_flight);
-                return Ok(());
+            finished.push((token, result));
+        }
+        #[cfg(feature = "test-support")]
+        if let Some(hook) = &workspace.hooks.immediate_decision {
+            for arrival in &arrivals {
+                if let impl_receive::Outcome::Request(admission, _, _) = arrival
+                    && matches!(admission.action, session::Action::Call { .. })
+                {
+                    hook(&admission.id);
+                }
+            }
+        }
+        // The fence for every decision below. Requests it handles are decided
+        // after the next one.
+        let deciding = std::mem::take(&mut arrivals);
+        if fence(&mut inbox, &mut session, &mut arrivals, &mut completed) {
+            for (token, _) in &finished {
+                if let Some(call) = in_flight.get(token) {
+                    call.cancel
+                        .store(true, std::sync::atomic::Ordering::Release);
+                }
             }
             cancel_dropped(&session, &mut in_flight);
-            if Instant::now() >= call.deadline {
-                result = deadline_answer(&call);
-            }
+            return Ok(());
+        }
+        cancel_dropped(&session, &mut in_flight);
+        #[cfg(feature = "test-support")]
+        if let Some(hook) = &workspace.hooks.fence_handled {
+            hook(deciding.len() + arrivals.len());
+        }
+        // Each decision: cancelled (not pending) -> deadline -> outcome.
+        for (token, result) in finished {
+            let Some(call) = in_flight.remove(&token) else {
+                continue;
+            };
+            let result = if Instant::now() >= call.deadline {
+                deadline_answer(&call)
+            } else {
+                result
+            };
             let response = serde_json::json!({"jsonrpc":"2.0","id":call.id,"result":result});
-            if let Some(prepared) = session.prepare(token, response)
-                && let Some(value) = session.commit(prepared)
+            if let Some(value) = session
+                .prepare(token, response)
+                .and_then(|prepared| session.commit(prepared))
             {
                 wire::write_relayed_response(&mut writer, call.relay, &value)?;
             }
         }
-        let Some(outcome) = outcomes.pop_front() else {
-            continue;
-        };
-        match outcome {
-            impl_receive::Outcome::Error(error, relay) => {
-                wire::write_relayed_response(&mut writer, relay, &error.response())?
+        let now = Instant::now();
+        let mut expired: Vec<u64> = in_flight
+            .iter()
+            .filter(|(_, call)| call.deadline <= now)
+            .map(|(token, _)| *token)
+            .collect();
+        expired.sort_unstable();
+        for token in expired {
+            let call = in_flight.remove(&token).expect("expired call");
+            call.cancel
+                .store(true, std::sync::atomic::Ordering::Release);
+            let response = serde_json::json!({"jsonrpc":"2.0","id":call.id,
+                "result":deadline_answer(&call)});
+            if let Some(value) = session
+                .prepare(token, response)
+                .and_then(|prepared| session.commit(prepared))
+            {
+                wire::write_relayed_response(&mut writer, call.relay, &value)?;
             }
-            impl_receive::Outcome::Request(admission, accepted, relay) => {
-                // Cancellation may have invalidated the token while its outcome waited.
-                if session.pending(admission.token).is_none() {
+        }
+        let mut non_calls = 0;
+        for arrival in deciding {
+            let (admission, accepted, relay) = match arrival {
+                impl_receive::Outcome::Error(error, relay) => {
+                    // Never admitted, so no cancel can name it.
+                    wire::write_relayed_response(&mut writer, relay, &error.response())?;
                     continue;
                 }
-                let modern = session.mode() == session::Mode::Modern;
-                let deadline = accepted + workspace.call_deadline;
-                let immediate = match &admission.action {
-                    session::Action::Discover => Some(catalog::discover(workspace.build_version())),
-                    session::Action::Initialize => {
-                        Some(catalog::initialize(workspace.build_version()))
-                    }
-                    session::Action::List => Some(catalog::list(modern)),
-                    session::Action::Unknown => None,
-                    session::Action::Call { name, arguments } => {
-                        let attempted = attempted_workspace(arguments.as_ref(), &workspace);
-                        if Instant::now() >= deadline {
-                            // Accepted, but the deadline passed before admission.
-                            Some(tools::result(
-                                tools::admission_failure(
-                                    &admission.id,
-                                    "deadline_exceeded",
-                                    &attempted,
-                                ),
-                                modern,
-                            ))
-                        } else if tools::validate(name, arguments.as_ref()).is_err() {
-                            // Application validation precedes capacity.
-                            let tool = tools::prepare(
+                impl_receive::Outcome::Request(admission, accepted, relay) => {
+                    (admission, accepted, relay)
+                }
+            };
+            if session.pending(admission.token).is_none() {
+                // Cancelled at the fence.
+                continue;
+            }
+            let modern = session.mode() == session::Mode::Modern;
+            let deadline = accepted + workspace.call_deadline;
+            let result = match &admission.action {
+                session::Action::Unknown => None,
+                session::Action::Call { name, arguments } => {
+                    let attempted = attempted_workspace(arguments.as_ref(), &workspace);
+                    let refuse = |code: &str| {
+                        Some(tools::result(
+                            tools::admission_failure(&admission.id, code, &attempted),
+                            modern,
+                        ))
+                    };
+                    if Instant::now() >= deadline {
+                        // The deadline overrides any outcome still unsent.
+                        refuse("deadline_exceeded")
+                    } else if tools::validate(name, arguments.as_ref()).is_err() {
+                        // Application validation precedes capacity.
+                        Some(
+                            tools::prepare(
                                 name,
                                 arguments.as_ref(),
                                 &admission.id,
                                 modern,
                                 &workspace,
-                            );
-                            Some(tool.response)
-                        } else if in_flight.len() >= MAX_CONNECTION_CALLS {
-                            Some(tools::result(
-                                tools::admission_failure(
-                                    &admission.id,
-                                    "too_many_requests",
-                                    &attempted,
-                                ),
-                                modern,
-                            ))
-                        } else if let Some(permit) = WorkerPermit::acquire() {
-                            let cancel =
-                                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                            let resolved: Resolved = Default::default();
-                            let context = CallContext {
-                                workspace: workspace.clone(),
-                                registry: registry.clone(),
-                                daemon_handle: daemon_handle.clone(),
-                                id: admission.id.clone(),
-                                modern,
-                                name: name.clone(),
-                                arguments: arguments.clone(),
-                                deadline,
-                                cancel: cancel.clone(),
-                                resolved: resolved.clone(),
-                            };
-                            let done = sender.clone();
-                            let token = admission.token;
-                            let spawned = std::thread::Builder::new()
+                            )
+                            .response,
+                        )
+                    } else if live_calls(&session, &in_flight) >= MAX_CONNECTION_CALLS {
+                        refuse("too_many_requests")
+                    } else if let Some(permit) = WorkerPermit::acquire() {
+                        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                        let resolved: Resolved = Default::default();
+                        let context = CallContext {
+                            workspace: workspace.clone(),
+                            registry: registry.clone(),
+                            daemon_handle: daemon_handle.clone(),
+                            id: admission.id.clone(),
+                            modern,
+                            name: name.clone(),
+                            arguments: arguments.clone(),
+                            deadline,
+                            cancel: cancel.clone(),
+                            resolved: resolved.clone(),
+                        };
+                        let done = sender.clone();
+                        let token = admission.token;
+                        #[cfg(feature = "test-support")]
+                        let worker_done = workspace.hooks.worker_done.clone();
+                        let spawned =
+                            std::thread::Builder::new()
                                 .name("mcp-call".into())
                                 .spawn(move || {
                                     let _permit = permit;
                                     let outcome = run_call(context);
                                     let _ = done.send(Input::Done(token, outcome));
+                                    #[cfg(feature = "test-support")]
+                                    if let Some(hook) = worker_done {
+                                        hook();
+                                    }
                                 });
-                            match spawned {
-                                Ok(_) => {
-                                    in_flight.insert(
-                                        token,
-                                        InFlight {
-                                            id: admission.id.clone(),
-                                            relay,
-                                            modern,
-                                            deadline,
-                                            cancel,
-                                            resolved,
-                                            attempted,
-                                        },
-                                    );
-                                    None
-                                }
-                                // The permit went with the failed closure.
-                                Err(_) => Some(tools::result(
-                                    tools::admission_failure(
-                                        &admission.id,
-                                        "too_many_requests",
-                                        &attempted,
-                                    ),
-                                    modern,
-                                )),
+                        match spawned {
+                            Ok(_) => {
+                                in_flight.insert(
+                                    token,
+                                    InFlight {
+                                        id: admission.id.clone(),
+                                        relay,
+                                        modern,
+                                        deadline,
+                                        cancel,
+                                        resolved,
+                                        attempted,
+                                    },
+                                );
+                                // Dispatched: decided when it finishes.
+                                continue;
                             }
-                        } else {
-                            Some(tools::result(
-                                tools::admission_failure(
-                                    &admission.id,
-                                    "too_many_requests",
-                                    &attempted,
-                                ),
-                                modern,
-                            ))
+                            // The permit went with the failed closure.
+                            Err(_) => refuse("too_many_requests"),
                         }
+                    } else {
+                        refuse("too_many_requests")
                     }
-                };
-                let response = match (&admission.action, immediate) {
-                    (session::Action::Unknown, _) => {
-                        wire::ProtocolError::new(-32601, admission.id.clone()).response()
-                    }
-                    (_, Some(result)) => {
-                        serde_json::json!({"jsonrpc":"2.0","id":admission.id,"result":result})
-                    }
-                    // Dispatched to a worker; decided later.
-                    (_, None) => continue,
-                };
-                let call = matches!(admission.action, session::Action::Call { .. });
-                #[cfg(feature = "test-support")]
-                if call && let Some(hook) = &workspace.hooks.immediate_decision {
-                    hook(&admission.id);
                 }
-                let Some(prepared) = session.prepare(admission.token, response) else {
-                    continue;
-                };
-                // A final input pass takes precedence over the unsent result.
-                if settle(
-                    &mut inbox,
-                    &mut session,
-                    &mut outcomes,
-                    &mut completed,
-                    in_flight.len(),
-                    &mut writer,
-                )? {
-                    cancel_dropped(&session, &mut in_flight);
-                    return Ok(());
-                }
-                // The deadline overrides an outcome still unsent at it.
-                let prepared = if call && Instant::now() >= deadline {
-                    let attempted = match &admission.action {
-                        session::Action::Call { arguments, .. } => {
-                            attempted_workspace(arguments.as_ref(), &workspace)
+                action => {
+                    non_calls += 1;
+                    if non_calls > MAX_CONNECTION_REQUESTS {
+                        let response = serde_json::json!({"jsonrpc":"2.0","id":admission.id,
+                            "error":{"code":-32000,"message":"Too many outstanding requests",
+                                "data":{"code":"too_many_requests"}}});
+                        if let Some(value) = session
+                            .prepare(admission.token, response)
+                            .and_then(|prepared| session.commit(prepared))
+                        {
+                            wire::write_relayed_response(&mut writer, relay, &value)?;
                         }
-                        _ => unreachable!("checked call"),
-                    };
-                    let expired = serde_json::json!({"jsonrpc":"2.0","id":admission.id,
-                    "result":tools::result(
-                        tools::admission_failure(&admission.id, "deadline_exceeded", &attempted),
-                        modern,
-                    )});
-                    session.prepare(admission.token, expired)
-                } else {
-                    Some(prepared)
-                };
-                if let Some(value) = prepared.and_then(|prepared| session.commit(prepared)) {
-                    wire::write_relayed_response(&mut writer, relay, &value)?;
+                        continue;
+                    }
+                    Some(match action {
+                        session::Action::Discover => catalog::discover(workspace.build_version()),
+                        session::Action::Initialize => {
+                            catalog::initialize(workspace.build_version())
+                        }
+                        _ => catalog::list(modern),
+                    })
                 }
+            };
+            let response = match result {
+                Some(result) => {
+                    serde_json::json!({"jsonrpc":"2.0","id":admission.id,"result":result})
+                }
+                None => wire::ProtocolError::new(-32601, admission.id.clone()).response(),
+            };
+            if let Some(value) = session
+                .prepare(admission.token, response)
+                .and_then(|prepared| session.commit(prepared))
+            {
+                wire::write_relayed_response(&mut writer, relay, &value)?;
             }
         }
     }
 }
 
-/// Whether the outcome just queued is beyond the connection's bounds: more
-/// than 16 non-call requests, more than 4 valid calls counting those running,
-/// or more than 16 protocol errors. Invalid calls are never counted.
-fn over_bounds(
-    outcomes: &std::collections::VecDeque<impl_receive::Outcome>,
-    running: usize,
-) -> bool {
-    let valid_call = |outcome: &impl_receive::Outcome| match outcome {
-        impl_receive::Outcome::Request(admission, _, _) => match &admission.action {
-            session::Action::Call { name, arguments } => {
-                tools::validate(name, arguments.as_ref()).is_ok()
-            }
-            _ => false,
-        },
-        _ => false,
-    };
-    let Some(last) = outcomes.back() else {
-        return false;
-    };
-    match last {
-        impl_receive::Outcome::Error(..) => {
-            outcomes
-                .iter()
-                .filter(|outcome| matches!(outcome, impl_receive::Outcome::Error(..)))
-                .count()
-                > MAX_QUEUED_ERRORS
-        }
-        impl_receive::Outcome::Request(admission, _, _) => match admission.action {
-            session::Action::Call { .. } => {
-                valid_call(last)
-                    && running
-                        + outcomes
-                            .iter()
-                            .filter(|outcome| valid_call(outcome))
-                            .count()
-                        > MAX_CONNECTION_CALLS
-            }
-            _ => {
-                outcomes
-                    .iter()
-                    .filter(|outcome| {
-                        matches!(outcome, impl_receive::Outcome::Request(admission, _, _)
-                            if !matches!(admission.action, session::Action::Call { .. }))
-                    })
-                    .count()
-                    > MAX_CONNECTION_REQUESTS
-            }
-        },
-    }
+/// Live calls on this connection: dispatched and still pending. The one place
+/// call capacity is counted (Decision 0009 §7); a cancel frees it at once.
+fn live_calls(
+    session: &session::Session,
+    in_flight: &std::collections::HashMap<u64, InFlight>,
+) -> usize {
+    in_flight
+        .keys()
+        .filter(|token| session.pending(**token).is_some())
+        .count()
 }
 
 /// The workspace a call attempted: its explicit selection, else the launch
@@ -1284,45 +1225,6 @@ fn attempted_workspace(
         .and_then(|o| o.get("workspace"))
         .cloned()
         .unwrap_or_else(|| serde_json::json!(workspace.root()))
-}
-
-/// Refuse an outcome beyond the connection's bounds: a protocol error is
-/// written as is; a request gets too_many_requests (a call in the
-/// pre-resolution shape). A cancelled request is not answered.
-fn refuse_queued(
-    outcome: impl_receive::Outcome,
-    session: &mut session::Session,
-    workspace: &OpenedWorkspace,
-    mut writer: &mut dyn std::io::Write,
-) -> std::io::Result<()> {
-    match outcome {
-        impl_receive::Outcome::Error(error, relay) => {
-            wire::write_relayed_response(&mut writer, relay, &error.response())
-        }
-        impl_receive::Outcome::Request(admission, _, relay) => {
-            let response = match &admission.action {
-                session::Action::Call { arguments, .. } => {
-                    let attempted = attempted_workspace(arguments.as_ref(), workspace);
-                    let modern = session.mode() == session::Mode::Modern;
-                    serde_json::json!({"jsonrpc":"2.0","id":admission.id,
-                    "result":tools::result(
-                        tools::admission_failure(&admission.id, "too_many_requests", &attempted),
-                        modern,
-                    )})
-                }
-                _ => serde_json::json!({"jsonrpc":"2.0","id":admission.id,
-                    "error":{"code":-32000,"message":"Too many queued requests",
-                        "data":{"code":"too_many_requests"}}}),
-            };
-            match session
-                .prepare(admission.token, response)
-                .and_then(|prepared| session.commit(prepared))
-            {
-                Some(value) => wire::write_relayed_response(&mut writer, relay, &value),
-                None => Ok(()),
-            }
-        }
-    }
 }
 
 fn receive(
@@ -1391,10 +1293,14 @@ mod settlement_tests {
     /// for the next decision.
     #[test]
     fn settlement_takes_only_frames_completed_by_the_decision() {
-        let (sender, receiver) = std::sync::mpsc::sync_channel(4);
+        let (sender, receiver) = std::sync::mpsc::channel();
         let completed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+        let window = std::sync::Arc::new(FrameWindow::default());
+        window.acquire();
+        window.acquire();
         let mut inbox = Inbox {
             receiver,
+            window,
             completed: completed.clone(),
             received: 0,
             later: None,

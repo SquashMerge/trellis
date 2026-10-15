@@ -4132,12 +4132,15 @@ async fn over_bound_requests_are_refused_after_validation() {
     let temp = tempfile::tempdir().unwrap();
     let (identity, registry, runtime) = ready_registry(temp.path(), 84).await;
     let (send_decision, entered, release) = hold_send_decision(1);
+    let (frame_read, read) = frames_read();
     let hooks = trellis::mcp::TransportHooksForTests {
+        frame_read: Some(frame_read),
         send_decision: Some(send_decision),
         ..Default::default()
     };
     let (mut client, mut reader, session) = hooked_session(&identity, &registry, 84, None, hooks);
     writeln!(client, "{}", describe_call(1)).unwrap();
+    read.recv_timeout(trellis::testing::HANG_BACKSTOP).unwrap();
     entered
         .recv_timeout(trellis::testing::HANG_BACKSTOP)
         .expect("call 1 did not reach its send decision");
@@ -4161,6 +4164,11 @@ async fn over_bound_requests_are_refused_after_validation() {
         burst.push_str(&format!("{}\n", modern(json!(id), "tools/list", json!({}))));
     }
     client.write_all(burst.as_bytes()).unwrap();
+    // Every burst frame is complete before the decision: one fence handles
+    // them all, so 17 non-call requests are live at once.
+    for _ in 0..burst.lines().count() {
+        read.recv_timeout(trellis::testing::HANG_BACKSTOP).unwrap();
+    }
     release.send(()).unwrap();
     let mut seen = std::collections::BTreeMap::new();
     while !(seen.contains_key("6") && seen.contains_key("7") && seen.contains_key("117")) {
@@ -4227,5 +4235,252 @@ async fn an_immediate_outcome_unsent_at_the_deadline_expires() {
     );
     drop(reader);
     drop(client);
+    session.join().unwrap().unwrap();
+}
+
+fn cancel_frame(id: i64) -> Value {
+    json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":id}})
+}
+
+/// Decision 0009 §7: capacity counts live calls only. With four calls held,
+/// a cancel for one and a fifth call in the same burst admit the fifth.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fifth_call_after_a_cancellation_is_admitted() {
+    let temp = tempfile::tempdir().unwrap();
+    let (identity, registry, runtime) = ready_registry(temp.path(), 86).await;
+    let gate = ReadGate::default();
+    runtime.set_mcp_read_gate_for_tests(gate.hook());
+    let (mut client, mut reader, session) = socket_session(&identity, &registry, 86, None);
+    for id in 1..=4 {
+        writeln!(client, "{}", describe_call(id)).unwrap();
+    }
+    let waiter = gate.clone();
+    tokio::task::spawn_blocking(move || waiter.await_held(4))
+        .await
+        .unwrap();
+    write!(client, "{}\n{}\n", cancel_frame(1), describe_call(5)).unwrap();
+    // The fifth call reaches its read: admitted, not refused.
+    let waiter = gate.clone();
+    tokio::task::spawn_blocking(move || waiter.await_held(5))
+        .await
+        .unwrap();
+    gate.open();
+    let mut answered: Vec<i64> = (0..4)
+        .map(|_| {
+            let reply = next_reply(&mut reader);
+            assert!(
+                reply["result"]["structuredContent"]["data"].is_object(),
+                "{reply}"
+            );
+            reply["id"].as_i64().unwrap()
+        })
+        .collect();
+    answered.sort_unstable();
+    assert_eq!(answered, vec![2, 3, 4, 5]);
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
+/// Decision 0009 §7: a capacity refusal still unsent at the call's deadline
+/// answers deadline_exceeded. Capacity here is the daemon-wide worker budget,
+/// which timed-out workers keep, so it stays full past the call's deadline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_capacity_refusal_unsent_at_the_deadline_expires() {
+    let temp = tempfile::tempdir().unwrap();
+    let (identity, registry, runtime) = ready_registry(temp.path(), 87).await;
+    let gate = ReadGate::default();
+    runtime.set_mcp_read_gate_for_tests(gate.hook());
+    // Sixteen held workers on four other connections exhaust the budget.
+    let mut held = Vec::new();
+    for connection in 0..4 {
+        let (mut client, reader, session) = socket_session(&identity, &registry, 87, None);
+        for call in 0..4 {
+            writeln!(client, "{}", describe_call(connection * 10 + call)).unwrap();
+        }
+        held.push((client, reader, session));
+    }
+    let waiter = gate.clone();
+    tokio::task::spawn_blocking(move || waiter.await_held(16))
+        .await
+        .unwrap();
+    let deadline = Duration::from_millis(500);
+    let (frame_read, read) = frames_read();
+    let (entered_tx, entered) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let release_rx = std::sync::Mutex::new(release_rx);
+    let hooks = trellis::mcp::TransportHooksForTests {
+        frame_read: Some(frame_read),
+        immediate_decision: Some(std::sync::Arc::new(move |_: &Value| {
+            let _ = entered_tx.send(());
+            let _ = release_rx.lock().unwrap().recv();
+        })),
+        ..Default::default()
+    };
+    let (mut client, mut reader, session) =
+        hooked_session(&identity, &registry, 87, Some(deadline), hooks);
+    writeln!(client, "{}", describe_call(99)).unwrap();
+    let accepted = read.recv_timeout(trellis::testing::HANG_BACKSTOP).unwrap();
+    entered
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .unwrap();
+    tokio::time::sleep_until((accepted + deadline).into()).await;
+    release_tx.send(()).unwrap();
+    let reply = next_reply(&mut reader);
+    assert_eq!(
+        reply["result"]["structuredContent"]["error"]["code"], "deadline_exceeded",
+        "a capacity refusal was sent past its deadline: {reply}"
+    );
+    gate.open();
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+    for (client, reader, session) in held {
+        drop(reader);
+        drop(client);
+        session.join().unwrap().unwrap();
+    }
+}
+
+/// Decision 0009 §7 / T00: a sustained stream of invalid calls is answered
+/// invalid_request, each fence handles a bounded batch, and a call's reply
+/// is decided while the stream continues.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn continuous_invalid_calls_stay_bounded_and_a_due_reply_is_decided() {
+    let temp = tempfile::tempdir().unwrap();
+    let (identity, registry, runtime) = ready_registry(temp.path(), 88).await;
+    let gate = ReadGate::default();
+    runtime.set_mcp_read_gate_for_tests(gate.hook());
+    let largest = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = largest.clone();
+    let hooks = trellis::mcp::TransportHooksForTests {
+        fence_handled: Some(std::sync::Arc::new(move |handled| {
+            observed.fetch_max(handled, std::sync::atomic::Ordering::AcqRel);
+        })),
+        ..Default::default()
+    };
+    let (client, reader, session) = hooked_session(&identity, &registry, 88, None, hooks);
+    let mut writer = client.try_clone().unwrap();
+    writeln!(writer, "{}", describe_call(0)).unwrap();
+    let waiter = gate.clone();
+    tokio::task::spawn_blocking(move || waiter.await_held(1))
+        .await
+        .unwrap();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flooding = stop.clone();
+    let flood = std::thread::spawn(move || {
+        let mut id = 1_000;
+        while !flooding.load(std::sync::atomic::Ordering::Acquire) {
+            let invalid = modern(
+                json!(id),
+                "tools/call",
+                json!({"name":"trellis_workspace_describe","arguments":{}}),
+            );
+            if writeln!(writer, "{invalid}").is_err() {
+                break;
+            }
+            id += 1;
+        }
+        id - 1_000
+    });
+    // Let the stream run, then release the held call while it continues.
+    let mut reader = reader;
+    let mut invalid = 0;
+    while invalid < 2_000 {
+        let reply = next_reply(&mut reader);
+        assert_eq!(
+            reply["result"]["structuredContent"]["error"]["code"], "invalid_request",
+            "{reply}"
+        );
+        invalid += 1;
+    }
+    gate.open();
+    loop {
+        let reply = next_reply(&mut reader);
+        if reply["id"] == 0 {
+            assert!(
+                reply["result"]["structuredContent"]["data"].is_object(),
+                "{reply}"
+            );
+            break;
+        }
+    }
+    // This side stops reading now: end the connection first, so a flood
+    // write blocked behind unread replies fails instead of waiting forever.
+    stop.store(true, std::sync::atomic::Ordering::Release);
+    client.shutdown(std::net::Shutdown::Both).unwrap();
+    let sent = flood.join().unwrap();
+    assert!(sent > 2_000);
+    let largest = largest.load(std::sync::atomic::Ordering::Acquire);
+    assert!(
+        largest <= 66,
+        "a fence handled {largest} requests: not bounded by the input channel"
+    );
+    drop(reader);
+    drop(client);
+    // Replies to flood requests may still be unwritten when the client goes:
+    // the session then ends on a broken pipe, which is not a failure here.
+    if let Err(error) = session.join().unwrap() {
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe, "{error}");
+    }
+}
+
+/// A finished call's result never waits for the client's input: with the
+/// coordinator held and the input window full of frames, the worker still
+/// hands its result over.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_worker_result_never_waits_for_client_input() {
+    let temp = tempfile::tempdir().unwrap();
+    let (identity, registry, runtime) = ready_registry(temp.path(), 89).await;
+    let gate = ReadGate::default();
+    runtime.set_mcp_read_gate_for_tests(gate.hook());
+    let (frame_read, read) = frames_read();
+    let (held_tx, held) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let release_rx = std::sync::Mutex::new(release_rx);
+    let (done_tx, done) = std::sync::mpsc::sync_channel(4);
+    let hooks = trellis::mcp::TransportHooksForTests {
+        frame_read: Some(frame_read),
+        // Hold the coordinator at call 2's decision.
+        immediate_decision: Some(std::sync::Arc::new(move |id: &Value| {
+            if id == &json!(2) {
+                let _ = held_tx.send(());
+                let _ = release_rx.lock().unwrap().recv();
+            }
+        })),
+        worker_done: Some(std::sync::Arc::new(move || {
+            let _ = done_tx.try_send(());
+        })),
+        ..Default::default()
+    };
+    let (mut client, mut reader, session) = hooked_session(&identity, &registry, 89, None, hooks);
+    writeln!(client, "{}", describe_call(1)).unwrap();
+    let waiter = gate.clone();
+    tokio::task::spawn_blocking(move || waiter.await_held(1))
+        .await
+        .unwrap();
+    writeln!(client, "{}", describe_call(2)).unwrap();
+    held.recv_timeout(trellis::testing::HANG_BACKSTOP).unwrap();
+    // Fill the input window while the coordinator is held.
+    let mut burst = String::new();
+    for id in 100..140 {
+        burst.push_str(&format!("{}\n", modern(json!(id), "tools/list", json!({}))));
+    }
+    client.write_all(burst.as_bytes()).unwrap();
+    for _ in 0..34 {
+        read.recv_timeout(trellis::testing::HANG_BACKSTOP).unwrap();
+    }
+    // Call 1 finishes: its result is handed over without the coordinator.
+    gate.open();
+    done.recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .expect("the worker's result waited for client input");
+    release_tx.send(()).unwrap();
+    let mut seen = std::collections::BTreeSet::new();
+    while !seen.contains(&1) {
+        let reply = next_reply(&mut reader);
+        seen.insert(reply["id"].as_i64().unwrap());
+    }
+    client.shutdown(std::net::Shutdown::Both).unwrap();
+    drop(reader);
     session.join().unwrap().unwrap();
 }
