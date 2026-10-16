@@ -79,15 +79,27 @@ impl Store {
         if fault == "missing_scope" {
             db.pragma_update(None, "foreign_keys", "OFF")?;
         }
+        // A length disagreeing with the BLOB can only arrive as on-disk
+        // corruption; the schema's CHECK refuses to write it.
+        if fault == "bad_length" {
+            db.pragma_update(None, "ignore_check_constraints", "ON")?;
+        }
         let tx = storage_result(db.transaction_with_behavior(TransactionBehavior::Immediate))?;
         let count = match fault {
             "missing_scope" => tx.execute("UPDATE document_versions SET path='missing.js' WHERE path='a.js'", [])?,
             "missing_header" => tx.execute("DELETE FROM native_version_headers WHERE syntax_id=(SELECT syntax_id FROM native_version_declarations WHERE name='Alpha' LIMIT 1)", [])?,
             "bad_digest" => tx.execute("UPDATE document_versions SET content_hash=?1 WHERE path='a.js'", ["0".repeat(64)])?,
+            "bad_length" => tx.execute("UPDATE document_versions SET byte_length=byte_length+1 WHERE path='a.js'", [])?,
             _ => anyhow::bail!("unknown find corruption fixture"),
         };
         ensure!(count == 1, "fixture corruption target absent");
         storage_result(tx.commit())?;
+        if fault == "missing_scope" {
+            db.pragma_update(None, "foreign_keys", "ON")?;
+        }
+        if fault == "bad_length" {
+            db.pragma_update(None, "ignore_check_constraints", "OFF")?;
+        }
         Ok(())
     }
 

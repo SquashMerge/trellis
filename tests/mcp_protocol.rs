@@ -762,6 +762,17 @@ fn both_modes_full_catalog_tools_and_lifecycle() {
             modern(json!(40), "tools/call", fields)
         });
         tool(&reply, Some("range_too_large"), !legacy);
+        // The outgoing view's limit has the same 1-50 range, checked before
+        // any lookup.
+        let fields = json!({"name":"trellis_inspect","arguments":{"schemaVersion":1,
+            "symbolId":format!("sid:v1:{}", "0".repeat(31) + "1"),
+            "view":"outgoing_calls","limit":51}});
+        let reply = peer.ask(if legacy {
+            request(json!(43), "tools/call", fields)
+        } else {
+            modern(json!(43), "tools/call", fields)
+        });
+        tool(&reply, Some("range_too_large"), !legacy);
         let wrong = json!({"name":"unknown","arguments":{}});
         error(
             &peer.ask(if legacy {
@@ -4114,6 +4125,93 @@ async fn a_call_expires_from_its_read_while_the_coordinator_is_held() {
     session.join().unwrap().unwrap();
 }
 
+/// A find answers wholly from the snapshot it admitted, even while a newer
+/// publication is pending; the next call sees the newer revision.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_find_answers_from_its_admitted_snapshot_while_a_publication_is_pending() {
+    let temp = tempfile::tempdir().unwrap();
+    let (identity, registry, runtime) = ready_registry(temp.path(), 84).await;
+    let admitted = {
+        let (response, _) = runtime.evidence_response().unwrap();
+        let revision = response.status().unwrap().revision;
+        response.finish(()).unwrap();
+        revision
+    };
+    let gate = ReadGate::default();
+    runtime.set_mcp_admitted_gate_for_tests(gate.hook());
+    let (mut client, mut reader, session) = socket_session(&identity, &registry, 84, None);
+    let find = |id: u64, query: &str| {
+        modern(
+            json!(id),
+            "tools/call",
+            json!({"name":"trellis_find_symbols","arguments":{"schemaVersion":1,"query":query}}),
+        )
+    };
+    writeln!(client, "{}", find(1, "held")).unwrap();
+    let waiter = gate.clone();
+    tokio::task::spawn_blocking(move || waiter.await_held(1))
+        .await
+        .unwrap();
+    // While that read holds its snapshot, change the source so the worker
+    // has a newer publication pending.
+    fs::write(identity.root.join("a.js"), "function moved() {}\n").unwrap();
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        while !runtime.catching_up() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the watcher never queued the edit");
+    gate.open();
+    let reply = next_reply(&mut reader);
+    tool(&reply, None, true);
+    let envelope = &reply["result"]["structuredContent"];
+    assert_eq!(
+        envelope["evidenceBasis"]["indexRevision"],
+        json!(admitted.index_revision),
+        "{reply}"
+    );
+    let symbols = envelope["data"]["symbols"].as_array().unwrap();
+    assert_eq!(symbols.len(), 1, "{reply}");
+    assert_eq!(symbols[0]["name"], "held", "{reply}");
+    // One snapshot: every coverage row carries the same native revision.
+    let coverage = envelope["data"]["coverage"].as_array().unwrap();
+    assert!(
+        coverage
+            .iter()
+            .all(|c| c["revisionId"] == coverage[0]["revisionId"]),
+        "{reply}"
+    );
+    // Once published, a new call answers from the newer revision.
+    let newer = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        for id in 2.. {
+            writeln!(client, "{}", find(id, "moved")).unwrap();
+            let reply = tokio::task::block_in_place(|| next_reply(&mut reader));
+            let envelope = &reply["result"]["structuredContent"];
+            if envelope["data"]["symbols"]
+                .as_array()
+                .is_some_and(|s| s.len() == 1)
+            {
+                return reply;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        unreachable!()
+    })
+    .await
+    .expect("the edit was never published");
+    assert!(
+        newer["result"]["structuredContent"]["evidenceBasis"]["indexRevision"]
+            .as_u64()
+            .unwrap()
+            > admitted.index_revision,
+        "{newer}"
+    );
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
 /// Decision 0009 §7: once read admission sampled catchingUp, a deadline
 /// answer keeps the resolved shape.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4845,14 +4943,15 @@ async fn mcp_find_selected_snapshot_ranks_and_keeps_zero_hit_scope() {
         .as_array()
         .unwrap()
         .len();
-    assert!((1..=50).contains(&max_symbols));
+    // 51 matches at limit 50. Fifty full Symbols (IDs, revision, provenance)
+    // exceed the 64 KiB response cap, so the reply keeps the longest fitting
+    // prefix and reports response_bytes, which outranks limit. The limit
+    // reason itself is pinned by the default-20 query below.
+    assert!((1..50).contains(&max_symbols), "{max_limit}");
+    assert_eq!(max_limit["result"]["structuredContent"]["truncated"], true);
     assert_eq!(
         max_limit["result"]["structuredContent"]["truncationReason"],
-        if max_symbols == 50 {
-            "limit"
-        } else {
-            "response_bytes"
-        }
+        "response_bytes"
     );
     let default = ask(&mut client, 151, "ManyDefault", None, None);
     tool(&default, None, true);
@@ -5038,6 +5137,175 @@ fn mcp_find_cold_prior_head_uses_registry_roots_without_creating_index() {
         invalid.to_string().contains("index_not_ready"),
         "a large non-index must not qualify as a published head: {invalid:#}"
     );
+}
+
+/// Publish an index for a fresh checkout with `files`, leaving it inactive.
+fn published_inactive_checkout(
+    temp: &std::path::Path,
+    files: &[(&str, &str)],
+) -> (
+    trellis::store::topology::WorkspaceIdentity,
+    trellis::store::topology::TopologyRoots,
+) {
+    use trellis::store::{
+        Store,
+        topology::{TopologyRoots, WorkspaceIdentity},
+    };
+    let root = checkout(temp);
+    for (path, text) in files {
+        fs::write(root.join(path), text).unwrap();
+    }
+    let identity = WorkspaceIdentity::discover(Some(&root), &root)
+        .unwrap()
+        .attach_marker()
+        .unwrap();
+    let store = Store::open_for_tests(temp, &root).unwrap();
+    store.mcp_prepare_virgin_queue_for_tests().unwrap();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
+        &trellis::indexer::IndexOptions::new(root.clone()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    let writer = store.publication_for_tests().unwrap();
+    store
+        .publish_native(
+            &graph,
+            &capture,
+            &native,
+            &writer,
+            store.index_baseline().unwrap(),
+            &cancel,
+        )
+        .unwrap();
+    drop(writer);
+    drop(store);
+    let topology = TopologyRoots::isolated_for_tests(temp.join("cache"), temp.join("data"));
+    (identity, topology)
+}
+
+/// Send one tool call over a daemon socket session and return its reply.
+fn one_socket_call(
+    identity: trellis::store::topology::WorkspaceIdentity,
+    registry: trellis::daemon::registry::CheckoutRegistry,
+    session_id: u64,
+    deadline: Duration,
+    tool_name: &str,
+    arguments: Value,
+) -> Value {
+    use std::os::unix::net::UnixStream;
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    let (mut client, server) = UnixStream::pair().unwrap();
+    client
+        .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
+        .unwrap();
+    let daemon_handle = tokio::runtime::Handle::current();
+    let session = std::thread::spawn(move || {
+        trellis::mcp::run_socket(
+            trellis::mcp::OpenedWorkspace::new(identity).with_call_deadline_for_tests(deadline),
+            server,
+            registry,
+            session_id,
+            daemon_handle,
+        )
+    });
+    writeln!(
+        client,
+        "{}",
+        modern(
+            json!(7),
+            "tools/call",
+            json!({"name":tool_name,"arguments":arguments})
+        )
+    )
+    .unwrap();
+    let mut reader = BufReader::new(client.try_clone().unwrap());
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+    serde_json::from_str(&line).unwrap()
+}
+
+/// Contention while a cold checkout proves its prior head is retried as
+/// contention until the call deadline, never reported as `store_unavailable`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_cold_prior_head_contention_retries_until_the_deadline() {
+    use trellis::daemon::registry::CheckoutRegistry;
+    let temp = tempfile::tempdir().unwrap();
+    let (identity, topology) =
+        published_inactive_checkout(temp.path(), &[("a.js", "function Alpha() {}\n")]);
+    // An index journal sidecar makes the cold read-only status check busy.
+    let index = topology.index_db(&identity);
+    let journal = index.with_file_name(format!(
+        "{}-journal",
+        index.file_name().unwrap().to_string_lossy()
+    ));
+    fs::write(&journal, b"").unwrap();
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(311, &identity).unwrap();
+    let busy = registry
+        .prior_head_probe(&identity.root_key)
+        .unwrap()
+        .check()
+        .unwrap_err();
+    assert!(
+        trellis::store::cli_read_retryable_contention(&busy),
+        "{busy:#}"
+    );
+    let reply = one_socket_call(
+        identity,
+        registry,
+        311,
+        Duration::from_millis(300),
+        "trellis_find_symbols",
+        json!({"schemaVersion":1,"query":"Alpha"}),
+    );
+    // Still busy at the deadline: the call never admitted a read.
+    tool(&reply, Some("deadline_exceeded"), true);
+    let envelope = &reply["result"]["structuredContent"];
+    assert_eq!(
+        envelope["error"]["attemptedWorkspace"]["kind"], "path",
+        "{reply}"
+    );
+    fs::remove_file(&journal).unwrap();
+}
+
+/// A deadline reached before read admission answers in the pre-resolution
+/// shape (Decision 0009), as the connection's own timer would.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_deadline_before_read_admission_uses_the_pre_resolution_shape() {
+    use trellis::daemon::registry::CheckoutRegistry;
+    let temp = tempfile::tempdir().unwrap();
+    let (identity, topology) =
+        published_inactive_checkout(temp.path(), &[("a.js", "function Alpha() {}\n")]);
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(312, &identity).unwrap();
+    let runtime = registry.activate(&identity.root_key).unwrap();
+    // Before the read is admitted, move the call's clock past its deadline.
+    let advanced = runtime.clone();
+    runtime.set_mcp_read_hook_for_tests(move || {
+        advanced.advance_mcp_clock_for_tests(Duration::from_secs(60));
+    });
+    let reply = one_socket_call(
+        identity,
+        registry,
+        312,
+        trellis::mcp::CALL_DEADLINE,
+        "trellis_find_symbols",
+        json!({"schemaVersion":1,"query":"Alpha"}),
+    );
+    tool(&reply, Some("deadline_exceeded"), true);
+    let envelope = &reply["result"]["structuredContent"];
+    assert_eq!(
+        envelope["error"]["attemptedWorkspace"]["kind"], "path",
+        "{reply}"
+    );
+    assert!(envelope.get("workspace").is_none(), "{reply}");
+    assert!(envelope.get("catchingUp").is_none(), "{reply}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6876,32 +7144,46 @@ async fn mcp_outgoing_near_call_deadline_preserves_required_call_without_optiona
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mcp_outgoing_mid_attestation_expiry_keeps_required_calls_and_prior_hints() {
-    // The first compound call completes without optional candidate work. The
-    // target lives in a different version, so its SHA chunk runs only inside
-    // optional candidate attestation. Advance the hint clock within that CPU
-    // operation, not at a between-row boundary.
+    // `Local` and `Target` live in their own versions, so each is verified
+    // only inside optional candidate attestation. local.js's source-hash chunks
+    // advance nothing and its hint survives; target.js's first chunk advances
+    // the hint clock inside that SHA phase, so Target's
+    // calls lose their hints while every required call survives.
     let (reply, _) = mcp_outgoing_wire_fixture(
         &[
             (
                 "owner.js",
-                "function Owner() { (obj.Unknown)(); Target(); Target(); }\n",
+                "function Owner() { Local(); (obj.Unknown)(); Target(); Target(); }\n",
             ),
+            ("local.js", "function Local() {}\n"),
             ("target.js", "function Target() {}\n"),
         ],
         "Owner",
         None,
-        Some(vec![("outgoing_hint_source_hash_chunk", 1001)]),
+        // Each candidate attestation hashes its source twice (source row, then
+        // native witness): local.js twice at no cost, then target.js expires.
+        Some(vec![
+            ("outgoing_hint_source_hash_chunk", 0),
+            ("outgoing_hint_source_hash_chunk", 0),
+            ("outgoing_hint_source_hash_chunk", 1001),
+        ]),
         false,
         true,
     );
     tool(&reply, None, true);
     let envelope = &reply["result"]["structuredContent"];
     let calls = envelope["data"]["calls"].as_array().unwrap();
-    assert_eq!(calls.len(), 3, "mandatory call list survives: {reply}");
-    assert!(calls[0]["calleeRange"].is_null(), "{reply}");
-    assert_eq!(calls[0]["nativeCandidates"]["items"], json!([]));
-    assert_eq!(calls[0]["nativeCandidates"]["omitted"], 0);
-    for call in &calls[1..] {
+    assert_eq!(calls.len(), 4, "mandatory call list survives: {reply}");
+    assert_eq!(calls[0]["calleeText"], "Local", "{reply}");
+    let local = calls[0]["nativeCandidates"]["items"].as_array().unwrap();
+    assert_eq!(local.len(), 1, "the earlier hint survives: {reply}");
+    assert_eq!(local[0]["name"], "Local", "{reply}");
+    assert_eq!(local[0]["document"]["path"], "local.js", "{reply}");
+    assert_eq!(calls[0]["nativeCandidates"]["omitted"], 0, "{reply}");
+    assert!(calls[1]["calleeRange"].is_null(), "{reply}");
+    assert_eq!(calls[1]["nativeCandidates"]["items"], json!([]));
+    assert_eq!(calls[1]["nativeCandidates"]["omitted"], 0);
+    for call in &calls[2..] {
         assert_eq!(call["calleeText"], "Target", "{reply}");
         assert_eq!(call["nativeCandidates"]["items"], json!([]));
         assert!(call["nativeCandidates"]["omitted"].is_null(), "{reply}");
@@ -7715,7 +7997,7 @@ async fn mcp_source_required_selected_path_and_digest_refuse_corrupt_rows() {
         Store,
         topology::{TopologyRoots, WorkspaceIdentity},
     };
-    for fault in ["missing_scope", "bad_digest"] {
+    for fault in ["missing_scope", "bad_digest", "bad_length"] {
         let temp = tempfile::tempdir().unwrap();
         let root = checkout(temp.path());
         fs::write(root.join("a.js"), "a\n").unwrap();
@@ -7784,6 +8066,13 @@ async fn mcp_source_required_selected_path_and_digest_refuse_corrupt_rows() {
             "{fault}: {error:#}"
         );
         drop(selected);
+        // Only stored bytes disagreeing with their recorded length or hash
+        // schedule a rebuild; a missing manifest scope does not.
+        assert_eq!(
+            store.recovery_pending_for_tests(),
+            fault != "missing_scope",
+            "{fault}"
+        );
         let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
         for legacy in [false, true] {
             let (mut client, mut reader, session) = socket_session(&identity, &registry, 145, None);

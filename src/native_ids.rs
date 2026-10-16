@@ -15,74 +15,53 @@ pub fn canonical(value: &Value) -> Vec<u8> {
 /// The canonical encoding of `value`, written to `out` piece by piece (for
 /// example straight into a hasher) instead of collected.
 pub fn canonical_into(value: &Value, out: &mut dyn FnMut(&[u8])) {
-    // This callback cannot fail; keep the original public, infallible API.
-    let _ = canonical_into_checked(value, &mut |bytes| {
-        out(bytes);
-        Ok(())
-    });
-}
-
-/// Fallible streaming form for optional hint work. It uses the same canonical
-/// encoding as `canonical_into` but lets the caller stop between bytes/rows.
-pub(crate) fn canonical_into_checked(
-    value: &Value,
-    out: &mut dyn FnMut(&[u8]) -> Result<()>,
-) -> Result<()> {
     match value {
-        Value::Null => out(b"null")?,
-        Value::Bool(b) => out(if *b { b"true" } else { b"false" })?,
-        Value::Number(n) => out(n.to_string().as_bytes())?,
-        Value::String(s) => canonical_string_into_checked(s, out)?,
+        Value::Null => out(b"null"),
+        Value::Bool(b) => out(if *b { b"true" } else { b"false" }),
+        Value::Number(n) => out(n.to_string().as_bytes()),
+        Value::String(s) => canonical_string_into(s, out),
         Value::Array(items) => {
-            out(b"[")?;
+            out(b"[");
             for (i, v) in items.iter().enumerate() {
                 if i != 0 {
-                    out(b",")?;
+                    out(b",");
                 }
-                canonical_into_checked(v, out)?;
+                canonical_into(v, out);
             }
-            out(b"]")?;
+            out(b"]");
         }
         Value::Object(map) => {
-            out(b"{")?;
+            out(b"{");
             let mut keys: Vec<_> = map.keys().collect();
             keys.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
             for (i, key) in keys.iter().enumerate() {
                 if i != 0 {
-                    out(b",")?;
+                    out(b",");
                 }
-                canonical_string_into_checked(key, out)?;
-                out(b":")?;
-                canonical_into_checked(&map[*key], out)?;
+                canonical_string_into(key, out);
+                out(b":");
+                canonical_into(&map[*key], out);
             }
-            out(b"}")?;
+            out(b"}");
         }
     }
-    Ok(())
 }
 
 /// The canonical encoding of one string.
 pub fn canonical_string_into(s: &str, out: &mut dyn FnMut(&[u8])) {
-    let _ = canonical_string_into_checked(s, &mut |bytes| {
-        out(bytes);
-        Ok(())
-    });
-}
-fn canonical_string_into_checked(s: &str, out: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
-    out(b"\"")?;
+    out(b"\"");
     for c in s.chars() {
         match c {
-            '"' => out(b"\\\"")?,
-            '\\' => out(b"\\\\")?,
-            '\u{0}'..='\u{1f}' => out(format!("\\u{:04x}", c as u32).as_bytes())?,
+            '"' => out(b"\\\""),
+            '\\' => out(b"\\\\"),
+            '\u{0}'..='\u{1f}' => out(format!("\\u{:04x}", c as u32).as_bytes()),
             _ => {
                 let mut bytes = [0; 4];
-                out(c.encode_utf8(&mut bytes).as_bytes())?;
+                out(c.encode_utf8(&mut bytes).as_bytes());
             }
         }
     }
-    out(b"\"")?;
-    Ok(())
+    out(b"\"");
 }
 
 pub fn digest(domain: &[u8], bytes: &[u8]) -> String {
@@ -339,28 +318,4 @@ pub fn extraction_context(language: &str, components: &[(String, String)]) -> Re
         b"trellis.extraction-context.v1\0",
         &canonical(&serde_json::json!({"language":language,"components":components})),
     ))
-}
-
-#[cfg(test)]
-#[test]
-fn checked_canonical_matches_required_encoding_and_can_stop() {
-    let value = serde_json::json!({"z": ["\n", {"a": "é\"\\"}], "a": 2});
-    let mut checked = Vec::new();
-    canonical_into_checked(&value, &mut |chunk| {
-        checked.extend_from_slice(chunk);
-        Ok(())
-    })
-    .unwrap();
-    assert_eq!(checked, canonical(&value));
-    let mut writes = 0;
-    assert!(
-        canonical_into_checked(&value, &mut |_| {
-            writes += 1;
-            if writes > 2 {
-                anyhow::bail!("expired")
-            }
-            Ok(())
-        })
-        .is_err()
-    );
 }

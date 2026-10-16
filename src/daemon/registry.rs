@@ -121,6 +121,38 @@ struct CheckoutMetadata {
     device: u64,
     inode: u64,
 }
+/// A cold checkout's prior-head check, captured under the registry lock and
+/// run without it.
+pub struct PriorHeadProbe {
+    identity: CheckoutMetadata,
+    roots: Option<TopologyRoots>,
+}
+impl PriorHeadProbe {
+    pub fn check(self) -> anyhow::Result<()> {
+        let identity = self.identity.rediscover()?;
+        let roots = match self.roots {
+            Some(roots) => roots,
+            None => TopologyRoots::production()?,
+        };
+        match Store::status_existing_readonly(roots, identity) {
+            Ok(_) => Ok(()),
+            // A cache tree without an admissible lock/format has no selected
+            // head. Preserve cold W1's inert answer without creating state.
+            Err(error)
+                if error.to_string().starts_with("unsafe managed directory:")
+                    || error
+                        .to_string()
+                        .starts_with("incompatible_index: missing or unsafe use lock")
+                    || error
+                        .to_string()
+                        .starts_with("recovery_required: exceptional index format;") =>
+            {
+                anyhow::bail!("index_not_ready: no admitted head")
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
 impl CheckoutMetadata {
     fn from_identity(identity: &WorkspaceIdentity) -> Self {
         Self {
@@ -249,32 +281,20 @@ impl CheckoutRegistry {
     /// Probe only this registry's configured topology. A virgin checkout must not
     /// create derived state to answer a read, while a published head may activate.
     pub fn eligible_prior_head(&self, key: &str) -> anyhow::Result<()> {
+        self.prior_head_probe(key)?.check()
+    }
+
+    /// Capture what a cold prior-head check needs, so the caller can release
+    /// the registry lock before rediscovery and the SQLite open.
+    pub fn prior_head_probe(&self, key: &str) -> anyhow::Result<PriorHeadProbe> {
         let entry = self
             .entries
             .get(key)
             .ok_or_else(|| anyhow::anyhow!("index_not_ready: checkout not attached"))?;
-        let identity = entry.identity.rediscover()?;
-        let roots = match &self.roots {
-            Some(roots) => roots.clone(),
-            None => TopologyRoots::production()?,
-        };
-        match Store::status_existing_readonly(roots, identity) {
-            Ok(_) => Ok(()),
-            // A cache tree without an admissible lock/format has no selected
-            // head. Preserve cold W1's inert answer without creating state.
-            Err(error)
-                if error.to_string().starts_with("unsafe managed directory:")
-                    || error
-                        .to_string()
-                        .starts_with("incompatible_index: missing or unsafe use lock")
-                    || error
-                        .to_string()
-                        .starts_with("recovery_required: exceptional index format;") =>
-            {
-                anyhow::bail!("index_not_ready: no admitted head")
-            }
-            Err(error) => Err(error),
-        }
+        Ok(PriorHeadProbe {
+            identity: entry.identity.clone(),
+            roots: self.roots.clone(),
+        })
     }
 
     /// Activate an already attached checkout. Registration and global discovery
@@ -1903,6 +1923,8 @@ impl CheckoutRuntime {
     /// Freeze only optional hint accounting. Mandatory call deadlines keep using real time.
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
+    /// Freeze the optional-hint clock. Freeze before the call is accepted: the
+    /// hint end is still capped by the call's real-clock deadline.
     pub fn freeze_mcp_hint_clock_for_tests(&self) {
         *self.mcp_hint_clock_origin.lock().unwrap() = Some(Instant::now());
     }

@@ -1535,14 +1535,10 @@ impl ParserState<'_> {
         }
         for indexes in by_owner.values_mut() {
             crate::store::optional_hint_check(self.progress)?;
-            crate::store::sort_optional_by_key(
-                indexes,
-                |i| {
-                    let r = &self.artifact.control_regions[*i].range;
-                    (r.start, r.end)
-                },
-                self.progress,
-            )?;
+            indexes.sort_by_key(|i| {
+                let r = &self.artifact.control_regions[*i].range;
+                (r.start, r.end)
+            });
             for (ordinal, i) in indexes.iter().enumerate() {
                 crate::store::optional_hint_check(self.progress)?;
                 let input = self.occurrence_input(
@@ -1579,14 +1575,10 @@ impl ParserState<'_> {
         }
         for indexes in by_owner.values_mut() {
             crate::store::optional_hint_check(self.progress)?;
-            crate::store::sort_optional_by_key(
-                indexes,
-                |i| {
-                    let r = &self.artifact.calls[*i].range;
-                    (r.start, r.end)
-                },
-                self.progress,
-            )?;
+            indexes.sort_by_key(|i| {
+                let r = &self.artifact.calls[*i].range;
+                (r.start, r.end)
+            });
             for (ordinal, i) in indexes.iter().enumerate() {
                 crate::store::optional_hint_check(self.progress)?;
                 let input = self.occurrence_input(
