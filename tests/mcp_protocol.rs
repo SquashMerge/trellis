@@ -1262,17 +1262,31 @@ fn golden_tool_envelopes_and_maximum_ids_both_modes() {
                 exact_tool_for_id(&invalid, &id, Some("invalid_request"), !legacy, "checkout");
                 let args = fixture()["validArguments"][index].clone();
                 let accepted = peer.ask(call(legacy, id.clone(), name, args));
-                exact_tool_for_id(
-                    &accepted,
-                    &id,
-                    if index == 0 {
-                        None
-                    } else {
-                        Some("index_not_ready")
-                    },
-                    !legacy,
-                    "checkout",
-                );
+                if index == 1 && accepted["result"]["isError"] == false {
+                    tool(&accepted, None, !legacy);
+                    let actual = &accepted["result"]["structuredContent"];
+                    assert_eq!(
+                        actual["data"],
+                        json!({"symbols":[],"coverage":[],"provenance":[]})
+                    );
+                    assert!(actual["evidenceBasis"]["indexRevision"].as_u64().unwrap() > 0);
+                    assert_eq!(actual["partial"], false);
+                    assert_eq!(actual["truncated"], false);
+                    assert_eq!(actual["warnings"].as_array().unwrap().len(), 1);
+                    assert_eq!(actual["warnings"][0]["code"], "syntaxOnly");
+                } else {
+                    exact_tool_for_id(
+                        &accepted,
+                        &id,
+                        if index == 0 {
+                            None
+                        } else {
+                            Some("index_not_ready")
+                        },
+                        !legacy,
+                        "checkout",
+                    );
+                }
             }
         }
         for name in &names {
@@ -1302,13 +1316,29 @@ fn golden_tool_envelopes_and_maximum_ids_both_modes() {
                 json!({"schemaVersion":1,"path":"src-sentinel.txt","startLine":1,"endLine":200,"expectedBasis":pin,"expectedContentHash":"a".repeat(64)}),
             ),
         ] {
-            exact_tool_for_id(
-                &peer.ask(call(legacy, json!(heavy_id), name, args)),
-                &json!(heavy_id),
-                Some("index_not_ready"),
-                !legacy,
-                "checkout",
-            );
+            let answer = peer.ask(call(legacy, json!(heavy_id), name, args));
+            if name == "trellis_find_symbols"
+                && answer["result"]["structuredContent"]["error"]["code"] == "revision_conflict"
+            {
+                tool(&answer, Some("revision_conflict"), !legacy);
+                let envelope = &answer["result"]["structuredContent"];
+                assert_eq!(answer["id"], json!(heavy_id));
+                assert!(
+                    envelope["error"]["currentBasis"]["indexRevision"]
+                        .as_u64()
+                        .unwrap()
+                        > 0
+                );
+                assert!(envelope.get("data").is_none());
+            } else {
+                exact_tool_for_id(
+                    &answer,
+                    &json!(heavy_id),
+                    Some("index_not_ready"),
+                    !legacy,
+                    "checkout",
+                );
+            }
         }
         let mut wrong = fixture()["validArguments"][1].clone();
         wrong["limit"] = json!(51);
@@ -1947,6 +1977,19 @@ fn per_call_linked_worktree_selection_and_closed_failures() {
             "linked"
         );
         assert!(linked_marker.exists());
+        let deadline = std::time::Instant::now() + trellis::testing::HANG_BACKSTOP;
+        loop {
+            let status = describe(&mut peer, 20, json!({"schemaVersion":1,"workspace":linked}));
+            tool(&status, None, !legacy);
+            if status["result"]["structuredContent"]["data"]["indexState"] == "ready" {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "linked checkout head was not admitted"
+            );
+            std::thread::yield_now();
+        }
         for (offset, name) in fixture()["names"]
             .as_array()
             .unwrap()
@@ -1962,7 +2005,13 @@ fn per_call_linked_worktree_selection_and_closed_failures() {
                 name.as_str().unwrap(),
                 arguments,
             ));
-            tool(&answer, Some("index_not_ready"), !legacy);
+            if offset == 1 {
+                tool(&answer, None, !legacy);
+                let data = &answer["result"]["structuredContent"]["data"];
+                assert_eq!(*data, json!({"symbols":[],"coverage":[],"provenance":[]}));
+            } else {
+                tool(&answer, Some("index_not_ready"), !legacy);
+            }
             assert_eq!(
                 answer["result"]["structuredContent"]["workspace"],
                 json!(linked)
@@ -4526,4 +4575,187 @@ async fn a_client_hang_up_ends_the_session_cleanly() {
         ended.is_ok(),
         "a client hang-up failed the session: {ended:?}"
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn mcp_find_selected_snapshot_ranks_and_keeps_zero_hit_scope() {
+    use std::os::unix::net::UnixStream;
+    use trellis::daemon::registry::CheckoutRegistry;
+    use trellis::store::{
+        Store,
+        topology::{TopologyRoots, WorkspaceIdentity},
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let root = checkout(temp.path());
+    let mut source =
+        "function Alpha() {}\nfunction Alphabet() {}\nfunction xAlpha() {}\n".to_owned();
+    for index in 0..51 {
+        source.push_str(&format!("function Many{index:03}() {{}}\n"));
+    }
+    fs::write(root.join("a.js"), source).unwrap();
+    fs::write(root.join("b.py"), "def separate(): pass\n").unwrap();
+    let identity = WorkspaceIdentity::discover(Some(&root), &root)
+        .unwrap()
+        .attach_marker()
+        .unwrap();
+    let store = Store::open_for_tests(temp.path(), &root).unwrap();
+    let baseline = store.index_baseline().unwrap();
+    store.mcp_prepare_virgin_queue_for_tests().unwrap();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
+        &trellis::indexer::IndexOptions::new(root.clone()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    let writer = store.publication_for_tests().unwrap();
+    let pin = store
+        .publish_native(&graph, &capture, &native, &writer, baseline, &cancel)
+        .unwrap();
+    store
+        .mcp_set_coverage_for_tests(&writer, "b.py", true, "failed")
+        .unwrap();
+    drop(writer);
+    drop(store);
+    let topology =
+        TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(143, &identity).unwrap();
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (resume_tx, resume_rx) = mpsc::sync_channel(1);
+    let resume_rx = std::sync::Mutex::new(resume_rx);
+    registry.set_next_startup_hook_for_tests(std::sync::Arc::new(move || {
+        entered_tx.send(()).unwrap();
+        resume_rx
+            .lock()
+            .unwrap()
+            .recv_timeout(trellis::testing::HANG_BACKSTOP)
+            .unwrap();
+    }));
+    let runtime = registry.activate(&identity.root_key).unwrap();
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        loop {
+            if entered_rx.try_recv().is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("startup reconciliation did not pause");
+    assert!(runtime.catching_up());
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    let (mut client, server) = UnixStream::pair().unwrap();
+    client
+        .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
+        .unwrap();
+    let handle = tokio::runtime::Handle::current();
+    let session = std::thread::spawn(move || {
+        trellis::mcp::run_socket(
+            trellis::mcp::OpenedWorkspace::new(identity),
+            server,
+            registry,
+            143,
+            handle,
+        )
+    });
+    let ask =
+        |client: &mut UnixStream, id: i64, query: &str, limit: u64, expected: Option<Value>| {
+            let mut args = json!({"schemaVersion":1,"query":query,"limit":limit});
+            if let Some(pin) = expected {
+                args["expectedBasis"] = pin;
+            }
+            writeln!(
+                client,
+                "{}",
+                modern(
+                    json!(id),
+                    "tools/call",
+                    json!({"name":"trellis_find_symbols","arguments":args})
+                )
+            )
+            .unwrap();
+            let mut line = String::new();
+            BufReader::new(client.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            serde_json::from_str::<Value>(&line).unwrap()
+        };
+    let first = ask(&mut client, 144, "alpha", 1, None);
+    tool(&first, None, true);
+    let data = &first["result"]["structuredContent"];
+    assert_eq!(data["catchingUp"], true);
+    assert_eq!(
+        data["evidenceBasis"],
+        json!({
+            "indexGeneration":pin.index_generation.to_string(),"indexRevision":pin.index_revision
+        })
+    );
+    resume_tx.send(()).unwrap();
+    assert_eq!(data["data"]["symbols"][0]["name"], "Alpha");
+    assert_eq!(data["truncated"], true);
+    assert_eq!(data["truncationReason"], "limit");
+    assert_eq!(data["data"]["provenance"].as_array().unwrap().len(), 1);
+    let ranked = ask(&mut client, 147, "ALPHA", 20, None);
+    tool(&ranked, None, true);
+    let ranked = &ranked["result"]["structuredContent"];
+    assert_eq!(
+        ranked["data"]["symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|symbol| symbol["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["Alpha", "Alphabet", "xAlpha"]
+    );
+    assert_eq!(ranked["truncated"], false);
+    let exact_limit = ask(&mut client, 149, "alpha", 3, None);
+    tool(&exact_limit, None, true);
+    assert_eq!(
+        exact_limit["result"]["structuredContent"]["truncated"],
+        false
+    );
+    let max_limit = ask(&mut client, 150, "Many", 50, None);
+    tool(&max_limit, None, true);
+    assert_eq!(
+        max_limit["result"]["structuredContent"]["data"]["symbols"]
+            .as_array()
+            .unwrap()
+            .len(),
+        50
+    );
+    assert_eq!(
+        max_limit["result"]["structuredContent"]["truncationReason"],
+        "limit"
+    );
+    let default = ask(&mut client, 151, "Many", 20, None);
+    tool(&default, None, true);
+    assert_eq!(
+        default["result"]["structuredContent"]["data"]["symbols"]
+            .as_array()
+            .unwrap()
+            .len(),
+        20
+    );
+    let literal = ask(&mut client, 148, " alpha ", 20, None);
+    tool(&literal, None, true);
+    assert_eq!(
+        literal["result"]["structuredContent"]["data"]["symbols"],
+        json!([])
+    );
+    let empty = ask(&mut client, 145, "no-such-name", 20, None);
+    tool(&empty, None, true);
+    let data = &empty["result"]["structuredContent"];
+    assert_eq!(data["data"]["symbols"], json!([]));
+    assert_eq!(data["data"]["coverage"].as_array().unwrap().len(), 2);
+    assert_eq!(data["data"]["provenance"], json!([]));
+    assert_eq!(data["partial"], true);
+    assert_eq!(data["warnings"][0]["code"], "coverageIncomplete");
+    assert_eq!(data["warnings"][1]["code"], "syntaxOnly");
+    let old = json!({"indexGeneration":pin.index_generation.to_string(),"indexRevision":0});
+    let stale = ask(&mut client, 146, "no-such-name", 20, Some(old));
+    tool(&stale, Some("revision_conflict"), true);
+    drop(client);
+    session.join().unwrap().unwrap();
 }
