@@ -607,11 +607,9 @@ fn build_native_header<'a>(
             .cmp(&language_order(&b.language).unwrap())
             .then(a.path.as_bytes().cmp(b.path.as_bytes()))
     });
-    let docs: Vec<Value> = files.iter().map(|f| json!({"language":f.language,"path":f.path,"bytes":hex::encode(f.text.as_bytes()),"byteLength":f.text.len()})).collect();
-    let revision_input = json!({"sourceSetId":source_set_id,"documents":docs,"toolchain":toolchain,"config":config,"dependencies":dependencies});
     let id = format!(
         "revision:v1:{}",
-        digest(b"trellis.native-revision.v1\0", &canonical(&revision_input))
+        native_revision_digest(&source_set_id, &files, &toolchain, &config, &dependencies)
     );
     let documents = files
         .iter()
@@ -645,6 +643,64 @@ fn build_native_header<'a>(
         control_regions: vec![],
     };
     Ok((artifact, files))
+}
+
+/// `digest("trellis.native-revision.v1\0", canonical(revision_input))`, where
+/// `revision_input` is
+/// `{"config","dependencies","documents":[{"byteLength","bytes":hex,"language","path"}],"sourceSetId","toolchain"}`.
+/// The canonical bytes are written straight into the hasher, in canonical key
+/// order, with each document's bytes hex-encoded a chunk at a time, so the
+/// whole-corpus encoding is never held in memory. The digest is identical.
+fn native_revision_digest(
+    source_set_id: &str,
+    files: &[&SourceFile],
+    toolchain: &Value,
+    config: &[Value],
+    dependencies: &[Value],
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"trellis.native-revision.v1\0");
+    let out = &mut |bytes: &[u8]| hasher.update(bytes);
+    let array = |items: &[Value], out: &mut dyn FnMut(&[u8])| {
+        out(b"[");
+        for (i, item) in items.iter().enumerate() {
+            if i != 0 {
+                out(b",");
+            }
+            crate::native_ids::canonical_into(item, out);
+        }
+        out(b"]");
+    };
+    out(b"{\"config\":");
+    array(config, out);
+    out(b",\"dependencies\":");
+    array(dependencies, out);
+    out(b",\"documents\":[");
+    let mut hex = [0_u8; 8192];
+    for (i, file) in files.iter().enumerate() {
+        if i != 0 {
+            out(b",");
+        }
+        out(b"{\"byteLength\":");
+        out(file.text.len().to_string().as_bytes());
+        out(b",\"bytes\":\"");
+        for chunk in file.text.as_bytes().chunks(hex.len() / 2) {
+            let encoded = &mut hex[..chunk.len() * 2];
+            hex::encode_to_slice(chunk, encoded).expect("hex buffer is twice the chunk");
+            out(encoded);
+        }
+        out(b"\",\"language\":");
+        crate::native_ids::canonical_string_into(&file.language, out);
+        out(b",\"path\":");
+        crate::native_ids::canonical_string_into(&file.path, out);
+        out(b"}");
+    }
+    out(b"],\"sourceSetId\":");
+    crate::native_ids::canonical_string_into(source_set_id, out);
+    out(b",\"toolchain\":");
+    crate::native_ids::canonical_into(toolchain, out);
+    out(b"}");
+    hex::encode(hasher.finalize())
 }
 
 fn build_native(capture: &Capture, root: &Path, root_id: &str) -> Result<Artifact> {
@@ -2506,6 +2562,73 @@ mod cached_executable_digest_tests {
             assert_eq!(
                 occurrence_count, old_occurrences,
                 "new occ:v2 record escaped component refusal"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod revision_digest_tests {
+    use super::*;
+    use crate::model::SourceFile;
+
+    /// The construction `native_revision_digest` replaces: the whole input
+    /// as one JSON value, canonicalized, then hashed.
+    fn materialized(
+        source_set_id: &str,
+        files: &[&SourceFile],
+        toolchain: &Value,
+        config: &[Value],
+        dependencies: &[Value],
+    ) -> String {
+        let docs: Vec<Value> = files.iter().map(|f| json!({"language":f.language,"path":f.path,"bytes":hex::encode(f.text.as_bytes()),"byteLength":f.text.len()})).collect();
+        let revision_input = json!({"sourceSetId":source_set_id,"documents":docs,"toolchain":toolchain,"config":config,"dependencies":dependencies});
+        digest(b"trellis.native-revision.v1\0", &canonical(&revision_input))
+    }
+
+    fn file(language: &str, path: &str, text: String) -> SourceFile {
+        SourceFile {
+            path: path.into(),
+            hash: String::new(),
+            language: language.into(),
+            text,
+        }
+    }
+
+    /// The streamed digest is byte-for-byte the materialized one, including
+    /// escaped paths, empty and multi-chunk bodies, and an empty corpus.
+    #[test]
+    fn the_streamed_revision_digest_equals_the_materialized_one() {
+        let toolchain = json!({"nativeExecutable":"abc","rootRustToolchain":{"path":"rust-toolchain","sha256":null},"rootRustToolchainToml":null});
+        let config = vec![
+            json!({"path":".gitignore","sha256":"x"}),
+            json!({"nativeAdmission":{"maxFileBytes":2097152}}),
+        ];
+        let dependencies = vec![
+            json!({"path":"Cargo.lock","bytes":null}),
+            json!([1, "two", {"z": true, "a": false}]),
+        ];
+        let files = [
+            file("rust", "src/a.rs", "fn a() {}\n".into()),
+            file(
+                "java",
+                "dir with \"quotes\"\\and\\backslash.java",
+                String::new(),
+            ),
+            file("python", "ctl\u{1}\u{1f}é漢字.py", "x = '\u{0}'\n".into()),
+            file("javascript", "big.js", "€".repeat(9000)),
+        ];
+        let refs: Vec<&SourceFile> = files.iter().collect();
+        for (set, docs) in [
+            ("source-set:v1:r", &refs[..]),
+            ("s\"et", &refs[..0]),
+            ("source-set:v1:r", &refs[3..]),
+        ] {
+            assert_eq!(
+                native_revision_digest(set, docs, &toolchain, &config, &dependencies),
+                materialized(set, docs, &toolchain, &config, &dependencies),
+                "source set {set}, {} documents",
+                docs.len()
             );
         }
     }

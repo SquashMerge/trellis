@@ -7,57 +7,61 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 pub fn canonical(value: &Value) -> Vec<u8> {
-    fn emit(value: &Value, out: &mut Vec<u8>) {
-        match value {
-            Value::Null => out.extend_from_slice(b"null"),
-            Value::Bool(b) => out.extend_from_slice(if *b { b"true" } else { b"false" }),
-            Value::Number(n) => out.extend_from_slice(n.to_string().as_bytes()),
-            Value::String(s) => {
-                out.push(b'"');
-                for c in s.chars() {
-                    match c {
-                        '"' => out.extend_from_slice(b"\\\""),
-                        '\\' => out.extend_from_slice(b"\\\\"),
-                        '\u{0}'..='\u{1f}' => {
-                            out.extend_from_slice(format!("\\u{:04x}", c as u32).as_bytes())
-                        }
-                        _ => {
-                            let mut bytes = [0; 4];
-                            out.extend_from_slice(c.encode_utf8(&mut bytes).as_bytes());
-                        }
-                    }
+    let mut out = Vec::new();
+    canonical_into(value, &mut |bytes| out.extend_from_slice(bytes));
+    out
+}
+
+/// The canonical encoding of `value`, written to `out` piece by piece (for
+/// example straight into a hasher) instead of collected.
+pub fn canonical_into(value: &Value, out: &mut dyn FnMut(&[u8])) {
+    match value {
+        Value::Null => out(b"null"),
+        Value::Bool(b) => out(if *b { b"true" } else { b"false" }),
+        Value::Number(n) => out(n.to_string().as_bytes()),
+        Value::String(s) => canonical_string_into(s, out),
+        Value::Array(items) => {
+            out(b"[");
+            for (i, v) in items.iter().enumerate() {
+                if i != 0 {
+                    out(b",");
                 }
-                out.push(b'"');
+                canonical_into(v, out);
             }
-            Value::Array(items) => {
-                out.push(b'[');
-                for (i, v) in items.iter().enumerate() {
-                    if i != 0 {
-                        out.push(b',');
-                    }
-                    emit(v, out);
+            out(b"]");
+        }
+        Value::Object(map) => {
+            out(b"{");
+            let mut keys: Vec<_> = map.keys().collect();
+            keys.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+            for (i, key) in keys.iter().enumerate() {
+                if i != 0 {
+                    out(b",");
                 }
-                out.push(b']');
+                canonical_string_into(key, out);
+                out(b":");
+                canonical_into(&map[*key], out);
             }
-            Value::Object(map) => {
-                out.push(b'{');
-                let mut keys: Vec<_> = map.keys().collect();
-                keys.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
-                for (i, key) in keys.iter().enumerate() {
-                    if i != 0 {
-                        out.push(b',');
-                    }
-                    emit(&Value::String((*key).clone()), out);
-                    out.push(b':');
-                    emit(&map[*key], out);
-                }
-                out.push(b'}');
+            out(b"}");
+        }
+    }
+}
+
+/// The canonical encoding of one string.
+pub fn canonical_string_into(s: &str, out: &mut dyn FnMut(&[u8])) {
+    out(b"\"");
+    for c in s.chars() {
+        match c {
+            '"' => out(b"\\\""),
+            '\\' => out(b"\\\\"),
+            '\u{0}'..='\u{1f}' => out(format!("\\u{:04x}", c as u32).as_bytes()),
+            _ => {
+                let mut bytes = [0; 4];
+                out(c.encode_utf8(&mut bytes).as_bytes());
             }
         }
     }
-    let mut out = Vec::new();
-    emit(value, &mut out);
-    out
+    out(b"\"");
 }
 
 pub fn digest(domain: &[u8], bytes: &[u8]) -> String {
