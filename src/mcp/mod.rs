@@ -239,6 +239,123 @@ fn mcp_read_error(error: &anyhow::Error) -> &'static str {
     }
 }
 
+/// A failed evidence read's wire code.
+fn evidence_failure_code(error: &anyhow::Error) -> &'static str {
+    let message = error.to_string();
+    if message.starts_with("revision conflict:") {
+        "revision_conflict"
+    } else if message.starts_with("unsupported_encoding:") {
+        "unsupported_encoding"
+    } else if message.starts_with("range_too_large:") {
+        "range_too_large"
+    } else if message.starts_with("invalid_request:") {
+        "invalid_request"
+    } else {
+        mcp_read_error(error)
+    }
+}
+
+/// One tool's read and projection inside an admitted snapshot. An error is
+/// either retryable contention or a failure to report with its wire code.
+type EvidenceToolRead<'a> = Box<
+    dyn Fn(
+            &crate::daemon::registry::CheckoutRuntime,
+            &crate::daemon::registry::CheckoutEvidence,
+            bool,
+        ) -> anyhow::Result<serde_json::Value>
+        + 'a,
+>;
+
+/// The shared cached-evidence read for find, inspect and read_source. A cold
+/// checkout must show a prior head before it is activated; then one snapshot is
+/// admitted, read, and finished. Store contention, including the cold check's,
+/// retries until the call deadline.
+#[allow(clippy::too_many_arguments)]
+fn evidence_read(
+    registry: &std::sync::Arc<tokio::sync::Mutex<crate::daemon::registry::CheckoutRegistry>>,
+    key: &str,
+    daemon_handle: Option<&tokio::runtime::Handle>,
+    selected: Option<&crate::daemon::registry::SelectedCheckout>,
+    deadline: std::time::Instant,
+    cancel: &std::sync::atomic::AtomicBool,
+    publish: &dyn Fn(bool),
+    id: &serde_json::Value,
+    read: &dyn Fn(
+        &crate::daemon::registry::CheckoutRuntime,
+        &crate::daemon::registry::CheckoutEvidence,
+        bool,
+    ) -> anyhow::Result<serde_json::Value>,
+) -> anyhow::Result<(serde_json::Value, bool)> {
+    let cancelled = || cancel.load(std::sync::atomic::Ordering::Acquire);
+    let runtime = loop {
+        if let Some(runtime) = registry.blocking_lock().runtime(key) {
+            break runtime;
+        }
+        // A cold evidence call must not activate a checkout merely to discover
+        // that it has no derived index yet. Check outside the registry lock.
+        let probe = registry.blocking_lock().prior_head_probe(key)?;
+        match probe.check() {
+            Ok(()) => {}
+            Err(error) if crate::store::cli_read_retryable_contention(&error) => {
+                if cancelled() || std::time::Instant::now() >= deadline {
+                    anyhow::bail!("deadline_exceeded: MCP selected read deadline");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                continue;
+            }
+            Err(error) => return Err(error),
+        }
+        break match daemon_handle {
+            Some(handle) => handle.block_on(async { registry.lock().await.activate(key) })?,
+            None => anyhow::bail!("index_not_ready: checkout not activated"),
+        };
+    };
+    #[cfg(feature = "test-support")]
+    runtime.run_mcp_read_hook_for_tests();
+    loop {
+        if cancelled() || runtime.mcp_clock_now() >= deadline {
+            anyhow::bail!("deadline_exceeded: MCP selected read deadline");
+        }
+        let attempt = (|| {
+            let (response, sampled) = match selected {
+                Some(witness) => runtime.evidence_for_selected(witness)?,
+                None => runtime.evidence_response()?,
+            };
+            publish(sampled);
+            #[cfg(feature = "test-support")]
+            runtime.run_mcp_admitted_gate_for_tests();
+            if cancelled() || runtime.mcp_clock_now() >= deadline {
+                anyhow::bail!("deadline_exceeded: MCP selected read deadline");
+            }
+            let pin = response.status()?.revision;
+            let mut envelope = match read(&runtime, &response, sampled) {
+                Ok(envelope) => envelope,
+                Err(error) if crate::store::cli_read_retryable_contention(&error) => {
+                    return Err(error);
+                }
+                Err(error) => tools::failure(id, evidence_failure_code(&error)),
+            };
+            // W8: a rejected store reports no basis; every other failure reports
+            // the admitted snapshot's.
+            if envelope.get("error").is_some() && envelope["error"]["code"] != "store_unavailable" {
+                envelope["error"]["currentBasis"] = serde_json::json!({
+                    "indexGeneration": pin.index_generation.to_string(),
+                    "indexRevision": pin.index_revision
+                });
+            }
+            response
+                .finish(envelope)
+                .map(|envelope| (envelope, sampled))
+        })();
+        match attempt {
+            Err(ref error) if crate::store::cli_read_retryable_contention(error) => {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            answer => return answer,
+        }
+    }
+}
+
 struct DescribedSnapshot {
     data: Option<(crate::model::IndexStatus, [[u64; 5]; 4])>,
     catching_up: bool,
@@ -582,486 +699,136 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                     }
                 }
             }
-            if name == "trellis_find_symbols"
-                && tool.valid_arguments
-                && envelope["error"]["code"] == "index_not_ready"
-                && let Some((registry, _)) = &registry
-            {
-                let args = arguments
-                    .as_ref()
-                    .and_then(serde_json::Value::as_object)
-                    .expect("validated find arguments");
-                let query = args["query"].as_str().expect("validated find query");
-                let limit = args
-                    .get("limit")
-                    .map_or(20, |v| wire::uint(v).expect("validated limit") as usize);
-                let expected = validated_expected_basis(args);
-                let publish = |sampled: bool| {
-                    *resolved.lock().unwrap() = Some((answering.root().to_owned(), sampled));
-                };
-                let read = (|| -> anyhow::Result<(serde_json::Value, bool)> {
-                    let existing = registry.blocking_lock().runtime(key);
-                    let runtime = match existing {
-                        Some(runtime) => runtime,
-                        None => {
-                            // A cold evidence call must not activate a checkout merely to
-                            // discover that it has no derived index yet.
-                            registry.blocking_lock().eligible_prior_head(key)?;
-                            match daemon_handle.as_ref() {
-                                Some(handle) => handle
-                                    .block_on(async { registry.lock().await.activate(key) })?,
-                                None => anyhow::bail!("index_not_ready: checkout not activated"),
-                            }
-                        }
-                    };
-                    #[cfg(feature = "test-support")]
-                    runtime.run_mcp_read_hook_for_tests();
-                    loop {
-                        if cancel.load(std::sync::atomic::Ordering::Acquire)
-                            || runtime.mcp_clock_now() >= deadline
-                        {
-                            anyhow::bail!("deadline_exceeded: MCP selected read deadline");
-                        }
-                        let attempt = (|| {
-                            let (response, sampled) = match selected.as_ref() {
-                                Some(witness) => runtime.evidence_for_selected(witness)?,
-                                None => runtime.evidence_response()?,
-                            };
-                            publish(sampled);
-                            #[cfg(feature = "test-support")]
-                            runtime.run_mcp_admitted_gate_for_tests();
-                            let pin = response.status()?.revision;
-                            let basis = serde_json::json!({
-                                "indexGeneration":pin.index_generation.to_string(),
-                                "indexRevision":pin.index_revision
-                            });
-                            let envelope = match response.mcp_find(query, limit, expected) {
-                                Ok(result) => {
-                                    projection::find(&id, result, answering.root(), sampled, modern)
-                                        .unwrap_or_else(|| tools::failure(&id, "range_too_large"))
-                                }
-                                Err(error)
-                                    if crate::store::cli_read_retryable_contention(&error) =>
-                                {
-                                    return Err(error);
-                                }
-                                Err(error) => {
-                                    let code =
-                                        if error.to_string().starts_with("revision conflict:") {
-                                            "revision_conflict"
-                                        } else {
-                                            mcp_read_error(&error)
-                                        };
-                                    tools::failure(&id, code)
-                                }
-                            };
-                            let mut envelope = envelope;
-                            if envelope.get("error").is_some()
-                                && envelope["error"]["code"] != "store_unavailable"
-                            {
-                                envelope["error"]["currentBasis"] = basis;
-                            }
-                            response
-                                .finish(envelope)
-                                .map(|envelope| (envelope, sampled))
-                        })();
-                        match attempt {
-                            Err(ref error)
-                                if crate::store::cli_read_retryable_contention(error) =>
-                            {
-                                std::thread::sleep(std::time::Duration::from_millis(1));
-                            }
-                            answer => return answer,
-                        }
-                    }
-                })();
-                match read {
-                    Ok((found, sampled)) => {
-                        envelope = found;
-                        sampled_catching_up = sampled;
-                    }
-                    Err(error) => {
-                        let code = if error.to_string().starts_with("revision conflict:") {
-                            "revision_conflict"
-                        } else {
-                            mcp_read_error(&error)
-                        };
-                        envelope = tools::failure(&id, code);
-                    }
+            let args = arguments.as_ref().and_then(serde_json::Value::as_object);
+            let view = args.and_then(|a| a.get("view")).and_then(|v| v.as_str());
+            let root = answering.root();
+            let id = &id;
+            let tool_read: Option<EvidenceToolRead> = match (name.as_str(), view, args) {
+                _ if !tool.valid_arguments || envelope["error"]["code"] != "index_not_ready" => {
+                    None
                 }
-            }
-            if name == "trellis_inspect"
-                && arguments
-                    .as_ref()
-                    .and_then(|v| v.get("view"))
-                    .and_then(|v| v.as_str())
-                    == Some("declaration")
-                && tool.valid_arguments
-                && envelope["error"]["code"] == "index_not_ready"
-                && let Some((registry, _)) = &registry
-            {
-                let args = arguments
-                    .as_ref()
-                    .and_then(serde_json::Value::as_object)
-                    .expect("validated declaration arguments");
-                let symbol_id = args["symbolId"].as_str().expect("validated declaration ID");
-                let expected = validated_expected_basis(args);
-                let publish = |sampled: bool| {
-                    *resolved.lock().unwrap() = Some((answering.root().to_owned(), sampled));
-                };
-                let read = (|| -> anyhow::Result<(serde_json::Value, bool)> {
-                    let existing = registry.blocking_lock().runtime(key);
-                    let runtime = match existing {
-                        Some(runtime) => runtime,
-                        None => {
-                            // A cold evidence call must not activate a checkout merely to
-                            // discover that it has no derived index yet.
-                            registry.blocking_lock().eligible_prior_head(key)?;
-                            match daemon_handle.as_ref() {
-                                Some(handle) => handle
-                                    .block_on(async { registry.lock().await.activate(key) })?,
-                                None => anyhow::bail!("index_not_ready: checkout not activated"),
-                            }
-                        }
-                    };
-                    #[cfg(feature = "test-support")]
-                    runtime.run_mcp_read_hook_for_tests();
-                    loop {
-                        if cancel.load(std::sync::atomic::Ordering::Acquire)
-                            || runtime.mcp_clock_now() >= deadline
-                        {
-                            anyhow::bail!("deadline_exceeded: MCP selected read deadline");
-                        }
-                        let attempt = (|| {
-                            let (response, sampled) = match selected.as_ref() {
-                                Some(witness) => runtime.evidence_for_selected(witness)?,
-                                None => runtime.evidence_response()?,
-                            };
-                            publish(sampled);
-                            #[cfg(feature = "test-support")]
-                            runtime.run_mcp_admitted_gate_for_tests();
-                            let pin = response.status()?.revision;
-                            let basis = serde_json::json!({
-                                "indexGeneration":pin.index_generation.to_string(),
-                                "indexRevision":pin.index_revision
-                            });
-                            let envelope = match response.mcp_declaration(symbol_id, expected) {
-                                Ok(Some(result)) => projection::declaration(
-                                    &id,
-                                    result,
-                                    answering.root(),
-                                    sampled,
-                                    modern,
-                                )
-                                .unwrap_or_else(|| tools::failure(&id, "range_too_large")),
-                                Ok(None) => tools::failure(&id, "not_found"),
-                                Err(error)
-                                    if crate::store::cli_read_retryable_contention(&error) =>
-                                {
-                                    return Err(error);
-                                }
-                                Err(error) => {
-                                    let code =
-                                        if error.to_string().starts_with("revision conflict:") {
-                                            "revision_conflict"
-                                        } else {
-                                            mcp_read_error(&error)
-                                        };
-                                    tools::failure(&id, code)
-                                }
-                            };
-                            let mut envelope = envelope;
-                            if envelope.get("error").is_some()
-                                && envelope["error"]["code"] != "store_unavailable"
-                            {
-                                envelope["error"]["currentBasis"] = basis;
-                            }
-                            response
-                                .finish(envelope)
-                                .map(|envelope| (envelope, sampled))
-                        })();
-                        match attempt {
-                            Err(ref error)
-                                if crate::store::cli_read_retryable_contention(error) =>
-                            {
-                                std::thread::sleep(std::time::Duration::from_millis(1));
-                            }
-                            answer => return answer,
-                        }
-                    }
-                })();
-                match read {
-                    Ok((found, sampled)) => {
-                        envelope = found;
-                        sampled_catching_up = sampled;
-                    }
-                    Err(error) => {
-                        let code = if error.to_string().starts_with("revision conflict:") {
-                            "revision_conflict"
-                        } else {
-                            mcp_read_error(&error)
-                        };
-                        envelope = tools::failure(&id, code);
-                    }
+                ("trellis_find_symbols", _, Some(args)) => {
+                    let query = args["query"].as_str().expect("validated find query");
+                    let limit = args
+                        .get("limit")
+                        .map_or(20, |v| wire::uint(v).expect("validated limit") as usize);
+                    let expected = validated_expected_basis(args);
+                    Some(Box::new(move |_, response, sampled| {
+                        let found = response.mcp_find(query, limit, expected.clone())?;
+                        Ok(projection::find(id, found, root, sampled, modern)
+                            .unwrap_or_else(|| tools::failure(id, "range_too_large")))
+                    }))
                 }
-            }
-            if name == "trellis_inspect"
-                && arguments
-                    .as_ref()
-                    .and_then(|v| v.get("view"))
-                    .and_then(|v| v.as_str())
-                    == Some("outgoing_calls")
-                && tool.valid_arguments
-                && envelope["error"]["code"] == "index_not_ready"
-                && let Some((registry, _)) = &registry
-            {
-                let args = arguments
-                    .as_ref()
-                    .and_then(serde_json::Value::as_object)
-                    .expect("validated outgoing arguments");
-                let symbol_id = args["symbolId"].as_str().expect("validated outgoing ID");
-                let limit = args
-                    .get("limit")
-                    .map_or(20, |v| wire::uint(v).expect("validated limit") as usize);
-                let expected = validated_expected_basis(args);
-                let publish = |sampled: bool| {
-                    *resolved.lock().unwrap() = Some((answering.root().to_owned(), sampled));
-                };
-                let read = (|| -> anyhow::Result<(serde_json::Value, bool)> {
-                    let existing = registry.blocking_lock().runtime(key);
-                    let runtime = match existing {
-                        Some(runtime) => runtime,
-                        None => {
-                            // A cold evidence call must not activate a checkout merely to
-                            // discover that it has no derived index yet.
-                            registry.blocking_lock().eligible_prior_head(key)?;
-                            match daemon_handle.as_ref() {
-                                Some(handle) => handle
-                                    .block_on(async { registry.lock().await.activate(key) })?,
-                                None => anyhow::bail!("index_not_ready: checkout not activated"),
-                            }
-                        }
-                    };
-                    #[cfg(feature = "test-support")]
-                    runtime.run_mcp_read_hook_for_tests();
-                    loop {
-                        if cancel.load(std::sync::atomic::Ordering::Acquire)
-                            || runtime.mcp_clock_now() >= deadline
-                        {
-                            anyhow::bail!("deadline_exceeded: MCP selected read deadline");
-                        }
-                        let attempt = (|| {
-                            let (response, sampled) = match selected.as_ref() {
-                                Some(witness) => runtime.evidence_for_selected(witness)?,
-                                None => runtime.evidence_response()?,
-                            };
-                            publish(sampled);
-                            #[cfg(feature = "test-support")]
-                            runtime.run_mcp_admitted_gate_for_tests();
-                            let pin = response.status()?.revision;
-                            let basis = serde_json::json!({
-                                "indexGeneration":pin.index_generation.to_string(),
-                                "indexRevision":pin.index_revision
-                            });
-                            let envelope = match response.mcp_outgoing(
+                ("trellis_inspect", Some("declaration"), Some(args)) => {
+                    let symbol_id = args["symbolId"].as_str().expect("validated declaration ID");
+                    let expected = validated_expected_basis(args);
+                    Some(Box::new(move |_, response, sampled| {
+                        Ok(
+                            match response.mcp_declaration(symbol_id, expected.clone())? {
+                                Some(found) => {
+                                    projection::declaration(id, found, root, sampled, modern)
+                                        .unwrap_or_else(|| tools::failure(id, "range_too_large"))
+                                }
+                                None => tools::failure(id, "not_found"),
+                            },
+                        )
+                    }))
+                }
+                ("trellis_inspect", Some("outgoing_calls"), Some(args)) => {
+                    let symbol_id = args["symbolId"].as_str().expect("validated outgoing ID");
+                    let limit = args
+                        .get("limit")
+                        .map_or(20, |v| wire::uint(v).expect("validated limit") as usize);
+                    let expected = validated_expected_basis(args);
+                    Some(Box::new(move |runtime, response, sampled| {
+                        Ok(
+                            match response.mcp_outgoing(
                                 symbol_id,
                                 limit,
-                                expected,
+                                expected.clone(),
                                 &|| runtime.mcp_hint_clock_now(),
                                 deadline,
-                            ) {
-                                Ok(Some(result)) => projection::outgoing(
-                                    &id,
-                                    result,
-                                    answering.root(),
-                                    sampled,
-                                    modern,
-                                )
-                                .unwrap_or_else(|| tools::failure(&id, "range_too_large")),
-                                Ok(None) => tools::failure(&id, "not_found"),
-                                Err(error)
-                                    if crate::store::cli_read_retryable_contention(&error) =>
-                                {
-                                    return Err(error);
+                            )? {
+                                Some(found) => {
+                                    projection::outgoing(id, found, root, sampled, modern)
+                                        .unwrap_or_else(|| tools::failure(id, "range_too_large"))
                                 }
-                                Err(error) => {
-                                    let code =
-                                        if error.to_string().starts_with("revision conflict:") {
-                                            "revision_conflict"
-                                        } else {
-                                            mcp_read_error(&error)
-                                        };
-                                    tools::failure(&id, code)
-                                }
-                            };
-                            let mut envelope = envelope;
-                            if envelope.get("error").is_some()
-                                && envelope["error"]["code"] != "store_unavailable"
-                            {
-                                envelope["error"]["currentBasis"] = basis;
-                            }
-                            response
-                                .finish(envelope)
-                                .map(|envelope| (envelope, sampled))
-                        })();
-                        match attempt {
-                            Err(ref error)
-                                if crate::store::cli_read_retryable_contention(error) =>
-                            {
-                                std::thread::sleep(std::time::Duration::from_millis(1));
-                            }
-                            answer => return answer,
-                        }
-                    }
-                })();
-                match read {
-                    Ok((found, sampled)) => {
-                        envelope = found;
-                        sampled_catching_up = sampled;
-                    }
-                    Err(error) => {
-                        let code = if error.to_string().starts_with("revision conflict:") {
-                            "revision_conflict"
-                        } else {
-                            mcp_read_error(&error)
-                        };
-                        envelope = tools::failure(&id, code);
-                    }
+                                None => tools::failure(id, "not_found"),
+                            },
+                        )
+                    }))
                 }
-            }
-            if name == "trellis_read_source"
-                && tool.valid_arguments
-                && envelope["error"]["code"] == "index_not_ready"
-                && let Some((registry, _)) = &registry
-            {
-                let args = arguments
-                    .as_ref()
-                    .and_then(serde_json::Value::as_object)
-                    .expect("validated source arguments");
-                let path = args["path"].as_str().expect("validated source path");
-                let start = wire::uint(&args["startLine"]).expect("validated source start");
-                let end = wire::uint(&args["endLine"]).expect("validated source end");
-                let expected_hash = args.get("expectedContentHash").and_then(|v| v.as_str());
-                let expected = validated_expected_basis(args);
-                let publish = |sampled: bool| {
-                    *resolved.lock().unwrap() = Some((answering.root().to_owned(), sampled));
-                };
-                let read = (|| -> anyhow::Result<(serde_json::Value, bool)> {
-                    let existing = registry.blocking_lock().runtime(key);
-                    let runtime = match existing {
-                        Some(runtime) => runtime,
-                        None => {
-                            registry.blocking_lock().eligible_prior_head(key)?;
-                            match daemon_handle.as_ref() {
-                                Some(handle) => handle
-                                    .block_on(async { registry.lock().await.activate(key) })?,
-                                None => anyhow::bail!("index_not_ready: checkout not activated"),
-                            }
-                        }
-                    };
-                    #[cfg(feature = "test-support")]
-                    runtime.run_mcp_read_hook_for_tests();
-                    loop {
-                        if cancel.load(std::sync::atomic::Ordering::Acquire)
-                            || runtime.mcp_clock_now() >= deadline
+                ("trellis_read_source", _, Some(args)) => {
+                    let path = args["path"].as_str().expect("validated source path");
+                    let start = wire::uint(&args["startLine"]).expect("validated source start");
+                    let end = wire::uint(&args["endLine"]).expect("validated source end");
+                    let expected_hash = args.get("expectedContentHash").and_then(|v| v.as_str());
+                    let expected = validated_expected_basis(args);
+                    Some(Box::new(move |_, response, sampled| {
+                        match response.mcp_source(path, start, end, expected.clone(), expected_hash)
                         {
-                            anyhow::bail!("deadline_exceeded: MCP selected read deadline");
-                        }
-                        let attempt = (|| {
-                            let (response, sampled) = match selected.as_ref() {
-                                Some(witness) => runtime.evidence_for_selected(witness)?,
-                                None => runtime.evidence_response()?,
-                            };
-                            publish(sampled);
-                            #[cfg(feature = "test-support")]
-                            runtime.run_mcp_admitted_gate_for_tests();
-                            if cancel.load(std::sync::atomic::Ordering::Acquire)
-                                || runtime.mcp_clock_now() >= deadline
-                            {
-                                anyhow::bail!("deadline_exceeded: MCP selected read deadline");
+                            Ok(Some(found)) => {
+                                Ok(projection::source(id, found, root, sampled, modern)
+                                    .unwrap_or_else(|| tools::failure(id, "range_too_large")))
                             }
-                            let pin = response.status()?.revision;
-                            let basis = serde_json::json!({
-                                "indexGeneration":pin.index_generation.to_string(),
-                                "indexRevision":pin.index_revision
-                            });
-                            let mut content_hash = None;
-                            let envelope = match response.mcp_source(
-                                path,
-                                start,
-                                end,
-                                expected,
-                                expected_hash,
-                            ) {
-                                Ok(Some(result)) => projection::source(
-                                    &id,
-                                    result,
-                                    answering.root(),
-                                    sampled,
-                                    modern,
-                                )
-                                .unwrap_or_else(|| tools::failure(&id, "range_too_large")),
-                                Ok(None) => tools::failure(&id, "not_found"),
-                                Err(error)
-                                    if crate::store::cli_read_retryable_contention(&error) =>
-                                {
-                                    return Err(error);
-                                }
-                                Err(error) => {
-                                    let message = error.to_string();
-                                    let code = if message.starts_with("revision conflict:") {
-                                        if message.contains("content hash") {
-                                            content_hash = response.mcp_source_hash(path)?;
-                                        }
-                                        "revision_conflict"
-                                    } else if message.starts_with("unsupported_encoding:") {
-                                        "unsupported_encoding"
-                                    } else if message.starts_with("range_too_large:") {
-                                        "range_too_large"
-                                    } else if message.starts_with("invalid_request:") {
-                                        "invalid_request"
-                                    } else {
-                                        mcp_read_error(&error)
-                                    };
-                                    tools::failure(&id, code)
-                                }
-                            };
-                            let mut envelope = envelope;
-                            if envelope.get("error").is_some() {
-                                if envelope["error"]["code"] != "store_unavailable" {
-                                    envelope["error"]["currentBasis"] = basis;
-                                }
-                                if let Some(hash) = content_hash {
+                            Ok(None) => Ok(tools::failure(id, "not_found")),
+                            Err(error)
+                                if !crate::store::cli_read_retryable_contention(&error)
+                                    && error.to_string().starts_with("revision conflict:")
+                                    && error.to_string().contains("content hash") =>
+                            {
+                                let mut envelope = tools::failure(id, "revision_conflict");
+                                if let Some(hash) = response.mcp_source_hash(path)? {
                                     envelope["error"]["currentContentHash"] =
                                         serde_json::json!(hash);
                                 }
+                                Ok(envelope)
                             }
-                            response
-                                .finish(envelope)
-                                .map(|envelope| (envelope, sampled))
-                        })();
-                        match attempt {
-                            Err(ref error)
-                                if crate::store::cli_read_retryable_contention(error) =>
-                            {
-                                std::thread::sleep(std::time::Duration::from_millis(1));
-                            }
-                            answer => return answer,
+                            Err(error) => Err(error),
                         }
-                    }
-                })();
-                match read {
+                    }))
+                }
+                _ => None,
+            };
+            if let Some(tool_read) = tool_read
+                && let Some((registry, _)) = &registry
+            {
+                let publish = |sampled: bool| {
+                    *resolved.lock().unwrap() = Some((root.to_owned(), sampled));
+                };
+                match evidence_read(
+                    registry,
+                    key,
+                    daemon_handle.as_ref(),
+                    selected.as_ref(),
+                    deadline,
+                    &cancel,
+                    &publish,
+                    id,
+                    &*tool_read,
+                ) {
                     Ok((found, sampled)) => {
                         envelope = found;
                         sampled_catching_up = sampled;
                     }
                     Err(error) => {
-                        let code = if error.to_string().starts_with("revision conflict:") {
-                            "revision_conflict"
-                        } else {
-                            mcp_read_error(&error)
-                        };
-                        envelope = tools::failure(&id, code);
+                        let code = evidence_failure_code(&error);
+                        if code == "deadline_exceeded" && resolved.lock().unwrap().is_none() {
+                            // No read was admitted, so the call never resolved:
+                            // answer in the pre-resolution shape (Decision 0009).
+                            return Ok(CallOutcome {
+                                result: tools::result(
+                                    tools::admission_failure(
+                                        id,
+                                        "deadline_exceeded",
+                                        &attempted_workspace(arguments.as_ref(), &workspace),
+                                    ),
+                                    modern,
+                                ),
+                                finals: Finals::None,
+                            });
+                        }
+                        envelope = tools::failure(id, code);
                     }
                 }
             }

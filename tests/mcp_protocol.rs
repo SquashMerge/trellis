@@ -5040,6 +5040,175 @@ fn mcp_find_cold_prior_head_uses_registry_roots_without_creating_index() {
     );
 }
 
+/// Publish an index for a fresh checkout with `files`, leaving it inactive.
+fn published_inactive_checkout(
+    temp: &std::path::Path,
+    files: &[(&str, &str)],
+) -> (
+    trellis::store::topology::WorkspaceIdentity,
+    trellis::store::topology::TopologyRoots,
+) {
+    use trellis::store::{
+        Store,
+        topology::{TopologyRoots, WorkspaceIdentity},
+    };
+    let root = checkout(temp);
+    for (path, text) in files {
+        fs::write(root.join(path), text).unwrap();
+    }
+    let identity = WorkspaceIdentity::discover(Some(&root), &root)
+        .unwrap()
+        .attach_marker()
+        .unwrap();
+    let store = Store::open_for_tests(temp, &root).unwrap();
+    store.mcp_prepare_virgin_queue_for_tests().unwrap();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
+        &trellis::indexer::IndexOptions::new(root.clone()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    let writer = store.publication_for_tests().unwrap();
+    store
+        .publish_native(
+            &graph,
+            &capture,
+            &native,
+            &writer,
+            store.index_baseline().unwrap(),
+            &cancel,
+        )
+        .unwrap();
+    drop(writer);
+    drop(store);
+    let topology = TopologyRoots::isolated_for_tests(temp.join("cache"), temp.join("data"));
+    (identity, topology)
+}
+
+/// Send one tool call over a daemon socket session and return its reply.
+fn one_socket_call(
+    identity: trellis::store::topology::WorkspaceIdentity,
+    registry: trellis::daemon::registry::CheckoutRegistry,
+    session_id: u64,
+    deadline: Duration,
+    tool_name: &str,
+    arguments: Value,
+) -> Value {
+    use std::os::unix::net::UnixStream;
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    let (mut client, server) = UnixStream::pair().unwrap();
+    client
+        .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
+        .unwrap();
+    let daemon_handle = tokio::runtime::Handle::current();
+    let session = std::thread::spawn(move || {
+        trellis::mcp::run_socket(
+            trellis::mcp::OpenedWorkspace::new(identity).with_call_deadline_for_tests(deadline),
+            server,
+            registry,
+            session_id,
+            daemon_handle,
+        )
+    });
+    writeln!(
+        client,
+        "{}",
+        modern(
+            json!(7),
+            "tools/call",
+            json!({"name":tool_name,"arguments":arguments})
+        )
+    )
+    .unwrap();
+    let mut reader = BufReader::new(client.try_clone().unwrap());
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+    serde_json::from_str(&line).unwrap()
+}
+
+/// Contention while a cold checkout proves its prior head is retried as
+/// contention until the call deadline, never reported as `store_unavailable`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_cold_prior_head_contention_retries_until_the_deadline() {
+    use trellis::daemon::registry::CheckoutRegistry;
+    let temp = tempfile::tempdir().unwrap();
+    let (identity, topology) =
+        published_inactive_checkout(temp.path(), &[("a.js", "function Alpha() {}\n")]);
+    // An index journal sidecar makes the cold read-only status check busy.
+    let index = topology.index_db(&identity);
+    let journal = index.with_file_name(format!(
+        "{}-journal",
+        index.file_name().unwrap().to_string_lossy()
+    ));
+    fs::write(&journal, b"").unwrap();
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(311, &identity).unwrap();
+    let busy = registry
+        .prior_head_probe(&identity.root_key)
+        .unwrap()
+        .check()
+        .unwrap_err();
+    assert!(
+        trellis::store::cli_read_retryable_contention(&busy),
+        "{busy:#}"
+    );
+    let reply = one_socket_call(
+        identity,
+        registry,
+        311,
+        Duration::from_millis(300),
+        "trellis_find_symbols",
+        json!({"schemaVersion":1,"query":"Alpha"}),
+    );
+    // Still busy at the deadline: the call never admitted a read.
+    tool(&reply, Some("deadline_exceeded"), true);
+    let envelope = &reply["result"]["structuredContent"];
+    assert_eq!(
+        envelope["error"]["attemptedWorkspace"]["kind"], "path",
+        "{reply}"
+    );
+    fs::remove_file(&journal).unwrap();
+}
+
+/// A deadline reached before read admission answers in the pre-resolution
+/// shape (Decision 0009), as the connection's own timer would.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_deadline_before_read_admission_uses_the_pre_resolution_shape() {
+    use trellis::daemon::registry::CheckoutRegistry;
+    let temp = tempfile::tempdir().unwrap();
+    let (identity, topology) =
+        published_inactive_checkout(temp.path(), &[("a.js", "function Alpha() {}\n")]);
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(312, &identity).unwrap();
+    let runtime = registry.activate(&identity.root_key).unwrap();
+    // Before the read is admitted, move the call's clock past its deadline.
+    let advanced = runtime.clone();
+    runtime.set_mcp_read_hook_for_tests(move || {
+        advanced.advance_mcp_clock_for_tests(Duration::from_secs(60));
+    });
+    let reply = one_socket_call(
+        identity,
+        registry,
+        312,
+        trellis::mcp::CALL_DEADLINE,
+        "trellis_find_symbols",
+        json!({"schemaVersion":1,"query":"Alpha"}),
+    );
+    tool(&reply, Some("deadline_exceeded"), true);
+    let envelope = &reply["result"]["structuredContent"];
+    assert_eq!(
+        envelope["error"]["attemptedWorkspace"]["kind"], "path",
+        "{reply}"
+    );
+    assert!(envelope.get("workspace").is_none(), "{reply}");
+    assert!(envelope.get("catchingUp").is_none(), "{reply}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mcp_find_required_rows_and_coverage_fail_closed() {
     use trellis::daemon::registry::CheckoutRegistry;
