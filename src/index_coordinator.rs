@@ -417,6 +417,8 @@ impl std::error::Error for CutoffChanged {}
 /// This is an in-memory scheduler, not a second request queue.
 pub struct WatcherWork {
     watch: crate::watch::WatchSignals,
+    /// Shared with every watcher this owner creates; read without its lock.
+    health: Arc<crate::watch::WatcherHealth>,
     last_inventory: std::time::Instant,
     retry_after: Option<std::time::Instant>,
     last_accounted_generation: Option<u64>,
@@ -428,22 +430,56 @@ pub struct WatcherWork {
     witness_ordinal: u64,
     witness_ordinal_source: Option<Arc<std::sync::atomic::AtomicU64>>,
     witness_reported_generation: Option<u64>,
+    /// The owning worker's wake, installed on every watcher this owner creates.
+    waker: Option<crate::watch::Waker>,
+    /// Set only for retirement's attempt: the batch must be exactly this generation.
+    generation_limit: Option<u64>,
 }
 
+/// The retirement attempt found ingress past its cutoff: it captures nothing.
+#[derive(Debug)]
+pub struct PastCutoff;
+impl std::fmt::Display for PastCutoff {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("watcher ingress passed the retirement cutoff")
+    }
+}
+impl std::error::Error for PastCutoff {}
+
+const PERIODIC_INVENTORY: std::time::Duration = std::time::Duration::from_secs(60);
+
 impl WatcherWork {
-    /// Construct only after the daemon commits mandatory H.
+    /// Construct only after the daemon commits mandatory startup reconciliation.
     pub fn new(
         store: &Store,
         session: &Arc<WriterSession>,
         options: &IndexOptions,
     ) -> Result<Self> {
+        Self::publishing(
+            store,
+            session,
+            options,
+            Arc::new(crate::watch::WatcherHealth::default()),
+        )
+    }
+
+    /// Like `new`, publishing watcher health through the owner's `health` flag
+    /// for lock-free reads. Every replacement watcher shares the same flag.
+    pub fn publishing(
+        store: &Store,
+        session: &Arc<WriterSession>,
+        options: &IndexOptions,
+        health: Arc<crate::watch::WatcherHealth>,
+    ) -> Result<Self> {
         store.verify_writer_session(session)?;
-        let watch = crate::watch::WatchSignals::new(
+        let watch = crate::watch::WatchSignals::publishing(
             options.workspace_root.clone(),
             options.scip_path.clone(),
             options.manifest_path.clone(),
+            health.clone(),
         );
         Ok(Self {
+            health,
             watch,
             last_inventory: std::time::Instant::now(),
             retry_after: None,
@@ -456,7 +492,86 @@ impl WatcherWork {
             witness_ordinal: 0,
             witness_ordinal_source: None,
             witness_reported_generation: None,
+            waker: None,
+            generation_limit: None,
         })
+    }
+
+    /// Retirement's one attempt (Decision 0009 §5): reconcile only while the
+    /// accepted generation is still `cutoff`. A later signal, before or during
+    /// the capture, abandons it, so nothing after the cutoff is captured or
+    /// acknowledged.
+    pub fn reconcile_through_cutoff(
+        &mut self,
+        store: &Store,
+        session: &Arc<WriterSession>,
+        options: &IndexOptions,
+        cancel: &CancelFlag,
+        cutoff: u64,
+    ) -> Result<bool> {
+        if self.options_differ(options) {
+            return Err(PastCutoff.into());
+        }
+        self.generation_limit = Some(cutoff);
+        let outcome = self.reconcile_due(store, session, options, cancel, true);
+        self.generation_limit = None;
+        outcome
+    }
+
+    /// Wake `waker` after every accepted signal, on this and every later watcher.
+    pub fn set_waker(&mut self, waker: crate::watch::Waker) {
+        self.watch.set_waker(waker.clone());
+        self.waker = Some(waker);
+    }
+
+    /// The current watcher's live ingress generation (replaced with the watcher).
+    pub fn generation_handle(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        self.watch.generation_handle()
+    }
+
+    pub fn acknowledged_generation(&self) -> u64 {
+        self.watch.acknowledged_generation()
+    }
+
+    /// `accepted_watch_intent` without the ingress-generation comparison, which
+    /// readers make themselves against the live generation.
+    pub fn intent_besides_generation(&self, options: &IndexOptions) -> bool {
+        let now = std::time::Instant::now();
+        let periodic_ready = now.duration_since(self.last_inventory) >= PERIODIC_INVENTORY
+            && !self.retry_after.is_some_and(|deadline| deadline > now);
+        self.options_differ(options) || self.watch.full_intent() || periodic_ready
+    }
+
+    fn options_differ(&self, options: &IndexOptions) -> bool {
+        self.options.workspace_root != options.workspace_root
+            || self.options.scip_path != options.scip_path
+            || self.options.manifest_path != options.manifest_path
+            || self.options.max_file_bytes != options.max_file_bytes
+    }
+
+    /// When `reconcile_due` next has work: a failed run's retry delay, else the
+    /// debounce deadline of accepted signals, else the periodic inventory.
+    /// Signals still in the ingress channel wake the worker themselves.
+    pub fn next_due(&self) -> std::time::Instant {
+        if let Some(retry) = self.retry_after
+            && retry > std::time::Instant::now()
+        {
+            return retry;
+        }
+        let periodic = self.last_inventory + PERIODIC_INVENTORY;
+        let accounted = self.watch.degraded()
+            && self.last_accounted_generation
+                == Some(
+                    self.watch
+                        .generation_handle()
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                );
+        if accounted {
+            return periodic;
+        }
+        self.watch
+            .next_deadline()
+            .map_or(periodic, |deadline| deadline.min(periodic))
     }
 
     /// Bind the optional fixture reporter only after this verified owner installs
@@ -506,15 +621,9 @@ impl WatcherWork {
         // must not starve maintenance during the 60s inventory idle interval.
         // Once the inventory is due, it gets the same retry eligibility as
         // reconcile_due and takes priority before maintenance admission.
-        let periodic_ready = now.duration_since(self.last_inventory)
-            >= std::time::Duration::from_secs(60)
+        let periodic_ready = now.duration_since(self.last_inventory) >= PERIODIC_INVENTORY
             && !self.retry_after.is_some_and(|deadline| deadline > now);
-        self.options.workspace_root != options.workspace_root
-            || self.options.scip_path != options.scip_path
-            || self.options.manifest_path != options.manifest_path
-            || self.options.max_file_bytes != options.max_file_bytes
-            || self.watch.accepted_unacked()
-            || periodic_ready
+        self.options_differ(options) || self.watch.accepted_unacked() || periodic_ready
     }
 
     #[doc(hidden)]
@@ -535,9 +644,21 @@ impl WatcherWork {
     #[doc(hidden)]
     pub fn suppress_watch_signals_for_tests(&mut self, absent_watch_root: std::path::PathBuf) {
         assert!(!absent_watch_root.exists());
-        self.watch = crate::watch::WatchSignals::new(absent_watch_root, None, None);
+        self.watch = crate::watch::WatchSignals::publishing(
+            absent_watch_root,
+            None,
+            None,
+            self.health.clone(),
+        );
         assert!(self.watch.degraded());
         self.last_accounted_generation = Some(self.watch.drain().generation);
+    }
+
+    /// Push the periodic inventory out of a test's reach, so only a wake can
+    /// make the worker reconcile. The next completed inventory resets it.
+    #[doc(hidden)]
+    pub fn delay_periodic_inventory_for_tests(&mut self) {
+        self.last_inventory = std::time::Instant::now() + std::time::Duration::from_secs(3600);
     }
 
     /// Advance only the inventory deadline in a test. The next ordinary tick
@@ -593,16 +714,16 @@ impl WatcherWork {
         // The durable FIFO head may have different selected inputs from this
         // daemon's defaults. Keep its watcher until a new watcher has registered
         // for the new options; its full wake then closes the transition gap.
-        if self.options.workspace_root != options.workspace_root
-            || self.options.scip_path != options.scip_path
-            || self.options.manifest_path != options.manifest_path
-            || self.options.max_file_bytes != options.max_file_bytes
-        {
-            let next = crate::watch::WatchSignals::new(
+        if self.options_differ(options) {
+            let next = crate::watch::WatchSignals::publishing(
                 options.workspace_root.clone(),
                 options.scip_path.clone(),
                 options.manifest_path.clone(),
+                self.health.clone(),
             );
+            if let Some(waker) = &self.waker {
+                next.set_waker(waker.clone());
+            }
             self.watch = next;
             self.options = options.clone();
             self.last_accounted_generation = None;
@@ -614,9 +735,16 @@ impl WatcherWork {
             }
         }
         let now = std::time::Instant::now();
-        let periodic =
-            now.duration_since(self.last_inventory) >= std::time::Duration::from_secs(60);
+        let periodic = now.duration_since(self.last_inventory) >= PERIODIC_INVENTORY;
         let batch = self.watch.drain();
+        // Retirement's attempt never captures past its cutoff; the capture's
+        // own generation fence then keeps the batch at exactly the cutoff.
+        if self
+            .generation_limit
+            .is_some_and(|limit| batch.generation != limit)
+        {
+            return Err(PastCutoff.into());
+        }
         // Observe each new generation before its capture can acknowledge it.
         // The queue tick holds watcher_work across this call; the bounded
         // reporter only try_sends and never opens a socket on this path.
@@ -638,7 +766,7 @@ impl WatcherWork {
         {
             return Ok(false);
         }
-        // The first post-registration full inventory closes the H/watch gap.
+        // The first post-registration full inventory closes the startup/watch gap.
         // An identical selected capture needs no gratuitous new revision.
         let outcome: Result<PublishPermit> = (|| {
             let publication =
@@ -706,7 +834,7 @@ impl WatcherWork {
                 } else {
                     self.last_accounted_pin = None;
                     // A concurrent event is not part of this selected capture.
-                    // Keep it dirty for the next local H and full inventory.
+                    // Keep it dirty for the next local startup reconciliation and full inventory.
                     self.watch.require_full();
                 }
                 drop(publication);
@@ -738,7 +866,7 @@ pub fn reconcile_workspace(
     progress: impl Fn(IndexProgress) + Sync,
 ) -> Result<(IndexPin, Arc<WriterSession>)> {
     // Explicit daemon indexing obeys the same queue-recovery barrier as
-    // activation: confirm old-root terminal rows before ANY H publication.
+    // activation: confirm old-root terminal rows before ANY startup reconciliation publication.
     store.settle_foreign_root_requests()?;
     if store.is_recreate_pending() {
         return store.recreate_pending_writer_session(options, cancel);
@@ -905,7 +1033,7 @@ fn drain_requests_observed_with_cancel(
             // An invalidated capture cannot publish. A failed busy COMMIT can
             // be ambiguous. For either one, authenticate the claim and exact
             // unchanged pin before returning the SAME seq to queued. A changed
-            // pin stays running for the next validated H, never an
+            // pin stays running for the next validated startup reconciliation, never an
             // invented terminal ACK or a duplicate native publication.
             let before = match before_publish {
                 Some(pin) => pin,
@@ -1002,7 +1130,7 @@ pub fn cooperative_maintenance_unit(
 }
 
 /// A checkout's daemon-local writer confirms old-root queue settlement, then
-/// commits mandatory H before its scheduler may claim FIFO requests.
+/// commits mandatory startup reconciliation before its scheduler may claim FIFO requests.
 pub fn establish_serving_session(
     store: &Store,
     explicit_options: Option<&IndexOptions>,
@@ -1053,7 +1181,7 @@ mod tests {
     #[test]
     fn acquired_leader_cannot_claim_its_own_row_at_precommit_capture_pause() {
         use crate::store::topology::IndexNotReady;
-        use std::{sync::mpsc, time::Duration};
+        use std::sync::mpsc;
         let state = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
         fs::write(workspace.path().join("a.js"), "function old() {}\n").unwrap();
@@ -1077,16 +1205,20 @@ mod tests {
                     |_| {},
                     |_| {
                         paused_tx.send(()).unwrap();
-                        release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                        release_rx
+                            .recv_timeout(crate::testing::HANG_BACKSTOP)
+                            .unwrap();
                     },
                 )
             });
-            paused_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            paused_rx
+                .recv_timeout(crate::testing::HANG_BACKSTOP)
+                .unwrap();
             session.verify().unwrap();
             let precommit = store.claim_request(&session).unwrap_err();
             assert!(
                 precommit.downcast_ref::<IndexNotReady>().is_some(),
-                "an acquired EX without its own committed H cannot claim: {precommit:#}"
+                "an acquired EX without its own committed startup reconciliation cannot claim: {precommit:#}"
             );
             let row = store.request_by_id(&own.id).unwrap().unwrap();
             assert_eq!(row.state, "queued");
@@ -1299,7 +1431,7 @@ mod tests {
         let mut work = WatcherWork::new(&store, &owner, &head_options).unwrap();
         let mut daemon_options = head_options.clone();
         daemon_options.max_file_bytes = 1024;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + crate::testing::HANG_BACKSTOP;
         while work.last_accounted_generation.is_none() {
             // Native watcher ingress can invalidate the cutoff of this first
             // inventory. Retry the normal tick until the replacement full wake
@@ -1339,7 +1471,12 @@ mod tests {
         // inventory, but an accounted idle generation must not veto maintenance.
         let absent_watch_root = workspace.path().join("absent_watch_root");
         assert!(!absent_watch_root.exists());
-        work.watch = crate::watch::WatchSignals::new(absent_watch_root, None, None);
+        work.watch = crate::watch::WatchSignals::publishing(
+            absent_watch_root,
+            None,
+            None,
+            work.health.clone(),
+        );
         assert!(work.watch.degraded());
         assert!(work.accepted_watch_intent(&options));
         assert!(
@@ -1379,7 +1516,7 @@ mod tests {
         // Due periodic inventory is real work, but retry_after prevents its
         // maintenance veto until the retry deadline has elapsed.
         work.last_inventory -= std::time::Duration::from_secs(60);
-        work.retry_after = Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
+        work.retry_after = Some(std::time::Instant::now() + crate::testing::HANG_BACKSTOP);
         assert!(!work.accepted_watch_intent(&options));
         assert!(
             !work
@@ -1837,7 +1974,7 @@ mod tests {
         assert_eq!(ops, expected(&files));
         assert_eq!(store.index_baseline().unwrap(), first);
         // Cancellation before COMMIT must not close the validated prior head
-        // to daemon-local reads while this Store still awaits its new H.
+        // to daemon-local reads while this Store still awaits its new startup reconciliation.
         let prior = store.evidence_response_daemon_local().unwrap();
         assert_eq!(prior.status().unwrap().revision, first);
         assert_eq!(

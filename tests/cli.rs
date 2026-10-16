@@ -233,7 +233,7 @@ impl FixtureDaemon {
         if !sent {
             return Err("daemon_kill_failed");
         }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + trellis::testing::HANG_BACKSTOP;
         while std::time::Instant::now() < deadline {
             if std::os::unix::net::UnixStream::connect(&socket).is_err() {
                 let _ = fs::remove_file(&marker);
@@ -286,7 +286,7 @@ fn bounded_invalid_cli(
         .stderr(Stdio::from(fs::File::create(&stderr).unwrap()))
         .spawn()
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
     let status = loop {
         if let Some(status) = child.try_wait().unwrap() {
             break status;
@@ -330,7 +330,7 @@ fn unchanged_serve_reuses_selected_versions_and_detects_selected_source_corrupti
         let mut server = Server(child);
         // The CLI may spend 5s connecting and 10s awaiting the daemon reply
         // before printing the bound address. The test still fails boundedly.
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let deadline = std::time::Instant::now() + trellis::testing::HANG_BACKSTOP;
         loop {
             let stderr = fs::read_to_string(log).unwrap();
             if let Some(raw) = stderr
@@ -419,36 +419,19 @@ fn unchanged_serve_reuses_selected_versions_and_detects_selected_source_corrupti
 
     let first_log = temp.path().join("serve-unchanged.log");
     let leader = serve(&root, &home, &first_log);
-    // Serve registration is inert. A CLI attachment elects the checkout and
-    // performs mandatory H against the selected persisted head.
+    // Serve registers in place on the running checkout (Decision 0009 §6): no
+    // replacement runtime and no new startup reconciliation, so an unchanged
+    // workspace publishes nothing.
     let attached = command(&root, &home, "status").output().unwrap();
     assert!(
         attached.status.success(),
         "{}",
         String::from_utf8_lossy(&attached.stderr)
     );
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while rusqlite::Connection::open(&dbpath)
-        .map(|db| pin_and_ids(&db).0)
-        .unwrap()
-        < 3
-    {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "mandatory H did not publish"
-        );
-        let attached = command(&root, &home, "status").output().unwrap();
-        assert!(
-            attached.status.success(),
-            "{}",
-            String::from_utf8_lossy(&attached.stderr)
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
     let db = rusqlite::Connection::open(&dbpath).unwrap();
     let (r2, ids) = pin_and_ids(&db);
-    assert_eq!(r2, 3, "new header+manifest pin required");
-    assert_eq!(ids.len(), 3);
+    assert_eq!(r2, 2, "unchanged serve publishes no new pin");
+    assert_eq!(ids.len(), 2);
     assert_eq!(
         (&ids[0].1, &ids[0].2, &ids[0].3),
         (&ids[1].1, &ids[1].2, &ids[1].3)
@@ -476,7 +459,7 @@ fn unchanged_serve_reuses_selected_versions_and_detects_selected_source_corrupti
     );
     assert_eq!(
         serde_json::from_slice::<Value>(&status.stdout).unwrap()["revision"]["indexRevision"],
-        3
+        2
     );
     drop(db);
     drop(leader);
@@ -526,8 +509,8 @@ fn unchanged_serve_reuses_selected_versions_and_detects_selected_source_corrupti
         .as_i64()
         .unwrap();
     assert!(
-        matches!(published_rev, 4 | 5),
-        "one Q publication, with at most one mandatory takeover H: {result}"
+        matches!(published_rev, 3 | 4),
+        "one Q publication, with at most one watcher publication of the edit: {result}"
     );
     let attached = command(&root, &home, "status").output().unwrap();
     assert!(
@@ -537,11 +520,11 @@ fn unchanged_serve_reuses_selected_versions_and_detects_selected_source_corrupti
     );
     // Restart, reconcile and watcher publication share a loaded verify host;
     // a 10 s bound failed intermittently (#131).
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let deadline = std::time::Instant::now() + trellis::testing::HANG_BACKSTOP;
     while rusqlite::Connection::open(&dbpath)
         .map(|db| pin_and_ids(&db).0)
         .unwrap()
-        < 4
+        < published_rev
     {
         assert!(
             std::time::Instant::now() < deadline,
@@ -564,16 +547,17 @@ fn unchanged_serve_reuses_selected_versions_and_detects_selected_source_corrupti
         ids.as_slice(),
         "retained prior pins changed"
     );
-    let changed_ids = &next_ids[3];
+    let changed_ids = &next_ids[ids.len()];
     assert_ne!(
-        ids[2].1, changed_ids.1,
+        ids.last().unwrap().1,
+        changed_ids.1,
         "same-length/mtime edit reused stale bytes"
     );
-    for current in next_ids.iter().skip(3) {
+    for current in next_ids.iter().skip(ids.len()) {
         assert_eq!(
             (&current.1, &current.2, &current.3),
             (&changed_ids.1, &changed_ids.2, &changed_ids.3),
-            "takeover H and Q must select the same new immutable evidence"
+            "the watcher and Q must select the same new immutable evidence"
         );
     }
     assert_eq!(next_ids[0].1, old_ids[0].1, "retained old pin changed");
@@ -593,7 +577,7 @@ fn unchanged_serve_reuses_selected_versions_and_detects_selected_source_corrupti
     drop(db);
     let corrupt_log = temp.path().join("serve-corrupt.log");
     let rejected = serve(&root, &home, &corrupt_log);
-    // Attachment starts H; a selected read must still refuse the damaged head.
+    // Attachment starts startup reconciliation; a selected read must still refuse the damaged head.
     let corrupt_selected = command(&root, &home, "symbols").output().unwrap();
     assert!(
         !corrupt_selected.status.success(),
@@ -1016,7 +1000,7 @@ async fn serve_ingress_persists_relative_presentation_paths_before_cross_cwd_tak
         .spawn()
         .unwrap();
     let mut server = Server(Some(child));
-    let startup = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+    let startup = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             let log = fs::read(&stderr_path).unwrap();
             if log
@@ -1046,7 +1030,7 @@ async fn serve_ingress_persists_relative_presentation_paths_before_cross_cwd_tak
     // response, not a logged banner, proves the listener is actually ready.
     let mut last_health = String::from("no_response");
     let mut ready = false;
-    let health = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+    let health = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             match reqwest::get(format!("http://127.0.0.1:{port}/healthz")).await {
                 Ok(response) if response.status().is_success() => {
@@ -1084,7 +1068,7 @@ async fn serve_ingress_persists_relative_presentation_paths_before_cross_cwd_tak
     // SIGTERM lets the daemon finish in-flight blocking work before it exits.
     let pid = server.0.as_ref().unwrap().id();
     assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGTERM) }, 0);
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    let deadline = tokio::time::Instant::now() + trellis::testing::HANG_BACKSTOP;
     loop {
         if let Some(status) = server.0.as_mut().unwrap().try_wait().unwrap() {
             // Reaped children must not be killed again by the cleanup guard.
@@ -1405,7 +1389,7 @@ async fn corrupted_daemon_startup_uses_configured_options_and_does_not_fallback_
         .stderr(Stdio::from(fs::File::create(&stderr_path).unwrap()))
         .spawn()
         .unwrap();
-    let startup_deadline = Instant::now() + Duration::from_secs(10);
+    let startup_deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
     while !marker.exists() {
         if child.try_wait().unwrap().is_some() || Instant::now() >= startup_deadline {
             let _ = child.kill();
@@ -1418,7 +1402,7 @@ async fn corrupted_daemon_startup_uses_configured_options_and_does_not_fallback_
     assert!(fs::read(&stdout_path).unwrap().is_empty());
     assert_eq!(fs::read(&index).unwrap(), corrupt);
     drop(reader);
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
     let exit = loop {
         if let Some(exit) = child.try_wait().unwrap() {
             break exit;
@@ -1501,7 +1485,7 @@ fn cli_round_trip_uses_persistent_store_and_never_executes_workspace() {
             .stderr(Stdio::from(fs::File::create(&stderr_path).unwrap()))
             .spawn()
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
         let status = loop {
             if let Some(status) = child.try_wait().unwrap() {
                 break status;
@@ -1774,7 +1758,7 @@ fn fixed_locations_and_removed_flag() {
             .stderr(Stdio::from(fs::File::create(&stderr).unwrap()))
             .spawn()
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
         let status = loop {
             if let Some(status) = child.try_wait().unwrap() {
                 break status;
@@ -2010,7 +1994,7 @@ fn current_commands_pair_matrix() {
             .stderr(Stdio::from(fs::File::create(&stderr).unwrap()))
             .spawn()
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
         let status = loop {
             if let Some(status) = child.try_wait().unwrap() {
                 break status;
@@ -2697,7 +2681,7 @@ impl LegacyClient {
         let address = url.strip_prefix("http://").unwrap().parse().unwrap();
         let state = http::new(store.clone(), options.clone(), token.to_owned(), address).unwrap();
         if retain_session {
-            // A daemon-local writer must commit H before selected reads or
+            // A daemon-local writer must commit startup reconciliation before selected reads or
             // FIFO claims. The legacy router fixture models only that session.
             let cancel: trellis::model::CancelFlag =
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2863,7 +2847,7 @@ async fn start_saved_item_server(
             home.join(".local/share/trellis")
         };
         let socket = trellis::daemon::SocketPaths::new(&data).socket;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + trellis::testing::HANG_BACKSTOP;
         while std::os::unix::net::UnixStream::connect(&socket).is_ok() {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -2900,7 +2884,7 @@ async fn real_index_job(
     .await;
     assert_eq!(status, reqwest::StatusCode::ACCEPTED, "{accepted}");
     let id = accepted["id"].as_str().unwrap();
-    let completed = tokio::time::timeout(Duration::from_secs(20), async {
+    let completed = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             let (status, job) = real_api(
                 client,
@@ -3267,7 +3251,7 @@ def sink():
             .build()
             .unwrap();
         let mut server = provision();
-        let token = tokio::time::timeout(Duration::from_secs(15), async {
+        let token = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
             loop {
                 if let Ok(response) = client.get(format!("{origin}/healthz")).send().await
                     && response.status().is_success()
@@ -3287,62 +3271,63 @@ def sink():
         let token = token.trim();
         let selected_status =
             |client: &reqwest::Client| client.get(format!("{url}/status")).bearer_auth(token);
-        let post_start_status: Value = tokio::time::timeout(Duration::from_secs(20), async {
-            loop {
-                // The client deadline is shorter than a bounded SQLite busy
-                // wait. Retry only transport timeouts inside the outer H limit;
-                // every answered status still has to prove its selected pin.
-                let response = match selected_status(&client).send().await {
-                    Ok(response) => response,
-                    Err(error) if error.is_timeout() => {
-                        assert!(
-                            server.0.try_wait().unwrap().is_none(),
-                            "{name}: serve exited during selected status poll"
-                        );
-                        continue;
-                    }
-                    Err(error) => panic!("{name}: selected status request: {error}"),
-                };
-                if response.status().is_success() {
-                    let status: Value = response.json().await.unwrap();
-                    let revision = &status["revision"];
-                    assert_eq!(
-                        revision["indexGeneration"], old_pin["indexGeneration"],
-                        "{name}: unexpected generation during H: {status}"
-                    );
-                    let current = revision["indexRevision"]
-                        .as_u64()
-                        .expect("selected index revision");
-                    let previous = old_pin["indexRevision"].as_u64().unwrap();
-                    let catching_up = status["catchingUp"]
-                        .as_bool()
-                        .expect("selected catch-up state");
-                    if current == previous {
-                        assert!(
-                            catching_up,
-                            "{name}: prior head without pending mandatory H: {status}"
-                        );
-                    } else {
-                        assert!(
-                            current > previous,
-                            "{name}: selected pin moved backwards: {status}"
-                        );
-                        if !catching_up {
-                            break status;
+        let post_start_status: Value =
+            tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+                loop {
+                    // The client deadline is shorter than a bounded SQLite busy
+                    // wait. Retry only transport timeouts inside the outer startup reconciliation limit;
+                    // every answered status still has to prove its selected pin.
+                    let response = match selected_status(&client).send().await {
+                        Ok(response) => response,
+                        Err(error) if error.is_timeout() => {
+                            assert!(
+                                server.0.try_wait().unwrap().is_none(),
+                                "{name}: serve exited during selected status poll"
+                            );
+                            continue;
                         }
+                        Err(error) => panic!("{name}: selected status request: {error}"),
+                    };
+                    if response.status().is_success() {
+                        let status: Value = response.json().await.unwrap();
+                        let revision = &status["revision"];
+                        assert_eq!(
+                            revision["indexGeneration"], old_pin["indexGeneration"],
+                            "{name}: unexpected generation during startup reconciliation: {status}"
+                        );
+                        let current = revision["indexRevision"]
+                            .as_u64()
+                            .expect("selected index revision");
+                        let previous = old_pin["indexRevision"].as_u64().unwrap();
+                        let catching_up = status["catchingUp"]
+                            .as_bool()
+                            .expect("selected catch-up state");
+                        if current == previous {
+                            assert!(
+                                catching_up,
+                                "{name}: prior head without pending mandatory startup reconciliation: {status}"
+                            );
+                        } else {
+                            assert!(
+                                current > previous,
+                                "{name}: selected pin moved backwards: {status}"
+                            );
+                            if !catching_up {
+                                break status;
+                            }
+                        }
+                    } else {
+                        assert_eq!(
+                            response.status(),
+                            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                            "{name}"
+                        );
                     }
-                } else {
-                    assert_eq!(
-                        response.status(),
-                        reqwest::StatusCode::SERVICE_UNAVAILABLE,
-                        "{name}"
-                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .unwrap();
+            })
+            .await
+            .unwrap();
         let post_start_pin = post_start_status["revision"].clone();
         assert_eq!(
             post_start_pin["indexGeneration"], old_pin["indexGeneration"],
@@ -3351,7 +3336,7 @@ def sink():
         assert!(
             post_start_pin["indexRevision"].as_u64().unwrap()
                 > old_pin["indexRevision"].as_u64().unwrap(),
-            "{name}: mandatory H committed"
+            "{name}: mandatory startup reconciliation committed"
         );
         let follower_status: Value =
             serde_json::from_slice(&command(&root, &home, "status").output().unwrap().stdout)
@@ -3508,7 +3493,7 @@ def sink():
             started["id"], current_before["id"],
             "{name}: authorized request needs a new ID"
         );
-        let completed = tokio::time::timeout(Duration::from_secs(20), async {
+        let completed = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
             loop {
                 let job: Value = client
                     .get(format!("{url}/jobs/{id}"))
@@ -3671,7 +3656,7 @@ def sink():
             "{name}: accepted before claim-time CAS"
         );
         let stale_id = stale["id"].as_str().unwrap();
-        let failed = tokio::time::timeout(Duration::from_secs(20), async {
+        let failed = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
             loop {
                 let row: Value = client
                     .get(format!("{url}/jobs/{stale_id}"))
@@ -4250,7 +4235,7 @@ fn virgin_cli_activation_contention_expires_before_enqueue_and_new_index_succeed
         .stderr(Stdio::from(fs::File::create(&stderr_path).unwrap()))
         .spawn()
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
     let status = loop {
         if let Some(status) = child.try_wait().unwrap() {
             break status;
@@ -4347,7 +4332,7 @@ fn daemon_publication_is_independent_of_cli_output_file() {
         .stderr(Stdio::from(fs::File::create(&stderr_path).unwrap()))
         .spawn()
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
     loop {
         if let Some(exit) = child.try_wait().unwrap() {
             assert!(
@@ -4421,7 +4406,7 @@ async fn saved_items_real_index_matrix() {
     assert_eq!(status, reqwest::StatusCode::OK, "{serving_status}");
     let pin = serving_status["revision"].clone();
     assert_eq!(pin["indexGeneration"], initial_pin["indexGeneration"]);
-    // The direct router may commit mandatory H after the daemon exits.
+    // The direct router may commit mandatory startup reconciliation after the daemon exits.
     assert!(
         pin["indexRevision"].as_u64().unwrap() >= initial_pin["indexRevision"].as_u64().unwrap()
     );
@@ -4858,7 +4843,7 @@ async fn saved_items_real_index_matrix() {
     assert_eq!(status, reqwest::StatusCode::OK, "{reopened_status}");
     let reopened_pin = reopened_status["revision"].clone();
     assert_eq!(reopened_pin["indexGeneration"], next["indexGeneration"]);
-    // Reopening the direct router may publish mandatory H again.
+    // Reopening the direct router may publish mandatory startup reconciliation again.
     assert!(
         reopened_pin["indexRevision"].as_u64().unwrap() >= next["indexRevision"].as_u64().unwrap()
     );

@@ -342,7 +342,7 @@ async fn cached_java_python_sequences_keep_measured_calls_after_source_deletion(
         // Observe the real watcher commit for THIS deletion before asserting
         // historical reads. An in-flight same-generation publication may
         // temporarily close public reads; it is never an HTTP success result.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let deadline = std::time::Instant::now() + trellis::testing::HANG_BACKSTOP;
         let prior_head = loop {
             match f.store.status() {
                 Ok(status) => break status.revision,
@@ -361,7 +361,7 @@ async fn cached_java_python_sequences_keep_measured_calls_after_source_deletion(
         std::fs::remove_file(&deleted_path).unwrap();
         // A deletion may be coalesced by the OS watcher under all-target load.
         // Submit one accepted hint through the daemon's real watcher ingress.
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
             loop {
                 let hint =
                     notify::Event::new(notify::EventKind::Remove(notify::event::RemoveKind::File))

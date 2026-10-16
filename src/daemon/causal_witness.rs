@@ -262,12 +262,12 @@ mod tests {
 
     async fn receive_event(listener: &tokio::net::UnixListener) -> serde_json::Value {
         use tokio::io::AsyncReadExt;
-        let (mut peer, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+        let (mut peer, _) = tokio::time::timeout(crate::testing::HANG_BACKSTOP, listener.accept())
             .await
             .unwrap()
             .unwrap();
         let mut bytes = Vec::new();
-        tokio::time::timeout(Duration::from_secs(2), peer.read_to_end(&mut bytes))
+        tokio::time::timeout(crate::testing::HANG_BACKSTOP, peer.read_to_end(&mut bytes))
             .await
             .unwrap()
             .unwrap();
@@ -314,7 +314,7 @@ mod tests {
         }
         assert!(!failed.load(Ordering::Acquire));
         drop(reporter);
-        tokio::time::timeout(Duration::from_secs(2), writer)
+        tokio::time::timeout(crate::testing::HANG_BACKSTOP, writer)
             .await
             .unwrap()
             .unwrap();
@@ -347,7 +347,7 @@ mod tests {
         assert_eq!(event["kind"], "ERROR");
         assert_eq!(event["streamSeq"], 1);
         drop(reporter);
-        tokio::time::timeout(Duration::from_secs(2), writer)
+        tokio::time::timeout(crate::testing::HANG_BACKSTOP, writer)
             .await
             .unwrap()
             .unwrap();
@@ -388,7 +388,7 @@ mod tests {
             failed.clone(),
         ));
         reporter.watch_pending(owner, 1);
-        tokio::time::timeout(Duration::from_secs(2), writer)
+        tokio::time::timeout(crate::testing::HANG_BACKSTOP, writer)
             .await
             .unwrap()
             .unwrap();

@@ -2543,7 +2543,7 @@ fn failed_publication_after_additive_v8_upgrade_preserves_old_pin() {
         &leader,
     )
     .unwrap();
-    // Keep the accepted request after H, but retire the test writer guard
+    // Keep the accepted request after startup reconciliation, but retire the test writer guard
     // before the virgin queue's EX-protected first publication.
     drop(leader);
     let accepted = store
@@ -3521,8 +3521,8 @@ fn maintenance_releases_thousands_of_js_facts_without_permanent_deferral() {
         "{facts} declarations remained pending after {progress} progress units"
     );
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(30),
-        "large-document release and interleaved edit took too long: {:?}",
+        started.elapsed() < trellis::testing::HANG_BACKSTOP,
+        "large-document release and interleaved edit hung: {:?}",
         started.elapsed()
     );
     assert_eq!(store.status().unwrap().revision, new_head);

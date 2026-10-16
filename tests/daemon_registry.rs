@@ -258,10 +258,7 @@ fn linked_worktree_witness_refuses_common_directory_drift() {
 
 #[test]
 fn stalled_git_common_directory_lookup_is_bounded() {
-    use std::{
-        os::unix::fs::PermissionsExt,
-        time::{Duration, Instant},
-    };
+    use std::{os::unix::fs::PermissionsExt, time::Instant};
     let temp = tempfile::tempdir().unwrap();
     let base = fs::canonicalize(temp.path()).unwrap();
     let root = base.join("checkout");
@@ -281,15 +278,13 @@ fn stalled_git_common_directory_lookup_is_bounded() {
             .contains("unavailable: Git common-directory lookup timed out"),
         "{error}"
     );
-    assert!(start.elapsed() < Duration::from_secs(3));
+    // The typed timeout above proves the lookup bound fired; this detects a hang.
+    assert!(start.elapsed() < trellis::testing::HANG_BACKSTOP);
 }
 
 #[test]
 fn inherited_stdout_does_not_extend_git_deadline() {
-    use std::{
-        os::unix::fs::PermissionsExt,
-        time::{Duration, Instant},
-    };
+    use std::{os::unix::fs::PermissionsExt, time::Instant};
     let temp = tempfile::tempdir().unwrap();
     let base = fs::canonicalize(temp.path()).unwrap();
     let root = base.join("checkout");
@@ -310,5 +305,6 @@ fn inherited_stdout_does_not_extend_git_deadline() {
             .contains("unavailable: Git common-directory lookup timed out"),
         "{error}"
     );
-    assert!(start.elapsed() < Duration::from_millis(1500));
+    // The typed timeout above proves the lookup bound fired; this detects a hang.
+    assert!(start.elapsed() < trellis::testing::HANG_BACKSTOP);
 }

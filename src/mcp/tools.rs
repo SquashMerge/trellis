@@ -229,6 +229,15 @@ pub fn selection_failure(id: &Value, error: SelectionError, value: &Value) -> Va
     envelope["error"]["attemptedWorkspace"] = attempted(value);
     envelope
 }
+/// A `too_many_requests` or `deadline_exceeded` decided before read admission
+/// sampled `catchingUp` (Decision 0009 §7): no answering workspace, only the
+/// bounded attempted one (the selection, or the launch workspace path).
+pub fn admission_failure(id: &Value, code: &str, attempted_workspace: &Value) -> Value {
+    debug_assert!(matches!(code, "too_many_requests" | "deadline_exceeded"));
+    let mut envelope = failure(id, code);
+    envelope["error"]["attemptedWorkspace"] = attempted(attempted_workspace);
+    envelope
+}
 pub fn attributed_root(mut envelope: Value, root: &std::path::Path, catching_up: bool) -> Value {
     envelope["workspace"] = json!(root);
     envelope["catchingUp"] = json!(catching_up);

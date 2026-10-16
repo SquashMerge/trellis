@@ -71,7 +71,7 @@ fn absent_queue_readers_are_existing_only_and_leave_home_bytes_unchanged() {
 }
 
 #[test]
-fn first_h_bootstraps_virgin_queue_but_published_missing_queue_is_refused() {
+fn first_startup_bootstraps_virgin_queue_but_published_missing_queue_is_refused() {
     use std::sync::{Arc, atomic::AtomicBool};
     let state = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
@@ -85,13 +85,16 @@ fn first_h_bootstraps_virgin_queue_but_published_missing_queue_is_refused() {
         trellis::index_coordinator::establish_serving_session(&store, Some(&options), &cancel)
             .unwrap();
     assert_eq!(store.index_baseline().unwrap().index_revision, 1);
-    assert!(queue.is_file(), "first H must create the durable queue");
+    assert!(
+        queue.is_file(),
+        "first startup reconciliation must create the durable queue"
+    );
     assert!(store.earliest_unfinished_request().unwrap().is_none());
     drop(session);
     drop(store);
 
-    // Once H published a head, a missing queue may contain lost accepted IDs.
-    // The next daemon instance must refuse H instead of creating a fresh queue.
+    // Once startup reconciliation published a head, a missing queue may contain lost accepted IDs.
+    // The next daemon instance must refuse startup reconciliation instead of creating a fresh queue.
     fs::remove_file(&queue).unwrap();
     let reopened = Store::open_for_tests(state.path(), workspace.path()).unwrap();
     let index = queue.with_file_name("index.db");
@@ -174,7 +177,7 @@ fn published_pin_before_completion_crash_child() {
     let proof = std::path::PathBuf::from(std::env::var("TRELLIS_TEST_CRASH_GAP_PROOF").unwrap());
     let store = Store::open_for_tests(std::path::Path::new(&state), &workspace).unwrap();
     let options = IndexOptions::new(workspace);
-    // A new daemon instance must commit H before it claims the durable running gap.
+    // A new daemon instance must commit startup reconciliation before it claims the durable running gap.
     let (_, owner) = trellis::index_coordinator::reconcile_workspace(
         &store,
         &options,
@@ -372,7 +375,7 @@ fn first_daemon_activation_reconciles_then_claims_fifo_head() {
         trellis::index_coordinator::reconcile_workspace(&store, &options, &cancel, |_| {}).unwrap();
     assert_eq!(
         h.index_revision, 1,
-        "mandatory H commits before the first claim"
+        "mandatory startup reconciliation commits before the first claim"
     );
     assert_eq!(store.current_request().unwrap().unwrap().state, "queued");
     assert_eq!(
@@ -536,7 +539,7 @@ fn old_holder_fails_queued_and_running_rows_after_root_is_moved() {
 }
 
 #[test]
-fn replacement_activation_settles_old_root_before_h_and_new_fifo() {
+fn replacement_activation_settles_old_root_before_startup_and_new_fifo() {
     let state = tempfile::tempdir().unwrap();
     let parent = tempfile::tempdir().unwrap();
     let root = parent.path().join("workspace");

@@ -286,7 +286,7 @@ async fn stale_success_and_failure_are_rejected_after_process() {
         let run = tokio::spawn(async move { call(&app, "POST", &path, json!({})).await });
         let entered = f.dir.path().join("entered");
         tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            trellis::testing::HANG_BACKSTOP,
             tokio::task::spawn_blocking(move || std::fs::read(entered).unwrap()),
         )
         .await
@@ -298,7 +298,7 @@ async fn stale_success_and_failure_are_rejected_after_process() {
             .await
             .unwrap();
         assert_eq!(
-            tokio::time::timeout(std::time::Duration::from_secs(5), run)
+            tokio::time::timeout(trellis::testing::HANG_BACKSTOP, run)
                 .await
                 .unwrap()
                 .unwrap()

@@ -59,11 +59,30 @@ impl RetentionClock {
 }
 
 // A single process/root gate serializes maintenance with the entire publication
-// lifetime, including terminal ACK. Independent Store instances share the gate.
-#[derive(Debug, Default)]
+// lifetime, including terminal ACK. Independent Store instances share the gate,
+// and through it the queue's in-process signals (Decision 0009 §8).
+#[derive(Default)]
 struct PublicationGate {
     state: Mutex<GateState>,
     changed: Condvar,
+    /// Checkout workers to wake after any Store instance commits an enqueue.
+    queue_wakers: Mutex<Vec<std::sync::Weak<dyn Fn() + Send + Sync>>>,
+    /// Enqueues between their start and their wake, plus `CLOSING` while a
+    /// runtime for this queue is closing (Decision 0009 §5). Retirement sets
+    /// `CLOSING` only if no enqueue is in flight, in one compare-and-swap:
+    /// every enqueue either counts before that instant (and the retirement
+    /// cancels) or starts after it (and waits for the next activation).
+    enqueue_word: std::sync::atomic::AtomicUsize,
+    #[cfg(feature = "test-support")]
+    test_after_enqueue_commit: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// `state.waiting`, published for lock-free maintenance checks (#138
+    /// item 12): a briefly held state lock never reads as a waiting publisher.
+    waiting_published: std::sync::atomic::AtomicUsize,
+    /// Confirmed terminal request COMMITs on this queue, by any Store instance
+    /// (Decision 0009 §8). A waiter records it, re-reads its row, and waits
+    /// for it to change; requests.db stays the only record of outcomes.
+    terminal_commits: Mutex<u64>,
+    terminal_changed: Condvar,
     #[cfg(feature = "test-support")]
     test_ambiguous_settlement_once: AtomicBool,
     #[cfg(feature = "test-support")]
@@ -80,6 +99,45 @@ pub enum PublicationWaitReason {
     None,
     Maintenance,
     Publisher,
+}
+impl std::fmt::Debug for PublicationGate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PublicationGate").finish_non_exhaustive()
+    }
+}
+impl PublicationGate {
+    fn publish_waiting(&self, state: &GateState) {
+        self.waiting_published
+            .store(state.waiting, std::sync::atomic::Ordering::Release);
+    }
+
+    fn notify_terminal(&self) {
+        *self.terminal_commits.lock().unwrap() += 1;
+        self.terminal_changed.notify_all();
+    }
+
+    fn wake_queue(&self) {
+        let wakers: Vec<_> = {
+            let mut wakers = self.queue_wakers.lock().unwrap();
+            wakers.retain(|waker| waker.strong_count() > 0);
+            wakers.iter().filter_map(std::sync::Weak::upgrade).collect()
+        };
+        for wake in wakers {
+            wake();
+        }
+    }
+}
+/// The closing bit of a queue's enqueue word; the rest counts enqueues.
+const CLOSING: usize = 1 << (usize::BITS - 1);
+
+/// An enqueue counted as in flight on its queue's gate.
+pub(crate) struct EnqueueInFlight(Arc<PublicationGate>);
+impl Drop for EnqueueInFlight {
+    fn drop(&mut self) {
+        self.0
+            .enqueue_word
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
 }
 #[must_use]
 #[derive(Debug)]
@@ -176,6 +234,8 @@ pub struct Store {
     test_queue_select_hook: Arc<TestOneShotHook>,
     #[cfg(any(test, feature = "test-support"))]
     test_queue_terminal_notify: Arc<Mutex<Option<TestTerminalNotify>>>,
+    #[cfg(feature = "test-support")]
+    test_ambiguous_completion_once: Arc<AtomicBool>,
     #[cfg(test)]
     test_exclusive_recovery_hook: Arc<TestOneShotHook>,
     #[cfg(test)]
@@ -184,7 +244,7 @@ pub struct Store {
     test_queue_post_commit_failures: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
     test_publish_commit_busy_once: Arc<AtomicBool>,
-    // Distinct direct typed SQLite BUSY fixture for mandatory H retries.
+    // Distinct direct typed SQLite BUSY fixture for mandatory startup reconciliation retries.
     // The older plain-string hook remains unchanged for classifier tests.
     #[cfg(test)]
     test_publish_commit_typed_busy_once: Arc<AtomicBool>,
@@ -810,7 +870,7 @@ impl EvidenceResponse {
     }
     /// Ordinary reads release the snapshot before slow response assembly.
     /// A transitional exact-pin fence retains its predecessor snapshot; T03
-    /// releases it after materialization so H may commit before finish.
+    /// releases it after materialization so startup reconciliation may commit before finish.
     pub fn into_fence(self, policy: EvidenceFencePolicy) -> EvidenceFence {
         let Self { store, db, fence } = self;
         let snapshot_valid = fence.verify(&store, Some(&db)).is_ok();
@@ -1603,10 +1663,9 @@ struct MaintenanceProgress<'a> {
 impl MaintenanceProgress<'_> {
     fn check(&self) -> bool {
         self.gate
-            .state
-            .try_lock()
-            .map(|state| state.waiting == 0)
-            .unwrap_or(false)
+            .waiting_published
+            .load(std::sync::atomic::Ordering::Acquire)
+            == 0
     }
 }
 unsafe extern "C" fn maintenance_progress_callback(arg: *mut std::ffi::c_void) -> libc::c_int {
@@ -1663,7 +1722,11 @@ mod maintenance_progress_ffi_tests {
         let handler = install_maintenance_progress(&db, &progress);
         let tx = db.transaction().unwrap();
         tx.execute("DELETE FROM rows WHERE id<=300", []).unwrap();
-        gate.state.lock().unwrap().waiting = 1;
+        {
+            let mut state = gate.state.lock().unwrap();
+            state.waiting = 1;
+            gate.publish_waiting(&state);
+        }
         let interrupted = tx.execute("DELETE FROM rows WHERE id>300", []).unwrap_err();
         assert!(matches!(
             interrupted,
@@ -5034,6 +5097,99 @@ fn native_index_unavailable(error: &anyhow::Error) -> bool {
     error.downcast_ref::<topology::IndexNotReady>().is_some()
 }
 impl Store {
+    /// Wake `waker` after every enqueue COMMIT on this checkout's queue, by any
+    /// Store instance in this process. Held weakly: dropping it unregisters.
+    pub fn register_queue_waker(&self, waker: &Arc<dyn Fn() + Send + Sync>) {
+        self.publication_gate
+            .queue_wakers
+            .lock()
+            .unwrap()
+            .push(Arc::downgrade(waker));
+    }
+
+    pub(crate) fn wake_queue_workers(&self) {
+        self.publication_gate.wake_queue();
+    }
+
+    /// Retirement's linearization point: mark this queue's runtime closing,
+    /// only if no enqueue is in flight (one atomic step).
+    pub(crate) fn try_begin_closing(&self) -> bool {
+        self.publication_gate
+            .enqueue_word
+            .compare_exchange(
+                0,
+                CLOSING,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// The closing runtime has retired; a fresh one may activate.
+    pub(crate) fn end_closing(&self) {
+        self.publication_gate
+            .enqueue_word
+            .fetch_and(!CLOSING, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// Count an enqueue as in flight until the returned guard drops.
+    pub(crate) fn enqueue_in_flight(&self) -> EnqueueInFlight {
+        self.publication_gate
+            .enqueue_word
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        EnqueueInFlight(Arc::clone(&self.publication_gate))
+    }
+
+    /// Pause the next enqueue on this queue after its COMMIT, before its wake.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn set_after_enqueue_commit_hook_for_tests(&self, hook: impl FnOnce() + Send + 'static) {
+        *self
+            .publication_gate
+            .test_after_enqueue_commit
+            .lock()
+            .unwrap() = Some(Box::new(hook));
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn run_after_enqueue_commit_hook(&self) {
+        let hook = self
+            .publication_gate
+            .test_after_enqueue_commit
+            .lock()
+            .unwrap()
+            .take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    /// Signal waiters after a confirmed terminal request COMMIT.
+    pub(crate) fn notify_terminal_waiters(&self) {
+        self.publication_gate.notify_terminal();
+        crate::index_coordinator::diagnostic_marker(
+            "-",
+            "terminal_notify",
+            &format!("generation={}", self.terminal_generation()),
+        );
+    }
+
+    /// The terminal-commit count to record before re-reading a request row.
+    pub fn terminal_generation(&self) -> u64 {
+        *self.publication_gate.terminal_commits.lock().unwrap()
+    }
+
+    /// Block until a terminal COMMIT after `seen`; then re-read the row.
+    pub fn wait_terminal_change(&self, seen: u64) {
+        let gate = &self.publication_gate;
+        let commits = gate.terminal_commits.lock().unwrap();
+        drop(
+            gate.terminal_changed
+                .wait_while(commits, |current| *current == seen)
+                .unwrap(),
+        );
+    }
+
     /// The waiting count is registered before waiting, giving new publications
     /// priority over the next maintenance unit. The permit is owned across ACK.
     pub fn enter_publication(
@@ -5047,14 +5203,17 @@ impl Store {
         let mut state = gate.state.lock().unwrap();
         let mut wait_reason = PublicationWaitReason::None;
         state.waiting += 1;
+        gate.publish_waiting(&state);
         loop {
             if cancel.load(Ordering::Acquire) {
                 state.waiting -= 1;
+                gate.publish_waiting(&state);
                 gate.changed.notify_all();
                 anyhow::bail!("index publication cancelled");
             }
             if !state.active {
                 state.waiting -= 1;
+                gate.publish_waiting(&state);
                 state.active = true;
                 state.maintenance = false;
                 return Ok(PublishPermit {
@@ -5073,20 +5232,21 @@ impl Store {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 state.waiting -= 1;
+                gate.publish_waiting(&state);
                 gate.changed.notify_all();
                 return Err(SqliteContention(()).into());
             }
-            state = gate
-                .changed
-                .wait_timeout(state, remaining.min(Duration::from_millis(25)))
-                .unwrap()
-                .0;
+            // Woken when a permit is released (#138 item 14); no caller cancels
+            // a gate wait from outside, so cancellation is checked per wake.
+            state = gate.changed.wait_timeout(state, remaining).unwrap().0;
         }
     }
 
     pub fn maintenance_try_enter(&self) -> Option<MaintenancePermit> {
         let gate = &self.publication_gate;
-        let mut state = gate.state.try_lock().ok()?;
+        // An O(1) section: wait for the lock rather than reading a briefly
+        // held one as busy (#138 item 13).
+        let mut state = gate.state.lock().unwrap();
         if state.active || state.waiting != 0 {
             return None;
         }
@@ -5332,6 +5492,8 @@ impl Store {
             test_queue_select_hook: Arc::new(TestOneShotHook::default()),
             #[cfg(any(test, feature = "test-support"))]
             test_queue_terminal_notify: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "test-support")]
+            test_ambiguous_completion_once: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             test_exclusive_recovery_hook: Arc::new(TestOneShotHook::default()),
             #[cfg(test)]
@@ -6085,7 +6247,7 @@ impl Store {
         self.writer()
     }
 
-    /// Exercise daemon-local H and FIFO in isolated integration fixtures.
+    /// Exercise daemon-local startup reconciliation and FIFO in isolated integration fixtures.
     #[cfg(feature = "test-support")]
     pub fn writer_session_for_tests(&self) -> Result<Arc<topology::WriterSession>> {
         self.writer_session()
@@ -6093,7 +6255,7 @@ impl Store {
 
     pub(crate) fn writer_session(&self) -> Result<Arc<topology::WriterSession>> {
         let writer = self.writer()?;
-        // H must commit and attest a selected head before this local session
+        // startup reconciliation must commit and attest a selected head before this local session
         // may claim a durable request. Reads admit the validated prior head.
         self.recovery_required.store(true, Ordering::Release);
         Ok(Arc::new(topology::WriterSession::writer(writer)))
@@ -6495,6 +6657,7 @@ impl Store {
             diagnostics: serde_json::from_str(&row.9)?,
             evidence_format: (row.0 == i64::from(DATABASE_SCHEMA_VERSION) && row.6 > 0)
                 .then(|| EVIDENCE_FORMAT.to_owned()),
+            watcher: None,
         })
     }
     fn ensure_public_read_ready(&self) -> Result<()> {
@@ -6530,11 +6693,11 @@ impl Store {
     fn read_status(&self, db: &Connection) -> Result<IndexStatus> {
         self.read_status_for(db, false)
     }
-    fn read_status_for(&self, db: &Connection, pre_h: bool) -> Result<IndexStatus> {
-        let status = if pre_h {
+    fn read_status_for(&self, db: &Connection, pre_startup: bool) -> Result<IndexStatus> {
+        let status = if pre_startup {
             self.verify_metadata_root(db)
                 .map_err(|error| self.report_live_read_failure(error))?;
-            // H may keep a valid prior head readable, but a selected document
+            // startup reconciliation may keep a valid prior head readable, but a selected document
             // already proved corrupt cannot be admitted by that same path.
             if self.disposition() == RecoveryDisposition::Rebuild {
                 anyhow::bail!(
@@ -9109,9 +9272,9 @@ impl Store {
         &self,
         db: &Connection,
         expected: Option<IndexPin>,
-        pre_h: bool,
+        pre_startup: bool,
     ) -> Result<ReadRevision> {
-        let head = self.read_status_for(db, pre_h)?.revision;
+        let head = self.read_status_for(db, pre_startup)?.revision;
         let pin = expected.unwrap_or(head);
         ensure!(
             pin.index_generation == head.index_generation
@@ -10568,9 +10731,10 @@ impl Store {
         &self,
         tx: &Connection,
         request: &crate::navigation::NavigationRequest,
-        pre_h: bool,
+        pre_startup: bool,
     ) -> Result<crate::navigation::NavigationResult> {
-        let selected = self.read_revision_for(tx, Some(request.expected_revision()), pre_h)?;
+        let selected =
+            self.read_revision_for(tx, Some(request.expected_revision()), pre_startup)?;
         let revision = selected.pin;
         // Navigation's source selector counts lines from the stored source BLOB,
         // and its member selector reads versioned class/node rows. Before either
@@ -10659,7 +10823,7 @@ impl Store {
         query: &str,
         expected: Option<IndexPin>,
         pagination: (usize, usize),
-        pre_h: bool,
+        pre_startup: bool,
     ) -> Result<crate::class_diagram::ClassPage> {
         use crate::class_diagram::ClassPage;
         let (offset, limit) = pagination;
@@ -10683,7 +10847,7 @@ impl Store {
                 InvalidRequest("Choose a workspace-relative class source path.")
             );
         }
-        let selected_revision = self.read_revision_for(tx, expected, pre_h)?;
+        let selected_revision = self.read_revision_for(tx, expected, pre_startup)?;
         let revision = selected_revision.pin;
         let (mut warnings, truncated) = class_metadata(tx, &selected_revision)
             .map_err(|error| self.report_selected_failure(selected_integrity(error)))?;
@@ -10785,10 +10949,10 @@ impl Store {
         &self,
         tx: &Connection,
         request: &crate::class_diagram::ClassDiagramRequest,
-        pre_h: bool,
+        pre_startup: bool,
     ) -> Result<crate::class_diagram::ClassDiagram> {
         use crate::class_diagram::{self, InvalidRequest};
-        let selected = self.read_revision_for(tx, Some(request.expected_revision), pre_h)?;
+        let selected = self.read_revision_for(tx, Some(request.expected_revision), pre_startup)?;
         let revision = selected.pin;
         let (warnings, truncated) = class_metadata(tx, &selected)
             .map_err(|error| self.report_selected_failure(selected_integrity(error)))?;
@@ -10836,9 +11000,9 @@ impl Store {
         tx: &Connection,
         query: &str,
         limit: usize,
-        pre_h: bool,
+        pre_startup: bool,
     ) -> Result<(IndexPin, Vec<Symbol>)> {
-        let selected = self.read_revision_for(tx, None, pre_h)?;
+        let selected = self.read_revision_for(tx, None, pre_startup)?;
         let revision = selected.pin;
         let selected_paths: BTreeSet<String> = tx.prepare("SELECT n.path FROM graph_nodes n JOIN revision_documents m ON m.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND m.graph_projection_id=n.projection_id WHERE instr(lower(n.name),lower(?1)) > 0 OR instr(lower(n.id),lower(?1)) > 0 ORDER BY CASE WHEN lower(n.name)=lower(?1) THEN 0 WHEN instr(lower(n.name),lower(?1))=1 THEN 1 ELSE 2 END,n.name,n.id LIMIT ?2")?
             .query_map(params![query,limit.min(150) as i64],|r|r.get::<_,String>(0))?
@@ -10878,9 +11042,9 @@ impl Store {
         tx: &Connection,
         id: &str,
         expected_revision: Option<IndexPin>,
-        pre_h: bool,
+        pre_startup: bool,
     ) -> Result<Option<(IndexPin, Symbol)>> {
-        let selected = self.read_revision_for(tx, expected_revision, pre_h)?;
+        let selected = self.read_revision_for(tx, expected_revision, pre_startup)?;
         let revision = selected.pin;
         let selected_path: Option<String> = tx
                 .query_row("SELECT n.path FROM graph_nodes n JOIN revision_documents m ON m.revision_id=?2 AND m.graph_projection_id=n.projection_id WHERE n.id=?1", params![id, selected.key], |r| r.get(0))
@@ -11057,9 +11221,9 @@ impl Store {
         tx: &Connection,
         root: &Path,
         items: &mut [crate::file_tree::Entry],
-        pre_h: bool,
+        pre_startup: bool,
     ) -> Result<(IndexPin, String, TreeOverlays)> {
-        let revision = self.read_status_for(tx, pre_h)?.revision;
+        let revision = self.read_status_for(tx, pre_startup)?.revision;
         let workspace = Path::new(&self.workspace_root);
         let mut valid_stmt = tx.prepare(
                 "SELECT NOT EXISTS(SELECT 1 FROM graph_nodes n WHERE n.projection_id=m.graph_projection_id AND json_valid(n.payload)=0) FROM revision_documents m JOIN index_metadata active_manifest ON active_manifest.singleton=1 AND m.revision_id='pin:v1:'||active_manifest.index_generation||':'||active_manifest.index_revision WHERE m.path=?1",
@@ -11116,9 +11280,9 @@ impl Store {
         expected: Option<IndexPin>,
         offset: usize,
         limit: usize,
-        pre_h: bool,
+        pre_startup: bool,
     ) -> Result<serde_json::Value> {
-        let selected = self.read_revision_for(tx, expected, pre_h)?;
+        let selected = self.read_revision_for(tx, expected, pre_startup)?;
         let revision = selected.pin;
         let mut stmt = tx.prepare(
             "SELECT m.path,d.language,m.graph_projection_id FROM revision_documents m
@@ -11159,9 +11323,9 @@ impl Store {
         tx: &Connection,
         path: &str,
         expected: Option<IndexPin>,
-        pre_h: bool,
+        pre_startup: bool,
     ) -> Result<Option<serde_json::Value>> {
-        let selected = self.read_revision_for(tx, expected, pre_h)?;
+        let selected = self.read_revision_for(tx, expected, pre_startup)?;
         let revision = selected.pin;
         let projection_id: Option<String> = tx
             .query_row(
@@ -11208,9 +11372,9 @@ impl Store {
         seed: &str,
         expected: IndexPin,
         show_all: bool,
-        pre_h: bool,
+        pre_startup: bool,
     ) -> Result<Option<crate::behavior::SequenceView>> {
-        let selected_revision = self.read_revision_for(tx, Some(expected), pre_h)?;
+        let selected_revision = self.read_revision_for(tx, Some(expected), pre_startup)?;
         let revision = selected_revision.pin;
         let selected: Option<(String, String)> = tx
             .query_row(
@@ -11432,9 +11596,9 @@ impl Store {
         tx: &Connection,
         query: &ViewQuery,
         expected_pin: Option<&IndexPin>,
-        pre_h: bool,
+        pre_startup: bool,
     ) -> Result<Option<ViewResult>> {
-        let selected = self.read_revision_for(tx, expected_pin.copied(), pre_h)?;
+        let selected = self.read_revision_for(tx, expected_pin.copied(), pre_startup)?;
         let revision = selected.pin;
         let selected_path: Option<String> = tx
             .query_row("SELECT n.path FROM graph_nodes n JOIN revision_documents m ON m.revision_id=?2 AND m.graph_projection_id=n.projection_id WHERE n.id=?1", params![query.seed, selected.key], |r| {
@@ -11521,9 +11685,9 @@ impl Store {
         db: &Connection,
         store: &Self,
         target: &str,
-        pre_h: bool,
+        pre_startup: bool,
     ) -> Result<DurableAnchor> {
-        let revision = store.read_revision_for(db, None, pre_h)?;
+        let revision = store.read_revision_for(db, None, pre_startup)?;
         let selected: Option<(String, String)> = db
             .query_row(
                 "SELECT m.language,m.path FROM native_version_declarations d
@@ -11614,9 +11778,9 @@ impl Store {
         store: &Self,
         view: SavedViewRecord,
         pin: Option<IndexPin>,
-        pre_h: bool,
+        pre_startup: bool,
     ) -> Result<SavedViewState> {
-        let selected = store.read_revision_for(db, pin, pre_h)?;
+        let selected = store.read_revision_for(db, pin, pre_startup)?;
         let ids: BTreeSet<&String> = std::iter::once(&view.query.seed)
             .chain(view.pins.keys())
             .chain(view.hidden.iter())
@@ -11760,9 +11924,9 @@ impl Store {
         store: &Self,
         annotation: AnnotationRecord,
         pin: Option<IndexPin>,
-        pre_h: bool,
+        pre_startup: bool,
     ) -> Result<AnnotationState> {
-        let selected = store.read_revision_for(db, pin, pre_h)?;
+        let selected = store.read_revision_for(db, pin, pre_startup)?;
         let attachment =
             Self::anchor_attachment(db, store, annotation.anchor.as_deref(), &selected)?;
         let orphaned = attachment
@@ -11997,7 +12161,7 @@ mod selected_manifest_query_plan_tests {
         let options = IndexOptions::new(work.path().to_owned());
         let worker = std::thread::spawn(move || h.run(&options, &abort, |_| {}));
         arrived_rx
-            .recv_timeout(std::time::Duration::from_secs(20))
+            .recv_timeout(crate::testing::HANG_BACKSTOP)
             .expect("reconciliation did not reach the writer-transaction barrier");
         let selected = reopened.evidence_response_daemon_local().unwrap();
         let during = selected.status().unwrap();
@@ -12079,7 +12243,7 @@ mod selected_manifest_query_plan_tests {
             .unwrap();
         let publisher = std::thread::spawn(move || job.run(&options, &cancel, |_| {}));
         arrived_rx
-            .recv_timeout(std::time::Duration::from_secs(20))
+            .recv_timeout(crate::testing::HANG_BACKSTOP)
             .expect("publication did not reach the writer-transaction barrier");
         let during_status = store.status();
         let during_pinned = store.source_at("A.java", Some(first));
@@ -13528,7 +13692,7 @@ mod rebaseline_fault_tests {
                         .send(())
                         .context("failed to signal BeforeCommit stage")?;
                     release_rx
-                        .recv_timeout(Duration::from_secs(30))
+                        .recv_timeout(crate::testing::HANG_BACKSTOP)
                         .context("bounded BeforeCommit release timed out")?;
                     Ok(())
                 },
@@ -13539,7 +13703,7 @@ mod rebaseline_fault_tests {
             release: Some(release_tx),
             worker: Some(worker),
         };
-        if let Err(wait) = entered_rx.recv_timeout(Duration::from_secs(30)) {
+        if let Err(wait) = entered_rx.recv_timeout(crate::testing::HANG_BACKSTOP) {
             let detail = if guard.worker.as_ref().is_some_and(JoinHandle::is_finished) {
                 worker_outcome(guard.worker.take().unwrap().join())
             } else {
@@ -13783,7 +13947,7 @@ mod rebaseline_fault_tests {
                     validate_paired_metadata(tx,worker_store.root_id(),PairedManifestScope::Full)?;
                     validate_paired_rows(tx)?;
                     entered_tx.send(()).context("cannot signal staged BeforeCommit")?;
-                    release_rx.recv_timeout(Duration::from_secs(30))
+                    release_rx.recv_timeout(crate::testing::HANG_BACKSTOP)
                         .context("bounded BeforeCommit release timed out")?;
                     Ok(())
                 },

@@ -4,10 +4,7 @@ use serde::Serialize;
 use std::{
     net::SocketAddr,
     path::PathBuf,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, atomic::Ordering},
     time::{Duration, Instant},
 };
 use trellis::{
@@ -443,6 +440,16 @@ fn start_daemon() -> std::io::Result<client::StartOutcome> {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+    // A fixture may keep an auto-started daemon's diagnostics.
+    #[cfg(feature = "test-support")]
+    if let Some(path) = std::env::var_os("TRELLIS_TEST_DAEMON_STDERR") {
+        command.stderr(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)?,
+        );
+    }
     // The daemon must outlive the first CLI/MCP client's process group/session.
     // setsid is async-signal-safe: no allocation or lock is taken in the child.
     unsafe {
@@ -702,6 +709,8 @@ async fn serve_via_daemon(args: &ServeArgs) -> Result<()> {
     let socket = socket_path()?;
     let mut stream = client::connect_or_start(&socket, start_daemon, Duration::from_secs(5))
         .map_err(|_| anyhow::anyhow!("daemon_unavailable"))?;
+    // Serve registers in place and never waits for a checkout's index work
+    // (Decision 0009 §6).
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     protocol::write_frame(
         &mut stream,
@@ -774,7 +783,6 @@ async fn run_daemon() -> Result<()> {
     let registry = Arc::new(tokio::sync::Mutex::new(registry::CheckoutRegistry::new()));
     let browser = Arc::new(tokio::sync::Mutex::new(daemon::BrowserProvisioner::new()));
     let next_session = Arc::new(std::sync::atomic::AtomicU64::new(1));
-    let stopping = Arc::new(AtomicBool::new(false));
     let (browser_shutdown, _) = tokio::sync::watch::channel(false);
     let idle = daemon::run_idle_lifecycle(registry.clone());
     tokio::pin!(idle);
@@ -818,15 +826,13 @@ async fn run_daemon() -> Result<()> {
                 let registry = registry.clone();
                 let browser = browser.clone();
                 let id = next_session.fetch_add(1, Ordering::Relaxed);
-                let stopping = stopping.clone();
                 let browser_shutdown = browser_shutdown.clone();
                 tokio::task::spawn_blocking(move || {
-                    let _ = dispatch_connection(stream, id, registry, browser, stopping, browser_shutdown);
+                    let _ = dispatch_connection(stream, id, registry, browser, browser_shutdown);
                 });
             }
         }
     }
-    stopping.store(true, Ordering::Release);
     let _ = browser_shutdown.send(true);
     drop(listener);
     drop(owner);
@@ -866,13 +872,17 @@ fn dispatch_connection(
     session: u64,
     registry: Arc<tokio::sync::Mutex<registry::CheckoutRegistry>>,
     browser: Arc<tokio::sync::Mutex<daemon::BrowserProvisioner>>,
-    stopping: Arc<AtomicBool>,
     browser_shutdown: tokio::sync::watch::Sender<bool>,
 ) -> Result<()> {
     let runtime = tokio::runtime::Handle::current();
     stream.set_read_timeout(Some(Duration::from_secs(15)))?;
     let request: protocol::Request = protocol::read_frame(&mut stream)?;
     if request.operation == "mcp" {
+        let relayed = request
+            .payload
+            .get("relay")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
         let result = (|| -> Result<mcp::OpenedWorkspace> {
             let root: PathBuf = serde_json::from_value(
                 request
@@ -926,13 +936,25 @@ fn dispatch_connection(
                 stream
                     .set_read_timeout(None)
                     .and_then(|()| {
-                        mcp::run_socket(
-                            workspace,
-                            stream,
-                            registry.clone(),
-                            session,
-                            runtime.clone(),
-                        )
+                        // `trellis mcp`'s relay frames each line with its own
+                        // relay ID (Decision 0009 §7).
+                        if relayed {
+                            mcp::run_relayed_socket(
+                                workspace,
+                                stream,
+                                registry.clone(),
+                                session,
+                                runtime.clone(),
+                            )
+                        } else {
+                            mcp::run_socket(
+                                workspace,
+                                stream,
+                                registry.clone(),
+                                session,
+                                runtime.clone(),
+                            )
+                        }
                     })
                     .map_err(anyhow::Error::from)
             }
@@ -1038,6 +1060,9 @@ fn dispatch_connection(
         let args = request.payload.get("args").context("missing args")?;
         let deadline = Instant::now() + CLI_READ_WAIT;
         loop {
+            // Recorded before the read: a state change between the read and
+            // the wait below is never missed.
+            let state_version = checkout.state_version();
             let selected = match request.operation.as_str() {
                 "status" => checkout.cli_status(),
                 "symbols" => checkout.cli_symbols(
@@ -1071,7 +1096,7 @@ fn dispatch_connection(
                 }
                 _ => anyhow::bail!("unknown daemon operation"),
             };
-            // Mandatory H may be running when a CLI read first attaches.
+            // Mandatory startup reconciliation may be running when a CLI read first attaches.
             // This only repeats read-only calls; index is never replayed.
             if request.operation != "index"
                 && selected
@@ -1080,7 +1105,12 @@ fn dispatch_connection(
                     .is_some_and(|error| error.to_string().starts_with("index_not_ready:"))
                 && Instant::now() < deadline
             {
-                std::thread::sleep(Duration::from_millis(20));
+                // Wait for startup reconciliation to progress, not a poll (#138
+                // item 16).
+                checkout.wait_state_change(
+                    state_version,
+                    deadline.saturating_duration_since(Instant::now()),
+                );
                 continue;
             }
             break selected;
@@ -1098,20 +1128,26 @@ fn dispatch_connection(
     };
     write_daemon_reply(&mut stream, &reply)?;
     if serve {
-        // This control connection only observes the daemon process lifetime.
-        stream.set_read_timeout(Some(Duration::from_millis(250)))?;
+        // This control connection only observes the daemon process lifetime:
+        // it ends when the client closes it or the daemon stops, signalled by
+        // the shutdown channel instead of a polled flag (#138 item 21).
+        let closer = stream.try_clone()?;
+        let mut shutdown = browser_shutdown.subscribe();
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel::<()>();
+        let watcher = runtime.spawn(async move {
+            tokio::select! {
+                _ = shutdown.wait_for(|stopped| *stopped) => {
+                    let _ = closer.shutdown(std::net::Shutdown::Both);
+                }
+                _ = closed_rx => {}
+            }
+        });
+        stream.set_read_timeout(None)?;
         let mut one = [0u8; 1];
         use std::io::Read;
-        while !stopping.load(Ordering::Acquire) {
-            match stream.read(&mut one) {
-                Ok(0) => break,
-                Ok(_) => (),
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::WouldBlock
-                        || error.kind() == std::io::ErrorKind::TimedOut => {}
-                Err(_) => break,
-            }
-        }
+        while matches!(stream.read(&mut one), Ok(n) if n > 0) {}
+        let _ = closed_tx.send(());
+        let _ = runtime.block_on(watcher);
     }
     Ok(())
 }

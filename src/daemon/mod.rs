@@ -205,17 +205,29 @@ impl Drop for SocketOwner {
 pub async fn run_idle_lifecycle(
     registry: std::sync::Arc<tokio::sync::Mutex<registry::CheckoutRegistry>>,
 ) -> Result<(), registry::SelectionError> {
-    let mut ticks = tokio::time::interval(std::time::Duration::from_millis(250));
-    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Event-driven (Decision 0009 §5): sleep until the next policy deadline
+    // unless a client change, a retirement, drained work or a released lease
+    // signals first. A signal sent while advancing is kept as a permit.
+    let signal = registry.lock().await.lifecycle_signal();
     loop {
-        ticks.tick().await;
-        if registry
-            .lock()
-            .await
-            .advance(std::time::Instant::now())?
-            .exit
-        {
+        let now = std::time::Instant::now();
+        let tick = {
+            let mut registry = registry.lock().await;
+            let tick = registry.advance(now)?;
+            (tick.exit, registry.next_lifecycle_deadline(now))
+        };
+        let (exit, deadline) = tick;
+        if exit {
             return Ok(());
+        }
+        match deadline {
+            Some(deadline) => {
+                tokio::select! {
+                    () = signal.notified() => {}
+                    () = tokio::time::sleep_until(deadline.into()) => {}
+                }
+            }
+            None => signal.notified().await,
         }
     }
 }
@@ -310,8 +322,8 @@ impl BrowserProvisioner {
             .await
     }
 
-    /// Hook for deterministic boundary tests. `retry_wait` (test-support only)
-    /// runs after dropping the registry guard; other stages run under it.
+    /// Hook for deterministic boundary tests; every stage runs under the
+    /// registry guard.
     #[doc(hidden)]
     pub async fn register_serve_with_hook(
         &mut self,
@@ -334,31 +346,16 @@ impl BrowserProvisioner {
             .file_name()
             .ok_or_else(|| anyhow::anyhow!("token file needs a name"))?;
         let token_path = parent.canonicalize()?.join(file);
-        // A CLI-only runtime may still be finishing H, a selected read, or
-        // accepted work. Wait only for that typed transient state, releasing
-        // the registry guard so the runtime can finish. A genuine conflicting
-        // registration or attached client remains an immediate refusal.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
-        let mut checked = loop {
-            let mut checked = registry.lock().await;
-            match checked.can_register(identity, &options) {
-                Ok(()) => break checked,
-                Err(registry::SelectionError::StorageBusy) => {
-                    drop(checked);
-                    if std::time::Instant::now() >= deadline {
-                        let checked = registry.lock().await;
-                        checked.abandon_cli_replacement(&identity.root_key);
-                        anyhow::bail!("{}", registry::SelectionError::StorageBusy.reason());
-                    }
-                    #[cfg(feature = "test-support")]
-                    if let Some(hook) = hook.as_mut() {
-                        hook("retry_wait");
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-                }
-                Err(error) => anyhow::bail!("{}", error.reason()),
-            }
-        };
+        // One guard covers the conflict check, the configuration build, binding,
+        // token creation and the in-place publication (Decision 0009 §6). The
+        // daemon's provisioning mutex serializes serve registrations, so no
+        // other registration can win between these steps. Nothing waits for a
+        // checkout's index work.
+        let mut checked = registry.lock().await;
+        checked
+            .can_register(identity, &options)
+            .map_err(|error| anyhow::anyhow!("{}", error.reason()))?;
+        let config = checked.registration_config(identity, &options)?;
         // The same successful guard covers validation, binding, token creation
         // and registration; no other attachment can win between these steps.
         if let Some(hook) = hook.as_mut() {
@@ -387,9 +384,7 @@ impl BrowserProvisioner {
                 self.token.as_ref() == Some(&token),
                 "serve token contents changed"
             );
-            checked
-                .register(identity, options)
-                .map_err(|error| anyhow::anyhow!("{}", error.reason()))?;
+            checked.register_in_place(identity, options, config)?;
             return self
                 .address()
                 .ok_or_else(|| anyhow::anyhow!("browser listener closed"));
@@ -404,9 +399,7 @@ impl BrowserProvisioner {
         check_token_path(&token_path, inode)?;
         let browser =
             crate::http::ProvisionedBrowser::new(registry.clone(), token.clone(), address)?;
-        checked
-            .register(identity, options)
-            .map_err(|error| anyhow::anyhow!("{}", error.reason()))?;
+        checked.register_in_place(identity, options, config)?;
         self.listener = Some(listener);
         self.effective_address = Some(address);
         self.browser = Some(browser);

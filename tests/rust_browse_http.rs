@@ -85,7 +85,7 @@ async fn rust_methods_sequence_and_source_survive_live_file_removal() {
             .any(|f| f.path == "helper.js" && f.language == "javascript")
     );
     // The daemon stages its virgin queue before retaining writer SH, then
-    // commits the recorded-options H before it can accept the next browser Q.
+    // commits the recorded-options startup reconciliation before it can accept the next browser Q.
     let (pin, session) =
         trellis::index_coordinator::reconcile_workspace(&store, &options, &cancel, |_| {}).unwrap();
     assert_eq!(store.status().unwrap().revision, pin);
@@ -173,7 +173,7 @@ async fn rust_methods_sequence_and_source_survive_live_file_removal() {
     let (code, job) = request(&app, "POST", "/api/index", json!({})).await;
     assert_eq!(code, 202, "{job}");
     let id = job["id"].as_str().unwrap();
-    let completed = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+    let completed = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             let (code, result) =
                 request(&app, "GET", &format!("/api/jobs/{id}"), Value::Null).await;
@@ -267,7 +267,7 @@ async fn daemon_tick_keeps_pinned_and_current_source_available_across_fifty_edit
         // Native OS delivery can coalesce same-size successive writes. Give
         // this daemon-tick fixture one accepted hint through the real watcher
         // ingress per edit, rather than depending on the OS callback deadline.
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
             loop {
                 let hint = Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content)))
                     .add_path(source.clone());
@@ -281,7 +281,7 @@ async fn daemon_tick_keeps_pinned_and_current_source_available_across_fifty_edit
         .expect("daemon watcher did not register");
         // Publication shares a loaded verify host; the hint removes only the
         // notification latency (#131).
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
         loop {
             let (status_code, status) = request(&app, "GET", "/api/status", Value::Null).await;
             assert_eq!(status_code, 200, "edit {edit}: {status}");

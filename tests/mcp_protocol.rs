@@ -21,7 +21,7 @@ fn bounded_group_wait(child: &mut Child) -> (std::process::ExitStatus, bool) {
     // Both spawn sites use CommandExt::process_group(0); a failed group setup
     // fails spawn. Do not probe getpgid here: Darwin can transiently report
     // ESRCH before a nonblocking waitid observes a fast child's exit.
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + trellis::testing::HANG_BACKSTOP;
     let expired = loop {
         if std::time::Instant::now() >= deadline {
             break true;
@@ -66,7 +66,7 @@ fn capture_file(path: &Path) -> Vec<u8> {
 /// Silence is established only after the reader has closed its sender. Timeout is
 /// inconclusive and must fail, never count as an empty protocol transcript.
 fn drain_stdout(lines: Receiver<Vec<u8>>) -> Vec<Vec<u8>> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + trellis::testing::HANG_BACKSTOP;
     let mut captured = Vec::new();
     loop {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -175,7 +175,7 @@ fn stop_fixture_daemon(home: &Path) {
     if !sent {
         return;
     }
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let deadline = std::time::Instant::now() + trellis::testing::HANG_BACKSTOP;
     while std::time::Instant::now() < deadline {
         if owned_daemon_connection(home, pid).is_none() {
             let _ = fs::remove_file(&marker);
@@ -311,7 +311,7 @@ impl Peer {
     fn reply_bytes(&self) -> Vec<u8> {
         let raw = self
             .lines
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(trellis::testing::HANG_BACKSTOP)
             .expect("bounded MCP reply");
         assert!(raw.len() <= 65_536);
         assert_eq!(raw.last(), Some(&b'\n'));
@@ -384,7 +384,7 @@ fn marker_for_other_fixture_daemon_does_not_target_this_private_socket() {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + trellis::testing::HANG_BACKSTOP;
     loop {
         if private_socket_under(other.path())
             .is_some_and(|path| std::os::unix::net::UnixStream::connect(path).is_ok())
@@ -433,7 +433,8 @@ fn tool(v: &Value, code: Option<&str>, modern: bool) {
     );
     assert_eq!(envelope["requestId"], v["id"]);
     if let Some(code) = code {
-        assert_eq!(envelope["error"]["code"], code);
+        // The whole reply, so an unexpected code shows its reason.
+        assert_eq!(envelope["error"]["code"], code, "{v}");
     }
 }
 fn expected_envelope(id: &Value, code: Option<&str>, label: &str, root: &Value) -> Value {
@@ -554,7 +555,7 @@ fn call(legacy: bool, id: Value, name: &str, arguments: Value) -> Value {
 }
 fn phase_barrier(listener: &std::os::unix::net::UnixListener, stage: &str, mutate: impl FnOnce()) {
     listener.set_nonblocking(true).unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + trellis::testing::HANG_BACKSTOP;
     let mut stream = loop {
         match listener.accept() {
             Ok((stream, _)) => break stream,
@@ -569,7 +570,7 @@ fn phase_barrier(listener: &std::os::unix::net::UnixListener, stage: &str, mutat
     };
     stream.set_nonblocking(false).unwrap();
     stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
+        .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
         .unwrap();
     let mut line = String::new();
     BufReader::new(stream.try_clone().unwrap())
@@ -2329,7 +2330,7 @@ async fn next_causal_event(
     use tokio::io::AsyncReadExt;
     let (socket, _) = tokio::time::timeout_at(deadline, listener.accept())
         .await
-        .expect("daemon did not emit a causal H/watch witness")
+        .expect("daemon did not emit a causal startup/watch witness")
         .unwrap();
     let mut bytes = Vec::new();
     tokio::time::timeout_at(deadline, socket.take(513).read_to_end(&mut bytes))
@@ -2439,7 +2440,7 @@ impl CausalReadiness {
                     self.announced_generations.contains(&generation),
                     "ACK without same-lineage WATCH_PENDING for its generation"
                 );
-                // CLI row completion is not H/watch settlement. Earlier H ACKs
+                // CLI row completion is not startup/watch settlement. Earlier startup reconciliation ACKs
                 // may be observed, but only the accepted CLI pin binds this ACK.
                 if event["pin"] == *published {
                     self.acked = Some(self.acked.map_or(generation, |prior| prior.max(generation)));
@@ -2471,7 +2472,7 @@ async fn catching_up_reports_pending_work_then_witnessed_readiness_on_same_check
     ));
     tool(&first, None, true);
     // This first true means pending work; without a phase witness it does not
-    // distinguish mandatory H from a queued watcher hint.
+    // distinguish mandatory startup reconciliation from a queued watcher hint.
     assert_eq!(first["result"]["structuredContent"]["catchingUp"], true);
     assert!(first["result"]["structuredContent"]["evidenceBasis"].is_null());
     assert_eq!(
@@ -2502,7 +2503,7 @@ async fn catching_up_reports_pending_work_then_witnessed_readiness_on_same_check
     assert!(published["indexRevision"].is_u64());
 
     // A completed CLI queue row pins a publication, not the daemon's mandatory
-    // H or its watcher inventory. The same Peer must keep its launch selection,
+    // startup reconciliation or its watcher inventory. The same Peer must keep its launch selection,
     // but a second tool call may still report catchingUp=true.
     let second = peer.ask(call(
         false,
@@ -2529,12 +2530,12 @@ async fn catching_up_reports_pending_work_then_witnessed_readiness_on_same_check
     // {kind,rootKey,streamId,streamSeq,lineageOrdinal,ownerIncarnation,
     //  watchEpoch,pin,watchGeneration,queueEmpty}. A single FIFO writer sends
     // one complete event per connection. Any missing/duplicate sequence fails.
-    // H_READY follows verified owner installation AND phase Ready/H=false.
+    // H_READY follows verified owner installation AND phase Ready/startup reconciliation=false.
     // WATCH_ACK follows full inventory acknowledgment with no unfinished FIFO.
     // WATCH_PENDING is
     // emitted for a later accepted hint, so an ACK is never a future quiet lease.
     // The socket is read-only, private to HOME, and does not address a PID.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let deadline = tokio::time::Instant::now() + trellis::testing::HANG_BACKSTOP;
     let mut events = 0;
     let mut readiness = CausalReadiness::default();
     let mut next_event = async || {
@@ -2544,8 +2545,8 @@ async fn catching_up_reports_pending_work_then_witnessed_readiness_on_same_check
         assert_eq!(event["rootKey"], root_key, "foreign causal witness");
         event
     };
-    // H and ACK must be from the SAME verified owner and watch epoch. If a
-    // successor takes over, discard the former generation and require new H.
+    // startup reconciliation and ACK must be from the SAME verified owner and watch epoch. If a
+    // successor takes over, discard the former generation and require new startup reconciliation.
     while !readiness.settled() {
         readiness.observe(&next_event().await, published);
     }
@@ -2577,7 +2578,9 @@ async fn catching_up_reports_pending_work_then_witnessed_readiness_on_same_check
             id < 5,
             "new watcher hints exceeded the bounded transition budget"
         );
-        let prior_ordinal = readiness.lineage_ordinal.expect("correlated H/ACK lineage");
+        let prior_ordinal = readiness
+            .lineage_ordinal
+            .expect("correlated startup reconciliation/ACK lineage");
         let prior_ack = readiness.acked.expect("CLI-pinned watcher ACK");
         let mut witnessed_later = false;
         loop {
@@ -2588,7 +2591,7 @@ async fn catching_up_reports_pending_work_then_witnessed_readiness_on_same_check
                 && event["watchGeneration"].as_u64().expect("watch generation") > prior_ack;
             let current = readiness.observe(&event, published);
             // Old-epoch deliveries still consume streamSeq but cannot replace
-            // a newer H witness or count as a new reason to retry.
+            // a newer startup reconciliation witness or count as a new reason to retry.
             if current && (ordinal > prior_ordinal || later_hint) {
                 witnessed_later = true;
             }
@@ -2602,7 +2605,7 @@ async fn catching_up_reports_pending_work_then_witnessed_readiness_on_same_check
 
 /// Drive a real same-owner selected-options change through the daemon FIFO.
 /// The fresh H_READY is a Ready snapshot for the replacement watcher; it does
-/// not claim that mandatory H reran when the accepted CLI index changed inputs.
+/// not claim that mandatory startup reconciliation reran when the accepted CLI index changed inputs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn selected_options_replacement_reissues_ready_for_new_watch_epoch() {
     let temp = tempfile::tempdir().unwrap();
@@ -2641,7 +2644,7 @@ async fn selected_options_replacement_reissues_ready_for_new_watch_epoch() {
         result["publishedRevision"].clone()
     };
     let first_pin = index(None);
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let deadline = tokio::time::Instant::now() + trellis::testing::HANG_BACKSTOP;
     let mut state = CausalReadiness::default();
     let mut records = 0;
     while !state.settled() {
@@ -2688,7 +2691,7 @@ async fn selected_options_replacement_reissues_ready_for_new_watch_epoch() {
     let options: Value = serde_json::from_str(&options).unwrap();
     assert_eq!(options["maxFileBytes"], 4096);
     drop(db);
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let deadline = tokio::time::Instant::now() + trellis::testing::HANG_BACKSTOP;
     let mut observed = std::collections::HashSet::new();
     while !state.settled() || state.lineage_ordinal == Some(original_ordinal) {
         records += 1;
@@ -2700,7 +2703,7 @@ async fn selected_options_replacement_reissues_ready_for_new_watch_epoch() {
         if ordinal > original_ordinal {
             assert_eq!(
                 lineage.0, original.0,
-                "option changes retain the same H owner"
+                "option changes retain the same startup reconciliation owner"
             );
             assert_ne!(
                 lineage.1, original.1,
@@ -2712,7 +2715,7 @@ async fn selected_options_replacement_reissues_ready_for_new_watch_epoch() {
     }
     assert!(
         observed.contains("H_READY"),
-        "new epoch needs its own H-ready snapshot"
+        "new epoch needs its own startup reconciliation-ready snapshot"
     );
     assert!(
         observed.contains("WATCH_PENDING"),
@@ -2757,7 +2760,7 @@ fn causal_fixture_event(
 }
 
 #[test]
-fn causal_witness_ignores_late_retired_epoch_and_requires_successor_h() {
+fn causal_witness_ignores_late_retired_epoch_and_requires_successor_startup() {
     let stream = uuid::Uuid::new_v4();
     let owner = uuid::Uuid::new_v4();
     let old = uuid::Uuid::new_v4();
@@ -2783,7 +2786,7 @@ fn causal_witness_ignores_late_retired_epoch_and_requires_successor_h() {
     ));
     assert!(!state.settled());
     // An old epoch arrives after the new event. It consumes the stream sequence
-    // but cannot reset the new epoch or certify readiness with stale H/ACK.
+    // but cannot reset the new epoch or certify readiness with stale startup reconciliation/ACK.
     assert!(!state.observe(
         &causal_fixture_event(stream, 5, 1, owner, old, "WATCH_ACK", &pin, 2),
         &pin
@@ -2793,7 +2796,10 @@ fn causal_witness_ignores_late_retired_epoch_and_requires_successor_h() {
         &causal_fixture_event(stream, 6, 2, owner, next, "WATCH_ACK", &pin, 1),
         &pin
     ));
-    assert!(!state.settled(), "ACK without successor H is insufficient");
+    assert!(
+        !state.settled(),
+        "ACK without successor startup reconciliation is insufficient"
+    );
     assert!(state.observe(
         &causal_fixture_event(stream, 7, 2, owner, next, "H_READY", &pin, 1),
         &pin
@@ -2881,7 +2887,7 @@ async fn describe_reports_actual_degraded_watcher_on_selected_snapshot() {
     let mut registry = CheckoutRegistry::with_roots(topology);
     registry.attach_launch(31, &identity).unwrap();
     let runtime = registry.activate(&identity.root_key).unwrap();
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             if let Ok((snapshot, _)) = runtime.evidence_response()
                 && snapshot.finish(()).is_ok()
@@ -2892,9 +2898,9 @@ async fn describe_reports_actual_degraded_watcher_on_selected_snapshot() {
         }
     })
     .await
-    .expect("mandatory H did not publish");
+    .expect("mandatory startup reconciliation did not publish");
     let scheduler = runtime.browser_scheduler().unwrap();
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             if scheduler.submit_watch_event_for_tests(Err(notify::Error::generic(
                 "degraded watcher fixture",
@@ -2906,12 +2912,9 @@ async fn describe_reports_actual_degraded_watcher_on_selected_snapshot() {
     })
     .await
     .expect("watcher was not installed after H");
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
-            if runtime
-                .mcp_watcher_degraded(std::time::Instant::now() + Duration::from_secs(5))
-                .unwrap_or(false)
-            {
+            if runtime.mcp_watcher_degraded().unwrap_or(false) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -2922,7 +2925,7 @@ async fn describe_reports_actual_degraded_watcher_on_selected_snapshot() {
     let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
     let (mut client, server) = UnixStream::pair().unwrap();
     client
-        .set_read_timeout(Some(Duration::from_secs(10)))
+        .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
         .unwrap();
     let daemon_handle = tokio::runtime::Handle::current();
     let session = std::thread::spawn(move || {
@@ -2959,8 +2962,105 @@ async fn describe_reports_actual_degraded_watcher_on_selected_snapshot() {
     session.join().unwrap().unwrap();
 }
 
+/// The call deadline bounds the reply, measured from admission. A selected
+/// read still running at the deadline gets `deadline_exceeded` then, from the
+/// call's timer, and its late successful result is discarded, never written.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn describe_refuses_watcher_health_when_inventory_outlasts_deadline() {
+async fn describe_replies_at_its_deadline_while_the_read_is_still_running() {
+    use std::os::unix::net::UnixStream;
+    use trellis::daemon::registry::CheckoutRegistry;
+    use trellis::store::topology::{TopologyRoots, WorkspaceIdentity};
+    let temp = tempfile::tempdir().unwrap();
+    let root = checkout(temp.path());
+    fs::write(root.join("a.js"), "function slow() {}\n").unwrap();
+    let identity = WorkspaceIdentity::discover(Some(&root), &root)
+        .unwrap()
+        .attach_marker()
+        .unwrap();
+    let topology =
+        TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(34, &identity).unwrap();
+    let runtime = registry.activate(&identity.root_key).unwrap();
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        loop {
+            if let Ok((response, catching_up)) = runtime.evidence_response()
+                && response.finish(()).is_ok()
+                && !catching_up
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("initial startup reconciliation did not finish");
+    // Hold the next selected read once it has started.
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel::<()>(1);
+    runtime.set_mcp_read_hook_for_tests(move || {
+        entered_tx.send(()).unwrap();
+        // Held until released, or until the test ends and drops the sender:
+        // never released by a timer.
+        let _ = release_rx.recv();
+    });
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    let (mut client, server) = UnixStream::pair().unwrap();
+    client
+        .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
+        .unwrap();
+    let daemon_handle = tokio::runtime::Handle::current();
+    let session = std::thread::spawn(move || {
+        trellis::mcp::run_socket(
+            trellis::mcp::OpenedWorkspace::new(identity)
+                .with_call_deadline_for_tests(Duration::from_millis(300)),
+            server,
+            registry,
+            34,
+            daemon_handle,
+        )
+    });
+    writeln!(
+        client,
+        "{}",
+        modern(
+            json!(61),
+            "tools/call",
+            json!({"name":"trellis_workspace_describe","arguments":{"schemaVersion":1}})
+        )
+    )
+    .unwrap();
+    entered_rx
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .expect("the selected read never started");
+    let mut reader = BufReader::new(client.try_clone().unwrap());
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    // The read is still held, so only the call's timer can have answered.
+    let response: Value = serde_json::from_str(&line).unwrap();
+    release_tx.send(()).unwrap();
+    tool(&response, Some("deadline_exceeded"), true);
+    assert_eq!(
+        response["result"]["structuredContent"]["error"]["retryable"],
+        true
+    );
+    // The released read now succeeds in the background; its result must not
+    // reach the client.
+    client
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    let mut stray = String::new();
+    assert!(
+        reader.read_line(&mut stray).is_err(),
+        "late result was written after the deadline reply: {stray}"
+    );
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn describe_reports_published_watcher_health_while_an_inventory_holds_the_watcher() {
     use std::os::unix::net::UnixStream;
     use trellis::daemon::registry::CheckoutRegistry;
     use trellis::store::topology::{TopologyRoots, WorkspaceIdentity};
@@ -2976,7 +3076,7 @@ async fn describe_refuses_watcher_health_when_inventory_outlasts_deadline() {
     let mut registry = CheckoutRegistry::with_roots(topology);
     registry.attach_launch(32, &identity).unwrap();
     let runtime = registry.activate(&identity.root_key).unwrap();
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             if let Ok((response, catching_up)) = runtime.evidence_response()
                 && response.finish(()).is_ok()
@@ -2988,21 +3088,25 @@ async fn describe_refuses_watcher_health_when_inventory_outlasts_deadline() {
         }
     })
     .await
-    .expect("initial H did not finish");
+    .expect("initial startup reconciliation did not finish");
     let scheduler = runtime.browser_scheduler().unwrap();
     let (entered_tx, entered_rx) = mpsc::sync_channel(1);
     let (release_tx, release_rx) = mpsc::sync_channel(1);
     let holder = std::thread::spawn(move || {
-        scheduler.hold_watcher_gate_for_tests(|| {
+        scheduler.hold_worker_step_for_tests(|| {
             entered_tx.send(()).unwrap();
-            release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            release_rx
+                .recv_timeout(trellis::testing::HANG_BACKSTOP)
+                .unwrap();
         })
     });
-    entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    entered_rx
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .unwrap();
     let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
     let (mut client, server) = UnixStream::pair().unwrap();
     client
-        .set_read_timeout(Some(Duration::from_secs(8)))
+        .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
         .unwrap();
     let daemon_handle = tokio::runtime::Handle::current();
     let session = std::thread::spawn(move || {
@@ -3014,7 +3118,6 @@ async fn describe_refuses_watcher_health_when_inventory_outlasts_deadline() {
             daemon_handle,
         )
     });
-    let start = std::time::Instant::now();
     writeln!(
         client,
         "{}",
@@ -3030,19 +3133,22 @@ async fn describe_refuses_watcher_health_when_inventory_outlasts_deadline() {
         .read_line(&mut line)
         .unwrap();
     let response: Value = serde_json::from_str(&line).unwrap();
-    tool(&response, Some("deadline_exceeded"), true);
-    assert!(
-        start.elapsed() <= Duration::from_secs(6),
-        "health wait exceeded call deadline"
-    );
+    // Health is published, not sampled under the watcher lock. Describe
+    // answers while the gate is still held, so it never waited for the
+    // inventory; success, not a deadline refusal, proves it.
     release_tx.send(()).unwrap();
+    tool(&response, None, true);
+    assert_eq!(
+        response["result"]["structuredContent"]["data"]["watcherDegraded"], false,
+        "{response}"
+    );
     holder.join().unwrap();
     drop(client);
     session.join().unwrap().unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn describe_serves_valid_prior_head_while_mandatory_h_is_paused() {
+async fn describe_serves_valid_prior_head_while_startup_reconciliation_is_paused() {
     use std::os::unix::net::UnixStream;
     use trellis::daemon::registry::CheckoutRegistry;
     use trellis::store::topology::{TopologyRoots, WorkspaceIdentity};
@@ -3058,7 +3164,7 @@ async fn describe_serves_valid_prior_head_while_mandatory_h_is_paused() {
     let mut registry = CheckoutRegistry::with_roots(topology);
     registry.attach_launch(43, &identity).unwrap();
     let runtime = registry.activate(&identity.root_key).unwrap();
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             if let Ok((response, catching_up)) = runtime.evidence_response()
                 && response.finish(()).is_ok()
@@ -3070,13 +3176,13 @@ async fn describe_serves_valid_prior_head_while_mandatory_h_is_paused() {
         }
     })
     .await
-    .expect("initial H did not finish");
+    .expect("initial startup reconciliation did not finish");
     let (response, _) = runtime.evidence_response().unwrap();
     let prior = response.status().unwrap().revision;
     response.finish(()).unwrap();
     drop(response);
     registry.disconnect(43);
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         while !registry.release(&identity.root_key).unwrap() {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
@@ -3085,19 +3191,19 @@ async fn describe_serves_valid_prior_head_while_mandatory_h_is_paused() {
     .expect("checkout was not released");
     fs::write(root.join("prior.js"), "function later() {}\n").unwrap();
     registry.attach_launch(44, &identity).unwrap();
-    let resumed = registry.activate(&identity.root_key).unwrap();
     let (entered_tx, entered_rx) = mpsc::sync_channel(1);
     let (resume_tx, resume_rx) = mpsc::sync_channel(1);
     let resume_rx = std::sync::Mutex::new(resume_rx);
-    resumed.set_pre_h_hook_for_tests(std::sync::Arc::new(move || {
+    registry.set_next_startup_hook_for_tests(std::sync::Arc::new(move || {
         entered_tx.send(()).unwrap();
         resume_rx
             .lock()
             .unwrap()
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(trellis::testing::HANG_BACKSTOP)
             .unwrap();
     }));
-    tokio::time::timeout(Duration::from_secs(5), async {
+    let _resumed = registry.activate(&identity.root_key).unwrap();
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             if entered_rx.try_recv().is_ok() {
                 break;
@@ -3110,7 +3216,7 @@ async fn describe_serves_valid_prior_head_while_mandatory_h_is_paused() {
     let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
     let (mut client, server) = UnixStream::pair().unwrap();
     client
-        .set_read_timeout(Some(Duration::from_secs(8)))
+        .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
         .unwrap();
     let daemon_handle = tokio::runtime::Handle::current();
     let session = std::thread::spawn(move || {
@@ -3154,7 +3260,7 @@ async fn describe_serves_valid_prior_head_while_mandatory_h_is_paused() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn describe_cold_initial_h_reports_indexing_without_prior_coverage() {
+async fn describe_cold_initial_startup_reports_indexing_without_prior_coverage() {
     use std::os::unix::net::UnixStream;
     use trellis::daemon::registry::CheckoutRegistry;
     use trellis::store::topology::{TopologyRoots, WorkspaceIdentity};
@@ -3169,19 +3275,19 @@ async fn describe_cold_initial_h_reports_indexing_without_prior_coverage() {
         TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
     let mut registry = CheckoutRegistry::with_roots(topology);
     registry.attach_launch(46, &identity).unwrap();
-    let runtime = registry.activate(&identity.root_key).unwrap();
     let (entered_tx, entered_rx) = mpsc::sync_channel(1);
     let (resume_tx, resume_rx) = mpsc::sync_channel(1);
     let resume_rx = std::sync::Mutex::new(resume_rx);
-    runtime.set_pre_h_hook_for_tests(std::sync::Arc::new(move || {
+    registry.set_next_startup_hook_for_tests(std::sync::Arc::new(move || {
         entered_tx.send(()).unwrap();
         resume_rx
             .lock()
             .unwrap()
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(trellis::testing::HANG_BACKSTOP)
             .unwrap();
     }));
-    tokio::time::timeout(Duration::from_secs(5), async {
+    let _runtime = registry.activate(&identity.root_key).unwrap();
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             if entered_rx.try_recv().is_ok() {
                 break;
@@ -3190,11 +3296,11 @@ async fn describe_cold_initial_h_reports_indexing_without_prior_coverage() {
         }
     })
     .await
-    .expect("initial H did not pause");
+    .expect("initial startup reconciliation did not pause");
     let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
     let (mut client, server) = UnixStream::pair().unwrap();
     client
-        .set_read_timeout(Some(Duration::from_secs(8)))
+        .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
         .unwrap();
     let daemon_handle = tokio::runtime::Handle::current();
     let session = std::thread::spawn(move || {
@@ -3296,20 +3402,20 @@ async fn describe_counts_persisted_selected_and_unselected_native_coverage() {
         TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
     let mut registry = CheckoutRegistry::with_roots(topology);
     registry.attach_launch(48, &identity).unwrap();
-    let runtime = registry.activate(&identity.root_key).unwrap();
     let (entered_tx, entered_rx) = mpsc::sync_channel(1);
     let (resume_tx, resume_rx) = mpsc::sync_channel(1);
     let resume_rx = std::sync::Mutex::new(resume_rx);
-    // Current-thread Tokio cannot poll spawned H before this synchronous hook setup.
-    runtime.set_pre_h_hook_for_tests(std::sync::Arc::new(move || {
+    // Installed before activation starts the worker, so startup cannot pass it first.
+    registry.set_next_startup_hook_for_tests(std::sync::Arc::new(move || {
         entered_tx.send(()).unwrap();
         resume_rx
             .lock()
             .unwrap()
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(trellis::testing::HANG_BACKSTOP)
             .unwrap();
     }));
-    tokio::time::timeout(Duration::from_secs(5), async {
+    let runtime = registry.activate(&identity.root_key).unwrap();
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             if entered_rx.try_recv().is_ok() {
                 break;
@@ -3333,7 +3439,7 @@ async fn describe_counts_persisted_selected_and_unselected_native_coverage() {
     let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
     let (mut client, server) = UnixStream::pair().unwrap();
     client
-        .set_read_timeout(Some(Duration::from_secs(8)))
+        .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
         .unwrap();
     let daemon_handle = tokio::runtime::Handle::current();
     let session = std::thread::spawn(move || {
@@ -3406,7 +3512,7 @@ async fn describe_retries_direct_sqlite_contention_on_fresh_selected_snapshot() 
     let mut registry = CheckoutRegistry::with_roots(topology);
     registry.attach_launch(50, &identity).unwrap();
     let runtime = registry.activate(&identity.root_key).unwrap();
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             if let Ok((response, catching_up)) = runtime.evidence_response()
                 && response.finish(()).is_ok()
@@ -3418,11 +3524,11 @@ async fn describe_retries_direct_sqlite_contention_on_fresh_selected_snapshot() 
         }
     })
     .await
-    .expect("initial H did not settle");
+    .expect("initial startup reconciliation did not settle");
     let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
     let (mut client, server) = UnixStream::pair().unwrap();
     client
-        .set_read_timeout(Some(Duration::from_secs(8)))
+        .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
         .unwrap();
     let daemon_handle = tokio::runtime::Handle::current();
     let session = std::thread::spawn(move || {
@@ -3471,11 +3577,13 @@ async fn describe_retries_direct_sqlite_contention_on_fresh_selected_snapshot() 
             .unwrap()
             > 0
     );
+    // Selected reads stay busy for good, so only the call deadline can end
+    // this call. Advance the checkout's MCP clock past it instead of waiting:
+    // a server that waited for the reads instead would hang here.
     runtime.mcp_busy_reads_for_tests(usize::MAX).unwrap();
-    let start = std::time::Instant::now();
+    runtime.advance_mcp_clock_for_tests(trellis::mcp::CALL_DEADLINE + Duration::from_secs(1));
     let expired = describe(&mut client, 52);
     tool(&expired, Some("deadline_exceeded"), true);
-    assert!(start.elapsed() <= Duration::from_secs(6));
     let envelope = &expired["result"]["structuredContent"];
     assert!(envelope.get("data").is_none());
     assert_eq!(envelope["error"]["retryable"], true);
@@ -3529,4 +3637,893 @@ fn invalid_calls_and_non_w1_stubs_never_open_derived_databases() {
         }
         assert!(peer.finish().0.success());
     }
+}
+
+/// A read gate that holds every MCP selected read until opened.
+#[derive(Clone, Default)]
+struct ReadGate(std::sync::Arc<(std::sync::Mutex<(usize, bool)>, std::sync::Condvar)>);
+impl ReadGate {
+    fn hook(&self) -> std::sync::Arc<dyn Fn() + Send + Sync> {
+        let gate = self.clone();
+        std::sync::Arc::new(move || {
+            let (state, changed) = &*gate.0;
+            let mut held = state.lock().unwrap();
+            held.0 += 1;
+            changed.notify_all();
+            while !held.1 {
+                held = changed.wait(held).unwrap();
+            }
+        })
+    }
+    /// Wait (bounded only by the hang backstop) until `count` reads are held.
+    fn await_held(&self, count: usize) {
+        let (state, changed) = &*self.0;
+        let held = state.lock().unwrap();
+        let (held, timeout) = changed
+            .wait_timeout_while(held, trellis::testing::HANG_BACKSTOP, |held| held.0 < count)
+            .unwrap();
+        assert!(!timeout.timed_out(), "only {} reads were held", held.0);
+    }
+    fn open(&self) {
+        let (state, changed) = &*self.0;
+        state.lock().unwrap().1 = true;
+        changed.notify_all();
+    }
+}
+impl Drop for ReadGate {
+    fn drop(&mut self) {
+        // Never strand held readers when a test fails.
+        if std::sync::Arc::strong_count(&self.0) == 1 {
+            self.open();
+        }
+    }
+}
+
+/// An activated, settled checkout and its daemon registry.
+async fn ready_registry(
+    temp: &Path,
+    session: u64,
+) -> (
+    trellis::store::topology::WorkspaceIdentity,
+    std::sync::Arc<tokio::sync::Mutex<trellis::daemon::registry::CheckoutRegistry>>,
+    std::sync::Arc<trellis::daemon::registry::CheckoutRuntime>,
+) {
+    use trellis::daemon::registry::CheckoutRegistry;
+    use trellis::store::topology::{TopologyRoots, WorkspaceIdentity};
+    let root = checkout(temp);
+    fs::write(root.join("a.js"), "function held() {}\n").unwrap();
+    let identity = WorkspaceIdentity::discover(Some(&root), &root)
+        .unwrap()
+        .attach_marker()
+        .unwrap();
+    let topology = TopologyRoots::isolated_for_tests(temp.join("cache"), temp.join("data"));
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(session, &identity).unwrap();
+    let runtime = registry.activate(&identity.root_key).unwrap();
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        loop {
+            if let Ok((response, catching_up)) = runtime.evidence_response()
+                && response.finish(()).is_ok()
+                && !catching_up
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("startup reconciliation did not finish");
+    let identity = WorkspaceIdentity::discover(Some(&root), &root)
+        .unwrap()
+        .attach_marker()
+        .unwrap();
+    (
+        identity,
+        std::sync::Arc::new(tokio::sync::Mutex::new(registry)),
+        runtime,
+    )
+}
+
+/// One daemon-socket MCP connection served on a thread.
+fn socket_session(
+    identity: &trellis::store::topology::WorkspaceIdentity,
+    registry: &std::sync::Arc<tokio::sync::Mutex<trellis::daemon::registry::CheckoutRegistry>>,
+    session: u64,
+    deadline: Option<Duration>,
+) -> (
+    std::os::unix::net::UnixStream,
+    BufReader<std::os::unix::net::UnixStream>,
+    std::thread::JoinHandle<std::io::Result<()>>,
+) {
+    hooked_session(identity, registry, session, deadline, Default::default())
+}
+
+fn hooked_session(
+    identity: &trellis::store::topology::WorkspaceIdentity,
+    registry: &std::sync::Arc<tokio::sync::Mutex<trellis::daemon::registry::CheckoutRegistry>>,
+    session: u64,
+    deadline: Option<Duration>,
+    hooks: trellis::mcp::TransportHooksForTests,
+) -> (
+    std::os::unix::net::UnixStream,
+    BufReader<std::os::unix::net::UnixStream>,
+    std::thread::JoinHandle<std::io::Result<()>>,
+) {
+    let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+    client
+        .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
+        .unwrap();
+    let mut workspace = trellis::mcp::OpenedWorkspace::new(
+        trellis::store::topology::WorkspaceIdentity::discover(Some(&identity.root), &identity.root)
+            .unwrap()
+            .attach_marker()
+            .unwrap(),
+    );
+    if let Some(deadline) = deadline {
+        workspace = workspace.with_call_deadline_for_tests(deadline);
+    }
+    let workspace = workspace.with_transport_hooks_for_tests(hooks);
+    let registry = registry.clone();
+    let handle = tokio::runtime::Handle::current();
+    let thread = std::thread::spawn(move || {
+        trellis::mcp::run_socket(workspace, server, registry, session, handle)
+    });
+    let reader = BufReader::new(client.try_clone().unwrap());
+    (client, reader, thread)
+}
+
+fn describe_call(id: i64) -> Value {
+    modern(
+        json!(id),
+        "tools/call",
+        json!({"name":"trellis_workspace_describe","arguments":{"schemaVersion":1}}),
+    )
+}
+
+fn next_reply(reader: &mut BufReader<std::os::unix::net::UnixStream>) -> Value {
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    serde_json::from_str(&line).unwrap()
+}
+
+/// Decision 0009 §7: four admitted calls on a connection run at once; a fifth
+/// is refused at once, without queueing, in the pre-resolution shape.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn four_calls_run_concurrently_and_a_fifth_is_refused() {
+    let temp = tempfile::tempdir().unwrap();
+    let (identity, registry, runtime) = ready_registry(temp.path(), 71).await;
+    let gate = ReadGate::default();
+    runtime.set_mcp_read_gate_for_tests(gate.hook());
+    let (mut client, mut reader, session) = socket_session(&identity, &registry, 71, None);
+    for id in 1..=4 {
+        writeln!(client, "{}", describe_call(id)).unwrap();
+    }
+    let waiter = gate.clone();
+    tokio::task::spawn_blocking(move || waiter.await_held(4))
+        .await
+        .unwrap();
+    writeln!(client, "{}", describe_call(5)).unwrap();
+    let refused = next_reply(&mut reader);
+    assert_eq!(refused["id"], 5, "{refused}");
+    let envelope = &refused["result"]["structuredContent"];
+    assert_eq!(envelope["error"]["code"], "too_many_requests", "{refused}");
+    assert_eq!(envelope["error"]["retryable"], true);
+    assert_eq!(envelope["error"]["attemptedWorkspace"]["kind"], "path");
+    assert!(envelope.get("workspace").is_none() && envelope.get("catchingUp").is_none());
+    gate.open();
+    let mut answered: Vec<i64> = (0..4)
+        .map(|_| {
+            let reply = next_reply(&mut reader);
+            tool(&reply, None, true);
+            reply["id"].as_i64().unwrap()
+        })
+        .collect();
+    answered.sort_unstable();
+    assert_eq!(answered, vec![1, 2, 3, 4]);
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
+/// Decision 0009 §7: a call worker keeps its permit until its thread exits,
+/// even after its call answered deadline_exceeded, across connections; the
+/// daemon-wide budget then refuses new calls until workers finish.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn timed_out_workers_keep_their_permits_across_connections() {
+    let temp = tempfile::tempdir().unwrap();
+    let (identity, registry, runtime) = ready_registry(temp.path(), 72).await;
+    let gate = ReadGate::default();
+    runtime.set_mcp_read_gate_for_tests(gate.hook());
+    let mut connections = Vec::new();
+    for connection in 0..4 {
+        let (mut client, mut reader, session) =
+            socket_session(&identity, &registry, 72, Some(Duration::from_millis(300)));
+        for call in 0..4 {
+            writeln!(client, "{}", describe_call(connection * 10 + call)).unwrap();
+        }
+        for _ in 0..4 {
+            let reply = next_reply(&mut reader);
+            assert_eq!(
+                reply["result"]["structuredContent"]["error"]["code"], "deadline_exceeded",
+                "{reply}"
+            );
+        }
+        connections.push((client, reader, session));
+    }
+    let waiter = gate.clone();
+    tokio::task::spawn_blocking(move || waiter.await_held(16))
+        .await
+        .unwrap();
+    assert_eq!(trellis::mcp::live_call_workers_for_tests(), 16);
+    // A new connection: every permit is still held by a timed-out worker.
+    let (mut client, mut reader, session) = socket_session(&identity, &registry, 72, None);
+    writeln!(client, "{}", describe_call(99)).unwrap();
+    let refused = next_reply(&mut reader);
+    assert_eq!(
+        refused["result"]["structuredContent"]["error"]["code"], "too_many_requests",
+        "{refused}"
+    );
+    gate.open();
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        while trellis::mcp::live_call_workers_for_tests() != 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("timed-out workers did not exit");
+    writeln!(client, "{}", describe_call(100)).unwrap();
+    tool(&next_reply(&mut reader), None, true);
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+    for (client, reader, session) in connections {
+        drop(reader);
+        drop(client);
+        session.join().unwrap().unwrap();
+    }
+}
+
+/// Decision 0009 §7: a cancelled call writes nothing and its worker exits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_call_writes_nothing_and_its_worker_exits() {
+    let temp = tempfile::tempdir().unwrap();
+    let (identity, registry, runtime) = ready_registry(temp.path(), 73).await;
+    let gate = ReadGate::default();
+    runtime.set_mcp_read_gate_for_tests(gate.hook());
+    let (mut client, mut reader, session) = socket_session(&identity, &registry, 73, None);
+    writeln!(client, "{}", describe_call(1)).unwrap();
+    let waiter = gate.clone();
+    tokio::task::spawn_blocking(move || waiter.await_held(1))
+        .await
+        .unwrap();
+    writeln!(
+        client,
+        "{}",
+        json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}})
+    )
+    .unwrap();
+    // A later call is answered, so the cancellation has been settled.
+    let tools_list = modern(json!(2), "tools/list", json!({}));
+    writeln!(client, "{tools_list}").unwrap();
+    let listed = next_reply(&mut reader);
+    assert_eq!(listed["id"], 2, "the cancelled call answered: {listed}");
+    gate.open();
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        while trellis::mcp::live_call_workers_for_tests() != 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the cancelled worker did not exit");
+    client
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    let mut stray = String::new();
+    assert!(
+        reader.read_line(&mut stray).is_err(),
+        "the cancelled call wrote: {stray}"
+    );
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
+/// A one-shot pause for one call ID at the coordinator's send decision.
+fn hold_send_decision(
+    id: i64,
+) -> (
+    trellis::mcp::CallHookForTests,
+    std::sync::mpsc::Receiver<()>,
+    std::sync::mpsc::SyncSender<()>,
+) {
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let release_rx = std::sync::Mutex::new(release_rx);
+    let hook = std::sync::Arc::new(move |call: &Value| {
+        if call.as_i64() == Some(id) {
+            let _ = entered_tx.send(());
+            // A dropped sender (test failure) ends the hold.
+            let _ = release_rx.lock().unwrap().recv();
+        }
+    });
+    (hook, entered_rx, release_tx)
+}
+
+/// Signals each frame the connection's reader completes.
+fn frames_read() -> (
+    std::sync::Arc<dyn Fn() + Send + Sync>,
+    std::sync::mpsc::Receiver<std::time::Instant>,
+) {
+    let (read_tx, read_rx) = std::sync::mpsc::channel();
+    let read_tx = std::sync::Mutex::new(read_tx);
+    let hook = std::sync::Arc::new(move || {
+        let _ = read_tx.lock().unwrap().send(std::time::Instant::now());
+    });
+    (hook, read_rx)
+}
+
+/// Decision 0009 §7: a call's deadline starts when its frame is read, even if
+/// the coordinator is held deciding an earlier call; a call that expired
+/// meanwhile answers deadline_exceeded (pre-resolution shape), and the held
+/// call's own decision rechecks its deadline after the final check.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_call_expires_from_its_read_while_the_coordinator_is_held() {
+    let temp = tempfile::tempdir().unwrap();
+    let (identity, registry, _runtime) = ready_registry(temp.path(), 81).await;
+    let (send_decision, entered, release) = hold_send_decision(1);
+    let (frame_read, read) = frames_read();
+    let deadline = Duration::from_millis(300);
+    let hooks = trellis::mcp::TransportHooksForTests {
+        frame_read: Some(frame_read),
+        send_decision: Some(send_decision),
+        ..Default::default()
+    };
+    let (mut client, mut reader, session) =
+        hooked_session(&identity, &registry, 81, Some(deadline), hooks);
+    writeln!(client, "{}", describe_call(1)).unwrap();
+    read.recv_timeout(trellis::testing::HANG_BACKSTOP).unwrap();
+    entered
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .expect("call 1 did not reach its send decision");
+    writeln!(client, "{}", describe_call(2)).unwrap();
+    let accepted = read.recv_timeout(trellis::testing::HANG_BACKSTOP).unwrap();
+    // Wait out call 2's own deadline (measured from its read) while held.
+    tokio::time::sleep_until((accepted + deadline).into()).await;
+    release.send(()).unwrap();
+    for id in [1, 2] {
+        let reply = next_reply(&mut reader);
+        assert_eq!(reply["id"], id, "{reply}");
+        let envelope = &reply["result"]["structuredContent"];
+        assert_eq!(envelope["error"]["code"], "deadline_exceeded", "{reply}");
+        if id == 2 {
+            assert!(
+                envelope["error"]["attemptedWorkspace"].is_object(),
+                "{reply}"
+            );
+            assert!(envelope.get("workspace").is_none(), "{reply}");
+        }
+    }
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
+/// Decision 0009 §7: once read admission sampled catchingUp, a deadline
+/// answer keeps the resolved shape.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_deadline_after_read_admission_keeps_the_resolved_shape() {
+    let temp = tempfile::tempdir().unwrap();
+    let (identity, registry, runtime) = ready_registry(temp.path(), 82).await;
+    let gate = ReadGate::default();
+    runtime.set_mcp_admitted_gate_for_tests(gate.hook());
+    let (mut client, mut reader, session) =
+        socket_session(&identity, &registry, 82, Some(Duration::from_millis(300)));
+    writeln!(client, "{}", describe_call(1)).unwrap();
+    let waiter = gate.clone();
+    tokio::task::spawn_blocking(move || waiter.await_held(1))
+        .await
+        .unwrap();
+    let reply = next_reply(&mut reader);
+    gate.open();
+    let envelope = &reply["result"]["structuredContent"];
+    assert_eq!(envelope["error"]["code"], "deadline_exceeded", "{reply}");
+    assert_eq!(
+        envelope["workspace"],
+        json!(identity.root),
+        "post-admission deadline lost its resolved shape: {reply}"
+    );
+    assert!(envelope["catchingUp"].is_boolean(), "{reply}");
+    assert!(
+        envelope["error"].get("attemptedWorkspace").is_none(),
+        "{reply}"
+    );
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
+/// #127 at the daemon (Decision 0009 §7): a cancel the reader completed
+/// before the send decision, but has not yet published, still suppresses the
+/// unsent result: the decision waits for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancel_completed_before_the_decision_wins_even_if_unpublished() {
+    let temp = tempfile::tempdir().unwrap();
+    let (identity, registry, _runtime) = ready_registry(temp.path(), 83).await;
+    let (send_decision, entered, release) = hold_send_decision(1);
+    // The reader holds the second frame (the cancel) after completing and
+    // counting it, before publishing it.
+    let (reader_held_tx, reader_held) = std::sync::mpsc::sync_channel(1);
+    let (publish_tx, publish_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let publish_rx = std::sync::Mutex::new(publish_rx);
+    let frames = std::sync::atomic::AtomicUsize::new(0);
+    let frame_read: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
+        if frames.fetch_add(1, std::sync::atomic::Ordering::AcqRel) == 1 {
+            let _ = reader_held_tx.send(());
+            let _ = publish_rx.lock().unwrap().recv();
+        }
+    });
+    let (waiting_tx, waiting) = std::sync::mpsc::sync_channel(4);
+    let settle_waiting: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
+        let _ = waiting_tx.try_send(());
+    });
+    let hooks = trellis::mcp::TransportHooksForTests {
+        frame_read: Some(frame_read),
+        send_decision: Some(send_decision),
+        settle_waiting: Some(settle_waiting),
+        ..Default::default()
+    };
+    let (mut client, reader, session) = hooked_session(&identity, &registry, 83, None, hooks);
+    let replies = {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut reader = reader;
+        std::thread::spawn(move || {
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+                let _ = tx.send(serde_json::from_str::<Value>(&line).unwrap());
+            }
+        });
+        rx
+    };
+    writeln!(client, "{}", describe_call(1)).unwrap();
+    entered
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .expect("call 1 did not reach its send decision");
+    writeln!(
+        client,
+        "{}",
+        json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}})
+    )
+    .unwrap();
+    reader_held
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .expect("the reader did not complete the cancel");
+    release.send(()).unwrap();
+    // The decision must wait for the completed cancel: it is never answered.
+    let deadline = std::time::Instant::now() + trellis::testing::HANG_BACKSTOP;
+    loop {
+        if waiting.try_recv().is_ok() {
+            break;
+        }
+        if let Ok(reply) = replies.try_recv() {
+            panic!("decided without the completed cancel: {reply}");
+        }
+        assert!(std::time::Instant::now() < deadline, "no decision");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    publish_tx.send(()).unwrap();
+    writeln!(client, "{}", modern(json!(2), "tools/list", json!({}))).unwrap();
+    let next = replies
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .unwrap();
+    assert_eq!(next["id"], 2, "the cancelled call was answered: {next}");
+    // The reply thread holds a clone: end input explicitly, then close ours.
+    client.shutdown(std::net::Shutdown::Both).unwrap();
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
+/// Decision 0009 §7: requests beyond the connection's bounds are refused at
+/// once, application validation first: an invalid call stays
+/// invalid_request; a fifth valid call gets too_many_requests; a 17th
+/// outstanding non-call request gets -32000 too_many_requests.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn over_bound_requests_are_refused_after_validation() {
+    let temp = tempfile::tempdir().unwrap();
+    let (identity, registry, runtime) = ready_registry(temp.path(), 84).await;
+    let (send_decision, entered, release) = hold_send_decision(1);
+    let (frame_read, read) = frames_read();
+    let hooks = trellis::mcp::TransportHooksForTests {
+        frame_read: Some(frame_read),
+        send_decision: Some(send_decision),
+        ..Default::default()
+    };
+    let (mut client, mut reader, session) = hooked_session(&identity, &registry, 84, None, hooks);
+    writeln!(client, "{}", describe_call(1)).unwrap();
+    read.recv_timeout(trellis::testing::HANG_BACKSTOP).unwrap();
+    entered
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .expect("call 1 did not reach its send decision");
+    // Held reads keep calls 2..5 outstanding once dispatched.
+    let gate = ReadGate::default();
+    runtime.set_mcp_read_gate_for_tests(gate.hook());
+    let mut burst = String::new();
+    for id in 2..=5 {
+        burst.push_str(&format!("{}\n", describe_call(id)));
+    }
+    burst.push_str(&format!(
+        "{}\n",
+        modern(
+            json!(6),
+            "tools/call",
+            json!({"name":"trellis_workspace_describe","arguments":{}})
+        )
+    ));
+    burst.push_str(&format!("{}\n", describe_call(7)));
+    for id in 101..=117 {
+        burst.push_str(&format!("{}\n", modern(json!(id), "tools/list", json!({}))));
+    }
+    client.write_all(burst.as_bytes()).unwrap();
+    // Every burst frame is complete before the decision: one fence handles
+    // them all, so 17 non-call requests are live at once.
+    for _ in 0..burst.lines().count() {
+        read.recv_timeout(trellis::testing::HANG_BACKSTOP).unwrap();
+    }
+    release.send(()).unwrap();
+    let mut seen = std::collections::BTreeMap::new();
+    while !(seen.contains_key("6") && seen.contains_key("7") && seen.contains_key("117")) {
+        let reply = next_reply(&mut reader);
+        seen.insert(reply["id"].to_string(), reply);
+    }
+    gate.open();
+    let invalid = &seen["6"]["result"]["structuredContent"];
+    assert_eq!(
+        invalid["error"]["code"], "invalid_request",
+        "validation lost to capacity: {invalid}"
+    );
+    let fifth = &seen["7"]["result"]["structuredContent"];
+    assert_eq!(fifth["error"]["code"], "too_many_requests", "{fifth}");
+    let seventeenth = &seen["117"];
+    assert_eq!(seventeenth["error"]["code"], -32000, "{seventeenth}");
+    assert_eq!(seventeenth["error"]["data"]["code"], "too_many_requests");
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
+/// Decision 0009 §7: an immediate call outcome still unsent at the deadline
+/// answers deadline_exceeded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_immediate_outcome_unsent_at_the_deadline_expires() {
+    let temp = tempfile::tempdir().unwrap();
+    let (identity, registry, _runtime) = ready_registry(temp.path(), 85).await;
+    let deadline = Duration::from_millis(300);
+    let (frame_read, read) = frames_read();
+    let (entered_tx, entered) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let release_rx = std::sync::Mutex::new(release_rx);
+    let hooks = trellis::mcp::TransportHooksForTests {
+        frame_read: Some(frame_read),
+        immediate_decision: Some(std::sync::Arc::new(move |_: &Value| {
+            let _ = entered_tx.send(());
+            let _ = release_rx.lock().unwrap().recv();
+        })),
+        ..Default::default()
+    };
+    let (mut client, mut reader, session) =
+        hooked_session(&identity, &registry, 85, Some(deadline), hooks);
+    writeln!(
+        client,
+        "{}",
+        modern(
+            json!(1),
+            "tools/call",
+            json!({"name":"trellis_workspace_describe","arguments":{}})
+        )
+    )
+    .unwrap();
+    let accepted = read.recv_timeout(trellis::testing::HANG_BACKSTOP).unwrap();
+    entered
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .unwrap();
+    tokio::time::sleep_until((accepted + deadline).into()).await;
+    release_tx.send(()).unwrap();
+    let reply = next_reply(&mut reader);
+    assert_eq!(
+        reply["result"]["structuredContent"]["error"]["code"], "deadline_exceeded",
+        "an unsent outcome survived its deadline: {reply}"
+    );
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
+fn cancel_frame(id: i64) -> Value {
+    json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":id}})
+}
+
+/// Decision 0009 §7: capacity counts live calls only. With four calls held,
+/// a cancel for one and a fifth call in the same burst admit the fifth.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fifth_call_after_a_cancellation_is_admitted() {
+    let temp = tempfile::tempdir().unwrap();
+    let (identity, registry, runtime) = ready_registry(temp.path(), 86).await;
+    let gate = ReadGate::default();
+    runtime.set_mcp_read_gate_for_tests(gate.hook());
+    let (mut client, mut reader, session) = socket_session(&identity, &registry, 86, None);
+    for id in 1..=4 {
+        writeln!(client, "{}", describe_call(id)).unwrap();
+    }
+    let waiter = gate.clone();
+    tokio::task::spawn_blocking(move || waiter.await_held(4))
+        .await
+        .unwrap();
+    write!(client, "{}\n{}\n", cancel_frame(1), describe_call(5)).unwrap();
+    // The fifth call reaches its read: admitted, not refused.
+    let waiter = gate.clone();
+    tokio::task::spawn_blocking(move || waiter.await_held(5))
+        .await
+        .unwrap();
+    gate.open();
+    let mut answered: Vec<i64> = (0..4)
+        .map(|_| {
+            let reply = next_reply(&mut reader);
+            assert!(
+                reply["result"]["structuredContent"]["data"].is_object(),
+                "{reply}"
+            );
+            reply["id"].as_i64().unwrap()
+        })
+        .collect();
+    answered.sort_unstable();
+    assert_eq!(answered, vec![2, 3, 4, 5]);
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
+/// Decision 0009 §7: a capacity refusal still unsent at the call's deadline
+/// answers deadline_exceeded. Capacity here is the daemon-wide worker budget,
+/// which timed-out workers keep, so it stays full past the call's deadline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_capacity_refusal_unsent_at_the_deadline_expires() {
+    let temp = tempfile::tempdir().unwrap();
+    let (identity, registry, runtime) = ready_registry(temp.path(), 87).await;
+    let gate = ReadGate::default();
+    runtime.set_mcp_read_gate_for_tests(gate.hook());
+    // Sixteen held workers on four other connections exhaust the budget.
+    let mut held = Vec::new();
+    for connection in 0..4 {
+        let (mut client, reader, session) = socket_session(&identity, &registry, 87, None);
+        for call in 0..4 {
+            writeln!(client, "{}", describe_call(connection * 10 + call)).unwrap();
+        }
+        held.push((client, reader, session));
+    }
+    let waiter = gate.clone();
+    tokio::task::spawn_blocking(move || waiter.await_held(16))
+        .await
+        .unwrap();
+    let deadline = Duration::from_millis(500);
+    let (frame_read, read) = frames_read();
+    let (entered_tx, entered) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let release_rx = std::sync::Mutex::new(release_rx);
+    let hooks = trellis::mcp::TransportHooksForTests {
+        frame_read: Some(frame_read),
+        immediate_decision: Some(std::sync::Arc::new(move |_: &Value| {
+            let _ = entered_tx.send(());
+            let _ = release_rx.lock().unwrap().recv();
+        })),
+        ..Default::default()
+    };
+    let (mut client, mut reader, session) =
+        hooked_session(&identity, &registry, 87, Some(deadline), hooks);
+    writeln!(client, "{}", describe_call(99)).unwrap();
+    let accepted = read.recv_timeout(trellis::testing::HANG_BACKSTOP).unwrap();
+    entered
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .unwrap();
+    tokio::time::sleep_until((accepted + deadline).into()).await;
+    release_tx.send(()).unwrap();
+    let reply = next_reply(&mut reader);
+    assert_eq!(
+        reply["result"]["structuredContent"]["error"]["code"], "deadline_exceeded",
+        "a capacity refusal was sent past its deadline: {reply}"
+    );
+    gate.open();
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+    for (client, reader, session) in held {
+        drop(reader);
+        drop(client);
+        session.join().unwrap().unwrap();
+    }
+}
+
+/// Decision 0009 §7 / T00: a sustained stream of invalid calls is answered
+/// invalid_request, each fence handles a bounded batch, and a call's reply
+/// is decided while the stream continues.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn continuous_invalid_calls_stay_bounded_and_a_due_reply_is_decided() {
+    let temp = tempfile::tempdir().unwrap();
+    let (identity, registry, runtime) = ready_registry(temp.path(), 88).await;
+    let gate = ReadGate::default();
+    runtime.set_mcp_read_gate_for_tests(gate.hook());
+    let largest = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = largest.clone();
+    let hooks = trellis::mcp::TransportHooksForTests {
+        fence_handled: Some(std::sync::Arc::new(move |handled| {
+            observed.fetch_max(handled, std::sync::atomic::Ordering::AcqRel);
+        })),
+        ..Default::default()
+    };
+    let (client, reader, session) = hooked_session(&identity, &registry, 88, None, hooks);
+    let mut writer = client.try_clone().unwrap();
+    writeln!(writer, "{}", describe_call(0)).unwrap();
+    let waiter = gate.clone();
+    tokio::task::spawn_blocking(move || waiter.await_held(1))
+        .await
+        .unwrap();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flooding = stop.clone();
+    let flood = std::thread::spawn(move || {
+        let mut id = 1_000;
+        while !flooding.load(std::sync::atomic::Ordering::Acquire) {
+            let invalid = modern(
+                json!(id),
+                "tools/call",
+                json!({"name":"trellis_workspace_describe","arguments":{}}),
+            );
+            if writeln!(writer, "{invalid}").is_err() {
+                break;
+            }
+            id += 1;
+        }
+        id - 1_000
+    });
+    // Let the stream run, then release the held call while it continues.
+    let mut reader = reader;
+    let mut invalid = 0;
+    while invalid < 2_000 {
+        let reply = next_reply(&mut reader);
+        assert_eq!(
+            reply["result"]["structuredContent"]["error"]["code"], "invalid_request",
+            "{reply}"
+        );
+        invalid += 1;
+    }
+    gate.open();
+    loop {
+        let reply = next_reply(&mut reader);
+        if reply["id"] == 0 {
+            assert!(
+                reply["result"]["structuredContent"]["data"].is_object(),
+                "{reply}"
+            );
+            break;
+        }
+    }
+    // This side stops reading now: end the connection first, so a flood
+    // write blocked behind unread replies fails instead of waiting forever.
+    stop.store(true, std::sync::atomic::Ordering::Release);
+    client.shutdown(std::net::Shutdown::Both).unwrap();
+    let sent = flood.join().unwrap();
+    assert!(sent > 2_000);
+    let largest = largest.load(std::sync::atomic::Ordering::Acquire);
+    assert!(
+        largest <= 66,
+        "a fence handled {largest} requests: not bounded by the input channel"
+    );
+    drop(reader);
+    drop(client);
+    // Replies to flood requests may still be unwritten when the client goes:
+    // a hang-up ends the session cleanly.
+    session.join().unwrap().unwrap();
+}
+
+/// A finished call's result never waits for the client's input: with the
+/// coordinator held and the input window full of frames, the worker still
+/// hands its result over.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_worker_result_never_waits_for_client_input() {
+    let temp = tempfile::tempdir().unwrap();
+    let (identity, registry, runtime) = ready_registry(temp.path(), 89).await;
+    let gate = ReadGate::default();
+    runtime.set_mcp_read_gate_for_tests(gate.hook());
+    let (frame_read, read) = frames_read();
+    let (held_tx, held) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let release_rx = std::sync::Mutex::new(release_rx);
+    let (done_tx, done) = std::sync::mpsc::sync_channel(4);
+    let hooks = trellis::mcp::TransportHooksForTests {
+        frame_read: Some(frame_read),
+        // Hold the coordinator at call 2's decision.
+        immediate_decision: Some(std::sync::Arc::new(move |id: &Value| {
+            if id == &json!(2) {
+                let _ = held_tx.send(());
+                let _ = release_rx.lock().unwrap().recv();
+            }
+        })),
+        worker_done: Some(std::sync::Arc::new(move || {
+            let _ = done_tx.try_send(());
+        })),
+        ..Default::default()
+    };
+    let (mut client, mut reader, session) = hooked_session(&identity, &registry, 89, None, hooks);
+    writeln!(client, "{}", describe_call(1)).unwrap();
+    let waiter = gate.clone();
+    tokio::task::spawn_blocking(move || waiter.await_held(1))
+        .await
+        .unwrap();
+    writeln!(client, "{}", describe_call(2)).unwrap();
+    held.recv_timeout(trellis::testing::HANG_BACKSTOP).unwrap();
+    // Fill the input window while the coordinator is held.
+    let mut burst = String::new();
+    for id in 100..140 {
+        burst.push_str(&format!("{}\n", modern(json!(id), "tools/list", json!({}))));
+    }
+    client.write_all(burst.as_bytes()).unwrap();
+    for _ in 0..34 {
+        read.recv_timeout(trellis::testing::HANG_BACKSTOP).unwrap();
+    }
+    // Call 1 finishes: its result is handed over without the coordinator.
+    gate.open();
+    done.recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .expect("the worker's result waited for client input");
+    release_tx.send(()).unwrap();
+    let mut seen = std::collections::BTreeSet::new();
+    while !seen.contains(&1) {
+        let reply = next_reply(&mut reader);
+        seen.insert(reply["id"].as_i64().unwrap());
+    }
+    // Close every client handle: replies still being written then fail at
+    // once. A shutdown alone need not unblock a full macOS socket buffer.
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
+/// A client that hangs up while its reply is being written ends the session
+/// cleanly (Ok): the write after the decision meets a closed peer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_client_hang_up_ends_the_session_cleanly() {
+    let temp = tempfile::tempdir().unwrap();
+    let (identity, registry, _runtime) = ready_registry(temp.path(), 90).await;
+    let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let marked = finished.clone();
+    let (at_write_tx, at_write) = std::sync::mpsc::sync_channel(1);
+    let (closed_tx, closed_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let closed_rx = std::sync::Mutex::new(closed_rx);
+    let hooks = trellis::mcp::TransportHooksForTests {
+        send_decision: Some(std::sync::Arc::new(move |_: &Value| {
+            marked.store(true, std::sync::atomic::Ordering::Release);
+        })),
+        // After the fence that decides call 1, before its reply is written.
+        fence_handled: Some(std::sync::Arc::new(move |_| {
+            if finished.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                let _ = at_write_tx.send(());
+                let _ = closed_rx.lock().unwrap().recv();
+            }
+        })),
+        ..Default::default()
+    };
+    let (mut client, reader, session) = hooked_session(&identity, &registry, 90, None, hooks);
+    writeln!(client, "{}", describe_call(1)).unwrap();
+    at_write
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .expect("call 1 was never decided");
+    drop(reader);
+    drop(client);
+    closed_tx.send(()).unwrap();
+    let ended = tokio::task::spawn_blocking(move || session.join().unwrap())
+        .await
+        .unwrap();
+    assert!(
+        ended.is_ok(),
+        "a client hang-up failed the session: {ended:?}"
+    );
 }

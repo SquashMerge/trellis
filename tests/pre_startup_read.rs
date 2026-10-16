@@ -1,4 +1,4 @@
-//! Daemon-local selected reads use a validated committed head during mandatory H.
+//! Daemon-local selected reads use a validated committed head during mandatory startup reconciliation.
 //! The retired cross-process predecessor permit and leader lock are not read gates.
 mod common;
 use std::sync::{Arc, atomic::AtomicBool};
@@ -55,7 +55,7 @@ fn cold_head_has_no_valid_selected_revision() {
 }
 
 #[test]
-fn local_h_keeps_validated_prior_head_readable_until_commit_then_selects_new_head() {
+fn local_startup_keeps_validated_prior_head_readable_until_commit_then_selects_new_head() {
     let (_state, work, store, options, cancel, first) = published();
     std::fs::write(work.path().join("a.js"), "function newHead() {}\n").unwrap();
     let coordinator = IndexJobCoordinator::prepare(&store, None).unwrap();
@@ -81,7 +81,7 @@ fn local_h_keeps_validated_prior_head_readable_until_commit_then_selects_new_hea
 }
 
 #[test]
-fn mandatory_h_blocks_fifo_claim_without_blocking_validated_prior_read() {
+fn startup_reconciliation_blocks_fifo_claim_without_blocking_validated_prior_read() {
     let (_state, _work, store, options, cancel, first) = published();
     let accepted = store.enqueue_request(&options, None).unwrap();
     let coordinator = IndexJobCoordinator::prepare(&store, None).unwrap();

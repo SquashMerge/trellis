@@ -2018,7 +2018,7 @@ fn extractor_and_typed_mismatch_rebuild_in_place_and_failed_rebuild_stays_closed
     recovered = typed_recovered;
     assert_eq!(store.status().unwrap().revision, recovered);
 
-    // A newly acquired writer must complete H before it can serve reads.
+    // A newly acquired writer must complete startup reconciliation before it can serve reads.
     // The latch is shared by Store clones and remains closed after the guard drops.
     let clone = store.clone();
     drop(session);

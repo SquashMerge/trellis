@@ -10,7 +10,7 @@ use std::{
     path::{Component, Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc::{self, Receiver, SyncSender, TryRecvError},
     },
     time::{Duration, Instant},
@@ -19,6 +19,138 @@ use std::{
 const MAX_DIRTY_PATHS: usize = 256;
 const QUIET: Duration = Duration::from_millis(75);
 const MAX_WAIT: Duration = Duration::from_millis(250);
+
+/// Watcher health shared by every watcher one owner creates, read without a
+/// lock. Each watcher reports under its own epoch, so a callback from a
+/// replaced watcher can never mark the current one degraded (#138 item 22).
+#[derive(Default)]
+pub struct WatcherHealth {
+    /// `epoch << 2 | native << 1 | degraded`: the epoch check and the health
+    /// update are one compare-and-swap, so a report from a replaced watcher
+    /// can never land after a new epoch began.
+    state: AtomicU64,
+    /// Transitions to degraded, across all epochs. Counted before the
+    /// transition is published, so a reader that sees the transition (or any
+    /// later state) also sees its count; a count whose transition then loses
+    /// to a new epoch only over-reports.
+    degradations: AtomicU64,
+    #[cfg(test)]
+    after_load: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+/// One coherent reading of watcher health, for measurement (Decision 0009
+/// §5): watching stayed healthy between two readings only if they are equal
+/// and the first is native and not degraded. The current bit alone can
+/// return to healthy unseen, with a new epoch or between readings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WatcherWitness {
+    pub epoch: u64,
+    pub native: bool,
+    pub degraded: bool,
+    pub degradations: u64,
+}
+
+impl std::fmt::Debug for WatcherHealth {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WatcherHealth")
+            .field("degraded", &self.degraded())
+            .finish()
+    }
+}
+
+impl WatcherHealth {
+    pub fn degraded(&self) -> bool {
+        self.state.load(Ordering::Acquire) & 1 == 1
+    }
+
+    /// The state, then the count: every state change is a release
+    /// read-modify-write, so the count of any transition visible in the state
+    /// is visible too.
+    pub fn witness(&self) -> WatcherWitness {
+        let state = self.state.load(Ordering::Acquire);
+        WatcherWitness {
+            epoch: state >> 2,
+            native: state & 2 != 0,
+            degraded: state & 1 != 0,
+            degradations: self.degradations.load(Ordering::Acquire),
+        }
+    }
+
+    /// Start a new watcher's epoch, healthy and not yet native; reports from
+    /// earlier watchers are ignored from here on.
+    fn begin_epoch(&self) -> u64 {
+        let mut current = self.state.load(Ordering::Acquire);
+        loop {
+            let epoch = (current >> 2) + 1;
+            match self.state.compare_exchange_weak(
+                current,
+                epoch << 2,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return epoch,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    /// Set `bits` as of `epoch`; ignored once a later epoch has begun.
+    fn set(&self, epoch: u64, bits: u64) {
+        let mut current = self.state.load(Ordering::Acquire);
+        #[cfg(test)]
+        {
+            let hook = self.after_load.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        let mut counted = false;
+        while current >> 2 == epoch && current & bits != bits {
+            if bits & 1 == 1 && current & 1 == 0 && !counted {
+                self.degradations.fetch_add(1, Ordering::AcqRel);
+                counted = true;
+            }
+            match self.state.compare_exchange_weak(
+                current,
+                current | bits,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    /// Report the watcher of `epoch` degraded. Degradation is sticky for the
+    /// epoch.
+    fn degrade(&self, epoch: u64) {
+        self.set(epoch, 1);
+    }
+
+    /// What setup found, published after the callback is installed. The epoch
+    /// began healthy and setup only adds to it, so an error the callback
+    /// already published is never cleared.
+    fn publish_setup(&self, epoch: u64, native: bool, degraded: bool) {
+        if native {
+            self.set(epoch, 2);
+        }
+        if degraded {
+            self.degrade(epoch);
+        }
+    }
+
+    /// The owner dropped its watcher: healthy until a new one reports.
+    pub fn reset(&self) {
+        self.begin_epoch();
+    }
+}
+
+/// Wakes the checkout worker. Called after ingress records its generation, so a
+/// wake can coalesce but never carries state the worker would not re-read.
+pub type Waker = Arc<dyn Fn() + Send + Sync>;
 
 /// A generation can be cleared only after the corresponding capture was verified and published.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -34,20 +166,44 @@ struct Signal {
 }
 
 // Both the real notify callback and deterministic injected events use this exact ingress.
+#[allow(clippy::too_many_arguments)]
 fn submit(
     sender: &SyncSender<Signal>,
     generation: &AtomicU64,
     overflow: &AtomicBool,
+    waker: &std::sync::OnceLock<Waker>,
     root: &Path,
     selected: &BTreeSet<PathBuf>,
     executable: Option<&Path>,
     event: notify::Result<Event>,
 ) {
-    if event.as_ref().is_ok_and(|event| {
-        read_only(event.kind) || certainly_excluded(event, root, selected, executable)
-    }) {
-        return;
+    if relevant(&event, root, selected, executable) {
+        accept(sender, generation, overflow, waker, event);
     }
+}
+
+/// Whether an event can affect the checkout. This may read file metadata, so
+/// a callback runs it before taking its liveness lock.
+fn relevant(
+    event: &notify::Result<Event>,
+    root: &Path,
+    selected: &BTreeSet<PathBuf>,
+    executable: Option<&Path>,
+) -> bool {
+    !event.as_ref().is_ok_and(|event| {
+        read_only(event.kind) || certainly_excluded(event, root, selected, executable)
+    })
+}
+
+/// Accept an event: bump the generation, queue it, wake the worker. Only short,
+/// non-blocking steps, so a callback may do this under its liveness lock.
+fn accept(
+    sender: &SyncSender<Signal>,
+    generation: &AtomicU64,
+    overflow: &AtomicBool,
+    waker: &std::sync::OnceLock<Waker>,
+    event: notify::Result<Event>,
+) {
     generation.fetch_add(1, Ordering::SeqCst);
     if sender
         .try_send(Signal {
@@ -57,6 +213,9 @@ fn submit(
         .is_err()
     {
         overflow.store(true, Ordering::SeqCst);
+    }
+    if let Some(wake) = waker.get() {
+        wake();
     }
 }
 
@@ -151,6 +310,126 @@ fn read_only(kind: EventKind) -> bool {
     )
 }
 
+/// One per active checkout, plus 4 for replacement and stuck teardown.
+pub const MAX_NATIVE_WATCHERS: usize = crate::daemon::registry::MAX_ACTIVE_CHECKOUTS + 4;
+
+/// The native-watcher budget (Decision 0009 §§2, 5, as amended 2026-10-15).
+/// A slot is reserved before a native watcher is created and freed only when
+/// its teardown returns, so a native stop that is lost (notify's macOS
+/// FSEvents stop can never return) strands at most the watchers that hold
+/// slots. At the limit no new native watcher is created: the checkout reports
+/// degraded health and relies on periodic inventory. The daemon uses one
+/// process-wide budget; a test uses its own.
+pub struct NativeBudget {
+    limit: usize,
+    /// Native watchers holding a slot: active, or released and tearing down.
+    held: AtomicUsize,
+    /// Released watchers whose native teardown has not finished.
+    stranded: AtomicUsize,
+    /// Test-only: reapers wait on this before they drop, to stand in for a
+    /// lost stop.
+    #[cfg(test)]
+    hold_reapers: std::sync::Mutex<Option<ReaperGate>>,
+}
+
+impl NativeBudget {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            held: AtomicUsize::new(0),
+            stranded: AtomicUsize::new(0),
+            #[cfg(test)]
+            hold_reapers: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// The daemon's process-wide budget.
+    fn global() -> Arc<Self> {
+        static GLOBAL: std::sync::OnceLock<Arc<NativeBudget>> = std::sync::OnceLock::new();
+        Arc::clone(GLOBAL.get_or_init(|| Arc::new(NativeBudget::new(MAX_NATIVE_WATCHERS))))
+    }
+
+    /// Reserve a slot, if the budget allows one.
+    fn reserve(&self) -> bool {
+        let mut held = self.held.load(Ordering::Acquire);
+        while held < self.limit {
+            match self.held.compare_exchange_weak(
+                held,
+                held + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(current) => held = current,
+            }
+        }
+        false
+    }
+
+    fn free(&self) {
+        self.held.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    /// Native watchers holding a slot: active, or released and tearing down.
+    pub fn held(&self) -> usize {
+        self.held.load(Ordering::Acquire)
+    }
+
+    /// Released watchers whose native teardown has not finished.
+    pub fn stranded(&self) -> usize {
+        self.stranded.load(Ordering::Acquire)
+    }
+}
+
+/// Test-only gate a reaper waits on before it drops its watcher.
+#[cfg(test)]
+type ReaperGate = Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>;
+
+/// A one-shot test hook.
+#[cfg(test)]
+type TestHook = Arc<std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>>;
+
+/// Hand a native watcher to a reaper. It counts as stranded, and keeps its
+/// slot in `budget`, until its drop returns; if no reaper thread can start it
+/// is leaked and stays counted.
+fn release_watcher(budget: &Arc<NativeBudget>, watcher: Option<RecommendedWatcher>) {
+    let Some(watcher) = watcher else {
+        return;
+    };
+    budget.stranded.fetch_add(1, Ordering::AcqRel);
+    let slot = Arc::new(std::sync::Mutex::new(Some(watcher)));
+    let reaped = Arc::clone(&slot);
+    let reaper_budget = Arc::clone(budget);
+    #[cfg(test)]
+    let hold = budget.hold_reapers.lock().unwrap().clone();
+    let spawned = std::thread::Builder::new()
+        .name("notify-reaper".into())
+        .spawn(move || {
+            #[cfg(test)]
+            if let Some(hold) = hold {
+                let (released, changed) = &*hold;
+                let mut released = released.lock().unwrap();
+                while !*released {
+                    released = changed.wait(released).unwrap();
+                }
+            }
+            drop(reaped.lock().unwrap().take());
+            reaper_budget.stranded.fetch_sub(1, Ordering::AcqRel);
+            reaper_budget.free();
+        });
+    if spawned.is_err()
+        && let Some(watcher) = slot.lock().unwrap().take()
+    {
+        std::mem::forget(watcher);
+    }
+}
+
+impl Drop for WatchSignals {
+    fn drop(&mut self) {
+        self.release_native();
+    }
+}
+
 /// Owned by the elected leader, never by a reader or a second durable work queue.
 pub struct WatchSignals {
     root: PathBuf,
@@ -167,6 +446,29 @@ pub struct WatchSignals {
     last_signal: Option<Instant>,
     urgent: bool,
     degraded: bool,
+    /// Published copy of `degraded` for lock-free health reads, shared across
+    /// every replacement watcher; this watcher reports under `epoch`.
+    health: Arc<WatcherHealth>,
+    epoch: u64,
+    /// Set once by the owning worker; ingress wakes it after each signal.
+    waker: Arc<std::sync::OnceLock<Waker>>,
+    /// Cleared when the native watcher is released: its callbacks then do
+    /// nothing (no health, no events, no wakes).
+    live: Arc<std::sync::Mutex<bool>>,
+    /// The budget this watcher's native slot belongs to.
+    budget: Arc<NativeBudget>,
+    /// The native callback, for tests to deliver events directly.
+    #[cfg(test)]
+    callback: Arc<dyn Fn(notify::Result<Event>) + Send + Sync>,
+    /// Test-only: run once in this watcher's callback, under its lock.
+    #[cfg(test)]
+    pause_callback: TestHook,
+    /// Test-only: run once in this watcher's callback, while classifying.
+    #[cfg(test)]
+    pause_classify: TestHook,
+    /// Test-only: run once when a release finds a callback holding the lock.
+    #[cfg(test)]
+    release_waiting: TestHook,
 }
 
 impl WatchSignals {
@@ -175,7 +477,22 @@ impl WatchSignals {
     /// outside this root; their paths still demand a full input reconciliation.
     /// The adapter does not elect a leader or retry registration on its own.
     pub fn new(root: PathBuf, scip_path: Option<PathBuf>, manifest_path: Option<PathBuf>) -> Self {
-        Self::construct(root, scip_path, manifest_path, true)
+        Self::publishing(
+            root,
+            scip_path,
+            manifest_path,
+            Arc::new(WatcherHealth::default()),
+        )
+    }
+
+    /// A native watcher whose health is also published through `health`.
+    pub fn publishing(
+        root: PathBuf,
+        scip_path: Option<PathBuf>,
+        manifest_path: Option<PathBuf>,
+        health: Arc<WatcherHealth>,
+    ) -> Self {
+        Self::construct(root, scip_path, manifest_path, true, health)
     }
 
     /// Fixture-only ingress with no asynchronous OS backend. Synthetic events
@@ -186,7 +503,13 @@ impl WatchSignals {
         scip_path: Option<PathBuf>,
         manifest_path: Option<PathBuf>,
     ) -> Self {
-        Self::construct(root, scip_path, manifest_path, false)
+        Self::construct(
+            root,
+            scip_path,
+            manifest_path,
+            false,
+            Arc::new(WatcherHealth::default()),
+        )
     }
 
     fn construct(
@@ -194,6 +517,25 @@ impl WatchSignals {
         scip_path: Option<PathBuf>,
         manifest_path: Option<PathBuf>,
         native: bool,
+        health: Arc<WatcherHealth>,
+    ) -> Self {
+        Self::construct_in(
+            root,
+            scip_path,
+            manifest_path,
+            native,
+            health,
+            NativeBudget::global(),
+        )
+    }
+
+    fn construct_in(
+        root: PathBuf,
+        scip_path: Option<PathBuf>,
+        manifest_path: Option<PathBuf>,
+        native: bool,
+        health: Arc<WatcherHealth>,
+        budget: Arc<NativeBudget>,
     ) -> Self {
         // Preserve short bursts beyond one bounded drain without treating a
         // repeated path as lost input. Actual channel overflow still forces full.
@@ -216,26 +558,92 @@ impl WatchSignals {
             })
             .collect::<BTreeSet<_>>();
         let callback_executable = std::env::current_exe().ok();
-        let callback = move |event| {
-            submit(
-                &callback_sender,
-                &callback_generation,
-                &callback_overflow,
+        let waker = Arc::new(std::sync::OnceLock::new());
+        let callback_waker = Arc::clone(&waker);
+        let epoch = health.begin_epoch();
+        let callback_health = Arc::clone(&health);
+        let live = Arc::new(std::sync::Mutex::new(true));
+        let callback_live = Arc::clone(&live);
+        #[cfg(test)]
+        let pause_callback: TestHook = Default::default();
+        #[cfg(test)]
+        let callback_pause = Arc::clone(&pause_callback);
+        #[cfg(test)]
+        let pause_classify: TestHook = Default::default();
+        #[cfg(test)]
+        let classify_pause = Arc::clone(&pause_classify);
+        let callback = Arc::new(move |event: notify::Result<Event>| {
+            // Classification may read file metadata: never under the lock.
+            #[cfg(test)]
+            {
+                let pause = classify_pause.lock().unwrap().take();
+                if let Some(pause) = pause {
+                    pause();
+                }
+            }
+            let relevant = relevant(
+                &event,
                 &callback_root,
                 &callback_selected,
                 callback_executable.as_deref(),
-                event,
             );
-        };
-        let watcher = native
-            .then(|| {
-                notify::recommended_watcher(callback).and_then(|mut watcher| {
-                    watcher.watch(&root, RecursiveMode::Recursive)?;
-                    Ok(watcher)
-                })
-            })
-            .and_then(Result::ok);
+            // A released watcher has no authority over the checkout. The
+            // lock is held only through the short effects below, so a
+            // release waits for a callback already past this check.
+            let live = callback_live
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !*live {
+                return;
+            }
+            #[cfg(test)]
+            {
+                let pause = callback_pause.lock().unwrap().take();
+                if let Some(pause) = pause {
+                    pause();
+                }
+            }
+            // A watcher error is published at once, not when the worker drains.
+            if event.is_err() {
+                callback_health.degrade(epoch);
+            }
+            if relevant {
+                accept(
+                    &callback_sender,
+                    &callback_generation,
+                    &callback_overflow,
+                    &callback_waker,
+                    event,
+                );
+            }
+        });
+        // A native watcher first reserves its slot; past the budget none is
+        // created and the checkout runs degraded.
+        let native_callback = Arc::clone(&callback);
+        let watcher = (native && budget.reserve())
+            .then(
+                || match notify::recommended_watcher(move |event| native_callback(event)) {
+                    Ok(mut watcher) => match watcher.watch(&root, RecursiveMode::Recursive) {
+                        Ok(()) => Some(watcher),
+                        Err(_) => {
+                            // A failed setup is torn down off this thread too;
+                            // it keeps its slot until that teardown returns.
+                            *live
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) = false;
+                            release_watcher(&budget, Some(watcher));
+                            None
+                        }
+                    },
+                    Err(_) => {
+                        budget.free();
+                        None
+                    }
+                },
+            )
+            .flatten();
         let degraded = native && watcher.is_none();
+        health.publish_setup(epoch, watcher.is_some(), degraded);
         let captured_inputs = [scip_path, manifest_path]
             .into_iter()
             .flatten()
@@ -266,7 +674,68 @@ impl WatchSignals {
             last_signal: None,
             urgent: true,
             degraded,
+            health,
+            epoch,
+            waker,
+            live,
+            budget,
+            #[cfg(test)]
+            callback,
+            #[cfg(test)]
+            pause_callback,
+            #[cfg(test)]
+            pause_classify,
+            #[cfg(test)]
+            release_waiting: Default::default(),
         }
+    }
+
+    /// Release the native watcher: once this returns its callbacks do nothing
+    /// (a callback already past its check finishes first), and its teardown
+    /// runs on a reaper (Decision 0009 §§2, 5).
+    fn release_native(&mut self) {
+        let mut live = match self.live.try_lock() {
+            Ok(live) => live,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                // A callback is applying its effects: wait for it.
+                #[cfg(test)]
+                {
+                    let hook = self.release_waiting.lock().unwrap().take();
+                    if let Some(hook) = hook {
+                        hook();
+                    }
+                }
+                self.live
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+            }
+        };
+        *live = false;
+        drop(live);
+        release_watcher(&self.budget, self.watcher.take());
+    }
+
+    /// Wake `waker` after every accepted signal from now on.
+    pub fn set_waker(&self, waker: Waker) {
+        let _ = self.waker.set(waker);
+    }
+
+    /// The live ingress generation, incremented before any wake. A reader
+    /// compares it with the acknowledged generation without taking a lock.
+    pub fn generation_handle(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.generation)
+    }
+
+    pub fn acknowledged_generation(&self) -> u64 {
+        self.acknowledged_generation
+    }
+
+    /// Ingress intent other than an unacknowledged generation: the initial or
+    /// forced full inventory, unless a verified capture already accounted for
+    /// this degraded watcher's generation.
+    pub fn full_intent(&self) -> bool {
+        !self.degraded && (self.pending.full || self.urgent)
     }
 
     /// This is set synchronously at ingress, before debounce or a channel drain.
@@ -290,7 +759,7 @@ impl WatchSignals {
     /// exact bounded synthetic ingress, generation and acknowledgment logic.
     #[doc(hidden)]
     pub fn disable_native_watcher_for_tests(&mut self) {
-        self.watcher = None;
+        self.release_native();
     }
 
     pub fn watching(&self) -> bool {
@@ -311,6 +780,7 @@ impl WatchSignals {
             &self.sender,
             &self.generation,
             &self.overflow,
+            &self.waker,
             &self.root,
             &self.captured_inputs,
             self.executable.as_deref(),
@@ -394,9 +864,10 @@ impl WatchSignals {
 
     fn fail(&mut self) {
         self.degraded = true;
+        self.health.degrade(self.epoch);
         self.pending.full = true;
         self.urgent = true;
-        self.watcher = None;
+        self.release_native();
     }
 
     /// Direct feed for the leader's wider event loop. The normal notify callback
@@ -544,5 +1015,325 @@ mod ingress_tests {
             &BTreeSet::new(),
             Some(&executable)
         ));
+    }
+}
+
+#[cfg(test)]
+mod health_epoch_tests {
+    use super::*;
+
+    /// #138 item 22: a report from a replaced watcher never changes the
+    /// current watcher's published health.
+    #[test]
+    fn a_replaced_watcher_cannot_mark_the_current_one_degraded() {
+        let health = WatcherHealth::default();
+        let replaced = health.begin_epoch();
+        let current = health.begin_epoch();
+        health.degrade(replaced);
+        assert!(!health.degraded());
+        health.degrade(current);
+        assert!(health.degraded());
+        health.reset();
+        assert!(!health.degraded());
+        health.degrade(current);
+        assert!(!health.degraded(), "a reset ends the current epoch too");
+    }
+
+    /// A stale report paused after reading the epoch, resumed after the
+    /// replacement began and reported healthy, changes nothing.
+    #[test]
+    fn a_stale_report_paused_across_replacement_is_dropped() {
+        let health = Arc::new(WatcherHealth::default());
+        let old = health.begin_epoch();
+        let (paused_tx, paused_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
+        *health.after_load.lock().unwrap() = Some(Box::new(move || {
+            paused_tx.send(()).unwrap();
+            resume_rx.recv().unwrap();
+        }));
+        let stale = {
+            let health = Arc::clone(&health);
+            std::thread::spawn(move || health.degrade(old))
+        };
+        paused_rx.recv().unwrap();
+        health.begin_epoch();
+        resume_tx.send(()).unwrap();
+        stale.join().unwrap();
+        assert!(!health.degraded(), "the replaced watcher's error leaked");
+    }
+
+    /// An error the callback publishes during setup survives setup.
+    #[test]
+    fn a_setup_error_from_the_callback_is_not_cleared() {
+        let health = WatcherHealth::default();
+        let epoch = health.begin_epoch();
+        health.degrade(epoch); // the OS callback, mid-setup
+        health.publish_setup(epoch, true, false);
+        assert!(health.degraded());
+    }
+
+    /// A degradation that health no longer shows, because a new epoch began
+    /// or not, is still visible in the witness.
+    #[test]
+    fn the_witness_keeps_a_degradation_the_health_bit_lost() {
+        let health = WatcherHealth::default();
+        let epoch = health.begin_epoch();
+        health.publish_setup(epoch, true, false);
+        let baseline = health.witness();
+        assert!(baseline.native && !baseline.degraded);
+        assert_eq!(health.witness(), baseline, "an unchanged reading");
+        health.degrade(epoch);
+        let replacement = health.begin_epoch();
+        health.publish_setup(replacement, true, false);
+        let after = health.witness();
+        assert!(
+            after.native && !after.degraded,
+            "health looks healthy again"
+        );
+        assert_eq!(after.degradations, baseline.degradations + 1);
+        assert_ne!(after, baseline);
+    }
+
+    /// A new epoch is not native until its setup publishes a native watcher.
+    #[test]
+    fn a_new_epoch_is_not_native_until_setup_publishes() {
+        let health = WatcherHealth::default();
+        let epoch = health.begin_epoch();
+        assert!(!health.witness().native);
+        health.publish_setup(epoch, false, false);
+        assert!(!health.witness().native);
+        health.publish_setup(epoch, true, false);
+        assert!(health.witness().native);
+    }
+}
+
+#[cfg(test)]
+mod reaper_tests {
+    use super::*;
+
+    /// A test's own native-watcher budget, with its reapers held until
+    /// `open`; nothing it counts is shared with other tests.
+    struct Budget(Arc<NativeBudget>);
+    impl Budget {
+        fn held(limit: usize) -> Self {
+            let budget = Arc::new(NativeBudget::new(limit));
+            *budget.hold_reapers.lock().unwrap() = Some(Arc::new((
+                std::sync::Mutex::new(false),
+                std::sync::Condvar::new(),
+            )));
+            Self(budget)
+        }
+        fn open(&self) {
+            if let Some(gate) = self.0.hold_reapers.lock().unwrap().take() {
+                *gate.0.lock().unwrap() = true;
+                gate.1.notify_all();
+            }
+        }
+        /// Wait until no native watcher holds a slot in this budget.
+        fn drained(&self) {
+            let deadline = Instant::now() + crate::testing::HANG_BACKSTOP;
+            while self.0.held() != 0 {
+                assert!(Instant::now() < deadline, "reapers never finished");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        fn signals(&self, root: &Path, health: &Arc<WatcherHealth>) -> WatchSignals {
+            WatchSignals::construct_in(
+                root.to_path_buf(),
+                None,
+                None,
+                true,
+                Arc::clone(health),
+                Arc::clone(&self.0),
+            )
+        }
+    }
+    impl Drop for Budget {
+        fn drop(&mut self) {
+            self.open();
+        }
+    }
+
+    fn hook(run: impl FnOnce() + Send + 'static) -> Option<Box<dyn FnOnce() + Send>> {
+        Some(Box::new(run))
+    }
+
+    /// Decision 0009 §§2, 5 (amended): a native watcher holds its slot from
+    /// creation until its teardown returns, so stuck teardowns can never
+    /// exceed the budget, even across a replacement that creates the new
+    /// watcher before releasing the old. At the budget a checkout degrades.
+    #[test]
+    fn the_native_budget_counts_active_and_stranded_watchers() {
+        let temp = tempfile::tempdir().unwrap();
+        let budget = Budget::held(3);
+        let health = || Arc::new(WatcherHealth::default());
+        let first = budget.signals(temp.path(), &health());
+        let second = budget.signals(temp.path(), &health());
+        assert!(first.watcher.is_some() && second.watcher.is_some());
+        // A replacement: the new watcher exists before the old is released.
+        let replacement = budget.signals(temp.path(), &health());
+        assert!(replacement.watcher.is_some());
+        drop(first);
+        assert_eq!((budget.0.held(), budget.0.stranded()), (3, 1));
+        // The stuck teardown still holds its slot: no fourth native watcher.
+        let limited_health = health();
+        let limited = budget.signals(temp.path(), &limited_health);
+        assert!(
+            limited.watcher.is_none(),
+            "a native watcher past the budget"
+        );
+        assert!(limited_health.degraded());
+        drop(limited);
+        drop(second);
+        drop(replacement);
+        assert!(budget.0.stranded() <= 3, "more stranded than the budget");
+        budget.open();
+        budget.drained();
+        let resumed = budget.signals(temp.path(), &health());
+        assert!(resumed.watcher.is_some());
+        drop(resumed);
+        budget.drained();
+    }
+
+    /// Decision 0009 §5 (amended): a release waits for a callback that is
+    /// applying its effects, and afterwards callbacks do nothing. The release
+    /// is shown blocked on that callback (its waiting hook runs only when the
+    /// lock is held), not inferred from timing.
+    #[test]
+    fn a_release_waits_for_an_in_flight_callback_and_silences_later_ones() {
+        let temp = tempfile::tempdir().unwrap();
+        let health = Arc::new(WatcherHealth::default());
+        let watched = WatchSignals::construct(
+            temp.path().to_path_buf(),
+            None,
+            None,
+            false,
+            Arc::clone(&health),
+        );
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&wakes);
+        watched.set_waker(Arc::new(move || {
+            counted.fetch_add(1, Ordering::AcqRel);
+        }));
+        let callback = Arc::clone(&watched.callback);
+        let event = || {
+            Ok(
+                Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
+                    .add_path(temp.path().join("a.js")),
+            )
+        };
+        let (paused_tx, paused) = std::sync::mpsc::sync_channel(1);
+        let (resume_tx, resume) = std::sync::mpsc::sync_channel::<()>(1);
+        *watched.pause_callback.lock().unwrap() = hook(move || {
+            paused_tx.send(()).unwrap();
+            let _ = resume.recv();
+        });
+        let (waiting_tx, waiting) = std::sync::mpsc::sync_channel(1);
+        *watched.release_waiting.lock().unwrap() = hook(move || {
+            waiting_tx.send(()).unwrap();
+        });
+        let in_flight = {
+            let callback = Arc::clone(&callback);
+            let event = event();
+            std::thread::spawn(move || callback(event))
+        };
+        paused
+            .recv_timeout(crate::testing::HANG_BACKSTOP)
+            .expect("the callback never reached its effects");
+        let releasing = std::thread::spawn(move || drop(watched));
+        waiting
+            .recv_timeout(crate::testing::HANG_BACKSTOP)
+            .expect("the release did not wait for the in-flight callback");
+        resume_tx.send(()).unwrap();
+        in_flight.join().unwrap();
+        releasing.join().unwrap();
+        assert_eq!(wakes.load(Ordering::Acquire), 1, "the in-flight wake");
+        callback(event());
+        assert_eq!(
+            wakes.load(Ordering::Acquire),
+            1,
+            "a released watcher's callback woke the worker"
+        );
+    }
+
+    /// Classification (which may read file metadata) runs outside the lock:
+    /// a release is not held up by a callback still classifying, and that
+    /// callback then does nothing.
+    #[test]
+    fn a_release_is_not_held_by_a_callback_still_classifying() {
+        let temp = tempfile::tempdir().unwrap();
+        let watched = WatchSignals::construct(
+            temp.path().to_path_buf(),
+            None,
+            None,
+            false,
+            Arc::new(WatcherHealth::default()),
+        );
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&wakes);
+        watched.set_waker(Arc::new(move || {
+            counted.fetch_add(1, Ordering::AcqRel);
+        }));
+        let callback = Arc::clone(&watched.callback);
+        let (paused_tx, paused) = std::sync::mpsc::sync_channel(1);
+        let (resume_tx, resume) = std::sync::mpsc::sync_channel::<()>(1);
+        *watched.pause_classify.lock().unwrap() = hook(move || {
+            paused_tx.send(()).unwrap();
+            let _ = resume.recv();
+        });
+        // Either the release waits on the callback, or it finishes.
+        let (outcome_tx, outcome) = std::sync::mpsc::channel();
+        let waiting_tx = outcome_tx.clone();
+        *watched.release_waiting.lock().unwrap() = hook(move || {
+            let _ = waiting_tx.send("waited");
+        });
+        let classifying = {
+            let callback = Arc::clone(&callback);
+            let event = Ok(
+                Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
+                    .add_path(temp.path().join("a.js")),
+            );
+            std::thread::spawn(move || callback(event))
+        };
+        paused
+            .recv_timeout(crate::testing::HANG_BACKSTOP)
+            .expect("the callback never classified");
+        let releasing = std::thread::spawn(move || {
+            drop(watched);
+            let _ = outcome_tx.send("released");
+        });
+        let first = outcome
+            .recv_timeout(crate::testing::HANG_BACKSTOP)
+            .expect("the release neither waited nor finished");
+        resume_tx.send(()).unwrap();
+        classifying.join().unwrap();
+        releasing.join().unwrap();
+        assert_eq!(first, "released", "the release waited on classification");
+        assert_eq!(
+            wakes.load(Ordering::Acquire),
+            0,
+            "a callback classified before release acted after it"
+        );
+    }
+
+    /// A watcher whose setup fails is torn down by a reaper, never on the
+    /// constructing (checkout worker) thread.
+    #[test]
+    fn a_failed_watcher_setup_is_torn_down_by_a_reaper() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing");
+        let budget = Budget::held(MAX_NATIVE_WATCHERS);
+        let health = Arc::new(WatcherHealth::default());
+        let failed = budget.signals(&missing, &health);
+        assert!(failed.watcher.is_none());
+        assert!(health.degraded());
+        assert_eq!(
+            (budget.0.stranded(), budget.0.held()),
+            (1, 1),
+            "the failed watcher was dropped on the constructing thread"
+        );
+        drop(failed);
+        budget.open();
+        budget.drained();
     }
 }

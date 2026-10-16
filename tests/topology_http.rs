@@ -891,7 +891,7 @@ async fn saved_views_and_annotations_attach_to_the_requested_retained_manifest()
     let release_before = retained_release_snapshot(&temp.path().join("state"), &root, &r1);
     let maintenance_busy_before = store.maintenance_sqlite_busy_attempts();
     let release_started = std::time::Instant::now();
-    let release_deadline = std::time::Duration::from_secs(5);
+    let release_deadline = trellis::testing::HANG_BACKSTOP;
     let mut release_deferred = Vec::new();
     let mut release_attempts = 0;
     let mut released = false;

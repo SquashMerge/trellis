@@ -170,7 +170,7 @@ impl Drop for FixtureDaemon {
         if !sent {
             return;
         }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + trellis::testing::HANG_BACKSTOP;
         while std::time::Instant::now() < deadline {
             if owned().is_none() {
                 if marker_pid.is_some() {
@@ -282,7 +282,7 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
         home.join(".local/share/trellis")
     };
     let socket = trellis::daemon::SocketPaths::new(&data).socket;
-    let stop_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let stop_deadline = std::time::Instant::now() + trellis::testing::HANG_BACKSTOP;
     while std::os::unix::net::UnixStream::connect(&socket).is_ok() {
         assert!(
             std::time::Instant::now() < stop_deadline,
@@ -322,7 +322,7 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
     let mut server = Server(child);
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
-    tokio::time::timeout(Duration::from_secs(25), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             if let Ok(response) = client.get(format!("{base}/healthz")).send().await
                 && response.status().is_success()
@@ -412,7 +412,7 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
         (&b_key, &b, "beta_checkout"),
     ] {
         let verified_root = root.canonicalize().unwrap();
-        let status = tokio::time::timeout(Duration::from_secs(25), async {
+        let status = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
             loop {
                 let response = client
                     .get(format!("{base}/api/checkouts/{key}/status"))
@@ -445,9 +445,9 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
         let status: Value = status.json().await.unwrap();
         assert_eq!(status["workspaceRoot"], verified_root.to_str().unwrap());
         // TODO(runtime-recovery): prior-head admission must make this read
-        // immediately available during H, as the preceding status was 200.
-        // Until that slice lands, only a typed cold/H index_not_ready may wait.
-        let jev = tokio::time::timeout(Duration::from_secs(12), async {
+        // immediately available during startup reconciliation, as the preceding status was 200.
+        // Until that slice lands, only a typed cold/startup reconciliation index_not_ready may wait.
+        let jev = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
             loop {
                 let response = client
                     .get(format!("{base}/api/checkouts/{key}/jev/status"))
@@ -484,10 +484,10 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
             status["catchingUp"].as_bool().unwrap().to_string(),
             status_header
         );
-        // This test checks stable selected routes, not the prior-head/H gap.
+        // This test checks stable selected routes, not the prior-head/startup reconciliation gap.
         // Wait for this checkout's daemon-owned reconciliation before asserting
         // application errors such as directory_missing.
-        tokio::time::timeout(Duration::from_secs(20), async {
+        tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
             loop {
                 let response = client
                     .get(format!("{base}/api/checkouts/{key}/status"))
@@ -1120,7 +1120,7 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
         let private = root.join("private");
         fs::create_dir(&private).unwrap();
         fs::set_permissions(&private, fs::Permissions::from_mode(0o000)).unwrap();
-        let forbidden_dir = tokio::time::timeout(Duration::from_secs(10), async {
+        let forbidden_dir = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
             loop {
                 let response = client
                     .get(format!("{base}/api/checkouts/{key}/tree"))
@@ -1143,7 +1143,7 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
             }
         })
         .await
-        .expect("selected tree did not leave transient H admission");
+        .expect("selected tree did not leave transient startup reconciliation admission");
         assert_eq!(forbidden_dir.status(), reqwest::StatusCode::FORBIDDEN);
         assert_eq!(
             forbidden_dir.json::<Value>().await.unwrap()["error"]["code"],
@@ -1394,9 +1394,9 @@ async fn resolved_root_change_retains_headers_even_when_read_fence_fails() {
         let mut last_code = None;
         let mut last_error_code = None;
         let mut saw_runtime = false;
-        let mut first_h_error = None;
+        let mut first_startup_error = None;
         let mut saw_retry_waiting = false;
-        tokio::time::timeout(Duration::from_secs(20), async {
+        tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
             loop {
                 let response = call(app.clone()).await;
                 last_code = Some(response.status());
@@ -1413,15 +1413,15 @@ async fn resolved_root_change_retains_headers_even_when_read_fence_fails() {
                 if let Some(runtime) = runtime {
                     let waiting = runtime.retry_waiting_for_tests();
                     saw_retry_waiting |= waiting;
-                    if first_h_error.is_none() {
-                        first_h_error = runtime.reconciliation_error().map(|error| (error, waiting));
+                    if first_startup_error.is_none() {
+                        first_startup_error = runtime.reconciliation_error().map(|error| (error, waiting));
                     }
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         })
         .await
-        .unwrap_or_else(|_| panic!("{stage}/{route_suffix} cold selected route did not become ready: {last_code:?}/{last_error_code:?}; runtime seen: {saw_runtime}; first H error/retry: {first_h_error:?}; saw retry waiting: {saw_retry_waiting}; queue exists: {}", queue_path.exists()));
+        .unwrap_or_else(|_| panic!("{stage}/{route_suffix} cold selected route did not become ready: {last_code:?}/{last_error_code:?}; runtime seen: {saw_runtime}; first startup reconciliation error/retry: {first_startup_error:?}; saw retry waiting: {saw_retry_waiting}; queue exists: {}", queue_path.exists()));
         let changed = Arc::new(AtomicBool::new(false));
         let source = identity.root.clone();
         let destination = temp.path().join("moved");
@@ -1481,7 +1481,7 @@ async fn selected_question_export_keeps_legacy_oversize_error() {
     .unwrap()
     .router();
     let prefix = format!("/api/checkouts/{}", identity.root_key);
-    let pin = tokio::time::timeout(Duration::from_secs(30), async {
+    let pin = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             let (status, _, value) =
                 selected_json(app.clone(), "GET", &format!("{prefix}/status"), Value::Null).await;
@@ -1572,22 +1572,23 @@ async fn selected_question_preview_keeps_legacy_oversize_error() {
     .router();
     let prefix = format!("/api/checkouts/{}", identity.root_key);
     let mut last_status = None;
-    let mut first_h_error = None;
+    let mut first_startup_error = None;
     let mut saw_retry_waiting = false;
-    let pin = tokio::time::timeout(Duration::from_secs(30), async {
+    let pin = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             let (status, _, value) =
                 selected_json(app.clone(), "GET", &format!("{prefix}/status"), Value::Null).await;
             last_status = Some((status, value.clone()));
-            // Sample while H is still retrying. The first error can disappear
+            // Sample while startup reconciliation is still retrying. The first error can disappear
             // after a successful retry, before the final timeout diagnostic.
             if (status != axum::http::StatusCode::OK || value["catchingUp"] != false)
                 && let Some(runtime) = registry.lock().await.runtime(&identity.root_key)
             {
                 let waiting = runtime.retry_waiting_for_tests();
                 saw_retry_waiting |= waiting;
-                if first_h_error.is_none() {
-                    first_h_error = runtime.reconciliation_error().map(|error| (error, waiting));
+                if first_startup_error.is_none() {
+                    first_startup_error =
+                        runtime.reconciliation_error().map(|error| (error, waiting));
                 }
             }
             if status == axum::http::StatusCode::OK && value["catchingUp"] == false {
@@ -1598,7 +1599,7 @@ async fn selected_question_preview_keeps_legacy_oversize_error() {
     })
     .await;
     let pin = pin.unwrap_or_else(|_| {
-        panic!("cold selected preview status stayed not-ready: {last_status:?}; first H error/retry: {first_h_error:?}; saw retry waiting: {saw_retry_waiting}")
+        panic!("cold selected preview status stayed not-ready: {last_status:?}; first startup reconciliation error/retry: {first_startup_error:?}; saw retry waiting: {saw_retry_waiting}")
     });
     let (status, _, symbols) = selected_json(
         app.clone(),
@@ -1664,7 +1665,7 @@ async fn selected_saved_mutation_reports_committed_drift_and_preserves_real_reco
                 .unwrap();
                 let app = browser.clone().router();
                 let prefix = format!("/api/checkouts/{}", identity.root_key);
-                let pin = tokio::time::timeout(Duration::from_secs(20), async {
+                let pin = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
                     loop {
                         let (status, _, value) = selected_json(
                             app.clone(),
@@ -1819,7 +1820,7 @@ async fn browser_only_live_listener_releases_resources_then_exits_with_control_p
     // closes the dispatch-owned serve control connection on daemon exit.
     let (mut serve_control, daemon_control) = std::os::unix::net::UnixStream::pair().unwrap();
     serve_control
-        .set_read_timeout(Some(Duration::from_secs(30)))
+        .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
         .unwrap();
     let serve_exit = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
         use std::io::Read;
@@ -1845,7 +1846,7 @@ async fn browser_only_live_listener_releases_resources_then_exits_with_control_p
     let client = reqwest::Client::new();
     let base = format!("http://{address}");
     let before_request = std::time::Instant::now();
-    tokio::time::timeout(Duration::from_secs(20), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             let response = client
                 .get(format!("{base}/api/checkouts/{}/status", identity.root_key))
@@ -1899,7 +1900,7 @@ async fn browser_only_live_listener_releases_resources_then_exits_with_control_p
     checked.set_clock_override_for_tests(after_request + Duration::from_secs(30 * 60));
     checked.advance(std::time::Instant::now()).unwrap();
     drop(checked);
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         while runtime.has_active_resources() {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -1919,17 +1920,17 @@ async fn browser_only_live_listener_releases_resources_then_exits_with_control_p
         .lock()
         .await
         .set_clock_override_for_tests(after_request + Duration::from_secs(45 * 60));
-    tokio::time::timeout(Duration::from_secs(3), daemon_exit)
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, daemon_exit)
         .await
         .unwrap()
         .unwrap();
-    let observed_eof = tokio::time::timeout(Duration::from_secs(3), serve_exit).await;
+    let observed_eof = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, serve_exit).await;
     assert!(
         observed_eof.is_ok(),
         "serve control did not reach EOF after daemon exit"
     );
     observed_eof.unwrap().unwrap().unwrap();
-    tokio::time::timeout(Duration::from_secs(3), listener)
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, listener)
         .await
         .unwrap()
         .unwrap()
@@ -1982,14 +1983,13 @@ async fn cold_selected_native_read_is_not_ready_without_a_fabricated_basis() {
         registry
             .browser_request_at(&identity, std::time::Instant::now())
             .unwrap();
-        let runtime = registry.activate(&identity.root_key).unwrap();
-        runtime.set_pre_h_hook_for_tests(Arc::new(move || {
+        registry.set_next_startup_hook_for_tests(Arc::new(move || {
             entered_tx.send(()).unwrap();
             resume_rx.lock().unwrap().recv().unwrap();
         }));
-        runtime
+        registry.activate(&identity.root_key).unwrap()
     };
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         while entered_rx.try_recv().is_err() {
             tokio::task::yield_now().await;
         }
@@ -2027,7 +2027,7 @@ async fn cold_selected_native_read_is_not_ready_without_a_fabricated_basis() {
 
 #[cfg(feature = "test-support")]
 #[tokio::test]
-async fn selected_status_serves_validated_pre_h_head_and_clears_freshness_after_h() {
+async fn selected_status_serves_validated_pre_startup_head_and_clears_freshness_after_startup() {
     use axum::{
         body::{Body, to_bytes},
         http::Request,
@@ -2082,7 +2082,7 @@ async fn selected_status_serves_validated_pre_h_head_and_clears_freshness_after_
             (code, headers, body)
         }
     };
-    let old_revision = tokio::time::timeout(Duration::from_secs(20), async {
+    let old_revision = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             let (code, headers, body) = status(app.clone()).await;
             if code == axum::http::StatusCode::OK && body["catchingUp"] == false {
@@ -2122,7 +2122,7 @@ async fn selected_status_serves_validated_pre_h_head_and_clears_freshness_after_
         assert_eq!(code, axum::http::StatusCode::OK, "{body}");
     }
     let release_at = std::time::Instant::now() + Duration::from_secs(30 * 60);
-    tokio::time::timeout(Duration::from_secs(30), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             let released = {
                 let mut registry = registry.lock().await;
@@ -2146,14 +2146,13 @@ async fn selected_status_serves_validated_pre_h_head_and_clears_freshness_after_
         registry
             .browser_request_at(&identity, std::time::Instant::now())
             .unwrap();
-        let runtime = registry.activate(&identity.root_key).unwrap();
-        runtime.set_pre_h_hook_for_tests(Arc::new(move || {
+        registry.set_next_startup_hook_for_tests(Arc::new(move || {
             entered_tx.send(()).unwrap();
             resume_rx.lock().unwrap().recv().unwrap();
         }));
-        runtime
+        registry.activate(&identity.root_key).unwrap()
     };
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         while entered_rx.try_recv().is_err() {
             tokio::task::yield_now().await;
         }
@@ -2291,7 +2290,7 @@ async fn selected_status_serves_validated_pre_h_head_and_clears_freshness_after_
         assert_eq!(headers["X-Trellis-Catching-Up"], "true");
     }
     resume_tx.send(()).unwrap();
-    tokio::time::timeout(Duration::from_secs(20), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             if !runtime.catching_up() {
                 let (code, headers, current) = status(app.clone()).await;
@@ -2414,7 +2413,7 @@ async fn provider_routes_use_only_the_selected_checkout() {
     .router();
     let a_prefix = format!("/api/checkouts/{}", a_id.root_key);
     let b_prefix = format!("/api/checkouts/{}", b_id.root_key);
-    tokio::time::timeout(Duration::from_secs(25), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             let (a_code, _, _) = selected_json(
                 app.clone(),
@@ -2550,7 +2549,7 @@ async fn provider_routes_use_only_the_selected_checkout() {
     .await;
     assert_eq!(code, axum::http::StatusCode::ACCEPTED, "{initial_refresh}");
     assert_eq!(headers["X-Trellis-Workspace"], a_id.root.to_str().unwrap());
-    let a_catalog = tokio::time::timeout(Duration::from_secs(20), async {
+    let a_catalog = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             let (code, _, status) = selected_json(
                 app.clone(),
@@ -2620,7 +2619,7 @@ async fn provider_routes_use_only_the_selected_checkout() {
     .await;
     assert_eq!(code, axum::http::StatusCode::ACCEPTED, "{b_refresh}");
     assert_eq!(headers["X-Trellis-Workspace"], b_id.root.to_str().unwrap());
-    let b_catalog_before = tokio::time::timeout(Duration::from_secs(20), async {
+    let b_catalog_before = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             let (code, _, status) = selected_json(
                 app.clone(),
@@ -2648,7 +2647,7 @@ async fn provider_routes_use_only_the_selected_checkout() {
     assert_eq!(code, axum::http::StatusCode::ACCEPTED, "{refresh}");
     assert_eq!(refresh["state"], "loading");
     assert_eq!(headers["X-Trellis-Workspace"], a_id.root.to_str().unwrap());
-    tokio::time::timeout(Duration::from_secs(20), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             let (code, _, status) = selected_json(
                 app.clone(),
@@ -2970,19 +2969,20 @@ async fn production_browser_rejects_every_selector_free_checkout_route_without_a
         assert_eq!(registry.lock().await.browser_checkouts(), original);
         let first = &identities[0];
         let prefix = format!("/api/checkouts/{}", first.root_key);
-        let (code, headers, status) = tokio::time::timeout(Duration::from_secs(20), async {
-            loop {
-                let result =
-                    selected_json(app.clone(), "GET", &format!("{prefix}/status"), Value::Null)
-                        .await;
-                if result.0 == axum::http::StatusCode::OK {
-                    break result;
+        let (code, headers, status) =
+            tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+                loop {
+                    let result =
+                        selected_json(app.clone(), "GET", &format!("{prefix}/status"), Value::Null)
+                            .await;
+                    if result.0 == axum::http::StatusCode::OK {
+                        break result;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .unwrap();
+            })
+            .await
+            .unwrap();
         assert_eq!(code, axum::http::StatusCode::OK, "{status}");
         assert_eq!(headers["X-Trellis-Workspace"], first.root.to_str().unwrap());
         assert_eq!(
@@ -3030,7 +3030,7 @@ async fn production_browser_rejects_every_selector_free_checkout_route_without_a
 
 #[cfg(feature = "test-support")]
 #[tokio::test]
-async fn virgin_queue_use_lock_contention_retries_h_before_claiming_fifo() {
+async fn virgin_queue_use_lock_contention_retries_startup_before_claiming_fifo() {
     use std::sync::Arc;
     use trellis::{
         daemon::registry::{CheckoutOptions, CheckoutRegistry},
@@ -3068,8 +3068,8 @@ async fn virgin_queue_use_lock_contention_retries_h_before_claiming_fifo() {
             .browser_request_at(&identity, std::time::Instant::now())
             .unwrap();
         // Bootstrap now precedes publication. An outstanding SH prevents its
-        // EX lock, so activation must fail without exposing an H runtime or
-        // publishing a queue that could accept a FIFO request before H.
+        // EX lock, so activation must fail without exposing an startup reconciliation runtime or
+        // publishing a queue that could accept a FIFO request before startup reconciliation.
         let error = match checked.activate(&identity.root_key) {
             Ok(_) => panic!("virgin queue activation must not publish under SH contention"),
             Err(error) => error,
@@ -3099,7 +3099,7 @@ async fn virgin_queue_use_lock_contention_retries_h_before_claiming_fifo() {
         .enqueue_request(&IndexOptions::new(root), None)
         .unwrap();
     assert_eq!(queued.state, "queued");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + trellis::testing::HANG_BACKSTOP;
     let terminal = Arc::new(tokio::sync::Notify::new());
     runtime
         .notify_on_terminal_request_for_tests(&queued.id, terminal.clone())
@@ -3108,7 +3108,7 @@ async fn virgin_queue_use_lock_contention_retries_h_before_claiming_fifo() {
     let ready = tokio::time::timeout_at(deadline, async {
         // The request may have committed between enqueue and registration.
         // Otherwise wait for this ID's durable terminal COMMIT without a
-        // stream of protected status/queue SH reads competing with H's EX.
+        // stream of protected status/queue SH reads competing with startup reconciliation's EX.
         let mut finished = loop {
             match store.request_by_id(&queued.id) {
                 Ok(Some(row)) => break row,
@@ -3144,7 +3144,7 @@ async fn virgin_queue_use_lock_contention_retries_h_before_claiming_fifo() {
             if code == axum::http::StatusCode::OK && status["catchingUp"] == false {
                 assert!(
                     status["revision"]["indexRevision"].as_u64().unwrap() >= 2,
-                    "mandatory H must publish before FIFO completion: {status}"
+                    "mandatory startup reconciliation must publish before FIFO completion: {status}"
                 );
                 break;
             }
@@ -3239,30 +3239,30 @@ async fn selected_reads_validated_predecessor_through_owner_handoff() {
     )
     .unwrap()
     .router();
-    let runtime = {
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let release_rx = Mutex::new(release_rx);
+    let _runtime = {
         let mut checked = registry.lock().await;
         checked
             .browser_request_at(&identity, std::time::Instant::now())
             .unwrap();
+        // Installed before the worker starts, so this runtime pauses before
+        // its mandatory local startup reconciliation.
+        checked.set_next_startup_hook_for_tests(Arc::new(move || {
+            entered_tx.send(()).unwrap();
+            release_rx.lock().unwrap().recv().unwrap();
+        }));
         checked.activate(&identity.root_key).unwrap()
     };
-    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
-    let (release_tx, release_rx) = mpsc::sync_channel(1);
-    let release_rx = Mutex::new(release_rx);
-    // Activation schedules reconciliation on Tokio. Set the hook before the
-    // first await so this runtime pauses before its mandatory local H.
-    runtime.set_pre_h_hook_for_tests(Arc::new(move || {
-        entered_tx.send(()).unwrap();
-        release_rx.lock().unwrap().recv().unwrap();
-    }));
     let prefix = format!("/api/checkouts/{}", identity.root_key);
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         while entered_rx.try_recv().is_err() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("daemon-local H did not reach pre-publication boundary");
+    .expect("daemon-local startup reconciliation did not reach pre-publication boundary");
     let (code, headers, files) = selected_json(
         browser.clone(),
         "GET",
@@ -3300,10 +3300,10 @@ async fn selected_reads_validated_predecessor_through_owner_handoff() {
     assert_eq!(
         published.request_by_id(&queued.id).unwrap().unwrap().state,
         "queued",
-        "pre-H selected reads cannot claim accepted FIFO work"
+        "pre-startup reconciliation selected reads cannot claim accepted FIFO work"
     );
     release_tx.send(()).unwrap();
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             let (code, _, status) = selected_json(
                 browser.clone(),
@@ -3316,7 +3316,7 @@ async fn selected_reads_validated_predecessor_through_owner_handoff() {
                 assert!(
                     status["revision"]["indexRevision"].as_u64().unwrap()
                         >= prior["indexRevision"].as_u64().unwrap() + 2,
-                    "mandatory H must publish before queued work"
+                    "mandatory startup reconciliation must publish before queued work"
                 );
                 break;
             }
@@ -3324,10 +3324,192 @@ async fn selected_reads_validated_predecessor_through_owner_handoff() {
         }
     })
     .await
-    .expect("local H and accepted FIFO head did not finish");
+    .expect("local startup reconciliation and accepted FIFO head did not finish");
     let finished = published.request_by_id(&queued.id).unwrap().unwrap();
     assert_eq!(
         (finished.id.as_str(), finished.seq, finished.state.as_str()),
         (queued.id.as_str(), queued.seq, "done")
     );
+}
+
+/// Decision 0009 §6: a browser request uses one configuration version even if
+/// serve publishes a new one while the request is in flight.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn browser_request_pins_one_configuration_version() {
+    use std::sync::Arc;
+    use trellis::{
+        daemon::{
+            BrowserProvisioner,
+            registry::{CheckoutOptions, CheckoutRegistry},
+        },
+        http::ProvisionedBrowser,
+        store::topology::TopologyRoots,
+    };
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("checkout");
+    fs::create_dir_all(root.join("sub")).unwrap();
+    fs::write(root.join("core.js"), "function core() {}\n").unwrap();
+    let identity = WorkspaceIdentity::discover(Some(&root), &root)
+        .unwrap()
+        .attach_marker()
+        .unwrap();
+    let roots =
+        TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+    let registry = Arc::new(tokio::sync::Mutex::new(CheckoutRegistry::with_roots(roots)));
+    let runtime = {
+        let mut checked = registry.lock().await;
+        checked.attach_launch(7, &identity).unwrap();
+        checked.activate(&identity.root_key).unwrap()
+    };
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        loop {
+            if let Ok((response, catching_up)) = runtime.evidence_response()
+                && response.finish(()).is_ok()
+                && !catching_up
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let browser = ProvisionedBrowser::new(
+        registry.clone(),
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
+        "127.0.0.1:7331".parse().unwrap(),
+    )
+    .unwrap();
+    // Mid-request, serve publishes a configuration with another browse root.
+    let swapped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hook_swapped = swapped.clone();
+    let hook_registry = registry.clone();
+    let hook_identity = WorkspaceIdentity::discover(Some(&root), &root)
+        .unwrap()
+        .attach_marker()
+        .unwrap();
+    let token = temp.path().join("token");
+    let browse = root.join("sub");
+    let handle = tokio::runtime::Handle::current();
+    browser.set_selected_response_hook_for_tests(Arc::new(move |at| {
+        if at == "before_work" && !hook_swapped.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            handle
+                .block_on(BrowserProvisioner::new().register_serve(
+                    &hook_registry,
+                    &hook_identity,
+                    CheckoutOptions(serde_json::json!({"browseRoot": browse})),
+                    "127.0.0.1:0".parse().unwrap(),
+                    &token,
+                ))
+                .unwrap();
+        }
+    }));
+    let (status, _, page) = selected_json(
+        browser.router(),
+        "GET",
+        &format!("/api/checkouts/{}/tree", identity.root_key),
+        Value::Null,
+    )
+    .await;
+    assert!(swapped.load(std::sync::atomic::Ordering::Acquire));
+    assert_eq!(status, axum::http::StatusCode::OK, "{page}");
+    assert_eq!(
+        page["root"],
+        identity.root.to_str().unwrap(),
+        "one request read two configuration versions"
+    );
+    assert!(
+        page["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["path"] == "core.js"),
+        "{page}"
+    );
+}
+
+/// Decision 0009 §6: a dependency refresh schedules only for the configuration
+/// version it checked; a registration during its preflight refuses it.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn dependency_refresh_is_fenced_to_its_configuration_version() {
+    use std::sync::Arc;
+    use trellis::{
+        daemon::{
+            BrowserProvisioner,
+            registry::{CheckoutOptions, CheckoutRegistry},
+        },
+        http::ProvisionedBrowser,
+        store::topology::TopologyRoots,
+    };
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("checkout");
+    fs::create_dir_all(root.join("sub")).unwrap();
+    fs::write(root.join("core.js"), "function core() {}\n").unwrap();
+    let identity = WorkspaceIdentity::discover(Some(&root), &root)
+        .unwrap()
+        .attach_marker()
+        .unwrap();
+    let roots =
+        TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+    let registry = Arc::new(tokio::sync::Mutex::new(CheckoutRegistry::with_roots(roots)));
+    let runtime = {
+        let mut checked = registry.lock().await;
+        checked.attach_launch(7, &identity).unwrap();
+        checked.activate(&identity.root_key).unwrap()
+    };
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        loop {
+            if let Ok((response, catching_up)) = runtime.evidence_response()
+                && response.finish(()).is_ok()
+                && !catching_up
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let browser = ProvisionedBrowser::new(
+        registry.clone(),
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
+        "127.0.0.1:7331".parse().unwrap(),
+    )
+    .unwrap();
+    let swapped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hook_swapped = swapped.clone();
+    let hook_registry = registry.clone();
+    let hook_identity = WorkspaceIdentity::discover(Some(&root), &root)
+        .unwrap()
+        .attach_marker()
+        .unwrap();
+    let token = temp.path().join("token");
+    let browse = root.join("sub");
+    let handle = tokio::runtime::Handle::current();
+    browser.set_selected_response_hook_for_tests(Arc::new(move |at| {
+        if at == "before_mutation" && !hook_swapped.swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            handle
+                .block_on(BrowserProvisioner::new().register_serve(
+                    &hook_registry,
+                    &hook_identity,
+                    CheckoutOptions(serde_json::json!({"browseRoot": browse})),
+                    "127.0.0.1:0".parse().unwrap(),
+                    &token,
+                ))
+                .unwrap();
+        }
+    }));
+    let (status, _, value) = selected_json(
+        browser.router(),
+        "POST",
+        &format!("/api/checkouts/{}/dependencies/refresh", identity.root_key),
+        serde_json::json!({}),
+    )
+    .await;
+    assert!(swapped.load(std::sync::atomic::Ordering::Acquire));
+    assert_eq!(status, axum::http::StatusCode::CONFLICT, "{value}");
+    assert_eq!(value["error"]["code"], "configuration_changed");
 }

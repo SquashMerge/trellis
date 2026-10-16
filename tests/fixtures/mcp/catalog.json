@@ -503,6 +503,67 @@
             "daemon_unavailable",
             "outcome_unknown"
           ]
+        },
+        "AdmissionFailure": {
+          "additionalProperties": false,
+          "properties": {
+            "error": {
+              "additionalProperties": false,
+              "properties": {
+                "code": {
+                  "enum": [
+                    "too_many_requests",
+                    "deadline_exceeded"
+                  ]
+                },
+                "currentBasis": {
+                  "const": null
+                },
+                "currentContentHash": {
+                  "const": null
+                },
+                "message": {
+                  "$ref": "#/$defs/Text"
+                },
+                "retryable": {
+                  "const": true
+                },
+                "attemptedWorkspace": {
+                  "$ref": "#/$defs/AttemptedWorkspace"
+                }
+              },
+              "required": [
+                "code",
+                "message",
+                "retryable",
+                "currentBasis",
+                "currentContentHash",
+                "attemptedWorkspace"
+              ],
+              "type": "object"
+            },
+            "requestId": {
+              "oneOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "maximum": 9007199254740991,
+                  "minimum": -9007199254740991,
+                  "type": "integer"
+                }
+              ]
+            },
+            "schemaVersion": {
+              "const": 1
+            }
+          },
+          "required": [
+            "schemaVersion",
+            "requestId",
+            "error"
+          ],
+          "type": "object"
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -665,6 +726,9 @@
         },
         {
           "$ref": "#/$defs/InvalidWorkspaceFailure"
+        },
+        {
+          "$ref": "#/$defs/AdmissionFailure"
         }
       ]
     }
@@ -1510,6 +1574,67 @@
             "daemon_unavailable",
             "outcome_unknown"
           ]
+        },
+        "AdmissionFailure": {
+          "additionalProperties": false,
+          "properties": {
+            "error": {
+              "additionalProperties": false,
+              "properties": {
+                "code": {
+                  "enum": [
+                    "too_many_requests",
+                    "deadline_exceeded"
+                  ]
+                },
+                "currentBasis": {
+                  "const": null
+                },
+                "currentContentHash": {
+                  "const": null
+                },
+                "message": {
+                  "$ref": "#/$defs/Text"
+                },
+                "retryable": {
+                  "const": true
+                },
+                "attemptedWorkspace": {
+                  "$ref": "#/$defs/AttemptedWorkspace"
+                }
+              },
+              "required": [
+                "code",
+                "message",
+                "retryable",
+                "currentBasis",
+                "currentContentHash",
+                "attemptedWorkspace"
+              ],
+              "type": "object"
+            },
+            "requestId": {
+              "oneOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "maximum": 9007199254740991,
+                  "minimum": -9007199254740991,
+                  "type": "integer"
+                }
+              ]
+            },
+            "schemaVersion": {
+              "const": 1
+            }
+          },
+          "required": [
+            "schemaVersion",
+            "requestId",
+            "error"
+          ],
+          "type": "object"
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1626,6 +1751,9 @@
         },
         {
           "$ref": "#/$defs/InvalidWorkspaceFailure"
+        },
+        {
+          "$ref": "#/$defs/AdmissionFailure"
         }
       ]
     }
@@ -3128,6 +3256,67 @@
             "daemon_unavailable",
             "outcome_unknown"
           ]
+        },
+        "AdmissionFailure": {
+          "additionalProperties": false,
+          "properties": {
+            "error": {
+              "additionalProperties": false,
+              "properties": {
+                "code": {
+                  "enum": [
+                    "too_many_requests",
+                    "deadline_exceeded"
+                  ]
+                },
+                "currentBasis": {
+                  "const": null
+                },
+                "currentContentHash": {
+                  "const": null
+                },
+                "message": {
+                  "$ref": "#/$defs/Text"
+                },
+                "retryable": {
+                  "const": true
+                },
+                "attemptedWorkspace": {
+                  "$ref": "#/$defs/AttemptedWorkspace"
+                }
+              },
+              "required": [
+                "code",
+                "message",
+                "retryable",
+                "currentBasis",
+                "currentContentHash",
+                "attemptedWorkspace"
+              ],
+              "type": "object"
+            },
+            "requestId": {
+              "oneOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "maximum": 9007199254740991,
+                  "minimum": -9007199254740991,
+                  "type": "integer"
+                }
+              ]
+            },
+            "schemaVersion": {
+              "const": 1
+            }
+          },
+          "required": [
+            "schemaVersion",
+            "requestId",
+            "error"
+          ],
+          "type": "object"
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -3294,6 +3483,9 @@
         },
         {
           "$ref": "#/$defs/InvalidWorkspaceFailure"
+        },
+        {
+          "$ref": "#/$defs/AdmissionFailure"
         }
       ]
     }
@@ -3801,6 +3993,67 @@
             "daemon_unavailable",
             "outcome_unknown"
           ]
+        },
+        "AdmissionFailure": {
+          "additionalProperties": false,
+          "properties": {
+            "error": {
+              "additionalProperties": false,
+              "properties": {
+                "code": {
+                  "enum": [
+                    "too_many_requests",
+                    "deadline_exceeded"
+                  ]
+                },
+                "currentBasis": {
+                  "const": null
+                },
+                "currentContentHash": {
+                  "const": null
+                },
+                "message": {
+                  "$ref": "#/$defs/Text"
+                },
+                "retryable": {
+                  "const": true
+                },
+                "attemptedWorkspace": {
+                  "$ref": "#/$defs/AttemptedWorkspace"
+                }
+              },
+              "required": [
+                "code",
+                "message",
+                "retryable",
+                "currentBasis",
+                "currentContentHash",
+                "attemptedWorkspace"
+              ],
+              "type": "object"
+            },
+            "requestId": {
+              "oneOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "maximum": 9007199254740991,
+                  "minimum": -9007199254740991,
+                  "type": "integer"
+                }
+              ]
+            },
+            "schemaVersion": {
+              "const": 1
+            }
+          },
+          "required": [
+            "schemaVersion",
+            "requestId",
+            "error"
+          ],
+          "type": "object"
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -3924,6 +4177,9 @@
         },
         {
           "$ref": "#/$defs/InvalidWorkspaceFailure"
+        },
+        {
+          "$ref": "#/$defs/AdmissionFailure"
         }
       ]
     }

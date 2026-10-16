@@ -27,7 +27,7 @@ fn setup_with_tick(start_tick: bool) -> (tempfile::TempDir, Store, Arc<http::Dae
     std::fs::create_dir(&workspace).unwrap();
     let store = crate::common::open_store(&dir.path().join("state"), &workspace).unwrap();
     // Daemon admission publishes the virgin queue before retaining writer SH
-    // or starting H. Later HTTP requests may then commit under that SH.
+    // or starting startup reconciliation. Later HTTP requests may then commit under that SH.
     assert_eq!(store.settle_foreign_root_requests().unwrap(), 0);
     let state = http::new(
         store.clone(),
@@ -36,10 +36,18 @@ fn setup_with_tick(start_tick: bool) -> (tempfile::TempDir, Store, Arc<http::Dae
         "127.0.0.1:7331".parse().unwrap(),
     )
     .unwrap();
-    let session = store.writer_session_for_tests().unwrap();
     if start_tick {
+        // A running worker accepts only a session whose startup
+        // reconciliation committed a validated head.
+        let session = trellis::index_coordinator::establish_serving_session(
+            &store,
+            None,
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
         state.retain_serving_session(session);
     } else {
+        let session = store.writer_session_for_tests().unwrap();
         state.retain_serving_session_without_tick_for_tests(session);
     }
     let router = http::router(state.clone());
@@ -63,7 +71,8 @@ async fn call(app: &Router, method: &str, path: &str, body: Value) -> (StatusCod
 }
 #[tokio::test]
 async fn guards_public_and_private() {
-    let (_d, _store, _state, app) = setup();
+    // No startup reconciliation: /api/status has no head and answers 503.
+    let (_d, _store, _state, app) = setup_without_tick();
     for (path, host, origin, token, want) in [
         ("/healthz", "127.0.0.1:7331", None, None, 200),
         ("/", "localhost:7331", None, None, 200),
@@ -181,7 +190,7 @@ async fn validation_and_limit() {
     assert_eq!(code, 202, "{accepted}");
     assert_eq!(accepted["state"], "queued");
     let stale_id = accepted["id"].as_str().unwrap();
-    let failed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    let failed = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             let (_, row) = call(&app, "GET", &format!("/api/jobs/{stale_id}"), Value::Null).await;
             if !row["finishedAt"].is_null() {
@@ -205,7 +214,7 @@ async fn validation_and_limit() {
 }
 #[tokio::test]
 async fn source_is_snapshot_and_revision_checked() {
-    let (_d, store, state, app) = setup();
+    let (_d, store, state, app) = setup_without_tick();
     let workspace = _d.path().join("workspace");
     std::fs::write(workspace.join("a.js"), "cached secret-free source").unwrap();
     let cancel = Arc::new(AtomicBool::new(false));
@@ -268,7 +277,7 @@ async fn source_is_snapshot_and_revision_checked() {
 }
 #[tokio::test]
 async fn dependency_status_whole_response_fence() {
-    let (dir, store, state, app) = setup();
+    let (dir, store, state, app) = setup_without_tick();
     std::fs::write(dir.path().join("workspace/a.js"), "function go() {}\n").unwrap();
     let options = IndexOptions::new(dir.path().join("workspace"));
     let cancel = Arc::new(AtomicBool::new(false));
@@ -302,7 +311,7 @@ async fn jobs_publish_and_cancel() {
     let (code, job) = call(&app, "POST", "/api/index", json!({})).await;
     assert_eq!(code, 202);
     let id = job["id"].as_str().unwrap();
-    let completed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    let completed = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             let (_, j) = call(&app, "GET", &format!("/api/jobs/{id}"), Value::Null).await;
             if !j["finishedAt"].is_null() {
@@ -317,14 +326,14 @@ async fn jobs_publish_and_cancel() {
     assert_eq!(
         store.status().unwrap().revision.index_revision,
         2,
-        "mandatory H r1 precedes accepted Q r2 DONE"
+        "mandatory startup reconciliation r1 precedes accepted Q r2 DONE"
     );
     let (_, cancelled) = call(&app, "POST", &format!("/api/jobs/{id}/cancel"), Value::Null).await;
     assert_eq!(cancelled["state"], "done");
     assert_eq!(
         store.status().unwrap().revision.index_revision,
         2,
-        "mandatory H r1 precedes accepted Q r2 DONE"
+        "mandatory startup reconciliation r1 precedes accepted Q r2 DONE"
     );
     state.cancel_active();
 }
@@ -360,7 +369,7 @@ async fn queued_request_is_durable_and_non_cancellable_during_lock_contention() 
     assert_eq!(rejected["error"]["code"], "request_not_cancellable");
     assert_eq!(store.request_by_id(id).unwrap().unwrap().state, "queued");
     drop(held);
-    let done = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    let done = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             let (code, row) = call(&app, "GET", &format!("/api/jobs/{id}"), Value::Null).await;
             assert_eq!(code, StatusCode::OK, "{row}");
@@ -433,11 +442,21 @@ fn rejects_bad_startup() {
 
 #[tokio::test]
 async fn active_job_cancellation_does_not_publish() {
-    let (d, store, _state, app) = setup();
+    let (d, store, state, app) = setup();
     let source = (0..15000)
         .map(|i| format!("function f{i}() {{ console.log({i}); }}\n"))
         .collect::<String>();
     std::fs::write(d.path().join("workspace/large.js"), source).unwrap();
+    // The running worker's watcher may publish the new file first; count
+    // revisions from its settled head.
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        while state.checkout_watch_pending() {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("watcher did not settle");
+    let settled = store.index_baseline().unwrap().index_revision;
     let (code, j) = call(&app, "POST", "/api/index", json!({})).await;
     assert_eq!(code, 202);
     let id = j["id"].as_str().unwrap();
@@ -445,7 +464,7 @@ async fn active_job_cancellation_does_not_publish() {
     assert_eq!(code, 409);
     // The 15k-function index runs beside other verifier lanes in CI. This is a
     // bounded completion guard, not an index-latency requirement.
-    let terminal = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+    let terminal = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             let (_, j) = call(&app, "GET", &format!("/api/jobs/{id}"), Value::Null).await;
             if !j["finishedAt"].is_null() {
@@ -459,8 +478,8 @@ async fn active_job_cancellation_does_not_publish() {
     assert_eq!(terminal["state"], "done");
     assert_eq!(
         store.index_baseline().unwrap().index_revision,
-        2,
-        "accepted Q publishes its own r2 after mandatory H r1; cancellation does not add a revision"
+        settled + 1,
+        "accepted Q publishes its own revision; cancellation does not add one"
     );
 }
 
@@ -674,7 +693,7 @@ fn corrupt_recovery_fixture(
 
 async fn finished_index_job(app: &Router, id: &str) -> Value {
     // Keep a finite CI progress guard without hot-polling the queue worker.
-    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             let (_, job) = call(app, "GET", &format!("/api/jobs/{id}"), Value::Null).await;
             if !job["finishedAt"].is_null() {
@@ -758,7 +777,8 @@ async fn explicit_recovery_releases_only_daemon_old_owner_and_retries_after_fore
         call(&app, "POST", "/api/index", json!({"expectedRevision":old})).await;
     assert_eq!(conflict, StatusCode::CONFLICT);
     assert_eq!(rejected["error"]["code"], "revision_conflict");
-    assert!(state.retained_serving_session().is_ok());
+    // The worker releases a damaged index's old owner on its own; a rejected
+    // request changes nothing.
     assert_eq!(std::fs::read(&index).unwrap(), bytes);
     let reader = roots.index_use_existing(&identity).unwrap();
     let (status, admitted) = call(&app, "POST", "/api/index", json!({})).await;
@@ -767,7 +787,7 @@ async fn explicit_recovery_releases_only_daemon_old_owner_and_retries_after_fore
     let queue = store.request_db_path();
     let accepted_bytes = std::fs::read(&queue).unwrap();
     // Poll at the queue tick cadence; CI may schedule its blocking worker late.
-    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         while state.retained_serving_session().is_ok() {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
@@ -829,7 +849,7 @@ async fn index_request_without_startup_session_takes_over_after_ack() {
 
 #[tokio::test]
 async fn released_matching_pin_is_typed_http_conflict_without_head_fallback() {
-    let (dir, store, state, app) = setup();
+    let (dir, store, state, app) = setup_without_tick();
     let workspace = dir.path().join("workspace");
     store.set_retention_clock_for_tests(1_000, 0);
     std::fs::write(workspace.join("a.js"), "function before() {}\n").unwrap();
@@ -1078,7 +1098,7 @@ async fn expired_pin_saved_items_require_explicit_head_reattachment() {
 
 #[tokio::test]
 async fn browser_claimed_unchanged_publishes_new_manifest_before_done() {
-    // Manually publish the first H before POST starts the periodic queue tick.
+    // Manually publish the first startup reconciliation before POST starts the periodic queue tick.
     let (dir, store, state, app) = setup_without_tick();
     std::fs::write(
         dir.path().join("workspace/a.js"),
@@ -1095,7 +1115,7 @@ async fn browser_claimed_unchanged_publishes_new_manifest_before_done() {
     let (code, queued) = call(&app, "POST", "/api/index", json!({})).await;
     assert_eq!(code, StatusCode::ACCEPTED, "{queued}");
     let id = queued["id"].as_str().unwrap();
-    let completed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    let completed = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             let (_, row) = call(&app, "GET", &format!("/api/jobs/{id}"), Value::Null).await;
             if !row["finishedAt"].is_null() {

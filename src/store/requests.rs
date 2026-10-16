@@ -613,7 +613,7 @@ impl Store {
     }
     /// Prepare a virgin queue before exposing a new checkout runtime to
     /// selected reads. Otherwise repeated cold status reads can hold SH while
-    /// mandatory H tries to publish the queue under EX.
+    /// mandatory startup reconciliation tries to publish the queue under EX.
     pub(crate) fn prepare_virgin_queue_before_activation(&self) -> Result<()> {
         self.identity.verify()?;
         let path = self.request_db_path();
@@ -622,8 +622,8 @@ impl Store {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
-        // Existing queues and prior heads retain the ordinary H settlement
-        // path, so validated prior-head reads remain available during H.
+        // Existing queues and prior heads retain the ordinary startup reconciliation settlement
+        // path, so validated prior-head reads remain available during startup reconciliation.
         if !self.is_ready_disposition() || self.index_baseline()?.index_revision != 0 {
             return Ok(());
         }
@@ -966,6 +966,8 @@ impl Store {
         after_write_lock: impl FnOnce(),
         after_insert: impl FnOnce(),
     ) -> Result<Request> {
+        // In flight from before the transaction until after the wake.
+        let _in_flight = self.enqueue_in_flight();
         self.identity.verify()?;
         let selected = std::fs::symlink_metadata(&options.workspace_root)?;
         ensure!(
@@ -998,6 +1000,11 @@ impl Store {
         let seq = tx.last_insert_rowid();
         after_insert();
         tx.commit()?;
+        #[cfg(feature = "test-support")]
+        self.run_after_enqueue_commit_hook();
+        crate::index_coordinator::diagnostic_marker("-", "request_enqueued", &format!("id={id}"));
+        // The row is durable: wake the checkout's worker, which re-reads the queue.
+        self.wake_queue_workers();
         self.identity.verify()?;
         // Return the exact accepted row constructed under the INSERT transaction.
         // The local writer may claim immediately after COMMIT; reading it back would race
@@ -1202,6 +1209,9 @@ impl Store {
                 let (_guard, reread) = self.request_connection_for_root_loss(true, true)?;
                 let confirmed = attest_prior_root_rows(&reread, &seen)?
                     && self.old_root_pending_in(&reread)? == 0;
+                if confirmed && !seen.is_empty() {
+                    self.notify_terminal_waiters();
+                }
                 if confirmed {
                     ensure!(
                         self.identity.root_path_replaced()?,
@@ -1232,7 +1242,7 @@ impl Store {
             |row| row.get(0),
         ))
     }
-    /// Settle every accepted foreign-root row before the new root's H or FIFO claim.
+    /// Settle every accepted foreign-root row before the new root's startup reconciliation or FIFO claim.
     /// The caller serializes checkout writers. Opening the existing queue first lets
     /// SQLite recover a hot journal before deciding which rows were accepted.
     pub fn settle_foreign_root_requests(&self) -> Result<usize> {
@@ -1246,7 +1256,7 @@ impl Store {
         let path = self.request_db_path();
         if matches!(fs::symlink_metadata(&path), Err(ref error) if error.kind() == std::io::ErrorKind::NotFound)
         {
-            // A new daemon creates its queue before first H. After a published
+            // A new daemon creates its queue before first startup reconciliation. After a published
             // head, absence is corruption: accepted IDs could have been lost.
             ensure!(
                 self.is_ready_disposition()
@@ -1261,7 +1271,7 @@ impl Store {
         let mut after_commit = Some(after_commit);
         let mut seen = Vec::<Request>::new();
         // Each protected open has SQLite's three-second busy timeout. Two
-        // attempts bound contention; never start H or claim on uncertain rows.
+        // attempts bound contention; never start startup reconciliation or claim on uncertain rows.
         for attempt_number in 0..2 {
             let attempt = (|| -> Result<bool> {
                 let (_guard, mut db) = self
@@ -1324,6 +1334,9 @@ impl Store {
                     &self.identity.device.to_string(),
                     &self.identity.inode.to_string(),
                 )? && attest_prior_root_rows(&reread, &seen)?;
+                if confirmed && !affected.is_empty() {
+                    self.notify_terminal_waiters();
+                }
                 if confirmed {
                     self.identity.verify()?;
                 }
@@ -1346,7 +1359,7 @@ impl Store {
 
     pub fn claim_request(&self, session: &WriterSession) -> Result<Option<Request>> {
         // EX ownership alone is not authority to claim. The same incarnation
-        // must first commit and attest its selected post-acquisition H.
+        // must first commit and attest its selected post-acquisition startup reconciliation.
         self.verify_committed_writer_claim(session)?;
         let (_guard, mut db) = self.request_connection()?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1368,6 +1381,11 @@ impl Store {
             read,
         )?;
         tx.commit()?;
+        crate::index_coordinator::diagnostic_marker(
+            "-",
+            "request_claimed",
+            &format!("id={}", claimed.id),
+        );
         Ok(Some(claimed))
     }
     /// Resolve an operational publish BUSY before retrying an accepted claim.
@@ -1467,6 +1485,15 @@ impl Store {
         Ok(())
     }
 
+    /// Make the next completion COMMIT durable but report an error, as an
+    /// ambiguous COMMIT does, before any waiter is signalled.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn fail_next_completion_after_commit_for_tests(&self) {
+        self.test_ambiguous_completion_once
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
     /// Wake one in-process test after this exact accepted ID commits terminally.
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
@@ -1534,6 +1561,8 @@ impl Store {
                 "revision conflict: cached completion differs from durable terminal"
             );
             *slot = None;
+            // An earlier ambiguous COMMIT is confirmed only now: wake waiters.
+            self.notify_terminal_waiters();
             return Ok(true);
         }
         ensure!(
@@ -1560,6 +1589,8 @@ impl Store {
                     pending.outcome.matches_terminal(&reread),
                     "revision conflict: cached completion differs from durable terminal"
                 );
+                // The ambiguous COMMIT is confirmed by this reread: wake waiters.
+                self.notify_terminal_waiters();
             } else {
                 return Err(error);
             }
@@ -1615,6 +1646,19 @@ impl Store {
         let changed=tx.execute("UPDATE requests SET state=?1,result_generation=?2,result_revision=?3,error_code=?4,finished_at=?5 WHERE seq=?6 AND state='running' AND claim_incarnation=?7 AND root_device=?8 AND root_inode=?9",params![if code.is_some(){"failed"}else{"done"},generation,revision,code,now(),request.seq,session.incarnation().to_string(),self.identity.device.to_string(),self.identity.inode.to_string()])?;
         ensure!(changed == 1, "storage_busy: request claim changed");
         tx.commit()?;
+        #[cfg(feature = "test-support")]
+        if self
+            .test_ambiguous_completion_once
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            anyhow::bail!("storage_busy: injected ambiguous completion COMMIT");
+        }
+        crate::index_coordinator::diagnostic_marker(
+            "-",
+            "request_terminal",
+            &format!("id={} failed={}", request.id, code.is_some()),
+        );
+        self.notify_terminal_waiters();
         #[cfg(any(test, feature = "test-support"))]
         {
             let notify = {
@@ -2212,7 +2256,7 @@ mod foreign_root_settlement_tests {
     }
 
     #[test]
-    fn accepted_before_h_accidentally_truncated_v0_is_never_initialized() {
+    fn accepted_before_startup_accidentally_truncated_v0_is_never_initialized() {
         let state = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
         let store = Store::open_for_tests(state.path(), root.path()).unwrap();
@@ -2251,13 +2295,17 @@ mod foreign_root_settlement_tests {
             second.bootstrap_missing_queue(
                 |_| {
                     staged_tx.send(()).unwrap();
-                    resume_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    resume_rx
+                        .recv_timeout(crate::testing::HANG_BACKSTOP)
+                        .unwrap();
                     Ok(())
                 },
                 |_| Ok(()),
             )
         });
-        staged_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        staged_rx
+            .recv_timeout(crate::testing::HANG_BACKSTOP)
+            .unwrap();
         let main_absent = !store.request_db_path().exists();
         let contender = store.bootstrap_missing_queue(|_| Ok(()), |_| Ok(()));
         resume_tx.send(()).unwrap();
@@ -2289,13 +2337,17 @@ mod foreign_root_settlement_tests {
             builder.bootstrap_missing_queue(
                 |_| {
                     staged_tx.send(()).unwrap();
-                    resume_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    resume_rx
+                        .recv_timeout(crate::testing::HANG_BACKSTOP)
+                        .unwrap();
                     Ok(())
                 },
                 |_| Ok(()),
             )
         });
-        staged_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        staged_rx
+            .recv_timeout(crate::testing::HANG_BACKSTOP)
+            .unwrap();
         let (retry_tx, retry_rx) = mpsc::channel();
         let hook = caller.test_queue_before_shared_hook.clone();
         caller.test_queue_before_shared_hook.set(move || {
@@ -2304,7 +2356,7 @@ mod foreign_root_settlement_tests {
         let options = IndexOptions::new(root.path().to_owned());
         let queued = std::thread::spawn(move || caller.enqueue_request(&options, None));
         // The second SH attempt proves the first one failed under builder EX.
-        let reached_retry = retry_rx.recv_timeout(Duration::from_secs(5));
+        let reached_retry = retry_rx.recv_timeout(crate::testing::HANG_BACKSTOP);
         // Release EX and join even when the expected retry signal was missed.
         resume_tx.send(()).unwrap();
         creator.join().unwrap().unwrap();
@@ -2335,13 +2387,17 @@ mod foreign_root_settlement_tests {
             builder.bootstrap_missing_queue(
                 |_| {
                     staged_tx.send(()).unwrap();
-                    resume_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    resume_rx
+                        .recv_timeout(crate::testing::HANG_BACKSTOP)
+                        .unwrap();
                     Ok(())
                 },
                 |_| Ok(()),
             )
         });
-        staged_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        staged_rx
+            .recv_timeout(crate::testing::HANG_BACKSTOP)
+            .unwrap();
         let error = caller
             .request_connection_for_enqueue_until(Instant::now())
             .err()
@@ -2371,7 +2427,7 @@ mod foreign_root_settlement_tests {
     }
 
     #[test]
-    fn missing_virgin_queue_bootstraps_empty_queue_before_first_h() {
+    fn missing_virgin_queue_bootstraps_empty_queue_before_first_startup() {
         let state = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
         let store = Store::open_for_tests(state.path(), root.path()).unwrap();
