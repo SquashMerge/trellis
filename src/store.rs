@@ -2424,9 +2424,10 @@ impl std::error::Error for SqliteContention {}
 
 const HOT_INDEX_JOURNAL: &str = "recovery_required: hot index journal";
 
-/// Whether `index.db-journal` may be hot: non-empty and starting with SQLite's
-/// journal magic. An unreadable journal counts, so its recovery attempt
-/// reports a typed deferral instead of skipping it.
+/// Whether `index.db-journal` may be hot: starting with SQLite's journal
+/// magic. A journal shorter than the magic is cold. An otherwise unreadable
+/// journal counts, so its recovery attempt reports a typed deferral instead of
+/// skipping it.
 fn hot_index_journal_present(index: &Path) -> Result<bool> {
     use std::io::Read;
     const MAGIC: [u8; 8] = [0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7];
@@ -2438,9 +2439,11 @@ fn hot_index_journal_present(index: &Path) -> Result<bool> {
         Ok(_) => {}
     }
     let mut magic = [0u8; 8];
-    Ok(std::fs::File::open(&journal)
-        .and_then(|mut file| file.read_exact(&mut magic))
-        .map_or(true, |()| magic == MAGIC))
+    match std::fs::File::open(&journal).and_then(|mut file| file.read_exact(&mut magic)) {
+        Ok(()) => Ok(magic == MAGIC),
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(_) => Ok(true),
+    }
 }
 
 fn storage_result<T>(result: rusqlite::Result<T>) -> Result<T> {

@@ -379,3 +379,30 @@ async fn killed_mid_index_commit_recovers(torn_header: bool) {
         "the resumed publication indexed the rewritten tree"
     );
 }
+
+/// A journal shorter than SQLite's magic is cold, never a hot journal to roll
+/// back: first activation of an index with a corrupt header takes the same
+/// path as with no journal at all, never `recovery_deferred`.
+#[test]
+fn short_cold_journal_does_not_defer_first_activation() {
+    use std::os::unix::fs::FileExt;
+    for journal_len in [None, Some(1), Some(7)] {
+        let base = tempfile::tempdir().unwrap();
+        let state = base.path().join("state");
+        let root = base.path().join("work");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("a.js"), "function a() {}\n").unwrap();
+        drop(Store::open(roots(&state), identity(&root)).unwrap());
+        let index = index_db(&state, &root);
+        let file = fs::OpenOptions::new().write(true).open(&index).unwrap();
+        file.write_all_at(&[0u8; 100], 0).unwrap();
+        file.sync_all().unwrap();
+        if let Some(len) = journal_len {
+            fs::write(index.with_file_name("index.db-journal"), vec![0xd9; len]).unwrap();
+        }
+        // The corrupt header goes to the existing recreation path: the store
+        // opens (recreate pending), exactly as with no journal.
+        let opened = Store::open(roots(&state), identity(&root)).map(|_| ());
+        assert!(opened.is_ok(), "{journal_len:?}: {opened:?}");
+    }
+}
