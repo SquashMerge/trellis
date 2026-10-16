@@ -458,6 +458,62 @@ fn mcp_callee_text(
     Ok((Some(text[..end].to_owned()), end < text.len()))
 }
 
+// Only optional candidate work installs this handler on the admitted snapshot.
+// Remove it before the connection finishes or can serve another read.
+struct OptionalHintProgress<'a> {
+    now: &'a dyn Fn() -> std::time::Instant,
+    end: std::time::Instant,
+}
+
+impl OptionalHintProgress<'_> {
+    fn expired(&self) -> bool {
+        (self.now)() >= self.end
+    }
+}
+
+unsafe extern "C" fn optional_hint_progress_callback(arg: *mut std::ffi::c_void) -> libc::c_int {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: the scope below outlives its SQLite progress registration.
+        let progress = unsafe { &*(arg as *const OptionalHintProgress<'_>) };
+        i32::from(progress.expired())
+    }))
+    .unwrap_or(1)
+}
+
+struct OptionalHintProgressGuard(*mut rusqlite::ffi::sqlite3);
+impl Drop for OptionalHintProgressGuard {
+    fn drop(&mut self) {
+        // SAFETY: the admitted connection remains alive until after this guard.
+        unsafe { rusqlite::ffi::sqlite3_progress_handler(self.0, 0, None, std::ptr::null_mut()) };
+    }
+}
+
+fn optional_hint_interrupt(error: &rusqlite::Error, progress: &OptionalHintProgress<'_>) -> bool {
+    progress.expired()
+        && matches!(error, rusqlite::Error::SqliteFailure(info, _)
+            if info.code == rusqlite::ErrorCode::OperationInterrupted)
+}
+
+fn install_optional_hint_progress(
+    db: &rusqlite::Connection,
+    progress: &OptionalHintProgress<'_>,
+) -> OptionalHintProgressGuard {
+    // SAFETY: only this thread uses the admitted connection. The guard removes
+    // the handler before `progress` or the connection can be dropped.
+    let handle = unsafe { db.handle() };
+    unsafe {
+        rusqlite::ffi::sqlite3_progress_handler(
+            handle,
+            256,
+            Some(optional_hint_progress_callback),
+            (progress as *const OptionalHintProgress<'_>)
+                .cast_mut()
+                .cast(),
+        );
+    }
+    OptionalHintProgressGuard(handle)
+}
+
 impl EvidenceResponse {
     pub fn mcp_outgoing(
         &self,
@@ -465,6 +521,7 @@ impl EvidenceResponse {
         limit: usize,
         expected: Option<IndexPin>,
         hint_now: &dyn Fn() -> std::time::Instant,
+        required_deadline: std::time::Instant,
     ) -> Result<Option<McpOutgoing>> {
         use crate::native_evidence::{DocumentKey, Provenance};
         let selected = self.store.read_revision_for(&self.db, None, true)?;
@@ -517,11 +574,32 @@ impl EvidenceResponse {
                 omitted: Some(0),
             });
         }
-        let hint_end = hint_now() + std::time::Duration::from_millis(1000);
+        #[cfg(feature = "test-support")]
+        crate::mcp::phase_hook("outgoing_hint_start").map_err(|e| anyhow::anyhow!(e))?;
+        // Leave time to finish the selected read and serialize/send its mandatory
+        // answer. Optional hints never extend the accepted call's deadline.
+        let required_hint_end = required_deadline
+            .checked_sub(std::time::Duration::from_millis(75))
+            .unwrap_or(required_deadline);
+        let progress = OptionalHintProgress {
+            now: hint_now,
+            end: (hint_now() + std::time::Duration::from_millis(1000)).min(required_hint_end),
+        };
         #[cfg(feature = "test-support")]
         crate::mcp::phase_hook("outgoing_hint").map_err(|e| anyhow::anyhow!(e))?;
-        for item in &mut calls {
-            if hint_now() >= hint_end {
+        // SQLite checks inside long optional statements as well as between rows.
+        // The read-only selected snapshot already holds its shared lock; no new
+        // connection or lock transition is needed for these candidate SELECTs.
+        let _progress_guard =
+            (!calls.is_empty()).then(|| install_optional_hint_progress(&self.db, &progress));
+        for (item_index, item) in calls.iter_mut().enumerate() {
+            #[cfg(feature = "test-support")]
+            if item_index == 1 {
+                crate::mcp::phase_hook("outgoing_hint_item_1").map_err(|e| anyhow::anyhow!(e))?;
+            }
+            #[cfg(not(feature = "test-support"))]
+            let _ = item_index;
+            if progress.expired() {
                 item.omitted = None;
                 continue;
             }
@@ -541,26 +619,54 @@ impl EvidenceResponse {
             let Ok(lookup) = crate::native_evidence::lookup(&scope.key.language, token) else {
                 continue;
             };
-            let mut statement = self.db.prepare(
+            let mut statement = match self.db.prepare(
                 "SELECT d.version_id,d.syntax_id,m.source_set_id,m.language,m.path
                  FROM native_version_declarations d JOIN revision_documents m
                    ON m.document_version_id=d.version_id AND m.revision_id=?1
                  WHERE m.source_set_id=?2 AND m.language=?3 AND d.lookup_key=?4",
-            )?;
-            let mut rows = statement.query(params![
+            ) {
+                Ok(statement) => statement,
+                Err(error) if optional_hint_interrupt(&error, &progress) => {
+                    item.omitted = None;
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let mut rows = match statement.query(params![
                 selected.key,
                 scope.key.source_set_id,
                 scope.key.language,
                 lookup
-            ])?;
+            ]) {
+                Ok(rows) => rows,
+                Err(error) if optional_hint_interrupt(&error, &progress) => {
+                    item.omitted = None;
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
             let mut candidates = BTreeMap::<String, McpOutgoingCandidate>::new();
             let mut timed_out = false;
             loop {
-                if hint_now() >= hint_end {
+                if progress.expired() {
                     timed_out = true;
                     break;
                 }
-                let Some(row) = rows.next()? else { break };
+                let row = match rows.next() {
+                    Ok(row) => row,
+                    Err(error) if optional_hint_interrupt(&error, &progress) => {
+                        timed_out = true;
+                        break;
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                let Some(row) = row else { break };
+                #[cfg(feature = "test-support")]
+                crate::mcp::phase_hook("outgoing_hint_row").map_err(|e| anyhow::anyhow!(e))?;
+                if progress.expired() {
+                    timed_out = true;
+                    break;
+                }
                 let version: String = row.get(0)?;
                 let id: String = row.get(1)?;
                 let key = DocumentKey {
@@ -626,12 +732,23 @@ impl EvidenceResponse {
                         provenance,
                     }))
                 })();
-                let Ok(Some(candidate)) = candidate else {
-                    continue;
+                let candidate = match candidate {
+                    Ok(Some(candidate)) => candidate,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        if error
+                            .downcast_ref::<rusqlite::Error>()
+                            .is_some_and(|sqlite| optional_hint_interrupt(sqlite, &progress))
+                        {
+                            timed_out = true;
+                            break;
+                        }
+                        continue;
+                    }
                 };
                 insert_mcp_candidate(&mut candidates, id, candidate)?;
             }
-            if timed_out || hint_now() >= hint_end {
+            if timed_out || progress.expired() {
                 item.omitted = None;
                 continue;
             }
@@ -750,6 +867,41 @@ mod outgoing_tests {
                 .unwrap_err()
                 .to_string()
                 .contains("conflicting duplicate native hint")
+        );
+    }
+
+    #[test]
+    fn expired_optional_sqlite_work_interrupts_and_restores_selected_connection() {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        let ticks = std::cell::Cell::new(0);
+        let start = std::time::Instant::now();
+        let clock = || {
+            let tick = ticks.get();
+            ticks.set(tick + 1);
+            if tick < 2 {
+                start
+            } else {
+                start + std::time::Duration::from_secs(61)
+            }
+        };
+        let progress = OptionalHintProgress {
+            now: &clock,
+            end: start + std::time::Duration::from_secs(60),
+        };
+        let guard = install_optional_hint_progress(&db, &progress);
+        let error = db
+            .query_row(
+                "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<100000) SELECT sum(x) FROM n",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_err();
+        assert!(optional_hint_interrupt(&error, &progress), "{error}");
+        drop(guard);
+        assert_eq!(
+            db.query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
         );
     }
 

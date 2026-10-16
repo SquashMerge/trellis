@@ -863,6 +863,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                                 limit,
                                 expected.as_ref().ok().and_then(|pin| *pin),
                                 &|| runtime.mcp_clock_now(),
+                                deadline,
                             ) {
                                 Ok(Some(result)) => projection::outgoing(
                                     &id,

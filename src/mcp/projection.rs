@@ -673,4 +673,124 @@ mod outgoing_tests {
         );
         assert_eq!(clipped["data"]["calls"][0]["targetId"], Value::Null);
     }
+    fn required_call(clipped: bool) -> McpOutgoingCall {
+        let owner = owner();
+        McpOutgoingCall {
+            call: serde_json::from_value(json!({
+                "id":"cid:v1:1","ownerSyntaxId":owner.declaration.syntax_id,
+                "ordinal":0,"document":owner.declaration.document,
+                "revisionId":"revision:v2:test","range":{"start":21,"end":30},
+                "calleeRange":{"start":21,"end":25},"spelling":"Target",
+                "regionIds":[],"provenanceId":"native-proof:v1:test"
+            }))
+            .unwrap(),
+            content_hash: "a".repeat(64),
+            callee_text: Some("é".repeat(512)),
+            callee_text_truncated: clipped,
+            candidates: vec![],
+            omitted: Some(0),
+        }
+    }
+
+    #[test]
+    fn fixed_closure_and_first_required_call_never_become_empty_success() {
+        let root = std::path::Path::new("/workspace");
+        for modern in [true, false] {
+            let fits_empty = |diagnostic_size| {
+                let mut selected = owner();
+                selected.coverage[0].diagnostic = Some("x".repeat(diagnostic_size));
+                outgoing(
+                    &json!(1),
+                    McpOutgoing {
+                        owner: selected,
+                        calls: vec![],
+                        has_more: false,
+                    },
+                    root,
+                    false,
+                    modern,
+                )
+                .is_some()
+            };
+            let mut low = 0;
+            let mut high = super::super::wire::RESPONSE_BYTES;
+            while low + 1 < high {
+                let middle = low + (high - low) / 2;
+                if fits_empty(middle) {
+                    low = middle;
+                } else {
+                    high = middle;
+                }
+            }
+            assert!(fits_empty(low));
+            assert!(
+                !fits_empty(high),
+                "fixed selected coverage must not be clipped"
+            );
+            let mut selected = owner();
+            selected.coverage[0].diagnostic = Some("x".repeat(low));
+            assert!(
+                outgoing(
+                    &json!(1),
+                    McpOutgoing {
+                        owner: selected,
+                        calls: vec![required_call(false)],
+                        has_more: false,
+                    },
+                    root,
+                    false,
+                    modern
+                )
+                .is_none(),
+                "a required call must not be replaced by an empty success"
+            );
+        }
+    }
+
+    #[test]
+    fn outgoing_truncation_prioritizes_bytes_over_limit_over_callee_text() {
+        let root = std::path::Path::new("/workspace");
+        for modern in [true, false] {
+            let limited = outgoing(
+                &json!(1),
+                McpOutgoing {
+                    owner: owner(),
+                    calls: vec![required_call(true)],
+                    has_more: true,
+                },
+                root,
+                false,
+                modern,
+            )
+            .unwrap();
+            assert_eq!(limited["truncationReason"], "limit");
+            let mut calls = Vec::new();
+            for ordinal in 0..50 {
+                let mut item = required_call(true);
+                item.call.id = format!("cid:v1:{ordinal}");
+                item.call.ordinal = ordinal;
+                calls.push(item);
+            }
+            let bytes = outgoing(
+                &json!(1),
+                McpOutgoing {
+                    owner: owner(),
+                    calls,
+                    has_more: true,
+                },
+                root,
+                false,
+                modern,
+            )
+            .unwrap();
+            let emitted = bytes["data"]["calls"].as_array().unwrap();
+            assert!(!emitted.is_empty() && emitted.len() < 50);
+            assert_eq!(bytes["truncationReason"], "response_bytes");
+            assert!(bytes["truncated"].as_bool().unwrap());
+            assert!(bytes["partial"].as_bool().unwrap());
+            let frame = json!({"jsonrpc":"2.0","id":1,
+                "result":super::super::tools::result(bytes,modern)});
+            assert!(serde_json::to_vec(&frame).unwrap().len() < super::super::wire::RESPONSE_BYTES);
+        }
+    }
 }
