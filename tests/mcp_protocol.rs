@@ -536,6 +536,42 @@ fn exact_tool_for_id(
     );
     exact_tool(v, code, modern, label);
 }
+/// Exact post-H golden responses include the separately serialized text copy.
+fn exact_golden_settled(v: &Value, expected_id: &Value, modern: bool, envelope: Value) {
+    assert_eq!(&v["id"], expected_id, "outer JSON-RPC ID must echo sent ID");
+    assert_eq!(envelope["requestId"], *expected_id);
+    let text = serde_json::to_string(&envelope).unwrap();
+    let mut result = json!({"isError":envelope.get("error").is_some(),
+        "structuredContent":envelope,"content":[{"type":"text","text":text}]});
+    if modern {
+        result["resultType"] = json!("complete");
+    }
+    assert_eq!(
+        *v,
+        json!({"jsonrpc":"2.0","id":expected_id,"result":result})
+    );
+}
+
+fn golden_settled_failure(id: &Value, root: &Value, code: &str, basis: Value) -> Value {
+    let (message, retryable) = match code {
+        "not_found" => ("Not found", false),
+        "revision_conflict" => ("Revision conflict", false),
+        "index_not_ready" => ("Index is not ready", true),
+        _ => panic!("unexpected post-H golden failure {code}"),
+    };
+    json!({"schemaVersion":1,"requestId":id,"workspace":root,
+        "catchingUp":false,"error":{"code":code,"message":message,
+            "retryable":retryable,"currentBasis":basis,"currentContentHash":null}})
+}
+
+fn golden_settled_empty_find(id: &Value, root: &Value, pin: &Value) -> Value {
+    json!({"schemaVersion":1,"requestId":id,"workspace":root,"catchingUp":false,
+        "evidenceBasis":pin,"data":{"symbols":[],"coverage":[],"provenance":[]},
+        "warnings":[{"code":"syntaxOnly","message":"Only syntax evidence is available",
+            "provenanceId":null}],"partial":false,"truncated":false,
+        "truncationReason":null})
+}
+
 fn ready_legacy(peer: &mut Peer) {
     let init = peer.ask(request(
         json!(1),
@@ -1224,8 +1260,8 @@ fn id_boundaries_binary_both_modes_and_unselected() {
     }
 }
 
-#[test]
-fn golden_tool_envelopes_and_maximum_ids_both_modes() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn golden_tool_envelopes_and_maximum_ids_both_modes() {
     let tmp = tempfile::tempdir().unwrap();
     let root = checkout(tmp.path());
     fs::write(root.join("src-sentinel.txt"), b"original source bytes").unwrap();
@@ -1238,8 +1274,12 @@ fn golden_tool_envelopes_and_maximum_ids_both_modes() {
     );
     assert_eq!(2 + 80 * 2 + 20 * 2 + 7 * 6 + 12, 256);
     let names = fixture()["names"].as_array().unwrap().clone();
+    let root_key = trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root)
+        .unwrap()
+        .root_key;
     for legacy in [false, true] {
-        let mut peer = Peer::start(Some(&root));
+        let (mut peer, witness) = Peer::start_with_causal_witness(Some(&root));
+        let mut settled_pin: Option<Value> = None;
         if legacy {
             ready_legacy(&mut peer)
         } else {
@@ -1262,30 +1302,21 @@ fn golden_tool_envelopes_and_maximum_ids_both_modes() {
                 exact_tool_for_id(&invalid, &id, Some("invalid_request"), !legacy, "checkout");
                 let args = fixture()["validArguments"][index].clone();
                 let accepted = peer.ask(call(legacy, id.clone(), name, args));
-                if index == 1 && accepted["result"]["isError"] == false {
-                    tool(&accepted, None, !legacy);
-                    let actual = &accepted["result"]["structuredContent"];
-                    assert_eq!(
-                        actual["data"],
-                        json!({"symbols":[],"coverage":[],"provenance":[]})
-                    );
-                    assert!(actual["evidenceBasis"]["indexRevision"].as_u64().unwrap() > 0);
-                    assert_eq!(actual["partial"], false);
-                    assert_eq!(actual["truncated"], false);
-                    assert_eq!(actual["warnings"].as_array().unwrap().len(), 1);
-                    assert_eq!(actual["warnings"][0]["code"], "syntaxOnly");
+                if index == 0 {
+                    exact_tool_for_id(&accepted, &id, None, !legacy, "checkout");
+                    if settled_pin.is_none() {
+                        settled_pin = Some(await_settled_golden_h(&witness, &root_key).await);
+                    }
                 } else {
-                    exact_tool_for_id(
-                        &accepted,
-                        &id,
-                        if index == 0 {
-                            None
-                        } else {
-                            Some("index_not_ready")
-                        },
-                        !legacy,
-                        "checkout",
-                    );
+                    let published = settled_pin.as_ref().expect("same-lineage H and watch ACK");
+                    let workspace = &accepted["result"]["structuredContent"]["workspace"];
+                    let expected = match index {
+                        1 => golden_settled_empty_find(&id, workspace, published),
+                        2 => golden_settled_failure(&id, workspace, "not_found", published.clone()),
+                        3 => golden_settled_failure(&id, workspace, "index_not_ready", Value::Null),
+                        _ => unreachable!("fixed golden tool order"),
+                    };
+                    exact_golden_settled(&accepted, &id, !legacy, expected);
                 }
             }
         }
@@ -1317,28 +1348,19 @@ fn golden_tool_envelopes_and_maximum_ids_both_modes() {
             ),
         ] {
             let answer = peer.ask(call(legacy, json!(heavy_id), name, args));
-            if name == "trellis_find_symbols"
-                && answer["result"]["structuredContent"]["error"]["code"] == "revision_conflict"
-            {
-                tool(&answer, Some("revision_conflict"), !legacy);
-                let envelope = &answer["result"]["structuredContent"];
-                assert_eq!(answer["id"], json!(heavy_id));
-                assert!(
-                    envelope["error"]["currentBasis"]["indexRevision"]
-                        .as_u64()
-                        .unwrap()
-                        > 0
-                );
-                assert!(envelope.get("data").is_none());
+            let published = settled_pin.as_ref().expect("same-lineage H and watch ACK");
+            let workspace = &answer["result"]["structuredContent"]["workspace"];
+            let (code, basis) = if name == "trellis_read_source" {
+                ("index_not_ready", Value::Null)
             } else {
-                exact_tool_for_id(
-                    &answer,
-                    &json!(heavy_id),
-                    Some("index_not_ready"),
-                    !legacy,
-                    "checkout",
-                );
-            }
+                ("revision_conflict", published.clone())
+            };
+            exact_golden_settled(
+                &answer,
+                &json!(heavy_id),
+                !legacy,
+                golden_settled_failure(&json!(heavy_id), workspace, code, basis),
+            );
         }
         let mut wrong = fixture()["validArguments"][1].clone();
         wrong["limit"] = json!(51);
@@ -2509,6 +2531,44 @@ impl CausalReadiness {
                 .acked
                 .is_some_and(|ack| self.pending.is_some_and(|hint| ack >= hint))
     }
+}
+
+/// H publication and a same-lineage, empty watch ACK settle this golden
+/// checkout. The observed H pin is a causal witness, not a copied tool reply.
+async fn await_settled_golden_h(listener: &tokio::net::UnixListener, root_key: &str) -> Value {
+    let deadline = tokio::time::Instant::now() + trellis::testing::HANG_BACKSTOP;
+    let mut events = Vec::new();
+    let mut published_pin: Option<Value> = None;
+    let mut readiness = CausalReadiness::default();
+    for _ in 0..24 {
+        let event = next_causal_event(listener, deadline).await;
+        assert_eq!(event["rootKey"], root_key, "foreign causal witness");
+        if event["kind"] == "H_READY" {
+            let pin = &event["pin"];
+            uuid::Uuid::parse_str(pin["indexGeneration"].as_str().expect("H generation"))
+                .expect("valid H generation UUID");
+            assert!(
+                pin["indexRevision"]
+                    .as_u64()
+                    .is_some_and(|revision| revision > 0)
+            );
+            if let Some(first) = &published_pin {
+                assert_eq!(pin, first, "golden pin changed without a fixture edit");
+            } else {
+                published_pin = Some(pin.clone());
+            }
+        }
+        events.push(event);
+        if let Some(pin) = &published_pin {
+            for event in events.drain(..) {
+                readiness.observe(&event, pin);
+            }
+            if readiness.settled() {
+                return pin.clone();
+            }
+        }
+    }
+    panic!("golden H/watch settlement exceeded causal transition budget");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
