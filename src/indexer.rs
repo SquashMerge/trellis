@@ -1146,7 +1146,11 @@ pub(crate) fn validate_native_graph_records_with_progress(
     progress: Option<&dyn Fn() -> bool>,
 ) -> Result<()> {
     crate::store::optional_hint_check(progress)?;
-    let files: BTreeMap<_, _> = graph.files.iter().map(|f| (f.path.as_str(), f)).collect();
+    let mut files = BTreeMap::new();
+    for file in &graph.files {
+        crate::store::optional_hint_check(progress)?;
+        files.insert(file.path.as_str(), file);
+    }
     let lines = if progress.is_some() {
         let mut indexes = BTreeMap::new();
         for (path, file) in &files {
@@ -1168,15 +1172,19 @@ pub(crate) fn validate_native_graph_records_with_progress(
         crate::store::optional_hint_check(progress)?;
         let key = (
             d.document.path.as_str(),
-            serde_json::to_string(&d.ancestors)?,
-            serde_json::to_string(&d.key)?,
+            crate::store::stringify_optional_json(&d.ancestors, progress)?,
+            crate::store::stringify_optional_json(&d.key, progress)?,
         );
         ensure!(
             declaration_keys.insert(key, d.syntax_id.as_str()).is_none(),
             "native declaration key collision"
         );
     }
-    let symbols: BTreeMap<_, _> = graph.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+    let mut symbols = BTreeMap::new();
+    for node in &graph.nodes {
+        crate::store::optional_hint_check(progress)?;
+        symbols.insert(node.id.as_str(), node);
+    }
     ensure!(
         symbols.len() == native.declarations.len() && graph.nodes.len() == symbols.len(),
         "native_evidence_required: graph declaration cardinality"
@@ -1191,8 +1199,11 @@ pub(crate) fn validate_native_graph_records_with_progress(
             .get(d.syntax_id.as_str())
             .context("native_evidence_required: missing measured declaration")?;
         let owner = if let Some(last) = d.ancestors.last() {
-            let prefix = serde_json::to_string(&d.ancestors[..d.ancestors.len() - 1])?;
-            let last = serde_json::to_string(last)?;
+            let prefix = crate::store::stringify_optional_json(
+                &d.ancestors[..d.ancestors.len() - 1],
+                progress,
+            )?;
+            let last = crate::store::stringify_optional_json(last, progress)?;
             Some(
                 *declaration_keys
                     .get(&(d.document.path.as_str(), prefix, last))
@@ -1223,7 +1234,11 @@ pub(crate) fn validate_native_graph_records_with_progress(
             "native_evidence_required: graph declaration differs from measured native row"
         );
     }
-    let regions: BTreeMap<_, _> = graph.regions.iter().map(|r| (r.id.as_str(), r)).collect();
+    let mut regions = BTreeMap::new();
+    for region in &graph.regions {
+        crate::store::optional_hint_check(progress)?;
+        regions.insert(region.id.as_str(), region);
+    }
     ensure!(
         regions.len() == native.control_regions.len() && graph.regions.len() == regions.len(),
         "native_evidence_required: graph region cardinality"
@@ -1251,7 +1266,11 @@ pub(crate) fn validate_native_graph_records_with_progress(
             "native_evidence_required: graph region differs from measured native row"
         );
     }
-    let calls: BTreeMap<_, _> = graph.calls.iter().map(|c| (c.id.as_str(), c)).collect();
+    let mut calls = BTreeMap::new();
+    for call in &graph.calls {
+        crate::store::optional_hint_check(progress)?;
+        calls.insert(call.id.as_str(), call);
+    }
     ensure!(
         calls.len() == native.calls.len() && graph.calls.len() == calls.len(),
         "native_evidence_required: graph call cardinality"

@@ -551,15 +551,15 @@ impl Builder<'_> {
     fn resolve(&mut self) -> Result<()> {
         // A declared type name is source text, not a type relationship. Do not
         // turn scoped name matches into a target or candidate graph edge.
-        self.catalog.relations = std::mem::take(&mut self.pending)
-            .into_iter()
-            .map(|mut pending| {
-                pending.relation.target = None;
-                pending.relation.candidate_ids.clear();
-                pending.relation.match_kind = "unmatched".into();
-                pending.relation
-            })
-            .collect();
+        let mut relations = Vec::with_capacity(self.pending.len());
+        for mut pending in std::mem::take(&mut self.pending) {
+            crate::store::optional_hint_check(self.progress)?;
+            pending.relation.target = None;
+            pending.relation.candidate_ids.clear();
+            pending.relation.match_kind = "unmatched".into();
+            relations.push(pending.relation);
+        }
+        self.catalog.relations = relations;
         Ok(())
     }
 }
@@ -1452,6 +1452,7 @@ mod budget_tests {
                 pending: vec![],
                 symbols,
                 cancel: &cancel,
+                progress: None,
                 records,
                 text_bytes: 0,
                 detail_text_bytes,
