@@ -8274,7 +8274,12 @@ impl Store {
             let source_set_id = format!("source-set:v1:{}", self.root_id());
             let producer_id = crate::native_evidence::PRODUCER;
             let producer_version = crate::native_evidence::NATIVE_VERSION;
-            let mut statement = db.prepare("SELECT m.source_set_id,m.path,m.language,v.content_hash,v.byte_length,v.source_bytes,
+            // Unchanged prior documents are trusted by their stored, validated
+            // content hash (owner ruling, #141): their bytes are not read,
+            // re-hashed or decoded here. Only the changed document's bytes are
+            // loaded and witness-checked below. Selected reads still attest
+            // what they serve.
+            let mut statement = db.prepare("SELECT m.source_set_id,m.path,m.language,v.content_hash,v.byte_length,NULL,
                 v.extraction_context,v.producer_id,v.producer_version,m.document_version_id,
                 m.graph_projection_id,m.class_projection_id,g.graph_hash,c.content_hash,
                 g.class_extraction_payload,m.coverage_requested,m.coverage_selected,
@@ -8285,7 +8290,7 @@ impl Store {
                 WHERE m.revision_id=?1 ORDER BY m.ordinal")?;
             for row in statement.query_map([&selected.key], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?, r.get::<_, i64>(4)?, r.get::<_, Vec<u8>>(5)?,
+                    r.get::<_, String>(3)?, r.get::<_, i64>(4)?, (),
                     r.get::<_, String>(6)?, r.get::<_, String>(7)?, r.get::<_, String>(8)?,
                     r.get::<_, String>(9)?, r.get::<_, String>(10)?,
                     r.get::<_, Option<String>>(11)?, r.get::<_, String>(12)?,
@@ -8293,12 +8298,11 @@ impl Store {
                     r.get::<_, bool>(15)?, r.get::<_, bool>(16)?,
                     r.get::<_, String>(17)?, r.get::<_, Option<String>>(18)?))
             })? {
-                let (row_source_set_id,path,language,hash,length,bytes,context,id,version,version_id,
+                let (row_source_set_id,path,language,hash,length,(),context,id,version,version_id,
                     graph_id,class_id,graph_hash,class_hash,extraction,requested,covered,state,diagnostic)=row?;
                 ensure!(row_source_set_id == source_set_id,
                     "incompatible_index: prior manifest source-set identity mismatch");
-                ensure!(length >= 0 && length as usize == bytes.len()
-                    && hash == hex::encode(sha2::Sha256::digest(&bytes)),
+                ensure!(length >= 0 && hash.len() == 64,
                     "incompatible_index: prior captured source witness mismatch");
                 ensure!(id == producer_id && version == producer_version
                     && context == crate::native_evidence::declared_selected_extraction_context(
@@ -8306,7 +8310,7 @@ impl Store {
                     )?
                     && class_id.is_some() && class_hash.is_some(),
                     "incompatible_index: prior document producer/context missing");
-                let source = SourceFile {path:path.clone(),language:language.clone(),hash:hash.clone(),text:String::from_utf8(bytes)?};
+                let source = SourceFile {path:path.clone(),language:language.clone(),hash:hash.clone(),text:String::new()};
                 previous.push(source);
                 ensure!(prior_ids.insert(path.clone(), V8DocumentProjection {
                     version_id, graph_id, class_id:class_id.context("class projection missing")?,
@@ -8323,6 +8327,25 @@ impl Store {
                     prior_extractions.insert(path.clone(), serde_json::from_str(&payload)?);
                 }
                 changed_counts.insert(path, (0_usize,0_usize,0_usize));
+            }
+            // The one document whose old text matters (proved_body_only reads
+            // it) is the only one whose stored bytes are read and checked.
+            let current_hashes: BTreeMap<&str, &str> =
+                capture.files.iter().map(|f| (f.path.as_str(), f.hash.as_str())).collect();
+            let changed_paths: Vec<usize> = previous.iter().enumerate()
+                .filter(|(_, old)| current_hashes.get(old.path.as_str()).is_some_and(|new| *new != old.hash))
+                .map(|(i, _)| i).collect();
+            if let [i] = changed_paths[..] {
+                let old = &mut previous[i];
+                let (length, bytes): (i64, Vec<u8>) = db.query_row(
+                    "SELECT v.byte_length,v.source_bytes FROM revision_documents m
+                     JOIN document_versions v ON v.id=m.document_version_id
+                     WHERE m.revision_id=?1 AND m.path=?2 AND m.language=?3",
+                    params![selected.key, old.path, old.language], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                ensure!(length >= 0 && length as usize == bytes.len()
+                    && old.hash == hex::encode(sha2::Sha256::digest(&bytes)),
+                    "incompatible_index: prior captured source witness mismatch");
+                old.text = String::from_utf8(bytes)?;
             }
             let decision = crate::indexer::measure_persisted_change(
                 &previous, &previous_options, &previous_inputs, capture)?;
@@ -12560,6 +12583,100 @@ mod rebaseline_fault_tests {
     use super::*;
     use crate::indexer::{IndexOptions, index_workspace_bundle};
     use std::{fs, sync::atomic::AtomicBool};
+
+    /// Zero a selected document's stored source bytes in place (same length,
+    /// wrong hash), through the store's own connection.
+    fn corrupt_stored_source(store: &Store, pin: IndexPin, path: &str) {
+        let mut db = store.cache_write().unwrap();
+        let tx = db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let selected = store.read_revision_for(&tx, Some(pin), true).unwrap();
+        let changed = tx
+            .execute(
+                "UPDATE document_versions SET source_bytes=zeroblob(length(source_bytes))
+                 WHERE id=(SELECT m.document_version_id FROM revision_documents m
+                 WHERE m.revision_id=?1 AND m.path=?2)",
+                params![selected.key, path],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+        tx.commit().unwrap();
+    }
+
+    fn local_edit_fixture() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        Store,
+        IndexOptions,
+        IndexPin,
+    ) {
+        use crate::index_coordinator::IndexJobCoordinator;
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        fs::write(
+            work.path().join("local.js"),
+            "function local(){return 1;}\n",
+        )
+        .unwrap();
+        fs::write(
+            work.path().join("A.java"),
+            "class A { int run(){return 1;} }\n",
+        )
+        .unwrap();
+        let options = IndexOptions::new(work.path().to_owned());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+        let job = IndexJobCoordinator::prepare(&store, None).unwrap();
+        let first = job.run(&options, &cancel, |_| {}).unwrap();
+        (state, work, store, options, first)
+    }
+
+    fn prepare_one_file_edit(
+        store: &Store,
+        options: &IndexOptions,
+    ) -> Result<Option<LocalPrepared>> {
+        use crate::capture::Capture;
+        fs::write(
+            options.workspace_root.join("local.js"),
+            "function local(){return 2;}\n",
+        )
+        .unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let capture = Capture::admit(options, &cancel, &|_| {}).unwrap();
+        let baseline = store.recovery_index_baseline().unwrap();
+        store.prepare_local_revision(&capture, &baseline, &cancel)
+    }
+
+    /// #141 (owner ruling): an unchanged prior document is trusted by its
+    /// stored content hash; its bytes are not read or re-hashed on a local
+    /// edit of another document.
+    #[test]
+    fn a_local_edit_does_not_reread_unchanged_prior_documents() {
+        let (_state, _work, store, options, pin) = local_edit_fixture();
+        corrupt_stored_source(&store, pin, "A.java");
+        let prepared = prepare_one_file_edit(&store, &options).unwrap();
+        assert_eq!(
+            prepared
+                .expect("the one-file edit stays local")
+                .changed_path,
+            "local.js"
+        );
+    }
+
+    /// The changed document's stored bytes are still read and witness-checked.
+    #[test]
+    fn a_local_edit_still_checks_the_changed_documents_stored_bytes() {
+        let (_state, _work, store, options, pin) = local_edit_fixture();
+        corrupt_stored_source(&store, pin, "local.js");
+        let Err(error) = prepare_one_file_edit(&store, &options) else {
+            panic!("a corrupt changed document must not prepare");
+        };
+        assert!(
+            format!("{error:#}").contains("prior captured source witness mismatch"),
+            "{error:#}"
+        );
+    }
 
     #[test]
     fn selective_publication_faults_rollback_and_retry_same_expected_pin() {
