@@ -6397,11 +6397,25 @@ async fn mcp_outgoing_response_bytes_call_prefix_before_global_hints() {
     let calls = envelope["data"]["calls"].as_array().unwrap();
     assert!(!calls.is_empty() && calls.len() < 50, "{reply}");
     assert_eq!(envelope["truncationReason"], "response_bytes");
+    let mut optional_budget_expired = false;
     for (index, call) in calls.iter().enumerate() {
         assert_eq!(call["ordinal"], json!(index));
         assert_eq!(call["disposition"], "unresolved");
-        let count = call["nativeCandidates"]["items"].as_array().unwrap().len();
-        assert_eq!(call["nativeCandidates"]["omitted"], json!(9 - count));
+        let candidates = &call["nativeCandidates"];
+        let count = candidates["items"].as_array().unwrap().len();
+        assert_eq!(candidates["complete"], false);
+        if candidates["omitted"].is_null() {
+            // The optional progress budget expired before this call's hints completed.
+            // Partial hint work is discarded, and every later call stays unknown.
+            optional_budget_expired = true;
+            assert_eq!(candidates["items"], json!([]), "{reply}");
+        } else {
+            assert!(
+                !optional_budget_expired,
+                "optional hint budget cannot resume"
+            );
+            assert_eq!(candidates["omitted"], json!(9 - count), "{reply}");
+        }
         if index > 0 {
             assert!(
                 count == 0
