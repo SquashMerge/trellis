@@ -415,3 +415,372 @@ impl EvidenceResponse {
         }))
     }
 }
+
+/// An outgoing call and its optional, independently verified lexical suggestions.
+pub struct McpOutgoingCall {
+    pub call: crate::native_evidence::Call,
+    pub content_hash: String,
+    pub callee_text: Option<String>,
+    pub callee_text_truncated: bool,
+    pub candidates: Vec<McpOutgoingCandidate>,
+    pub omitted: Option<usize>,
+}
+
+#[derive(Clone)]
+pub struct McpOutgoingCandidate {
+    pub declaration: crate::native_evidence::Declaration,
+    pub coverage: crate::native_evidence::Coverage,
+    pub provenance: crate::native_evidence::Provenance,
+}
+
+pub struct McpOutgoing {
+    pub owner: McpDeclaration,
+    pub calls: Vec<McpOutgoingCall>,
+    pub has_more: bool,
+}
+
+fn mcp_callee_text(
+    source: &str,
+    range: Option<&crate::native_evidence::Range>,
+) -> Result<(Option<String>, bool)> {
+    let Some(range) = range else {
+        return Ok((None, false));
+    };
+    let text = source
+        .get(range.start..range.end)
+        .context("store_unavailable: invalid selected callee range")?;
+    let end = text
+        .char_indices()
+        .map(|(at, ch)| at + ch.len_utf8())
+        .take_while(|&end| end <= 1024)
+        .last()
+        .unwrap_or(0);
+    Ok((Some(text[..end].to_owned()), end < text.len()))
+}
+
+impl EvidenceResponse {
+    pub fn mcp_outgoing(
+        &self,
+        symbol_id: &str,
+        limit: usize,
+        expected: Option<IndexPin>,
+        hint_now: &dyn Fn() -> std::time::Instant,
+    ) -> Result<Option<McpOutgoing>> {
+        use crate::native_evidence::{DocumentKey, Provenance};
+        let selected = self.store.read_revision_for(&self.db, None, true)?;
+        ensure!(
+            expected.is_none_or(|pin| pin == selected.pin),
+            "revision conflict: expected basis differs from admitted head"
+        );
+        let Some(owner) = self.mcp_declaration(symbol_id, expected)? else {
+            return Ok(None);
+        };
+        let scope = v8_owner_scope_for(&self.db, symbol_id, &selected)?
+            .context("store_unavailable: selected outgoing owner absent")?;
+        let source = self
+            .store
+            .selected_source_row_for(&self.db, &scope.key.path, &selected)?
+            .context("store_unavailable: selected outgoing source absent")?;
+        ensure!(
+            source.hash == owner.content_hash,
+            "store_unavailable: selected outgoing source hash mismatch"
+        );
+        let mut measured = read_native_calls_v8(&self.db, &scope, Some(symbol_id))?;
+        for call in &measured {
+            ensure!(
+                call.owner_syntax_id == symbol_id
+                    && call.document == scope.key
+                    && call.revision_id == scope.native_revision_id
+                    && call.provenance_id == scope.proof_id(),
+                "store_unavailable: outgoing call proof mismatch"
+            );
+        }
+        measured.sort_by(|a, b| {
+            (&a.document.path, a.range.start, a.range.end, &a.id).cmp(&(
+                &b.document.path,
+                b.range.start,
+                b.range.end,
+                &b.id,
+            ))
+        });
+        let has_more = measured.len() > limit;
+        let mut calls = Vec::new();
+        for call in measured.into_iter().take(limit) {
+            let (callee_text, callee_text_truncated) =
+                mcp_callee_text(&source.text, call.callee_range.as_ref())?;
+            calls.push(McpOutgoingCall {
+                call,
+                content_hash: owner.content_hash.clone(),
+                callee_text,
+                callee_text_truncated,
+                candidates: vec![],
+                omitted: Some(0),
+            });
+        }
+        let hint_end = hint_now() + std::time::Duration::from_millis(1000);
+        #[cfg(feature = "test-support")]
+        crate::mcp::phase_hook("outgoing_hint").map_err(|e| anyhow::anyhow!(e))?;
+        for item in &mut calls {
+            if hint_now() >= hint_end {
+                item.omitted = None;
+                continue;
+            }
+            let Some(range) = &item.call.callee_range else {
+                continue;
+            };
+            let Some(spelling) = item.call.spelling.as_deref() else {
+                continue;
+            };
+            let Some(token) = source.text.get(range.start..range.end) else {
+                continue;
+            };
+            // The full measured spelling is the token, not a member expression suffix.
+            if token != spelling {
+                continue;
+            }
+            let Ok(lookup) = crate::native_evidence::lookup(&scope.key.language, token) else {
+                continue;
+            };
+            let mut statement = self.db.prepare(
+                "SELECT d.version_id,d.syntax_id,m.source_set_id,m.language,m.path
+                 FROM native_version_declarations d JOIN revision_documents m
+                   ON m.document_version_id=d.version_id AND m.revision_id=?1
+                 WHERE m.source_set_id=?2 AND m.language=?3 AND d.lookup_key=?4",
+            )?;
+            let mut rows = statement.query(params![
+                selected.key,
+                scope.key.source_set_id,
+                scope.key.language,
+                lookup
+            ])?;
+            let mut candidates = BTreeMap::<String, McpOutgoingCandidate>::new();
+            let mut timed_out = false;
+            loop {
+                if hint_now() >= hint_end {
+                    timed_out = true;
+                    break;
+                }
+                let Some(row) = rows.next()? else { break };
+                let version: String = row.get(0)?;
+                let id: String = row.get(1)?;
+                let key = DocumentKey {
+                    source_set_id: row.get(2)?,
+                    language: row.get(3)?,
+                    path: row.get(4)?,
+                };
+                let candidate = (|| -> Result<Option<McpOutgoingCandidate>> {
+                    let Some(candidate_scope) = v8_native_scope_for(&self.db, &key, &selected)?
+                    else {
+                        return Ok(None);
+                    };
+                    if candidate_scope.version_id != version {
+                        return Ok(None);
+                    }
+                    let Some(declaration) =
+                        read_native_declarations_v8(&self.db, &candidate_scope, None, true)?
+                            .into_iter()
+                            .find(|row| row.syntax_id == id)
+                    else {
+                        return Ok(None);
+                    };
+                    if declaration.name.is_none()
+                        || declaration.lookup_key.as_deref() != Some(lookup.as_str())
+                        || declaration.provenance_id != candidate_scope.proof_id()
+                        || declaration.revision_id != candidate_scope.native_revision_id
+                        || declaration.document != candidate_scope.key
+                        || !mcp_canonical_syntax_id(&id)
+                    {
+                        return Ok(None);
+                    }
+                    let coverage = read_native_coverage_v8(&self.db, &candidate_scope)?;
+                    if !coverage.requested
+                        || !coverage.selected
+                        || !matches!(coverage.state.as_str(), "complete" | "partial")
+                        || coverage.revision_id != candidate_scope.native_revision_id
+                        || coverage.producer_id != candidate_scope.producer_id
+                        || coverage.language != key.language
+                        || coverage.source_set_id != key.source_set_id
+                        || coverage.document_path != key.path
+                    {
+                        return Ok(None);
+                    }
+                    self.store
+                        .attest_selected_document_for(&self.db, &key.path, &selected)?;
+                    let hash: String = self.db.query_row(
+                        "SELECT content_hash FROM document_versions WHERE id=?1 AND source_set_id=?2 AND language=?3 AND path=?4",
+                        params![version,key.source_set_id,key.language,key.path],|r|r.get(0))?;
+                    let provenance = Provenance {
+                        id: candidate_scope.proof_id(),
+                        producer_id: candidate_scope.producer_id,
+                        document: key,
+                        revision_id: candidate_scope.native_revision_id,
+                        content_hash: hash,
+                        evidence_kind: "measuredSyntax".into(),
+                        basis: None,
+                        freshness: "fresh".into(),
+                        derived_from: None,
+                    };
+                    Ok(Some(McpOutgoingCandidate {
+                        declaration,
+                        coverage,
+                        provenance,
+                    }))
+                })();
+                let Ok(Some(candidate)) = candidate else {
+                    continue;
+                };
+                insert_mcp_candidate(&mut candidates, id, candidate)?;
+            }
+            if timed_out || hint_now() >= hint_end {
+                item.omitted = None;
+                continue;
+            }
+            item.candidates = candidates.into_values().collect();
+            item.candidates.sort_by(|a, b| {
+                (
+                    &a.declaration.document.path,
+                    a.declaration.range.start,
+                    a.declaration.range.end,
+                    &a.declaration.syntax_id,
+                )
+                    .cmp(&(
+                        &b.declaration.document.path,
+                        b.declaration.range.start,
+                        b.declaration.range.end,
+                        &b.declaration.syntax_id,
+                    ))
+            });
+            item.omitted = Some(item.candidates.len().saturating_sub(8));
+        }
+        Ok(Some(McpOutgoing {
+            owner,
+            calls,
+            has_more,
+        }))
+    }
+}
+
+fn insert_mcp_candidate(
+    candidates: &mut BTreeMap<String, McpOutgoingCandidate>,
+    id: String,
+    candidate: McpOutgoingCandidate,
+) -> Result<()> {
+    match candidates.entry(id) {
+        std::collections::btree_map::Entry::Vacant(entry) => {
+            entry.insert(candidate);
+        }
+        std::collections::btree_map::Entry::Occupied(entry) => {
+            ensure!(
+                entry.get().declaration == candidate.declaration
+                    && entry.get().coverage == candidate.coverage
+                    && entry.get().provenance == candidate.provenance,
+                "store_unavailable: conflicting duplicate native hint"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn mcp_canonical_syntax_id(id: &str) -> bool {
+    id.len() == 39
+        && id.starts_with("sid:v1:")
+        && id[7..]
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
+#[cfg(test)]
+mod outgoing_tests {
+    use super::*;
+    #[test]
+    fn duplicate_verified_hint_dedupes_but_conflicting_record_fails() {
+        use crate::native_evidence::{Coverage, Declaration, DocumentKey, Provenance};
+        use serde_json::json;
+        let document = DocumentKey {
+            source_set_id: "source-set:v1:test".into(),
+            language: "javascript".into(),
+            path: "a.js".into(),
+        };
+        let declaration: Declaration = serde_json::from_value(json!({
+            "syntaxId":format!("sid:v1:{}","a".repeat(32)),"document":document,
+            "revisionId":"revision:v2:test","kind":"function","name":"Target",
+            "lookupKey":"Target","ancestors":[],
+            "key":{"kind":"function","name":"Target","signature":null,"ordinal":0},
+            "range":{"start":0,"end":20},"nameRange":null,
+            "header":{"kind":"function","name":"Target","modifiers":[],
+                "typeParameters":[],"parameters":[],"resultType":null,"bases":[]},
+            "provenanceId":"native-proof:v1:test"
+        }))
+        .unwrap();
+        let candidate = McpOutgoingCandidate {
+            declaration: declaration.clone(),
+            coverage: Coverage {
+                producer_id: "native:v1".into(),
+                language: "javascript".into(),
+                source_set_id: document.source_set_id.clone(),
+                document_path: document.path.clone(),
+                revision_id: "revision:v2:test".into(),
+                requested: true,
+                selected: true,
+                state: "complete".into(),
+                supported_roles: vec!["definition".into()],
+                observed_roles: vec!["definition".into()],
+                diagnostic: None,
+            },
+            provenance: Provenance {
+                id: "native-proof:v1:test".into(),
+                producer_id: "native:v1".into(),
+                document,
+                revision_id: "revision:v2:test".into(),
+                content_hash: "a".repeat(64),
+                evidence_kind: "measuredSyntax".into(),
+                basis: None,
+                freshness: "fresh".into(),
+                derived_from: None,
+            },
+        };
+        let mut found = BTreeMap::new();
+        insert_mcp_candidate(&mut found, declaration.syntax_id.clone(), candidate.clone()).unwrap();
+        insert_mcp_candidate(&mut found, declaration.syntax_id.clone(), candidate.clone()).unwrap();
+        assert_eq!(found.len(), 1);
+        let mut conflict = candidate;
+        conflict.provenance.content_hash = "b".repeat(64);
+        assert!(
+            insert_mcp_candidate(&mut found, declaration.syntax_id, conflict)
+                .unwrap_err()
+                .to_string()
+                .contains("conflicting duplicate native hint")
+        );
+    }
+
+    #[test]
+    fn unicode_callee_clips_on_utf8_scalar_boundary() {
+        let text = format!("{}éz", "a".repeat(1023));
+        let range = crate::native_evidence::Range {
+            start: 0,
+            end: text.len(),
+        };
+        let (shown, clipped) = mcp_callee_text(&text, Some(&range)).unwrap();
+        assert_eq!(shown.unwrap().len(), 1023);
+        assert!(clipped);
+        let range = crate::native_evidence::Range {
+            start: 1023,
+            end: 1025,
+        };
+        assert_eq!(
+            mcp_callee_text(&text, Some(&range)).unwrap(),
+            (Some("é".into()), false)
+        );
+        assert_eq!(mcp_callee_text(&text, None).unwrap(), (None, false));
+        assert!(
+            mcp_callee_text(
+                &text,
+                Some(&crate::native_evidence::Range {
+                    start: 1024,
+                    end: 1025
+                })
+            )
+            .is_err()
+        );
+    }
+}
