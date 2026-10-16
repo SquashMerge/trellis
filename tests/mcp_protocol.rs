@@ -4732,11 +4732,40 @@ async fn mcp_find_selected_snapshot_ranks_and_keeps_zero_hit_scope() {
             "indexGeneration":current.index_generation.to_string(),"indexRevision":current.index_revision
         })
     );
+    let state = runtime.state_version();
     resume_tx.send(()).unwrap();
     assert_eq!(data["data"]["symbols"][0]["name"], "Alpha");
     assert_eq!(data["truncated"], true);
     assert_eq!(data["truncationReason"], "limit");
     assert_eq!(data["data"]["provenance"].as_array().unwrap().len(), 1);
+    // The hook runs after the Reconciling notification. The next state change
+    // after release is the startup Ready commit or a recorded startup error.
+    // catching_up may remain advisory-true for pending watcher work after Ready.
+    let deadline = std::time::Instant::now() + trellis::testing::HANG_BACKSTOP;
+    while runtime.catching_up() && runtime.state_version() == state {
+        assert!(
+            runtime.reconciliation_error().is_none(),
+            "startup reconciliation failed: {:?}",
+            runtime.reconciliation_error()
+        );
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "startup reconciliation did not commit Ready: {:?}",
+            runtime.reconciliation_error()
+        );
+        runtime.wait_state_change(state, remaining);
+    }
+    assert_ne!(
+        runtime.state_version(),
+        state,
+        "startup Ready transition was not observed"
+    );
+    assert!(
+        runtime.reconciliation_error().is_none(),
+        "startup reconciliation failed: {:?}",
+        runtime.reconciliation_error()
+    );
     let ranked = ask(&mut client, 147, "ALPHA", Some(20), None);
     tool(&ranked, None, true);
     let ranked = &ranked["result"]["structuredContent"];
