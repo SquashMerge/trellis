@@ -592,17 +592,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                         None => {
                             // A cold evidence call must not activate a checkout merely to
                             // discover that it has no derived index yet.
-                            let known_index = crate::store::topology::TopologyRoots::production()
-                                .ok()
-                                .and_then(|roots| {
-                                    std::fs::metadata(roots.index_db(answering.identity())).ok()
-                                })
-                                .is_some_and(|metadata| {
-                                    metadata.is_file() && metadata.len() >= 100
-                                });
-                            if !known_index {
-                                anyhow::bail!("index_not_ready: no admitted head");
-                            }
+                            registry.blocking_lock().eligible_prior_head(key)?;
                             match daemon_handle.as_ref() {
                                 Some(handle) => handle
                                     .block_on(async { registry.lock().await.activate(key) })?,

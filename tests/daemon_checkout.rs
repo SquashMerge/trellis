@@ -1884,45 +1884,132 @@ async fn closing_runtime_is_never_revived() {
     ready(&fresh).await;
 }
 
-/// Maintenance is the lowest class (Decision 0009 §4): with a unit due and a
-/// FIFO row accepted, the row completes before the unit begins.
+/// Maintenance is the lowest class (Decision 0009 §4): a due release
+/// cannot commit while an accepted FIFO row is still queued.
 #[cfg(feature = "test-support")]
-#[tokio::test]
-async fn maintenance_never_runs_ahead_of_accepted_fifo_work() {
+#[test]
+fn maintenance_never_runs_ahead_of_accepted_fifo_work() {
+    use std::sync::{Arc, atomic::AtomicBool};
+
     let base = tempfile::tempdir().unwrap();
     let checkout = base.path().join("work");
     fs::create_dir(&checkout).unwrap();
     fs::write(checkout.join("a.js"), "function a() {}\n").unwrap();
     let id = identity(&checkout);
-    let mut registry = CheckoutRegistry::with_roots(roots(base.path()));
-    registry.attach_launch(1, &id).unwrap();
-    let runtime = registry.activate(&id.root_key).unwrap();
-    ready(&runtime).await;
-    let scheduler = runtime.browser_scheduler().unwrap();
-    let store = Store::open(roots(base.path()), identity(&checkout)).unwrap();
-    // Hold the worker, make a unit due, then accept a row: both are pending
-    // when the worker next runs.
-    let held = scheduler.hold_worker_for_tests();
-    let (seen_tx, seen_rx) = std::sync::mpsc::sync_channel(1);
-    let observer = Store::open(roots(base.path()), identity(&checkout)).unwrap();
-    scheduler.on_next_maintenance_unit_for_tests(move || {
-        let unfinished = observer.earliest_unfinished_request().unwrap().is_some();
-        seen_tx.send(unfinished).unwrap();
-    });
-    let row = store
-        .enqueue_request(&trellis::indexer::IndexOptions::new(checkout.clone()), None)
-        .unwrap();
-    drop(held);
-    let unfinished = tokio::time::timeout(
-        trellis::testing::HANG_BACKSTOP,
-        tokio::task::spawn_blocking(move || seen_rx.recv()),
+    let index_path = roots(base.path()).index_dir(&id).join("index.db");
+    let store = Store::open(roots(base.path()), id).unwrap();
+    let options = trellis::indexer::IndexOptions::new(checkout.clone());
+    let cancel = Arc::new(AtomicBool::new(false));
+    let owner =
+        trellis::index_coordinator::establish_serving_session(&store, Some(&options), &cancel)
+            .unwrap();
+    let daemon = trellis::http::new(
+        store.clone(),
+        options.clone(),
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+        "127.0.0.1:7331".parse().unwrap(),
     )
-    .await
-    .expect("no maintenance unit ran")
-    .unwrap()
     .unwrap();
-    assert!(!unfinished, "maintenance began before accepted FIFO work");
+    daemon.retain_serving_session_without_tick_for_tests(owner.clone());
+    // Complete the standalone fixture's initial watcher reconcile before
+    // creating retention debt, so only the FIFO competes with maintenance.
+    daemon.force_retention_idle_tick_for_tests().unwrap();
+    store.set_retention_clock_for_tests(1_000, 0);
+    let publish = |expected| {
+        let (graph, native, capture) =
+            trellis::indexer::index_workspace_bundle(&options, store.root_id(), &cancel, |_| {})
+                .unwrap();
+        store
+            .publish_native(
+                &graph,
+                &capture,
+                &native,
+                owner.writer_guard().unwrap(),
+                expected,
+                &cancel,
+            )
+            .unwrap()
+    };
+    let old = publish(store.index_baseline().unwrap());
+    publish(old);
+    let revision_id = format!("pin:v1:{}:{}", old.index_generation, old.index_revision);
+    let debt = || {
+        let db = rusqlite::Connection::open_with_flags(
+            &index_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        db.query_row(
+            "SELECT s.state,
+                    (SELECT count(*) FROM native_revision_release_debt d
+                     WHERE d.revision_id=s.revision_id),
+                    (SELECT count(*) FROM revision_documents r
+                     WHERE r.revision_id=s.revision_id)
+             FROM native_revision_supersessions s WHERE s.revision_id=?1",
+            [&revision_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .unwrap()
+    };
+    let pending_debt = || {
+        let db = rusqlite::Connection::open_with_flags(
+            &index_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        db.query_row(
+            "SELECT (SELECT count(*) FROM native_revision_supersessions WHERE state='pending'),
+                    (SELECT count(*) FROM native_revision_release_debt)",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .unwrap()
+    };
+    let before = debt();
+    let pending_before = pending_debt();
+    assert_eq!(pending_before, (0, 0));
+    assert_eq!(before.0, "retained");
+    assert_eq!(before.1, 0);
+    assert!(before.2 > 0);
+    store.set_retention_clock_for_tests(1_900, 900);
+    let row = store.enqueue_request(&options, None).unwrap();
+    daemon.force_retention_idle_tick_for_tests().unwrap();
+    assert_eq!(
+        store.request_by_id(&row.id).unwrap().unwrap().state,
+        "queued"
+    );
+    assert_eq!(
+        debt(),
+        before,
+        "maintenance committed ahead of accepted FIFO work"
+    );
+    assert_eq!(
+        pending_debt(),
+        pending_before,
+        "release debt advanced before FIFO"
+    );
+
+    daemon.force_root_transition_tick_for_tests().unwrap();
     assert_eq!(store.request_by_id(&row.id).unwrap().unwrap().state, "done");
+    // A manually driven worker step does not consume the inbox wake or
+    // publish its FIFO-clear signal. A fresh standalone scheduler has no
+    // accepted wake after the terminal commit and can run the due unit.
+    let idle = trellis::http::new(
+        store.clone(),
+        options,
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+        "127.0.0.1:7332".parse().unwrap(),
+    )
+    .unwrap();
+    idle.retain_serving_session_without_tick_for_tests(owner);
+    idle.force_retention_idle_tick_for_tests().unwrap();
+    assert_eq!(pending_debt(), (1, 1), "due maintenance did not advance");
 }
 
 /// Decision 0009 §8: an index waiter records the terminal-commit count, re-reads

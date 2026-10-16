@@ -66,6 +66,31 @@ impl Store {
         self.prepare_virgin_queue_before_activation()
     }
 
+    /// Introduce one required-row fault through Store's cached connection.
+    pub fn mcp_corrupt_find_for_tests(
+        &self,
+        writer: &topology::WriterGuard,
+        fault: &str,
+    ) -> Result<()> {
+        writer.belongs_to(&self.identity)?;
+        self.identity.verify()?;
+        writer.verify()?;
+        let mut db = self.cache_write()?;
+        if fault == "missing_scope" {
+            db.pragma_update(None, "foreign_keys", "OFF")?;
+        }
+        let tx = storage_result(db.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        let count = match fault {
+            "missing_scope" => tx.execute("UPDATE document_versions SET path='missing.js' WHERE path='a.js'", [])?,
+            "missing_header" => tx.execute("DELETE FROM native_version_headers WHERE syntax_id=(SELECT syntax_id FROM native_version_declarations WHERE name='Alpha' LIMIT 1)", [])?,
+            "bad_digest" => tx.execute("UPDATE document_versions SET content_hash=?1 WHERE path='a.js'", ["0".repeat(64)])?,
+            _ => anyhow::bail!("unknown find corruption fixture"),
+        };
+        ensure!(count == 1, "fixture corruption target absent");
+        storage_result(tx.commit())?;
+        Ok(())
+    }
+
     /// Fixture-only revision row setup for W1 projection tests. Uses Store's own
     /// cached SQLite connection; never closes another FD on a live index inode.
     pub fn mcp_set_coverage_for_tests(
@@ -76,7 +101,10 @@ impl Store {
         state: &str,
     ) -> Result<()> {
         anyhow::ensure!(
-            matches!(state, "complete" | "partial" | "failed" | "unsupported"),
+            matches!(
+                state,
+                "complete" | "partial" | "failed" | "omitted" | "unsupported"
+            ),
             "invalid fixture state"
         );
         writer.belongs_to(&self.identity)?;
@@ -116,7 +144,22 @@ impl EvidenceResponse {
         expected: Option<IndexPin>,
     ) -> Result<McpFind> {
         use crate::native_evidence::{DocumentKey, Provenance};
-        let selected = self.store.read_revision_for(&self.db, expected, true)?;
+        #[cfg(feature = "test-support")]
+        if self
+            .store
+            .mcp_read_busy_attempts
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count > 0).then(|| count - 1)
+            })
+            .is_ok()
+        {
+            return Err(SqliteContention(()).into());
+        }
+        let selected = self.store.read_revision_for(&self.db, None, true)?;
+        ensure!(
+            expected.is_none_or(|pin| pin == selected.pin),
+            "revision conflict: expected basis differs from admitted head"
+        );
         // Include manifest rows without native declarations, including failed and unselected rows.
         let keys = self
             .db
@@ -146,20 +189,64 @@ impl EvidenceResponse {
                     && row.document_path == key.path,
                 "store_unavailable: native coverage identity mismatch"
             );
+            let valid_state = match row.state.as_str() {
+                "notRequested" => !row.requested && !row.selected && row.diagnostic.is_none(),
+                "omitted" | "unsupported" => {
+                    row.requested && !row.selected && row.diagnostic.is_some()
+                }
+                "failed" | "partial" => row.requested && row.selected && row.diagnostic.is_some(),
+                "complete" => row.requested && row.selected && row.diagnostic.is_none(),
+                _ => false,
+            };
+            let ordered_roles = |roles: &[String]| {
+                roles.windows(2).all(|pair| {
+                    matches!((pair[0].as_str(), pair[1].as_str()), ("definition", "call"))
+                })
+            };
+            ensure!(
+                valid_state
+                    && ordered_roles(&row.supported_roles)
+                    && ordered_roles(&row.observed_roles)
+                    && row
+                        .observed_roles
+                        .iter()
+                        .all(|role| row.supported_roles.contains(role))
+                    && row
+                        .supported_roles
+                        .iter()
+                        .all(|role| matches!(role.as_str(), "definition" | "call"))
+                    && row
+                        .observed_roles
+                        .iter()
+                        .all(|role| matches!(role.as_str(), "definition" | "call")),
+                "store_unavailable: inconsistent native coverage tuple"
+            );
             coverage.push(row);
             scopes.insert(scope.version_id.clone(), scope);
+        }
+        let language_order = |language: &str| -> Result<u8> {
+            match language {
+                "java" => Ok(0),
+                "rust" => Ok(1),
+                "python" => Ok(2),
+                "javascript" => Ok(3),
+                _ => anyhow::bail!("store_unavailable: invalid native coverage language"),
+            }
+        };
+        for row in &coverage {
+            language_order(&row.language)?;
         }
         coverage.sort_by(|a, b| {
             (
                 &a.producer_id,
-                &a.language,
+                language_order(&a.language).unwrap(),
                 &a.source_set_id,
                 &a.document_path,
                 &a.revision_id,
             )
                 .cmp(&(
                     &b.producer_id,
-                    &b.language,
+                    language_order(&b.language).unwrap(),
                     &b.source_set_id,
                     &b.document_path,
                     &b.revision_id,
