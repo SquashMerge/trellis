@@ -4459,7 +4459,10 @@ async fn continuous_invalid_calls_stay_bounded_and_a_due_reply_is_decided() {
     // This side stops reading now: end the connection first, so a flood
     // write blocked behind unread replies fails instead of waiting forever.
     stop.store(true, std::sync::atomic::Ordering::Release);
-    client.shutdown(std::net::Shutdown::Both).unwrap();
+    // The server can close first after deciding the due reply.
+    if let Err(error) = client.shutdown(std::net::Shutdown::Both) {
+        assert_eq!(error.kind(), std::io::ErrorKind::NotConnected);
+    }
     let sent = flood.join().unwrap();
     assert!(sent > 2_000);
     let largest = largest.load(std::sync::atomic::Ordering::Acquire);
