@@ -1257,6 +1257,16 @@ pub(crate) fn selected_source_witness(
     source_set: SourceSet,
     revision: Revision,
 ) -> Result<Artifact> {
+    selected_source_witness_with_progress(file, producer, source_set, revision, None)
+}
+pub(crate) fn selected_source_witness_with_progress(
+    file: &SourceFile,
+    producer: Producer,
+    source_set: SourceSet,
+    revision: Revision,
+    progress: Option<&dyn Fn() -> bool>,
+) -> Result<Artifact> {
+    crate::store::optional_hint_check(progress)?;
     ensure!(
         revision.source_set_id == source_set.id
             && revision.documents.len() == 1
@@ -1276,7 +1286,15 @@ pub(crate) fn selected_source_witness(
         calls: vec![],
         control_regions: vec![],
     };
-    extract(&mut artifact, file, &mut IdentityRegistry::default())?;
+    let document = artifact.revision.documents[0].clone();
+    extract_known_with_progress(
+        &mut artifact,
+        file,
+        &document,
+        &mut IdentityRegistry::default(),
+        progress,
+    )?;
+    crate::store::optional_hint_check(progress)?;
     Ok(artifact)
 }
 
@@ -1299,13 +1317,33 @@ fn extract_known(
     document: &Document,
     ids: &mut IdentityRegistry,
 ) -> Result<()> {
+    extract_known_with_progress(a, f, document, ids, None)
+}
+fn extract_known_with_progress(
+    a: &mut Artifact,
+    f: &SourceFile,
+    document: &Document,
+    ids: &mut IdentityRegistry,
+    progress: Option<&dyn Fn() -> bool>,
+) -> Result<()> {
+    crate::store::optional_hint_check(progress)?;
     language_order(&f.language)?;
     safe_path(&f.path)?;
     // Occurrence identity binds this captured document version. Authenticate its content hash
     // and extraction context against the captured revision before measuring, so a failed
     // precondition mints no occ:v2 record at all.
     ensure!(
-        f.hash == hash(f.text.as_bytes()),
+        f.hash
+            == if progress.is_some() {
+                let mut digest = Sha256::new();
+                for chunk in f.text.as_bytes().chunks(64 * 1024) {
+                    crate::store::optional_hint_check(progress)?;
+                    digest.update(chunk);
+                }
+                hex::encode(digest.finalize())
+            } else {
+                hash(f.text.as_bytes())
+            },
         "native captured source hash mismatch"
     );
     ensure!(
@@ -1324,9 +1362,20 @@ fn extract_known(
         "python" => tree_sitter_python::LANGUAGE.into(),
         _ => tree_sitter_javascript::LANGUAGE.into(),
     })?;
-    let tree = parser
-        .parse(&f.text, None)
-        .context("native parser failed")?;
+    let tree = if let Some(expired) = progress {
+        let mut cancelled = |_: &tree_sitter::ParseState| expired();
+        let tree = parser.parse_with_options(
+            &mut |offset, _| &f.text.as_bytes()[offset..],
+            None,
+            Some(tree_sitter::ParseOptions::new().progress_callback(&mut cancelled)),
+        );
+        crate::store::optional_hint_check(progress)?;
+        tree.context("native parser failed")?
+    } else {
+        parser
+            .parse(&f.text, None)
+            .context("native parser failed")?
+    };
     let key = DocumentKey {
         source_set_id: a.source_set.id.clone(),
         language: f.language.clone(),
@@ -1396,9 +1445,11 @@ fn extract_known(
         saw_call: false,
         visits: 0,
         opaque_rust: false,
+        progress,
     };
     state.walk(tree.root_node(), &module_id, &[], &[], 0)?;
     state.finish_occurrences()?;
+    crate::store::optional_hint_check(progress)?;
     let observed_roles = [
         (state.saw_definition, "definition"),
         (state.saw_call, "call"),
@@ -1460,6 +1511,7 @@ struct ParserState<'a> {
     saw_call: bool,
     visits: usize,
     opaque_rust: bool,
+    progress: Option<&'a dyn Fn() -> bool>,
 }
 impl ParserState<'_> {
     fn occurrence_input(&self, owner: &str, kind: &str, ordinal: usize) -> Value {
@@ -1479,6 +1531,7 @@ impl ParserState<'_> {
             .iter()
             .enumerate()
         {
+            crate::store::optional_hint_check(self.progress)?;
             ensure!(
                 region.document == self.document,
                 "foreign native control in current document"
@@ -1489,11 +1542,13 @@ impl ParserState<'_> {
                 .push(self.control_start + offset);
         }
         for indexes in by_owner.values_mut() {
+            crate::store::optional_hint_check(self.progress)?;
             indexes.sort_by_key(|i| {
                 let r = &self.artifact.control_regions[*i].range;
                 (r.start, r.end)
             });
             for (ordinal, i) in indexes.iter().enumerate() {
+                crate::store::optional_hint_check(self.progress)?;
                 let input = self.occurrence_input(
                     &self.artifact.control_regions[*i].owner_syntax_id,
                     "control",
@@ -1506,6 +1561,7 @@ impl ParserState<'_> {
             }
         }
         for region in &mut self.artifact.control_regions[self.control_start..] {
+            crate::store::optional_hint_check(self.progress)?;
             if let Some(parent) = &mut region.parent_id {
                 *parent = replacements
                     .get(parent)
@@ -1515,6 +1571,7 @@ impl ParserState<'_> {
         }
         let mut by_owner: BTreeMap<String, Vec<usize>> = BTreeMap::new();
         for (offset, call) in self.artifact.calls[self.call_start..].iter().enumerate() {
+            crate::store::optional_hint_check(self.progress)?;
             ensure!(
                 call.document == self.document,
                 "foreign native call in current document"
@@ -1525,11 +1582,13 @@ impl ParserState<'_> {
                 .push(self.call_start + offset);
         }
         for indexes in by_owner.values_mut() {
+            crate::store::optional_hint_check(self.progress)?;
             indexes.sort_by_key(|i| {
                 let r = &self.artifact.calls[*i].range;
                 (r.start, r.end)
             });
             for (ordinal, i) in indexes.iter().enumerate() {
+                crate::store::optional_hint_check(self.progress)?;
                 let input = self.occurrence_input(
                     &self.artifact.calls[*i].owner_syntax_id,
                     "call",
@@ -1558,6 +1617,7 @@ impl ParserState<'_> {
         regions: &[String],
         depth: usize,
     ) -> Result<()> {
+        crate::store::optional_hint_check(self.progress)?;
         ensure!(
             depth < 128 && self.visits < 1_000_000,
             "native extraction work budget exceeded"

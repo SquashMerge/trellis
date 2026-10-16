@@ -1137,10 +1137,35 @@ pub(crate) fn validate_native_graph_records(
     native: &native_evidence::Artifact,
     cancel: &CancelFlag,
 ) -> Result<()> {
+    validate_native_graph_records_with_progress(graph, native, cancel, None)
+}
+pub(crate) fn validate_native_graph_records_with_progress(
+    graph: &Graph,
+    native: &native_evidence::Artifact,
+    cancel: &CancelFlag,
+    progress: Option<&dyn Fn() -> bool>,
+) -> Result<()> {
+    crate::store::optional_hint_check(progress)?;
     let files: BTreeMap<_, _> = graph.files.iter().map(|f| (f.path.as_str(), f)).collect();
-    let lines = line_indexes(&files);
+    let lines = if progress.is_some() {
+        let mut indexes = BTreeMap::new();
+        for (path, file) in &files {
+            let mut starts = vec![0];
+            for (part, chunk) in file.text.as_bytes().chunks(64 * 1024).enumerate() {
+                crate::store::optional_hint_check(progress)?;
+                starts.extend(chunk.iter().enumerate().filter_map(|(offset, byte)| {
+                    (*byte == b'\n').then_some(part * 64 * 1024 + offset + 1)
+                }));
+            }
+            indexes.insert(*path, LineIndex(starts));
+        }
+        indexes
+    } else {
+        line_indexes(&files)
+    };
     let mut declaration_keys = BTreeMap::new();
     for d in &native.declarations {
+        crate::store::optional_hint_check(progress)?;
         let key = (
             d.document.path.as_str(),
             serde_json::to_string(&d.ancestors)?,
@@ -1157,6 +1182,7 @@ pub(crate) fn validate_native_graph_records(
         "native_evidence_required: graph declaration cardinality"
     );
     for d in &native.declarations {
+        crate::store::optional_hint_check(progress)?;
         ensure!(!cancel.load(Ordering::Relaxed), "indexing cancelled");
         let f = files
             .get(d.document.path.as_str())
@@ -1203,6 +1229,7 @@ pub(crate) fn validate_native_graph_records(
         "native_evidence_required: graph region cardinality"
     );
     for r in &native.control_regions {
+        crate::store::optional_hint_check(progress)?;
         ensure!(!cancel.load(Ordering::Relaxed), "indexing cancelled");
         let f = files
             .get(r.document.path.as_str())
@@ -1230,6 +1257,7 @@ pub(crate) fn validate_native_graph_records(
         "native_evidence_required: graph call cardinality"
     );
     for c in &native.calls {
+        crate::store::optional_hint_check(progress)?;
         ensure!(!cancel.load(Ordering::Relaxed), "indexing cancelled");
         let f = files
             .get(c.document.path.as_str())
@@ -1263,6 +1291,7 @@ pub(crate) fn validate_native_graph_records(
     };
     let mut diagnostics = Vec::new();
     for c in &native.coverage {
+        crate::store::optional_hint_check(progress)?;
         if c.state != "complete" {
             let recovered = c
                 .diagnostic
@@ -1286,6 +1315,7 @@ pub(crate) fn validate_native_graph_records(
             });
         }
     }
+    crate::store::optional_hint_check(progress)?;
     ensure!(
         graph.stats == stats && graph.diagnostics == diagnostics,
         "native_evidence_required: graph diagnostics or statistics differ from native coverage"

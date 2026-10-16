@@ -462,6 +462,21 @@ impl std::io::Write for EncodedSourceBudget {
         Ok(())
     }
 }
+struct OptionalSourceBudget<'a> {
+    budget: &'a mut EncodedSourceBudget,
+    progress: Option<&'a dyn Fn() -> bool>,
+}
+impl std::io::Write for OptionalSourceBudget<'_> {
+    fn write(&mut self, chunk: &[u8]) -> std::io::Result<usize> {
+        if self.progress.is_some_and(|expired| expired()) {
+            return Err(std::io::Error::other("optional hint work budget expired"));
+        }
+        std::io::Write::write(self.budget, chunk)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 const SELECTED_ANCILLARY_BYTE_SQL: &str = r#"SELECT COALESCE(max(row_bytes),0),COALESCE(sum(row_bytes),0) FROM (
 SELECT COALESCE(length(CAST(x.version_id AS BLOB)),0)+COALESCE(length(CAST(x.role_kind AS BLOB)),0)+COALESCE(length(CAST(x.role AS BLOB)),0)+COALESCE(length(CAST(x.ordinal AS BLOB)),0) AS row_bytes FROM native_version_coverage_roles x WHERE x.version_id=?1
 UNION ALL
@@ -2202,7 +2217,26 @@ fn recovery_class(error: &anyhow::Error) -> RecoveryClass {
     }
     RecoveryClass::Hard
 }
+#[derive(Debug)]
+pub(crate) struct OptionalHintExpired;
+impl std::fmt::Display for OptionalHintExpired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("optional hint work budget expired")
+    }
+}
+impl std::error::Error for OptionalHintExpired {}
+
+pub(crate) fn optional_hint_check(progress: Option<&dyn Fn() -> bool>) -> Result<()> {
+    if progress.is_some_and(|expired| expired()) {
+        return Err(OptionalHintExpired.into());
+    }
+    Ok(())
+}
+
 fn selected_integrity(error: anyhow::Error) -> anyhow::Error {
+    if error.downcast_ref::<OptionalHintExpired>().is_some() {
+        return error;
+    }
     if recovery_class(&error) != RecoveryClass::Hard
         || error.downcast_ref::<rusqlite::Error>().is_some()
         || error.downcast_ref::<SqliteContention>().is_some()
@@ -3010,8 +3044,18 @@ fn publication_rows<'a>(
     native: &'a crate::native_evidence::Artifact,
     classes: &'a crate::classes::Catalog,
 ) -> Result<BTreeMap<&'a str, PublicationRows<'a>>> {
+    publication_rows_with_progress(graph, native, classes, None)
+}
+fn publication_rows_with_progress<'a>(
+    graph: &'a Graph,
+    native: &'a crate::native_evidence::Artifact,
+    classes: &'a crate::classes::Catalog,
+    progress: Option<&dyn Fn() -> bool>,
+) -> Result<BTreeMap<&'a str, PublicationRows<'a>>> {
+    optional_hint_check(progress)?;
     let mut rows = BTreeMap::<&str, PublicationRows>::new();
     for file in &graph.files {
+        optional_hint_check(progress)?;
         ensure!(
             rows.insert(&file.path, PublicationRows::default())
                 .is_none(),
@@ -3019,18 +3063,21 @@ fn publication_rows<'a>(
         );
     }
     for node in &graph.nodes {
+        optional_hint_check(progress)?;
         rows.get_mut(node.path.as_str())
             .context("graph node path missing")?
             .nodes
             .push(node);
     }
     for call in &graph.calls {
+        optional_hint_check(progress)?;
         rows.get_mut(call.path.as_str())
             .context("graph call path missing")?
             .calls
             .push(call);
     }
     for region in &graph.regions {
+        optional_hint_check(progress)?;
         rows.get_mut(region.path.as_str())
             .context("graph region path missing")?
             .regions
@@ -3038,6 +3085,7 @@ fn publication_rows<'a>(
     }
     let mut owners = BTreeMap::new();
     for class in &classes.classes {
+        optional_hint_check(progress)?;
         rows.get_mut(class.symbol.path.as_str())
             .context("class path missing")?
             .classes
@@ -3050,6 +3098,7 @@ fn publication_rows<'a>(
         );
     }
     for relation in &classes.relations {
+        optional_hint_check(progress)?;
         let path = owners
             .get(relation.owner.as_str())
             .context("class relation owner missing")?;
@@ -3059,18 +3108,21 @@ fn publication_rows<'a>(
             .push(relation);
     }
     for decl in &native.declarations {
+        optional_hint_check(progress)?;
         rows.get_mut(decl.document.path.as_str())
             .context("native declaration path missing")?
             .native_declarations
             .push(decl);
     }
     for call in &native.calls {
+        optional_hint_check(progress)?;
         rows.get_mut(call.document.path.as_str())
             .context("native call path missing")?
             .native_calls
             .push(call);
     }
     for region in &native.control_regions {
+        optional_hint_check(progress)?;
         rows.get_mut(region.document.path.as_str())
             .context("native control path missing")?
             .native_regions
@@ -3084,6 +3136,15 @@ fn v8_document_projection(
     native: &crate::native_evidence::Artifact,
     grouped: &PublicationRows<'_>,
 ) -> Result<V8DocumentProjection> {
+    v8_document_projection_with_progress(file, native, grouped, None)
+}
+fn v8_document_projection_with_progress(
+    file: &SourceFile,
+    native: &crate::native_evidence::Artifact,
+    grouped: &PublicationRows<'_>,
+    progress: Option<&dyn Fn() -> bool>,
+) -> Result<V8DocumentProjection> {
+    optional_hint_check(progress)?;
     let context = crate::native_evidence::native_extraction_context(
         &native.producer,
         &file.language,
@@ -3098,12 +3159,16 @@ fn v8_document_projection(
             "producerId": native.producer.id, "producerVersion": native.producer.version,
         }),
     );
+    optional_hint_check(progress)?;
     let mut nodes = grouped.nodes.clone();
     nodes.sort_by(|a, b| a.id.cmp(&b.id));
+    optional_hint_check(progress)?;
     let mut calls = grouped.calls.clone();
     calls.sort_by(|a, b| a.id.cmp(&b.id));
+    optional_hint_check(progress)?;
     let mut regions = grouped.regions.clone();
     regions.sort_by(|a, b| a.id.cmp(&b.id));
+    optional_hint_check(progress)?;
     let graph_hash = v8_id(
         "",
         b"trellis.graph-projection.v1\0",
@@ -3114,10 +3179,13 @@ fn v8_document_projection(
     );
     let graph_hash = graph_hash.trim_start_matches(':').to_owned();
     let graph_id = format!("graph:v1:{graph_hash}");
+    optional_hint_check(progress)?;
     let mut selected_classes = grouped.classes.clone();
     selected_classes.sort_by(|a, b| a.symbol.id.cmp(&b.symbol.id));
+    optional_hint_check(progress)?;
     let mut selected_relations = grouped.relations.clone();
     selected_relations.sort_by(|a, b| a.id.cmp(&b.id));
+    optional_hint_check(progress)?;
     let class_hash = v8_id(
         "",
         b"trellis.class-projection.v1\0",
@@ -3128,6 +3196,7 @@ fn v8_document_projection(
     );
     let class_hash = class_hash.trim_start_matches(':').to_owned();
     let class_id = format!("class-projection:v1:{class_hash}");
+    optional_hint_check(progress)?;
     Ok(V8DocumentProjection {
         version_id,
         graph_id,
@@ -5045,17 +5114,40 @@ fn read_native_declarations_v8(
     lookup_key: Option<&str>,
     all_lookup_keys: bool,
 ) -> Result<Vec<crate::native_evidence::Declaration>> {
+    read_native_declarations_v8_inner(db, scope, lookup_key, all_lookup_keys, None)
+}
+
+pub(crate) fn read_native_declarations_v8_optional(
+    db: &Connection,
+    scope: &V8NativeScope,
+    lookup_key: Option<&str>,
+    all_lookup_keys: bool,
+    expired: &dyn Fn() -> bool,
+) -> Result<Vec<crate::native_evidence::Declaration>> {
+    read_native_declarations_v8_inner(db, scope, lookup_key, all_lookup_keys, Some(expired))
+}
+
+fn read_native_declarations_v8_inner(
+    db: &Connection,
+    scope: &V8NativeScope,
+    lookup_key: Option<&str>,
+    all_lookup_keys: bool,
+    progress: Option<&dyn Fn() -> bool>,
+) -> Result<Vec<crate::native_evidence::Declaration>> {
     use crate::native_evidence::{Declaration, Header, Key, Parameter, Range};
+    optional_hint_check(progress)?;
     let v = &scope.version_id;
     let mut own_types: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for row in db.prepare("SELECT syntax_id,ordinal,type_name FROM native_version_own_signature_types WHERE version_id=?1 ORDER BY syntax_id,ordinal")?
         .query_map([v],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?)))? {
+        optional_hint_check(progress)?;
         let (id,ord,value)=row?;let entry=own_types.entry(id).or_default();
         contiguous(ord,entry.len(),"own signature")?;entry.push(value);
     }
     let mut ancestor_types: BTreeMap<(String, i64), Vec<String>> = BTreeMap::new();
     for row in db.prepare("SELECT syntax_id,ancestor_ordinal,ordinal,type_name FROM native_version_ancestor_signature_types WHERE version_id=?1 ORDER BY syntax_id,ancestor_ordinal,ordinal")?
         .query_map([v],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?,r.get::<_,String>(3)?)))? {
+        optional_hint_check(progress)?;
         let (id,ancestor,ord,value)=row?;let entry=ancestor_types.entry((id,ancestor)).or_default();
         contiguous(ord,entry.len(),"ancestor signature")?;entry.push(value);
     }
@@ -5071,6 +5163,7 @@ fn read_native_declarations_v8(
     let mut ancestors: BTreeMap<String, Vec<Ancestor>> = BTreeMap::new();
     for row in db.prepare("SELECT syntax_id,ordinal,kind,name,sibling_ordinal,signature_present,type_parameter_count,variadic FROM native_version_declaration_ancestors WHERE version_id=?1 ORDER BY syntax_id,ordinal")?
         .query_map([v],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,i64>(4)?,r.get::<_,bool>(5)?,r.get::<_,Option<i64>>(6)?,r.get::<_,Option<bool>>(7)?)))? {
+        optional_hint_check(progress)?;
         let (id,ord,kind,name,sibling,present,count,variadic)=row?;
         let entry=ancestors.entry(id).or_default();contiguous(ord,entry.len(),"ancestor")?;
         entry.push((ord,kind,name,sibling,present,count,variadic));
@@ -5078,6 +5171,7 @@ fn read_native_declarations_v8(
     let mut headers: BTreeMap<String, Header> = BTreeMap::new();
     for row in db.prepare("SELECT syntax_id,kind,name,result_type FROM native_version_headers WHERE version_id=?1 ORDER BY syntax_id")?
         .query_map([v],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,Option<String>>(3)?)))? {
+        optional_hint_check(progress)?;
         let (id,kind,name,result_type)=row?;
         ensure!(headers.insert(id,Header{kind,name,modifiers:vec![],type_parameters:vec![],parameters:vec![],result_type,bases:vec![]}).is_none(),"duplicate native header");
     }
@@ -5085,6 +5179,7 @@ fn read_native_declarations_v8(
     let mut item_ordinals: BTreeMap<(String, String), usize> = BTreeMap::new();
     for row in db.prepare("SELECT syntax_id,item_kind,ordinal,value FROM native_version_header_items WHERE version_id=?1 ORDER BY syntax_id,item_kind,ordinal")?
         .query_map([v],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?,r.get::<_,String>(3)?)))? {
+        optional_hint_check(progress)?;
         let (id,kind,ordinal,value)=row?;
         let n=item_ordinals.entry((id.clone(),kind.clone())).or_default();contiguous(ordinal,*n,"header item")?;*n+=1;
         let h=headers.get_mut(&id).context("orphan native header item")?;
@@ -5093,6 +5188,7 @@ fn read_native_declarations_v8(
     let mut param_ordinals: BTreeMap<String, usize> = BTreeMap::new();
     for row in db.prepare("SELECT syntax_id,ordinal,name,type_name,variadic FROM native_version_parameters WHERE version_id=?1 ORDER BY syntax_id,ordinal")?
         .query_map([v],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,bool>(4)?)))? {
+        optional_hint_check(progress)?;
         let (id,ordinal,name,type_name,variadic)=row?;
         let n=param_ordinals.entry(id.clone()).or_default();contiguous(ordinal,*n,"header parameter")?;*n+=1;
         headers.get_mut(&id).context("orphan native header parameter")?.parameters.push(Parameter{name,type_name,variadic});
@@ -5102,6 +5198,7 @@ fn read_native_declarations_v8(
     let mut recorded_owners: BTreeMap<String, Option<String>> = BTreeMap::new();
     for row in db.prepare("SELECT syntax_id,owner_syntax_id,kind,name,lookup_key,key_signature_present,key_type_parameter_count,key_variadic,key_ordinal,start_byte,end_byte,name_start,name_end FROM native_version_declarations WHERE version_id=?1 ORDER BY syntax_id")?
       .query_map([v],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,String>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,Option<String>>(4)?,r.get::<_,bool>(5)?,r.get::<_,Option<i64>>(6)?,r.get::<_,Option<bool>>(7)?,r.get::<_,i64>(8)?,r.get::<_,i64>(9)?,r.get::<_,i64>(10)?,r.get::<_,Option<i64>>(11)?,r.get::<_,Option<i64>>(12)?)))? {
+        optional_hint_check(progress)?;
         let (id,owner,kind,name,lookup,present,count,variadic,ordinal,start,end,name_start,name_end)=row?;
         ensure!(recorded_owners.insert(id.clone(),owner).is_none(),"duplicate native declaration");
         let key=Key{kind:kind.clone(),name:name.clone(),signature:decode_signature(&mut own_types,&id,present,count,variadic)?,ordinal:usize::try_from(ordinal)?};
@@ -5129,6 +5226,7 @@ fn read_native_declarations_v8(
     // from serialized ancestor prefix and final Key; compare against complete decoded tree.
     let mut by_key: BTreeMap<(String, String), String> = BTreeMap::new();
     for d in &result {
+        optional_hint_check(progress)?;
         let identity = (
             serde_json::to_string(&d.ancestors)?,
             serde_json::to_string(&d.key)?,
@@ -5139,6 +5237,7 @@ fn read_native_declarations_v8(
         );
     }
     for d in &result {
+        optional_hint_check(progress)?;
         let expected = d
             .ancestors
             .last()
@@ -5199,6 +5298,15 @@ fn read_native_calls_v8(
     scope: &V8NativeScope,
     owner: Option<&str>,
 ) -> Result<Vec<crate::native_evidence::Call>> {
+    read_native_calls_v8_inner(db, scope, owner, None)
+}
+fn read_native_calls_v8_inner(
+    db: &Connection,
+    scope: &V8NativeScope,
+    owner: Option<&str>,
+    progress: Option<&dyn Fn() -> bool>,
+) -> Result<Vec<crate::native_evidence::Call>> {
+    optional_hint_check(progress)?;
     use crate::native_evidence::{Call, Range};
     let version = &scope.version_id;
     let known: BTreeSet<String> = db
@@ -5217,6 +5325,7 @@ fn read_native_calls_v8(
     let mut ordinals: BTreeMap<String, usize> = BTreeMap::new();
     for row in db.prepare("SELECT id,owner_syntax_id,ordinal,start_byte,end_byte,callee_start,callee_end,spelling FROM native_version_calls WHERE version_id=?1 ORDER BY owner_syntax_id,ordinal")?
         .query_map([version],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?,r.get::<_,i64>(3)?,r.get::<_,i64>(4)?,r.get::<_,Option<i64>>(5)?,r.get::<_,Option<i64>>(6)?,r.get::<_,Option<String>>(7)?)))? {
+        optional_hint_check(progress)?;
         let (id,call_owner,ordinal,start,end,callee_start,callee_end,spelling)=row?;
         ensure!(known.contains(&call_owner),"orphan native call owner");
         let n=ordinals.entry(call_owner.clone()).or_default();contiguous(ordinal,*n,"call")?;*n+=1;
@@ -5231,6 +5340,7 @@ fn read_native_calls_v8(
     }
     for row in db.prepare("SELECT call_id,region_id,ordinal FROM native_version_call_regions WHERE version_id=?1 ORDER BY call_id,ordinal")?
         .query_map([version],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?)))? {
+        optional_hint_check(progress)?;
         let (call_id,region_id,ordinal)=row?;
         let call=&mut calls[*indexes.get(&call_id).context("orphan native call region")?];
         ensure!(region_owner.get(&region_id)==Some(&call.owner_syntax_id),"cross-owner native call region");
@@ -5247,6 +5357,15 @@ fn read_native_control_regions_v8(
     scope: &V8NativeScope,
     owner: Option<&str>,
 ) -> Result<Vec<crate::native_evidence::ControlRegion>> {
+    read_native_control_regions_v8_inner(db, scope, owner, None)
+}
+fn read_native_control_regions_v8_inner(
+    db: &Connection,
+    scope: &V8NativeScope,
+    owner: Option<&str>,
+    progress: Option<&dyn Fn() -> bool>,
+) -> Result<Vec<crate::native_evidence::ControlRegion>> {
+    optional_hint_check(progress)?;
     use crate::native_evidence::{ControlRegion, Range};
     let known: BTreeSet<String> = db
         .prepare("SELECT syntax_id FROM native_version_declarations WHERE version_id=?1")?
@@ -5258,6 +5377,7 @@ fn read_native_control_regions_v8(
     let mut ordinals = BTreeMap::<String, usize>::new();
     for row in db.prepare("SELECT id,owner_syntax_id,ordinal,kind,start_byte,end_byte,parent_id,arm FROM native_version_control_regions WHERE version_id=?1 ORDER BY owner_syntax_id,ordinal")?
         .query_map([&scope.version_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?,r.get::<_,String>(3)?,r.get::<_,i64>(4)?,r.get::<_,i64>(5)?,r.get::<_,Option<String>>(6)?,r.get::<_,Option<String>>(7)?)))? {
+        optional_hint_check(progress)?;
         let (id,region_owner,ordinal,kind,start,end,parent_id,arm)=row?;
         ensure!(known.contains(&region_owner),"orphan native region owner");
         let n=ordinals.entry(region_owner.clone()).or_default();contiguous(ordinal,*n,"region")?;*n+=1;
@@ -5268,6 +5388,7 @@ fn read_native_control_regions_v8(
             provenance_id:proof.clone()});
     }
     for region in &regions {
+        optional_hint_check(progress)?;
         if let Some(parent_id) = &region.parent_id {
             let parent = &regions[*indexes
                 .get(parent_id)
@@ -6497,6 +6618,10 @@ impl Store {
         self.recovery_disposition
             .fetch_max(disposition as u8, Ordering::AcqRel);
         self.recovery_required.store(true, Ordering::Release);
+    }
+    #[cfg(feature = "test-support")]
+    pub fn recovery_pending_for_tests(&self) -> bool {
+        self.recovery_required.load(Ordering::Acquire)
     }
     fn ensure_not_recreate_pending(&self) -> Result<()> {
         ensure!(
@@ -10145,6 +10270,16 @@ impl Store {
         path: &str,
         selected: &ReadRevision,
     ) -> Result<crate::native_evidence::Artifact> {
+        self.selected_native_witness_for_inner(db, path, selected, None)
+    }
+    fn selected_native_witness_for_inner(
+        &self,
+        db: &Connection,
+        path: &str,
+        selected: &ReadRevision,
+        progress: Option<&dyn Fn() -> bool>,
+    ) -> Result<crate::native_evidence::Artifact> {
+        optional_hint_check(progress)?;
         use crate::native_evidence::{Document, DocumentKey, Producer, Revision, SourceSet};
         let (source_set_id, revision_id): (String, String) = db
             .query_row(
@@ -10160,8 +10295,14 @@ impl Store {
             source_set_id == format!("source-set:v1:{}", self.root_id()),
             "incompatible_index: selected source set mismatch"
         );
-        let file = Self::selected_source_row_bounded_for(db, path, 256 * 1024 * 1024, selected)?
-            .context("incompatible_index: selected graph source absent")?;
+        let file = Self::selected_source_row_bounded_for_inner(
+            db,
+            path,
+            256 * 1024 * 1024,
+            selected,
+            progress,
+        )?
+        .context("incompatible_index: selected graph source absent")?;
         let mut producer:Producer=db.query_row(
             "SELECT id,version,executable_hash,kind,position_encoding FROM native_producers LIMIT 1",[],
             |r|Ok(Producer{id:r.get(0)?,version:r.get(1)?,executable_hash:r.get(2)?,kind:r.get(3)?,languages:vec![],position_encoding:r.get(4)?}),
@@ -10206,8 +10347,10 @@ impl Store {
             content_hash: file.hash.clone(),
             byte_length: file.text.len(),
         });
-        crate::native_evidence::selected_source_witness(&file, producer, source_set, revision)
-            .context("incompatible_index: selected source extraction failed")
+        crate::native_evidence::selected_source_witness_with_progress(
+            &file, producer, source_set, revision, progress,
+        )
+        .context("incompatible_index: selected source extraction failed")
     }
 
     /// Authenticate one selected document's normalized records and graph DTOs
@@ -10231,7 +10374,18 @@ impl Store {
         path: &str,
         selected: &ReadRevision,
     ) -> Result<()> {
-        self.attest_selected_document_inner(db, path, selected)
+        self.attest_selected_document_inner(db, path, selected, None)
+            .map_err(selected_integrity)
+            .map_err(|error| self.report_selected_failure(error))
+    }
+    pub(crate) fn attest_selected_document_optional_for(
+        &self,
+        db: &Connection,
+        path: &str,
+        selected: &ReadRevision,
+        expired: &dyn Fn() -> bool,
+    ) -> Result<()> {
+        self.attest_selected_document_inner(db, path, selected, Some(expired))
             .map_err(selected_integrity)
             .map_err(|error| self.report_selected_failure(error))
     }
@@ -10240,8 +10394,10 @@ impl Store {
         db: &Connection,
         path: &str,
         selected: &ReadRevision,
+        progress: Option<&dyn Fn() -> bool>,
     ) -> Result<()> {
         use crate::native_evidence::DocumentKey;
+        optional_hint_check(progress)?;
         let sql = "SELECT m.source_set_id,m.language,m.path,m.document_version_id,m.graph_projection_id,
             m.class_projection_id,d.content_hash,d.byte_length,length(d.source_bytes),
             g.graph_hash,g.state,g.class_extraction_state,length(CAST(g.class_extraction_payload AS BLOB)),
@@ -10254,6 +10410,7 @@ impl Store {
             LEFT JOIN class_projections c ON c.id=m.class_projection_id AND c.graph_projection_id=g.id
             WHERE m.path=?1 AND m.revision_id=?2 LIMIT 2";
         let mut stmt = db.prepare(sql)?;
+        optional_hint_check(progress)?;
         let rows = stmt
             .query_map(params![path, selected.key], |r| {
                 Ok((
@@ -10375,6 +10532,7 @@ impl Store {
             counts.iter().all(|&n| n >= 0 && n <= row_limit),
             "incompatible_index: selected evidence row budget exceeded"
         );
+        optional_hint_check(progress)?;
         let (max_row, total_bytes) =
             Self::selected_ancillary_byte_usage(db, &version_id, &class_id)?;
         ensure!(
@@ -10396,6 +10554,7 @@ impl Store {
             SELECT length(CAST(id AS BLOB))+length(CAST(name AS BLOB))+length(CAST(path AS BLOB))+length(CAST(payload AS BLOB)) AS row_bytes FROM graph_nodes WHERE projection_id=?1
             UNION ALL SELECT length(CAST(id AS BLOB))+length(CAST(caller AS BLOB))+COALESCE(length(CAST(target AS BLOB)),0)+length(CAST(path AS BLOB))+length(CAST(payload AS BLOB)) FROM graph_calls WHERE projection_id=?1
             UNION ALL SELECT length(CAST(id AS BLOB))+length(CAST(owner AS BLOB))+length(CAST(path AS BLOB))+length(CAST(payload AS BLOB)) FROM graph_regions WHERE projection_id=?1)";
+        optional_hint_check(progress)?;
         let (graph_row, graph_total): (i64, i64) =
             db.query_row(graph_byte_sql, [&graph_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
         ensure!(
@@ -10413,19 +10572,26 @@ impl Store {
                         .min(512 * 1024 * 1024),
             "incompatible_index: selected graph row byte budget exceeded"
         );
-        let file = Self::selected_source_row_bounded_for(db, path, 256 * 1024 * 1024, selected)?
-            .context("incompatible_index: selected source missing")?;
+        let file = Self::selected_source_row_bounded_for_inner(
+            db,
+            path,
+            256 * 1024 * 1024,
+            selected,
+            progress,
+        )?
+        .context("incompatible_index: selected source missing")?;
         ensure!(
             file.hash == hash && file.language == language && file.text.len() == bytes as usize,
             "incompatible_index: selected source identity mismatch"
         );
-        let witness = self.selected_native_witness_for(db, path, selected)?;
+        let witness = self.selected_native_witness_for_inner(db, path, selected, progress)?;
         let coverage = read_native_coverage_v8(db, &scope)?;
         ensure!(
             witness.coverage == vec![coverage],
             "incompatible_index: selected native coverage differs from source"
         );
-        let mut declarations = read_native_declarations_v8(db, &scope, None, true)?;
+        let mut declarations = read_native_declarations_v8_inner(db, &scope, None, true, progress)?;
+        optional_hint_check(progress)?;
         let mut expected = witness.declarations.clone();
         declarations.sort_by(|a, b| a.syntax_id.cmp(&b.syntax_id));
         expected.sort_by(|a, b| a.syntax_id.cmp(&b.syntax_id));
@@ -10433,6 +10599,7 @@ impl Store {
             declarations == expected,
             "incompatible_index: selected native declarations differ from source"
         );
+        optional_hint_check(progress)?;
         let mut owners: BTreeSet<_> = expected.iter().map(|d| d.syntax_id.clone()).collect();
         for table in ["native_version_calls", "native_version_control_regions"] {
             let query = format!("SELECT DISTINCT owner_syntax_id FROM {table} WHERE version_id=?1");
@@ -10444,7 +10611,8 @@ impl Store {
             }
         }
         for owner in owners {
-            let calls = read_native_calls_v8(db, &scope, Some(&owner))?;
+            optional_hint_check(progress)?;
+            let calls = read_native_calls_v8_inner(db, &scope, Some(&owner), progress)?;
             let mut expected_calls: Vec<_> = witness
                 .calls
                 .iter()
@@ -10456,7 +10624,8 @@ impl Store {
                 calls == expected_calls,
                 "incompatible_index: selected native calls differ from source"
             );
-            let regions = read_native_control_regions_v8(db, &scope, Some(&owner))?;
+            optional_hint_check(progress)?;
+            let regions = read_native_control_regions_v8_inner(db, &scope, Some(&owner), progress)?;
             let mut expected_regions: Vec<_> = witness
                 .control_regions
                 .iter()
@@ -10483,6 +10652,7 @@ impl Store {
                 ))
             })?
         {
+            optional_hint_check(progress)?;
             let (id, name, path, payload) = row?;
             let node: Symbol = serde_json::from_str(&payload)?;
             ensure!(
@@ -10494,6 +10664,7 @@ impl Store {
         let mut calls = Vec::new();
         for row in db.prepare("SELECT id,caller,target,path,payload FROM graph_calls WHERE projection_id=?1 ORDER BY id")?
             .query_map([&graph_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?)))? {
+            optional_hint_check(progress)?;
             let (id,caller,target,path,payload)=row?;
             let call:CallSite=serde_json::from_str(&payload)?;
             ensure!(call.id==id && call.caller==caller && call.path==path && path==file.path && target.is_none(),
@@ -10503,6 +10674,7 @@ impl Store {
         let mut regions = Vec::new();
         for row in db.prepare("SELECT id,owner,path,payload FROM graph_regions WHERE projection_id=?1 ORDER BY id")?
             .query_map([&graph_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?)))? {
+            optional_hint_check(progress)?;
             let (id,owner,path,payload)=row?;
             let region:ControlRegion=serde_json::from_str(&payload)?;
             ensure!(region.id==id && region.owner==owner && region.path==path && path==file.path,
@@ -10512,6 +10684,7 @@ impl Store {
         let mut class_rows = Vec::new();
         for row in db.prepare("SELECT id,name,qualified_name,path,payload FROM classes WHERE projection_id=?1 ORDER BY id")?
             .query_map([&class_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?)))? {
+            optional_hint_check(progress)?;
             let (id,name,qualified,path,payload)=row?;
             let class:crate::classes::ClassDefinition=serde_json::from_str(&payload)?;
             ensure!(class.symbol.id==id && class.symbol.name==name && class.symbol.path==path
@@ -10522,12 +10695,14 @@ impl Store {
         let mut class_relations = Vec::new();
         for row in db.prepare("SELECT id,owner,target,payload FROM class_relations WHERE projection_id=?1 ORDER BY id")?
             .query_map([&class_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,String>(3)?)))? {
+            optional_hint_check(progress)?;
             let (id,owner,target,payload)=row?;
             let relation:crate::classes::ClassRelation=serde_json::from_str(&payload)?;
             ensure!(relation.id==id && relation.owner==owner && relation.target==target,
                 "incompatible_index: selected class relation materialization differs");
             class_relations.push(relation);
         }
+        optional_hint_check(progress)?;
         let mut graph = Graph {
             files: vec![file],
             nodes,
@@ -10541,6 +10716,7 @@ impl Store {
         graph.stats.regions = graph.regions.len();
         graph.stats.unresolved = graph.calls.len();
         for coverage in &witness.coverage {
+            optional_hint_check(progress)?;
             if coverage.state != "complete" {
                 let recovered = coverage
                     .diagnostic
@@ -10564,10 +10740,12 @@ impl Store {
                 });
             }
         }
-        crate::indexer::validate_native_graph_records(
+        optional_hint_check(progress)?;
+        crate::indexer::validate_native_graph_records_with_progress(
             &graph,
             &witness,
             &Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            progress,
         )?;
         let stored_f: Option<String> = db.query_row(
             "SELECT class_extraction_payload FROM graph_projections WHERE id=?1",
@@ -10575,11 +10753,13 @@ impl Store {
             |r| r.get(0),
         )?;
         if matches!(language.as_str(), "java" | "python") {
-            let expected_f = crate::classes::FileExtraction::extract_file(
+            optional_hint_check(progress)?;
+            let expected_f = crate::classes::FileExtraction::extract_file_with_progress(
                 &graph.files[0],
                 &graph.nodes,
                 &Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 crate::classes::Limits::default(),
+                progress,
             )?;
             ensure!(
                 stored_f
@@ -10595,17 +10775,21 @@ impl Store {
                 "incompatible_index: non-class graph carries F"
             );
         }
+        optional_hint_check(progress)?;
         let catalog = crate::classes::Catalog {
             classes: class_rows,
             relations: class_relations,
             warnings: vec![],
             truncated: false,
         };
-        let rows = publication_rows(&graph, &witness, &catalog)?;
+        optional_hint_check(progress)?;
+        let rows = publication_rows_with_progress(&graph, &witness, &catalog, progress)?;
         let grouped = rows
             .get(graph.files[0].path.as_str())
             .context("selected rows missing")?;
-        let ids = v8_document_projection(&graph.files[0], &witness, grouped)?;
+        optional_hint_check(progress)?;
+        let ids =
+            v8_document_projection_with_progress(&graph.files[0], &witness, grouped, progress)?;
         ensure!(
             ids.version_id == version_id
                 && ids.graph_id == graph_id
@@ -11401,6 +11585,16 @@ impl Store {
         max_bytes: i64,
         selected: &ReadRevision,
     ) -> Result<Option<SourceFile>> {
+        Self::selected_source_row_bounded_for_inner(db, path, max_bytes, selected, None)
+    }
+    fn selected_source_row_bounded_for_inner(
+        db: &Connection,
+        path: &str,
+        max_bytes: i64,
+        selected: &ReadRevision,
+        progress: Option<&dyn Fn() -> bool>,
+    ) -> Result<Option<SourceFile>> {
+        optional_hint_check(progress)?;
         let selected_sql = "FROM revision_documents m JOIN document_versions d
             ON d.id=m.document_version_id AND d.source_set_id=m.source_set_id
               AND d.language=m.language AND d.path=m.path
@@ -11412,6 +11606,7 @@ impl Store {
         let mut sizes = stmt.query(params![path, selected.key])?;
         let mut present = false;
         while let Some(row) = sizes.next()? {
+            optional_hint_check(progress)?;
             ensure!(!present, "incompatible_index: ambiguous manifest source");
             present = true;
             let bytes: i64 = row.get(0)?;
@@ -11441,17 +11636,29 @@ impl Store {
                     let hash: String = r.get(3)?;
                     let length: i64 = r.get(4)?;
                     let raw = r.get_ref(5)?.as_blob()?;
+                    let mut digest = Sha256::new();
+                    for (index, chunk) in raw.chunks(64 * 1024).enumerate() {
+                        if index == 0 && progress.is_some() {
+                            #[cfg(feature = "test-support")]
+                            crate::mcp::phase_hook("outgoing_hint_source_hash_chunk")
+                                .map_err(|error| anyhow::anyhow!(error))?;
+                        }
+                        optional_hint_check(progress)?;
+                        digest.update(chunk);
+                    }
+                    optional_hint_check(progress)?;
                     ensure!(
                         source_set.starts_with("source-set:v1:")
                             && stored_path == path
                             && length == raw.len() as i64
-                            && hash == hex::encode(Sha256::digest(raw)),
+                            && hash == hex::encode(digest.finalize()),
                         "incompatible_index: source hash mismatch"
                     );
                     Ok((source_set, language, stored_path, hash, raw.to_vec()))
                 })())
             })?;
         let (_source_set, language, stored_path, hash, bytes) = checked?;
+        optional_hint_check(progress)?;
         let file = SourceFile {
             path: stored_path,
             hash,
@@ -11462,7 +11669,19 @@ impl Store {
             bytes: 0,
             max_bytes: usize::try_from(max_bytes)?.saturating_add(16 * 1024),
         };
-        serde_json::to_writer(&mut budget, &file)?;
+        if progress.is_some() {
+            let encoded = serde_json::to_writer(
+                &mut OptionalSourceBudget {
+                    budget: &mut budget,
+                    progress,
+                },
+                &file,
+            );
+            optional_hint_check(progress)?;
+            encoded?;
+        } else {
+            serde_json::to_writer(&mut budget, &file)?;
+        }
         Ok(Some(file))
     }
     pub fn source_at(
