@@ -911,15 +911,46 @@ fn run_transport(
     // A client that hangs up while replies are still being written ends the
     // session; that is not a failure.
     match coordinate(workspace, input, output, registry, daemon_handle, relayed) {
-        Err(error)
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
-            ) =>
-        {
-            Ok(())
-        }
+        Err(error) if client_hung_up(&error) => Ok(()),
         other => other,
+    }
+}
+
+/// The write errors a closed client peer produces. macOS can report a write
+/// to a socket whose peer has gone as `NotConnected` (ENOTCONN) rather than
+/// `BrokenPipe`.
+fn client_hung_up(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::NotConnected
+    )
+}
+
+#[cfg(test)]
+mod hang_up_tests {
+    use super::client_hung_up;
+    use std::io::{Error, ErrorKind};
+
+    #[test]
+    fn a_closed_peer_is_a_hang_up_in_each_form_the_os_reports_it() {
+        for kind in [
+            ErrorKind::BrokenPipe,
+            ErrorKind::ConnectionReset,
+            ErrorKind::NotConnected,
+        ] {
+            assert!(client_hung_up(&Error::from(kind)), "{kind:?}");
+        }
+        // ENOTCONN as macOS reports it on a write to a socket whose peer closed.
+        assert!(client_hung_up(&Error::from_raw_os_error(libc::ENOTCONN)));
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::InvalidData,
+            ErrorKind::TimedOut,
+        ] {
+            assert!(!client_hung_up(&Error::from(kind)), "{kind:?}");
+        }
     }
 }
 

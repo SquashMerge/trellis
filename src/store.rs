@@ -2010,6 +2010,49 @@ fn has_revision_producer_bindings(db: &Connection) -> Result<bool> {
         [], |r| r.get(0),
     )?)
 }
+thread_local! {
+    static READ_DEADLINE: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+fn read_deadline() -> Option<Instant> {
+    READ_DEADLINE.with(std::cell::Cell::get)
+}
+
+/// Run one read under a single deadline (#142). Every SQLite busy wait of a
+/// read-only index connection opened on this thread inside `read` draws on
+/// that one deadline, so waits cannot stack per statement; when it passes,
+/// SQLite reports BUSY and the read fails with typed `storage_busy`. Nested
+/// scopes keep the earlier deadline.
+pub fn with_read_deadline<T>(deadline: Instant, read: impl FnOnce() -> T) -> T {
+    struct Restore(Option<Instant>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            READ_DEADLINE.with(|cell| cell.set(self.0));
+        }
+    }
+    let previous = read_deadline();
+    let _restore = Restore(previous);
+    let effective = previous.map_or(deadline, |earlier| earlier.min(deadline));
+    READ_DEADLINE.with(|cell| cell.set(Some(effective)));
+    read()
+}
+
+/// SQLite busy handler for read-scope connections: back off briefly while the
+/// scope's deadline allows, then give up (BUSY). A connection used after its
+/// scope ended falls back to a bounded wait (as `busy_timeout` would).
+fn read_deadline_busy(attempt: i32) -> bool {
+    let pause = Duration::from_millis((1_u64 << attempt.clamp(0, 4) as u32).min(20));
+    let remaining = match read_deadline() {
+        Some(deadline) => deadline.saturating_duration_since(Instant::now()),
+        None => Duration::from_secs(5).saturating_sub(pause * attempt.max(0) as u32),
+    };
+    if remaining.is_zero() {
+        return false;
+    }
+    std::thread::sleep(pause.min(remaining));
+    true
+}
+
 fn open_index_marker_probe(
     path: &Path,
     writable: bool,
@@ -2024,7 +2067,13 @@ fn open_index_marker_probe(
         OpenFlags::SQLITE_OPEN_READ_ONLY
     } | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let db = protected_sqlite_open(path, flags)?;
-    storage_result(db.busy_timeout(busy_wait))?;
+    // Inside a read scope a read-only connection's waits share the scope's one
+    // deadline (#142); otherwise each SQLite call waits up to `busy_wait`.
+    if !writable && read_deadline().is_some() && !busy_wait.is_zero() {
+        storage_result(db.busy_handler(Some(read_deadline_busy)))?;
+    } else {
+        storage_result(db.busy_timeout(busy_wait))?;
+    }
     storage_result(db.pragma_update(None, "temp_store", "MEMORY"))?;
     storage_result(db.pragma_update(None, "foreign_keys", "ON"))?;
     if writable {
@@ -2375,6 +2424,147 @@ fn storage_result<T>(result: rusqlite::Result<T>) -> Result<T> {
 #[cfg(test)]
 mod sqlite_contention_type_tests {
     use super::*;
+
+    /// #142: one deadline per read scope. Past it, the busy handler declines
+    /// at once (no per-statement wait); before it, it waits.
+    #[test]
+    fn the_read_scope_busy_handler_follows_the_scope_deadline() {
+        let past = Instant::now() - Duration::from_millis(1);
+        assert!(!with_read_deadline(past, || read_deadline_busy(0)));
+        assert!(!with_read_deadline(past, || read_deadline_busy(7)));
+        let future = Instant::now() + Duration::from_secs(60);
+        assert!(with_read_deadline(future, || read_deadline_busy(0)));
+    }
+
+    #[test]
+    fn read_scopes_nest_to_the_earlier_deadline_and_restore() {
+        assert_eq!(read_deadline(), None);
+        let earlier = Instant::now() + Duration::from_secs(1);
+        let later = earlier + Duration::from_secs(1);
+        let inner = with_read_deadline(earlier, || with_read_deadline(later, read_deadline));
+        assert_eq!(inner, Some(earlier));
+        assert_eq!(
+            with_read_deadline(later, || with_read_deadline(earlier, read_deadline)),
+            Some(earlier)
+        );
+        assert_eq!(
+            read_deadline(),
+            None,
+            "the scope must restore the previous deadline"
+        );
+    }
+
+    /// Holds `BEGIN EXCLUSIVE` on `path` from another connection (no write,
+    /// so no journal sidecar) until `release` is sent.
+    fn hold_exclusive(path: &Path) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let path = path.to_path_buf();
+        let holder = std::thread::spawn(move || {
+            let writer = rusqlite::Connection::open(&path).unwrap();
+            writer.execute_batch("BEGIN EXCLUSIVE").unwrap();
+            locked_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+            writer.execute_batch("ROLLBACK").unwrap();
+        });
+        locked_rx.recv().unwrap();
+        (release_tx, holder)
+    }
+
+    /// Releases the writer's lock shortly after a probe starts: a probe that
+    /// still waits per statement then succeeds, one bound by an expired read
+    /// scope has already failed.
+    fn probe_against_releasing_writer(
+        path: &Path,
+        writable: bool,
+        probe: impl FnOnce(&Path, bool) -> Result<ProtectedSqliteConnection>,
+    ) -> Result<ProtectedSqliteConnection> {
+        let (release, holder) = hold_exclusive(path);
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(500));
+            let _ = release.send(());
+        });
+        let opened = probe(path, writable);
+        releaser.join().unwrap();
+        holder.join().unwrap();
+        opened
+    }
+
+    /// #142: the read deadline reaches real index connections. Inside an
+    /// expired read scope, a read-only `open_index_marker_probe` fails typed
+    /// instead of waiting out its per-call busy timeout; outside a scope, and
+    /// for a writable open, it waits as before.
+    #[test]
+    fn open_index_marker_probe_applies_the_read_scope_only_to_read_only_opens() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().canonicalize().unwrap().join("index.db");
+        {
+            let setup = rusqlite::Connection::open(&path).unwrap();
+            setup
+                .execute_batch("PRAGMA journal_mode=DELETE; CREATE TABLE witness(id INTEGER)")
+                .unwrap();
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let expired = || Instant::now() - Duration::from_millis(1);
+
+        let in_scope = probe_against_releasing_writer(&path, false, |path, writable| {
+            with_read_deadline(expired(), || {
+                open_index_marker_probe(path, writable, Duration::from_secs(5))
+            })
+        });
+        let busy = in_scope
+            .err()
+            .expect("a read-only probe in an expired scope must not wait");
+        assert!(
+            busy.downcast_ref::<SqliteContention>().is_some(),
+            "{busy:#}"
+        );
+
+        let outside = probe_against_releasing_writer(&path, false, |path, writable| {
+            open_index_marker_probe(path, writable, Duration::from_secs(5))
+        });
+        assert!(
+            outside.is_ok(),
+            "outside a read scope the probe waits: {:#}",
+            outside.err().unwrap()
+        );
+
+        let writable = probe_against_releasing_writer(&path, true, |path, writable| {
+            with_read_deadline(expired(), || {
+                open_index_marker_probe(path, writable, Duration::from_secs(5))
+            })
+        });
+        assert!(
+            writable.is_ok(),
+            "a writable probe ignores the read scope: {:#}",
+            writable.err().unwrap()
+        );
+    }
+
+    /// A reader blocked by a writer, in a scope whose deadline has passed,
+    /// gets typed storage_busy on its first statement instead of waiting.
+    #[test]
+    fn an_expired_read_scope_fails_typed_without_waiting() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let writer = rusqlite::Connection::open(&path).unwrap();
+        writer
+            .execute_batch("PRAGMA journal_mode=DELETE; CREATE TABLE witness(id INTEGER)")
+            .unwrap();
+        let reader = rusqlite::Connection::open(&path).unwrap();
+        reader.busy_handler(Some(read_deadline_busy)).unwrap();
+        writer.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let busy = with_read_deadline(Instant::now() - Duration::from_millis(1), || {
+            storage_result(
+                reader.query_row("SELECT count(*) FROM witness", [], |r| r.get::<_, i64>(0)),
+            )
+            .unwrap_err()
+        });
+        assert_eq!(busy.to_string(), "storage_busy: SQLite lock contention");
+        assert!(busy.downcast_ref::<SqliteContention>().is_some());
+        writer.execute_batch("ROLLBACK").unwrap();
+    }
 
     #[test]
     fn rollback_writer_busy_is_typed_without_raw_sqlite_cause_or_rebuild() {
@@ -3850,7 +4040,7 @@ fn revision_producer_binding(db: &Connection, revision_key: &str) -> Result<(Str
         },
     )?;
     ensure!(
-        native_revision.starts_with("revision:v1:")
+        native_revision.starts_with("revision:v2:")
             && [toolchain.as_str(), config.as_str(), dependency.as_str()]
                 .iter()
                 .all(|hash| hash.len() == 64
@@ -4121,7 +4311,7 @@ fn validate_paired_metadata(
                 .as_ref()
                 .is_some_and(|(id, root)| id == &expected_source && root == root_id)
             && revision.as_ref().is_some_and(
-                |(id, source)| id.starts_with("revision:v1:") && source == &expected_source
+                |(id, source)| id.starts_with("revision:v2:") && source == &expected_source
             ),
         "incompatible_index: missing native pair metadata"
     );
@@ -8087,7 +8277,12 @@ impl Store {
             let source_set_id = format!("source-set:v1:{}", self.root_id());
             let producer_id = crate::native_evidence::PRODUCER;
             let producer_version = crate::native_evidence::NATIVE_VERSION;
-            let mut statement = db.prepare("SELECT m.source_set_id,m.path,m.language,v.content_hash,v.byte_length,v.source_bytes,
+            // Unchanged prior documents are trusted by their stored, validated
+            // content hash (owner ruling, #141): their bytes are not read,
+            // re-hashed or decoded here. Only the changed document's bytes are
+            // loaded and witness-checked below. Selected reads still attest
+            // what they serve.
+            let mut statement = db.prepare("SELECT m.source_set_id,m.path,m.language,v.content_hash,v.byte_length,NULL,
                 v.extraction_context,v.producer_id,v.producer_version,m.document_version_id,
                 m.graph_projection_id,m.class_projection_id,g.graph_hash,c.content_hash,
                 g.class_extraction_payload,m.coverage_requested,m.coverage_selected,
@@ -8098,7 +8293,7 @@ impl Store {
                 WHERE m.revision_id=?1 ORDER BY m.ordinal")?;
             for row in statement.query_map([&selected.key], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?, r.get::<_, i64>(4)?, r.get::<_, Vec<u8>>(5)?,
+                    r.get::<_, String>(3)?, r.get::<_, i64>(4)?, (),
                     r.get::<_, String>(6)?, r.get::<_, String>(7)?, r.get::<_, String>(8)?,
                     r.get::<_, String>(9)?, r.get::<_, String>(10)?,
                     r.get::<_, Option<String>>(11)?, r.get::<_, String>(12)?,
@@ -8106,12 +8301,11 @@ impl Store {
                     r.get::<_, bool>(15)?, r.get::<_, bool>(16)?,
                     r.get::<_, String>(17)?, r.get::<_, Option<String>>(18)?))
             })? {
-                let (row_source_set_id,path,language,hash,length,bytes,context,id,version,version_id,
+                let (row_source_set_id,path,language,hash,length,(),context,id,version,version_id,
                     graph_id,class_id,graph_hash,class_hash,extraction,requested,covered,state,diagnostic)=row?;
                 ensure!(row_source_set_id == source_set_id,
                     "incompatible_index: prior manifest source-set identity mismatch");
-                ensure!(length >= 0 && length as usize == bytes.len()
-                    && hash == hex::encode(sha2::Sha256::digest(&bytes)),
+                ensure!(length >= 0 && hash.len() == 64,
                     "incompatible_index: prior captured source witness mismatch");
                 ensure!(id == producer_id && version == producer_version
                     && context == crate::native_evidence::declared_selected_extraction_context(
@@ -8119,7 +8313,7 @@ impl Store {
                     )?
                     && class_id.is_some() && class_hash.is_some(),
                     "incompatible_index: prior document producer/context missing");
-                let source = SourceFile {path:path.clone(),language:language.clone(),hash:hash.clone(),text:String::from_utf8(bytes)?};
+                let source = SourceFile {path:path.clone(),language:language.clone(),hash:hash.clone(),text:String::new()};
                 previous.push(source);
                 ensure!(prior_ids.insert(path.clone(), V8DocumentProjection {
                     version_id, graph_id, class_id:class_id.context("class projection missing")?,
@@ -8136,6 +8330,25 @@ impl Store {
                     prior_extractions.insert(path.clone(), serde_json::from_str(&payload)?);
                 }
                 changed_counts.insert(path, (0_usize,0_usize,0_usize));
+            }
+            // The one document whose old text matters (proved_body_only reads
+            // it) is the only one whose stored bytes are read and checked.
+            let current_hashes: BTreeMap<&str, &str> =
+                capture.files.iter().map(|f| (f.path.as_str(), f.hash.as_str())).collect();
+            let changed_paths: Vec<usize> = previous.iter().enumerate()
+                .filter(|(_, old)| current_hashes.get(old.path.as_str()).is_some_and(|new| *new != old.hash))
+                .map(|(i, _)| i).collect();
+            if let [i] = changed_paths[..] {
+                let old = &mut previous[i];
+                let (length, bytes): (i64, Vec<u8>) = db.query_row(
+                    "SELECT v.byte_length,v.source_bytes FROM revision_documents m
+                     JOIN document_versions v ON v.id=m.document_version_id
+                     WHERE m.revision_id=?1 AND m.path=?2 AND m.language=?3",
+                    params![selected.key, old.path, old.language], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                ensure!(length >= 0 && length as usize == bytes.len()
+                    && old.hash == hex::encode(sha2::Sha256::digest(&bytes)),
+                    "incompatible_index: prior captured source witness mismatch");
+                old.text = String::from_utf8(bytes)?;
             }
             let decision = crate::indexer::measure_persisted_change(
                 &previous, &previous_options, &previous_inputs, capture)?;
@@ -12397,6 +12610,100 @@ mod rebaseline_fault_tests {
     use super::*;
     use crate::indexer::{IndexOptions, index_workspace_bundle};
     use std::{fs, sync::atomic::AtomicBool};
+
+    /// Zero a selected document's stored source bytes in place (same length,
+    /// wrong hash), through the store's own connection.
+    fn corrupt_stored_source(store: &Store, pin: IndexPin, path: &str) {
+        let mut db = store.cache_write().unwrap();
+        let tx = db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let selected = store.read_revision_for(&tx, Some(pin), true).unwrap();
+        let changed = tx
+            .execute(
+                "UPDATE document_versions SET source_bytes=zeroblob(length(source_bytes))
+                 WHERE id=(SELECT m.document_version_id FROM revision_documents m
+                 WHERE m.revision_id=?1 AND m.path=?2)",
+                params![selected.key, path],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+        tx.commit().unwrap();
+    }
+
+    fn local_edit_fixture() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        Store,
+        IndexOptions,
+        IndexPin,
+    ) {
+        use crate::index_coordinator::IndexJobCoordinator;
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        fs::write(
+            work.path().join("local.js"),
+            "function local(){return 1;}\n",
+        )
+        .unwrap();
+        fs::write(
+            work.path().join("A.java"),
+            "class A { int run(){return 1;} }\n",
+        )
+        .unwrap();
+        let options = IndexOptions::new(work.path().to_owned());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+        let job = IndexJobCoordinator::prepare(&store, None).unwrap();
+        let first = job.run(&options, &cancel, |_| {}).unwrap();
+        (state, work, store, options, first)
+    }
+
+    fn prepare_one_file_edit(
+        store: &Store,
+        options: &IndexOptions,
+    ) -> Result<Option<LocalPrepared>> {
+        use crate::capture::Capture;
+        fs::write(
+            options.workspace_root.join("local.js"),
+            "function local(){return 2;}\n",
+        )
+        .unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let capture = Capture::admit(options, &cancel, &|_| {}).unwrap();
+        let baseline = store.recovery_index_baseline().unwrap();
+        store.prepare_local_revision(&capture, &baseline, &cancel)
+    }
+
+    /// #141 (owner ruling): an unchanged prior document is trusted by its
+    /// stored content hash; its bytes are not read or re-hashed on a local
+    /// edit of another document.
+    #[test]
+    fn a_local_edit_does_not_reread_unchanged_prior_documents() {
+        let (_state, _work, store, options, pin) = local_edit_fixture();
+        corrupt_stored_source(&store, pin, "A.java");
+        let prepared = prepare_one_file_edit(&store, &options).unwrap();
+        assert_eq!(
+            prepared
+                .expect("the one-file edit stays local")
+                .changed_path,
+            "local.js"
+        );
+    }
+
+    /// The changed document's stored bytes are still read and witness-checked.
+    #[test]
+    fn a_local_edit_still_checks_the_changed_documents_stored_bytes() {
+        let (_state, _work, store, options, pin) = local_edit_fixture();
+        corrupt_stored_source(&store, pin, "local.js");
+        let Err(error) = prepare_one_file_edit(&store, &options) else {
+            panic!("a corrupt changed document must not prepare");
+        };
+        assert!(
+            format!("{error:#}").contains("prior captured source witness mismatch"),
+            "{error:#}"
+        );
+    }
 
     #[test]
     fn selective_publication_faults_rollback_and_retry_same_expected_pin() {
