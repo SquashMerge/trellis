@@ -2729,3 +2729,346 @@ async fn enqueue_after_closing_runs_at_next_activation() {
     .await
     .expect("the durable row did not run at the next activation");
 }
+
+/// Every request row of a queue as `id:state/error_code`, ordered by seq.
+/// Read from requests.db directly: the old-root Store refuses reads once its
+/// root changed.
+#[cfg(feature = "test-support")]
+fn queue_rows(db: &Path) -> Vec<String> {
+    let db = rusqlite::Connection::open(db).unwrap();
+    let mut statement = db
+        .prepare("SELECT id,state,error_code FROM requests ORDER BY seq")
+        .unwrap();
+    statement
+        .query_map([], |row| {
+            Ok(format!(
+                "{}:{}/{}",
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?.unwrap_or_default()
+            ))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+/// #122 live replacement: with the daemon's runtime running, the root is
+/// replaced at the same path while old-root rows are accepted. The old
+/// runtime's confirmed `root_changed` settlement is observed (durably, from a
+/// separate connection) at its Closing linearization, strictly before the new
+/// root's startup reconciliation (H) begins and before its first FIFO claim.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn live_same_path_replacement_settles_old_rows_before_new_root_startup_and_claim() {
+    let base = tempfile::tempdir().unwrap();
+    let checkout = base.path().join("work");
+    fs::create_dir(&checkout).unwrap();
+    fs::write(checkout.join("a.js"), "function oldRoot() {}\n").unwrap();
+    let old_id = identity(&checkout);
+    let key = old_id.root_key.clone();
+    let topology = roots(base.path());
+    let db_path = topology.requests_db(&old_id);
+    let mut registry = CheckoutRegistry::with_roots(topology.clone());
+    registry.attach_launch(1, &old_id).unwrap();
+    let old = registry.activate(&key).unwrap();
+    ready(&old).await;
+    let old_scheduler = old.browser_scheduler().unwrap();
+    // Hold the running worker so both old-root rows are accepted, not
+    // claimed, when the root is replaced.
+    let (release_hold, holder) = hold_worker(old_scheduler.clone()).await;
+    let enqueuer = Store::open(topology.clone(), identity(&checkout)).unwrap();
+    let options = trellis::indexer::IndexOptions::new(checkout.clone());
+    let old_rows = [
+        enqueuer.enqueue_request(&options, None).unwrap().id,
+        enqueuer.enqueue_request(&options, None).unwrap().id,
+    ];
+    drop(enqueuer);
+    fs::rename(&checkout, base.path().join("moved")).unwrap();
+    fs::create_dir(&checkout).unwrap();
+    fs::write(checkout.join("a.js"), "function newRoot() {}\n").unwrap();
+    let new_id = identity(&checkout);
+    // The old runtime is live and has not settled: the new root cannot
+    // attach, so no new-root runtime (and no H) can start yet.
+    assert!(registry.attach_launch(2, &new_id).is_err());
+    // Ordering witness: each hook records what a separate connection reads
+    // from requests.db at that point.
+    let witness = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(&str, Vec<String>)>::new()));
+    let record = |at: &'static str| {
+        let (witness, db_path) = (witness.clone(), db_path.clone());
+        move || witness.lock().unwrap().push((at, queue_rows(&db_path)))
+    };
+    let closing = record("old_closing");
+    old_scheduler.set_closing_hook_for_tests(closing);
+    drop(release_hold);
+    holder.join().unwrap();
+    retired(&old_scheduler).await;
+    assert!(old_scheduler.checkout_root_loss_retired());
+    // The replacement attaches once the old runtime closed for root loss.
+    registry.attach_launch(2, &new_id).unwrap();
+    let startup = record("new_startup");
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let resume_rx = std::sync::Mutex::new(resume_rx);
+    registry.set_next_startup_hook_for_tests(std::sync::Arc::new(move || {
+        startup();
+        entered_tx.send(()).unwrap();
+        let _ = resume_rx.lock().unwrap().recv();
+    }));
+    let fresh = registry.activate(&key).unwrap();
+    assert!(!std::sync::Arc::ptr_eq(&fresh, &old));
+    entered(entered_rx, "new-root startup reconciliation").await;
+    fresh.set_after_claim_hook_for_tests(record("first_claim"));
+    // A new-root client is already waiting while H is held.
+    let indexer = fresh.clone();
+    let new_options = trellis::indexer::IndexOptions::new(checkout.clone());
+    let index = tokio::task::spawn_blocking(move || indexer.cli_index(&new_options));
+    let new_row = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        loop {
+            let rows = queue_rows(&db_path);
+            if rows.len() == 3 {
+                break rows[2].split(':').next().unwrap().to_owned();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("new-root request was not accepted");
+    resume_tx.send(()).unwrap();
+    let answer = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, index)
+        .await
+        .expect("new-root request did not complete")
+        .unwrap()
+        .unwrap();
+    assert!(answer["publishedRevision"].is_object());
+    let settled: Vec<String> = old_rows
+        .iter()
+        .map(|id| format!("{id}:failed/root_changed"))
+        .collect();
+    let witness = witness.lock().unwrap().clone();
+    assert_eq!(
+        witness,
+        vec![
+            ("old_closing", settled.clone()),
+            ("new_startup", settled.clone()),
+            (
+                "first_claim",
+                [settled, vec![format!("{new_row}:running/")]].concat(),
+            ),
+        ],
+        "old-root settlement must be durable before new-root H and claim"
+    );
+}
+
+#[cfg(feature = "test-support")]
+async fn selected_get(
+    app: &axum::Router,
+    path: &str,
+) -> (axum::http::StatusCode, serde_json::Value) {
+    use axum::{
+        body::{Body, to_bytes},
+        http::Request,
+    };
+    use tower::ServiceExt;
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(path)
+                .header("host", "127.0.0.1:7331")
+                .header(
+                    "authorization",
+                    "Bearer 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap_or_default())
+}
+
+/// The daemon's browser surface over a shared registry.
+#[cfg(feature = "test-support")]
+fn browser(registry: &std::sync::Arc<tokio::sync::Mutex<CheckoutRegistry>>) -> axum::Router {
+    trellis::http::ProvisionedBrowser::new(
+        registry.clone(),
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
+        "127.0.0.1:7331".parse().unwrap(),
+    )
+    .unwrap()
+    .router()
+}
+
+/// Run the daemon's GC lane on `runtime` until the `gone` queue is deleted.
+#[cfg(feature = "test-support")]
+async fn gc_until_deleted(runtime: &trellis::daemon::registry::CheckoutRuntime, gone: &Path) {
+    let scheduler = runtime.browser_scheduler().unwrap();
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        while gone.exists() {
+            scheduler.force_retention_idle_tick_for_tests().unwrap();
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("daemon GC did not delete the eligible index");
+}
+
+/// Decision 0008 §3, T04: a queue no client activates keeps its accepted row
+/// pending until eligible GC deletes the index. After the daemon's GC removes
+/// the replaced root's index, a lookup of that ID through the daemon is a
+/// typed `not_found`, while the route still answers IDs the new root accepted.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn gc_abandons_unserviced_pending_request_and_later_lookup_is_not_found() {
+    let base = tempfile::tempdir().unwrap();
+    let (current, lost) = (base.path().join("current"), base.path().join("lost"));
+    for (root, text) in [
+        (&current, "function current() {}\n"),
+        (&lost, "function lost() {}\n"),
+    ] {
+        fs::create_dir(root).unwrap();
+        fs::write(root.join("a.js"), text).unwrap();
+    }
+    let topology = roots(base.path());
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(CheckoutRegistry::with_roots(
+        topology.clone(),
+    )));
+    let app = browser(&registry);
+    let lost_id = identity(&lost);
+    let key = lost_id.root_key.clone();
+    let queue = topology.requests_db(&lost_id);
+    {
+        let mut registry = registry.lock().await;
+        let runtime = idle_detached(&mut registry, &lost_id).await;
+        release_when_idle(&mut registry, &key).await;
+        assert!(!runtime.has_active_resources());
+    }
+    // Accepted durably (as before a daemon crash); no client activates it.
+    let store = Store::open(topology.clone(), identity(&lost)).unwrap();
+    let pending = store
+        .enqueue_request(&trellis::indexer::IndexOptions::new(lost.clone()), None)
+        .unwrap();
+    drop(store);
+    fs::rename(&lost, base.path().join("moved")).unwrap();
+    fs::create_dir(&lost).unwrap();
+    fs::write(lost.join("a.js"), "function replacement() {}\n").unwrap();
+    assert_eq!(queue_rows(&queue), vec![format!("{}:queued/", pending.id)]);
+    let gc = {
+        let mut registry = registry.lock().await;
+        registry.attach_launch(1, &identity(&current)).unwrap();
+        registry.activate(&identity(&current).root_key).unwrap()
+    };
+    ready(&gc).await;
+    gc_until_deleted(&gc, &queue).await;
+    assert!(!topology.index_dir(&lost_id).exists());
+    let (status, body) =
+        selected_get(&app, &format!("/api/checkouts/{key}/jobs/{}", pending.id)).await;
+    assert_eq!(
+        (status, body["error"]["code"].as_str()),
+        (axum::http::StatusCode::NOT_FOUND, Some("not_found")),
+        "{body}"
+    );
+    // The same route answers an ID accepted by the replacement root.
+    let replacement = registry.lock().await.runtime(&key).unwrap();
+    let options = trellis::indexer::IndexOptions::new(lost.clone());
+    let indexer = replacement.clone();
+    tokio::time::timeout(
+        trellis::testing::HANG_BACKSTOP,
+        tokio::task::spawn_blocking(move || indexer.cli_index(&options)),
+    )
+    .await
+    .expect("replacement index did not complete")
+    .unwrap()
+    .unwrap();
+    let accepted = queue_rows(&queue);
+    assert_eq!(accepted.len(), 1, "the abandoned row must not reappear");
+    let id = accepted[0].split(':').next().unwrap();
+    let (status, body) = selected_get(&app, &format!("/api/checkouts/{key}/jobs/{id}")).await;
+    assert_eq!(
+        (status, body["state"].as_str()),
+        (axum::http::StatusCode::OK, Some("done")),
+        "{body}"
+    );
+}
+
+/// Decision 0008 §3, T04: a client already waiting on a request whose root is
+/// then lost gets `root_changed`, never `not_found`, even though eligible GC
+/// later deletes the index; a fresh lookup after GC gets `not_found`.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn waiting_client_gets_root_changed_for_lost_root_then_gc_lookup_is_not_found() {
+    let base = tempfile::tempdir().unwrap();
+    let (current, lost) = (base.path().join("current"), base.path().join("lost"));
+    for (root, text) in [
+        (&current, "function current() {}\n"),
+        (&lost, "function lost() {}\n"),
+    ] {
+        fs::create_dir(root).unwrap();
+        fs::write(root.join("a.js"), text).unwrap();
+    }
+    let topology = roots(base.path());
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(CheckoutRegistry::with_roots(
+        topology.clone(),
+    )));
+    let app = browser(&registry);
+    let lost_id = identity(&lost);
+    let key = lost_id.root_key.clone();
+    let queue = topology.requests_db(&lost_id);
+    let runtime = {
+        let mut registry = registry.lock().await;
+        registry.attach_launch(1, &lost_id).unwrap();
+        registry.activate(&key).unwrap()
+    };
+    ready(&runtime).await;
+    let scheduler = runtime.browser_scheduler().unwrap();
+    let (release_hold, holder) = hold_worker(scheduler.clone()).await;
+    let indexer = runtime.clone();
+    let options = trellis::indexer::IndexOptions::new(lost.clone());
+    let waiter = tokio::task::spawn_blocking(move || indexer.cli_index(&options));
+    let id = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        loop {
+            if let [row] = queue_rows(&queue).as_slice() {
+                break row.split(':').next().unwrap().to_owned();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("request was not accepted");
+    assert_eq!(queue_rows(&queue), vec![format!("{id}:queued/")]);
+    // The client is waiting on its accepted row when the root is lost.
+    fs::rename(&lost, base.path().join("moved")).unwrap();
+    fs::create_dir(&lost).unwrap();
+    fs::write(lost.join("a.js"), "function replacement() {}\n").unwrap();
+    drop(release_hold);
+    holder.join().unwrap();
+    let error = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, waiter)
+        .await
+        .expect("waiting client was not answered")
+        .unwrap()
+        .expect_err("a lost root cannot complete its request");
+    assert!(error.to_string().starts_with("root_changed"), "{error:#}");
+    retired(&scheduler).await;
+    assert_eq!(
+        queue_rows(&queue),
+        vec![format!("{id}:failed/root_changed")]
+    );
+    let gc = {
+        let mut registry = registry.lock().await;
+        registry.disconnect(1);
+        release_when_idle(&mut registry, &key).await;
+        registry.attach_launch(2, &identity(&current)).unwrap();
+        registry.activate(&identity(&current).root_key).unwrap()
+    };
+    ready(&gc).await;
+    gc_until_deleted(&gc, &queue).await;
+    let (status, body) = selected_get(&app, &format!("/api/checkouts/{key}/jobs/{id}")).await;
+    assert_eq!(
+        (status, body["error"]["code"].as_str()),
+        (axum::http::StatusCode::NOT_FOUND, Some("not_found")),
+        "{body}"
+    );
+}
