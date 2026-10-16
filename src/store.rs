@@ -2007,6 +2007,49 @@ fn has_revision_producer_bindings(db: &Connection) -> Result<bool> {
         [], |r| r.get(0),
     )?)
 }
+thread_local! {
+    static READ_DEADLINE: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+fn read_deadline() -> Option<Instant> {
+    READ_DEADLINE.with(std::cell::Cell::get)
+}
+
+/// Run one read under a single deadline (#142). Every SQLite busy wait of a
+/// read-only index connection opened on this thread inside `read` draws on
+/// that one deadline, so waits cannot stack per statement; when it passes,
+/// SQLite reports BUSY and the read fails with typed `storage_busy`. Nested
+/// scopes keep the earlier deadline.
+pub fn with_read_deadline<T>(deadline: Instant, read: impl FnOnce() -> T) -> T {
+    struct Restore(Option<Instant>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            READ_DEADLINE.with(|cell| cell.set(self.0));
+        }
+    }
+    let previous = read_deadline();
+    let _restore = Restore(previous);
+    let effective = previous.map_or(deadline, |earlier| earlier.min(deadline));
+    READ_DEADLINE.with(|cell| cell.set(Some(effective)));
+    read()
+}
+
+/// SQLite busy handler for read-scope connections: back off briefly while the
+/// scope's deadline allows, then give up (BUSY). A connection used after its
+/// scope ended falls back to a bounded wait (as `busy_timeout` would).
+fn read_deadline_busy(attempt: i32) -> bool {
+    let pause = Duration::from_millis((1_u64 << attempt.clamp(0, 4) as u32).min(20));
+    let remaining = match read_deadline() {
+        Some(deadline) => deadline.saturating_duration_since(Instant::now()),
+        None => Duration::from_secs(5).saturating_sub(pause * attempt.max(0) as u32),
+    };
+    if remaining.is_zero() {
+        return false;
+    }
+    std::thread::sleep(pause.min(remaining));
+    true
+}
+
 fn open_index_marker_probe(
     path: &Path,
     writable: bool,
@@ -2021,7 +2064,13 @@ fn open_index_marker_probe(
         OpenFlags::SQLITE_OPEN_READ_ONLY
     } | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let db = protected_sqlite_open(path, flags)?;
-    storage_result(db.busy_timeout(busy_wait))?;
+    // Inside a read scope a read-only connection's waits share the scope's one
+    // deadline (#142); otherwise each SQLite call waits up to `busy_wait`.
+    if !writable && read_deadline().is_some() && !busy_wait.is_zero() {
+        storage_result(db.busy_handler(Some(read_deadline_busy)))?;
+    } else {
+        storage_result(db.busy_timeout(busy_wait))?;
+    }
     storage_result(db.pragma_update(None, "temp_store", "MEMORY"))?;
     storage_result(db.pragma_update(None, "foreign_keys", "ON"))?;
     if writable {
@@ -2372,6 +2421,147 @@ fn storage_result<T>(result: rusqlite::Result<T>) -> Result<T> {
 #[cfg(test)]
 mod sqlite_contention_type_tests {
     use super::*;
+
+    /// #142: one deadline per read scope. Past it, the busy handler declines
+    /// at once (no per-statement wait); before it, it waits.
+    #[test]
+    fn the_read_scope_busy_handler_follows_the_scope_deadline() {
+        let past = Instant::now() - Duration::from_millis(1);
+        assert!(!with_read_deadline(past, || read_deadline_busy(0)));
+        assert!(!with_read_deadline(past, || read_deadline_busy(7)));
+        let future = Instant::now() + Duration::from_secs(60);
+        assert!(with_read_deadline(future, || read_deadline_busy(0)));
+    }
+
+    #[test]
+    fn read_scopes_nest_to_the_earlier_deadline_and_restore() {
+        assert_eq!(read_deadline(), None);
+        let earlier = Instant::now() + Duration::from_secs(1);
+        let later = earlier + Duration::from_secs(1);
+        let inner = with_read_deadline(earlier, || with_read_deadline(later, read_deadline));
+        assert_eq!(inner, Some(earlier));
+        assert_eq!(
+            with_read_deadline(later, || with_read_deadline(earlier, read_deadline)),
+            Some(earlier)
+        );
+        assert_eq!(
+            read_deadline(),
+            None,
+            "the scope must restore the previous deadline"
+        );
+    }
+
+    /// Holds `BEGIN EXCLUSIVE` on `path` from another connection (no write,
+    /// so no journal sidecar) until `release` is sent.
+    fn hold_exclusive(path: &Path) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let path = path.to_path_buf();
+        let holder = std::thread::spawn(move || {
+            let writer = rusqlite::Connection::open(&path).unwrap();
+            writer.execute_batch("BEGIN EXCLUSIVE").unwrap();
+            locked_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+            writer.execute_batch("ROLLBACK").unwrap();
+        });
+        locked_rx.recv().unwrap();
+        (release_tx, holder)
+    }
+
+    /// Releases the writer's lock shortly after a probe starts: a probe that
+    /// still waits per statement then succeeds, one bound by an expired read
+    /// scope has already failed.
+    fn probe_against_releasing_writer(
+        path: &Path,
+        writable: bool,
+        probe: impl FnOnce(&Path, bool) -> Result<ProtectedSqliteConnection>,
+    ) -> Result<ProtectedSqliteConnection> {
+        let (release, holder) = hold_exclusive(path);
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(500));
+            let _ = release.send(());
+        });
+        let opened = probe(path, writable);
+        releaser.join().unwrap();
+        holder.join().unwrap();
+        opened
+    }
+
+    /// #142: the read deadline reaches real index connections. Inside an
+    /// expired read scope, a read-only `open_index_marker_probe` fails typed
+    /// instead of waiting out its per-call busy timeout; outside a scope, and
+    /// for a writable open, it waits as before.
+    #[test]
+    fn open_index_marker_probe_applies_the_read_scope_only_to_read_only_opens() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().canonicalize().unwrap().join("index.db");
+        {
+            let setup = rusqlite::Connection::open(&path).unwrap();
+            setup
+                .execute_batch("PRAGMA journal_mode=DELETE; CREATE TABLE witness(id INTEGER)")
+                .unwrap();
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let expired = || Instant::now() - Duration::from_millis(1);
+
+        let in_scope = probe_against_releasing_writer(&path, false, |path, writable| {
+            with_read_deadline(expired(), || {
+                open_index_marker_probe(path, writable, Duration::from_secs(5))
+            })
+        });
+        let busy = in_scope
+            .err()
+            .expect("a read-only probe in an expired scope must not wait");
+        assert!(
+            busy.downcast_ref::<SqliteContention>().is_some(),
+            "{busy:#}"
+        );
+
+        let outside = probe_against_releasing_writer(&path, false, |path, writable| {
+            open_index_marker_probe(path, writable, Duration::from_secs(5))
+        });
+        assert!(
+            outside.is_ok(),
+            "outside a read scope the probe waits: {:#}",
+            outside.err().unwrap()
+        );
+
+        let writable = probe_against_releasing_writer(&path, true, |path, writable| {
+            with_read_deadline(expired(), || {
+                open_index_marker_probe(path, writable, Duration::from_secs(5))
+            })
+        });
+        assert!(
+            writable.is_ok(),
+            "a writable probe ignores the read scope: {:#}",
+            writable.err().unwrap()
+        );
+    }
+
+    /// A reader blocked by a writer, in a scope whose deadline has passed,
+    /// gets typed storage_busy on its first statement instead of waiting.
+    #[test]
+    fn an_expired_read_scope_fails_typed_without_waiting() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let writer = rusqlite::Connection::open(&path).unwrap();
+        writer
+            .execute_batch("PRAGMA journal_mode=DELETE; CREATE TABLE witness(id INTEGER)")
+            .unwrap();
+        let reader = rusqlite::Connection::open(&path).unwrap();
+        reader.busy_handler(Some(read_deadline_busy)).unwrap();
+        writer.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let busy = with_read_deadline(Instant::now() - Duration::from_millis(1), || {
+            storage_result(
+                reader.query_row("SELECT count(*) FROM witness", [], |r| r.get::<_, i64>(0)),
+            )
+            .unwrap_err()
+        });
+        assert_eq!(busy.to_string(), "storage_busy: SQLite lock contention");
+        assert!(busy.downcast_ref::<SqliteContention>().is_some());
+        writer.execute_batch("ROLLBACK").unwrap();
+    }
 
     #[test]
     fn rollback_writer_busy_is_typed_without_raw_sqlite_cause_or_rebuild() {

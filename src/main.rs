@@ -976,7 +976,15 @@ fn dispatch_connection(
         return write_daemon_reply(&mut stream, &reply);
     }
     let serve = request.operation == "serve";
-    let result = (|| -> Result<serde_json::Value> {
+    // One deadline for the whole CLI read (#142): activation contention, the
+    // wait for startup reconciliation and every SQLite busy wait share it, so
+    // they cannot stack. When it passes the read fails typed.
+    let request_deadline = Instant::now() + CLI_READ_WAIT;
+    let read_scope = matches!(
+        request.operation.as_str(),
+        "status" | "symbols" | "query" | "export"
+    );
+    let run = || -> Result<serde_json::Value> {
         let root: PathBuf = serde_json::from_value(
             request
                 .payload
@@ -1037,7 +1045,7 @@ fn dispatch_connection(
         // Virgin queue publication can contend with a short-lived index-use
         // reader before any request ID has been accepted. Retry only that
         // typed pre-acceptance admission; never replay an enqueue after COMMIT.
-        let activation_deadline = Instant::now() + CLI_READ_WAIT;
+        let activation_deadline = request_deadline;
         let checkout = loop {
             let activated = runtime.block_on(async {
                 let mut checked = registry.lock().await;
@@ -1058,7 +1066,7 @@ fn dispatch_connection(
             }
         };
         let args = request.payload.get("args").context("missing args")?;
-        let deadline = Instant::now() + CLI_READ_WAIT;
+        let deadline = request_deadline;
         loop {
             // Recorded before the read: a state change between the read and
             // the wait below is never missed.
@@ -1115,7 +1123,12 @@ fn dispatch_connection(
             }
             break selected;
         }
-    })();
+    };
+    let result = if read_scope {
+        trellis::store::with_read_deadline(request_deadline, run)
+    } else {
+        run()
+    };
     if !serve {
         runtime.block_on(async { registry.lock().await.disconnect(session) });
     }
