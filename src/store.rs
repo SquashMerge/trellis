@@ -2286,6 +2286,54 @@ pub(crate) fn sort_optional_by_key<T, K: Ord, F: Fn(&T) -> K>(
 
 #[cfg(test)]
 #[test]
+fn optional_projection_hash_matches_required_for_multiple_rows() {
+    let graph = serde_json::json!({
+        "documentVersionId": "document:v1:test",
+        "nodes": [{"id":"b","name":"é"},{"id":"a","name":"x"}],
+        "calls": [{"id":"call:1"},{"id":"call:2"}],
+        "regions": [{"id":"region:1"}]
+    });
+    let classes = serde_json::json!({
+        "graphProjectionId": "graph:v1:test",
+        "classes": [{"id":"class:1"},{"id":"class:2"}],
+        "relations": [{"id":"relation:1"},{"id":"relation:2"}]
+    });
+    for (domain, value, scalar, arrays) in [
+        (
+            b"trellis.graph-projection.v1\0".as_slice(),
+            graph,
+            "documentVersionId",
+            vec!["nodes", "calls", "regions"],
+        ),
+        (
+            b"trellis.class-projection.v1\0".as_slice(),
+            classes,
+            "graphProjectionId",
+            vec!["classes", "relations"],
+        ),
+    ] {
+        let mut proof = serde_json::Map::new();
+        proof.insert(
+            scalar.into(),
+            serde_json::Value::String(value[scalar].as_str().unwrap().into()),
+        );
+        for field in arrays {
+            proof.insert(
+                field.into(),
+                serde_json::Value::Array(value[field].as_array().unwrap().clone()),
+            );
+        }
+        let optional = serde_json::Value::Object(proof);
+        assert_eq!(optional, value);
+        assert_eq!(
+            v8_id("", domain, value),
+            v8_id_with_progress("", domain, &optional, Some(&|| false)).unwrap()
+        );
+    }
+}
+
+#[cfg(test)]
+#[test]
 fn optional_sort_keeps_equal_key_order_and_stops() {
     let mut values = vec![(2, 0), (1, 1), (2, 2), (1, 3), (2, 4)];
     sort_optional_by_key(&mut values, |item| item.0, Some(&|| false)).unwrap();
@@ -3351,13 +3399,18 @@ fn v8_document_projection_with_progress(
         let calls = projection_values(&calls, progress)?;
         let regions = projection_values(&regions, progress)?;
         optional_hint_check(progress)?;
+        let mut proof = serde_json::Map::new();
+        proof.insert(
+            "documentVersionId".into(),
+            serde_json::Value::String(version_id.clone()),
+        );
+        proof.insert("nodes".into(), serde_json::Value::Array(nodes));
+        proof.insert("calls".into(), serde_json::Value::Array(calls));
+        proof.insert("regions".into(), serde_json::Value::Array(regions));
         v8_id_with_progress(
             "",
             b"trellis.graph-projection.v1\0",
-            &serde_json::json!({
-                "documentVersionId": version_id,
-                "nodes": nodes, "calls": calls, "regions": regions,
-            }),
+            &serde_json::Value::Object(proof),
             progress,
         )?
     } else {
@@ -3383,13 +3436,17 @@ fn v8_document_projection_with_progress(
         let classes = projection_values(&selected_classes, progress)?;
         let relations = projection_values(&selected_relations, progress)?;
         optional_hint_check(progress)?;
+        let mut proof = serde_json::Map::new();
+        proof.insert(
+            "graphProjectionId".into(),
+            serde_json::Value::String(graph_id.clone()),
+        );
+        proof.insert("classes".into(), serde_json::Value::Array(classes));
+        proof.insert("relations".into(), serde_json::Value::Array(relations));
         v8_id_with_progress(
             "",
             b"trellis.class-projection.v1\0",
-            &serde_json::json!({
-                "graphProjectionId": graph_id,
-                "classes": classes, "relations": relations,
-            }),
+            &serde_json::Value::Object(proof),
             progress,
         )?
     } else {
