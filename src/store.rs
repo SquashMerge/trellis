@@ -3126,7 +3126,7 @@ fn decode_optional_json<T: serde::de::DeserializeOwned>(
     optional_hint_check(progress)?;
     Ok(result?)
 }
-pub(crate) fn stringify_optional_json<T: serde::Serialize>(
+pub(crate) fn stringify_optional_json<T: serde::Serialize + ?Sized>(
     item: &T,
     progress: Option<&dyn Fn() -> bool>,
 ) -> Result<String> {
@@ -5520,7 +5520,7 @@ fn read_native_calls_v8_inner(
     let mut known = BTreeSet::new();
     for row in db
         .prepare("SELECT syntax_id FROM native_version_declarations WHERE version_id=?1")?
-        .query_map([version], |r| r.get(0))?
+        .query_map([version], |r| r.get::<_, String>(0))?
     {
         optional_hint_check(progress)?;
         known.insert(row?);
@@ -5530,7 +5530,9 @@ fn read_native_calls_v8_inner(
         .prepare(
             "SELECT id,owner_syntax_id FROM native_version_control_regions WHERE version_id=?1",
         )?
-        .query_map([version], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .query_map([version], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?
     {
         optional_hint_check(progress)?;
         let (id, owner) = row?;
@@ -5595,7 +5597,7 @@ fn read_native_control_regions_v8_inner(
     let mut known = BTreeSet::new();
     for row in db
         .prepare("SELECT syntax_id FROM native_version_declarations WHERE version_id=?1")?
-        .query_map([&scope.version_id], |r| r.get(0))?
+        .query_map([&scope.version_id], |r| r.get::<_, String>(0))?
     {
         optional_hint_check(progress)?;
         known.insert(row?);
