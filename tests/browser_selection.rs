@@ -2026,6 +2026,83 @@ async fn cold_selected_native_read_is_not_ready_without_a_fabricated_basis() {
 }
 
 #[cfg(feature = "test-support")]
+/// After startup reconciliation, the navigation, classes, sequence and query
+/// surfaces serve the reconciled head with `catchingUp` cleared. Returns false
+/// when a later watcher wake moved the head between reads, so the caller retries.
+async fn fresh_read_surfaces(app: axum::Router, prefix: &str, revision: &Value) -> bool {
+    let fresh = |code: axum::http::StatusCode, headers: &axum::http::HeaderMap, body: &Value| {
+        code == axum::http::StatusCode::OK
+            && headers["X-Trellis-Catching-Up"] == "false"
+            && body["revision"] == *revision
+    };
+    let (code, headers, classes) = selected_json(
+        app.clone(),
+        "GET",
+        &format!("{prefix}/classes?q=Widget"),
+        Value::Null,
+    )
+    .await;
+    if !fresh(code, &headers, &classes) {
+        return false;
+    }
+    assert!(
+        classes["items"].to_string().contains("FreshWidget"),
+        "{classes}"
+    );
+    assert!(
+        !classes["items"].to_string().contains("OldWidget"),
+        "{classes}"
+    );
+    let (code, headers, navigation) = selected_json(
+        app.clone(),
+        "POST",
+        &format!("{prefix}/navigation"),
+        serde_json::json!({"expectedRevision":revision,"path":"widget.py","line":2}),
+    )
+    .await;
+    if !fresh(code, &headers, &navigation) {
+        return false;
+    }
+    assert!(
+        navigation["targets"].to_string().contains("FreshWidget"),
+        "{navigation}"
+    );
+    let (code, _, symbols) = selected_json(
+        app.clone(),
+        "GET",
+        &format!("{prefix}/symbols?q=fresh_step"),
+        Value::Null,
+    )
+    .await;
+    if code != axum::http::StatusCode::OK || symbols["revision"] != *revision {
+        return false;
+    }
+    let seed = symbols["items"][0]["id"].as_str().unwrap().to_owned();
+    let (code, headers, sequence) = selected_json(
+        app.clone(),
+        "POST",
+        &format!("{prefix}/sequence"),
+        serde_json::json!({"seed":seed,"expectedRevision":revision}),
+    )
+    .await;
+    if !fresh(code, &headers, &sequence) {
+        return false;
+    }
+    assert_eq!(sequence["seed"]["name"], "fresh_step", "{sequence}");
+    let (code, headers, query) = selected_json(
+        app,
+        "POST",
+        &format!("{prefix}/query"),
+        serde_json::json!({"seed":seed}),
+    )
+    .await;
+    if !fresh(code, &headers, &query) {
+        return false;
+    }
+    assert!(query["nodes"].to_string().contains("fresh_step"), "{query}");
+    true
+}
+
 #[tokio::test]
 async fn selected_status_serves_validated_pre_startup_head_and_clears_freshness_after_startup() {
     use axum::{
@@ -2044,6 +2121,11 @@ async fn selected_status_serves_validated_pre_startup_head_and_clears_freshness_
     let root = temp.path().join("checkout");
     fs::create_dir(&root).unwrap();
     fs::write(root.join("core.js"), "function old_step() {}\n").unwrap();
+    fs::write(
+        root.join("widget.py"),
+        "def old_helper():\n    return 1\n\nclass OldWidget:\n    def run(self):\n        return old_helper()\n",
+    )
+    .unwrap();
     let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
     let roots =
         TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
@@ -2138,6 +2220,11 @@ async fn selected_status_serves_validated_pre_startup_head_and_clears_freshness_
     .await
     .expect("selected checkout did not become releasable after worker quiescence");
     fs::write(root.join("core.js"), "function fresh_step() {}\n").unwrap();
+    fs::write(
+        root.join("widget.py"),
+        "class FreshWidget:\n    def run(self):\n        return 1\n",
+    )
+    .unwrap();
     let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
     let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
     let resume_rx = std::sync::Mutex::new(resume_rx);
@@ -2289,6 +2376,59 @@ async fn selected_status_serves_validated_pre_startup_head_and_clears_freshness_
         );
         assert_eq!(headers["X-Trellis-Catching-Up"], "true");
     }
+    // Decision 0008 §4: every daemon-routed read surface serves the admitted
+    // prior head with catchingUp while startup reconciliation is held.
+    let (code, headers, classes) = selected_json(
+        app.clone(),
+        "GET",
+        &format!("{prefix}/classes?q=OldWidget"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(code, axum::http::StatusCode::OK, "{classes}");
+    assert_eq!(headers["X-Trellis-Catching-Up"], "true");
+    assert_eq!(classes["revision"], old_revision);
+    assert!(
+        classes["items"].to_string().contains("OldWidget"),
+        "{classes}"
+    );
+    let (code, headers, navigation) = selected_json(
+        app.clone(),
+        "POST",
+        &format!("{prefix}/navigation"),
+        serde_json::json!({"expectedRevision":old_revision,"path":"widget.py","line":6}),
+    )
+    .await;
+    assert_eq!(code, axum::http::StatusCode::OK, "{navigation}");
+    assert_eq!(headers["X-Trellis-Catching-Up"], "true");
+    assert_eq!(navigation["revision"], old_revision);
+    assert!(
+        navigation["targets"].to_string().contains("OldWidget"),
+        "{navigation}"
+    );
+    let (code, headers, sequence) = selected_json(
+        app.clone(),
+        "POST",
+        &format!("{prefix}/sequence"),
+        serde_json::json!({"seed":seed,"expectedRevision":old_revision}),
+    )
+    .await;
+    assert_eq!(code, axum::http::StatusCode::OK, "{sequence}");
+    assert_eq!(headers["X-Trellis-Catching-Up"], "true");
+    assert_eq!(sequence["revision"], old_revision);
+    assert!(sequence.to_string().contains("old_step"), "{sequence}");
+    let (code, headers, query) = selected_json(
+        app.clone(),
+        "POST",
+        &format!("{prefix}/query"),
+        serde_json::json!({"seed":seed}),
+    )
+    .await;
+    assert_eq!(code, axum::http::StatusCode::OK, "{query}");
+    assert_eq!(headers["X-Trellis-Catching-Up"], "true");
+    assert_eq!(query["revision"], old_revision);
+    assert_eq!(query["query"]["seed"], seed.as_str());
+    assert!(query.to_string().contains("old_step"), "{query}");
     resume_tx.send(()).unwrap();
     tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
@@ -2319,7 +2459,10 @@ async fn selected_status_serves_validated_pre_startup_head_and_clears_freshness_
                     )
                     .unwrap();
                     if code == axum::http::StatusCode::OK {
-                        if fresh && files["revision"] == current["revision"] {
+                        if fresh
+                            && files["revision"] == current["revision"]
+                            && fresh_read_surfaces(app.clone(), &prefix, &current["revision"]).await
+                        {
                             break;
                         }
                     } else {
