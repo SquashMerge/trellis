@@ -1972,16 +1972,22 @@ async fn maintenance_never_runs_ahead_of_accepted_fifo_work() {
         "FIFO terminal COMMIT was not notified"
     );
     assert_eq!(state_at_unit, (before, pending_before));
+    // Wait for the terminal state of this debt, not a transient one. Two due
+    // revisions (the activation head and `old`, both stamped at 1_000) take two
+    // units each, and the worker may finish all four between two polls, so the
+    // global (1, 1) pending state is never guaranteed to be observable. Poll at
+    // a modest interval: maintenance defers on any SQLite contention, and
+    // back-to-back reads from this process could starve its COMMIT.
+    let released = (("released".to_string(), 0, 0), (0, 0));
+    let mut last = state();
     tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
-        loop {
-            if state().1 == (1, 1) {
-                break;
-            }
-            tokio::task::yield_now().await;
+        while last != released {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            last = state();
         }
     })
     .await
-    .expect("due retention did not advance after FIFO drained");
+    .unwrap_or_else(|_| panic!("due retention did not complete after FIFO drained: {last:?}"));
     assert_eq!(store.request_by_id(&row.id).unwrap().unwrap().state, "done");
 }
 
