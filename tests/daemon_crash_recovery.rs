@@ -1,6 +1,11 @@
-//! #122: a daemon process that is really killed (SIGKILL) at a hooked point
-//! leaves only durable state; a restarted daemon runtime recovers from it
-//! (Decision 0008 §3).
+//! #122: a process that is really killed (SIGKILL) at a hooked point leaves
+//! only durable state; a restarted daemon runtime recovers from it (Decision
+//! 0008 §3).
+//!
+//! Coverage, precisely: the killed child runs the Store / index-coordinator
+//! path the daemon worker calls (startup reconciliation, claim, drain and
+//! publication), not the daemon's worker thread itself. The restart side is
+//! the real daemon: `CheckoutRegistry::activate` and its checkout worker.
 #![cfg(feature = "test-support")]
 use std::{
     fs,
@@ -66,17 +71,30 @@ fn run_child_until_hook_then_kill(child_test: &str, state: &Path, root: &Path) -
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();
-    let mut output = BufReader::new(child.stdout.take().unwrap());
-    let mut line = String::new();
-    // libtest may print "test <name> ... " on the same line before the hook.
-    while output.read_line(&mut line).unwrap() != 0 && !line.contains("HOOKED ") {
-        line.clear();
+    let output = child.stdout.take().unwrap();
+    let (found_tx, found) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut output = BufReader::new(output);
+        let mut line = String::new();
+        // libtest may print "test <name> ... " on the same line before the hook.
+        while output.read_line(&mut line).unwrap_or(0) != 0 && !line.contains("HOOKED ") {
+            line.clear();
+        }
+        let _ = found_tx.send(line);
+    });
+    // Bounded: a child that never reaches its hook fails the test, never hangs it.
+    let line = match found.recv_timeout(trellis::testing::HANG_BACKSTOP) {
+        Ok(line) => line,
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("child did not reach its hook within the hang backstop");
+        }
+    };
+    if !line.contains("HOOKED ") {
+        let _ = child.kill();
+        panic!("child exited before its hook: {:?}", child.wait());
     }
-    assert!(
-        line.contains("HOOKED "),
-        "child exited before its hook: {:?}",
-        child.wait()
-    );
     child.kill().unwrap();
     let status = child.wait().unwrap();
     use std::os::unix::process::ExitStatusExt;
@@ -257,6 +275,17 @@ fn rewrite_workspace(root: &Path, tag: &str) {
 
 #[tokio::test]
 async fn killed_mid_index_commit_rolls_back_hot_journal_then_queue_resumes() {
+    killed_mid_index_commit_recovers(false).await;
+}
+
+/// The killed COMMIT may also have torn page 1 of index.db. Rollback restores
+/// it from the journal; the header check must not see it first and recreate.
+#[tokio::test]
+async fn killed_mid_index_commit_with_torn_header_rolls_back_then_queue_resumes() {
+    killed_mid_index_commit_recovers(true).await;
+}
+
+async fn killed_mid_index_commit_recovers(torn_header: bool) {
     let base = tempfile::tempdir().unwrap();
     let state = base.path().join("state");
     let root = base.path().join("work");
@@ -297,6 +326,14 @@ async fn killed_mid_index_commit_rolls_back_hot_journal_then_queue_resumes() {
         index_revision: fields[1].parse().unwrap(),
     };
 
+    if torn_header {
+        // Damage page 1's header in place (same inode); the journal holds
+        // its original, since every write transaction changes page 1.
+        use std::os::unix::fs::FileExt;
+        let file = fs::OpenOptions::new().write(true).open(&index).unwrap();
+        file.write_all_at(&[0u8; 100], 0).unwrap();
+        file.sync_all().unwrap();
+    }
     // A failure during recovery defers it: a typed error, the same index.db
     // inode and the journal kept, never a recreated index.
     use std::os::unix::fs::{MetadataExt, PermissionsExt};

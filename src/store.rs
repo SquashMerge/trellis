@@ -2424,6 +2424,25 @@ impl std::error::Error for SqliteContention {}
 
 const HOT_INDEX_JOURNAL: &str = "recovery_required: hot index journal";
 
+/// Whether `index.db-journal` may be hot: non-empty and starting with SQLite's
+/// journal magic. An unreadable journal counts, so its recovery attempt
+/// reports a typed deferral instead of skipping it.
+fn hot_index_journal_present(index: &Path) -> Result<bool> {
+    use std::io::Read;
+    const MAGIC: [u8; 8] = [0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7];
+    let journal = index.with_file_name("index.db-journal");
+    match std::fs::symlink_metadata(&journal) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+        Ok(meta) if meta.len() == 0 => return Ok(false),
+        Ok(_) => {}
+    }
+    let mut magic = [0u8; 8];
+    Ok(std::fs::File::open(&journal)
+        .and_then(|mut file| file.read_exact(&mut magic))
+        .map_or(true, |()| magic == MAGIC))
+}
+
 fn storage_result<T>(result: rusqlite::Result<T>) -> Result<T> {
     match result {
         Err(rusqlite::Error::SqliteFailure(info, _))
@@ -5751,6 +5770,12 @@ impl Store {
             let _ = store.recovery_baseline_full(&tx)?;
             Ok(())
         };
+        // Recover a killed publication's hot journal before the first admission:
+        // a torn page-1 header must be restored by rollback, never classified
+        // as corruption by the header check that admission runs first.
+        if hot_index_journal_present(&store.roots.index_db(&store.identity))? {
+            store.recover_hot_index_journal()?;
+        }
         let admission = match admit() {
             // A daemon killed mid-COMMIT leaves a hot journal that a read-only
             // connection cannot roll back. Recover it, then admit normally.
