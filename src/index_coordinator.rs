@@ -424,11 +424,17 @@ pub struct WatcherWork {
     last_accounted_generation: Option<u64>,
     last_accounted_pin: Option<IndexPin>,
     options: IndexOptions,
+    #[cfg(feature = "test-support")]
     witness: Option<Arc<crate::daemon::causal_witness::CausalWitness>>,
+    #[cfg(feature = "test-support")]
     witness_owner: Option<uuid::Uuid>,
+    #[cfg(feature = "test-support")]
     witness_epoch: uuid::Uuid,
+    #[cfg(feature = "test-support")]
     witness_ordinal: u64,
+    #[cfg(feature = "test-support")]
     witness_ordinal_source: Option<Arc<std::sync::atomic::AtomicU64>>,
+    #[cfg(feature = "test-support")]
     witness_reported_generation: Option<u64>,
     /// The owning worker's wake, installed on every watcher this owner creates.
     waker: Option<crate::watch::Waker>,
@@ -486,11 +492,17 @@ impl WatcherWork {
             last_accounted_generation: None,
             last_accounted_pin: None,
             options: options.clone(),
+            #[cfg(feature = "test-support")]
             witness: None,
+            #[cfg(feature = "test-support")]
             witness_owner: None,
+            #[cfg(feature = "test-support")]
             witness_epoch: uuid::Uuid::nil(),
+            #[cfg(feature = "test-support")]
             witness_ordinal: 0,
+            #[cfg(feature = "test-support")]
             witness_ordinal_source: None,
+            #[cfg(feature = "test-support")]
             witness_reported_generation: None,
             waker: None,
             generation_limit: None,
@@ -576,6 +588,7 @@ impl WatcherWork {
 
     /// Bind the optional fixture reporter only after this verified owner installs
     /// the watcher. Generation numbers belong to this exact watch epoch.
+    #[cfg(feature = "test-support")]
     pub fn attach_causal_witness(
         &mut self,
         reporter: Arc<crate::daemon::causal_witness::CausalWitness>,
@@ -589,6 +602,7 @@ impl WatcherWork {
         self.witness = Some(reporter);
     }
 
+    #[cfg(feature = "test-support")]
     pub fn causal_lineage(&self) -> Option<crate::daemon::causal_witness::Lineage> {
         Some(crate::daemon::causal_witness::Lineage {
             owner_incarnation: self.witness_owner?,
@@ -728,6 +742,7 @@ impl WatcherWork {
             self.options = options.clone();
             self.last_accounted_generation = None;
             self.last_accounted_pin = None;
+            #[cfg(feature = "test-support")]
             if let Some(source) = &self.witness_ordinal_source {
                 self.witness_epoch = uuid::Uuid::new_v4();
                 self.witness_reported_generation = None;
@@ -748,6 +763,7 @@ impl WatcherWork {
         // Observe each new generation before its capture can acknowledge it.
         // The queue tick holds watcher_work across this call; the bounded
         // reporter only try_sends and never opens a socket on this path.
+        #[cfg(feature = "test-support")]
         if self.witness_reported_generation != Some(batch.generation) {
             if let (Some(reporter), Some(lineage)) = (&self.witness, self.causal_lineage()) {
                 reporter.watch_pending(lineage, batch.generation);
@@ -822,10 +838,13 @@ impl WatcherWork {
                 // Optional witness data must be captured under the same
                 // publication permit as this inventory. An uncertain read
                 // suppresses only the fixture event, not real reconciliation.
+                #[cfg(feature = "test-support")]
                 let witnessed_pin = self
                     .witness
                     .as_ref()
                     .and_then(|_| store.index_baseline().ok());
+                #[cfg(not(feature = "test-support"))]
+                let witnessed_pin = None;
                 after_cutoff(&self.watch);
                 let accounted = self.watch.acknowledge(&batch);
                 if accounted {

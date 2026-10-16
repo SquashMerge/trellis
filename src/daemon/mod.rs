@@ -1,4 +1,5 @@
 //! Per-user daemon election and private Unix socket ownership.
+#[cfg(feature = "test-support")]
 pub mod causal_witness;
 pub mod client;
 pub mod protocol;

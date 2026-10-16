@@ -2422,12 +2422,36 @@ impl std::fmt::Display for SqliteContention {
 
 impl std::error::Error for SqliteContention {}
 
+const HOT_INDEX_JOURNAL: &str = "recovery_required: hot index journal";
+
+/// Whether `index.db-journal` may be hot: starting with SQLite's journal
+/// magic. A journal shorter than the magic is cold. An otherwise unreadable
+/// journal counts, so its recovery attempt reports a typed deferral instead of
+/// skipping it.
+fn hot_index_journal_present(index: &Path) -> Result<bool> {
+    use std::io::Read;
+    const MAGIC: [u8; 8] = [0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7];
+    let journal = index.with_file_name("index.db-journal");
+    match std::fs::symlink_metadata(&journal) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+        Ok(meta) if meta.len() == 0 => return Ok(false),
+        Ok(_) => {}
+    }
+    let mut magic = [0u8; 8];
+    match std::fs::File::open(&journal).and_then(|mut file| file.read_exact(&mut magic)) {
+        Ok(()) => Ok(magic == MAGIC),
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(_) => Ok(true),
+    }
+}
+
 fn storage_result<T>(result: rusqlite::Result<T>) -> Result<T> {
     match result {
         Err(rusqlite::Error::SqliteFailure(info, _))
             if info.extended_code == rusqlite::ffi::SQLITE_READONLY_ROLLBACK =>
         {
-            anyhow::bail!("recovery_required: hot index journal")
+            anyhow::bail!(HOT_INDEX_JOURNAL)
         }
         Err(rusqlite::Error::SqliteFailure(info, _))
             if matches!(
@@ -5743,12 +5767,27 @@ impl Store {
             }
             initialized?;
         }
-        let admission = (|| -> Result<()> {
+        let admit = || -> Result<()> {
             let mut db = store.cache()?;
             let tx = storage_result(db.transaction())?;
             let _ = store.recovery_baseline_full(&tx)?;
             Ok(())
-        })();
+        };
+        // Recover a killed publication's hot journal before the first admission:
+        // a torn page-1 header must be restored by rollback, never classified
+        // as corruption by the header check that admission runs first.
+        if hot_index_journal_present(&store.roots.index_db(&store.identity))? {
+            store.recover_hot_index_journal()?;
+        }
+        let admission = match admit() {
+            // A daemon killed mid-COMMIT leaves a hot journal that a read-only
+            // connection cannot roll back. Recover it, then admit normally.
+            Err(error) if error.to_string() == HOT_INDEX_JOURNAL => {
+                store.recover_hot_index_journal()?;
+                admit()
+            }
+            other => other,
+        };
         match admission {
             Ok(()) => Ok(store),
             Err(error) if recovery_class(&error) == RecoveryClass::RecreatePending => {
@@ -6589,6 +6628,61 @@ impl Store {
     }
     fn cache(&self) -> Result<IndexConnection> {
         self.connect_index(false)
+    }
+    /// Roll back the hot journal a killed publication left (Decision 0008 §3).
+    /// Under the exclusive use lock no connection in any process uses this
+    /// index, so the journal belongs to the witnessed `index.db` inode: SQLite
+    /// rolls it back on the first read of one writable connection. That open
+    /// neither rejects the journal nor requires a valid header first, since
+    /// rollback may restore the header. Busy, full-disk and I/O failures return
+    /// typed errors and defer recovery; none of them authorizes recreation.
+    /// The recovered head is then admitted and validated as usual.
+    fn recover_hot_index_journal(&self) -> Result<()> {
+        let path = self.roots.index_db(&self.identity);
+        let journal = path.with_file_name("index.db-journal");
+        let exclusive = self.roots.index_use_exclusive_existing(&self.identity)?;
+        if !index_path_present(&journal)? {
+            return Ok(());
+        }
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = path.with_file_name(format!("index.db{suffix}"));
+            ensure!(
+                !index_path_present(&sidecar)?,
+                "recovery_required: unsupported index sidecar: {}",
+                sidecar.display()
+            );
+        }
+        let witness = IndexFileWitness::open(&path)?;
+        self.identity.verify()?;
+        (|| -> Result<()> {
+            let db = protected_sqlite_open(
+                &path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )?;
+            storage_result(db.busy_timeout(Duration::from_secs(5)))?;
+            storage_result(
+                db.query_row("SELECT count(*) FROM sqlite_master", [], |row| {
+                    row.get::<_, i64>(0)
+                }),
+            )?;
+            Ok(())
+        })()
+        .map_err(|error| {
+            // Contention keeps its direct type so callers retry it.
+            if error.downcast_ref::<SqliteContention>().is_some() {
+                error
+            } else {
+                error.context("recovery_deferred: hot index journal rollback failed")
+            }
+        })?;
+        witness.verify()?;
+        ensure!(
+            !index_path_present(&journal)?,
+            "{HOT_INDEX_JOURNAL}: rollback left the journal in place"
+        );
+        drop(exclusive);
+        Ok(())
     }
     fn cache_write(&self) -> Result<IndexConnection> {
         self.connect_index(true)

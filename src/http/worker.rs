@@ -853,6 +853,7 @@ fn worker_loop(weak: std::sync::Weak<DaemonState>, inbox: Arc<WorkerInbox>) {
         deadline = match step {
             Ok(Ok(())) => {
                 // The witness reads phase only after the step released its locks.
+                #[cfg(feature = "test-support")]
                 state.report_causal_startup_ready();
                 if state.maintenance_ready() {
                     state.run_maintenance_unit();
