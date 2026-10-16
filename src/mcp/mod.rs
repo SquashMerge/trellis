@@ -714,7 +714,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                         .map_or(20, |v| wire::uint(v).expect("validated limit") as usize);
                     let expected = validated_expected_basis(args);
                     Some(Box::new(move |_, response, sampled| {
-                        let found = response.mcp_find(query, limit, expected.clone())?;
+                        let found = response.mcp_find(query, limit, expected)?;
                         Ok(projection::find(id, found, root, sampled, modern)
                             .unwrap_or_else(|| tools::failure(id, "range_too_large")))
                     }))
@@ -723,15 +723,13 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                     let symbol_id = args["symbolId"].as_str().expect("validated declaration ID");
                     let expected = validated_expected_basis(args);
                     Some(Box::new(move |_, response, sampled| {
-                        Ok(
-                            match response.mcp_declaration(symbol_id, expected.clone())? {
-                                Some(found) => {
-                                    projection::declaration(id, found, root, sampled, modern)
-                                        .unwrap_or_else(|| tools::failure(id, "range_too_large"))
-                                }
-                                None => tools::failure(id, "not_found"),
-                            },
-                        )
+                        Ok(match response.mcp_declaration(symbol_id, expected)? {
+                            Some(found) => {
+                                projection::declaration(id, found, root, sampled, modern)
+                                    .unwrap_or_else(|| tools::failure(id, "range_too_large"))
+                            }
+                            None => tools::failure(id, "not_found"),
+                        })
                     }))
                 }
                 ("trellis_inspect", Some("outgoing_calls"), Some(args)) => {
@@ -745,7 +743,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                             match response.mcp_outgoing(
                                 symbol_id,
                                 limit,
-                                expected.clone(),
+                                expected,
                                 &|| runtime.mcp_hint_clock_now(),
                                 deadline,
                             )? {
@@ -765,8 +763,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                     let expected_hash = args.get("expectedContentHash").and_then(|v| v.as_str());
                     let expected = validated_expected_basis(args);
                     Some(Box::new(move |_, response, sampled| {
-                        match response.mcp_source(path, start, end, expected.clone(), expected_hash)
-                        {
+                        match response.mcp_source(path, start, end, expected, expected_hash) {
                             Ok(Some(found)) => {
                                 Ok(projection::source(id, found, root, sampled, modern)
                                     .unwrap_or_else(|| tools::failure(id, "range_too_large")))
