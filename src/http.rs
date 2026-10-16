@@ -6260,13 +6260,6 @@ mod normal_post_capture_cancellation_tests {
             |_| {},
         )
         .unwrap();
-        let before = pair_snapshot(&index);
-        fs::write(
-            root.join("one.js"),
-            "function seed() { fresh(); } function fresh() {}\n",
-        )
-        .unwrap();
-        fs::write(root.join("two.js"), "function extra() {}\n").unwrap();
         let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         let state = new(
             store.clone(),
@@ -6275,6 +6268,34 @@ mod normal_post_capture_cancellation_tests {
             "127.0.0.1:7331".parse().unwrap(),
         )
         .unwrap();
+        state.retain_serving_session(owner.clone());
+        tokio::time::timeout(crate::testing::HANG_BACKSTOP, async {
+            while state.checkout_watch_pending() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("initial watcher inventory did not quiesce");
+        let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let held_state = state.clone();
+        let holder = std::thread::spawn(move || {
+            held_state.hold_worker_step_for_tests(|| {
+                held_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+        });
+        tokio::time::timeout(crate::testing::HANG_BACKSTOP, held_rx)
+            .await
+            .expect("worker step was not held")
+            .unwrap();
+        let before = pair_snapshot(&index);
+        fs::write(
+            root.join("one.js"),
+            "function seed() { fresh(); } function fresh() {}\n",
+        )
+        .unwrap();
+        fs::write(root.join("two.js"), "function extra() {}\n").unwrap();
         let app = router(state.clone());
         let (code, accepted) = api(&app, token, "POST", "/api/index", Some(json!({}))).await;
         assert_eq!(code, StatusCode::ACCEPTED, "{accepted}");
@@ -6286,7 +6307,8 @@ mod normal_post_capture_cancellation_tests {
         assert_eq!(rejected["error"]["code"], "request_not_cancellable");
         assert_eq!(pair_snapshot(&index), before);
         assert_eq!(store.request_by_id(id).unwrap().unwrap().state, "queued");
-        drop(owner);
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
         let completed = tokio::time::timeout(crate::testing::HANG_BACKSTOP, async {
             loop {
                 let (code, row) = api(&app, token, "GET", &format!("/api/jobs/{id}"), None).await;
