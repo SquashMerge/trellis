@@ -1313,7 +1313,7 @@ async fn golden_tool_envelopes_and_maximum_ids_both_modes() {
                     let expected = match index {
                         1 => golden_settled_empty_find(&id, workspace, published),
                         2 => golden_settled_failure(&id, workspace, "not_found", published.clone()),
-                        3 => golden_settled_failure(&id, workspace, "index_not_ready", Value::Null),
+                        3 => golden_settled_failure(&id, workspace, "not_found", published.clone()),
                         _ => unreachable!("fixed golden tool order"),
                     };
                     exact_golden_settled(&accepted, &id, !legacy, expected);
@@ -1350,11 +1350,7 @@ async fn golden_tool_envelopes_and_maximum_ids_both_modes() {
             let answer = peer.ask(call(legacy, json!(heavy_id), name, args));
             let published = settled_pin.as_ref().expect("same-lineage H and watch ACK");
             let workspace = &answer["result"]["structuredContent"]["workspace"];
-            let (code, basis) = if name == "trellis_read_source" {
-                ("index_not_ready", Value::Null)
-            } else {
-                ("revision_conflict", published.clone())
-            };
+            let (code, basis) = ("revision_conflict", published.clone());
             exact_golden_settled(
                 &answer,
                 &json!(heavy_id),
@@ -2031,11 +2027,9 @@ fn per_call_linked_worktree_selection_and_closed_failures() {
                 tool(&answer, None, !legacy);
                 let data = &answer["result"]["structuredContent"]["data"];
                 assert_eq!(*data, json!({"symbols":[],"coverage":[],"provenance":[]}));
-            } else if offset == 2 {
+            } else {
                 tool(&answer, Some("not_found"), !legacy);
                 assert!(answer["result"]["structuredContent"]["error"]["currentBasis"].is_object());
-            } else {
-                tool(&answer, Some("index_not_ready"), !legacy);
             }
             assert_eq!(
                 answer["result"]["structuredContent"]["workspace"],
@@ -6403,11 +6397,25 @@ async fn mcp_outgoing_response_bytes_call_prefix_before_global_hints() {
     let calls = envelope["data"]["calls"].as_array().unwrap();
     assert!(!calls.is_empty() && calls.len() < 50, "{reply}");
     assert_eq!(envelope["truncationReason"], "response_bytes");
+    let mut optional_budget_expired = false;
     for (index, call) in calls.iter().enumerate() {
         assert_eq!(call["ordinal"], json!(index));
         assert_eq!(call["disposition"], "unresolved");
-        let count = call["nativeCandidates"]["items"].as_array().unwrap().len();
-        assert_eq!(call["nativeCandidates"]["omitted"], json!(9 - count));
+        let candidates = &call["nativeCandidates"];
+        let count = candidates["items"].as_array().unwrap().len();
+        assert_eq!(candidates["complete"], false);
+        if candidates["omitted"].is_null() {
+            // The optional progress budget expired before this call's hints completed.
+            // Partial hint work is discarded, and every later call stays unknown.
+            optional_budget_expired = true;
+            assert_eq!(candidates["items"], json!([]), "{reply}");
+        } else {
+            assert!(
+                !optional_budget_expired,
+                "optional hint budget cannot resume"
+            );
+            assert_eq!(candidates["omitted"], json!(9 - count), "{reply}");
+        }
         if index > 0 {
             assert!(
                 count == 0
@@ -6901,4 +6909,751 @@ async fn mcp_outgoing_foreign_source_set_is_not_an_optional_candidate() {
         "foreign source set leaked: {reply}"
     );
     assert_eq!(calls[0]["nativeCandidates"]["omitted"], 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_source_selected_cached_bytes_not_disk() {
+    use trellis::daemon::registry::CheckoutRegistry;
+    use trellis::store::{
+        Store,
+        topology::{TopologyRoots, WorkspaceIdentity},
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let root = checkout(temp.path());
+    fs::write(root.join("a.js"), "a\r\nb\n").unwrap();
+    let identity = WorkspaceIdentity::discover(Some(&root), &root)
+        .unwrap()
+        .attach_marker()
+        .unwrap();
+    let store = Store::open_for_tests(temp.path(), &root).unwrap();
+    store.mcp_prepare_virgin_queue_for_tests().unwrap();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
+        &trellis::indexer::IndexOptions::new(root.clone()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    let writer = store.publication_for_tests().unwrap();
+    store
+        .publish_native(
+            &graph,
+            &capture,
+            &native,
+            &writer,
+            store.index_baseline().unwrap(),
+            &cancel,
+        )
+        .unwrap();
+    drop(writer);
+    drop(store);
+    let topology =
+        TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(143, &identity).unwrap();
+    registry.activate(&identity.root_key).unwrap();
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    let (mut client, mut reader, session) = socket_session(&identity, &registry, 143, None);
+    writeln!(
+        client,
+        "{}",
+        call(
+            false,
+            json!(1),
+            "trellis_read_source",
+            json!({"schemaVersion":1,"path":"a.js","startLine":1,"endLine":1})
+        )
+    )
+    .unwrap();
+    let response = next_reply(&mut reader);
+    tool(&response, None, true);
+    let data = &response["result"]["structuredContent"]["data"];
+    assert_eq!(data["text"], "a\r\n");
+    assert_eq!(data["byteRange"], json!({"start":0,"end":3}));
+    assert_eq!(data["path"], "a.js");
+    assert_eq!(data["startLine"], 1);
+    assert_eq!(data["endLine"], 1);
+    assert_eq!(
+        data["evidence"],
+        json!({"evidenceTier":"syntax",
+        "semanticBasis":null,"freshness":"fresh","staleBecause":[]})
+    );
+    assert_eq!(response["result"]["structuredContent"]["partial"], false);
+    assert_eq!(response["result"]["structuredContent"]["truncated"], false);
+    let good_hash = data["contentHash"].clone();
+    for (id, args, code, hash) in [
+        (
+            2,
+            json!({"schemaVersion":1,"path":"missing.js","startLine":1,"endLine":1}),
+            "not_found",
+            None,
+        ),
+        (
+            3,
+            json!({"schemaVersion":1,"path":"a.js","startLine":3,"endLine":3,
+            "expectedContentHash":"0".repeat(64)}),
+            "revision_conflict",
+            Some(good_hash),
+        ),
+        (
+            4,
+            json!({"schemaVersion":1,"path":"a.js","startLine":3,"endLine":3}),
+            "range_too_large",
+            None,
+        ),
+    ] {
+        writeln!(
+            client,
+            "{}",
+            call(false, json!(id), "trellis_read_source", args)
+        )
+        .unwrap();
+        let reply = next_reply(&mut reader);
+        tool(&reply, Some(code), true);
+        let envelope = &reply["result"]["structuredContent"];
+        assert_eq!(
+            envelope["error"]["currentContentHash"],
+            hash.unwrap_or(Value::Null)
+        );
+        assert!(envelope["error"]["currentBasis"].is_object());
+    }
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_source_post_validation_invalid_bytes_only_selected_range_fails() {
+    use sha2::{Digest, Sha256};
+    use trellis::daemon::registry::CheckoutRegistry;
+    use trellis::store::{
+        Store,
+        topology::{TopologyRoots, WorkspaceIdentity},
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let root = checkout(temp.path());
+    fs::write(root.join("a.js"), "a\nb\n").unwrap();
+    let store = Store::open_for_tests(temp.path(), &root).unwrap();
+    store.mcp_prepare_virgin_queue_for_tests().unwrap();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
+        &trellis::indexer::IndexOptions::new(root.clone()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    let writer = store.publication_for_tests().unwrap();
+    store
+        .publish_native(
+            &graph,
+            &capture,
+            &native,
+            &writer,
+            store.index_baseline().unwrap(),
+            &cancel,
+        )
+        .unwrap();
+    drop(writer);
+    let identity = WorkspaceIdentity::discover(Some(&root), &root)
+        .unwrap()
+        .attach_marker()
+        .unwrap();
+    let topology =
+        TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(144, &identity).unwrap();
+    let runtime = registry.activate(&identity.root_key).unwrap();
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        loop {
+            if let Ok((response, catching_up)) = runtime.evidence_response()
+                && response.finish(()).is_ok()
+                && !catching_up
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("runtime did not finish valid startup before source mutation");
+    let writer = store.publication_for_tests().unwrap();
+    let malformed = [0x61, 0x0a, 0xff, 0x0a];
+    store
+        .mcp_replace_validated_source_bytes_for_tests(&writer, "a.js", &malformed)
+        .unwrap();
+    drop(writer);
+    let response = store.evidence_response().unwrap();
+    let good = response
+        .mcp_source("a.js", 1, 1, None, None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(good.text, "a\n");
+    assert_eq!((good.byte_start, good.byte_end), (0, 2));
+    assert_eq!(
+        good.content_hash,
+        "ead0215fe443756c2739e50b368ff79c283d540214d4ef503350fa25103198be"
+    );
+    assert_eq!(good.content_hash, hex::encode(Sha256::digest(malformed)));
+    let wrong = response
+        .mcp_source("a.js", 2, 2, None, Some(&"0".repeat(64)))
+        .err()
+        .unwrap();
+    assert!(
+        wrong.to_string().starts_with("revision conflict:"),
+        "{wrong:#}"
+    );
+    let bad = response.mcp_source("a.js", 2, 2, None, None).err().unwrap();
+    assert!(
+        bad.to_string().starts_with("unsupported_encoding:"),
+        "{bad:#}"
+    );
+    response.finish(()).unwrap();
+    assert!(
+        response.source_at("a.js", None).is_err(),
+        "public attestation must not weaken"
+    );
+    drop(response);
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    for legacy in [false, true] {
+        let (mut client, mut reader, session) = socket_session(&identity, &registry, 144, None);
+        if legacy {
+            writeln!(
+                client,
+                "{}",
+                request(
+                    json!(90),
+                    "initialize",
+                    fixture()["legacyInitialize"].clone()
+                )
+            )
+            .unwrap();
+            assert_eq!(
+                next_reply(&mut reader)["result"]["protocolVersion"],
+                "2025-11-25"
+            );
+            writeln!(
+                client,
+                "{}",
+                json!({"jsonrpc":"2.0","method":"notifications/initialized"})
+            )
+            .unwrap();
+        }
+        let read = |id, line, expected_hash: Option<String>| {
+            let mut args = json!({"schemaVersion":1,"path":"a.js","startLine":line,"endLine":line});
+            if let Some(hash) = expected_hash {
+                args["expectedContentHash"] = json!(hash);
+            }
+            call(legacy, json!(id), "trellis_read_source", args)
+        };
+        writeln!(client, "{}", read(1, 1, None)).unwrap();
+        let valid = next_reply(&mut reader);
+        tool(&valid, None, !legacy);
+        let data = &valid["result"]["structuredContent"]["data"];
+        assert_eq!(data["text"], "a\n", "{valid}");
+        assert_eq!(data["byteRange"], json!({"start":0,"end":2}));
+        assert_eq!(data["contentHash"], hex::encode(Sha256::digest(malformed)));
+        let basis = valid["result"]["structuredContent"]["evidenceBasis"].clone();
+        writeln!(client, "{}", read(2, 2, Some("0".repeat(64)))).unwrap();
+        let conflict = next_reply(&mut reader);
+        tool(&conflict, Some("revision_conflict"), !legacy);
+        assert_eq!(
+            conflict["result"]["structuredContent"]["error"]["currentBasis"],
+            basis
+        );
+        assert_eq!(
+            conflict["result"]["structuredContent"]["error"]["currentContentHash"],
+            data["contentHash"]
+        );
+        writeln!(client, "{}", read(3, 2, None)).unwrap();
+        let invalid = next_reply(&mut reader);
+        tool(&invalid, Some("unsupported_encoding"), !legacy);
+        let envelope = &invalid["result"]["structuredContent"];
+        assert_eq!(envelope["error"]["retryable"], false);
+        assert_eq!(envelope["error"]["currentBasis"], basis);
+        assert_eq!(envelope["error"]["currentContentHash"], Value::Null);
+        assert!(envelope.get("data").is_none(), "{invalid}");
+        assert!(
+            !invalid.to_string().contains('�'),
+            "replacement character: {invalid}"
+        );
+        assert!(
+            !invalid.to_string().contains("repair"),
+            "repair text: {invalid}"
+        );
+        drop(reader);
+        drop(client);
+        session.join().unwrap().unwrap();
+    }
+}
+
+#[test]
+fn mcp_source_lf_ranges_exact_caps_and_hash_before_range() {
+    use trellis::store::Store;
+    let temp = tempfile::tempdir().unwrap();
+    let root = checkout(temp.path());
+    fs::write(root.join("a.js"), "a\r\nb\n").unwrap();
+    let store = Store::open_for_tests(temp.path(), &root).unwrap();
+    store.mcp_prepare_virgin_queue_for_tests().unwrap();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
+        &trellis::indexer::IndexOptions::new(root.clone()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    let writer = store.publication_for_tests().unwrap();
+    store
+        .publish_native(
+            &graph,
+            &capture,
+            &native,
+            &writer,
+            store.index_baseline().unwrap(),
+            &cancel,
+        )
+        .unwrap();
+    drop(writer);
+    fs::write(root.join("a.js"), "changed on disk\n").unwrap();
+    let response = store.evidence_response().unwrap();
+    let first = response
+        .mcp_source("a.js", 1, 1, None, None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.text, "a\r\n");
+    assert_eq!((first.byte_start, first.byte_end), (0, 3));
+    let second = response
+        .mcp_source("a.js", 2, 2, None, None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(second.text, "b\n");
+    assert_eq!((second.byte_start, second.byte_end), (3, 5));
+    for (start, end) in [(3, 3), (1, 3), (0, 1), (1, 201)] {
+        assert!(response.mcp_source("a.js", start, end, None, None).is_err());
+    }
+    assert!(
+        response
+            .mcp_source("missing.js", 1, 1, None, None)
+            .unwrap()
+            .is_none()
+    );
+    let wrong = response
+        .mcp_source("a.js", 3, 3, None, Some(&"0".repeat(64)))
+        .err()
+        .unwrap();
+    assert!(
+        wrong.to_string().starts_with("revision conflict:"),
+        "{wrong:#}"
+    );
+    let wrong_pin = trellis::model::IndexPin {
+        index_generation: first.pin.index_generation,
+        index_revision: first.pin.index_revision + 1,
+    };
+    let pin_error = response
+        .mcp_source("missing.js", 1, 1, Some(wrong_pin), None)
+        .err()
+        .unwrap();
+    assert!(pin_error.to_string().starts_with("revision conflict:"));
+    response.finish(()).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_source_required_selected_path_and_digest_refuse_corrupt_rows() {
+    use trellis::daemon::registry::CheckoutRegistry;
+    use trellis::store::{
+        Store,
+        topology::{TopologyRoots, WorkspaceIdentity},
+    };
+    for fault in ["missing_scope", "bad_digest"] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = checkout(temp.path());
+        fs::write(root.join("a.js"), "a\n").unwrap();
+        let store = Store::open_for_tests(temp.path(), &root).unwrap();
+        store.mcp_prepare_virgin_queue_for_tests().unwrap();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
+            &trellis::indexer::IndexOptions::new(root.clone()),
+            store.root_id(),
+            &cancel,
+            |_| {},
+        )
+        .unwrap();
+        let writer = store.publication_for_tests().unwrap();
+        store
+            .publish_native(
+                &graph,
+                &capture,
+                &native,
+                &writer,
+                store.index_baseline().unwrap(),
+                &cancel,
+            )
+            .unwrap();
+        drop(writer);
+        let before = store.evidence_response().unwrap();
+        assert_eq!(
+            before
+                .mcp_source("a.js", 1, 1, None, None)
+                .unwrap()
+                .unwrap()
+                .text,
+            "a\n"
+        );
+        before.finish(()).unwrap();
+        drop(before);
+        let identity = WorkspaceIdentity::discover(Some(&root), &root)
+            .unwrap()
+            .attach_marker()
+            .unwrap();
+        let topology =
+            TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+        let mut registry = CheckoutRegistry::with_roots(topology);
+        registry.attach_launch(145, &identity).unwrap();
+        let runtime = registry.activate(&identity.root_key).unwrap();
+        tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+            loop {
+                if let Ok((response, catching_up)) = runtime.evidence_response()
+                    && response.finish(()).is_ok()
+                    && !catching_up
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("runtime did not finish valid startup before corruption");
+        let writer = store.publication_for_tests().unwrap();
+        store.mcp_corrupt_find_for_tests(&writer, fault).unwrap();
+        drop(writer);
+        let selected = store.evidence_response().unwrap();
+        let error = selected.mcp_source("a.js", 1, 1, None, None).err().unwrap();
+        assert!(
+            error.to_string().contains("store_unavailable"),
+            "{fault}: {error:#}"
+        );
+        drop(selected);
+        let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+        for legacy in [false, true] {
+            let (mut client, mut reader, session) = socket_session(&identity, &registry, 145, None);
+            if legacy {
+                writeln!(
+                    client,
+                    "{}",
+                    request(
+                        json!(90),
+                        "initialize",
+                        fixture()["legacyInitialize"].clone()
+                    )
+                )
+                .unwrap();
+                assert_eq!(
+                    next_reply(&mut reader)["result"]["protocolVersion"],
+                    "2025-11-25"
+                );
+                writeln!(
+                    client,
+                    "{}",
+                    json!({"jsonrpc":"2.0","method":"notifications/initialized"})
+                )
+                .unwrap();
+            }
+            writeln!(
+                client,
+                "{}",
+                call(
+                    legacy,
+                    json!(1),
+                    "trellis_read_source",
+                    json!({"schemaVersion":1,"path":"a.js","startLine":1,"endLine":1})
+                )
+            )
+            .unwrap();
+            let reply = next_reply(&mut reader);
+            tool(&reply, Some("store_unavailable"), !legacy);
+            let envelope = &reply["result"]["structuredContent"];
+            assert_eq!(
+                envelope["error"]["currentBasis"],
+                Value::Null,
+                "{fault}: {reply}"
+            );
+            assert_eq!(
+                envelope["error"]["currentContentHash"],
+                Value::Null,
+                "{fault}: {reply}"
+            );
+            assert!(envelope.get("data").is_none(), "{fault}: {reply}");
+            drop(reader);
+            drop(client);
+            session.join().unwrap().unwrap();
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_source_cold_coordinator_admits_prior_head_then_rejects_stale_pin() {
+    use trellis::daemon::registry::CheckoutRegistry;
+    use trellis::store::{
+        Store,
+        topology::{TopologyRoots, WorkspaceIdentity},
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let root = checkout(temp.path());
+    fs::write(root.join("a.js"), "function Alpha() {}\n").unwrap();
+    let identity = WorkspaceIdentity::discover(Some(&root), &root)
+        .unwrap()
+        .attach_marker()
+        .unwrap();
+    let topology =
+        TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+    let index = topology.index_db(&identity);
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(293, &identity).unwrap();
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    let (mut client, mut reader, session) = socket_session(&identity, &registry, 293, None);
+    let call = |id: i64| {
+        modern(
+            json!(id),
+            "tools/call",
+            json!({
+                "name":"trellis_read_source","arguments":{"schemaVersion":1,"path":"a.js","startLine":1,"endLine":1}
+            }),
+        )
+    };
+    writeln!(client, "{}", call(1)).unwrap();
+    tool(&next_reply(&mut reader), Some("index_not_ready"), true);
+    assert!(
+        !index.exists(),
+        "cold W5 created derived state without a prior head"
+    );
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+
+    let store = Store::open_for_tests(temp.path(), &root).unwrap();
+    store.mcp_prepare_virgin_queue_for_tests().unwrap();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
+        &trellis::indexer::IndexOptions::new(root.clone()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    let writer = store.publication_for_tests().unwrap();
+    let pin = store
+        .publish_native(
+            &graph,
+            &capture,
+            &native,
+            &writer,
+            store.index_baseline().unwrap(),
+            &cancel,
+        )
+        .unwrap();
+    drop(writer);
+    drop(store);
+    fs::write(root.join("a.js"), "function Changed() {}\n").unwrap();
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let release_rx = std::sync::Mutex::new(release_rx);
+    {
+        let mut registry = registry.lock().await;
+        registry.attach_launch(294, &identity).unwrap();
+        assert!(registry.runtime(&identity.root_key).is_none());
+        registry.set_next_startup_hook_for_tests(std::sync::Arc::new(move || {
+            entered_tx.send(()).unwrap();
+            release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(trellis::testing::HANG_BACKSTOP)
+                .unwrap();
+        }));
+    }
+    let (mut client, mut reader, session) = socket_session(&identity, &registry, 294, None);
+    writeln!(client, "{}", call(2)).unwrap();
+    entered_rx
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .unwrap();
+    let reply = next_reply(&mut reader);
+    tool(&reply, None, true);
+    let envelope = &reply["result"]["structuredContent"];
+    assert_eq!(envelope["catchingUp"], true);
+    assert_eq!(envelope["data"]["text"], "function Alpha() {}\n");
+    assert_eq!(
+        envelope["evidenceBasis"],
+        json!({
+            "indexGeneration":pin.index_generation.to_string(),"indexRevision":pin.index_revision
+        })
+    );
+    release_tx.send(()).unwrap();
+    let runtime = registry.lock().await.runtime(&identity.root_key).unwrap();
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        loop {
+            if let Ok((response, catching_up)) = runtime.evidence_response() {
+                let now = response.status().unwrap().revision;
+                if response.finish(()).is_ok() && !catching_up && now != pin {
+                    break;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("new H/watch source pin did not settle");
+    let mut stale = call(3);
+    stale["params"]["arguments"]["expectedBasis"] = json!({
+        "indexGeneration":pin.index_generation.to_string(), "indexRevision":pin.index_revision
+    });
+    writeln!(client, "{stale}").unwrap();
+    let conflict = next_reply(&mut reader);
+    tool(&conflict, Some("revision_conflict"), true);
+    let current = &conflict["result"]["structuredContent"]["error"]["currentBasis"];
+    assert_ne!(current, &stale["params"]["arguments"]["expectedBasis"]);
+    assert_eq!(
+        conflict["result"]["structuredContent"]["error"]["currentContentHash"],
+        Value::Null
+    );
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_source_linked_selected_success_cancel_and_final_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let (identity, linked, registry, runtime) = linked_find_registry(temp.path(), 291);
+    let (mut client, mut reader, session) = socket_session(&identity, &registry, 291, None);
+    let selected_call = |id: i64| {
+        modern(
+            json!(id),
+            "tools/call",
+            json!({
+                "name":"trellis_read_source",
+                "arguments":{"schemaVersion":1,"workspace":linked,"path":"a.js","startLine":1,"endLine":1}
+            }),
+        )
+    };
+    writeln!(client, "{}", selected_call(1)).unwrap();
+    let reply = next_reply(&mut reader);
+    tool(&reply, None, true);
+    let envelope = &reply["result"]["structuredContent"];
+    assert_eq!(envelope["workspace"], json!(linked), "{reply}");
+    assert!(envelope["catchingUp"].is_boolean());
+    assert_eq!(envelope["data"]["text"], "function held() {}\n");
+    assert_eq!(envelope["data"]["path"], "a.js");
+    assert!(envelope["data"]["contentHash"].as_str().is_some());
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+
+    let cancel_gate = ReadGate::default();
+    runtime.set_mcp_admitted_gate_for_tests(cancel_gate.hook());
+    let (read_tx, read_rx) = mpsc::sync_channel(1);
+    let frames = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let frame_count = frames.clone();
+    let hooks = trellis::mcp::TransportHooksForTests {
+        frame_read: Some(std::sync::Arc::new(move || {
+            if frame_count.fetch_add(1, std::sync::atomic::Ordering::AcqRel) == 1 {
+                let _ = read_tx.try_send(());
+            }
+        })),
+        ..Default::default()
+    };
+    let (mut client, mut reader, session) = hooked_session(&identity, &registry, 291, None, hooks);
+    writeln!(client, "{}", selected_call(4)).unwrap();
+    let waiter = cancel_gate.clone();
+    tokio::task::spawn_blocking(move || waiter.await_held(1))
+        .await
+        .unwrap();
+    writeln!(
+        client,
+        "{}",
+        json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":4}})
+    )
+    .unwrap();
+    read_rx
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .unwrap();
+    cancel_gate.open();
+    writeln!(client, "{}", modern(json!(5), "tools/list", json!({}))).unwrap();
+    let reply = next_reply(&mut reader);
+    assert_eq!(
+        reply["id"], 5,
+        "cancelled W5 selected call emitted evidence: {reply}"
+    );
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+
+    let final_gate = ReadGate::default();
+    runtime.set_mcp_admitted_gate_for_tests(final_gate.hook());
+    let (mut client, mut reader, session) = socket_session(&identity, &registry, 291, None);
+    writeln!(client, "{}", selected_call(3)).unwrap();
+    let waiter = final_gate.clone();
+    tokio::task::spawn_blocking(move || waiter.await_held(1))
+        .await
+        .unwrap();
+    fs::rename(&linked, temp.path().join("moved-linked")).unwrap();
+    final_gate.open();
+    let reply = next_reply(&mut reader);
+    tool(&reply, Some("root_changed"), true);
+    assert_eq!(
+        reply["result"]["structuredContent"]["workspace"],
+        json!(linked),
+        "{reply}"
+    );
+    assert_eq!(
+        reply["result"]["structuredContent"]["error"]["currentBasis"],
+        Value::Null
+    );
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_source_linked_selected_deadline_after_admission_keeps_resolved_shape() {
+    let temp = tempfile::tempdir().unwrap();
+    let (identity, linked, registry, runtime) = linked_find_registry(temp.path(), 295);
+    let gate = ReadGate::default();
+    runtime.set_mcp_admitted_gate_for_tests(gate.hook());
+    // Hold the W5 read after admission, then advance its virtual deadline.
+    let (mut client, mut reader, session) = socket_session(&identity, &registry, 295, None);
+    writeln!(
+        client,
+        "{}",
+        modern(
+            json!(1),
+            "tools/call",
+            json!({
+                "name":"trellis_read_source",
+                "arguments":{"schemaVersion":1,"workspace":linked,"path":"a.js","startLine":1,"endLine":1}
+            })
+        )
+    )
+    .unwrap();
+    let waiter = gate.clone();
+    tokio::task::spawn_blocking(move || waiter.await_held(1))
+        .await
+        .unwrap();
+    // Admission was observed before the test clock advances. One retryable
+    // read now returns to the worker loop, where the virtual deadline wins.
+    runtime.advance_mcp_clock_for_tests(trellis::mcp::CALL_DEADLINE + Duration::from_secs(1));
+    gate.open();
+    let reply = next_reply(&mut reader);
+    tool(&reply, Some("deadline_exceeded"), true);
+    let envelope = &reply["result"]["structuredContent"];
+    assert_eq!(envelope["workspace"], json!(linked), "{reply}");
+    assert!(envelope["catchingUp"].is_boolean(), "{reply}");
+    assert!(
+        envelope["error"].get("attemptedWorkspace").is_none(),
+        "{reply}"
+    );
+    assert!(envelope.get("data").is_none(), "{reply}");
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
 }

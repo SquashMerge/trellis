@@ -794,3 +794,83 @@ mod outgoing_tests {
         }
     }
 }
+
+/// Single complete selected source range; both serialized copies must fit.
+pub fn source(
+    id: &Value,
+    result: crate::store::mcp_read::McpSource,
+    root: &std::path::Path,
+    catching_up: bool,
+    modern: bool,
+) -> Option<Value> {
+    let envelope = json!({
+        "schemaVersion":1,"requestId":id,"workspace":root,"catchingUp":catching_up,
+        "evidenceBasis":{"indexGeneration":result.pin.index_generation.to_string(),
+            "indexRevision":result.pin.index_revision},
+        "data":{"path":result.path,"contentHash":result.content_hash,
+            "startLine":result.start_line,"endLine":result.end_line,
+            "byteRange":{"start":result.byte_start,"end":result.byte_end},
+            "text":result.text,
+            "evidence":{"evidenceTier":"syntax","semanticBasis":null,
+                "freshness":"fresh","staleBecause":[]}},
+        "warnings":[{"code":"syntaxOnly","message":"Only syntax evidence is available",
+            "provenanceId":null}],
+        "partial":false,"truncated":false,"truncationReason":null,
+    });
+    let frame = json!({"jsonrpc":"2.0","id":id,
+        "result":super::tools::result(envelope.clone(), modern)});
+    (serde_json::to_vec(&frame).ok()?.len() < super::wire::RESPONSE_BYTES).then_some(envelope)
+}
+
+#[cfg(test)]
+mod source_tests {
+    use super::*;
+    use crate::store::mcp_read::McpSource;
+    #[test]
+    fn whole_dual_wire_source_or_range_error_without_truncation() {
+        let pin: crate::model::IndexPin = serde_json::from_value(json!({
+            "indexGeneration":"123e4567-e89b-42d3-a456-426614174000",
+            "indexRevision":1}))
+        .unwrap();
+        let item = |text: String| McpSource {
+            path: "a.js".into(),
+            content_hash: "a".repeat(64),
+            start_line: 1,
+            end_line: 1,
+            byte_start: 0,
+            byte_end: text.len(),
+            text,
+            pin,
+        };
+        for modern in [true, false] {
+            let envelope = source(
+                &json!(1),
+                item("hello\r\n".into()),
+                std::path::Path::new("/root"),
+                false,
+                modern,
+            )
+            .unwrap();
+            assert_eq!(envelope["data"]["text"], "hello\r\n");
+            assert_eq!(envelope["data"]["byteRange"], json!({"start":0,"end":7}));
+            assert_eq!(envelope["partial"], false);
+            assert_eq!(envelope["truncated"], false);
+            assert_eq!(envelope["warnings"][0]["code"], "syntaxOnly");
+            let frame = json!({"jsonrpc":"2.0","id":1,
+                "result":super::super::tools::result(envelope,modern)});
+            let mut bytes = Vec::new();
+            super::super::wire::write_response(&mut bytes, &frame).unwrap();
+            assert!(bytes.len() <= super::super::wire::RESPONSE_BYTES);
+            assert!(
+                source(
+                    &json!(1),
+                    item("\n".repeat(16384)),
+                    std::path::Path::new("/root"),
+                    false,
+                    modern
+                )
+                .is_none()
+            );
+        }
+    }
+}

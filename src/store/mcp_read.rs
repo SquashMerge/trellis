@@ -122,6 +122,98 @@ impl Store {
     }
 }
 
+/// Verified raw source range from the one selected MCP read snapshot.
+pub struct McpSource {
+    pub path: String,
+    pub content_hash: String,
+    pub start_line: u64,
+    pub end_line: u64,
+    pub byte_start: usize,
+    pub byte_end: usize,
+    pub text: String,
+    pub pin: IndexPin,
+}
+
+fn mcp_lf_range(bytes: &[u8], start: u64, end: u64) -> Result<(usize, usize)> {
+    ensure!(
+        start > 0 && end >= start,
+        "invalid_request: reversed source range"
+    );
+    ensure!(end - start < 200, "range_too_large: source line cap");
+    let mut line = 1_u64;
+    let mut from = (start == 1).then_some(0);
+    let mut to = None;
+    for (at, byte) in bytes.iter().enumerate() {
+        if *byte == b'\n' {
+            if line == end {
+                to = Some(at + 1);
+                break;
+            }
+            line += 1;
+            if line == start {
+                from = Some(at + 1);
+            }
+        }
+    }
+    if !bytes.is_empty() && bytes.last() != Some(&b'\n') && line == end {
+        to = Some(bytes.len());
+    }
+    let (from, to) = from
+        .zip(to)
+        .context("range_too_large: source line absent")?;
+    ensure!(to - from <= 16384, "range_too_large: source byte cap");
+    Ok((from, to))
+}
+
+impl EvidenceResponse {
+    pub fn mcp_source_hash(&self, path: &str) -> Result<Option<String>> {
+        let selected = self.store.read_revision_for(&self.db, None, true)?;
+        Ok(self
+            .store
+            .mcp_selected_raw_source_for(&self.db, path, &selected)?
+            .map(|(hash, _)| hash))
+    }
+
+    pub fn mcp_source(
+        &self,
+        path: &str,
+        start_line: u64,
+        end_line: u64,
+        expected: Option<IndexPin>,
+        expected_hash: Option<&str>,
+    ) -> Result<Option<McpSource>> {
+        let selected = self.store.read_revision_for(&self.db, None, true)?;
+        ensure!(
+            expected.is_none_or(|pin| pin == selected.pin),
+            "revision conflict: expected basis differs from admitted head"
+        );
+        let Some((content_hash, bytes)) = self
+            .store
+            .mcp_selected_raw_source_for(&self.db, path, &selected)?
+        else {
+            return Ok(None);
+        };
+        ensure!(
+            expected_hash.is_none_or(|hash| hash == content_hash),
+            "revision conflict: expected content hash differs from selected source"
+        );
+        let (byte_start, byte_end) = mcp_lf_range(&bytes, start_line, end_line)?;
+        let text = std::str::from_utf8(&bytes[byte_start..byte_end])
+            .map_err(|_| anyhow::anyhow!("unsupported_encoding: selected source slice"))?
+            .to_owned();
+        Ok(Some(McpSource {
+            path: path.to_owned(),
+            content_hash,
+            start_line,
+            end_line,
+            byte_start,
+            byte_end,
+            text,
+            pin: selected.pin,
+        }))
+    }
+}
+
 /// A find result keeps every required coverage tuple, independent of the hit prefix.
 pub struct McpFind {
     pub symbols: Vec<McpFindSymbol>,
@@ -934,5 +1026,33 @@ mod outgoing_tests {
             )
             .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod source_range_tests {
+    use super::mcp_lf_range;
+
+    #[test]
+    fn lf_inclusive_final_terminator_crlf_empty_and_exact_caps() {
+        let bytes = b"a\r\nb\n";
+        assert_eq!(mcp_lf_range(bytes, 1, 1).unwrap(), (0, 3));
+        assert_eq!(mcp_lf_range(bytes, 2, 2).unwrap(), (3, 5));
+        assert_eq!(mcp_lf_range(bytes, 1, 2).unwrap(), (0, 5));
+        assert!(mcp_lf_range(bytes, 3, 3).is_err(), "no phantom final line");
+        assert!(mcp_lf_range(b"", 1, 1).is_err());
+        assert_eq!(mcp_lf_range(b"a", 1, 1).unwrap(), (0, 1));
+        assert_eq!(mcp_lf_range(b"\n", 1, 1).unwrap(), (0, 1));
+        assert!(mcp_lf_range(b"\n", 2, 2).is_err());
+        assert_eq!(mcp_lf_range(&vec![b'a'; 16384], 1, 1).unwrap(), (0, 16384));
+        assert!(mcp_lf_range(&vec![b'a'; 16385], 1, 1).is_err());
+        let two_hundred = "x\n".repeat(200);
+        assert_eq!(
+            mcp_lf_range(two_hundred.as_bytes(), 1, 200).unwrap(),
+            (0, 400)
+        );
+        assert!(mcp_lf_range(two_hundred.as_bytes(), 1, 201).is_err());
+        assert!(mcp_lf_range(b"x", 2, 1).is_err());
+        assert!(mcp_lf_range(b"x", 0, 1).is_err());
     }
 }
