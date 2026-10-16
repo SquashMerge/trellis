@@ -330,3 +330,88 @@ impl EvidenceResponse {
         })
     }
 }
+
+/// One selected native declaration with its complete required evidence closure.
+pub struct McpDeclaration {
+    pub declaration: crate::native_evidence::Declaration,
+    pub content_hash: String,
+    pub coverage: Vec<crate::native_evidence::Coverage>,
+    pub provenance: Vec<crate::native_evidence::Provenance>,
+    pub pin: IndexPin,
+}
+
+impl EvidenceResponse {
+    pub fn mcp_declaration(
+        &self,
+        symbol_id: &str,
+        expected: Option<IndexPin>,
+    ) -> Result<Option<McpDeclaration>> {
+        use crate::native_evidence::Provenance;
+        #[cfg(feature = "test-support")]
+        if self
+            .store
+            .mcp_read_busy_attempts
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count > 0).then(|| count - 1)
+            })
+            .is_ok()
+        {
+            return Err(SqliteContention(()).into());
+        }
+        let selected = self.store.read_revision_for(&self.db, None, true)?;
+        ensure!(
+            expected.is_none_or(|pin| pin == selected.pin),
+            "revision conflict: expected basis differs from admitted head"
+        );
+        let Some(scope) = v8_owner_scope_for(&self.db, symbol_id, &selected)? else {
+            return Ok(None);
+        };
+        self.store
+            .attest_selected_document_for(&self.db, &scope.key.path, &selected)?;
+        let declaration = read_native_declarations_v8(&self.db, &scope, None, true)?
+            .into_iter()
+            .find(|row| row.syntax_id == symbol_id)
+            .context("store_unavailable: selected declaration absent")?;
+        ensure!(
+            declaration.provenance_id == scope.proof_id()
+                && declaration.revision_id == scope.native_revision_id
+                && declaration.document == scope.key,
+            "store_unavailable: selected declaration proof mismatch"
+        );
+        let coverage = read_native_coverage_v8(&self.db, &scope)?;
+        ensure!(
+            coverage.producer_id == scope.producer_id
+                && coverage.language == scope.key.language
+                && coverage.source_set_id == scope.key.source_set_id
+                && coverage.document_path == scope.key.path
+                && coverage.revision_id == scope.native_revision_id
+                && coverage.requested
+                && coverage.selected
+                && matches!(coverage.state.as_str(), "complete" | "partial" | "failed"),
+            "store_unavailable: selected declaration coverage mismatch"
+        );
+        let hash: String = self.db.query_row(
+            "SELECT content_hash FROM document_versions WHERE id=?1 AND source_set_id=?2 AND language=?3 AND path=?4",
+            params![scope.version_id, scope.key.source_set_id, scope.key.language, scope.key.path],
+            |r| r.get(0),
+        )?;
+        let provenance = Provenance {
+            id: scope.proof_id(),
+            producer_id: scope.producer_id.clone(),
+            document: scope.key,
+            revision_id: scope.native_revision_id,
+            content_hash: hash.clone(),
+            evidence_kind: "measuredSyntax".into(),
+            basis: None,
+            freshness: "fresh".into(),
+            derived_from: None,
+        };
+        Ok(Some(McpDeclaration {
+            declaration,
+            content_hash: hash,
+            coverage: vec![coverage],
+            provenance: vec![provenance],
+            pin: selected.pin,
+        }))
+    }
+}

@@ -2009,6 +2009,9 @@ fn per_call_linked_worktree_selection_and_closed_failures() {
                 tool(&answer, None, !legacy);
                 let data = &answer["result"]["structuredContent"]["data"];
                 assert_eq!(*data, json!({"symbols":[],"coverage":[],"provenance":[]}));
+            } else if offset == 2 {
+                tool(&answer, Some("not_found"), !legacy);
+                assert!(answer["result"]["structuredContent"]["error"]["currentBasis"].is_object());
             } else {
                 tool(&answer, Some("index_not_ready"), !legacy);
             }
@@ -4729,11 +4732,40 @@ async fn mcp_find_selected_snapshot_ranks_and_keeps_zero_hit_scope() {
             "indexGeneration":current.index_generation.to_string(),"indexRevision":current.index_revision
         })
     );
+    let state = runtime.state_version();
     resume_tx.send(()).unwrap();
     assert_eq!(data["data"]["symbols"][0]["name"], "Alpha");
     assert_eq!(data["truncated"], true);
     assert_eq!(data["truncationReason"], "limit");
     assert_eq!(data["data"]["provenance"].as_array().unwrap().len(), 1);
+    // The hook runs after the Reconciling notification. The next state change
+    // after release is the startup Ready commit or a recorded startup error.
+    // catching_up may remain advisory-true for pending watcher work after Ready.
+    let deadline = std::time::Instant::now() + trellis::testing::HANG_BACKSTOP;
+    while runtime.catching_up() && runtime.state_version() == state {
+        assert!(
+            runtime.reconciliation_error().is_none(),
+            "startup reconciliation failed: {:?}",
+            runtime.reconciliation_error()
+        );
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "startup reconciliation did not commit Ready: {:?}",
+            runtime.reconciliation_error()
+        );
+        runtime.wait_state_change(state, remaining);
+    }
+    assert_ne!(
+        runtime.state_version(),
+        state,
+        "startup Ready transition was not observed"
+    );
+    assert!(
+        runtime.reconciliation_error().is_none(),
+        "startup reconciliation failed: {:?}",
+        runtime.reconciliation_error()
+    );
     let ranked = ask(&mut client, 147, "ALPHA", Some(20), None);
     tool(&ranked, None, true);
     let ranked = &ranked["result"]["structuredContent"];
@@ -5408,6 +5440,420 @@ async fn mcp_find_linked_selected_deadline_after_admission_keeps_resolved_shape(
         envelope["error"].get("attemptedWorkspace").is_none(),
         "{reply}"
     );
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_declaration_selected_identity_and_measured_record() {
+    use std::os::unix::net::UnixStream;
+    use trellis::daemon::registry::CheckoutRegistry;
+    use trellis::store::{
+        Store,
+        topology::{TopologyRoots, WorkspaceIdentity},
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let root = checkout(temp.path());
+    fs::write(
+        root.join("a.js"),
+        "function Alpha(first, second) { return first; }\n",
+    )
+    .unwrap();
+    let identity = WorkspaceIdentity::discover(Some(&root), &root)
+        .unwrap()
+        .attach_marker()
+        .unwrap();
+    let store = Store::open_for_tests(temp.path(), &root).unwrap();
+    store.mcp_prepare_virgin_queue_for_tests().unwrap();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
+        &trellis::indexer::IndexOptions::new(root.clone()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    let writer = store.publication_for_tests().unwrap();
+    store
+        .publish_native(
+            &graph,
+            &capture,
+            &native,
+            &writer,
+            store.index_baseline().unwrap(),
+            &cancel,
+        )
+        .unwrap();
+    drop(writer);
+    drop(store);
+    let topology =
+        TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(143, &identity).unwrap();
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let release_rx = std::sync::Mutex::new(release_rx);
+    registry.set_next_startup_hook_for_tests(std::sync::Arc::new(move || {
+        entered_tx.send(()).unwrap();
+        release_rx
+            .lock()
+            .unwrap()
+            .recv_timeout(trellis::testing::HANG_BACKSTOP)
+            .unwrap();
+    }));
+    registry.activate(&identity.root_key).unwrap();
+    entered_rx
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .unwrap();
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    let (mut client, server) = UnixStream::pair().unwrap();
+    client
+        .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
+        .unwrap();
+    let handle = tokio::runtime::Handle::current();
+    let session = std::thread::spawn(move || {
+        trellis::mcp::run_socket(
+            trellis::mcp::OpenedWorkspace::new(identity),
+            server,
+            registry,
+            143,
+            handle,
+        )
+    });
+    let ask = |client: &mut UnixStream, id: i64, name: &str, args: Value| -> Value {
+        writeln!(
+            client,
+            "{}",
+            modern(
+                json!(id),
+                "tools/call",
+                json!({"name":name,"arguments":args})
+            )
+        )
+        .unwrap();
+        let mut line = String::new();
+        BufReader::new(client.try_clone().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        serde_json::from_str(&line).unwrap()
+    };
+    let found = ask(
+        &mut client,
+        1,
+        "trellis_find_symbols",
+        json!({"schemaVersion":1,"query":"Alpha"}),
+    );
+    tool(&found, None, true);
+    let symbol = &found["result"]["structuredContent"]["data"]["symbols"][0];
+    let id = symbol["symbolId"].as_str().unwrap();
+    let inspected = ask(
+        &mut client,
+        2,
+        "trellis_inspect",
+        json!({"schemaVersion":1,"symbolId":id,"view":"declaration"}),
+    );
+    tool(&inspected, None, true);
+    let envelope = &inspected["result"]["structuredContent"];
+    assert_eq!(
+        envelope["catchingUp"], true,
+        "validated prior head during H"
+    );
+    release_tx.send(()).unwrap();
+    assert_eq!(envelope["data"]["declaration"]["syntaxId"], id);
+    assert_eq!(envelope["data"]["displayKey"], "a.js#Alpha");
+    assert_eq!(envelope["data"]["contentHash"], symbol["contentHash"]);
+    assert_eq!(envelope["data"]["coverage"].as_array().unwrap().len(), 1);
+    assert_eq!(envelope["data"]["provenance"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        envelope["data"]["declaration"]["header"]["parameters"][0]["name"],
+        "first"
+    );
+    assert_eq!(
+        envelope["data"]["declaration"]["header"]["parameters"][1]["name"],
+        "second"
+    );
+    let found = ask(
+        &mut client,
+        3,
+        "trellis_find_symbols",
+        json!({"schemaVersion":1,"query":"sid:v1:"}),
+    );
+    tool(&found, None, true);
+    let unnamed = found["result"]["structuredContent"]["data"]["symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["name"].is_null() && s["document"]["path"] == "a.js")
+        .expect("selected unnamed module");
+    let inspected = ask(
+        &mut client,
+        4,
+        "trellis_inspect",
+        json!({
+            "schemaVersion":1,"view":"declaration","symbolId":unnamed["symbolId"]
+        }),
+    );
+    tool(&inspected, None, true);
+    assert_eq!(
+        inspected["result"]["structuredContent"]["data"]["displayKey"],
+        format!(
+            "a.js#{}@{}",
+            unnamed["kind"].as_str().unwrap(),
+            unnamed["range"]["start"].as_u64().unwrap()
+        )
+    );
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
+#[test]
+fn mcp_declaration_body_edit_retains_id_but_changes_selected_hash_and_pin() {
+    use trellis::store::Store;
+    let temp = tempfile::tempdir().unwrap();
+    let root = checkout(temp.path());
+    let path = root.join("a.js");
+    fs::write(&path, "function Alpha(first, second) { return first; }\n").unwrap();
+    let store = Store::open_for_tests(temp.path(), &root).unwrap();
+    store.mcp_prepare_virgin_queue_for_tests().unwrap();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = store.publication_for_tests().unwrap();
+    let publish = |expected| {
+        let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
+            &trellis::indexer::IndexOptions::new(root.clone()),
+            store.root_id(),
+            &cancel,
+            |_| {},
+        )
+        .unwrap();
+        store
+            .publish_native(&graph, &capture, &native, &writer, expected, &cancel)
+            .unwrap()
+    };
+    let first = publish(store.index_baseline().unwrap());
+    let selected = store.evidence_response().unwrap();
+    let found = selected.mcp_find("Alpha", 20, None).unwrap();
+    let symbol_id = found.symbols[0].declaration.syntax_id.clone();
+    let original = selected.mcp_declaration(&symbol_id, None).unwrap().unwrap();
+    assert_eq!(original.declaration.header.parameters.len(), 2);
+    assert_eq!(
+        original.declaration.header.parameters[0].name.as_deref(),
+        Some("first")
+    );
+    assert_eq!(
+        original.declaration.header.parameters[1].name.as_deref(),
+        Some("second")
+    );
+    assert_eq!(
+        original.provenance[0].id,
+        original.declaration.provenance_id
+    );
+    assert_eq!(original.provenance[0].content_hash, original.content_hash);
+    assert_eq!(original.coverage[0].document_path, "a.js");
+    let module = selected
+        .mcp_find("sid:v1:", 50, None)
+        .unwrap()
+        .symbols
+        .into_iter()
+        .find(|s| s.declaration.name.is_none())
+        .unwrap();
+    assert!(
+        selected
+            .mcp_declaration(&module.declaration.syntax_id, None)
+            .unwrap()
+            .unwrap()
+            .declaration
+            .name
+            .is_none()
+    );
+    drop(selected);
+    fs::write(&path, "function Alpha(first, second) { return second; }\n").unwrap();
+    let second = publish(first);
+    assert_ne!(first, second);
+    let selected = store.evidence_response().unwrap();
+    let stale = selected
+        .mcp_declaration(&format!("sid:v1:{}", "0".repeat(32)), Some(first))
+        .err()
+        .unwrap();
+    assert!(
+        stale.to_string().starts_with("revision conflict:"),
+        "{stale:#}"
+    );
+    let changed = selected.mcp_declaration(&symbol_id, None).unwrap().unwrap();
+    assert_eq!(changed.declaration.syntax_id, symbol_id);
+    assert_ne!(changed.content_hash, original.content_hash);
+    assert_ne!(
+        changed.provenance[0].revision_id,
+        original.provenance[0].revision_id
+    );
+    assert_eq!(changed.provenance[0].content_hash, changed.content_hash);
+    assert!(
+        selected
+            .mcp_declaration(&format!("sid:v1:{}", "0".repeat(32)), None)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn mcp_declaration_corrupt_required_proof_refuses_whole_result() {
+    use trellis::store::Store;
+    for fault in ["missing_header", "bad_digest"] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = checkout(temp.path());
+        fs::write(root.join("a.js"), "function Alpha() {}\n").unwrap();
+        let store = Store::open_for_tests(temp.path(), &root).unwrap();
+        store.mcp_prepare_virgin_queue_for_tests().unwrap();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
+            &trellis::indexer::IndexOptions::new(root.clone()),
+            store.root_id(),
+            &cancel,
+            |_| {},
+        )
+        .unwrap();
+        let writer = store.publication_for_tests().unwrap();
+        store
+            .publish_native(
+                &graph,
+                &capture,
+                &native,
+                &writer,
+                store.index_baseline().unwrap(),
+                &cancel,
+            )
+            .unwrap();
+        drop(writer);
+        let response = store.evidence_response().unwrap();
+        let id = response.mcp_find("Alpha", 20, None).unwrap().symbols[0]
+            .declaration
+            .syntax_id
+            .clone();
+        assert!(response.mcp_declaration(&id, None).unwrap().is_some());
+        response.finish(()).unwrap();
+        drop(response);
+        let writer = store.publication_for_tests().unwrap();
+        store.mcp_corrupt_find_for_tests(&writer, fault).unwrap();
+        drop(writer);
+        let response = store.evidence_response().unwrap();
+        let error = response.mcp_declaration(&id, None).err().unwrap();
+        assert!(
+            !error.to_string().starts_with("revision conflict:"),
+            "{fault}: {error:#}"
+        );
+    }
+}
+
+#[test]
+fn mcp_declaration_rejects_noncanonical_id_before_read() {
+    use trellis::mcp::tools::validate;
+    for invalid in [
+        "sid:v1:ABCDEF0123456789abcdef0123456789",
+        "sid:v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "sid:v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaag",
+    ] {
+        assert_eq!(
+            validate(
+                "trellis_inspect",
+                Some(&json!({
+                    "schemaVersion":1,"view":"declaration","symbolId":invalid
+                }))
+            ),
+            Err("invalid_request")
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_declaration_refuses_oversized_whole_wire_dto() {
+    use trellis::daemon::registry::CheckoutRegistry;
+    use trellis::store::{
+        Store,
+        topology::{TopologyRoots, WorkspaceIdentity},
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let root = checkout(temp.path());
+    let name = format!("Alpha{}", "a".repeat(12_000));
+    fs::write(root.join("a.js"), format!("function {name}() {{}}\n")).unwrap();
+    let identity = WorkspaceIdentity::discover(Some(&root), &root)
+        .unwrap()
+        .attach_marker()
+        .unwrap();
+    let store = Store::open_for_tests(temp.path(), &root).unwrap();
+    store.mcp_prepare_virgin_queue_for_tests().unwrap();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
+        &trellis::indexer::IndexOptions::new(root.clone()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    let writer = store.publication_for_tests().unwrap();
+    store
+        .publish_native(
+            &graph,
+            &capture,
+            &native,
+            &writer,
+            store.index_baseline().unwrap(),
+            &cancel,
+        )
+        .unwrap();
+    drop(writer);
+    let id = store
+        .evidence_response()
+        .unwrap()
+        .mcp_find("Alpha", 1, None)
+        .unwrap()
+        .symbols[0]
+        .declaration
+        .syntax_id
+        .clone();
+    drop(store);
+    let topology =
+        TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(143, &identity).unwrap();
+    registry.activate(&identity.root_key).unwrap();
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    let (mut client, mut reader, session) = socket_session(&identity, &registry, 143, None);
+    writeln!(client, "{}", modern(json!(1), "tools/call", json!({
+        "name":"trellis_inspect", "arguments":{"schemaVersion":1,"view":"declaration","symbolId":id}
+    }))).unwrap();
+    let response = next_reply(&mut reader);
+    tool(&response, Some("range_too_large"), true);
+    assert!(response["result"]["structuredContent"]["data"].is_null());
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_declaration_cold_head_precedes_complete_pin_conflict() {
+    use trellis::daemon::registry::CheckoutRegistry;
+    use trellis::store::topology::{TopologyRoots, WorkspaceIdentity};
+    let temp = tempfile::tempdir().unwrap();
+    let root = checkout(temp.path());
+    let identity = WorkspaceIdentity::discover(Some(&root), &root)
+        .unwrap()
+        .attach_marker()
+        .unwrap();
+    let topology =
+        TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+    let index = topology.index_db(&identity);
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(143, &identity).unwrap();
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    let (mut client, mut reader, session) = socket_session(&identity, &registry, 143, None);
+    writeln!(client, "{}", modern(json!(1), "tools/call", json!({
+        "name":"trellis_inspect", "arguments":{"schemaVersion":1,"view":"declaration",
+        "symbolId":format!("sid:v1:{}", "0".repeat(32)),
+        "expectedBasis":{"indexGeneration":"123e4567-e89b-42d3-a456-426614174000","indexRevision":1}}
+    }))).unwrap();
+    let response = next_reply(&mut reader);
+    tool(&response, Some("index_not_ready"), true);
+    assert!(!index.exists(), "cold inspect created a derived database");
     drop(reader);
     drop(client);
     session.join().unwrap().unwrap();
