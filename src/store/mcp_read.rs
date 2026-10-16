@@ -777,6 +777,7 @@ impl EvidenceResponse {
                     path: row.get(4)?,
                 };
                 let candidate = (|| -> Result<Option<McpOutgoingCandidate>> {
+                    optional_hint_check(Some(&|| progress.expired()))?;
                     let Some(candidate_scope) = v8_native_scope_for(&self.db, &key, &selected)?
                     else {
                         return Ok(None);
@@ -794,8 +795,13 @@ impl EvidenceResponse {
                         if progress.expired() {
                             return Ok(None);
                         }
-                        let declarations =
-                            read_native_declarations_v8(&self.db, &candidate_scope, None, true)?;
+                        let declarations = read_native_declarations_v8_optional(
+                            &self.db,
+                            &candidate_scope,
+                            None,
+                            true,
+                            &|| progress.expired(),
+                        )?;
                         let coverage = read_native_coverage_v8(&self.db, &candidate_scope)?;
                         // Reject an ineligible optional row before the expensive full
                         // attestation: an omitted candidate must not poison required calls.
@@ -820,8 +826,12 @@ impl EvidenceResponse {
                         {
                             return Ok(None);
                         }
-                        self.store
-                            .attest_selected_document_for(&self.db, &key.path, &selected)?;
+                        self.store.attest_selected_document_optional_for(
+                            &self.db,
+                            &key.path,
+                            &selected,
+                            &|| progress.expired(),
+                        )?;
                         let hash: String = self.db.query_row(
                             "SELECT content_hash FROM document_versions WHERE id=?1 AND source_set_id=?2 AND language=?3 AND path=?4",
                             params![version,key.source_set_id,key.language,key.path],|r|r.get(0))?;
@@ -876,6 +886,10 @@ impl EvidenceResponse {
                     Ok(Some(candidate)) => candidate,
                     Ok(None) => continue,
                     Err(error) => {
+                        if error.downcast_ref::<OptionalHintExpired>().is_some() {
+                            timed_out = true;
+                            break;
+                        }
                         if error
                             .downcast_ref::<rusqlite::Error>()
                             .is_some_and(|sqlite| optional_hint_interrupt(sqlite, &progress))

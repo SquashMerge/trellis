@@ -6046,7 +6046,7 @@ fn mcp_outgoing_fixture_with_budget(
     limit: Option<usize>,
     advance_hints: Option<Vec<(&'static str, u64)>>,
 ) -> Value {
-    mcp_outgoing_wire_fixture(files, owner, limit, advance_hints, false).0
+    mcp_outgoing_wire_fixture(files, owner, limit, advance_hints, false, false).0
 }
 
 fn mcp_outgoing_wire_fixture(
@@ -6055,6 +6055,7 @@ fn mcp_outgoing_wire_fixture(
     limit: Option<usize>,
     advance_hints: Option<Vec<(&'static str, u64)>>,
     legacy: bool,
+    check_selected_after_hints: bool,
 ) -> (Value, Vec<u8>) {
     use trellis::daemon::registry::CheckoutRegistry;
     use trellis::store::{
@@ -6098,6 +6099,28 @@ fn mcp_outgoing_wire_fixture(
     let mut registry = CheckoutRegistry::with_roots(topology);
     registry.attach_launch(301, &identity).unwrap();
     let runtime = registry.activate(&identity.root_key).unwrap();
+    if check_selected_after_hints {
+        // The virgin fixture can briefly request normal startup reconciliation.
+        // Prove a clean admitted head before attributing recovery to optional work.
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+                    loop {
+                        if let Ok((selected, catching_up)) = runtime.evidence_response()
+                            && selected.finish(()).is_ok()
+                            && !catching_up
+                            && !runtime.mcp_recovery_pending_for_tests().unwrap()
+                        {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                    }
+                })
+                .await
+                .expect("outgoing fixture did not settle its clean head");
+            });
+        });
+    }
     let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
     let (mut client, mut reader, session) = socket_session(&identity, &registry, 301, None);
     if legacy {
@@ -6143,7 +6166,14 @@ fn mcp_outgoing_wire_fixture(
     if let Some(limit) = limit {
         args["limit"] = json!(limit);
     }
+    if check_selected_after_hints {
+        assert!(
+            !runtime.mcp_recovery_pending_for_tests().unwrap(),
+            "fixture starts with pending recovery"
+        );
+    }
     runtime.freeze_mcp_hint_clock_for_tests();
+    let runtime_after_hints = runtime.clone();
     let budget_gate = if let Some(stages) = advance_hints {
         let path = temp.path().join("hint.sock");
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
@@ -6192,6 +6222,23 @@ fn mcp_outgoing_wire_fixture(
             std::env::remove_var("TRELLIS_TEST_MCP_PHASE");
             std::env::remove_var("TRELLIS_TEST_MCP_PHASE_SOCKET");
         }
+    }
+    if check_selected_after_hints {
+        assert!(
+            !runtime_after_hints
+                .mcp_recovery_pending_for_tests()
+                .unwrap(),
+            "optional expiry must not mark recovery"
+        );
+        let (selected, _) = runtime_after_hints.evidence_response().unwrap();
+        let found = selected.mcp_find(owner, 20, None).unwrap();
+        assert!(
+            found
+                .symbols
+                .iter()
+                .any(|symbol| symbol.declaration.name.as_deref() == Some(owner))
+        );
+        selected.finish(()).unwrap();
     }
     drop(reader);
     drop(client);
@@ -6828,6 +6875,41 @@ async fn mcp_outgoing_near_call_deadline_preserves_required_call_without_optiona
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_outgoing_mid_attestation_expiry_keeps_required_calls_and_prior_hints() {
+    // The first compound call completes without optional candidate work. The
+    // target lives in a different version, so its SHA chunk runs only inside
+    // optional candidate attestation. Advance the hint clock within that CPU
+    // operation, not at a between-row boundary.
+    let (reply, _) = mcp_outgoing_wire_fixture(
+        &[
+            (
+                "owner.js",
+                "function Owner() { (obj.Unknown)(); Target(); Target(); }\n",
+            ),
+            ("target.js", "function Target() {}\n"),
+        ],
+        "Owner",
+        None,
+        Some(vec![("outgoing_hint_source_hash_chunk", 1001)]),
+        false,
+        true,
+    );
+    tool(&reply, None, true);
+    let envelope = &reply["result"]["structuredContent"];
+    let calls = envelope["data"]["calls"].as_array().unwrap();
+    assert_eq!(calls.len(), 3, "mandatory call list survives: {reply}");
+    assert!(calls[0]["calleeRange"].is_null(), "{reply}");
+    assert_eq!(calls[0]["nativeCandidates"]["items"], json!([]));
+    assert_eq!(calls[0]["nativeCandidates"]["omitted"], 0);
+    for call in &calls[1..] {
+        assert_eq!(call["calleeText"], "Target", "{reply}");
+        assert_eq!(call["nativeCandidates"]["items"], json!([]));
+        assert!(call["nativeCandidates"]["omitted"].is_null(), "{reply}");
+    }
+    assert_eq!(envelope["error"], Value::Null, "{reply}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mcp_outgoing_same_version_attested_once_for_repeated_calls() {
     // This gate has one release. A second verification attempt fails its gate
     // connection, so both candidates can survive only with per-version reuse.
@@ -6915,7 +6997,8 @@ async fn mcp_outgoing_complete_modern_legacy_frames_fill_candidates_after_all_ca
         .map(|(p, s)| (p.as_str(), s.as_str()))
         .collect();
     for legacy in [false, true] {
-        let (reply, frame) = mcp_outgoing_wire_fixture(&borrowed, "Owner", Some(50), None, legacy);
+        let (reply, frame) =
+            mcp_outgoing_wire_fixture(&borrowed, "Owner", Some(50), None, legacy, false);
         tool(&reply, None, !legacy);
         assert_eq!(frame.last(), Some(&b'\n'));
         assert!(

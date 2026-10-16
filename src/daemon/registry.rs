@@ -1969,6 +1969,13 @@ impl CheckoutRuntime {
             .fetch_add(millis, std::sync::atomic::Ordering::AcqRel);
     }
 
+    /// Inspect this runtime's existing recovery flag in optional MCP expiry fixtures.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn mcp_recovery_pending_for_tests(&self) -> anyhow::Result<bool> {
+        Ok(self.resources()?.store.recovery_pending_for_tests())
+    }
+
     #[cfg(feature = "test-support")]
     pub fn mcp_busy_reads_for_tests(&self, count: usize) -> anyhow::Result<()> {
         self.resources()?.store.mcp_busy_reads_for_tests(count);
