@@ -1,6 +1,6 @@
 //! SQLite snapshots and durable user data. Connections are never shared between threads.
 pub mod anchors;
-mod mcp_read;
+pub(crate) mod mcp_read;
 pub mod requests;
 pub mod topology;
 use crate::model::*;
@@ -201,6 +201,9 @@ struct TestTerminalNotify {
     id: String,
     notify: Arc<tokio::sync::Notify>,
 }
+
+#[cfg(feature = "test-support")]
+pub type RetentionStateForTests = ((String, i64, i64), (i64, i64));
 
 #[derive(Clone)]
 pub struct Store {
@@ -11481,6 +11484,30 @@ impl Store {
             self.read_graph_for(tx, &selected)
         })
     }
+    /// Inspect retention state through the protected index read path in integration tests.
+    #[cfg(feature = "test-support")]
+    pub fn retention_state_for_tests(&self, revision_id: &str) -> Result<RetentionStateForTests> {
+        self.with_evidence(|db| {
+            let revision = storage_result(db.query_row(
+                "SELECT s.state,
+                        (SELECT count(*) FROM native_revision_release_debt d
+                         WHERE d.revision_id=s.revision_id),
+                        (SELECT count(*) FROM revision_documents r
+                         WHERE r.revision_id=s.revision_id)
+                 FROM native_revision_supersessions s WHERE s.revision_id=?1",
+                [revision_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            ))?;
+            let pending = storage_result(db.query_row(
+                "SELECT (SELECT count(*) FROM native_revision_supersessions WHERE state='pending'),
+                        (SELECT count(*) FROM native_revision_release_debt)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ))?;
+            Ok((revision, pending))
+        })
+    }
+
     /// Simulate accidental same-pin damage while a test provider is paused. Use
     /// the protected Store connection, not a second raw SQLite file handle.
     #[cfg(all(test, feature = "test-support"))]

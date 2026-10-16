@@ -246,6 +246,37 @@ impl CheckoutRegistry {
         }
     }
 
+    /// Probe only this registry's configured topology. A virgin checkout must not
+    /// create derived state to answer a read, while a published head may activate.
+    pub fn eligible_prior_head(&self, key: &str) -> anyhow::Result<()> {
+        let entry = self
+            .entries
+            .get(key)
+            .ok_or_else(|| anyhow::anyhow!("index_not_ready: checkout not attached"))?;
+        let identity = entry.identity.rediscover()?;
+        let roots = match &self.roots {
+            Some(roots) => roots.clone(),
+            None => TopologyRoots::production()?,
+        };
+        match Store::status_existing_readonly(roots, identity) {
+            Ok(_) => Ok(()),
+            // A cache tree without an admissible lock/format has no selected
+            // head. Preserve cold W1's inert answer without creating state.
+            Err(error)
+                if error.to_string().starts_with("unsafe managed directory:")
+                    || error
+                        .to_string()
+                        .starts_with("incompatible_index: missing or unsafe use lock")
+                    || error
+                        .to_string()
+                        .starts_with("recovery_required: exceptional index format;") =>
+            {
+                anyhow::bail!("index_not_ready: no admitted head")
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Activate an already attached checkout. Registration and global discovery
     /// never call this method and therefore never open SQLite or acquire locks.
     pub fn activate(&mut self, key: &str) -> anyhow::Result<Arc<CheckoutRuntime>> {

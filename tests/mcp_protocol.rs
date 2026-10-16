@@ -1262,17 +1262,31 @@ fn golden_tool_envelopes_and_maximum_ids_both_modes() {
                 exact_tool_for_id(&invalid, &id, Some("invalid_request"), !legacy, "checkout");
                 let args = fixture()["validArguments"][index].clone();
                 let accepted = peer.ask(call(legacy, id.clone(), name, args));
-                exact_tool_for_id(
-                    &accepted,
-                    &id,
-                    if index == 0 {
-                        None
-                    } else {
-                        Some("index_not_ready")
-                    },
-                    !legacy,
-                    "checkout",
-                );
+                if index == 1 && accepted["result"]["isError"] == false {
+                    tool(&accepted, None, !legacy);
+                    let actual = &accepted["result"]["structuredContent"];
+                    assert_eq!(
+                        actual["data"],
+                        json!({"symbols":[],"coverage":[],"provenance":[]})
+                    );
+                    assert!(actual["evidenceBasis"]["indexRevision"].as_u64().unwrap() > 0);
+                    assert_eq!(actual["partial"], false);
+                    assert_eq!(actual["truncated"], false);
+                    assert_eq!(actual["warnings"].as_array().unwrap().len(), 1);
+                    assert_eq!(actual["warnings"][0]["code"], "syntaxOnly");
+                } else {
+                    exact_tool_for_id(
+                        &accepted,
+                        &id,
+                        if index == 0 {
+                            None
+                        } else {
+                            Some("index_not_ready")
+                        },
+                        !legacy,
+                        "checkout",
+                    );
+                }
             }
         }
         for name in &names {
@@ -1302,13 +1316,29 @@ fn golden_tool_envelopes_and_maximum_ids_both_modes() {
                 json!({"schemaVersion":1,"path":"src-sentinel.txt","startLine":1,"endLine":200,"expectedBasis":pin,"expectedContentHash":"a".repeat(64)}),
             ),
         ] {
-            exact_tool_for_id(
-                &peer.ask(call(legacy, json!(heavy_id), name, args)),
-                &json!(heavy_id),
-                Some("index_not_ready"),
-                !legacy,
-                "checkout",
-            );
+            let answer = peer.ask(call(legacy, json!(heavy_id), name, args));
+            if name == "trellis_find_symbols"
+                && answer["result"]["structuredContent"]["error"]["code"] == "revision_conflict"
+            {
+                tool(&answer, Some("revision_conflict"), !legacy);
+                let envelope = &answer["result"]["structuredContent"];
+                assert_eq!(answer["id"], json!(heavy_id));
+                assert!(
+                    envelope["error"]["currentBasis"]["indexRevision"]
+                        .as_u64()
+                        .unwrap()
+                        > 0
+                );
+                assert!(envelope.get("data").is_none());
+            } else {
+                exact_tool_for_id(
+                    &answer,
+                    &json!(heavy_id),
+                    Some("index_not_ready"),
+                    !legacy,
+                    "checkout",
+                );
+            }
         }
         let mut wrong = fixture()["validArguments"][1].clone();
         wrong["limit"] = json!(51);
@@ -1947,6 +1977,19 @@ fn per_call_linked_worktree_selection_and_closed_failures() {
             "linked"
         );
         assert!(linked_marker.exists());
+        let deadline = std::time::Instant::now() + trellis::testing::HANG_BACKSTOP;
+        loop {
+            let status = describe(&mut peer, 20, json!({"schemaVersion":1,"workspace":linked}));
+            tool(&status, None, !legacy);
+            if status["result"]["structuredContent"]["data"]["indexState"] == "ready" {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "linked checkout head was not admitted"
+            );
+            std::thread::yield_now();
+        }
         for (offset, name) in fixture()["names"]
             .as_array()
             .unwrap()
@@ -1962,7 +2005,13 @@ fn per_call_linked_worktree_selection_and_closed_failures() {
                 name.as_str().unwrap(),
                 arguments,
             ));
-            tool(&answer, Some("index_not_ready"), !legacy);
+            if offset == 1 {
+                tool(&answer, None, !legacy);
+                let data = &answer["result"]["structuredContent"]["data"];
+                assert_eq!(*data, json!({"symbols":[],"coverage":[],"provenance":[]}));
+            } else {
+                tool(&answer, Some("index_not_ready"), !legacy);
+            }
             assert_eq!(
                 answer["result"]["structuredContent"]["workspace"],
                 json!(linked)
@@ -4410,7 +4459,10 @@ async fn continuous_invalid_calls_stay_bounded_and_a_due_reply_is_decided() {
     // This side stops reading now: end the connection first, so a flood
     // write blocked behind unread replies fails instead of waiting forever.
     stop.store(true, std::sync::atomic::Ordering::Release);
-    client.shutdown(std::net::Shutdown::Both).unwrap();
+    // The server can close first after deciding the due reply.
+    if let Err(error) = client.shutdown(std::net::Shutdown::Both) {
+        assert_eq!(error.kind(), std::io::ErrorKind::NotConnected);
+    }
     let sent = flood.join().unwrap();
     assert!(sent > 2_000);
     let largest = largest.load(std::sync::atomic::Ordering::Acquire);
@@ -4526,4 +4578,837 @@ async fn a_client_hang_up_ends_the_session_cleanly() {
         ended.is_ok(),
         "a client hang-up failed the session: {ended:?}"
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn mcp_find_selected_snapshot_ranks_and_keeps_zero_hit_scope() {
+    use std::os::unix::net::UnixStream;
+    use trellis::daemon::registry::CheckoutRegistry;
+    use trellis::store::{
+        Store,
+        topology::{TopologyRoots, WorkspaceIdentity},
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let root = checkout(temp.path());
+    let mut source =
+        "function Alpha() {}\nfunction Alphabet() {}\nfunction xAlpha() {}\nfunction Cafe\u{301}() {}\nfunction Café() {}\nfunction Écho() {}\nfunction écho() {}\nfunction $Find() {}\n".to_owned();
+    for index in 0..51 {
+        if index < 21 {
+            source.push_str(&format!("function ManyDefault{index:03}() {{}}\n"));
+        } else {
+            source.push_str(&format!("function Many{index:03}() {{}}\n"));
+        }
+    }
+    fs::write(root.join("a.js"), source).unwrap();
+    fs::write(root.join("b.py"), "def separate(): pass\n").unwrap();
+    fs::write(root.join("c.rs"), "fn unrelated() {}\n").unwrap();
+    fs::write(root.join("d.java"), "class Unrelated {}\n").unwrap();
+    fs::write(root.join("e.py"), "def another(): pass\n").unwrap();
+    fs::write(root.join("f.java"), "class Another {}\n").unwrap();
+    let identity = WorkspaceIdentity::discover(Some(&root), &root)
+        .unwrap()
+        .attach_marker()
+        .unwrap();
+    let store = Store::open_for_tests(temp.path(), &root).unwrap();
+    let baseline = store.index_baseline().unwrap();
+    store.mcp_prepare_virgin_queue_for_tests().unwrap();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
+        &trellis::indexer::IndexOptions::new(root.clone()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    let writer = store.publication_for_tests().unwrap();
+    let pin = store
+        .publish_native(&graph, &capture, &native, &writer, baseline, &cancel)
+        .unwrap();
+    let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
+        &trellis::indexer::IndexOptions::new(root.clone()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    let current = store
+        .publish_native(&graph, &capture, &native, &writer, pin, &cancel)
+        .unwrap();
+    assert!(current.index_revision > pin.index_revision);
+    store
+        .mcp_set_coverage_for_tests(&writer, "b.py", true, "failed")
+        .unwrap();
+    store
+        .mcp_set_coverage_for_tests(&writer, "d.java", false, "unsupported")
+        .unwrap();
+    store
+        .mcp_set_coverage_for_tests(&writer, "e.py", true, "partial")
+        .unwrap();
+    store
+        .mcp_set_coverage_for_tests(&writer, "f.java", false, "omitted")
+        .unwrap();
+    drop(writer);
+    drop(store);
+    let topology =
+        TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(143, &identity).unwrap();
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (resume_tx, resume_rx) = mpsc::sync_channel(1);
+    let resume_rx = std::sync::Mutex::new(resume_rx);
+    registry.set_next_startup_hook_for_tests(std::sync::Arc::new(move || {
+        entered_tx.send(()).unwrap();
+        resume_rx
+            .lock()
+            .unwrap()
+            .recv_timeout(trellis::testing::HANG_BACKSTOP)
+            .unwrap();
+    }));
+    let runtime = registry.activate(&identity.root_key).unwrap();
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        loop {
+            if entered_rx.try_recv().is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("startup reconciliation did not pause");
+    assert!(runtime.catching_up());
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    let (mut client, server) = UnixStream::pair().unwrap();
+    client
+        .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
+        .unwrap();
+    let handle = tokio::runtime::Handle::current();
+    let session = std::thread::spawn(move || {
+        trellis::mcp::run_socket(
+            trellis::mcp::OpenedWorkspace::new(identity),
+            server,
+            registry,
+            143,
+            handle,
+        )
+    });
+    let ask = |client: &mut UnixStream,
+               id: i64,
+               query: &str,
+               limit: Option<u64>,
+               expected: Option<Value>| {
+        let mut args = json!({"schemaVersion":1,"query":query});
+        if let Some(limit) = limit {
+            args["limit"] = json!(limit);
+        }
+        if let Some(pin) = expected {
+            args["expectedBasis"] = pin;
+        }
+        writeln!(
+            client,
+            "{}",
+            modern(
+                json!(id),
+                "tools/call",
+                json!({"name":"trellis_find_symbols","arguments":args})
+            )
+        )
+        .unwrap();
+        let mut line = String::new();
+        BufReader::new(client.try_clone().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        serde_json::from_str::<Value>(&line).unwrap()
+    };
+    let first = ask(&mut client, 144, "alpha", Some(1), None);
+    tool(&first, None, true);
+    let data = &first["result"]["structuredContent"];
+    assert_eq!(data["catchingUp"], true);
+    assert_eq!(
+        data["evidenceBasis"],
+        json!({
+            "indexGeneration":current.index_generation.to_string(),"indexRevision":current.index_revision
+        })
+    );
+    resume_tx.send(()).unwrap();
+    assert_eq!(data["data"]["symbols"][0]["name"], "Alpha");
+    assert_eq!(data["truncated"], true);
+    assert_eq!(data["truncationReason"], "limit");
+    assert_eq!(data["data"]["provenance"].as_array().unwrap().len(), 1);
+    let ranked = ask(&mut client, 147, "ALPHA", Some(20), None);
+    tool(&ranked, None, true);
+    let ranked = &ranked["result"]["structuredContent"];
+    assert_eq!(
+        ranked["data"]["symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|symbol| symbol["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["Alpha", "Alphabet", "xAlpha"]
+    );
+    assert_eq!(ranked["truncated"], false);
+    let exact_limit = ask(&mut client, 149, "alpha", Some(3), None);
+    tool(&exact_limit, None, true);
+    assert_eq!(
+        exact_limit["result"]["structuredContent"]["truncated"],
+        false
+    );
+    let max_limit = ask(&mut client, 150, "Many", Some(50), None);
+    tool(&max_limit, None, true);
+    let max_symbols = max_limit["result"]["structuredContent"]["data"]["symbols"]
+        .as_array()
+        .unwrap()
+        .len();
+    assert!((1..=50).contains(&max_symbols));
+    assert_eq!(
+        max_limit["result"]["structuredContent"]["truncationReason"],
+        if max_symbols == 50 {
+            "limit"
+        } else {
+            "response_bytes"
+        }
+    );
+    let default = ask(&mut client, 151, "ManyDefault", None, None);
+    tool(&default, None, true);
+    let default_data = &default["result"]["structuredContent"];
+    let default_symbols = default_data["data"]["symbols"].as_array().unwrap();
+    assert_eq!(default_symbols.len(), 20);
+    assert_eq!(default_symbols[0]["name"], "ManyDefault000");
+    assert_eq!(default_symbols[19]["name"], "ManyDefault019");
+    assert_eq!(default_data["truncated"], true);
+    assert_eq!(default_data["truncationReason"], "limit");
+    let shorter = ask(&mut client, 156, "ManyDefault", Some(3), None);
+    tool(&shorter, None, true);
+    let shorter_data = &shorter["result"]["structuredContent"];
+    assert_eq!(shorter_data["data"]["symbols"].as_array().unwrap().len(), 3);
+    assert_eq!(shorter_data["truncated"], true);
+    assert_eq!(shorter_data["truncationReason"], "limit");
+    let unicode = ask(&mut client, 153, "Caf", Some(20), None);
+    tool(&unicode, None, true);
+    assert_eq!(
+        unicode["result"]["structuredContent"]["data"]["symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .take(2)
+            .map(|symbol| symbol["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["Cafe\u{301}", "Café"]
+    );
+    let composed = ask(&mut client, 154, "Café", Some(20), None);
+    tool(&composed, None, true);
+    assert_eq!(
+        composed["result"]["structuredContent"]["data"]["symbols"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    for (query, names) in [
+        ("ÉCHO", vec!["Écho"]),
+        ("éCHO", vec!["écho"]),
+        ("$Find", vec!["$Find"]),
+        ("%", vec![]),
+        ("*", vec![]),
+        (".", vec![]),
+    ] {
+        let response = ask(&mut client, 157, query, Some(20), None);
+        tool(&response, None, true);
+        let actual: Vec<_> = response["result"]["structuredContent"]["data"]["symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|symbol| symbol["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(actual, names, "literal ASCII-only match for {query:?}");
+    }
+    let id = ranked["data"]["symbols"][0]["symbolId"].as_str().unwrap();
+    let id_only = ask(&mut client, 155, id, Some(20), None);
+    tool(&id_only, None, true);
+    assert_eq!(
+        id_only["result"]["structuredContent"]["data"]["symbols"][0]["symbolId"],
+        id
+    );
+    let literal = ask(&mut client, 148, " alpha ", Some(20), None);
+    tool(&literal, None, true);
+    assert_eq!(
+        literal["result"]["structuredContent"]["data"]["symbols"],
+        json!([])
+    );
+    let empty = ask(&mut client, 145, "no-such-name", Some(20), None);
+    tool(&empty, None, true);
+    let data = &empty["result"]["structuredContent"];
+    assert_eq!(data["data"]["symbols"], json!([]));
+    let coverage = data["data"]["coverage"].as_array().unwrap();
+    assert_eq!(coverage.len(), 6);
+    assert_eq!(
+        coverage
+            .iter()
+            .map(|row| row["language"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["java", "java", "rust", "python", "python", "javascript"]
+    );
+    assert_eq!(
+        coverage
+            .iter()
+            .map(|row| row["state"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "unsupported",
+            "omitted",
+            "complete",
+            "failed",
+            "partial",
+            "complete"
+        ]
+    );
+    assert_eq!(coverage[0]["selected"], false);
+    assert_eq!(coverage[1]["selected"], false);
+    assert_eq!(coverage[3]["selected"], true);
+    assert_eq!(coverage[4]["selected"], true);
+    assert_eq!(data["data"]["provenance"], json!([]));
+    assert_eq!(data["partial"], true);
+    assert_eq!(data["warnings"][0]["code"], "coverageIncomplete");
+    assert_eq!(data["warnings"][1]["code"], "syntaxOnly");
+    let old = json!({"indexGeneration":pin.index_generation.to_string(),"indexRevision":0});
+    let stale = ask(&mut client, 146, "no-such-name", Some(20), Some(old));
+    tool(&stale, Some("revision_conflict"), true);
+    let retained = ask(
+        &mut client,
+        152,
+        "not-a-declaration",
+        Some(20),
+        Some(
+            json!({"indexGeneration":pin.index_generation.to_string(),"indexRevision":pin.index_revision}),
+        ),
+    );
+    tool(&retained, Some("revision_conflict"), true);
+    let admitted = &retained["result"]["structuredContent"]["error"]["currentBasis"];
+    assert_eq!(
+        admitted["indexGeneration"],
+        current.index_generation.to_string()
+    );
+    assert!(admitted["indexRevision"].as_u64().unwrap() >= current.index_revision);
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
+#[test]
+fn mcp_find_cold_prior_head_uses_registry_roots_without_creating_index() {
+    use trellis::daemon::registry::CheckoutRegistry;
+    use trellis::store::{
+        Store,
+        topology::{TopologyRoots, WorkspaceIdentity},
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let root = checkout(temp.path());
+    fs::write(root.join("a.js"), "function Alpha() {}\n").unwrap();
+    let identity = WorkspaceIdentity::discover(Some(&root), &root)
+        .unwrap()
+        .attach_marker()
+        .unwrap();
+    let topology =
+        TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+    let index = topology.index_db(&identity);
+    let mut registry = CheckoutRegistry::with_roots(topology.clone());
+    registry.attach_launch(287, &identity).unwrap();
+    assert!(
+        registry
+            .eligible_prior_head(&identity.root_key)
+            .unwrap_err()
+            .to_string()
+            .contains("index_not_ready")
+    );
+    assert!(!index.exists(), "cold read created a derived database");
+    let store = Store::open_for_tests(temp.path(), &root).unwrap();
+    store.mcp_prepare_virgin_queue_for_tests().unwrap();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
+        &trellis::indexer::IndexOptions::new(root.clone()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    let writer = store.publication_for_tests().unwrap();
+    store
+        .publish_native(
+            &graph,
+            &capture,
+            &native,
+            &writer,
+            store.index_baseline().unwrap(),
+            &cancel,
+        )
+        .unwrap();
+    drop(writer);
+    drop(store);
+    registry.eligible_prior_head(&identity.root_key).unwrap();
+    fs::write(&index, vec![b'X'; 4096]).unwrap();
+    let invalid = registry
+        .eligible_prior_head(&identity.root_key)
+        .unwrap_err();
+    assert!(
+        invalid.to_string().contains("index_not_ready"),
+        "a large non-index must not qualify as a published head: {invalid:#}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_find_required_rows_and_coverage_fail_closed() {
+    use trellis::daemon::registry::CheckoutRegistry;
+    use trellis::store::{
+        Store,
+        topology::{TopologyRoots, WorkspaceIdentity},
+    };
+    for fault in [
+        "invalid_coverage",
+        "missing_scope",
+        "missing_header",
+        "bad_digest",
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = checkout(temp.path());
+        fs::write(root.join("a.js"), "function Alpha() {}\n").unwrap();
+        let store = Store::open_for_tests(temp.path(), &root).unwrap();
+        store.mcp_prepare_virgin_queue_for_tests().unwrap();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
+            &trellis::indexer::IndexOptions::new(root.clone()),
+            store.root_id(),
+            &cancel,
+            |_| {},
+        )
+        .unwrap();
+        let writer = store.publication_for_tests().unwrap();
+        store
+            .publish_native(
+                &graph,
+                &capture,
+                &native,
+                &writer,
+                store.index_baseline().unwrap(),
+                &cancel,
+            )
+            .unwrap();
+        drop(writer);
+        let response = store.evidence_response().unwrap();
+        let valid = response
+            .mcp_find("Alpha", 20, None)
+            .unwrap_or_else(|error| panic!("fixture find: {error}"));
+        assert!(
+            !valid.symbols.is_empty(),
+            "fixture must prove a selected hit"
+        );
+        response.finish(()).unwrap();
+        drop(response);
+        let writer = store.publication_for_tests().unwrap();
+        if fault == "invalid_coverage" {
+            store
+                .mcp_set_coverage_for_tests(&writer, "a.js", false, "failed")
+                .unwrap();
+        } else {
+            store.mcp_corrupt_find_for_tests(&writer, fault).unwrap();
+        }
+        drop(writer);
+        let response = store.evidence_response().unwrap();
+        assert!(
+            response.mcp_find("Alpha", 20, None).is_err(),
+            "{fault} must fail as a whole without partial find evidence"
+        );
+        drop(response);
+        drop(store);
+        if fault == "invalid_coverage" {
+            let identity = WorkspaceIdentity::discover(Some(&root), &root)
+                .unwrap()
+                .attach_marker()
+                .unwrap();
+            let topology = TopologyRoots::isolated_for_tests(
+                temp.path().join("cache"),
+                temp.path().join("data"),
+            );
+            let mut registry = CheckoutRegistry::with_roots(topology);
+            registry.attach_launch(292, &identity).unwrap();
+            let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+            let (release_tx, release_rx) = mpsc::sync_channel(1);
+            let release_rx = std::sync::Mutex::new(release_rx);
+            registry.set_next_startup_hook_for_tests(std::sync::Arc::new(move || {
+                entered_tx.send(()).unwrap();
+                release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(trellis::testing::HANG_BACKSTOP)
+                    .unwrap();
+            }));
+            let _runtime = registry.activate(&identity.root_key).unwrap();
+            entered_rx
+                .recv_timeout(trellis::testing::HANG_BACKSTOP)
+                .unwrap();
+            let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+            let (mut client, mut reader, session) = socket_session(&identity, &registry, 292, None);
+            writeln!(client, "{}", modern(json!(1), "tools/call", json!({
+                "name":"trellis_find_symbols","arguments":{"schemaVersion":1,"query":"Alpha"}
+            }))).unwrap();
+            let reply = next_reply(&mut reader);
+            tool(&reply, Some("store_unavailable"), true);
+            assert!(reply["result"]["structuredContent"]["data"].is_null());
+            release_tx.send(()).unwrap();
+            drop(reader);
+            drop(client);
+            session.join().unwrap().unwrap();
+        }
+    }
+}
+
+fn linked_find_registry(
+    temp: &Path,
+    session: u64,
+) -> (
+    trellis::store::topology::WorkspaceIdentity,
+    PathBuf,
+    std::sync::Arc<tokio::sync::Mutex<trellis::daemon::registry::CheckoutRegistry>>,
+    std::sync::Arc<trellis::daemon::registry::CheckoutRuntime>,
+) {
+    use trellis::daemon::registry::CheckoutRegistry;
+    use trellis::store::{
+        Store,
+        topology::{TopologyRoots, WorkspaceIdentity},
+    };
+    let (main, linked) = git_linked_fixture(temp);
+    fs::write(linked.join("a.js"), "function held() {}\n").unwrap();
+    let identity = WorkspaceIdentity::discover(Some(&main), &main)
+        .unwrap()
+        .attach_marker()
+        .unwrap();
+    let selected = WorkspaceIdentity::discover(Some(&linked), &linked)
+        .unwrap()
+        .attach_marker()
+        .unwrap();
+    let store = Store::open_for_tests(temp, &linked).unwrap();
+    store.mcp_prepare_virgin_queue_for_tests().unwrap();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
+        &trellis::indexer::IndexOptions::new(linked.clone()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    let writer = store.publication_for_tests().unwrap();
+    store
+        .publish_native(
+            &graph,
+            &capture,
+            &native,
+            &writer,
+            store.index_baseline().unwrap(),
+            &cancel,
+        )
+        .unwrap();
+    drop(writer);
+    drop(store);
+    let topology = TopologyRoots::isolated_for_tests(temp.join("cache"), temp.join("data"));
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(session, &identity).unwrap();
+    registry.select(session, &identity, &linked).unwrap();
+    let runtime = registry.activate(&selected.root_key).unwrap();
+    (
+        identity,
+        linked,
+        std::sync::Arc::new(tokio::sync::Mutex::new(registry)),
+        runtime,
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_find_linked_selected_success_cancel_and_final_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let (identity, linked, registry, runtime) = linked_find_registry(temp.path(), 291);
+    let (mut client, mut reader, session) = socket_session(&identity, &registry, 291, None);
+    let selected_call = |id: i64| {
+        modern(
+            json!(id),
+            "tools/call",
+            json!({
+                "name":"trellis_find_symbols",
+                "arguments":{"schemaVersion":1,"workspace":linked,"query":"held"}
+            }),
+        )
+    };
+    writeln!(client, "{}", selected_call(1)).unwrap();
+    let reply = next_reply(&mut reader);
+    tool(&reply, None, true);
+    let envelope = &reply["result"]["structuredContent"];
+    assert_eq!(envelope["workspace"], json!(linked), "{reply}");
+    assert!(envelope["catchingUp"].is_boolean());
+    assert_eq!(envelope["data"]["symbols"][0]["name"], "held");
+    assert_eq!(envelope["data"]["provenance"].as_array().unwrap().len(), 1);
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+
+    let cancel_gate = ReadGate::default();
+    runtime.set_mcp_admitted_gate_for_tests(cancel_gate.hook());
+    let (read_tx, read_rx) = mpsc::sync_channel(1);
+    let frames = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let frame_count = frames.clone();
+    let hooks = trellis::mcp::TransportHooksForTests {
+        frame_read: Some(std::sync::Arc::new(move || {
+            if frame_count.fetch_add(1, std::sync::atomic::Ordering::AcqRel) == 1 {
+                let _ = read_tx.try_send(());
+            }
+        })),
+        ..Default::default()
+    };
+    let (mut client, mut reader, session) = hooked_session(&identity, &registry, 291, None, hooks);
+    writeln!(client, "{}", selected_call(4)).unwrap();
+    let waiter = cancel_gate.clone();
+    tokio::task::spawn_blocking(move || waiter.await_held(1))
+        .await
+        .unwrap();
+    writeln!(
+        client,
+        "{}",
+        json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":4}})
+    )
+    .unwrap();
+    read_rx
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .unwrap();
+    cancel_gate.open();
+    writeln!(client, "{}", modern(json!(5), "tools/list", json!({}))).unwrap();
+    let reply = next_reply(&mut reader);
+    assert_eq!(
+        reply["id"], 5,
+        "cancelled W2 selected call emitted evidence: {reply}"
+    );
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+
+    let final_gate = ReadGate::default();
+    runtime.set_mcp_admitted_gate_for_tests(final_gate.hook());
+    let (mut client, mut reader, session) = socket_session(&identity, &registry, 291, None);
+    writeln!(client, "{}", selected_call(3)).unwrap();
+    let waiter = final_gate.clone();
+    tokio::task::spawn_blocking(move || waiter.await_held(1))
+        .await
+        .unwrap();
+    fs::rename(&linked, temp.path().join("moved-linked")).unwrap();
+    final_gate.open();
+    let reply = next_reply(&mut reader);
+    tool(&reply, Some("root_changed"), true);
+    assert_eq!(
+        reply["result"]["structuredContent"]["workspace"],
+        json!(linked),
+        "{reply}"
+    );
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
+#[test]
+fn mcp_find_null_name_and_id_byte_ties_are_ranked() {
+    use trellis::store::Store;
+    let temp = tempfile::tempdir().unwrap();
+    let root = checkout(temp.path());
+    fs::write(root.join("a.js"), "function Alpha() {}\n").unwrap();
+    fs::write(root.join("b.js"), "function Beta() {}\n").unwrap();
+    let store = Store::open_for_tests(temp.path(), &root).unwrap();
+    store.mcp_prepare_virgin_queue_for_tests().unwrap();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
+        &trellis::indexer::IndexOptions::new(root.clone()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    let writer = store.publication_for_tests().unwrap();
+    store
+        .publish_native(
+            &graph,
+            &capture,
+            &native,
+            &writer,
+            store.index_baseline().unwrap(),
+            &cancel,
+        )
+        .unwrap();
+    drop(writer);
+    let response = store.evidence_response().unwrap();
+    let result = response
+        .mcp_find("sid:v1:", 50, None)
+        .unwrap_or_else(|error| panic!("ID find: {error:#}"));
+    assert!(result.symbols.len() >= 4);
+    assert!(
+        result.symbols[0].declaration.name.is_none(),
+        "null name precedes named ID matches"
+    );
+    let nulls: Vec<_> = result
+        .symbols
+        .iter()
+        .take_while(|symbol| symbol.declaration.name.is_none())
+        .map(|symbol| symbol.declaration.syntax_id.as_str())
+        .collect();
+    assert!(nulls.len() >= 2, "one unnamed module per source document");
+    assert!(
+        nulls
+            .windows(2)
+            .all(|ids| ids[0].as_bytes() <= ids[1].as_bytes())
+    );
+    assert!(
+        result
+            .symbols
+            .iter()
+            .skip(nulls.len())
+            .any(|symbol| symbol.declaration.name.is_some())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_find_cold_coordinator_admits_prior_head_only_under_configured_roots() {
+    use trellis::daemon::registry::CheckoutRegistry;
+    use trellis::store::{
+        Store,
+        topology::{TopologyRoots, WorkspaceIdentity},
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let root = checkout(temp.path());
+    fs::write(root.join("a.js"), "function Alpha() {}\n").unwrap();
+    let identity = WorkspaceIdentity::discover(Some(&root), &root)
+        .unwrap()
+        .attach_marker()
+        .unwrap();
+    let topology =
+        TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+    let index = topology.index_db(&identity);
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(293, &identity).unwrap();
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    let (mut client, mut reader, session) = socket_session(&identity, &registry, 293, None);
+    let call = |id: i64| {
+        modern(
+            json!(id),
+            "tools/call",
+            json!({
+                "name":"trellis_find_symbols","arguments":{"schemaVersion":1,"query":"Alpha"}
+            }),
+        )
+    };
+    writeln!(client, "{}", call(1)).unwrap();
+    tool(&next_reply(&mut reader), Some("index_not_ready"), true);
+    assert!(
+        !index.exists(),
+        "cold W2 created derived state without a prior head"
+    );
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+
+    let store = Store::open_for_tests(temp.path(), &root).unwrap();
+    store.mcp_prepare_virgin_queue_for_tests().unwrap();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
+        &trellis::indexer::IndexOptions::new(root.clone()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    let writer = store.publication_for_tests().unwrap();
+    let pin = store
+        .publish_native(
+            &graph,
+            &capture,
+            &native,
+            &writer,
+            store.index_baseline().unwrap(),
+            &cancel,
+        )
+        .unwrap();
+    drop(writer);
+    drop(store);
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let release_rx = std::sync::Mutex::new(release_rx);
+    {
+        let mut registry = registry.lock().await;
+        registry.attach_launch(294, &identity).unwrap();
+        assert!(registry.runtime(&identity.root_key).is_none());
+        registry.set_next_startup_hook_for_tests(std::sync::Arc::new(move || {
+            entered_tx.send(()).unwrap();
+            release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(trellis::testing::HANG_BACKSTOP)
+                .unwrap();
+        }));
+    }
+    let (mut client, mut reader, session) = socket_session(&identity, &registry, 294, None);
+    writeln!(client, "{}", call(2)).unwrap();
+    entered_rx
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .unwrap();
+    let reply = next_reply(&mut reader);
+    tool(&reply, None, true);
+    let envelope = &reply["result"]["structuredContent"];
+    assert_eq!(envelope["catchingUp"], true);
+    assert_eq!(envelope["data"]["symbols"][0]["name"], "Alpha");
+    assert_eq!(
+        envelope["evidenceBasis"],
+        json!({
+            "indexGeneration":pin.index_generation.to_string(),"indexRevision":pin.index_revision
+        })
+    );
+    release_tx.send(()).unwrap();
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_find_linked_selected_deadline_after_admission_keeps_resolved_shape() {
+    let temp = tempfile::tempdir().unwrap();
+    let (identity, linked, registry, runtime) = linked_find_registry(temp.path(), 295);
+    let gate = ReadGate::default();
+    runtime.set_mcp_admitted_gate_for_tests(gate.hook());
+    // Only W2 consumes this injected contention. The call cannot finish while
+    // the post-admission gate holds its selected read.
+    runtime.mcp_busy_reads_for_tests(1).unwrap();
+    let (mut client, mut reader, session) = socket_session(&identity, &registry, 295, None);
+    writeln!(
+        client,
+        "{}",
+        modern(
+            json!(1),
+            "tools/call",
+            json!({
+                "name":"trellis_find_symbols",
+                "arguments":{"schemaVersion":1,"workspace":linked,"query":"held"}
+            })
+        )
+    )
+    .unwrap();
+    let waiter = gate.clone();
+    tokio::task::spawn_blocking(move || waiter.await_held(1))
+        .await
+        .unwrap();
+    // Admission was observed before the test clock advances. One retryable
+    // read now returns to the worker loop, where the virtual deadline wins.
+    runtime.advance_mcp_clock_for_tests(trellis::mcp::CALL_DEADLINE + Duration::from_secs(1));
+    gate.open();
+    let reply = next_reply(&mut reader);
+    tool(&reply, Some("deadline_exceeded"), true);
+    let envelope = &reply["result"]["structuredContent"];
+    assert_eq!(envelope["workspace"], json!(linked), "{reply}");
+    assert!(envelope["catchingUp"].is_boolean(), "{reply}");
+    assert!(
+        envelope["error"].get("attemptedWorkspace").is_none(),
+        "{reply}"
+    );
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
 }
