@@ -1896,7 +1896,6 @@ fn maintenance_never_runs_ahead_of_accepted_fifo_work() {
     fs::create_dir(&checkout).unwrap();
     fs::write(checkout.join("a.js"), "function a() {}\n").unwrap();
     let id = identity(&checkout);
-    let index_path = roots(base.path()).index_dir(&id).join("index.db");
     let store = Store::open(roots(base.path()), id).unwrap();
     let options = trellis::indexer::IndexOptions::new(checkout.clone());
     let cancel = Arc::new(AtomicBool::new(false));
@@ -1933,46 +1932,8 @@ fn maintenance_never_runs_ahead_of_accepted_fifo_work() {
     let old = publish(store.index_baseline().unwrap());
     publish(old);
     let revision_id = format!("pin:v1:{}:{}", old.index_generation, old.index_revision);
-    let debt = || {
-        let db = rusqlite::Connection::open_with_flags(
-            &index_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .unwrap();
-        db.query_row(
-            "SELECT s.state,
-                    (SELECT count(*) FROM native_revision_release_debt d
-                     WHERE d.revision_id=s.revision_id),
-                    (SELECT count(*) FROM revision_documents r
-                     WHERE r.revision_id=s.revision_id)
-             FROM native_revision_supersessions s WHERE s.revision_id=?1",
-            [&revision_id],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            },
-        )
-        .unwrap()
-    };
-    let pending_debt = || {
-        let db = rusqlite::Connection::open_with_flags(
-            &index_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .unwrap();
-        db.query_row(
-            "SELECT (SELECT count(*) FROM native_revision_supersessions WHERE state='pending'),
-                    (SELECT count(*) FROM native_revision_release_debt)",
-            [],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-        )
-        .unwrap()
-    };
-    let before = debt();
-    let pending_before = pending_debt();
+    let state = || store.retention_state_for_tests(&revision_id).unwrap();
+    let (before, pending_before) = state();
     assert_eq!(pending_before, (0, 0));
     assert_eq!(before.0, "retained");
     assert_eq!(before.1, 0);
@@ -1984,14 +1945,13 @@ fn maintenance_never_runs_ahead_of_accepted_fifo_work() {
         store.request_by_id(&row.id).unwrap().unwrap().state,
         "queued"
     );
+    let (queued_revision, queued_pending) = state();
     assert_eq!(
-        debt(),
-        before,
+        queued_revision, before,
         "maintenance committed ahead of accepted FIFO work"
     );
     assert_eq!(
-        pending_debt(),
-        pending_before,
+        queued_pending, pending_before,
         "release debt advanced before FIFO"
     );
 
@@ -2009,7 +1969,7 @@ fn maintenance_never_runs_ahead_of_accepted_fifo_work() {
     .unwrap();
     idle.retain_serving_session_without_tick_for_tests(owner);
     idle.force_retention_idle_tick_for_tests().unwrap();
-    assert_eq!(pending_debt(), (1, 1), "due maintenance did not advance");
+    assert_eq!(state().1, (1, 1), "due maintenance did not advance");
 }
 
 /// Decision 0009 §8: an index waiter records the terminal-commit count, re-reads

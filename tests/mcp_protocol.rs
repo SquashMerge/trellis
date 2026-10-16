@@ -4588,9 +4588,13 @@ async fn mcp_find_selected_snapshot_ranks_and_keeps_zero_hit_scope() {
     let temp = tempfile::tempdir().unwrap();
     let root = checkout(temp.path());
     let mut source =
-        "function Alpha() {}\nfunction Alphabet() {}\nfunction xAlpha() {}\nfunction Cafe\u{301}() {}\nfunction Café() {}\n".to_owned();
+        "function Alpha() {}\nfunction Alphabet() {}\nfunction xAlpha() {}\nfunction Cafe\u{301}() {}\nfunction Café() {}\nfunction Écho() {}\nfunction écho() {}\nfunction $Find() {}\n".to_owned();
     for index in 0..51 {
-        source.push_str(&format!("function Many{index:03}() {{}}\n"));
+        if index < 21 {
+            source.push_str(&format!("function ManyDefault{index:03}() {{}}\n"));
+        } else {
+            source.push_str(&format!("function Many{index:03}() {{}}\n"));
+        }
     }
     fs::write(root.join("a.js"), source).unwrap();
     fs::write(root.join("b.py"), "def separate(): pass\n").unwrap();
@@ -4684,29 +4688,35 @@ async fn mcp_find_selected_snapshot_ranks_and_keeps_zero_hit_scope() {
             handle,
         )
     });
-    let ask =
-        |client: &mut UnixStream, id: i64, query: &str, limit: u64, expected: Option<Value>| {
-            let mut args = json!({"schemaVersion":1,"query":query,"limit":limit});
-            if let Some(pin) = expected {
-                args["expectedBasis"] = pin;
-            }
-            writeln!(
-                client,
-                "{}",
-                modern(
-                    json!(id),
-                    "tools/call",
-                    json!({"name":"trellis_find_symbols","arguments":args})
-                )
+    let ask = |client: &mut UnixStream,
+               id: i64,
+               query: &str,
+               limit: Option<u64>,
+               expected: Option<Value>| {
+        let mut args = json!({"schemaVersion":1,"query":query});
+        if let Some(limit) = limit {
+            args["limit"] = json!(limit);
+        }
+        if let Some(pin) = expected {
+            args["expectedBasis"] = pin;
+        }
+        writeln!(
+            client,
+            "{}",
+            modern(
+                json!(id),
+                "tools/call",
+                json!({"name":"trellis_find_symbols","arguments":args})
             )
+        )
+        .unwrap();
+        let mut line = String::new();
+        BufReader::new(client.try_clone().unwrap())
+            .read_line(&mut line)
             .unwrap();
-            let mut line = String::new();
-            BufReader::new(client.try_clone().unwrap())
-                .read_line(&mut line)
-                .unwrap();
-            serde_json::from_str::<Value>(&line).unwrap()
-        };
-    let first = ask(&mut client, 144, "alpha", 1, None);
+        serde_json::from_str::<Value>(&line).unwrap()
+    };
+    let first = ask(&mut client, 144, "alpha", Some(1), None);
     tool(&first, None, true);
     let data = &first["result"]["structuredContent"];
     assert_eq!(data["catchingUp"], true);
@@ -4721,7 +4731,7 @@ async fn mcp_find_selected_snapshot_ranks_and_keeps_zero_hit_scope() {
     assert_eq!(data["truncated"], true);
     assert_eq!(data["truncationReason"], "limit");
     assert_eq!(data["data"]["provenance"].as_array().unwrap().len(), 1);
-    let ranked = ask(&mut client, 147, "ALPHA", 20, None);
+    let ranked = ask(&mut client, 147, "ALPHA", Some(20), None);
     tool(&ranked, None, true);
     let ranked = &ranked["result"]["structuredContent"];
     assert_eq!(
@@ -4734,13 +4744,13 @@ async fn mcp_find_selected_snapshot_ranks_and_keeps_zero_hit_scope() {
         vec!["Alpha", "Alphabet", "xAlpha"]
     );
     assert_eq!(ranked["truncated"], false);
-    let exact_limit = ask(&mut client, 149, "alpha", 3, None);
+    let exact_limit = ask(&mut client, 149, "alpha", Some(3), None);
     tool(&exact_limit, None, true);
     assert_eq!(
         exact_limit["result"]["structuredContent"]["truncated"],
         false
     );
-    let max_limit = ask(&mut client, 150, "Many", 50, None);
+    let max_limit = ask(&mut client, 150, "Many", Some(50), None);
     tool(&max_limit, None, true);
     let max_symbols = max_limit["result"]["structuredContent"]["data"]["symbols"]
         .as_array()
@@ -4755,16 +4765,22 @@ async fn mcp_find_selected_snapshot_ranks_and_keeps_zero_hit_scope() {
             "response_bytes"
         }
     );
-    let default = ask(&mut client, 151, "Many", 20, None);
+    let default = ask(&mut client, 151, "ManyDefault", None, None);
     tool(&default, None, true);
-    assert_eq!(
-        default["result"]["structuredContent"]["data"]["symbols"]
-            .as_array()
-            .unwrap()
-            .len(),
-        20
-    );
-    let unicode = ask(&mut client, 153, "Caf", 20, None);
+    let default_data = &default["result"]["structuredContent"];
+    let default_symbols = default_data["data"]["symbols"].as_array().unwrap();
+    assert_eq!(default_symbols.len(), 20);
+    assert_eq!(default_symbols[0]["name"], "ManyDefault000");
+    assert_eq!(default_symbols[19]["name"], "ManyDefault019");
+    assert_eq!(default_data["truncated"], true);
+    assert_eq!(default_data["truncationReason"], "limit");
+    let shorter = ask(&mut client, 156, "ManyDefault", Some(3), None);
+    tool(&shorter, None, true);
+    let shorter_data = &shorter["result"]["structuredContent"];
+    assert_eq!(shorter_data["data"]["symbols"].as_array().unwrap().len(), 3);
+    assert_eq!(shorter_data["truncated"], true);
+    assert_eq!(shorter_data["truncationReason"], "limit");
+    let unicode = ask(&mut client, 153, "Caf", Some(20), None);
     tool(&unicode, None, true);
     assert_eq!(
         unicode["result"]["structuredContent"]["data"]["symbols"]
@@ -4776,7 +4792,7 @@ async fn mcp_find_selected_snapshot_ranks_and_keeps_zero_hit_scope() {
             .collect::<Vec<_>>(),
         ["Cafe\u{301}", "Café"]
     );
-    let composed = ask(&mut client, 154, "Café", 20, None);
+    let composed = ask(&mut client, 154, "Café", Some(20), None);
     tool(&composed, None, true);
     assert_eq!(
         composed["result"]["structuredContent"]["data"]["symbols"]
@@ -4785,20 +4801,38 @@ async fn mcp_find_selected_snapshot_ranks_and_keeps_zero_hit_scope() {
             .len(),
         1
     );
+    for (query, names) in [
+        ("ÉCHO", vec!["Écho"]),
+        ("éCHO", vec!["écho"]),
+        ("$Find", vec!["$Find"]),
+        ("%", vec![]),
+        ("*", vec![]),
+        (".", vec![]),
+    ] {
+        let response = ask(&mut client, 157, query, Some(20), None);
+        tool(&response, None, true);
+        let actual: Vec<_> = response["result"]["structuredContent"]["data"]["symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|symbol| symbol["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(actual, names, "literal ASCII-only match for {query:?}");
+    }
     let id = ranked["data"]["symbols"][0]["symbolId"].as_str().unwrap();
-    let id_only = ask(&mut client, 155, id, 20, None);
+    let id_only = ask(&mut client, 155, id, Some(20), None);
     tool(&id_only, None, true);
     assert_eq!(
         id_only["result"]["structuredContent"]["data"]["symbols"][0]["symbolId"],
         id
     );
-    let literal = ask(&mut client, 148, " alpha ", 20, None);
+    let literal = ask(&mut client, 148, " alpha ", Some(20), None);
     tool(&literal, None, true);
     assert_eq!(
         literal["result"]["structuredContent"]["data"]["symbols"],
         json!([])
     );
-    let empty = ask(&mut client, 145, "no-such-name", 20, None);
+    let empty = ask(&mut client, 145, "no-such-name", Some(20), None);
     tool(&empty, None, true);
     let data = &empty["result"]["structuredContent"];
     assert_eq!(data["data"]["symbols"], json!([]));
@@ -4834,13 +4868,13 @@ async fn mcp_find_selected_snapshot_ranks_and_keeps_zero_hit_scope() {
     assert_eq!(data["warnings"][0]["code"], "coverageIncomplete");
     assert_eq!(data["warnings"][1]["code"], "syntaxOnly");
     let old = json!({"indexGeneration":pin.index_generation.to_string(),"indexRevision":0});
-    let stale = ask(&mut client, 146, "no-such-name", 20, Some(old));
+    let stale = ask(&mut client, 146, "no-such-name", Some(20), Some(old));
     tool(&stale, Some("revision_conflict"), true);
     let retained = ask(
         &mut client,
         152,
         "not-a-declaration",
-        20,
+        Some(20),
         Some(
             json!({"indexGeneration":pin.index_generation.to_string(),"indexRevision":pin.index_revision}),
         ),
