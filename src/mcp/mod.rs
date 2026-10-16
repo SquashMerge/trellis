@@ -797,6 +797,131 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                     }
                 }
             }
+            if name == "trellis_inspect"
+                && arguments
+                    .as_ref()
+                    .and_then(|v| v.get("view"))
+                    .and_then(|v| v.as_str())
+                    == Some("outgoing_calls")
+                && tool.valid_arguments
+                && envelope["error"]["code"] == "index_not_ready"
+                && let Some((registry, _)) = &registry
+            {
+                let args = arguments
+                    .as_ref()
+                    .and_then(serde_json::Value::as_object)
+                    .expect("validated outgoing arguments");
+                let symbol_id = args["symbolId"].as_str().expect("validated outgoing ID");
+                let limit = args
+                    .get("limit")
+                    .map_or(20, |v| v.as_u64().unwrap_or(20) as usize);
+                let expected = args
+                    .get("expectedBasis")
+                    .map(|v| serde_json::from_value::<crate::model::IndexPin>(v.clone()))
+                    .transpose();
+                let publish = |sampled: bool| {
+                    *resolved.lock().unwrap() = Some((answering.root().to_owned(), sampled));
+                };
+                let read = (|| -> anyhow::Result<(serde_json::Value, bool)> {
+                    let existing = registry.blocking_lock().runtime(key);
+                    let runtime = match existing {
+                        Some(runtime) => runtime,
+                        None => {
+                            // A cold evidence call must not activate a checkout merely to
+                            // discover that it has no derived index yet.
+                            registry.blocking_lock().eligible_prior_head(key)?;
+                            match daemon_handle.as_ref() {
+                                Some(handle) => handle
+                                    .block_on(async { registry.lock().await.activate(key) })?,
+                                None => anyhow::bail!("index_not_ready: checkout not activated"),
+                            }
+                        }
+                    };
+                    #[cfg(feature = "test-support")]
+                    runtime.run_mcp_read_hook_for_tests();
+                    loop {
+                        if cancel.load(std::sync::atomic::Ordering::Acquire)
+                            || runtime.mcp_clock_now() >= deadline
+                        {
+                            anyhow::bail!("deadline_exceeded: MCP selected read deadline");
+                        }
+                        let attempt = (|| {
+                            let (response, sampled) = match selected.as_ref() {
+                                Some(witness) => runtime.evidence_for_selected(witness)?,
+                                None => runtime.evidence_response()?,
+                            };
+                            publish(sampled);
+                            #[cfg(feature = "test-support")]
+                            runtime.run_mcp_admitted_gate_for_tests();
+                            let pin = response.status()?.revision;
+                            let basis = serde_json::json!({
+                                "indexGeneration":pin.index_generation.to_string(),
+                                "indexRevision":pin.index_revision
+                            });
+                            let envelope = match response.mcp_outgoing(
+                                symbol_id,
+                                limit,
+                                expected.as_ref().ok().and_then(|pin| *pin),
+                                &|| runtime.mcp_clock_now(),
+                                deadline,
+                            ) {
+                                Ok(Some(result)) => projection::outgoing(
+                                    &id,
+                                    result,
+                                    answering.root(),
+                                    sampled,
+                                    modern,
+                                )
+                                .unwrap_or_else(|| tools::failure(&id, "range_too_large")),
+                                Ok(None) => tools::failure(&id, "not_found"),
+                                Err(error)
+                                    if crate::store::cli_read_retryable_contention(&error) =>
+                                {
+                                    return Err(error);
+                                }
+                                Err(error) => {
+                                    let code =
+                                        if error.to_string().starts_with("revision conflict:") {
+                                            "revision_conflict"
+                                        } else {
+                                            mcp_read_error(&error)
+                                        };
+                                    tools::failure(&id, code)
+                                }
+                            };
+                            let mut envelope = envelope;
+                            if envelope.get("error").is_some() {
+                                envelope["error"]["currentBasis"] = basis;
+                            }
+                            response
+                                .finish(envelope)
+                                .map(|envelope| (envelope, sampled))
+                        })();
+                        match attempt {
+                            Err(ref error)
+                                if crate::store::cli_read_retryable_contention(error) =>
+                            {
+                                std::thread::sleep(std::time::Duration::from_millis(1));
+                            }
+                            answer => return answer,
+                        }
+                    }
+                })();
+                match read {
+                    Ok((found, sampled)) => {
+                        envelope = found;
+                        sampled_catching_up = sampled;
+                    }
+                    Err(error) => {
+                        let code = if error.to_string().starts_with("revision conflict:") {
+                            "revision_conflict"
+                        } else {
+                            mcp_read_error(&error)
+                        };
+                        envelope = tools::failure(&id, code);
+                    }
+                }
+            }
             *resolved.lock().unwrap() = Some((answering.root().to_owned(), sampled_catching_up));
             envelope["workspace"] = serde_json::json!(answering.root());
             envelope["catchingUp"] = serde_json::json!(sampled_catching_up);

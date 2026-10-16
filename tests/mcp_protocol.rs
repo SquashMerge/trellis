@@ -536,6 +536,42 @@ fn exact_tool_for_id(
     );
     exact_tool(v, code, modern, label);
 }
+/// Exact post-H golden responses include the separately serialized text copy.
+fn exact_golden_settled(v: &Value, expected_id: &Value, modern: bool, envelope: Value) {
+    assert_eq!(&v["id"], expected_id, "outer JSON-RPC ID must echo sent ID");
+    assert_eq!(envelope["requestId"], *expected_id);
+    let text = serde_json::to_string(&envelope).unwrap();
+    let mut result = json!({"isError":envelope.get("error").is_some(),
+        "structuredContent":envelope,"content":[{"type":"text","text":text}]});
+    if modern {
+        result["resultType"] = json!("complete");
+    }
+    assert_eq!(
+        *v,
+        json!({"jsonrpc":"2.0","id":expected_id,"result":result})
+    );
+}
+
+fn golden_settled_failure(id: &Value, root: &Value, code: &str, basis: Value) -> Value {
+    let (message, retryable) = match code {
+        "not_found" => ("Not found", false),
+        "revision_conflict" => ("Revision conflict", false),
+        "index_not_ready" => ("Index is not ready", true),
+        _ => panic!("unexpected post-H golden failure {code}"),
+    };
+    json!({"schemaVersion":1,"requestId":id,"workspace":root,
+        "catchingUp":false,"error":{"code":code,"message":message,
+            "retryable":retryable,"currentBasis":basis,"currentContentHash":null}})
+}
+
+fn golden_settled_empty_find(id: &Value, root: &Value, pin: &Value) -> Value {
+    json!({"schemaVersion":1,"requestId":id,"workspace":root,"catchingUp":false,
+        "evidenceBasis":pin,"data":{"symbols":[],"coverage":[],"provenance":[]},
+        "warnings":[{"code":"syntaxOnly","message":"Only syntax evidence is available",
+            "provenanceId":null}],"partial":false,"truncated":false,
+        "truncationReason":null})
+}
+
 fn ready_legacy(peer: &mut Peer) {
     let init = peer.ask(request(
         json!(1),
@@ -1224,8 +1260,8 @@ fn id_boundaries_binary_both_modes_and_unselected() {
     }
 }
 
-#[test]
-fn golden_tool_envelopes_and_maximum_ids_both_modes() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn golden_tool_envelopes_and_maximum_ids_both_modes() {
     let tmp = tempfile::tempdir().unwrap();
     let root = checkout(tmp.path());
     fs::write(root.join("src-sentinel.txt"), b"original source bytes").unwrap();
@@ -1238,8 +1274,12 @@ fn golden_tool_envelopes_and_maximum_ids_both_modes() {
     );
     assert_eq!(2 + 80 * 2 + 20 * 2 + 7 * 6 + 12, 256);
     let names = fixture()["names"].as_array().unwrap().clone();
+    let root_key = trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root)
+        .unwrap()
+        .root_key;
     for legacy in [false, true] {
-        let mut peer = Peer::start(Some(&root));
+        let (mut peer, witness) = Peer::start_with_causal_witness(Some(&root));
+        let mut settled_pin: Option<Value> = None;
         if legacy {
             ready_legacy(&mut peer)
         } else {
@@ -1262,30 +1302,21 @@ fn golden_tool_envelopes_and_maximum_ids_both_modes() {
                 exact_tool_for_id(&invalid, &id, Some("invalid_request"), !legacy, "checkout");
                 let args = fixture()["validArguments"][index].clone();
                 let accepted = peer.ask(call(legacy, id.clone(), name, args));
-                if index == 1 && accepted["result"]["isError"] == false {
-                    tool(&accepted, None, !legacy);
-                    let actual = &accepted["result"]["structuredContent"];
-                    assert_eq!(
-                        actual["data"],
-                        json!({"symbols":[],"coverage":[],"provenance":[]})
-                    );
-                    assert!(actual["evidenceBasis"]["indexRevision"].as_u64().unwrap() > 0);
-                    assert_eq!(actual["partial"], false);
-                    assert_eq!(actual["truncated"], false);
-                    assert_eq!(actual["warnings"].as_array().unwrap().len(), 1);
-                    assert_eq!(actual["warnings"][0]["code"], "syntaxOnly");
+                if index == 0 {
+                    exact_tool_for_id(&accepted, &id, None, !legacy, "checkout");
+                    if settled_pin.is_none() {
+                        settled_pin = Some(await_settled_golden_h(&witness, &root_key).await);
+                    }
                 } else {
-                    exact_tool_for_id(
-                        &accepted,
-                        &id,
-                        if index == 0 {
-                            None
-                        } else {
-                            Some("index_not_ready")
-                        },
-                        !legacy,
-                        "checkout",
-                    );
+                    let published = settled_pin.as_ref().expect("same-lineage H and watch ACK");
+                    let workspace = &accepted["result"]["structuredContent"]["workspace"];
+                    let expected = match index {
+                        1 => golden_settled_empty_find(&id, workspace, published),
+                        2 => golden_settled_failure(&id, workspace, "not_found", published.clone()),
+                        3 => golden_settled_failure(&id, workspace, "index_not_ready", Value::Null),
+                        _ => unreachable!("fixed golden tool order"),
+                    };
+                    exact_golden_settled(&accepted, &id, !legacy, expected);
                 }
             }
         }
@@ -1317,28 +1348,19 @@ fn golden_tool_envelopes_and_maximum_ids_both_modes() {
             ),
         ] {
             let answer = peer.ask(call(legacy, json!(heavy_id), name, args));
-            if name == "trellis_find_symbols"
-                && answer["result"]["structuredContent"]["error"]["code"] == "revision_conflict"
-            {
-                tool(&answer, Some("revision_conflict"), !legacy);
-                let envelope = &answer["result"]["structuredContent"];
-                assert_eq!(answer["id"], json!(heavy_id));
-                assert!(
-                    envelope["error"]["currentBasis"]["indexRevision"]
-                        .as_u64()
-                        .unwrap()
-                        > 0
-                );
-                assert!(envelope.get("data").is_none());
+            let published = settled_pin.as_ref().expect("same-lineage H and watch ACK");
+            let workspace = &answer["result"]["structuredContent"]["workspace"];
+            let (code, basis) = if name == "trellis_read_source" {
+                ("index_not_ready", Value::Null)
             } else {
-                exact_tool_for_id(
-                    &answer,
-                    &json!(heavy_id),
-                    Some("index_not_ready"),
-                    !legacy,
-                    "checkout",
-                );
-            }
+                ("revision_conflict", published.clone())
+            };
+            exact_golden_settled(
+                &answer,
+                &json!(heavy_id),
+                !legacy,
+                golden_settled_failure(&json!(heavy_id), workspace, code, basis),
+            );
         }
         let mut wrong = fixture()["validArguments"][1].clone();
         wrong["limit"] = json!(51);
@@ -2509,6 +2531,44 @@ impl CausalReadiness {
                 .acked
                 .is_some_and(|ack| self.pending.is_some_and(|hint| ack >= hint))
     }
+}
+
+/// H publication and a same-lineage, empty watch ACK settle this golden
+/// checkout. The observed H pin is a causal witness, not a copied tool reply.
+async fn await_settled_golden_h(listener: &tokio::net::UnixListener, root_key: &str) -> Value {
+    let deadline = tokio::time::Instant::now() + trellis::testing::HANG_BACKSTOP;
+    let mut events = Vec::new();
+    let mut published_pin: Option<Value> = None;
+    let mut readiness = CausalReadiness::default();
+    for _ in 0..24 {
+        let event = next_causal_event(listener, deadline).await;
+        assert_eq!(event["rootKey"], root_key, "foreign causal witness");
+        if event["kind"] == "H_READY" {
+            let pin = &event["pin"];
+            uuid::Uuid::parse_str(pin["indexGeneration"].as_str().expect("H generation"))
+                .expect("valid H generation UUID");
+            assert!(
+                pin["indexRevision"]
+                    .as_u64()
+                    .is_some_and(|revision| revision > 0)
+            );
+            if let Some(first) = &published_pin {
+                assert_eq!(pin, first, "golden pin changed without a fixture edit");
+            } else {
+                published_pin = Some(pin.clone());
+            }
+        }
+        events.push(event);
+        if let Some(pin) = &published_pin {
+            for event in events.drain(..) {
+                readiness.observe(&event, pin);
+            }
+            if readiness.settled() {
+                return pin.clone();
+            }
+        }
+    }
+    panic!("golden H/watch settlement exceeded causal transition budget");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5857,4 +5917,988 @@ async fn mcp_declaration_cold_head_precedes_complete_pin_conflict() {
     drop(reader);
     drop(client);
     session.join().unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_outgoing_selected_direct_calls_and_unresolved_hints() {
+    use trellis::daemon::registry::CheckoutRegistry;
+    use trellis::store::{
+        Store,
+        topology::{TopologyRoots, WorkspaceIdentity},
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let root = checkout(temp.path());
+    fs::write(
+        root.join("a.js"),
+        "function Alpha() { Beta(); }\nfunction Beta() {}\n",
+    )
+    .unwrap();
+    let identity = WorkspaceIdentity::discover(Some(&root), &root)
+        .unwrap()
+        .attach_marker()
+        .unwrap();
+    let store = Store::open_for_tests(temp.path(), &root).unwrap();
+    store.mcp_prepare_virgin_queue_for_tests().unwrap();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
+        &trellis::indexer::IndexOptions::new(root.clone()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    let writer = store.publication_for_tests().unwrap();
+    store
+        .publish_native(
+            &graph,
+            &capture,
+            &native,
+            &writer,
+            store.index_baseline().unwrap(),
+            &cancel,
+        )
+        .unwrap();
+    drop(writer);
+    drop(store);
+    let topology =
+        TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(300, &identity).unwrap();
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let release_rx = std::sync::Mutex::new(release_rx);
+    registry.set_next_startup_hook_for_tests(std::sync::Arc::new(move || {
+        entered_tx.send(()).unwrap();
+        release_rx
+            .lock()
+            .unwrap()
+            .recv_timeout(trellis::testing::HANG_BACKSTOP)
+            .unwrap();
+    }));
+    registry.activate(&identity.root_key).unwrap();
+    entered_rx
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .unwrap();
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    let (mut client, mut reader, session) = socket_session(&identity, &registry, 300, None);
+    let ask = |client: &mut std::os::unix::net::UnixStream,
+               reader: &mut BufReader<std::os::unix::net::UnixStream>,
+               id,
+               name,
+               args: Value| {
+        writeln!(
+            client,
+            "{}",
+            modern(
+                json!(id),
+                "tools/call",
+                json!({"name":name,"arguments":args})
+            )
+        )
+        .unwrap();
+        next_reply(reader)
+    };
+    let found = ask(
+        &mut client,
+        &mut reader,
+        1,
+        "trellis_find_symbols",
+        json!({"schemaVersion":1,"query":"Alpha"}),
+    );
+    tool(&found, None, true);
+    let symbol_id = &found["result"]["structuredContent"]["data"]["symbols"][0]["symbolId"];
+    let response = ask(
+        &mut client,
+        &mut reader,
+        2,
+        "trellis_inspect",
+        json!({"schemaVersion":1,"symbolId":symbol_id,"view":"outgoing_calls"}),
+    );
+    tool(&response, None, true);
+    let data = &response["result"]["structuredContent"]["data"];
+    assert_eq!(response["result"]["structuredContent"]["catchingUp"], true);
+    assert_eq!(data["calls"].as_array().unwrap().len(), 1);
+    assert_eq!(data["calls"][0]["calleeText"], "Beta");
+    assert_eq!(data["calls"][0]["disposition"], "unresolved");
+    assert!(data["calls"][0]["binding"].is_null());
+    let mut stale = found["result"]["structuredContent"]["evidenceBasis"].clone();
+    stale["indexRevision"] = json!(stale["indexRevision"].as_u64().unwrap() + 1);
+    let refused = ask(
+        &mut client,
+        &mut reader,
+        3,
+        "trellis_inspect",
+        json!({"schemaVersion":1,"symbolId":format!("sid:v1:{}","0".repeat(32)),
+            "view":"outgoing_calls","expectedBasis":stale}),
+    );
+    tool(&refused, Some("revision_conflict"), true);
+    assert_eq!(
+        refused["result"]["structuredContent"]["error"]["currentBasis"],
+        found["result"]["structuredContent"]["evidenceBasis"]
+    );
+    release_tx.send(()).unwrap();
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
+fn mcp_outgoing_fixture(files: &[(&str, &str)], owner: &str, limit: Option<usize>) -> Value {
+    mcp_outgoing_fixture_with_budget(files, owner, limit, None)
+}
+
+fn mcp_outgoing_fixture_with_budget(
+    files: &[(&str, &str)],
+    owner: &str,
+    limit: Option<usize>,
+    advance_hints: Option<Vec<(&'static str, u64)>>,
+) -> Value {
+    mcp_outgoing_wire_fixture(files, owner, limit, advance_hints, false).0
+}
+
+fn mcp_outgoing_wire_fixture(
+    files: &[(&str, &str)],
+    owner: &str,
+    limit: Option<usize>,
+    advance_hints: Option<Vec<(&'static str, u64)>>,
+    legacy: bool,
+) -> (Value, Vec<u8>) {
+    use trellis::daemon::registry::CheckoutRegistry;
+    use trellis::store::{
+        Store,
+        topology::{TopologyRoots, WorkspaceIdentity},
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let root = checkout(temp.path());
+    for (path, text) in files {
+        fs::write(root.join(path), text).unwrap();
+    }
+    let identity = WorkspaceIdentity::discover(Some(&root), &root)
+        .unwrap()
+        .attach_marker()
+        .unwrap();
+    let store = Store::open_for_tests(temp.path(), &root).unwrap();
+    store.mcp_prepare_virgin_queue_for_tests().unwrap();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
+        &trellis::indexer::IndexOptions::new(root.clone()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    let writer = store.publication_for_tests().unwrap();
+    store
+        .publish_native(
+            &graph,
+            &capture,
+            &native,
+            &writer,
+            store.index_baseline().unwrap(),
+            &cancel,
+        )
+        .unwrap();
+    drop(writer);
+    drop(store);
+    let topology =
+        TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(301, &identity).unwrap();
+    let runtime = registry.activate(&identity.root_key).unwrap();
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    let (mut client, mut reader, session) = socket_session(&identity, &registry, 301, None);
+    if legacy {
+        writeln!(
+            client,
+            "{}",
+            request(
+                json!(0),
+                "initialize",
+                fixture()["legacyInitialize"].clone()
+            )
+        )
+        .unwrap();
+        assert_eq!(
+            next_reply(&mut reader)["result"]["protocolVersion"],
+            "2025-11-25"
+        );
+        writeln!(
+            client,
+            "{}",
+            json!({"jsonrpc":"2.0","method":"notifications/initialized"})
+        )
+        .unwrap();
+    }
+    writeln!(
+        client,
+        "{}",
+        call(
+            legacy,
+            json!(1),
+            "trellis_find_symbols",
+            json!({"schemaVersion":1,"query":owner})
+        )
+    )
+    .unwrap();
+    let found = next_reply(&mut reader);
+    tool(&found, None, !legacy);
+    let symbols = found["result"]["structuredContent"]["data"]["symbols"]
+        .as_array()
+        .unwrap();
+    let symbol = symbols.iter().find(|s| s["name"] == owner).unwrap();
+    let mut args = json!({"schemaVersion":1,"symbolId":symbol["symbolId"],"view":"outgoing_calls"});
+    if let Some(limit) = limit {
+        args["limit"] = json!(limit);
+    }
+    let budget_gate = if let Some(stages) = advance_hints {
+        let path = temp.path().join("hint.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(false).unwrap();
+        unsafe {
+            std::env::set_var("TRELLIS_TEST_MCP_PHASE", stages[0].0);
+            std::env::set_var("TRELLIS_TEST_MCP_PHASE_SOCKET", &path);
+        }
+        Some(std::thread::spawn(move || {
+            for (index, (stage, millis)) in stages.iter().enumerate() {
+                let (mut gate, _) = listener.accept().unwrap();
+                gate.set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
+                    .unwrap();
+                let mut received = String::new();
+                BufReader::new(gate.try_clone().unwrap())
+                    .read_line(&mut received)
+                    .unwrap();
+                assert_eq!(received, format!("{stage}\n"));
+                runtime.advance_mcp_clock_for_tests(Duration::from_millis(*millis));
+                if let Some((next_stage, _)) = stages.get(index + 1) {
+                    unsafe { std::env::set_var("TRELLIS_TEST_MCP_PHASE", next_stage) };
+                }
+                gate.write_all(b"!").unwrap();
+            }
+        }))
+    } else {
+        None
+    };
+    writeln!(
+        client,
+        "{}",
+        call(legacy, json!(2), "trellis_inspect", args)
+    )
+    .unwrap();
+    let mut frame = Vec::new();
+    reader.read_until(b'\n', &mut frame).unwrap();
+    assert_eq!(
+        frame.last(),
+        Some(&b'\n'),
+        "response must be a complete frame"
+    );
+    let response: Value = serde_json::from_slice(&frame).unwrap();
+    if let Some(gate) = budget_gate {
+        gate.join().unwrap();
+        unsafe {
+            std::env::remove_var("TRELLIS_TEST_MCP_PHASE");
+            std::env::remove_var("TRELLIS_TEST_MCP_PHASE_SOCKET");
+        }
+    }
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+    (response, frame)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_outgoing_nested_owner_and_compound_member_exclusion() {
+    let reply = mcp_outgoing_fixture(
+        &[(
+            "a.js",
+            "function Target() {}\nfunction Outer() { Target(); function Inner() { Target(); } obj.Target(); }\n",
+        )],
+        "Outer",
+        None,
+    );
+    tool(&reply, None, true);
+    let data = &reply["result"]["structuredContent"]["data"];
+    let calls = data["calls"].as_array().unwrap();
+    assert_eq!(
+        calls.len(),
+        2,
+        "nested Inner call must not become Outer call: {reply}"
+    );
+    assert_eq!(calls[0]["calleeText"], "Target");
+    assert_eq!(calls[1]["calleeText"], "Target");
+    assert_eq!(
+        calls[0]["nativeCandidates"]["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        calls[1]["nativeCandidates"]["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    for call in calls {
+        assert_eq!(call["disposition"], "unresolved");
+        assert!(call["targetId"].is_null());
+        assert!(call["binding"].is_null());
+    }
+    assert!(
+        calls[0]["range"]["start"].as_u64().unwrap() < calls[1]["range"]["start"].as_u64().unwrap()
+    );
+    let inner = mcp_outgoing_fixture(
+        &[(
+            "a.js",
+            "function Target() {}\nfunction Outer() { function Inner() { Target(); } }\n",
+        )],
+        "Inner",
+        None,
+    );
+    tool(&inner, None, true);
+    assert_eq!(
+        inner["result"]["structuredContent"]["data"]["calls"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_outgoing_nine_hints_exact_omissions_and_language_scope() {
+    let mut files: Vec<(String, String)> = (0..9)
+        .map(|i| (format!("b{i}.js"), "function Target() {}\n".to_owned()))
+        .collect();
+    files.push(("a.js".into(), "function Owner() { Target(); }\n".into()));
+    files.push(("c.py".into(), "def Target():\n    pass\n".into()));
+    let borrowed: Vec<_> = files
+        .iter()
+        .map(|(p, s)| (p.as_str(), s.as_str()))
+        .collect();
+    let reply = mcp_outgoing_fixture(&borrowed, "Owner", None);
+    tool(&reply, None, true);
+    let envelope = &reply["result"]["structuredContent"];
+    let data = &envelope["data"];
+    let call = &data["calls"][0];
+    let hints = call["nativeCandidates"]["items"].as_array().unwrap();
+    assert_eq!(hints.len(), 8, "{reply}");
+    assert_eq!(call["nativeCandidates"]["omitted"], 1);
+    assert_eq!(call["nativeCandidates"]["complete"], false);
+    assert_eq!(envelope["truncationReason"], "limit");
+    assert_eq!(data["coverage"].as_array().unwrap().len(), 9);
+    assert_eq!(data["provenance"].as_array().unwrap().len(), 9);
+    assert_eq!(hints[0]["document"]["path"], "b0.js");
+    assert_eq!(hints[7]["document"]["path"], "b7.js");
+    assert!(
+        hints
+            .iter()
+            .all(|candidate| candidate["document"]["language"] == "javascript")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_outgoing_limit_truncation_preserves_call_first() {
+    let reply = mcp_outgoing_fixture(
+        &[(
+            "a.js",
+            "function Target() {}\nfunction Owner() { Target(); Target(); }\n",
+        )],
+        "Owner",
+        Some(1),
+    );
+    tool(&reply, None, true);
+    let envelope = &reply["result"]["structuredContent"];
+    assert_eq!(envelope["data"]["calls"].as_array().unwrap().len(), 1);
+    assert_eq!(envelope["truncationReason"], "limit");
+    assert_eq!(
+        envelope["data"]["calls"][0]["nativeCandidates"]["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(envelope["partial"], true);
+    assert_eq!(envelope["data"]["calls"][0]["binding"], Value::Null);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_outgoing_hooked_optional_budget_does_not_refuse_mandatory_calls() {
+    let reply = mcp_outgoing_fixture_with_budget(
+        &[(
+            "a.js",
+            "function Target() {}\nfunction Owner() { Target(); Target(); }\n",
+        )],
+        "Owner",
+        None,
+        Some(vec![("outgoing_hint", 1001)]),
+    );
+    tool(&reply, None, true);
+    let envelope = &reply["result"]["structuredContent"];
+    assert_eq!(envelope["data"]["calls"].as_array().unwrap().len(), 2);
+    for call in envelope["data"]["calls"].as_array().unwrap() {
+        assert_eq!(call["nativeCandidates"]["items"], json!([]));
+        assert!(call["nativeCandidates"]["omitted"].is_null());
+        assert_eq!(call["nativeCandidates"]["complete"], false);
+        assert_eq!(call["disposition"], "unresolved");
+    }
+    assert_eq!(
+        envelope["truncated"], false,
+        "unknown optional hints alone are not truncation"
+    );
+    assert_eq!(
+        envelope["partial"], true,
+        "unresolved boundary calls remain partial"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_outgoing_compound_expression_has_no_guessed_hint() {
+    let reply = mcp_outgoing_fixture(
+        &[(
+            "a.js",
+            "function Target() {}\nfunction Owner() { (obj.Target)(); Target(); }\n",
+        )],
+        "Owner",
+        None,
+    );
+    tool(&reply, None, true);
+    let calls = reply["result"]["structuredContent"]["data"]["calls"]
+        .as_array()
+        .unwrap();
+    assert_eq!(calls.len(), 2);
+    assert!(
+        calls[0]["calleeRange"].is_null(),
+        "compound callee cannot be a token: {reply}"
+    );
+    assert!(calls[0]["calleeText"].is_null());
+    assert_eq!(calls[0]["nativeCandidates"]["items"], json!([]));
+    assert_eq!(calls[0]["nativeCandidates"]["omitted"], 0);
+    assert_eq!(
+        calls[1]["nativeCandidates"]["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_outgoing_response_bytes_call_prefix_before_global_hints() {
+    let mut files: Vec<(String, String)> = (0..9)
+        .map(|i| (format!("b{i}.js"), "function Target() {}\n".to_owned()))
+        .collect();
+    let mut source = "function Owner() {\n".to_owned();
+    for _ in 0..50 {
+        source.push_str(" Target();\n");
+    }
+    source.push_str("}\n");
+    files.push(("a.js".into(), source));
+    let borrowed: Vec<_> = files
+        .iter()
+        .map(|(p, s)| (p.as_str(), s.as_str()))
+        .collect();
+    let reply = mcp_outgoing_fixture(&borrowed, "Owner", Some(50));
+    tool(&reply, None, true);
+    let envelope = &reply["result"]["structuredContent"];
+    let calls = envelope["data"]["calls"].as_array().unwrap();
+    assert!(!calls.is_empty() && calls.len() < 50, "{reply}");
+    assert_eq!(envelope["truncationReason"], "response_bytes");
+    for (index, call) in calls.iter().enumerate() {
+        assert_eq!(call["ordinal"], json!(index));
+        assert_eq!(call["disposition"], "unresolved");
+        let count = call["nativeCandidates"]["items"].as_array().unwrap().len();
+        assert_eq!(call["nativeCandidates"]["omitted"], json!(9 - count));
+        if index > 0 {
+            assert!(
+                count == 0
+                    || calls[index - 1]["nativeCandidates"]["items"]
+                        .as_array()
+                        .unwrap()
+                        .len()
+                        == 8
+            );
+        }
+    }
+    let closure = &envelope["data"];
+    let proofs: std::collections::BTreeSet<_> = closure["provenance"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["id"].as_str().unwrap())
+        .collect();
+    let required: std::collections::BTreeSet<_> = calls
+        .iter()
+        .flat_map(|call| {
+            std::iter::once(call["provenanceId"].as_str().unwrap()).chain(
+                call["nativeCandidates"]["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|c| c["provenanceId"].as_str().unwrap()),
+            )
+        })
+        .collect();
+    assert_eq!(proofs, required);
+    assert!(serde_json::to_vec(&reply).unwrap().len() < 65_536);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_outgoing_near_call_deadline_preserves_required_call_without_optional_work() {
+    // Required calls finish before the hint budget starts. The row gate advances
+    // the virtual clock into the reserved send-decision window, without crossing
+    // the overall deadline. Only optional hints may be abandoned.
+    let reply = mcp_outgoing_fixture_with_budget(
+        &[(
+            "a.js",
+            "function Target() {}\nfunction Owner() { Target(); }\n",
+        )],
+        "Owner",
+        None,
+        Some(vec![
+            ("outgoing_hint_start", 4000),
+            ("outgoing_hint_row", 940),
+        ]),
+    );
+    tool(&reply, None, true);
+    let envelope = &reply["result"]["structuredContent"];
+    let calls = envelope["data"]["calls"].as_array().unwrap();
+    assert_eq!(
+        calls.len(),
+        1,
+        "mandatory call must survive optional budget: {reply}"
+    );
+    assert_eq!(calls[0]["calleeText"], "Target");
+    assert_eq!(calls[0]["disposition"], "unresolved");
+    assert_eq!(
+        calls[0]["nativeCandidates"]["items"],
+        json!([]),
+        "optional hints must not spend the remaining required call deadline: {reply}"
+    );
+    assert_eq!(
+        calls[0]["nativeCandidates"]["omitted"],
+        Value::Null,
+        "optional hint count is unknown at the deadline: {reply}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_outgoing_shared_hint_budget_keeps_a_and_marks_b_c_unknown() {
+    // Gate exactly before B's budget check: the first call has finished matching.
+    // Exhausting the shared budget cannot erase A or invent a zero for B/C.
+    let reply = mcp_outgoing_fixture_with_budget(
+        &[(
+            "a.js",
+            "function Target() {}\nfunction Owner() { Target(); Target(); Target(); }\n",
+        )],
+        "Owner",
+        None,
+        Some(vec![("outgoing_hint_item_1", 1001)]),
+    );
+    tool(&reply, None, true);
+    let envelope = &reply["result"]["structuredContent"];
+    let calls = envelope["data"]["calls"].as_array().unwrap();
+    assert_eq!(calls.len(), 3, "all required calls must survive: {reply}");
+    for (i, call) in calls.iter().enumerate() {
+        assert_eq!(call["ordinal"], json!(i));
+        assert_eq!(call["calleeText"], "Target");
+        assert_eq!(call["disposition"], "unresolved");
+        assert_eq!(call["nativeCandidates"]["complete"], false);
+    }
+    assert_eq!(
+        calls[0]["nativeCandidates"]["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(calls[0]["nativeCandidates"]["omitted"], 0);
+    for call in &calls[1..] {
+        assert_eq!(call["nativeCandidates"]["items"], json!([]));
+        assert_eq!(call["nativeCandidates"]["omitted"], Value::Null);
+    }
+    assert_eq!(envelope["truncated"], false);
+    assert_eq!(envelope["partial"], true);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_outgoing_complete_modern_legacy_frames_fill_candidates_after_all_calls() {
+    let mut files: Vec<(String, String)> = (0..9)
+        .map(|i| {
+            (
+                format!("candidate{i:02}.js"),
+                "function Target() {}\n".to_owned(),
+            )
+        })
+        .collect();
+    let mut source = "function Owner() {\n".to_owned();
+    for _ in 0..24 {
+        source.push_str("  Target();\n");
+    }
+    source.push_str("}\n");
+    files.push(("owner.js".into(), source));
+    let borrowed: Vec<_> = files
+        .iter()
+        .map(|(p, s)| (p.as_str(), s.as_str()))
+        .collect();
+    for legacy in [false, true] {
+        let (reply, frame) = mcp_outgoing_wire_fixture(&borrowed, "Owner", Some(50), None, legacy);
+        tool(&reply, None, !legacy);
+        assert_eq!(frame.last(), Some(&b'\n'));
+        assert!(
+            frame.len() <= 65_536,
+            "complete dual-content frame exceeds cap: {}",
+            frame.len()
+        );
+        assert_eq!(serde_json::from_slice::<Value>(&frame).unwrap(), reply);
+        let envelope = &reply["result"]["structuredContent"];
+        let calls = envelope["data"]["calls"].as_array().unwrap();
+        assert_eq!(
+            calls.len(),
+            24,
+            "all required calls must fit before hints: {legacy} {}",
+            frame.len()
+        );
+        assert_eq!(
+            envelope["truncationReason"],
+            "response_bytes",
+            "{legacy} {}",
+            frame.len()
+        );
+        assert_eq!(envelope["truncated"], true);
+        let mut first_omission = None;
+        for (i, call) in calls.iter().enumerate() {
+            assert_eq!(call["ordinal"], json!(i));
+            let shown = call["nativeCandidates"]["items"].as_array().unwrap().len();
+            assert!(shown <= 8);
+            assert_eq!(call["nativeCandidates"]["omitted"], json!(9 - shown));
+            assert_eq!(call["nativeCandidates"]["complete"], false);
+            if shown < 8 {
+                first_omission.get_or_insert(i);
+            } else {
+                assert!(
+                    first_omission.is_none(),
+                    "candidate prefix resumed after omission"
+                );
+            }
+        }
+        assert!(
+            first_omission.is_some(),
+            "candidate-only overflow was not reached"
+        );
+        let provenance: std::collections::BTreeSet<_> = envelope["data"]["provenance"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["id"].as_str().unwrap())
+            .collect();
+        let required: std::collections::BTreeSet<_> = calls
+            .iter()
+            .flat_map(|call| {
+                std::iter::once(call["provenanceId"].as_str().unwrap()).chain(
+                    call["nativeCandidates"]["items"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|item| item["provenanceId"].as_str().unwrap()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            provenance, required,
+            "each emitted hint has proof; no excluded proof"
+        );
+    }
+}
+
+/// Mutate an already published derived fixture only while no Store/SQLite handle is live.
+/// The next selected response must either omit an unverified optional hint or fail
+/// the whole required answer, never quietly claim a complete proof.
+fn mcp_outgoing_corrupt_boundary_fixture(fault: &str) -> Value {
+    use trellis::daemon::registry::CheckoutRegistry;
+    use trellis::store::{
+        Store,
+        topology::{TopologyRoots, WorkspaceIdentity},
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let root = checkout(temp.path());
+    fs::write(root.join("owner.js"), "function Owner() { Target(); }\n").unwrap();
+    fs::write(root.join("target.js"), "function Target() {}\n").unwrap();
+    let identity = WorkspaceIdentity::discover(Some(&root), &root)
+        .unwrap()
+        .attach_marker()
+        .unwrap();
+    let store = Store::open_for_tests(temp.path(), &root).unwrap();
+    store.mcp_prepare_virgin_queue_for_tests().unwrap();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
+        &trellis::indexer::IndexOptions::new(root.clone()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    let writer = store.publication_for_tests().unwrap();
+    store
+        .publish_native(
+            &graph,
+            &capture,
+            &native,
+            &writer,
+            store.index_baseline().unwrap(),
+            &cancel,
+        )
+        .unwrap();
+    drop(writer);
+    let selected = store.evidence_response().unwrap();
+    let owner_id = selected
+        .mcp_find("Owner", 20, None)
+        .unwrap()
+        .symbols
+        .into_iter()
+        .find(|s| s.declaration.name.as_deref() == Some("Owner"))
+        .unwrap()
+        .declaration
+        .syntax_id;
+    selected.finish(()).unwrap();
+    drop(selected);
+    drop(store);
+    let topology =
+        TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+    let db_path = topology.index_db(&identity);
+    {
+        let db = rusqlite::Connection::open(&db_path).unwrap();
+        db.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        // The ID rewrite also leaves a keyed header orphan. This tests
+        // optional closure rejection, not an isolated canonical-ID branch.
+        // Native provenance IDs are derived from the selected V8 scope; there
+        // is no independent stored optional proof ID to corrupt here.
+        let (sql, expect) = match fault {
+            "orphaned_optional_id" => (
+                "UPDATE native_version_declarations SET syntax_id='not-a-canonical-syntax-id' WHERE name='Target'",
+                1,
+            ),
+            "missing_optional_header" => (
+                "DELETE FROM native_version_headers WHERE syntax_id IN (SELECT syntax_id FROM native_version_declarations WHERE name='Target')",
+                1,
+            ),
+            "invalid_optional_coverage" => (
+                "UPDATE revision_documents SET coverage_selected=0,coverage_state='omitted',coverage_diagnostic='fixture unselected' WHERE path='target.js'",
+                1,
+            ),
+            "foreign_source_set" => (
+                "UPDATE revision_documents SET source_set_id='source-set:v1:foreign' WHERE path='target.js'",
+                1,
+            ),
+            "missing_required_owner_header" => (
+                "DELETE FROM native_version_headers WHERE syntax_id IN (SELECT syntax_id FROM native_version_declarations WHERE name='Owner')",
+                1,
+            ),
+            "missing_required_owner_coverage" => (
+                "UPDATE revision_documents SET coverage_selected=0,coverage_state='omitted',coverage_diagnostic='fixture unselected' WHERE path='owner.js'",
+                1,
+            ),
+            "invalid_required_call_id" => (
+                "UPDATE native_version_calls SET id='not-a-canonical-call-id' WHERE owner_syntax_id IN (SELECT syntax_id FROM native_version_declarations WHERE name='Owner')",
+                1,
+            ),
+            _ => panic!("unknown fixture fault: {fault}"),
+        };
+        assert_eq!(db.execute(sql, []).unwrap(), expect, "{fault}");
+    }
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(302, &identity).unwrap();
+    registry.activate(&identity.root_key).unwrap();
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    let (mut client, mut reader, session) = socket_session(&identity, &registry, 302, None);
+    writeln!(
+        client,
+        "{}",
+        call(
+            false,
+            json!(2),
+            "trellis_inspect",
+            json!({
+                "schemaVersion":1,"symbolId":owner_id,"view":"outgoing_calls"
+            })
+        )
+    )
+    .unwrap();
+    let reply = next_reply(&mut reader);
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+    reply
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_outgoing_unverified_optional_candidate_never_poison_required_answer() {
+    for fault in [
+        "orphaned_optional_id",
+        "missing_optional_header",
+        "invalid_optional_coverage",
+    ] {
+        let reply = mcp_outgoing_corrupt_boundary_fixture(fault);
+        assert!(
+            reply["result"]["structuredContent"]["error"].is_null(),
+            "{fault}: {reply}"
+        );
+        tool(&reply, None, true);
+        let calls = reply["result"]["structuredContent"]["data"]["calls"]
+            .as_array()
+            .unwrap();
+        assert_eq!(calls.len(), 1, "required call lost under {fault}: {reply}");
+        assert_eq!(calls[0]["calleeText"], "Target");
+        assert_eq!(calls[0]["disposition"], "unresolved");
+        assert_eq!(
+            calls[0]["nativeCandidates"]["items"],
+            json!([]),
+            "{fault}: {reply}"
+        );
+        assert_eq!(
+            calls[0]["nativeCandidates"]["omitted"], 0,
+            "{fault}: {reply}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_outgoing_corrupt_required_owner_or_call_refuses_whole_result() {
+    for fault in [
+        "missing_required_owner_header",
+        "missing_required_owner_coverage",
+        "invalid_required_call_id",
+    ] {
+        let reply = mcp_outgoing_corrupt_boundary_fixture(fault);
+        tool(&reply, Some("store_unavailable"), true);
+        let envelope = &reply["result"]["structuredContent"];
+        assert!(
+            envelope.get("data").is_none(),
+            "corrupt required evidence yielded partial data: {fault}: {reply}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_outgoing_prior_revision_target_is_not_a_selected_candidate() {
+    use trellis::daemon::registry::CheckoutRegistry;
+    use trellis::store::{
+        Store,
+        topology::{TopologyRoots, WorkspaceIdentity},
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let root = checkout(temp.path());
+    fs::write(root.join("owner.js"), "function Owner() { Target(); }\n").unwrap();
+    let target = root.join("target.js");
+    fs::write(&target, "function Target() {}\n").unwrap();
+    let identity = WorkspaceIdentity::discover(Some(&root), &root)
+        .unwrap()
+        .attach_marker()
+        .unwrap();
+    let store = Store::open_for_tests(temp.path(), &root).unwrap();
+    store.mcp_prepare_virgin_queue_for_tests().unwrap();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = store.publication_for_tests().unwrap();
+    let publish = |baseline| {
+        let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
+            &trellis::indexer::IndexOptions::new(root.clone()),
+            store.root_id(),
+            &cancel,
+            |_| {},
+        )
+        .unwrap();
+        store
+            .publish_native(&graph, &capture, &native, &writer, baseline, &cancel)
+            .unwrap()
+    };
+    let first = publish(store.index_baseline().unwrap());
+    let selected = store.evidence_response().unwrap();
+    let owner_id = selected
+        .mcp_find("Owner", 20, None)
+        .unwrap()
+        .symbols
+        .into_iter()
+        .find(|s| s.declaration.name.as_deref() == Some("Owner"))
+        .unwrap()
+        .declaration
+        .syntax_id;
+    let first_calls = selected
+        .mcp_outgoing(
+            &owner_id,
+            20,
+            None,
+            &|| std::time::Instant::now(),
+            std::time::Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(first_calls.calls.len(), 1);
+    assert_eq!(first_calls.calls[0].candidates.len(), 1);
+    selected.finish(()).unwrap();
+    drop(selected);
+    fs::write(&target, "function Other() {}\n").unwrap();
+    let second = publish(first);
+    assert_ne!(first, second);
+    drop(writer);
+    drop(store);
+    let topology =
+        TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+    let db = rusqlite::Connection::open(topology.index_db(&identity)).unwrap();
+    let prior: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM native_version_declarations WHERE name='Target'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(prior > 0, "fixture must retain prior Target records");
+    drop(db);
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(303, &identity).unwrap();
+    registry.activate(&identity.root_key).unwrap();
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    let (mut client, mut reader, session) = socket_session(&identity, &registry, 303, None);
+    writeln!(
+        client,
+        "{}",
+        call(
+            false,
+            json!(2),
+            "trellis_inspect",
+            json!({
+                "schemaVersion":1,"symbolId":owner_id,"view":"outgoing_calls"
+            })
+        )
+    )
+    .unwrap();
+    let reply = next_reply(&mut reader);
+    tool(&reply, None, true);
+    let calls = reply["result"]["structuredContent"]["data"]["calls"]
+        .as_array()
+        .unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        calls[0]["nativeCandidates"]["items"],
+        json!([]),
+        "prior target leaked into selected revision: {reply}"
+    );
+    assert_eq!(calls[0]["nativeCandidates"]["omitted"], 0);
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_outgoing_foreign_source_set_is_not_an_optional_candidate() {
+    let reply = mcp_outgoing_corrupt_boundary_fixture("foreign_source_set");
+    tool(&reply, None, true);
+    let calls = reply["result"]["structuredContent"]["data"]["calls"]
+        .as_array()
+        .unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        calls[0]["nativeCandidates"]["items"],
+        json!([]),
+        "foreign source set leaked: {reply}"
+    );
+    assert_eq!(calls[0]["nativeCandidates"]["omitted"], 0);
 }
