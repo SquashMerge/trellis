@@ -1884,36 +1884,31 @@ async fn closing_runtime_is_never_revived() {
     ready(&fresh).await;
 }
 
-/// Maintenance is the lowest class (Decision 0009 §4): a due release
-/// cannot commit while an accepted FIFO row is still queued.
+/// Maintenance is the lowest class (Decision 0009 §4): when the activated
+/// checkout worker has both a due release and an accepted FIFO row, the
+/// terminal FIFO COMMIT precedes its first maintenance unit.
 #[cfg(feature = "test-support")]
-#[test]
-fn maintenance_never_runs_ahead_of_accepted_fifo_work() {
-    use std::sync::{Arc, atomic::AtomicBool};
-
+#[tokio::test]
+async fn maintenance_never_runs_ahead_of_accepted_fifo_work() {
     let base = tempfile::tempdir().unwrap();
     let checkout = base.path().join("work");
     fs::create_dir(&checkout).unwrap();
     fs::write(checkout.join("a.js"), "function a() {}\n").unwrap();
     let id = identity(&checkout);
-    let store = Store::open(roots(base.path()), id).unwrap();
+    let mut registry = CheckoutRegistry::with_roots(roots(base.path()));
+    registry.attach_launch(1, &id).unwrap();
+    let runtime = registry.activate(&id.root_key).unwrap();
+    ready(&runtime).await;
+    let scheduler = runtime.browser_scheduler().unwrap();
+    let store = Store::open(roots(base.path()), identity(&checkout)).unwrap();
     let options = trellis::indexer::IndexOptions::new(checkout.clone());
-    let cancel = Arc::new(AtomicBool::new(false));
-    let owner =
-        trellis::index_coordinator::establish_serving_session(&store, Some(&options), &cancel)
-            .unwrap();
-    let daemon = trellis::http::new(
-        store.clone(),
-        options.clone(),
-        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
-        "127.0.0.1:7331".parse().unwrap(),
-    )
-    .unwrap();
-    daemon.retain_serving_session_without_tick_for_tests(owner.clone());
-    // Complete the standalone fixture's initial watcher reconcile before
-    // creating retention debt, so only the FIFO competes with maintenance.
-    daemon.force_retention_idle_tick_for_tests().unwrap();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Keep the activated worker at its gate while creating genuine retention
+    // debt. This store's injected clock dates only these two publications;
+    // the checkout worker still owns the real queue and maintenance lanes.
+    let held = scheduler.hold_worker_for_tests();
     store.set_retention_clock_for_tests(1_000, 0);
+    let owner = scheduler.checkout_serving_owner().unwrap();
     let publish = |expected| {
         let (graph, native, capture) =
             trellis::indexer::index_workspace_bundle(&options, store.root_id(), &cancel, |_| {})
@@ -1938,38 +1933,56 @@ fn maintenance_never_runs_ahead_of_accepted_fifo_work() {
     assert_eq!(before.0, "retained");
     assert_eq!(before.1, 0);
     assert!(before.2 > 0);
-    store.set_retention_clock_for_tests(1_900, 900);
+
+    let terminal_before = store.terminal_generation();
     let row = store.enqueue_request(&options, None).unwrap();
-    daemon.force_retention_idle_tick_for_tests().unwrap();
+    let (seen_tx, seen_rx) = std::sync::mpsc::sync_channel(1);
+    let observer = store.clone();
+    let row_id = row.id.clone();
+    let revision_for_hook = revision_id.clone();
+    scheduler.on_next_maintenance_unit_for_tests(move || {
+        seen_tx
+            .send((
+                observer.request_by_id(&row_id).unwrap().unwrap().state,
+                observer.terminal_generation(),
+                observer
+                    .retention_state_for_tests(&revision_for_hook)
+                    .unwrap(),
+            ))
+            .unwrap();
+    });
     assert_eq!(
         store.request_by_id(&row.id).unwrap().unwrap().state,
         "queued"
     );
-    let (queued_revision, queued_pending) = state();
-    assert_eq!(
-        queued_revision, before,
-        "maintenance committed ahead of accepted FIFO work"
-    );
-    assert_eq!(
-        queued_pending, pending_before,
-        "release debt advanced before FIFO"
-    );
+    assert_eq!(state(), (before.clone(), pending_before));
+    drop(held);
 
-    daemon.force_root_transition_tick_for_tests().unwrap();
-    assert_eq!(store.request_by_id(&row.id).unwrap().unwrap().state, "done");
-    // A manually driven worker step does not consume the inbox wake or
-    // publish its FIFO-clear signal. A fresh standalone scheduler has no
-    // accepted wake after the terminal commit and can run the due unit.
-    let idle = trellis::http::new(
-        store.clone(),
-        options,
-        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
-        "127.0.0.1:7332".parse().unwrap(),
+    let (request_state, terminal_at_unit, state_at_unit) = tokio::time::timeout(
+        trellis::testing::HANG_BACKSTOP,
+        tokio::task::spawn_blocking(move || seen_rx.recv()),
     )
+    .await
+    .expect("activated worker did not reach maintenance")
+    .unwrap()
     .unwrap();
-    idle.retain_serving_session_without_tick_for_tests(owner);
-    idle.force_retention_idle_tick_for_tests().unwrap();
-    assert_eq!(state().1, (1, 1), "due maintenance did not advance");
+    assert_eq!(request_state, "done", "maintenance preceded FIFO COMMIT");
+    assert!(
+        terminal_at_unit > terminal_before,
+        "FIFO terminal COMMIT was not notified"
+    );
+    assert_eq!(state_at_unit, (before, pending_before));
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        loop {
+            if state().1 == (1, 1) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("due retention did not advance after FIFO drained");
+    assert_eq!(store.request_by_id(&row.id).unwrap().unwrap().state, "done");
 }
 
 /// Decision 0009 §8: an index waiter records the terminal-commit count, re-reads
