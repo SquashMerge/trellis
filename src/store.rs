@@ -11277,6 +11277,105 @@ impl Store {
         Ok(node.map(|node| (revision, node)))
     }
 
+    #[cfg(feature = "test-support")]
+    /// Alter an already validated selected BLOB only in the live test store.
+    /// This intentionally never publishes or reopens the malformed source.
+    pub fn mcp_replace_validated_source_bytes_for_tests(
+        &self,
+        writer: &topology::WriterGuard,
+        path: &str,
+        bytes: &[u8],
+    ) -> Result<()> {
+        use sha2::{Digest, Sha256};
+        writer.belongs_to(&self.identity)?;
+        self.identity.verify()?;
+        writer.verify()?;
+        let response = self.evidence_response()?;
+        ensure!(
+            response.source_at(path, None)?.is_some(),
+            "fixture source absent"
+        );
+        response.finish(())?;
+        drop(response);
+        let db = self.cache_write()?;
+        let changed = storage_result(db.execute(
+            "UPDATE document_versions SET source_bytes=?1,byte_length=?2,content_hash=?3
+             WHERE id=(SELECT document_version_id FROM revision_documents
+                 WHERE revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision
+                     FROM index_metadata WHERE singleton=1) AND path=?4)",
+            params![
+                bytes,
+                bytes.len() as i64,
+                hex::encode(Sha256::digest(bytes)),
+                path
+            ],
+        ))?;
+        ensure!(changed == 1, "fixture selected source absent");
+        Ok(())
+    }
+
+    /// Read only the selected raw source identity, without the native witness or UTF-8
+    /// conversion used by the public source reader. W5 verifies the entire cached BLOB.
+    fn mcp_selected_raw_source_for(
+        &self,
+        db: &Connection,
+        path: &str,
+        selected: &ReadRevision,
+    ) -> Result<Option<(String, Vec<u8>)>> {
+        let mut statement = db.prepare(
+            "SELECT document_version_id,source_set_id,language FROM revision_documents
+             WHERE revision_id=?1 AND path=?2 LIMIT 2",
+        )?;
+        let mut rows = statement.query(params![selected.key, path])?;
+        let manifest = rows
+            .next()?
+            .map(|row| -> rusqlite::Result<_> {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .transpose()?;
+        ensure!(
+            rows.next()?.is_none(),
+            "store_unavailable: ambiguous selected source path"
+        );
+        let Some((version, source_set, language)) = manifest else {
+            return Ok(None);
+        };
+        let row: Option<(String, String, String, String, i64, Vec<u8>)> = db
+            .query_row(
+                "SELECT source_set_id,language,path,content_hash,byte_length,source_bytes
+                 FROM document_versions WHERE id=?1",
+                [&version],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let (stored_set, stored_language, stored_path, hash, length, bytes) =
+            row.context("store_unavailable: selected source version absent")?;
+        use sha2::{Digest, Sha256};
+        ensure!(
+            stored_set == source_set
+                && stored_language == language
+                && stored_path == path
+                && length >= 0
+                && usize::try_from(length).ok() == Some(bytes.len())
+                && hash == hex::encode(Sha256::digest(&bytes)),
+            "store_unavailable: selected raw source identity or digest mismatch"
+        );
+        Ok(Some((hash, bytes)))
+    }
+
     fn selected_source_row_for(
         &self,
         db: &Connection,

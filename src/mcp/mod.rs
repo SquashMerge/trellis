@@ -922,6 +922,138 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                     }
                 }
             }
+            if name == "trellis_read_source"
+                && tool.valid_arguments
+                && envelope["error"]["code"] == "index_not_ready"
+                && let Some((registry, _)) = &registry
+            {
+                let args = arguments
+                    .as_ref()
+                    .and_then(serde_json::Value::as_object)
+                    .expect("validated source arguments");
+                let path = args["path"].as_str().expect("validated source path");
+                let start = args["startLine"].as_u64().expect("validated source start");
+                let end = args["endLine"].as_u64().expect("validated source end");
+                let expected_hash = args.get("expectedContentHash").and_then(|v| v.as_str());
+                let expected = args
+                    .get("expectedBasis")
+                    .map(|v| serde_json::from_value::<crate::model::IndexPin>(v.clone()))
+                    .transpose();
+                let publish = |sampled: bool| {
+                    *resolved.lock().unwrap() = Some((answering.root().to_owned(), sampled));
+                };
+                let read = (|| -> anyhow::Result<(serde_json::Value, bool)> {
+                    let existing = registry.blocking_lock().runtime(key);
+                    let runtime = match existing {
+                        Some(runtime) => runtime,
+                        None => {
+                            registry.blocking_lock().eligible_prior_head(key)?;
+                            match daemon_handle.as_ref() {
+                                Some(handle) => handle
+                                    .block_on(async { registry.lock().await.activate(key) })?,
+                                None => anyhow::bail!("index_not_ready: checkout not activated"),
+                            }
+                        }
+                    };
+                    #[cfg(feature = "test-support")]
+                    runtime.run_mcp_read_hook_for_tests();
+                    loop {
+                        if cancel.load(std::sync::atomic::Ordering::Acquire)
+                            || runtime.mcp_clock_now() >= deadline
+                        {
+                            anyhow::bail!("deadline_exceeded: MCP selected read deadline");
+                        }
+                        let attempt = (|| {
+                            let (response, sampled) = match selected.as_ref() {
+                                Some(witness) => runtime.evidence_for_selected(witness)?,
+                                None => runtime.evidence_response()?,
+                            };
+                            publish(sampled);
+                            #[cfg(feature = "test-support")]
+                            runtime.run_mcp_admitted_gate_for_tests();
+                            let pin = response.status()?.revision;
+                            let basis = serde_json::json!({
+                                "indexGeneration":pin.index_generation.to_string(),
+                                "indexRevision":pin.index_revision
+                            });
+                            let mut content_hash = None;
+                            let envelope = match response.mcp_source(
+                                path,
+                                start,
+                                end,
+                                expected.as_ref().ok().and_then(|pin| *pin),
+                                expected_hash,
+                            ) {
+                                Ok(Some(result)) => projection::source(
+                                    &id,
+                                    result,
+                                    answering.root(),
+                                    sampled,
+                                    modern,
+                                )
+                                .unwrap_or_else(|| tools::failure(&id, "range_too_large")),
+                                Ok(None) => tools::failure(&id, "not_found"),
+                                Err(error)
+                                    if crate::store::cli_read_retryable_contention(&error) =>
+                                {
+                                    return Err(error);
+                                }
+                                Err(error) => {
+                                    let message = error.to_string();
+                                    let code = if message.starts_with("revision conflict:") {
+                                        if message.contains("content hash") {
+                                            content_hash = response.mcp_source_hash(path)?;
+                                        }
+                                        "revision_conflict"
+                                    } else if message.starts_with("unsupported_encoding:") {
+                                        "unsupported_encoding"
+                                    } else if message.starts_with("range_too_large:") {
+                                        "range_too_large"
+                                    } else if message.starts_with("invalid_request:") {
+                                        "invalid_request"
+                                    } else {
+                                        mcp_read_error(&error)
+                                    };
+                                    tools::failure(&id, code)
+                                }
+                            };
+                            let mut envelope = envelope;
+                            if envelope.get("error").is_some() {
+                                envelope["error"]["currentBasis"] = basis;
+                                if let Some(hash) = content_hash {
+                                    envelope["error"]["currentContentHash"] =
+                                        serde_json::json!(hash);
+                                }
+                            }
+                            response
+                                .finish(envelope)
+                                .map(|envelope| (envelope, sampled))
+                        })();
+                        match attempt {
+                            Err(ref error)
+                                if crate::store::cli_read_retryable_contention(error) =>
+                            {
+                                std::thread::sleep(std::time::Duration::from_millis(1));
+                            }
+                            answer => return answer,
+                        }
+                    }
+                })();
+                match read {
+                    Ok((found, sampled)) => {
+                        envelope = found;
+                        sampled_catching_up = sampled;
+                    }
+                    Err(error) => {
+                        let code = if error.to_string().starts_with("revision conflict:") {
+                            "revision_conflict"
+                        } else {
+                            mcp_read_error(&error)
+                        };
+                        envelope = tools::failure(&id, code);
+                    }
+                }
+            }
             *resolved.lock().unwrap() = Some((answering.root().to_owned(), sampled_catching_up));
             envelope["workspace"] = serde_json::json!(answering.root());
             envelope["catchingUp"] = serde_json::json!(sampled_catching_up);

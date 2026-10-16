@@ -1313,7 +1313,7 @@ async fn golden_tool_envelopes_and_maximum_ids_both_modes() {
                     let expected = match index {
                         1 => golden_settled_empty_find(&id, workspace, published),
                         2 => golden_settled_failure(&id, workspace, "not_found", published.clone()),
-                        3 => golden_settled_failure(&id, workspace, "index_not_ready", Value::Null),
+                        3 => golden_settled_failure(&id, workspace, "not_found", published.clone()),
                         _ => unreachable!("fixed golden tool order"),
                     };
                     exact_golden_settled(&accepted, &id, !legacy, expected);
@@ -1350,11 +1350,7 @@ async fn golden_tool_envelopes_and_maximum_ids_both_modes() {
             let answer = peer.ask(call(legacy, json!(heavy_id), name, args));
             let published = settled_pin.as_ref().expect("same-lineage H and watch ACK");
             let workspace = &answer["result"]["structuredContent"]["workspace"];
-            let (code, basis) = if name == "trellis_read_source" {
-                ("index_not_ready", Value::Null)
-            } else {
-                ("revision_conflict", published.clone())
-            };
+            let (code, basis) = ("revision_conflict", published.clone());
             exact_golden_settled(
                 &answer,
                 &json!(heavy_id),
@@ -2031,11 +2027,9 @@ fn per_call_linked_worktree_selection_and_closed_failures() {
                 tool(&answer, None, !legacy);
                 let data = &answer["result"]["structuredContent"]["data"];
                 assert_eq!(*data, json!({"symbols":[],"coverage":[],"provenance":[]}));
-            } else if offset == 2 {
+            } else {
                 tool(&answer, Some("not_found"), !legacy);
                 assert!(answer["result"]["structuredContent"]["error"]["currentBasis"].is_object());
-            } else {
-                tool(&answer, Some("index_not_ready"), !legacy);
             }
             assert_eq!(
                 answer["result"]["structuredContent"]["workspace"],
@@ -6901,4 +6895,304 @@ async fn mcp_outgoing_foreign_source_set_is_not_an_optional_candidate() {
         "foreign source set leaked: {reply}"
     );
     assert_eq!(calls[0]["nativeCandidates"]["omitted"], 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_source_selected_cached_bytes_not_disk() {
+    use trellis::daemon::registry::CheckoutRegistry;
+    use trellis::store::{
+        Store,
+        topology::{TopologyRoots, WorkspaceIdentity},
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let root = checkout(temp.path());
+    fs::write(root.join("a.js"), "a\r\nb\n").unwrap();
+    let identity = WorkspaceIdentity::discover(Some(&root), &root)
+        .unwrap()
+        .attach_marker()
+        .unwrap();
+    let store = Store::open_for_tests(temp.path(), &root).unwrap();
+    store.mcp_prepare_virgin_queue_for_tests().unwrap();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
+        &trellis::indexer::IndexOptions::new(root.clone()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    let writer = store.publication_for_tests().unwrap();
+    store
+        .publish_native(
+            &graph,
+            &capture,
+            &native,
+            &writer,
+            store.index_baseline().unwrap(),
+            &cancel,
+        )
+        .unwrap();
+    drop(writer);
+    drop(store);
+    let topology =
+        TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(143, &identity).unwrap();
+    registry.activate(&identity.root_key).unwrap();
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    let (mut client, mut reader, session) = socket_session(&identity, &registry, 143, None);
+    writeln!(
+        client,
+        "{}",
+        call(
+            false,
+            json!(1),
+            "trellis_read_source",
+            json!({"schemaVersion":1,"path":"a.js","startLine":1,"endLine":1})
+        )
+    )
+    .unwrap();
+    let response = next_reply(&mut reader);
+    tool(&response, None, true);
+    let data = &response["result"]["structuredContent"]["data"];
+    assert_eq!(data["text"], "a\r\n");
+    assert_eq!(data["byteRange"], json!({"start":0,"end":3}));
+    assert_eq!(data["path"], "a.js");
+    assert_eq!(data["startLine"], 1);
+    assert_eq!(data["endLine"], 1);
+    assert_eq!(
+        data["evidence"],
+        json!({"evidenceTier":"syntax",
+        "semanticBasis":null,"freshness":"fresh","staleBecause":[]})
+    );
+    assert_eq!(response["result"]["structuredContent"]["partial"], false);
+    assert_eq!(response["result"]["structuredContent"]["truncated"], false);
+    let good_hash = data["contentHash"].clone();
+    for (id, args, code, hash) in [
+        (
+            2,
+            json!({"schemaVersion":1,"path":"missing.js","startLine":1,"endLine":1}),
+            "not_found",
+            None,
+        ),
+        (
+            3,
+            json!({"schemaVersion":1,"path":"a.js","startLine":3,"endLine":3,
+            "expectedContentHash":"0".repeat(64)}),
+            "revision_conflict",
+            Some(good_hash),
+        ),
+        (
+            4,
+            json!({"schemaVersion":1,"path":"a.js","startLine":3,"endLine":3}),
+            "range_too_large",
+            None,
+        ),
+    ] {
+        writeln!(
+            client,
+            "{}",
+            call(false, json!(id), "trellis_read_source", args)
+        )
+        .unwrap();
+        let reply = next_reply(&mut reader);
+        tool(&reply, Some(code), true);
+        let envelope = &reply["result"]["structuredContent"];
+        assert_eq!(
+            envelope["error"]["currentContentHash"],
+            hash.unwrap_or(Value::Null)
+        );
+        assert!(envelope["error"]["currentBasis"].is_object());
+    }
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
+#[test]
+fn mcp_source_post_validation_invalid_bytes_only_selected_range_fails() {
+    use sha2::{Digest, Sha256};
+    use trellis::store::Store;
+    let temp = tempfile::tempdir().unwrap();
+    let root = checkout(temp.path());
+    fs::write(root.join("a.js"), "a\nb\n").unwrap();
+    let store = Store::open_for_tests(temp.path(), &root).unwrap();
+    store.mcp_prepare_virgin_queue_for_tests().unwrap();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
+        &trellis::indexer::IndexOptions::new(root.clone()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    let writer = store.publication_for_tests().unwrap();
+    store
+        .publish_native(
+            &graph,
+            &capture,
+            &native,
+            &writer,
+            store.index_baseline().unwrap(),
+            &cancel,
+        )
+        .unwrap();
+    let malformed = [0x61, 0x0a, 0xff, 0x0a];
+    store
+        .mcp_replace_validated_source_bytes_for_tests(&writer, "a.js", &malformed)
+        .unwrap();
+    drop(writer);
+    let response = store.evidence_response().unwrap();
+    let good = response
+        .mcp_source("a.js", 1, 1, None, None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(good.text, "a\n");
+    assert_eq!((good.byte_start, good.byte_end), (0, 2));
+    assert_eq!(
+        good.content_hash,
+        "ead0215fe443756c2739e50b368ff79c283d540214d4ef503350fa25103198be"
+    );
+    assert_eq!(good.content_hash, hex::encode(Sha256::digest(malformed)));
+    let wrong = response
+        .mcp_source("a.js", 2, 2, None, Some(&"0".repeat(64)))
+        .err()
+        .unwrap();
+    assert!(
+        wrong.to_string().starts_with("revision conflict:"),
+        "{wrong:#}"
+    );
+    let bad = response.mcp_source("a.js", 2, 2, None, None).err().unwrap();
+    assert!(
+        bad.to_string().starts_with("unsupported_encoding:"),
+        "{bad:#}"
+    );
+    response.finish(()).unwrap();
+    assert!(
+        response.source_at("a.js", None).is_err(),
+        "public attestation must not weaken"
+    );
+}
+
+#[test]
+fn mcp_source_lf_ranges_exact_caps_and_hash_before_range() {
+    use trellis::store::Store;
+    let temp = tempfile::tempdir().unwrap();
+    let root = checkout(temp.path());
+    fs::write(root.join("a.js"), "a\r\nb\n").unwrap();
+    let store = Store::open_for_tests(temp.path(), &root).unwrap();
+    store.mcp_prepare_virgin_queue_for_tests().unwrap();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
+        &trellis::indexer::IndexOptions::new(root.clone()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    let writer = store.publication_for_tests().unwrap();
+    store
+        .publish_native(
+            &graph,
+            &capture,
+            &native,
+            &writer,
+            store.index_baseline().unwrap(),
+            &cancel,
+        )
+        .unwrap();
+    drop(writer);
+    fs::write(root.join("a.js"), "changed on disk\n").unwrap();
+    let response = store.evidence_response().unwrap();
+    let first = response
+        .mcp_source("a.js", 1, 1, None, None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.text, "a\r\n");
+    assert_eq!((first.byte_start, first.byte_end), (0, 3));
+    let second = response
+        .mcp_source("a.js", 2, 2, None, None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(second.text, "b\n");
+    assert_eq!((second.byte_start, second.byte_end), (3, 5));
+    for (start, end) in [(3, 3), (1, 3), (0, 1), (1, 201)] {
+        assert!(response.mcp_source("a.js", start, end, None, None).is_err());
+    }
+    assert!(
+        response
+            .mcp_source("missing.js", 1, 1, None, None)
+            .unwrap()
+            .is_none()
+    );
+    let wrong = response
+        .mcp_source("a.js", 3, 3, None, Some(&"0".repeat(64)))
+        .err()
+        .unwrap();
+    assert!(
+        wrong.to_string().starts_with("revision conflict:"),
+        "{wrong:#}"
+    );
+    let wrong_pin = trellis::model::IndexPin {
+        index_generation: first.pin.index_generation,
+        index_revision: first.pin.index_revision + 1,
+    };
+    let pin_error = response
+        .mcp_source("missing.js", 1, 1, Some(wrong_pin), None)
+        .err()
+        .unwrap();
+    assert!(pin_error.to_string().starts_with("revision conflict:"));
+    response.finish(()).unwrap();
+}
+
+#[test]
+fn mcp_source_required_selected_path_and_digest_refuse_corrupt_rows() {
+    use trellis::store::Store;
+    for fault in ["missing_scope", "bad_digest"] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = checkout(temp.path());
+        fs::write(root.join("a.js"), "a\n").unwrap();
+        let store = Store::open_for_tests(temp.path(), &root).unwrap();
+        store.mcp_prepare_virgin_queue_for_tests().unwrap();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
+            &trellis::indexer::IndexOptions::new(root.clone()),
+            store.root_id(),
+            &cancel,
+            |_| {},
+        )
+        .unwrap();
+        let writer = store.publication_for_tests().unwrap();
+        store
+            .publish_native(
+                &graph,
+                &capture,
+                &native,
+                &writer,
+                store.index_baseline().unwrap(),
+                &cancel,
+            )
+            .unwrap();
+        drop(writer);
+        let before = store.evidence_response().unwrap();
+        assert_eq!(
+            before
+                .mcp_source("a.js", 1, 1, None, None)
+                .unwrap()
+                .unwrap()
+                .text,
+            "a\n"
+        );
+        before.finish(()).unwrap();
+        drop(before);
+        let writer = store.publication_for_tests().unwrap();
+        store.mcp_corrupt_find_for_tests(&writer, fault).unwrap();
+        drop(writer);
+        let selected = store.evidence_response().unwrap();
+        let error = selected.mcp_source("a.js", 1, 1, None, None).err().unwrap();
+        assert!(
+            error.to_string().contains("store_unavailable"),
+            "{fault}: {error:#}"
+        );
+    }
 }
