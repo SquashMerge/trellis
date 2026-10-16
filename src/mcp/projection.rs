@@ -62,6 +62,60 @@ mod tests {
     }
 }
 
+fn display_key(d: &crate::native_evidence::Declaration) -> String {
+    let mut segments: Vec<String> = d
+        .ancestors
+        .iter()
+        .map(|key| {
+            key.name
+                .clone()
+                .unwrap_or_else(|| format!("{}@{}", key.kind, key.ordinal))
+        })
+        .collect();
+    segments.push(
+        d.name
+            .clone()
+            .unwrap_or_else(|| format!("{}@{}", d.kind, d.range.start)),
+    );
+    format!("{}#{}", d.document.path, segments.join("."))
+}
+
+/// A declaration cannot be shortened: its measured record and closure fit together or fail.
+pub fn declaration(
+    id: &Value,
+    result: crate::store::mcp_read::McpDeclaration,
+    root: &std::path::Path,
+    catching_up: bool,
+    modern: bool,
+) -> Option<Value> {
+    let incomplete = result
+        .coverage
+        .iter()
+        .any(|c| c.selected && c.state != "complete");
+    let warnings = if incomplete {
+        vec![
+            json!({"code":"coverageIncomplete","message":"Selected syntax coverage is incomplete","provenanceId":null}),
+            json!({"code":"syntaxOnly","message":"Only syntax evidence is available","provenanceId":null}),
+        ]
+    } else {
+        vec![
+            json!({"code":"syntaxOnly","message":"Only syntax evidence is available","provenanceId":null}),
+        ]
+    };
+    let basis = json!({"indexGeneration":result.pin.index_generation.to_string(),
+        "indexRevision":result.pin.index_revision});
+    let envelope = json!({"schemaVersion":1,"requestId":id,"workspace":root,"catchingUp":catching_up,
+        "evidenceBasis":basis,
+        "data":{"displayKey":display_key(&result.declaration),"declaration":result.declaration,
+            "contentHash":result.content_hash,
+            "evidence":{"evidenceTier":"syntax","semanticBasis":null,"freshness":"fresh","staleBecause":[]},
+            "coverage":result.coverage,"provenance":result.provenance},
+        "warnings":warnings,"partial":incomplete,"truncated":false,"truncationReason":null});
+    let frame =
+        json!({"jsonrpc":"2.0","id":id,"result":super::tools::result(envelope.clone(), modern)});
+    (serde_json::to_vec(&frame).ok()?.len() < super::wire::RESPONSE_BYTES).then_some(envelope)
+}
+
 /// Budget the actual dual-content JSON-RPC frame, not the structured envelope alone.
 pub fn find(
     id: &Value,
@@ -91,21 +145,7 @@ pub fn find(
     let mut last = None;
     for symbol in &result.symbols {
         let d = &symbol.declaration;
-        let mut segments: Vec<String> = d
-            .ancestors
-            .iter()
-            .map(|key| {
-                key.name
-                    .clone()
-                    .unwrap_or_else(|| format!("{}@{}", key.kind, key.ordinal))
-            })
-            .collect();
-        segments.push(
-            d.name
-                .clone()
-                .unwrap_or_else(|| format!("{}@{}", d.kind, d.range.start)),
-        );
-        let display = format!("{}#{}", d.document.path, segments.join("."));
+        let display = display_key(d);
         symbols.push(
             json!({"symbolId":d.syntax_id,"name":d.name,"displayKey":display,
             "kind":d.kind,"document":d.document,"range":d.range,"nameRange":d.name_range,
