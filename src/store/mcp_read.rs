@@ -684,6 +684,16 @@ impl EvidenceResponse {
         // connection or lock transition is needed for these candidate SELECTs.
         let _progress_guard =
             (!calls.is_empty()).then(|| install_optional_hint_progress(&self.db, &progress));
+        // One admitted snapshot: verify and decode each selected version only once.
+        // A failed optional verification is never cached as trusted evidence.
+        let mut verified_versions = BTreeMap::<
+            String,
+            (
+                Vec<crate::native_evidence::Declaration>,
+                crate::native_evidence::Coverage,
+                String,
+            ),
+        >::new();
         for (item_index, item) in calls.iter_mut().enumerate() {
             #[cfg(feature = "test-support")]
             if item_index == 1 {
@@ -774,10 +784,54 @@ impl EvidenceResponse {
                     if candidate_scope.version_id != version {
                         return Ok(None);
                     }
-                    let Some(declaration) =
-                        read_native_declarations_v8(&self.db, &candidate_scope, None, true)?
-                            .into_iter()
-                            .find(|row| row.syntax_id == id)
+                    if !verified_versions.contains_key(&version) {
+                        if progress.expired() {
+                            return Ok(None);
+                        }
+                        #[cfg(feature = "test-support")]
+                        crate::mcp::phase_hook("outgoing_hint_verify_version")
+                            .map_err(|error| anyhow::anyhow!(error))?;
+                        if progress.expired() {
+                            return Ok(None);
+                        }
+                        let declarations =
+                            read_native_declarations_v8(&self.db, &candidate_scope, None, true)?;
+                        let coverage = read_native_coverage_v8(&self.db, &candidate_scope)?;
+                        // Reject an ineligible optional row before the expensive full
+                        // attestation: an omitted candidate must not poison required calls.
+                        let Some(declaration) = declarations.iter().find(|row| row.syntax_id == id)
+                        else {
+                            return Ok(None);
+                        };
+                        if declaration.name.is_none()
+                            || declaration.lookup_key.as_deref() != Some(lookup.as_str())
+                            || declaration.provenance_id != candidate_scope.proof_id()
+                            || declaration.revision_id != candidate_scope.native_revision_id
+                            || declaration.document != candidate_scope.key
+                            || !mcp_canonical_syntax_id(&id)
+                            || !coverage.requested
+                            || !coverage.selected
+                            || !matches!(coverage.state.as_str(), "complete" | "partial")
+                            || coverage.revision_id != candidate_scope.native_revision_id
+                            || coverage.producer_id != candidate_scope.producer_id
+                            || coverage.language != key.language
+                            || coverage.source_set_id != key.source_set_id
+                            || coverage.document_path != key.path
+                        {
+                            return Ok(None);
+                        }
+                        self.store
+                            .attest_selected_document_for(&self.db, &key.path, &selected)?;
+                        let hash: String = self.db.query_row(
+                            "SELECT content_hash FROM document_versions WHERE id=?1 AND source_set_id=?2 AND language=?3 AND path=?4",
+                            params![version,key.source_set_id,key.language,key.path],|r|r.get(0))?;
+                        if progress.expired() {
+                            return Ok(None);
+                        }
+                        verified_versions.insert(version.clone(), (declarations, coverage, hash));
+                    }
+                    let (declarations, coverage, hash) = &verified_versions[&version];
+                    let Some(declaration) = declarations.iter().find(|row| row.syntax_id == id)
                     else {
                         return Ok(None);
                     };
@@ -790,7 +844,6 @@ impl EvidenceResponse {
                     {
                         return Ok(None);
                     }
-                    let coverage = read_native_coverage_v8(&self.db, &candidate_scope)?;
                     if !coverage.requested
                         || !coverage.selected
                         || !matches!(coverage.state.as_str(), "complete" | "partial")
@@ -802,25 +855,20 @@ impl EvidenceResponse {
                     {
                         return Ok(None);
                     }
-                    self.store
-                        .attest_selected_document_for(&self.db, &key.path, &selected)?;
-                    let hash: String = self.db.query_row(
-                        "SELECT content_hash FROM document_versions WHERE id=?1 AND source_set_id=?2 AND language=?3 AND path=?4",
-                        params![version,key.source_set_id,key.language,key.path],|r|r.get(0))?;
                     let provenance = Provenance {
                         id: candidate_scope.proof_id(),
                         producer_id: candidate_scope.producer_id,
                         document: key,
                         revision_id: candidate_scope.native_revision_id,
-                        content_hash: hash,
+                        content_hash: hash.clone(),
                         evidence_kind: "measuredSyntax".into(),
                         basis: None,
                         freshness: "fresh".into(),
                         derived_from: None,
                     };
                     Ok(Some(McpOutgoingCandidate {
-                        declaration,
-                        coverage,
+                        declaration: declaration.clone(),
+                        coverage: coverage.clone(),
                         provenance,
                     }))
                 })();

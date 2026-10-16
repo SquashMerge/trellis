@@ -200,6 +200,23 @@ pub fn run_relayed_socket(
     )
 }
 
+/// Convert only an already validated wire basis; the model deserializer has a
+/// narrower UUIDv4/plain-integer contract than the MCP wire schema.
+fn validated_expected_basis(
+    args: &serde_json::Map<String, serde_json::Value>,
+) -> Option<crate::model::IndexPin> {
+    let value = args.get("expectedBasis")?;
+    Some(crate::model::IndexPin {
+        index_generation: uuid::Uuid::parse_str(
+            value["indexGeneration"]
+                .as_str()
+                .expect("validated generation"),
+        )
+        .expect("validated canonical UUID"),
+        index_revision: wire::uint(&value["indexRevision"]).expect("validated revision"),
+    })
+}
+
 fn mcp_read_error(error: &anyhow::Error) -> &'static str {
     if error
         .downcast_ref::<crate::store::topology::StorageBusy>()
@@ -577,11 +594,8 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                 let query = args["query"].as_str().expect("validated find query");
                 let limit = args
                     .get("limit")
-                    .map_or(20, |v| v.as_u64().unwrap_or(20) as usize);
-                let expected = args
-                    .get("expectedBasis")
-                    .map(|v| serde_json::from_value::<crate::model::IndexPin>(v.clone()))
-                    .transpose();
+                    .map_or(20, |v| wire::uint(v).expect("validated limit") as usize);
+                let expected = validated_expected_basis(args);
                 let publish = |sampled: bool| {
                     *resolved.lock().unwrap() = Some((answering.root().to_owned(), sampled));
                 };
@@ -621,11 +635,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                                 "indexGeneration":pin.index_generation.to_string(),
                                 "indexRevision":pin.index_revision
                             });
-                            let envelope = match response.mcp_find(
-                                query,
-                                limit,
-                                expected.as_ref().ok().and_then(|pin| *pin),
-                            ) {
+                            let envelope = match response.mcp_find(query, limit, expected) {
                                 Ok(result) => {
                                     projection::find(&id, result, answering.root(), sampled, modern)
                                         .unwrap_or_else(|| tools::failure(&id, "range_too_large"))
@@ -646,7 +656,9 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                                 }
                             };
                             let mut envelope = envelope;
-                            if envelope.get("error").is_some() {
+                            if envelope.get("error").is_some()
+                                && envelope["error"]["code"] != "store_unavailable"
+                            {
                                 envelope["error"]["currentBasis"] = basis;
                             }
                             response
@@ -693,10 +705,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                     .and_then(serde_json::Value::as_object)
                     .expect("validated declaration arguments");
                 let symbol_id = args["symbolId"].as_str().expect("validated declaration ID");
-                let expected = args
-                    .get("expectedBasis")
-                    .map(|v| serde_json::from_value::<crate::model::IndexPin>(v.clone()))
-                    .transpose();
+                let expected = validated_expected_basis(args);
                 let publish = |sampled: bool| {
                     *resolved.lock().unwrap() = Some((answering.root().to_owned(), sampled));
                 };
@@ -736,10 +745,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                                 "indexGeneration":pin.index_generation.to_string(),
                                 "indexRevision":pin.index_revision
                             });
-                            let envelope = match response.mcp_declaration(
-                                symbol_id,
-                                expected.as_ref().ok().and_then(|pin| *pin),
-                            ) {
+                            let envelope = match response.mcp_declaration(symbol_id, expected) {
                                 Ok(Some(result)) => projection::declaration(
                                     &id,
                                     result,
@@ -765,7 +771,9 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                                 }
                             };
                             let mut envelope = envelope;
-                            if envelope.get("error").is_some() {
+                            if envelope.get("error").is_some()
+                                && envelope["error"]["code"] != "store_unavailable"
+                            {
                                 envelope["error"]["currentBasis"] = basis;
                             }
                             response
@@ -814,11 +822,8 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                 let symbol_id = args["symbolId"].as_str().expect("validated outgoing ID");
                 let limit = args
                     .get("limit")
-                    .map_or(20, |v| v.as_u64().unwrap_or(20) as usize);
-                let expected = args
-                    .get("expectedBasis")
-                    .map(|v| serde_json::from_value::<crate::model::IndexPin>(v.clone()))
-                    .transpose();
+                    .map_or(20, |v| wire::uint(v).expect("validated limit") as usize);
+                let expected = validated_expected_basis(args);
                 let publish = |sampled: bool| {
                     *resolved.lock().unwrap() = Some((answering.root().to_owned(), sampled));
                 };
@@ -861,8 +866,8 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                             let envelope = match response.mcp_outgoing(
                                 symbol_id,
                                 limit,
-                                expected.as_ref().ok().and_then(|pin| *pin),
-                                &|| runtime.mcp_clock_now(),
+                                expected,
+                                &|| runtime.mcp_hint_clock_now(),
                                 deadline,
                             ) {
                                 Ok(Some(result)) => projection::outgoing(
@@ -890,7 +895,9 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                                 }
                             };
                             let mut envelope = envelope;
-                            if envelope.get("error").is_some() {
+                            if envelope.get("error").is_some()
+                                && envelope["error"]["code"] != "store_unavailable"
+                            {
                                 envelope["error"]["currentBasis"] = basis;
                             }
                             response
@@ -932,13 +939,10 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                     .and_then(serde_json::Value::as_object)
                     .expect("validated source arguments");
                 let path = args["path"].as_str().expect("validated source path");
-                let start = args["startLine"].as_u64().expect("validated source start");
-                let end = args["endLine"].as_u64().expect("validated source end");
+                let start = wire::uint(&args["startLine"]).expect("validated source start");
+                let end = wire::uint(&args["endLine"]).expect("validated source end");
                 let expected_hash = args.get("expectedContentHash").and_then(|v| v.as_str());
-                let expected = args
-                    .get("expectedBasis")
-                    .map(|v| serde_json::from_value::<crate::model::IndexPin>(v.clone()))
-                    .transpose();
+                let expected = validated_expected_basis(args);
                 let publish = |sampled: bool| {
                     *resolved.lock().unwrap() = Some((answering.root().to_owned(), sampled));
                 };
@@ -986,7 +990,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                                 path,
                                 start,
                                 end,
-                                expected.as_ref().ok().and_then(|pin| *pin),
+                                expected,
                                 expected_hash,
                             ) {
                                 Ok(Some(result)) => projection::source(

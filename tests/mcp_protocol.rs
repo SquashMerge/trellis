@@ -6143,6 +6143,7 @@ fn mcp_outgoing_wire_fixture(
     if let Some(limit) = limit {
         args["limit"] = json!(limit);
     }
+    runtime.freeze_mcp_hint_clock_for_tests();
     let budget_gate = if let Some(stages) = advance_hints {
         let path = temp.path().join("hint.sock");
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
@@ -6196,6 +6197,343 @@ fn mcp_outgoing_wire_fixture(
     drop(client);
     session.join().unwrap().unwrap();
     (response, frame)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_corrupt_find_declaration_outgoing_omit_current_basis_but_stale_pin_conflicts() {
+    use trellis::daemon::registry::CheckoutRegistry;
+    use trellis::store::{
+        Store,
+        topology::{TopologyRoots, WorkspaceIdentity},
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let root = checkout(temp.path());
+    fs::write(root.join("a.js"), "function Alpha() { Alpha(); }\n").unwrap();
+    let store = Store::open_for_tests(temp.path(), &root).unwrap();
+    store.mcp_prepare_virgin_queue_for_tests().unwrap();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
+        &trellis::indexer::IndexOptions::new(root.clone()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    let writer = store.publication_for_tests().unwrap();
+    store
+        .publish_native(
+            &graph,
+            &capture,
+            &native,
+            &writer,
+            store.index_baseline().unwrap(),
+            &cancel,
+        )
+        .unwrap();
+    drop(writer);
+    let selected = store.evidence_response().unwrap();
+    let id = selected.mcp_find("Alpha", 20, None).unwrap().symbols[0]
+        .declaration
+        .syntax_id
+        .clone();
+    selected.finish(()).unwrap();
+    drop(selected);
+    drop(store);
+    let identity = WorkspaceIdentity::discover(Some(&root), &root)
+        .unwrap()
+        .attach_marker()
+        .unwrap();
+    let topology =
+        TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(371, &identity).unwrap();
+    let runtime = registry.activate(&identity.root_key).unwrap();
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        loop {
+            if let Ok((response, catching_up)) = runtime.evidence_response()
+                && response.finish(()).is_ok()
+                && !catching_up
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("runtime did not complete startup");
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    for corrupt in [false, true] {
+        if corrupt {
+            let store = Store::open_for_tests(temp.path(), &root).unwrap();
+            let writer = store.publication_for_tests().unwrap();
+            store
+                .mcp_corrupt_find_for_tests(&writer, "missing_header")
+                .unwrap();
+            drop(writer);
+            drop(store);
+        }
+        for legacy in [false, true] {
+            let (mut client, mut reader, session) = socket_session(&identity, &registry, 371, None);
+            if legacy {
+                writeln!(
+                    client,
+                    "{}",
+                    request(
+                        json!(0),
+                        "initialize",
+                        fixture()["legacyInitialize"].clone()
+                    )
+                )
+                .unwrap();
+                assert_eq!(
+                    next_reply(&mut reader)["result"]["protocolVersion"],
+                    "2025-11-25"
+                );
+                writeln!(
+                    client,
+                    "{}",
+                    json!({"jsonrpc":"2.0","method":"notifications/initialized"})
+                )
+                .unwrap();
+            }
+            for (name, base) in [
+                (
+                    "trellis_find_symbols",
+                    json!({"schemaVersion":1,"query":"Alpha"}),
+                ),
+                (
+                    "trellis_inspect",
+                    json!({"schemaVersion":1,"symbolId":id,"view":"declaration"}),
+                ),
+                (
+                    "trellis_inspect",
+                    json!({"schemaVersion":1,"symbolId":id,"view":"outgoing_calls"}),
+                ),
+            ] {
+                let mut args = base;
+                if !corrupt {
+                    args["expectedBasis"] = json!({"indexGeneration":"123e4567-e89b-12d3-a456-426614174000","indexRevision":1});
+                }
+                writeln!(client, "{}", call(legacy, json!(1), name, args)).unwrap();
+                let reply = next_reply(&mut reader);
+                tool(
+                    &reply,
+                    Some(if corrupt {
+                        "store_unavailable"
+                    } else {
+                        "revision_conflict"
+                    }),
+                    !legacy,
+                );
+                let envelope = &reply["result"]["structuredContent"];
+                if corrupt {
+                    assert!(
+                        envelope["error"]["currentBasis"].is_null(),
+                        "{legacy} {name}: {reply}"
+                    );
+                    assert!(envelope.get("data").is_none(), "{reply}");
+                } else {
+                    assert!(
+                        envelope["error"]["currentBasis"].is_object(),
+                        "{legacy} {name}: {reply}"
+                    );
+                }
+            }
+            drop(reader);
+            drop(client);
+            session.join().unwrap().unwrap();
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_wire_valid_basis_and_uint_are_not_silently_dropped() {
+    use trellis::daemon::registry::CheckoutRegistry;
+    use trellis::store::{
+        Store,
+        topology::{TopologyRoots, WorkspaceIdentity},
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let root = checkout(temp.path());
+    fs::write(root.join("a.js"),
+        "function Target0() {}\nfunction Target1() {}\nfunction Target2() {}\nfunction Owner() { Target0(); Target1(); Target2(); }\n").unwrap();
+    let identity = WorkspaceIdentity::discover(Some(&root), &root)
+        .unwrap()
+        .attach_marker()
+        .unwrap();
+    let store = Store::open_for_tests(temp.path(), &root).unwrap();
+    store.mcp_prepare_virgin_queue_for_tests().unwrap();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
+        &trellis::indexer::IndexOptions::new(root.clone()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    let writer = store.publication_for_tests().unwrap();
+    store
+        .publish_native(
+            &graph,
+            &capture,
+            &native,
+            &writer,
+            store.index_baseline().unwrap(),
+            &cancel,
+        )
+        .unwrap();
+    drop(writer);
+    drop(store);
+    let topology =
+        TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(370, &identity).unwrap();
+    let runtime = registry.activate(&identity.root_key).unwrap();
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        loop {
+            if let Ok((response, catching_up)) = runtime.evidence_response()
+                && response.finish(()).is_ok()
+                && !catching_up
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("runtime did not complete startup");
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    for legacy in [false, true] {
+        let (mut client, mut reader, session) = socket_session(&identity, &registry, 370, None);
+        if legacy {
+            writeln!(
+                client,
+                "{}",
+                request(
+                    json!(0),
+                    "initialize",
+                    fixture()["legacyInitialize"].clone()
+                )
+            )
+            .unwrap();
+            assert_eq!(
+                next_reply(&mut reader)["result"]["protocolVersion"],
+                "2025-11-25"
+            );
+            writeln!(
+                client,
+                "{}",
+                json!({"jsonrpc":"2.0","method":"notifications/initialized"})
+            )
+            .unwrap();
+        }
+        let mut ask = |name: &str, args: Value| -> Value {
+            writeln!(client, "{}", call(legacy, json!(1), name, args)).unwrap();
+            let reply = next_reply(&mut reader);
+            assert_eq!(reply["id"], 1, "{reply}");
+            reply["result"]["structuredContent"].clone()
+        };
+        let found = ask(
+            "trellis_find_symbols",
+            json!({"schemaVersion":1,"query":"Owner"}),
+        );
+        let pin = found["evidenceBasis"].clone();
+        let id = found["data"]["symbols"][0]["symbolId"].clone();
+        let requests = [
+            (
+                "trellis_find_symbols",
+                json!({"schemaVersion":1,"query":"Target"}),
+            ),
+            (
+                "trellis_inspect",
+                json!({"schemaVersion":1,"symbolId":id,"view":"declaration"}),
+            ),
+            (
+                "trellis_inspect",
+                json!({"schemaVersion":1,"symbolId":id,"view":"outgoing_calls"}),
+            ),
+            (
+                "trellis_read_source",
+                json!({"schemaVersion":1,"path":"a.js","startLine":1,"endLine":1}),
+            ),
+        ];
+        for (name, base) in requests {
+            for stale in [
+                json!({"indexGeneration":"123e4567-e89b-12d3-a456-426614174000","indexRevision":1}),
+                serde_json::from_str::<Value>(&format!(
+                    r#"{{"indexGeneration":"{}","indexRevision":{}.0}}"#,
+                    pin["indexGeneration"].as_str().unwrap(),
+                    pin["indexRevision"].as_u64().unwrap() + 1
+                ))
+                .unwrap(),
+            ] {
+                let mut args = base.clone();
+                args["expectedBasis"] = stale.clone();
+                let envelope = ask(name, args);
+                assert_eq!(
+                    envelope["error"]["code"], "revision_conflict",
+                    "{legacy} {name} stale={stale}: {envelope}"
+                );
+                assert_eq!(envelope["error"]["currentBasis"], pin);
+            }
+            let mut args = base;
+            args["expectedBasis"] = serde_json::from_str(&format!(
+                r#"{{"indexGeneration":"{}","indexRevision":{}e0}}"#,
+                pin["indexGeneration"].as_str().unwrap(),
+                pin["indexRevision"].as_u64().unwrap()
+            ))
+            .unwrap();
+            let envelope = ask(name, args);
+            assert!(
+                envelope.get("data").is_some(),
+                "{legacy} {name}: {envelope}"
+            );
+        }
+        for (name, args, expected_count) in [
+            (
+                "trellis_find_symbols",
+                serde_json::from_str::<Value>(
+                    r#"{"schemaVersion":1,"query":"Target","limit":1.0}"#,
+                )
+                .unwrap(),
+                1,
+            ),
+            (
+                "trellis_inspect",
+                serde_json::from_str::<Value>(&format!(
+                    r#"{{"schemaVersion":1,"symbolId":"{}","view":"outgoing_calls","limit":2e0}}"#,
+                    id.as_str().unwrap()
+                ))
+                .unwrap(),
+                2,
+            ),
+        ] {
+            let envelope = ask(name, args);
+            let items = if name == "trellis_find_symbols" {
+                &envelope["data"]["symbols"]
+            } else {
+                &envelope["data"]["calls"]
+            };
+            assert_eq!(
+                items.as_array().map(Vec::len),
+                Some(expected_count),
+                "{legacy}: {envelope}"
+            );
+        }
+        let lines = serde_json::from_str::<Value>(
+            r#"{"schemaVersion":1,"path":"a.js","startLine":1.0,"endLine":10e-1}"#,
+        )
+        .unwrap();
+        let envelope = ask("trellis_read_source", lines);
+        assert_eq!(
+            envelope["data"]["text"], "function Target0() {}\n",
+            "{legacy}: {envelope}"
+        );
+        drop(ask);
+        drop(reader);
+        drop(client);
+        session.join().unwrap().unwrap();
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6391,7 +6729,7 @@ async fn mcp_outgoing_response_bytes_call_prefix_before_global_hints() {
         .iter()
         .map(|(p, s)| (p.as_str(), s.as_str()))
         .collect();
-    let reply = mcp_outgoing_fixture(&borrowed, "Owner", Some(50));
+    let reply = mcp_outgoing_fixture_with_budget(&borrowed, "Owner", Some(50), None);
     tool(&reply, None, true);
     let envelope = &reply["result"]["structuredContent"];
     let calls = envelope["data"]["calls"].as_array().unwrap();
@@ -6487,6 +6825,34 @@ async fn mcp_outgoing_near_call_deadline_preserves_required_call_without_optiona
         Value::Null,
         "optional hint count is unknown at the deadline: {reply}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_outgoing_same_version_attested_once_for_repeated_calls() {
+    // This gate has one release. A second verification attempt fails its gate
+    // connection, so both candidates can survive only with per-version reuse.
+    let reply = mcp_outgoing_fixture_with_budget(
+        &[(
+            "a.js",
+            "function Target() {}\nfunction Owner() { Target(); Target(); }\n",
+        )],
+        "Owner",
+        None,
+        Some(vec![("outgoing_hint_verify_version", 0)]),
+    );
+    tool(&reply, None, true);
+    let calls = reply["result"]["structuredContent"]["data"]["calls"]
+        .as_array()
+        .unwrap();
+    assert_eq!(calls.len(), 2, "{reply}");
+    for call in calls {
+        assert_eq!(
+            call["nativeCandidates"]["items"].as_array().unwrap().len(),
+            1,
+            "{reply}"
+        );
+        assert_eq!(call["nativeCandidates"]["omitted"], 0, "{reply}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
