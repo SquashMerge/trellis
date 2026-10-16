@@ -1251,14 +1251,6 @@ fn callee(n: Node<'_>, f: &SourceFile) -> (Option<String>, Option<Range>) {
 }
 /// Reparse only a selected stored source snapshot. This does not admit or reread
 /// workspace files and does not project a second whole-workspace graph.
-pub(crate) fn selected_source_witness(
-    file: &SourceFile,
-    producer: Producer,
-    source_set: SourceSet,
-    revision: Revision,
-) -> Result<Artifact> {
-    selected_source_witness_with_progress(file, producer, source_set, revision, None)
-}
 pub(crate) fn selected_source_witness_with_progress(
     file: &SourceFile,
     producer: Producer,
@@ -2196,7 +2188,7 @@ mod occurrence_identity_tests {
             config_hash: hash(revision_id.as_bytes()),
             dependency_hash: "3".repeat(64),
         };
-        selected_source_witness(file, producer(version), source_set, revision)
+        selected_source_witness_with_progress(file, producer(version), source_set, revision, None)
     }
     fn file(text: &str) -> SourceFile {
         SourceFile {

@@ -5117,7 +5117,7 @@ fn read_native_declarations_v8(
     read_native_declarations_v8_inner(db, scope, lookup_key, all_lookup_keys, None)
 }
 
-pub(crate) fn read_native_declarations_v8_optional(
+fn read_native_declarations_v8_optional(
     db: &Connection,
     scope: &V8NativeScope,
     lookup_key: Option<&str>,
@@ -10264,14 +10264,6 @@ impl Store {
 
     /// Reparse exactly one selected, paired source in this SQLite snapshot.
     /// This never rereads a workspace path or projects the whole graph.
-    fn selected_native_witness_for(
-        &self,
-        db: &Connection,
-        path: &str,
-        selected: &ReadRevision,
-    ) -> Result<crate::native_evidence::Artifact> {
-        self.selected_native_witness_for_inner(db, path, selected, None)
-    }
     fn selected_native_witness_for_inner(
         &self,
         db: &Connection,
@@ -10378,7 +10370,7 @@ impl Store {
             .map_err(selected_integrity)
             .map_err(|error| self.report_selected_failure(error))
     }
-    pub(crate) fn attest_selected_document_optional_for(
+    fn attest_selected_document_optional_for(
         &self,
         db: &Connection,
         path: &str,
