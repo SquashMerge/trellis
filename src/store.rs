@@ -4037,7 +4037,7 @@ fn revision_producer_binding(db: &Connection, revision_key: &str) -> Result<(Str
         },
     )?;
     ensure!(
-        native_revision.starts_with("revision:v1:")
+        native_revision.starts_with("revision:v2:")
             && [toolchain.as_str(), config.as_str(), dependency.as_str()]
                 .iter()
                 .all(|hash| hash.len() == 64
@@ -4308,7 +4308,7 @@ fn validate_paired_metadata(
                 .as_ref()
                 .is_some_and(|(id, root)| id == &expected_source && root == root_id)
             && revision.as_ref().is_some_and(
-                |(id, source)| id.starts_with("revision:v1:") && source == &expected_source
+                |(id, source)| id.starts_with("revision:v2:") && source == &expected_source
             ),
         "incompatible_index: missing native pair metadata"
     );

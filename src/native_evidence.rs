@@ -608,7 +608,7 @@ fn build_native_header<'a>(
             .then(a.path.as_bytes().cmp(b.path.as_bytes()))
     });
     let id = format!(
-        "revision:v1:{}",
+        "revision:v2:{}",
         native_revision_digest(&source_set_id, &files, &toolchain, &config, &dependencies)
     );
     let documents = files
@@ -645,12 +645,13 @@ fn build_native_header<'a>(
     Ok((artifact, files))
 }
 
-/// `digest("trellis.native-revision.v1\0", canonical(revision_input))`, where
+/// `digest("trellis.native-revision.v2\0", canonical(revision_input))`, where
 /// `revision_input` is
-/// `{"config","dependencies","documents":[{"byteLength","bytes":hex,"language","path"}],"sourceSetId","toolchain"}`.
-/// The canonical bytes are written straight into the hasher, in canonical key
-/// order, with each document's bytes hex-encoded a chunk at a time, so the
-/// whole-corpus encoding is never held in memory. The digest is identical.
+/// `{"config","dependencies","documents":[{"byteLength","contentHash","language","path"}],"sourceSetId","toolchain"}`
+/// (Decision 0010). Each document enters by its SHA-256 content hash, which
+/// capture already computed, not by its bytes, so the cost is per document,
+/// not per corpus byte. The canonical bytes are written straight into the
+/// hasher in canonical key order.
 fn native_revision_digest(
     source_set_id: &str,
     files: &[&SourceFile],
@@ -659,7 +660,7 @@ fn native_revision_digest(
     dependencies: &[Value],
 ) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"trellis.native-revision.v1\0");
+    hasher.update(b"trellis.native-revision.v2\0");
     let out = &mut |bytes: &[u8]| hasher.update(bytes);
     let array = |items: &[Value], out: &mut dyn FnMut(&[u8])| {
         out(b"[");
@@ -676,20 +677,15 @@ fn native_revision_digest(
     out(b",\"dependencies\":");
     array(dependencies, out);
     out(b",\"documents\":[");
-    let mut hex = [0_u8; 8192];
     for (i, file) in files.iter().enumerate() {
         if i != 0 {
             out(b",");
         }
         out(b"{\"byteLength\":");
         out(file.text.len().to_string().as_bytes());
-        out(b",\"bytes\":\"");
-        for chunk in file.text.as_bytes().chunks(hex.len() / 2) {
-            let encoded = &mut hex[..chunk.len() * 2];
-            hex::encode_to_slice(chunk, encoded).expect("hex buffer is twice the chunk");
-            out(encoded);
-        }
-        out(b"\",\"language\":");
+        out(b",\"contentHash\":");
+        crate::native_ids::canonical_string_into(&file.hash, out);
+        out(b",\"language\":");
         crate::native_ids::canonical_string_into(&file.language, out);
         out(b",\"path\":");
         crate::native_ids::canonical_string_into(&file.path, out);
@@ -1761,7 +1757,7 @@ impl Artifact {
         text(&self.source_set.root_id)?;
         ensure!(
             self.revision.source_set_id == self.source_set.id
-                && self.revision.id.starts_with("revision:v1:")
+                && self.revision.id.starts_with("revision:v2:")
                 && valid_hash(&self.revision.id[12..])
                 && valid_hash(&self.revision.toolchain_hash)
                 && valid_hash(&self.revision.config_hash)
@@ -2153,7 +2149,7 @@ mod occurrence_identity_tests {
 
     #[test]
     fn native_producer_declares_and_authenticates_an_explicit_empty_inventory() {
-        let revision = selected(&file("f();"), "revision:v1:r1", NATIVE_VERSION)
+        let revision = selected(&file("f();"), "revision:v2:r1", NATIVE_VERSION)
             .unwrap()
             .revision;
         for language in LANGUAGES {
@@ -2234,10 +2230,10 @@ mod occurrence_identity_tests {
     #[test]
     fn failed_precondition_mints_no_occurrence() {
         let source = file("function f() { g(); if (x) { h(); } }");
-        assert!(selected(&source, "revision:v1:r1", "native-v2").is_err());
+        assert!(selected(&source, "revision:v2:r1", "native-v2").is_err());
         let mut forged = source.clone();
         forged.hash = "0".repeat(64);
-        let mut artifact = selected(&source, "revision:v1:r1", NATIVE_VERSION).unwrap();
+        let mut artifact = selected(&source, "revision:v2:r1", NATIVE_VERSION).unwrap();
         artifact.calls.clear();
         artifact.control_regions.clear();
         assert!(extract(&mut artifact, &forged, &mut IdentityRegistry::default()).is_err());
@@ -2268,8 +2264,8 @@ mod occurrence_identity_tests {
             [1, 0, 2, 3]
         );
         let source = file("function f() { g(); if (x) { h(); } }");
-        let a = selected(&source, "revision:v1:r1", NATIVE_VERSION).unwrap();
-        let b = selected(&source, "revision:v1:r2", NATIVE_VERSION).unwrap();
+        let a = selected(&source, "revision:v2:r1", NATIVE_VERSION).unwrap();
+        let b = selected(&source, "revision:v2:r2", NATIVE_VERSION).unwrap();
         let witness = |artifact: &Artifact| {
             document_witness(
                 &artifact.revision.documents[0],
@@ -2297,8 +2293,8 @@ mod occurrence_identity_tests {
     #[test]
     fn document_version_keeps_occurrence_ids_across_revisions() {
         let source = file("function f() { g(); if (x) { h(); } }");
-        let r1 = selected(&source, "revision:v1:r1", NATIVE_VERSION).unwrap();
-        let r2 = selected(&source, "revision:v1:r2", NATIVE_VERSION).unwrap();
+        let r1 = selected(&source, "revision:v2:r1", NATIVE_VERSION).unwrap();
+        let r2 = selected(&source, "revision:v2:r2", NATIVE_VERSION).unwrap();
         assert_eq!(r1.calls.len(), 2);
         assert_eq!(r1.control_regions.len(), 1);
         for (a, b) in r1.calls.iter().zip(&r2.calls) {
@@ -2307,14 +2303,14 @@ mod occurrence_identity_tests {
             assert_eq!(a.region_ids, b.region_ids);
             assert_eq!(
                 (a.revision_id.as_str(), b.revision_id.as_str()),
-                ("revision:v1:r1", "revision:v1:r2")
+                ("revision:v2:r1", "revision:v2:r2")
             );
         }
         assert_eq!(r1.control_regions[0].id, r2.control_regions[0].id);
         assert_ne!(r1.provenance[0].id, r2.provenance[0].id);
         let edited = selected(
             &file("function f() { g(); if (x) { h(); } } "),
-            "revision:v1:r2",
+            "revision:v2:r2",
             NATIVE_VERSION,
         )
         .unwrap();
@@ -2581,15 +2577,15 @@ mod revision_digest_tests {
         config: &[Value],
         dependencies: &[Value],
     ) -> String {
-        let docs: Vec<Value> = files.iter().map(|f| json!({"language":f.language,"path":f.path,"bytes":hex::encode(f.text.as_bytes()),"byteLength":f.text.len()})).collect();
+        let docs: Vec<Value> = files.iter().map(|f| json!({"language":f.language,"path":f.path,"contentHash":f.hash,"byteLength":f.text.len()})).collect();
         let revision_input = json!({"sourceSetId":source_set_id,"documents":docs,"toolchain":toolchain,"config":config,"dependencies":dependencies});
-        digest(b"trellis.native-revision.v1\0", &canonical(&revision_input))
+        digest(b"trellis.native-revision.v2\0", &canonical(&revision_input))
     }
 
     fn file(language: &str, path: &str, text: String) -> SourceFile {
         SourceFile {
             path: path.into(),
-            hash: String::new(),
+            hash: hex::encode(Sha256::digest(text.as_bytes())),
             language: language.into(),
             text,
         }
@@ -2597,6 +2593,28 @@ mod revision_digest_tests {
 
     /// The streamed digest is byte-for-byte the materialized one, including
     /// escaped paths, empty and multi-chunk bodies, and an empty corpus.
+    /// Decision 0010: the ID commits to every document through its content
+    /// hash, path and length; any change to one of them changes the ID.
+    #[test]
+    fn the_revision_id_changes_with_any_documents_content_or_path() {
+        let toolchain = json!({"nativeExecutable":"abc"});
+        let id = |files: &[SourceFile]| {
+            let refs: Vec<&SourceFile> = files.iter().collect();
+            native_revision_digest("source-set:v1:r", &refs, &toolchain, &[], &[])
+        };
+        let base = [
+            file("rust", "src/a.rs", "fn a() {}\n".into()),
+            file("java", "B.java", "class B {}\n".into()),
+        ];
+        assert_eq!(id(&base), id(&base.clone()));
+        let mut content = base.clone();
+        content[1] = file("java", "B.java", "class B { }\n".into());
+        assert_ne!(id(&base), id(&content));
+        let mut path = base.clone();
+        path[0] = file("rust", "src/b.rs", "fn a() {}\n".into());
+        assert_ne!(id(&base), id(&path));
+    }
+
     #[test]
     fn the_streamed_revision_digest_equals_the_materialized_one() {
         let toolchain = json!({"nativeExecutable":"abc","rootRustToolchain":{"path":"rust-toolchain","sha256":null},"rootRustToolchainToml":null});
