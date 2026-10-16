@@ -310,9 +310,13 @@ pub struct DaemonState {
             crate::index_coordinator::WatcherWork,
         )>,
     >,
+    #[cfg(feature = "test-support")]
     causal_witness: Mutex<Option<Arc<crate::daemon::causal_witness::CausalWitness>>>,
+    #[cfg(feature = "test-support")]
     causal_runtime: Mutex<Option<std::sync::Weak<crate::daemon::registry::CheckoutRuntime>>>,
+    #[cfg(feature = "test-support")]
     causal_lineage_ordinal: Arc<AtomicU64>,
+    #[cfg(feature = "test-support")]
     causal_startup_reported: Mutex<Option<(uuid::Uuid, uuid::Uuid, u64)>>,
     recovery_retry_after: Mutex<Option<Instant>>,
     /// Watcher health, published by the current watcher through one flag that
@@ -546,9 +550,13 @@ pub fn new_with_config(
         job_progress: Mutex::new(BTreeMap::new()),
         step_lock: Mutex::new(()),
         watcher_work: Mutex::new(None),
+        #[cfg(feature = "test-support")]
         causal_witness: Mutex::new(None),
+        #[cfg(feature = "test-support")]
         causal_runtime: Mutex::new(None),
+        #[cfg(feature = "test-support")]
         causal_lineage_ordinal: Arc::new(AtomicU64::new(0)),
+        #[cfg(feature = "test-support")]
         causal_startup_reported: Mutex::new(None),
         recovery_retry_after: Mutex::new(None),
         watcher_health: Arc::new(crate::watch::WatcherHealth::default()),
@@ -578,6 +586,7 @@ pub fn new_with_config(
 impl DaemonState {
     /// Register a test-only, read-only witness after this checkout activates.
     /// The reverse edge is weak: release may drop the runtime independently.
+    #[cfg(feature = "test-support")]
     pub fn set_causal_witness_runtime(
         &self,
         reporter: Arc<crate::daemon::causal_witness::CausalWitness>,
@@ -588,6 +597,7 @@ impl DaemonState {
     }
 
     /// Called only after a worker step returned and released its locks.
+    #[cfg(feature = "test-support")]
     fn report_causal_startup_ready(self: &Arc<Self>) {
         let runtime = self.causal_runtime.lock().unwrap().clone();
         if let Some(runtime) = runtime.and_then(|runtime| runtime.upgrade()) {
@@ -595,6 +605,7 @@ impl DaemonState {
         }
     }
 
+    #[cfg(feature = "test-support")]
     pub fn causal_lineage_for(
         &self,
         session: &Arc<crate::store::topology::WriterSession>,
@@ -614,6 +625,7 @@ impl DaemonState {
         scheduler.causal_lineage()
     }
 
+    #[cfg(feature = "test-support")]
     pub fn causal_startup_already_reported(
         &self,
         lineage: crate::daemon::causal_witness::Lineage,
@@ -626,6 +638,7 @@ impl DaemonState {
             ))
     }
 
+    #[cfg(feature = "test-support")]
     pub fn emit_causal_startup_ready_once(
         &self,
         lineage: crate::daemon::causal_witness::Lineage,
@@ -1310,6 +1323,7 @@ impl DaemonState {
                             &selected_options,
                             self.watcher_health.clone(),
                         )?;
+                        #[cfg(feature = "test-support")]
                         if let Some(reporter) = self.causal_witness.lock().unwrap().clone() {
                             scheduler.attach_causal_witness(
                                 reporter,
@@ -1353,6 +1367,7 @@ impl DaemonState {
                         // ACK only a verified, acknowledged full inventory.
                         // Neither a failed FIFO probe nor a newer accepted hint
                         // can be called settled. The reporter only try_sends here.
+                        #[cfg(feature = "test-support")]
                         if accounted
                             && let Some(reporter) = self.causal_witness.lock().unwrap().clone()
                             && !scheduler.accepted_watch_intent(&selected_options)

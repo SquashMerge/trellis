@@ -2,7 +2,7 @@
 
 ## How Trellis is used
 
-Trellis is a local developer tool. One developer runs it on their own machine, across a few checkouts. A checkout has at most **2–3 Trellis processes** at once: the daemon (index leader and file watcher, which also serves the browser), plus one CLI or MCP session. It is not a server and not multi-user, and it listens on loopback only. Don't design or test for heavy concurrency or many simultaneous clients.
+Trellis is a local developer tool. One developer runs it on their own machine, across a few checkouts. A checkout has at most **2–3 Trellis processes** at once: the daemon (the only index writer and the file watcher, which also serves the browser), plus one CLI or MCP session. It is not a server and not multi-user, and it listens on loopback only. Don't design or test for heavy concurrency or many simultaneous clients.
 
 Trellis is pre-release, so there is **no backward compatibility**. Old or intermediate formats of **disposable derived state** (the indexes) are recreated where their contract permits it, never migrated or specially handled. Durable state, such as saved views, notes and the request queue, follows its own contract in `docs/local-topology.md`.
 

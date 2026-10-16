@@ -1649,6 +1649,7 @@ impl CheckoutRuntime {
     /// Invoked through a weak edge AFTER a queue tick releases all stream and
     /// watcher locks. This is a snapshot of the current verified startup reconciliation owner, not a
     /// claim that startup reconciliation ran again when a serving watcher gets a new epoch.
+    #[cfg(feature = "test-support")]
     pub(crate) fn report_causal_startup_ready(&self, scheduler: &Arc<http::DaemonState>) {
         let Some(owner) = scheduler.checkout_serving_owner() else {
             return;
