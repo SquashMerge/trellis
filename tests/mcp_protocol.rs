@@ -6876,32 +6876,46 @@ async fn mcp_outgoing_near_call_deadline_preserves_required_call_without_optiona
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mcp_outgoing_mid_attestation_expiry_keeps_required_calls_and_prior_hints() {
-    // The first compound call completes without optional candidate work. The
-    // target lives in a different version, so its SHA chunk runs only inside
-    // optional candidate attestation. Advance the hint clock within that CPU
-    // operation, not at a between-row boundary.
+    // `Local` and `Target` live in their own versions, so each is verified
+    // only inside optional candidate attestation. local.js's source-hash chunks
+    // advance nothing and its hint survives; target.js's first chunk advances
+    // the hint clock inside that SHA phase, so Target's
+    // calls lose their hints while every required call survives.
     let (reply, _) = mcp_outgoing_wire_fixture(
         &[
             (
                 "owner.js",
-                "function Owner() { (obj.Unknown)(); Target(); Target(); }\n",
+                "function Owner() { Local(); (obj.Unknown)(); Target(); Target(); }\n",
             ),
+            ("local.js", "function Local() {}\n"),
             ("target.js", "function Target() {}\n"),
         ],
         "Owner",
         None,
-        Some(vec![("outgoing_hint_source_hash_chunk", 1001)]),
+        // Each candidate attestation hashes its source twice (source row, then
+        // native witness): local.js twice at no cost, then target.js expires.
+        Some(vec![
+            ("outgoing_hint_source_hash_chunk", 0),
+            ("outgoing_hint_source_hash_chunk", 0),
+            ("outgoing_hint_source_hash_chunk", 1001),
+        ]),
         false,
         true,
     );
     tool(&reply, None, true);
     let envelope = &reply["result"]["structuredContent"];
     let calls = envelope["data"]["calls"].as_array().unwrap();
-    assert_eq!(calls.len(), 3, "mandatory call list survives: {reply}");
-    assert!(calls[0]["calleeRange"].is_null(), "{reply}");
-    assert_eq!(calls[0]["nativeCandidates"]["items"], json!([]));
-    assert_eq!(calls[0]["nativeCandidates"]["omitted"], 0);
-    for call in &calls[1..] {
+    assert_eq!(calls.len(), 4, "mandatory call list survives: {reply}");
+    assert_eq!(calls[0]["calleeText"], "Local", "{reply}");
+    let local = calls[0]["nativeCandidates"]["items"].as_array().unwrap();
+    assert_eq!(local.len(), 1, "the earlier hint survives: {reply}");
+    assert_eq!(local[0]["name"], "Local", "{reply}");
+    assert_eq!(local[0]["document"]["path"], "local.js", "{reply}");
+    assert_eq!(calls[0]["nativeCandidates"]["omitted"], 0, "{reply}");
+    assert!(calls[1]["calleeRange"].is_null(), "{reply}");
+    assert_eq!(calls[1]["nativeCandidates"]["items"], json!([]));
+    assert_eq!(calls[1]["nativeCandidates"]["omitted"], 0);
+    for call in &calls[2..] {
         assert_eq!(call["calleeText"], "Target", "{reply}");
         assert_eq!(call["nativeCandidates"]["items"], json!([]));
         assert!(call["nativeCandidates"]["omitted"].is_null(), "{reply}");

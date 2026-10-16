@@ -1903,6 +1903,8 @@ impl CheckoutRuntime {
     /// Freeze only optional hint accounting. Mandatory call deadlines keep using real time.
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
+    /// Freeze the optional-hint clock. Freeze before the call is accepted: the
+    /// hint end is still capped by the call's real-clock deadline.
     pub fn freeze_mcp_hint_clock_for_tests(&self) {
         *self.mcp_hint_clock_origin.lock().unwrap() = Some(Instant::now());
     }

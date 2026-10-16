@@ -1151,29 +1151,15 @@ pub(crate) fn validate_native_graph_records_with_progress(
         crate::store::optional_hint_check(progress)?;
         files.insert(file.path.as_str(), file);
     }
-    let lines = if progress.is_some() {
-        let mut indexes = BTreeMap::new();
-        for (path, file) in &files {
-            let mut starts = vec![0];
-            for (part, chunk) in file.text.as_bytes().chunks(64 * 1024).enumerate() {
-                crate::store::optional_hint_check(progress)?;
-                starts.extend(chunk.iter().enumerate().filter_map(|(offset, byte)| {
-                    (*byte == b'\n').then_some(part * 64 * 1024 + offset + 1)
-                }));
-            }
-            indexes.insert(*path, LineIndex(starts));
-        }
-        indexes
-    } else {
-        line_indexes(&files)
-    };
+    let lines = line_indexes(&files);
+    crate::store::optional_hint_check(progress)?;
     let mut declaration_keys = BTreeMap::new();
     for d in &native.declarations {
         crate::store::optional_hint_check(progress)?;
         let key = (
             d.document.path.as_str(),
-            crate::store::stringify_optional_json(&d.ancestors, progress)?,
-            crate::store::stringify_optional_json(&d.key, progress)?,
+            serde_json::to_string(&d.ancestors)?,
+            serde_json::to_string(&d.key)?,
         );
         ensure!(
             declaration_keys.insert(key, d.syntax_id.as_str()).is_none(),
@@ -1199,11 +1185,8 @@ pub(crate) fn validate_native_graph_records_with_progress(
             .get(d.syntax_id.as_str())
             .context("native_evidence_required: missing measured declaration")?;
         let owner = if let Some(last) = d.ancestors.last() {
-            let prefix = crate::store::stringify_optional_json(
-                &d.ancestors[..d.ancestors.len() - 1],
-                progress,
-            )?;
-            let last = crate::store::stringify_optional_json(last, progress)?;
+            let prefix = serde_json::to_string(&d.ancestors[..d.ancestors.len() - 1])?;
+            let last = serde_json::to_string(last)?;
             Some(
                 *declaration_keys
                     .get(&(d.document.path.as_str(), prefix, last))
