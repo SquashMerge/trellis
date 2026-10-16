@@ -22,6 +22,7 @@ use trellis::{
 
 const STATE_ENV: &str = "TRELLIS_TEST_CRASH_RECOVERY_STATE";
 const ROOT_ENV: &str = "TRELLIS_TEST_CRASH_RECOVERY_ROOT";
+const SQLITE_JOURNAL_MAGIC: [u8; 8] = [0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7];
 
 fn identity(root: &Path) -> WorkspaceIdentity {
     WorkspaceIdentity::discover(Some(root), root)
@@ -207,4 +208,137 @@ async fn killed_daemon_with_accepted_queue_restarts_to_one_fifo_terminal_result_
         "terminal results out of FIFO order: {revisions:?}"
     );
     assert!(store.earliest_unfinished_request().unwrap().is_none());
+}
+
+#[test]
+fn index_commit_hot_journal_daemon_child() {
+    let Some((state, root)) = child_paths() else {
+        return;
+    };
+    let store = Store::open(roots(&state), identity(&root)).unwrap();
+    let options = IndexOptions::new(root.clone());
+    let (head, session) =
+        trellis::index_coordinator::reconcile_workspace(&store, &options, &cancel(), |_| {})
+            .unwrap();
+    // Change every file so the request's index publication rewrites enough
+    // pages that SQLite spills them into index.db before COMMIT.
+    rewrite_workspace(&root, "after");
+    let journal = index_db(&state, &root).with_file_name("index.db-journal");
+    store.set_publication_before_commit_hook_for_tests(move || {
+        let header = fs::read(&journal).map(|bytes| bytes[..8].to_vec());
+        announce_and_wait_for_kill(&format!(
+            "HOOKED {} {} {}",
+            head.index_generation,
+            head.index_revision,
+            matches!(header, Ok(bytes) if bytes == SQLITE_JOURNAL_MAGIC)
+        ));
+    });
+    let _ = trellis::index_coordinator::drain_requests(&store, &session);
+    unreachable!("the publication hook never returns");
+}
+
+fn index_db(state: &Path, root: &Path) -> PathBuf {
+    roots(state).index_db(&identity(root))
+}
+
+fn rewrite_workspace(root: &Path, tag: &str) {
+    for file in 0..200 {
+        let body: String = (0..40)
+            .map(|f| {
+                format!(
+                    "function {tag}_{file}_{f}(x) {{ return {tag}_{file}_{}(x); }}\n",
+                    f + 1
+                )
+            })
+            .collect();
+        fs::write(root.join(format!("m{file}.js")), body).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn killed_mid_index_commit_rolls_back_hot_journal_then_queue_resumes() {
+    let base = tempfile::tempdir().unwrap();
+    let state = base.path().join("state");
+    let root = base.path().join("work");
+    fs::create_dir(&root).unwrap();
+    rewrite_workspace(&root, "before");
+    let store = Store::open(roots(&state), identity(&root)).unwrap();
+    let accepted = store
+        .enqueue_request(&IndexOptions::new(root.clone()), None)
+        .unwrap();
+    drop(store);
+
+    let announced =
+        run_child_until_hook_then_kill("index_commit_hot_journal_daemon_child", &state, &root);
+    let fields: Vec<&str> = announced.split(' ').collect();
+    assert_eq!(fields.len(), 3, "{announced}");
+    assert_eq!(
+        fields[2], "true",
+        "journal was not hot inside the transaction"
+    );
+
+    // The killed COMMIT left SQLite's genuine hot rollback journal behind.
+    let index = index_db(&state, &root);
+    let journal = index.with_file_name("index.db-journal");
+    assert_eq!(
+        fs::read(&journal).unwrap()[..8],
+        SQLITE_JOURNAL_MAGIC,
+        "the killed daemon must leave a hot journal"
+    );
+    // Until the daemon recovers it, a read-only reader cannot roll back: its
+    // status is a typed busy refusal, never a view of the killed publication.
+    let refused = Store::status_existing_readonly(roots(&state), identity(&root)).unwrap_err();
+    assert!(
+        refused.to_string().starts_with("storage_busy"),
+        "{refused:#}"
+    );
+    let prior = trellis::model::IndexPin {
+        index_generation: fields[0].parse().unwrap(),
+        index_revision: fields[1].parse().unwrap(),
+    };
+
+    // A failure during recovery defers it: a typed error, the same index.db
+    // inode and the journal kept, never a recreated index.
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let inode = fs::metadata(&index).unwrap().ino();
+    fs::set_permissions(&journal, fs::Permissions::from_mode(0o000)).unwrap();
+    let deferred = Store::open(roots(&state), identity(&root))
+        .map(|_| ())
+        .unwrap_err();
+    fs::set_permissions(&journal, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(
+        deferred.to_string().starts_with("recovery_deferred"),
+        "an I/O failure defers recovery: {deferred:#}"
+    );
+    assert_eq!(fs::metadata(&index).unwrap().ino(), inode, "{deferred:#}");
+    assert_eq!(
+        fs::read(&journal).unwrap()[..8],
+        SQLITE_JOURNAL_MAGIC,
+        "a deferred recovery keeps the hot journal: {deferred:#}"
+    );
+
+    // The queue resumes: the restarted daemon reclaims and finishes the request.
+    let (_registry, _runtime) = restart_daemon_until_terminal(&state, &root, &accepted.id).await;
+    let store = Store::open(roots(&state), identity(&root)).unwrap();
+    let done = store.request_by_id(&accepted.id).unwrap().unwrap();
+    assert_eq!(done.state, "done", "{done:?}");
+    // Recovery rolled the hot journal back to exactly the prior committed head.
+    assert!(
+        !journal.exists(),
+        "the restarted daemon recovered the hot journal"
+    );
+    let (pin, source) = store
+        .source_at("m0.js", Some(prior))
+        .unwrap()
+        .expect("the prior head is intact after rollback");
+    assert_eq!(pin, prior);
+    assert!(source.text.contains("before_0_0") && !source.text.contains("after_0_0"));
+    let committed = done.revision.unwrap();
+    assert!(committed.index_revision > prior.index_revision);
+    let (served, after) = store.symbols_at("after_0_0", 5).unwrap();
+    assert!(served.index_revision >= committed.index_revision);
+    assert!(
+        after.iter().any(|symbol| symbol.name == "after_0_0"),
+        "the resumed publication indexed the rewritten tree"
+    );
 }
