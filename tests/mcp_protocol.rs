@@ -762,6 +762,17 @@ fn both_modes_full_catalog_tools_and_lifecycle() {
             modern(json!(40), "tools/call", fields)
         });
         tool(&reply, Some("range_too_large"), !legacy);
+        // The outgoing view's limit has the same 1-50 range, checked before
+        // any lookup.
+        let fields = json!({"name":"trellis_inspect","arguments":{"schemaVersion":1,
+            "symbolId":format!("sid:v1:{}", "0".repeat(31) + "1"),
+            "view":"outgoing_calls","limit":51}});
+        let reply = peer.ask(if legacy {
+            request(json!(43), "tools/call", fields)
+        } else {
+            modern(json!(43), "tools/call", fields)
+        });
+        tool(&reply, Some("range_too_large"), !legacy);
         let wrong = json!({"name":"unknown","arguments":{}});
         error(
             &peer.ask(if legacy {
@@ -4114,6 +4125,93 @@ async fn a_call_expires_from_its_read_while_the_coordinator_is_held() {
     session.join().unwrap().unwrap();
 }
 
+/// A find answers wholly from the snapshot it admitted, even while a newer
+/// publication is pending; the next call sees the newer revision.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_find_answers_from_its_admitted_snapshot_while_a_publication_is_pending() {
+    let temp = tempfile::tempdir().unwrap();
+    let (identity, registry, runtime) = ready_registry(temp.path(), 84).await;
+    let admitted = {
+        let (response, _) = runtime.evidence_response().unwrap();
+        let revision = response.status().unwrap().revision;
+        response.finish(()).unwrap();
+        revision
+    };
+    let gate = ReadGate::default();
+    runtime.set_mcp_admitted_gate_for_tests(gate.hook());
+    let (mut client, mut reader, session) = socket_session(&identity, &registry, 84, None);
+    let find = |id: u64, query: &str| {
+        modern(
+            json!(id),
+            "tools/call",
+            json!({"name":"trellis_find_symbols","arguments":{"schemaVersion":1,"query":query}}),
+        )
+    };
+    writeln!(client, "{}", find(1, "held")).unwrap();
+    let waiter = gate.clone();
+    tokio::task::spawn_blocking(move || waiter.await_held(1))
+        .await
+        .unwrap();
+    // While that read holds its snapshot, change the source so the worker
+    // has a newer publication pending.
+    fs::write(identity.root.join("a.js"), "function moved() {}\n").unwrap();
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        while !runtime.catching_up() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the watcher never queued the edit");
+    gate.open();
+    let reply = next_reply(&mut reader);
+    tool(&reply, None, true);
+    let envelope = &reply["result"]["structuredContent"];
+    assert_eq!(
+        envelope["evidenceBasis"]["indexRevision"],
+        json!(admitted.index_revision),
+        "{reply}"
+    );
+    let symbols = envelope["data"]["symbols"].as_array().unwrap();
+    assert_eq!(symbols.len(), 1, "{reply}");
+    assert_eq!(symbols[0]["name"], "held", "{reply}");
+    // One snapshot: every coverage row carries the same native revision.
+    let coverage = envelope["data"]["coverage"].as_array().unwrap();
+    assert!(
+        coverage
+            .iter()
+            .all(|c| c["revisionId"] == coverage[0]["revisionId"]),
+        "{reply}"
+    );
+    // Once published, a new call answers from the newer revision.
+    let newer = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        for id in 2.. {
+            writeln!(client, "{}", find(id, "moved")).unwrap();
+            let reply = tokio::task::block_in_place(|| next_reply(&mut reader));
+            let envelope = &reply["result"]["structuredContent"];
+            if envelope["data"]["symbols"]
+                .as_array()
+                .is_some_and(|s| s.len() == 1)
+            {
+                return reply;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        unreachable!()
+    })
+    .await
+    .expect("the edit was never published");
+    assert!(
+        newer["result"]["structuredContent"]["evidenceBasis"]["indexRevision"]
+            .as_u64()
+            .unwrap()
+            > admitted.index_revision,
+        "{newer}"
+    );
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
 /// Decision 0009 §7: once read admission sampled catchingUp, a deadline
 /// answer keeps the resolved shape.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4845,14 +4943,15 @@ async fn mcp_find_selected_snapshot_ranks_and_keeps_zero_hit_scope() {
         .as_array()
         .unwrap()
         .len();
-    assert!((1..=50).contains(&max_symbols));
+    // 51 matches at limit 50. Fifty full Symbols (IDs, revision, provenance)
+    // exceed the 64 KiB response cap, so the reply keeps the longest fitting
+    // prefix and reports response_bytes, which outranks limit. The limit
+    // reason itself is pinned by the default-20 query below.
+    assert!((1..50).contains(&max_symbols), "{max_limit}");
+    assert_eq!(max_limit["result"]["structuredContent"]["truncated"], true);
     assert_eq!(
         max_limit["result"]["structuredContent"]["truncationReason"],
-        if max_symbols == 50 {
-            "limit"
-        } else {
-            "response_bytes"
-        }
+        "response_bytes"
     );
     let default = ask(&mut client, 151, "ManyDefault", None, None);
     tool(&default, None, true);
