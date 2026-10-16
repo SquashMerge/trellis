@@ -1,9 +1,10 @@
 name: Rust foundation
 # One run per commit: pull requests run on their merge ref; pushes run only
-# for the long-lived branches (a PR branch would otherwise run twice).
+# for the long-lived branches, main and feature-* (no slash). Topic and PR
+# branches, including Factory's feature/<n>, get only their PR run.
 on:
   push:
-    branches: [main, "feature-*", "feature/**"]
+    branches: [main, "feature-*"]
   pull_request:
 permissions:
   contents: read
@@ -45,7 +46,7 @@ jobs:
             . -> target
             . -> target-test-support
           cache-directories: ${{ env.COMPOSITION_TARGET }}
-          save-if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/feature-') || startsWith(github.ref, 'refs/heads/feature/')) }}
+          save-if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/feature-')) }}
       - run: npm ci --prefix tests/browser --ignore-scripts
         env:
           PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/pw-browsers
