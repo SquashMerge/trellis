@@ -2103,6 +2103,7 @@ async fn fresh_read_surfaces(app: axum::Router, prefix: &str, revision: &Value) 
     true
 }
 
+#[cfg(feature = "test-support")]
 #[tokio::test]
 async fn selected_status_serves_validated_pre_startup_head_and_clears_freshness_after_startup() {
     use axum::{
