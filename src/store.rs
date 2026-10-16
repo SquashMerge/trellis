@@ -11539,14 +11539,18 @@ impl Store {
             row.context("store_unavailable: selected source version absent")?;
         use sha2::{Digest, Sha256};
         ensure!(
-            stored_set == source_set
-                && stored_language == language
-                && stored_path == path
-                && length >= 0
-                && usize::try_from(length).ok() == Some(bytes.len())
-                && hash == hex::encode(Sha256::digest(&bytes)),
-            "store_unavailable: selected raw source identity or digest mismatch"
+            stored_set == source_set && stored_language == language && stored_path == path,
+            "store_unavailable: selected raw source identity mismatch"
         );
+        // Stored bytes that disagree with their own recorded length or hash are
+        // corrupt: schedule a rebuild. This never covers decoding, so invalid
+        // UTF-8 outside a requested range can't trigger it (W5).
+        if usize::try_from(length).ok() != Some(bytes.len())
+            || hash != hex::encode(Sha256::digest(&bytes))
+        {
+            self.mark_recovery(RecoveryDisposition::Rebuild);
+            anyhow::bail!("store_unavailable: selected raw source length or digest mismatch");
+        }
         Ok(Some((hash, bytes)))
     }
 

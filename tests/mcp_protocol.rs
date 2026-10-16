@@ -7898,7 +7898,7 @@ async fn mcp_source_required_selected_path_and_digest_refuse_corrupt_rows() {
         Store,
         topology::{TopologyRoots, WorkspaceIdentity},
     };
-    for fault in ["missing_scope", "bad_digest"] {
+    for fault in ["missing_scope", "bad_digest", "bad_length"] {
         let temp = tempfile::tempdir().unwrap();
         let root = checkout(temp.path());
         fs::write(root.join("a.js"), "a\n").unwrap();
@@ -7967,6 +7967,13 @@ async fn mcp_source_required_selected_path_and_digest_refuse_corrupt_rows() {
             "{fault}: {error:#}"
         );
         drop(selected);
+        // Only stored bytes disagreeing with their recorded length or hash
+        // schedule a rebuild; a missing manifest scope does not.
+        assert_eq!(
+            store.recovery_pending_for_tests(),
+            fault != "missing_scope",
+            "{fault}"
+        );
         let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
         for legacy in [false, true] {
             let (mut client, mut reader, session) = socket_session(&identity, &registry, 145, None);
