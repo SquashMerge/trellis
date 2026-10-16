@@ -971,6 +971,11 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                             publish(sampled);
                             #[cfg(feature = "test-support")]
                             runtime.run_mcp_admitted_gate_for_tests();
+                            if cancel.load(std::sync::atomic::Ordering::Acquire)
+                                || runtime.mcp_clock_now() >= deadline
+                            {
+                                anyhow::bail!("deadline_exceeded: MCP selected read deadline");
+                            }
                             let pin = response.status()?.revision;
                             let basis = serde_json::json!({
                                 "indexGeneration":pin.index_generation.to_string(),
@@ -1019,7 +1024,9 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                             };
                             let mut envelope = envelope;
                             if envelope.get("error").is_some() {
-                                envelope["error"]["currentBasis"] = basis;
+                                if envelope["error"]["code"] != "store_unavailable" {
+                                    envelope["error"]["currentBasis"] = basis;
+                                }
                                 if let Some(hash) = content_hash {
                                     envelope["error"]["currentContentHash"] =
                                         serde_json::json!(hash);
