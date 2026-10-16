@@ -1884,8 +1884,9 @@ async fn closing_runtime_is_never_revived() {
     ready(&fresh).await;
 }
 
-/// Maintenance is the lowest class (Decision 0009 §4): with a unit due and a
-/// FIFO row accepted, the row completes before the unit begins.
+/// Maintenance is the lowest class (Decision 0009 §4): when the activated
+/// checkout worker has both a due release and an accepted FIFO row, the
+/// terminal FIFO COMMIT precedes its first maintenance unit.
 #[cfg(feature = "test-support")]
 #[tokio::test]
 async fn maintenance_never_runs_ahead_of_accepted_fifo_work() {
@@ -1900,28 +1901,87 @@ async fn maintenance_never_runs_ahead_of_accepted_fifo_work() {
     ready(&runtime).await;
     let scheduler = runtime.browser_scheduler().unwrap();
     let store = Store::open(roots(base.path()), identity(&checkout)).unwrap();
-    // Hold the worker, make a unit due, then accept a row: both are pending
-    // when the worker next runs.
+    let options = trellis::indexer::IndexOptions::new(checkout.clone());
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Keep the activated worker at its gate while creating genuine retention
+    // debt. This store's injected clock dates only these two publications;
+    // the checkout worker still owns the real queue and maintenance lanes.
     let held = scheduler.hold_worker_for_tests();
+    store.set_retention_clock_for_tests(1_000, 0);
+    let owner = scheduler.checkout_serving_owner().unwrap();
+    let publish = |expected| {
+        let (graph, native, capture) =
+            trellis::indexer::index_workspace_bundle(&options, store.root_id(), &cancel, |_| {})
+                .unwrap();
+        store
+            .publish_native(
+                &graph,
+                &capture,
+                &native,
+                owner.writer_guard().unwrap(),
+                expected,
+                &cancel,
+            )
+            .unwrap()
+    };
+    let old = publish(store.index_baseline().unwrap());
+    publish(old);
+    let revision_id = format!("pin:v1:{}:{}", old.index_generation, old.index_revision);
+    let state = || store.retention_state_for_tests(&revision_id).unwrap();
+    let (before, pending_before) = state();
+    assert_eq!(pending_before, (0, 0));
+    assert_eq!(before.0, "retained");
+    assert_eq!(before.1, 0);
+    assert!(before.2 > 0);
+
+    let terminal_before = store.terminal_generation();
+    let row = store.enqueue_request(&options, None).unwrap();
     let (seen_tx, seen_rx) = std::sync::mpsc::sync_channel(1);
-    let observer = Store::open(roots(base.path()), identity(&checkout)).unwrap();
+    let observer = store.clone();
+    let row_id = row.id.clone();
+    let revision_for_hook = revision_id.clone();
     scheduler.on_next_maintenance_unit_for_tests(move || {
-        let unfinished = observer.earliest_unfinished_request().unwrap().is_some();
-        seen_tx.send(unfinished).unwrap();
+        seen_tx
+            .send((
+                observer.request_by_id(&row_id).unwrap().unwrap().state,
+                observer.terminal_generation(),
+                observer
+                    .retention_state_for_tests(&revision_for_hook)
+                    .unwrap(),
+            ))
+            .unwrap();
     });
-    let row = store
-        .enqueue_request(&trellis::indexer::IndexOptions::new(checkout.clone()), None)
-        .unwrap();
+    assert_eq!(
+        store.request_by_id(&row.id).unwrap().unwrap().state,
+        "queued"
+    );
+    assert_eq!(state(), (before.clone(), pending_before));
     drop(held);
-    let unfinished = tokio::time::timeout(
+
+    let (request_state, terminal_at_unit, state_at_unit) = tokio::time::timeout(
         trellis::testing::HANG_BACKSTOP,
         tokio::task::spawn_blocking(move || seen_rx.recv()),
     )
     .await
-    .expect("no maintenance unit ran")
+    .expect("activated worker did not reach maintenance")
     .unwrap()
     .unwrap();
-    assert!(!unfinished, "maintenance began before accepted FIFO work");
+    assert_eq!(request_state, "done", "maintenance preceded FIFO COMMIT");
+    assert!(
+        terminal_at_unit > terminal_before,
+        "FIFO terminal COMMIT was not notified"
+    );
+    assert_eq!(state_at_unit, (before, pending_before));
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        loop {
+            if state().1 == (1, 1) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("due retention did not advance after FIFO drained");
     assert_eq!(store.request_by_id(&row.id).unwrap().unwrap().state, "done");
 }
 

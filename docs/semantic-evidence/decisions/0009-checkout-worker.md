@@ -11,7 +11,7 @@
   - the causal meaning of the `H_READY` and `WATCH_ACK` witness events, whatever their names become;
   - prior-head read eligibility;
   - pins, retention, and GC eligibility and its use-lock protection (Decisions 0006 §2 and 0008 §2);
-  - validated-head reads and selected-document attestation.
+  - validated-head admission and selected-document attestation for other readers, including public `source_at`. W5 has the narrow selected raw-source exception in §3; other read checks are unchanged.
 - **Compatibility:** none needed (pre-release).
 
 ## Background
@@ -80,7 +80,7 @@ The state sits behind one mutex shared by the registry, the enqueue gate and the
 ### 3. Published status is advisory, never authority
 
 Readers use the published snapshot for **status only**: state, `catchingUp`, FIFO pending, accepted versus acknowledged watcher generation, watcher health, and last error.
-- **Reads** still go through validated-head admission and selected-document attestation, with the root checked before and after materializing.
+- **Reads** still go through validated-head admission, with the root checked before and after materializing. Other readers, including public `source_at`, retain selected-document native-witness attestation. For MCP W5 `trellis_read_source` only, the selected EvidenceResponse instead verifies the selected path/document-version identity and the full cached raw BLOB byte length and SHA-256 against its selected row before LF slicing or decoding; it strictly decodes only the requested UTF-8 slice. It does not check native, graph or class witnesses, which attest semantic evidence rather than these returned source bytes. An invalid selected slice returns `unsupported_encoding` without data or repair; invalid bytes outside it do not fail a valid slice. W5 never reads source from disk. This exception does not change capture, publication or index-validation checks.
 - **Old-root settlement** still requires a confirmed terminal COMMIT.
 - **`requests.db`** remains the record of every request outcome.
 

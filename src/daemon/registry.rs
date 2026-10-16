@@ -246,6 +246,37 @@ impl CheckoutRegistry {
         }
     }
 
+    /// Probe only this registry's configured topology. A virgin checkout must not
+    /// create derived state to answer a read, while a published head may activate.
+    pub fn eligible_prior_head(&self, key: &str) -> anyhow::Result<()> {
+        let entry = self
+            .entries
+            .get(key)
+            .ok_or_else(|| anyhow::anyhow!("index_not_ready: checkout not attached"))?;
+        let identity = entry.identity.rediscover()?;
+        let roots = match &self.roots {
+            Some(roots) => roots.clone(),
+            None => TopologyRoots::production()?,
+        };
+        match Store::status_existing_readonly(roots, identity) {
+            Ok(_) => Ok(()),
+            // A cache tree without an admissible lock/format has no selected
+            // head. Preserve cold W1's inert answer without creating state.
+            Err(error)
+                if error.to_string().starts_with("unsafe managed directory:")
+                    || error
+                        .to_string()
+                        .starts_with("incompatible_index: missing or unsafe use lock")
+                    || error
+                        .to_string()
+                        .starts_with("recovery_required: exceptional index format;") =>
+            {
+                anyhow::bail!("index_not_ready: no admitted head")
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Activate an already attached checkout. Registration and global discovery
     /// never call this method and therefore never open SQLite or acquire locks.
     pub fn activate(&mut self, key: &str) -> anyhow::Result<Arc<CheckoutRuntime>> {
@@ -319,6 +350,8 @@ impl CheckoutRegistry {
             initial_indexing,
             #[cfg(feature = "test-support")]
             mcp_clock_skew_ms: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(feature = "test-support")]
+            mcp_hint_clock_origin: std::sync::Mutex::new(None),
             #[cfg(feature = "test-support")]
             mcp_read_hook: std::sync::Mutex::new(None),
             #[cfg(feature = "test-support")]
@@ -1528,6 +1561,9 @@ pub struct CheckoutRuntime {
     /// a test can pass a call deadline without waiting real seconds.
     #[cfg(feature = "test-support")]
     mcp_clock_skew_ms: std::sync::atomic::AtomicU64,
+    /// Optional hint clock can be frozen separately from the real mandatory deadline.
+    #[cfg(feature = "test-support")]
+    mcp_hint_clock_origin: std::sync::Mutex<Option<Instant>>,
     /// Test-support hold point at the start of the next MCP selected read.
     #[cfg(feature = "test-support")]
     mcp_read_hook: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
@@ -1864,6 +1900,25 @@ impl CheckoutRuntime {
         Instant::now() + skew
     }
 
+    /// Freeze only optional hint accounting. Mandatory call deadlines keep using real time.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn freeze_mcp_hint_clock_for_tests(&self) {
+        *self.mcp_hint_clock_origin.lock().unwrap() = Some(Instant::now());
+    }
+
+    pub(crate) fn mcp_hint_clock_now(&self) -> Instant {
+        #[cfg(feature = "test-support")]
+        if let Some(origin) = *self.mcp_hint_clock_origin.lock().unwrap() {
+            return origin
+                + Duration::from_millis(
+                    self.mcp_clock_skew_ms
+                        .load(std::sync::atomic::Ordering::Acquire),
+                );
+        }
+        self.mcp_clock_now()
+    }
+
     /// Hold this checkout's next MCP selected read until `hook` returns.
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
@@ -1912,6 +1967,13 @@ impl CheckoutRuntime {
         let millis = u64::try_from(by.as_millis()).unwrap_or(u64::MAX);
         self.mcp_clock_skew_ms
             .fetch_add(millis, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// Inspect this runtime's existing recovery flag in optional MCP expiry fixtures.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn mcp_recovery_pending_for_tests(&self) -> anyhow::Result<bool> {
+        Ok(self.resources()?.store.recovery_pending_for_tests())
     }
 
     #[cfg(feature = "test-support")]

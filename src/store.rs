@@ -1,6 +1,6 @@
 //! SQLite snapshots and durable user data. Connections are never shared between threads.
 pub mod anchors;
-mod mcp_read;
+pub(crate) mod mcp_read;
 pub mod requests;
 pub mod topology;
 use crate::model::*;
@@ -201,6 +201,9 @@ struct TestTerminalNotify {
     id: String,
     notify: Arc<tokio::sync::Notify>,
 }
+
+#[cfg(feature = "test-support")]
+pub type RetentionStateForTests = ((String, i64, i64), (i64, i64));
 
 #[derive(Clone)]
 pub struct Store {
@@ -454,6 +457,21 @@ impl std::io::Write for EncodedSourceBudget {
             .ok_or_else(|| std::io::Error::other("selected source JSON budget exceeded"))?;
         self.bytes = next;
         Ok(chunk.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+struct OptionalSourceBudget<'a> {
+    budget: &'a mut EncodedSourceBudget,
+    progress: Option<&'a dyn Fn() -> bool>,
+}
+impl std::io::Write for OptionalSourceBudget<'_> {
+    fn write(&mut self, chunk: &[u8]) -> std::io::Result<usize> {
+        if self.progress.is_some_and(|expired| expired()) {
+            return Err(std::io::Error::other("optional hint work budget expired"));
+        }
+        std::io::Write::write(self.budget, chunk)
     }
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
@@ -2199,7 +2217,139 @@ fn recovery_class(error: &anyhow::Error) -> RecoveryClass {
     }
     RecoveryClass::Hard
 }
+#[derive(Debug)]
+pub(crate) struct OptionalHintExpired;
+impl std::fmt::Display for OptionalHintExpired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("optional hint work budget expired")
+    }
+}
+impl std::error::Error for OptionalHintExpired {}
+
+pub(crate) fn optional_hint_check(progress: Option<&dyn Fn() -> bool>) -> Result<()> {
+    if progress.is_some_and(|expired| expired()) {
+        return Err(OptionalHintExpired.into());
+    }
+    Ok(())
+}
+
+// The optional path bounds each sort phase without changing required stable sorting.
+// Chunk order in the merge preserves original order for equal keys.
+pub(crate) fn sort_optional_by_key<T, K: Ord, F: Fn(&T) -> K>(
+    items: &mut Vec<T>,
+    key: F,
+    progress: Option<&dyn Fn() -> bool>,
+) -> Result<()> {
+    let Some(_) = progress else {
+        items.sort_by_key(key);
+        return Ok(());
+    };
+    use std::cmp::Reverse;
+    use std::collections::{BinaryHeap, VecDeque};
+    const CHUNK: usize = 256;
+    for part in items.chunks_mut(CHUNK) {
+        optional_hint_check(progress)?;
+        part.sort_by_key(&key);
+    }
+    let mut parts = Vec::<VecDeque<T>>::new();
+    let mut taken = std::mem::take(items).into_iter();
+    loop {
+        let mut part = VecDeque::with_capacity(CHUNK);
+        for _ in 0..CHUNK {
+            optional_hint_check(progress)?;
+            let Some(item) = taken.next() else { break };
+            part.push_back(item);
+        }
+        if part.is_empty() {
+            break;
+        }
+        parts.push(part);
+    }
+    let mut head = BinaryHeap::new();
+    for (index, part) in parts.iter().enumerate() {
+        optional_hint_check(progress)?;
+        if let Some(front) = part.front() {
+            head.push(Reverse((key(front), index)));
+        }
+    }
+    let mut result = Vec::with_capacity(parts.len().saturating_mul(CHUNK));
+    while let Some(Reverse((_, index))) = head.pop() {
+        optional_hint_check(progress)?;
+        result.push(parts[index].pop_front().expect("nonempty sorted chunk"));
+        if let Some(front) = parts[index].front() {
+            head.push(Reverse((key(front), index)));
+        }
+    }
+    *items = result;
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn optional_projection_hash_matches_required_for_multiple_rows() {
+    let graph = serde_json::json!({
+        "documentVersionId": "document:v1:test",
+        "nodes": [{"id":"b","name":"é"},{"id":"a","name":"x"}],
+        "calls": [{"id":"call:1"},{"id":"call:2"}],
+        "regions": [{"id":"region:1"}]
+    });
+    let classes = serde_json::json!({
+        "graphProjectionId": "graph:v1:test",
+        "classes": [{"id":"class:1"},{"id":"class:2"}],
+        "relations": [{"id":"relation:1"},{"id":"relation:2"}]
+    });
+    for (domain, value, scalar, arrays) in [
+        (
+            b"trellis.graph-projection.v1\0".as_slice(),
+            graph,
+            "documentVersionId",
+            vec!["nodes", "calls", "regions"],
+        ),
+        (
+            b"trellis.class-projection.v1\0".as_slice(),
+            classes,
+            "graphProjectionId",
+            vec!["classes", "relations"],
+        ),
+    ] {
+        let mut proof = serde_json::Map::new();
+        proof.insert(
+            scalar.into(),
+            serde_json::Value::String(value[scalar].as_str().unwrap().into()),
+        );
+        for field in arrays {
+            proof.insert(
+                field.into(),
+                serde_json::Value::Array(value[field].as_array().unwrap().clone()),
+            );
+        }
+        let optional = serde_json::Value::Object(proof);
+        assert_eq!(optional, value);
+        assert_eq!(
+            v8_id("", domain, value),
+            v8_id_with_progress("", domain, &optional, Some(&|| false)).unwrap()
+        );
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn optional_sort_keeps_equal_key_order_and_stops() {
+    let mut values = vec![(2, 0), (1, 1), (2, 2), (1, 3), (2, 4)];
+    sort_optional_by_key(&mut values, |item| item.0, Some(&|| false)).unwrap();
+    assert_eq!(values, vec![(1, 1), (1, 3), (2, 0), (2, 2), (2, 4)]);
+    assert!(
+        sort_optional_by_key(&mut values, |item| item.0, Some(&|| true))
+            .unwrap_err()
+            .downcast_ref::<OptionalHintExpired>()
+            .is_some()
+    );
+}
+
 fn selected_integrity(error: anyhow::Error) -> anyhow::Error {
+    if error.downcast_ref::<OptionalHintExpired>().is_some() {
+        return error;
+    }
     if recovery_class(&error) != RecoveryClass::Hard
         || error.downcast_ref::<rusqlite::Error>().is_some()
         || error.downcast_ref::<SqliteContention>().is_some()
@@ -2953,6 +3103,118 @@ fn v8_id(prefix: &str, domain: &[u8], value: serde_json::Value) -> String {
         crate::native_ids::digest(domain, &crate::native_ids::canonical(&value))
     )
 }
+// The optional projection proof must not materialize one giant canonical byte buffer.
+fn v8_id_with_progress(
+    prefix: &str,
+    domain: &[u8],
+    value: &serde_json::Value,
+    progress: Option<&dyn Fn() -> bool>,
+) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    optional_hint_check(progress)?;
+    let mut hash = Sha256::new();
+    hash.update(domain);
+    let mut pending = Vec::with_capacity(16 * 1024);
+    crate::native_ids::canonical_into_checked(value, &mut |bytes| {
+        pending.extend_from_slice(bytes);
+        if pending.len() >= 16 * 1024 {
+            optional_hint_check(progress)?;
+            hash.update(&pending);
+            pending.clear();
+        }
+        Ok(())
+    })?;
+    optional_hint_check(progress)?;
+    hash.update(&pending);
+    Ok(format!("{prefix}:{}", hex::encode(hash.finalize())))
+}
+
+struct OptionalJsonWriter<'a> {
+    out: &'a mut Vec<u8>,
+    progress: Option<&'a dyn Fn() -> bool>,
+}
+impl std::io::Write for OptionalJsonWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        for chunk in bytes.chunks(16 * 1024) {
+            if self.progress.is_some_and(|expired| expired()) {
+                return Err(std::io::Error::other("optional hint work budget expired"));
+            }
+            self.out.extend_from_slice(chunk);
+        }
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+struct OptionalJsonReader<'a> {
+    bytes: &'a [u8],
+    progress: Option<&'a dyn Fn() -> bool>,
+}
+impl std::io::Read for OptionalJsonReader<'_> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if self.progress.is_some_and(|expired| expired()) {
+            return Err(std::io::Error::other("optional hint work budget expired"));
+        }
+        let len = self.bytes.len().min(out.len()).min(16 * 1024);
+        out[..len].copy_from_slice(&self.bytes[..len]);
+        self.bytes = &self.bytes[len..];
+        Ok(len)
+    }
+}
+fn decode_optional_json<T: serde::de::DeserializeOwned>(
+    bytes: &[u8],
+    progress: Option<&dyn Fn() -> bool>,
+) -> Result<T> {
+    optional_hint_check(progress)?;
+    let result = serde_json::from_reader(std::io::BufReader::with_capacity(
+        16 * 1024,
+        OptionalJsonReader { bytes, progress },
+    ));
+    optional_hint_check(progress)?;
+    Ok(result?)
+}
+pub(crate) fn stringify_optional_json<T: serde::Serialize + ?Sized>(
+    item: &T,
+    progress: Option<&dyn Fn() -> bool>,
+) -> Result<String> {
+    if progress.is_none() {
+        return Ok(serde_json::to_string(item)?);
+    }
+    optional_hint_check(progress)?;
+    let mut raw = Vec::new();
+    let encoded = serde_json::to_writer(
+        &mut OptionalJsonWriter {
+            out: &mut raw,
+            progress,
+        },
+        item,
+    );
+    optional_hint_check(progress)?;
+    encoded?;
+    Ok(String::from_utf8(raw)?)
+}
+fn projection_values<T: serde::Serialize>(
+    items: &[&T],
+    progress: Option<&dyn Fn() -> bool>,
+) -> Result<Vec<serde_json::Value>> {
+    let mut values = Vec::with_capacity(items.len());
+    for item in items {
+        optional_hint_check(progress)?;
+        let mut raw = Vec::new();
+        let result = serde_json::to_writer(
+            &mut OptionalJsonWriter {
+                out: &mut raw,
+                progress,
+            },
+            item,
+        );
+        optional_hint_check(progress)?;
+        result?;
+        values.push(decode_optional_json(&raw, progress)?);
+    }
+    Ok(values)
+}
 
 struct V8DocumentProjection {
     version_id: String,
@@ -3007,8 +3269,18 @@ fn publication_rows<'a>(
     native: &'a crate::native_evidence::Artifact,
     classes: &'a crate::classes::Catalog,
 ) -> Result<BTreeMap<&'a str, PublicationRows<'a>>> {
+    publication_rows_with_progress(graph, native, classes, None)
+}
+fn publication_rows_with_progress<'a>(
+    graph: &'a Graph,
+    native: &'a crate::native_evidence::Artifact,
+    classes: &'a crate::classes::Catalog,
+    progress: Option<&dyn Fn() -> bool>,
+) -> Result<BTreeMap<&'a str, PublicationRows<'a>>> {
+    optional_hint_check(progress)?;
     let mut rows = BTreeMap::<&str, PublicationRows>::new();
     for file in &graph.files {
+        optional_hint_check(progress)?;
         ensure!(
             rows.insert(&file.path, PublicationRows::default())
                 .is_none(),
@@ -3016,18 +3288,21 @@ fn publication_rows<'a>(
         );
     }
     for node in &graph.nodes {
+        optional_hint_check(progress)?;
         rows.get_mut(node.path.as_str())
             .context("graph node path missing")?
             .nodes
             .push(node);
     }
     for call in &graph.calls {
+        optional_hint_check(progress)?;
         rows.get_mut(call.path.as_str())
             .context("graph call path missing")?
             .calls
             .push(call);
     }
     for region in &graph.regions {
+        optional_hint_check(progress)?;
         rows.get_mut(region.path.as_str())
             .context("graph region path missing")?
             .regions
@@ -3035,6 +3310,7 @@ fn publication_rows<'a>(
     }
     let mut owners = BTreeMap::new();
     for class in &classes.classes {
+        optional_hint_check(progress)?;
         rows.get_mut(class.symbol.path.as_str())
             .context("class path missing")?
             .classes
@@ -3047,6 +3323,7 @@ fn publication_rows<'a>(
         );
     }
     for relation in &classes.relations {
+        optional_hint_check(progress)?;
         let path = owners
             .get(relation.owner.as_str())
             .context("class relation owner missing")?;
@@ -3056,18 +3333,21 @@ fn publication_rows<'a>(
             .push(relation);
     }
     for decl in &native.declarations {
+        optional_hint_check(progress)?;
         rows.get_mut(decl.document.path.as_str())
             .context("native declaration path missing")?
             .native_declarations
             .push(decl);
     }
     for call in &native.calls {
+        optional_hint_check(progress)?;
         rows.get_mut(call.document.path.as_str())
             .context("native call path missing")?
             .native_calls
             .push(call);
     }
     for region in &native.control_regions {
+        optional_hint_check(progress)?;
         rows.get_mut(region.document.path.as_str())
             .context("native control path missing")?
             .native_regions
@@ -3081,6 +3361,15 @@ fn v8_document_projection(
     native: &crate::native_evidence::Artifact,
     grouped: &PublicationRows<'_>,
 ) -> Result<V8DocumentProjection> {
+    v8_document_projection_with_progress(file, native, grouped, None)
+}
+fn v8_document_projection_with_progress(
+    file: &SourceFile,
+    native: &crate::native_evidence::Artifact,
+    grouped: &PublicationRows<'_>,
+    progress: Option<&dyn Fn() -> bool>,
+) -> Result<V8DocumentProjection> {
+    optional_hint_check(progress)?;
     let context = crate::native_evidence::native_extraction_context(
         &native.producer,
         &file.language,
@@ -3095,36 +3384,84 @@ fn v8_document_projection(
             "producerId": native.producer.id, "producerVersion": native.producer.version,
         }),
     );
+    optional_hint_check(progress)?;
     let mut nodes = grouped.nodes.clone();
-    nodes.sort_by(|a, b| a.id.cmp(&b.id));
+    sort_optional_by_key(&mut nodes, |n| n.id.clone(), progress)?;
+    optional_hint_check(progress)?;
     let mut calls = grouped.calls.clone();
-    calls.sort_by(|a, b| a.id.cmp(&b.id));
+    sort_optional_by_key(&mut calls, |c| c.id.clone(), progress)?;
+    optional_hint_check(progress)?;
     let mut regions = grouped.regions.clone();
-    regions.sort_by(|a, b| a.id.cmp(&b.id));
-    let graph_hash = v8_id(
-        "",
-        b"trellis.graph-projection.v1\0",
-        serde_json::json!({
-            "documentVersionId": version_id,
-            "nodes": nodes, "calls": calls, "regions": regions,
-        }),
-    );
+    sort_optional_by_key(&mut regions, |r| r.id.clone(), progress)?;
+    optional_hint_check(progress)?;
+    let graph_hash = if progress.is_some() {
+        let nodes = projection_values(&nodes, progress)?;
+        let calls = projection_values(&calls, progress)?;
+        let regions = projection_values(&regions, progress)?;
+        optional_hint_check(progress)?;
+        let mut proof = serde_json::Map::new();
+        proof.insert(
+            "documentVersionId".into(),
+            serde_json::Value::String(version_id.clone()),
+        );
+        proof.insert("nodes".into(), serde_json::Value::Array(nodes));
+        proof.insert("calls".into(), serde_json::Value::Array(calls));
+        proof.insert("regions".into(), serde_json::Value::Array(regions));
+        v8_id_with_progress(
+            "",
+            b"trellis.graph-projection.v1\0",
+            &serde_json::Value::Object(proof),
+            progress,
+        )?
+    } else {
+        v8_id(
+            "",
+            b"trellis.graph-projection.v1\0",
+            serde_json::json!({
+                "documentVersionId": version_id,
+                "nodes": nodes, "calls": calls, "regions": regions,
+            }),
+        )
+    };
     let graph_hash = graph_hash.trim_start_matches(':').to_owned();
     let graph_id = format!("graph:v1:{graph_hash}");
+    optional_hint_check(progress)?;
     let mut selected_classes = grouped.classes.clone();
-    selected_classes.sort_by(|a, b| a.symbol.id.cmp(&b.symbol.id));
+    sort_optional_by_key(&mut selected_classes, |c| c.symbol.id.clone(), progress)?;
+    optional_hint_check(progress)?;
     let mut selected_relations = grouped.relations.clone();
-    selected_relations.sort_by(|a, b| a.id.cmp(&b.id));
-    let class_hash = v8_id(
-        "",
-        b"trellis.class-projection.v1\0",
-        serde_json::json!({
-            "graphProjectionId": graph_id,
-            "classes": selected_classes, "relations": selected_relations,
-        }),
-    );
+    sort_optional_by_key(&mut selected_relations, |r| r.id.clone(), progress)?;
+    optional_hint_check(progress)?;
+    let class_hash = if progress.is_some() {
+        let classes = projection_values(&selected_classes, progress)?;
+        let relations = projection_values(&selected_relations, progress)?;
+        optional_hint_check(progress)?;
+        let mut proof = serde_json::Map::new();
+        proof.insert(
+            "graphProjectionId".into(),
+            serde_json::Value::String(graph_id.clone()),
+        );
+        proof.insert("classes".into(), serde_json::Value::Array(classes));
+        proof.insert("relations".into(), serde_json::Value::Array(relations));
+        v8_id_with_progress(
+            "",
+            b"trellis.class-projection.v1\0",
+            &serde_json::Value::Object(proof),
+            progress,
+        )?
+    } else {
+        v8_id(
+            "",
+            b"trellis.class-projection.v1\0",
+            serde_json::json!({
+                "graphProjectionId": graph_id,
+                "classes": selected_classes, "relations": selected_relations,
+            }),
+        )
+    };
     let class_hash = class_hash.trim_start_matches(':').to_owned();
     let class_id = format!("class-projection:v1:{class_hash}");
+    optional_hint_check(progress)?;
     Ok(V8DocumentProjection {
         version_id,
         graph_id,
@@ -5042,17 +5379,40 @@ fn read_native_declarations_v8(
     lookup_key: Option<&str>,
     all_lookup_keys: bool,
 ) -> Result<Vec<crate::native_evidence::Declaration>> {
+    read_native_declarations_v8_inner(db, scope, lookup_key, all_lookup_keys, None)
+}
+
+fn read_native_declarations_v8_optional(
+    db: &Connection,
+    scope: &V8NativeScope,
+    lookup_key: Option<&str>,
+    all_lookup_keys: bool,
+    expired: &dyn Fn() -> bool,
+) -> Result<Vec<crate::native_evidence::Declaration>> {
+    read_native_declarations_v8_inner(db, scope, lookup_key, all_lookup_keys, Some(expired))
+}
+
+fn read_native_declarations_v8_inner(
+    db: &Connection,
+    scope: &V8NativeScope,
+    lookup_key: Option<&str>,
+    all_lookup_keys: bool,
+    progress: Option<&dyn Fn() -> bool>,
+) -> Result<Vec<crate::native_evidence::Declaration>> {
     use crate::native_evidence::{Declaration, Header, Key, Parameter, Range};
+    optional_hint_check(progress)?;
     let v = &scope.version_id;
     let mut own_types: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for row in db.prepare("SELECT syntax_id,ordinal,type_name FROM native_version_own_signature_types WHERE version_id=?1 ORDER BY syntax_id,ordinal")?
         .query_map([v],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?)))? {
+        optional_hint_check(progress)?;
         let (id,ord,value)=row?;let entry=own_types.entry(id).or_default();
         contiguous(ord,entry.len(),"own signature")?;entry.push(value);
     }
     let mut ancestor_types: BTreeMap<(String, i64), Vec<String>> = BTreeMap::new();
     for row in db.prepare("SELECT syntax_id,ancestor_ordinal,ordinal,type_name FROM native_version_ancestor_signature_types WHERE version_id=?1 ORDER BY syntax_id,ancestor_ordinal,ordinal")?
         .query_map([v],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?,r.get::<_,String>(3)?)))? {
+        optional_hint_check(progress)?;
         let (id,ancestor,ord,value)=row?;let entry=ancestor_types.entry((id,ancestor)).or_default();
         contiguous(ord,entry.len(),"ancestor signature")?;entry.push(value);
     }
@@ -5068,6 +5428,7 @@ fn read_native_declarations_v8(
     let mut ancestors: BTreeMap<String, Vec<Ancestor>> = BTreeMap::new();
     for row in db.prepare("SELECT syntax_id,ordinal,kind,name,sibling_ordinal,signature_present,type_parameter_count,variadic FROM native_version_declaration_ancestors WHERE version_id=?1 ORDER BY syntax_id,ordinal")?
         .query_map([v],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,i64>(4)?,r.get::<_,bool>(5)?,r.get::<_,Option<i64>>(6)?,r.get::<_,Option<bool>>(7)?)))? {
+        optional_hint_check(progress)?;
         let (id,ord,kind,name,sibling,present,count,variadic)=row?;
         let entry=ancestors.entry(id).or_default();contiguous(ord,entry.len(),"ancestor")?;
         entry.push((ord,kind,name,sibling,present,count,variadic));
@@ -5075,6 +5436,7 @@ fn read_native_declarations_v8(
     let mut headers: BTreeMap<String, Header> = BTreeMap::new();
     for row in db.prepare("SELECT syntax_id,kind,name,result_type FROM native_version_headers WHERE version_id=?1 ORDER BY syntax_id")?
         .query_map([v],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,Option<String>>(3)?)))? {
+        optional_hint_check(progress)?;
         let (id,kind,name,result_type)=row?;
         ensure!(headers.insert(id,Header{kind,name,modifiers:vec![],type_parameters:vec![],parameters:vec![],result_type,bases:vec![]}).is_none(),"duplicate native header");
     }
@@ -5082,6 +5444,7 @@ fn read_native_declarations_v8(
     let mut item_ordinals: BTreeMap<(String, String), usize> = BTreeMap::new();
     for row in db.prepare("SELECT syntax_id,item_kind,ordinal,value FROM native_version_header_items WHERE version_id=?1 ORDER BY syntax_id,item_kind,ordinal")?
         .query_map([v],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?,r.get::<_,String>(3)?)))? {
+        optional_hint_check(progress)?;
         let (id,kind,ordinal,value)=row?;
         let n=item_ordinals.entry((id.clone(),kind.clone())).or_default();contiguous(ordinal,*n,"header item")?;*n+=1;
         let h=headers.get_mut(&id).context("orphan native header item")?;
@@ -5090,6 +5453,7 @@ fn read_native_declarations_v8(
     let mut param_ordinals: BTreeMap<String, usize> = BTreeMap::new();
     for row in db.prepare("SELECT syntax_id,ordinal,name,type_name,variadic FROM native_version_parameters WHERE version_id=?1 ORDER BY syntax_id,ordinal")?
         .query_map([v],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,bool>(4)?)))? {
+        optional_hint_check(progress)?;
         let (id,ordinal,name,type_name,variadic)=row?;
         let n=param_ordinals.entry(id.clone()).or_default();contiguous(ordinal,*n,"header parameter")?;*n+=1;
         headers.get_mut(&id).context("orphan native header parameter")?.parameters.push(Parameter{name,type_name,variadic});
@@ -5099,6 +5463,7 @@ fn read_native_declarations_v8(
     let mut recorded_owners: BTreeMap<String, Option<String>> = BTreeMap::new();
     for row in db.prepare("SELECT syntax_id,owner_syntax_id,kind,name,lookup_key,key_signature_present,key_type_parameter_count,key_variadic,key_ordinal,start_byte,end_byte,name_start,name_end FROM native_version_declarations WHERE version_id=?1 ORDER BY syntax_id")?
       .query_map([v],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,String>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,Option<String>>(4)?,r.get::<_,bool>(5)?,r.get::<_,Option<i64>>(6)?,r.get::<_,Option<bool>>(7)?,r.get::<_,i64>(8)?,r.get::<_,i64>(9)?,r.get::<_,i64>(10)?,r.get::<_,Option<i64>>(11)?,r.get::<_,Option<i64>>(12)?)))? {
+        optional_hint_check(progress)?;
         let (id,owner,kind,name,lookup,present,count,variadic,ordinal,start,end,name_start,name_end)=row?;
         ensure!(recorded_owners.insert(id.clone(),owner).is_none(),"duplicate native declaration");
         let key=Key{kind:kind.clone(),name:name.clone(),signature:decode_signature(&mut own_types,&id,present,count,variadic)?,ordinal:usize::try_from(ordinal)?};
@@ -5126,9 +5491,10 @@ fn read_native_declarations_v8(
     // from serialized ancestor prefix and final Key; compare against complete decoded tree.
     let mut by_key: BTreeMap<(String, String), String> = BTreeMap::new();
     for d in &result {
+        optional_hint_check(progress)?;
         let identity = (
-            serde_json::to_string(&d.ancestors)?,
-            serde_json::to_string(&d.key)?,
+            stringify_optional_json(&d.ancestors, progress)?,
+            stringify_optional_json(&d.key, progress)?,
         );
         ensure!(
             by_key.insert(identity, d.syntax_id.clone()).is_none(),
@@ -5136,14 +5502,15 @@ fn read_native_declarations_v8(
         );
     }
     for d in &result {
+        optional_hint_check(progress)?;
         let expected = d
             .ancestors
             .last()
             .map(|last| -> Result<String> {
                 by_key
                     .get(&(
-                        serde_json::to_string(&d.ancestors[..d.ancestors.len() - 1])?,
-                        serde_json::to_string(last)?,
+                        stringify_optional_json(&d.ancestors[..d.ancestors.len() - 1], progress)?,
+                        stringify_optional_json(last, progress)?,
                     ))
                     .cloned()
                     .context("missing native parent")
@@ -5196,24 +5563,45 @@ fn read_native_calls_v8(
     scope: &V8NativeScope,
     owner: Option<&str>,
 ) -> Result<Vec<crate::native_evidence::Call>> {
+    read_native_calls_v8_inner(db, scope, owner, None)
+}
+fn read_native_calls_v8_inner(
+    db: &Connection,
+    scope: &V8NativeScope,
+    owner: Option<&str>,
+    progress: Option<&dyn Fn() -> bool>,
+) -> Result<Vec<crate::native_evidence::Call>> {
+    optional_hint_check(progress)?;
     use crate::native_evidence::{Call, Range};
     let version = &scope.version_id;
-    let known: BTreeSet<String> = db
+    let mut known = BTreeSet::new();
+    for row in db
         .prepare("SELECT syntax_id FROM native_version_declarations WHERE version_id=?1")?
-        .query_map([version], |r| r.get(0))?
-        .collect::<rusqlite::Result<_>>()?;
-    let region_owner: BTreeMap<String, String> = db
+        .query_map([version], |r| r.get::<_, String>(0))?
+    {
+        optional_hint_check(progress)?;
+        known.insert(row?);
+    }
+    let mut region_owner = BTreeMap::new();
+    for row in db
         .prepare(
             "SELECT id,owner_syntax_id FROM native_version_control_regions WHERE version_id=?1",
         )?
-        .query_map([version], |r| Ok((r.get(0)?, r.get(1)?)))?
-        .collect::<rusqlite::Result<_>>()?;
+        .query_map([version], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?
+    {
+        optional_hint_check(progress)?;
+        let (id, owner) = row?;
+        region_owner.insert(id, owner);
+    }
     let proof = scope.proof_id();
     let mut calls: Vec<Call> = vec![];
     let mut indexes: BTreeMap<String, usize> = BTreeMap::new();
     let mut ordinals: BTreeMap<String, usize> = BTreeMap::new();
     for row in db.prepare("SELECT id,owner_syntax_id,ordinal,start_byte,end_byte,callee_start,callee_end,spelling FROM native_version_calls WHERE version_id=?1 ORDER BY owner_syntax_id,ordinal")?
         .query_map([version],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?,r.get::<_,i64>(3)?,r.get::<_,i64>(4)?,r.get::<_,Option<i64>>(5)?,r.get::<_,Option<i64>>(6)?,r.get::<_,Option<String>>(7)?)))? {
+        optional_hint_check(progress)?;
         let (id,call_owner,ordinal,start,end,callee_start,callee_end,spelling)=row?;
         ensure!(known.contains(&call_owner),"orphan native call owner");
         let n=ordinals.entry(call_owner.clone()).or_default();contiguous(ordinal,*n,"call")?;*n+=1;
@@ -5228,33 +5616,56 @@ fn read_native_calls_v8(
     }
     for row in db.prepare("SELECT call_id,region_id,ordinal FROM native_version_call_regions WHERE version_id=?1 ORDER BY call_id,ordinal")?
         .query_map([version],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?)))? {
+        optional_hint_check(progress)?;
         let (call_id,region_id,ordinal)=row?;
         let call=&mut calls[*indexes.get(&call_id).context("orphan native call region")?];
         ensure!(region_owner.get(&region_id)==Some(&call.owner_syntax_id),"cross-owner native call region");
         contiguous(ordinal,call.region_ids.len(),"call region")?;
         call.region_ids.push(region_id);
     }
-    Ok(calls
-        .into_iter()
-        .filter(|call| owner.is_none_or(|selected| call.owner_syntax_id == selected))
-        .collect())
+    if owner.is_none() {
+        optional_hint_check(progress)?;
+        return Ok(calls);
+    }
+    let mut selected = Vec::new();
+    for call in calls {
+        optional_hint_check(progress)?;
+        if owner.is_some_and(|id| call.owner_syntax_id == id) {
+            selected.push(call);
+        }
+    }
+    Ok(selected)
 }
 fn read_native_control_regions_v8(
     db: &Connection,
     scope: &V8NativeScope,
     owner: Option<&str>,
 ) -> Result<Vec<crate::native_evidence::ControlRegion>> {
+    read_native_control_regions_v8_inner(db, scope, owner, None)
+}
+fn read_native_control_regions_v8_inner(
+    db: &Connection,
+    scope: &V8NativeScope,
+    owner: Option<&str>,
+    progress: Option<&dyn Fn() -> bool>,
+) -> Result<Vec<crate::native_evidence::ControlRegion>> {
+    optional_hint_check(progress)?;
     use crate::native_evidence::{ControlRegion, Range};
-    let known: BTreeSet<String> = db
+    let mut known = BTreeSet::new();
+    for row in db
         .prepare("SELECT syntax_id FROM native_version_declarations WHERE version_id=?1")?
-        .query_map([&scope.version_id], |r| r.get(0))?
-        .collect::<rusqlite::Result<_>>()?;
+        .query_map([&scope.version_id], |r| r.get::<_, String>(0))?
+    {
+        optional_hint_check(progress)?;
+        known.insert(row?);
+    }
     let proof = scope.proof_id();
     let mut regions = Vec::<ControlRegion>::new();
     let mut indexes = BTreeMap::<String, usize>::new();
     let mut ordinals = BTreeMap::<String, usize>::new();
     for row in db.prepare("SELECT id,owner_syntax_id,ordinal,kind,start_byte,end_byte,parent_id,arm FROM native_version_control_regions WHERE version_id=?1 ORDER BY owner_syntax_id,ordinal")?
         .query_map([&scope.version_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?,r.get::<_,String>(3)?,r.get::<_,i64>(4)?,r.get::<_,i64>(5)?,r.get::<_,Option<String>>(6)?,r.get::<_,Option<String>>(7)?)))? {
+        optional_hint_check(progress)?;
         let (id,region_owner,ordinal,kind,start,end,parent_id,arm)=row?;
         ensure!(known.contains(&region_owner),"orphan native region owner");
         let n=ordinals.entry(region_owner.clone()).or_default();contiguous(ordinal,*n,"region")?;*n+=1;
@@ -5265,6 +5676,7 @@ fn read_native_control_regions_v8(
             provenance_id:proof.clone()});
     }
     for region in &regions {
+        optional_hint_check(progress)?;
         if let Some(parent_id) = &region.parent_id {
             let parent = &regions[*indexes
                 .get(parent_id)
@@ -5277,10 +5689,18 @@ fn read_native_control_regions_v8(
             );
         }
     }
-    Ok(regions
-        .into_iter()
-        .filter(|region| owner.is_none_or(|selected| region.owner_syntax_id == selected))
-        .collect())
+    if owner.is_none() {
+        optional_hint_check(progress)?;
+        return Ok(regions);
+    }
+    let mut selected = Vec::new();
+    for region in regions {
+        optional_hint_check(progress)?;
+        if owner.is_some_and(|id| region.owner_syntax_id == id) {
+            selected.push(region);
+        }
+    }
+    Ok(selected)
 }
 
 fn native_index_unavailable(error: &anyhow::Error) -> bool {
@@ -6494,6 +6914,10 @@ impl Store {
         self.recovery_disposition
             .fetch_max(disposition as u8, Ordering::AcqRel);
         self.recovery_required.store(true, Ordering::Release);
+    }
+    #[cfg(feature = "test-support")]
+    pub fn recovery_pending_for_tests(&self) -> bool {
+        self.recovery_required.load(Ordering::Acquire)
     }
     fn ensure_not_recreate_pending(&self) -> Result<()> {
         ensure!(
@@ -10136,12 +10560,14 @@ impl Store {
 
     /// Reparse exactly one selected, paired source in this SQLite snapshot.
     /// This never rereads a workspace path or projects the whole graph.
-    fn selected_native_witness_for(
+    fn selected_native_witness_for_inner(
         &self,
         db: &Connection,
         path: &str,
         selected: &ReadRevision,
+        progress: Option<&dyn Fn() -> bool>,
     ) -> Result<crate::native_evidence::Artifact> {
+        optional_hint_check(progress)?;
         use crate::native_evidence::{Document, DocumentKey, Producer, Revision, SourceSet};
         let (source_set_id, revision_id): (String, String) = db
             .query_row(
@@ -10157,8 +10583,14 @@ impl Store {
             source_set_id == format!("source-set:v1:{}", self.root_id()),
             "incompatible_index: selected source set mismatch"
         );
-        let file = Self::selected_source_row_bounded_for(db, path, 256 * 1024 * 1024, selected)?
-            .context("incompatible_index: selected graph source absent")?;
+        let file = Self::selected_source_row_bounded_for_inner(
+            db,
+            path,
+            256 * 1024 * 1024,
+            selected,
+            progress,
+        )?
+        .context("incompatible_index: selected graph source absent")?;
         let mut producer:Producer=db.query_row(
             "SELECT id,version,executable_hash,kind,position_encoding FROM native_producers LIMIT 1",[],
             |r|Ok(Producer{id:r.get(0)?,version:r.get(1)?,executable_hash:r.get(2)?,kind:r.get(3)?,languages:vec![],position_encoding:r.get(4)?}),
@@ -10203,8 +10635,10 @@ impl Store {
             content_hash: file.hash.clone(),
             byte_length: file.text.len(),
         });
-        crate::native_evidence::selected_source_witness(&file, producer, source_set, revision)
-            .context("incompatible_index: selected source extraction failed")
+        crate::native_evidence::selected_source_witness_with_progress(
+            &file, producer, source_set, revision, progress,
+        )
+        .context("incompatible_index: selected source extraction failed")
     }
 
     /// Authenticate one selected document's normalized records and graph DTOs
@@ -10228,7 +10662,18 @@ impl Store {
         path: &str,
         selected: &ReadRevision,
     ) -> Result<()> {
-        self.attest_selected_document_inner(db, path, selected)
+        self.attest_selected_document_inner(db, path, selected, None)
+            .map_err(selected_integrity)
+            .map_err(|error| self.report_selected_failure(error))
+    }
+    fn attest_selected_document_optional_for(
+        &self,
+        db: &Connection,
+        path: &str,
+        selected: &ReadRevision,
+        expired: &dyn Fn() -> bool,
+    ) -> Result<()> {
+        self.attest_selected_document_inner(db, path, selected, Some(expired))
             .map_err(selected_integrity)
             .map_err(|error| self.report_selected_failure(error))
     }
@@ -10237,8 +10682,10 @@ impl Store {
         db: &Connection,
         path: &str,
         selected: &ReadRevision,
+        progress: Option<&dyn Fn() -> bool>,
     ) -> Result<()> {
         use crate::native_evidence::DocumentKey;
+        optional_hint_check(progress)?;
         let sql = "SELECT m.source_set_id,m.language,m.path,m.document_version_id,m.graph_projection_id,
             m.class_projection_id,d.content_hash,d.byte_length,length(d.source_bytes),
             g.graph_hash,g.state,g.class_extraction_state,length(CAST(g.class_extraction_payload AS BLOB)),
@@ -10251,6 +10698,7 @@ impl Store {
             LEFT JOIN class_projections c ON c.id=m.class_projection_id AND c.graph_projection_id=g.id
             WHERE m.path=?1 AND m.revision_id=?2 LIMIT 2";
         let mut stmt = db.prepare(sql)?;
+        optional_hint_check(progress)?;
         let rows = stmt
             .query_map(params![path, selected.key], |r| {
                 Ok((
@@ -10372,6 +10820,7 @@ impl Store {
             counts.iter().all(|&n| n >= 0 && n <= row_limit),
             "incompatible_index: selected evidence row budget exceeded"
         );
+        optional_hint_check(progress)?;
         let (max_row, total_bytes) =
             Self::selected_ancillary_byte_usage(db, &version_id, &class_id)?;
         ensure!(
@@ -10393,6 +10842,7 @@ impl Store {
             SELECT length(CAST(id AS BLOB))+length(CAST(name AS BLOB))+length(CAST(path AS BLOB))+length(CAST(payload AS BLOB)) AS row_bytes FROM graph_nodes WHERE projection_id=?1
             UNION ALL SELECT length(CAST(id AS BLOB))+length(CAST(caller AS BLOB))+COALESCE(length(CAST(target AS BLOB)),0)+length(CAST(path AS BLOB))+length(CAST(payload AS BLOB)) FROM graph_calls WHERE projection_id=?1
             UNION ALL SELECT length(CAST(id AS BLOB))+length(CAST(owner AS BLOB))+length(CAST(path AS BLOB))+length(CAST(payload AS BLOB)) FROM graph_regions WHERE projection_id=?1)";
+        optional_hint_check(progress)?;
         let (graph_row, graph_total): (i64, i64) =
             db.query_row(graph_byte_sql, [&graph_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
         ensure!(
@@ -10410,61 +10860,112 @@ impl Store {
                         .min(512 * 1024 * 1024),
             "incompatible_index: selected graph row byte budget exceeded"
         );
-        let file = Self::selected_source_row_bounded_for(db, path, 256 * 1024 * 1024, selected)?
-            .context("incompatible_index: selected source missing")?;
+        let file = Self::selected_source_row_bounded_for_inner(
+            db,
+            path,
+            256 * 1024 * 1024,
+            selected,
+            progress,
+        )?
+        .context("incompatible_index: selected source missing")?;
         ensure!(
             file.hash == hash && file.language == language && file.text.len() == bytes as usize,
             "incompatible_index: selected source identity mismatch"
         );
-        let witness = self.selected_native_witness_for(db, path, selected)?;
+        let witness = self.selected_native_witness_for_inner(db, path, selected, progress)?;
         let coverage = read_native_coverage_v8(db, &scope)?;
         ensure!(
             witness.coverage == vec![coverage],
             "incompatible_index: selected native coverage differs from source"
         );
-        let mut declarations = read_native_declarations_v8(db, &scope, None, true)?;
-        let mut expected = witness.declarations.clone();
-        declarations.sort_by(|a, b| a.syntax_id.cmp(&b.syntax_id));
-        expected.sort_by(|a, b| a.syntax_id.cmp(&b.syntax_id));
+        let mut declarations = read_native_declarations_v8_inner(db, &scope, None, true, progress)?;
+        optional_hint_check(progress)?;
+        let mut expected = Vec::new();
+        for declaration in &witness.declarations {
+            optional_hint_check(progress)?;
+            expected.push(declaration.clone());
+        }
+        sort_optional_by_key(&mut declarations, |d| d.syntax_id.clone(), progress)?;
+        sort_optional_by_key(&mut expected, |d| d.syntax_id.clone(), progress)?;
         ensure!(
             declarations == expected,
             "incompatible_index: selected native declarations differ from source"
         );
-        let mut owners: BTreeSet<_> = expected.iter().map(|d| d.syntax_id.clone()).collect();
-        for table in ["native_version_calls", "native_version_control_regions"] {
-            let query = format!("SELECT DISTINCT owner_syntax_id FROM {table} WHERE version_id=?1");
-            for row in db
-                .prepare(&query)?
-                .query_map([&version_id], |r| r.get::<_, String>(0))?
-            {
-                owners.insert(row?);
+        optional_hint_check(progress)?;
+        if progress.is_some() {
+            // Decode each version exactly once. Repeating the full call/region scan per
+            // owner makes optional hints quadratic on a large document.
+            let calls = read_native_calls_v8_inner(db, &scope, None, progress)?;
+            let mut expected_calls = Vec::new();
+            for call in &witness.calls {
+                optional_hint_check(progress)?;
+                expected_calls.push(call.clone());
             }
-        }
-        for owner in owners {
-            let calls = read_native_calls_v8(db, &scope, Some(&owner))?;
-            let mut expected_calls: Vec<_> = witness
-                .calls
-                .iter()
-                .filter(|c| c.owner_syntax_id == owner)
-                .cloned()
-                .collect();
-            expected_calls.sort_by_key(|c| c.ordinal);
+            sort_optional_by_key(
+                &mut expected_calls,
+                |c| (c.owner_syntax_id.clone(), c.ordinal),
+                progress,
+            )?;
             ensure!(
                 calls == expected_calls,
                 "incompatible_index: selected native calls differ from source"
             );
-            let regions = read_native_control_regions_v8(db, &scope, Some(&owner))?;
-            let mut expected_regions: Vec<_> = witness
-                .control_regions
-                .iter()
-                .filter(|r| r.owner_syntax_id == owner)
-                .cloned()
-                .collect();
-            expected_regions.sort_by_key(|r| r.ordinal);
+            let regions = read_native_control_regions_v8_inner(db, &scope, None, progress)?;
+            let mut expected_regions = Vec::new();
+            for region in &witness.control_regions {
+                optional_hint_check(progress)?;
+                expected_regions.push(region.clone());
+            }
+            sort_optional_by_key(
+                &mut expected_regions,
+                |r| (r.owner_syntax_id.clone(), r.ordinal),
+                progress,
+            )?;
             ensure!(
                 regions == expected_regions,
                 "incompatible_index: selected native regions differ from source"
             );
+        } else {
+            let mut owners: BTreeSet<_> = expected.iter().map(|d| d.syntax_id.clone()).collect();
+            for table in ["native_version_calls", "native_version_control_regions"] {
+                let query =
+                    format!("SELECT DISTINCT owner_syntax_id FROM {table} WHERE version_id=?1");
+                for row in db
+                    .prepare(&query)?
+                    .query_map([&version_id], |r| r.get::<_, String>(0))?
+                {
+                    owners.insert(row?);
+                }
+            }
+            for owner in owners {
+                optional_hint_check(progress)?;
+                let calls = read_native_calls_v8_inner(db, &scope, Some(&owner), progress)?;
+                let mut expected_calls: Vec<_> = witness
+                    .calls
+                    .iter()
+                    .filter(|c| c.owner_syntax_id == owner)
+                    .cloned()
+                    .collect();
+                sort_optional_by_key(&mut expected_calls, |c| c.ordinal, progress)?;
+                ensure!(
+                    calls == expected_calls,
+                    "incompatible_index: selected native calls differ from source"
+                );
+                optional_hint_check(progress)?;
+                let regions =
+                    read_native_control_regions_v8_inner(db, &scope, Some(&owner), progress)?;
+                let mut expected_regions: Vec<_> = witness
+                    .control_regions
+                    .iter()
+                    .filter(|r| r.owner_syntax_id == owner)
+                    .cloned()
+                    .collect();
+                sort_optional_by_key(&mut expected_regions, |r| r.ordinal, progress)?;
+                ensure!(
+                    regions == expected_regions,
+                    "incompatible_index: selected native regions differ from source"
+                );
+            }
         }
         let mut nodes = Vec::new();
         for row in db
@@ -10480,8 +10981,13 @@ impl Store {
                 ))
             })?
         {
+            optional_hint_check(progress)?;
             let (id, name, path, payload) = row?;
-            let node: Symbol = serde_json::from_str(&payload)?;
+            let node: Symbol = if progress.is_some() {
+                decode_optional_json(payload.as_bytes(), progress)?
+            } else {
+                serde_json::from_str(&payload)?
+            };
             ensure!(
                 node.id == id && node.name == name && node.path == path && path == file.path,
                 "incompatible_index: selected graph node materialization differs"
@@ -10491,8 +10997,9 @@ impl Store {
         let mut calls = Vec::new();
         for row in db.prepare("SELECT id,caller,target,path,payload FROM graph_calls WHERE projection_id=?1 ORDER BY id")?
             .query_map([&graph_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?)))? {
+            optional_hint_check(progress)?;
             let (id,caller,target,path,payload)=row?;
-            let call:CallSite=serde_json::from_str(&payload)?;
+            let call:CallSite=if progress.is_some() { decode_optional_json(payload.as_bytes(), progress)? } else { serde_json::from_str(&payload)? };
             ensure!(call.id==id && call.caller==caller && call.path==path && path==file.path && target.is_none(),
                 "incompatible_index: selected graph call materialization differs");
             calls.push(call);
@@ -10500,8 +11007,9 @@ impl Store {
         let mut regions = Vec::new();
         for row in db.prepare("SELECT id,owner,path,payload FROM graph_regions WHERE projection_id=?1 ORDER BY id")?
             .query_map([&graph_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?)))? {
+            optional_hint_check(progress)?;
             let (id,owner,path,payload)=row?;
-            let region:ControlRegion=serde_json::from_str(&payload)?;
+            let region:ControlRegion=if progress.is_some() { decode_optional_json(payload.as_bytes(), progress)? } else { serde_json::from_str(&payload)? };
             ensure!(region.id==id && region.owner==owner && region.path==path && path==file.path,
                 "incompatible_index: selected graph region materialization differs");
             regions.push(region);
@@ -10509,8 +11017,9 @@ impl Store {
         let mut class_rows = Vec::new();
         for row in db.prepare("SELECT id,name,qualified_name,path,payload FROM classes WHERE projection_id=?1 ORDER BY id")?
             .query_map([&class_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?)))? {
+            optional_hint_check(progress)?;
             let (id,name,qualified,path,payload)=row?;
-            let class:crate::classes::ClassDefinition=serde_json::from_str(&payload)?;
+            let class:crate::classes::ClassDefinition=if progress.is_some() { decode_optional_json(payload.as_bytes(), progress)? } else { serde_json::from_str(&payload)? };
             ensure!(class.symbol.id==id && class.symbol.name==name && class.symbol.path==path
                 && class.qualified_name==qualified && path==file.path,
                 "incompatible_index: selected class materialization differs");
@@ -10519,12 +11028,14 @@ impl Store {
         let mut class_relations = Vec::new();
         for row in db.prepare("SELECT id,owner,target,payload FROM class_relations WHERE projection_id=?1 ORDER BY id")?
             .query_map([&class_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,String>(3)?)))? {
+            optional_hint_check(progress)?;
             let (id,owner,target,payload)=row?;
-            let relation:crate::classes::ClassRelation=serde_json::from_str(&payload)?;
+            let relation:crate::classes::ClassRelation=if progress.is_some() { decode_optional_json(payload.as_bytes(), progress)? } else { serde_json::from_str(&payload)? };
             ensure!(relation.id==id && relation.owner==owner && relation.target==target,
                 "incompatible_index: selected class relation materialization differs");
             class_relations.push(relation);
         }
+        optional_hint_check(progress)?;
         let mut graph = Graph {
             files: vec![file],
             nodes,
@@ -10538,6 +11049,7 @@ impl Store {
         graph.stats.regions = graph.regions.len();
         graph.stats.unresolved = graph.calls.len();
         for coverage in &witness.coverage {
+            optional_hint_check(progress)?;
             if coverage.state != "complete" {
                 let recovered = coverage
                     .diagnostic
@@ -10561,10 +11073,12 @@ impl Store {
                 });
             }
         }
-        crate::indexer::validate_native_graph_records(
+        optional_hint_check(progress)?;
+        crate::indexer::validate_native_graph_records_with_progress(
             &graph,
             &witness,
             &Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            progress,
         )?;
         let stored_f: Option<String> = db.query_row(
             "SELECT class_extraction_payload FROM graph_projections WHERE id=?1",
@@ -10572,18 +11086,28 @@ impl Store {
             |r| r.get(0),
         )?;
         if matches!(language.as_str(), "java" | "python") {
-            let expected_f = crate::classes::FileExtraction::extract_file(
+            optional_hint_check(progress)?;
+            let expected_f = crate::classes::FileExtraction::extract_file_with_progress(
                 &graph.files[0],
                 &graph.nodes,
                 &Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 crate::classes::Limits::default(),
+                progress,
             )?;
+            let recorded_f: Option<crate::classes::FileExtraction> =
+                if let Some(raw) = stored_f.as_deref() {
+                    if progress.is_some() {
+                        let decoded = decode_optional_json(raw.as_bytes(), progress).ok();
+                        optional_hint_check(progress)?;
+                        decoded
+                    } else {
+                        serde_json::from_str(raw).ok()
+                    }
+                } else {
+                    None
+                };
             ensure!(
-                stored_f
-                    .as_deref()
-                    .and_then(|f| serde_json::from_str::<crate::classes::FileExtraction>(f).ok())
-                    .as_ref()
-                    == Some(&expected_f),
+                recorded_f.as_ref() == Some(&expected_f),
                 "incompatible_index: selected F differs from authenticated source and graph"
             );
         } else {
@@ -10592,17 +11116,21 @@ impl Store {
                 "incompatible_index: non-class graph carries F"
             );
         }
+        optional_hint_check(progress)?;
         let catalog = crate::classes::Catalog {
             classes: class_rows,
             relations: class_relations,
             warnings: vec![],
             truncated: false,
         };
-        let rows = publication_rows(&graph, &witness, &catalog)?;
+        optional_hint_check(progress)?;
+        let rows = publication_rows_with_progress(&graph, &witness, &catalog, progress)?;
         let grouped = rows
             .get(graph.files[0].path.as_str())
             .context("selected rows missing")?;
-        let ids = v8_document_projection(&graph.files[0], &witness, grouped)?;
+        optional_hint_check(progress)?;
+        let ids =
+            v8_document_projection_with_progress(&graph.files[0], &witness, grouped, progress)?;
         ensure!(
             ids.version_id == version_id
                 && ids.graph_id == graph_id
@@ -11274,6 +11802,105 @@ impl Store {
         Ok(node.map(|node| (revision, node)))
     }
 
+    #[cfg(feature = "test-support")]
+    /// Alter an already validated selected BLOB only in the live test store.
+    /// This intentionally never publishes or reopens the malformed source.
+    pub fn mcp_replace_validated_source_bytes_for_tests(
+        &self,
+        writer: &topology::WriterGuard,
+        path: &str,
+        bytes: &[u8],
+    ) -> Result<()> {
+        use sha2::{Digest, Sha256};
+        writer.belongs_to(&self.identity)?;
+        self.identity.verify()?;
+        writer.verify()?;
+        let response = self.evidence_response()?;
+        ensure!(
+            response.source_at(path, None)?.is_some(),
+            "fixture source absent"
+        );
+        response.finish(())?;
+        drop(response);
+        let db = self.cache_write()?;
+        let changed = storage_result(db.execute(
+            "UPDATE document_versions SET source_bytes=?1,byte_length=?2,content_hash=?3
+             WHERE id=(SELECT document_version_id FROM revision_documents
+                 WHERE revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision
+                     FROM index_metadata WHERE singleton=1) AND path=?4)",
+            params![
+                bytes,
+                bytes.len() as i64,
+                hex::encode(Sha256::digest(bytes)),
+                path
+            ],
+        ))?;
+        ensure!(changed == 1, "fixture selected source absent");
+        Ok(())
+    }
+
+    /// Read only the selected raw source identity, without the native witness or UTF-8
+    /// conversion used by the public source reader. W5 verifies the entire cached BLOB.
+    fn mcp_selected_raw_source_for(
+        &self,
+        db: &Connection,
+        path: &str,
+        selected: &ReadRevision,
+    ) -> Result<Option<(String, Vec<u8>)>> {
+        let mut statement = db.prepare(
+            "SELECT document_version_id,source_set_id,language FROM revision_documents
+             WHERE revision_id=?1 AND path=?2 LIMIT 2",
+        )?;
+        let mut rows = statement.query(params![selected.key, path])?;
+        let manifest = rows
+            .next()?
+            .map(|row| -> rusqlite::Result<_> {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .transpose()?;
+        ensure!(
+            rows.next()?.is_none(),
+            "store_unavailable: ambiguous selected source path"
+        );
+        let Some((version, source_set, language)) = manifest else {
+            return Ok(None);
+        };
+        let row: Option<(String, String, String, String, i64, Vec<u8>)> = db
+            .query_row(
+                "SELECT source_set_id,language,path,content_hash,byte_length,source_bytes
+                 FROM document_versions WHERE id=?1",
+                [&version],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let (stored_set, stored_language, stored_path, hash, length, bytes) =
+            row.context("store_unavailable: selected source version absent")?;
+        use sha2::{Digest, Sha256};
+        ensure!(
+            stored_set == source_set
+                && stored_language == language
+                && stored_path == path
+                && length >= 0
+                && usize::try_from(length).ok() == Some(bytes.len())
+                && hash == hex::encode(Sha256::digest(&bytes)),
+            "store_unavailable: selected raw source identity or digest mismatch"
+        );
+        Ok(Some((hash, bytes)))
+    }
+
     fn selected_source_row_for(
         &self,
         db: &Connection,
@@ -11299,6 +11926,16 @@ impl Store {
         max_bytes: i64,
         selected: &ReadRevision,
     ) -> Result<Option<SourceFile>> {
+        Self::selected_source_row_bounded_for_inner(db, path, max_bytes, selected, None)
+    }
+    fn selected_source_row_bounded_for_inner(
+        db: &Connection,
+        path: &str,
+        max_bytes: i64,
+        selected: &ReadRevision,
+        progress: Option<&dyn Fn() -> bool>,
+    ) -> Result<Option<SourceFile>> {
+        optional_hint_check(progress)?;
         let selected_sql = "FROM revision_documents m JOIN document_versions d
             ON d.id=m.document_version_id AND d.source_set_id=m.source_set_id
               AND d.language=m.language AND d.path=m.path
@@ -11310,6 +11947,7 @@ impl Store {
         let mut sizes = stmt.query(params![path, selected.key])?;
         let mut present = false;
         while let Some(row) = sizes.next()? {
+            optional_hint_check(progress)?;
             ensure!(!present, "incompatible_index: ambiguous manifest source");
             present = true;
             let bytes: i64 = row.get(0)?;
@@ -11339,17 +11977,29 @@ impl Store {
                     let hash: String = r.get(3)?;
                     let length: i64 = r.get(4)?;
                     let raw = r.get_ref(5)?.as_blob()?;
+                    let mut digest = Sha256::new();
+                    for (index, chunk) in raw.chunks(64 * 1024).enumerate() {
+                        if index == 0 && progress.is_some() {
+                            #[cfg(feature = "test-support")]
+                            crate::mcp::phase_hook("outgoing_hint_source_hash_chunk")
+                                .map_err(|error| anyhow::anyhow!(error))?;
+                        }
+                        optional_hint_check(progress)?;
+                        digest.update(chunk);
+                    }
+                    optional_hint_check(progress)?;
                     ensure!(
                         source_set.starts_with("source-set:v1:")
                             && stored_path == path
                             && length == raw.len() as i64
-                            && hash == hex::encode(Sha256::digest(raw)),
+                            && hash == hex::encode(digest.finalize()),
                         "incompatible_index: source hash mismatch"
                     );
                     Ok((source_set, language, stored_path, hash, raw.to_vec()))
                 })())
             })?;
         let (_source_set, language, stored_path, hash, bytes) = checked?;
+        optional_hint_check(progress)?;
         let file = SourceFile {
             path: stored_path,
             hash,
@@ -11360,7 +12010,19 @@ impl Store {
             bytes: 0,
             max_bytes: usize::try_from(max_bytes)?.saturating_add(16 * 1024),
         };
-        serde_json::to_writer(&mut budget, &file)?;
+        if progress.is_some() {
+            let encoded = serde_json::to_writer(
+                &mut OptionalSourceBudget {
+                    budget: &mut budget,
+                    progress,
+                },
+                &file,
+            );
+            optional_hint_check(progress)?;
+            encoded?;
+        } else {
+            serde_json::to_writer(&mut budget, &file)?;
+        }
         Ok(Some(file))
     }
     pub fn source_at(
@@ -11694,6 +12356,30 @@ impl Store {
             self.read_graph_for(tx, &selected)
         })
     }
+    /// Inspect retention state through the protected index read path in integration tests.
+    #[cfg(feature = "test-support")]
+    pub fn retention_state_for_tests(&self, revision_id: &str) -> Result<RetentionStateForTests> {
+        self.with_evidence(|db| {
+            let revision = storage_result(db.query_row(
+                "SELECT s.state,
+                        (SELECT count(*) FROM native_revision_release_debt d
+                         WHERE d.revision_id=s.revision_id),
+                        (SELECT count(*) FROM revision_documents r
+                         WHERE r.revision_id=s.revision_id)
+                 FROM native_revision_supersessions s WHERE s.revision_id=?1",
+                [revision_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            ))?;
+            let pending = storage_result(db.query_row(
+                "SELECT (SELECT count(*) FROM native_revision_supersessions WHERE state='pending'),
+                        (SELECT count(*) FROM native_revision_release_debt)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ))?;
+            Ok((revision, pending))
+        })
+    }
+
     /// Simulate accidental same-pin damage while a test provider is paused. Use
     /// the protected Store connection, not a second raw SQLite file handle.
     #[cfg(all(test, feature = "test-support"))]

@@ -144,6 +144,7 @@ struct Builder<'a> {
     pending: Vec<Pending>,
     symbols: BTreeMap<(&'a str, usize, usize), Vec<&'a Symbol>>,
     cancel: &'a CancelFlag,
+    progress: Option<&'a dyn Fn() -> bool>,
     records: usize,
     text_bytes: usize,
     detail_text_bytes: usize,
@@ -389,13 +390,24 @@ impl FileExtraction {
         cancel: &CancelFlag,
         limits: Limits,
     ) -> Result<Self> {
+        Self::extract_file_with_progress(file, nodes, cancel, limits, None)
+    }
+    pub(crate) fn extract_file_with_progress(
+        file: &SourceFile,
+        nodes: &[Symbol],
+        cancel: &CancelFlag,
+        limits: Limits,
+        progress: Option<&dyn Fn() -> bool>,
+    ) -> Result<Self> {
         check(cancel)?;
+        crate::store::optional_hint_check(progress)?;
         let mut b = Builder {
             catalog: Catalog::default(),
             scopes: vec![],
             pending: vec![],
             symbols: BTreeMap::new(),
             cancel,
+            progress,
             records: 0,
             text_bytes: 0,
             detail_text_bytes: 0,
@@ -418,6 +430,7 @@ impl FileExtraction {
                     )
             }) {
                 check(cancel)?;
+                crate::store::optional_hint_check(progress)?;
                 b.symbols
                     .entry((&symbol.path, symbol.range.start_byte, symbol.range.end_byte))
                     .or_default()
@@ -429,13 +442,16 @@ impl FileExtraction {
             } else {
                 tree_sitter_python::LANGUAGE.into()
             })?;
-            let mut cancelled = |_: &tree_sitter::ParseState| cancel.load(Ordering::Relaxed);
+            let mut cancelled = |_: &tree_sitter::ParseState| {
+                cancel.load(Ordering::Relaxed) || progress.is_some_and(|expired| expired())
+            };
             let tree = parser.parse_with_options(
                 &mut |offset, _| &file.text.as_bytes()[offset..],
                 None,
                 Some(tree_sitter::ParseOptions::new().progress_callback(&mut cancelled)),
             );
             check(cancel)?;
+            crate::store::optional_hint_check(progress)?;
             let tree = tree.context("class catalog parser failed")?;
             if tree.root_node().has_error() {
                 b.registry_limit(&format!(
@@ -465,8 +481,10 @@ impl FileExtraction {
                 }
             }
         }
+        crate::store::optional_hint_check(progress)?;
         b.resolve()?;
         check(cancel)?;
+        crate::store::optional_hint_check(progress)?;
         Ok(Self {
             path: file.path.clone(),
             source_bytes: file.text.len(),
@@ -533,15 +551,15 @@ impl Builder<'_> {
     fn resolve(&mut self) -> Result<()> {
         // A declared type name is source text, not a type relationship. Do not
         // turn scoped name matches into a target or candidate graph edge.
-        self.catalog.relations = std::mem::take(&mut self.pending)
-            .into_iter()
-            .map(|mut pending| {
-                pending.relation.target = None;
-                pending.relation.candidate_ids.clear();
-                pending.relation.match_kind = "unmatched".into();
-                pending.relation
-            })
-            .collect();
+        let mut relations = Vec::with_capacity(self.pending.len());
+        for mut pending in std::mem::take(&mut self.pending) {
+            crate::store::optional_hint_check(self.progress)?;
+            pending.relation.target = None;
+            pending.relation.candidate_ids.clear();
+            pending.relation.match_kind = "unmatched".into();
+            relations.push(pending.relation);
+        }
+        self.catalog.relations = relations;
         Ok(())
     }
 }
@@ -561,6 +579,7 @@ impl Extractor<'_, '_> {
     }
     fn tick(&mut self, depth: usize) -> Result<bool> {
         check(self.b.cancel)?;
+        crate::store::optional_hint_check(self.b.progress)?;
         if self.exhausted {
             return Ok(false);
         }
@@ -577,6 +596,7 @@ impl Extractor<'_, '_> {
     }
     fn details(&mut self, index: usize) -> Result<bool> {
         check(self.b.cancel)?;
+        crate::store::optional_hint_check(self.b.progress)?;
         if self.detail_visits >= self.b.limits.visits {
             self.b.catalog.classes[index].truncated = true;
             self.b.limit("Class detail limit reached (250000 records / 64 MiB text / 100000 visits per file); declaration discovery continues");
@@ -1432,6 +1452,7 @@ mod budget_tests {
                 pending: vec![],
                 symbols,
                 cancel: &cancel,
+                progress: None,
                 records,
                 text_bytes: 0,
                 detail_text_bytes,
