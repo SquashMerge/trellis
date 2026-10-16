@@ -1,5 +1,10 @@
 name: Rust foundation
-on: [push, pull_request]
+# One run per commit: pull requests run on their merge ref; pushes run only
+# for the long-lived branches (a PR branch would otherwise run twice).
+on:
+  push:
+    branches: [main, "feature-*", "feature/**"]
+  pull_request:
 permissions:
   contents: read
 jobs:
@@ -29,9 +34,18 @@ jobs:
       - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
         with:
           tool: cargo-nextest@0.9.148
+      # verify builds two target directories: the default build (`target`) and
+      # the test-support build (`target-test-support`), which is the larger.
+      # Caches are saved only from pushes to the long-lived branches, so a pull
+      # request restores its base branch's warm cache and never evicts it
+      # (GitHub scopes a PR's cache reads to its own, base and default branch).
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
+          workspaces: |
+            . -> target
+            . -> target-test-support
           cache-directories: ${{ env.COMPOSITION_TARGET }}
+          save-if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/feature-') || startsWith(github.ref, 'refs/heads/feature/')) }}
       - run: npm ci --prefix tests/browser --ignore-scripts
         env:
           PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/pw-browsers
