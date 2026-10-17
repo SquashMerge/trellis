@@ -1,6 +1,15 @@
 //! Closed W1 wire projection; no Store admission occurs in this layer.
 use serde_json::{Value, json};
 
+/// The four `LanguageStatus` rows, in #22 language order, from per-language
+/// tuple counts [selected, complete, partial, failed, unselected].
+fn language_status(rows: &[[u64; 5]; 4]) -> Vec<Value> {
+    ["java", "rust", "python", "javascript"].into_iter().zip(rows).map(|(language, row)| {
+        json!({"language":language,"evidenceTier":"syntax","coverage":{
+            "selected":row[0],"complete":row[1],"partial":row[2],"failed":row[3],"unselected":row[4]}})
+    }).collect()
+}
+
 pub fn describe(
     id: &Value,
     label: &str,
@@ -13,12 +22,7 @@ pub fn describe(
     let partial = counts
         .as_ref()
         .is_none_or(|rows| rows.iter().any(|row| row[2] != 0 || row[3] != 0));
-    let languages: Vec<Value> = counts.map_or_else(Vec::new, |rows| {
-        ["java", "rust", "python", "javascript"].into_iter().zip(rows).map(|(language, row)| {
-            json!({"language":language,"evidenceTier":"syntax","coverage":{
-                "selected":row[0],"complete":row[1],"partial":row[2],"failed":row[3],"unselected":row[4]}})
-        }).collect()
-    });
+    let languages: Vec<Value> = counts.map_or_else(Vec::new, |rows| language_status(&rows));
     let deadline_ms = u64::try_from(super::CALL_DEADLINE.as_millis()).unwrap_or(u64::MAX);
     json!({"schemaVersion":1,"requestId":id,"evidenceBasis":basis,
       "data":{"workspaceLabel":label,"indexState":state,"progress":progress,
@@ -124,10 +128,9 @@ pub fn find(
     catching_up: bool,
     modern: bool,
 ) -> Option<Value> {
-    let incomplete = result
-        .coverage
-        .iter()
-        .any(|c| c.selected && c.state != "complete");
+    // #156: completeness is a property of the whole searched scope, carried by
+    // `scopeCoverage`; per-document coverage covers only the emitted symbols.
+    let incomplete = result.scope.iter().any(|row| row[2] != 0 || row[3] != 0);
     let warnings = if incomplete {
         vec![
             json!({"code":"coverageIncomplete","message":"Selected syntax coverage is incomplete","provenanceId":null}),
@@ -138,11 +141,16 @@ pub fn find(
             json!({"code":"syntaxOnly","message":"Only syntax evidence is available","provenanceId":null}),
         ]
     };
+    let scope = language_status(&result.scope);
     let basis = json!({"indexGeneration":result.pin.index_generation.to_string(),
         "indexRevision":result.pin.index_revision});
+    let language_order = |language: &str| match language {
+        "java" => 0,
+        "rust" => 1,
+        "python" => 2,
+        _ => 3,
+    };
     let mut symbols = Vec::new();
-    let mut proofs = Vec::new();
-    let mut last = None;
     for symbol in &result.symbols {
         let d = &symbol.declaration;
         let display = display_key(d);
@@ -152,34 +160,61 @@ pub fn find(
             "contentHash":symbol.content_hash,"provenanceId":d.provenance_id,
             "evidenceTier":"syntax","semanticBasis":null,"freshness":"fresh","staleBecause":[]}),
         );
-        if !proofs
-            .iter()
-            .any(|p: &crate::native_evidence::Provenance| p.id == d.provenance_id)
-        {
-            proofs.push(
-                result
-                    .provenance
-                    .iter()
-                    .find(|p| p.id == d.provenance_id)?
-                    .clone(),
-            );
-            proofs.sort_by(|a, b| a.id.cmp(&b.id));
-        }
     }
-    // A first, empty prefix is mandatory; a failure here must never discard coverage.
+    let mut last = None;
+    // The empty prefix carries only the fixed envelope and the scope rows; if
+    // even it cannot fit, the answer is range_too_large.
     for n in 0..=symbols.len() {
-        let required: std::collections::BTreeSet<&str> = result.symbols[..n]
-            .iter()
-            .map(|s| s.declaration.provenance_id.as_str())
-            .collect();
-        let closure: Vec<_> = proofs
-            .iter()
-            .filter(|p| required.contains(p.id.as_str()))
-            .collect();
+        let emitted = &result.symbols[..n];
+        let mut closure: Vec<&crate::native_evidence::Provenance> = Vec::new();
+        for symbol in emitted {
+            let id = &symbol.declaration.provenance_id;
+            if !closure.iter().any(|p| &p.id == id) {
+                closure.push(result.provenance.iter().find(|p| &p.id == id)?);
+            }
+        }
+        closure.sort_by(|a, b| a.id.cmp(&b.id));
+        let mut coverage: Vec<&crate::native_evidence::Coverage> = Vec::new();
+        for symbol in emitted {
+            let c = &symbol.coverage;
+            if !coverage.iter().any(|seen| {
+                (
+                    &seen.producer_id,
+                    &seen.language,
+                    &seen.source_set_id,
+                    &seen.document_path,
+                    &seen.revision_id,
+                ) == (
+                    &c.producer_id,
+                    &c.language,
+                    &c.source_set_id,
+                    &c.document_path,
+                    &c.revision_id,
+                )
+            }) {
+                coverage.push(c);
+            }
+        }
+        coverage.sort_by(|a, b| {
+            (
+                &a.producer_id,
+                language_order(&a.language),
+                &a.source_set_id,
+                &a.document_path,
+                &a.revision_id,
+            )
+                .cmp(&(
+                    &b.producer_id,
+                    language_order(&b.language),
+                    &b.source_set_id,
+                    &b.document_path,
+                    &b.revision_id,
+                ))
+        });
         let truncated = n < symbols.len() || result.has_more;
         let envelope = json!({"schemaVersion":1,"requestId":id,"workspace":root,
             "catchingUp":catching_up,"evidenceBasis":basis,
-            "data":{"symbols":&symbols[..n],"coverage":result.coverage,"provenance":closure},
+            "data":{"symbols":&symbols[..n],"coverage":coverage,"scopeCoverage":scope,"provenance":closure},
             "warnings":warnings,"partial":incomplete || truncated,"truncated":truncated,
             "truncationReason": if n < symbols.len() {Some("response_bytes")}
                 else if result.has_more {Some("limit")} else {None}});
@@ -208,32 +243,33 @@ mod find_tests {
         .unwrap()
     }
 
-    fn coverage(diagnostic: usize) -> Coverage {
+    fn coverage(document: &DocumentKey, state: &str) -> Coverage {
         Coverage {
             producer_id: "native:v1".into(),
-            language: "javascript".into(),
-            source_set_id: "source-set:v1:test".into(),
-            document_path: "src/a.js".into(),
+            language: document.language.clone(),
+            source_set_id: document.source_set_id.clone(),
+            document_path: document.path.clone(),
             revision_id: "revision:v1:test".into(),
             requested: true,
             selected: true,
-            state: "failed".into(),
+            state: state.into(),
             supported_roles: vec![],
             observed_roles: vec![],
-            diagnostic: Some("x".repeat(diagnostic)),
+            diagnostic: (state != "complete").then(|| "fixture".into()),
         }
     }
 
-    fn fixture(names: &[String], has_more: bool) -> McpFind {
+    /// Hits `(name, source set, path)`, each in its own proof unless a path repeats.
+    fn fixture(hits: &[(String, &str, String)], scope: [[u64; 5]; 4], has_more: bool) -> McpFind {
         let mut symbols = Vec::new();
-        let mut provenance = Vec::new();
-        for (i, name) in names.iter().enumerate() {
+        let mut provenance: Vec<Provenance> = Vec::new();
+        for (i, (name, source_set, path)) in hits.iter().enumerate() {
             let document = DocumentKey {
-                source_set_id: "source-set:v1:test".into(),
+                source_set_id: (*source_set).into(),
                 language: "javascript".into(),
-                path: format!("src/{i}.js"),
+                path: path.clone(),
             };
-            let proof_id = format!("proof:{i}");
+            let proof_id = format!("proof:{source_set}:{path}");
             let declaration: Declaration = serde_json::from_value(json!({
                 "syntaxId": format!("sid:{i}"), "document":document,
                 "revisionId":"revision:v1:test", "kind":"function", "name":name,
@@ -245,30 +281,44 @@ mod find_tests {
                 "provenanceId":proof_id
             }))
             .unwrap();
-            provenance.push(Provenance {
-                id: proof_id,
-                producer_id: "native:v1".into(),
-                document: document.clone(),
-                revision_id: "revision:v1:test".into(),
-                content_hash: "a".repeat(64),
-                evidence_kind: "measuredSyntax".into(),
-                basis: None,
-                freshness: "fresh".into(),
-                derived_from: None,
-            });
+            if !provenance.iter().any(|p| p.id == proof_id) {
+                provenance.push(Provenance {
+                    id: proof_id,
+                    producer_id: "native:v1".into(),
+                    document: document.clone(),
+                    revision_id: "revision:v1:test".into(),
+                    content_hash: "a".repeat(64),
+                    evidence_kind: "measuredSyntax".into(),
+                    basis: None,
+                    freshness: "fresh".into(),
+                    derived_from: None,
+                });
+            }
             symbols.push(McpFindSymbol {
+                coverage: coverage(&document, "complete"),
                 declaration,
                 content_hash: "a".repeat(64),
             });
         }
         McpFind {
             symbols,
+            scope,
             provenance,
-            coverage: vec![coverage(0)],
             has_more,
             pin: pin(),
         }
     }
+    fn hit(name: impl Into<String>, path: &str) -> (String, &'static str, String) {
+        (name.into(), "source-set:v1:test", path.into())
+    }
+    /// The #156 smoke checkout: 270 documents, 111 partial Rust files.
+    const LARGE_SCOPE: [[u64; 5]; 4] = [
+        [4, 4, 0, 0, 0],
+        [117, 6, 111, 0, 0],
+        [9, 9, 0, 0, 0],
+        [140, 140, 0, 0, 0],
+    ];
+    const COMPLETE_SCOPE: [[u64; 5]; 4] = [[1, 1, 0, 0, 0], [0; 5], [0; 5], [3, 3, 0, 0, 0]];
 
     fn assert_wire(envelope: Value, id: &Value, modern: bool) -> Value {
         let result = super::super::tools::result(envelope.clone(), modern);
@@ -286,68 +336,142 @@ mod find_tests {
     }
 
     #[test]
-    fn zero_hit_coverage_cannot_be_trimmed_to_fit_duplicate_wire() {
-        let result = |diagnostic| McpFind {
-            symbols: vec![],
-            coverage: vec![coverage(diagnostic)],
-            provenance: vec![],
-            has_more: false,
-            pin: pin(),
-        };
+    fn zero_hits_report_scope_counts_without_document_rows() {
         let root = std::path::Path::new("/workspace");
-        let id = json!("\"\\\n".repeat(30));
+        let id = json!(7);
         for modern in [false, true] {
-            let envelope = find(&id, result(20_000), root, false, modern).unwrap();
-            assert_eq!(envelope["data"]["coverage"], json!([coverage(20_000)]));
-            assert_eq!(envelope["data"]["symbols"], json!([]));
-            assert_eq!(envelope["partial"], true);
-            assert_eq!(envelope["truncated"], false);
-            assert_wire(envelope, &id, modern);
-            assert!(find(&id, result(33_000), root, false, modern).is_none());
+            // The scope that overflowed the cap with per-document rows now fits.
+            let large = find(&id, fixture(&[], LARGE_SCOPE, false), root, false, modern).unwrap();
+            let data = &large["data"];
+            assert_eq!(data["symbols"], json!([]));
+            assert_eq!(data["coverage"], json!([]));
+            assert_eq!(data["provenance"], json!([]));
+            assert_eq!(
+                data["scopeCoverage"],
+                json!([
+                    {"language":"java","evidenceTier":"syntax","coverage":{"selected":4,"complete":4,"partial":0,"failed":0,"unselected":0}},
+                    {"language":"rust","evidenceTier":"syntax","coverage":{"selected":117,"complete":6,"partial":111,"failed":0,"unselected":0}},
+                    {"language":"python","evidenceTier":"syntax","coverage":{"selected":9,"complete":9,"partial":0,"failed":0,"unselected":0}},
+                    {"language":"javascript","evidenceTier":"syntax","coverage":{"selected":140,"complete":140,"partial":0,"failed":0,"unselected":0}}
+                ])
+            );
+            // Incomplete selected scope: partial, one aggregate warning first.
+            assert_eq!(large["partial"], true);
+            assert_eq!(large["truncated"], false);
+            assert_eq!(large["warnings"][0]["code"], "coverageIncomplete");
+            assert_eq!(large["warnings"][1]["code"], "syntaxOnly");
+            assert_wire(large, &id, modern);
 
-            // Find the exact wire threshold, including both content copies, RPC ID,
-            // modern resultType, and the LF written by write_response.
-            let (mut low, mut high) = (20_000, 33_000);
-            while high - low > 1 {
-                let mid = (low + high) / 2;
-                if find(&id, result(mid), root, false, modern).is_some() {
-                    low = mid;
-                } else {
-                    high = mid;
-                }
-            }
-            let last = find(&id, result(low), root, false, modern).unwrap();
-            assert_wire(last, &id, modern);
-            assert!(find(&id, result(low + 1), root, false, modern).is_none());
+            // A failed selected tuple alone also flags the scope.
+            let failed = [[0; 5], [0; 5], [1, 0, 0, 1, 0], [0; 5]];
+            let envelope = find(&id, fixture(&[], failed, false), root, false, modern).unwrap();
+            assert_eq!(envelope["partial"], true);
+            assert_eq!(envelope["warnings"][0]["code"], "coverageIncomplete");
+
+            // Unselected-only tuples (and zero-language rows) flag nothing.
+            let unselected = [[0; 5], [0, 0, 0, 0, 3], [0; 5], [2, 2, 0, 0, 0]];
+            let envelope = find(&id, fixture(&[], unselected, false), root, false, modern).unwrap();
+            assert_eq!(envelope["partial"], false);
+            assert_eq!(envelope["warnings"].as_array().unwrap().len(), 1);
+            assert_eq!(envelope["warnings"][0]["code"], "syntaxOnly");
+            assert_eq!(
+                envelope["data"]["scopeCoverage"].as_array().unwrap().len(),
+                4
+            );
         }
     }
 
     #[test]
-    fn find_keeps_longest_fitting_hit_prefix_and_only_its_proofs() {
+    fn coverage_is_the_closure_of_emitted_symbols_by_full_document_key() {
+        let root = std::path::Path::new("/workspace");
+        let id = json!(1);
+        let hits = vec![
+            hit("one", "src/a.js"),
+            hit("two", "src/a.js"),
+            ("three".into(), "source-set:v1:other", "src/a.js".into()),
+            hit("four", "src/b.js"),
+        ];
+        for modern in [false, true] {
+            let envelope = find(
+                &id,
+                fixture(&hits, COMPLETE_SCOPE, false),
+                root,
+                false,
+                modern,
+            )
+            .unwrap();
+            let rows = envelope["data"]["coverage"].as_array().unwrap();
+            // Same path in two source sets is two documents; a repeated document is one row.
+            let keys: Vec<_> = rows
+                .iter()
+                .map(|c| {
+                    (
+                        c["sourceSetId"].as_str().unwrap(),
+                        c["documentPath"].as_str().unwrap(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                keys,
+                vec![
+                    ("source-set:v1:other", "src/a.js"),
+                    ("source-set:v1:test", "src/a.js"),
+                    ("source-set:v1:test", "src/b.js"),
+                ]
+            );
+            assert_eq!(envelope["data"]["provenance"].as_array().unwrap().len(), 3);
+            assert_eq!(envelope["partial"], false);
+            assert_wire(envelope, &id, modern);
+        }
+    }
+
+    #[test]
+    fn find_keeps_longest_fitting_hit_prefix_and_only_its_closure() {
         let root = std::path::Path::new("/workspace");
         let id = json!("id\n\"\\");
         // Each name appears in a symbol and its displayKey, then again in text.
         // Two fit; the third would overrun the complete JSON-RPC frame.
-        let names = vec!["A".repeat(6_000), "B".repeat(6_000), "C".repeat(6_000)];
+        let hits = vec![
+            hit("A".repeat(6_000), "src/0.js"),
+            hit("B".repeat(6_000), "src/1.js"),
+            hit("C".repeat(6_000), "src/2.js"),
+        ];
         for modern in [false, true] {
-            let envelope = find(&id, fixture(&names, false), root, true, modern).unwrap();
+            let envelope = find(
+                &id,
+                fixture(&hits, COMPLETE_SCOPE, false),
+                root,
+                true,
+                modern,
+            )
+            .unwrap();
             assert_wire(envelope.clone(), &id, modern);
             let data = &envelope["data"];
-            assert_eq!(data["coverage"], json!([coverage(0)]));
             assert_eq!(data["symbols"].as_array().unwrap().len(), 2);
             assert_eq!(data["symbols"][0]["symbolId"], "sid:0");
             assert_eq!(data["symbols"][1]["symbolId"], "sid:1");
+            let paths: Vec<_> = data["coverage"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| c["documentPath"].clone())
+                .collect();
+            assert_eq!(paths, vec![json!("src/0.js"), json!("src/1.js")]);
             assert_eq!(data["provenance"].as_array().unwrap().len(), 2);
-            assert_eq!(data["provenance"][0]["id"], "proof:0");
-            assert_eq!(data["provenance"][1]["id"], "proof:1");
+            assert_eq!(data["scopeCoverage"].as_array().unwrap().len(), 4);
             assert_eq!(envelope["catchingUp"], true);
             assert_eq!(envelope["truncated"], true);
             assert_eq!(envelope["truncationReason"], "response_bytes");
             assert_eq!(envelope["partial"], true);
 
-            // With only two hits the full response fits; no shorter prefix
-            // can be the longest fitting prefix of the original result.
-            let two = find(&id, fixture(&names[..2], false), root, true, modern).unwrap();
+            let two = find(
+                &id,
+                fixture(&hits[..2], COMPLETE_SCOPE, false),
+                root,
+                true,
+                modern,
+            )
+            .unwrap();
             assert_eq!(two["data"]["symbols"], data["symbols"]);
             assert_eq!(two["truncated"], false);
             assert_wire(two, &id, modern);
@@ -355,22 +479,49 @@ mod find_tests {
     }
 
     #[test]
+    fn a_first_hit_too_large_returns_an_empty_truncated_prefix() {
+        let root = std::path::Path::new("/workspace");
+        let id = json!(3);
+        for modern in [false, true] {
+            let hits = vec![hit("Z".repeat(40_000), "src/z.js")];
+            let envelope = find(
+                &id,
+                fixture(&hits, COMPLETE_SCOPE, false),
+                root,
+                false,
+                modern,
+            )
+            .unwrap();
+            assert_eq!(envelope["data"]["symbols"], json!([]));
+            assert_eq!(envelope["data"]["coverage"], json!([]));
+            assert_eq!(envelope["data"]["provenance"], json!([]));
+            assert_eq!(envelope["truncated"], true);
+            assert_eq!(envelope["truncationReason"], "response_bytes");
+            assert_eq!(envelope["partial"], true);
+            assert_wire(envelope, &id, modern);
+        }
+    }
+
+    #[test]
     fn all_hits_fit_with_limit_truncation_and_full_proof_closure() {
-        let names = vec!["first".into(), "second".into()];
+        let hits = vec![hit("first", "src/0.js"), hit("second", "src/1.js")];
         let id = json!(1);
-        let envelope = find(
-            &id,
-            fixture(&names, true),
-            std::path::Path::new("/workspace"),
-            false,
-            true,
-        )
-        .unwrap();
-        assert_eq!(envelope["data"]["symbols"].as_array().unwrap().len(), 2);
-        assert_eq!(envelope["data"]["provenance"].as_array().unwrap().len(), 2);
-        assert_eq!(envelope["truncationReason"], "limit");
-        assert_eq!(envelope["truncated"], true);
-        assert_wire(envelope, &id, true);
+        for modern in [false, true] {
+            let envelope = find(
+                &id,
+                fixture(&hits, COMPLETE_SCOPE, true),
+                std::path::Path::new("/workspace"),
+                false,
+                modern,
+            )
+            .unwrap();
+            assert_eq!(envelope["data"]["symbols"].as_array().unwrap().len(), 2);
+            assert_eq!(envelope["data"]["provenance"].as_array().unwrap().len(), 2);
+            assert_eq!(envelope["data"]["coverage"].as_array().unwrap().len(), 2);
+            assert_eq!(envelope["truncationReason"], "limit");
+            assert_eq!(envelope["truncated"], true);
+            assert_wire(envelope, &id, modern);
+        }
     }
 }
 

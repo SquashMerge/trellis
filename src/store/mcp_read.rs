@@ -226,10 +226,14 @@ impl EvidenceResponse {
     }
 }
 
-/// A find result keeps every required coverage tuple, independent of the hit prefix.
+/// A find result: the emitted hits, each with its document's coverage tuple,
+/// and per-language counts of every native coverage tuple in the searched
+/// scope (#156). The counts are independent of query, limit and clipping.
 pub struct McpFind {
     pub symbols: Vec<McpFindSymbol>,
-    pub coverage: Vec<crate::native_evidence::Coverage>,
+    /// Per language (java, rust, python, javascript):
+    /// [selected, complete, partial, failed, unselected].
+    pub scope: [[u64; 5]; 4],
     pub provenance: Vec<crate::native_evidence::Provenance>,
     pub has_more: bool,
     pub pin: IndexPin,
@@ -238,6 +242,8 @@ pub struct McpFind {
 pub struct McpFindSymbol {
     pub declaration: crate::native_evidence::Declaration,
     pub content_hash: String,
+    /// The native coverage tuple of the symbol's document.
+    pub coverage: crate::native_evidence::Coverage,
 }
 
 impl EvidenceResponse {
@@ -279,7 +285,9 @@ impl EvidenceResponse {
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut coverage = Vec::with_capacity(keys.len());
+        // Every searched tuple is still validated: corrupt required scope
+        // evidence fails closed, even though only counts leave this layer.
+        let mut coverage = BTreeMap::new();
         let mut scopes = BTreeMap::new();
         for key in keys {
             let scope = v8_native_scope_for(&self.db, &key, &selected)?
@@ -325,37 +333,30 @@ impl EvidenceResponse {
                         .all(|role| matches!(role.as_str(), "definition" | "call")),
                 "store_unavailable: inconsistent native coverage tuple"
             );
-            coverage.push(row);
+            coverage.insert(scope.version_id.clone(), row);
             scopes.insert(scope.version_id.clone(), scope);
         }
-        let language_order = |language: &str| -> Result<u8> {
-            match language {
-                "java" => Ok(0),
-                "rust" => Ok(1),
-                "python" => Ok(2),
-                "javascript" => Ok(3),
+        let mut scope_counts = [[0_u64; 5]; 4];
+        for row in coverage.values() {
+            let language = match row.language.as_str() {
+                "java" => 0,
+                "rust" => 1,
+                "python" => 2,
+                "javascript" => 3,
                 _ => anyhow::bail!("store_unavailable: invalid native coverage language"),
+            };
+            let counts = &mut scope_counts[language];
+            if row.selected {
+                counts[0] += 1;
+                counts[match row.state.as_str() {
+                    "complete" => 1,
+                    "partial" => 2,
+                    _ => 3,
+                }] += 1;
+            } else {
+                counts[4] += 1;
             }
-        };
-        for row in &coverage {
-            language_order(&row.language)?;
         }
-        coverage.sort_by(|a, b| {
-            (
-                &a.producer_id,
-                language_order(&a.language).unwrap(),
-                &a.source_set_id,
-                &a.document_path,
-                &a.revision_id,
-            )
-                .cmp(&(
-                    &b.producer_id,
-                    language_order(&b.language).unwrap(),
-                    &b.source_set_id,
-                    &b.document_path,
-                    &b.revision_id,
-                ))
-        });
         // SQLite lower folds ASCII only. instr treats the query as literal bytes, not a pattern.
         let mut statement = self.db.prepare(
             "SELECT d.version_id,d.syntax_id FROM native_version_declarations d
@@ -422,12 +423,16 @@ impl EvidenceResponse {
             symbols.push(McpFindSymbol {
                 declaration,
                 content_hash: hash.clone(),
+                coverage: coverage
+                    .get(&version)
+                    .context("store_unavailable: find coverage absent")?
+                    .clone(),
             });
         }
         provenance.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(McpFind {
             symbols,
-            coverage,
+            scope: scope_counts,
             provenance,
             has_more,
             pin: selected.pin,
