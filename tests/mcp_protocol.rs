@@ -513,6 +513,12 @@ fn tool(v: &Value, code: Option<&str>, modern: bool) {
         } else {
             String::new()
         };
+        // A count of one takes the singular item word (#167).
+        let items = if count == 1 {
+            items.strip_suffix('s').unwrap_or(items)
+        } else {
+            items
+        };
         (
             name,
             format!("{name}: {count} {items}{truncated}; full result in structuredContent."),
@@ -7741,7 +7747,10 @@ async fn mcp_outgoing_nine_hints_exact_omissions_and_language_scope() {
     assert_eq!(hints.len(), 8, "{reply}");
     assert_eq!(call["nativeCandidates"]["omitted"], 1);
     assert_eq!(call["nativeCandidates"]["complete"], false);
-    assert_eq!(envelope["truncationReason"], "limit");
+    // The eight-hint cap is reported per call, never as top-level truncation (#167).
+    assert_eq!(envelope["truncated"], false);
+    assert_eq!(envelope["truncationReason"], Value::Null);
+    assert_eq!(envelope["partial"], true);
     assert_eq!(data["coverage"].as_array().unwrap().len(), 9);
     assert_eq!(data["provenance"].as_array().unwrap().len(), 9);
     assert_eq!(
@@ -7884,7 +7893,13 @@ async fn mcp_outgoing_response_bytes_call_prefix_before_global_hints() {
             "when all calls fit, optional candidates consume the remaining byte budget"
         );
     }
-    assert_eq!(envelope["truncationReason"], "response_bytes");
+    // Only calls cut for bytes truncate; clipped hints stay per call (#167).
+    let expected_reason = if calls.len() < 50 {
+        json!("response_bytes")
+    } else {
+        Value::Null
+    };
+    assert_eq!(envelope["truncationReason"], expected_reason);
     let mut optional_budget_expired = false;
     for (index, call) in calls.iter().enumerate() {
         assert_eq!(call["ordinal"], json!(index));
@@ -8161,13 +8176,14 @@ async fn mcp_outgoing_complete_modern_legacy_frames_fill_candidates_after_all_ca
             "all required calls must fit before hints: {legacy} {}",
             frame.len()
         );
+        // Every call fits; hints clipped for bytes are reported per call only (#167).
         assert_eq!(
             envelope["truncationReason"],
-            "response_bytes",
+            Value::Null,
             "{legacy} {}",
             frame.len()
         );
-        assert_eq!(envelope["truncated"], true);
+        assert_eq!(envelope["truncated"], false);
         let mut first_omission = None;
         for (i, call) in calls.iter().enumerate() {
             assert_eq!(call["ordinal"], json!(i));

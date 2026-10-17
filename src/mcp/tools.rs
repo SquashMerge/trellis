@@ -317,6 +317,12 @@ pub fn result(name: &str, envelope: Value, modern: bool) -> Value {
         } else {
             String::new()
         };
+        // A count of one takes the singular item word (#167): "1 symbol", "1 call".
+        let items = if count == 1 {
+            items.strip_suffix('s').unwrap_or(items)
+        } else {
+            items
+        };
         format!("{name}: {count} {items}{truncation}; full result in structuredContent.")
     };
     assert!(text.len() <= 512, "tool summary exceeds 512 UTF-8 bytes");
@@ -776,5 +782,36 @@ mod tests {
             invalid.response["structuredContent"]["error"]["code"],
             "invalid_request"
         );
+    }
+    #[test]
+    fn summary_uses_the_singular_for_one_item() {
+        let success = |data: Value| json!({"schemaVersion":1,"requestId":1,"data":data,"truncated":false,"truncationReason":null});
+        for (name, data, text) in [
+            ("trellis_find_symbols", json!({"symbols":[{}]}), "1 symbol"),
+            ("trellis_find_symbols", json!({"symbols":[]}), "0 symbols"),
+            ("trellis_outgoing_calls", json!({"calls":[{}]}), "1 call"),
+            (
+                "trellis_outgoing_calls",
+                json!({"calls":[{},{}]}),
+                "2 calls",
+            ),
+            (
+                "trellis_read_source",
+                json!({"startLine":4,"endLine":4}),
+                "1 line",
+            ),
+            (
+                "trellis_read_source",
+                json!({"startLine":4,"endLine":5}),
+                "2 lines",
+            ),
+            ("trellis_declaration", json!({}), "1 declaration"),
+            ("trellis_workspace_describe", json!({}), "1 workspace"),
+        ] {
+            assert_eq!(
+                result(name, success(data), true)["content"][0]["text"],
+                format!("{name}: {text}; full result in structuredContent.")
+            );
+        }
     }
 }
