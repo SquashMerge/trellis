@@ -38,7 +38,7 @@ pub fn compute(
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<Vec<DeclarationMetrics>> {
     let source_only = compute_source(language, source, declarations, check)?;
-    bind(declarations, calls, regions, source_only, check)
+    bind(source, declarations, calls, regions, source_only, check)
 }
 
 /// A memo hit still binds the caller's current declarations, calls and regions.
@@ -50,14 +50,34 @@ pub fn compute_memoized(
     regions: &[ControlRegion],
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<Vec<DeclarationMetrics>> {
-    let source_only = memo.source(
-        source.language,
-        source.content_hash,
+    let key = (
+        VERSION.to_owned(),
+        source.language.to_owned(),
+        source.content_hash.to_owned(),
+    );
+    let cached = memo
+        .entries
+        .iter()
+        .find(|(k, _, _)| *k == key)
+        .map(|(_, scores, _)| scores.clone());
+    let was_cached = cached.is_some();
+    let scores = match cached {
+        Some(scores) => scores,
+        None => compute_source(source.language, source.text, declarations, check)?,
+    };
+    let rows = bind(
         source.text,
         declarations,
+        calls,
+        regions,
+        scores.clone(),
         check,
     )?;
-    bind(declarations, calls, regions, source_only, check)
+    check()?;
+    if !was_cached {
+        memo.insert(key, scores)?;
+    }
+    Ok(rows)
 }
 /// The selected pinned source; only its language, hash and bytes enter the memo key.
 pub struct SourceInput<'a> {
@@ -66,6 +86,7 @@ pub struct SourceInput<'a> {
     pub text: &'a str,
 }
 fn bind(
+    source: &str,
     declarations: &[Declaration],
     calls: &[Call],
     regions: &[ControlRegion],
@@ -88,7 +109,14 @@ fn bind(
             metrics.cognitive += calls
                 .iter()
                 .filter(|c| {
-                    c.owner_syntax_id == d.syntax_id && c.spelling.as_deref() == Some(name.as_str())
+                    c.owner_syntax_id == d.syntax_id
+                        && c.spelling.as_deref() == Some(name.as_str())
+                        && c.callee_range.as_ref().is_some_and(|range| {
+                            source.get(..range.start).is_some_and(|prefix| {
+                                !prefix.trim_end().ends_with('.')
+                                    && !prefix.trim_end().ends_with("::")
+                            })
+                        })
                 })
                 .count();
         }
@@ -257,14 +285,14 @@ fn compute_source(
     check()?;
     let mut parser = Parser::new();
     parser.set_language(&grammar(language)?)?;
-    let mut aborted = false;
+    let mut aborted = None;
     let tree = parser.parse_with_options(
         &mut |offset, _| &source.as_bytes()[offset..],
         None,
         Some(
             tree_sitter::ParseOptions::new().progress_callback(&mut |_| {
-                if check().is_err() {
-                    aborted = true;
+                if let Err(error) = check() {
+                    aborted = Some(error);
                     true
                 } else {
                     false
@@ -272,9 +300,11 @@ fn compute_source(
             }),
         ),
     );
+    if let Some(error) = aborted {
+        return Err(error);
+    }
     check()?;
-    ensure!(!aborted, "deadline_exceeded or cancelled");
-    let tree = tree.context("deadline_exceeded or cancelled: parser stopped")?;
+    let tree = tree.context("bounded_work: parser stopped")?;
     syntax_ok(tree.root_node(), check)?;
     let newline_offsets: Vec<usize> = source
         .bytes()
@@ -346,6 +376,33 @@ fn score(
             continue;
         }
         let kind = node.kind();
+        if matches!(
+            kind,
+            "decorator" | "attribute_item" | "outer_attribute_item" | "inner_attribute_item"
+        ) {
+            continue;
+        }
+        if matches!(
+            kind,
+            "string" | "string_literal" | "character_literal" | "raw_string_literal"
+        ) && !node.children(&mut node.walk()).any(|child| {
+            matches!(
+                child.kind(),
+                "interpolation" | "template_substitution" | "interpolated_string_expression"
+            )
+        }) {
+            let token = &source[node.byte_range()];
+            *operands.entry(token.to_owned()).or_default() += 1;
+            let lo = node.start_byte().max(d.range.start);
+            let hi = node.end_byte().min(d.range.end);
+            if lo < hi {
+                let first = newline_offsets.partition_point(|&offset| offset < lo);
+                let last = newline_offsets.partition_point(|&offset| offset < hi)
+                    - usize::from(source.as_bytes()[hi - 1] == b'\n');
+                code_lines.extend(first..=last);
+            }
+            continue;
+        }
         if node.is_named() {
             let structural = matches!(
                 kind,
@@ -369,14 +426,22 @@ fn score(
                     | "conditional_expression"
             );
             if structural {
-                s.cyclomatic += 1;
-                s.cognitive += 1 + depth;
-            }
-            if matches!(kind, "elif_clause" | "else_clause") {
-                s.cognitive += 1;
-                if kind == "elif_clause" {
+                if !matches!(
+                    kind,
+                    "match_statement"
+                        | "match_expression"
+                        | "switch_expression"
+                        | "switch_statement"
+                ) {
                     s.cyclomatic += 1;
                 }
+                s.cognitive += 1 + depth;
+            }
+            if kind == "elif_clause" {
+                s.cognitive += 1;
+                s.cyclomatic += 1;
+            } else if kind == "else_clause" {
+                s.cognitive += 1;
             }
             if matches!(
                 kind,
@@ -388,7 +453,9 @@ fn score(
             ) && !source[node.byte_range()]
                 .trim_start()
                 .starts_with("default")
-                && !source[node.byte_range()].trim_start().starts_with("_")
+                && !(kind == "case_clause"
+                    && source[node.byte_range()].trim_start().starts_with("case _"))
+                && !(kind == "match_arm" && source[node.byte_range()].trim_start().starts_with('_'))
             {
                 s.cyclomatic += 1;
             }
@@ -404,7 +471,9 @@ fn score(
                     | "continue_expression"
                     | "break_statement"
                     | "continue_statement"
-            ) && node.named_child_count() > 0
+            ) && source[node.byte_range()]
+                .trim_start_matches(|c: char| c.is_alphabetic() || c.is_whitespace())
+                .starts_with('\'')
             {
                 s.cognitive += 1;
             }
@@ -420,7 +489,18 @@ fn score(
             let children: Vec<_> = node.children(&mut cursor).collect();
             if !children.is_empty() {
                 for child in children.into_iter().rev() {
-                    stack.push((child, depth + usize::from(structural || lambda)));
+                    let continuation = kind == "if_statement"
+                        && matches!(child.kind(), "if_statement" | "else_clause");
+                    let else_continuation = kind == "else_clause" && child.kind() == "if_statement";
+                    stack.push((
+                        child,
+                        depth
+                            + usize::from(
+                                (structural && !continuation)
+                                    || lambda
+                                    || (kind == "else_clause" && !else_continuation),
+                            ),
+                    ));
                 }
                 continue;
             }
@@ -451,10 +531,21 @@ fn score(
         for line in first_line..=last_line {
             code_lines.insert(line);
         }
+        if token == "else"
+            && language != "python"
+            && node
+                .parent()
+                .is_none_or(|parent| parent.kind() != "else_clause")
+        {
+            s.cognitive += 1;
+        }
         if matches!(token, "(" | ")" | "[" | "]" | "{" | "}" | "," | ";" | ":") {
             continue;
         }
-        let operand = kind.contains("identifier")
+        let operand = matches!(
+            kind,
+            "string_fragment" | "template_chars" | "string_content" | "escape_sequence"
+        ) || kind.contains("identifier")
             || kind.contains("literal")
             || kind.contains("string")
             || kind.contains("number")
@@ -469,7 +560,23 @@ fn score(
         }
         if matches!(token, "&&" | "||") || (language == "python" && matches!(token, "and" | "or")) {
             s.cyclomatic += 1;
-            s.cognitive += 1;
+            let parent = node.parent();
+            let same_run = parent.is_some_and(|parent| {
+                let text = &source[parent.byte_range()];
+                let op = token;
+                (parent.kind() == "binary_expression" || parent.kind() == "boolean_operator")
+                    && parent.parent().is_some_and(|ancestor| {
+                        (ancestor.kind() == "binary_expression"
+                            || ancestor.kind() == "boolean_operator")
+                            && ancestor
+                                .child_by_field_name("operator")
+                                .is_some_and(|operator| &source[operator.byte_range()] == op)
+                            && text.contains(op)
+                    })
+            });
+            if !same_run {
+                s.cognitive += 1;
+            }
         }
     }
     if d.range.start < d.range.end {
@@ -514,8 +621,9 @@ fn score(
 }
 
 /// FIFO memo contains only complete source-derived scores, never native identity or calls.
+type MemoEntry = ((String, String, String), Vec<Score>, usize);
 pub struct MetricsMemo {
-    entries: VecDeque<((String, String), Vec<Score>, usize)>,
+    entries: VecDeque<MemoEntry>,
     bytes: usize,
     limit: usize,
 }
@@ -536,25 +644,45 @@ impl MetricsMemo {
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<Vec<Score>> {
         check()?;
-        let key = (language.to_owned(), hash.to_owned());
+        let key = (VERSION.to_owned(), language.to_owned(), hash.to_owned());
         if let Some((_, value, _)) = self.entries.iter().find(|(k, _, _)| *k == key) {
             return Ok(value.clone());
         }
         let value = compute_source(language, text, declarations, check)?;
         check()?;
-        let size = serde_json::to_vec(&value)?.len();
-        if size <= self.limit {
-            while self.bytes + size > self.limit {
+        self.insert(key, value.clone())?;
+        Ok(value)
+    }
+    fn insert(&mut self, key: (String, String, String), value: Vec<Score>) -> Result<()> {
+        let size = key
+            .0
+            .capacity()
+            .saturating_add(key.1.capacity())
+            .saturating_add(key.2.capacity())
+            .saturating_add(
+                value
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Score>()),
+            )
+            .saturating_add(std::mem::size_of::<(
+                String,
+                String,
+                String,
+                Vec<Score>,
+                usize,
+            )>());
+        if size <= self.limit.min(64 * 1024 * 1024) {
+            while self.bytes.saturating_add(size) > self.limit.min(64 * 1024 * 1024) {
                 if let Some((_, _, n)) = self.entries.pop_front() {
                     self.bytes -= n;
                 } else {
                     break;
                 }
             }
-            self.entries.push_back((key, value.clone(), size));
+            self.entries.push_back((key, value, size));
             self.bytes += size;
         }
-        Ok(value)
+        Ok(())
     }
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -568,16 +696,16 @@ struct CheckedWriter<'a, C> {
     bytes: Vec<u8>,
     cap: usize,
     check: &'a mut C,
-    failed: Option<&'static str>,
+    failed: Option<anyhow::Error>,
 }
 impl<C: FnMut() -> Result<()>> Write for CheckedWriter<'_, C> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if (self.check)().is_err() {
-            self.failed = Some("deadline_exceeded or cancelled");
-            return Err(io::Error::other("deadline_exceeded or cancelled"));
+        if let Err(error) = (self.check)() {
+            self.failed = Some(error);
+            return Err(io::Error::other("cancelled serialization"));
         }
         if buf.len() > self.cap.saturating_sub(self.bytes.len()) {
-            self.failed = Some("response_too_large");
+            self.failed = Some(anyhow::anyhow!("response_too_large"));
             return Err(io::Error::other("response_too_large"));
         }
         self.bytes.extend_from_slice(buf);
@@ -601,7 +729,7 @@ pub fn serialize_checked<T: Serialize>(
     };
     let result = serde_json::to_writer(&mut writer, value);
     if let Some(reason) = writer.failed {
-        anyhow::bail!(reason);
+        return Err(reason);
     }
     result?;
     (writer.check)()?;
