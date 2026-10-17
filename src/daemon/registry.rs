@@ -1537,6 +1537,15 @@ impl std::ops::Deref for SelectedCheckout {
 
 /// Keeps a selected immutable snapshot alive through final workspace and
 /// revision checks; idle release cannot drop its owner before this guard drops.
+/// Ordering seams for one metrics read and its checked response materialization.
+pub struct MetricsResponseHooks<'a> {
+    pub before_work: &'a mut dyn FnMut(),
+    pub before_finish: &'a mut dyn FnMut(),
+    pub after_finish: &'a mut dyn FnMut(),
+    pub on_write: &'a mut dyn FnMut(usize),
+    pub on_progress: &'a mut dyn FnMut(),
+}
+
 pub struct CheckoutEvidence {
     response: crate::store::EvidenceResponse,
     /// Held against release until this evidence drops.
@@ -2067,6 +2076,86 @@ impl CheckoutRuntime {
             },
             catching_up,
         ))
+    }
+
+    /// One admitted read, one projection, and one final selected-read fence.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn metrics_memo_entries_for_tests(&self) -> anyhow::Result<usize> {
+        Ok(self.resources()?.store.metrics_memo_entries_for_tests())
+    }
+
+    pub fn metrics_response(
+        &self,
+        options: &crate::store::MetricsOptions,
+        check: &mut impl FnMut() -> anyhow::Result<()>,
+        hooks: MetricsResponseHooks<'_>,
+        max_bytes: usize,
+    ) -> anyhow::Result<(Vec<u8>, bool)> {
+        use serde::Serialize;
+        struct Bounded<'a, F> {
+            bytes: Vec<u8>,
+            check: &'a mut F,
+            on_write: &'a mut dyn FnMut(usize),
+            max_bytes: usize,
+            failure: Option<anyhow::Error>,
+        }
+        impl<F: FnMut() -> anyhow::Result<()>> std::io::Write for Bounded<'_, F> {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                (self.on_write)(self.bytes.len());
+                if let Err(error) = (self.check)() {
+                    self.failure = Some(error);
+                    return Err(std::io::Error::other("metrics check failed"));
+                }
+                if data.len() > self.max_bytes.saturating_sub(self.bytes.len()) {
+                    self.failure = Some(anyhow::anyhow!("response_too_large"));
+                    return Err(std::io::Error::other("response_too_large"));
+                }
+                self.bytes.extend_from_slice(data);
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Envelope<'a> {
+            catching_up: bool,
+            payload: &'a crate::store::MetricsPayload,
+        }
+        let (response, catching_up) = self.evidence_response()?;
+        (hooks.before_work)();
+        check()?;
+        let payload = response.metrics_at(options, &mut || {
+            (hooks.on_progress)();
+            check()
+        })?;
+        let mut writer = Bounded {
+            bytes: Vec::new(),
+            check,
+            on_write: hooks.on_write,
+            max_bytes,
+            failure: None,
+        };
+        let encoded = serde_json::to_writer(
+            &mut writer,
+            &Envelope {
+                catching_up,
+                payload: &payload,
+            },
+        );
+        if let Some(error) = writer.failure.take() {
+            return Err(error);
+        }
+        encoded.map_err(|_| anyhow::anyhow!("bounded_work: metrics serialization failed"))?;
+        (writer.check)()?;
+        (hooks.before_finish)();
+        (writer.check)()?;
+        let bytes = response.finish(writer.bytes)?;
+        (hooks.after_finish)();
+        (writer.check)()?;
+        Ok((bytes, catching_up))
     }
 
     pub fn evidence_for_selected(
