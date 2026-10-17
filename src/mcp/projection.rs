@@ -425,10 +425,11 @@ mod find_tests {
         } else {
             String::new()
         };
+        let items = if count == 1 { "symbol" } else { "symbols" };
         assert_eq!(
             result["content"][0]["text"],
             format!(
-                "trellis_find_symbols: {count} symbols{truncated}; full result in structuredContent."
+                "trellis_find_symbols: {count} {items}{truncated}; full result in structuredContent."
             )
         );
         assert_eq!(result.get("resultType").is_some(), modern);
@@ -778,16 +779,14 @@ pub fn outgoing(
             provenance.insert(row.id.clone(), row.clone());
         }
         let mut calls = Vec::new();
-        let mut byte_omission = false;
-        let mut limited = result.has_more;
+        // Top-level truncation describes the required calls only (#167); optional
+        // hint clipping is reported per call in `nativeCandidates.omitted`.
+        let limited = result.has_more;
         let mut clipped = false;
         for (index, item) in result.calls[..count].iter().enumerate() {
             let text = item.selected.callee_text.as_deref();
             clipped |= item.selected.callee_text_truncated;
-            let available = item.selected.candidates.len().min(8);
             let n = shown[index];
-            byte_omission |= n < available;
-            limited |= item.selected.candidates.len() > 8;
             for (candidate, version) in item.selected.candidates[..n]
                 .iter()
                 .zip(&item.candidate_documents[..n])
@@ -862,8 +861,8 @@ pub fn outgoing(
                 ))
         });
         let incomplete = coverage.iter().any(|c| c.selected && c.state != "complete");
-        let truncated = count < result.calls.len() || byte_omission || limited || clipped;
-        let reason = if count < result.calls.len() || byte_omission {
+        let truncated = count < result.calls.len() || limited || clipped;
+        let reason = if count < result.calls.len() {
             Some("response_bytes")
         } else if limited {
             Some("limit")

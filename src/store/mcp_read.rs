@@ -1008,6 +1008,7 @@ impl EvidenceResponse {
         // connection or lock transition is needed for these candidate SELECTs.
         let _progress_guard =
             (!calls.is_empty()).then(|| install_optional_hint_progress(&self.db, &progress));
+        let owner_is_test = mcp_test_path(&scope.key.path);
         // One admitted snapshot: verify and decode each selected version only once.
         // A failed optional verification is never cached as trusted evidence.
         let mut verified_versions = BTreeMap::<
@@ -1100,6 +1101,11 @@ impl EvidenceResponse {
                     language: row.get(3)?,
                     path: row.get(4)?,
                 };
+                // Test code is not an eligible hint for non-test code; skip it
+                // before verification so it costs no hint budget.
+                if !owner_is_test && mcp_test_path(&key.path) {
+                    continue;
+                }
                 let candidate = (|| -> Result<Option<McpOutgoingCandidate>> {
                     optional_hint_check(Some(&|| progress.expired()))?;
                     let Some(candidate_scope) = v8_native_scope_for(&self.db, &key, &selected)?
@@ -1239,18 +1245,17 @@ impl EvidenceResponse {
             }
             item.candidates = candidates.into_values().collect();
             item.candidates.sort_by(|a, b| {
-                (
-                    &a.declaration.document.path,
-                    a.declaration.range.start,
-                    a.declaration.range.end,
-                    &a.declaration.syntax_id,
-                )
-                    .cmp(&(
-                        &b.declaration.document.path,
-                        b.declaration.range.start,
-                        b.declaration.range.end,
-                        &b.declaration.syntax_id,
-                    ))
+                let key = |c: &McpOutgoingCandidate| {
+                    let d = &c.declaration;
+                    (
+                        mcp_hint_proximity(&scope.key.path, &d.document.path),
+                        d.document.path.clone(),
+                        d.range.start,
+                        d.range.end,
+                        d.syntax_id.clone(),
+                    )
+                };
+                key(a).cmp(&key(b))
             });
             item.omitted = Some(item.candidates.len().saturating_sub(8));
         }
@@ -1341,6 +1346,54 @@ impl EvidenceResponse {
             calls,
             has_more: outgoing.has_more,
         }))
+    }
+}
+
+/// Whether a root-relative path is test code by path convention alone (#167):
+/// a `tests`, `test`, `__tests__` or `spec` directory, or a test file name.
+/// Inline test modules inside production files are not detected.
+pub(crate) fn mcp_test_path(path: &str) -> bool {
+    let (dirs, name) = path.rsplit_once('/').unwrap_or(("", path));
+    if dirs
+        .split('/')
+        .any(|dir| matches!(dir, "tests" | "test" | "__tests__" | "spec"))
+    {
+        return true;
+    }
+    // `*.test.*` / `*.spec.*`: any inner dot segment, so multi-dot names such
+    // as `component.integration.test.ts` match too.
+    let segments: Vec<&str> = name.split('.').collect();
+    if segments.len() > 2
+        && segments[1..segments.len() - 1]
+            .iter()
+            .any(|segment| matches!(*segment, "test" | "spec"))
+    {
+        return true;
+    }
+    match name.rsplit_once('.') {
+        Some((stem, "rs")) => {
+            stem == "tests" || stem.ends_with("_tests") || stem.ends_with("_test")
+        }
+        Some((stem, "py")) => {
+            stem.starts_with("test_") || stem.ends_with("_test") || stem == "conftest"
+        }
+        Some((stem, "java")) => stem.ends_with("Test") || stem.ends_with("Tests"),
+        _ => false,
+    }
+}
+
+/// Hint rank by location relative to the calling document: the same document,
+/// then the same directory, then elsewhere (#167).
+fn mcp_hint_proximity(owner: &str, candidate: &str) -> u8 {
+    fn dir(path: &str) -> &str {
+        path.rsplit_once('/').map_or("", |(dir, _)| dir)
+    }
+    if owner == candidate {
+        0
+    } else if dir(owner) == dir(candidate) {
+        1
+    } else {
+        2
     }
 }
 
@@ -1869,6 +1922,135 @@ mod enriched_read_tests {
             assert_eq!(declaration.source.lines, symbol.source.lines);
         }
         read.finish(()).unwrap();
+    }
+
+    #[test]
+    fn hints_skip_test_code_for_production_callers_and_rank_by_proximity() {
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        for (path, text) in [
+            (
+                "src/owner.js",
+                "function Owner() { Target(); }\nfunction Target() {}\n",
+            ),
+            ("src/sibling.js", "function Target() {}\n"),
+            ("lib/far.js", "function Target() {}\n"),
+            ("src/x.test.js", "function Target() {}\n"),
+            ("src/c.integration.test.js", "function Target() {}\n"),
+            ("tests/t.js", "function Target() {}\n"),
+            ("tests/owner.js", "function TestOwner() { Target(); }\n"),
+        ] {
+            let path = workspace.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let (pin, _owner) = crate::index_coordinator::reconcile_workspace(
+            &store,
+            &IndexOptions::new(workspace.path().to_owned()),
+            &Arc::new(AtomicBool::new(false)),
+            |_| {},
+        )
+        .unwrap();
+        let read = store.evidence_response().unwrap();
+        let base = std::time::Instant::now();
+        let hints = |name: &str| {
+            let owner = read
+                .mcp_find_with_lines(name, 20, Some(pin))
+                .unwrap()
+                .symbols
+                .into_iter()
+                .find(|symbol| symbol.symbol.declaration.name.as_deref() == Some(name))
+                .unwrap();
+            let outgoing = read
+                .mcp_outgoing(
+                    &owner.symbol.declaration.syntax_id,
+                    20,
+                    Some(pin),
+                    &|| base,
+                    base + std::time::Duration::from_secs(5),
+                )
+                .unwrap()
+                .unwrap();
+            let call = &outgoing.calls[0];
+            (
+                call.candidates
+                    .iter()
+                    .map(|c| c.declaration.document.path.clone())
+                    .collect::<Vec<_>>(),
+                call.omitted,
+            )
+        };
+        // Production caller: the same document, the same directory, then elsewhere;
+        // test-code matches are not eligible and not counted as omitted.
+        assert_eq!(
+            hints("Owner"),
+            (
+                vec![
+                    "src/owner.js".into(),
+                    "src/sibling.js".into(),
+                    "lib/far.js".into()
+                ],
+                Some(0)
+            )
+        );
+        // Test caller: test code is eligible, nearest first.
+        assert_eq!(
+            hints("TestOwner"),
+            (
+                vec![
+                    "tests/t.js".into(),
+                    "lib/far.js".into(),
+                    "src/c.integration.test.js".into(),
+                    "src/owner.js".into(),
+                    "src/sibling.js".into(),
+                    "src/x.test.js".into(),
+                ],
+                Some(0)
+            )
+        );
+        read.finish(()).unwrap();
+    }
+
+    #[test]
+    fn test_paths_follow_the_documented_conventions() {
+        for path in [
+            "tests/a.rs",
+            "crate/tests/deep/a.rs",
+            "src/test/java/a/B.java",
+            "web/__tests__/a.js",
+            "spec/a.rb",
+            "src/http/tests.rs",
+            "src/store/serving_holder_tests.rs",
+            "src/a_test.rs",
+            "pkg/test_a.py",
+            "pkg/a_test.py",
+            "pkg/conftest.py",
+            "src/a/BTest.java",
+            "src/a/BTests.java",
+            "web/a.test.js",
+            "web/a.spec.ts",
+            "web/component.integration.test.ts",
+            "web/a.b.spec.js",
+        ] {
+            assert!(mcp_test_path(path), "{path}");
+        }
+        for path in [
+            "src/store.rs",
+            "src/testing.rs",
+            "src/attest.rs",
+            "pkg/testing.py",
+            "pkg/contest.py",
+            "src/a/Testable.java",
+            "web/latest.js",
+            "web/a.js",
+            "testdata.js",
+            "web/test.js",
+            "web/a.testing.js",
+            "src/a.b.rs",
+        ] {
+            assert!(!mcp_test_path(path), "{path}");
+        }
     }
 }
 
