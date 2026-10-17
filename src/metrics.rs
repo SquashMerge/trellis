@@ -378,7 +378,12 @@ fn score(
         let kind = node.kind();
         if matches!(
             kind,
-            "decorator" | "attribute_item" | "outer_attribute_item" | "inner_attribute_item"
+            "decorator"
+                | "annotation"
+                | "marker_annotation"
+                | "attribute_item"
+                | "outer_attribute_item"
+                | "inner_attribute_item"
         ) {
             continue;
         }

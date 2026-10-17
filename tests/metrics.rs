@@ -1056,3 +1056,33 @@ fn java_javascript_rust_halstead_raw_and_derived_are_hand_checked() {
         );
     }
 }
+
+#[test]
+fn java_annotation_is_excluded_from_halstead_without_dropping_method() {
+    let plain = "class C { int calc() { return 1; } }";
+    let decorated = "class C { @Deprecated int calc() { return 1; } }";
+    let a = metrics::compute(
+        "java",
+        plain,
+        &[declaration("java", plain.len())],
+        &[],
+        &[],
+        &mut || Ok(()),
+    )
+    .unwrap()
+    .remove(0)
+    .metrics;
+    let b = metrics::compute(
+        "java",
+        decorated,
+        &[declaration("java", decorated.len())],
+        &[],
+        &[],
+        &mut || Ok(()),
+    )
+    .unwrap()
+    .remove(0)
+    .metrics;
+    assert_eq!(a.halstead, b.halstead);
+    assert_eq!(a.sloc, b.sloc);
+}
