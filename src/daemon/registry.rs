@@ -1924,21 +1924,24 @@ impl CheckoutRuntime {
     /// Freeze only optional hint accounting. Mandatory call deadlines keep using real time.
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
-    /// Freeze the optional-hint clock. Freeze before the call is accepted: the
-    /// hint end is still capped by the call's real-clock deadline.
+    /// Freeze the optional-hint clock: it then reads the call's acceptance
+    /// instant plus the advanced skew, so the hint budget and the call
+    /// deadline share one origin however long acceptance took (#131).
     pub fn freeze_mcp_hint_clock_for_tests(&self) {
         *self.mcp_hint_clock_origin.lock().unwrap() = Some(Instant::now());
     }
 
-    pub(crate) fn mcp_hint_clock_now(&self) -> Instant {
+    /// The optional-hint clock for a call accepted at `accepted`.
+    pub(crate) fn mcp_hint_clock_now(&self, accepted: Instant) -> Instant {
         #[cfg(feature = "test-support")]
-        if let Some(origin) = *self.mcp_hint_clock_origin.lock().unwrap() {
-            return origin
+        if self.mcp_hint_clock_origin.lock().unwrap().is_some() {
+            return accepted
                 + Duration::from_millis(
                     self.mcp_clock_skew_ms
                         .load(std::sync::atomic::Ordering::Acquire),
                 );
         }
+        let _ = accepted;
         self.mcp_clock_now()
     }
 

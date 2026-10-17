@@ -6437,6 +6437,29 @@ fn mcp_outgoing_wire_fixture(
     legacy: bool,
     check_selected_after_hints: bool,
 ) -> (Value, Vec<u8>) {
+    mcp_outgoing_wire_fixture_delayed(
+        files,
+        owner,
+        limit,
+        advance_hints,
+        legacy,
+        check_selected_after_hints,
+        Duration::ZERO,
+    )
+}
+
+/// As `mcp_outgoing_wire_fixture`, sending the call `accept_delay` after the
+/// hint clock is frozen, so a test can show the hint budget does not depend on
+/// acceptance timing (#131).
+fn mcp_outgoing_wire_fixture_delayed(
+    files: &[(&str, &str)],
+    owner: &str,
+    limit: Option<usize>,
+    advance_hints: Option<Vec<(&'static str, u64)>>,
+    legacy: bool,
+    check_selected_after_hints: bool,
+    accept_delay: Duration,
+) -> (Value, Vec<u8>) {
     use trellis::daemon::registry::CheckoutRegistry;
     use trellis::store::{
         Store,
@@ -6582,6 +6605,9 @@ fn mcp_outgoing_wire_fixture(
     } else {
         None
     };
+    if !accept_delay.is_zero() {
+        std::thread::sleep(accept_delay);
+    }
     writeln!(
         client,
         "{}",
@@ -7215,12 +7241,25 @@ async fn mcp_outgoing_response_bytes_call_prefix_before_global_hints() {
     assert!(serde_json::to_vec(&reply).unwrap().len() < 65_536);
 }
 
+/// #131: the same near-deadline budget, with the call accepted 300 ms after
+/// the hint clock was frozen. The hint budget is anchored to acceptance, so
+/// the delay cannot move the cap and leak an optional hint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_outgoing_near_call_deadline_is_independent_of_acceptance_delay() {
+    mcp_outgoing_near_call_deadline_body(Duration::from_millis(300)).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mcp_outgoing_near_call_deadline_preserves_required_call_without_optional_work() {
+    mcp_outgoing_near_call_deadline_body(Duration::ZERO).await;
+}
+
+async fn mcp_outgoing_near_call_deadline_body(accept_delay: Duration) {
     // Required calls finish before the hint budget starts. The row gate advances
     // the virtual clock into the reserved send-decision window, without crossing
     // the overall deadline. Only optional hints may be abandoned.
-    let reply = mcp_outgoing_fixture_with_budget(
+    // mcp_outgoing_fixture_with_budget, with the call accepted after `accept_delay`.
+    let (reply, _) = mcp_outgoing_wire_fixture_delayed(
         &[(
             "a.js",
             "function Target() {}\nfunction Owner() { Target(); }\n",
@@ -7231,6 +7270,9 @@ async fn mcp_outgoing_near_call_deadline_preserves_required_call_without_optiona
             ("outgoing_hint_start", 4000),
             ("outgoing_hint_row", 940),
         ]),
+        false,
+        false,
+        accept_delay,
     );
     tool(&reply, None, true);
     let envelope = &reply["result"]["structuredContent"];
