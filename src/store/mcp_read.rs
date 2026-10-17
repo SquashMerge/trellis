@@ -1360,8 +1360,17 @@ pub(crate) fn mcp_test_path(path: &str) -> bool {
     {
         return true;
     }
-    let stem_ext = name.split_once('.');
-    match stem_ext {
+    // `*.test.*` / `*.spec.*`: any inner dot segment, so multi-dot names such
+    // as `component.integration.test.ts` match too.
+    let segments: Vec<&str> = name.split('.').collect();
+    if segments.len() > 2
+        && segments[1..segments.len() - 1]
+            .iter()
+            .any(|segment| matches!(*segment, "test" | "spec"))
+    {
+        return true;
+    }
+    match name.rsplit_once('.') {
         Some((stem, "rs")) => {
             stem == "tests" || stem.ends_with("_tests") || stem.ends_with("_test")
         }
@@ -1369,8 +1378,7 @@ pub(crate) fn mcp_test_path(path: &str) -> bool {
             stem.starts_with("test_") || stem.ends_with("_test") || stem == "conftest"
         }
         Some((stem, "java")) => stem.ends_with("Test") || stem.ends_with("Tests"),
-        Some((_, rest)) => rest.starts_with("test.") || rest.starts_with("spec."),
-        None => false,
+        _ => false,
     }
 }
 
@@ -1928,6 +1936,7 @@ mod enriched_read_tests {
             ("src/sibling.js", "function Target() {}\n"),
             ("lib/far.js", "function Target() {}\n"),
             ("src/x.test.js", "function Target() {}\n"),
+            ("src/c.integration.test.js", "function Target() {}\n"),
             ("tests/t.js", "function Target() {}\n"),
             ("tests/owner.js", "function TestOwner() { Target(); }\n"),
         ] {
@@ -1992,6 +2001,7 @@ mod enriched_read_tests {
                 vec![
                     "tests/t.js".into(),
                     "lib/far.js".into(),
+                    "src/c.integration.test.js".into(),
                     "src/owner.js".into(),
                     "src/sibling.js".into(),
                     "src/x.test.js".into(),
@@ -2020,6 +2030,8 @@ mod enriched_read_tests {
             "src/a/BTests.java",
             "web/a.test.js",
             "web/a.spec.ts",
+            "web/component.integration.test.ts",
+            "web/a.b.spec.js",
         ] {
             assert!(mcp_test_path(path), "{path}");
         }
@@ -2033,6 +2045,9 @@ mod enriched_read_tests {
             "web/latest.js",
             "web/a.js",
             "testdata.js",
+            "web/test.js",
+            "web/a.testing.js",
+            "src/a.b.rs",
         ] {
             assert!(!mcp_test_path(path), "{path}");
         }
