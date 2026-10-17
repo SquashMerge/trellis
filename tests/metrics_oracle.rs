@@ -566,3 +566,53 @@ fn assert_real_oracle_comparisons(records: &[Value]) {
         "{matched} compared, {diverged} divergent, {unavailable} unavailable"
     );
 }
+
+#[test]
+fn manual_regeneration_inventory_covers_every_committed_raw_pair() {
+    use std::process::Command;
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let result = Command::new("python3")
+        .arg(root.join("tools/metrics-oracle/regenerate.py"))
+        .arg("--inventory-json")
+        .current_dir(root)
+        .output()
+        .expect("python3 is required for the documented manual regeneration command");
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let stdout = String::from_utf8(result.stdout).unwrap();
+    let inventory: Value = serde_json::from_str(stdout.lines().last().unwrap()).unwrap();
+    let entries = inventory.as_array().unwrap();
+    assert_eq!(entries.len(), 18);
+    let expected = fixture_sources();
+    for (language, path) in expected {
+        let matched: Vec<_> = entries
+            .iter()
+            .filter(|row| row["language"] == language && row["path"] == path)
+            .collect();
+        assert_eq!(
+            matched.len(),
+            1,
+            "regeneration omitted or duplicated {path}"
+        );
+        let stem = matched[0]["stem"].as_str().unwrap();
+        assert_eq!(stem, golden_stem(path));
+        for oracle in ["arborist", "rca"] {
+            let raw: Value = serde_json::from_slice(
+                &fs::read(
+                    root.join("tests/fixtures/metrics/golden")
+                        .join(format!("{stem}.{oracle}.json")),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let emitted_path = if oracle == "arborist" { "path" } else { "name" };
+            assert_eq!(
+                raw[emitted_path], path,
+                "{stem}.{oracle}.json must keep repository-relative source path"
+            );
+        }
+    }
+}
