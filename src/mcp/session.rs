@@ -574,14 +574,18 @@ mod tests {
             assert_eq!(s.pending(first.token).unwrap().id, first.id);
         }
     }
-    /// Test-owned dual-content tool result. Catalog construction belongs to the next slice.
+    /// Synthetic reducer fixture with a short text summary and separate structured envelope.
     fn tool_response(id: &Value, tag: &str, is_error: bool, modern: bool) -> Value {
         let envelope = if is_error {
             json!({"schemaVersion":1,"requestId":id,"error":{"code":"index_not_ready","message":"Index is not ready","retryable":true,"currentBasis":null,"currentContentHash":null}})
         } else {
             json!({"schemaVersion":1,"requestId":id,"evidenceBasis":null,"data":{"tag":tag},"warnings":[],"partial":true,"truncated":false,"truncationReason":null})
         };
-        let text = serde_json::to_string(&envelope).unwrap();
+        let text = if is_error {
+            "probe failed: index_not_ready: Index is not ready"
+        } else {
+            "probe: 1 item; full result in structuredContent."
+        };
         let mut result = json!({"isError":is_error,"structuredContent":envelope,"content":[{"type":"text","text":text}]});
         if modern {
             result["resultType"] = json!("complete");
@@ -631,14 +635,21 @@ mod tests {
                     );
                     let old_response = tool_response(&a.id, "old", old_is_error, !legacy);
                     assert_eq!(old_response["result"]["isError"], json!(old_is_error));
+                    let old_text = old_response["result"]["content"][0]["text"]
+                        .as_str()
+                        .unwrap();
                     assert_eq!(
-                        serde_json::from_str::<Value>(
-                            old_response["result"]["content"][0]["text"]
-                                .as_str()
-                                .unwrap()
-                        )
-                        .unwrap(),
-                        old_response["result"]["structuredContent"]
+                        old_text,
+                        if old_is_error {
+                            "probe failed: index_not_ready: Index is not ready"
+                        } else {
+                            "probe: 1 item; full result in structuredContent."
+                        }
+                    );
+                    assert!(old_text.len() <= 512);
+                    assert_eq!(
+                        old_response["result"]["structuredContent"]["requestId"],
+                        a.id
                     );
                     if old_is_error {
                         assert_eq!(
@@ -685,13 +696,17 @@ mod tests {
                     assert_eq!(s.commit(own), Some(expected.clone()));
                     assert_eq!(expected["id"], b.id);
                     assert_eq!(expected["result"]["structuredContent"]["requestId"], b.id);
+                    let text = expected["result"]["content"][0]["text"].as_str().unwrap();
                     assert_eq!(
-                        serde_json::from_str::<Value>(
-                            expected["result"]["content"][0]["text"].as_str().unwrap()
-                        )
-                        .unwrap(),
-                        expected["result"]["structuredContent"]
+                        text,
+                        if old_is_error {
+                            "probe: 1 item; full result in structuredContent."
+                        } else {
+                            "probe failed: index_not_ready: Index is not ready"
+                        }
                     );
+                    assert!(text.len() <= 512);
+                    assert_eq!(expected["result"]["structuredContent"]["requestId"], b.id);
                     assert!(s.commit(queued).is_none());
                     assert_eq!(s.pending_count(), 0);
                 }
