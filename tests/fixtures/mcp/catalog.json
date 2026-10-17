@@ -1635,6 +1635,51 @@
             "error"
           ],
           "type": "object"
+        },
+        "LanguageStatus": {
+          "additionalProperties": false,
+          "properties": {
+            "coverage": {
+              "additionalProperties": false,
+              "properties": {
+                "complete": {
+                  "$ref": "#/$defs/UInt"
+                },
+                "failed": {
+                  "$ref": "#/$defs/UInt"
+                },
+                "partial": {
+                  "$ref": "#/$defs/UInt"
+                },
+                "selected": {
+                  "$ref": "#/$defs/UInt"
+                },
+                "unselected": {
+                  "$ref": "#/$defs/UInt"
+                }
+              },
+              "required": [
+                "selected",
+                "complete",
+                "partial",
+                "failed",
+                "unselected"
+              ],
+              "type": "object"
+            },
+            "evidenceTier": {
+              "const": "syntax"
+            },
+            "language": {
+              "$ref": "#/$defs/Language"
+            }
+          },
+          "required": [
+            "language",
+            "evidenceTier",
+            "coverage"
+          ],
+          "type": "object"
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1657,6 +1702,14 @@
                   },
                   "type": "array"
                 },
+                "scopeCoverage": {
+                  "items": {
+                    "$ref": "#/$defs/LanguageStatus"
+                  },
+                  "maxItems": 4,
+                  "minItems": 4,
+                  "type": "array"
+                },
                 "symbols": {
                   "items": {
                     "$ref": "#/$defs/Symbol"
@@ -1667,6 +1720,7 @@
               "required": [
                 "symbols",
                 "coverage",
+                "scopeCoverage",
                 "provenance"
               ],
               "type": "object"

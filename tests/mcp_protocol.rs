@@ -564,9 +564,19 @@ fn golden_settled_failure(id: &Value, root: &Value, code: &str, basis: Value) ->
             "retryable":retryable,"currentBasis":basis,"currentContentHash":null}})
 }
 
+/// Find's four scope rows for a checkout with no native documents (#156).
+fn empty_scope_coverage() -> Value {
+    let row = |language: &str| {
+        json!({"language":language,"evidenceTier":"syntax","coverage":{
+            "selected":0,"complete":0,"partial":0,"failed":0,"unselected":0}})
+    };
+    json!([row("java"), row("rust"), row("python"), row("javascript")])
+}
+
 fn golden_settled_empty_find(id: &Value, root: &Value, pin: &Value) -> Value {
     json!({"schemaVersion":1,"requestId":id,"workspace":root,"catchingUp":false,
-        "evidenceBasis":pin,"data":{"symbols":[],"coverage":[],"provenance":[]},
+        "evidenceBasis":pin,"data":{"symbols":[],"coverage":[],
+            "scopeCoverage":empty_scope_coverage(),"provenance":[]},
         "warnings":[{"code":"syntaxOnly","message":"Only syntax evidence is available",
             "provenanceId":null}],"partial":false,"truncated":false,
         "truncationReason":null})
@@ -2037,7 +2047,11 @@ fn per_call_linked_worktree_selection_and_closed_failures() {
             if offset == 1 {
                 tool(&answer, None, !legacy);
                 let data = &answer["result"]["structuredContent"]["data"];
-                assert_eq!(*data, json!({"symbols":[],"coverage":[],"provenance":[]}));
+                assert_eq!(
+                    *data,
+                    json!({"symbols":[],"coverage":[],"scopeCoverage":empty_scope_coverage(),
+                        "provenance":[]})
+                );
             } else {
                 tool(&answer, Some("not_found"), !legacy);
                 assert!(answer["result"]["structuredContent"]["error"]["currentBasis"].is_object());
@@ -4943,15 +4957,13 @@ async fn mcp_find_selected_snapshot_ranks_and_keeps_zero_hit_scope() {
         .as_array()
         .unwrap()
         .len();
-    // 51 matches at limit 50. Fifty full Symbols (IDs, revision, provenance)
-    // exceed the 64 KiB response cap, so the reply keeps the longest fitting
-    // prefix and reports response_bytes, which outranks limit. The limit
-    // reason itself is pinned by the default-20 query below.
-    assert!((1..50).contains(&max_symbols), "{max_limit}");
+    // 51 matches at limit 50: the first 50, truncated by the limit. With
+    // coverage bounded by the emitted symbols (#156), all fifty fit the cap.
+    assert_eq!(max_symbols, 50, "{max_limit}");
     assert_eq!(max_limit["result"]["structuredContent"]["truncated"], true);
     assert_eq!(
         max_limit["result"]["structuredContent"]["truncationReason"],
-        "response_bytes"
+        "limit"
     );
     let default = ask(&mut client, 151, "ManyDefault", None, None);
     tool(&default, None, true);
@@ -5024,33 +5036,23 @@ async fn mcp_find_selected_snapshot_ranks_and_keeps_zero_hit_scope() {
     tool(&empty, None, true);
     let data = &empty["result"]["structuredContent"];
     assert_eq!(data["data"]["symbols"], json!([]));
-    let coverage = data["data"]["coverage"].as_array().unwrap();
-    assert_eq!(coverage.len(), 6);
+    // #156: a zero-hit find carries no per-document rows; the searched
+    // scope is reported as per-language tuple counts from the same snapshot.
+    assert_eq!(data["data"]["coverage"], json!([]));
+    let row = |language: &str, counts: [u64; 5]| {
+        json!({"language":language,"evidenceTier":"syntax","coverage":{
+            "selected":counts[0],"complete":counts[1],"partial":counts[2],
+            "failed":counts[3],"unselected":counts[4]}})
+    };
     assert_eq!(
-        coverage
-            .iter()
-            .map(|row| row["language"].as_str().unwrap())
-            .collect::<Vec<_>>(),
-        ["java", "java", "rust", "python", "python", "javascript"]
+        data["data"]["scopeCoverage"],
+        json!([
+            row("java", [0, 0, 0, 0, 2]),
+            row("rust", [1, 1, 0, 0, 0]),
+            row("python", [2, 0, 1, 1, 0]),
+            row("javascript", [1, 1, 0, 0, 0]),
+        ])
     );
-    assert_eq!(
-        coverage
-            .iter()
-            .map(|row| row["state"].as_str().unwrap())
-            .collect::<Vec<_>>(),
-        [
-            "unsupported",
-            "omitted",
-            "complete",
-            "failed",
-            "partial",
-            "complete"
-        ]
-    );
-    assert_eq!(coverage[0]["selected"], false);
-    assert_eq!(coverage[1]["selected"], false);
-    assert_eq!(coverage[3]["selected"], true);
-    assert_eq!(coverage[4]["selected"], true);
     assert_eq!(data["data"]["provenance"], json!([]));
     assert_eq!(data["partial"], true);
     assert_eq!(data["warnings"][0]["code"], "coverageIncomplete");
@@ -5228,6 +5230,53 @@ fn one_socket_call(
     drop(client);
     session.join().unwrap().unwrap();
     serde_json::from_str(&line).unwrap()
+}
+
+/// #156: find's required coverage no longer grows with the repository. A
+/// zero-hit query over a 270-document scope, which overflowed the 64 KiB cap
+/// when every searched tuple was returned, now answers with scope counts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_find_zero_hit_over_a_large_scope_fits_with_scope_counts() {
+    use trellis::daemon::registry::CheckoutRegistry;
+    let temp = tempfile::tempdir().unwrap();
+    let files: Vec<(String, String)> = (0..270)
+        .map(|i| {
+            (
+                format!("module_{i:03}.js"),
+                format!("function helper_{i:03}() {{ return {i}; }}\n"),
+            )
+        })
+        .collect();
+    let borrowed: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(p, t)| (p.as_str(), t.as_str()))
+        .collect();
+    let (identity, topology) = published_inactive_checkout(temp.path(), &borrowed);
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(313, &identity).unwrap();
+    let reply = one_socket_call(
+        identity,
+        registry,
+        313,
+        trellis::mcp::CALL_DEADLINE,
+        "trellis_find_symbols",
+        json!({"schemaVersion":1,"query":"zzzz_no_such_symbol"}),
+    );
+    tool(&reply, None, true);
+    let envelope = &reply["result"]["structuredContent"];
+    assert_eq!(envelope["data"]["symbols"], json!([]));
+    assert_eq!(envelope["data"]["coverage"], json!([]));
+    let scope = envelope["data"]["scopeCoverage"].as_array().unwrap();
+    let total: u64 = scope
+        .iter()
+        .map(|row| {
+            row["coverage"]["selected"].as_u64().unwrap()
+                + row["coverage"]["unselected"].as_u64().unwrap()
+        })
+        .sum();
+    assert_eq!(total, 270, "{envelope}");
+    assert_eq!(scope[3]["coverage"]["complete"], 270, "{envelope}");
+    assert_eq!(envelope["partial"], false);
 }
 
 /// Contention while a cold checkout proves its prior head is retried as
