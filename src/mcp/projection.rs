@@ -169,12 +169,12 @@ pub fn declaration(
             "evidence":{"evidenceTier":"syntax","semanticBasis":null,"freshness":"fresh","staleBecause":[]},
             "coverage":result.coverage,"provenance":result.provenance},
         "warnings":warnings,"partial":incomplete,"truncated":false,"truncationReason":null});
-    let frame =
-        json!({"jsonrpc":"2.0","id":id,"result":super::tools::result(envelope.clone(), modern)});
+    let frame = json!({"jsonrpc":"2.0","id":id,
+        "result":super::tools::result("trellis_declaration", envelope.clone(), modern)});
     (serde_json::to_vec(&frame).ok()?.len() < super::wire::RESPONSE_BYTES).then_some(envelope)
 }
 
-/// Budget the actual dual-content JSON-RPC frame, not the structured envelope alone.
+/// Budget the actual structured-plus-summary JSON-RPC frame, not the structured envelope alone.
 pub fn find(
     id: &Value,
     result: crate::store::mcp_read::McpFindWithLines,
@@ -280,7 +280,7 @@ pub fn find(
             "warnings":warnings,"partial":incomplete || truncated,"truncated":truncated,
             "truncationReason": if n < result.symbols.len() {Some("response_bytes")}
                 else if result.has_more {Some("limit")} else {None}});
-        let response = super::tools::result(envelope.clone(), modern);
+        let response = super::tools::result("trellis_find_symbols", envelope.clone(), modern);
         let frame = json!({"jsonrpc":"2.0","id":id,"result":response});
         if serde_json::to_vec(&frame)
             .map_err(|_| "store_unavailable: serialization")?
@@ -414,11 +414,23 @@ mod find_tests {
     const COMPLETE_SCOPE: [[u64; 5]; 4] = [[1, 1, 0, 0, 0], [0; 5], [0; 5], [3, 3, 0, 0, 0]];
 
     fn assert_wire(envelope: Value, id: &Value, modern: bool) -> Value {
-        let result = super::super::tools::result(envelope.clone(), modern);
+        let result = super::super::tools::result("trellis_find_symbols", envelope.clone(), modern);
         assert_eq!(result["structuredContent"], envelope);
-        let text: Value =
-            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
-        assert_eq!(text, envelope);
+        let count = envelope["data"]["symbols"].as_array().unwrap().len();
+        let truncated = if envelope["truncated"] == true {
+            format!(
+                ", truncated: {}",
+                envelope["truncationReason"].as_str().unwrap()
+            )
+        } else {
+            String::new()
+        };
+        assert_eq!(
+            result["content"][0]["text"],
+            format!(
+                "trellis_find_symbols: {count} symbols{truncated}; full result in structuredContent."
+            )
+        );
         assert_eq!(result.get("resultType").is_some(), modern);
         let frame = json!({"jsonrpc":"2.0","id":id,"result":result});
         let mut bytes = Vec::new();
@@ -608,12 +620,12 @@ mod find_tests {
     fn find_keeps_longest_fitting_hit_prefix_and_only_its_closure() {
         let root = std::path::Path::new("/workspace");
         let id = json!("id\n\"\\");
-        // Each name appears in a symbol and its displayKey, then again in text.
+        // Each name appears in a symbol and its displayKey, not in the summary.
         // Two fit; the third would overrun the complete JSON-RPC frame.
         let hits = vec![
-            hit("A".repeat(6_000), "src/0.js"),
-            hit("B".repeat(6_000), "src/1.js"),
-            hit("C".repeat(6_000), "src/2.js"),
+            hit("A".repeat(12_000), "src/0.js"),
+            hit("B".repeat(12_000), "src/1.js"),
+            hit("C".repeat(12_000), "src/2.js"),
         ];
         for modern in [false, true] {
             let envelope = find(
@@ -722,7 +734,7 @@ mod find_tests {
     }
 }
 
-/// Calls have priority over optional hints in the complete, dual-content wire budget.
+/// Calls have priority over optional hints in the complete structured-plus-summary wire budget.
 pub fn outgoing(
     id: &Value,
     result: crate::store::mcp_read::McpOutgoingWithLines,
@@ -736,7 +748,7 @@ pub fn outgoing(
         "indexRevision":result.owner.selected.pin.index_revision});
     let fits = |envelope: &Value| -> bool {
         let frame = json!({"jsonrpc":"2.0","id":id,
-            "result":super::tools::result(envelope.clone(), modern)});
+            "result":super::tools::result("trellis_outgoing_calls", envelope.clone(), modern)});
         serde_json::to_vec(&frame).is_ok_and(|bytes| bytes.len() < super::wire::RESPONSE_BYTES)
     };
     let build = |count: usize, shown: &[usize]| -> Result<Value, &'static str> {
@@ -1334,7 +1346,7 @@ mod outgoing_tests {
             assert!(bytes["truncated"].as_bool().unwrap());
             assert!(bytes["partial"].as_bool().unwrap());
             let frame = json!({"jsonrpc":"2.0","id":1,
-                "result":super::super::tools::result(bytes,modern)});
+                "result":super::super::tools::result("trellis_outgoing_calls", bytes,modern)});
             let mut line = Vec::new();
             super::super::wire::write_response(&mut line, &frame).unwrap();
             assert!(line.len() <= super::super::wire::RESPONSE_BYTES);
@@ -1366,7 +1378,7 @@ pub fn source(
         "partial":false,"truncated":false,"truncationReason":null,
     });
     let frame = json!({"jsonrpc":"2.0","id":id,
-        "result":super::tools::result(envelope.clone(), modern)});
+        "result":super::tools::result("trellis_read_source", envelope.clone(), modern)});
     (serde_json::to_vec(&frame).ok()?.len() < super::wire::RESPONSE_BYTES).then_some(envelope)
 }
 
@@ -1375,7 +1387,7 @@ mod source_tests {
     use super::*;
     use crate::store::mcp_read::McpSource;
     #[test]
-    fn whole_dual_wire_source_or_range_error_without_truncation() {
+    fn source_complete_frame_or_range_error_without_truncation() {
         let pin: crate::model::IndexPin = serde_json::from_value(json!({
             "indexGeneration":"123e4567-e89b-42d3-a456-426614174000",
             "indexRevision":1}))
@@ -1405,14 +1417,14 @@ mod source_tests {
             assert_eq!(envelope["truncated"], false);
             assert_eq!(envelope["warnings"][0]["code"], "syntaxOnly");
             let frame = json!({"jsonrpc":"2.0","id":1,
-                "result":super::super::tools::result(envelope,modern)});
+                "result":super::super::tools::result("trellis_read_source", envelope,modern)});
             let mut bytes = Vec::new();
             super::super::wire::write_response(&mut bytes, &frame).unwrap();
             assert!(bytes.len() <= super::super::wire::RESPONSE_BYTES);
             assert!(
                 source(
                     &json!(1),
-                    item("\n".repeat(16384)),
+                    item("\0".repeat(16384)),
                     std::path::Path::new("/root"),
                     false,
                     modern

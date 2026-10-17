@@ -6,6 +6,7 @@ use serde_json::{Value, json};
 const TOOLS: [&str; 5] = super::catalog::NAMES;
 #[derive(Debug)]
 pub struct PreparedTool {
+    pub name: String,
     pub response: Value,
     /// False for invalid application fields: their errors precede workspace verification.
     pub valid_arguments: bool,
@@ -250,19 +251,75 @@ pub fn attributed(envelope: Value, workspace: &OpenedWorkspace, catching_up: boo
     attributed_root(envelope, workspace.root(), catching_up)
 }
 pub fn resolved_root_changed(
+    name: &str,
     id: &Value,
     root: &std::path::Path,
     catching_up: bool,
     modern: bool,
 ) -> Value {
     result(
+        name,
         attributed_root(failure(id, "root_changed"), root, catching_up),
         modern,
     )
 }
-pub fn result(envelope: Value, modern: bool) -> Value {
-    let text = serde_json::to_string(&envelope).expect("bounded tool envelope");
+/// Keep the full, schema-valid envelope in structuredContent. Text is only a
+/// bounded display summary, not a second JSON representation of the evidence.
+pub fn result(name: &str, envelope: Value, modern: bool) -> Value {
     let error = envelope.get("error").is_some();
+    let text = if error {
+        format!(
+            "{name} failed: {}: {}",
+            envelope["error"]["code"]
+                .as_str()
+                .expect("typed failure code"),
+            envelope["error"]["message"]
+                .as_str()
+                .expect("sanitized failure message")
+        )
+    } else {
+        let (count, items) = match name {
+            "trellis_workspace_describe" => (1, "workspace"),
+            "trellis_find_symbols" => (
+                envelope["data"]["symbols"]
+                    .as_array()
+                    .expect("find symbols")
+                    .len(),
+                "symbols",
+            ),
+            "trellis_declaration" => (1, "declaration"),
+            "trellis_outgoing_calls" => (
+                envelope["data"]["calls"]
+                    .as_array()
+                    .expect("outgoing calls")
+                    .len(),
+                "calls",
+            ),
+            "trellis_read_source" => (
+                (envelope["data"]["endLine"]
+                    .as_u64()
+                    .expect("source end line")
+                    - envelope["data"]["startLine"]
+                        .as_u64()
+                        .expect("source start line")
+                    + 1) as usize,
+                "lines",
+            ),
+            _ => unreachable!("known tool name"),
+        };
+        let truncation = if envelope["truncated"] == true {
+            format!(
+                ", truncated: {}",
+                envelope["truncationReason"]
+                    .as_str()
+                    .expect("truncation reason")
+            )
+        } else {
+            String::new()
+        };
+        format!("{name}: {count} {items}{truncation}; full result in structuredContent.")
+    };
+    assert!(text.len() <= 512, "tool summary exceeds 512 UTF-8 bytes");
     let mut value = json!({"isError":error,"structuredContent":envelope,
         "content":[{"type":"text","text":text}]});
     if modern {
@@ -276,7 +333,7 @@ fn identity_error(error: IdentityError) -> &'static str {
         IdentityError::StoreUnavailable => "store_unavailable",
     }
 }
-/// Construct each envelope once and copy that same value to the text representation.
+/// Build one envelope; the text is a display summary of the structured result.
 pub fn prepare(
     name: &str,
     args: Option<&Value>,
@@ -319,7 +376,8 @@ pub fn prepare(
         ),
     };
     PreparedTool {
-        response: result(envelope, modern),
+        name: name.to_owned(),
+        response: result(name, envelope, modern),
         valid_arguments,
         id: id.clone(),
         modern,
@@ -333,6 +391,7 @@ pub fn final_check(prepared: &mut PreparedTool, workspace: &OpenedWorkspace) {
         && let Err(error) = workspace.check()
     {
         prepared.response = result(
+            &prepared.name,
             attributed(
                 failure(&prepared.id, identity_error(error)),
                 workspace,
@@ -565,11 +624,12 @@ mod tests {
                     assert_eq!(result.get("resultType").is_some(), modern);
                     assert_eq!(result["isError"], name != TOOLS[0]);
                     assert_eq!(
-                        serde_json::from_str::<Value>(
-                            result["content"][0]["text"].as_str().unwrap()
-                        )
-                        .unwrap(),
-                        result["structuredContent"]
+                        result["content"][0]["text"],
+                        if name == TOOLS[0] {
+                            format!("{name}: 1 workspace; full result in structuredContent.")
+                        } else {
+                            format!("{name} failed: index_not_ready: Index is not ready")
+                        }
                     );
                     assert_eq!(result["structuredContent"]["requestId"], *id);
                     if name != TOOLS[0] {
@@ -608,14 +668,17 @@ mod tests {
                         "root_changed",
                         "store_unavailable",
                     ] {
-                        let tool = super::result(super::failure(id, code), modern);
+                        let tool = super::result(name, super::failure(id, code), modern);
+                        let failure = &tool["structuredContent"]["error"];
                         assert_eq!(
-                            serde_json::from_str::<Value>(
-                                tool["content"][0]["text"].as_str().unwrap()
+                            tool["content"][0]["text"],
+                            format!(
+                                "{name} failed: {}: {}",
+                                failure["code"].as_str().unwrap(),
+                                failure["message"].as_str().unwrap()
                             )
-                            .unwrap(),
-                            tool["structuredContent"]
                         );
+                        assert!(tool["content"][0]["text"].as_str().unwrap().len() <= 512);
                         let mut wire = Vec::new();
                         write_response(&mut wire, &json!({"jsonrpc":"2.0","id":id,"result":tool}))
                             .unwrap();

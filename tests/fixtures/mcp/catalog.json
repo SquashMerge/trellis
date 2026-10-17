@@ -564,6 +564,63 @@
             "error"
           ],
           "type": "object"
+        },
+        "ArgumentFailure": {
+          "additionalProperties": false,
+          "properties": {
+            "error": {
+              "additionalProperties": false,
+              "properties": {
+                "code": {
+                  "enum": [
+                    "invalid_request",
+                    "range_too_large"
+                  ]
+                },
+                "message": {
+                  "$ref": "#/$defs/Text"
+                },
+                "retryable": {
+                  "const": false
+                },
+                "currentBasis": {
+                  "const": null
+                },
+                "currentContentHash": {
+                  "const": null
+                }
+              },
+              "required": [
+                "code",
+                "message",
+                "retryable",
+                "currentBasis",
+                "currentContentHash"
+              ],
+              "type": "object"
+            },
+            "requestId": {
+              "oneOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "maximum": 9007199254740991,
+                  "minimum": -9007199254740991,
+                  "type": "integer"
+                }
+              ]
+            },
+            "schemaVersion": {
+              "const": 1
+            }
+          },
+          "required": [
+            "schemaVersion",
+            "requestId",
+            "error"
+          ],
+          "type": "object"
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -729,6 +786,9 @@
         },
         {
           "$ref": "#/$defs/AdmissionFailure"
+        },
+        {
+          "$ref": "#/$defs/ArgumentFailure"
         }
       ],
       "type": "object"
@@ -1728,6 +1788,63 @@
             "contentHash",
             "provenanceId"
           ]
+        },
+        "ArgumentFailure": {
+          "additionalProperties": false,
+          "properties": {
+            "error": {
+              "additionalProperties": false,
+              "properties": {
+                "code": {
+                  "enum": [
+                    "invalid_request",
+                    "range_too_large"
+                  ]
+                },
+                "message": {
+                  "$ref": "#/$defs/Text"
+                },
+                "retryable": {
+                  "const": false
+                },
+                "currentBasis": {
+                  "const": null
+                },
+                "currentContentHash": {
+                  "const": null
+                }
+              },
+              "required": [
+                "code",
+                "message",
+                "retryable",
+                "currentBasis",
+                "currentContentHash"
+              ],
+              "type": "object"
+            },
+            "requestId": {
+              "oneOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "maximum": 9007199254740991,
+                  "minimum": -9007199254740991,
+                  "type": "integer"
+                }
+              ]
+            },
+            "schemaVersion": {
+              "const": 1
+            }
+          },
+          "required": [
+            "schemaVersion",
+            "requestId",
+            "error"
+          ],
+          "type": "object"
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1863,6 +1980,9 @@
         },
         {
           "$ref": "#/$defs/AdmissionFailure"
+        },
+        {
+          "$ref": "#/$defs/ArgumentFailure"
         }
       ],
       "type": "object"
@@ -2987,6 +3107,63 @@
             "daemon_unavailable",
             "outcome_unknown"
           ]
+        },
+        "ArgumentFailure": {
+          "additionalProperties": false,
+          "properties": {
+            "error": {
+              "additionalProperties": false,
+              "properties": {
+                "code": {
+                  "enum": [
+                    "invalid_request",
+                    "range_too_large"
+                  ]
+                },
+                "message": {
+                  "$ref": "#/$defs/Text"
+                },
+                "retryable": {
+                  "const": false
+                },
+                "currentBasis": {
+                  "const": null
+                },
+                "currentContentHash": {
+                  "const": null
+                }
+              },
+              "required": [
+                "code",
+                "message",
+                "retryable",
+                "currentBasis",
+                "currentContentHash"
+              ],
+              "type": "object"
+            },
+            "requestId": {
+              "oneOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "maximum": 9007199254740991,
+                  "minimum": -9007199254740991,
+                  "type": "integer"
+                }
+              ]
+            },
+            "schemaVersion": {
+              "const": 1
+            }
+          },
+          "required": [
+            "schemaVersion",
+            "requestId",
+            "error"
+          ],
+          "type": "object"
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -3133,6 +3310,9 @@
         },
         {
           "$ref": "#/$defs/AdmissionFailure"
+        },
+        {
+          "$ref": "#/$defs/ArgumentFailure"
         }
       ],
       "type": "object"
@@ -4418,6 +4598,63 @@
             "daemon_unavailable",
             "outcome_unknown"
           ]
+        },
+        "ArgumentFailure": {
+          "additionalProperties": false,
+          "properties": {
+            "error": {
+              "additionalProperties": false,
+              "properties": {
+                "code": {
+                  "enum": [
+                    "invalid_request",
+                    "range_too_large"
+                  ]
+                },
+                "message": {
+                  "$ref": "#/$defs/Text"
+                },
+                "retryable": {
+                  "const": false
+                },
+                "currentBasis": {
+                  "const": null
+                },
+                "currentContentHash": {
+                  "const": null
+                }
+              },
+              "required": [
+                "code",
+                "message",
+                "retryable",
+                "currentBasis",
+                "currentContentHash"
+              ],
+              "type": "object"
+            },
+            "requestId": {
+              "oneOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "maximum": 9007199254740991,
+                  "minimum": -9007199254740991,
+                  "type": "integer"
+                }
+              ]
+            },
+            "schemaVersion": {
+              "const": 1
+            }
+          },
+          "required": [
+            "schemaVersion",
+            "requestId",
+            "error"
+          ],
+          "type": "object"
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -4552,6 +4789,9 @@
         },
         {
           "$ref": "#/$defs/AdmissionFailure"
+        },
+        {
+          "$ref": "#/$defs/ArgumentFailure"
         }
       ],
       "type": "object"
@@ -5121,6 +5361,63 @@
             "error"
           ],
           "type": "object"
+        },
+        "ArgumentFailure": {
+          "additionalProperties": false,
+          "properties": {
+            "error": {
+              "additionalProperties": false,
+              "properties": {
+                "code": {
+                  "enum": [
+                    "invalid_request",
+                    "range_too_large"
+                  ]
+                },
+                "message": {
+                  "$ref": "#/$defs/Text"
+                },
+                "retryable": {
+                  "const": false
+                },
+                "currentBasis": {
+                  "const": null
+                },
+                "currentContentHash": {
+                  "const": null
+                }
+              },
+              "required": [
+                "code",
+                "message",
+                "retryable",
+                "currentBasis",
+                "currentContentHash"
+              ],
+              "type": "object"
+            },
+            "requestId": {
+              "oneOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "maximum": 9007199254740991,
+                  "minimum": -9007199254740991,
+                  "type": "integer"
+                }
+              ]
+            },
+            "schemaVersion": {
+              "const": 1
+            }
+          },
+          "required": [
+            "schemaVersion",
+            "requestId",
+            "error"
+          ],
+          "type": "object"
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -5247,6 +5544,9 @@
         },
         {
           "$ref": "#/$defs/AdmissionFailure"
+        },
+        {
+          "$ref": "#/$defs/ArgumentFailure"
         }
       ],
       "type": "object"

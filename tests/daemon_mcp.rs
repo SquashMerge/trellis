@@ -1604,11 +1604,12 @@ fn partial_daemon_reply_is_typed_and_never_reaches_stdout() {
         "unverified checkout attributed: {selected}"
     );
     assert!(envelope.get("catchingUp").is_none(), "{selected}");
+    let summary = selected["result"]["content"][0]["text"].as_str().unwrap();
     assert_eq!(
-        serde_json::from_str::<Value>(selected["result"]["content"][0]["text"].as_str().unwrap())
-            .unwrap(),
-        *envelope
+        summary,
+        "trellis_workspace_describe failed: workspace_selection_failed: Workspace selection failed"
     );
+    assert!(summary.len() <= 512);
     failed_attach.join().unwrap();
     // Even though attach now fails, prior modern mode still defines protocol errors.
     let metadata = json!({

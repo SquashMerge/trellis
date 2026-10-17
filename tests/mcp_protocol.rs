@@ -435,15 +435,123 @@ fn tool(v: &Value, code: Option<&str>, modern: bool) {
     assert_eq!(v["result"]["resultType"].as_str().is_some(), modern);
     assert_eq!(v["result"]["isError"], code.is_some(), "{v}");
     let envelope = &v["result"]["structuredContent"];
-    assert_eq!(
-        serde_json::from_str::<Value>(v["result"]["content"][0]["text"].as_str().unwrap()).unwrap(),
-        *envelope
-    );
+    let text = v["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.len() <= 512, "summary exceeds 512 UTF-8 bytes: {v}");
     assert_eq!(envelope["requestId"], v["id"]);
-    if let Some(code) = code {
+    let (name, expected) = if let Some(code) = code {
         // The whole reply, so an unexpected code shows its reason.
         assert_eq!(envelope["error"]["code"], code, "{v}");
+        let (name, _) = text.split_once(" failed:").expect("tool failure summary");
+        (
+            name,
+            format!(
+                "{name} failed: {code}: {}",
+                envelope["error"]["message"].as_str().unwrap()
+            ),
+        )
+    } else {
+        let data = &envelope["data"];
+        let (name, count, items) = if data.get("languages").is_some() {
+            ("trellis_workspace_describe", 1, "workspace")
+        } else if let Some(symbols) = data.get("symbols") {
+            (
+                "trellis_find_symbols",
+                symbols.as_array().unwrap().len(),
+                "symbols",
+            )
+        } else if data.get("declaration").is_some() {
+            ("trellis_declaration", 1, "declaration")
+        } else if let Some(calls) = data.get("calls") {
+            (
+                "trellis_outgoing_calls",
+                calls.as_array().unwrap().len(),
+                "calls",
+            )
+        } else {
+            (
+                "trellis_read_source",
+                (data["endLine"].as_u64().unwrap() - data["startLine"].as_u64().unwrap() + 1)
+                    as usize,
+                "lines",
+            )
+        };
+        let truncated = if envelope["truncated"] == true {
+            format!(
+                ", truncated: {}",
+                envelope["truncationReason"].as_str().unwrap()
+            )
+        } else {
+            String::new()
+        };
+        (
+            name,
+            format!("{name}: {count} {items}{truncated}; full result in structuredContent."),
+        )
+    };
+    assert!(
+        fixture()["names"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool == name)
+    );
+    assert_eq!(text, expected);
+    assert_eq!(v["result"]["content"].as_array().unwrap().len(), 1);
+}
+/// Validate actual tool envelopes, not the summary string, with each catalog JSON Schema.
+fn validate_structured_content(pairs: &[Value]) {
+    let script = r#"
+const {createRequire} = require('node:module');
+const {readFileSync} = require('node:fs');
+const requireFromRuntime = createRequire(process.cwd() + '/runtime/acp/package.json');
+const Ajv2020 = requireFromRuntime('ajv/dist/2020.js').default;
+const ajv = new Ajv2020({strict: false, allErrors: true});
+const catalog = JSON.parse(readFileSync('tests/fixtures/mcp/catalog.json', 'utf8'));
+const inputs = JSON.parse(readFileSync(0, 'utf8'));
+for (const {name, structuredContent} of inputs) {
+    const schema = catalog.find(tool => tool.name === name)?.outputSchema;
+    if (!schema) throw Error(`unknown schema: ${name}`);
+    const validate = ajv.compile(schema);
+    if (!validate(structuredContent)) throw Error(`${name}: ${JSON.stringify(validate.errors)}`);
+    if (structuredContent.error?.code === 'invalid_request' && !('workspace' in structuredContent)) {
+        if ('attemptedWorkspace' in structuredContent.error || 'catchingUp' in structuredContent)
+            throw Error(`${name}: unexpected pre-resolution field`);
+        const withWorkspaceOnly = {...structuredContent, workspace: '/selected'};
+        const withAttempt = {...structuredContent,
+            error: {...structuredContent.error, attemptedWorkspace: {kind: 'invalid_type', jsonType: 'array'}}};
+        if (validate(withWorkspaceOnly))
+            throw Error(`${name}: ArgumentFailure must not accept half-resolved workspace`);
+        if (!validate(withAttempt))
+            throw Error(`${name}: closed InvalidWorkspaceFailure branch missing`);
+        const resolved = {...structuredContent, workspace: '/selected', catchingUp: false};
+        if (!validate(resolved)) throw Error(`${name}: resolved Failure branch missing`);
+        if (validate({...resolved, error: withAttempt.error}))
+            throw Error(`${name}: resolved Failure must exclude attemptedWorkspace`);
+        if (validate({...withAttempt, workspace: '/selected'}))
+            throw Error(`${name}: InvalidWorkspaceFailure must exclude workspace`);
     }
+}
+"#;
+    let mut child = Command::new("node")
+        .args(["-e", script])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&serde_json::to_vec(pairs).unwrap())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "structuredContent schema validation: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 fn expected_envelope(id: &Value, code: Option<&str>, label: &str, root: &Value) -> Value {
     let fixture = fixture();
@@ -511,7 +619,8 @@ fn exact_tool(v: &Value, code: Option<&str>, modern: bool, label: &str) {
             envelope["data"]["progress"] = actual["data"]["progress"].clone();
         }
     }
-    let text = serde_json::to_string(&envelope).unwrap();
+    tool(v, code, modern);
+    let text = &v["result"]["content"][0]["text"];
     let mut result = json!({"isError":code.is_some(),"structuredContent":envelope,
         "content":[{"type":"text","text":text}]});
     if modern {
@@ -525,9 +634,10 @@ fn exact_selection_failure(v: &Value, id: i64, reason: &str, attempted: &Path) {
         "retryable":reason == "unavailable","reason":reason,
         "attemptedWorkspace":{"kind":"path","value":attempted,"utf8Bytes":attempted.to_str().unwrap().len(),"truncated":false},
         "currentBasis":null,"currentContentHash":null}});
+    tool(v, Some("workspace_selection_failed"), true);
     let result = json!({"resultType":"complete","isError":true,
         "structuredContent":envelope,
-        "content":[{"type":"text","text":serde_json::to_string(&envelope).unwrap()}]});
+        "content":[{"type":"text","text":v["result"]["content"][0]["text"]}]});
     assert_eq!(*v, json!({"jsonrpc":"2.0","id":id,"result":result}));
 }
 fn exact_tool_for_id(
@@ -544,11 +654,13 @@ fn exact_tool_for_id(
     );
     exact_tool(v, code, modern, label);
 }
-/// Exact post-H golden responses include the separately serialized text copy.
+/// Exact post-H golden responses retain full structured evidence and a summary.
 fn exact_golden_settled(v: &Value, expected_id: &Value, modern: bool, envelope: Value) {
     assert_eq!(&v["id"], expected_id, "outer JSON-RPC ID must echo sent ID");
     assert_eq!(envelope["requestId"], *expected_id);
-    let text = serde_json::to_string(&envelope).unwrap();
+    let code = envelope["error"]["code"].as_str();
+    tool(v, code, modern);
+    let text = &v["result"]["content"][0]["text"];
     let mut result = json!({"isError":envelope.get("error").is_some(),
         "structuredContent":envelope,"content":[{"type":"text","text":text}]});
     if modern {
@@ -1471,16 +1583,16 @@ async fn warm_relay_serves_both_new_tools_and_rejects_closed_inputs() {
         if legacy {
             ready_legacy(&mut peer);
         }
-        tool(
-            &peer.ask(call(
-                legacy,
-                json!(1),
-                "trellis_workspace_describe",
-                json!({"schemaVersion":1}),
-            )),
-            None,
-            !legacy,
-        );
+        let mut schema_pairs = Vec::new();
+        let describe = peer.ask(call(
+            legacy,
+            json!(1),
+            "trellis_workspace_describe",
+            json!({"schemaVersion":1}),
+        ));
+        tool(&describe, None, !legacy);
+        schema_pairs.push(json!({"name":"trellis_workspace_describe",
+            "structuredContent":describe["result"]["structuredContent"]}));
         let pin = await_settled_golden_h(&witness, &root_key).await;
         let names: Vec<_> = peer.ask(if legacy {
             request(json!(2), "tools/list", json!({}))
@@ -1508,6 +1620,8 @@ async fn warm_relay_serves_both_new_tools_and_rejects_closed_inputs() {
             json!({"schemaVersion":1,"query":"Owner","expectedBasis":pin}),
         ));
         tool(&found, None, !legacy);
+        schema_pairs.push(json!({"name":"trellis_find_symbols",
+            "structuredContent":found["result"]["structuredContent"]}));
         let id = found["result"]["structuredContent"]["data"]["symbols"][0]["symbolId"].clone();
         let target_find = peer.ask(call(
             legacy,
@@ -1540,6 +1654,8 @@ async fn warm_relay_serves_both_new_tools_and_rejects_closed_inputs() {
                 json!({"schemaVersion":1,"symbolId":id,"expectedBasis":pin}),
             ));
             tool(&reply, None, !legacy);
+            schema_pairs.push(json!({"name":name,
+                "structuredContent":reply["result"]["structuredContent"]}));
             let data = &reply["result"]["structuredContent"]["data"];
             assert_eq!(reply["result"]["structuredContent"]["evidenceBasis"], pin);
             assert!(
@@ -1589,6 +1705,30 @@ async fn warm_relay_serves_both_new_tools_and_rejects_closed_inputs() {
                 !legacy,
             );
         }
+        let source = peer.ask(call(
+            legacy,
+            json!(14),
+            "trellis_read_source",
+            json!({"schemaVersion":1,"path":"a.js","startLine":1,"endLine":1,
+                "expectedBasis":pin,
+                "expectedContentHash":found["result"]["structuredContent"]["data"]["documents"][0]["contentHash"]}),
+        ));
+        tool(&source, None, !legacy);
+        schema_pairs.push(json!({"name":"trellis_read_source",
+            "structuredContent":source["result"]["structuredContent"]}));
+        for (index, name) in fixture()["names"].as_array().unwrap().iter().enumerate() {
+            let name = name.as_str().unwrap();
+            let failed = peer.ask(call(
+                legacy,
+                json!(20 + index),
+                name,
+                json!({"schemaVersion":1,"unexpected":true}),
+            ));
+            tool(&failed, Some("invalid_request"), !legacy);
+            schema_pairs.push(json!({"name":name,
+                "structuredContent":failed["result"]["structuredContent"]}));
+        }
+        validate_structured_content(&schema_pairs);
         error(
             &peer.ask(call(
                 legacy,
@@ -3801,7 +3941,7 @@ async fn describe_cold_initial_startup_reports_indexing_without_prior_coverage()
     assert_eq!(*envelope, expected);
     assert_eq!(
         answer["result"]["content"][0]["text"],
-        serde_json::to_string(&expected).unwrap()
+        "trellis_workspace_describe: 1 workspace; full result in structuredContent."
     );
     resume_tx.send(()).unwrap();
     drop(client);
@@ -5085,7 +5225,7 @@ async fn mcp_find_selected_snapshot_ranks_and_keeps_zero_hit_scope() {
     let temp = tempfile::tempdir().unwrap();
     let root = checkout(temp.path());
     let mut source =
-        "function Alpha() {}\nfunction Alphabet() {}\nfunction xAlpha() {}\nfunction Cafe\u{301}() {}\nfunction Café() {}\nfunction Écho() {}\nfunction écho() {}\nfunction $Find() {}\n".to_owned();
+        "function Alpha() {}\nfunction Alphabet() {}\nfunction xAlpha() {}\nfunction $Cafe\u{301}() {}\nfunction $Café() {}\nfunction Écho() {}\nfunction écho() {}\nfunction $Find() {}\n".to_owned();
     for index in 0..51 {
         if index < 21 {
             source.push_str(&format!("function ManyDefault{index:03}() {{}}\n"));
@@ -5312,7 +5452,7 @@ async fn mcp_find_selected_snapshot_ranks_and_keeps_zero_hit_scope() {
     assert_eq!(shorter_data["data"]["symbols"].as_array().unwrap().len(), 3);
     assert_eq!(shorter_data["truncated"], true);
     assert_eq!(shorter_data["truncationReason"], "limit");
-    let unicode = ask(&mut client, 153, "Caf", Some(20), None);
+    let unicode = ask(&mut client, 153, "$Caf", Some(20), None);
     assert_eq!(
         unicode["result"]["isError"],
         false,
@@ -5328,12 +5468,12 @@ async fn mcp_find_selected_snapshot_ranks_and_keeps_zero_hit_scope() {
             .take(2)
             .map(|symbol| symbol["name"].as_str().unwrap())
             .collect::<Vec<_>>(),
-        ["Cafe\u{301}", "Café"]
+        ["$Cafe\u{301}", "$Café"]
     );
     // Repeat the formerly intermittent selected Unicode read under modest load.
     // A failure stops the loop and reports its captured internal chain.
     for id in 200..220 {
-        let repeated = ask(&mut client, id, "Caf", Some(20), None);
+        let repeated = ask(&mut client, id, "$Caf", Some(20), None);
         assert_eq!(
             repeated["result"]["isError"],
             false,
@@ -5341,7 +5481,7 @@ async fn mcp_find_selected_snapshot_ranks_and_keeps_zero_hit_scope() {
             diagnostics_rx.try_iter().collect::<Vec<_>>()
         );
     }
-    let composed = ask(&mut client, 154, "Café", Some(20), None);
+    let composed = ask(&mut client, 154, "$Café", Some(20), None);
     tool(&composed, None, true);
     assert_eq!(
         composed["result"]["structuredContent"]["data"]["symbols"]
@@ -5425,6 +5565,18 @@ async fn mcp_find_selected_snapshot_ranks_and_keeps_zero_hit_scope() {
         current.index_generation.to_string()
     );
     assert!(admitted["indexRevision"].as_u64().unwrap() >= current.index_revision);
+    // This fixture intentionally changed coverage without remeasuring source.
+    // An ID-only find admits those rows and must fail selected attestation; the
+    // `$Caf` name query above never matches a hexadecimal syntax ID by chance.
+    let id_scope = ask(&mut client, 158, "sid:v1:", Some(20), None);
+    tool(&id_scope, Some("store_unavailable"), true);
+    let details: Vec<_> = diagnostics_rx.try_iter().collect();
+    assert!(
+        details
+            .iter()
+            .any(|line| line.contains("selected native coverage differs from source")),
+        "fixture ID-only read did not reach changed coverage: {details:?}"
+    );
     drop(client);
     session.join().unwrap().unwrap();
 }
@@ -6343,7 +6495,6 @@ async fn mcp_declaration_selected_identity_and_measured_record() {
         envelope["catchingUp"], true,
         "validated prior head during H"
     );
-    release_tx.send(()).unwrap();
     assert_eq!(envelope["data"]["declaration"]["syntaxId"], id);
     assert_eq!(envelope["data"]["displayKey"], "a.js#Alpha");
     let declaration_data = &envelope["data"];
@@ -6493,6 +6644,9 @@ async fn mcp_declaration_selected_identity_and_measured_record() {
             unnamed["range"]["start"].as_u64().unwrap()
         )
     );
+    // All pinned W5 reads above must use the validated prior head while H is held.
+    // Releasing startup reconciliation earlier may publish a new basis mid-test.
+    release_tx.send(()).unwrap();
     drop(client);
     session.join().unwrap().unwrap();
 }
@@ -6663,7 +6817,7 @@ async fn mcp_declaration_refuses_oversized_whole_wire_dto() {
     };
     let temp = tempfile::tempdir().unwrap();
     let root = checkout(temp.path());
-    let name = format!("Alpha{}", "a".repeat(12_000));
+    let name = format!("Alpha{}", "a".repeat(20_000));
     fs::write(root.join("a.js"), format!("function {name}() {{}}\n")).unwrap();
     let identity = WorkspaceIdentity::discover(Some(&root), &root)
         .unwrap()
@@ -7945,7 +8099,7 @@ async fn mcp_outgoing_complete_modern_legacy_frames_fill_candidates_after_all_ca
         })
         .collect();
     let mut source = "function Owner() {\n".to_owned();
-    for _ in 0..24 {
+    for _ in 0..40 {
         source.push_str("  Target();\n");
     }
     source.push_str("}\n");
@@ -7961,7 +8115,7 @@ async fn mcp_outgoing_complete_modern_legacy_frames_fill_candidates_after_all_ca
         assert_eq!(frame.last(), Some(&b'\n'));
         assert!(
             frame.len() <= 65_536,
-            "complete dual-content frame exceeds cap: {}",
+            "complete structured-plus-summary frame exceeds cap: {}",
             frame.len()
         );
         assert_eq!(serde_json::from_slice::<Value>(&frame).unwrap(), reply);
@@ -7969,7 +8123,7 @@ async fn mcp_outgoing_complete_modern_legacy_frames_fill_candidates_after_all_ca
         let calls = envelope["data"]["calls"].as_array().unwrap();
         assert_eq!(
             calls.len(),
-            24,
+            40,
             "all required calls must fit before hints: {legacy} {}",
             frame.len()
         );

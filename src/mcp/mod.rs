@@ -598,6 +598,7 @@ type Resolved = std::sync::Arc<std::sync::Mutex<Option<(std::path::PathBuf, bool
 
 struct InFlight {
     id: serde_json::Value,
+    name: String,
     relay: Option<u64>,
     modern: bool,
     deadline: std::time::Instant,
@@ -678,7 +679,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                         .as_ref()
                         .map_or(workspace.root(), |witness| witness.identity.root.as_path());
                     return Ok(CallOutcome {
-                        result: tools::resolved_root_changed(&id, root, catching_up, modern),
+                        result: tools::resolved_root_changed(&name, &id, root, catching_up, modern),
                         finals: Finals::None,
                     });
                 }
@@ -885,6 +886,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                             // answer in the pre-resolution shape (Decision 0009).
                             return Ok(CallOutcome {
                                 result: tools::result(
+                                    &name,
                                     tools::admission_failure(
                                         id,
                                         "deadline_exceeded",
@@ -902,7 +904,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
             *resolved.lock().unwrap() = Some((answering.root().to_owned(), sampled_catching_up));
             envelope["workspace"] = serde_json::json!(answering.root());
             envelope["catchingUp"] = serde_json::json!(sampled_catching_up);
-            tool.response = tools::result(envelope, modern);
+            tool.response = tools::result(&name, envelope, modern);
             let finals = match selected {
                 Some(witness) => Finals::Selected {
                     witness,
@@ -934,6 +936,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                     let catching_up = catching_up(&registry, &witness.identity.root_key);
                     *resolved.lock().unwrap() = Some((witness.identity.root.clone(), catching_up));
                     let result = tools::result(
+                        &name,
                         tools::attributed_root(
                             tools::failure(&id, "checkout_capacity"),
                             &witness.identity.root,
@@ -951,6 +954,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                 }
                 Err(error) => Ok(CallOutcome {
                     result: tools::result(
+                        &name,
                         tools::selection_failure(&id, error, &serde_json::json!(path)),
                         modern,
                     ),
@@ -963,7 +967,11 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                 .cloned()
                 .unwrap_or_else(|| serde_json::json!(workspace.root()));
             Ok(CallOutcome {
-                result: tools::result(tools::selection_failure(&id, error, &attempted), modern),
+                result: tools::result(
+                    &name,
+                    tools::selection_failure(&id, error, &attempted),
+                    modern,
+                ),
                 finals: Finals::None,
             })
         }
@@ -1303,7 +1311,7 @@ fn coordinate(
             ),
             None => tools::admission_failure(&call.id, "deadline_exceeded", &call.attempted),
         };
-        tools::result(envelope, call.modern)
+        tools::result(&call.name, envelope, call.modern)
     };
     // Requests handled at the last fence and not yet decided.
     let mut arrivals: VecDeque<impl_receive::Outcome> = VecDeque::new();
@@ -1343,6 +1351,7 @@ fn coordinate(
                         phase_hook("launch_final")?;
                         if workspace.check().is_err() {
                             result = tools::resolved_root_changed(
+                                &call.name,
                                 &call.id,
                                 workspace.root(),
                                 *catching_up,
@@ -1357,6 +1366,7 @@ fn coordinate(
                         phase_hook("selected_final")?;
                         if witness.before_answer().is_err() {
                             result = tools::resolved_root_changed(
+                                &call.name,
                                 &call.id,
                                 &witness.identity.root,
                                 *catching_up,
@@ -1371,6 +1381,7 @@ fn coordinate(
                         phase_hook("capacity_final")?;
                         if witness.before_answer().is_err() {
                             result = tools::resolved_root_changed(
+                                &call.name,
                                 &call.id,
                                 &witness.identity.root,
                                 *catching_up,
@@ -1476,6 +1487,7 @@ fn coordinate(
                     let attempted = attempted_workspace(arguments.as_ref(), &workspace);
                     let refuse = |code: &str| {
                         Some(tools::result(
+                            name,
                             tools::admission_failure(&admission.id, code, &attempted),
                             modern,
                         ))
@@ -1534,6 +1546,7 @@ fn coordinate(
                                     token,
                                     InFlight {
                                         id: admission.id.clone(),
+                                        name: name.clone(),
                                         relay,
                                         modern,
                                         deadline,
