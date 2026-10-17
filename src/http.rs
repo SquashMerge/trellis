@@ -6659,6 +6659,10 @@ pub struct ProvisionedBrowser {
     hosts: Vec<String>,
     origins: Vec<String>,
     response_hook: Arc<Mutex<Option<SelectedResponseHook>>>,
+    metrics_limit: Arc<std::sync::atomic::AtomicUsize>,
+    metrics_deadline_ms: Arc<std::sync::atomic::AtomicU64>,
+    metrics_test_cancel: Arc<std::sync::atomic::AtomicBool>,
+    metrics_clock_skew_ms: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl ProvisionedBrowser {
@@ -6680,12 +6684,38 @@ impl ProvisionedBrowser {
             hosts,
             origins,
             response_hook: Arc::new(Mutex::new(None)),
+            metrics_limit: Arc::new(std::sync::atomic::AtomicUsize::new(64 * 1024 * 1024)),
+            metrics_deadline_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            metrics_test_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            metrics_clock_skew_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 
     #[doc(hidden)]
     pub fn set_selected_response_hook_for_tests(&self, hook: SelectedResponseHook) {
         *self.response_hook.lock().unwrap() = Some(hook);
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn set_metrics_controls_for_tests(
+        &self,
+        limit: usize,
+        deadline: Option<Duration>,
+        cancel: bool,
+    ) {
+        use std::sync::atomic::Ordering;
+        self.metrics_limit.store(limit, Ordering::Relaxed);
+        self.metrics_deadline_ms.store(
+            deadline.map_or(0, |d| d.as_millis().max(1) as u64),
+            Ordering::Relaxed,
+        );
+        self.metrics_test_cancel.store(cancel, Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn set_metrics_clock_skew_for_tests(&self, milliseconds: u64) {
+        self.metrics_clock_skew_ms
+            .store(milliseconds, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn router(self) -> Router {
@@ -6895,8 +6925,25 @@ async fn provisioned_core(
         Err(error) => Err(error),
         Ok(runtime) => {
             let hook = browser.response_hook.lock().unwrap().clone();
-            let result =
-                provisioned_core_answer(&runtime, &method, &suffix, &uri, body, hook.clone()).await;
+            let result = provisioned_core_answer(
+                &runtime,
+                &method,
+                &suffix,
+                &uri,
+                body,
+                hook.clone(),
+                MetricsHttpControls {
+                    limit: browser
+                        .metrics_limit
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    deadline_ms: browser
+                        .metrics_deadline_ms
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    test_cancel: browser.metrics_test_cancel.clone(),
+                    clock_skew_ms: browser.metrics_clock_skew_ms.clone(),
+                },
+            )
+            .await;
             if let Some(hook) = hook {
                 hook("after_handler");
             }
@@ -7297,15 +7344,20 @@ fn metrics_query(uri: &axum::http::Uri) -> Result<crate::store::MetricsOptions, 
             return Err(invalid());
         }
     }
-    if options
-        .source_set_id
-        .as_ref()
-        .is_some_and(|id| !id.starts_with("source-set:v1:") || id.len() <= "source-set:v1:".len())
-        || options.path.as_ref().is_some_and(|path| path.contains(':'))
-        || options
-            .sid
-            .as_ref()
-            .is_some_and(|v| !v.starts_with("sid:v1:") || v.len() <= 7)
+    if options.source_set_id.as_ref().is_some_and(|id| {
+        !id.starts_with("source-set:v1:path-")
+            || id.len() != "source-set:v1:path-".len() + 64
+            || !id["source-set:v1:path-".len()..]
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    }) || options.path.as_ref().is_some_and(|path| path.contains(':'))
+        || options.sid.as_ref().is_some_and(|v| {
+            v.len() != 39
+                || !v.starts_with("sid:v1:")
+                || !v[7..]
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        })
         || options
             .language
             .as_ref()
@@ -7316,6 +7368,13 @@ fn metrics_query(uri: &axum::http::Uri) -> Result<crate::store::MetricsOptions, 
     Ok(options)
 }
 
+struct MetricsHttpControls {
+    limit: usize,
+    deadline_ms: u64,
+    test_cancel: Arc<std::sync::atomic::AtomicBool>,
+    clock_skew_ms: Arc<std::sync::atomic::AtomicU64>,
+}
+
 async fn provisioned_core_answer(
     runtime: &Arc<crate::daemon::registry::CheckoutRuntime>,
     method: &axum::http::Method,
@@ -7323,37 +7382,92 @@ async fn provisioned_core_answer(
     uri: &axum::http::Uri,
     body: Bytes,
     hook: Option<SelectedResponseHook>,
+    metrics: MetricsHttpControls,
 ) -> Result<(Response, bool), ApiError> {
     use axum::http::Method;
     match (method, suffix) {
         (&Method::GET, "metrics") => {
             let options = metrics_query(uri)?;
             let runtime = runtime.clone();
+            // The guard belongs to this request future, not to the blocking worker.
+            struct CancelOnDrop(Arc<std::sync::atomic::AtomicBool>);
+            impl Drop for CancelOnDrop {
+                fn drop(&mut self) {
+                    self.0.store(true, std::sync::atomic::Ordering::Release);
+                }
+            }
+            let guard = CancelOnDrop(Arc::new(std::sync::atomic::AtomicBool::new(false)));
+            let cancellation = guard.0.clone();
             let (body, catching_up) = tokio::task::spawn_blocking(move || {
-                let duration = if matches!(options.scope.as_str(), "revision" | "directory") {
+                let duration = if metrics.deadline_ms != 0 {
+                    Duration::from_millis(metrics.deadline_ms)
+                } else if matches!(options.scope.as_str(), "revision" | "directory") {
                     Duration::from_secs(300)
                 } else {
                     Duration::from_secs(30)
                 };
                 let deadline = Instant::now() + duration;
+                let work_hook = hook.clone();
+                let finish_hook = hook.clone();
+                let serialize_hook = hook.clone();
+                let after_finish_hook = hook.clone();
+                let check_hook = hook.clone();
+                let mut before_work = || {
+                    if let Some(hook) = &work_hook {
+                        hook("before_work");
+                    }
+                };
+                let mut before_finish = || {
+                    if let Some(hook) = &finish_hook {
+                        hook("before_read_finish");
+                    }
+                };
+                let mut after_finish = || {
+                    if let Some(hook) = &after_finish_hook {
+                        hook("after_read_finish");
+                    }
+                };
+                let mut on_write = |written: usize| {
+                    if let Some(hook) = &serialize_hook {
+                        hook(if written >= metrics.limit.saturating_sub(80) {
+                            "metrics_serialize_last"
+                        } else {
+                            "metrics_serialize"
+                        });
+                    }
+                };
                 runtime.metrics_response(
                     &options,
                     &mut || {
-                        if Instant::now() >= deadline {
+                        if cancellation.load(std::sync::atomic::Ordering::Acquire)
+                            || metrics
+                                .test_cancel
+                                .load(std::sync::atomic::Ordering::Relaxed)
+                        {
+                            if let Some(hook) = &check_hook {
+                                hook("metrics_cancelled");
+                            }
+                            anyhow::bail!("cancelled");
+                        }
+                        if Instant::now()
+                            + Duration::from_millis(
+                                metrics
+                                    .clock_skew_ms
+                                    .load(std::sync::atomic::Ordering::Relaxed),
+                            )
+                            >= deadline
+                        {
                             anyhow::bail!("deadline_exceeded");
                         }
                         Ok(())
                     },
-                    || {
-                        if let Some(hook) = &hook {
-                            hook("before_work");
-                        }
+                    crate::daemon::registry::MetricsResponseHooks {
+                        before_work: &mut before_work,
+                        before_finish: &mut before_finish,
+                        after_finish: &mut after_finish,
+                        on_write: &mut on_write,
                     },
-                    || {
-                        if let Some(hook) = &hook {
-                            hook("before_read_finish");
-                        }
-                    },
+                    metrics.limit,
                 )
             })
             .await
@@ -7364,6 +7478,7 @@ async fn provisioned_core_answer(
                     "Operation failed",
                 )
             })??;
+            drop(guard);
             Ok((
                 (
                     [(axum::http::header::CONTENT_TYPE, "application/json")],
