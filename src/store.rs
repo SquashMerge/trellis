@@ -768,6 +768,36 @@ impl ReadFence {
 }
 type TreeOverlays = Vec<(usize, String, usize)>;
 
+// Adapt the read helpers' boolean progress seam without erasing the caller's
+// original typed cancellation/deadline error.
+struct MetricsReadCheck<'a> {
+    check: std::cell::RefCell<&'a mut dyn FnMut() -> Result<()>>,
+    failure: std::cell::RefCell<Option<anyhow::Error>>,
+}
+impl MetricsReadCheck<'_> {
+    fn check(&self) -> Result<()> {
+        (*self.check.borrow_mut())()
+    }
+    fn expired(&self) -> bool {
+        if self.failure.borrow().is_some() {
+            return true;
+        }
+        match self.check() {
+            Ok(()) => false,
+            Err(error) => {
+                *self.failure.borrow_mut() = Some(error);
+                true
+            }
+        }
+    }
+    fn result<T>(&self, result: Result<T>) -> Result<T> {
+        if let Some(error) = self.failure.borrow_mut().take() {
+            return Err(error);
+        }
+        result
+    }
+}
+
 impl EvidenceResponse {
     /// Compute metrics from one selected revision in this response's read transaction.
     pub fn metrics_at(
@@ -776,7 +806,11 @@ impl EvidenceResponse {
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<MetricsPayload> {
         options.validate()?;
-        check()?;
+        let progress = MetricsReadCheck {
+            check: std::cell::RefCell::new(check),
+            failure: std::cell::RefCell::new(None),
+        };
+        progress.check()?;
         let selected = self.store.read_revision_for(&self.db, options.pin, true)?;
         let selected_metrics: Vec<String> = crate::metrics::METRIC_ORDER
             .iter()
@@ -791,16 +825,17 @@ impl EvidenceResponse {
             "SELECT source_set_id,language,path FROM revision_documents
             WHERE revision_id=?1 ORDER BY source_set_id,language,path",
         )?;
-        let documents: Vec<DocumentKey> = stmt
-            .query_map([&selected.key], |r| {
-                Ok(DocumentKey {
-                    source_set_id: r.get(0)?,
-                    language: r.get(1)?,
-                    path: r.get(2)?,
-                })
-            })?
-            .collect::<rusqlite::Result<_>>()?;
-        check()?;
+        let mut documents = Vec::new();
+        let mut cursor = stmt.query([&selected.key])?;
+        while let Some(row) = cursor.next()? {
+            progress.check()?;
+            documents.push(DocumentKey {
+                source_set_id: row.get(0)?,
+                language: row.get(1)?,
+                path: row.get(2)?,
+            });
+        }
+        progress.check()?;
         // Existence is decided from the manifest, not from callable rows.
         let included: Vec<&DocumentKey> = documents
             .iter()
@@ -832,28 +867,48 @@ impl EvidenceResponse {
         let mut directories: BTreeMap<(String, String), crate::metrics::Accumulator> =
             BTreeMap::new();
         for key in included {
-            check()?;
+            progress.check()?;
             // Read and attest only the selected version; no checkout filesystem access.
-            let source = self
-                .store
-                .selected_source_row_for(&self.db, &key.path, &selected)?
+            let expired = || progress.expired();
+            let source = progress
+                .result(
+                    Store::selected_source_row_bounded_for_inner(
+                        &self.db,
+                        &key.path,
+                        256 * 1024 * 1024,
+                        &selected,
+                        Some(&expired),
+                    )
+                    .map_err(selected_integrity)
+                    .map_err(|error| self.store.report_selected_failure(error)),
+                )?
                 .context("incompatible_index: selected metrics source missing")?;
-            self.store
-                .attest_selected_document_for(&self.db, &key.path, &selected)?;
+            progress.result(
+                self.store.attest_selected_document_optional_for(
+                    &self.db, &key.path, &selected, &expired,
+                ),
+            )?;
             ensure!(
                 source.language == key.language,
                 "incompatible_index: metrics language mismatch"
             );
             let scope = v8_native_scope_for(&self.db, key, &selected)?
                 .context("incompatible_index: selected metrics manifest missing")?;
-            let native_declarations = read_native_declarations_v8(&self.db, &scope, None, true)
-                .map_err(selected_integrity)?;
-            check()?;
-            let calls = read_native_calls_v8(&self.db, &scope, None).map_err(selected_integrity)?;
-            check()?;
-            let regions = read_native_control_regions_v8(&self.db, &scope, None)
-                .map_err(selected_integrity)?;
-            check()?;
+            let native_declarations = progress.result(
+                read_native_declarations_v8_optional(&self.db, &scope, None, true, &expired)
+                    .map_err(selected_integrity),
+            )?;
+            progress.check()?;
+            let calls = progress.result(
+                read_native_calls_v8_inner(&self.db, &scope, None, Some(&expired))
+                    .map_err(selected_integrity),
+            )?;
+            progress.check()?;
+            let regions = progress.result(
+                read_native_control_regions_v8_inner(&self.db, &scope, None, Some(&expired))
+                    .map_err(selected_integrity),
+            )?;
+            progress.check()?;
             let rows = crate::metrics::compute_memoized(
                 &mut self.store.metrics_memo.lock().unwrap(),
                 crate::metrics::SourceInput {
@@ -864,7 +919,7 @@ impl EvidenceResponse {
                 &native_declarations,
                 &calls,
                 &regions,
-                check,
+                &mut || progress.check(),
             )?;
             let mut file_fold = crate::metrics::Accumulator::default();
             let mut parents = vec![String::new()];
@@ -897,7 +952,7 @@ impl EvidenceResponse {
                     .or_default();
             }
             for row in &rows {
-                check()?;
+                progress.check()?;
                 file_fold.push(&row.metrics)?;
                 for path in &parents {
                     directories
@@ -969,7 +1024,7 @@ impl EvidenceResponse {
             directories
                 .into_iter()
                 .map(|((source_set_id, path), fold)| {
-                    check()?;
+                    progress.check()?;
                     Ok(MetricsDirectoryRow {
                         source_set_id,
                         path,
@@ -981,7 +1036,7 @@ impl EvidenceResponse {
         } else {
             vec![]
         };
-        check()?;
+        progress.check()?;
         Ok(MetricsPayload {
             metrics_version: crate::metrics::VERSION,
             index_generation: selected.pin.index_generation.to_string(),
@@ -7800,6 +7855,12 @@ impl Store {
 
     pub fn evidence_response(&self) -> Result<EvidenceResponse> {
         self.evidence_response_daemon_local()
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn metrics_memo_entries_for_tests(&self) -> usize {
+        self.metrics_memo.lock().unwrap().len()
     }
 
     fn with_evidence<T>(&self, read: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
