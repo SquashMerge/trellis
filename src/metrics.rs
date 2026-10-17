@@ -476,11 +476,17 @@ fn score(
                     | "continue_expression"
                     | "break_statement"
                     | "continue_statement"
-            ) && source[node.byte_range()]
-                .trim_start_matches(|c: char| c.is_alphabetic() || c.is_whitespace())
-                .starts_with('\'')
-            {
-                s.cognitive += 1;
+            ) {
+                let labeled = if language == "rust" {
+                    source[node.byte_range()]
+                        .trim_start_matches(|c: char| c.is_alphabetic() || c.is_whitespace())
+                        .starts_with('\'')
+                } else {
+                    matches!(language, "java" | "javascript") && node.named_child_count() > 0
+                };
+                if labeled {
+                    s.cognitive += 1;
+                }
             }
             let lambda = matches!(
                 kind,

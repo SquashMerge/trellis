@@ -1086,3 +1086,32 @@ fn java_annotation_is_excluded_from_halstead_without_dropping_method() {
     assert_eq!(a.halstead, b.halstead);
     assert_eq!(a.sloc, b.sloc);
 }
+
+#[test]
+fn labeled_break_adds_flat_cognitive_without_branch() {
+    for (lang, source) in [
+        (
+            "java",
+            "class C { void calc() { outer: while (true) { break outer; } } }",
+        ),
+        (
+            "javascript",
+            "function calc() { outer: while (true) { break outer; } }",
+        ),
+        ("rust", "fn calc() { 'outer: loop { break 'outer; } }"),
+    ] {
+        let score = metrics::compute(
+            lang,
+            source,
+            &[declaration(lang, source.len())],
+            &[],
+            &[],
+            &mut || Ok(()),
+        )
+        .unwrap()
+        .remove(0)
+        .metrics;
+        assert_eq!(score.cyclomatic, 2, "{lang}");
+        assert_eq!(score.cognitive, 2, "{lang}");
+    }
+}
