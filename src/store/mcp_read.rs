@@ -156,33 +156,68 @@ fn mcp_lf_lines(bytes: &[u8]) -> impl Iterator<Item = (usize, usize)> + '_ {
         })
 }
 
+struct McpSelectedLines {
+    bytes: Vec<u8>,
+    // Sparse by both line and byte count, so neither long lines nor LF-only
+    // source cause repeated full scans or unbounded per-line index allocation.
+    checkpoints: Vec<(usize, u64)>,
+}
+
+impl McpSelectedLines {
+    fn new(bytes: Vec<u8>) -> Self {
+        let mut checkpoints = vec![(0, 1)];
+        let mut lines = 1_u64;
+        for (at, byte) in bytes.iter().enumerate() {
+            if at > 0 && at.is_multiple_of(65536) {
+                checkpoints.push((at, lines));
+            }
+            if *byte == b'\n' {
+                lines += 1;
+                if (lines - 1).is_multiple_of(256) {
+                    checkpoints.push((at + 1, lines));
+                }
+            }
+        }
+        Self { bytes, checkpoints }
+    }
+
+    fn range(&self, range: &crate::native_evidence::Range) -> Result<Option<McpLines>> {
+        ensure!(
+            range.start <= range.end && range.end <= self.bytes.len(),
+            "store_unavailable: selected byte range outside source"
+        );
+        if self.bytes.is_empty() {
+            return Ok(None);
+        }
+        let line_at = |offset: usize| -> u64 {
+            let offset = offset.min(self.bytes.len() - 1);
+            let index = self
+                .checkpoints
+                .partition_point(|&(start, _)| start <= offset)
+                - 1;
+            let (start, line) = self.checkpoints[index];
+            line + self.bytes[start..offset]
+                .iter()
+                .filter(|&&byte| byte == b'\n')
+                .count() as u64
+        };
+        Ok(Some(McpLines {
+            start: line_at(range.start),
+            end: line_at(if range.end > range.start {
+                range.end - 1
+            } else {
+                range.start
+            }),
+        }))
+    }
+}
+
+#[cfg(test)]
 fn mcp_lines_for_range(
     bytes: &[u8],
     range: &crate::native_evidence::Range,
 ) -> Result<Option<McpLines>> {
-    ensure!(
-        range.start <= range.end && range.end <= bytes.len(),
-        "store_unavailable: selected byte range outside source"
-    );
-    if bytes.is_empty() {
-        return Ok(None);
-    }
-    let line_at = |offset: usize| -> Result<u64> {
-        let offset = offset.min(bytes.len() - 1);
-        mcp_lf_lines(bytes)
-            .enumerate()
-            .find(|(_, (_, end))| offset < *end)
-            .map(|(line, _)| line as u64 + 1)
-            .context("store_unavailable: selected source line absent")
-    };
-    Ok(Some(McpLines {
-        start: line_at(range.start)?,
-        end: line_at(if range.end > range.start {
-            range.end - 1
-        } else {
-            range.start
-        })?,
-    }))
+    McpSelectedLines::new(bytes.to_vec()).range(range)
 }
 
 fn mcp_lf_range(bytes: &[u8], start: u64, end: u64) -> Result<(usize, usize)> {
@@ -275,15 +310,54 @@ pub struct McpItemSource {
     pub lines: Option<McpLines>,
 }
 
+struct McpCheckedSource {
+    document: McpDocumentVersion,
+    lines: McpSelectedLines,
+}
+
+impl McpCheckedSource {
+    fn item(&self, range: &crate::native_evidence::Range) -> Result<McpItemSource> {
+        Ok(McpItemSource {
+            document: self.document.clone(),
+            lines: self.lines.range(range)?,
+        })
+    }
+}
+
 impl EvidenceResponse {
+    fn mcp_checked_source<'a>(
+        &self,
+        cache: &'a mut BTreeMap<crate::native_evidence::DocumentKey, McpCheckedSource>,
+        selected: &ReadRevision,
+        declaration: &crate::native_evidence::Declaration,
+        hash: &str,
+        provenance: &crate::native_evidence::Provenance,
+    ) -> Result<&'a McpCheckedSource> {
+        if !cache.contains_key(&declaration.document) {
+            let source = self.mcp_document_version(selected, declaration, hash, provenance)?;
+            cache.insert(declaration.document.clone(), source);
+        }
+        let source = &cache[&declaration.document];
+        ensure!(
+            source.document.revision_id == declaration.revision_id
+                && source.document.provenance_id == declaration.provenance_id
+                && source.document.content_hash == hash
+                && provenance.document == source.document.document
+                && provenance.revision_id == source.document.revision_id
+                && provenance.id == source.document.provenance_id
+                && provenance.content_hash == source.document.content_hash,
+            "store_unavailable: selected document proof mismatch"
+        );
+        Ok(source)
+    }
+
     fn mcp_document_version(
         &self,
         selected: &ReadRevision,
         declaration: &crate::native_evidence::Declaration,
         hash: &str,
         provenance: &crate::native_evidence::Provenance,
-        range: Option<&crate::native_evidence::Range>,
-    ) -> Result<McpItemSource> {
+    ) -> Result<McpCheckedSource> {
         use sha2::{Digest, Sha256};
         let scope = v8_native_scope_for(&self.db, &declaration.document, selected)?
             .context("store_unavailable: selected document scope absent")?;
@@ -320,17 +394,14 @@ impl EvidenceResponse {
             self.store.mark_recovery(RecoveryDisposition::Rebuild);
             anyhow::bail!("store_unavailable: selected raw source length or digest mismatch");
         }
-        Ok(McpItemSource {
+        Ok(McpCheckedSource {
             document: McpDocumentVersion {
                 document: declaration.document.clone(),
                 revision_id: declaration.revision_id.clone(),
                 content_hash: stored_hash,
                 provenance_id: declaration.provenance_id.clone(),
             },
-            lines: range
-                .map(|range| mcp_lines_for_range(&bytes, range))
-                .transpose()?
-                .flatten(),
+            lines: McpSelectedLines::new(bytes),
         })
     }
 }
@@ -573,6 +644,7 @@ impl EvidenceResponse {
         let selected = self
             .store
             .read_revision_for(&self.db, Some(found.pin), true)?;
+        let mut source_cache = BTreeMap::new();
         let symbols = found
             .symbols
             .into_iter()
@@ -582,13 +654,15 @@ impl EvidenceResponse {
                     .iter()
                     .find(|proof| proof.id == symbol.declaration.provenance_id)
                     .context("store_unavailable: find provenance absent")?;
-                let source = self.mcp_document_version(
-                    &selected,
-                    &symbol.declaration,
-                    &symbol.content_hash,
-                    proof,
-                    Some(&symbol.declaration.range),
-                )?;
+                let source = self
+                    .mcp_checked_source(
+                        &mut source_cache,
+                        &selected,
+                        &symbol.declaration,
+                        &symbol.content_hash,
+                        proof,
+                    )?
+                    .item(&symbol.declaration.range)?;
                 Ok(McpFindSymbolWithLines { symbol, source })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -709,13 +783,14 @@ impl EvidenceResponse {
             .iter()
             .find(|proof| proof.id == declaration.declaration.provenance_id)
             .context("store_unavailable: declaration provenance absent")?;
-        let source = self.mcp_document_version(
-            &selected,
-            &declaration.declaration,
-            &declaration.content_hash,
-            proof,
-            Some(&declaration.declaration.range),
-        )?;
+        let source = self
+            .mcp_document_version(
+                &selected,
+                &declaration.declaration,
+                &declaration.content_hash,
+                proof,
+            )?
+            .item(&declaration.declaration.range)?;
         Ok(Some(McpDeclarationWithLines {
             selected: declaration,
             source,
@@ -1189,13 +1264,16 @@ impl EvidenceResponse {
             .iter()
             .find(|proof| proof.id == outgoing.owner.declaration.provenance_id)
             .context("store_unavailable: outgoing owner provenance absent")?;
-        let owner_source = self.mcp_document_version(
-            &selected,
-            &outgoing.owner.declaration,
-            &outgoing.owner.content_hash,
-            proof,
-            Some(&outgoing.owner.declaration.range),
-        )?;
+        let mut source_cache = BTreeMap::new();
+        let owner_source = self
+            .mcp_checked_source(
+                &mut source_cache,
+                &selected,
+                &outgoing.owner.declaration,
+                &outgoing.owner.content_hash,
+                proof,
+            )?
+            .item(&outgoing.owner.declaration.range)?;
         let calls = outgoing
             .calls
             .into_iter()
@@ -1206,27 +1284,27 @@ impl EvidenceResponse {
                         && call.call.provenance_id == outgoing.owner.declaration.provenance_id,
                     "store_unavailable: outgoing call proof mismatch"
                 );
-                let source = self.mcp_document_version(
-                    &selected,
-                    &outgoing.owner.declaration,
-                    &call.content_hash,
-                    proof,
-                    Some(&call.call.range),
-                )?;
+                let source = self
+                    .mcp_checked_source(
+                        &mut source_cache,
+                        &selected,
+                        &outgoing.owner.declaration,
+                        &call.content_hash,
+                        proof,
+                    )?
+                    .item(&call.call.range)?;
+                // The optional phase already validated each candidate's selected
+                // scope, provenance and source hash inside its shared hint budget.
                 let candidate_documents = call
                     .candidates
                     .iter()
-                    .map(|candidate| {
-                        self.mcp_document_version(
-                            &selected,
-                            &candidate.declaration,
-                            &candidate.provenance.content_hash,
-                            &candidate.provenance,
-                            None,
-                        )
-                        .map(|source| source.document)
+                    .map(|candidate| McpDocumentVersion {
+                        document: candidate.provenance.document.clone(),
+                        revision_id: candidate.provenance.revision_id.clone(),
+                        content_hash: candidate.provenance.content_hash.clone(),
+                        provenance_id: candidate.provenance.id.clone(),
                     })
-                    .collect::<Result<Vec<_>>>()?;
+                    .collect();
                 Ok(McpOutgoingCallWithLines {
                     selected: call,
                     source,
@@ -1431,6 +1509,143 @@ mod enriched_read_tests {
     use std::sync::{Arc, atomic::AtomicBool};
 
     #[test]
+    fn distinct_document_candidate_is_verified_and_budgeted_in_enriched_outgoing() {
+        use sha2::{Digest, Sha256};
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(
+            workspace.path().join("owner.js"),
+            "function Owner() { Target(); }\n",
+        )
+        .unwrap();
+        let target_bytes = b"function Target() {}\n";
+        std::fs::write(workspace.path().join("target.js"), target_bytes).unwrap();
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let (pin, _owner) = crate::index_coordinator::reconcile_workspace(
+            &store,
+            &IndexOptions::new(workspace.path().to_owned()),
+            &Arc::new(AtomicBool::new(false)),
+            |_| {},
+        )
+        .unwrap();
+        let read = store.evidence_response().unwrap();
+        let owner = read
+            .mcp_find_with_lines("Owner", 20, Some(pin))
+            .unwrap()
+            .symbols
+            .into_iter()
+            .find(|symbol| symbol.symbol.declaration.name.as_deref() == Some("Owner"))
+            .unwrap();
+        let id = owner.symbol.declaration.syntax_id;
+        let base = std::time::Instant::now();
+        let result = read
+            .mcp_outgoing_with_lines(
+                &id,
+                20,
+                Some(pin),
+                &|| base,
+                base + std::time::Duration::from_secs(5),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.calls.len(), 1);
+        let call = &result.calls[0];
+        assert_eq!(call.selected.omitted, Some(0));
+        assert_eq!(
+            call.selected.candidates.len(),
+            1,
+            "fixture must exercise optional candidate metadata"
+        );
+        assert_eq!(call.candidate_documents.len(), 1);
+        let candidate = &call.selected.candidates[0];
+        let document = &call.candidate_documents[0];
+        assert_eq!(document.document.path, "target.js");
+        assert_ne!(document.document, result.owner.source.document.document);
+        assert_eq!(document.document, candidate.declaration.document);
+        assert_eq!(
+            document.document.source_set_id,
+            result.owner.source.document.document.source_set_id
+        );
+        assert_eq!(document.document.language, "javascript");
+        assert_eq!(document.revision_id, candidate.declaration.revision_id);
+        assert_eq!(document.provenance_id, candidate.declaration.provenance_id);
+        assert_eq!(document.provenance_id, candidate.provenance.id);
+        assert_eq!(
+            document.content_hash,
+            hex::encode(Sha256::digest(target_bytes))
+        );
+        assert_eq!(document.content_hash, candidate.provenance.content_hash);
+        let target = read
+            .mcp_declaration_with_lines(&candidate.declaration.syntax_id, Some(pin))
+            .unwrap()
+            .unwrap();
+        assert_eq!(*document, target.source.document);
+        read.finish(()).unwrap();
+        drop(read);
+
+        // Expiry before the first optional lookup cannot remove a mandatory call.
+        let read = store.evidence_response().unwrap();
+        let ticks = std::cell::Cell::new(0);
+        let clock = || {
+            let tick = ticks.get();
+            ticks.set(tick + 1);
+            if tick == 0 {
+                base
+            } else {
+                base + std::time::Duration::from_secs(60)
+            }
+        };
+        let expired = read
+            .mcp_outgoing_with_lines(
+                &id,
+                20,
+                Some(pin),
+                &clock,
+                base + std::time::Duration::from_secs(5),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(expired.calls.len(), 1);
+        assert_eq!(expired.calls[0].selected.omitted, None);
+        assert!(expired.calls[0].selected.candidates.is_empty());
+        assert!(expired.calls[0].candidate_documents.is_empty());
+        read.finish(()).unwrap();
+        drop(read);
+
+        // Malformed optional declaration evidence is omitted, not a partial
+        // required answer or an unverified candidate document.
+        let db = store.cache_write().unwrap();
+        db.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        assert_eq!(
+            db.execute(
+                "DELETE FROM native_version_headers WHERE syntax_id IN
+                (SELECT syntax_id FROM native_version_declarations WHERE name='Target')",
+                [],
+            )
+            .unwrap(),
+            1
+        );
+        db.pragma_update(None, "foreign_keys", "ON").unwrap();
+        drop(db);
+        let read = store.evidence_response().unwrap();
+        let after_fault = read
+            .mcp_outgoing_with_lines(
+                &id,
+                20,
+                Some(pin),
+                &|| base,
+                base + std::time::Duration::from_secs(5),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_fault.calls.len(), 1);
+        assert_eq!(after_fault.calls[0].selected.omitted, Some(0));
+        assert!(after_fault.calls[0].selected.candidates.is_empty());
+        assert!(after_fault.calls[0].candidate_documents.is_empty());
+        read.finish(()).unwrap();
+    }
+
+    #[test]
     fn selected_find_declaration_and_outgoing_return_checked_source_lines() {
         let state = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
@@ -1448,6 +1663,18 @@ mod enriched_read_tests {
         )
         .unwrap();
         let read = store.evidence_response().unwrap();
+        let repeated = read.mcp_find_with_lines("a", 20, Some(pin)).unwrap();
+        let alpha = repeated
+            .symbols
+            .iter()
+            .find(|symbol| symbol.symbol.declaration.name.as_deref() == Some("Alpha"))
+            .unwrap();
+        let beta = repeated
+            .symbols
+            .iter()
+            .find(|symbol| symbol.symbol.declaration.name.as_deref() == Some("Beta"))
+            .unwrap();
+        assert_eq!(alpha.source.document, beta.source.document);
         let find = read.mcp_find_with_lines("Alpha", 20, Some(pin)).unwrap();
         let symbol = find
             .symbols
@@ -1501,7 +1728,6 @@ mod enriched_read_tests {
                 &symbol.symbol.declaration,
                 &symbol.symbol.content_hash,
                 &conflicting_proof,
-                Some(&symbol.symbol.declaration.range),
             )
             .err()
             .unwrap();
