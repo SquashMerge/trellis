@@ -7429,6 +7429,11 @@ async fn provisioned_core_answer(
                 };
                 let mut on_progress = || {
                     if let Some(hook) = &hook {
+                        #[cfg(feature = "test-support")]
+                        if crate::metrics::in_parser_progress_for_tests() {
+                            hook("metrics_parser_progress");
+                            return;
+                        }
                         hook("metrics_read_progress");
                     }
                 };

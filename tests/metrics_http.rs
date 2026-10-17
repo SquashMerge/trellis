@@ -40,11 +40,12 @@ async fn fixture() -> (
     ProvisionedBrowser,
     String,
 ) {
-    fixture_with_startup_hook(None, true).await
+    fixture_with_startup_hook(None, true, false).await
 }
 async fn fixture_with_startup_hook(
     startup_hook: Option<Arc<dyn Fn() + Send + Sync>>,
     wait_ready: bool,
+    parser_fixture: bool,
 ) -> (
     tempfile::TempDir,
     Arc<trellis::daemon::registry::CheckoutRuntime>,
@@ -64,6 +65,14 @@ async fn fixture_with_startup_hook(
     fs::write(root.join("empty.js"), "// no callable\n").unwrap();
     fs::create_dir(root.join("zero")).unwrap();
     fs::write(root.join("zero/empty.js"), "// zero-callable directory\n").unwrap();
+    if parser_fixture {
+        let mut source = String::from("function parseMany() {\n");
+        for i in 0..4000 {
+            source.push_str(&format!("  const n{i} = {i};\n"));
+        }
+        source.push_str("  return 1;\n}\n");
+        fs::write(root.join("parser.js"), source).unwrap();
+    }
     let identity = WorkspaceIdentity::discover(Some(&root), &root)
         .unwrap()
         .attach_marker()
@@ -587,29 +596,43 @@ async fn selected_metrics_atomic_bounds_and_deadlines() {
     // The blocking hook holds the request at each named phase. The test clock
     // expires while the HTTP caller still waits, then releases the worker.
     for (stage, cap) in [
-        ("metrics_read_progress", 64 * 1024 * 1024),
+        ("metrics_parser_progress", 64 * 1024 * 1024),
         ("metrics_serialize_last", full_len + 1),
         ("after_read_finish", 64 * 1024 * 1024),
     ] {
-        let (_base, runtime, browser, key) = fixture().await;
+        let parser = stage == "metrics_parser_progress";
+        let (_base, runtime, browser, key) = if parser {
+            fixture_with_startup_hook(None, true, true).await
+        } else {
+            fixture().await
+        };
+        let query = if parser {
+            format!(
+                "?scope=file&sourceSetId=source-set:v1:path-{key}&language=javascript&path=parser.js"
+            )
+        } else {
+            String::new()
+        };
         let (entered_tx, entered_rx) = mpsc::sync_channel(1);
         let (resume_tx, resume_rx) = mpsc::sync_channel(1);
         let resume = Mutex::new(resume_rx);
         let once = AtomicBool::new(true);
-        let progress = std::sync::atomic::AtomicUsize::new(0);
+        let parser_callbacks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let callbacks_in_hook = parser_callbacks.clone();
         browser.set_selected_response_hook_for_tests(Arc::new(move |called| {
-            let inside_parse = called == "metrics_read_progress"
-                && progress.fetch_add(1, Ordering::Relaxed) == 100;
-            if (called == stage && (stage != "metrics_read_progress" || inside_parse))
-                && once.swap(false, Ordering::AcqRel)
-            {
+            if called == "metrics_parser_progress" {
+                callbacks_in_hook.fetch_add(1, Ordering::Relaxed);
+            }
+            if called == stage && once.swap(false, Ordering::AcqRel) {
                 entered_tx.send(()).unwrap();
                 resume.lock().unwrap().recv().unwrap();
             }
         }));
         browser.set_metrics_controls_for_tests(cap, Some(Duration::from_millis(1000)), false);
         let app = browser.clone().router();
-        let worker = tokio::spawn(async move { request(app, &key, "").await });
+        let request_key = key.clone();
+        let request_query = query.clone();
+        let worker = tokio::spawn(async move { request(app, &request_key, &request_query).await });
         tokio::time::timeout(
             trellis::testing::HANG_BACKSTOP,
             tokio::task::spawn_blocking(move || entered_rx.recv().unwrap()),
@@ -617,16 +640,22 @@ async fn selected_metrics_atomic_bounds_and_deadlines() {
         .await
         .unwrap()
         .unwrap();
-        if stage == "metrics_read_progress" {
-            assert_eq!(runtime.metrics_memo_entries_for_tests().unwrap(), 0);
-        }
         browser.set_metrics_clock_skew_for_tests(1001);
         resume_tx.send(()).unwrap();
         let (status, value) = worker.await.unwrap();
         assert_eq!(status, StatusCode::REQUEST_TIMEOUT, "{stage}: {value}");
         assert_eq!(value["error"]["code"], "deadline_exceeded", "{stage}");
-        if stage == "metrics_read_progress" {
+        if stage == "metrics_parser_progress" {
+            assert_eq!(
+                parser_callbacks.load(Ordering::Relaxed),
+                1,
+                "parse must stop in the first callback after deadline expiry"
+            );
             assert_eq!(runtime.metrics_memo_entries_for_tests().unwrap(), 0);
+            browser.set_metrics_clock_skew_for_tests(0);
+            let (status, body) = request(browser.clone().router(), &key, &query).await;
+            assert_eq!(status, StatusCode::OK, "following parser request: {body}");
+            assert_eq!(runtime.metrics_memo_entries_for_tests().unwrap(), 1);
         }
     }
 }
@@ -641,7 +670,7 @@ async fn selected_metrics_reports_catching_up_from_same_admission() {
         entered_tx.send(()).unwrap();
         resume.lock().unwrap().recv().unwrap();
     });
-    let (_base, runtime, browser, key) = fixture_with_startup_hook(Some(hook), false).await;
+    let (_base, runtime, browser, key) = fixture_with_startup_hook(Some(hook), false, false).await;
     tokio::time::timeout(
         trellis::testing::HANG_BACKSTOP,
         tokio::task::spawn_blocking(move || entered_rx.recv().unwrap()),

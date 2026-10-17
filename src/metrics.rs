@@ -10,6 +10,32 @@ use tree_sitter::{Node, Parser};
 
 use crate::native_evidence::{Call, ControlRegion, Declaration, Range};
 
+#[cfg(feature = "test-support")]
+thread_local! {
+    static IN_PARSER_PROGRESS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(feature = "test-support")]
+struct ParserProgressMarker(bool);
+#[cfg(feature = "test-support")]
+impl ParserProgressMarker {
+    fn enter() -> Self {
+        Self(IN_PARSER_PROGRESS.with(|value| value.replace(true)))
+    }
+}
+#[cfg(feature = "test-support")]
+impl Drop for ParserProgressMarker {
+    fn drop(&mut self) {
+        IN_PARSER_PROGRESS.with(|value| value.set(self.0));
+    }
+}
+
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn in_parser_progress_for_tests() -> bool {
+    IN_PARSER_PROGRESS.with(std::cell::Cell::get)
+}
+
 pub const VERSION: &str = "metrics:v1";
 pub const FAN_IN_REASON: &str = "call resolution not yet produced (#40/#68)";
 pub const METRIC_ORDER: [&str; 12] = [
@@ -343,6 +369,8 @@ fn compute_source(
         None,
         Some(
             tree_sitter::ParseOptions::new().progress_callback(&mut |_| {
+                #[cfg(feature = "test-support")]
+                let _parser_progress = ParserProgressMarker::enter();
                 if let Err(error) = check() {
                     aborted = Some(error);
                     true
