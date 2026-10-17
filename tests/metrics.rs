@@ -57,7 +57,11 @@ fn four_grammars_hand_checked_branches_and_fan_in() {
         )
         .unwrap();
         assert_eq!(rows.len(), 1, "{lang}");
-        assert_eq!(rows[0].metrics.cyclomatic, 2, "{lang}");
+        assert_eq!(
+            rows[0].metrics.cyclomatic,
+            if lang == "rust" { 4 } else { 5 },
+            "{lang}"
+        );
         assert_eq!(rows[0].metrics.fan_in.value, None);
         assert_eq!(rows[0].metrics.fan_out, 0);
         assert_eq!(
@@ -93,29 +97,35 @@ fn cancelled_parse_never_enters_memo() {
     let src = fixture("rust");
     let mut memo = MetricsMemo::new(1024);
     let mut first = true;
-    let err = memo
-        .source(
-            "rust",
-            "hash",
-            src,
-            &[declaration("rust", src.len())],
-            &mut || {
-                if first {
-                    first = false;
-                    Ok(())
-                } else {
-                    anyhow::bail!("cancelled")
-                }
-            },
-        )
-        .unwrap_err();
+    let input = || SourceInput {
+        language: "rust",
+        content_hash: "hash",
+        text: src,
+    };
+    let err = metrics::compute_memoized(
+        &mut memo,
+        input(),
+        &[declaration("rust", src.len())],
+        &[],
+        &[],
+        &mut || {
+            if first {
+                first = false;
+                Ok(())
+            } else {
+                anyhow::bail!("cancelled")
+            }
+        },
+    )
+    .unwrap_err();
     assert!(err.to_string().contains("cancelled"));
     assert_eq!(memo.len(), 0);
-    memo.source(
-        "rust",
-        "hash",
-        src,
+    metrics::compute_memoized(
+        &mut memo,
+        input(),
         &[declaration("rust", src.len())],
+        &[],
+        &[],
         &mut || Ok(()),
     )
     .unwrap();
@@ -214,11 +224,11 @@ fn declaration_fold_is_exact_and_empty_leaves_are_null() {
     assert_eq!(fold.count(), 2);
     assert_eq!(
         fold.project("sum", &["cyclomatic"]).unwrap()["cyclomatic"],
-        4
+        10
     );
     assert_eq!(
         fold.project("mean", &["cyclomatic"]).unwrap()["cyclomatic"],
-        2.0
+        5.0
     );
     assert!(fold.project("sum", &["fanIn"]).unwrap()["fanIn"]["value"].is_null());
 }
@@ -541,10 +551,10 @@ fn production_native_declarations_have_precise_ranges_and_parameters() {
     let capture = Capture::admit(&IndexOptions::new(root.path().into()), &cancel, &|_| {}).unwrap();
     let artifact = from_capture(&capture, root.path(), &identity.record_id, &cancel).unwrap();
     for (language, filename, loc, exits) in [
-        ("java", "Example.java", 1, 2),
-        ("python", "example.py", 4, 2),
-        ("javascript", "example.js", 1, 2),
-        ("rust", "example.rs", 1, 1),
+        ("java", "Example.java", 11, 3),
+        ("python", "example.py", 11, 4),
+        ("javascript", "example.js", 11, 3),
+        ("rust", "example.rs", 7, 1),
     ] {
         let source = fixture(language);
         let declarations: Vec<_> = artifact
@@ -591,11 +601,25 @@ fn production_native_declarations_have_precise_ranges_and_parameters() {
                 },
             "{language}"
         );
-        assert_eq!(row.metrics.parameters, 1, "{language}");
+        assert_eq!(row.metrics.parameters, 2, "{language}");
         assert_eq!(row.metrics.loc, loc, "{language}");
-        assert_eq!(row.metrics.cyclomatic, 2, "{language}");
+        assert_eq!(
+            row.metrics.cyclomatic,
+            if language == "rust" { 4 } else { 5 },
+            "{language}"
+        );
         assert_eq!(row.metrics.exits.returns, exits, "{language}");
-        assert_eq!(row.metrics.max_nesting, 1, "{language}");
+        assert_eq!(
+            row.metrics.max_nesting,
+            if language == "rust" {
+                1
+            } else if language == "javascript" {
+                3
+            } else {
+                2
+            },
+            "{language}"
+        );
     }
 }
 
@@ -724,4 +748,311 @@ fn each_numeric_leaf_aggregates_from_declarations_without_recalculation() {
         / 1_000_000.0;
     assert_eq!(mean["maintainabilityIndex"], mi_mean);
     assert!(mean["fanIn"]["value"].is_null());
+}
+
+#[test]
+fn interpolated_literal_chunks_are_operands_without_delimiter_operators() {
+    for (lang, source) in [
+        ("javascript", "function calc(x) { return `a${x}b`; }"),
+        (
+            "python",
+            r#"def calc(x):
+    return f"a{x}b"
+"#,
+        ),
+    ] {
+        let score = metrics::compute(
+            lang,
+            source,
+            &[declaration(lang, source.len())],
+            &[],
+            &[],
+            &mut || Ok(()),
+        )
+        .unwrap()
+        .remove(0)
+        .metrics;
+        assert_eq!((score.halstead.n1, score.halstead.n2), (2, 4), "{lang}");
+        assert_eq!(
+            (
+                score.halstead.total_operators,
+                score.halstead.total_operands
+            ),
+            (2, 5),
+            "{lang}"
+        );
+    }
+}
+
+#[test]
+fn resident_memo_limit_evicts_fifo_and_never_caches_oversized_score() {
+    let src = fixture("rust");
+    let declaration = declaration("rust", src.len());
+    let mut tiny = MetricsMemo::new(1);
+    for _ in 0..2 {
+        metrics::compute_memoized(
+            &mut tiny,
+            SourceInput {
+                language: "rust",
+                content_hash: "a",
+                text: src,
+            },
+            std::slice::from_ref(&declaration),
+            &[],
+            &[],
+            &mut || Ok(()),
+        )
+        .unwrap();
+    }
+    assert!(tiny.is_empty());
+    let entry_bytes = 4 * std::mem::size_of::<metrics::Score>()
+        + std::mem::size_of::<((String, String, String), Vec<metrics::Score>, usize)>()
+        + metrics::VERSION.len()
+        + "rust".len()
+        + "a".len();
+    let mut memo = MetricsMemo::new(entry_bytes + 8);
+    for hash in ["a", "b"] {
+        metrics::compute_memoized(
+            &mut memo,
+            SourceInput {
+                language: "rust",
+                content_hash: hash,
+                text: src,
+            },
+            std::slice::from_ref(&declaration),
+            &[],
+            &[],
+            &mut || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(memo.len(), 1);
+    }
+}
+
+#[test]
+fn lambda_and_closure_nesting_increases_cognitive_but_not_cyclomatic() {
+    let cases = [
+        (
+            "java",
+            "class C { int calc() { java.util.function.Function<Integer,Integer> f = x -> x > 0 ? 1 : 0; return 0; } }",
+            2,
+        ),
+        (
+            "python",
+            "def calc(x):\n    f = lambda y: 1 if y else 0\n    return f(x)\n",
+            2,
+        ),
+        (
+            "javascript",
+            "function calc() { [1].map(x => x ? 1 : 0); }",
+            2,
+        ),
+        (
+            "rust",
+            "fn calc() { let f = |x| if x { 1 } else { 0 }; }",
+            3,
+        ),
+    ];
+    for (lang, source, cognitive) in cases {
+        let row = metrics::compute(
+            lang,
+            source,
+            &[declaration(lang, source.len())],
+            &[],
+            &[],
+            &mut || Ok(()),
+        )
+        .unwrap()
+        .remove(0);
+        assert_eq!(row.metrics.cyclomatic, 2, "{lang}");
+        assert_eq!(row.metrics.cognitive, cognitive, "{lang}");
+    }
+}
+
+#[test]
+fn framework_arrow_callback_is_scored_separately_when_native_represents_it() {
+    use std::{
+        fs,
+        sync::{Arc, atomic::AtomicBool},
+    };
+    use trellis::{
+        capture::Capture, indexer::IndexOptions, model::CancelFlag, native_evidence::from_capture,
+    };
+    let source = "function calc(xs) { xs.map(x => { if (x) return x; return 0; }); return 0; }";
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("example.js"), source).unwrap();
+    let identity =
+        trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+            .unwrap();
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let capture = Capture::admit(&IndexOptions::new(root.path().into()), &cancel, &|_| {}).unwrap();
+    let artifact = from_capture(&capture, root.path(), &identity.record_id, &cancel).unwrap();
+    let rows = metrics::compute(
+        "javascript",
+        source,
+        &artifact.declarations,
+        &artifact.calls,
+        &artifact.control_regions,
+        &mut || Ok(()),
+    )
+    .unwrap();
+    assert_eq!(rows.len(), 2);
+    let parent = rows.iter().find(|r| r.range.start == 0).unwrap();
+    let callback = rows.iter().find(|r| r.range.start != 0).unwrap();
+    assert_eq!(parent.metrics.cyclomatic, 1);
+    assert_eq!(parent.metrics.fan_out, 1);
+    assert_eq!(callback.metrics.cyclomatic, 2);
+    assert_eq!(callback.metrics.exits.returns, 2);
+}
+
+#[test]
+fn deadline_from_parser_and_cancellation_during_score_walk_keep_memo_empty() {
+    let src = "fn calc(x: i32) -> i32 { if x > 0 { x } else { 0 } }";
+    let decl = declaration("rust", src.len());
+    let mut memo = MetricsMemo::new(4096);
+    let mut parse_checks = 0;
+    let error = metrics::compute_memoized(
+        &mut memo,
+        SourceInput {
+            language: "rust",
+            content_hash: "parse",
+            text: src,
+        },
+        std::slice::from_ref(&decl),
+        &[],
+        &[],
+        &mut || {
+            parse_checks += 1;
+            if parse_checks == 2 {
+                anyhow::bail!("deadline_exceeded")
+            }
+            Ok(())
+        },
+    )
+    .unwrap_err();
+    assert_eq!(error.to_string(), "deadline_exceeded");
+    assert!(parse_checks >= 2);
+    assert!(memo.is_empty());
+    let mut checks_without_scoring = 0;
+    metrics::compute("rust", src, &[], &[], &[], &mut || {
+        checks_without_scoring += 1;
+        Ok(())
+    })
+    .unwrap();
+    let mut score_checks = 0;
+    let error = metrics::compute_memoized(
+        &mut memo,
+        SourceInput {
+            language: "rust",
+            content_hash: "walk",
+            text: src,
+        },
+        std::slice::from_ref(&decl),
+        &[],
+        &[],
+        &mut || {
+            score_checks += 1;
+            if score_checks == checks_without_scoring + 2 {
+                anyhow::bail!("cancelled")
+            }
+            Ok(())
+        },
+    )
+    .unwrap_err();
+    assert_eq!(error.to_string(), "cancelled");
+    assert!(memo.is_empty());
+}
+
+#[test]
+fn checked_serialization_rejects_cancellation_at_final_check() {
+    let rows = vec!["value"; 10];
+    let mut baseline = 0;
+    metrics::serialize_checked(&rows, 4096, &mut || {
+        baseline += 1;
+        Ok(())
+    })
+    .unwrap();
+    let mut checks = 0;
+    let error = metrics::serialize_checked(&rows, 4096, &mut || {
+        checks += 1;
+        if checks == baseline {
+            anyhow::bail!("cancelled")
+        }
+        Ok(())
+    })
+    .unwrap_err();
+    assert_eq!(error.to_string(), "cancelled");
+    assert_eq!(checks, baseline);
+}
+
+#[test]
+fn java_javascript_rust_halstead_raw_and_derived_are_hand_checked() {
+    let cases = [
+        (
+            "java",
+            "class C { int calc(int x) { return x + 1; } }",
+            "int calc",
+            (3, 3, 4, 4),
+        ),
+        (
+            "javascript",
+            "function calc(x) { return x + 1; }",
+            "function calc",
+            (3, 3, 3, 4),
+        ),
+        ("rust", "fn calc() { return 1; }", "fn calc", (2, 2, 2, 2)),
+    ];
+    for (lang, source, begin, expected) in cases {
+        let mut decl = declaration(lang, source.len());
+        decl.range.start = source.find(begin).unwrap();
+        if lang == "java" {
+            decl.range.end = source.find("; }").unwrap() + 3;
+        }
+        let score = metrics::compute(lang, source, &[decl], &[], &[], &mut || Ok(()))
+            .unwrap()
+            .remove(0)
+            .metrics;
+        assert_eq!(
+            (
+                score.halstead.n1,
+                score.halstead.n2,
+                score.halstead.total_operators,
+                score.halstead.total_operands
+            ),
+            expected,
+            "{lang}"
+        );
+        assert_eq!(score.loc, 1, "{lang}");
+        let h = &score.halstead;
+        let length = expected.2 + expected.3;
+        let vocabulary = expected.0 + expected.1;
+        assert_eq!(
+            h.volume,
+            ((length as f64 * (vocabulary as f64).log2()) * 1e6).round() / 1e6,
+            "{lang}"
+        );
+        assert_eq!(
+            h.difficulty,
+            (expected.0 as f64 / 2.0 * expected.3 as f64 / expected.1 as f64 * 1e6).round() / 1e6,
+            "{lang}"
+        );
+        assert_eq!(
+            h.effort,
+            (h.difficulty * h.volume * 1e6).round() / 1e6,
+            "{lang}"
+        );
+        assert_eq!(
+            h.estimated_bugs,
+            (h.volume / 3000.0 * 1e6).round() / 1e6,
+            "{lang}"
+        );
+        let mi = ((171.0 - 5.2 * h.volume.max(1.0).ln() - 0.23 * score.cyclomatic as f64) * 100.0
+            / 171.0)
+            .clamp(0.0, 100.0);
+        assert_eq!(
+            score.maintainability_index,
+            (mi * 1e6).round() / 1e6,
+            "{lang}"
+        );
+    }
 }

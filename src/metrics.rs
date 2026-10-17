@@ -528,6 +528,15 @@ fn score(
         if token.trim().is_empty() {
             continue;
         }
+        if matches!(kind, "string_start" | "string_end")
+            || (matches!(token, "`" | "${")
+                && node.parent().is_some_and(|parent| {
+                    matches!(parent.kind(), "template_string" | "template_substitution")
+                }))
+        {
+            code_lines.extend(first_line..=last_line);
+            continue;
+        }
         for line in first_line..=last_line {
             code_lines.insert(line);
         }
@@ -634,24 +643,6 @@ impl MetricsMemo {
             bytes: 0,
             limit,
         }
-    }
-    pub fn source(
-        &mut self,
-        language: &str,
-        hash: &str,
-        text: &str,
-        declarations: &[Declaration],
-        check: &mut impl FnMut() -> Result<()>,
-    ) -> Result<Vec<Score>> {
-        check()?;
-        let key = (VERSION.to_owned(), language.to_owned(), hash.to_owned());
-        if let Some((_, value, _)) = self.entries.iter().find(|(k, _, _)| *k == key) {
-            return Ok(value.clone());
-        }
-        let value = compute_source(language, text, declarations, check)?;
-        check()?;
-        self.insert(key, value.clone())?;
-        Ok(value)
     }
     fn insert(&mut self, key: (String, String, String), value: Vec<Score>) -> Result<()> {
         let size = key

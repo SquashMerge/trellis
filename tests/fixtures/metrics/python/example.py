@@ -1,4 +1,11 @@
-def calc(n):
-    if n > 0:
-        return n
-    return 0
+def calc(x, y):
+    try:
+        if x and y:
+            return x
+        match x:
+            case 1:
+                return 1
+            case _:
+                return 0
+    except ValueError:
+        return -1

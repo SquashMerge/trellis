@@ -1,1 +1,7 @@
-fn calc(n: i32) -> i32 { if n > 0 { return n; } 0 }
+fn calc(x: i32, y: bool) -> i32 {
+    if y && x > 0 { return x; }
+    match x {
+        1 => 1,
+        _ => 0,
+    }
+}

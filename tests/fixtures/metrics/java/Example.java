@@ -1,1 +1,13 @@
-class Example { int calc(int n) { if (n > 0) return n; return 0; } }
+class Example {
+    int calc(int x, boolean y) {
+        try {
+            if (y && x > 0) return x;
+            switch (x) {
+                case 1: return 1;
+                default: return 0;
+            }
+        } catch (RuntimeException e) {
+            throw e;
+        }
+    }
+}
