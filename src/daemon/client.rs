@@ -79,10 +79,76 @@ pub fn call(
     Err(CallError::DaemonUnavailable)
 }
 
+/// Metrics retries are read-only, but neither ingress nor the full response
+/// receives a fresh clock on reconnect.
+pub fn call_metrics(
+    request: &Request,
+    ingress_deadline: Instant,
+    end_deadline: Instant,
+    mut connect: impl FnMut(Duration) -> io::Result<UnixStream>,
+) -> Result<Reply, CallError> {
+    for attempt in 0..2 {
+        let remaining = match ingress_deadline.checked_duration_since(Instant::now()) {
+            Some(remaining) if !remaining.is_zero() => remaining,
+            _ => return Err(CallError::DaemonUnavailable),
+        };
+        let mut stream = match connect(remaining.min(Duration::from_secs(5))) {
+            Ok(stream) if Instant::now() < ingress_deadline => stream,
+            _ if attempt == 0 => continue,
+            _ => return Err(CallError::DaemonUnavailable),
+        };
+        let reply = (|| {
+            protocol::write_preface_until(&mut stream, ingress_deadline)?;
+            protocol::write_frame_until(&mut stream, request, ingress_deadline)?;
+            let admission: Reply = protocol::read_frame_until(&mut stream, ingress_deadline)?;
+            if admission.id != request.id
+                || admission.payload != serde_json::json!({"admitted": true})
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid metrics admission",
+                ));
+            }
+            read_reply_until(&mut stream, request.id, Some(end_deadline))
+        })();
+        match reply {
+            Ok(reply) => return Ok(reply),
+            Err(_) if attempt == 0 && Instant::now() < ingress_deadline => continue,
+            Err(_) => return Err(CallError::DaemonUnavailable),
+        }
+    }
+    Err(CallError::DaemonUnavailable)
+}
+
 /// One large CLI export is a sequence of individually bounded frames. The
 /// final JSON is parsed only after every frame with the same request ID arrives.
 fn read_reply(stream: &mut UnixStream, id: u64) -> io::Result<Reply> {
-    let mut reply: Reply = protocol::read_frame(stream)?;
+    read_reply_until(stream, id, None)
+}
+
+fn read_reply_until(
+    stream: &mut UnixStream,
+    id: u64,
+    deadline: Option<Instant>,
+) -> io::Result<Reply> {
+    let read = |stream: &mut UnixStream| -> io::Result<Reply> {
+        match deadline {
+            Some(deadline) => protocol::read_frame_until(stream, deadline),
+            None => protocol::read_frame(stream),
+        }
+    };
+    let check = || -> io::Result<()> {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "metrics result deadline exceeded",
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    let mut reply: Reply = read(stream)?;
+    check()?;
     if reply.id != id {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -101,6 +167,13 @@ fn read_reply(stream: &mut UnixStream, id: u64) -> io::Result<Reply> {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid daemon chunk"))?;
         let part = hex::decode(chunk).map_err(io::Error::other)?;
         bytes.extend_from_slice(&part);
+        if deadline.is_some() && bytes.len() > 64 * 1024 * 1024 + 4096 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "metrics reply too large",
+            ));
+        }
+        check()?;
         let more = reply
             .payload
             .get("more")
@@ -109,12 +182,12 @@ fn read_reply(stream: &mut UnixStream, id: u64) -> io::Result<Reply> {
                 io::Error::new(io::ErrorKind::InvalidData, "missing daemon chunk flag")
             })?;
         if !more {
-            return Ok(Reply {
-                id,
-                payload: serde_json::from_slice(&bytes).map_err(io::Error::other)?,
-            });
+            let payload = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+            check()?;
+            return Ok(Reply { id, payload });
         }
-        reply = protocol::read_frame(stream)?;
+        reply = read(stream)?;
+        check()?;
         if reply.id != id {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,

@@ -1671,3 +1671,813 @@ async fn serve_first_carries_jev_credential_to_new_daemon() {
     let indexed = run(&home, "index", &root);
     assert!(indexed["status"]["catchingUp"].is_boolean());
 }
+
+#[test]
+fn metrics_cli_reports_pinned_envelope_and_typed_selectors() {
+    let temp = short_temp();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let _daemon = AutoDaemonGuard::for_home(&home);
+    let root = checkout(temp.path(), "metricscli");
+    run(&home, "index", &root);
+    let response = cli(&home)
+        .args(["metrics", "--json", "--workspace"])
+        .arg(&root)
+        .output()
+        .unwrap();
+    assert!(
+        response.status.success(),
+        "{}",
+        String::from_utf8_lossy(&response.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&response.stdout).unwrap();
+    assert!(envelope["catchingUp"].is_boolean());
+    assert_eq!(envelope["payload"]["metricsVersion"], "metrics:v1");
+    assert_eq!(envelope["payload"]["scope"], "revision");
+    assert_eq!(envelope["payload"]["declarations"], serde_json::json!([]));
+    assert!(!envelope["payload"]["files"].as_array().unwrap().is_empty());
+    let generation = envelope["payload"]["indexGeneration"].as_str().unwrap();
+    let revision = envelope["payload"]["indexRevision"].as_u64().unwrap();
+    let pin = format!("{generation}:{revision}");
+    let file = &envelope["payload"]["files"][0];
+    let selected = cli(&home)
+        .args(["metrics", "--json", "--workspace"])
+        .arg(&root)
+        .args([
+            "--scope",
+            "file",
+            "--pin",
+            &pin,
+            "--source-set-id",
+            file["sourceSetId"].as_str().unwrap(),
+            "--language",
+            file["language"].as_str().unwrap(),
+            "--path",
+            file["path"].as_str().unwrap(),
+            "--aggregate",
+            "mean",
+            "--metrics",
+            "loc,fanIn",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        selected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&selected.stderr)
+    );
+    let selected: Value = serde_json::from_slice(&selected.stdout).unwrap();
+    assert_eq!(
+        selected["payload"]["selectedMetrics"],
+        serde_json::json!(["loc", "fanIn"])
+    );
+    assert_eq!(selected["payload"]["files"].as_array().unwrap().len(), 1);
+    assert_eq!(selected["payload"]["directories"], serde_json::json!([]));
+    let text = cli(&home)
+        .args(["metrics", "--workspace"])
+        .arg(&root)
+        .output()
+        .unwrap();
+    assert!(text.status.success());
+    assert!(String::from_utf8_lossy(&text.stdout).contains("catchingUp="));
+    let bad = cli(&home)
+        .args(["metrics", "--workspace"])
+        .arg(&root)
+        .args(["--scope", "file", "--path", "nonexistent.js"])
+        .output()
+        .unwrap();
+    assert!(!bad.status.success());
+    assert!(String::from_utf8_lossy(&bad.stderr).contains("invalid_argument"));
+    let pin_error = cli(&home)
+        .args(["metrics", "--workspace"])
+        .arg(&root)
+        .args(["--pin", "not-a-pin:1"])
+        .output()
+        .unwrap();
+    assert!(!pin_error.status.success());
+    assert!(String::from_utf8_lossy(&pin_error.stderr).contains("invalid_argument"));
+}
+
+#[test]
+fn metrics_protocol_deadline_covers_whole_frame_not_each_read() {
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+    let (mut writer, mut reader) = UnixStream::pair().unwrap();
+    let producer = std::thread::spawn(move || {
+        for byte in [0u8, 0, 0, 20] {
+            if writer.write_all(&[byte]).is_err() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(15));
+        }
+    });
+    let deadline = Instant::now() + Duration::from_millis(35);
+    let error =
+        trellis::daemon::protocol::read_frame_until::<Value>(&mut reader, deadline).unwrap_err();
+    assert!(matches!(
+        error.kind(),
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+    ));
+    producer.join().unwrap();
+}
+
+#[test]
+fn metrics_client_rejects_wrong_admission_and_partial_result() {
+    use std::os::unix::net::UnixStream;
+    use trellis::daemon::{client, protocol};
+    let request = protocol::Request {
+        id: 17,
+        operation: "metrics".into(),
+        payload: serde_json::json!({}),
+    };
+    for partial in [false, true] {
+        let (left, mut right) = UnixStream::pair().unwrap();
+        let peer = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let mut preface = [0];
+            right.read_exact(&mut preface).unwrap();
+            assert_eq!(preface, [0xff]);
+            let _: protocol::Request = protocol::read_frame(&mut right).unwrap();
+            protocol::write_frame(
+                &mut right,
+                &protocol::Reply {
+                    id: if partial { 17 } else { 18 },
+                    payload: serde_json::json!({"admitted": true}),
+                },
+            )
+            .unwrap();
+            if partial {
+                right.write_all(&[0, 0, 0, 42, b'{']).unwrap();
+            }
+        });
+        let mut socket = Some(left);
+        let start = Instant::now();
+        let result = client::call_metrics(
+            &request,
+            start + Duration::from_millis(250),
+            start + Duration::from_secs(1),
+            |_| {
+                socket.take().ok_or(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    "one attempt",
+                ))
+            },
+        );
+        assert_eq!(result.unwrap_err(), client::CallError::DaemonUnavailable);
+        peer.join().unwrap();
+    }
+}
+
+#[test]
+fn metrics_preface_rejects_other_operation_and_preserves_ordinary_frames() {
+    use std::os::unix::net::UnixStream;
+    use trellis::daemon::protocol::{self, Reply, Request};
+    let temp = short_temp();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let _daemon = AutoDaemonGuard::for_home(&home);
+    let root = checkout(temp.path(), "metricsframing");
+    run(&home, "index", &root);
+    let socket = fixture_socket_paths(&home).socket;
+    let request = Request {
+        id: 9,
+        operation: "status".to_owned(),
+        payload: serde_json::json!({"workspace": root, "args": {}}),
+    };
+    let mut ordinary = UnixStream::connect(&socket).unwrap();
+    ordinary
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    protocol::write_frame(&mut ordinary, &request).unwrap();
+    let answer: Reply = protocol::read_frame(&mut ordinary).unwrap();
+    assert_eq!(answer.id, 9);
+    assert!(
+        answer.payload["result"]["catchingUp"].is_boolean(),
+        "{answer:?}"
+    );
+    let mut prefaced = UnixStream::connect(&socket).unwrap();
+    prefaced
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    protocol::write_preface_until(&mut prefaced, Instant::now() + Duration::from_secs(1)).unwrap();
+    protocol::write_frame(&mut prefaced, &request).unwrap();
+    assert!(protocol::read_frame::<Reply>(&mut prefaced).is_err());
+    let mut again = UnixStream::connect(&socket).unwrap();
+    protocol::write_frame(&mut again, &request).unwrap();
+    assert!(protocol::read_frame::<Reply>(&mut again).unwrap().payload["result"].is_object());
+}
+
+#[test]
+fn metrics_client_reassembles_complete_chunks_under_original_deadline() {
+    use std::os::unix::net::UnixStream;
+    use trellis::daemon::{client, protocol};
+    let (left, mut right) = UnixStream::pair().unwrap();
+    let server = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut preface = [0];
+        right.read_exact(&mut preface).unwrap();
+        assert_eq!(preface, [0xff]);
+        let request: protocol::Request = protocol::read_frame(&mut right).unwrap();
+        protocol::write_frame(
+            &mut right,
+            &protocol::Reply {
+                id: request.id,
+                payload: serde_json::json!({"admitted": true}),
+            },
+        )
+        .unwrap();
+        let body = serde_json::to_vec(
+            &serde_json::json!({"result": {"catchingUp": false, "payload": {"scope": "revision"}}}),
+        )
+        .unwrap();
+        for (part, more) in [(body[..10].to_vec(), true), (body[10..].to_vec(), false)] {
+            protocol::write_frame(
+                &mut right,
+                &protocol::Reply {
+                    id: request.id,
+                    payload: serde_json::json!({"chunk": hex::encode(part), "more": more}),
+                },
+            )
+            .unwrap();
+        }
+    });
+    let request = protocol::Request {
+        id: 41,
+        operation: "metrics".into(),
+        payload: serde_json::json!({}),
+    };
+    let mut socket = Some(left);
+    let now = Instant::now();
+    let reply = client::call_metrics(
+        &request,
+        now + Duration::from_secs(1),
+        now + Duration::from_secs(2),
+        |_| {
+            socket.take().ok_or(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "retry",
+            ))
+        },
+    )
+    .unwrap();
+    assert_eq!(reply.payload["result"]["payload"]["scope"], "revision");
+    server.join().unwrap();
+}
+
+#[test]
+fn metrics_cli_work_timeout_is_typed_and_does_not_poison_daemon() {
+    let temp = short_temp();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let _daemon = AutoDaemonGuard::for_home(&home);
+    let root = checkout(temp.path(), "metricstimeout");
+    let indexed = cli(&home)
+        .arg("index")
+        .arg("--workspace")
+        .arg(&root)
+        .env("TRELLIS_TEST_METRICS_WORK_DEADLINE_MS", "25")
+        .env("TRELLIS_TEST_METRICS_WORK_DELAY_MS", "40")
+        .output()
+        .unwrap();
+    assert!(
+        indexed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+    let timed_out = cli(&home)
+        .arg("metrics")
+        .arg("--json")
+        .arg("--workspace")
+        .arg(&root)
+        .output()
+        .unwrap();
+    assert!(!timed_out.status.success());
+    assert!(timed_out.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&timed_out.stderr).contains("deadline_exceeded"),
+        "{}",
+        String::from_utf8_lossy(&timed_out.stderr)
+    );
+    assert!(run(&home, "status", &root)["catchingUp"].is_boolean());
+}
+
+#[test]
+fn metrics_admission_near_ingress_limit_still_allows_later_complete_result() {
+    use std::os::unix::net::UnixStream;
+    use trellis::daemon::{client, protocol};
+    let (left, mut right) = UnixStream::pair().unwrap();
+    let server = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut preface = [0];
+        right.read_exact(&mut preface).unwrap();
+        let request: protocol::Request = protocol::read_frame(&mut right).unwrap();
+        std::thread::sleep(Duration::from_millis(650));
+        protocol::write_frame(
+            &mut right,
+            &protocol::Reply {
+                id: request.id,
+                payload: serde_json::json!({"admitted": true}),
+            },
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(350));
+        protocol::write_frame(
+            &mut right,
+            &protocol::Reply {
+                id: request.id,
+                payload: serde_json::json!({"result": {"catchingUp": false}}),
+            },
+        )
+        .unwrap();
+    });
+    let request = protocol::Request {
+        id: 34,
+        operation: "metrics".into(),
+        payload: serde_json::json!({}),
+    };
+    let now = Instant::now();
+    let mut socket = Some(left);
+    let reply = client::call_metrics(
+        &request,
+        now + Duration::from_millis(950),
+        now + Duration::from_secs(3),
+        |_| {
+            socket.take().ok_or(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "not replayed",
+            ))
+        },
+    )
+    .unwrap();
+    assert_eq!(reply.payload["result"]["catchingUp"], false);
+    server.join().unwrap();
+}
+
+#[tokio::test]
+async fn metrics_cli_json_matches_authenticated_selected_http_envelope() {
+    let temp = short_temp();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let root = checkout(temp.path(), "metricshttp");
+    let address = free_address();
+    let token = temp.path().join("token");
+    let mut served = detached(serve(&home, &root, address, &token));
+    let client = reqwest::Client::new();
+    ready(&client, address, &mut served.0, &home).await;
+    run(&home, "index", &root);
+    let key = trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root)
+        .unwrap()
+        .root_key;
+    let auth = fs::read_to_string(&token).unwrap();
+    let response = client
+        .get(format!("http://{address}/api/checkouts/{key}/metrics"))
+        .bearer_auth(auth.trim())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::OK,
+        "{}",
+        response.text().await.unwrap_or_default()
+    );
+    let http: Value = response.json().await.unwrap();
+    let generation = http["payload"]["indexGeneration"].as_str().unwrap();
+    let revision = http["payload"]["indexRevision"].as_u64().unwrap();
+    let pin = format!("{generation}:{revision}");
+    let cli = cli(&home)
+        .args(["metrics", "--json", "--workspace"])
+        .arg(&root)
+        .args(["--pin", &pin])
+        .output()
+        .unwrap();
+    assert!(
+        cli.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cli.stderr)
+    );
+    let daemon: Value = serde_json::from_slice(&cli.stdout).unwrap();
+    assert_eq!(daemon["payload"], http["payload"]);
+    assert!(daemon["catchingUp"].is_boolean());
+}
+
+#[test]
+fn metrics_client_discards_partial_chunks_after_absolute_result_deadline() {
+    use std::os::unix::net::UnixStream;
+    use trellis::daemon::{client, protocol};
+    let (left, mut right) = UnixStream::pair().unwrap();
+    let server = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut preface = [0];
+        right.read_exact(&mut preface).unwrap();
+        let request: protocol::Request = protocol::read_frame(&mut right).unwrap();
+        protocol::write_frame(
+            &mut right,
+            &protocol::Reply {
+                id: request.id,
+                payload: serde_json::json!({"admitted": true}),
+            },
+        )
+        .unwrap();
+        protocol::write_frame(
+            &mut right,
+            &protocol::Reply {
+                id: request.id,
+                payload: serde_json::json!({"chunk": hex::encode(b"{\"result\":"), "more": true}),
+            },
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(160));
+    });
+    let request = protocol::Request {
+        id: 43,
+        operation: "metrics".into(),
+        payload: serde_json::json!({}),
+    };
+    let mut socket = Some(left);
+    let now = Instant::now();
+    let result = client::call_metrics(
+        &request,
+        now + Duration::from_millis(60),
+        now + Duration::from_millis(100),
+        |_| {
+            socket.take().ok_or(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "no replay",
+            ))
+        },
+    );
+    assert_eq!(result.unwrap_err(), client::CallError::DaemonUnavailable);
+    server.join().unwrap();
+}
+
+#[test]
+fn metrics_real_daemon_work_over_sixty_seconds_returns_complete_multiframe_revision() {
+    struct ReleaseGate(std::path::PathBuf);
+    impl Drop for ReleaseGate {
+        fn drop(&mut self) {
+            let _ = fs::write(&self.0, b"release");
+        }
+    }
+    let temp = short_temp();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let _daemon = AutoDaemonGuard::for_home(&home);
+    let root = checkout(temp.path(), "metricslarge");
+    fs::create_dir(root.join("src")).unwrap();
+    const FILES: usize = 4_000;
+    for number in 0..FILES {
+        fs::write(
+            root.join(format!("src/f{number:04}.js")),
+            format!("function f{number:04}(x) {{ if (x) return x + 1; return 0; }}\n"),
+        )
+        .unwrap();
+    }
+    let gate = temp.path().join("metrics-gate");
+    fs::create_dir(&gate).unwrap();
+    let indexed = cli(&home)
+        .arg("index")
+        .arg("--workspace")
+        .arg(&root)
+        .env("TRELLIS_TEST_METRICS_WORK_GATE", &gate)
+        .output()
+        .unwrap();
+    assert!(
+        indexed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+    let release = ReleaseGate(gate.join("release"));
+    let start = Instant::now();
+    let mut process = cli(&home)
+        .args(["metrics", "--json", "--workspace"])
+        .arg(&root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let admitted = Instant::now() + Duration::from_secs(30);
+    loop {
+        if fs::metadata(gate.join("started")).is_ok() {
+            break;
+        }
+        assert!(
+            Instant::now() < admitted,
+            "metrics request did not reach the work gate"
+        );
+        assert!(
+            process.try_wait().unwrap().is_none(),
+            "metrics exited before its work gate"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // Release only after the old 60-second socket read bound would have fired.
+    std::thread::sleep(Duration::from_millis(60_500));
+    fs::write(&release.0, b"release").unwrap();
+    let result = process.wait_with_output().unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(start.elapsed() > Duration::from_secs(60));
+    let envelope: Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(
+        envelope["payload"]["files"].as_array().unwrap().len(),
+        FILES + 1
+    );
+    assert_eq!(envelope["payload"]["declarations"], serde_json::json!([]));
+    assert!(envelope["catchingUp"].is_boolean());
+    let wire = serde_json::to_vec(&serde_json::json!({"result": envelope})).unwrap();
+    assert!(
+        wire.len() > trellis::daemon::protocol::MAX_FRAME,
+        "reply was not multi-frame: {}",
+        wire.len()
+    );
+    assert_eq!(
+        fs::read(gate.join("started")).unwrap(),
+        b"x",
+        "request reconnected and recomputed"
+    );
+}
+
+#[test]
+fn metrics_cli_parser_and_serialization_timeouts_are_atomic() {
+    for (stage, delay_key) in [
+        ("parse", "TRELLIS_TEST_METRICS_PARSE_DELAY_MS"),
+        ("serialize", "TRELLIS_TEST_METRICS_SERIALIZE_DELAY_MS"),
+    ] {
+        let temp = short_temp();
+        let home = temp.path().join("home");
+        fs::create_dir(&home).unwrap();
+        let _daemon = AutoDaemonGuard::for_home(&home);
+        let root = checkout(temp.path(), stage);
+        if stage == "parse" {
+            let mut source = String::from("function parseSymbol(x) {\n");
+            for number in 0..4_000 {
+                source.push_str(&format!("if (x) x += {number};\n"));
+            }
+            source.push_str("return x;\n}\n");
+            fs::write(root.join("sample.js"), source).unwrap();
+        }
+        let hit = temp.path().join(format!("{stage}-hit"));
+        let marker_key = if stage == "parse" {
+            "TRELLIS_TEST_METRICS_PARSE_HIT_FILE"
+        } else {
+            "TRELLIS_TEST_METRICS_SERIALIZE_HIT_FILE"
+        };
+        let indexed = cli(&home)
+            .arg("index")
+            .arg("--workspace")
+            .arg(&root)
+            .env("TRELLIS_TEST_METRICS_WORK_DEADLINE_MS", "1500")
+            .env(delay_key, "2000")
+            .env(marker_key, &hit)
+            .env("TRELLIS_TEST_METRICS_SERIALIZE_DELAY_AT_BYTES", "0")
+            .output()
+            .unwrap();
+        assert!(
+            indexed.status.success(),
+            "{stage}: {}",
+            String::from_utf8_lossy(&indexed.stderr)
+        );
+        let output = cli(&home)
+            .arg("metrics")
+            .arg("--json")
+            .arg("--workspace")
+            .arg(&root)
+            .output()
+            .unwrap();
+        assert_eq!(
+            fs::read(&hit).unwrap(),
+            stage.as_bytes(),
+            "{stage} hook did not run"
+        );
+        assert!(!output.status.success(), "{stage} succeeded after deadline");
+        assert!(output.stdout.is_empty(), "{stage} sent partial success");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("deadline_exceeded"),
+            "{stage}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(run(&home, "status", &root)["catchingUp"].is_boolean());
+    }
+}
+
+#[test]
+fn metrics_prefaced_trickle_expires_whole_daemon_ingress_without_ack() {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+    let temp = short_temp();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let _daemon = AutoDaemonGuard::for_home(&home);
+    let root = checkout(temp.path(), "metricstrickle");
+    let gate = temp.path().join("unused-metrics-gate");
+    fs::create_dir(&gate).unwrap();
+    let indexed = cli(&home)
+        .arg("index")
+        .arg("--workspace")
+        .arg(&root)
+        .env("TRELLIS_TEST_METRICS_INGRESS_DEADLINE_MS", "800")
+        .env("TRELLIS_TEST_METRICS_WORK_GATE", &gate)
+        .output()
+        .unwrap();
+    assert!(
+        indexed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+    let mut stream = UnixStream::connect(fixture_socket_paths(&home).socket).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    stream.write_all(&[0xff]).unwrap();
+    // Every individual byte arrives before the socket read timeout; the
+    // complete length prefix does not arrive before the absolute ingress cap.
+    for byte in [0u8, 0, 0, 80] {
+        std::thread::sleep(Duration::from_millis(250));
+        if stream.write_all(&[byte]).is_err() {
+            break;
+        }
+    }
+    let mut one = [0];
+    assert!(
+        matches!(stream.read(&mut one), Ok(0) | Err(_)),
+        "expired request got an ACK"
+    );
+    assert!(
+        !gate.join("started").exists(),
+        "metrics work started without admission"
+    );
+    assert!(run(&home, "status", &root)["catchingUp"].is_boolean());
+}
+
+#[test]
+fn metrics_peer_closes_at_parser_hook_without_poisoning_daemon() {
+    use std::os::unix::net::UnixStream;
+    use trellis::daemon::protocol::{self, Reply, Request};
+    let temp = short_temp();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let _daemon = AutoDaemonGuard::for_home(&home);
+    let root = checkout(temp.path(), "metricsclosed");
+    let mut source = String::from("function metricsclosedSymbol(x) {\n");
+    for number in 0..4_000 {
+        source.push_str(&format!("if (x) x += {number};\n"));
+    }
+    source.push_str("return x;\n}\n");
+    fs::write(root.join("sample.js"), source).unwrap();
+    let hit = temp.path().join("parser-started");
+    let indexed = cli(&home)
+        .arg("index")
+        .arg("--workspace")
+        .arg(&root)
+        .env("TRELLIS_TEST_METRICS_PARSE_DELAY_MS", "400")
+        .env("TRELLIS_TEST_METRICS_PARSE_HIT_FILE", &hit)
+        .output()
+        .unwrap();
+    assert!(
+        indexed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+    let mut stream = UnixStream::connect(fixture_socket_paths(&home).socket).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    protocol::write_preface_until(&mut stream, deadline).unwrap();
+    protocol::write_frame_until(&mut stream, &Request {
+        id: 39, operation: "metrics".into(),
+        payload: serde_json::json!({"workspace": root, "args": {"scope": "revision", "aggregate": "sum"}}),
+    }, deadline).unwrap();
+    let admission: Reply = protocol::read_frame_until(&mut stream, deadline).unwrap();
+    assert_eq!(admission.payload, serde_json::json!({"admitted": true}));
+    let progress_deadline = Instant::now() + Duration::from_secs(5);
+    while !hit.exists() {
+        assert!(
+            Instant::now() < progress_deadline,
+            "parser hook did not run"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    drop(stream);
+    let later = cli(&home)
+        .args(["metrics", "--json", "--workspace"])
+        .arg(&root)
+        .output()
+        .unwrap();
+    assert!(
+        later.status.success(),
+        "{}",
+        String::from_utf8_lossy(&later.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&later.stdout).unwrap();
+    assert_eq!(envelope["payload"]["files"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn metrics_cli_low_cap_and_last_row_timeout_never_emit_partial_success() {
+    let temp = short_temp();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let _daemon = AutoDaemonGuard::for_home(&home);
+    let root = checkout(temp.path(), "metricslimit");
+    let limit_file = temp.path().join("metrics-limit");
+    let threshold_file = temp.path().join("metrics-threshold");
+    let hit = temp.path().join("metrics-last-row-hit");
+    let indexed = cli(&home)
+        .arg("index")
+        .arg("--workspace")
+        .arg(&root)
+        .env("TRELLIS_TEST_METRICS_LIMIT_FILE", &limit_file)
+        .env(
+            "TRELLIS_TEST_METRICS_SERIALIZE_DELAY_AT_BYTES_FILE",
+            &threshold_file,
+        )
+        .env("TRELLIS_TEST_METRICS_SERIALIZE_DELAY_MS", "2000")
+        .env("TRELLIS_TEST_METRICS_SERIALIZE_HIT_FILE", &hit)
+        .env("TRELLIS_TEST_METRICS_WORK_DEADLINE_MS", "500")
+        .output()
+        .unwrap();
+    assert!(
+        indexed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+    let metrics = || {
+        cli(&home)
+            .args(["metrics", "--json", "--workspace"])
+            .arg(&root)
+            .output()
+            .unwrap()
+    };
+    let baseline = metrics();
+    assert!(
+        baseline.status.success(),
+        "{}",
+        String::from_utf8_lossy(&baseline.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&baseline.stdout).unwrap();
+    let bytes = serde_json::to_vec(&envelope).unwrap();
+    assert!(bytes.len() > 80);
+    fs::write(&limit_file, (bytes.len() - 2).to_string()).unwrap();
+    let over_cap = metrics();
+    assert!(!over_cap.status.success());
+    assert!(over_cap.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&over_cap.stderr).contains("response_too_large"),
+        "{}",
+        String::from_utf8_lossy(&over_cap.stderr)
+    );
+    fs::remove_file(&limit_file).unwrap();
+    fs::write(&threshold_file, (bytes.len() - 80).to_string()).unwrap();
+    let last_row = metrics();
+    assert_eq!(
+        fs::read(&hit).unwrap(),
+        b"serialize",
+        "late serializer hook did not run"
+    );
+    assert!(!last_row.status.success());
+    assert!(last_row.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&last_row.stderr).contains("deadline_exceeded"),
+        "{}",
+        String::from_utf8_lossy(&last_row.stderr)
+    );
+}
+
+#[test]
+fn metrics_reconnect_keeps_original_ingress_deadline() {
+    use std::os::unix::net::UnixStream;
+    use trellis::daemon::{client, protocol};
+    let (left, mut right) = UnixStream::pair().unwrap();
+    let server = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut preface = [0];
+        right.read_exact(&mut preface).unwrap();
+        let _: protocol::Request = protocol::read_frame(&mut right).unwrap();
+        std::thread::sleep(Duration::from_millis(180));
+    });
+    let request = protocol::Request {
+        id: 78,
+        operation: "metrics".into(),
+        payload: serde_json::json!({}),
+    };
+    let start = Instant::now();
+    let mut socket = Some(left);
+    let mut connects = 0;
+    let result = client::call_metrics(
+        &request,
+        start + Duration::from_millis(110),
+        start + Duration::from_secs(1),
+        |_| {
+            connects += 1;
+            socket.take().ok_or(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "unexpected reconnect",
+            ))
+        },
+    );
+    assert_eq!(result.unwrap_err(), client::CallError::DaemonUnavailable);
+    assert_eq!(connects, 1, "reconnect reset the original ingress budget");
+    server.join().unwrap();
+}
