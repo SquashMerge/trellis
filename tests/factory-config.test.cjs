@@ -215,6 +215,7 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
       cohorts: [["node", "--test", "tools/synthetic-cohorts/test/cohorts.test.mjs"]],
       checks: [
         ["node", "--test", "runtime/acp/runner.test.mjs"],
+        ["node", "--test", "tests/mcp-catalog-sdk.test.mjs"],
         ["node", "--test", "tests/factory-config.test.cjs"],
         ["node", "tests/browser/saved-items.test.cjs"],
         ["node", "docs/semantic-evidence/check-policy.mjs"],
