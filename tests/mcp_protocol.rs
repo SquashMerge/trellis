@@ -6431,7 +6431,8 @@ fn mcp_outgoing_fixture_with_budget(
 
 /// A fixed delay between freezing the hint clock and sending the call, so a
 /// test can show the hint budget does not depend on acceptance timing (#131).
-/// Each nextest test runs in its own process, so this is per test.
+/// Each nextest test runs in its own process; the one test that sets it also
+/// resets it on exit, for runners that share a process.
 static OUTGOING_ACCEPT_DELAY_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -7230,6 +7231,14 @@ async fn mcp_outgoing_response_bytes_call_prefix_before_global_hints() {
 /// the delay cannot move the cap and leak an optional hint.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mcp_outgoing_near_call_deadline_is_independent_of_acceptance_delay() {
+    // Reset on every exit: plain `cargo test` shares one process across tests.
+    struct ResetDelay;
+    impl Drop for ResetDelay {
+        fn drop(&mut self) {
+            OUTGOING_ACCEPT_DELAY_MS.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    let _reset = ResetDelay;
     OUTGOING_ACCEPT_DELAY_MS.store(300, std::sync::atomic::Ordering::Relaxed);
     mcp_outgoing_near_call_deadline_preserves_required_call_without_optional_work_body().await;
 }
