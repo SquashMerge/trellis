@@ -23,6 +23,10 @@ pub struct OpenedWorkspace {
 #[cfg(feature = "test-support")]
 pub type CallHookForTests = std::sync::Arc<dyn Fn(&serde_json::Value) + Send + Sync>;
 
+#[cfg(feature = "test-support")]
+type EvidenceErrorHook =
+    std::sync::Arc<dyn Fn(&serde_json::Value, &'static str, &str) + Send + Sync>;
+
 /// Test-only pause points on one connection's transport.
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
@@ -41,6 +45,8 @@ pub struct TransportHooksForTests {
     pub fence_handled: Option<std::sync::Arc<dyn Fn(usize) + Send + Sync>>,
     /// On a call worker, once its result has been handed to the coordinator.
     pub worker_done: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    /// Opt-in diagnostic for a selected read/finish error. Never enters MCP output.
+    pub evidence_error: Option<EvidenceErrorHook>,
     /// On the coordinator, at a finished call's send decision after its final
     /// root check, before the last input pass; given the call's ID.
     pub send_decision: Option<CallHookForTests>,
@@ -266,6 +272,46 @@ type EvidenceToolRead<'a> = Box<
         + 'a,
 >;
 
+#[cfg(feature = "test-support")]
+fn capture_evidence_error(
+    hook: Option<&EvidenceErrorHook>,
+    id: &serde_json::Value,
+    stage: &'static str,
+    error: &anyhow::Error,
+) {
+    struct LimitedText<'a>(&'a mut String);
+    impl std::fmt::Write for LimitedText<'_> {
+        fn write_str(&mut self, part: &str) -> std::fmt::Result {
+            let available = 1024 - self.0.len();
+            if part.len() <= available {
+                self.0.push_str(part);
+                return Ok(());
+            }
+            let boundary = (0..=available)
+                .rev()
+                .find(|&n| part.is_char_boundary(n))
+                .unwrap();
+            self.0.push_str(&part[..boundary]);
+            Err(std::fmt::Error)
+        }
+    }
+    if let Some(hook) = hook {
+        let mut detail = String::new();
+        for cause in error.chain().take(8) {
+            if !detail.is_empty() {
+                if detail.len() + 2 > 1024 {
+                    break;
+                }
+                detail.push_str(": ");
+            }
+            if std::fmt::write(&mut LimitedText(&mut detail), format_args!("{cause}")).is_err() {
+                break;
+            }
+        }
+        hook(id, stage, &detail);
+    }
+}
+
 /// The shared cached-evidence read for find, inspect and read_source. A cold
 /// checkout must show a prior head before it is activated; then one snapshot is
 /// admitted, read, and finished. Store contention, including the cold check's,
@@ -280,6 +326,7 @@ fn evidence_read(
     cancel: &std::sync::atomic::AtomicBool,
     publish: &dyn Fn(bool),
     id: &serde_json::Value,
+    #[cfg(feature = "test-support")] evidence_error: Option<&EvidenceErrorHook>,
     read: &dyn Fn(
         &crate::daemon::registry::CheckoutRuntime,
         &crate::daemon::registry::CheckoutEvidence,
@@ -327,13 +374,23 @@ fn evidence_read(
             if cancelled() || runtime.mcp_clock_now() >= deadline {
                 anyhow::bail!("deadline_exceeded: MCP selected read deadline");
             }
-            let pin = response.status()?.revision;
+            #[cfg(feature = "test-support")]
+            let status = response.status().inspect_err(|error| {
+                capture_evidence_error(evidence_error, id, "status", error);
+            })?;
+            #[cfg(not(feature = "test-support"))]
+            let status = response.status()?;
+            let pin = status.revision;
             let mut envelope = match read(&runtime, &response, sampled) {
                 Ok(envelope) => envelope,
                 Err(error) if crate::store::cli_read_retryable_contention(&error) => {
                     return Err(error);
                 }
-                Err(error) => tools::failure(id, evidence_failure_code(&error)),
+                Err(error) => {
+                    #[cfg(feature = "test-support")]
+                    capture_evidence_error(evidence_error, id, "read", &error);
+                    tools::failure(id, evidence_failure_code(&error))
+                }
             };
             // W8: a rejected store reports no basis; every other failure reports
             // the admitted snapshot's.
@@ -343,9 +400,13 @@ fn evidence_read(
                     "indexRevision": pin.index_revision
                 });
             }
-            response
-                .finish(envelope)
-                .map(|envelope| (envelope, sampled))
+            #[cfg(feature = "test-support")]
+            let envelope = response.finish(envelope).inspect_err(|error| {
+                capture_evidence_error(evidence_error, id, "finish", error);
+            })?;
+            #[cfg(not(feature = "test-support"))]
+            let envelope = response.finish(envelope)?;
+            Ok((envelope, sampled))
         })();
         match attempt {
             Err(ref error) if crate::store::cli_read_retryable_contention(error) => {
@@ -809,6 +870,8 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                     &cancel,
                     &publish,
                     id,
+                    #[cfg(feature = "test-support")]
+                    workspace.hooks.evidence_error.as_ref(),
                     &*tool_read,
                 ) {
                     Ok((found, sampled)) => {

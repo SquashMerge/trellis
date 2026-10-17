@@ -439,6 +439,7 @@ mod find_tests {
                 .unwrap();
             let data = &large["data"];
             assert_eq!(data["symbols"], json!([]));
+            assert_eq!(data["documents"], json!([]));
             assert_eq!(data["coverage"], json!([]));
             assert_eq!(data["provenance"], json!([]));
             assert_eq!(
@@ -520,6 +521,19 @@ mod find_tests {
                 ]
             );
             assert_eq!(envelope["data"]["provenance"].as_array().unwrap().len(), 3);
+            let repeated = find(
+                &id,
+                fixture(&hits, COMPLETE_SCOPE, false),
+                root,
+                false,
+                modern,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                serde_json::to_vec(&envelope).unwrap(),
+                serde_json::to_vec(&repeated).unwrap()
+            );
             let documents = envelope["data"]["documents"].as_array().unwrap();
             assert_eq!(documents.len(), 3);
             let refs: Vec<_> = envelope["data"]["symbols"]
@@ -567,21 +581,27 @@ mod find_tests {
 
     #[test]
     fn conflicting_selected_document_version_is_store_unavailable() {
-        let mut selected = fixture(
-            &[hit("one", "a.js"), hit("two", "a.js")],
-            COMPLETE_SCOPE,
-            false,
-        );
-        selected.symbols[1].source.document.content_hash = "b".repeat(64);
-        let failure = find(
-            &json!(1),
-            selected,
-            std::path::Path::new("/workspace"),
-            false,
-            true,
-        )
-        .unwrap_err();
-        assert!(failure.starts_with("store_unavailable"));
+        for differing_proof in [false, true] {
+            let mut conflicting = fixture(
+                &[hit("one", "a.js"), hit("two", "a.js")],
+                COMPLETE_SCOPE,
+                false,
+            );
+            if differing_proof {
+                conflicting.symbols[1].source.document.provenance_id = "other-proof".into();
+            } else {
+                conflicting.symbols[1].source.document.content_hash = "b".repeat(64);
+            }
+            let failure = find(
+                &json!(1),
+                conflicting,
+                std::path::Path::new("/workspace"),
+                false,
+                true,
+            )
+            .unwrap_err();
+            assert!(failure.starts_with("store_unavailable"));
+        }
     }
 
     #[test]
@@ -618,6 +638,19 @@ mod find_tests {
                 .collect();
             assert_eq!(paths, vec![json!("src/0.js"), json!("src/1.js")]);
             assert_eq!(data["provenance"].as_array().unwrap().len(), 2);
+            let documents = data["documents"].as_array().unwrap();
+            assert_eq!(documents.len(), 2);
+            for (index, document) in documents.iter().enumerate() {
+                assert_eq!(document["ref"], index);
+                assert_eq!(document["document"]["path"], format!("src/{index}.js"));
+                assert!(
+                    data["symbols"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|symbol| symbol["doc"] == index)
+                );
+            }
             assert_eq!(data["scopeCoverage"].as_array().unwrap().len(), 4);
             assert_eq!(envelope["catchingUp"], true);
             assert_eq!(envelope["truncated"], true);
@@ -655,6 +688,7 @@ mod find_tests {
             .unwrap()
             .unwrap();
             assert_eq!(envelope["data"]["symbols"], json!([]));
+            assert_eq!(envelope["data"]["documents"], json!([]));
             assert_eq!(envelope["data"]["coverage"], json!([]));
             assert_eq!(envelope["data"]["provenance"], json!([]));
             assert_eq!(envelope["truncated"], true);
@@ -880,16 +914,11 @@ mod outgoing_tests {
     use crate::native_evidence::{Coverage, Declaration, DocumentKey, Provenance};
     use crate::store::mcp_read::{
         McpDeclaration, McpDeclarationWithLines, McpDocumentVersion, McpItemSource, McpLines,
-        McpOutgoing, McpOutgoingCall, McpOutgoingCallWithLines, McpOutgoingWithLines,
+        McpOutgoing, McpOutgoingCall, McpOutgoingCallWithLines, McpOutgoingCandidate,
+        McpOutgoingWithLines,
     };
 
-    fn outgoing_fixture(
-        id: &Value,
-        result: McpOutgoing,
-        root: &std::path::Path,
-        catching_up: bool,
-        modern: bool,
-    ) -> Option<Value> {
+    fn with_lines(result: McpOutgoing) -> McpOutgoingWithLines {
         let owner_doc = McpDocumentVersion {
             document: result.owner.declaration.document.clone(),
             revision_id: result.owner.declaration.revision_id.clone(),
@@ -920,24 +949,27 @@ mod outgoing_tests {
                 }
             })
             .collect();
-        outgoing(
-            id,
-            McpOutgoingWithLines {
-                owner: McpDeclarationWithLines {
-                    selected: result.owner,
-                    source: McpItemSource {
-                        document: owner_doc,
-                        lines: Some(McpLines { start: 1, end: 1 }),
-                    },
+        McpOutgoingWithLines {
+            owner: McpDeclarationWithLines {
+                selected: result.owner,
+                source: McpItemSource {
+                    document: owner_doc,
+                    lines: Some(McpLines { start: 1, end: 1 }),
                 },
-                calls,
-                has_more: result.has_more,
             },
-            root,
-            catching_up,
-            modern,
-        )
-        .unwrap()
+            calls,
+            has_more: result.has_more,
+        }
+    }
+
+    fn outgoing_fixture(
+        id: &Value,
+        result: McpOutgoing,
+        root: &std::path::Path,
+        catching_up: bool,
+        modern: bool,
+    ) -> Option<Value> {
+        outgoing(id, with_lines(result), root, catching_up, modern).unwrap()
     }
     fn owner() -> McpDeclaration {
         let document = DocumentKey {
@@ -992,6 +1024,49 @@ mod outgoing_tests {
     }
 
     #[test]
+    fn shown_candidate_uses_its_own_proof_not_another_valid_proof() {
+        let make_result = || {
+            let mut target = owner();
+            target.declaration.syntax_id = "sid:v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into();
+            target.declaration.document.path = "target.js".into();
+            target.declaration.provenance_id = "native-proof:v1:target".into();
+            target.coverage[0].document_path = "target.js".into();
+            target.provenance[0].document = target.declaration.document.clone();
+            target.provenance[0].id = target.declaration.provenance_id.clone();
+            let mut call = required_call(false);
+            call.candidates.push(McpOutgoingCandidate {
+                declaration: target.declaration,
+                coverage: target.coverage.remove(0),
+                provenance: target.provenance.remove(0),
+            });
+            with_lines(McpOutgoing {
+                owner: owner(),
+                calls: vec![call],
+                has_more: false,
+            })
+        };
+        let root = std::path::Path::new("/workspace");
+        let valid = outgoing(&json!(1), make_result(), root, false, true)
+            .unwrap()
+            .unwrap();
+        let entry = &valid["data"]["documents"]
+            [valid["data"]["calls"][0]["nativeCandidates"]["items"][0]["doc"]
+                .as_u64()
+                .unwrap() as usize];
+        assert_eq!(entry["provenanceId"], "native-proof:v1:target");
+        assert_ne!(
+            entry["provenanceId"],
+            valid["data"]["documents"][0]["provenanceId"]
+        );
+        let mut wrong = make_result();
+        // The owner proof is real and present in the response, but it is not
+        // the independent target declaration's proof.
+        wrong.calls[0].candidate_documents[0].provenance_id = owner().provenance[0].id.clone();
+        let failure = outgoing(&json!(1), wrong, root, false, true).unwrap_err();
+        assert!(failure.starts_with("store_unavailable"));
+    }
+
+    #[test]
     fn outgoing_empty_complete_vs_incomplete_coverage_and_unresolved_boundary() {
         let root = std::path::Path::new("/workspace");
         let incomplete = outgoing_fixture(
@@ -1007,6 +1082,12 @@ mod outgoing_tests {
         )
         .unwrap();
         assert_eq!(incomplete["data"]["calls"], json!([]));
+        assert_eq!(incomplete["data"]["documents"], json!([]));
+        assert_eq!(incomplete["data"]["coverage"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            incomplete["data"]["provenance"].as_array().unwrap().len(),
+            1
+        );
         assert_eq!(incomplete["warnings"][0]["code"], "coverageIncomplete");
         assert_eq!(incomplete["partial"], true);
         assert_eq!(incomplete["truncated"], false);
@@ -1163,26 +1244,101 @@ mod outgoing_tests {
                 item.call.ordinal = ordinal;
                 calls.push(item);
             }
-            let bytes = outgoing_fixture(
-                &json!(1),
-                McpOutgoing {
-                    owner: owner(),
-                    calls,
-                    has_more: true,
-                },
-                root,
-                false,
-                modern,
-            )
-            .unwrap();
+            // A hint attached only to the excluded last call must never leak
+            // a table entry, coverage row, or proof into the selected prefix.
+            let mut candidate = owner();
+            candidate.declaration.document.path = "excluded.js".into();
+            candidate.declaration.revision_id = "revision:v2:excluded".into();
+            candidate.declaration.provenance_id = "native-proof:v1:excluded".into();
+            candidate.coverage[0].document_path = "excluded.js".into();
+            candidate.coverage[0].revision_id = "revision:v2:excluded".into();
+            candidate.provenance[0].document = candidate.declaration.document.clone();
+            candidate.provenance[0].revision_id = "revision:v2:excluded".into();
+            candidate.provenance[0].id = "native-proof:v1:excluded".into();
+            calls[49].candidates.push(McpOutgoingCandidate {
+                declaration: candidate.declaration,
+                coverage: candidate.coverage.remove(0),
+                provenance: candidate.provenance.remove(0),
+            });
+            let answer = || {
+                outgoing_fixture(
+                    &json!(1),
+                    McpOutgoing {
+                        owner: owner(),
+                        calls: (0..50)
+                            .map(|ordinal| {
+                                let mut item = required_call(true);
+                                item.call.id = format!("cid:v1:{ordinal}");
+                                item.call.ordinal = ordinal;
+                                if ordinal == 49 {
+                                    item.candidates = calls[49].candidates.clone();
+                                }
+                                item
+                            })
+                            .collect(),
+                        has_more: true,
+                    },
+                    root,
+                    false,
+                    modern,
+                )
+                .unwrap()
+            };
+            let bytes = answer();
+            assert_eq!(
+                serde_json::to_vec(&bytes).unwrap(),
+                serde_json::to_vec(&answer()).unwrap()
+            );
             let emitted = bytes["data"]["calls"].as_array().unwrap();
             assert!(!emitted.is_empty() && emitted.len() < 50);
+            assert_eq!(
+                emitted
+                    .iter()
+                    .map(|call| call["ordinal"].as_u64().unwrap())
+                    .collect::<Vec<_>>(),
+                (0..emitted.len() as u64).collect::<Vec<_>>()
+            );
+            assert_eq!(bytes["data"]["documents"].as_array().unwrap().len(), 1);
+            assert_eq!(bytes["data"]["coverage"].as_array().unwrap().len(), 1);
+            assert_eq!(bytes["data"]["provenance"].as_array().unwrap().len(), 1);
+            assert!(emitted.iter().all(|call| call["doc"] == 0));
+            assert_eq!(bytes["data"]["documents"][0]["document"]["path"], "a.js");
             assert_eq!(bytes["truncationReason"], "response_bytes");
+            let required_prefix = |count: usize| {
+                outgoing_fixture(
+                    &json!(1),
+                    McpOutgoing {
+                        owner: owner(),
+                        calls: (0..count)
+                            .map(|ordinal| {
+                                let mut call = required_call(true);
+                                call.call.id = format!("cid:v1:{ordinal}");
+                                call.call.ordinal = ordinal;
+                                call
+                            })
+                            .collect(),
+                        has_more: false,
+                    },
+                    root,
+                    false,
+                    modern,
+                )
+                .unwrap()
+            };
+            let exactly_fits = required_prefix(emitted.len());
+            assert_eq!(exactly_fits["data"]["calls"], bytes["data"]["calls"]);
+            assert_eq!(exactly_fits["truncationReason"], "callee_text");
+            let first_excluded = required_prefix(emitted.len() + 1);
+            assert_eq!(first_excluded["data"]["calls"], bytes["data"]["calls"]);
+            assert_eq!(first_excluded["truncationReason"], "response_bytes");
             assert!(bytes["truncated"].as_bool().unwrap());
             assert!(bytes["partial"].as_bool().unwrap());
             let frame = json!({"jsonrpc":"2.0","id":1,
                 "result":super::super::tools::result(bytes,modern)});
-            assert!(serde_json::to_vec(&frame).unwrap().len() < super::super::wire::RESPONSE_BYTES);
+            let mut line = Vec::new();
+            super::super::wire::write_response(&mut line, &frame).unwrap();
+            assert!(line.len() <= super::super::wire::RESPONSE_BYTES);
+            assert_eq!(line.last(), Some(&b'\n'));
         }
     }
 }

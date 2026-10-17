@@ -1324,6 +1324,286 @@ fn id_boundaries_binary_both_modes_and_unselected() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wire_lines_remain_when_source_line_or_byte_cap_refuses() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = checkout(temp.path());
+    fs::write(
+        root.join("lines.js"),
+        format!("function BigLines() {{\n{}}}\n", " ;\n".repeat(201)),
+    )
+    .unwrap();
+    fs::write(
+        root.join("bytes.js"),
+        format!("function BigBytes() {{ /*{}*/ }}\n", "x".repeat(16_390)),
+    )
+    .unwrap();
+    let root_key = trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root)
+        .unwrap()
+        .root_key;
+    let (mut peer, witness) = Peer::start_with_causal_witness(Some(&root));
+    tool(
+        &peer.ask(call(
+            false,
+            json!(1),
+            "trellis_workspace_describe",
+            json!({"schemaVersion":1}),
+        )),
+        None,
+        true,
+    );
+    let pin = await_settled_golden_h(&witness, &root_key).await;
+    let mut old_hash = None;
+    for (offset, name, path, too_many_lines) in [
+        (0, "BigLines", "lines.js", true),
+        (10, "BigBytes", "bytes.js", false),
+    ] {
+        let found = peer.ask(call(
+            false,
+            json!(2 + offset),
+            "trellis_find_symbols",
+            json!({"schemaVersion":1,"query":name,"expectedBasis":pin}),
+        ));
+        tool(&found, None, true);
+        let found_data = &found["result"]["structuredContent"]["data"];
+        let symbol = found_data["symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|symbol| symbol["name"] == name)
+            .unwrap();
+        let declaration = peer.ask(call(
+            false,
+            json!(3 + offset),
+            "trellis_declaration",
+            json!({"schemaVersion":1,"symbolId":symbol["symbolId"],"expectedBasis":pin}),
+        ));
+        tool(&declaration, None, true);
+        let declaration_data = &declaration["result"]["structuredContent"]["data"];
+        for (item_data, item) in [(found_data, symbol), (declaration_data, declaration_data)] {
+            let version = emitted_document(item_data, item);
+            if offset == 0 {
+                old_hash = Some(version["contentHash"].clone());
+            }
+            assert_eq!(version["document"]["path"], path);
+            let lines = &item["lines"];
+            assert!(
+                !lines.is_null(),
+                "source caps must not erase selected lines"
+            );
+            if too_many_lines {
+                assert!(lines["end"].as_u64().unwrap() - lines["start"].as_u64().unwrap() >= 200);
+            } else {
+                assert_eq!(lines, &json!({"start":1,"end":1}));
+            }
+            let source = peer.ask(call(
+                false,
+                json!(4 + offset),
+                "trellis_read_source",
+                json!({
+                    "schemaVersion":1,"path":path,"startLine":lines["start"],"endLine":lines["end"],
+                    "expectedBasis":pin,"expectedContentHash":version["contentHash"]
+                }),
+            ));
+            tool(&source, Some("range_too_large"), true);
+        }
+    }
+    fs::write(root.join("lines.js"), "function BigLines() {}\n").unwrap();
+    let home = peer._home.path().to_path_buf();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_trellis"));
+    command
+        .arg("index")
+        .arg("--workspace")
+        .arg(&root)
+        .env("HOME", &home)
+        .env("XDG_CACHE_HOME", home.join("cache"))
+        .env("XDG_DATA_HOME", home.join("data"));
+    let indexed = bounded_output(command);
+    assert!(
+        indexed.status.success(),
+        "index: {}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+    let publication: Value = serde_json::from_slice(&indexed.stdout).unwrap();
+    let current = &publication["publishedRevision"];
+    assert_ne!(current, &pin);
+    let stale = peer.ask(call(
+        false,
+        json!(22),
+        "trellis_read_source",
+        json!({
+            "schemaVersion":1,"path":"lines.js","startLine":1,"endLine":1,
+            "expectedBasis":pin,"expectedContentHash":old_hash
+        }),
+    ));
+    tool(&stale, Some("revision_conflict"), true);
+    assert_eq!(
+        stale["result"]["structuredContent"]["error"]["currentBasis"],
+        *current
+    );
+    let wrong_hash = peer.ask(call(
+        false,
+        json!(23),
+        "trellis_read_source",
+        json!({
+            "schemaVersion":1,"path":"lines.js","startLine":1,"endLine":1,
+            "expectedBasis":current,"expectedContentHash":old_hash
+        }),
+    ));
+    tool(&wrong_hash, Some("revision_conflict"), true);
+    assert_ne!(
+        wrong_hash["result"]["structuredContent"]["error"]["currentContentHash"],
+        *old_hash.as_ref().unwrap()
+    );
+    assert!(peer.finish().0.success());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn warm_relay_serves_both_new_tools_and_rejects_closed_inputs() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = checkout(temp.path());
+    fs::write(root.join("a.js"), "function Owner() { Target(); }\n").unwrap();
+    fs::write(root.join("b.js"), "function Target() {}\n").unwrap();
+    let root_key = trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root)
+        .unwrap()
+        .root_key;
+    for legacy in [false, true] {
+        let (mut peer, witness) = Peer::start_with_causal_witness(Some(&root));
+        if legacy {
+            ready_legacy(&mut peer);
+        }
+        tool(
+            &peer.ask(call(
+                legacy,
+                json!(1),
+                "trellis_workspace_describe",
+                json!({"schemaVersion":1}),
+            )),
+            None,
+            !legacy,
+        );
+        let pin = await_settled_golden_h(&witness, &root_key).await;
+        let names: Vec<_> = peer.ask(if legacy {
+            request(json!(2), "tools/list", json!({}))
+        } else {
+            modern(json!(2), "tools/list", json!({}))
+        })["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["name"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            names,
+            fixture()["names"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|name| name.as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        );
+        let found = peer.ask(call(
+            legacy,
+            json!(3),
+            "trellis_find_symbols",
+            json!({"schemaVersion":1,"query":"Owner","expectedBasis":pin}),
+        ));
+        tool(&found, None, !legacy);
+        let id = found["result"]["structuredContent"]["data"]["symbols"][0]["symbolId"].clone();
+        let target_find = peer.ask(call(
+            legacy,
+            json!(12),
+            "trellis_find_symbols",
+            json!({"schemaVersion":1,"query":"Target","expectedBasis":pin}),
+        ));
+        tool(&target_find, None, !legacy);
+        let target_id = target_find["result"]["structuredContent"]["data"]["symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|symbol| symbol["name"] == "Target")
+            .unwrap()["symbolId"]
+            .clone();
+        let selected_target = peer.ask(call(
+            legacy,
+            json!(13),
+            "trellis_declaration",
+            json!({"schemaVersion":1,"symbolId":target_id,"expectedBasis":pin}),
+        ));
+        tool(&selected_target, None, !legacy);
+        let target_data = &selected_target["result"]["structuredContent"]["data"];
+        let target_version = emitted_document(target_data, target_data);
+        for (number, name) in [(4, "trellis_declaration"), (5, "trellis_outgoing_calls")] {
+            let reply = peer.ask(call(
+                legacy,
+                json!(number),
+                name,
+                json!({"schemaVersion":1,"symbolId":id,"expectedBasis":pin}),
+            ));
+            tool(&reply, None, !legacy);
+            let data = &reply["result"]["structuredContent"]["data"];
+            assert_eq!(reply["result"]["structuredContent"]["evidenceBasis"], pin);
+            assert!(
+                data["documents"]
+                    .as_array()
+                    .is_some_and(|docs| !docs.is_empty())
+            );
+            if name == "trellis_declaration" {
+                assert_eq!(data["declaration"]["syntaxId"], id);
+            } else {
+                assert_eq!(data["calls"].as_array().unwrap().len(), 1);
+                assert_eq!(data["calls"][0]["calleeText"], "Target");
+                let candidate = &data["calls"][0]["nativeCandidates"]["items"][0];
+                assert_eq!(candidate["syntaxId"], target_id);
+                let wire_version = emitted_document(data, candidate);
+                for field in ["document", "revisionId", "contentHash", "provenanceId"] {
+                    assert_eq!(wire_version[field], target_version[field]);
+                }
+                assert_ne!(
+                    wire_version["provenanceId"],
+                    emitted_document(data, &data["calls"][0])["provenanceId"]
+                );
+            }
+        }
+        for (number, name, field, value) in [
+            (6, "trellis_declaration", "limit", json!(1)),
+            (7, "trellis_declaration", "view", json!("declaration")),
+            (8, "trellis_outgoing_calls", "view", json!("outgoing_calls")),
+        ] {
+            let mut args = json!({"schemaVersion":1,"symbolId":id});
+            args[field] = value;
+            tool(
+                &peer.ask(call(legacy, json!(number), name, args)),
+                Some("invalid_request"),
+                !legacy,
+            );
+        }
+        for (number, limit) in [(9, 0), (10, 51)] {
+            tool(
+                &peer.ask(call(
+                    legacy,
+                    json!(number),
+                    "trellis_outgoing_calls",
+                    json!({"schemaVersion":1,"symbolId":id,"limit":limit}),
+                )),
+                Some("range_too_large"),
+                !legacy,
+            );
+        }
+        error(
+            &peer.ask(call(
+                legacy,
+                json!(11),
+                "trellis_inspect",
+                json!({"schemaVersion":1,"symbolId":id,"view":"declaration"}),
+            )),
+            -32602,
+            json!(11),
+        );
+        assert!(peer.finish().0.success());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn golden_tool_envelopes_and_maximum_ids_both_modes() {
     let tmp = tempfile::tempdir().unwrap();
     let root = checkout(tmp.path());
@@ -4896,9 +5176,16 @@ async fn mcp_find_selected_snapshot_ranks_and_keeps_zero_hit_scope() {
         .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
         .unwrap();
     let handle = tokio::runtime::Handle::current();
+    let (diagnostics_tx, diagnostics_rx) = mpsc::channel::<String>();
+    let hooks = trellis::mcp::TransportHooksForTests {
+        evidence_error: Some(std::sync::Arc::new(move |id, stage, detail| {
+            let _ = diagnostics_tx.send(format!("{id} {stage}: {detail}"));
+        })),
+        ..Default::default()
+    };
     let session = std::thread::spawn(move || {
         trellis::mcp::run_socket(
-            trellis::mcp::OpenedWorkspace::new(identity),
+            trellis::mcp::OpenedWorkspace::new(identity).with_transport_hooks_for_tests(hooks),
             server,
             registry,
             143,
@@ -5026,6 +5313,12 @@ async fn mcp_find_selected_snapshot_ranks_and_keeps_zero_hit_scope() {
     assert_eq!(shorter_data["truncated"], true);
     assert_eq!(shorter_data["truncationReason"], "limit");
     let unicode = ask(&mut client, 153, "Caf", Some(20), None);
+    assert_eq!(
+        unicode["result"]["isError"],
+        false,
+        "selected read details: {:?}; response: {unicode}",
+        diagnostics_rx.try_iter().collect::<Vec<_>>()
+    );
     tool(&unicode, None, true);
     assert_eq!(
         unicode["result"]["structuredContent"]["data"]["symbols"]
@@ -5037,6 +5330,17 @@ async fn mcp_find_selected_snapshot_ranks_and_keeps_zero_hit_scope() {
             .collect::<Vec<_>>(),
         ["Cafe\u{301}", "Café"]
     );
+    // Repeat the formerly intermittent selected Unicode read under modest load.
+    // A failure stops the loop and reports its captured internal chain.
+    for id in 200..220 {
+        let repeated = ask(&mut client, id, "Caf", Some(20), None);
+        assert_eq!(
+            repeated["result"]["isError"],
+            false,
+            "request {id} selected read details: {:?}; response: {repeated}",
+            diagnostics_rx.try_iter().collect::<Vec<_>>()
+        );
+    }
     let composed = ask(&mut client, 154, "Café", Some(20), None);
     tool(&composed, None, true);
     assert_eq!(
@@ -5936,9 +6240,10 @@ async fn mcp_declaration_selected_identity_and_measured_record() {
     let root = checkout(temp.path());
     fs::write(
         root.join("a.js"),
-        "function Alpha(first, second) { return first; }\n",
+        "function Alpha(first, second) {\r\n return first;\r\n}\r\n",
     )
     .unwrap();
+    fs::write(root.join("empty.js"), "").unwrap();
     let identity = WorkspaceIdentity::discover(Some(&root), &root)
         .unwrap()
         .attach_marker()
@@ -6041,6 +6346,19 @@ async fn mcp_declaration_selected_identity_and_measured_record() {
     release_tx.send(()).unwrap();
     assert_eq!(envelope["data"]["declaration"]["syntaxId"], id);
     assert_eq!(envelope["data"]["displayKey"], "a.js#Alpha");
+    let declaration_data = &envelope["data"];
+    for field in ["document", "revisionId", "provenanceId"] {
+        assert!(declaration_data["declaration"].get(field).is_none());
+    }
+    assert!(declaration_data.get("contentHash").is_none());
+    let version = emitted_document(declaration_data, declaration_data);
+    let proof = &declaration_data["provenance"][0];
+    assert_eq!(version["document"], proof["document"]);
+    assert_eq!(version["revisionId"], proof["revisionId"]);
+    assert_eq!(version["contentHash"], proof["contentHash"]);
+    assert_eq!(version["provenanceId"], proof["id"]);
+    assert_eq!(declaration_data["lines"], json!({"start":1,"end":3}));
+    assert_eq!(symbol["lines"], json!({"start":1,"end":3}));
     assert_eq!(
         emitted_document(&envelope["data"], &envelope["data"])["contentHash"],
         emitted_document(&found["result"]["structuredContent"]["data"], symbol)["contentHash"]
@@ -6090,6 +6408,42 @@ async fn mcp_declaration_selected_identity_and_measured_record() {
         json!({"schemaVersion":1,"query":"sid:v1:"}),
     );
     tool(&found, None, true);
+    let empty_module =
+        found["result"]["structuredContent"]["data"]["symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|symbol| {
+                emitted_document(&found["result"]["structuredContent"]["data"], symbol)["document"]
+                    ["path"]
+                    == "empty.js"
+            })
+            .expect("empty-file module declaration");
+    assert_eq!(empty_module["range"], json!({"start":0,"end":0}));
+    assert!(empty_module["lines"].is_null());
+    let empty_declaration = ask(
+        &mut client,
+        7,
+        "trellis_declaration",
+        json!({"schemaVersion":1,"symbolId":empty_module["symbolId"]}),
+    );
+    tool(&empty_declaration, None, true);
+    assert!(empty_declaration["result"]["structuredContent"]["data"]["lines"].is_null());
+    let empty_version = emitted_document(
+        &empty_declaration["result"]["structuredContent"]["data"],
+        &empty_declaration["result"]["structuredContent"]["data"],
+    );
+    let no_line = ask(
+        &mut client,
+        8,
+        "trellis_read_source",
+        json!({
+            "schemaVersion":1,"path":"empty.js","startLine":1,"endLine":1,
+            "expectedBasis":empty_declaration["result"]["structuredContent"]["evidenceBasis"],
+            "expectedContentHash":empty_version["contentHash"]
+        }),
+    );
+    tool(&no_line, Some("range_too_large"), true);
     let unnamed = found["result"]["structuredContent"]["data"]["symbols"]
         .as_array()
         .unwrap()
@@ -6105,6 +6459,32 @@ async fn mcp_declaration_selected_identity_and_measured_record() {
         }),
     );
     tool(&inspected, None, true);
+    let module_data = &inspected["result"]["structuredContent"]["data"];
+    assert_eq!(module_data["lines"], json!({"start":1,"end":3}));
+    assert_eq!(unnamed["lines"], module_data["lines"]);
+    let version = emitted_document(module_data, module_data);
+    let complete = ask(
+        &mut client,
+        9,
+        "trellis_read_source",
+        json!({
+            "schemaVersion":1,"path":"a.js","startLine":1,"endLine":3,
+            "expectedBasis":inspected["result"]["structuredContent"]["evidenceBasis"],
+            "expectedContentHash":version["contentHash"]
+        }),
+    );
+    tool(&complete, None, true);
+    let selected_end = complete["result"]["structuredContent"]["data"]["byteRange"]["end"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(
+        selected_end,
+        module_data["declaration"]["range"]["end"].as_u64().unwrap()
+    );
+    assert_eq!(
+        selected_end as usize,
+        fs::read(root.join("a.js")).unwrap().len()
+    );
     assert_eq!(
         inspected["result"]["structuredContent"]["data"]["displayKey"],
         format!(
@@ -7002,7 +7382,7 @@ async fn mcp_wire_valid_basis_and_uint_are_not_silently_dropped() {
                 json!({"schemaVersion":1,"query":"Target"}),
             ),
             (
-                "trellis_outgoing_calls",
+                "trellis_declaration",
                 json!({"schemaVersion":1,"symbolId":id}),
             ),
             (
