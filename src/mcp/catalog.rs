@@ -92,7 +92,9 @@ mod tests {
                 assert!(reference.starts_with("#/$defs/"));
                 assert!(defs.contains_key(&reference[8..]));
             }
-            if v.get("type").and_then(Value::as_str) == Some("object") {
+            // A root union of closed branches is itself closed: MCP requires its
+            // root `type: "object"` (#158), and each `oneOf` branch is walked below.
+            if v.get("type").and_then(Value::as_str) == Some("object") && v.get("oneOf").is_none() {
                 assert_eq!(v["additionalProperties"], false);
                 let properties = v["properties"].as_object().unwrap();
                 let required = v["required"].as_array().unwrap();
