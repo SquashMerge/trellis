@@ -5357,6 +5357,69 @@ async fn mcp_deadline_before_read_admission_uses_the_pre_resolution_shape() {
     assert!(envelope.get("catchingUp").is_none(), "{reply}");
 }
 
+/// #156: find still validates every searched coverage tuple, although only
+/// counts leave the store. A corrupt row in an unrelated document fails a
+/// zero-hit query, and a query whose hit lies elsewhere, as store_unavailable,
+/// never a successful answer with counts.
+#[test]
+fn mcp_find_unrelated_corrupt_scope_row_fails_zero_hit_and_elsewhere_hits() {
+    use trellis::store::Store;
+    let temp = tempfile::tempdir().unwrap();
+    let root = checkout(temp.path());
+    fs::write(root.join("a.js"), "function Alpha() {}\n").unwrap();
+    fs::write(root.join("b.js"), "function Beta() {}\n").unwrap();
+    let store = Store::open_for_tests(temp.path(), &root).unwrap();
+    store.mcp_prepare_virgin_queue_for_tests().unwrap();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
+        &trellis::indexer::IndexOptions::new(root.clone()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    let writer = store.publication_for_tests().unwrap();
+    store
+        .publish_native(
+            &graph,
+            &capture,
+            &native,
+            &writer,
+            store.index_baseline().unwrap(),
+            &cancel,
+        )
+        .unwrap();
+    drop(writer);
+    let response = store.evidence_response().unwrap();
+    assert!(
+        response
+            .mcp_find("no_such_name", 20, None)
+            .unwrap()
+            .symbols
+            .is_empty()
+    );
+    assert_eq!(
+        response.mcp_find("Alpha", 20, None).unwrap().symbols.len(),
+        1
+    );
+    response.finish(()).unwrap();
+    drop(response);
+    // Only b.js's tuple becomes inconsistent (unselected yet "failed").
+    let writer = store.publication_for_tests().unwrap();
+    store
+        .mcp_set_coverage_for_tests(&writer, "b.js", false, "failed")
+        .unwrap();
+    drop(writer);
+    let response = store.evidence_response().unwrap();
+    for query in ["no_such_name", "Alpha"] {
+        let error = response.mcp_find(query, 20, None).map(|_| ()).unwrap_err();
+        assert!(
+            error.to_string().starts_with("store_unavailable"),
+            "{query}: {error:#}"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mcp_find_required_rows_and_coverage_fail_closed() {
     use trellis::daemon::registry::CheckoutRegistry;

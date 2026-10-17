@@ -391,36 +391,38 @@ mod find_tests {
             ("three".into(), "source-set:v1:other", "src/a.js".into()),
             hit("four", "src/b.js"),
         ];
-        let envelope = find(
-            &id,
-            fixture(&hits, COMPLETE_SCOPE, false),
-            root,
-            false,
-            true,
-        )
-        .unwrap();
-        let rows = envelope["data"]["coverage"].as_array().unwrap();
-        // Same path in two source sets is two documents; a repeated document is one row.
-        let keys: Vec<_> = rows
-            .iter()
-            .map(|c| {
-                (
-                    c["sourceSetId"].as_str().unwrap(),
-                    c["documentPath"].as_str().unwrap(),
-                )
-            })
-            .collect();
-        assert_eq!(
-            keys,
-            vec![
-                ("source-set:v1:other", "src/a.js"),
-                ("source-set:v1:test", "src/a.js"),
-                ("source-set:v1:test", "src/b.js"),
-            ]
-        );
-        assert_eq!(envelope["data"]["provenance"].as_array().unwrap().len(), 3);
-        assert_eq!(envelope["partial"], false);
-        assert_wire(envelope, &id, true);
+        for modern in [false, true] {
+            let envelope = find(
+                &id,
+                fixture(&hits, COMPLETE_SCOPE, false),
+                root,
+                false,
+                modern,
+            )
+            .unwrap();
+            let rows = envelope["data"]["coverage"].as_array().unwrap();
+            // Same path in two source sets is two documents; a repeated document is one row.
+            let keys: Vec<_> = rows
+                .iter()
+                .map(|c| {
+                    (
+                        c["sourceSetId"].as_str().unwrap(),
+                        c["documentPath"].as_str().unwrap(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                keys,
+                vec![
+                    ("source-set:v1:other", "src/a.js"),
+                    ("source-set:v1:test", "src/a.js"),
+                    ("source-set:v1:test", "src/b.js"),
+                ]
+            );
+            assert_eq!(envelope["data"]["provenance"].as_array().unwrap().len(), 3);
+            assert_eq!(envelope["partial"], false);
+            assert_wire(envelope, &id, modern);
+        }
     }
 
     #[test]
@@ -504,20 +506,22 @@ mod find_tests {
     fn all_hits_fit_with_limit_truncation_and_full_proof_closure() {
         let hits = vec![hit("first", "src/0.js"), hit("second", "src/1.js")];
         let id = json!(1);
-        let envelope = find(
-            &id,
-            fixture(&hits, COMPLETE_SCOPE, true),
-            std::path::Path::new("/workspace"),
-            false,
-            true,
-        )
-        .unwrap();
-        assert_eq!(envelope["data"]["symbols"].as_array().unwrap().len(), 2);
-        assert_eq!(envelope["data"]["provenance"].as_array().unwrap().len(), 2);
-        assert_eq!(envelope["data"]["coverage"].as_array().unwrap().len(), 2);
-        assert_eq!(envelope["truncationReason"], "limit");
-        assert_eq!(envelope["truncated"], true);
-        assert_wire(envelope, &id, true);
+        for modern in [false, true] {
+            let envelope = find(
+                &id,
+                fixture(&hits, COMPLETE_SCOPE, true),
+                std::path::Path::new("/workspace"),
+                false,
+                modern,
+            )
+            .unwrap();
+            assert_eq!(envelope["data"]["symbols"].as_array().unwrap().len(), 2);
+            assert_eq!(envelope["data"]["provenance"].as_array().unwrap().len(), 2);
+            assert_eq!(envelope["data"]["coverage"].as_array().unwrap().len(), 2);
+            assert_eq!(envelope["truncationReason"], "limit");
+            assert_eq!(envelope["truncated"], true);
+            assert_wire(envelope, &id, modern);
+        }
     }
 }
 
