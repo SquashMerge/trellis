@@ -2049,6 +2049,82 @@ mod enriched_read_tests {
     }
 
     #[test]
+    fn malformed_top_ranked_hint_is_skipped_and_the_next_valid_one_shown() {
+        // Proximity ranks src/near.js (same directory) above lib/far.js. After
+        // the near match is made malformed, rank-first verification (#170)
+        // skips it, shows the far match, and does not count the failed one.
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        for (path, text) in [
+            ("src/owner.js", "function Owner() { Target(); }\n"),
+            ("src/near.js", "function Target() {}\n"),
+            ("lib/far.js", "function Target() {}\n"),
+        ] {
+            let path = workspace.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let (pin, _owner) = crate::index_coordinator::reconcile_workspace(
+            &store,
+            &IndexOptions::new(workspace.path().to_owned()),
+            &Arc::new(AtomicBool::new(false)),
+            |_| {},
+        )
+        .unwrap();
+        let base = std::time::Instant::now();
+        let hints = || {
+            let read = store.evidence_response().unwrap();
+            let owner = read
+                .mcp_find_with_lines("Owner", 20, Some(pin))
+                .unwrap()
+                .symbols
+                .into_iter()
+                .find(|symbol| symbol.symbol.declaration.name.as_deref() == Some("Owner"))
+                .unwrap();
+            let outgoing = read
+                .mcp_outgoing(
+                    &owner.symbol.declaration.syntax_id,
+                    20,
+                    Some(pin),
+                    &|| base,
+                    base + std::time::Duration::from_secs(5),
+                )
+                .unwrap()
+                .unwrap();
+            read.finish(()).unwrap();
+            let call = &outgoing.calls[0];
+            (
+                call.candidates
+                    .iter()
+                    .map(|c| c.declaration.document.path.clone())
+                    .collect::<Vec<_>>(),
+                call.omitted,
+            )
+        };
+        assert_eq!(
+            hints(),
+            (vec!["src/near.js".into(), "lib/far.js".into()], Some(0))
+        );
+        let db = store.cache_write().unwrap();
+        db.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        assert_eq!(
+            db.execute(
+                "DELETE FROM native_version_headers WHERE syntax_id IN
+                (SELECT d.syntax_id FROM native_version_declarations d
+                 JOIN document_versions v ON v.id=d.version_id
+                 WHERE d.name='Target' AND v.path='src/near.js')",
+                [],
+            )
+            .unwrap(),
+            1
+        );
+        db.pragma_update(None, "foreign_keys", "ON").unwrap();
+        drop(db);
+        assert_eq!(hints(), (vec!["lib/far.js".into()], Some(0)));
+    }
+
+    #[test]
     fn test_paths_follow_the_documented_conventions() {
         for path in [
             "tests/a.rs",
