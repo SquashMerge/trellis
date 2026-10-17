@@ -1,6 +1,6 @@
 # Trellis — Architecture Spec
 
-**Status:** implemented Rust daemon and embedded browser with JavaScript/Rust/Java/Python syntax extraction, static sequences and Java/Python class diagrams. JavaScript SCIP import is implemented. Multi-language semantic import, the stdio MCP server, per-checkout indexes with real-time native refresh, coding-agent ACP sessions and diagram artifacts below are accepted direction, not shipped features; mechanics of the index/MCP topology remain proposed until Stage 1 of the semantic-index program ratifies them. The existing one-shot ACP answer adapter is separate. **Direction reviewed:** 2026-09-23.
+**Status:** the Rust per-user daemon and embedded browser, per-checkout indexes with native watcher refresh, and the five-tool stdio MCP daemon client are implemented. JavaScript/Rust/Java/Python syntax extraction, static sequences, Java/Python class diagrams and JavaScript SCIP import are implemented. Multi-language semantic import, coding-agent ACP sessions and diagram artifacts below remain future work; the historical Stage 1–4 plan does not override the implemented [local topology](docs/local-topology.md) or the [MCP contract](docs/mcp-readonly-pilot-contract.md). The existing one-shot ACP answer adapter is separate. **Direction reviewed:** 2026-09-23.
 
 **Validation:** The first extraction/storage spike is recorded in
 [docs/research/EXTRACTION-RESULTS.md](docs/research/EXTRACTION-RESULTS.md). It validates a bounded JavaScript
@@ -41,13 +41,13 @@ Sections 4, 6, 8 and 12 are the current agent/semantic integration direction:
 - Agents reach Trellis through `trellis mcp`, a stdio MCP server the agent client launches in the
   checkout it works in. Each checkout, including every Git worktree, has its own index: a pure cache
   outside the checkout, keyed by the checkout's path. A shared per-file fact cache makes new and moved
-  checkouts cheap to index. The first catalog is four read-only tools over syntax-tier evidence. There
+  checkouts cheap to index. The first catalog is five read-only tools over syntax-tier evidence. There
   are no grants and no agent network listener; the boundary is the OS user. See the
   [local topology](docs/local-topology.md).
-- One process per checkout is the leader, chosen by an OS file lock. It alone watches the files and
-  writes native index rows; explicit index requests are queued to it. Native extraction is the only
-  automatic work; it executes no repository code. Snapshot text search, artifact writes and broad
-  agent orchestration are later independently tested slices.
+- The per-user daemon is the sole index and queue writer. Its checkout worker watches, reconciles
+  and publishes each active checkout; MCP clients relay selected reads to it. Native extraction is
+  the only automatic work; it executes no repository code. Snapshot text search, artifact writes
+  and broad agent orchestration are later independently tested slices.
 - SCIP is the preferred batch semantic-artifact route, generalized one language at a time.
   LSP/compiler adapters remain possible complementary read/refactoring providers, not a
   requirement for the MCP pilot. No indexer build, download or repository code runs implicitly.
@@ -178,7 +178,7 @@ The store is split in two, physically:
   rebuilt deterministically, never authoritative, never migrated. FTS and broader edge kinds are not
   implemented. Today this is `cache.db` in an out-of-tree state directory. The accepted direction
   keeps it out of tree in the per-user cache directory, keyed by the checkout's canonical path
-  (see [local topology](docs/local-topology.md#storage)).
+  (see [local topology](docs/local-topology.md#t02--locations-and-store-responsibilities)).
 - **`workspace.db`** — durable views and annotations today; versioned artifacts and other proposed
   records later. References to missing symbol IDs become orphans; a cache rebuild does not guarantee
   automatic reattachment. The accepted direction keys it by a workspace UUID kept in the checkout's
@@ -226,14 +226,14 @@ The core owns Trellis's stores, query services and UI events. It supervises only
 that Trellis explicitly launches, such as a future ACP adapter. It does **not** own every
 agent, shell or Herdr pane associated with a project. `trellis mcp` processes are owned by the
 agent clients that launch them and exit with those clients; they need no supervisor. The browser
-daemon and any `trellis mcp` process share each index through SQLite: whichever holds the leader lock
-watches and writes; the others read and queue explicit index requests to it.
+daemon alone opens and writes each index; its checkout worker watches, reconciles and publishes.
+`trellis mcp` is a read-only stdio daemon client, not a standalone SQLite reader or writer.
 
 ```mermaid
 flowchart LR
-  UI[Trellis browser] -->|explicit requests| CORE[Trellis core]
-  CORE -->|evidence and artifact events| UI
-  CORE --> M[(Per-checkout index and out-of-tree durable data)]
+  UI[Trellis browser] -->|explicit requests| CORE[Per-user Trellis daemon]
+  CORE -->|evidence and future artifact events| UI
+  CORE -->|sole index and queue writer| M[(Per-checkout index and out-of-tree durable data)]
   DIRECT[Direct agent: embedded or external terminal] -->|launches, stdio MCP| MCP[trellis mcp, one per agent session]
   UI <-->|authenticated terminal stream| PTY[Owned PTY service]
   PTY -->|explicit launch only| DIRECT
@@ -241,8 +241,7 @@ flowchart LR
   UI -->|optional ACP session controls| ACP[Trellis ACP client adapter]
   ACP -->|negotiated ACP| HARNESS[Existing harness or Mimir proxy]
   HARNESS -->|same tools via admitted local bridge| MCP
-  MCP -->|read-only SQLite snapshots| M
-  MCP -. when leader: watches and writes .-> M
+  MCP -->|read-only selected snapshot requests| CORE
   CORE -. optional metadata association .-> HM[Herdr adapter]
 ```
 
@@ -472,11 +471,12 @@ malformed, oversized or unsupported artifacts before publication. Do not downloa
 Trellis or silently retry a build to resolve missing evidence.
 
 Stale semantic evidence must be rejected or downgraded visibly, preserving syntax-only browsing.
-The current system uses explicit full refresh. The accepted direction adds a file watcher that refreshes
-**native** evidence per changed file (§7.2). A changed file's semantic overlays stop applying, because
-they are keyed by its old content hash. Other semantic facts are reported possibly stale, computed at
-read time, whenever any declaration surface or build/configuration input in their source set changed
-after they were imported. This is conservative by design. The watcher never runs a producer. None of this is implemented yet.
+The daemon's watcher already refreshes **native** evidence for changed files and reconciles missed
+events (see [local topology T05](docs/local-topology.md#t05--watch-capture-reassembly-and-publication)).
+It never runs a semantic producer. Future multi-language semantic overlays must stop applying when
+a changed file's content hash no longer matches. Other semantic facts must report possible staleness at read time
+when declaration surfaces or build/configuration inputs in their source set change after import.
+That semantic freshness work remains future; it does not make native watcher refresh future work.
 
 ### 6.3 LSP and compiler APIs remain complementary
 
@@ -520,11 +520,16 @@ Three conceptual passes, keyed on source and relevant extraction/configuration h
    Syntax-only import/name matching may provide explicitly scoped navigation candidates, not
    resolved dispatch. It must never silently replace missing compiler evidence with a guessed call.
 
-### 7.2 Maintenance
+### 7.2 Maintenance — superseded historical sketch
 
-Watcher, incremental invalidation and scheduling below are accepted direction with proposed mechanics
-([local topology](docs/local-topology.md#leader)), not current behavior or permission to execute
-producer tools. Automatic producer scheduling stays off.
+The bullets below retain the **historical Stage 1 maintenance sketch**, not the current process
+or read-admission contract. Its per-checkout leader, follower/takeover, retention and cleanup details
+are superseded by the normative [local topology T03](docs/local-topology.md#t03--use-locks-daemon-ownership-and-reads),
+[T04](docs/local-topology.md#t04--one-native-queue-and-explicit-requests) and
+[T05](docs/local-topology.md#t05--watch-capture-reassembly-and-publication): the per-user daemon
+is the sole index/queue writer, and one checkout worker owns watcher, publication and FIFO work
+for each active checkout. Future semantic re-resolution and freshness still need their
+own implementation; automatic producer scheduling stays off.
 
 - **Leader.** An OS file lock picks one process per checkout. It alone writes native rows, running
   watcher batches, reconciles and explicit requests one at a time from a single ordered queue. On
@@ -595,15 +600,15 @@ building on it. LSIF is superseded by SCIP.
 the original ACP-only launcher/registry topology and its prototype `query_graph`, `get_symbol`,
 `emit_diagram` names, and the later owner-grant pilot. The [local topology](docs/local-topology.md),
 [integration plan](docs/agent-integration-plan.md) and [MCP contract](docs/mcp-readonly-pilot-contract.md)
-define the portable `trellis_*` names. These tools and the general coding-agent client are not
-implemented yet.
+define the portable `trellis_*` names. The five read-only MCP tools are implemented;
+the general coding-agent ACP client and embedded terminal workbench are not.
 
 ### 8.1 Direct agents, including embedded terminals
 
 An agent can run in an ordinary terminal, in a Trellis-owned terminal tab, or in an optional
-Herdr pane. Configure the proposed `trellis mcp` stdio server through that agent's supported
-MCP settings; the agent client launches it in the checkout it works in, and the server serves that
-checkout only. Trellis need not become its ACP client or its reasoning harness. A user may
+Herdr pane. Configure the shipped `trellis mcp` stdio daemon client through that agent's
+supported MCP settings; the agent client launches it in the selected checkout, and the daemon
+serves that checkout only. Trellis need not become its ACP client or its reasoning harness. A user may
 continue to launch agents outside Trellis; tools and published diagrams work the same way.
 
 The target workbench includes terminal tabs alongside diagrams and source (§4). MCP and PTY
@@ -852,7 +857,7 @@ and any one is a project.
 
 ## Appendix A — illustrative schema (not finalized)
 
-### Index (`cache.db` today; per-user cache keyed by checkout path, proposed) — derived, deletable
+### Index (historical illustrative SQL, not the current `index.db` schema) — derived, deletable
 
 ```sql
 CREATE TABLE files (

@@ -34,7 +34,7 @@ marker and follow a moved Git checkout; a copied marker shares those items. Non-
 are path-bound. `serve` requires an explicit private `--token-file` outside the selected checkout;
 Jev and ACP ledgers also require explicit external paths when enabled. No old state migrates
 automatically. Indexing never runs package scripts, installs source dependencies, or edits source.
-See [local topology](docs/local-topology.md#storage).
+See [local topology](docs/local-topology.md#t02--locations-and-store-responsibilities).
 
 `trellis gc --report` only inventories derived-index and saved-record candidates. A historical
 index marked `eligible` is **not deleted**. Trellis has no derived-index deletion command or
@@ -83,19 +83,20 @@ in order, are `trellis_workspace_describe`, `trellis_find_symbols`, `trellis_dec
 validated cached snapshot; before a valid head is ready, evidence tools return typed
 `index_not_ready`, while describe can report not-ready status. Declaration takes a `symbolId` with
 no `limit` or `view`; outgoing calls takes a `symbolId` and optional `limit`, with no `view`.
-Find, declaration and outgoing results use compact `doc` references into their `documents` table;
-items with selectable source include inclusive 1-based `lines` beside byte ranges. Use the returned
-`evidenceBasis` and document `contentHash` to pin a bounded `trellis_read_source` by path and lines.
+Find, declaration and outgoing results use compact `doc` references into their `documents` table.
+Symbols, declaration data and calls include inclusive 1-based `lines` beside byte ranges when the
+source is selectable; `NativeCandidate` has no `lines`. Use the returned `evidenceBasis` and
+referenced document `contentHash` to pin a bounded `trellis_read_source` by path and lines.
 Each tool's `content[0].text` is a deterministic summary of at most 512 UTF-8 bytes; the full,
 schema-valid result is in `structuredContent`. MCP does not execute repository code or trigger
 on-demand indexing, enroll grants, expose an HTTP listener or accept authenticated MCP intake.
 See the [MCP contract](docs/mcp-readonly-pilot-contract.md) for limits and schemas. Run the native
 protocol fixtures with `cargo test --locked --test mcp_protocol`.
 
-Real-time native refresh, snapshot text search, versioned diagram artifacts, the unified terminal
-workbench and a browser project picker remain separate work. Extend SCIP import beyond JavaScript
-through tested language adapters, initially Java; producing semantic artifacts remains explicitly
-authorized work.
+The daemon already watches and refreshes native evidence. Snapshot text search, versioned diagram
+artifacts, the unified terminal workbench and a browser project picker remain separate work.
+Extend SCIP import beyond JavaScript through tested language adapters, initially Java; producing
+semantic artifacts remains explicitly authorized work.
 
 See the [local topology](docs/local-topology.md), [integration plan](docs/agent-integration-plan.md), [MCP contract](docs/mcp-readonly-pilot-contract.md),
 [terminal workbench](docs/terminal-workbench-contract.md), [SCIP roadmap](docs/scip-multilanguage-plan.md),
@@ -183,11 +184,11 @@ and the Feature Factory fixtures (`tests/fixtures/extraction/inputs/feature-fact
 - [Extraction spike](docs/research/EXTRACTION-RESULTS.md)
 - [Jev/Opus exploratory comparison](docs/research/selection/HARD-RESULTS.md)
 
-Next: connect eligible evidence snapshots to the already shipped per-checkout stdio MCP protocol
-([#17](https://github.com/SquashMerge/trellis/issues/17)) as part of the semantic-index program
-([#8](https://github.com/SquashMerge/trellis/issues/8)). Multi-language SCIP import and separately
-gated snapshot search, diagram artifacts and embedded terminal/ACP integration remain future work.
+The [semantic-index program](https://github.com/SquashMerge/trellis/issues/8) now serves eligible
+cached snapshots through the daemon and stdio MCP ([#17](https://github.com/SquashMerge/trellis/issues/17));
+its watcher refreshes native evidence without running repository code. Next: multi-language SCIP
+import and separately gated snapshot search, diagram artifacts and embedded terminal/ACP integration.
 Continue static sequence coverage and library adapters beyond Rust/Cargo; source-backed provider
 validation still requires authorization and working authentication.
-The local literal preview does not understand questions. TypeScript parsing, file watching (accepted direction, not built),
-terminals, React/Tauri and database diagrams remain outside the current implementation.
+The local literal preview does not understand questions. TypeScript parsing, terminal UI,
+React/Tauri and database diagrams remain outside the current implementation.
