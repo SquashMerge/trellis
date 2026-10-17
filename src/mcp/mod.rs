@@ -23,6 +23,10 @@ pub struct OpenedWorkspace {
 #[cfg(feature = "test-support")]
 pub type CallHookForTests = std::sync::Arc<dyn Fn(&serde_json::Value) + Send + Sync>;
 
+#[cfg(feature = "test-support")]
+type EvidenceErrorHook =
+    std::sync::Arc<dyn Fn(&serde_json::Value, &'static str, &str) + Send + Sync>;
+
 /// Test-only pause points on one connection's transport.
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
@@ -41,6 +45,8 @@ pub struct TransportHooksForTests {
     pub fence_handled: Option<std::sync::Arc<dyn Fn(usize) + Send + Sync>>,
     /// On a call worker, once its result has been handed to the coordinator.
     pub worker_done: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    /// Opt-in diagnostic for a selected read/finish error. Never enters MCP output.
+    pub evidence_error: Option<EvidenceErrorHook>,
     /// On the coordinator, at a finished call's send decision after its final
     /// root check, before the last input pass; given the call's ID.
     pub send_decision: Option<CallHookForTests>,
@@ -266,6 +272,46 @@ type EvidenceToolRead<'a> = Box<
         + 'a,
 >;
 
+#[cfg(feature = "test-support")]
+fn capture_evidence_error(
+    hook: Option<&EvidenceErrorHook>,
+    id: &serde_json::Value,
+    stage: &'static str,
+    error: &anyhow::Error,
+) {
+    struct LimitedText<'a>(&'a mut String);
+    impl std::fmt::Write for LimitedText<'_> {
+        fn write_str(&mut self, part: &str) -> std::fmt::Result {
+            let available = 1024 - self.0.len();
+            if part.len() <= available {
+                self.0.push_str(part);
+                return Ok(());
+            }
+            let boundary = (0..=available)
+                .rev()
+                .find(|&n| part.is_char_boundary(n))
+                .unwrap();
+            self.0.push_str(&part[..boundary]);
+            Err(std::fmt::Error)
+        }
+    }
+    if let Some(hook) = hook {
+        let mut detail = String::new();
+        for cause in error.chain().take(8) {
+            if !detail.is_empty() {
+                if detail.len() + 2 > 1024 {
+                    break;
+                }
+                detail.push_str(": ");
+            }
+            if std::fmt::write(&mut LimitedText(&mut detail), format_args!("{cause}")).is_err() {
+                break;
+            }
+        }
+        hook(id, stage, &detail);
+    }
+}
+
 /// The shared cached-evidence read for find, inspect and read_source. A cold
 /// checkout must show a prior head before it is activated; then one snapshot is
 /// admitted, read, and finished. Store contention, including the cold check's,
@@ -280,6 +326,7 @@ fn evidence_read(
     cancel: &std::sync::atomic::AtomicBool,
     publish: &dyn Fn(bool),
     id: &serde_json::Value,
+    #[cfg(feature = "test-support")] evidence_error: Option<&EvidenceErrorHook>,
     read: &dyn Fn(
         &crate::daemon::registry::CheckoutRuntime,
         &crate::daemon::registry::CheckoutEvidence,
@@ -327,13 +374,23 @@ fn evidence_read(
             if cancelled() || runtime.mcp_clock_now() >= deadline {
                 anyhow::bail!("deadline_exceeded: MCP selected read deadline");
             }
-            let pin = response.status()?.revision;
+            #[cfg(feature = "test-support")]
+            let status = response.status().inspect_err(|error| {
+                capture_evidence_error(evidence_error, id, "status", error);
+            })?;
+            #[cfg(not(feature = "test-support"))]
+            let status = response.status()?;
+            let pin = status.revision;
             let mut envelope = match read(&runtime, &response, sampled) {
                 Ok(envelope) => envelope,
                 Err(error) if crate::store::cli_read_retryable_contention(&error) => {
                     return Err(error);
                 }
-                Err(error) => tools::failure(id, evidence_failure_code(&error)),
+                Err(error) => {
+                    #[cfg(feature = "test-support")]
+                    capture_evidence_error(evidence_error, id, "read", &error);
+                    tools::failure(id, evidence_failure_code(&error))
+                }
             };
             // W8: a rejected store reports no basis; every other failure reports
             // the admitted snapshot's.
@@ -343,9 +400,13 @@ fn evidence_read(
                     "indexRevision": pin.index_revision
                 });
             }
-            response
-                .finish(envelope)
-                .map(|envelope| (envelope, sampled))
+            #[cfg(feature = "test-support")]
+            let envelope = response.finish(envelope).inspect_err(|error| {
+                capture_evidence_error(evidence_error, id, "finish", error);
+            })?;
+            #[cfg(not(feature = "test-support"))]
+            let envelope = response.finish(envelope)?;
+            Ok((envelope, sampled))
         })();
         match attempt {
             Err(ref error) if crate::store::cli_read_retryable_contention(error) => {
@@ -537,6 +598,7 @@ type Resolved = std::sync::Arc<std::sync::Mutex<Option<(std::path::PathBuf, bool
 
 struct InFlight {
     id: serde_json::Value,
+    name: String,
     relay: Option<u64>,
     modern: bool,
     deadline: std::time::Instant,
@@ -617,7 +679,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                         .as_ref()
                         .map_or(workspace.root(), |witness| witness.identity.root.as_path());
                     return Ok(CallOutcome {
-                        result: tools::resolved_root_changed(&id, root, catching_up, modern),
+                        result: tools::resolved_root_changed(&name, &id, root, catching_up, modern),
                         finals: Finals::None,
                     });
                 }
@@ -700,43 +762,45 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                 }
             }
             let args = arguments.as_ref().and_then(serde_json::Value::as_object);
-            let view = args.and_then(|a| a.get("view")).and_then(|v| v.as_str());
             let root = answering.root();
             let id = &id;
             // The coordinator stamped `deadline = accepted + call_deadline`.
             let accepted = deadline
                 .checked_sub(workspace.call_deadline)
                 .unwrap_or(deadline);
-            let tool_read: Option<EvidenceToolRead> = match (name.as_str(), view, args) {
+            let tool_read: Option<EvidenceToolRead> = match (name.as_str(), args) {
                 _ if !tool.valid_arguments || envelope["error"]["code"] != "index_not_ready" => {
                     None
                 }
-                ("trellis_find_symbols", _, Some(args)) => {
+                ("trellis_find_symbols", Some(args)) => {
                     let query = args["query"].as_str().expect("validated find query");
                     let limit = args
                         .get("limit")
                         .map_or(20, |v| wire::uint(v).expect("validated limit") as usize);
                     let expected = validated_expected_basis(args);
                     Some(Box::new(move |_, response, sampled| {
-                        let found = response.mcp_find(query, limit, expected)?;
+                        let found = response.mcp_find_with_lines(query, limit, expected)?;
                         Ok(projection::find(id, found, root, sampled, modern)
+                            .map_err(|error| anyhow::anyhow!(error))?
                             .unwrap_or_else(|| tools::failure(id, "range_too_large")))
                     }))
                 }
-                ("trellis_inspect", Some("declaration"), Some(args)) => {
+                ("trellis_declaration", Some(args)) => {
                     let symbol_id = args["symbolId"].as_str().expect("validated declaration ID");
                     let expected = validated_expected_basis(args);
                     Some(Box::new(move |_, response, sampled| {
-                        Ok(match response.mcp_declaration(symbol_id, expected)? {
-                            Some(found) => {
-                                projection::declaration(id, found, root, sampled, modern)
-                                    .unwrap_or_else(|| tools::failure(id, "range_too_large"))
-                            }
-                            None => tools::failure(id, "not_found"),
-                        })
+                        Ok(
+                            match response.mcp_declaration_with_lines(symbol_id, expected)? {
+                                Some(found) => {
+                                    projection::declaration(id, found, root, sampled, modern)
+                                        .unwrap_or_else(|| tools::failure(id, "range_too_large"))
+                                }
+                                None => tools::failure(id, "not_found"),
+                            },
+                        )
                     }))
                 }
-                ("trellis_inspect", Some("outgoing_calls"), Some(args)) => {
+                ("trellis_outgoing_calls", Some(args)) => {
                     let symbol_id = args["symbolId"].as_str().expect("validated outgoing ID");
                     let limit = args
                         .get("limit")
@@ -744,7 +808,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                     let expected = validated_expected_basis(args);
                     Some(Box::new(move |runtime, response, sampled| {
                         Ok(
-                            match response.mcp_outgoing(
+                            match response.mcp_outgoing_with_lines(
                                 symbol_id,
                                 limit,
                                 expected,
@@ -753,6 +817,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                             )? {
                                 Some(found) => {
                                     projection::outgoing(id, found, root, sampled, modern)
+                                        .map_err(|error| anyhow::anyhow!(error))?
                                         .unwrap_or_else(|| tools::failure(id, "range_too_large"))
                                 }
                                 None => tools::failure(id, "not_found"),
@@ -760,7 +825,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                         )
                     }))
                 }
-                ("trellis_read_source", _, Some(args)) => {
+                ("trellis_read_source", Some(args)) => {
                     let path = args["path"].as_str().expect("validated source path");
                     let start = wire::uint(&args["startLine"]).expect("validated source start");
                     let end = wire::uint(&args["endLine"]).expect("validated source end");
@@ -806,6 +871,8 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                     &cancel,
                     &publish,
                     id,
+                    #[cfg(feature = "test-support")]
+                    workspace.hooks.evidence_error.as_ref(),
                     &*tool_read,
                 ) {
                     Ok((found, sampled)) => {
@@ -819,6 +886,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                             // answer in the pre-resolution shape (Decision 0009).
                             return Ok(CallOutcome {
                                 result: tools::result(
+                                    &name,
                                     tools::admission_failure(
                                         id,
                                         "deadline_exceeded",
@@ -836,7 +904,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
             *resolved.lock().unwrap() = Some((answering.root().to_owned(), sampled_catching_up));
             envelope["workspace"] = serde_json::json!(answering.root());
             envelope["catchingUp"] = serde_json::json!(sampled_catching_up);
-            tool.response = tools::result(envelope, modern);
+            tool.response = tools::result(&name, envelope, modern);
             let finals = match selected {
                 Some(witness) => Finals::Selected {
                     witness,
@@ -868,6 +936,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                     let catching_up = catching_up(&registry, &witness.identity.root_key);
                     *resolved.lock().unwrap() = Some((witness.identity.root.clone(), catching_up));
                     let result = tools::result(
+                        &name,
                         tools::attributed_root(
                             tools::failure(&id, "checkout_capacity"),
                             &witness.identity.root,
@@ -885,6 +954,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                 }
                 Err(error) => Ok(CallOutcome {
                     result: tools::result(
+                        &name,
                         tools::selection_failure(&id, error, &serde_json::json!(path)),
                         modern,
                     ),
@@ -897,7 +967,11 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                 .cloned()
                 .unwrap_or_else(|| serde_json::json!(workspace.root()));
             Ok(CallOutcome {
-                result: tools::result(tools::selection_failure(&id, error, &attempted), modern),
+                result: tools::result(
+                    &name,
+                    tools::selection_failure(&id, error, &attempted),
+                    modern,
+                ),
                 finals: Finals::None,
             })
         }
@@ -1237,7 +1311,7 @@ fn coordinate(
             ),
             None => tools::admission_failure(&call.id, "deadline_exceeded", &call.attempted),
         };
-        tools::result(envelope, call.modern)
+        tools::result(&call.name, envelope, call.modern)
     };
     // Requests handled at the last fence and not yet decided.
     let mut arrivals: VecDeque<impl_receive::Outcome> = VecDeque::new();
@@ -1277,6 +1351,7 @@ fn coordinate(
                         phase_hook("launch_final")?;
                         if workspace.check().is_err() {
                             result = tools::resolved_root_changed(
+                                &call.name,
                                 &call.id,
                                 workspace.root(),
                                 *catching_up,
@@ -1291,6 +1366,7 @@ fn coordinate(
                         phase_hook("selected_final")?;
                         if witness.before_answer().is_err() {
                             result = tools::resolved_root_changed(
+                                &call.name,
                                 &call.id,
                                 &witness.identity.root,
                                 *catching_up,
@@ -1305,6 +1381,7 @@ fn coordinate(
                         phase_hook("capacity_final")?;
                         if witness.before_answer().is_err() {
                             result = tools::resolved_root_changed(
+                                &call.name,
                                 &call.id,
                                 &witness.identity.root,
                                 *catching_up,
@@ -1410,6 +1487,7 @@ fn coordinate(
                     let attempted = attempted_workspace(arguments.as_ref(), &workspace);
                     let refuse = |code: &str| {
                         Some(tools::result(
+                            name,
                             tools::admission_failure(&admission.id, code, &attempted),
                             modern,
                         ))
@@ -1468,6 +1546,7 @@ fn coordinate(
                                     token,
                                     InFlight {
                                         id: admission.id.clone(),
+                                        name: name.clone(),
                                         relay,
                                         modern,
                                         deadline,
