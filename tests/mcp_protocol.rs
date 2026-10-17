@@ -61,6 +61,36 @@ fn bounded_group_wait(child: &mut Child) -> (std::process::ExitStatus, bool) {
     let status = child.wait().unwrap();
     (status, expired)
 }
+/// Every reply, including every tool result, stays within the response cap;
+/// only a `tools/list` catalog may use its separate, larger cap (#165).
+fn assert_reply_cap(raw: &[u8]) {
+    let value: Value = serde_json::from_slice(raw).expect("one JSON reply");
+    let cap = if value.pointer("/result/tools").is_some_and(Value::is_array) {
+        trellis::mcp::wire::CATALOG_BYTES
+    } else {
+        trellis::mcp::wire::RESPONSE_BYTES
+    };
+    assert!(
+        raw.len() <= cap,
+        "{}-byte reply exceeds its {cap}-byte cap",
+        raw.len()
+    );
+}
+#[test]
+fn reply_cap_admits_only_a_catalog_past_the_response_cap() {
+    let frame = |result: Value| {
+        let mut line =
+            serde_json::to_vec(&json!({"jsonrpc":"2.0","id":1,"result":result})).unwrap();
+        line.push(b'\n');
+        line
+    };
+    let large = "x".repeat(trellis::mcp::wire::RESPONSE_BYTES);
+    let catalog = frame(json!({"tools":[{"name":large}]}));
+    assert!(catalog.len() > trellis::mcp::wire::RESPONSE_BYTES);
+    assert_reply_cap(&catalog);
+    let tool_result = frame(json!({"structuredContent":{"data":large}}));
+    assert!(std::panic::catch_unwind(|| assert_reply_cap(&tool_result)).is_err());
+}
 fn capture_file(path: &Path) -> Vec<u8> {
     let file = fs::File::open(path).unwrap();
     let mut bytes = Vec::new();
@@ -84,7 +114,7 @@ fn drain_stdout(lines: Receiver<Vec<u8>>) -> Vec<Vec<u8>> {
         );
         match lines.recv_timeout(remaining) {
             Ok(line) => {
-                assert!(line.len() <= 65_536, "stdout frame exceeds response cap");
+                assert_reply_cap(&line);
                 captured.push(line);
                 assert!(captured.len() <= 16, "too many stdout frames after EOF");
             }
@@ -281,10 +311,10 @@ impl Peer {
                 }
                 let end = available.iter().position(|&b| b == b'\n');
                 let take = end.map_or(available.len(), |at| at + 1);
-                if line.len() + take > 65_536 {
+                if line.len() + take > trellis::mcp::wire::CATALOG_BYTES {
                     // Treat an unbounded line as a failed protocol response, never
                     // allocate an attacker-controlled amount of captured stdout.
-                    let _ = tx.send(vec![0; 65_537]);
+                    let _ = tx.send(vec![0; trellis::mcp::wire::CATALOG_BYTES + 1]);
                     break;
                 }
                 line.extend_from_slice(&available[..take]);
@@ -321,7 +351,7 @@ impl Peer {
             .lines
             .recv_timeout(trellis::testing::HANG_BACKSTOP)
             .expect("bounded MCP reply");
-        assert!(raw.len() <= 65_536);
+        assert_reply_cap(&raw);
         assert_eq!(raw.last(), Some(&b'\n'));
         assert!(
             !raw[..raw.len() - 1].contains(&b'\n'),
@@ -2295,7 +2325,7 @@ fn ordinary_cancellation_and_eof_without_private_race_hook() {
     let all = drain_stdout(lines);
     assert!(all.len() <= 1, "EOF cannot cause duplicate outcomes");
     for line in all {
-        assert!(line.len() <= 65_536);
+        assert_reply_cap(&line);
         assert_eq!(
             line.last(),
             Some(&b'\n'),
@@ -7625,7 +7655,6 @@ async fn mcp_wire_valid_basis_and_uint_are_not_silently_dropped() {
             envelope["data"]["text"], "function Target0() {}\n",
             "{legacy}: {envelope}"
         );
-        drop(ask);
         drop(reader);
         drop(client);
         session.join().unwrap().unwrap();

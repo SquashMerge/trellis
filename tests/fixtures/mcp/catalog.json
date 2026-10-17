@@ -90,16 +90,7 @@
               "type": "object"
             },
             "requestId": {
-              "oneOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "maximum": 9007199254740991,
-                  "minimum": -9007199254740991,
-                  "type": "integer"
-                }
-              ]
+              "$ref": "#/$defs/RequestId"
             },
             "schemaVersion": {
               "const": 1
@@ -407,16 +398,7 @@
               ]
             },
             "requestId": {
-              "oneOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "maximum": 9007199254740991,
-                  "minimum": -9007199254740991,
-                  "type": "integer"
-                }
-              ]
+              "$ref": "#/$defs/RequestId"
             },
             "schemaVersion": {
               "const": 1
@@ -465,16 +447,7 @@
               "type": "object"
             },
             "requestId": {
-              "oneOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "maximum": 9007199254740991,
-                  "minimum": -9007199254740991,
-                  "type": "integer"
-                }
-              ]
+              "$ref": "#/$defs/RequestId"
             },
             "schemaVersion": {
               "const": 1
@@ -543,16 +516,7 @@
               "type": "object"
             },
             "requestId": {
-              "oneOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "maximum": 9007199254740991,
-                  "minimum": -9007199254740991,
-                  "type": "integer"
-                }
-              ]
+              "$ref": "#/$defs/RequestId"
             },
             "schemaVersion": {
               "const": 1
@@ -600,16 +564,7 @@
               "type": "object"
             },
             "requestId": {
-              "oneOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "maximum": 9007199254740991,
-                  "minimum": -9007199254740991,
-                  "type": "integer"
-                }
-              ]
+              "$ref": "#/$defs/RequestId"
             },
             "schemaVersion": {
               "const": 1
@@ -621,6 +576,18 @@
             "error"
           ],
           "type": "object"
+        },
+        "RequestId": {
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "maximum": 9007199254740991,
+              "minimum": -9007199254740991,
+              "type": "integer"
+            }
+          ]
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -717,16 +684,7 @@
               "type": "boolean"
             },
             "requestId": {
-              "oneOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "maximum": 9007199254740991,
-                  "minimum": -9007199254740991,
-                  "type": "integer"
-                }
-              ]
+              "$ref": "#/$defs/RequestId"
             },
             "schemaVersion": {
               "const": 1
@@ -1037,16 +995,7 @@
               "type": "object"
             },
             "requestId": {
-              "oneOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "maximum": 9007199254740991,
-                  "minimum": -9007199254740991,
-                  "type": "integer"
-                }
-              ]
+              "$ref": "#/$defs/RequestId"
             },
             "schemaVersion": {
               "const": 1
@@ -1542,16 +1491,7 @@
               ]
             },
             "requestId": {
-              "oneOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "maximum": 9007199254740991,
-                  "minimum": -9007199254740991,
-                  "type": "integer"
-                }
-              ]
+              "$ref": "#/$defs/RequestId"
             },
             "schemaVersion": {
               "const": 1
@@ -1600,16 +1540,7 @@
               "type": "object"
             },
             "requestId": {
-              "oneOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "maximum": 9007199254740991,
-                  "minimum": -9007199254740991,
-                  "type": "integer"
-                }
-              ]
+              "$ref": "#/$defs/RequestId"
             },
             "schemaVersion": {
               "const": 1
@@ -1678,16 +1609,7 @@
               "type": "object"
             },
             "requestId": {
-              "oneOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "maximum": 9007199254740991,
-                  "minimum": -9007199254740991,
-                  "type": "integer"
-                }
-              ]
+              "$ref": "#/$defs/RequestId"
             },
             "schemaVersion": {
               "const": 1
@@ -1824,16 +1746,7 @@
               "type": "object"
             },
             "requestId": {
-              "oneOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "maximum": 9007199254740991,
-                  "minimum": -9007199254740991,
-                  "type": "integer"
-                }
-              ]
+              "$ref": "#/$defs/RequestId"
             },
             "schemaVersion": {
               "const": 1
@@ -1845,6 +1758,18 @@
             "error"
           ],
           "type": "object"
+        },
+        "RequestId": {
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "maximum": 9007199254740991,
+              "minimum": -9007199254740991,
+              "type": "integer"
+            }
+          ]
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1911,16 +1836,7 @@
               "type": "boolean"
             },
             "requestId": {
-              "oneOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "maximum": 9007199254740991,
-                  "minimum": -9007199254740991,
-                  "type": "integer"
-                }
-              ]
+              "$ref": "#/$defs/RequestId"
             },
             "schemaVersion": {
               "const": 1
@@ -2322,16 +2238,7 @@
               "type": "object"
             },
             "requestId": {
-              "oneOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "maximum": 9007199254740991,
-                  "minimum": -9007199254740991,
-                  "type": "integer"
-                }
-              ]
+              "$ref": "#/$defs/RequestId"
             },
             "schemaVersion": {
               "const": 1
@@ -2888,16 +2795,7 @@
               ]
             },
             "requestId": {
-              "oneOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "maximum": 9007199254740991,
-                  "minimum": -9007199254740991,
-                  "type": "integer"
-                }
-              ]
+              "$ref": "#/$defs/RequestId"
             },
             "schemaVersion": {
               "const": 1
@@ -2946,16 +2844,7 @@
               "type": "object"
             },
             "requestId": {
-              "oneOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "maximum": 9007199254740991,
-                  "minimum": -9007199254740991,
-                  "type": "integer"
-                }
-              ]
+              "$ref": "#/$defs/RequestId"
             },
             "schemaVersion": {
               "const": 1
@@ -3024,16 +2913,7 @@
               "type": "object"
             },
             "requestId": {
-              "oneOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "maximum": 9007199254740991,
-                  "minimum": -9007199254740991,
-                  "type": "integer"
-                }
-              ]
+              "$ref": "#/$defs/RequestId"
             },
             "schemaVersion": {
               "const": 1
@@ -3143,16 +3023,7 @@
               "type": "object"
             },
             "requestId": {
-              "oneOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "maximum": 9007199254740991,
-                  "minimum": -9007199254740991,
-                  "type": "integer"
-                }
-              ]
+              "$ref": "#/$defs/RequestId"
             },
             "schemaVersion": {
               "const": 1
@@ -3164,6 +3035,18 @@
             "error"
           ],
           "type": "object"
+        },
+        "RequestId": {
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "maximum": 9007199254740991,
+              "minimum": -9007199254740991,
+              "type": "integer"
+            }
+          ]
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -3241,16 +3124,7 @@
               "type": "boolean"
             },
             "requestId": {
-              "oneOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "maximum": 9007199254740991,
-                  "minimum": -9007199254740991,
-                  "type": "integer"
-                }
-              ]
+              "$ref": "#/$defs/RequestId"
             },
             "schemaVersion": {
               "const": 1
@@ -3771,16 +3645,7 @@
               "type": "object"
             },
             "requestId": {
-              "oneOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "maximum": 9007199254740991,
-                  "minimum": -9007199254740991,
-                  "type": "integer"
-                }
-              ]
+              "$ref": "#/$defs/RequestId"
             },
             "schemaVersion": {
               "const": 1
@@ -4379,16 +4244,7 @@
               ]
             },
             "requestId": {
-              "oneOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "maximum": 9007199254740991,
-                  "minimum": -9007199254740991,
-                  "type": "integer"
-                }
-              ]
+              "$ref": "#/$defs/RequestId"
             },
             "schemaVersion": {
               "const": 1
@@ -4437,16 +4293,7 @@
               "type": "object"
             },
             "requestId": {
-              "oneOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "maximum": 9007199254740991,
-                  "minimum": -9007199254740991,
-                  "type": "integer"
-                }
-              ]
+              "$ref": "#/$defs/RequestId"
             },
             "schemaVersion": {
               "const": 1
@@ -4515,16 +4362,7 @@
               "type": "object"
             },
             "requestId": {
-              "oneOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "maximum": 9007199254740991,
-                  "minimum": -9007199254740991,
-                  "type": "integer"
-                }
-              ]
+              "$ref": "#/$defs/RequestId"
             },
             "schemaVersion": {
               "const": 1
@@ -4634,16 +4472,7 @@
               "type": "object"
             },
             "requestId": {
-              "oneOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "maximum": 9007199254740991,
-                  "minimum": -9007199254740991,
-                  "type": "integer"
-                }
-              ]
+              "$ref": "#/$defs/RequestId"
             },
             "schemaVersion": {
               "const": 1
@@ -4655,6 +4484,18 @@
             "error"
           ],
           "type": "object"
+        },
+        "RequestId": {
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "maximum": 9007199254740991,
+              "minimum": -9007199254740991,
+              "type": "integer"
+            }
+          ]
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -4720,16 +4561,7 @@
               "type": "boolean"
             },
             "requestId": {
-              "oneOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "maximum": 9007199254740991,
-                  "minimum": -9007199254740991,
-                  "type": "integer"
-                }
-              ]
+              "$ref": "#/$defs/RequestId"
             },
             "schemaVersion": {
               "const": 1
@@ -4967,16 +4799,7 @@
               "type": "object"
             },
             "requestId": {
-              "oneOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "maximum": 9007199254740991,
-                  "minimum": -9007199254740991,
-                  "type": "integer"
-                }
-              ]
+              "$ref": "#/$defs/RequestId"
             },
             "schemaVersion": {
               "const": 1
@@ -5204,16 +5027,7 @@
               ]
             },
             "requestId": {
-              "oneOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "maximum": 9007199254740991,
-                  "minimum": -9007199254740991,
-                  "type": "integer"
-                }
-              ]
+              "$ref": "#/$defs/RequestId"
             },
             "schemaVersion": {
               "const": 1
@@ -5262,16 +5076,7 @@
               "type": "object"
             },
             "requestId": {
-              "oneOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "maximum": 9007199254740991,
-                  "minimum": -9007199254740991,
-                  "type": "integer"
-                }
-              ]
+              "$ref": "#/$defs/RequestId"
             },
             "schemaVersion": {
               "const": 1
@@ -5340,16 +5145,7 @@
               "type": "object"
             },
             "requestId": {
-              "oneOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "maximum": 9007199254740991,
-                  "minimum": -9007199254740991,
-                  "type": "integer"
-                }
-              ]
+              "$ref": "#/$defs/RequestId"
             },
             "schemaVersion": {
               "const": 1
@@ -5397,16 +5193,7 @@
               "type": "object"
             },
             "requestId": {
-              "oneOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "maximum": 9007199254740991,
-                  "minimum": -9007199254740991,
-                  "type": "integer"
-                }
-              ]
+              "$ref": "#/$defs/RequestId"
             },
             "schemaVersion": {
               "const": 1
@@ -5418,6 +5205,18 @@
             "error"
           ],
           "type": "object"
+        },
+        "RequestId": {
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "maximum": 9007199254740991,
+              "minimum": -9007199254740991,
+              "type": "integer"
+            }
+          ]
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -5475,16 +5274,7 @@
               "type": "boolean"
             },
             "requestId": {
-              "oneOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "maximum": 9007199254740991,
-                  "minimum": -9007199254740991,
-                  "type": "integer"
-                }
-              ]
+              "$ref": "#/$defs/RequestId"
             },
             "schemaVersion": {
               "const": 1

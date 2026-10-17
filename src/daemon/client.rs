@@ -621,7 +621,8 @@ fn spawn_reply_reader(
                         }
                         let end = available.iter().position(|&b| b == b'\n');
                         let take = end.map_or(available.len(), |at| at + 1);
-                        if line.len() + take > crate::mcp::wire::RESPONSE_BYTES + 32 {
+                        // The daemon's largest frame is its catalog (#165).
+                        if line.len() + take > crate::mcp::wire::CATALOG_BYTES + 32 {
                             return Err(io::Error::new(
                                 io::ErrorKind::InvalidData,
                                 "MCP response too large",
