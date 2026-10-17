@@ -825,7 +825,10 @@ pub struct McpOutgoingCall {
     pub content_hash: String,
     pub callee_text: Option<String>,
     pub callee_text_truncated: bool,
+    /// At most eight verified hints, in rank order.
     pub candidates: Vec<McpOutgoingCandidate>,
+    /// Distinct eligible matches left unexamined after eight hints passed, or
+    /// `None` when the hint budget ran out.
     pub omitted: Option<usize>,
 }
 
@@ -1047,7 +1050,8 @@ impl EvidenceResponse {
                 continue;
             };
             let mut statement = match self.db.prepare(
-                "SELECT d.version_id,d.syntax_id,m.source_set_id,m.language,m.path
+                "SELECT d.version_id,d.syntax_id,m.source_set_id,m.language,m.path,
+                        d.start_byte,d.end_byte
                  FROM native_version_declarations d JOIN revision_documents m
                    ON m.document_version_id=d.version_id AND m.revision_id=?1
                  WHERE m.source_set_id=?2 AND m.language=?3 AND d.lookup_key=?4",
@@ -1072,7 +1076,9 @@ impl EvidenceResponse {
                 }
                 Err(error) => return Err(error.into()),
             };
-            let mut candidates = BTreeMap::<String, McpOutgoingCandidate>::new();
+            // Rank the cheap lexical rows first, then verify in rank order only
+            // until eight hints pass (#170); later matches are left unexamined.
+            let mut ranked = Vec::new();
             let mut timed_out = false;
             loop {
                 if progress.expired() {
@@ -1101,10 +1107,39 @@ impl EvidenceResponse {
                     language: row.get(3)?,
                     path: row.get(4)?,
                 };
+                let (start, end): (i64, i64) = (row.get(5)?, row.get(6)?);
                 // Test code is not an eligible hint for non-test code; skip it
                 // before verification so it costs no hint budget.
                 if !owner_is_test && mcp_test_path(&key.path) {
                     continue;
+                }
+                ranked.push((
+                    mcp_hint_proximity(&scope.key.path, &key.path),
+                    key.path.clone(),
+                    start,
+                    end,
+                    id,
+                    version,
+                    key,
+                ));
+            }
+            if timed_out || progress.expired() {
+                item.omitted = None;
+                continue;
+            }
+            ranked.sort_by(|a, b| (a.0, &a.1, a.2, a.3, &a.4).cmp(&(b.0, &b.1, b.2, b.3, &b.4)));
+            let mut candidates = BTreeMap::<String, McpOutgoingCandidate>::new();
+            let mut unexamined = std::collections::BTreeSet::new();
+            for (_, _, _, _, id, version, key) in ranked {
+                if candidates.len() == 8 {
+                    if !candidates.contains_key(&id) {
+                        unexamined.insert(id);
+                    }
+                    continue;
+                }
+                if progress.expired() {
+                    timed_out = true;
+                    break;
                 }
                 let candidate = (|| -> Result<Option<McpOutgoingCandidate>> {
                     optional_hint_check(Some(&|| progress.expired()))?;
@@ -1257,7 +1292,8 @@ impl EvidenceResponse {
                 };
                 key(a).cmp(&key(b))
             });
-            item.omitted = Some(item.candidates.len().saturating_sub(8));
+            // Distinct eligible matches left unexamined once eight hints passed.
+            item.omitted = Some(unexamined.len());
         }
         Ok(Some(McpOutgoing {
             owner,
