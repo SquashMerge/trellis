@@ -730,7 +730,8 @@
         {
           "$ref": "#/$defs/AdmissionFailure"
         }
-      ]
+      ],
+      "type": "object"
     }
   },
   {
@@ -1809,7 +1810,8 @@
         {
           "$ref": "#/$defs/AdmissionFailure"
         }
-      ]
+      ],
+      "type": "object"
     }
   },
   {
@@ -1909,7 +1911,8 @@
           ],
           "type": "object"
         }
-      ]
+      ],
+      "type": "object"
     },
     "name": "trellis_inspect",
     "outputSchema": {
@@ -3541,7 +3544,8 @@
         {
           "$ref": "#/$defs/AdmissionFailure"
         }
-      ]
+      ],
+      "type": "object"
     }
   },
   {
@@ -4235,7 +4239,8 @@
         {
           "$ref": "#/$defs/AdmissionFailure"
         }
-      ]
+      ],
+      "type": "object"
     }
   }
 ]
