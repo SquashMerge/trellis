@@ -11,6 +11,14 @@ use std::{
     time::Duration,
 };
 
+fn emitted_document<'a>(data: &'a Value, item: &Value) -> &'a Value {
+    let doc = item["doc"].as_u64().expect("emitted doc index") as usize;
+    let documents = data["documents"].as_array().expect("document table");
+    let entry = &documents[doc];
+    assert_eq!(entry["ref"], doc);
+    entry
+}
+
 fn fixture() -> Value {
     serde_json::from_str(include_str!("fixtures/mcp/protocol.json")).unwrap()
 }
@@ -575,7 +583,7 @@ fn empty_scope_coverage() -> Value {
 
 fn golden_settled_empty_find(id: &Value, root: &Value, pin: &Value) -> Value {
     json!({"schemaVersion":1,"requestId":id,"workspace":root,"catchingUp":false,
-        "evidenceBasis":pin,"data":{"symbols":[],"coverage":[],
+        "evidenceBasis":pin,"data":{"symbols":[],"documents":[],"coverage":[],
             "scopeCoverage":empty_scope_coverage(),"provenance":[]},
         "warnings":[{"code":"syntaxOnly","message":"Only syntax evidence is available",
             "provenanceId":null}],"partial":false,"truncated":false,
@@ -694,7 +702,7 @@ fn both_modes_full_catalog_tools_and_lifecycle() {
         let response = peer.ask(list);
         let catalog: Value =
             serde_json::from_str(include_str!("fixtures/mcp/catalog.json")).unwrap();
-        assert_eq!(catalog.as_array().unwrap().len(), 4);
+        assert_eq!(catalog.as_array().unwrap().len(), 5);
         let expected_list = |id: Value| {
             let result = if legacy {
                 json!({"tools":catalog})
@@ -774,15 +782,49 @@ fn both_modes_full_catalog_tools_and_lifecycle() {
         tool(&reply, Some("range_too_large"), !legacy);
         // The outgoing view's limit has the same 1-50 range, checked before
         // any lookup.
-        let fields = json!({"name":"trellis_inspect","arguments":{"schemaVersion":1,
-            "symbolId":format!("sid:v1:{}", "0".repeat(31) + "1"),
-            "view":"outgoing_calls","limit":51}});
+        let fields = json!({"name":"trellis_outgoing_calls","arguments":{"schemaVersion":1,
+            "symbolId":format!("sid:v1:{}", "0".repeat(31) + "1"),"limit":51}});
         let reply = peer.ask(if legacy {
             request(json!(43), "tools/call", fields)
         } else {
             modern(json!(43), "tools/call", fields)
         });
         tool(&reply, Some("range_too_large"), !legacy);
+        for (id, name, arguments) in [
+            (
+                44,
+                "trellis_declaration",
+                json!({"schemaVersion":1,"symbolId":format!("sid:v1:{}", "a".repeat(32)),"view":"declaration"}),
+            ),
+            (
+                45,
+                "trellis_declaration",
+                json!({"schemaVersion":1,"symbolId":format!("sid:v1:{}", "a".repeat(32)),"limit":1}),
+            ),
+            (
+                46,
+                "trellis_outgoing_calls",
+                json!({"schemaVersion":1,"symbolId":format!("sid:v1:{}", "a".repeat(32)),"view":"outgoing_calls"}),
+            ),
+        ] {
+            let fields = json!({"name":name,"arguments":arguments});
+            let reply = peer.ask(if legacy {
+                request(json!(id), "tools/call", fields)
+            } else {
+                modern(json!(id), "tools/call", fields)
+            });
+            tool(&reply, Some("invalid_request"), !legacy);
+        }
+        let old = json!({"name":"trellis_inspect","arguments":{"schemaVersion":1}});
+        error(
+            &peer.ask(if legacy {
+                request(json!(47), "tools/call", old)
+            } else {
+                modern(json!(47), "tools/call", old)
+            }),
+            -32602,
+            json!(47),
+        );
         let wrong = json!({"name":"unknown","arguments":{}});
         error(
             &peer.ask(if legacy {
@@ -841,7 +883,7 @@ fn framing_ids_negotiation_and_application_validation() {
     for spelling in [r#""\u00e9""#, r#""é""#, r#""\ud83d\ude00""#, r#""😀""#] {
         peer.send_raw(format!(r#"{{"jsonrpc":"2.0","id":{spelling},"method":"tools/list","params":{{"_meta":{}}}}}"#,fixture()["modernMeta"]).as_bytes());
         let v = peer.reply();
-        assert_eq!(v["result"]["tools"].as_array().unwrap().len(), 4);
+        assert_eq!(v["result"]["tools"].as_array().unwrap().len(), 5);
     }
     for n in ["1e0", "1.0", "-0", "9007199254740991", "-9007199254740991"] {
         peer.send_raw(format!(r#"{{"jsonrpc":"2.0","id":{n},"method":"server/discover","params":{{"_meta":{}}}}}"#,fixture()["modernMeta"]).as_bytes());
@@ -890,8 +932,8 @@ fn framing_ids_negotiation_and_application_validation() {
             "invalid_request",
         ),
         (
-            "trellis_inspect",
-            json!({"schemaVersion":1,"symbolId":"sid:v1:x","view":"declaration"}),
+            "trellis_declaration",
+            json!({"schemaVersion":1,"symbolId":"sid:v1:x"}),
             "invalid_request",
         ),
         (
@@ -946,7 +988,7 @@ fn legacy_title_recovery_max_id_and_root_selection() {
             .as_array()
             .unwrap()
             .len(),
-        4
+        5
     );
     assert!(peer.finish().0.success());
     // Topology overlap is refused before marker attachment.
@@ -1334,7 +1376,9 @@ async fn golden_tool_envelopes_and_maximum_ids_both_modes() {
                     let expected = match index {
                         1 => golden_settled_empty_find(&id, workspace, published),
                         2 => golden_settled_failure(&id, workspace, "not_found", published.clone()),
-                        3 => golden_settled_failure(&id, workspace, "not_found", published.clone()),
+                        3 | 4 => {
+                            golden_settled_failure(&id, workspace, "not_found", published.clone())
+                        }
                         _ => unreachable!("fixed golden tool order"),
                     };
                     exact_golden_settled(&accepted, &id, !legacy, expected);
@@ -1360,8 +1404,8 @@ async fn golden_tool_envelopes_and_maximum_ids_both_modes() {
                 json!({"schemaVersion":1,"query":"x","expectedBasis":pin}),
             ),
             (
-                "trellis_inspect",
-                json!({"schemaVersion":1,"symbolId":format!("sid:v1:{}","a".repeat(32)),"view":"outgoing_calls","limit":50,"expectedBasis":pin}),
+                "trellis_outgoing_calls",
+                json!({"schemaVersion":1,"symbolId":format!("sid:v1:{}","a".repeat(32)),"limit":50,"expectedBasis":pin}),
             ),
             (
                 "trellis_read_source",
@@ -1696,7 +1740,8 @@ fn unusable_index_sentinels_do_not_change_unavailable_projection_or_get_repaired
     }
     for name in [
         "trellis_find_symbols",
-        "trellis_inspect",
+        "trellis_declaration",
+        "trellis_outgoing_calls",
         "trellis_read_source",
     ] {
         let i = fixture()["names"]
@@ -2049,7 +2094,7 @@ fn per_call_linked_worktree_selection_and_closed_failures() {
                 let data = &answer["result"]["structuredContent"]["data"];
                 assert_eq!(
                     *data,
-                    json!({"symbols":[],"coverage":[],"scopeCoverage":empty_scope_coverage(),
+                    json!({"symbols":[],"documents":[],"coverage":[],"scopeCoverage":empty_scope_coverage(),
                         "provenance":[]})
                 );
             } else {
@@ -2151,7 +2196,7 @@ fn per_call_linked_worktree_selection_and_closed_failures() {
 #[test]
 fn catalog_rejects_contradictory_unresolved_and_resolved_failures() {
     let catalog: Value = serde_json::from_str(include_str!("fixtures/mcp/catalog.json")).unwrap();
-    assert_eq!(catalog.as_array().unwrap().len(), 4);
+    assert_eq!(catalog.as_array().unwrap().len(), 5);
     for entry in catalog.as_array().unwrap() {
         let defs = &entry["outputSchema"]["$defs"];
         assert_eq!(
@@ -2274,7 +2319,7 @@ fn selected_clone_failure_is_resolved_and_does_not_kill_the_session() {
 }
 
 #[test]
-fn final_resolved_drift_is_attributed_for_four_tools_and_both_modes() {
+fn final_resolved_drift_is_attributed_for_five_tools_and_both_modes() {
     for legacy in [false, true] {
         for (index, name) in fixture()["names"].as_array().unwrap().iter().enumerate() {
             for explicit in [false, true] {
@@ -5984,8 +6029,8 @@ async fn mcp_declaration_selected_identity_and_measured_record() {
     let inspected = ask(
         &mut client,
         2,
-        "trellis_inspect",
-        json!({"schemaVersion":1,"symbolId":id,"view":"declaration"}),
+        "trellis_declaration",
+        json!({"schemaVersion":1,"symbolId":id}),
     );
     tool(&inspected, None, true);
     let envelope = &inspected["result"]["structuredContent"];
@@ -5996,9 +6041,40 @@ async fn mcp_declaration_selected_identity_and_measured_record() {
     release_tx.send(()).unwrap();
     assert_eq!(envelope["data"]["declaration"]["syntaxId"], id);
     assert_eq!(envelope["data"]["displayKey"], "a.js#Alpha");
-    assert_eq!(envelope["data"]["contentHash"], symbol["contentHash"]);
+    assert_eq!(
+        emitted_document(&envelope["data"], &envelope["data"])["contentHash"],
+        emitted_document(&found["result"]["structuredContent"]["data"], symbol)["contentHash"]
+    );
     assert_eq!(envelope["data"]["coverage"].as_array().unwrap().len(), 1);
     assert_eq!(envelope["data"]["provenance"].as_array().unwrap().len(), 1);
+    let found_envelope = &found["result"]["structuredContent"];
+    for (request_id, source_envelope, item) in [
+        (5, found_envelope, symbol),
+        (6, envelope, &envelope["data"]),
+    ] {
+        let source_data = &source_envelope["data"];
+        let entry = emitted_document(source_data, item);
+        let selected = ask(
+            &mut client,
+            request_id,
+            "trellis_read_source",
+            json!({
+                "schemaVersion":1,"path":entry["document"]["path"],
+                "startLine":item["lines"]["start"],"endLine":item["lines"]["end"],
+                "expectedBasis":source_envelope["evidenceBasis"],
+                "expectedContentHash":entry["contentHash"]
+            }),
+        );
+        tool(&selected, None, true);
+        let selected_range = &selected["result"]["structuredContent"]["data"]["byteRange"];
+        let range = if request_id == 5 {
+            &item["range"]
+        } else {
+            &item["declaration"]["range"]
+        };
+        assert!(selected_range["start"].as_u64().unwrap() <= range["start"].as_u64().unwrap());
+        assert!(range["end"].as_u64().unwrap() <= selected_range["end"].as_u64().unwrap());
+    }
     assert_eq!(
         envelope["data"]["declaration"]["header"]["parameters"][0]["name"],
         "first"
@@ -6018,14 +6094,14 @@ async fn mcp_declaration_selected_identity_and_measured_record() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|s| s["name"].is_null() && s["document"]["path"] == "a.js")
+        .find(|s| s["name"].is_null() && emitted_document(&found["result"]["structuredContent"]["data"], s)["document"]["path"] == "a.js")
         .expect("selected unnamed module");
     let inspected = ask(
         &mut client,
         4,
-        "trellis_inspect",
+        "trellis_declaration",
         json!({
-            "schemaVersion":1,"view":"declaration","symbolId":unnamed["symbolId"]
+            "schemaVersion":1,"symbolId":unnamed["symbolId"]
         }),
     );
     tool(&inspected, None, true);
@@ -6188,9 +6264,9 @@ fn mcp_declaration_rejects_noncanonical_id_before_read() {
     ] {
         assert_eq!(
             validate(
-                "trellis_inspect",
+                "trellis_declaration",
                 Some(&json!({
-                    "schemaVersion":1,"view":"declaration","symbolId":invalid
+                    "schemaVersion":1,"symbolId":invalid
                 }))
             ),
             Err("invalid_request")
@@ -6252,9 +6328,18 @@ async fn mcp_declaration_refuses_oversized_whole_wire_dto() {
     registry.activate(&identity.root_key).unwrap();
     let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
     let (mut client, mut reader, session) = socket_session(&identity, &registry, 143, None);
-    writeln!(client, "{}", modern(json!(1), "tools/call", json!({
-        "name":"trellis_inspect", "arguments":{"schemaVersion":1,"view":"declaration","symbolId":id}
-    }))).unwrap();
+    writeln!(
+        client,
+        "{}",
+        modern(
+            json!(1),
+            "tools/call",
+            json!({
+                "name":"trellis_declaration", "arguments":{"schemaVersion":1,"symbolId":id}
+            })
+        )
+    )
+    .unwrap();
     let response = next_reply(&mut reader);
     tool(&response, Some("range_too_large"), true);
     assert!(response["result"]["structuredContent"]["data"].is_null());
@@ -6281,7 +6366,7 @@ async fn mcp_declaration_cold_head_precedes_complete_pin_conflict() {
     let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
     let (mut client, mut reader, session) = socket_session(&identity, &registry, 143, None);
     writeln!(client, "{}", modern(json!(1), "tools/call", json!({
-        "name":"trellis_inspect", "arguments":{"schemaVersion":1,"view":"declaration",
+        "name":"trellis_declaration", "arguments":{"schemaVersion":1,
         "symbolId":format!("sid:v1:{}", "0".repeat(32)),
         "expectedBasis":{"indexGeneration":"123e4567-e89b-42d3-a456-426614174000","indexRevision":1}}
     }))).unwrap();
@@ -6385,14 +6470,34 @@ async fn mcp_outgoing_selected_direct_calls_and_unresolved_hints() {
         &mut client,
         &mut reader,
         2,
-        "trellis_inspect",
-        json!({"schemaVersion":1,"symbolId":symbol_id,"view":"outgoing_calls"}),
+        "trellis_outgoing_calls",
+        json!({"schemaVersion":1,"symbolId":symbol_id}),
     );
     tool(&response, None, true);
     let data = &response["result"]["structuredContent"]["data"];
     assert_eq!(response["result"]["structuredContent"]["catchingUp"], true);
     assert_eq!(data["calls"].as_array().unwrap().len(), 1);
     assert_eq!(data["calls"][0]["calleeText"], "Beta");
+    let call = &data["calls"][0];
+    let document = emitted_document(data, call);
+    let lines = &call["lines"];
+    assert!(lines["start"].as_u64().unwrap() <= lines["end"].as_u64().unwrap());
+    let selected_source = ask(
+        &mut client,
+        &mut reader,
+        4,
+        "trellis_read_source",
+        json!({
+            "schemaVersion":1,"path":document["document"]["path"],
+            "startLine":lines["start"],"endLine":lines["end"],
+            "expectedBasis":response["result"]["structuredContent"]["evidenceBasis"],
+            "expectedContentHash":document["contentHash"]
+        }),
+    );
+    tool(&selected_source, None, true);
+    let returned = &selected_source["result"]["structuredContent"]["data"]["byteRange"];
+    assert!(returned["start"].as_u64().unwrap() <= call["range"]["start"].as_u64().unwrap());
+    assert!(returned["end"].as_u64().unwrap() >= call["range"]["end"].as_u64().unwrap());
     assert_eq!(data["calls"][0]["disposition"], "unresolved");
     assert!(data["calls"][0]["binding"].is_null());
     let mut stale = found["result"]["structuredContent"]["evidenceBasis"].clone();
@@ -6401,9 +6506,8 @@ async fn mcp_outgoing_selected_direct_calls_and_unresolved_hints() {
         &mut client,
         &mut reader,
         3,
-        "trellis_inspect",
-        json!({"schemaVersion":1,"symbolId":format!("sid:v1:{}","0".repeat(32)),
-            "view":"outgoing_calls","expectedBasis":stale}),
+        "trellis_outgoing_calls",
+        json!({"schemaVersion":1,"symbolId":format!("sid:v1:{}","0".repeat(32)),"expectedBasis":stale}),
     );
     tool(&refused, Some("revision_conflict"), true);
     assert_eq!(
@@ -6565,7 +6669,7 @@ fn mcp_outgoing_wire_fixture_delayed(
         .as_array()
         .unwrap();
     let symbol = symbols.iter().find(|s| s["name"] == owner).unwrap();
-    let mut args = json!({"schemaVersion":1,"symbolId":symbol["symbolId"],"view":"outgoing_calls"});
+    let mut args = json!({"schemaVersion":1,"symbolId":symbol["symbolId"]});
     if let Some(limit) = limit {
         args["limit"] = json!(limit);
     }
@@ -6611,7 +6715,7 @@ fn mcp_outgoing_wire_fixture_delayed(
     writeln!(
         client,
         "{}",
-        call(legacy, json!(2), "trellis_inspect", args)
+        call(legacy, json!(2), "trellis_outgoing_calls", args)
     )
     .unwrap();
     let mut frame = Vec::new();
@@ -6755,12 +6859,12 @@ async fn mcp_corrupt_find_declaration_outgoing_omit_current_basis_but_stale_pin_
                     json!({"schemaVersion":1,"query":"Alpha"}),
                 ),
                 (
-                    "trellis_inspect",
-                    json!({"schemaVersion":1,"symbolId":id,"view":"declaration"}),
+                    "trellis_declaration",
+                    json!({"schemaVersion":1,"symbolId":id}),
                 ),
                 (
-                    "trellis_inspect",
-                    json!({"schemaVersion":1,"symbolId":id,"view":"outgoing_calls"}),
+                    "trellis_outgoing_calls",
+                    json!({"schemaVersion":1,"symbolId":id}),
                 ),
             ] {
                 let mut args = base;
@@ -6898,12 +7002,12 @@ async fn mcp_wire_valid_basis_and_uint_are_not_silently_dropped() {
                 json!({"schemaVersion":1,"query":"Target"}),
             ),
             (
-                "trellis_inspect",
-                json!({"schemaVersion":1,"symbolId":id,"view":"declaration"}),
+                "trellis_outgoing_calls",
+                json!({"schemaVersion":1,"symbolId":id}),
             ),
             (
-                "trellis_inspect",
-                json!({"schemaVersion":1,"symbolId":id,"view":"outgoing_calls"}),
+                "trellis_outgoing_calls",
+                json!({"schemaVersion":1,"symbolId":id}),
             ),
             (
                 "trellis_read_source",
@@ -6952,9 +7056,9 @@ async fn mcp_wire_valid_basis_and_uint_are_not_silently_dropped() {
                 1,
             ),
             (
-                "trellis_inspect",
+                "trellis_outgoing_calls",
                 serde_json::from_str::<Value>(&format!(
-                    r#"{{"schemaVersion":1,"symbolId":"{}","view":"outgoing_calls","limit":2e0}}"#,
+                    r#"{{"schemaVersion":1,"symbolId":"{}","limit":2e0}}"#,
                     id.as_str().unwrap()
                 ))
                 .unwrap(),
@@ -7072,13 +7176,28 @@ async fn mcp_outgoing_nine_hints_exact_omissions_and_language_scope() {
     assert_eq!(envelope["truncationReason"], "limit");
     assert_eq!(data["coverage"].as_array().unwrap().len(), 9);
     assert_eq!(data["provenance"].as_array().unwrap().len(), 9);
-    assert_eq!(hints[0]["document"]["path"], "b0.js");
-    assert_eq!(hints[7]["document"]["path"], "b7.js");
-    assert!(
-        hints
-            .iter()
-            .all(|candidate| candidate["document"]["language"] == "javascript")
+    assert_eq!(
+        emitted_document(data, &hints[0])["document"]["path"],
+        "b0.js"
     );
+    assert_eq!(
+        emitted_document(data, &hints[7])["document"]["path"],
+        "b7.js"
+    );
+    assert!(hints.iter().all(
+        |candidate| emitted_document(data, candidate)["document"]["language"] == "javascript"
+    ));
+    let documents = data["documents"].as_array().unwrap();
+    assert_eq!(documents.len(), 9); // One owner version and eight emitted hint versions.
+    for candidate in hints {
+        assert!(candidate.get("lines").is_none());
+        let entry = emitted_document(data, candidate);
+        assert!(data["provenance"].as_array().unwrap().iter().any(|proof| {
+            proof["id"] == entry["provenanceId"]
+                && proof["document"] == entry["document"]
+                && proof["revisionId"] == entry["revisionId"]
+        }));
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7186,7 +7305,17 @@ async fn mcp_outgoing_response_bytes_call_prefix_before_global_hints() {
     tool(&reply, None, true);
     let envelope = &reply["result"]["structuredContent"];
     let calls = envelope["data"]["calls"].as_array().unwrap();
-    assert!(!calls.is_empty() && calls.len() < 50, "{reply}");
+    assert!(!calls.is_empty() && calls.len() <= 50);
+    if calls.len() == 50 {
+        assert!(
+            calls.iter().any(|call| {
+                call["nativeCandidates"]["omitted"]
+                    .as_u64()
+                    .is_some_and(|n| n > 0)
+            }),
+            "when all calls fit, optional candidates consume the remaining byte budget"
+        );
+    }
     assert_eq!(envelope["truncationReason"], "response_bytes");
     let mut optional_budget_expired = false;
     for (index, call) in calls.iter().enumerate() {
@@ -7228,12 +7357,21 @@ async fn mcp_outgoing_response_bytes_call_prefix_before_global_hints() {
     let required: std::collections::BTreeSet<_> = calls
         .iter()
         .flat_map(|call| {
-            std::iter::once(call["provenanceId"].as_str().unwrap()).chain(
+            std::iter::once(
+                emitted_document(closure, call)["provenanceId"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .chain(
                 call["nativeCandidates"]["items"]
                     .as_array()
                     .unwrap()
                     .iter()
-                    .map(|c| c["provenanceId"].as_str().unwrap()),
+                    .map(|c| {
+                        emitted_document(closure, c)["provenanceId"]
+                            .as_str()
+                            .unwrap()
+                    }),
             )
         })
         .collect();
@@ -7332,7 +7470,11 @@ async fn mcp_outgoing_mid_attestation_expiry_keeps_required_calls_and_prior_hint
     let local = calls[0]["nativeCandidates"]["items"].as_array().unwrap();
     assert_eq!(local.len(), 1, "the earlier hint survives: {reply}");
     assert_eq!(local[0]["name"], "Local", "{reply}");
-    assert_eq!(local[0]["document"]["path"], "local.js", "{reply}");
+    assert_eq!(
+        emitted_document(&reply["result"]["structuredContent"]["data"], &local[0])["document"]["path"],
+        "local.js",
+        "{reply}"
+    );
     assert_eq!(calls[0]["nativeCandidates"]["omitted"], 0, "{reply}");
     assert!(calls[1]["calleeRange"].is_null(), "{reply}");
     assert_eq!(calls[1]["nativeCandidates"]["items"], json!([]));
@@ -7487,12 +7629,21 @@ async fn mcp_outgoing_complete_modern_legacy_frames_fill_candidates_after_all_ca
         let required: std::collections::BTreeSet<_> = calls
             .iter()
             .flat_map(|call| {
-                std::iter::once(call["provenanceId"].as_str().unwrap()).chain(
+                std::iter::once(
+                    emitted_document(&envelope["data"], call)["provenanceId"]
+                        .as_str()
+                        .unwrap(),
+                )
+                .chain(
                     call["nativeCandidates"]["items"]
                         .as_array()
                         .unwrap()
                         .iter()
-                        .map(|item| item["provenanceId"].as_str().unwrap()),
+                        .map(|item| {
+                            emitted_document(&envelope["data"], item)["provenanceId"]
+                                .as_str()
+                                .unwrap()
+                        }),
                 )
             })
             .collect();
@@ -7609,9 +7760,9 @@ fn mcp_outgoing_corrupt_boundary_fixture(fault: &str) -> Value {
         call(
             false,
             json!(2),
-            "trellis_inspect",
+            "trellis_outgoing_calls",
             json!({
-                "schemaVersion":1,"symbolId":owner_id,"view":"outgoing_calls"
+                "schemaVersion":1,"symbolId":owner_id
             })
         )
     )
@@ -7756,9 +7907,9 @@ async fn mcp_outgoing_prior_revision_target_is_not_a_selected_candidate() {
         call(
             false,
             json!(2),
-            "trellis_inspect",
+            "trellis_outgoing_calls",
             json!({
-                "schemaVersion":1,"symbolId":owner_id,"view":"outgoing_calls"
+                "schemaVersion":1,"symbolId":owner_id
             })
         )
     )

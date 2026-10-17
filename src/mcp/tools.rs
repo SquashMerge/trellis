@@ -3,7 +3,7 @@ use super::{IdentityError, OpenedWorkspace, wire};
 use crate::daemon::registry::SelectionError;
 use serde_json::{Value, json};
 
-const TOOLS: [&str; 4] = super::catalog::NAMES;
+const TOOLS: [&str; 5] = super::catalog::NAMES;
 #[derive(Debug)]
 pub struct PreparedTool {
     pub response: Value,
@@ -85,16 +85,19 @@ pub fn validate(name: &str, args: Option<&Value>) -> Result<(), &'static str> {
             ],
             &["schemaVersion", "query"],
         ),
-        "trellis_inspect" => (
+        "trellis_declaration" => (
+            &["schemaVersion", "symbolId", "expectedBasis", "workspace"],
+            &["schemaVersion", "symbolId"],
+        ),
+        "trellis_outgoing_calls" => (
             &[
                 "schemaVersion",
                 "symbolId",
-                "view",
                 "limit",
                 "expectedBasis",
                 "workspace",
             ],
-            &["schemaVersion", "symbolId", "view"],
+            &["schemaVersion", "symbolId"],
         ),
         _ => (
             &[
@@ -124,7 +127,7 @@ pub fn validate(name: &str, args: Option<&Value>) -> Result<(), &'static str> {
             }
             limit(o)
         }
-        "trellis_inspect" => {
+        "trellis_declaration" | "trellis_outgoing_calls" => {
             let sid = string(o.get("symbolId")).ok_or("invalid_request")?;
             if sid.len() > 8192
                 || sid.len() != 39
@@ -135,10 +138,10 @@ pub fn validate(name: &str, args: Option<&Value>) -> Result<(), &'static str> {
             {
                 return Err("invalid_request");
             }
-            match string(o.get("view")) {
-                Some("declaration") if !o.contains_key("limit") => Ok(()),
-                Some("outgoing_calls") => limit(o),
-                _ => Err("invalid_request"),
+            if name == "trellis_outgoing_calls" {
+                limit(o)
+            } else {
+                Ok(())
             }
         }
         _ => {
@@ -363,7 +366,9 @@ mod tests {
         match name {
             "trellis_workspace_describe" => json!({"schemaVersion":1}),
             "trellis_find_symbols" => json!({"schemaVersion":1,"query":"a"}),
-            "trellis_inspect" => json!({"schemaVersion":1,"symbolId":sid(),"view":"declaration"}),
+            "trellis_declaration" | "trellis_outgoing_calls" => {
+                json!({"schemaVersion":1,"symbolId":sid()})
+            }
             _ => json!({"schemaVersion":1,"path":"src/a.rs","startLine":1,"endLine":1}),
         }
     }
@@ -431,14 +436,8 @@ mod tests {
         let mut v = good(n);
         v["query"] = json!(null);
         check(n, &v, "invalid_request");
-        for name in [TOOLS[1], TOOLS[2]] {
-            let original = if name == TOOLS[2] {
-                let mut v = good(name);
-                v["view"] = json!("outgoing_calls");
-                v
-            } else {
-                good(name)
-            };
+        for name in [TOOLS[1], TOOLS[3]] {
+            let original = good(name);
             for (number, expected) in [
                 (json!(0), Some("range_too_large")),
                 (json!(1), None),
@@ -472,6 +471,9 @@ mod tests {
         let mut v = good(n);
         v["limit"] = json!(1);
         check(n, &v, "invalid_request");
+        let mut v = good(TOOLS[3]);
+        v["view"] = json!("outgoing_calls");
+        check(TOOLS[3], &v, "invalid_request");
         for wrong in [
             "sid:v1:ABCDEF0123456789abcdef0123456789",
             "sid:v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -486,7 +488,7 @@ mod tests {
     }
     #[test]
     fn source_path_hash_and_line_matrix() {
-        let n = TOOLS[3];
+        let n = TOOLS[4];
         for path in [
             "",
             "/a",

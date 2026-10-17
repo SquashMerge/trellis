@@ -700,43 +700,45 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                 }
             }
             let args = arguments.as_ref().and_then(serde_json::Value::as_object);
-            let view = args.and_then(|a| a.get("view")).and_then(|v| v.as_str());
             let root = answering.root();
             let id = &id;
             // The coordinator stamped `deadline = accepted + call_deadline`.
             let accepted = deadline
                 .checked_sub(workspace.call_deadline)
                 .unwrap_or(deadline);
-            let tool_read: Option<EvidenceToolRead> = match (name.as_str(), view, args) {
+            let tool_read: Option<EvidenceToolRead> = match (name.as_str(), args) {
                 _ if !tool.valid_arguments || envelope["error"]["code"] != "index_not_ready" => {
                     None
                 }
-                ("trellis_find_symbols", _, Some(args)) => {
+                ("trellis_find_symbols", Some(args)) => {
                     let query = args["query"].as_str().expect("validated find query");
                     let limit = args
                         .get("limit")
                         .map_or(20, |v| wire::uint(v).expect("validated limit") as usize);
                     let expected = validated_expected_basis(args);
                     Some(Box::new(move |_, response, sampled| {
-                        let found = response.mcp_find(query, limit, expected)?;
+                        let found = response.mcp_find_with_lines(query, limit, expected)?;
                         Ok(projection::find(id, found, root, sampled, modern)
+                            .map_err(|error| anyhow::anyhow!(error))?
                             .unwrap_or_else(|| tools::failure(id, "range_too_large")))
                     }))
                 }
-                ("trellis_inspect", Some("declaration"), Some(args)) => {
+                ("trellis_declaration", Some(args)) => {
                     let symbol_id = args["symbolId"].as_str().expect("validated declaration ID");
                     let expected = validated_expected_basis(args);
                     Some(Box::new(move |_, response, sampled| {
-                        Ok(match response.mcp_declaration(symbol_id, expected)? {
-                            Some(found) => {
-                                projection::declaration(id, found, root, sampled, modern)
-                                    .unwrap_or_else(|| tools::failure(id, "range_too_large"))
-                            }
-                            None => tools::failure(id, "not_found"),
-                        })
+                        Ok(
+                            match response.mcp_declaration_with_lines(symbol_id, expected)? {
+                                Some(found) => {
+                                    projection::declaration(id, found, root, sampled, modern)
+                                        .unwrap_or_else(|| tools::failure(id, "range_too_large"))
+                                }
+                                None => tools::failure(id, "not_found"),
+                            },
+                        )
                     }))
                 }
-                ("trellis_inspect", Some("outgoing_calls"), Some(args)) => {
+                ("trellis_outgoing_calls", Some(args)) => {
                     let symbol_id = args["symbolId"].as_str().expect("validated outgoing ID");
                     let limit = args
                         .get("limit")
@@ -744,7 +746,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                     let expected = validated_expected_basis(args);
                     Some(Box::new(move |runtime, response, sampled| {
                         Ok(
-                            match response.mcp_outgoing(
+                            match response.mcp_outgoing_with_lines(
                                 symbol_id,
                                 limit,
                                 expected,
@@ -753,6 +755,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                             )? {
                                 Some(found) => {
                                     projection::outgoing(id, found, root, sampled, modern)
+                                        .map_err(|error| anyhow::anyhow!(error))?
                                         .unwrap_or_else(|| tools::failure(id, "range_too_large"))
                                 }
                                 None => tools::failure(id, "not_found"),
@@ -760,7 +763,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                         )
                     }))
                 }
-                ("trellis_read_source", _, Some(args)) => {
+                ("trellis_read_source", Some(args)) => {
                     let path = args["path"].as_str().expect("validated source path");
                     let start = wire::uint(&args["startLine"]).expect("validated source start");
                     let end = wire::uint(&args["endLine"]).expect("validated source end");
