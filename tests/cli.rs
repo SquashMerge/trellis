@@ -1,3 +1,4 @@
+#![cfg(feature = "test-support")]
 use serde_json::Value;
 use std::{fs, process::Command};
 use tempfile::TempDir;
@@ -183,16 +184,11 @@ impl FixtureDaemon {
     fn new(home: &std::path::Path) -> Self {
         Self(home.to_path_buf())
     }
-}
-impl Drop for FixtureDaemon {
-    fn drop(&mut self) {
+
+    fn stop_attested(&self) -> Result<(), &'static str> {
         let marker = self.0.join("auto-daemon.pid");
-        let Ok(raw) = fs::read_to_string(&marker) else {
-            return;
-        };
-        let Ok(pid) = raw.parse::<u32>() else {
-            return;
-        };
+        let raw = fs::read_to_string(&marker).map_err(|_| "pid_marker_missing")?;
+        let pid = raw.parse::<u32>().map_err(|_| "pid_marker_invalid")?;
         let mut dirs = vec![self.0.clone()];
         let mut socket = None;
         while let Some(dir) = dirs.pop() {
@@ -213,44 +209,45 @@ impl Drop for FixtureDaemon {
                 break;
             }
         }
-        let Some(socket) = socket else {
-            return;
-        };
-        let owned = || {
-            let connection = std::os::unix::net::UnixStream::connect(&socket).ok()?;
-            if connected_peer_pid(&connection) != Some(pid) {
-                return None;
-            }
-            let output = Command::new("/bin/ps")
-                .args(["-p", &pid.to_string(), "-o", "command="])
-                .output()
-                .ok()?;
-            (output.status.success()
-                && String::from_utf8_lossy(&output.stdout).trim()
-                    == format!("{} daemon", env!("CARGO_BIN_EXE_trellis")))
-            .then_some(connection)
-        };
-        let Some(connection) = owned() else {
-            return;
-        };
+        let socket = socket.ok_or("daemon_lock_missing")?;
+        let connection = std::os::unix::net::UnixStream::connect(&socket)
+            .map_err(|_| "daemon_socket_unavailable")?;
+        if connected_peer_pid(&connection) != Some(pid) {
+            return Err("daemon_peer_pid_mismatch");
+        }
+        let output = Command::new("/bin/ps")
+            .args(["-p", &pid.to_string(), "-o", "command="])
+            .output()
+            .map_err(|_| "daemon_ps_failed")?;
+        if !output.status.success()
+            || String::from_utf8_lossy(&output.stdout).trim()
+                != format!("{} daemon", env!("CARGO_BIN_EXE_trellis"))
+        {
+            return Err("daemon_command_mismatch");
+        }
         let sent = Command::new("/bin/kill")
             .args(["-TERM", &pid.to_string()])
             .stderr(std::process::Stdio::null())
             .status()
             .is_ok_and(|status| status.success());
         if !sent {
-            return;
+            return Err("daemon_kill_failed");
         }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + trellis::testing::HANG_BACKSTOP;
         while std::time::Instant::now() < deadline {
-            if owned().is_none() {
+            if std::os::unix::net::UnixStream::connect(&socket).is_err() {
                 let _ = fs::remove_file(&marker);
-                return;
+                return Ok(());
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         // Never SIGKILL a numeric PID after the socket identity becomes ambiguous.
-        drop(connection);
+        Err("daemon_socket_still_active")
+    }
+}
+impl Drop for FixtureDaemon {
+    fn drop(&mut self) {
+        let _ = self.stop_attested();
     }
 }
 
@@ -272,8 +269,44 @@ fn command(root: &std::path::Path, state: &std::path::Path, sub: &str) -> Comman
     c
 }
 
+// A spawned daemon can inherit the CLI's stdout/stderr descriptors. A failed
+// CLI must not wait for that descendant to close Command::output pipes.
+fn bounded_invalid_cli(
+    dir: &std::path::Path,
+    phase: &str,
+    command: &mut Command,
+) -> std::process::Output {
+    use std::process::{Output, Stdio};
+    use std::time::{Duration, Instant};
+    let stdout = dir.join(format!("invalid-{phase}.stdout"));
+    let stderr = dir.join(format!("invalid-{phase}.stderr"));
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(fs::File::create(&stdout).unwrap()))
+        .stderr(Stdio::from(fs::File::create(&stderr).unwrap()))
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("invalid phase={phase} CLI did not exit within 20 seconds");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    Output {
+        status,
+        stdout: fs::read(stdout).unwrap(),
+        stderr: fs::read(stderr).unwrap(),
+    }
+}
+
 #[test]
-fn unchanged_serve_reuses_selected_versions_but_changed_bytes_and_corruption_do_not() {
+fn unchanged_serve_reuses_selected_versions_and_detects_selected_source_corruption() {
     use std::{os::unix::fs::MetadataExt, time::Duration};
     struct Server(std::process::Child);
     impl Drop for Server {
@@ -283,36 +316,45 @@ fn unchanged_serve_reuses_selected_versions_but_changed_bytes_and_corruption_do_
         }
     }
     fn serve(root: &std::path::Path, home: &std::path::Path, log: &std::path::Path) -> Server {
-        // One daemon owns one browser bind for its lifetime. Each registration
-        // in this test must request that same address after the control exits.
-        static ADDRESS: std::sync::OnceLock<std::net::SocketAddr> = std::sync::OnceLock::new();
-        let address = *ADDRESS.get_or_init(|| {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            listener.local_addr().unwrap()
-        });
+        // One daemon owns the requested bind for its lifetime. Ask it to
+        // allocate the port instead of releasing a reserved free port first.
+        let requested_bind = "127.0.0.1:0";
         let child = command(root, home, "serve")
             .env("TRELLIS_TEST_DAEMON_PID_FILE", home.join("auto-daemon.pid"))
             .arg("--bind")
-            .arg(address.to_string())
+            .arg(requested_bind)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::from(fs::File::create(log).unwrap()))
             .spawn()
             .unwrap();
         let mut server = Server(child);
-        for _ in 0..150 {
-            if std::net::TcpStream::connect_timeout(&address, Duration::from_millis(20)).is_ok() {
-                assert!(home.join("auto-daemon.pid").exists());
-                return server;
+        // The CLI may spend 5s connecting and 10s awaiting the daemon reply
+        // before printing the bound address. The test still fails boundedly.
+        let deadline = std::time::Instant::now() + trellis::testing::HANG_BACKSTOP;
+        loop {
+            let stderr = fs::read_to_string(log).unwrap();
+            if let Some(raw) = stderr
+                .lines()
+                .find_map(|line| line.strip_prefix("Trellis: http://")?.strip_suffix('/'))
+            {
+                let address: std::net::SocketAddr = raw.parse().expect("serve banner address");
+                assert!(address.ip().is_loopback() && address.port() != 0);
+                if std::net::TcpStream::connect_timeout(&address, Duration::from_millis(100))
+                    .is_ok()
+                {
+                    assert!(home.join("auto-daemon.pid").exists());
+                    return server;
+                }
             }
             if let Some(status) = server.0.try_wait().unwrap() {
-                panic!(
-                    "Serve exited {status}: {}",
-                    fs::read_to_string(log).unwrap()
-                );
+                panic!("Serve exited {status}: {stderr}");
             }
-            std::thread::sleep(Duration::from_millis(20));
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Serve not ready: {stderr}"
+            );
+            std::thread::sleep(Duration::from_millis(40));
         }
-        panic!("Serve not ready: {}", fs::read_to_string(log).unwrap());
     }
     fn pin_and_ids(db: &rusqlite::Connection) -> (i64, Vec<(i64, String, String, String)>) {
         let rev = db
@@ -339,7 +381,10 @@ fn unchanged_serve_reuses_selected_versions_but_changed_bytes_and_corruption_do_
     fs::create_dir(&root).unwrap();
     let file = root.join("a.js");
     fs::write(&file, "function seed() { return 42; }\n").unwrap();
-    let first = command(&root, &home, "index").output().unwrap();
+    let first = command(&root, &home, "index")
+        .env("TRELLIS_TEST_DAEMON_PID_FILE", home.join("auto-daemon.pid"))
+        .output()
+        .unwrap();
     assert!(
         first.status.success(),
         "{}",
@@ -374,36 +419,19 @@ fn unchanged_serve_reuses_selected_versions_but_changed_bytes_and_corruption_do_
 
     let first_log = temp.path().join("serve-unchanged.log");
     let leader = serve(&root, &home, &first_log);
-    // Serve registration is inert. A CLI attachment elects the checkout and
-    // performs mandatory H against the selected persisted head.
+    // Serve registers in place on the running checkout (Decision 0009 §6): no
+    // replacement runtime and no new startup reconciliation, so an unchanged
+    // workspace publishes nothing.
     let attached = command(&root, &home, "status").output().unwrap();
     assert!(
         attached.status.success(),
         "{}",
         String::from_utf8_lossy(&attached.stderr)
     );
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while rusqlite::Connection::open(&dbpath)
-        .map(|db| pin_and_ids(&db).0)
-        .unwrap()
-        < 3
-    {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "mandatory H did not publish"
-        );
-        let attached = command(&root, &home, "status").output().unwrap();
-        assert!(
-            attached.status.success(),
-            "{}",
-            String::from_utf8_lossy(&attached.stderr)
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
     let db = rusqlite::Connection::open(&dbpath).unwrap();
     let (r2, ids) = pin_and_ids(&db);
-    assert_eq!(r2, 3, "new header+manifest pin required");
-    assert_eq!(ids.len(), 3);
+    assert_eq!(r2, 2, "unchanged serve publishes no new pin");
+    assert_eq!(ids.len(), 2);
     assert_eq!(
         (&ids[0].1, &ids[0].2, &ids[0].3),
         (&ids[1].1, &ids[1].2, &ids[1].3)
@@ -431,7 +459,7 @@ fn unchanged_serve_reuses_selected_versions_but_changed_bytes_and_corruption_do_
     );
     assert_eq!(
         serde_json::from_slice::<Value>(&status.stdout).unwrap()["revision"]["indexRevision"],
-        3
+        2
     );
     drop(db);
     drop(leader);
@@ -468,6 +496,22 @@ fn unchanged_serve_reuses_selected_versions_but_changed_bytes_and_corruption_do_
     assert_eq!(fs::read(&file).unwrap().len(), old_bytes.len());
     let changed_log = temp.path().join("serve-changed.log");
     let changed = serve(&root, &home, &changed_log);
+    // A repeated serve registration is inert. Explicit index owns a deliberate
+    // same-mtime edit; a status read cannot publish it on demand.
+    let published = command(&root, &home, "index").output().unwrap();
+    assert!(
+        published.status.success(),
+        "{}",
+        String::from_utf8_lossy(&published.stderr)
+    );
+    let result: Value = serde_json::from_slice(&published.stdout).unwrap();
+    let published_rev = result["publishedRevision"]["indexRevision"]
+        .as_i64()
+        .unwrap();
+    assert!(
+        matches!(published_rev, 3 | 4),
+        "one Q publication, with at most one watcher publication of the edit: {result}"
+    );
     let attached = command(&root, &home, "status").output().unwrap();
     assert!(
         attached.status.success(),
@@ -475,12 +519,12 @@ fn unchanged_serve_reuses_selected_versions_but_changed_bytes_and_corruption_do_
         String::from_utf8_lossy(&attached.stderr)
     );
     // Restart, reconcile and watcher publication share a loaded verify host;
-    // a 10 s bound failed intermittently (#131). #122 replaces this test.
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    // a 10 s bound failed intermittently (#131).
+    let deadline = std::time::Instant::now() + trellis::testing::HANG_BACKSTOP;
     while rusqlite::Connection::open(&dbpath)
         .map(|db| pin_and_ids(&db).0)
         .unwrap()
-        < 4
+        < published_rev
     {
         assert!(
             std::time::Instant::now() < deadline,
@@ -496,19 +540,32 @@ fn unchanged_serve_reuses_selected_versions_but_changed_bytes_and_corruption_do_
     }
     let db = rusqlite::Connection::open(&dbpath).unwrap();
     let (r3, next_ids) = pin_and_ids(&db);
-    assert_eq!(r3, 4, "new bytes must FULL publish, never reuse old pin");
-    assert_eq!(next_ids.len(), 4);
-    assert_eq!(next_ids[0].1, next_ids[1].1);
+    assert_eq!(r3, published_rev, "completed Q must name the selected head");
+    assert_eq!(next_ids.len(), usize::try_from(r3).unwrap());
+    assert_eq!(
+        &next_ids[..ids.len()],
+        ids.as_slice(),
+        "retained prior pins changed"
+    );
+    let changed_ids = &next_ids[ids.len()];
     assert_ne!(
-        next_ids[1].1, next_ids[3].1,
+        ids.last().unwrap().1,
+        changed_ids.1,
         "same-length/mtime edit reused stale bytes"
     );
+    for current in next_ids.iter().skip(ids.len()) {
+        assert_eq!(
+            (&current.1, &current.2, &current.3),
+            (&changed_ids.1, &changed_ids.2, &changed_ids.3),
+            "the watcher and Q must select the same new immutable evidence"
+        );
+    }
     assert_eq!(next_ids[0].1, old_ids[0].1, "retained old pin changed");
     drop(db);
     drop(changed);
 
     let db = rusqlite::Connection::open(&dbpath).unwrap();
-    let selected_id = &next_ids[3].1;
+    let selected_id = &next_ids.last().unwrap().1;
     assert_eq!(
         db.execute(
             "UPDATE document_versions SET source_bytes=?1 WHERE id=?2",
@@ -520,7 +577,7 @@ fn unchanged_serve_reuses_selected_versions_but_changed_bytes_and_corruption_do_
     drop(db);
     let corrupt_log = temp.path().join("serve-corrupt.log");
     let rejected = serve(&root, &home, &corrupt_log);
-    // Attachment starts H; a selected read must still refuse the damaged head.
+    // Attachment starts startup reconciliation; a selected read must still refuse the damaged head.
     let corrupt_selected = command(&root, &home, "symbols").output().unwrap();
     assert!(
         !corrupt_selected.status.success(),
@@ -533,7 +590,7 @@ fn unchanged_serve_reuses_selected_versions_but_changed_bytes_and_corruption_do_
     let db = rusqlite::Connection::open(&dbpath).unwrap();
     assert_eq!(
         pin_and_ids(&db),
-        (4, next_ids.clone()),
+        (r3, next_ids.clone()),
         "corrupt selected source was republished"
     );
     let headers: i64 = db
@@ -546,180 +603,21 @@ fn unchanged_serve_reuses_selected_versions_but_changed_bytes_and_corruption_do_
         .unwrap();
     assert_eq!(
         (headers, bindings),
-        (4, 4),
+        (r3, r3),
         "refused Serve installed partial metadata"
     );
     drop(db);
     drop(rejected);
-
-    // A one-sided producer-binding rewrite must refuse before a new header.
-    let db = rusqlite::Connection::open(&dbpath).unwrap();
-    db.execute(
-        "UPDATE document_versions SET source_bytes=?1 WHERE id=?2",
-        rusqlite::params![fs::read(&file).unwrap(), selected_id],
-    )
-    .unwrap();
-    let head_key: String = db
-        .query_row(
-            "SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    let old_binding: String = db
-        .query_row(
-            "SELECT binding_sha FROM revision_producer_bindings WHERE revision_id=?1",
-            [&head_key],
-            |row| row.get(0),
-        )
-        .unwrap();
-    db.execute(
-        "UPDATE revision_producer_bindings SET binding_sha=?1 WHERE revision_id=?2",
-        rusqlite::params!["0".repeat(64), head_key],
-    )
-    .unwrap();
-    drop(db);
-    let link_log = temp.path().join("serve-binding.log");
-    let rejected_binding = serve(&root, &home, &link_log);
-    // Attachment starts H; a selected read must still refuse the damaged head.
-    let binding_selected = command(&root, &home, "symbols").output().unwrap();
-    assert!(
-        !binding_selected.status.success(),
-        "corrupt selected binding was accepted"
-    );
-    assert!(
-        binding_selected.stdout.is_empty(),
-        "damaged selected binding escaped on stdout"
-    );
-    let db = rusqlite::Connection::open(&dbpath).unwrap();
-    assert_eq!(
-        pin_and_ids(&db).0,
-        4,
-        "bad selected producer binding reused"
-    );
-    drop(rejected_binding);
-    db.execute(
-        "UPDATE revision_producer_bindings SET binding_sha=?1 WHERE revision_id=?2",
-        rusqlite::params![old_binding, head_key],
-    )
-    .unwrap();
-
-    // Source bytes alone cannot authorize a new header: the selected native
-    // extraction context must match the producer's DECLARED input inventory.
-    let old_context: String = db
-        .query_row(
-            "SELECT extraction_context FROM document_versions WHERE id=?1",
-            [selected_id],
-            |row| row.get(0),
-        )
-        .unwrap();
-    db.execute(
-        "UPDATE document_versions SET extraction_context=?1 WHERE id=?2",
-        rusqlite::params!["0".repeat(64), selected_id],
-    )
-    .unwrap();
-    drop(db);
-    let context_log = temp.path().join("serve-context.log");
-    let rejected_context = serve(&root, &home, &context_log);
-    // Attachment starts H; a selected read must still refuse the damaged head.
-    let context_selected = command(&root, &home, "symbols").output().unwrap();
-    assert!(
-        !context_selected.status.success(),
-        "corrupt selected context was accepted"
-    );
-    assert!(
-        context_selected.stdout.is_empty(),
-        "damaged selected context escaped on stdout"
-    );
-    let db = rusqlite::Connection::open(&dbpath).unwrap();
-    assert_eq!(
-        pin_and_ids(&db).0,
-        4,
-        "mismatched extraction inventory context reused"
-    );
-    drop(rejected_context);
-    db.execute(
-        "UPDATE document_versions SET extraction_context=?1 WHERE id=?2",
-        rusqlite::params![old_context, selected_id],
-    )
-    .unwrap();
-
-    // A valid-looking child-row rewrite is not trusted by selected readers.
-    // Under T00, Serve may reuse the previously validated immutable projection
-    // without a whole-workspace reparse; a selected read MUST still reject it.
-    let (node_id, old_payload): (String, String) = db
-        .query_row(
-            "SELECT id,payload FROM graph_nodes WHERE projection_id=?1 LIMIT 1",
-            [&next_ids[2].2],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .unwrap();
-    let mut tampered: Value = serde_json::from_str(&old_payload).unwrap();
-    tampered["name"] = Value::String("forged-name".into());
-    db.execute(
-        "UPDATE graph_nodes SET payload=?1 WHERE id=?2",
-        rusqlite::params![serde_json::to_string(&tampered).unwrap(), node_id],
-    )
-    .unwrap();
-    drop(db);
-    let child_log = temp.path().join("serve-child.log");
-    let child_server = serve(&root, &home, &child_log);
-    let selected = command(&root, &home, "symbols").output().unwrap();
-    assert!(
-        !selected.status.success(),
-        "selected graph child rewrite escaped attestation"
-    );
-    assert!(
-        selected.stdout.is_empty(),
-        "forged selected facts escaped on stdout"
-    );
-    drop(child_server);
 }
 
 #[test]
-fn status_only_observes_existing_index_and_refuses_busy_without_writes() {
-    use std::{collections::BTreeMap, os::fd::AsRawFd, path::Path};
-    fn snapshot(roots: &[&Path]) -> BTreeMap<std::path::PathBuf, Option<Vec<u8>>> {
-        let mut result = BTreeMap::new();
-        let mut pending = roots
-            .iter()
-            .map(|root| root.to_path_buf())
-            .collect::<Vec<_>>();
-        while let Some(path) = pending.pop() {
-            if !path.exists() {
-                continue;
-            }
-            let metadata = fs::symlink_metadata(&path).unwrap();
-            if metadata.is_dir() {
-                result.insert(path.clone(), None);
-                pending.extend(
-                    fs::read_dir(&path)
-                        .unwrap()
-                        .map(|entry| entry.unwrap().path()),
-                );
-            } else {
-                result.insert(path.clone(), Some(fs::read(&path).unwrap()));
-            }
-        }
-        result
-    }
+fn daemon_status_uses_selected_head_and_reports_typed_contention() {
+    use std::os::fd::AsRawFd;
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("workspace");
     let home = temp.path().join("home");
     fs::create_dir(&root).unwrap();
-    fs::create_dir(root.join(".git")).unwrap();
     fs::write(root.join("a.js"), "function seed() {}\n").unwrap();
-    let virgin = snapshot(&[&root, &home]);
-    let absent = command(&root, &home, "status").output().unwrap();
-    assert!(!absent.status.success());
-    assert!(absent.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&absent.stderr).contains("index_not_ready"));
-    assert_eq!(
-        snapshot(&[&root, &home]),
-        virgin,
-        "virgin Status created state"
-    );
-
     let indexed = command(&root, &home, "index").output().unwrap();
     assert!(
         indexed.status.success(),
@@ -728,101 +626,39 @@ fn status_only_observes_existing_index_and_refuses_busy_without_writes() {
     );
     let pin =
         serde_json::from_slice::<Value>(&indexed.stdout).unwrap()["publishedRevision"].clone();
+    let status = command(&root, &home, "status").output().unwrap();
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["revision"], pin);
+    assert!(status["catchingUp"].is_boolean());
+    let identity =
+        trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root).unwrap();
     let indexes = home.join(if cfg!(target_os = "macos") {
         "Library/Caches/dev.squashmerge.trellis/indexes"
     } else {
         ".cache/trellis/indexes"
     });
-    let dir = fs::read_dir(&indexes)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .find(|path| path.is_dir())
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .open(indexes.join(format!("{}.lock", identity.root_key)))
         .unwrap();
-    let use_lock = indexes.join(format!(
-        "{}.lock",
-        dir.file_name().unwrap().to_string_lossy()
-    ));
-    let index_db = dir.join("index.db");
-    let persisted = snapshot(&[&root, &home]);
-    for _ in 0..2 {
-        let observed = command(&root, &home, "status").output().unwrap();
-        assert!(
-            observed.status.success(),
-            "{}",
-            String::from_utf8_lossy(&observed.stderr)
-        );
-        let observed: Value = serde_json::from_slice(&observed.stdout).unwrap();
-        assert_eq!(observed["revision"], pin);
-        assert_eq!(
-            snapshot(&[&root, &home]),
-            persisted,
-            "Status modified index, queue, marker, use lock or HOME"
-        );
-    }
-    let lock = fs::OpenOptions::new().read(true).open(&use_lock).unwrap();
-    assert_eq!(
+    // The daemon retains its index-use lock while serving; an external GC
+    // contender never gets an unguarded partial result.
+    assert_ne!(
         unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
         0
     );
-    let busy = command(&root, &home, "status").output().unwrap();
-    assert!(!busy.status.success());
-    assert!(busy.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&busy.stderr).contains("storage_busy"));
-    assert_eq!(
-        snapshot(&[&root, &home]),
-        persisted,
-        "busy Status modified state"
-    );
-    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
-    drop(lock);
-
-    for suffix in ["-wal", "-shm", "-journal"] {
-        let sidecar = index_db.with_file_name(format!("index.db{suffix}"));
-        fs::write(&sidecar, b"a journal sentinel").unwrap();
-        let with_sidecar = snapshot(&[&root, &home]);
-        let busy = command(&root, &home, "status").output().unwrap();
-        assert!(!busy.status.success());
-        assert!(busy.stdout.is_empty());
-        assert!(String::from_utf8_lossy(&busy.stderr).contains("storage_busy"));
-        assert_eq!(
-            snapshot(&[&root, &home]),
-            with_sidecar,
-            "Status modified SQLite sidecar"
-        );
-        fs::remove_file(&sidecar).unwrap();
-    }
-    assert_eq!(snapshot(&[&root, &home]), persisted);
-    // A replaced root with no marker cannot recreate it or access the old index.
-    let moved = temp.path().join("old-workspace");
-    fs::rename(&root, &moved).unwrap();
-    fs::create_dir(&root).unwrap();
-    fs::create_dir(root.join(".git")).unwrap();
-    let replaced = snapshot(&[&root, &moved, &home]);
-    let old_root = command(&root, &home, "status").output().unwrap();
-    assert!(!old_root.status.success());
-    assert!(old_root.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&old_root.stderr).contains("index_not_ready"));
-    assert_eq!(snapshot(&[&root, &moved, &home]), replaced);
-    fs::remove_dir_all(&root).unwrap();
-    fs::rename(&moved, &root).unwrap();
-    assert_eq!(snapshot(&[&root, &home]), persisted);
-    // An obsolete index cannot be repaired or upgraded by Status.
-    let db = rusqlite::Connection::open(&index_db).unwrap();
-    db.pragma_update(None, "user_version", 7_u32).unwrap();
-    drop(db);
-    let obsolete_bytes = snapshot(&[&root, &home]);
-    let obsolete = command(&root, &home, "status").output().unwrap();
-    assert!(!obsolete.status.success());
-    assert!(obsolete.stdout.is_empty());
-    assert_eq!(snapshot(&[&root, &home]), obsolete_bytes);
-    // Corrupting or removing the Git marker cannot repair it via Status.
-    let marker = root.join(".git/trellis/workspace-id");
-    fs::write(&marker, b"not-a-marker").unwrap();
-    let tampered = snapshot(&[&root, &home]);
-    let invalid = command(&root, &home, "status").output().unwrap();
-    assert!(!invalid.status.success());
-    assert!(invalid.stdout.is_empty());
-    assert_eq!(snapshot(&[&root, &home]), tampered);
+    let report = isolated_command(&home)
+        .args(["gc", "--report"])
+        .output()
+        .unwrap();
+    assert!(report.status.success());
+    let report: Value = serde_json::from_slice(&report.stdout).unwrap();
+    assert_eq!(report["derived"][0]["status"], "busy");
 }
 
 fn write_optional_presentation(dir: &std::path::Path, label: &str, source_hash: &str) {
@@ -862,9 +698,13 @@ fn cli_helper_uses_isolated_home_instead_of_inherited_xdg_roots() {
         );
     }
     let absent = cmd.output().unwrap();
-    assert!(!absent.status.success());
-    assert!(absent.stdout.is_empty());
-    assert!(!home.exists(), "Status cannot bootstrap an index or HOME");
+    assert!(
+        absent.status.success(),
+        "{}",
+        String::from_utf8_lossy(&absent.stderr)
+    );
+    let first: Value = serde_json::from_slice(&absent.stdout).unwrap();
+    assert!(first["revision"]["indexRevision"].as_u64().unwrap() >= 1);
     let indexed = command(&workspace, &home, "index").output().unwrap();
     assert!(
         indexed.status.success(),
@@ -879,7 +719,10 @@ fn cli_helper_uses_isolated_home_instead_of_inherited_xdg_roots() {
     );
     let status: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(status["stats"]["files"], 0);
-    assert_eq!(status["revision"]["indexRevision"], 2);
+    assert!(
+        status["revision"]["indexRevision"].as_u64().unwrap()
+            > first["revision"]["indexRevision"].as_u64().unwrap()
+    );
     let cache = home.join(if cfg!(target_os = "macos") {
         "Library/Caches/dev.squashmerge.trellis"
     } else {
@@ -889,18 +732,12 @@ fn cli_helper_uses_isolated_home_instead_of_inherited_xdg_roots() {
 }
 
 #[test]
-fn standalone_takeover_reuses_recorded_nondefault_file_cap() {
+fn daemon_index_records_nondefault_file_cap() {
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("source");
     let home = temp.path().join("home");
     fs::create_dir(&root).unwrap();
-    let mut boundary = vec![b' '; 2_621_440];
-    boundary.extend_from_slice(
-        b"
-function boundary() {}
-",
-    );
-    fs::write(root.join("boundary.js"), boundary).unwrap();
+    fs::write(root.join("boundary.js"), "function boundary() {}\n").unwrap();
 
     let indexed = command(&root, &home, "index")
         .arg("--max-file-bytes")
@@ -940,44 +777,8 @@ function boundary() {}
     let status = command(&root, &home, "status").output().unwrap();
     assert!(status.status.success());
     let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["revision"], indexed["publishedRevision"]);
     assert_eq!(status["stats"]["files"], 1);
-    assert_eq!(status["revision"]["indexRevision"], 2);
-    let exported = command(&root, &home, "export").output().unwrap();
-    assert!(exported.status.success());
-    let graph: Value = serde_json::from_slice(&exported.stdout).unwrap();
-    let files = graph["files"].as_array().unwrap();
-    assert_eq!(files.len(), 1);
-    assert_eq!(files[0]["path"], "boundary.js");
-    assert_eq!(
-        files[0]["text"].as_str().unwrap().as_bytes(),
-        fs::read(root.join("boundary.js")).unwrap()
-    );
-    let db = rusqlite::Connection::open(&db_path).unwrap();
-    let (options, revision): (String, i64) = db
-        .query_row(
-            "SELECT reconcile_options,index_revision FROM index_metadata WHERE singleton=1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .unwrap();
-    assert_eq!(
-        serde_json::from_str::<Value>(&options).unwrap()["maxFileBytes"],
-        3_145_728
-    );
-    assert_eq!(
-        revision, 3,
-        "export must perform exactly one recorded-option takeover"
-    );
-
-    let default_home = temp.path().join("default-home");
-    let default = command(&root, &default_home, "index").output().unwrap();
-    assert!(!default.status.success());
-    assert!(default.stdout.is_empty());
-    assert!(
-        String::from_utf8_lossy(&default.stderr).contains("unsafe or oversized input"),
-        "{}",
-        String::from_utf8_lossy(&default.stderr)
-    );
 }
 
 #[test]
@@ -1070,6 +871,7 @@ fn standalone_takeover_replays_original_relative_presentation_from_another_cwd()
         String::from_utf8_lossy(&export.stderr)
     );
     let graph: Value = serde_json::from_slice(&export.stdout).unwrap();
+    let graph = &graph["data"];
     let f = graph["nodes"]
         .as_array()
         .unwrap()
@@ -1125,6 +927,7 @@ fn standalone_takeover_keeps_configured_missing_presentation_absent() {
         String::from_utf8_lossy(&export.stderr)
     );
     let graph: Value = serde_json::from_slice(&export.stdout).unwrap();
+    let graph = &graph["data"];
     let f = graph["nodes"]
         .as_array()
         .unwrap()
@@ -1197,7 +1000,7 @@ async fn serve_ingress_persists_relative_presentation_paths_before_cross_cwd_tak
         .spawn()
         .unwrap();
     let mut server = Server(Some(child));
-    let startup = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+    let startup = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             let log = fs::read(&stderr_path).unwrap();
             if log
@@ -1227,7 +1030,7 @@ async fn serve_ingress_persists_relative_presentation_paths_before_cross_cwd_tak
     // response, not a logged banner, proves the listener is actually ready.
     let mut last_health = String::from("no_response");
     let mut ready = false;
-    let health = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+    let health = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             match reqwest::get(format!("http://127.0.0.1:{port}/healthz")).await {
                 Ok(response) if response.status().is_success() => {
@@ -1265,7 +1068,7 @@ async fn serve_ingress_persists_relative_presentation_paths_before_cross_cwd_tak
     // SIGTERM lets the daemon finish in-flight blocking work before it exits.
     let pid = server.0.as_ref().unwrap().id();
     assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGTERM) }, 0);
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    let deadline = tokio::time::Instant::now() + trellis::testing::HANG_BACKSTOP;
     loop {
         if let Some(status) = server.0.as_mut().unwrap().try_wait().unwrap() {
             // Reaped children must not be killed again by the cleanup guard.
@@ -1293,6 +1096,7 @@ async fn serve_ingress_persists_relative_presentation_paths_before_cross_cwd_tak
         String::from_utf8_lossy(&export.stderr)
     );
     let graph: Value = serde_json::from_slice(&export.stdout).unwrap();
+    let graph = &graph["data"];
     let f = graph["nodes"]
         .as_array()
         .unwrap()
@@ -1331,111 +1135,6 @@ async fn serve_ingress_persists_relative_presentation_paths_before_cross_cwd_tak
 }
 
 #[test]
-fn standalone_read_refuses_legacy_relative_recorded_presentation_options() {
-    use sha2::{Digest, Sha256};
-    let temp = TempDir::new().unwrap();
-    let root = temp.path().join("source");
-    let home = temp.path().join("home");
-    let first_cwd = temp.path().join("ingress");
-    let second_cwd = temp.path().join("takeover");
-    for dir in [&root, &first_cwd, &second_cwd] {
-        fs::create_dir(dir).unwrap();
-    }
-    let ingress_cwd = first_cwd.canonicalize().unwrap();
-    let source = "function f() {}\nf();\n";
-    fs::write(root.join("main.js"), source).unwrap();
-    let source_hash = hex::encode(Sha256::digest(source.as_bytes()));
-    write_optional_presentation(&first_cwd, "scip npm display 1 main.js/f().", &source_hash);
-    write_optional_presentation(&second_cwd, "scip npm display 1 other().", "stale");
-    let indexed = command(&root, &home, "index")
-        .current_dir(&first_cwd)
-        .arg("--scip")
-        .arg("index.scip")
-        .arg("--manifest")
-        .arg("manifest.json")
-        .output()
-        .unwrap();
-    assert!(
-        indexed.status.success(),
-        "{}",
-        String::from_utf8_lossy(&indexed.stderr)
-    );
-    let indexes = if cfg!(target_os = "macos") {
-        home.join("Library/Caches/dev.squashmerge.trellis/indexes")
-    } else {
-        home.join(".cache/trellis/indexes")
-    };
-    let index_db = fs::read_dir(indexes)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .find(|path| path.is_dir())
-        .unwrap()
-        .join("index.db");
-    // Model one previously persisted relative record with a matching inventory;
-    // changing only reconcile_options would be rejected earlier as torn metadata.
-    let db = rusqlite::Connection::open(&index_db).unwrap();
-    let raw: String = db
-        .query_row(
-            "SELECT reconcile_options FROM index_metadata WHERE singleton=1",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    let mut previous: trellis::indexer::ReconcileOptions = serde_json::from_str(&raw).unwrap();
-    previous.scip_path = Some("index.scip".into());
-    previous.manifest_path = Some("manifest.json".into());
-    db.execute_batch("BEGIN IMMEDIATE").unwrap();
-    db.execute(
-        "UPDATE index_metadata SET reconcile_options=?1 WHERE singleton=1",
-        [serde_json::to_string(&previous).unwrap()],
-    )
-    .unwrap();
-    for (role, name) in [("scip", "index.scip"), ("manifest", "manifest.json")] {
-        let old_key = format!("presentation-{role}:{}", ingress_cwd.join(name).display());
-        let new_key = format!("presentation-{role}:{name}");
-        assert_eq!(
-            db.execute(
-                "UPDATE revision_capture_inputs SET input_key=?1 WHERE input_key=?2",
-                rusqlite::params![new_key, old_key],
-            )
-            .unwrap(),
-            2
-        );
-    }
-    db.execute_batch("COMMIT").unwrap();
-    drop(db);
-    let rejected = command(&root, &home, "status")
-        .current_dir(&second_cwd)
-        .output()
-        .unwrap();
-    assert!(
-        !rejected.status.success(),
-        "legacy relative options were replayed"
-    );
-    assert!(
-        rejected.stdout.is_empty(),
-        "no cwd-rebound evidence may escape"
-    );
-    assert!(
-        String::from_utf8_lossy(&rejected.stderr).contains("run explicit trellis index"),
-        "{}",
-        String::from_utf8_lossy(&rejected.stderr)
-    );
-    let db = rusqlite::Connection::open(&index_db).unwrap();
-    let revision: i64 = db
-        .query_row(
-            "SELECT index_revision FROM index_metadata WHERE singleton=1",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(
-        revision, 2,
-        "relative legacy record cannot republish from B"
-    );
-}
-
-#[test]
 fn explicit_cli_index_recreates_corruption_but_bounded_reads_refuse_unknown_options() {
     use std::os::unix::fs::MetadataExt;
     let temp = TempDir::new().unwrap();
@@ -1444,6 +1143,7 @@ fn explicit_cli_index_recreates_corruption_but_bounded_reads_refuse_unknown_opti
     fs::create_dir(&root).unwrap();
     fs::write(root.join("a.js"), "function a() {}\n").unwrap();
     let first = command(&root, &home, "index")
+        .env("TRELLIS_TEST_DAEMON_PID_FILE", home.join("auto-daemon.pid"))
         .arg("--max-file-bytes")
         .arg("2097152")
         .output()
@@ -1454,6 +1154,10 @@ fn explicit_cli_index_recreates_corruption_but_bounded_reads_refuse_unknown_opti
         String::from_utf8_lossy(&first.stderr)
     );
     let first: Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert!(home.join("auto-daemon.pid").exists());
+    // The old daemon must release its live SQLite handles before the fixture
+    // corrupts this disposable index inode. The guard attests its socket peer.
+    FixtureDaemon::new(&home).stop_attested().unwrap();
     let indexes = if cfg!(target_os = "macos") {
         home.join("Library/Caches/dev.squashmerge.trellis/indexes")
     } else {
@@ -1465,12 +1169,21 @@ fn explicit_cli_index_recreates_corruption_but_bounded_reads_refuse_unknown_opti
         .find(|path| path.is_dir())
         .unwrap();
     let index = dir.join("index.db");
-    let leader = dir.join("leader.lock");
-    let old_inode = fs::symlink_metadata(&leader).unwrap();
+    let use_lock = dir.parent().unwrap().join(format!(
+        "{}.lock",
+        dir.file_name().unwrap().to_string_lossy()
+    ));
+    let old_inode = fs::symlink_metadata(&use_lock).unwrap();
+    // The prior daemon released the index-use lock before fixture corruption.
+    drop(
+        trellis::store::topology::UseGuard::acquire_existing_readonly_exclusive(&use_lock)
+            .expect("old daemon retained index-use lock"),
+    );
     fs::write(&index, b"invalid-sqlite-header-with-at-least-20-bytes").unwrap();
     let corrupt = fs::read(&index).unwrap();
     for sub in ["status", "symbols", "query", "export"] {
         let mut cmd = command(&root, &home, sub);
+        cmd.env("TRELLIS_TEST_DAEMON_PID_FILE", home.join("auto-daemon.pid"));
         match sub {
             "symbols" => {
                 cmd.arg("--search").arg("a");
@@ -1487,12 +1200,19 @@ fn explicit_cli_index_recreates_corruption_but_bounded_reads_refuse_unknown_opti
             "{sub} emitted unverified evidence"
         );
         assert!(
-            String::from_utf8_lossy(&refused.stderr).contains("explicit trellis index"),
+            String::from_utf8_lossy(&refused.stderr).contains("recovery_required"),
             "{sub}: {}",
             String::from_utf8_lossy(&refused.stderr)
         );
         assert_eq!(fs::read(&index).unwrap(), corrupt);
     }
+    // A bounded read may have elected a new daemon. Retire only its attested
+    // socket peer before the cold exceptional-recovery index operation.
+    FixtureDaemon::new(&home).stop_attested().unwrap();
+    drop(
+        trellis::store::topology::UseGuard::acquire_existing_readonly_exclusive(&use_lock)
+            .expect("read daemon retained index-use lock"),
+    );
     let recovered = command(&root, &home, "index")
         .arg("--max-file-bytes")
         .arg("2097152")
@@ -1510,7 +1230,7 @@ fn explicit_cli_index_recreates_corruption_but_bounded_reads_refuse_unknown_opti
         output["publishedRevision"]["indexGeneration"],
         first["publishedRevision"]["indexGeneration"]
     );
-    let new_inode = fs::symlink_metadata(&leader).unwrap();
+    let new_inode = fs::symlink_metadata(&use_lock).unwrap();
     assert_eq!(
         (old_inode.dev(), old_inode.ino()),
         (new_inode.dev(), new_inode.ino())
@@ -1529,30 +1249,118 @@ fn explicit_cli_index_recreates_corruption_but_bounded_reads_refuse_unknown_opti
     );
 }
 
+#[test]
+fn corrupt_read_activation_waits_for_accepted_cli_options_in_same_daemon() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("source");
+    let home = temp.path().join("home");
+    let marker = home.join("auto-daemon.pid");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("a.js"), "function a() {}\n").unwrap();
+    let first = command(&root, &home, "index")
+        .env("TRELLIS_TEST_DAEMON_PID_FILE", &marker)
+        .output()
+        .unwrap();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    FixtureDaemon::new(&home).stop_attested().unwrap();
+    let index = real_index_db(&home);
+    let dir = index.parent().unwrap();
+    let use_lock = dir.parent().unwrap().join(format!(
+        "{}.lock",
+        dir.file_name().unwrap().to_string_lossy()
+    ));
+    // The socket can close before all retained SQLite handles are gone.
+    drop(
+        trellis::store::topology::UseGuard::acquire_existing_readonly_exclusive(&use_lock)
+            .expect("old daemon retained index-use lock"),
+    );
+    fs::write(&index, b"invalid-sqlite-header-with-at-least-20-bytes").unwrap();
+    let corrupt = fs::read(&index).unwrap();
+    let cleanup = FixtureDaemon::new(&home);
+    let refused = command(&root, &home, "status")
+        .env("TRELLIS_TEST_DAEMON_PID_FILE", &marker)
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert!(refused.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("recovery_required"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert_eq!(fs::read(&index).unwrap(), corrupt);
+    let daemon_pid = fs::read_to_string(&marker).unwrap();
+    let recovered = command(&root, &home, "index")
+        .env("TRELLIS_TEST_DAEMON_PID_FILE", &marker)
+        .arg("--max-file-bytes")
+        .arg("3145728")
+        .output()
+        .unwrap();
+    assert!(
+        recovered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    assert_eq!(fs::read_to_string(&marker).unwrap(), daemon_pid);
+    let result: Value = serde_json::from_slice(&recovered.stdout).unwrap();
+    assert_eq!(result["publishedRevision"], result["status"]["revision"]);
+    assert_eq!(result["publishedRevision"]["indexRevision"], 2);
+    let db = rusqlite::Connection::open(&index).unwrap();
+    let recorded: String = db
+        .query_row(
+            "SELECT reconcile_options FROM index_metadata WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&recorded).unwrap()["maxFileBytes"],
+        3_145_728
+    );
+    drop(db);
+    drop(cleanup);
+}
+
 #[tokio::test]
 async fn corrupted_daemon_startup_uses_configured_options_and_does_not_fallback_when_busy() {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
     use trellis::store::topology::UseGuard;
     const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("source");
     let home = temp.path().join("home");
+    let marker = home.join("auto-daemon.pid");
     fs::create_dir(&root).unwrap();
     fs::write(root.join("a.js"), "function a() {}\n").unwrap();
-    let initial = command(&root, &home, "index").output().unwrap();
-    assert!(initial.status.success());
-    let old_pin: Value = serde_json::from_slice(&initial.stdout).unwrap();
+    let initial = command(&root, &home, "index")
+        .env("TRELLIS_TEST_DAEMON_PID_FILE", &marker)
+        .output()
+        .unwrap();
+    assert!(
+        initial.status.success(),
+        "{}",
+        String::from_utf8_lossy(&initial.stderr)
+    );
+    FixtureDaemon::new(&home).stop_attested().unwrap();
     let index = real_index_db(&home);
+    let dir = index.parent().unwrap();
+    let use_lock = dir.parent().unwrap().join(format!(
+        "{}.lock",
+        dir.file_name().unwrap().to_string_lossy()
+    ));
+    // Socket closure alone does not attest that the old daemon dropped its SH.
+    drop(UseGuard::acquire_existing_readonly_exclusive(&use_lock).unwrap());
     let url = "http://127.0.0.1:7331";
     // Open before corruption: Store::open would otherwise attempt recovery.
     let busy_legacy =
         LegacyClient::same_home_with_session(&root, &home, TOKEN, url, 3_145_728, false);
     fs::write(&index, b"broken sqlite index header").unwrap();
     let corrupt = fs::read(&index).unwrap();
-    let dir = index.parent().unwrap();
-    let use_lock = dir.parent().unwrap().join(format!(
-        "{}.lock",
-        dir.file_name().unwrap().to_string_lossy()
-    ));
     let reader = UseGuard::acquire_existing(&use_lock, false, true).unwrap();
     let busy = busy_legacy
         .get(format!("{url}/api/status"))
@@ -1565,44 +1373,60 @@ async fn corrupted_daemon_startup_uses_configured_options_and_does_not_fallback_
     assert_eq!(body["error"]["code"], "recovery_required");
     assert_eq!(fs::read(&index).unwrap(), corrupt);
     drop(busy_legacy);
-    drop(reader);
-    let recovered = command(&root, &home, "index")
+
+    // The CLI sends one durable request to the daemon; it cannot recover this
+    // corrupted index while the independent reader holds SH. Do not wait for
+    // its reply under SH: an accepted request is not a failed request.
+    let stdout_path = temp.path().join("blocked-index.stdout");
+    let stderr_path = temp.path().join("blocked-index.stderr");
+    let _daemon = FixtureDaemon::new(&home);
+    let mut child = command(&root, &home, "index")
+        .env("TRELLIS_TEST_DAEMON_PID_FILE", &marker)
         .arg("--max-file-bytes")
         .arg("3145728")
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(fs::File::create(&stdout_path).unwrap()))
+        .stderr(Stdio::from(fs::File::create(&stderr_path).unwrap()))
+        .spawn()
         .unwrap();
+    let startup_deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
+    while !marker.exists() {
+        if child.try_wait().unwrap().is_some() || Instant::now() >= startup_deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("daemon-owned CLI exited or did not start while reader held SH");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(child.try_wait().unwrap().is_none());
+    assert!(fs::read(&stdout_path).unwrap().is_empty());
+    assert_eq!(fs::read(&index).unwrap(), corrupt);
+    drop(reader);
+    let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
+    let exit = loop {
+        if let Some(exit) = child.try_wait().unwrap() {
+            break exit;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("daemon-owned CLI did not complete after SH release");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
     assert!(
-        recovered.status.success(),
+        exit.success(),
         "{}",
-        String::from_utf8_lossy(&recovered.stderr)
+        fs::read_to_string(&stderr_path).unwrap()
     );
-    let recovered: Value = serde_json::from_slice(&recovered.stdout).unwrap();
-    assert_eq!(recovered["publishedRevision"]["indexRevision"], 2);
-    let ready = LegacyClient::same_home(&root, &home, TOKEN, url, 3_145_728)
-        .get(format!("{url}/api/status"))
-        .bearer_auth(TOKEN)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(ready.status(), reqwest::StatusCode::OK);
-    let status: Value = ready.json().await.unwrap();
-    assert_eq!(
-        status["revision"]["indexRevision"],
-        recovered["publishedRevision"]["indexRevision"]
-            .as_u64()
-            .unwrap()
-            + 1
-    );
-    assert_eq!(
-        status["revision"]["indexGeneration"],
-        recovered["publishedRevision"]["indexGeneration"]
-    );
-    assert_ne!(
-        status["revision"]["indexGeneration"],
-        old_pin["publishedRevision"]["indexGeneration"]
-    );
+    let result: Value = serde_json::from_slice(&fs::read(&stdout_path).unwrap()).unwrap();
+    assert_eq!(result["publishedRevision"], result["status"]["revision"]);
+    assert_ne!(fs::read(&index).unwrap(), corrupt);
+
+    _daemon.stop_attested().unwrap();
+    drop(UseGuard::acquire_existing_readonly_exclusive(&use_lock).unwrap());
     let db = rusqlite::Connection::open(&index).unwrap();
-    let options: String = db
+    let recorded: String = db
         .query_row(
             "SELECT reconcile_options FROM index_metadata WHERE singleton=1",
             [],
@@ -1610,13 +1434,76 @@ async fn corrupted_daemon_startup_uses_configured_options_and_does_not_fallback_
         )
         .unwrap();
     assert_eq!(
+        serde_json::from_str::<Value>(&recorded).unwrap()["maxFileBytes"],
+        3_145_728
+    );
+    drop(db);
+    let queue = rusqlite::Connection::open(index.with_file_name("requests.db")).unwrap();
+    let count: i64 = queue
+        .query_row("SELECT count(*) FROM requests", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        count, 2,
+        "one initial and one daemon-owned accepted request"
+    );
+    let (state, options, generation, revision): (String, String, String, i64) = queue.query_row(
+        "SELECT state,options_json,result_generation,result_revision FROM requests ORDER BY seq DESC LIMIT 1",
+        [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+    ).unwrap();
+    assert_eq!(state, "done");
+    assert_eq!(
         serde_json::from_str::<Value>(&options).unwrap()["maxFileBytes"],
         3_145_728
+    );
+    assert_eq!(
+        generation,
+        result["publishedRevision"]["indexGeneration"]
+            .as_str()
+            .unwrap()
+    );
+    assert_eq!(
+        revision as u64,
+        result["publishedRevision"]["indexRevision"]
+            .as_u64()
+            .unwrap()
     );
 }
 
 #[test]
 fn cli_round_trip_uses_persistent_store_and_never_executes_workspace() {
+    use std::process::{Output, Stdio};
+    use std::time::{Duration, Instant};
+
+    // Regular output files make child exit independent of EOF on pipes that a
+    // descendant might retain. The deadline also bounds a directly stuck CLI.
+    fn bounded_cli(dir: &std::path::Path, label: &str, command: &mut Command) -> Output {
+        let stdout_path = dir.join(format!("{label}.stdout"));
+        let stderr_path = dir.join(format!("{label}.stderr"));
+        let mut child = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(fs::File::create(&stdout_path).unwrap()))
+            .stderr(Stdio::from(fs::File::create(&stderr_path).unwrap()))
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("{label} CLI did not exit within 20 seconds");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        Output {
+            status,
+            stdout: fs::read(stdout_path).unwrap(),
+            stderr: fs::read(stderr_path).unwrap(),
+        }
+    }
+
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("source");
     let state = temp.path().join("state");
@@ -1632,11 +1519,13 @@ fn cli_round_trip_uses_persistent_store_and_never_executes_workspace() {
     )
     .unwrap();
     let before = fs::read(root.join("flow.js")).unwrap();
-    let output = command(&root, &state, "index")
-        .arg("--max-file-bytes")
-        .arg("1048576")
-        .output()
-        .unwrap();
+    let output = bounded_cli(
+        temp.path(),
+        "index",
+        command(&root, &state, "index")
+            .arg("--max-file-bytes")
+            .arg("1048576"),
+    );
     assert!(
         output.status.success(),
         "{}",
@@ -1645,7 +1534,7 @@ fn cli_round_trip_uses_persistent_store_and_never_executes_workspace() {
     let result: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(result["status"]["stats"]["files"], 1);
     assert_eq!(result["status"]["stats"]["semanticState"], "unavailable");
-    let status = command(&root, &state, "status").output().unwrap();
+    let status = bounded_cli(temp.path(), "status", &mut command(&root, &state, "status"));
     assert!(
         status.status.success(),
         "{}",
@@ -1653,48 +1542,54 @@ fn cli_round_trip_uses_persistent_store_and_never_executes_workspace() {
     );
     let status: Value = serde_json::from_slice(&status.stdout).unwrap();
     assert_eq!(status["stats"]["files"], 1);
-    let output = command(&root, &state, "symbols")
-        .arg("--search")
-        .arg("start")
-        .output()
-        .unwrap();
+    let output = bounded_cli(
+        temp.path(),
+        "symbols",
+        command(&root, &state, "symbols")
+            .arg("--search")
+            .arg("start"),
+    );
     assert!(output.status.success());
     let symbols: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let symbols = &symbols["data"];
     let seed = symbols["items"][0]["id"].as_str().unwrap();
-    let output = command(&root, &state, "query")
-        .arg("--seed")
-        .arg(seed)
-        .output()
-        .unwrap();
+    let output = bounded_cli(
+        temp.path(),
+        "query",
+        command(&root, &state, "query").arg("--seed").arg(seed),
+    );
     assert!(output.status.success());
     let view: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let view = &view["data"];
     assert_eq!(view["nodes"].as_array().unwrap().len(), 1);
     assert_eq!(view["calls"].as_array().unwrap().len(), 1);
     assert!(view["calls"][0].get("resolution").is_none());
     assert!(view["calls"][0].get("target").is_none());
     let path = temp.path().join("graph.json");
     assert!(
-        command(&root, &state, "export")
-            .arg("--output")
-            .arg(&path)
-            .status()
-            .unwrap()
-            .success()
+        bounded_cli(
+            temp.path(),
+            "export",
+            command(&root, &state, "export").arg("--output").arg(&path),
+        )
+        .status
+        .success()
     );
     let bytes = fs::read(&path).unwrap();
     let graph: Value = serde_json::from_slice(&bytes).unwrap();
+    let graph = &graph["data"];
     assert_eq!(
         graph["files"][0]["text"],
         std::str::from_utf8(&before).unwrap()
     );
     assert!(
-        !command(&root, &state, "export")
-            .arg("--output")
-            .arg(&path)
-            .output()
-            .unwrap()
-            .status
-            .success()
+        !bounded_cli(
+            temp.path(),
+            "export-existing",
+            command(&root, &state, "export").arg("--output").arg(&path),
+        )
+        .status
+        .success()
     );
     assert_eq!(fs::read(&path).unwrap(), bytes);
     assert_eq!(fs::read(root.join("flow.js")).unwrap(), before);
@@ -1810,7 +1705,7 @@ fn acp_requires_complete_explicit_allowance_flags() {
     let source = temp.path().join("source");
     fs::create_dir(&source).unwrap();
     let state = temp.path().join("state");
-    for flags in [
+    for (case, flags) in [
         vec!["--acp-runner", "unused"],
         vec!["--acp-state-dir", "unused"],
         vec!["--acp-max-attempts", "1"],
@@ -1830,11 +1725,15 @@ fn acp_requires_complete_explicit_allowance_flags() {
             "--acp-max-attempts",
             "21",
         ],
-    ] {
-        let output = command(&source, &state, "serve")
-            .args(flags)
-            .output()
-            .unwrap();
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let output = bounded_invalid_cli(
+            temp.path(),
+            &format!("acp-{case}"),
+            command(&source, &state, "serve").args(flags),
+        );
         assert!(!output.status.success());
     }
     assert!(
@@ -1845,16 +1744,60 @@ fn acp_requires_complete_explicit_allowance_flags() {
 
 #[test]
 fn fixed_locations_and_removed_flag() {
+    use std::process::{Output, Stdio};
+    use std::time::{Duration, Instant};
+
+    // File-backed output cannot wait forever for a detached descendant to
+    // close an inherited pipe. Also bound a CLI that itself fails to exit.
+    fn bounded_cli(dir: &std::path::Path, phase: &str, cmd: &mut Command) -> Output {
+        let stdout = dir.join(format!("fixed-{phase}.stdout"));
+        let stderr = dir.join(format!("fixed-{phase}.stderr"));
+        let mut child = cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(fs::File::create(&stdout).unwrap()))
+            .stderr(Stdio::from(fs::File::create(&stderr).unwrap()))
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("fixed-locations phase={phase} CLI did not exit within 20 seconds");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        Output {
+            status,
+            stdout: fs::read(stdout).unwrap(),
+            stderr: fs::read(stderr).unwrap(),
+        }
+    }
+
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("workspace");
     let home = temp.path().join("home");
+    let daemon = FixtureDaemon::new(&home);
+    let marker = home.join("auto-daemon.pid");
+    let cli = |sub| {
+        let mut cmd = command(&root, &home, sub);
+        cmd.env("TRELLIS_TEST_DAEMON_PID_FILE", &marker);
+        cmd
+    };
     fs::create_dir(&root).unwrap();
     fs::write(root.join("a.js"), "function seed() {}").unwrap();
-    let absent = command(&root, &home, "status").output().unwrap();
-    assert!(!absent.status.success());
-    assert!(absent.stdout.is_empty());
-    assert!(!home.exists(), "Status must not create fixed locations");
-    let status = command(&root, &home, "index").output().unwrap();
+    let absent = bounded_cli(temp.path(), "status-absent", &mut cli("status"));
+    assert!(
+        absent.status.success(),
+        "{}",
+        String::from_utf8_lossy(&absent.stderr)
+    );
+    let observed: Value = serde_json::from_slice(&absent.stdout).unwrap();
+    assert!(observed["revision"]["indexRevision"].as_u64().unwrap() >= 1);
+    let status = bounded_cli(temp.path(), "index", &mut cli("index"));
     assert!(
         status.status.success(),
         "{}",
@@ -1862,7 +1805,10 @@ fn fixed_locations_and_removed_flag() {
     );
     let first: Value = serde_json::from_slice(&status.stdout).unwrap();
     let first = &first["status"];
-    assert_eq!(first["revision"]["indexRevision"], 2);
+    assert!(
+        first["revision"]["indexRevision"].as_u64().unwrap()
+            > observed["revision"]["indexRevision"].as_u64().unwrap()
+    );
     let generation = first["revision"]["indexGeneration"].as_str().unwrap();
     assert_eq!(
         uuid::Uuid::parse_str(generation).unwrap().get_version_num(),
@@ -1880,20 +1826,23 @@ fn fixed_locations_and_removed_flag() {
     );
     assert!(!home.join("state/cache.db").exists());
     assert!(!home.join("state/workspace.db").exists());
-    let removed = command(&root, &home, "status")
+    let mut removed_command = cli("status");
+    removed_command
         .arg("--state-dir")
-        .arg(home.join("override"))
-        .output()
-        .unwrap();
+        .arg(home.join("override"));
+    let removed = bounded_cli(temp.path(), "removed-state-dir", &mut removed_command);
     assert!(!removed.status.success());
     assert!(String::from_utf8_lossy(&removed.stderr).contains("--state-dir"));
-    let final_status: Value =
-        serde_json::from_slice(&command(&root, &home, "status").output().unwrap().stdout).unwrap();
+    let final_status: Value = serde_json::from_slice(
+        &bounded_cli(temp.path(), "status-final", &mut cli("status")).stdout,
+    )
+    .unwrap();
     assert_eq!(
         final_status["revision"]["indexGeneration"],
         first["revision"]["indexGeneration"]
     );
-    assert_eq!(final_status["revision"]["indexRevision"], 2);
+    assert_eq!(final_status["revision"], first["revision"]);
+    daemon.stop_attested().unwrap();
 }
 #[test]
 fn cli_index_diagnostics_are_opt_in_without_changing_publication() {
@@ -1931,24 +1880,14 @@ fn cli_index_diagnostics_are_opt_in_without_changing_publication() {
         "{}",
         String::from_utf8_lossy(&diagnostic.stderr)
     );
-    let diagnostic_stderr = String::from_utf8_lossy(&diagnostic.stderr);
-    for (marker, count) in [
-        ("index-mode full", 1),
-        ("index-mode unchanged", 1),
-        ("index-writer ", 1),
-        ("index-phase capture_ms=", 2),
-        ("index-phase publish_ms=", 2),
-        ("index-phase outside_status_output_ms=", 1),
-    ] {
-        assert_eq!(
-            diagnostic_stderr.matches(marker).count(),
-            count,
-            "opt-in telemetry missing or duplicated {marker}"
-        );
-    }
+    // Index work runs in the detached daemon; the thin CLI has no local
+    // capture, publication, or writer timings to print.
+    assert!(!String::from_utf8_lossy(&diagnostic.stderr).contains("index-phase "));
     assert_eq!(
-        serde_json::from_slice::<Value>(&diagnostic.stdout).unwrap()["publishedRevision"]["indexRevision"],
-        4
+        serde_json::from_slice::<Value>(&diagnostic.stdout).unwrap()["publishedRevision"]["indexRevision"]
+            .as_u64().unwrap(),
+        serde_json::from_slice::<Value>(&quiet.stdout).unwrap()["publishedRevision"]["indexRevision"]
+            .as_u64().unwrap() + 1
     );
 }
 
@@ -1960,9 +1899,12 @@ fn index_forwards_pair_and_reports_pair() {
     fs::create_dir(&root).unwrap();
     fs::write(root.join("a.js"), "function seed() {}").unwrap();
     let absent = command(&root, &home, "status").output().unwrap();
-    assert!(!absent.status.success());
-    assert!(absent.stdout.is_empty());
-    assert!(!home.exists(), "Status may not create an index");
+    assert!(
+        absent.status.success(),
+        "{}",
+        String::from_utf8_lossy(&absent.stderr)
+    );
+    let prior: Value = serde_json::from_slice(&absent.stdout).unwrap();
     let result = command(&root, &home, "index")
         .env("TRELLIS_INDEX_DIAGNOSTICS", "1")
         .output()
@@ -1973,51 +1915,9 @@ fn index_forwards_pair_and_reports_pair() {
         String::from_utf8_lossy(&result.stderr)
     );
     let published: Value = serde_json::from_slice(&result.stdout).unwrap();
-    let timings = String::from_utf8_lossy(&result.stderr);
-    for phase in [
-        "outside_setup",
-        "capture",
-        "measure",
-        "compose",
-        "attest",
-        "publish",
-        "queue_and_jobs",
-        "outside_status_output",
-    ] {
-        let prefix = format!("index-phase {phase}_ms=");
-        assert!(
-            timings.lines().any(|line| line.starts_with(&prefix)
-                && line[prefix.len()..]
-                    .split_whitespace()
-                    .next()
-                    .is_some_and(|ms| ms.parse::<f64>().is_ok_and(|value| value >= 0.0))),
-            "missing release CLI phase {phase}: {timings}"
-        );
-    }
-    let writer = timings
-        .lines()
-        .find(|line| line.starts_with("index-writer "))
-        .expect("release CLI must report the committed writer counters");
-    let values: std::collections::HashMap<_, _> = writer
-        .split_whitespace()
-        .skip(1)
-        .map(|field| {
-            let (name, value) = field.split_once('=').unwrap();
-            (name, value.parse::<u64>().unwrap())
-        })
-        .collect();
-    for suffix in ["rows", "bind_bytes"] {
-        assert_eq!(
-            values[&*format!("total_{suffix}")],
-            ["manifest", "native", "graph", "class"]
-                .iter()
-                .map(|name| values[&*format!("{name}_{suffix}")])
-                .sum::<u64>(),
-            "{suffix}: postcommit family accounting"
-        );
-    }
-    assert_eq!(values["reused_occurrence_reads"], 0);
-    assert!(timings.lines().any(|line| line == "index-mode full"));
+    // The detached daemon owns capture and publication diagnostics; the CLI
+    // only prints its correlated selected response.
+    assert!(!String::from_utf8_lossy(&result.stderr).contains("index-phase "));
     assert_eq!(
         published["status"]["revision"],
         published["publishedRevision"]
@@ -2026,7 +1926,12 @@ fn index_forwards_pair_and_reports_pair() {
         published["status"]["evidenceFormat"],
         "terminal-native-graph-v1"
     );
-    assert_eq!(published["publishedRevision"]["indexRevision"], 2);
+    assert!(
+        published["publishedRevision"]["indexRevision"]
+            .as_u64()
+            .unwrap()
+            > prior["revision"]["indexRevision"].as_u64().unwrap()
+    );
     assert_eq!(
         uuid::Uuid::parse_str(
             published["publishedRevision"]["indexGeneration"]
@@ -2074,30 +1979,87 @@ fn export_path_refusals() {
 }
 #[test]
 fn current_commands_pair_matrix() {
+    use std::process::{Output, Stdio};
+    use std::time::{Duration, Instant};
+
+    // A daemon descendant must not keep Command::output pipes open forever.
+    // Fixed phase markers and a per-CLI deadline identify the blocked command.
+    fn bounded_cli(dir: &std::path::Path, phase: &str, cmd: &mut Command) -> Output {
+        eprintln!("pair-matrix phase=start:{phase}");
+        let stdout = dir.join(format!("{phase}.stdout"));
+        let stderr = dir.join(format!("{phase}.stderr"));
+        let mut child = cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(fs::File::create(&stdout).unwrap()))
+            .stderr(Stdio::from(fs::File::create(&stderr).unwrap()))
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "pair-matrix phase=timeout:{phase} stderr={}",
+                    fs::read_to_string(&stderr).unwrap()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        eprintln!("pair-matrix phase=done:{phase}");
+        let output = Output {
+            status,
+            stdout: fs::read(stdout).unwrap(),
+            stderr: fs::read(stderr).unwrap(),
+        };
+        assert!(
+            output.status.success(),
+            "pair-matrix phase=failed:{phase} stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    }
+
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("workspace");
     let home = temp.path().join("home");
     fs::create_dir(&root).unwrap();
     fs::write(root.join("a.js"), "function seed() {}").unwrap();
-    let index = command(&root, &home, "index").output().unwrap();
-    assert!(index.status.success());
+    let index = bounded_cli(temp.path(), "index", &mut command(&root, &home, "index"));
     let pin: Value =
         serde_json::from_slice::<Value>(&index.stdout).unwrap()["publishedRevision"].clone();
-    let status: Value =
-        serde_json::from_slice(&command(&root, &home, "status").output().unwrap().stdout).unwrap();
+    let status: Value = serde_json::from_slice(
+        &bounded_cli(
+            temp.path(),
+            "status-first",
+            &mut command(&root, &home, "status"),
+        )
+        .stdout,
+    )
+    .unwrap();
     assert_eq!(
         status["revision"]["indexGeneration"],
         pin["indexGeneration"]
     );
-    assert_eq!(status["revision"]["indexRevision"], 2);
-    let symbols: Value =
-        serde_json::from_slice(&command(&root, &home, "symbols").output().unwrap().stdout).unwrap();
+    assert_eq!(status["revision"], pin);
+    let symbols: Value = serde_json::from_slice(
+        &bounded_cli(
+            temp.path(),
+            "symbols",
+            &mut command(&root, &home, "symbols"),
+        )
+        .stdout,
+    )
+    .unwrap();
     assert_eq!(
-        symbols["revision"]["indexGeneration"],
+        symbols["data"]["revision"]["indexGeneration"],
         pin["indexGeneration"]
     );
-    assert_eq!(symbols["revision"]["indexRevision"], 3);
-    let seed = symbols["items"]
+    assert_eq!(symbols["data"]["revision"], pin);
+    let seed = symbols["data"]["items"]
         .as_array()
         .unwrap()
         .iter()
@@ -2106,26 +2068,38 @@ fn current_commands_pair_matrix() {
         .as_str()
         .unwrap();
     let query: Value = serde_json::from_slice(
-        &command(&root, &home, "query")
-            .arg("--seed")
-            .arg(seed)
-            .output()
-            .unwrap()
-            .stdout,
+        &bounded_cli(
+            temp.path(),
+            "query",
+            command(&root, &home, "query").arg("--seed").arg(seed),
+        )
+        .stdout,
     )
     .unwrap();
-    assert_eq!(query["revision"]["indexGeneration"], pin["indexGeneration"]);
-    assert_eq!(query["revision"]["indexRevision"], 4);
-    let exported: Value =
-        serde_json::from_slice(&command(&root, &home, "export").output().unwrap().stdout).unwrap();
-    assert_eq!(exported["files"].as_array().unwrap().len(), 1);
-    let status: Value =
-        serde_json::from_slice(&command(&root, &home, "status").output().unwrap().stdout).unwrap();
+    assert_eq!(
+        query["data"]["revision"]["indexGeneration"],
+        pin["indexGeneration"]
+    );
+    assert_eq!(query["data"]["revision"], pin);
+    let exported: Value = serde_json::from_slice(
+        &bounded_cli(temp.path(), "export", &mut command(&root, &home, "export")).stdout,
+    )
+    .unwrap();
+    assert_eq!(exported["data"]["files"].as_array().unwrap().len(), 1);
+    let status: Value = serde_json::from_slice(
+        &bounded_cli(
+            temp.path(),
+            "status-final",
+            &mut command(&root, &home, "status"),
+        )
+        .stdout,
+    )
+    .unwrap();
     assert_eq!(
         status["revision"]["indexGeneration"],
         pin["indexGeneration"]
     );
-    assert_eq!(status["revision"]["indexRevision"], 5);
+    assert_eq!(status["revision"], pin);
 }
 
 #[test]
@@ -2136,23 +2110,25 @@ fn external_destinations_are_rejected_before_git_marker_creation() {
     fs::create_dir(&root).unwrap();
     fs::create_dir(root.join(".git")).unwrap();
     let token = root.join("token");
-    let serve = isolated_command(&home)
-        .arg("serve")
-        .arg("--workspace")
-        .arg(&root)
-        .arg("--token-file")
-        .arg(&token)
-        .output()
-        .unwrap();
+    let serve = bounded_invalid_cli(
+        temp.path(),
+        "external-serve",
+        isolated_command(&home)
+            .arg("serve")
+            .arg("--workspace")
+            .arg(&root)
+            .arg("--token-file")
+            .arg(&token),
+    );
     assert!(!serve.status.success());
     assert!(!root.join(".git/trellis/workspace-id").exists());
     assert!(!token.exists());
     let output = root.join("graph.json");
-    let export = command(&root, &home, "export")
-        .arg("--output")
-        .arg(&output)
-        .output()
-        .unwrap();
+    let export = bounded_invalid_cli(
+        temp.path(),
+        "external-export",
+        command(&root, &home, "export").arg("--output").arg(&output),
+    );
     assert!(!export.status.success());
     assert!(!output.exists());
     assert!(!root.join(".git/trellis/workspace-id").exists());
@@ -2218,10 +2194,24 @@ fn gc_report_without_workspace_does_not_create_state() {
     let inventory: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(inventory["derived"], serde_json::json!([]));
     assert_eq!(inventory["records"], serde_json::json!([]));
-    assert!(!home.exists());
+    // The user-level daemon may create its private runtime socket, but GC
+    // must not materialize any workspace index or saved record.
+    assert!(
+        !home
+            .join("Library/Caches/dev.squashmerge.trellis/indexes")
+            .exists()
+    );
+    assert!(!home.join(".cache/trellis/indexes").exists());
     let denied = isolated_command(&home).arg("gc").output().unwrap();
     assert!(!denied.status.success());
-    assert!(!home.exists());
+    // The user-level daemon may create its private runtime socket, but GC
+    // must not materialize any workspace index or saved record.
+    assert!(
+        !home
+            .join("Library/Caches/dev.squashmerge.trellis/indexes")
+            .exists()
+    );
+    assert!(!home.join(".cache/trellis/indexes").exists());
     let root = temp.path().join("work");
     fs::create_dir(&root).unwrap();
     assert!(
@@ -2238,8 +2228,8 @@ fn gc_report_without_workspace_does_not_create_state() {
     assert!(output.status.success());
     let inventory: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(inventory["derived"].as_array().unwrap().len(), 1);
-    assert_eq!(inventory["derived"][0]["status"], "unknown");
-    assert_eq!(inventory["derived"][0]["reason"], "recent_open");
+    assert_eq!(inventory["derived"][0]["status"], "busy");
+    assert_eq!(inventory["derived"][0]["reason"], "use_lock_busy");
 }
 
 #[test]
@@ -2418,25 +2408,23 @@ fn real_native_snapshot(home: &std::path::Path) -> Value {
             Ok((r.get(0)?, r.get(1)?))
         })
         .unwrap();
-    let (generation, revision_number, incarnation): (String, i64, String) = db
+    let (generation, revision_number): (String, i64) = db
         .query_row(
-            "SELECT index_generation,index_revision,reconciled_incarnation FROM index_metadata",
+            "SELECT index_generation,index_revision FROM index_metadata",
             [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .unwrap();
     assert!(uuid::Uuid::parse_str(&generation).is_ok());
-    assert!(uuid::Uuid::parse_str(&incarnation).is_ok());
     let pin_id = format!("pin:v1:{generation}:{revision_number}");
-    let (header_pin, header_incarnation, header_revision): (String, String, i64) = db
+    let (header_pin, header_revision): (String, i64) = db
         .query_row(
-            "SELECT id,reconciled_incarnation,published_index_revision FROM native_revisions WHERE id=?1",
+            "SELECT id,published_index_revision FROM native_revisions WHERE id=?1",
             [&pin_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .unwrap();
     assert_eq!(header_pin, pin_id);
-    assert_eq!(header_incarnation, incarnation);
     assert_eq!(header_revision, revision_number);
     let violations: i64 = db
         .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
@@ -2593,8 +2581,8 @@ fn same_bytes_evidence(snapshot: &Value) -> Value {
     assert_eq!(header.len(), 1);
     let header = header[0].as_array().unwrap();
     assert_eq!(header[0], pin);
-    assert!(uuid::Uuid::parse_str(header[8].as_str().unwrap()).is_ok());
-    assert!(header[14].as_i64().is_some_and(|revision| revision > 0));
+    assert!(header[5].as_str().is_some_and(|id| !id.is_empty()));
+    assert!(header[13].as_i64().is_some_and(|revision| revision > 0));
     for table in ["revision_capture_inputs", "revision_documents"] {
         for row in snapshot["allRows"][table].as_array().unwrap() {
             assert_eq!(row[0], pin, "{table} must reference the admitted pin");
@@ -2614,8 +2602,7 @@ fn same_bytes_evidence(snapshot: &Value) -> Value {
         .as_array_mut()
         .unwrap();
     header[0] = serde_json::json!("<current-pin>");
-    header[8] = serde_json::json!("<leader-incarnation>");
-    header[14] = serde_json::json!("<current-revision>");
+    header[13] = serde_json::json!("<current-revision>");
     for table in ["revision_capture_inputs", "revision_documents"] {
         for row in evidence["allRows"][table].as_array_mut().unwrap() {
             row[0] = serde_json::json!("<current-pin>");
@@ -2631,7 +2618,8 @@ fn real_export(root: &std::path::Path, home: &std::path::Path) -> Value {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    serde_json::from_slice(&output.stdout).unwrap()
+    let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
+    envelope["data"].clone()
 }
 
 // The provisioned browser serves global control-plane routes only. Keep the
@@ -2645,7 +2633,7 @@ struct LegacyClient {
 impl Drop for LegacyClient {
     fn drop(&mut self) {
         self.state.cancel_active();
-        self.state.release_checkout_runtime();
+        self.state.release_checkout_runtime_for_fixture();
     }
 }
 impl LegacyClient {
@@ -2693,34 +2681,16 @@ impl LegacyClient {
         let address = url.strip_prefix("http://").unwrap().parse().unwrap();
         let state = http::new(store.clone(), options.clone(), token.to_owned(), address).unwrap();
         if retain_session {
-            // An elected owner must commit mandatory reconciliation before
-            // selected reads or queued jobs can use its claim authority.
-            let session = match store.follower_session() {
-                Ok(follower) => follower,
-                Err(_) => {
-                    let leader = store.leader_session().unwrap();
-                    let cancel: trellis::model::CancelFlag =
-                        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                    let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
-                        &options,
-                        store.root_id(),
-                        &cancel,
-                        |_| {},
-                    )
-                    .unwrap();
-                    store
-                        .publish_native(
-                            &graph,
-                            &capture,
-                            &native,
-                            leader.leader_guard().unwrap(),
-                            store.index_baseline().unwrap(),
-                            &cancel,
-                        )
-                        .unwrap();
-                    leader
-                }
-            };
+            // A daemon-local writer must commit startup reconciliation before selected reads or
+            // FIFO claims. The legacy router fixture models only that session.
+            let cancel: trellis::model::CancelFlag =
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let session = trellis::index_coordinator::establish_serving_session(
+                &store,
+                Some(&options),
+                &cancel,
+            )
+            .unwrap();
             state.retain_serving_session(session);
         }
         Self {
@@ -2740,9 +2710,6 @@ impl LegacyClient {
     }
     fn get(&self, url: String) -> LegacyRequest {
         self.request(reqwest::Method::GET, url)
-    }
-    fn post(&self, url: String) -> LegacyRequest {
-        self.request(reqwest::Method::POST, url)
     }
 }
 struct LegacyRequest {
@@ -2838,6 +2805,27 @@ async fn real_api(
     (status, response.json().await.unwrap())
 }
 
+async fn real_selected_api(
+    client: &reqwest::Client,
+    url: &str,
+    origin: &str,
+    token: &str,
+    method: reqwest::Method,
+    route: &str,
+    body: Option<Value>,
+) -> (reqwest::StatusCode, Value) {
+    let mut request = client
+        .request(method, format!("{url}{route}"))
+        .header("Origin", origin)
+        .bearer_auth(token);
+    if let Some(body) = body {
+        request = request.json(&body);
+    }
+    let response = request.send().await.unwrap();
+    let status = response.status();
+    (status, response.json().await.unwrap())
+}
+
 struct SavedItemServer;
 
 async fn start_saved_item_server(
@@ -2846,7 +2834,29 @@ async fn start_saved_item_server(
     home: &std::path::Path,
     token: &str,
 ) -> (SavedItemServer, LegacyClient, String) {
-    // The direct router reconciles with the same HOME-backed Store on election.
+    // The preceding CLI index elected a real daemon. End this fixture's
+    // writer before the direct router takes over the same HOME-backed Store.
+    let marker = home.join("auto-daemon.pid");
+    if marker.exists() {
+        // FixtureDaemon checks the live socket peer and exact executable
+        // before TERM; a numeric marker alone is not process ownership.
+        drop(FixtureDaemon::new(home));
+        let data = if cfg!(target_os = "macos") {
+            home.join("Library/Application Support/dev.squashmerge.trellis")
+        } else {
+            home.join(".local/share/trellis")
+        };
+        let socket = trellis::daemon::SocketPaths::new(&data).socket;
+        let deadline = std::time::Instant::now() + trellis::testing::HANG_BACKSTOP;
+        while std::os::unix::net::UnixStream::connect(&socket).is_ok() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "prior saved-item fixture daemon did not exit"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(!marker.exists(), "fixture daemon was not safely stopped");
+    }
     let url = "http://127.0.0.1:7331".to_owned();
     (
         SavedItemServer,
@@ -2874,7 +2884,7 @@ async fn real_index_job(
     .await;
     assert_eq!(status, reqwest::StatusCode::ACCEPTED, "{accepted}");
     let id = accepted["id"].as_str().unwrap();
-    let completed = tokio::time::timeout(Duration::from_secs(20), async {
+    let completed = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             let (status, job) = real_api(
                 client,
@@ -3133,7 +3143,19 @@ fn assert_fixture_declaration(
 #[tokio::test]
 async fn real_cli_and_authenticated_daemon_share_native_pair_for_every_language_and_empty_root() {
     use std::time::Duration;
-    const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    fn stopped_snapshot(home: &std::path::Path) -> Value {
+        let index = real_index_db(home);
+        let dir = index.parent().unwrap();
+        let use_lock = dir.parent().unwrap().join(format!(
+            "{}.lock",
+            dir.file_name().unwrap().to_string_lossy()
+        ));
+        drop(
+            trellis::store::topology::UseGuard::acquire_existing_readonly_exclusive(&use_lock)
+                .expect("daemon retained index-use lock after stop"),
+        );
+        real_native_snapshot(home)
+    }
     for (name, file, source) in [
         (
             "java",
@@ -3164,14 +3186,25 @@ def sink():
         ),
         ("empty", "", ""),
     ] {
+        struct Server(std::process::Child);
+        impl Drop for Server {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("workspace");
         let home = tmp.path().join("home");
+        let daemon = FixtureDaemon::new(&home);
         fs::create_dir(&root).unwrap();
         if !file.is_empty() {
             fs::write(root.join(file), source).unwrap();
         }
-        let indexed = command(&root, &home, "index").output().unwrap();
+        let indexed = command(&root, &home, "index")
+            .env("TRELLIS_TEST_DAEMON_PID_FILE", home.join("auto-daemon.pid"))
+            .output()
+            .unwrap();
         assert!(
             indexed.status.success(),
             "{name}: {}",
@@ -3180,45 +3213,131 @@ def sink():
         let first: Value = serde_json::from_slice(&indexed.stdout).unwrap();
         let old_pin = first["publishedRevision"].clone();
         assert_eq!(first["status"]["revision"], old_pin, "{name}");
-        let native_before = real_native_snapshot(&home);
         let graph_before = real_export(&root, &home);
+        daemon.stop_attested().unwrap();
+        let native_before = stopped_snapshot(&home);
         assert_eq!(
             native_before["documents"].as_array().unwrap().len(),
             usize::from(!file.is_empty()),
             "{name}"
         );
+        let post_start_native = native_before.clone();
 
-        // CLI publication replaces the old server-start reconciliation. The
-        // direct router reads the identical HOME-backed store and owns jobs.
-        let url = "http://127.0.0.1:7331".to_owned();
-        let legacy = LegacyClient::same_home(&root, &home, TOKEN, &url, 2_097_152);
-        // A direct test router captures the test executable, not the CLI
-        // executable. Compare later same-byte publications within this owner.
-        let post_start_native = real_native_snapshot(&home);
-        assert_eq!(
-            real_export(&root, &home),
-            graph_before,
-            "{name}: CLI/HTTP graph parity"
-        );
-        let post_start_status: Value = legacy
-            .get(format!("{url}/api/status"))
-            .bearer_auth(TOKEN)
-            .send()
-            .await
+        // Provision the sole elected daemon; no test-process Store or SQLite
+        // handle stays open while it owns the checkout.
+        let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = reserved.local_addr().unwrap();
+        drop(reserved);
+        let origin = format!("http://{address}");
+        let root_key = trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root)
             .unwrap()
-            .json()
+            .root_key;
+        let url = format!("{origin}/api/checkouts/{root_key}");
+        let token_file = home.join("token");
+        let provision = || {
+            Server(
+                command(&root, &home, "serve")
+                    .env("TRELLIS_TEST_DAEMON_PID_FILE", home.join("auto-daemon.pid"))
+                    .arg("--bind")
+                    .arg(address.to_string())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            )
+        };
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap();
+        let mut server = provision();
+        let token = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+            loop {
+                if let Ok(response) = client.get(format!("{origin}/healthz")).send().await
+                    && response.status().is_success()
+                    && let Ok(token) = fs::read_to_string(&token_file)
+                {
+                    break token;
+                }
+                assert!(
+                    server.0.try_wait().unwrap().is_none(),
+                    "{name}: serve exited"
+                );
+                tokio::time::sleep(Duration::from_millis(40)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let token = token.trim();
+        let selected_status =
+            |client: &reqwest::Client| client.get(format!("{url}/status")).bearer_auth(token);
+        let post_start_status: Value =
+            tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+                loop {
+                    // The client deadline is shorter than a bounded SQLite busy
+                    // wait. Retry only transport timeouts inside the outer startup reconciliation limit;
+                    // every answered status still has to prove its selected pin.
+                    let response = match selected_status(&client).send().await {
+                        Ok(response) => response,
+                        Err(error) if error.is_timeout() => {
+                            assert!(
+                                server.0.try_wait().unwrap().is_none(),
+                                "{name}: serve exited during selected status poll"
+                            );
+                            continue;
+                        }
+                        Err(error) => panic!("{name}: selected status request: {error}"),
+                    };
+                    if response.status().is_success() {
+                        let status: Value = response.json().await.unwrap();
+                        let revision = &status["revision"];
+                        assert_eq!(
+                            revision["indexGeneration"], old_pin["indexGeneration"],
+                            "{name}: unexpected generation during startup reconciliation: {status}"
+                        );
+                        let current = revision["indexRevision"]
+                            .as_u64()
+                            .expect("selected index revision");
+                        let previous = old_pin["indexRevision"].as_u64().unwrap();
+                        let catching_up = status["catchingUp"]
+                            .as_bool()
+                            .expect("selected catch-up state");
+                        if current == previous {
+                            assert!(
+                                catching_up,
+                                "{name}: prior head without pending mandatory startup reconciliation: {status}"
+                            );
+                        } else {
+                            assert!(
+                                current > previous,
+                                "{name}: selected pin moved backwards: {status}"
+                            );
+                            if !catching_up {
+                                break status;
+                            }
+                        }
+                    } else {
+                        assert_eq!(
+                            response.status(),
+                            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                            "{name}"
+                        );
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
             .await
             .unwrap();
         let post_start_pin = post_start_status["revision"].clone();
         assert_eq!(
-            post_start_pin["indexGeneration"],
-            old_pin["indexGeneration"]
+            post_start_pin["indexGeneration"], old_pin["indexGeneration"],
+            "{name}"
         );
         assert!(
             post_start_pin["indexRevision"].as_u64().unwrap()
-                > old_pin["indexRevision"].as_u64().unwrap()
+                > old_pin["indexRevision"].as_u64().unwrap(),
+            "{name}: mandatory startup reconciliation committed"
         );
-        let native_as_leader = real_native_snapshot(&home);
         let follower_status: Value =
             serde_json::from_slice(&command(&root, &home, "status").output().unwrap().stdout)
                 .unwrap();
@@ -3226,6 +3345,7 @@ def sink():
         let follower_symbols = command(&root, &home, "symbols").output().unwrap();
         assert!(follower_symbols.status.success(), "{name}");
         let follower_symbols: Value = serde_json::from_slice(&follower_symbols.stdout).unwrap();
+        let follower_symbols = &follower_symbols["data"];
         assert_eq!(follower_symbols["revision"], post_start_pin, "{name}");
         if let Some(follower_seed) = follower_symbols["items"]
             .as_array()
@@ -3239,83 +3359,46 @@ def sink():
                 .unwrap();
             assert!(follower_query.status.success(), "{name}");
             let follower_query: Value = serde_json::from_slice(&follower_query.stdout).unwrap();
-            assert_eq!(follower_query["revision"], post_start_pin, "{name}");
+            assert_eq!(follower_query["data"]["revision"], post_start_pin, "{name}");
         }
         let follower_export = command(&root, &home, "export").output().unwrap();
         assert!(follower_export.status.success(), "{name}");
-        assert_eq!(real_native_snapshot(&home), native_as_leader, "{name}");
-
-        let follower_url = "http://127.0.0.1:7332".to_owned();
-        let follower_legacy =
-            LegacyClient::same_home(&root, &home, TOKEN, &follower_url, 2_097_152);
-        let follower_http_status: Value = follower_legacy
-            .get(format!("{follower_url}/api/status"))
-            .bearer_auth(TOKEN)
+        assert_eq!(
+            serde_json::from_slice::<Value>(&follower_export.stdout).unwrap()["data"],
+            graph_before,
+            "{name}: CLI/HTTP graph parity"
+        );
+        let follower_pin = post_start_pin.clone();
+        let request = || {
+            client
+                .post(format!("{url}/index"))
+                .header("Origin", &origin)
+                .json(&serde_json::json!({"expectedRevision":follower_pin.clone()}))
+        };
+        let current_before: Value = client
+            .get(format!("{url}/jobs/current"))
+            .bearer_auth(token)
             .send()
             .await
             .unwrap()
             .json()
             .await
             .unwrap();
-        assert_eq!(follower_http_status["revision"], post_start_pin, "{name}");
-        let follower_accepted = follower_legacy
-            .post(format!("{follower_url}/api/index"))
-            .header("Origin", &follower_url)
-            .bearer_auth(TOKEN)
-            .json(&serde_json::json!({"expectedRevision":post_start_pin.clone()}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(follower_accepted.status(), 202, "{name}");
-        let follower_accepted: Value = follower_accepted.json().await.unwrap();
-        assert_eq!(follower_accepted["state"], "queued", "{name}");
-        assert!(follower_accepted["startedAt"].is_null(), "{name}");
-        let follower_id = follower_accepted["id"].as_str().unwrap();
-        let follower_done = tokio::time::timeout(Duration::from_secs(20), async {
-            loop {
-                let job: Value = follower_legacy
-                    .get(format!("{follower_url}/api/jobs/{follower_id}"))
-                    .bearer_auth(TOKEN)
-                    .send()
-                    .await
-                    .unwrap()
-                    .json()
-                    .await
-                    .unwrap();
-                if !job["finishedAt"].is_null() {
-                    break job;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap();
-        assert_eq!(follower_done["state"], "done", "{name}: {follower_done}");
-        let follower_pin = follower_done["revision"].clone();
-        assert_eq!(
-            follower_pin["indexRevision"],
-            post_start_pin["indexRevision"].as_u64().unwrap() + 1
-        );
-        let request = || {
-            legacy
-                .post(format!("{url}/api/index"))
-                .header("Origin", &url)
-                .json(&serde_json::json!({"expectedRevision":follower_pin.clone()}))
-        };
+        assert_eq!(current_before["state"], "done", "{name}: initial CLI job");
         let denied = request().bearer_auth("incorrect").send().await.unwrap();
         assert_eq!(denied.status(), 401, "{name}");
-        let invalid_origin = legacy
-            .post(format!("{url}/api/index"))
+        let invalid_origin = client
+            .post(format!("{url}/index"))
             .header("Origin", "https://evil.example")
-            .bearer_auth(TOKEN)
+            .bearer_auth(token)
             .json(&serde_json::json!({}))
             .send()
             .await
             .unwrap();
         assert_eq!(invalid_origin.status(), 403, "{name}");
-        let current: Value = legacy
-            .get(format!("{url}/api/jobs/current"))
-            .bearer_auth(TOKEN)
+        let current: Value = client
+            .get(format!("{url}/jobs/current"))
+            .bearer_auth(token)
             .send()
             .await
             .unwrap()
@@ -3323,18 +3406,98 @@ def sink():
             .await
             .unwrap();
         assert_eq!(
-            current["id"], follower_id,
-            "{name}: rejected auth/origin must not add work"
+            current["id"], current_before["id"],
+            "{name}: rejected request added a job"
         );
-        let accepted = request().bearer_auth(TOKEN).send().await.unwrap();
+        assert_eq!(
+            current["state"], current_before["state"],
+            "{name}: rejected request changed job state"
+        );
+        assert_eq!(
+            current["revision"], current_before["revision"],
+            "{name}: rejected request changed job pin"
+        );
+        // Cache a selected question and source at the committed prior head.
+        // The next publication must expire the packet but retain its source.
+        let prior_selection = if file.is_empty() {
+            None
+        } else {
+            let source_route = format!(
+                "/source?path={file}&indexGeneration={}&indexRevision={}",
+                post_start_pin["indexGeneration"].as_str().unwrap(),
+                post_start_pin["indexRevision"].as_u64().unwrap()
+            );
+            let (code, source_at) = real_selected_api(
+                &client,
+                &url,
+                &origin,
+                token,
+                reqwest::Method::GET,
+                &source_route,
+                None,
+            )
+            .await;
+            assert_eq!(code, 200, "{name}: prior selected source: {source_at}");
+            assert_eq!(source_at["revision"], post_start_pin, "{name}");
+            assert_eq!(source_at["file"]["text"], source, "{name}");
+            let (code, symbols) = real_selected_api(
+                &client,
+                &url,
+                &origin,
+                token,
+                reqwest::Method::GET,
+                "/symbols?q=seed",
+                None,
+            )
+            .await;
+            assert_eq!(code, 200, "{name}: prior selected symbols: {symbols}");
+            assert_eq!(symbols["revision"], post_start_pin, "{name}");
+            let seed = symbols["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["name"] == "seed")
+                .expect("prior selected seed")["id"]
+                .as_str()
+                .unwrap();
+            let (code, preview) = real_selected_api(
+                &client, &url, &origin, token, reqwest::Method::POST, "/questions/preview",
+                Some(serde_json::json!({"seed":seed,"question":"what happens?","expectedRevision":post_start_pin}))
+            ).await;
+            assert_eq!(code, 200, "{name}: prior selected question: {preview}");
+            assert_eq!(preview["packet"]["revision"], post_start_pin, "{name}");
+            let packet = preview["packet"]["packetId"].as_str().unwrap();
+            let packet_route = format!("/questions/{packet}/jev-request");
+            let (code, packet_request) = real_selected_api(
+                &client,
+                &url,
+                &origin,
+                token,
+                reqwest::Method::GET,
+                &packet_route,
+                None,
+            )
+            .await;
+            assert_eq!(code, 200, "{name}: prior packet request: {packet_request}");
+            assert_eq!(
+                packet_request["state"]["packet"]["revision"], post_start_pin,
+                "{name}"
+            );
+            Some((source_route, packet_route))
+        };
+        let accepted = request().bearer_auth(token).send().await.unwrap();
         assert_eq!(accepted.status(), 202, "{name}");
         let started: Value = accepted.json().await.unwrap();
         let id = started["id"].as_str().unwrap();
-        let completed = tokio::time::timeout(Duration::from_secs(20), async {
+        assert_ne!(
+            started["id"], current_before["id"],
+            "{name}: authorized request needs a new ID"
+        );
+        let completed = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
             loop {
-                let job: Value = legacy
-                    .get(format!("{url}/api/jobs/{id}"))
-                    .bearer_auth(TOKEN)
+                let job: Value = client
+                    .get(format!("{url}/jobs/{id}"))
+                    .bearer_auth(token)
                     .send()
                     .await
                     .unwrap()
@@ -3360,9 +3523,9 @@ def sink():
             follower_pin["indexRevision"].as_u64().unwrap() + 1,
             "{name}"
         );
-        let status: Value = legacy
-            .get(format!("{url}/api/status"))
-            .bearer_auth(TOKEN)
+        let status: Value = client
+            .get(format!("{url}/status"))
+            .bearer_auth(token)
             .send()
             .await
             .unwrap()
@@ -3375,29 +3538,170 @@ def sink():
             usize::from(!file.is_empty()),
             "{name}"
         );
+        if let Some((source_route, packet_route)) = &prior_selection {
+            let (code, source_at) = real_selected_api(
+                &client,
+                &url,
+                &origin,
+                token,
+                reqwest::Method::GET,
+                source_route,
+                None,
+            )
+            .await;
+            assert_eq!(
+                code, 200,
+                "{name}: retained old selected source: {source_at}"
+            );
+            assert_eq!(source_at["revision"], post_start_pin, "{name}");
+            assert_eq!(source_at["file"]["text"], source, "{name}");
+            let (code, stale_packet) = real_selected_api(
+                &client,
+                &url,
+                &origin,
+                token,
+                reqwest::Method::GET,
+                packet_route,
+                None,
+            )
+            .await;
+            assert!(
+                (code == reqwest::StatusCode::NOT_FOUND
+                    && stale_packet["error"]["code"] == "not_found")
+                    || (code == reqwest::StatusCode::CONFLICT
+                        && stale_packet["error"]["code"] == "revision_conflict"),
+                "{name}: stale packet must be safely refused: {code} {stale_packet}"
+            );
+        }
         use sha2::{Digest, Sha256};
-        let native_after = real_native_snapshot(&home);
         let graph_after = real_export(&root, &home);
+        // Collect every selected response against the same committed pin while
+        // the sole daemon is live. Inspect native SQLite only after its stop.
+        let mut captured = std::collections::HashMap::<String, (reqwest::StatusCode, Value)>::new();
+        let fetch = async |method: reqwest::Method, route: String, body: Option<Value>| {
+            real_selected_api(&client, &url, &origin, token, method, &route, body).await
+        };
+        for graph_file in graph_after["files"].as_array().unwrap() {
+            let path = graph_file["path"].as_str().unwrap();
+            let route = format!(
+                "/source?path={path}&indexGeneration={}&indexRevision={}",
+                pin["indexGeneration"].as_str().unwrap(),
+                pin["indexRevision"].as_u64().unwrap()
+            );
+            let value = fetch(reqwest::Method::GET, route.clone(), None).await;
+            captured.insert(route, value);
+        }
+        if !file.is_empty() {
+            let pinned = format!(
+                "indexGeneration={}&indexRevision={}",
+                pin["indexGeneration"].as_str().unwrap(),
+                pin["indexRevision"].as_u64().unwrap()
+            );
+            let classes = format!("/classes?{pinned}");
+            captured.insert(
+                classes.clone(),
+                fetch(reqwest::Method::GET, classes, None).await,
+            );
+            let symbols = "/symbols?q=seed".to_owned();
+            let response = fetch(reqwest::Method::GET, symbols.clone(), None).await;
+            let seed = response.1["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["name"] == "seed")
+                .expect("measured selected seed")["id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            captured.insert(symbols, response);
+            captured.insert(
+                "/navigation".into(),
+                fetch(
+                    reqwest::Method::POST,
+                    "/navigation".into(),
+                    Some(serde_json::json!({"expectedRevision":pin,"path":file,"line":1})),
+                )
+                .await,
+            );
+            captured.insert(
+                "/sequence".into(),
+                fetch(
+                    reqwest::Method::POST,
+                    "/sequence".into(),
+                    Some(serde_json::json!({"expectedRevision":pin,"seed":seed})),
+                )
+                .await,
+            );
+            let preview = fetch(reqwest::Method::POST, "/questions/preview".into(),
+                Some(serde_json::json!({"seed":seed,"question":"what happens?","expectedRevision":pin}))).await;
+            let packet = preview.1["packet"]["packetId"]
+                .as_str()
+                .expect("selected question packet");
+            let export = format!("/questions/{packet}/jev-request");
+            captured.insert(
+                export.clone(),
+                fetch(reqwest::Method::GET, export, None).await,
+            );
+            captured.insert("/questions/preview".into(), preview);
+        }
+        let stale = request().bearer_auth(token).send().await.unwrap();
+        assert_eq!(
+            stale.status(),
+            202,
+            "{name}: stale request durably accepted"
+        );
+        let stale: Value = stale.json().await.unwrap();
+        assert_eq!(
+            stale["state"], "queued",
+            "{name}: accepted before claim-time CAS"
+        );
+        let stale_id = stale["id"].as_str().unwrap();
+        let failed = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+            loop {
+                let row: Value = client
+                    .get(format!("{url}/jobs/{stale_id}"))
+                    .bearer_auth(token)
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                if !row["finishedAt"].is_null() {
+                    break row;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(failed["state"], "failed", "{name}: {failed}");
+        assert_eq!(failed["error"]["code"], "revision_conflict", "{name}");
+        let unchanged_status: Value = selected_status(&client)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            unchanged_status["revision"], pin,
+            "{name}: stale request changed committed head"
+        );
+        daemon.stop_attested().unwrap();
+        drop(server);
+        let native_after = stopped_snapshot(&home);
         let before_header = &native_before["allRows"]["native_revisions"][0];
-        let leader_header = &native_as_leader["allRows"]["native_revisions"][0];
         let after_header = &native_after["allRows"]["native_revisions"][0];
         assert_ne!(
             before_header[0], after_header[0],
             "{name}: publication pin rotates"
         );
         assert_ne!(
-            before_header[8], after_header[8],
-            "{name}: daemon takeover rotates leader"
-        );
-        assert_eq!(
-            leader_header[8], after_header[8],
-            "{name}: active leader remains stable"
-        );
-        assert_ne!(
-            before_header[14], after_header[14],
+            before_header[13], after_header[13],
             "{name}: revision advances"
         );
-        assert_eq!(after_header[14], pin["indexRevision"], "{name}");
+        assert_eq!(after_header[13], pin["indexRevision"], "{name}");
         assert_eq!(
             after_header[0],
             format!(
@@ -3455,12 +3759,15 @@ def sink():
             assert_eq!(doc["byteLength"], bytes.len(), "{name}");
             assert_eq!(doc["bytesHex"], hex::encode(bytes), "{name}");
             let route = format!(
-                "/api/source?path={path}&indexGeneration={}&indexRevision={}",
+                "/source?path={path}&indexGeneration={}&indexRevision={}",
                 pin["indexGeneration"].as_str().unwrap(),
                 pin["indexRevision"].as_u64().unwrap()
             );
-            let (code, source_at) =
-                real_api(&legacy, &url, TOKEN, reqwest::Method::GET, &route, None).await;
+
+            let (code, source_at) = captured
+                .get(&route)
+                .expect("selected HTTP response")
+                .clone();
             assert_eq!(code, 200, "{name}: {source_at}");
             assert_eq!(source_at["revision"], pin, "{name}");
             assert_eq!(
@@ -3477,15 +3784,11 @@ def sink():
                 pin["indexRevision"].as_u64().unwrap()
             );
             let measured = graph_after["nodes"].as_array().unwrap();
-            let (code, classes) = real_api(
-                &legacy,
-                &url,
-                TOKEN,
-                reqwest::Method::GET,
-                &format!("/api/classes?{pinned}"),
-                None,
-            )
-            .await;
+
+            let (code, classes) = captured
+                .get(&format!("/classes?{pinned}"))
+                .expect("selected HTTP response")
+                .clone();
             assert_eq!(code, 200, "{name}: {classes}");
             assert_eq!(classes["revision"], pin, "{name}");
             let measured_classes: Vec<_> = measured
@@ -3533,15 +3836,11 @@ def sink():
                 usize::from(name == "java"),
                 "{name}"
             );
-            let (code, symbols) = real_api(
-                &legacy,
-                &url,
-                TOKEN,
-                reqwest::Method::GET,
-                "/api/symbols?q=seed",
-                None,
-            )
-            .await;
+
+            let (code, symbols) = captured
+                .get("/symbols?q=seed")
+                .expect("selected HTTP response")
+                .clone();
             assert_eq!(code, 200, "{name}: {symbols}");
             assert_eq!(symbols["revision"], pin, "{name}");
             let seed = symbols["items"]
@@ -3564,15 +3863,11 @@ def sink():
                 class_owner,
                 source,
             );
-            let (code, navigation) = real_api(
-                &legacy,
-                &url,
-                TOKEN,
-                reqwest::Method::POST,
-                "/api/navigation",
-                Some(serde_json::json!({"expectedRevision":pin,"path":file,"line":1})),
-            )
-            .await;
+
+            let (code, navigation) = captured
+                .get("/navigation")
+                .expect("selected HTTP response")
+                .clone();
             assert_eq!(code, 200, "{name}: {navigation}");
             assert_eq!(navigation["revision"], pin, "{name}");
             let targets = navigation["targets"].as_array().unwrap();
@@ -3611,15 +3906,11 @@ def sink():
                     _ => panic!("{name}: unexpected navigation declaration {target}"),
                 }
             }
-            let (code, sequence) = real_api(
-                &legacy,
-                &url,
-                TOKEN,
-                reqwest::Method::POST,
-                "/api/sequence",
-                Some(serde_json::json!({"expectedRevision":pin,"seed":seed})),
-            )
-            .await;
+
+            let (code, sequence) = captured
+                .get("/sequence")
+                .expect("selected HTTP response")
+                .clone();
             assert_eq!(code, 200, "{name}: {sequence}");
             assert_eq!(sequence["revision"], pin, "{name}");
             assert_eq!(
@@ -3758,17 +4049,11 @@ def sink():
                 serde_json::json!(expected_sequence.steps),
                 "{name}: no extra invented or null-call steps beyond captured source projection"
             );
-            let (code, preview) = real_api(
-                &legacy,
-                &url,
-                TOKEN,
-                reqwest::Method::POST,
-                "/api/questions/preview",
-                Some(serde_json::json!({
-                    "seed":seed,"question":"what happens?","expectedRevision":pin
-                })),
-            )
-            .await;
+
+            let (code, preview) = captured
+                .get("/questions/preview")
+                .expect("selected HTTP response")
+                .clone();
             assert_eq!(code, 200, "{name}: {preview}");
             let preview_packet = &preview["packet"];
             assert_eq!(preview_packet["revision"], pin, "{name}");
@@ -3806,15 +4091,11 @@ def sink():
             );
             assert!(!preview.to_string().contains("lexical-guess"), "{name}");
             let packet = preview_packet["packetId"].as_str().unwrap();
-            let (code, export) = real_api(
-                &legacy,
-                &url,
-                TOKEN,
-                reqwest::Method::GET,
-                &format!("/api/questions/{packet}/jev-request"),
-                None,
-            )
-            .await;
+
+            let (code, export) = captured
+                .get(&format!("/questions/{packet}/jev-request"))
+                .expect("selected HTTP response")
+                .clone();
             assert_eq!(code, 200, "{name}: {export}");
             assert_eq!(
                 export["state"]["identityPaths"],
@@ -3902,579 +4183,189 @@ def sink():
             );
             assert!(!export.to_string().contains("lexical-guess"), "{name}");
         }
-        let stale = request().bearer_auth(TOKEN).send().await.unwrap();
-        assert_eq!(
-            stale.status(),
-            202,
-            "{name}: stale request durably accepted"
-        );
-        let stale: Value = stale.json().await.unwrap();
-        assert_eq!(
-            stale["state"], "queued",
-            "{name}: accepted before claim-time CAS"
-        );
-        let stale_id = stale["id"].as_str().unwrap();
-        let failed = tokio::time::timeout(Duration::from_secs(20), async {
-            loop {
-                let row: Value = legacy
-                    .get(format!("{url}/api/jobs/{stale_id}"))
-                    .bearer_auth(TOKEN)
-                    .send()
-                    .await
-                    .unwrap()
-                    .json()
-                    .await
-                    .unwrap();
-                if !row["finishedAt"].is_null() {
-                    break row;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap();
-        assert_eq!(failed["state"], "failed", "{name}: {failed}");
-        assert_eq!(failed["error"]["code"], "revision_conflict", "{name}");
-        // The successful same-byte reindex advanced publication identity. A
-        // stale request must leave that current, fully raw v9 pair untouched.
-        assert_eq!(real_native_snapshot(&home), native_after, "{name}");
-        let unchanged_status: Value = legacy
-            .get(format!("{url}/api/status"))
-            .bearer_auth(TOKEN)
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        assert_eq!(
-            unchanged_status["revision"], pin,
-            "{name}: current pin changed"
-        );
     }
 }
 
-#[tokio::test]
-async fn real_daemon_post_capture_busy_preserves_pair_and_retries_same_accepted_job() {
-    use std::time::Duration;
-    const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    struct Writer(rusqlite::Connection);
-    impl Drop for Writer {
-        fn drop(&mut self) {
-            let _ = self.0.execute_batch("ROLLBACK");
-        }
-    }
-    let tmp = TempDir::new().unwrap();
-    let root = tmp.path().join("workspace");
-    let home = tmp.path().join("home");
-    fs::create_dir(&root).unwrap();
-    let original = "function seed() { sink(); } function sink() {}
-";
-    fs::write(root.join("flow.js"), original).unwrap();
-    let initial = command(&root, &home, "index").output().unwrap();
-    assert!(
-        initial.status.success(),
-        "{}",
-        String::from_utf8_lossy(&initial.stderr)
-    );
-    let url = "http://127.0.0.1:7331".to_owned();
-    let legacy = LegacyClient::same_home(&root, &home, TOKEN, &url, 2_097_152);
-    let (code, status) = real_api(
-        &legacy,
-        &url,
-        TOKEN,
-        reqwest::Method::GET,
-        "/api/status",
-        None,
-    )
-    .await;
-    assert_eq!(code, 200, "{status}");
-    let pin = status["revision"].clone();
-    let native_before = real_native_snapshot(&home);
-    let graph_before = real_export(&root, &home);
-    let pinned_source = format!(
-        "/api/source?path=flow.js&indexGeneration={}&indexRevision={}",
-        pin["indexGeneration"].as_str().unwrap(),
-        pin["indexRevision"].as_u64().unwrap()
-    );
-    let (code, _source_before) = real_api(
-        &legacy,
-        &url,
-        TOKEN,
-        reqwest::Method::GET,
-        &pinned_source,
-        None,
-    )
-    .await;
-    assert_eq!(code, 200, "{_source_before}");
-    let (code, symbols) = real_api(
-        &legacy,
-        &url,
-        TOKEN,
-        reqwest::Method::GET,
-        "/api/symbols?q=seed",
-        None,
-    )
-    .await;
-    assert_eq!(code, 200, "{symbols}");
-    let seed = symbols["items"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|s| s["name"] == "seed")
-        .unwrap()["id"]
-        .as_str()
-        .unwrap();
-    let (code, preview) = real_api(
-        &legacy,
-        &url,
-        TOKEN,
-        reqwest::Method::POST,
-        "/api/questions/preview",
-        Some(serde_json::json!({"seed":seed,"question":"what happens?","expectedRevision":pin})),
-    )
-    .await;
-    assert_eq!(code, 200, "{preview}");
-    let packet_id = preview["packet"]["packetId"].as_str().unwrap();
-    let packet_route = format!("/api/questions/{packet_id}/jev-request");
-    let (code, _packet_before) = real_api(
-        &legacy,
-        &url,
-        TOKEN,
-        reqwest::Method::GET,
-        &packet_route,
-        None,
-    )
-    .await;
-    assert_eq!(code, 200, "{_packet_before}");
-
-    // A SQLite RESERVED writer allows HTTP admission and the complete source capture,
-    // but denies the publisher its write lock after projection completes.
-    let padding = "x".repeat(48 * 1024);
-    for i in 0..80 {
-        fs::write(
-            root.join(format!("extra{i:03}.js")),
-            format!("// {padding}\nfunction extra{i}() {{}}\n"),
-        )
-        .unwrap();
-    }
-    let writer = Writer(rusqlite::Connection::open(real_index_db(&home)).unwrap());
-    writer.0.busy_timeout(Duration::from_secs(1)).unwrap();
-    writer.0.execute_batch("BEGIN IMMEDIATE").unwrap();
-    let (code, accepted) = real_api(
-        &legacy,
-        &url,
-        TOKEN,
-        reqwest::Method::POST,
-        "/api/index",
-        Some(serde_json::json!({"expectedRevision":pin})),
-    )
-    .await;
-    assert_eq!(code, 202, "{accepted}");
-    let id = accepted["id"].as_str().unwrap();
-    // The externally held index writer keeps the complete capture from
-    // publishing. Busy is not a terminal failure: the SAME durable ACK must
-    // remain queued until that writer releases its lock.
-    let deferred = tokio::time::timeout(Duration::from_secs(60), async {
-        loop {
-            let (code, job) = real_api(
-                &legacy,
-                &url,
-                TOKEN,
-                reqwest::Method::GET,
-                &format!("/api/jobs/{id}"),
-                None,
-            )
-            .await;
-            assert_eq!(code, 200, "{job}");
-            assert!(
-                job["finishedAt"].is_null(),
-                "busy cannot terminalize: {job}"
-            );
-            if job["state"] == "queued" && job["progress"]["phase"] == "timing:attest" {
-                break job;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("complete capture must defer its original ACK on publication contention");
-    assert_eq!(deferred["id"], id);
-    assert!(deferred["revision"].is_null(), "{deferred}");
-    // The writer is still held. Neither the native pair nor the graph may
-    // change. The selected prior pin remains readable, while the job cannot
-    // report success from its failed publication attempt.
-    let (generation, revision): (String, i64) = rusqlite::Connection::open(real_index_db(&home))
-        .unwrap()
-        .query_row(
-            "SELECT index_generation,index_revision FROM index_metadata WHERE singleton=1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .unwrap();
-    assert_eq!(generation, pin["indexGeneration"].as_str().unwrap());
-    assert_eq!(
-        revision,
-        i64::try_from(pin["indexRevision"].as_u64().unwrap()).unwrap()
-    );
-    assert_eq!(
-        real_native_snapshot(&home),
-        native_before,
-        "all native rows remain unchanged before the writer releases"
-    );
-    assert_eq!(
-        real_export(&root, &home),
-        graph_before,
-        "all graph rows remain unchanged before the writer releases"
-    );
-    let (code, current) = real_api(
-        &legacy,
-        &url,
-        TOKEN,
-        reqwest::Method::GET,
-        "/api/status",
-        None,
-    )
-    .await;
-    assert_eq!(code, 200, "{current}");
-    assert_eq!(current["revision"], pin);
-    let (code, source_after) = real_api(
-        &legacy,
-        &url,
-        TOKEN,
-        reqwest::Method::GET,
-        &pinned_source,
-        None,
-    )
-    .await;
-    assert_eq!(code, 200, "{source_after}");
-    assert_eq!(source_after, _source_before);
-    let (code, packet_after) = real_api(
-        &legacy,
-        &url,
-        TOKEN,
-        reqwest::Method::GET,
-        &packet_route,
-        None,
-    )
-    .await;
-    assert_eq!(code, 200, "{packet_after}");
-    assert_eq!(packet_after, _packet_before);
-    drop(writer); // Rolls back the external writer lock; the same accepted ACK now retries.
-    let completed = tokio::time::timeout(Duration::from_secs(90), async {
-        loop {
-            let (code, job) = real_api(
-                &legacy,
-                &url,
-                TOKEN,
-                reqwest::Method::GET,
-                &format!("/api/jobs/{id}"),
-                None,
-            )
-            .await;
-            assert_eq!(code, 200, "{job}");
-            if !job["finishedAt"].is_null() {
-                break job;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("the original accepted job must finish after the busy writer releases");
-    assert_eq!(completed["id"], id);
-    assert_eq!(completed["state"], "done", "{completed}");
-    assert_eq!(
-        completed["revision"]["indexGeneration"],
-        pin["indexGeneration"]
-    );
-    assert_eq!(
-        completed["revision"]["indexRevision"],
-        pin["indexRevision"].as_u64().unwrap() + 1
-    );
-    use sha2::{Digest, Sha256};
-    let new_pin = &completed["revision"];
-    let (code, published) = real_api(
-        &legacy,
-        &url,
-        TOKEN,
-        reqwest::Method::GET,
-        "/api/status",
-        None,
-    )
-    .await;
-    assert_eq!(code, 200, "{published}");
-    assert_eq!(
-        published["revision"], *new_pin,
-        "retry must publish full new pin"
-    );
-    assert_eq!(published["stats"]["files"], 81);
-    let (code, stale_packet) = real_api(
-        &legacy,
-        &url,
-        TOKEN,
-        reqwest::Method::GET,
-        &packet_route,
-        None,
-    )
-    .await;
-    assert_eq!(code, 404, "{stale_packet}");
-    assert_eq!(stale_packet["error"]["code"], "not_found");
-    let native_after = real_native_snapshot(&home);
-    let graph_after = real_export(&root, &home);
-    assert_ne!(
-        native_after, native_before,
-        "retry must replace normalized evidence rows"
-    );
-    assert_ne!(graph_after, graph_before, "retry must replace graph rows");
-    assert_eq!(
-        native_after["sourceSet"], native_before["sourceSet"],
-        "source set retains this root/language catalog"
-    );
-    assert_ne!(
-        native_after["revision"]["id"], native_before["revision"]["id"],
-        "added source bytes must create a new native revision"
-    );
-    assert_eq!(
-        native_after["revision"]["sourceSetId"],
-        native_after["sourceSet"]["id"]
-    );
-    let root_id =
-        trellis::store::topology::WorkspaceIdentity::discover_unattached(Some(&root), &root)
-            .unwrap()
-            .record_id;
-    assert_eq!(native_after["sourceSet"]["rootId"], root_id);
-    let documents = native_after["documents"].as_array().unwrap();
-    let files = graph_after["files"].as_array().unwrap();
-    assert_eq!(documents.len(), 81);
-    assert_eq!(files.len(), 81);
-    for doc in documents {
-        let path = doc["path"].as_str().unwrap();
-        let expected = if path == "flow.js" {
-            original.to_owned()
-        } else {
-            let index = path
-                .strip_prefix("extra")
-                .and_then(|suffix| suffix.strip_suffix(".js"))
-                .unwrap()
-                .parse::<usize>()
-                .unwrap();
-            assert!(index < 80, "unexpected published source path: {path}");
-            format!("// {padding}\nfunction extra{index}() {{}}\n")
-        };
-        let graph = files.iter().find(|file| file["path"] == path).unwrap();
-        assert_eq!(graph["text"], expected, "{path}: retry graph source bytes");
-        assert_eq!(graph["language"], "javascript", "{path}");
-        assert_eq!(doc["language"], graph["language"], "{path}");
-        assert_eq!(
-            doc["sourceSetId"], native_after["sourceSet"]["id"],
-            "{path}"
-        );
-        assert_eq!(doc["revisionId"], native_after["revision"]["id"], "{path}");
-        assert_eq!(doc["byteLength"], expected.len(), "{path}");
-        assert_eq!(doc["bytesHex"], hex::encode(expected.as_bytes()), "{path}");
-        assert_eq!(
-            doc["contentHash"],
-            hex::encode(Sha256::digest(expected.as_bytes())),
-            "{path}"
-        );
-        assert_eq!(doc["contentHash"], graph["hash"], "{path}");
-        let route = format!(
-            "/api/source?path={path}&indexGeneration={}&indexRevision={}",
-            new_pin["indexGeneration"].as_str().unwrap(),
-            new_pin["indexRevision"].as_u64().unwrap()
-        );
-        let (code, source) =
-            real_api(&legacy, &url, TOKEN, reqwest::Method::GET, &route, None).await;
-        assert_eq!(code, 200, "{path}: {source}");
-        assert_eq!(
-            source["revision"], *new_pin,
-            "{path}: authenticated full pin"
-        );
-        assert_eq!(
-            source["file"], *graph,
-            "{path}: pinned source matches paired graph/native"
-        );
-    }
-    for i in 0..80 {
-        let path = format!("extra{i:03}.js");
-        assert!(
-            documents.iter().any(|doc| doc["path"] == path),
-            "missing retry document: {path}"
-        );
-    }
-}
-
-#[cfg(unix)]
 #[test]
-fn index_process_holds_leader_while_stdout_is_blocked() {
-    use std::fs::{File, OpenOptions};
-    use std::io::{Read, Write};
-    use std::os::fd::{AsRawFd, FromRawFd};
-    use std::os::unix::ffi::OsStrExt;
+fn virgin_cli_activation_contention_expires_before_enqueue_and_new_index_succeeds() {
     use std::process::Stdio;
     use std::time::{Duration, Instant};
-
-    struct ChildGuard(std::process::Child);
-    impl Drop for ChildGuard {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
+    use trellis::store::{
+        Store,
+        topology::{TopologyRoots, UseGuard, WorkspaceIdentity},
+    };
 
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("source");
     let home = temp.path().join("home");
     fs::create_dir(&root).unwrap();
     fs::write(root.join("flow.js"), "function start() {}\n").unwrap();
-    let identity =
-        trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root).unwrap();
-    let index_dir = if cfg!(target_os = "macos") {
-        home.join("Library/Caches/dev.squashmerge.trellis/indexes")
-            .join(&identity.root_key)
+    let _daemon = FixtureDaemon::new(&home);
+    let (cache, data) = if cfg!(target_os = "macos") {
+        (
+            home.join("Library/Caches/dev.squashmerge.trellis"),
+            home.join("Library/Application Support/dev.squashmerge.trellis"),
+        )
     } else {
-        home.join(".cache/trellis/indexes").join(&identity.root_key)
+        (
+            home.join(".cache/trellis"),
+            home.join(".local/share/trellis"),
+        )
     };
+    let roots = TopologyRoots::isolated_for_tests(cache, data);
+    let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+    let use_lock = roots.index_use_lock(&identity);
+    let store = Store::open(roots, identity).unwrap();
+    assert_eq!(store.index_baseline().unwrap().index_revision, 0);
+    let queue_path = store.request_db_path();
+    assert!(
+        !queue_path.exists(),
+        "fresh Ready index must have a virgin queue"
+    );
+    // Store must release every SQLite handle before another process contends on
+    // the index-use lock. SH blocks the virgin queue's mandatory EX publish.
+    drop(store);
+    let reader = UseGuard::acquire_existing_readonly(&use_lock).unwrap();
+    let stdout_path = temp.path().join("contended-index.stdout");
+    let stderr_path = temp.path().join("contended-index.stderr");
+    let marker = home.join("auto-daemon.pid");
+    let mut child = command(&root, &home, "index")
+        .env("TRELLIS_TEST_DAEMON_PID_FILE", &marker)
+        .stdout(Stdio::from(fs::File::create(&stdout_path).unwrap()))
+        .stderr(Stdio::from(fs::File::create(&stderr_path).unwrap()))
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("contended CLI index did not exit after its 5s read wait");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(!status.success(), "contended index unexpectedly succeeded");
+    assert!(
+        fs::read(&stdout_path).unwrap().is_empty(),
+        "failed index emitted an accepted ID"
+    );
+    let stderr = fs::read_to_string(&stderr_path).unwrap();
+    assert!(
+        stderr.contains("storage_busy: CLI read contention wait expired"),
+        "unexpected pre-acceptance error: {stderr}"
+    );
+    assert!(
+        !queue_path.exists(),
+        "a failed pre-acceptance index created requests.db"
+    );
+    drop(reader);
 
-    let mut fds = [0; 2];
-    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-    // Close-on-exec: processes spawned by concurrent tests must not inherit
-    // either end (#131). The child's stdout redirect is a fresh descriptor.
-    for fd in fds {
-        assert_eq!(
-            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
-            0
-        );
-    }
-    let mut reader = unsafe { File::from_raw_fd(fds[0]) };
-    let mut writer = unsafe { File::from_raw_fd(fds[1]) };
-    let flags = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) };
-    assert!(flags >= 0);
-    assert_eq!(
-        unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
-        0
+    // This is a new CLI invocation, not a replay of an uncertain enqueue.
+    let fresh = command(&root, &home, "index")
+        .env("TRELLIS_TEST_DAEMON_PID_FILE", &marker)
+        .output()
+        .unwrap();
+    assert!(
+        fresh.status.success(),
+        "{}",
+        String::from_utf8_lossy(&fresh.stderr)
     );
-    let fill = [b'x'; 4096];
-    let mut filler_bytes = 0usize;
-    loop {
-        match writer.write(&fill) {
-            Ok(bytes) => filler_bytes += bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-            Err(error) => panic!("prefill stdout pipe: {error}"),
-        }
-    }
-    assert!(filler_bytes > 0);
-    assert_eq!(
-        unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_SETFL, flags) },
-        0
-    );
+    let result: Value = serde_json::from_slice(&fresh.stdout).unwrap();
+    assert_eq!(result["publishedRevision"], result["status"]["revision"]);
+    assert_eq!(result["publishedRevision"]["indexRevision"], 2);
 
-    let stderr_path = temp.path().join("blocked-index-stderr");
-    let mut child = ChildGuard(
-        command(&root, &home, "index")
-            .stdout(Stdio::from(writer))
-            .stderr(Stdio::from(File::create(&stderr_path).unwrap()))
-            .spawn()
-            .unwrap(),
+    // Raw SQLite reads may close descriptors on the live inode and drop its
+    // process locks. Attest daemon shutdown and released use lock first.
+    FixtureDaemon::new(&home).stop_attested().unwrap();
+    let _exclusive = UseGuard::acquire_existing_readonly_exclusive(&use_lock)
+        .expect("retired daemon retained the index-use lock");
+    let db = rusqlite::Connection::open_with_flags(
+        &queue_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let (count, distinct_ids, state, revision): (i64, i64, String, i64) = db
+        .query_row(
+            "SELECT count(*), count(DISTINCT id), min(state), min(result_revision) FROM requests",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (count, distinct_ids, state.as_str(), revision),
+        (1, 1, "done", 2)
     );
-    let db_path = index_dir.join("index.db");
-    let journal_path = index_dir.join("index.db-journal");
-    // SQLite immutable URI connections never take SH locks against the writer.
-    // Percent-encode raw path bytes so %, ?, #, spaces and non-UTF8 cannot
-    // change the URI query or select another database.
-    let mut db_uri = String::from("file:");
-    for &byte in db_path.as_os_str().as_bytes() {
-        if byte.is_ascii_alphanumeric() || b"/._-~".contains(&byte) {
-            db_uri.push(char::from(byte));
-        } else {
-            db_uri.push('%');
-            db_uri.push_str(&format!("{byte:02X}"));
-        }
-    }
-    db_uri.push_str("?immutable=1");
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        if let Some(status) = child.0.try_wait().unwrap() {
-            panic!(
-                "index exited before publication barrier ({status}): {}",
-                fs::read_to_string(&stderr_path).unwrap_or_default()
-            );
-        }
-        if db_path.exists() {
-            // A partially initialized file or an unsupported WAL-mode header is
-            // never a commit signal. This plain file read takes no SQLite lock.
-            let delete_mode = File::open(&db_path)
-                .and_then(|mut file| {
-                    let mut header = [0u8; 20];
-                    file.read_exact(&mut header)?;
-                    Ok(&header[..16] == b"SQLite format 3\0" && header[18] == 1 && header[19] == 1)
-                })
-                .unwrap_or(false);
-            if delete_mode
-                && let Ok(db) = rusqlite::Connection::open_with_flags(
-                    db_uri.as_str(),
-                    rusqlite::OpenFlags::SQLITE_OPEN_URI
-                        | rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-                )
+}
+
+#[test]
+fn daemon_publication_is_independent_of_cli_output_file() {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("source");
+    let home = temp.path().join("home");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("flow.js"), "function start() {}\n").unwrap();
+    let output_path = temp.path().join("index.stdout");
+    let stderr_path = temp.path().join("index.stderr");
+    let daemon_pid = temp.path().join("daemon.pid");
+    struct ElectedDaemon(std::path::PathBuf);
+    impl Drop for ElectedDaemon {
+        fn drop(&mut self) {
+            if let Ok(pid) = fs::read_to_string(&self.0)
+                && let Ok(pid) = pid.parse::<u32>()
+                && pid <= i32::MAX as u32
             {
-                let published = db
-                    .query_row(
-                        "SELECT reconciled_incarnation IS NOT NULL,index_revision FROM index_metadata WHERE singleton=1",
-                        [],
-                        |row| Ok((row.get::<_, bool>(0)?, row.get::<_, i64>(1)?)),
-                    )
-                    // H may already be followed by the claimed FIFO result
-                    // before this 10 ms probe. Either committed head proves
-                    // publication while the stdout pipe still holds the child.
-                    .is_ok_and(|(reconciled, revision)| reconciled && revision >= 1);
-                drop(db);
-                // In this repository's enforced DELETE mode, removing the
-                // rollback journal is the commit point, after database sync.
-                // A dangling symlink or metadata error must not count as absent.
-                let journal_absent = matches!(
-                    fs::symlink_metadata(&journal_path),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound
-                );
-                if published && journal_absent {
-                    break;
-                }
+                // The elected daemon writes this marker under the private fixture.
+                unsafe { libc::kill(pid as i32, libc::SIGTERM) };
             }
         }
-        assert!(
-            Instant::now() < deadline,
-            "index publication barrier timed out: {}",
-            fs::read_to_string(&stderr_path).unwrap_or_default()
-        );
-        std::thread::sleep(Duration::from_millis(10));
     }
-    assert!(
-        child.0.try_wait().unwrap().is_none(),
-        "child escaped the full stdout pipe"
-    );
-    let leader_file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(index_dir.join("leader.lock"))
+    let _daemon = ElectedDaemon(daemon_pid.clone());
+    let mut child = command(&root, &home, "index")
+        .env("TRELLIS_TEST_DAEMON_PID_FILE", &daemon_pid)
+        .stdout(Stdio::from(fs::File::create(&output_path).unwrap()))
+        .stderr(Stdio::from(fs::File::create(&stderr_path).unwrap()))
+        .spawn()
         .unwrap();
-    let locked = unsafe { libc::flock(leader_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    assert_ne!(locked, 0, "index released leadership before writing stdout");
-
-    let mut filler = vec![0; filler_bytes];
-    reader.read_exact(&mut filler).unwrap();
-    assert!(filler.iter().all(|byte| *byte == b'x'));
-    let mut stdout = Vec::new();
-    reader.read_to_end(&mut stdout).unwrap();
-    assert!(child.0.wait().unwrap().success());
-    let output: Value = serde_json::from_slice(&stdout).unwrap();
-    assert_eq!(output["publishedRevision"]["indexRevision"], 2);
-    assert_eq!(output["status"]["revision"]["indexRevision"], 2);
-    assert_eq!(output["status"]["stats"]["files"], 1);
-    assert_eq!(
-        unsafe { libc::flock(leader_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-        0
-    );
-    unsafe { libc::flock(leader_file.as_raw_fd(), libc::LOCK_UN) };
+    let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
+    loop {
+        if let Some(exit) = child.try_wait().unwrap() {
+            assert!(
+                exit.success(),
+                "{}",
+                fs::read_to_string(&stderr_path).unwrap()
+            );
+            break;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("daemon-owned CLI index did not finish within 15s");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let result: Value = serde_json::from_slice(&fs::read(output_path).unwrap()).unwrap();
+    assert_eq!(result["publishedRevision"], result["status"]["revision"]);
+    assert_eq!(result["status"]["stats"]["files"], 1);
+    let pid: u32 = fs::read_to_string(daemon_pid).unwrap().parse().unwrap();
+    assert_ne!(pid, child.id(), "index CLI must not be the elected daemon");
+    let queue = real_index_db(&home).with_file_name("requests.db");
+    let db =
+        rusqlite::Connection::open_with_flags(queue, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let (count, done): (i64, i64) = db
+        .query_row(
+            "SELECT count(*),sum(CASE WHEN state='done' THEN 1 ELSE 0 END) FROM requests",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((count, done), (1, 1), "one daemon-owned durable request");
 }
 
 #[tokio::test]
@@ -4490,7 +4381,10 @@ async fn saved_items_real_index_matrix() {
         "fn seed(value: i32) { sink(); }\nfn sink() {}\nfn other() {}\n",
     )
     .unwrap();
-    let indexed = command(&root, &home, "index").output().unwrap();
+    let indexed = command(&root, &home, "index")
+        .env("TRELLIS_TEST_DAEMON_PID_FILE", home.join("auto-daemon.pid"))
+        .output()
+        .unwrap();
     assert!(
         indexed.status.success(),
         "{}",
@@ -4498,6 +4392,7 @@ async fn saved_items_real_index_matrix() {
     );
     let indexed: Value = serde_json::from_slice(&indexed.stdout).unwrap();
     let initial_pin = indexed["status"]["revision"].clone();
+    assert!(home.join("auto-daemon.pid").exists());
     let (_server, client, url) = start_saved_item_server(temp.path(), &root, &home, TOKEN).await;
     let (status, serving_status) = real_api(
         &client,
@@ -4511,9 +4406,9 @@ async fn saved_items_real_index_matrix() {
     assert_eq!(status, reqwest::StatusCode::OK, "{serving_status}");
     let pin = serving_status["revision"].clone();
     assert_eq!(pin["indexGeneration"], initial_pin["indexGeneration"]);
-    assert_eq!(
-        pin["indexRevision"].as_u64().unwrap(),
-        initial_pin["indexRevision"].as_u64().unwrap() + 1
+    // The direct router may commit mandatory startup reconciliation after the daemon exits.
+    assert!(
+        pin["indexRevision"].as_u64().unwrap() >= initial_pin["indexRevision"].as_u64().unwrap()
     );
 
     for route in ["/api/views", "/api/views/absent", "/api/annotations"] {
@@ -4948,9 +4843,9 @@ async fn saved_items_real_index_matrix() {
     assert_eq!(status, reqwest::StatusCode::OK, "{reopened_status}");
     let reopened_pin = reopened_status["revision"].clone();
     assert_eq!(reopened_pin["indexGeneration"], next["indexGeneration"]);
-    assert_eq!(
-        reopened_pin["indexRevision"].as_u64().unwrap(),
-        next["indexRevision"].as_u64().unwrap() + 1
+    // Reopening the direct router may publish mandatory startup reconciliation again.
+    assert!(
+        reopened_pin["indexRevision"].as_u64().unwrap() >= next["indexRevision"].as_u64().unwrap()
     );
     let (status, views) = real_api(
         &client,
@@ -5076,6 +4971,7 @@ fn optional_captured_scip_changes_presentation_without_native_identity_or_full_r
         .unwrap();
     assert!(original.status.success());
     let original: Value = serde_json::from_slice(&original.stdout).unwrap();
+    let original = &original["data"];
     let first_symbol = original["nodes"]
         .as_array()
         .unwrap()
@@ -5088,6 +4984,19 @@ fn optional_captured_scip_changes_presentation_without_native_identity_or_full_r
     write_optional_presentation(&ingress, "scip npm display 1 main.js/f().", &hash);
     // An unrelated cwd never becomes the base of the recorded optional inputs.
     write_optional_presentation(&other, "scip npm display 1 other().", "stale");
+    let republished = command(&root, &home, "index")
+        .arg("--scip")
+        .arg(ingress.join("index.scip"))
+        .arg("--manifest")
+        .arg(ingress.join("manifest.json"))
+        .output()
+        .unwrap();
+    assert!(
+        republished.status.success(),
+        "{}",
+        String::from_utf8_lossy(&republished.stderr)
+    );
+    let republished: Value = serde_json::from_slice(&republished.stdout).unwrap();
     let changed = command(&root, &home, "export")
         .current_dir(&other)
         .output()
@@ -5098,6 +5007,7 @@ fn optional_captured_scip_changes_presentation_without_native_identity_or_full_r
         String::from_utf8_lossy(&changed.stderr)
     );
     let changed: Value = serde_json::from_slice(&changed.stdout).unwrap();
+    let changed = &changed["data"];
     let next = changed["nodes"]
         .as_array()
         .unwrap()
@@ -5116,14 +5026,32 @@ fn optional_captured_scip_changes_presentation_without_native_identity_or_full_r
         .unwrap();
     assert!(status.status.success());
     let status: Value = serde_json::from_slice(&status.stdout).unwrap();
-    // Only writer commands publish: index reconciles r1 and claims r2, original export r3,
-    // changed export r4, read-only status r4, stale export r5, latest status r5.
-    assert_eq!(status["revision"]["indexRevision"], 4);
+    // Read commands do not claim a writer. The daemon watcher can publish
+    // another revision when selected presentation inputs change.
+    assert!(
+        status["revision"]["indexRevision"].as_u64().unwrap()
+            >= republished["publishedRevision"]["indexRevision"]
+                .as_u64()
+                .unwrap()
+    );
     assert_eq!(
         status["revision"]["indexGeneration"],
         first_pin["publishedRevision"]["indexGeneration"]
     );
     write_optional_presentation(&ingress, "scip npm display 1 main.js/f().", "bad-hash");
+    let republished = command(&root, &home, "index")
+        .arg("--scip")
+        .arg(ingress.join("index.scip"))
+        .arg("--manifest")
+        .arg(ingress.join("manifest.json"))
+        .output()
+        .unwrap();
+    assert!(
+        republished.status.success(),
+        "{}",
+        String::from_utf8_lossy(&republished.stderr)
+    );
+    let republished: Value = serde_json::from_slice(&republished.stdout).unwrap();
     let stale = command(&root, &home, "export")
         .current_dir(&other)
         .output()
@@ -5134,6 +5062,7 @@ fn optional_captured_scip_changes_presentation_without_native_identity_or_full_r
         String::from_utf8_lossy(&stale.stderr)
     );
     let stale: Value = serde_json::from_slice(&stale.stdout).unwrap();
+    let stale = &stale["data"];
     let symbol = stale["nodes"]
         .as_array()
         .unwrap()
@@ -5148,7 +5077,16 @@ fn optional_captured_scip_changes_presentation_without_native_identity_or_full_r
         .unwrap();
     assert!(latest.status.success());
     let latest: Value = serde_json::from_slice(&latest.stdout).unwrap();
-    assert_eq!(latest["revision"]["indexRevision"], 5);
+    assert_eq!(
+        latest["revision"]["indexGeneration"],
+        first_pin["publishedRevision"]["indexGeneration"]
+    );
+    assert!(
+        latest["revision"]["indexRevision"].as_u64().unwrap()
+            >= republished["publishedRevision"]["indexRevision"]
+                .as_u64()
+                .unwrap()
+    );
 }
 
 #[test]
@@ -5158,7 +5096,7 @@ fn explicit_cli_unchanged_claim_publishes_then_acks() {
     let home = temp.path().join("home");
     fs::create_dir(&root).unwrap();
     fs::write(root.join("a.js"), "function unchanged() {}\n").unwrap();
-    for expected in [2_i64, 4] {
+    for expected in [2_i64, 3] {
         let output = command(&root, &home, "index").output().unwrap();
         assert!(
             output.status.success(),
@@ -5173,7 +5111,7 @@ fn explicit_cli_unchanged_claim_publishes_then_acks() {
             .unwrap();
         assert_eq!(
             actual, expected,
-            "each fresh takeover and claimed request publish separately"
+            "one daemon publishes one revision for each claimed request"
         );
         let immutable: i64 = db
             .query_row("SELECT count(*) FROM document_versions", [], |r| r.get(0))

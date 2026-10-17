@@ -1,3 +1,4 @@
+#![cfg(feature = "test-support")]
 //! HTTP protocol fixtures are offline; synthetic responses are not model quality evidence.
 mod common;
 use axum::{
@@ -10,7 +11,7 @@ use trellis::{
     http,
     indexer::{IndexOptions, index_workspace},
     model::*,
-    store::{Store, topology::LeaderSession},
+    store::{Store, topology::WriterSession},
 };
 #[path = "common/jev_wire.rs"]
 mod jev_wire;
@@ -27,7 +28,7 @@ fn setup(
     Arc<http::DaemonState>,
     Router,
     Value,
-    Arc<LeaderSession>,
+    Arc<WriterSession>,
 ) {
     let dir = tempfile::tempdir().unwrap();
     let workspace = dir.path().join("workspace");
@@ -46,12 +47,12 @@ fn setup(
         .id
         .clone();
     let store = crate::common::open_store(&dir.path().join("state"), &workspace).unwrap();
-    let session = store.leader_session().unwrap();
+    let session = store.writer_session_for_tests().unwrap();
     publish_bundle(
         &store,
         &graph,
         &workspace,
-        session.leader_guard().unwrap(),
+        session.writer_guard().unwrap(),
         trellis::model::IndexPin {
             index_generation: store.index_baseline().unwrap().index_generation,
             index_revision: 0,
@@ -307,7 +308,7 @@ async fn bad_choices_missing_packets_and_stale_revisions_are_client_errors() {
         &store,
         &graph,
         &dir.path().join("workspace"),
-        session.leader_guard().unwrap(),
+        session.writer_guard().unwrap(),
         trellis::model::IndexPin {
             index_generation,
             index_revision: 1,
@@ -484,18 +485,17 @@ async fn packet_operation_pair_matrix() {
     drop(session);
     let exclusive = UseGuard::acquire_existing(&lock, true, true).unwrap();
     std::fs::remove_file(dir.join("index.db")).unwrap();
-    std::fs::remove_file(dir.join("leader.lock")).unwrap();
     std::fs::remove_dir(dir).unwrap();
     exclusive.remove_last().unwrap();
     let recreated =
         crate::common::open_store(&temp.path().join("state"), &temp.path().join("workspace"))
             .unwrap();
-    let replacement_session = recreated.leader_session().unwrap();
+    let replacement_session = recreated.writer_session_for_tests().unwrap();
     publish_bundle(
         &recreated,
         &graph,
         &temp.path().join("workspace"),
-        replacement_session.leader_guard().unwrap(),
+        replacement_session.writer_guard().unwrap(),
         recreated.index_baseline().unwrap(),
         &Arc::new(AtomicBool::new(false)),
     )
@@ -521,7 +521,7 @@ fn publish_bundle(
     store: &trellis::store::Store,
     graph: &trellis::model::Graph,
     workspace: &std::path::Path,
-    leader: &trellis::store::topology::LeaderGuard,
+    leader: &trellis::store::topology::WriterGuard,
     expected: trellis::model::IndexPin,
     cancel: &trellis::model::CancelFlag,
 ) -> anyhow::Result<trellis::model::IndexPin> {

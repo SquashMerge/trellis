@@ -1,3 +1,4 @@
+#![cfg(feature = "test-support")]
 mod common;
 use axum::{
     Router,
@@ -11,7 +12,7 @@ use trellis::{
     http,
     indexer::{IndexOptions, index_workspace},
     model::{CancelFlag, Graph},
-    store::{Store, topology::LeaderSession},
+    store::{Store, topology::WriterSession},
 };
 const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 fn fixture() -> (
@@ -20,7 +21,7 @@ fn fixture() -> (
     Graph,
     Router,
     String,
-    Arc<LeaderSession>,
+    Arc<WriterSession>,
 ) {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("workspace");
@@ -41,7 +42,7 @@ fn fixture() -> (
         .id
         .clone();
     let store = crate::common::open_store(&temp.path().join("state"), &root).unwrap();
-    let session = store.leader_session().unwrap();
+    let session = store.writer_session_for_tests().unwrap();
     let state = http::new(
         store.clone(),
         options,
@@ -105,7 +106,7 @@ async fn durable_crud_matrix() {
         &store,
         &graph,
         &temp.path().join("workspace"),
-        session.leader_guard().unwrap(),
+        session.writer_guard().unwrap(),
         baseline,
         &Arc::new(AtomicBool::new(false)),
     )
@@ -197,7 +198,7 @@ async fn query_optional_pin_matrix() {
         &store,
         &graph,
         &root,
-        session.leader_guard().unwrap(),
+        session.writer_guard().unwrap(),
         store.index_baseline().unwrap(),
         &Arc::new(AtomicBool::new(false)),
     )
@@ -240,7 +241,7 @@ async fn query_optional_pin_matrix() {
         &store,
         &graph,
         &root,
-        session.leader_guard().unwrap(),
+        session.writer_guard().unwrap(),
         pin,
         &Arc::new(AtomicBool::new(false)),
     )
@@ -271,7 +272,7 @@ async fn saved_read_pin_and_ownership_matrix() {
         &store,
         &graph,
         &root,
-        session.leader_guard().unwrap(),
+        session.writer_guard().unwrap(),
         store.index_baseline().unwrap(),
         &Arc::new(AtomicBool::new(false)),
     )
@@ -420,7 +421,7 @@ async fn saved_read_pin_and_ownership_matrix() {
         &store,
         &graph,
         &root,
-        session.leader_guard().unwrap(),
+        session.writer_guard().unwrap(),
         pin,
         &Arc::new(AtomicBool::new(false)),
     )
@@ -454,7 +455,7 @@ async fn missing_anchor_document_keeps_authenticated_saved_routes_listable() {
     let options = IndexOptions::new(root.clone());
     let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
     let store = crate::common::open_store(&temp.path().join("state"), &root).unwrap();
-    let session = store.leader_session().unwrap();
+    let session = store.writer_session_for_tests().unwrap();
     let (graph, native, capture) =
         trellis::indexer::index_workspace_bundle(&options, store.root_id(), &cancel, |_| {})
             .unwrap();
@@ -477,7 +478,7 @@ async fn missing_anchor_document_keeps_authenticated_saved_routes_listable() {
             &graph,
             &capture,
             &native,
-            session.leader_guard().unwrap(),
+            session.writer_guard().unwrap(),
             store.index_baseline().unwrap(),
             &cancel,
         )
@@ -557,7 +558,7 @@ async fn missing_anchor_document_keeps_authenticated_saved_routes_listable() {
             &graph,
             &capture,
             &native,
-            session.leader_guard().unwrap(),
+            session.writer_guard().unwrap(),
             first,
             &cancel,
         )
@@ -724,7 +725,7 @@ fn publish_bundle(
     store: &trellis::store::Store,
     graph: &trellis::model::Graph,
     workspace: &std::path::Path,
-    leader: &trellis::store::topology::LeaderGuard,
+    leader: &trellis::store::topology::WriterGuard,
     expected: trellis::model::IndexPin,
     cancel: &trellis::model::CancelFlag,
 ) -> anyhow::Result<trellis::model::IndexPin> {
@@ -829,7 +830,7 @@ async fn saved_views_and_annotations_attach_to_the_requested_retained_manifest()
         &store,
         &graph,
         &root,
-        session.leader_guard().unwrap(),
+        session.writer_guard().unwrap(),
         store.index_baseline().unwrap(),
         &cancel,
     )
@@ -856,7 +857,7 @@ async fn saved_views_and_annotations_attach_to_the_requested_retained_manifest()
         &store,
         &updated,
         &root,
-        session.leader_guard().unwrap(),
+        session.writer_guard().unwrap(),
         r1,
         &cancel,
     )
@@ -890,7 +891,7 @@ async fn saved_views_and_annotations_attach_to_the_requested_retained_manifest()
     let release_before = retained_release_snapshot(&temp.path().join("state"), &root, &r1);
     let maintenance_busy_before = store.maintenance_sqlite_busy_attempts();
     let release_started = std::time::Instant::now();
-    let release_deadline = std::time::Duration::from_secs(5);
+    let release_deadline = trellis::testing::HANG_BACKSTOP;
     let mut release_deferred = Vec::new();
     let mut release_attempts = 0;
     let mut released = false;
@@ -899,7 +900,7 @@ async fn saved_views_and_annotations_attach_to_the_requested_retained_manifest()
             break;
         }
         release_attempts = attempt;
-        match store.release_revision(r1, session.leader_guard().unwrap()) {
+        match store.release_revision(r1, session.writer_guard().unwrap()) {
             Ok(()) => {
                 released = true;
                 break;

@@ -1137,10 +1137,25 @@ pub(crate) fn validate_native_graph_records(
     native: &native_evidence::Artifact,
     cancel: &CancelFlag,
 ) -> Result<()> {
-    let files: BTreeMap<_, _> = graph.files.iter().map(|f| (f.path.as_str(), f)).collect();
+    validate_native_graph_records_with_progress(graph, native, cancel, None)
+}
+pub(crate) fn validate_native_graph_records_with_progress(
+    graph: &Graph,
+    native: &native_evidence::Artifact,
+    cancel: &CancelFlag,
+    progress: Option<&dyn Fn() -> bool>,
+) -> Result<()> {
+    crate::store::optional_hint_check(progress)?;
+    let mut files = BTreeMap::new();
+    for file in &graph.files {
+        crate::store::optional_hint_check(progress)?;
+        files.insert(file.path.as_str(), file);
+    }
     let lines = line_indexes(&files);
+    crate::store::optional_hint_check(progress)?;
     let mut declaration_keys = BTreeMap::new();
     for d in &native.declarations {
+        crate::store::optional_hint_check(progress)?;
         let key = (
             d.document.path.as_str(),
             serde_json::to_string(&d.ancestors)?,
@@ -1151,12 +1166,17 @@ pub(crate) fn validate_native_graph_records(
             "native declaration key collision"
         );
     }
-    let symbols: BTreeMap<_, _> = graph.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+    let mut symbols = BTreeMap::new();
+    for node in &graph.nodes {
+        crate::store::optional_hint_check(progress)?;
+        symbols.insert(node.id.as_str(), node);
+    }
     ensure!(
         symbols.len() == native.declarations.len() && graph.nodes.len() == symbols.len(),
         "native_evidence_required: graph declaration cardinality"
     );
     for d in &native.declarations {
+        crate::store::optional_hint_check(progress)?;
         ensure!(!cancel.load(Ordering::Relaxed), "indexing cancelled");
         let f = files
             .get(d.document.path.as_str())
@@ -1197,12 +1217,17 @@ pub(crate) fn validate_native_graph_records(
             "native_evidence_required: graph declaration differs from measured native row"
         );
     }
-    let regions: BTreeMap<_, _> = graph.regions.iter().map(|r| (r.id.as_str(), r)).collect();
+    let mut regions = BTreeMap::new();
+    for region in &graph.regions {
+        crate::store::optional_hint_check(progress)?;
+        regions.insert(region.id.as_str(), region);
+    }
     ensure!(
         regions.len() == native.control_regions.len() && graph.regions.len() == regions.len(),
         "native_evidence_required: graph region cardinality"
     );
     for r in &native.control_regions {
+        crate::store::optional_hint_check(progress)?;
         ensure!(!cancel.load(Ordering::Relaxed), "indexing cancelled");
         let f = files
             .get(r.document.path.as_str())
@@ -1224,12 +1249,17 @@ pub(crate) fn validate_native_graph_records(
             "native_evidence_required: graph region differs from measured native row"
         );
     }
-    let calls: BTreeMap<_, _> = graph.calls.iter().map(|c| (c.id.as_str(), c)).collect();
+    let mut calls = BTreeMap::new();
+    for call in &graph.calls {
+        crate::store::optional_hint_check(progress)?;
+        calls.insert(call.id.as_str(), call);
+    }
     ensure!(
         calls.len() == native.calls.len() && graph.calls.len() == calls.len(),
         "native_evidence_required: graph call cardinality"
     );
     for c in &native.calls {
+        crate::store::optional_hint_check(progress)?;
         ensure!(!cancel.load(Ordering::Relaxed), "indexing cancelled");
         let f = files
             .get(c.document.path.as_str())
@@ -1263,6 +1293,7 @@ pub(crate) fn validate_native_graph_records(
     };
     let mut diagnostics = Vec::new();
     for c in &native.coverage {
+        crate::store::optional_hint_check(progress)?;
         if c.state != "complete" {
             let recovered = c
                 .diagnostic
@@ -1286,6 +1317,7 @@ pub(crate) fn validate_native_graph_records(
             });
         }
     }
+    crate::store::optional_hint_check(progress)?;
     ensure!(
         graph.stats == stats && graph.diagnostics == diagnostics,
         "native_evidence_required: graph diagnostics or statistics differ from native coverage"

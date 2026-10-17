@@ -4,45 +4,16 @@ use serde::Serialize;
 use std::{
     net::SocketAddr,
     path::PathBuf,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, atomic::Ordering},
     time::{Duration, Instant},
 };
 use trellis::{
     daemon::{self, client, protocol, registry},
     indexer::IndexOptions,
     mcp,
-    model::{CancelFlag, ViewQuery},
-    store::{
-        Store,
-        topology::{TopologyRoots, WorkspaceIdentity},
-    },
+    model::ViewQuery,
+    store::topology::{TopologyRoots, WorkspaceIdentity},
 };
-
-// Finite retry budget between terminal selected-status attempts, not a synchronous
-// SQLite-call wall-clock guarantee or a claim of p99 publication latency.
-const STATUS_RESULT_WAIT: Duration = Duration::from_secs(15);
-
-// Opt-in real-process test barrier. Normal CLI runs never open this socket.
-#[cfg(unix)]
-fn fixture_index_exchange(
-    socket: &mut std::os::unix::net::UnixStream,
-    sent: u8,
-    expected: u8,
-) -> Result<()> {
-    use std::io::{Read, Write};
-    socket
-        .write_all(&[sent])
-        .map_err(|_| anyhow::anyhow!("fixture index IPC send failed"))?;
-    let mut reply = [0u8];
-    socket
-        .read_exact(&mut reply)
-        .map_err(|_| anyhow::anyhow!("fixture index IPC response failed"))?;
-    ensure!(reply[0] == expected, "fixture index IPC response mismatch");
-    Ok(())
-}
 
 #[derive(Parser)]
 #[command(
@@ -194,33 +165,6 @@ impl WorkspaceArgs {
         roots.reject_root_overlap(&identity)?;
         Ok((roots, identity))
     }
-    fn resolve(&self) -> Result<(TopologyRoots, WorkspaceIdentity)> {
-        let (roots, identity) = self.resolve_unattached()?;
-        Ok((roots, identity.attach_marker()?))
-    }
-    fn store(&self) -> Result<Store> {
-        let (roots, identity) = self.resolve()?;
-        Store::open(roots, identity)
-    }
-}
-impl IndexArgs {
-    fn resolve(&self) -> Result<(Store, IndexOptions, PathBuf)> {
-        let max_file_bytes = self.max_file_bytes.unwrap_or(2_097_152);
-        ensure!(
-            (1..=16_777_216).contains(&max_file_bytes),
-            "max-file-bytes must be 1..16777216"
-        );
-        let (roots, identity) = self.workspace.resolve()?;
-        let root = identity.root.clone();
-        let cache = roots.cache.clone();
-        let store = Store::open(roots, identity)?;
-        let mut options = IndexOptions::new(root);
-        options.scip_path = self.scip.clone();
-        options.manifest_path = self.manifest.clone();
-        options.anchor_optional_inputs(&std::env::current_dir()?)?;
-        options.max_file_bytes = max_file_bytes;
-        Ok((store, options, cache))
-    }
 }
 fn print_json(value: &impl Serialize) -> Result<()> {
     use std::io::Write;
@@ -231,177 +175,7 @@ fn print_json(value: &impl Serialize) -> Result<()> {
     Ok(())
 }
 
-// Retry Store::open before admission, then reuse the admitted Store/session for
-// fresh selected-read snapshots. Guard loss outranks contention and expiry;
-// output destinations are opened only after a complete read succeeds.
 const CLI_READ_WAIT: Duration = Duration::from_secs(5);
-fn cli_read_with_retry<T>(
-    verify: impl Fn() -> Result<()>,
-    attempt: impl FnMut() -> Result<T>,
-) -> Result<T> {
-    cli_read_with_retry_until(Instant::now() + CLI_READ_WAIT, verify, attempt)
-}
-
-fn cli_read_with_retry_until<T>(
-    deadline: Instant,
-    verify: impl Fn() -> Result<()>,
-    mut attempt: impl FnMut() -> Result<T>,
-) -> Result<T> {
-    let mut backoff = Duration::from_millis(20);
-    loop {
-        verify()?;
-        match attempt() {
-            Ok(value) => {
-                verify()?;
-                return Ok(value);
-            }
-            Err(error) => {
-                verify()?;
-                if !trellis::store::cli_read_retryable_contention(&error) {
-                    return Err(error);
-                }
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    return Err(trellis::store::cli_read_busy_expired());
-                }
-                std::thread::sleep(backoff.min(remaining));
-                backoff = backoff.saturating_mul(2).min(Duration::from_millis(250));
-            }
-        }
-    }
-}
-
-// Do not repeat admission. It can commit H before failing its final attestation,
-// and a retry could elect another leader and publish another incarnation.
-fn cli_read_admit(
-    args: &WorkspaceArgs,
-    identity: &WorkspaceIdentity,
-    deadline: Instant,
-) -> Result<(Store, Arc<trellis::store::topology::LeaderSession>)> {
-    let store = cli_read_with_retry_until(deadline, || identity.verify(), || args.store())?;
-    identity.verify()?;
-    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
-    let result = trellis::index_coordinator::establish_serving_session(&store, None, &cancel);
-    identity.verify()?;
-    let session = match result {
-        Ok(session) => session,
-        Err(error) if trellis::store::cli_read_retryable_contention(&error) => {
-            // This may be after COMMIT; return typed contention without rerunning it.
-            return Err(trellis::store::cli_read_busy_expired());
-        }
-        Err(error) => return Err(error),
-    };
-    session.verify()?;
-    Ok((store, session))
-}
-
-// Identity/incarnation loss outranks even direct selected SQLite BUSY.
-fn terminal_status_retryable_after_guard(
-    error: &anyhow::Error,
-    verify: impl FnOnce() -> Result<()>,
-) -> Result<bool> {
-    verify()?;
-    Ok(trellis::store::terminal_status_sqlite_contention(error))
-}
-
-fn write_session_json(
-    value: &impl Serialize,
-    session: &Arc<trellis::store::topology::LeaderSession>,
-    mut writer: impl std::io::Write,
-) -> Result<()> {
-    let bytes = serde_json::to_vec_pretty(value)?;
-    session.verify()?;
-    writer.write_all(&bytes)?;
-    writer.write_all(b"\n")?;
-    writer.flush()?;
-    Ok(())
-}
-
-#[cfg(test)]
-mod session_output_tests {
-    use super::*;
-    #[test]
-    fn terminal_busy_cannot_override_post_read_root_guard_loss() {
-        let busy: anyhow::Error = rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
-            None,
-        )
-        .into();
-        let lost = terminal_status_retryable_after_guard(&busy, || {
-            anyhow::bail!("root_changed: original selected root replaced")
-        })
-        .unwrap_err();
-        assert_eq!(
-            lost.to_string(),
-            "root_changed: original selected root replaced"
-        );
-        assert!(terminal_status_retryable_after_guard(&busy, || Ok(())).unwrap());
-    }
-
-    use std::io::Write;
-    use trellis::store::topology::{LeaderSession, TopologyRoots, WorkspaceIdentity};
-
-    struct ProbeWriter {
-        roots: TopologyRoots,
-        workspace: PathBuf,
-        bytes: Vec<u8>,
-        probed: bool,
-    }
-    impl Write for ProbeWriter {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            if !self.probed {
-                self.probed = true;
-                let identity = WorkspaceIdentity::discover(Some(&self.workspace), &self.workspace)
-                    .map_err(std::io::Error::other)?;
-                let error = self.roots.leader(&identity).unwrap_err();
-                assert!(error.to_string().contains("storage_busy"), "{error:#}");
-            }
-            self.bytes.extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn index_output_holds_leader_until_write_finishes() {
-        let temp = tempfile::tempdir().unwrap();
-        let workspace = temp.path().join("workspace");
-        std::fs::create_dir(&workspace).unwrap();
-        let roots =
-            TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
-        let identity = Arc::new(WorkspaceIdentity::discover(Some(&workspace), &workspace).unwrap());
-        let session = Arc::new(LeaderSession::leader(
-            roots.leader(&identity).unwrap(),
-            identity,
-        ));
-        let mut writer = ProbeWriter {
-            roots: roots.clone(),
-            workspace: workspace.clone(),
-            bytes: vec![],
-            probed: false,
-        };
-        write_session_json(&serde_json::json!({"ok":true}), &session, &mut writer).unwrap();
-        assert!(writer.probed);
-        drop(session);
-        let identity = WorkspaceIdentity::discover(Some(&workspace), &workspace).unwrap();
-        roots.leader(&identity).unwrap();
-    }
-}
-
-async fn shutdown_signal() {
-    #[cfg(unix)]
-    {
-        if let Ok(mut term) =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        {
-            tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = term.recv() => {} }
-            return;
-        }
-    }
-    let _ = tokio::signal::ctrl_c().await;
-}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -422,20 +196,21 @@ async fn main() -> Result<()> {
     if let Command::Serve(args) = &command {
         return serve_via_daemon(args).await;
     }
-    if try_existing_daemon(&command)? {
-        return Ok(());
-    }
     match command {
         Command::Daemon | Command::Serve(_) => unreachable!(),
         Command::Mcp(args) => {
             let (_, identity) = args.resolve_unattached()?;
             let socket = socket_path()?;
-            let stream = client::connect_or_start(&socket, start_daemon, Duration::from_secs(5))?;
+            let stream = client::connect_or_start(&socket, start_daemon, Duration::from_secs(5))
+                .map_err(|_| anyhow::anyhow!("daemon_unavailable"))?;
             client::relay_stdio(stream, &identity, || {
                 client::connect_or_start(&socket, start_daemon, Duration::from_secs(5))
             })?;
         }
-        Command::Gc(_) => print_json(&TopologyRoots::production()?.gc_report()?)?,
+        Command::Gc(_) => {
+            let request = daemon_request("gc_report", serde_json::json!({}));
+            print_json(&send_daemon(&request, true)?)?;
+        }
         Command::Forget(args) => {
             use std::io::{self, Write};
             let deleted = TopologyRoots::production()?.forget_with_confirmation(
@@ -470,272 +245,11 @@ async fn main() -> Result<()> {
             );
             eprintln!("Forgot record {}", args.record_id);
         }
-        Command::Index(args) => {
-            let diagnostics = std::env::var("TRELLIS_INDEX_DIAGNOSTICS").as_deref() == Ok("1");
-            let command_start = Instant::now();
-            let (store, options, _) = args.resolve()?;
-            // Fixture-only owner barrier: unset for every normal CLI invocation.
-            #[cfg(unix)]
-            let fixture_socket = std::env::var_os("TRELLIS_TEST_FINITE_CLI_FD")
-                .map(|fd| -> Result<_> {
-                    use std::os::fd::FromRawFd;
-                    use std::os::unix::net::UnixStream;
-                    use std::time::Duration;
-                    ensure!(
-                        fd.to_str() == Some("3"),
-                        "fixture index IPC descriptor invalid"
-                    );
-                    // Only the opt-in test process passes this Unix socket via dup2.
-                    let socket = unsafe { UnixStream::from_raw_fd(3) };
-                    socket.set_read_timeout(Some(Duration::from_secs(20)))?;
-                    socket.set_write_timeout(Some(Duration::from_secs(20)))?;
-                    Ok(Arc::new(std::sync::Mutex::new(socket)))
-                })
-                .transpose()?;
-            #[cfg(not(unix))]
-            ensure!(
-                std::env::var_os("TRELLIS_TEST_FINITE_CLI_FD").is_none(),
-                "fixture index IPC requires Unix"
-            );
-            let fixture_seen = Arc::new(AtomicBool::new(false));
-            let fixture_failed = Arc::new(AtomicBool::new(false));
-            if diagnostics {
-                eprintln!(
-                    "index-phase outside_setup_ms={:.3}",
-                    command_start.elapsed().as_secs_f64() * 1e3
-                );
-            }
-            let worker_store = store.clone();
-            let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
-            let flag = cancel.clone();
-            let signal = tokio::spawn(async move {
-                shutdown_signal().await;
-                flag.store(true, Ordering::Release);
-            });
-            let queue_start = Instant::now();
-            let fixture_seen_worker = fixture_seen.clone();
-            let fixture_failed_worker = fixture_failed.clone();
-            let fixture_cancel = cancel.clone();
-            #[cfg(unix)]
-            let fixture_socket_worker = fixture_socket.clone();
-            let work = tokio::task::spawn_blocking(move || {
-                trellis::index_coordinator::enqueue_and_wait_observed_with_request(
-                    &worker_store,
-                    &options,
-                    &cancel,
-                    |phase| {
-                        if diagnostics {
-                            if let Some(name) = phase.phase.strip_prefix("timing:") {
-                                eprintln!(
-                                    "index-phase {name}_ms={:.3}",
-                                    phase.completed as f64 / 1e3
-                                );
-                            } else if let Some(mode) = phase.phase.strip_prefix("mode:") {
-                                eprintln!("index-mode {mode}");
-                            }
-                        }
-                        #[cfg(unix)]
-                        if phase.phase == "timing:publish"
-                            && let Some(socket) = fixture_socket_worker.as_ref()
-                            && !fixture_seen_worker.swap(true, Ordering::AcqRel)
-                            && fixture_index_exchange(&mut socket.lock().unwrap(), b'P', b'G')
-                                .is_err()
-                        {
-                            fixture_failed_worker.store(true, Ordering::Release);
-                            fixture_cancel.store(true, Ordering::Release);
-                        }
-                    },
-                )
-            })
-            .await
-            .context("index worker panicked")?;
-            if diagnostics {
-                eprintln!(
-                    "index-phase queue_and_jobs_ms={:.3}",
-                    queue_start.elapsed().as_secs_f64() * 1e3
-                );
-            }
-            signal.abort();
-            ensure!(
-                !fixture_failed.load(Ordering::Acquire),
-                "fixture index IPC failed before FIFO claim"
-            );
-            let (own_request_id, revision, session) = work?;
-            #[cfg(unix)]
-            if let Some(socket) = fixture_socket {
-                ensure!(
-                    fixture_seen.load(Ordering::Acquire),
-                    "fixture index IPC missed first publication"
-                );
-                session.verify()?;
-                ensure!(session.is_leader(), "fixture owner lost leadership");
-                let mut socket = socket.lock().unwrap();
-                socket.set_read_timeout(Some(std::time::Duration::from_secs(45)))?;
-                fixture_index_exchange(&mut socket, b'R', b'D')?;
-                session.verify()?;
-            }
-            if diagnostics {
-                eprintln!("index-phase coordinator_returned");
-            }
-            if diagnostics && let Some(diagnostic) = store.last_writer_diagnostic() {
-                eprintln!("{diagnostic}");
-            }
-            let status_start = Instant::now();
-            let deadline = status_start + STATUS_RESULT_WAIT;
-            let mut backoff = Duration::from_millis(20);
-            let status = loop {
-                session.verify()?;
-                if diagnostics {
-                    eprintln!("index-phase terminal_status_attempt");
-                }
-                // A single selected snapshot binds our accepted pin to status.
-                let selected = (|| -> Result<_> {
-                    let response = store.evidence_response()?;
-                    let result = response
-                        .validate_pin(revision)
-                        .and_then(|_| response.status());
-                    match result {
-                        Ok(status) => response.finish(status),
-                        Err(error) => {
-                            // Even on failed selected reads, root and follower-marker
-                            // fences outrank SQLite contention and expiry.
-                            response.finish(())?;
-                            Err(error)
-                        }
-                    }
-                })();
-                match selected {
-                    Ok(status) => break status,
-                    Err(error) => {
-                        if !terminal_status_retryable_after_guard(&error, || session.verify())? {
-                            return Err(error);
-                        }
-                        let remaining = deadline.saturating_duration_since(Instant::now());
-                        if remaining.is_zero() {
-                            anyhow::bail!(
-                                "storage_busy: request {} is durable and may already be complete; check job status",
-                                own_request_id
-                            );
-                        }
-                        tokio::time::sleep(backoff.min(remaining)).await;
-                        backoff = backoff.saturating_mul(2).min(Duration::from_millis(250));
-                    }
-                }
-            };
-            let output = serde_json::json!({"publishedRevision":revision,"status":status});
-            write_session_json(&output, &session, std::io::stdout().lock())?;
-            if diagnostics {
-                eprintln!(
-                    "index-phase outside_status_output_ms={:.3} total_ms={:.3}",
-                    status_start.elapsed().as_secs_f64() * 1e3,
-                    command_start.elapsed().as_secs_f64() * 1e3
-                );
-            }
-            // No cleanup can run before the terminal ACK, selected-status proof
-            // and explicit JSON flush. This CLI owns no timer after it exits.
-            if session.is_leader() {
-                for _ in 0..2 {
-                    let priority = || session.verify().is_ok() && store.verify_root().is_ok();
-                    match trellis::index_coordinator::cooperative_maintenance_unit(
-                        &store, &session, priority,
-                    ) {
-                        Ok(trellis::store::MaintenanceOutcome::Progress) => {}
-                        Ok(_) | Err(_) => break, // Durable debt belongs to the next owner.
-                    }
-                }
-            }
-        }
-        Command::Status(args) => {
-            let (roots, identity) = args.resolve_unattached()?;
-            let identity = identity.attach_existing_marker_readonly()?;
-            let status = cli_read_with_retry(
-                || identity.verify_readonly(),
-                || {
-                    let (_, fresh) = args.resolve_unattached()?;
-                    Store::status_existing_readonly(roots.clone(), fresh)
-                },
-            )?;
-            use std::io::Write;
-            let mut output = std::io::stdout().lock();
-            serde_json::to_writer_pretty(&mut output, &status)?;
-            output.write_all(b"\n")?;
-            output.flush()?;
-        }
-        Command::Symbols(args) => {
-            ensure!((1..=150).contains(&args.limit), "limit must be 1..150");
-            let (_, identity) = args.workspace.resolve()?;
-            let deadline = Instant::now() + CLI_READ_WAIT;
-            let (store, session) = cli_read_admit(&args.workspace, &identity, deadline)?;
-            let (revision, items) = cli_read_with_retry_until(
-                deadline,
-                || {
-                    identity.verify()?;
-                    session.verify()
-                },
-                || store.symbols_at(&args.search, args.limit),
-            )?;
-            write_session_json(
-                &serde_json::json!({"revision":revision,"items":items}),
-                &session,
-                std::io::stdout().lock(),
-            )?;
-        }
-        Command::Query(args) => {
-            let query = ViewQuery {
-                seed: args.seed,
-                depth: args.depth,
-                max_nodes: args.max_nodes,
-                max_calls: args.max_calls,
-                include_callbacks: args.include_callbacks,
-                exclude_paths: args.exclude_path,
-            };
-            query.validate()?;
-            let (_, identity) = args.workspace.resolve()?;
-            let deadline = Instant::now() + CLI_READ_WAIT;
-            let (store, session) = cli_read_admit(&args.workspace, &identity, deadline)?;
-            let view = cli_read_with_retry_until(
-                deadline,
-                || {
-                    identity.verify()?;
-                    session.verify()
-                },
-                || store.query_view(&query),
-            )?
-            .context("seed not found in current index")?;
-            write_session_json(&view, &session, std::io::stdout().lock())?;
-        }
-        Command::Export(args) => {
-            let (roots, identity) = args.workspace.resolve_unattached()?;
-            if let Some(path) = args.output.as_ref() {
-                roots.validate_external(&identity, std::slice::from_ref(path))?;
-            }
-            let identity = identity.attach_marker()?;
-            let deadline = Instant::now() + CLI_READ_WAIT;
-            let (store, session) = cli_read_admit(&args.workspace, &identity, deadline)?;
-            let graph = cli_read_with_retry_until(
-                deadline,
-                || {
-                    identity.verify()?;
-                    session.verify()
-                },
-                || store.graph(),
-            )?;
-            if let Some(path) = args.output {
-                let mut options = std::fs::OpenOptions::new();
-                options.write(true).create_new(true);
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::OpenOptionsExt;
-                    options.mode(0o600);
-                }
-                let mut file = options
-                    .open(path)
-                    .context("create export (existing files are never overwritten)")?;
-                write_session_json(&graph, &session, &mut file)?;
-            } else {
-                write_session_json(&graph, &session, std::io::stdout().lock())?;
-            }
-        }
+        command @ (Command::Index(_)
+        | Command::Status(_)
+        | Command::Symbols(_)
+        | Command::Query(_)
+        | Command::Export(_)) => dispatch_cli(&command)?,
     }
     Ok(())
 }
@@ -926,6 +440,16 @@ fn start_daemon() -> std::io::Result<client::StartOutcome> {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+    // A fixture may keep an auto-started daemon's diagnostics.
+    #[cfg(feature = "test-support")]
+    if let Some(path) = std::env::var_os("TRELLIS_TEST_DAEMON_STDERR") {
+        command.stderr(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)?,
+        );
+    }
     // The daemon must outlive the first CLI/MCP client's process group/session.
     // setsid is async-signal-safe: no allocation or lock is taken in the child.
     unsafe {
@@ -964,41 +488,61 @@ fn checked_reply(reply: protocol::Reply) -> Result<serde_json::Value> {
         .context("invalid daemon reply")
 }
 
-fn send_existing(request: &protocol::Request, read_only: bool) -> Result<serde_json::Value> {
+fn send_daemon(request: &protocol::Request, read_only: bool) -> Result<serde_json::Value> {
     let socket = socket_path()?;
+    let mut first = Some(
+        client::connect_or_start(&socket, start_daemon, Duration::from_secs(5))
+            .map_err(|_| anyhow::anyhow!("daemon_unavailable"))?,
+    );
     let reply = client::call(request, read_only, || {
-        std::os::unix::net::UnixStream::connect(&socket)
+        let stream = if let Some(stream) = first.take() {
+            stream
+        } else {
+            client::connect_or_start(&socket, start_daemon, Duration::from_secs(5))?
+        };
+        stream.set_read_timeout(Some(Duration::from_secs(60)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+        Ok(stream)
     })
     .map_err(|error| anyhow::anyhow!("{}", error.code()))?;
     checked_reply(reply)
 }
 
-fn try_existing_daemon(command: &Command) -> Result<bool> {
+fn dispatch_cli(command: &Command) -> Result<()> {
     let (operation, workspace, mut payload, read_only) = match command {
         Command::Status(args) => ("status", args, serde_json::json!({}), true),
-        Command::Symbols(args) => (
-            "symbols",
-            &args.workspace,
-            serde_json::json!({"search": args.search, "limit": args.limit}),
-            true,
-        ),
-        Command::Query(args) => (
-            "query",
-            &args.workspace,
-            serde_json::json!({
-                "seed": args.seed, "depth": args.depth, "maxNodes": args.max_nodes,
-                "maxCalls": args.max_calls, "includeCallbacks": args.include_callbacks,
-                "excludePaths": args.exclude_path
-            }),
-            true,
-        ),
-        Command::Export(args) => (
-            "export",
-            &args.workspace,
-            serde_json::json!({"output": args.output}),
-            true,
-        ),
-        Command::Index(args) if std::env::var_os("TRELLIS_TEST_FINITE_CLI_FD").is_none() => (
+        Command::Symbols(args) => {
+            ensure!((1..=150).contains(&args.limit), "limit must be 1..150");
+            (
+                "symbols",
+                &args.workspace,
+                serde_json::json!({"search": args.search, "limit": args.limit}),
+                true,
+            )
+        }
+        Command::Query(args) => {
+            ViewQuery {
+                seed: args.seed.clone(),
+                depth: args.depth,
+                max_nodes: args.max_nodes,
+                max_calls: args.max_calls,
+                include_callbacks: args.include_callbacks,
+                exclude_paths: args.exclude_path.clone(),
+            }
+            .validate()?;
+            (
+                "query",
+                &args.workspace,
+                serde_json::json!({
+                    "seed": args.seed, "depth": args.depth, "maxNodes": args.max_nodes,
+                    "maxCalls": args.max_calls, "includeCallbacks": args.include_callbacks,
+                    "excludePaths": args.exclude_path
+                }),
+                true,
+            )
+        }
+        Command::Export(args) => ("export", &args.workspace, serde_json::json!({}), true),
+        Command::Index(args) => (
             "index",
             &args.workspace,
             serde_json::json!({
@@ -1007,11 +551,8 @@ fn try_existing_daemon(command: &Command) -> Result<bool> {
             }),
             false,
         ),
-        _ => return Ok(false),
+        _ => unreachable!(),
     };
-    if std::os::unix::net::UnixStream::connect(socket_path()?).is_err() {
-        return Ok(false);
-    }
     let (roots, identity) = workspace.resolve_unattached()?;
     if let Command::Index(args) = command {
         ensure!(
@@ -1031,8 +572,7 @@ fn try_existing_daemon(command: &Command) -> Result<bool> {
                 .remove("maxFileBytes");
         }
     }
-    if operation == "export"
-        && let Command::Export(args) = command
+    if let Command::Export(args) = command
         && let Some(path) = &args.output
     {
         roots.validate_external(&identity, std::slice::from_ref(path))?;
@@ -1043,14 +583,19 @@ fn try_existing_daemon(command: &Command) -> Result<bool> {
             "workspace": identity.root, "args": payload,
         }),
     );
-    let value = send_existing(&request, read_only)?;
+    let value = send_daemon(&request, read_only)?;
     if let Command::Export(args) = command
         && let Some(path) = &args.output
     {
         use std::io::Write;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
             .open(path)
             .context("create export (existing files are never overwritten)")?;
         serde_json::to_writer_pretty(&mut file, &value)?;
@@ -1059,7 +604,7 @@ fn try_existing_daemon(command: &Command) -> Result<bool> {
     } else {
         print_json(&value)?;
     }
-    Ok(true)
+    Ok(())
 }
 
 async fn serve_via_daemon(args: &ServeArgs) -> Result<()> {
@@ -1137,6 +682,11 @@ async fn serve_via_daemon(args: &ServeArgs) -> Result<()> {
             .or_else(|| directories::BaseDirs::new().map(|d| d.home_dir().join(".cargo"))),
         jev_budget_dir: args.jev_budget_dir.clone(),
         jev_budget_cents: args.jev_budget_cents,
+        jev_key: if args.jev_budget_dir.is_some() {
+            Some(std::env::var("JEV_KEY")?)
+        } else {
+            None
+        },
         acp_runner: args.acp_runner.clone(),
         acp_state_dir: args.acp_state_dir.clone(),
         acp_max_attempts: args.acp_max_attempts,
@@ -1159,6 +709,8 @@ async fn serve_via_daemon(args: &ServeArgs) -> Result<()> {
     let socket = socket_path()?;
     let mut stream = client::connect_or_start(&socket, start_daemon, Duration::from_secs(5))
         .map_err(|_| anyhow::anyhow!("daemon_unavailable"))?;
+    // Serve registers in place and never waits for a checkout's index work
+    // (Decision 0009 §6).
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     protocol::write_frame(
         &mut stream,
@@ -1181,6 +733,7 @@ async fn serve_via_daemon(args: &ServeArgs) -> Result<()> {
     );
     // The opt-in test pause exposes the banner-to-select window. SIGTERM must
     // already be armed; normal serve executions never pause here.
+    #[cfg(feature = "test-support")]
     if std::env::var("TRELLIS_TEST_SERVE_AFTER_BANNER_PAUSE").as_deref() == Ok("1") {
         std::thread::sleep(Duration::from_millis(750));
     }
@@ -1221,6 +774,7 @@ async fn run_daemon() -> Result<()> {
         return Ok(());
     };
     // Test-only ownership marker: only the elected daemon records its PID.
+    #[cfg(feature = "test-support")]
     if let Some(path) = std::env::var_os("TRELLIS_TEST_DAEMON_PID_FILE") {
         std::fs::write(path, std::process::id().to_string())?;
     }
@@ -1229,11 +783,11 @@ async fn run_daemon() -> Result<()> {
     let registry = Arc::new(tokio::sync::Mutex::new(registry::CheckoutRegistry::new()));
     let browser = Arc::new(tokio::sync::Mutex::new(daemon::BrowserProvisioner::new()));
     let next_session = Arc::new(std::sync::atomic::AtomicU64::new(1));
-    let stopping = Arc::new(AtomicBool::new(false));
     let (browser_shutdown, _) = tokio::sync::watch::channel(false);
     let idle = daemon::run_idle_lifecycle(registry.clone());
     tokio::pin!(idle);
     // A single injected accept fault tests that the elected socket survives it.
+    #[cfg(feature = "test-support")]
     let mut injected_accept_errno =
         match std::env::var("TRELLIS_TEST_DAEMON_ACCEPT_ERROR_ONCE").as_deref() {
             Ok("emfile") => Some(libc::EMFILE),
@@ -1244,13 +798,19 @@ async fn run_daemon() -> Result<()> {
         tokio::select! {
             result = &mut idle => { result.map_err(|e| anyhow::anyhow!("{}", e.reason()))?; break; }
             accepted = async {
+                #[cfg(feature = "test-support")]
                 if let Some(errno) = injected_accept_errno {
                     Err(std::io::Error::from_raw_os_error(errno))
                 } else {
                     listener.accept().await
                 }
+                #[cfg(not(feature = "test-support"))]
+                {
+                    listener.accept().await
+                }
             } => {
-                injected_accept_errno = None;
+                #[cfg(feature = "test-support")]
+                { injected_accept_errno = None; }
                 let (stream, _) = match accepted {
                     Ok(pair) => pair,
                     Err(error) => {
@@ -1266,15 +826,13 @@ async fn run_daemon() -> Result<()> {
                 let registry = registry.clone();
                 let browser = browser.clone();
                 let id = next_session.fetch_add(1, Ordering::Relaxed);
-                let stopping = stopping.clone();
                 let browser_shutdown = browser_shutdown.clone();
                 tokio::task::spawn_blocking(move || {
-                    let _ = dispatch_connection(stream, id, registry, browser, stopping, browser_shutdown);
+                    let _ = dispatch_connection(stream, id, registry, browser, browser_shutdown);
                 });
             }
         }
     }
-    stopping.store(true, Ordering::Release);
     let _ = browser_shutdown.send(true);
     drop(listener);
     drop(owner);
@@ -1314,13 +872,17 @@ fn dispatch_connection(
     session: u64,
     registry: Arc<tokio::sync::Mutex<registry::CheckoutRegistry>>,
     browser: Arc<tokio::sync::Mutex<daemon::BrowserProvisioner>>,
-    stopping: Arc<AtomicBool>,
     browser_shutdown: tokio::sync::watch::Sender<bool>,
 ) -> Result<()> {
     let runtime = tokio::runtime::Handle::current();
     stream.set_read_timeout(Some(Duration::from_secs(15)))?;
     let request: protocol::Request = protocol::read_frame(&mut stream)?;
     if request.operation == "mcp" {
+        let relayed = request
+            .payload
+            .get("relay")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
         let result = (|| -> Result<mcp::OpenedWorkspace> {
             let root: PathBuf = serde_json::from_value(
                 request
@@ -1373,7 +935,27 @@ fn dispatch_connection(
                 // The CLI request deadline must not end an idle MCP attachment.
                 stream
                     .set_read_timeout(None)
-                    .and_then(|()| mcp::run_socket(workspace, stream, registry.clone(), session))
+                    .and_then(|()| {
+                        // `trellis mcp`'s relay frames each line with its own
+                        // relay ID (Decision 0009 §7).
+                        if relayed {
+                            mcp::run_relayed_socket(
+                                workspace,
+                                stream,
+                                registry.clone(),
+                                session,
+                                runtime.clone(),
+                            )
+                        } else {
+                            mcp::run_socket(
+                                workspace,
+                                stream,
+                                registry.clone(),
+                                session,
+                                runtime.clone(),
+                            )
+                        }
+                    })
                     .map_err(anyhow::Error::from)
             }
             (Err(error), _) => Err(error),
@@ -1382,8 +964,27 @@ fn dispatch_connection(
         runtime.block_on(async { registry.lock().await.disconnect(session) });
         return served;
     }
+    if request.operation == "gc_report" {
+        let result = TopologyRoots::production().and_then(|roots| roots.gc_report());
+        let reply = protocol::Reply {
+            id: request.id,
+            payload: match result {
+                Ok(value) => serde_json::json!({"result": value}),
+                Err(error) => serde_json::json!({"error": format!("{error:#}")}),
+            },
+        };
+        return write_daemon_reply(&mut stream, &reply);
+    }
     let serve = request.operation == "serve";
-    let result = (|| -> Result<serde_json::Value> {
+    // One deadline for the whole CLI read (#142): activation contention, the
+    // wait for startup reconciliation and every SQLite busy wait share it, so
+    // they cannot stack. When it passes the read fails typed.
+    let request_deadline = Instant::now() + CLI_READ_WAIT;
+    let read_scope = matches!(
+        request.operation.as_str(),
+        "status" | "symbols" | "query" | "export"
+    );
+    let run = || -> Result<serde_json::Value> {
         let root: PathBuf = serde_json::from_value(
             request
                 .payload
@@ -1441,16 +1042,35 @@ fn dispatch_connection(
         } else {
             identity.attach_marker()?
         };
-        let checkout = runtime.block_on(async {
-            let mut checked = registry.lock().await;
-            checked
-                .attach_launch(session, &identity)
-                .map_err(|e| anyhow::anyhow!("{}", e.reason()))?;
-            checked.activate(&identity.root_key)
-        })?;
+        // Virgin queue publication can contend with a short-lived index-use
+        // reader before any request ID has been accepted. Retry only that
+        // typed pre-acceptance admission; never replay an enqueue after COMMIT.
+        let activation_deadline = request_deadline;
+        let checkout = loop {
+            let activated = runtime.block_on(async {
+                let mut checked = registry.lock().await;
+                checked
+                    .attach_launch(session, &identity)
+                    .map_err(|e| anyhow::anyhow!("{}", e.reason()))?;
+                checked.activate(&identity.root_key)
+            });
+            match activated {
+                Ok(checkout) => break checkout,
+                Err(error) if trellis::store::cli_read_retryable_contention(&error) => {
+                    if Instant::now() >= activation_deadline {
+                        return Err(trellis::store::cli_read_busy_expired());
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => return Err(error),
+            }
+        };
         let args = request.payload.get("args").context("missing args")?;
-        let deadline = Instant::now() + CLI_READ_WAIT;
+        let deadline = request_deadline;
         loop {
+            // Recorded before the read: a state change between the read and
+            // the wait below is never missed.
+            let state_version = checkout.state_version();
             let selected = match request.operation.as_str() {
                 "status" => checkout.cli_status(),
                 "symbols" => checkout.cli_symbols(
@@ -1484,7 +1104,7 @@ fn dispatch_connection(
                 }
                 _ => anyhow::bail!("unknown daemon operation"),
             };
-            // Mandatory H may be running when a CLI read first attaches.
+            // Mandatory startup reconciliation may be running when a CLI read first attaches.
             // This only repeats read-only calls; index is never replayed.
             if request.operation != "index"
                 && selected
@@ -1493,12 +1113,22 @@ fn dispatch_connection(
                     .is_some_and(|error| error.to_string().starts_with("index_not_ready:"))
                 && Instant::now() < deadline
             {
-                std::thread::sleep(Duration::from_millis(20));
+                // Wait for startup reconciliation to progress, not a poll (#138
+                // item 16).
+                checkout.wait_state_change(
+                    state_version,
+                    deadline.saturating_duration_since(Instant::now()),
+                );
                 continue;
             }
             break selected;
         }
-    })();
+    };
+    let result = if read_scope {
+        trellis::store::with_read_deadline(request_deadline, run)
+    } else {
+        run()
+    };
     if !serve {
         runtime.block_on(async { registry.lock().await.disconnect(session) });
     }
@@ -1511,20 +1141,26 @@ fn dispatch_connection(
     };
     write_daemon_reply(&mut stream, &reply)?;
     if serve {
-        // This control connection only observes the daemon process lifetime.
-        stream.set_read_timeout(Some(Duration::from_millis(250)))?;
+        // This control connection only observes the daemon process lifetime:
+        // it ends when the client closes it or the daemon stops, signalled by
+        // the shutdown channel instead of a polled flag (#138 item 21).
+        let closer = stream.try_clone()?;
+        let mut shutdown = browser_shutdown.subscribe();
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel::<()>();
+        let watcher = runtime.spawn(async move {
+            tokio::select! {
+                _ = shutdown.wait_for(|stopped| *stopped) => {
+                    let _ = closer.shutdown(std::net::Shutdown::Both);
+                }
+                _ = closed_rx => {}
+            }
+        });
+        stream.set_read_timeout(None)?;
         let mut one = [0u8; 1];
         use std::io::Read;
-        while !stopping.load(Ordering::Acquire) {
-            match stream.read(&mut one) {
-                Ok(0) => break,
-                Ok(_) => (),
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::WouldBlock
-                        || error.kind() == std::io::ErrorKind::TimedOut => {}
-                Err(_) => break,
-            }
-        }
+        while matches!(stream.read(&mut one), Ok(n) if n > 0) {}
+        let _ = closed_tx.send(());
+        let _ = runtime.block_on(watcher);
     }
     Ok(())
 }

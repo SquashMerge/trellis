@@ -3,9 +3,10 @@ const assert = require("node:assert/strict");
 const test = require("node:test");
 const { existsSync, chmodSync, copyFileSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, readdirSync, rmSync, writeFileSync } = require("node:fs");
 const { tmpdir } = require("node:os");
-const { basename, join, resolve, sep } = require("node:path");
+const { basename, dirname, join, resolve, sep } = require("node:path");
 const { spawn } = require("node:child_process");
-const { randomBytes } = require("node:crypto");
+const { createHash, randomBytes } = require("node:crypto");
+const { createConnection } = require("node:net");
 const { DatabaseSync } = require("node:sqlite");
 
 const browserRoot = process.env.PLAYWRIGHT_BROWSERS_PATH;
@@ -33,6 +34,9 @@ function assertSelectedBrowserRequests(requests, rootKey) {
 let binary, suiteBinaryDir;
 
 const delay = ms => new Promise(resolveDelay => setTimeout(resolveDelay, ms));
+// Functional tests assert correctness, not speed: bounds only detect hangs
+// (matches trellis::testing::HANG_BACKSTOP, above serve's replacement wait).
+const HANG_BACKSTOP_MS = 120000;
 function run(command, args, {cwd = ROOT, env = process.env, timeout = 180000} = {}) {
   return new Promise((resolveRun, reject) => {
     const child = spawn(command, args, {cwd, env, stdio:["ignore", "pipe", "pipe"]});
@@ -101,6 +105,28 @@ function findNamed(root, name, found = []) {
   }
   return found;
 }
+async function listenerDiagnostics(paths) {
+  const locks = [...findNamed(paths.home, "daemon.lock"), ...findNamed(paths.xdgData, "daemon.lock")];
+  return Promise.all(locks.map(async lock => {
+    const dataRoot = dirname(dirname(lock));
+    const normal = join(dirname(lock), "daemon.sock");
+    const uid = process.getuid();
+    const uidBytes = Buffer.alloc(4);
+    uidBytes.writeUInt32BE(uid);
+    const digest = createHash("sha256").update(Buffer.from(dataRoot)).update(uidBytes).digest("hex").slice(0,32);
+    const socketPath = Buffer.byteLength(normal) <= (process.platform === "darwin" ? 103 : 107)
+      ? normal : join("/tmp", `trellis-${uid}-${digest}`, "daemon.sock");
+    if (!existsSync(socketPath)) return {lock, socketPath, listener:"socket_absent"};
+    const listener = await new Promise(resolveListener => {
+      const socket = createConnection(socketPath);
+      socket.setTimeout(1000);
+      socket.once("connect", () => { socket.destroy(); resolveListener("connected"); });
+      socket.once("error", error => { socket.destroy(); resolveListener(error.code || error.message); });
+      socket.once("timeout", () => { socket.destroy(); resolveListener("timeout"); });
+    });
+    return {lock, socketPath, listener};
+  }));
+}
 async function startDaemon(paths, expectedRevision) {
   const child = spawn(binary, ["serve", "--workspace", paths.workspace, "--bind", "127.0.0.1:0", "--token-file", paths.tokenFile],
     {cwd:ROOT, env:paths.env, stdio:["ignore","ignore","pipe"]});
@@ -114,11 +140,21 @@ async function startDaemon(paths, expectedRevision) {
         if (match && !base) { base = match[1]; resolveAddress(base); }
       });
       child.once("error", rejectAddress);
-      child.once("exit", (code, signal) => { if (!base) rejectAddress(new Error(`daemon exited before readiness (${code ?? signal}): ${stderr.replaceAll(paths.token,"[redacted]")}`)); });
+      child.once("exit", async (code, signal) => {
+        if (!base) {
+          let listener;
+          try { listener = await listenerDiagnostics(paths); }
+          catch (error) { listener = `diagnostic_error:${error.code || error.message}`; }
+          rejectAddress(new Error(`daemon exited before readiness (${code ?? signal}): listener=${JSON.stringify(listener)} stderr=${stderr.replaceAll(paths.token,"[redacted]")}`));
+        }
+      });
     });
-    const timer = setTimeout(() => rejected(new Error(`daemon address timed out: ${stderr.replaceAll(paths.token,"[redacted]")}`)),10000);
+    // Serve connects to (or launches) the daemon before it prints this banner.
+    // The internal connect and reply bounds total 15s; concurrent verify lanes
+    // can delay the child beyond the old 10s fixture timer.
+    const timer = setTimeout(() => rejected(new Error(`daemon address hung: pid=${child.pid} exit=${child.exitCode} signal=${child.signalCode} stderr=${stderr.replaceAll(paths.token,"[redacted]")}`)),HANG_BACKSTOP_MS);
     try { await address; } finally { clearTimeout(timer); }
-    const deadline = Date.now()+10000;
+    const deadline = Date.now()+HANG_BACKSTOP_MS;
     while (true) {
       try { const health=await fetch(`${base}/healthz`,{signal:AbortSignal.timeout(1000)}); if(health.ok) break; } catch {}
       if(Date.now()>deadline) throw new Error(`daemon health timed out: ${stderr.replaceAll(paths.token,"[redacted]")}`);
@@ -176,7 +212,7 @@ function assertPinnedUrl(raw, pin) {
 }
 async function indexThroughApi(server, token, expected, changedPath, changedSource) {
   const accepted=await api(server.base,token,"POST",scoped(server.rootKey,"index"),{expectedRevision:expected});assert.equal(accepted.status,202,JSON.stringify(accepted.data));
-  const deadline=Date.now()+20000;
+  const deadline=Date.now()+HANG_BACKSTOP_MS;
   let job;
   while(Date.now()<deadline){
     job=await api(server.base,token,"GET",scoped(server.rootKey,`jobs/${encodeURIComponent(accepted.data.id)}`));
@@ -184,8 +220,15 @@ async function indexThroughApi(server, token, expected, changedPath, changedSour
     if(job.data.finishedAt!==null)break;
     await delay(25);
   }
-  if(job?.data.finishedAt===null||job===undefined)throw new Error("index job did not complete within 20 seconds");
-  const current=await api(server.base,token,"GET",scoped(server.rootKey,"status"));assert.equal(current.status,200,JSON.stringify(current.data));
+  if(job?.data.finishedAt===null||job===undefined)throw new Error("index job did not complete within the hang backstop");
+  // A finished job can briefly leave the checkout catching up or contended.
+  let current;
+  while(true){
+    current=await api(server.base,token,"GET",scoped(server.rootKey,"status"));
+    if(current.status===503&&["storage_busy","index_not_ready"].includes(current.data?.error?.code)&&Date.now()<deadline){await delay(25);continue;}
+    break;
+  }
+  assert.equal(current.status,200,JSON.stringify(current.data));
   let pin;
   if(job.data.state==="done"){
     pin=job.data.revision;
@@ -198,7 +241,12 @@ async function indexThroughApi(server, token, expected, changedPath, changedSour
   }
   assert.equal(pin.indexGeneration,expected.indexGeneration);
   assert.ok(pin.indexRevision>expected.indexRevision,`no newer selected head: ${JSON.stringify(job.data)}; current=${JSON.stringify(current.data)}`);
-  const source=await api(server.base,token,"GET",scoped(server.rootKey,`source${pinSuffix(pin)}&path=${encodeURIComponent(changedPath)}`));
+  let source;
+  while(true){
+    source=await api(server.base,token,"GET",scoped(server.rootKey,`source${pinSuffix(pin)}&path=${encodeURIComponent(changedPath)}`));
+    if(source.status===503&&["storage_busy","index_not_ready"].includes(source.data?.error?.code)&&Date.now()<deadline){await delay(25);continue;}
+    break;
+  }
   assert.equal(source.status,200,JSON.stringify(source.data));
   assert.equal(source.data.file.text,changedSource,"attested changed source at selected pin");
   return pin;
@@ -248,7 +296,7 @@ async function savedDiagnostics(page, kind, id) {
 }
 function readPayload(dbPath, kind, id) {
   assert.ok(["view","note"].includes(kind));
-  const db=new DatabaseSync(dbPath,{readOnly:true});
+  const db=openDb(dbPath,{readOnly:true});
   try {
     const version=db.prepare("PRAGMA user_version").get().user_version;assert.equal(version,1);
     const table=kind==="view"?"views":"annotations";
@@ -267,8 +315,16 @@ function rawJsonProperty(payload, key) {
   }
   return payload.slice(start,at).trim();
 }
+// The user-level daemon outlives serve and may still be writing the store when
+// the test reads or writes it directly: wait on a lock (bounded by the hang
+// backstop) instead of failing with SQLITE_BUSY.
+function openDb(dbPath, options={}) {
+  const db=new DatabaseSync(dbPath,options);
+  db.exec(`PRAGMA busy_timeout=${HANG_BACKSTOP_MS}`);
+  return db;
+}
 function insertLegacy(dbPath, kind, id, seed) {
-  const db=new DatabaseSync(dbPath);
+  const db=openDb(dbPath);
   try {
     if(kind==="view") db.prepare("INSERT INTO views(id,payload) VALUES(?,?)").run(id,JSON.stringify({id,title:"Legacy view",query:{seed},pins:{},hidden:[]}));
     else db.prepare("INSERT INTO annotations(id,node_id,payload) VALUES(?,?,?)").run(id,seed,JSON.stringify({id,nodeId:seed,body:"Legacy body"}));
@@ -280,13 +336,15 @@ for (const kind of ["view","note"]) test(`real browser ${kind} save, edit, stale
   t.after(async()=>{try{await context?.close();}catch{}try{await browser?.close();}catch{}await stopDaemon(server);rmSync(paths.temp,{recursive:true,force:true,maxRetries:10,retryDelay:100});});
   const indexed=await run(binary,["index","--workspace",paths.workspace],{env:paths.env,timeout:30000});
   const initialPin=JSON.parse(indexed.stdout).status.revision;
-  server=await startDaemon(paths,initialPin.indexRevision+1);
+  // Serve registers in place on the indexed checkout (Decision 0009 §6): no
+  // new startup reconciliation, so the indexed pin stays the head.
+  server=await startDaemon(paths,initialPin.indexRevision);
   const servingStatus=await api(server.base,paths.token,"GET",scoped(server.rootKey,"status"));
   assert.equal(servingStatus.status,200,JSON.stringify(servingStatus.data));
   const originalRootKey=server.rootKey;
   const P=servingStatus.data.revision;
   assert.equal(P.indexGeneration,initialPin.indexGeneration);
-  assert.equal(P.indexRevision,initialPin.indexRevision+1);
+  assert.equal(P.indexRevision,initialPin.indexRevision);
   let wrongToken; do { wrongToken = randomBytes(32).toString("hex"); } while (wrongToken === paths.token);
   const denied = await fetch(`${server.base}${scoped(server.rootKey,"views")}`, {signal:AbortSignal.timeout(8000),
     headers:{Origin:server.base,Authorization:`Bearer ${wrongToken}`}});

@@ -1,13 +1,13 @@
+#[cfg(feature = "test-support")]
+use trellis::model::*;
 mod common;
 use std::{
     fs,
     sync::{Arc, atomic::AtomicBool},
 };
 use tempfile::TempDir;
-use trellis::{
-    indexer::{IndexOptions, index_workspace},
-    model::*,
-};
+use trellis::indexer::{IndexOptions, index_workspace};
+#[cfg(feature = "test-support")]
 #[test]
 fn real_syntax_rename_orphans_notes_and_cached_graph_preserves_call_order() {
     let temp = TempDir::new().unwrap();
@@ -24,12 +24,12 @@ fn real_syntax_rename_orphans_notes_and_cached_graph_preserves_call_order() {
     let symbol = graph.nodes.iter().find(|n| n.name == "first").unwrap();
     let old_id = symbol.id.clone();
     let store = crate::common::open_store(&state, &root).unwrap();
-    let session = store.leader_session().unwrap();
+    let session = store.writer_session_for_tests().unwrap();
     let rev = publish_bundle(
         &store,
         &graph,
         &root,
-        session.leader_guard().unwrap(),
+        session.writer_guard().unwrap(),
         trellis::model::IndexPin {
             index_generation: store.index_baseline().unwrap().index_generation,
             index_revision: 0,
@@ -69,7 +69,7 @@ fn real_syntax_rename_orphans_notes_and_cached_graph_preserves_call_order() {
         &store,
         &changed,
         &root,
-        session.leader_guard().unwrap(),
+        session.writer_guard().unwrap(),
         rev,
         &cancel,
     )
@@ -138,6 +138,7 @@ fn class_field_calls_keep_measured_declaration_owners_without_execution_claims()
             .any(|d| d.code == "instance-initializer-boundary")
     );
 }
+#[cfg(feature = "test-support")]
 fn index_db(state: &std::path::Path) -> std::path::PathBuf {
     std::fs::read_dir(state.join("cache/indexes"))
         .unwrap()
@@ -146,6 +147,7 @@ fn index_db(state: &std::path::Path) -> std::path::PathBuf {
         .unwrap()
         .join("index.db")
 }
+#[cfg(feature = "test-support")]
 #[test]
 fn injected_sql_failure_after_insert_preserves_previous_revision() {
     let temp = TempDir::new().unwrap();
@@ -157,12 +159,12 @@ fn injected_sql_failure_after_insert_preserves_previous_revision() {
     let cancel = Arc::new(AtomicBool::new(false));
     let first = index_workspace(&options, &cancel, |_| {}).unwrap();
     let store = crate::common::open_store(&state, &root).unwrap();
-    let session = store.leader_session().unwrap();
+    let session = store.writer_session_for_tests().unwrap();
     let revision = publish_bundle(
         &store,
         &first,
         &root,
-        session.leader_guard().unwrap(),
+        session.writer_guard().unwrap(),
         trellis::model::IndexPin {
             index_generation: store.index_baseline().unwrap().index_generation,
             index_revision: 0,
@@ -181,7 +183,7 @@ fn injected_sql_failure_after_insert_preserves_previous_revision() {
         &store,
         &next,
         &root,
-        session.leader_guard().unwrap(),
+        session.writer_guard().unwrap(),
         revision,
         &cancel,
     )
@@ -213,7 +215,7 @@ fn injected_sql_failure_after_insert_preserves_previous_revision() {
         &store,
         &next,
         &root,
-        session.leader_guard().unwrap(),
+        session.writer_guard().unwrap(),
         revision,
         &cancel,
     )
@@ -224,11 +226,12 @@ fn injected_sql_failure_after_insert_preserves_previous_revision() {
     assert_eq!(store.graph().unwrap(), next);
 }
 
+#[cfg(feature = "test-support")]
 fn publish_bundle(
     store: &trellis::store::Store,
     graph: &trellis::model::Graph,
     workspace: &std::path::Path,
-    leader: &trellis::store::topology::LeaderGuard,
+    leader: &trellis::store::topology::WriterGuard,
     expected: trellis::model::IndexPin,
     cancel: &trellis::model::CancelFlag,
 ) -> anyhow::Result<trellis::model::IndexPin> {

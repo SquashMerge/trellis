@@ -1,3 +1,4 @@
+#![cfg(feature = "test-support")]
 //! Synthetic Java/Python file -> method -> static sequence integration.
 //! Workspace code, build scripts, and Python imports must never execute.
 mod common;
@@ -19,7 +20,7 @@ use trellis::{
     model::{Graph, SymbolKind},
     store::{
         SqliteContention, Store,
-        topology::{IndexNotReady, LeaderSession},
+        topology::{IndexNotReady, WriterSession},
     },
 };
 
@@ -54,7 +55,7 @@ struct Fixture {
     graph: Graph,
     app: Router,
     state: Arc<http::DaemonState>,
-    session: Arc<LeaderSession>,
+    session: Arc<WriterSession>,
 }
 fn setup() -> Fixture {
     let temp = tempfile::tempdir().unwrap();
@@ -108,13 +109,14 @@ fn setup() -> Fixture {
     let graph = index_workspace(&options, &cancel, |_| {}).unwrap();
     assert!(!sentinel.exists(), "indexing executed workspace code");
     let store = crate::common::open_store(&temp.path().join("state"), &workspace).unwrap();
-    let session = store.leader_session().unwrap();
+    store.settle_foreign_root_requests().unwrap();
+    let session = store.writer_session_for_tests().unwrap();
     assert_eq!(
         publish_bundle(
             &store,
             &graph,
             &workspace,
-            session.leader_guard().unwrap(),
+            session.writer_guard().unwrap(),
             trellis::model::IndexPin {
                 index_generation: store.index_baseline().unwrap().index_generation,
                 index_revision: 0
@@ -340,7 +342,7 @@ async fn cached_java_python_sequences_keep_measured_calls_after_source_deletion(
         // Observe the real watcher commit for THIS deletion before asserting
         // historical reads. An in-flight same-generation publication may
         // temporarily close public reads; it is never an HTTP success result.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let deadline = std::time::Instant::now() + trellis::testing::HANG_BACKSTOP;
         let prior_head = loop {
             match f.store.status() {
                 Ok(status) => break status.revision,
@@ -355,19 +357,23 @@ async fn cached_java_python_sequences_keep_measured_calls_after_source_deletion(
         };
         assert_eq!(prior_head.index_generation, f.pin.index_generation);
         assert!(prior_head.index_revision >= f.pin.index_revision);
-        std::fs::remove_file(f.workspace.join(path)).unwrap();
-        // Deliver the deletion as the OS watcher would, so the commit below
-        // does not depend on notification latency under load (#131).
-        let removed =
-            notify::Event::new(notify::EventKind::Remove(notify::event::RemoveKind::File))
-                .add_path(f.workspace.join(path));
-        while !f.state.submit_watch_event_for_tests(removed.clone()) {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the queue tick never started its scheduler"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        let deleted_path = f.workspace.join(path);
+        std::fs::remove_file(&deleted_path).unwrap();
+        // A deletion may be coalesced by the OS watcher under all-target load.
+        // Submit one accepted hint through the daemon's real watcher ingress.
+        tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+            loop {
+                let hint =
+                    notify::Event::new(notify::EventKind::Remove(notify::event::RemoveKind::File))
+                        .add_path(deleted_path.clone());
+                if f.state.submit_watch_event_for_tests(Ok(hint)) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("daemon watcher did not register for deletion");
         loop {
             match f.store.status() {
                 Ok(status) => {
@@ -514,7 +520,7 @@ async fn java_python_cached_endpoints_enforce_revision_and_auth() {
             &f.store,
             &f.graph,
             &f.workspace,
-            f.session.leader_guard().unwrap(),
+            f.session.writer_guard().unwrap(),
             trellis::model::IndexPin {
                 index_generation,
                 index_revision: 1
@@ -595,7 +601,7 @@ fn publish_bundle(
     store: &trellis::store::Store,
     graph: &trellis::model::Graph,
     workspace: &std::path::Path,
-    leader: &trellis::store::topology::LeaderGuard,
+    leader: &trellis::store::topology::WriterGuard,
     expected: trellis::model::IndexPin,
     cancel: &trellis::model::CancelFlag,
 ) -> anyhow::Result<trellis::model::IndexPin> {

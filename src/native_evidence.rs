@@ -607,11 +607,9 @@ fn build_native_header<'a>(
             .cmp(&language_order(&b.language).unwrap())
             .then(a.path.as_bytes().cmp(b.path.as_bytes()))
     });
-    let docs: Vec<Value> = files.iter().map(|f| json!({"language":f.language,"path":f.path,"bytes":hex::encode(f.text.as_bytes()),"byteLength":f.text.len()})).collect();
-    let revision_input = json!({"sourceSetId":source_set_id,"documents":docs,"toolchain":toolchain,"config":config,"dependencies":dependencies});
     let id = format!(
-        "revision:v1:{}",
-        digest(b"trellis.native-revision.v1\0", &canonical(&revision_input))
+        "revision:v2:{}",
+        native_revision_digest(&source_set_id, &files, &toolchain, &config, &dependencies)
     );
     let documents = files
         .iter()
@@ -645,6 +643,60 @@ fn build_native_header<'a>(
         control_regions: vec![],
     };
     Ok((artifact, files))
+}
+
+/// `digest("trellis.native-revision.v2\0", canonical(revision_input))`, where
+/// `revision_input` is
+/// `{"config","dependencies","documents":[{"byteLength","contentHash","language","path"}],"sourceSetId","toolchain"}`
+/// (Decision 0010). Each document enters by its SHA-256 content hash, which
+/// capture already computed, not by its bytes, so the cost is per document,
+/// not per corpus byte. The canonical bytes are written straight into the
+/// hasher in canonical key order.
+fn native_revision_digest(
+    source_set_id: &str,
+    files: &[&SourceFile],
+    toolchain: &Value,
+    config: &[Value],
+    dependencies: &[Value],
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"trellis.native-revision.v2\0");
+    let out = &mut |bytes: &[u8]| hasher.update(bytes);
+    let array = |items: &[Value], out: &mut dyn FnMut(&[u8])| {
+        out(b"[");
+        for (i, item) in items.iter().enumerate() {
+            if i != 0 {
+                out(b",");
+            }
+            crate::native_ids::canonical_into(item, out);
+        }
+        out(b"]");
+    };
+    out(b"{\"config\":");
+    array(config, out);
+    out(b",\"dependencies\":");
+    array(dependencies, out);
+    out(b",\"documents\":[");
+    for (i, file) in files.iter().enumerate() {
+        if i != 0 {
+            out(b",");
+        }
+        out(b"{\"byteLength\":");
+        out(file.text.len().to_string().as_bytes());
+        out(b",\"contentHash\":");
+        crate::native_ids::canonical_string_into(&file.hash, out);
+        out(b",\"language\":");
+        crate::native_ids::canonical_string_into(&file.language, out);
+        out(b",\"path\":");
+        crate::native_ids::canonical_string_into(&file.path, out);
+        out(b"}");
+    }
+    out(b"],\"sourceSetId\":");
+    crate::native_ids::canonical_string_into(source_set_id, out);
+    out(b",\"toolchain\":");
+    crate::native_ids::canonical_into(toolchain, out);
+    out(b"}");
+    hex::encode(hasher.finalize())
 }
 
 fn build_native(capture: &Capture, root: &Path, root_id: &str) -> Result<Artifact> {
@@ -1199,12 +1251,14 @@ fn callee(n: Node<'_>, f: &SourceFile) -> (Option<String>, Option<Range>) {
 }
 /// Reparse only a selected stored source snapshot. This does not admit or reread
 /// workspace files and does not project a second whole-workspace graph.
-pub(crate) fn selected_source_witness(
+pub(crate) fn selected_source_witness_with_progress(
     file: &SourceFile,
     producer: Producer,
     source_set: SourceSet,
     revision: Revision,
+    progress: Option<&dyn Fn() -> bool>,
 ) -> Result<Artifact> {
+    crate::store::optional_hint_check(progress)?;
     ensure!(
         revision.source_set_id == source_set.id
             && revision.documents.len() == 1
@@ -1224,7 +1278,15 @@ pub(crate) fn selected_source_witness(
         calls: vec![],
         control_regions: vec![],
     };
-    extract(&mut artifact, file, &mut IdentityRegistry::default())?;
+    let document = artifact.revision.documents[0].clone();
+    extract_known_with_progress(
+        &mut artifact,
+        file,
+        &document,
+        &mut IdentityRegistry::default(),
+        progress,
+    )?;
+    crate::store::optional_hint_check(progress)?;
     Ok(artifact)
 }
 
@@ -1247,13 +1309,33 @@ fn extract_known(
     document: &Document,
     ids: &mut IdentityRegistry,
 ) -> Result<()> {
+    extract_known_with_progress(a, f, document, ids, None)
+}
+fn extract_known_with_progress(
+    a: &mut Artifact,
+    f: &SourceFile,
+    document: &Document,
+    ids: &mut IdentityRegistry,
+    progress: Option<&dyn Fn() -> bool>,
+) -> Result<()> {
+    crate::store::optional_hint_check(progress)?;
     language_order(&f.language)?;
     safe_path(&f.path)?;
     // Occurrence identity binds this captured document version. Authenticate its content hash
     // and extraction context against the captured revision before measuring, so a failed
     // precondition mints no occ:v2 record at all.
     ensure!(
-        f.hash == hash(f.text.as_bytes()),
+        f.hash
+            == if progress.is_some() {
+                let mut digest = Sha256::new();
+                for chunk in f.text.as_bytes().chunks(64 * 1024) {
+                    crate::store::optional_hint_check(progress)?;
+                    digest.update(chunk);
+                }
+                hex::encode(digest.finalize())
+            } else {
+                hash(f.text.as_bytes())
+            },
         "native captured source hash mismatch"
     );
     ensure!(
@@ -1272,9 +1354,20 @@ fn extract_known(
         "python" => tree_sitter_python::LANGUAGE.into(),
         _ => tree_sitter_javascript::LANGUAGE.into(),
     })?;
-    let tree = parser
-        .parse(&f.text, None)
-        .context("native parser failed")?;
+    let tree = if let Some(expired) = progress {
+        let mut cancelled = |_: &tree_sitter::ParseState| expired();
+        let tree = parser.parse_with_options(
+            &mut |offset, _| &f.text.as_bytes()[offset..],
+            None,
+            Some(tree_sitter::ParseOptions::new().progress_callback(&mut cancelled)),
+        );
+        crate::store::optional_hint_check(progress)?;
+        tree.context("native parser failed")?
+    } else {
+        parser
+            .parse(&f.text, None)
+            .context("native parser failed")?
+    };
     let key = DocumentKey {
         source_set_id: a.source_set.id.clone(),
         language: f.language.clone(),
@@ -1344,9 +1437,11 @@ fn extract_known(
         saw_call: false,
         visits: 0,
         opaque_rust: false,
+        progress,
     };
     state.walk(tree.root_node(), &module_id, &[], &[], 0)?;
     state.finish_occurrences()?;
+    crate::store::optional_hint_check(progress)?;
     let observed_roles = [
         (state.saw_definition, "definition"),
         (state.saw_call, "call"),
@@ -1408,6 +1503,7 @@ struct ParserState<'a> {
     saw_call: bool,
     visits: usize,
     opaque_rust: bool,
+    progress: Option<&'a dyn Fn() -> bool>,
 }
 impl ParserState<'_> {
     fn occurrence_input(&self, owner: &str, kind: &str, ordinal: usize) -> Value {
@@ -1427,6 +1523,7 @@ impl ParserState<'_> {
             .iter()
             .enumerate()
         {
+            crate::store::optional_hint_check(self.progress)?;
             ensure!(
                 region.document == self.document,
                 "foreign native control in current document"
@@ -1437,11 +1534,13 @@ impl ParserState<'_> {
                 .push(self.control_start + offset);
         }
         for indexes in by_owner.values_mut() {
+            crate::store::optional_hint_check(self.progress)?;
             indexes.sort_by_key(|i| {
                 let r = &self.artifact.control_regions[*i].range;
                 (r.start, r.end)
             });
             for (ordinal, i) in indexes.iter().enumerate() {
+                crate::store::optional_hint_check(self.progress)?;
                 let input = self.occurrence_input(
                     &self.artifact.control_regions[*i].owner_syntax_id,
                     "control",
@@ -1454,6 +1553,7 @@ impl ParserState<'_> {
             }
         }
         for region in &mut self.artifact.control_regions[self.control_start..] {
+            crate::store::optional_hint_check(self.progress)?;
             if let Some(parent) = &mut region.parent_id {
                 *parent = replacements
                     .get(parent)
@@ -1463,6 +1563,7 @@ impl ParserState<'_> {
         }
         let mut by_owner: BTreeMap<String, Vec<usize>> = BTreeMap::new();
         for (offset, call) in self.artifact.calls[self.call_start..].iter().enumerate() {
+            crate::store::optional_hint_check(self.progress)?;
             ensure!(
                 call.document == self.document,
                 "foreign native call in current document"
@@ -1473,11 +1574,13 @@ impl ParserState<'_> {
                 .push(self.call_start + offset);
         }
         for indexes in by_owner.values_mut() {
+            crate::store::optional_hint_check(self.progress)?;
             indexes.sort_by_key(|i| {
                 let r = &self.artifact.calls[*i].range;
                 (r.start, r.end)
             });
             for (ordinal, i) in indexes.iter().enumerate() {
+                crate::store::optional_hint_check(self.progress)?;
                 let input = self.occurrence_input(
                     &self.artifact.calls[*i].owner_syntax_id,
                     "call",
@@ -1506,6 +1609,7 @@ impl ParserState<'_> {
         regions: &[String],
         depth: usize,
     ) -> Result<()> {
+        crate::store::optional_hint_check(self.progress)?;
         ensure!(
             depth < 128 && self.visits < 1_000_000,
             "native extraction work budget exceeded"
@@ -1705,7 +1809,7 @@ impl Artifact {
         text(&self.source_set.root_id)?;
         ensure!(
             self.revision.source_set_id == self.source_set.id
-                && self.revision.id.starts_with("revision:v1:")
+                && self.revision.id.starts_with("revision:v2:")
                 && valid_hash(&self.revision.id[12..])
                 && valid_hash(&self.revision.toolchain_hash)
                 && valid_hash(&self.revision.config_hash)
@@ -2084,7 +2188,7 @@ mod occurrence_identity_tests {
             config_hash: hash(revision_id.as_bytes()),
             dependency_hash: "3".repeat(64),
         };
-        selected_source_witness(file, producer(version), source_set, revision)
+        selected_source_witness_with_progress(file, producer(version), source_set, revision, None)
     }
     fn file(text: &str) -> SourceFile {
         SourceFile {
@@ -2097,7 +2201,7 @@ mod occurrence_identity_tests {
 
     #[test]
     fn native_producer_declares_and_authenticates_an_explicit_empty_inventory() {
-        let revision = selected(&file("f();"), "revision:v1:r1", NATIVE_VERSION)
+        let revision = selected(&file("f();"), "revision:v2:r1", NATIVE_VERSION)
             .unwrap()
             .revision;
         for language in LANGUAGES {
@@ -2178,10 +2282,10 @@ mod occurrence_identity_tests {
     #[test]
     fn failed_precondition_mints_no_occurrence() {
         let source = file("function f() { g(); if (x) { h(); } }");
-        assert!(selected(&source, "revision:v1:r1", "native-v2").is_err());
+        assert!(selected(&source, "revision:v2:r1", "native-v2").is_err());
         let mut forged = source.clone();
         forged.hash = "0".repeat(64);
-        let mut artifact = selected(&source, "revision:v1:r1", NATIVE_VERSION).unwrap();
+        let mut artifact = selected(&source, "revision:v2:r1", NATIVE_VERSION).unwrap();
         artifact.calls.clear();
         artifact.control_regions.clear();
         assert!(extract(&mut artifact, &forged, &mut IdentityRegistry::default()).is_err());
@@ -2212,8 +2316,8 @@ mod occurrence_identity_tests {
             [1, 0, 2, 3]
         );
         let source = file("function f() { g(); if (x) { h(); } }");
-        let a = selected(&source, "revision:v1:r1", NATIVE_VERSION).unwrap();
-        let b = selected(&source, "revision:v1:r2", NATIVE_VERSION).unwrap();
+        let a = selected(&source, "revision:v2:r1", NATIVE_VERSION).unwrap();
+        let b = selected(&source, "revision:v2:r2", NATIVE_VERSION).unwrap();
         let witness = |artifact: &Artifact| {
             document_witness(
                 &artifact.revision.documents[0],
@@ -2241,8 +2345,8 @@ mod occurrence_identity_tests {
     #[test]
     fn document_version_keeps_occurrence_ids_across_revisions() {
         let source = file("function f() { g(); if (x) { h(); } }");
-        let r1 = selected(&source, "revision:v1:r1", NATIVE_VERSION).unwrap();
-        let r2 = selected(&source, "revision:v1:r2", NATIVE_VERSION).unwrap();
+        let r1 = selected(&source, "revision:v2:r1", NATIVE_VERSION).unwrap();
+        let r2 = selected(&source, "revision:v2:r2", NATIVE_VERSION).unwrap();
         assert_eq!(r1.calls.len(), 2);
         assert_eq!(r1.control_regions.len(), 1);
         for (a, b) in r1.calls.iter().zip(&r2.calls) {
@@ -2251,14 +2355,14 @@ mod occurrence_identity_tests {
             assert_eq!(a.region_ids, b.region_ids);
             assert_eq!(
                 (a.revision_id.as_str(), b.revision_id.as_str()),
-                ("revision:v1:r1", "revision:v1:r2")
+                ("revision:v2:r1", "revision:v2:r2")
             );
         }
         assert_eq!(r1.control_regions[0].id, r2.control_regions[0].id);
         assert_ne!(r1.provenance[0].id, r2.provenance[0].id);
         let edited = selected(
             &file("function f() { g(); if (x) { h(); } } "),
-            "revision:v1:r2",
+            "revision:v2:r2",
             NATIVE_VERSION,
         )
         .unwrap();
@@ -2322,13 +2426,13 @@ mod cached_executable_digest_tests {
             from_capture(&capture, &root, store.root_id(), &cancel).unwrap(),
             native
         );
-        let session = store.leader_session().unwrap();
+        let session = store.writer_session().unwrap();
         let pin = store
             .publish_native(
                 &graph,
                 &capture,
                 &native,
-                session.leader_guard().unwrap(),
+                session.writer_guard().unwrap(),
                 store.index_baseline().unwrap(),
                 &cancel,
             )
@@ -2397,8 +2501,8 @@ mod cached_executable_digest_tests {
         )
         .unwrap();
         let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
-        let session = store.leader_session().unwrap();
-        let leader = session.leader_guard().unwrap();
+        let session = store.writer_session().unwrap();
+        let leader = session.writer_guard().unwrap();
         let cancel = Arc::new(AtomicBool::new(false));
         let options = IndexOptions::new(workspace.path().to_owned());
         let (graph, native, capture) =
@@ -2506,6 +2610,95 @@ mod cached_executable_digest_tests {
             assert_eq!(
                 occurrence_count, old_occurrences,
                 "new occ:v2 record escaped component refusal"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod revision_digest_tests {
+    use super::*;
+    use crate::model::SourceFile;
+
+    /// The construction `native_revision_digest` replaces: the whole input
+    /// as one JSON value, canonicalized, then hashed.
+    fn materialized(
+        source_set_id: &str,
+        files: &[&SourceFile],
+        toolchain: &Value,
+        config: &[Value],
+        dependencies: &[Value],
+    ) -> String {
+        let docs: Vec<Value> = files.iter().map(|f| json!({"language":f.language,"path":f.path,"contentHash":f.hash,"byteLength":f.text.len()})).collect();
+        let revision_input = json!({"sourceSetId":source_set_id,"documents":docs,"toolchain":toolchain,"config":config,"dependencies":dependencies});
+        digest(b"trellis.native-revision.v2\0", &canonical(&revision_input))
+    }
+
+    fn file(language: &str, path: &str, text: String) -> SourceFile {
+        SourceFile {
+            path: path.into(),
+            hash: hex::encode(Sha256::digest(text.as_bytes())),
+            language: language.into(),
+            text,
+        }
+    }
+
+    /// The streamed digest is byte-for-byte the materialized one, including
+    /// escaped paths, empty and multi-chunk bodies, and an empty corpus.
+    /// Decision 0010: the ID commits to every document through its content
+    /// hash, path and length; any change to one of them changes the ID.
+    #[test]
+    fn the_revision_id_changes_with_any_documents_content_or_path() {
+        let toolchain = json!({"nativeExecutable":"abc"});
+        let id = |files: &[SourceFile]| {
+            let refs: Vec<&SourceFile> = files.iter().collect();
+            native_revision_digest("source-set:v1:r", &refs, &toolchain, &[], &[])
+        };
+        let base = [
+            file("rust", "src/a.rs", "fn a() {}\n".into()),
+            file("java", "B.java", "class B {}\n".into()),
+        ];
+        assert_eq!(id(&base), id(&base.clone()));
+        let mut content = base.clone();
+        content[1] = file("java", "B.java", "class B { }\n".into());
+        assert_ne!(id(&base), id(&content));
+        let mut path = base.clone();
+        path[0] = file("rust", "src/b.rs", "fn a() {}\n".into());
+        assert_ne!(id(&base), id(&path));
+    }
+
+    #[test]
+    fn the_streamed_revision_digest_equals_the_materialized_one() {
+        let toolchain = json!({"nativeExecutable":"abc","rootRustToolchain":{"path":"rust-toolchain","sha256":null},"rootRustToolchainToml":null});
+        let config = vec![
+            json!({"path":".gitignore","sha256":"x"}),
+            json!({"nativeAdmission":{"maxFileBytes":2097152}}),
+        ];
+        let dependencies = vec![
+            json!({"path":"Cargo.lock","bytes":null}),
+            json!([1, "two", {"z": true, "a": false}]),
+        ];
+        let files = [
+            file("rust", "src/a.rs", "fn a() {}\n".into()),
+            file(
+                "java",
+                "dir with \"quotes\"\\and\\backslash.java",
+                String::new(),
+            ),
+            file("python", "ctl\u{1}\u{1f}é漢字.py", "x = '\u{0}'\n".into()),
+            file("javascript", "big.js", "€".repeat(9000)),
+        ];
+        let refs: Vec<&SourceFile> = files.iter().collect();
+        for (set, docs) in [
+            ("source-set:v1:r", &refs[..]),
+            ("s\"et", &refs[..0]),
+            ("source-set:v1:r", &refs[3..]),
+        ] {
+            assert_eq!(
+                native_revision_digest(set, docs, &toolchain, &config, &dependencies),
+                materialized(set, docs, &toolchain, &config, &dependencies),
+                "source set {set}, {} documents",
+                docs.len()
             );
         }
     }

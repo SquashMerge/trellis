@@ -1,6 +1,8 @@
 mod common;
+use std::collections::BTreeMap;
+#[cfg(feature = "test-support")]
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     sync::{Arc, atomic::AtomicBool},
 };
 use tempfile::TempDir;
@@ -131,6 +133,7 @@ fn fixture() -> (TempDir, TempDir, Store) {
     let store = crate::common::open_store(state.path(), work.path()).unwrap();
     (state, work, store)
 }
+#[cfg(feature = "test-support")]
 fn pin(store: &Store, revision: u64) -> IndexPin {
     IndexPin {
         index_generation: store.status().unwrap().revision.index_generation,
@@ -145,9 +148,11 @@ fn index_db(state: &std::path::Path) -> std::path::PathBuf {
         .unwrap()
         .join("index.db")
 }
+#[cfg(feature = "test-support")]
 fn cancel() -> CancelFlag {
     Arc::new(AtomicBool::new(false))
 }
+#[cfg(feature = "test-support")]
 fn bundle(
     store: &Store,
     work: &TempDir,
@@ -164,6 +169,7 @@ fn bundle(
     )
     .unwrap()
 }
+#[cfg(feature = "test-support")]
 fn publish_bundle(
     store: &Store,
     bundle: &(
@@ -172,12 +178,13 @@ fn publish_bundle(
         trellis::capture::Capture,
     ),
     expected: IndexPin,
-    leader: &trellis::store::topology::LeaderGuard,
+    leader: &trellis::store::topology::WriterGuard,
 ) -> IndexPin {
     store
         .publish_native(&bundle.0, &bundle.2, &bundle.1, leader, expected, &cancel())
         .unwrap()
 }
+#[cfg(feature = "test-support")]
 fn write_source(work: &TempDir) {
     std::fs::write(
         work.path().join("a.js"),
@@ -188,6 +195,7 @@ function c() { a(); }
     )
     .unwrap();
 }
+#[cfg(feature = "test-support")]
 fn symbol_id(graph: &Graph, name: &str) -> String {
     graph
         .nodes
@@ -242,6 +250,7 @@ fn query() -> ViewQuery {
     serde_json::from_str(r#"{"seed":"a"}"#).unwrap()
 }
 #[test]
+#[cfg(feature = "test-support")]
 fn publication_is_atomic_and_reopens() {
     let (state, work, store) = fixture();
     write_source(&work);
@@ -254,9 +263,9 @@ fn publication_is_atomic_and_reopens() {
             .contains("index_not_ready")
     );
     let baseline = store.index_baseline().unwrap();
-    let leader = store.leader().unwrap();
-    // Leader acquisition deliberately updates last_opened_at. Snapshot only
-    // after that heartbeat to assert rejected publishes write zero bytes.
+    let leader = store.publication_for_tests().unwrap();
+    // A local writer guard does not publish. Snapshot now to prove
+    // rejected publications write zero bytes.
     let before = std::fs::read(index_db(state.path())).unwrap();
     for error in [
         store
@@ -281,7 +290,7 @@ fn publication_is_atomic_and_reopens() {
             .to_string()
             .contains("index_not_ready")
     );
-    let leader = store.leader().unwrap();
+    let leader = store.publication_for_tests().unwrap();
     let first = publish_bundle(&store, &captured, baseline, &leader);
     assert_eq!(first.index_revision, 1);
     let old = store.graph().unwrap();
@@ -411,11 +420,12 @@ fn publication_is_atomic_and_reopens() {
 }
 
 #[test]
+#[cfg(feature = "test-support")]
 fn delete_reader_pins_snapshot_and_blocks_publish() {
     let (state, work, store) = fixture();
     write_source(&work);
     let captured = bundle(&store, &work);
-    let leader = store.leader().unwrap();
+    let leader = store.publication_for_tests().unwrap();
     let first = publish_bundle(&store, &captured, store.index_baseline().unwrap(), &leader);
     let db = rusqlite::Connection::open(index_db(state.path())).unwrap();
     db.busy_timeout(std::time::Duration::ZERO).unwrap();
@@ -458,6 +468,9 @@ fn delete_reader_pins_snapshot_and_blocks_publish() {
         .unwrap();
     assert_eq!(revision(), 2);
     assert_eq!(next.index_revision, 2);
+    drop(store);
+    drop(leader);
+    drop(db);
 }
 
 #[test]
@@ -480,6 +493,7 @@ fn incompatible_index_refuses_without_touching_legacy_state() {
     assert_eq!(std::fs::read(legacy).unwrap(), b"untouched legacy bytes");
 }
 #[test]
+#[cfg(feature = "test-support")]
 fn literal_search_and_snapshot_only_sources() {
     let (_state, work, store) = fixture();
     // Odd names are not valid JavaScript declarations. Search metacharacters must
@@ -493,7 +507,7 @@ function percent() {}
     )
     .unwrap();
     let captured = bundle(&store, &work);
-    let leader = store.leader().unwrap();
+    let leader = store.publication_for_tests().unwrap();
     publish_bundle(&store, &captured, store.index_baseline().unwrap(), &leader);
     assert_eq!(store.symbols("a_", 1000).unwrap().len(), 1);
     assert!(store.symbols("%_", 1000).unwrap().is_empty());
@@ -508,11 +522,12 @@ function percent() {}
 }
 
 #[test]
+#[cfg(feature = "test-support")]
 fn traversal_cycles_bounds_callbacks_and_boundaries() {
     let (_state, work, store) = fixture();
     write_source(&work);
     let captured = bundle(&store, &work);
-    let leader = store.leader().unwrap();
+    let leader = store.publication_for_tests().unwrap();
     publish_bundle(&store, &captured, store.index_baseline().unwrap(), &leader);
     let mut q = query();
     q.seed = symbol_id(&captured.0, "a");
@@ -545,11 +560,12 @@ fn traversal_cycles_bounds_callbacks_and_boundaries() {
 }
 
 #[test]
+#[cfg(feature = "test-support")]
 fn durable_user_data_survives_cache_loss_and_resolves_orphans() {
     let (state, work, store) = fixture();
     write_source(&work);
     let captured = bundle(&store, &work);
-    let leader = store.leader().unwrap();
+    let leader = store.publication_for_tests().unwrap();
     publish_bundle(&store, &captured, store.index_baseline().unwrap(), &leader);
     let a = symbol_id(&captured.0, "a");
     let b = symbol_id(&captured.0, "b");
@@ -617,7 +633,7 @@ fn durable_user_data_survives_cache_loss_and_resolves_orphans() {
         BTreeSet::from([a.clone(), b.clone(), "missing".into()])
     );
     let fresh = bundle(&store, &work);
-    let leader = store.leader().unwrap();
+    let leader = store.publication_for_tests().unwrap();
     publish_bundle(&store, &fresh, store.index_baseline().unwrap(), &leader);
     let restored_note = store.annotations().unwrap().remove(0);
     assert!(restored_note.orphaned);
@@ -664,6 +680,7 @@ fn durable_user_data_survives_cache_loss_and_resolves_orphans() {
 }
 
 #[test]
+#[cfg(feature = "test-support")]
 fn live_current_decode_failure_hard_latches_saved_views() {
     let seed_records = |store: &Store| {
         store
@@ -688,12 +705,12 @@ fn live_current_decode_failure_hard_latches_saved_views() {
     seed_records(&stats_store);
     write_source(&stats_work);
     let captured = bundle(&stats_store, &stats_work);
-    let session = stats_store.leader_session().unwrap();
+    let session = stats_store.writer_session_for_tests().unwrap();
     publish_bundle(
         &stats_store,
         &captured,
         stats_store.index_baseline().unwrap(),
-        session.leader_guard().unwrap(),
+        session.writer_guard().unwrap(),
     );
     assert_eq!(
         stats_store.annotations().unwrap()[0].annotation.id,
@@ -709,7 +726,6 @@ fn live_current_decode_failure_hard_latches_saved_views() {
     stats_db
         .execute("UPDATE index_metadata SET stats='not-json'", [])
         .unwrap();
-    drop(stats_db);
     let first = stats_store.annotations().unwrap_err();
     assert!(
         first
@@ -724,12 +740,18 @@ fn live_current_decode_failure_hard_latches_saved_views() {
     ] {
         assert_eq!(
             closed.to_string(),
-            "incompatible_index: reconciliation required after invalid current index"
+            "incompatible_index: reconciliation required after invalid current index",
+            "every selected saved read must reject the latched corrupt current head"
         );
     }
+    drop(stats_clone);
+    drop(stats_store);
+    drop(session);
+    drop(stats_db);
 }
 
 #[test]
+#[cfg(feature = "test-support")]
 fn concurrent_publish_cas_has_one_winner() {
     let (_state, work, store) = fixture();
     write_source(&work);
@@ -743,7 +765,7 @@ fn concurrent_publish_cas_has_one_winner() {
             let captured = captured.clone();
             std::thread::spawn(move || {
                 barrier.wait();
-                match store.leader() {
+                match store.publication_for_tests() {
                     Ok(leader) => {
                         let result = store.publish_native(
                             &captured.0,
@@ -777,6 +799,17 @@ fn concurrent_publish_cas_has_one_winner() {
                 .as_ref()
                 .err()
                 .is_some_and(|e| e.to_string().starts_with("storage_busy")))
+            || outcomes
+                .iter()
+                .any(|(result, _)| result.as_ref().err().is_some_and(
+                    |e| e.to_string() == "incompatible_index: cache changed after admission"
+                )),
+        "unexpected typed CAS loser: {:?}",
+        outcomes
+            .iter()
+            .filter_map(|(result, _)| result.as_ref().err())
+            .map(|e| format!("{e:#}"))
+            .collect::<Vec<_>>()
     );
     assert_eq!(
         outcomes
@@ -789,11 +822,12 @@ fn concurrent_publish_cas_has_one_winner() {
 }
 
 #[test]
+#[cfg(feature = "test-support")]
 fn durable_orphan_fallback_does_not_mask_current_index_corruption() {
     let (state, work, store) = fixture();
     write_source(&work);
     let captured = bundle(&store, &work);
-    let leader = store.leader().unwrap();
+    let leader = store.publication_for_tests().unwrap();
     publish_bundle(&store, &captured, store.index_baseline().unwrap(), &leader);
     let saved: SavedView = serde_json::from_value(serde_json::json!({
         "id":"saved","title":"Saved","query":{"seed":"missing"}
@@ -807,13 +841,16 @@ fn durable_orphan_fallback_does_not_mask_current_index_corruption() {
         [],
     )
     .unwrap();
-    drop(db);
     for error in [store.views().unwrap_err(), clone.view("saved").unwrap_err()] {
         assert!(
             error.to_string().contains("incompatible_index"),
             "{error:#}"
         );
     }
+    drop(leader);
+    drop(clone);
+    drop(store);
+    drop(db);
 }
 
 #[test]
@@ -836,11 +873,12 @@ fn durable_storage_io_failure_is_never_converted_to_orphan_success() {
 }
 
 #[test]
-fn failed_leader_on_current_root_mismatch_never_enables_durable_orphans() {
+#[cfg(feature = "test-support")]
+fn selected_root_mismatch_never_enables_durable_orphans() {
     let (state, work, store) = fixture();
     write_source(&work);
     let captured = bundle(&store, &work);
-    let leader = store.leader().unwrap();
+    let leader = store.publication_for_tests().unwrap();
     publish_bundle(&store, &captured, store.index_baseline().unwrap(), &leader);
     let saved: SavedView = serde_json::from_value(serde_json::json!({
         "id":"root-mismatch","title":"Root mismatch","query":{"seed":"missing"}
@@ -860,8 +898,10 @@ fn failed_leader_on_current_root_mismatch_never_enables_durable_orphans() {
         [],
     )
     .unwrap();
-    drop(db);
-    let acquisition = store.leader_session().unwrap_err();
+    let acquisition = store
+        .evidence_response_daemon_local()
+        .err()
+        .expect("selected read must refuse mismatched root");
     assert!(
         acquisition.to_string().contains("root_changed"),
         "{acquisition:#}"
@@ -870,14 +910,17 @@ fn failed_leader_on_current_root_mismatch_never_enables_durable_orphans() {
         assert!(error.to_string().contains("root_changed"), "{error:#}");
         assert!(!error.to_string().contains("index_not_ready"), "{error:#}");
     }
+    drop(store);
+    drop(db);
 }
 
 #[test]
-fn durable_orphans_after_failed_takeover_but_not_current_marker_corruption() {
+#[cfg(feature = "test-support")]
+fn durable_orphans_after_cancelled_reconciliation_but_not_current_native_header_corruption() {
     let (_state, work, store) = fixture();
     write_source(&work);
     let captured = bundle(&store, &work);
-    let leader = store.leader().unwrap();
+    let leader = store.publication_for_tests().unwrap();
     publish_bundle(&store, &captured, store.index_baseline().unwrap(), &leader);
     let saved: SavedView = serde_json::from_value(serde_json::json!({
         "id":"takeover","title":"Takeover","query":{"seed":"missing"}
@@ -885,7 +928,7 @@ fn durable_orphans_after_failed_takeover_but_not_current_marker_corruption() {
     .unwrap();
     store.put_view(&saved).unwrap();
     drop(leader);
-    let failed_takeover = store.leader_session().unwrap();
+    let failed_takeover = store.writer_session_for_tests().unwrap();
     let coordinator = trellis::index_coordinator::IndexJobCoordinator::prepare_with_session(
         &store,
         None,
@@ -909,23 +952,28 @@ fn durable_orphans_after_failed_takeover_but_not_current_marker_corruption() {
             .to_string()
             .contains("index_not_ready")
     );
-    let orphan = store.view("takeover").unwrap().unwrap();
+    // A canceled startup reconciliation keeps public status latched, but daemon-local selected
+    // evidence can still resolve the validated prior head and saved record.
+    let selected = store.evidence_response_daemon_local().unwrap();
+    let orphan = selected.saved_view_at("takeover", None).unwrap().unwrap();
+    selected.finish(()).unwrap();
     assert_eq!(orphan.view, saved);
     assert_eq!(orphan.orphaned_ids, vec!["missing"]);
 
     let (state, work, store) = fixture();
     write_source(&work);
     let captured = bundle(&store, &work);
-    let leader = store.leader().unwrap();
+    let leader = store.publication_for_tests().unwrap();
     publish_bundle(&store, &captured, store.index_baseline().unwrap(), &leader);
     store.put_view(&saved).unwrap();
     let db = rusqlite::Connection::open(index_db(state.path())).unwrap();
     db.execute(
-        "UPDATE index_metadata SET reconciled_incarnation='not-a-uuid' WHERE singleton=1",
+        "UPDATE native_revisions SET graph_stats='{}' WHERE published_index_revision=1",
         [],
     )
     .unwrap();
-    drop(db);
+    // Keep the independent SQLite connection open while this Store and its
+    // clone may hold SQLite locks on the same index inode.
     let clone = store.clone();
     let first = store.status().unwrap_err();
     assert!(
@@ -942,28 +990,33 @@ fn durable_orphans_after_failed_takeover_but_not_current_marker_corruption() {
         );
     }
     drop(leader);
+    drop(clone);
+    drop(store);
+    drop(db);
 }
 
 #[test]
-fn null_current_marker_latches_before_durable_orphan_fallback() {
+#[cfg(feature = "test-support")]
+fn wrong_current_native_header_latches_before_durable_orphan_fallback() {
     let (state, work, store) = fixture();
     write_source(&work);
     let captured = bundle(&store, &work);
-    let leader = store.leader().unwrap();
+    let leader = store.publication_for_tests().unwrap();
     publish_bundle(&store, &captured, store.index_baseline().unwrap(), &leader);
     let saved: SavedView = serde_json::from_value(serde_json::json!({
-        "id":"null-marker","title":"Null marker","query":{"seed":"missing"}
+        "id":"wrong-native-header","title":"Wrong native header","query":{"seed":"missing"}
     }))
     .unwrap();
     store.put_view(&saved).unwrap();
     let clone = store.clone();
     let db = rusqlite::Connection::open(index_db(state.path())).unwrap();
     db.execute(
-        "UPDATE index_metadata SET reconciled_incarnation=NULL WHERE singleton=1",
+        "UPDATE native_revisions SET graph_stats='{}' WHERE published_index_revision=1",
         [],
     )
     .unwrap();
-    drop(db);
+    // Keep the independent SQLite observer open until the Store, clone, and
+    // local writer guard release this index inode.
     let first = store.status().unwrap_err();
     assert!(
         first.to_string().contains("incompatible_index"),
@@ -975,18 +1028,22 @@ fn null_current_marker_latches_before_durable_orphan_fallback() {
         "{latched:#}"
     );
     drop(leader);
+    drop(clone);
+    drop(store);
+    drop(db);
 }
 
 #[test]
-fn recognized_noncurrent_without_marker_column_is_explicitly_not_ready() {
+#[cfg(feature = "test-support")]
+fn virgin_head_without_selected_revision_is_explicitly_not_ready() {
     let (state, work, store) = fixture();
     let saved: SavedView = serde_json::from_value(serde_json::json!({
         "id":"legacy","title":"Legacy","query":{"seed":"missing"}
     }))
     .unwrap();
     store.put_view(&saved).unwrap();
-    let leader = store.leader().unwrap();
-    // Exclude the intentional leader heartbeat, not status or saved reads.
+    let leader = store.publication_for_tests().unwrap();
+    // Acquiring a local publication guard must not create a selected revision.
     let before = std::fs::read(index_db(state.path())).unwrap();
     let error = store.status().unwrap_err();
     assert!(error.to_string().contains("index_not_ready"), "{error:#}");
@@ -1000,11 +1057,12 @@ fn recognized_noncurrent_without_marker_column_is_explicitly_not_ready() {
 }
 
 #[test]
+#[cfg(feature = "test-support")]
 fn malformed_graph_rolls_back_and_structural_stats_are_recounted() {
     let (state, work, store) = fixture();
     write_source(&work);
     let captured = bundle(&store, &work);
-    let leader = store.leader().unwrap();
+    let leader = store.publication_for_tests().unwrap();
     let first = publish_bundle(&store, &captured, store.index_baseline().unwrap(), &leader);
     let baseline = store.graph().unwrap();
     assert_eq!(baseline.stats.symbols, captured.0.nodes.len());
@@ -1060,11 +1118,12 @@ fn malformed_graph_rolls_back_and_structural_stats_are_recounted() {
 }
 
 #[test]
+#[cfg(feature = "test-support")]
 fn cache_loss_never_reuses_revision_tokens_and_sql_enforces_foreign_keys() {
     let (state, work, store) = fixture();
     write_source(&work);
     let captured = bundle(&store, &work);
-    let leader = store.leader().unwrap();
+    let leader = store.publication_for_tests().unwrap();
     let rev = publish_bundle(&store, &captured, store.index_baseline().unwrap(), &leader);
     let db = rusqlite::Connection::open(index_db(state.path())).unwrap();
     db.pragma_update(None, "foreign_keys", true).unwrap();
@@ -1074,9 +1133,9 @@ fn cache_loss_never_reuses_revision_tokens_and_sql_enforces_foreign_keys() {
     );
     let a = symbol_id(&captured.0, "a");
     assert!(db.execute("DELETE FROM graph_nodes WHERE projection_id=(SELECT graph_projection_id FROM revision_documents WHERE path='a.js') AND id=?1", [&a]).is_err());
-    drop(db);
     drop(leader);
     drop(store);
+    drop(db);
     std::fs::remove_file(index_db(state.path())).unwrap();
     let store = crate::common::open_store(state.path(), work.path()).unwrap();
     assert!(
@@ -1087,7 +1146,7 @@ fn cache_loss_never_reuses_revision_tokens_and_sql_enforces_foreign_keys() {
             .contains("index_not_ready")
     );
     let fresh = bundle(&store, &work);
-    let leader = store.leader().unwrap();
+    let leader = store.publication_for_tests().unwrap();
     assert!(
         store
             .publish_native(&fresh.0, &fresh.2, &fresh.1, &leader, rev, &cancel())
@@ -1134,11 +1193,12 @@ fn graph_call_dto_rejects_lexical_proof_fields() {
 }
 
 #[test]
+#[cfg(feature = "test-support")]
 fn active_delete_journal_allows_prior_pair_or_busy_and_cold_journal_is_sqlite_managed() {
     let (state, work, store) = fixture();
     write_source(&work);
     let captured = bundle(&store, &work);
-    let leader = store.leader().unwrap();
+    let leader = store.publication_for_tests().unwrap();
     let previous = publish_bundle(&store, &captured, store.index_baseline().unwrap(), &leader);
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
@@ -1153,7 +1213,7 @@ fn active_delete_journal_allows_prior_pair_or_busy_and_cold_journal_is_sqlite_ma
         ready_tx.send(()).unwrap();
         done_rx.recv().unwrap();
         db.execute_batch("ROLLBACK").unwrap();
-        drop(leader);
+        (db, leader)
     });
     ready_rx.recv().unwrap();
 
@@ -1163,10 +1223,10 @@ fn active_delete_journal_allows_prior_pair_or_busy_and_cold_journal_is_sqlite_ma
     let active_journal_exists = journal.exists();
     let active_status = store.status();
     let active_source = store.source_at("a.js", Some(previous));
+    let raw_db = rusqlite::Connection::open(&path).unwrap();
     let raw_pair = (|| -> rusqlite::Result<(String, i64, String, String, Vec<u8>, String)> {
-        let db = rusqlite::Connection::open(&path)?;
-        db.busy_timeout(std::time::Duration::ZERO)?;
-        db.query_row(
+        raw_db.busy_timeout(std::time::Duration::ZERO)?;
+        raw_db.query_row(
             "SELECT m.index_generation,m.index_revision,d.path,d.content_hash,d.source_bytes,d.content_hash FROM index_metadata m JOIN native_revisions r ON r.published_index_revision=m.index_revision JOIN revision_documents rd ON rd.revision_id=r.id JOIN document_versions d ON d.id=rd.document_version_id WHERE m.singleton=1 AND rd.path='a.js'",
                 [],
                 |row| {
@@ -1182,7 +1242,7 @@ fn active_delete_journal_allows_prior_pair_or_busy_and_cold_journal_is_sqlite_ma
             )
     })();
     done_tx.send(()).unwrap();
-    writer.join().unwrap();
+    let (writer_db, writer_guard) = writer.join().unwrap();
 
     assert!(active_journal_exists);
     match active_status {
@@ -1229,37 +1289,39 @@ fn active_delete_journal_allows_prior_pair_or_busy_and_cold_journal_is_sqlite_ma
         ),
     }
     assert_eq!(store.index_baseline().unwrap(), previous);
-    for error in [
-        store.status().unwrap_err(),
-        store.source_at("a.js", Some(previous)).unwrap_err(),
-    ] {
-        assert!(error.to_string().contains("index_not_ready"), "{error:#}");
-    }
+    // Rolling back the uncommitted writer leaves the prior selected head valid.
+    assert_eq!(store.status().unwrap().revision, previous);
+    let (pin, selected) = store.source_at("a.js", Some(previous)).unwrap().unwrap();
+    assert_eq!(pin, previous);
+    assert_eq!(selected.text, captured.0.files[0].text);
+    assert_eq!(selected.hash, captured.0.files[0].hash);
 
+    // A local writer guard must not unlink or rewrite a cold SQLite journal.
+    // Only SQLite decides whether this journal participates in recovery.
     std::fs::write(&journal, [0u8; 512]).unwrap();
-    assert!(
-        store
-            .leader()
-            .unwrap_err()
-            .to_string()
-            .contains("recovery_required")
-    );
-    assert!(journal.exists());
+    let cold = std::fs::read(&journal).unwrap();
+    let cold_writer = store.publication_for_tests().unwrap();
+    assert_eq!(std::fs::read(&journal).unwrap(), cold);
+    drop(cold_writer);
+    drop(store);
+    drop(writer_guard);
+    drop(writer_db);
+    drop(raw_db);
 }
 
 #[test]
+#[cfg(feature = "test-support")]
 fn safe_cache_unknown_view_blocks_public_status_and_source_until_owner_intervenes() {
     let (state, work, store) = fixture();
     write_source(&work);
     let captured = bundle(&store, &work);
-    let leader = store.leader().unwrap();
+    let leader = store.publication_for_tests().unwrap();
     let before = publish_bundle(&store, &captured, store.index_baseline().unwrap(), &leader);
     let clone = store.clone();
     let path = index_db(state.path());
     let db = rusqlite::Connection::open(&path).unwrap();
     db.execute_batch("CREATE VIEW unapproved_view AS SELECT 1")
         .unwrap();
-    drop(db);
     let bytes = std::fs::read(&path).unwrap();
     let reopened = Store::open_for_tests(state.path(), work.path()).unwrap();
     assert!(
@@ -1298,10 +1360,7 @@ fn safe_cache_unknown_view_blocks_public_status_and_source_until_owner_intervene
         "{rejected:#}"
     );
     assert_eq!(std::fs::read(&path).unwrap(), bytes);
-    let db = rusqlite::Connection::open(&path).unwrap();
     db.execute_batch("DROP VIEW unapproved_view").unwrap();
-    drop(db);
-    drop(leader);
     assert_eq!(store.index_baseline().unwrap(), before);
     for error in [
         store.status().unwrap_err(),
@@ -1316,9 +1375,15 @@ fn safe_cache_unknown_view_blocks_public_status_and_source_until_owner_intervene
             "{error:#}"
         );
     }
+    drop(leader);
+    drop(reopened);
+    drop(clone);
+    drop(store);
+    drop(db);
 }
 
 #[test]
+#[cfg(feature = "test-support")]
 fn removed_or_renamed_anchor_documents_are_missing_without_poisoning_saved_lists() {
     for rename in [false, true] {
         let (_state, work, store) = fixture();
@@ -1333,7 +1398,7 @@ fn removed_or_renamed_anchor_documents_are_missing_without_poisoning_saved_lists
         )
         .unwrap();
         let captured = bundle(&store, &work);
-        let leader = store.leader().unwrap();
+        let leader = store.publication_for_tests().unwrap();
         let stable = captured
             .1
             .declarations
@@ -1501,6 +1566,7 @@ fn removed_or_renamed_anchor_documents_are_missing_without_poisoning_saved_lists
 }
 
 #[test]
+#[cfg(feature = "test-support")]
 fn same_path_different_association_is_missing_but_dangling_revision_fails_closed() {
     let (state, work, store) = fixture();
     std::fs::write(
@@ -1509,7 +1575,7 @@ fn same_path_different_association_is_missing_but_dangling_revision_fails_closed
     )
     .unwrap();
     let captured = bundle(&store, &work);
-    let leader = store.leader().unwrap();
+    let leader = store.publication_for_tests().unwrap();
     let target = captured
         .1
         .declarations
@@ -1599,7 +1665,6 @@ fn same_path_different_association_is_missing_but_dangling_revision_fails_closed
             [&original_payload],
         )
         .unwrap();
-    drop(records);
     let cache = rusqlite::Connection::open(index_db(state.path())).unwrap();
     cache.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
     cache
@@ -1609,7 +1674,6 @@ fn same_path_different_association_is_missing_but_dangling_revision_fails_closed
         )
         .unwrap();
     cache.execute_batch("PRAGMA foreign_keys=ON").unwrap();
-    drop(cache);
 
     let first = store.saved_views_at(Some(pin)).unwrap_err();
     let first_detail = format!("{first:#}");
@@ -1623,6 +1687,10 @@ fn same_path_different_association_is_missing_but_dangling_revision_fails_closed
         "incompatible_index: reconciliation required after invalid current index",
         "{second:#}"
     );
+    drop(leader);
+    drop(store);
+    drop(cache);
+    drop(records);
 }
 
 #[test]
@@ -1671,7 +1739,6 @@ fn partial_v8_bootstrap_never_turns_saved_records_into_index_unavailable() {
         [],
     )
     .unwrap();
-    drop(db);
     let clone = store.clone();
     let first = store.views().unwrap_err();
     assert!(
@@ -1683,6 +1750,9 @@ fn partial_v8_bootstrap_never_turns_saved_records_into_index_unavailable() {
         closed.to_string().contains("incompatible_index"),
         "{closed:#}"
     );
+    drop(clone);
+    drop(store);
+    drop(db);
 }
 
 #[test]
@@ -1771,4 +1841,6 @@ fn malformed_persisted_anchors_fail_closed_without_an_index() {
             .to_string()
             .contains("invalid durable anchor")
     );
+    drop(store);
+    drop(db);
 }

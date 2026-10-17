@@ -38,7 +38,7 @@ fn fixture() -> (
     (base, id, registry, now)
 }
 async fn ready(runtime: &trellis::daemon::registry::CheckoutRuntime) {
-    tokio::time::timeout(Duration::from_secs(20), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             if let Ok((response, catching_up)) = runtime.evidence_response() {
                 let finished = response.finish(()).is_ok();
@@ -53,13 +53,91 @@ async fn ready(runtime: &trellis::daemon::registry::CheckoutRuntime) {
     .unwrap();
 }
 
+async fn await_idle_release(registry: &mut CheckoutRegistry, at: Instant, key: &str) {
+    let started = Instant::now();
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        loop {
+            let tick = registry.advance(at + started.elapsed()).unwrap();
+            if !tick.released.is_empty() {
+                assert_eq!(tick.released, vec![key.to_owned()]);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("checkout did not release after watcher quiescence");
+}
+
+async fn await_release_after_drain(registry: &mut CheckoutRegistry, at: Instant, key: &str) {
+    let started = Instant::now();
+    let mut released = false;
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        loop {
+            let tick = registry.advance(at + started.elapsed()).unwrap();
+            if !tick.released.is_empty() {
+                assert_eq!(tick.released, vec![key.to_owned()]);
+                assert!(!released, "checkout released more than once");
+                released = true;
+            }
+            if tick.exit {
+                assert!(released, "daemon exited before releasing the checkout");
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("idle release did not finish after FIFO drain and watcher quiescence");
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn idle_exit_waits_for_release_when_read_finishes_between_idle_probes() {
+    let (_base, id, mut registry, now) = fixture();
+    registry.attach_launch(1, &id).unwrap();
+    let runtime = registry.activate(&id.root_key).unwrap();
+    ready(&runtime).await;
+    let (response, _) = runtime.evidence_response().unwrap();
+    registry.disconnect_at(1, now);
+    let due = now + DAEMON_IDLE_DELAY;
+    let (probed_tx, probed_rx) = tokio::sync::oneshot::channel();
+    let (continue_tx, continue_rx) = std::sync::mpsc::channel();
+    registry.set_after_due_release_for_tests(move || {
+        let _ = probed_tx.send(());
+        let _ = continue_rx.recv();
+    });
+    let tick = tokio::task::spawn_blocking(move || {
+        let result = registry.advance(due).unwrap();
+        (registry, result)
+    });
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, probed_rx)
+        .await
+        .expect("idle tick did not finish the due-release probe")
+        .unwrap();
+    assert!(runtime.has_active_resources());
+    response.finish(()).unwrap();
+    drop(response);
+    continue_tx.send(()).unwrap();
+    let (mut registry, first) = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, tick)
+        .await
+        .expect("idle tick did not resume")
+        .unwrap();
+    assert!(first.released.is_empty(), "active read had fenced release");
+    assert!(!first.exit, "unreleased runtime must fence daemon exit");
+    assert!(runtime.has_active_resources());
+    await_idle_release(&mut registry, due, &id.root_key).await;
+    assert!(!runtime.has_active_resources());
+    assert!(registry.advance(due + Duration::from_secs(1)).unwrap().exit);
+}
+
 #[tokio::test]
 async fn lifecycle_driver_exits_when_startup_deadline_is_due() {
     let registry = std::sync::Arc::new(tokio::sync::Mutex::new(CheckoutRegistry::starting_at(
         Instant::now() - DAEMON_IDLE_DELAY,
     )));
     tokio::time::timeout(
-        Duration::from_secs(1),
+        trellis::testing::HANG_BACKSTOP,
         trellis::daemon::run_idle_lifecycle(registry),
     )
     .await
@@ -95,13 +173,12 @@ async fn browser_expiry_starts_a_separate_release_grace_and_exit_clock() {
             .released
             .is_empty()
     );
-    assert!(
-        registry
-            .advance(now + BROWSER_IDLE_DELAY + CHECKOUT_RELEASE_DELAY)
-            .unwrap()
-            .released
-            .contains(&id.root_key)
-    );
+    await_idle_release(
+        &mut registry,
+        now + BROWSER_IDLE_DELAY + CHECKOUT_RELEASE_DELAY,
+        &id.root_key,
+    )
+    .await;
     assert!(!runtime.has_active_resources());
     assert!(
         !registry
@@ -130,9 +207,8 @@ async fn browser_client_cannot_collide_with_session_and_late_tick_keeps_deadline
         .unwrap();
     assert_eq!(registry.idle_exit_deadline(), None);
     let late = now + BROWSER_IDLE_DELAY + DAEMON_IDLE_DELAY + Duration::from_secs(1);
-    let tick = registry.advance(late).unwrap();
-    assert_eq!(tick.released, vec![id.root_key.clone()]);
-    assert!(tick.exit);
+    await_release_after_drain(&mut registry, late, &id.root_key).await;
+    assert!(!runtime.has_active_resources());
     assert_eq!(
         registry.idle_exit_deadline(),
         Some(now + BROWSER_IDLE_DELAY + DAEMON_IDLE_DELAY)
@@ -164,13 +240,13 @@ async fn final_mcp_disconnect_after_unpolled_browser_expiry_starts_its_own_grace
             .released
             .is_empty()
     );
-    assert_eq!(
-        registry
-            .advance(disconnected + CHECKOUT_RELEASE_DELAY)
-            .unwrap()
-            .released,
-        vec![id.root_key.clone()]
-    );
+    await_idle_release(
+        &mut registry,
+        disconnected + CHECKOUT_RELEASE_DELAY,
+        &id.root_key,
+    )
+    .await;
+    assert!(!runtime.has_active_resources());
 }
 
 #[tokio::test]
@@ -217,13 +293,8 @@ async fn final_session_disconnect_and_later_attach_reset_deadlines() {
     assert_eq!(registry.idle_exit_deadline(), None);
     assert!(registry.advance(before).unwrap().released.is_empty());
     registry.disconnect_at(3, before);
-    assert!(
-        registry
-            .advance(before + CHECKOUT_RELEASE_DELAY)
-            .unwrap()
-            .released
-            .contains(&id.root_key)
-    );
+    await_idle_release(&mut registry, before + CHECKOUT_RELEASE_DELAY, &id.root_key).await;
+    assert!(!runtime.has_active_resources());
 }
 
 #[test]
@@ -254,9 +325,8 @@ async fn queued_or_inflight_work_defers_expired_deadlines_until_drain() {
     response.finish(()).unwrap();
     drop(response);
     registry.set_pending_work(&id.root_key, false).unwrap();
-    let tick = registry.advance(elapsed).unwrap();
-    assert_eq!(tick.released, vec![id.root_key.clone()]);
-    assert!(tick.exit);
+    await_release_after_drain(&mut registry, elapsed, &id.root_key).await;
+    assert!(!runtime.has_active_resources());
 }
 
 #[test]
@@ -366,29 +436,22 @@ fn open_descriptors(path: &Path) -> usize {
 }
 
 #[tokio::test]
-async fn timed_release_closes_checkout_handles_and_reattach_runs_h() {
+async fn timed_release_closes_checkout_handles_and_reattach_runs_startup() {
     let (base, id, mut registry, now) = fixture();
     let root_baseline = open_descriptors(&id.root);
     let lock = base
         .path()
         .join("cache/indexes")
-        .join(&id.root_key)
-        .join("leader.lock");
+        .join(format!("{}.lock", id.root_key));
     registry.attach_launch(1, &id).unwrap();
     let old = registry.activate(&id.root_key).unwrap();
     ready(&old).await;
     assert!(open_descriptors(&id.root) > root_baseline);
     assert!(open_descriptors(&lock) > 0);
     registry.disconnect_at(1, now);
-    assert_eq!(
-        registry
-            .advance(now + CHECKOUT_RELEASE_DELAY)
-            .unwrap()
-            .released,
-        vec![id.root_key.clone()]
-    );
+    await_idle_release(&mut registry, now + CHECKOUT_RELEASE_DELAY, &id.root_key).await;
     assert!(!old.has_active_resources());
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         while open_descriptors(&id.root) != root_baseline || open_descriptors(&lock) != 0 {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -408,39 +471,50 @@ async fn timed_release_closes_checkout_handles_and_reattach_runs_h() {
     response.finish(()).unwrap();
 }
 
+#[cfg(feature = "test-support")]
 #[tokio::test]
-async fn absent_prior_head_permit_does_not_pin_idle_resources_or_skip_reattach_h() {
+async fn invalid_prior_head_does_not_pin_idle_resources_or_skip_reattach_startup() {
+    use std::os::unix::fs::MetadataExt;
     let (_base, id, mut registry, now) = fixture();
     registry.attach_launch(1, &id).unwrap();
     let old = registry.activate(&id.root_key).unwrap();
     ready(&old).await;
-    old.fail_next_release_permit_for_tests();
+    let queue = _base
+        .path()
+        .join("cache/indexes")
+        .join(&id.root_key)
+        .join("requests.db");
+    let queue_inode = fs::metadata(&queue).unwrap().ino();
     registry.disconnect_at(1, now);
-    assert_eq!(
-        registry
-            .advance(now + CHECKOUT_RELEASE_DELAY)
-            .unwrap()
-            .released,
-        vec![id.root_key.clone()]
-    );
+    await_idle_release(&mut registry, now + CHECKOUT_RELEASE_DELAY, &id.root_key).await;
     assert!(!old.has_active_resources());
     assert!(registry.advance(now + DAEMON_IDLE_DELAY).unwrap().exit);
+    // The released daemon owns no live SQLite handle. Losing its disposable
+    // index.db requires a new startup reconciliation, with no validated predecessor to select.
+    fs::remove_file(
+        _base
+            .path()
+            .join("cache/indexes")
+            .join(&id.root_key)
+            .join("index.db"),
+    )
+    .unwrap();
     registry.attach_launch(2, &id).unwrap();
-    let resumed = registry.activate(&id.root_key).unwrap();
     let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
     let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
     let resume_rx = std::sync::Mutex::new(resume_rx);
-    resumed.set_pre_h_hook_for_tests(std::sync::Arc::new(move || {
+    registry.set_next_startup_hook_for_tests(std::sync::Arc::new(move || {
         entered_tx.send(()).unwrap();
         resume_rx.lock().unwrap().recv().unwrap();
     }));
-    tokio::time::timeout(Duration::from_secs(5), async {
+    let resumed = registry.activate(&id.root_key).unwrap();
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         while entered_rx.try_recv().is_err() {
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("mandatory H did not reach pause");
+    .expect("mandatory startup reconciliation did not reach pause");
     assert!(resumed.catching_up());
     // Err carries no CheckoutEvidence, so there is no admitted basis to report.
     let error = match resumed.evidence_response() {
@@ -454,12 +528,41 @@ async fn absent_prior_head_permit_does_not_pin_idle_resources_or_skip_reattach_h
         "{error:#}"
     );
     resume_tx.send(()).unwrap();
-    ready(&resumed).await;
+    let recovered = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        loop {
+            if let Ok((response, catching_up)) = resumed.evidence_response() {
+                let finished = response.finish(()).is_ok();
+                if finished && !catching_up {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    if recovered.is_err() {
+        let diagnostic = resumed
+            .evidence_response()
+            .err()
+            .map(|error| format!("{error:#}"));
+        panic!(
+            "H did not recover invalid selected head: catching_up={}, retry_waiting={}, reconciliation_error={:?}, admission={diagnostic:?}",
+            resumed.catching_up(),
+            resumed.retry_waiting_for_tests(),
+            resumed.reconciliation_error()
+        );
+    }
     let (response, catching_up) = resumed.evidence_response().unwrap();
     assert!(!catching_up);
     response.finish(()).unwrap();
+    assert_eq!(
+        fs::metadata(&queue).unwrap().ino(),
+        queue_inode,
+        "H recovery must retain the durable queue inode"
+    );
 }
 
+#[cfg(feature = "test-support")]
 #[tokio::test]
 async fn active_writer_and_protected_reader_overlap_orphan_idle_scan() {
     use trellis::store::MaintenanceQueueState;
@@ -482,23 +585,23 @@ async fn active_writer_and_protected_reader_overlap_orphan_idle_scan() {
     assert_eq!(reader.check(), MaintenanceQueueState::Pending);
 
     registry.attach_launch(1, &id).unwrap();
-    let runtime = registry.activate(&id.root_key).unwrap();
-    // H must not claim the accepted row before the contention scan. Install
-    // the hook before yielding to the spawned reconciliation worker.
+    // startup reconciliation must not claim the accepted row before the contention scan. The
+    // hook is installed before activation starts the worker.
     let (h_entered_tx, h_entered_rx) = std::sync::mpsc::sync_channel(1);
     let (h_resume_tx, h_resume_rx) = std::sync::mpsc::sync_channel(1);
     let h_resume_rx = std::sync::Mutex::new(h_resume_rx);
-    runtime.set_pre_h_hook_for_tests(std::sync::Arc::new(move || {
+    registry.set_next_startup_hook_for_tests(std::sync::Arc::new(move || {
         h_entered_tx.send(()).unwrap();
         h_resume_rx.lock().unwrap().recv().unwrap();
     }));
-    tokio::time::timeout(Duration::from_secs(5), async {
+    let runtime = registry.activate(&id.root_key).unwrap();
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         while h_entered_rx.try_recv().is_err() {
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("mandatory H did not reach pause");
+    .expect("mandatory startup reconciliation did not reach pause");
     assert_eq!(
         store.request_by_id(&first.id).unwrap().unwrap().state,
         "queued"
@@ -513,7 +616,7 @@ async fn active_writer_and_protected_reader_overlap_orphan_idle_scan() {
             writer_resume_rx.recv().unwrap();
         })
     });
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         while writer_entered_rx.try_recv().is_err() {
             tokio::task::yield_now().await;
         }
@@ -571,7 +674,7 @@ async fn active_writer_and_protected_reader_overlap_orphan_idle_scan() {
     );
     drop(reader);
     h_resume_tx.send(()).unwrap();
-    tokio::time::timeout(Duration::from_secs(20), async {
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             let a = store.request_by_id(&first.id).unwrap().unwrap();
             let b = store.request_by_id(&second.id).unwrap().unwrap();
@@ -595,13 +698,13 @@ async fn active_writer_and_protected_reader_overlap_orphan_idle_scan() {
     assert!(
         first_done.revision.unwrap().index_revision < second_done.revision.unwrap().index_revision
     );
-    let drained = registry.advance(now + DAEMON_IDLE_DELAY).unwrap();
-    assert_eq!(drained.released, vec![id.root_key.clone()]);
-    assert!(drained.exit);
+    await_release_after_drain(&mut registry, now + DAEMON_IDLE_DELAY, &id.root_key).await;
+    assert!(!runtime.has_active_resources());
 }
 
+#[cfg(feature = "test-support")]
 #[tokio::test]
-async fn committed_fifo_queue_keeps_both_expired_clocks_until_normal_leader_drain() {
+async fn committed_fifo_queue_keeps_both_expired_clocks_until_normal_daemon_drain() {
     let (base, id, mut registry, now) = fixture();
     registry.attach_launch(1, &id).unwrap();
     let runtime = registry.activate(&id.root_key).unwrap();
@@ -610,9 +713,25 @@ async fn committed_fifo_queue_keeps_both_expired_clocks_until_normal_leader_drai
         TopologyRoots::isolated_for_tests(base.path().join("cache"), base.path().join("data"));
     let store = trellis::store::Store::open(roots, identity(&id.root)).unwrap();
     let options = trellis::indexer::IndexOptions::new(id.root.clone());
+    // The live worker claims the first request as soon as it is committed:
+    // hold it there, so the committed queue is observed before it drains.
+    let (claim_tx, claim_rx) = std::sync::mpsc::sync_channel(1);
+    let (continue_tx, continue_rx) = std::sync::mpsc::sync_channel(1);
+    let continue_rx = std::sync::Mutex::new(continue_rx);
+    runtime.set_after_claim_hook_for_tests(move || {
+        claim_tx.send(()).unwrap();
+        continue_rx.lock().unwrap().recv().unwrap();
+    });
     let first = store.enqueue_request(&options, None).unwrap();
     let second = store.enqueue_request(&options, None).unwrap();
     assert!(first.seq < second.seq);
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        while claim_rx.try_recv().is_err() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("first FIFO claim did not reach barrier");
     assert_eq!(
         store.earliest_unfinished_request().unwrap().unwrap().id,
         first.id
@@ -627,7 +746,8 @@ async fn committed_fifo_queue_keeps_both_expired_clocks_until_normal_leader_drai
     assert!(busy.released.is_empty());
     assert!(!busy.exit);
     assert!(runtime.has_active_resources());
-    tokio::time::timeout(Duration::from_secs(20), async {
+    continue_tx.send(()).unwrap();
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             let a = store.request_by_id(&first.id).unwrap().unwrap();
             let b = store.request_by_id(&second.id).unwrap().unwrap();
@@ -651,9 +771,8 @@ async fn committed_fifo_queue_keeps_both_expired_clocks_until_normal_leader_drai
         second_revision.index_generation
     );
     assert!(first_revision.index_revision < second_revision.index_revision);
-    let drained = registry.advance(deadline).unwrap();
-    assert_eq!(drained.released, vec![id.root_key.clone()]);
-    assert!(drained.exit);
+    await_release_after_drain(&mut registry, deadline, &id.root_key).await;
+    assert!(!runtime.has_active_resources());
 }
 
 #[test]
@@ -680,7 +799,7 @@ fn deleted_or_replaced_orphan_root_with_empty_queue_allows_exit() {
 }
 
 #[test]
-fn replaced_path_retires_only_quiescent_old_incarnation() {
+fn replaced_path_retires_only_quiescent_old_checkout() {
     let (base, old, mut registry, now) = fixture();
     registry.attach_launch(1, &old).unwrap();
     let moved = base.path().join("old");
@@ -690,12 +809,12 @@ fn replaced_path_retires_only_quiescent_old_incarnation() {
     assert_ne!(old.inode, next.inode);
     assert!(
         registry.attach_launch(2, &next).is_err(),
-        "live old client owns original incarnation"
+        "live old client still holds the original checkout"
     );
     registry.disconnect_at(1, now);
     registry
         .attach_launch(2, &next)
-        .expect("quiescent incarnation can be replaced");
+        .expect("quiescent checkout can be replaced");
     registry.disconnect_at(2, now);
     assert!(registry.release(&next.root_key).unwrap());
 }
@@ -717,7 +836,7 @@ fn git_init_retires_quiescent_non_git_identity_at_same_path() {
     registry.disconnect_at(1, now);
     registry
         .attach_launch(2, &next)
-        .expect("git-init starts a new incarnation");
+        .expect("git-init changes the checkout identity");
 }
 
 #[test]

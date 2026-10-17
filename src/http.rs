@@ -1,4 +1,8 @@
 //! Loopback-only HTTP API. Database and indexing work runs on blocking workers.
+#[cfg(feature = "test-support")]
+use crate::planning::FocusedView;
+#[cfg(feature = "test-support")]
+use crate::store::{EvidenceFence, EvidenceFencePolicy};
 use crate::{
     acp::Acp,
     auth::valid_token,
@@ -7,20 +11,23 @@ use crate::{
     jev,
     live_jev::LiveJev,
     model::*,
-    planning::{
-        self, FocusedView, QuestionPacket, QuestionPreview, QuestionRequest, SelectionEnvelope,
-    },
-    store::{EvidenceFence, EvidenceFencePolicy, Store},
+    planning::{self, QuestionPacket, QuestionPreview, QuestionRequest, SelectionEnvelope},
+    store::Store,
 };
 use anyhow::Context;
 use axum::{
     Json, Router,
     body::{Body, Bytes, to_bytes},
-    extract::{DefaultBodyLimit, Path, Query, Request, State},
+    extract::{Path, Query, Request, State},
     http::{StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, post, put},
+    routing::get,
+};
+#[cfg(feature = "test-support")]
+use axum::{
+    extract::DefaultBodyLimit,
+    routing::{post, put},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -34,9 +41,15 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 use subtle::ConstantTimeEq;
+
+mod config;
+mod worker;
+pub use config::BrowserConfig;
+pub use worker::{AdmissionLease, RetireOutcome, RuntimePhase};
+use worker::{RuntimeState, STARTUP_BACKOFF_FIRST};
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -208,50 +221,107 @@ impl MaintenanceTelemetry {
 
 pub struct DaemonState {
     store: Store,
-    serving_session: Mutex<Option<Arc<crate::store::topology::LeaderSession>>>,
-    // Old-root transition authority only: never used by readers or native work.
-    root_loss_session: Mutex<Option<Arc<crate::store::topology::LeaderSession>>>,
-    options: IndexOptions,
-    browser: crate::file_tree::SourceDir,
-    rust_sources: Vec<crate::rust_sources::Root>,
-    dependency_options: Option<CatalogOptions>,
+    /// Decision 0009 §2: the checkout's one runtime state, shared by the worker
+    /// and every reader. `Ready` holds the only serving writer session.
+    runtime: Mutex<RuntimeState>,
+    /// The first error of the current startup reconciliation run, cleared when
+    /// a validated head commits.
+    startup_error: Mutex<Option<String>>,
+    /// The next failed startup reconciliation waits this long (doubling, capped).
+    startup_backoff: Mutex<Duration>,
+    /// The current browser configuration (Decision 0009 §6), replaced whole.
+    config: std::sync::RwLock<Arc<BrowserConfig>>,
+    /// Explicit index options a new configuration brought, applied by the
+    /// worker's next full watcher inventory and then recorded.
+    explicit_pending: Mutex<Option<Arc<IndexOptions>>>,
+    /// The worker's wake inbox. The queue waker, registered with every Store
+    /// for this root, also marks FIFO work pending at the enqueue COMMIT; the
+    /// watch waker only wakes.
+    inbox: Arc<worker::WorkerInbox>,
+    /// Owned here; the Store registry holds it weakly.
+    _queue_waker: Arc<dyn Fn() + Send + Sync>,
+    watch_waker: Arc<dyn Fn() + Send + Sync>,
+    /// Hold the worker at the start of its next step.
+    #[cfg(feature = "test-support")]
+    worker_hold: std::sync::RwLock<()>,
+    /// The last step made progress, so more work may be ready at once.
+    step_progress: AtomicBool,
+    /// Published watcher intent; readers never take the watcher's lock.
+    watch_status: Mutex<Option<worker::WatchStatus>>,
+    /// Read and enqueue admission leases held against release.
+    leases: Arc<std::sync::atomic::AtomicUsize>,
+    /// Published by the worker after each step (and set by the enqueue gate):
+    /// accepted FIFO work keeps the runtime from retiring.
+    fifo_pending: Arc<AtomicBool>,
+    /// The registry's lifecycle wake (Decision 0009 §5).
+    lifecycle: Arc<std::sync::OnceLock<Arc<dyn Fn() + Send + Sync>>>,
+    /// The runtime closed because its captured root was lost.
+    root_lost: AtomicBool,
+    /// Every runtime state transition bumps this and signals `state_changed`.
+    state_version: AtomicU64,
+    state_changed: std::sync::Condvar,
+    /// Pause retirement before its `Closing` linearization point, and after it.
+    #[cfg(feature = "test-support")]
+    retire_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(feature = "test-support")]
+    retirement_entered_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(feature = "test-support")]
+    closing_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs as a maintenance unit begins, after its priority check passed.
+    #[cfg(feature = "test-support")]
+    maintenance_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     dependencies: Mutex<DependencyIndex>,
-    #[cfg(test)]
+    #[cfg(all(test, feature = "test-support"))]
     dependency_capture_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
-    #[cfg(test)]
+    #[cfg(all(test, feature = "test-support"))]
     outer_fence_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
-    #[cfg(test)]
+    #[cfg(all(test, feature = "test-support"))]
     preview_finish_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(feature = "test-support")]
     token: String,
+    #[cfg(feature = "test-support")]
     hosts: Vec<String>,
+    #[cfg(feature = "test-support")]
     origins: Vec<String>,
     jobs: Mutex<Jobs>,
-    queue_tick_started: AtomicBool,
-    checkout_runtime_stopped: AtomicBool,
-    checkout_takeover_h_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
-    maintenance_tick_started: AtomicBool,
+    worker_started: AtomicBool,
+    /// Watcher inventories run on the worker and are never cancelled from
+    /// outside it (Decision 0009 §1).
+    watcher_cancel: CancelFlag,
+    #[cfg(feature = "test-support")]
+    startup_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Startup reconciliation captures begun, for the single-owner tests.
+    #[cfg(feature = "test-support")]
+    startup_captures: AtomicU64,
     maintenance_telemetry: Mutex<MaintenanceTelemetry>,
     maintenance_error_limiter: Mutex<MaintenanceErrorLimiter>,
     #[cfg(test)]
-    queue_takeover_attempts: AtomicUsize,
-    #[cfg(test)]
     test_pending_read_failures: AtomicUsize,
+    #[cfg(test)]
+    test_activation_head_busy_once: AtomicBool,
     pending_requests: Mutex<Vec<String>>,
     job_progress: Mutex<BTreeMap<String, IndexProgress>>,
-    native_stream: Mutex<()>,
-    maintenance_stream: Mutex<()>,
-    leader_work: Mutex<
+    /// One worker step at a time. In production only the worker takes it; test
+    /// fixtures that drive steps by hand take it to serialize with the worker.
+    step_lock: Mutex<()>,
+    watcher_work: Mutex<
         Option<(
-            std::sync::Weak<crate::store::topology::LeaderSession>,
-            crate::index_coordinator::LeaderWork,
+            std::sync::Weak<crate::store::topology::WriterSession>,
+            crate::index_coordinator::WatcherWork,
         )>,
     >,
+    #[cfg(feature = "test-support")]
     causal_witness: Mutex<Option<Arc<crate::daemon::causal_witness::CausalWitness>>>,
+    #[cfg(feature = "test-support")]
     causal_runtime: Mutex<Option<std::sync::Weak<crate::daemon::registry::CheckoutRuntime>>>,
+    #[cfg(feature = "test-support")]
     causal_lineage_ordinal: Arc<AtomicU64>,
-    causal_h_reported: Mutex<Option<(uuid::Uuid, uuid::Uuid, u64)>>,
+    #[cfg(feature = "test-support")]
+    causal_startup_reported: Mutex<Option<(uuid::Uuid, uuid::Uuid, u64)>>,
     recovery_retry_after: Mutex<Option<Instant>>,
-    empty_takeover_retry: AtomicBool,
+    /// Watcher health, published by the current watcher through one flag that
+    /// lives as long as this state. Readers never wait for watcher work.
+    watcher_health: Arc<crate::watch::WatcherHealth>,
     retention_last_run: Mutex<Instant>,
     gc_last_check: Mutex<Instant>,
     #[cfg(test)]
@@ -261,11 +331,22 @@ pub struct DaemonState {
     #[cfg(test)]
     test_queue_after_pending_snapshot: crate::store::TestOneShotHook,
     #[cfg(test)]
-    test_queue_after_takeover_drain: crate::store::TestOneShotHook,
+    test_queue_after_startup_drain: crate::store::TestOneShotHook,
+    #[cfg(test)]
+    test_queue_before_watcher_reconcile: crate::store::TestOneShotHook,
+    #[cfg(test)]
+    test_queue_after_watcher_reconcile: crate::store::TestOneShotHook,
+    #[cfg(test)]
+    test_queue_current_phase: std::sync::atomic::AtomicU8,
     packets: Mutex<PacketCache>,
-    provider: Option<Arc<LiveJev>>,
-    acp: Option<Arc<Acp>>,
 }
+impl Drop for DaemonState {
+    /// A lossless shutdown: an idle worker waiting without a deadline exits.
+    fn drop(&mut self) {
+        self.inbox.shut_down();
+    }
+}
+
 /// Diagnostic logging must never kill the durable queue worker if the
 /// launching parent closed its stderr pipe after the server banner.
 fn best_effort_queue_stderr(mut output: impl std::io::Write, args: std::fmt::Arguments<'_>) {
@@ -356,26 +437,81 @@ pub fn new_with_dependency_options(
     source_roots: Vec<(String, std::path::PathBuf)>,
     catalog_options: Option<CatalogOptions>,
 ) -> anyhow::Result<Arc<DaemonState>> {
+    let config = BrowserConfig::build(
+        index_options,
+        false,
+        &browse_root,
+        source_roots,
+        catalog_options,
+        jev,
+        acp,
+    )?;
+    new_with_config(store, config, token, address)
+}
+
+/// A checkout scheduler with a prebuilt browser configuration.
+pub fn new_with_config(
+    store: Store,
+    config: BrowserConfig,
+    token: String,
+    address: SocketAddr,
+) -> anyhow::Result<Arc<DaemonState>> {
     anyhow::ensure!(
         address.ip().is_loopback() && address.port() != 0,
         "daemon requires a bound loopback address"
     );
     anyhow::ensure!(valid_token(&token), "invalid bearer token");
+    #[cfg(feature = "test-support")]
     let hosts = vec![address.to_string(), format!("localhost:{}", address.port())];
+    #[cfg(feature = "test-support")]
     let origins = hosts.iter().map(|h| format!("http://{h}")).collect();
+    let inbox = Arc::new(worker::WorkerInbox::default());
+    let fifo_pending = Arc::new(AtomicBool::new(false));
+    let queue_waker: Arc<dyn Fn() + Send + Sync> = {
+        let inbox = inbox.clone();
+        let fifo_pending = fifo_pending.clone();
+        Arc::new(move || {
+            fifo_pending.store(true, Ordering::Release);
+            inbox.wake();
+        })
+    };
+    let watch_waker: Arc<dyn Fn() + Send + Sync> = {
+        let inbox = inbox.clone();
+        Arc::new(move || inbox.wake())
+    };
+    store.register_queue_waker(&queue_waker);
     Ok(Arc::new(DaemonState {
         store,
-        serving_session: Mutex::new(None),
-        root_loss_session: Mutex::new(None),
-        options: index_options,
-        browser: crate::file_tree::SourceDir::open(&browse_root)?,
-        rust_sources: crate::rust_sources::open_roots(source_roots)?,
+        inbox,
+        _queue_waker: queue_waker,
+        watch_waker,
+        #[cfg(feature = "test-support")]
+        worker_hold: std::sync::RwLock::new(()),
+        step_progress: AtomicBool::new(false),
+        watch_status: Mutex::new(None),
+        leases: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        fifo_pending,
+        lifecycle: Arc::new(std::sync::OnceLock::new()),
+        root_lost: AtomicBool::new(false),
+        state_version: AtomicU64::new(0),
+        state_changed: std::sync::Condvar::new(),
+        #[cfg(feature = "test-support")]
+        retire_hook: Mutex::new(None),
+        #[cfg(feature = "test-support")]
+        retirement_entered_hook: Mutex::new(None),
+        #[cfg(feature = "test-support")]
+        closing_hook: Mutex::new(None),
+        #[cfg(feature = "test-support")]
+        maintenance_hook: Mutex::new(None),
+        runtime: Mutex::new(RuntimeState::Activating),
+        startup_error: Mutex::new(None),
+        startup_backoff: Mutex::new(STARTUP_BACKOFF_FIRST),
         dependencies: Mutex::new(DependencyIndex {
             generation: 0,
             cancel: Arc::new(AtomicBool::new(false)),
             stopped: false,
             worker_running: false,
-            state: if catalog_options.is_some() {
+            state: if config.dependency_options.is_some() {
                 "loading"
             } else {
                 "disabled"
@@ -383,40 +519,47 @@ pub fn new_with_dependency_options(
             catalog: None,
             warnings: Vec::new(),
         }),
-        #[cfg(test)]
+        #[cfg(all(test, feature = "test-support"))]
         dependency_capture_hook: Mutex::new(None),
-        #[cfg(test)]
+        #[cfg(all(test, feature = "test-support"))]
         outer_fence_hook: Mutex::new(None),
-        #[cfg(test)]
+        #[cfg(all(test, feature = "test-support"))]
         preview_finish_hook: Mutex::new(None),
-        dependency_options: catalog_options,
+        #[cfg(feature = "test-support")]
         token,
+        #[cfg(feature = "test-support")]
         hosts,
+        #[cfg(feature = "test-support")]
         origins,
-        provider: jev,
-        acp,
+        config: std::sync::RwLock::new(Arc::new(config)),
+        explicit_pending: Mutex::new(None),
         packets: Mutex::new(PacketCache::default()),
-        queue_tick_started: AtomicBool::new(false),
-        checkout_runtime_stopped: AtomicBool::new(false),
-        checkout_takeover_h_hook: Mutex::new(None),
-        maintenance_tick_started: AtomicBool::new(false),
+        worker_started: AtomicBool::new(false),
+        watcher_cancel: Arc::new(AtomicBool::new(false)),
+        #[cfg(feature = "test-support")]
+        startup_hook: Mutex::new(None),
+        #[cfg(feature = "test-support")]
+        startup_captures: AtomicU64::new(0),
         maintenance_telemetry: Mutex::new(MaintenanceTelemetry::default()),
         maintenance_error_limiter: Mutex::new(MaintenanceErrorLimiter::default()),
         #[cfg(test)]
-        queue_takeover_attempts: AtomicUsize::new(0),
-        #[cfg(test)]
         test_pending_read_failures: AtomicUsize::new(0),
+        #[cfg(test)]
+        test_activation_head_busy_once: AtomicBool::new(false),
         pending_requests: Mutex::new(Vec::new()),
         job_progress: Mutex::new(BTreeMap::new()),
-        native_stream: Mutex::new(()),
-        maintenance_stream: Mutex::new(()),
-        leader_work: Mutex::new(None),
+        step_lock: Mutex::new(()),
+        watcher_work: Mutex::new(None),
+        #[cfg(feature = "test-support")]
         causal_witness: Mutex::new(None),
+        #[cfg(feature = "test-support")]
         causal_runtime: Mutex::new(None),
+        #[cfg(feature = "test-support")]
         causal_lineage_ordinal: Arc::new(AtomicU64::new(0)),
-        causal_h_reported: Mutex::new(None),
+        #[cfg(feature = "test-support")]
+        causal_startup_reported: Mutex::new(None),
         recovery_retry_after: Mutex::new(None),
-        empty_takeover_retry: AtomicBool::new(false),
+        watcher_health: Arc::new(crate::watch::WatcherHealth::default()),
         retention_last_run: Mutex::new(Instant::now()),
         gc_last_check: Mutex::new(Instant::now() - Duration::from_secs(3600)),
         #[cfg(test)]
@@ -426,7 +569,13 @@ pub fn new_with_dependency_options(
         #[cfg(test)]
         test_queue_after_pending_snapshot: crate::store::TestOneShotHook::default(),
         #[cfg(test)]
-        test_queue_after_takeover_drain: crate::store::TestOneShotHook::default(),
+        test_queue_after_startup_drain: crate::store::TestOneShotHook::default(),
+        #[cfg(test)]
+        test_queue_before_watcher_reconcile: crate::store::TestOneShotHook::default(),
+        #[cfg(test)]
+        test_queue_after_watcher_reconcile: crate::store::TestOneShotHook::default(),
+        #[cfg(test)]
+        test_queue_current_phase: std::sync::atomic::AtomicU8::new(0),
         jobs: Mutex::new(Jobs {
             current: None,
             jobs: BTreeMap::new(),
@@ -437,6 +586,7 @@ pub fn new_with_dependency_options(
 impl DaemonState {
     /// Register a test-only, read-only witness after this checkout activates.
     /// The reverse edge is weak: release may drop the runtime independently.
+    #[cfg(feature = "test-support")]
     pub fn set_causal_witness_runtime(
         &self,
         reporter: Arc<crate::daemon::causal_witness::CausalWitness>,
@@ -446,26 +596,28 @@ impl DaemonState {
         *self.causal_runtime.lock().unwrap() = Some(runtime);
     }
 
-    /// Called only after queue_tick returned and released its native/work locks.
-    fn report_causal_h_ready(self: &Arc<Self>) {
+    /// Called only after a worker step returned and released its locks.
+    #[cfg(feature = "test-support")]
+    fn report_causal_startup_ready(self: &Arc<Self>) {
         let runtime = self.causal_runtime.lock().unwrap().clone();
         if let Some(runtime) = runtime.and_then(|runtime| runtime.upgrade()) {
-            runtime.report_causal_h_ready(self);
+            runtime.report_causal_startup_ready(self);
         }
     }
 
+    #[cfg(feature = "test-support")]
     pub fn causal_lineage_for(
         &self,
-        session: &Arc<crate::store::topology::LeaderSession>,
+        session: &Arc<crate::store::topology::WriterSession>,
     ) -> Option<crate::daemon::causal_witness::Lineage> {
-        let serving = self.serving_session.lock().unwrap();
+        let serving = self.runtime.lock().unwrap();
         if !serving
-            .as_ref()
+            .session()
             .is_some_and(|owner| Arc::ptr_eq(owner, session))
         {
             return None;
         }
-        let work = self.leader_work.lock().unwrap();
+        let work = self.watcher_work.lock().unwrap();
         let (owner, scheduler) = work.as_ref()?;
         owner
             .upgrade()
@@ -473,11 +625,12 @@ impl DaemonState {
         scheduler.causal_lineage()
     }
 
-    pub fn causal_h_already_reported(
+    #[cfg(feature = "test-support")]
+    pub fn causal_startup_already_reported(
         &self,
         lineage: crate::daemon::causal_witness::Lineage,
     ) -> bool {
-        self.causal_h_reported.lock().unwrap().as_ref()
+        self.causal_startup_reported.lock().unwrap().as_ref()
             == Some(&(
                 lineage.owner_incarnation,
                 lineage.watch_epoch,
@@ -485,7 +638,8 @@ impl DaemonState {
             ))
     }
 
-    pub fn emit_causal_h_ready_once(
+    #[cfg(feature = "test-support")]
+    pub fn emit_causal_startup_ready_once(
         &self,
         lineage: crate::daemon::causal_witness::Lineage,
         pin: IndexPin,
@@ -498,7 +652,7 @@ impl DaemonState {
             lineage.watch_epoch,
             lineage.ordinal,
         );
-        let mut reported = self.causal_h_reported.lock().unwrap();
+        let mut reported = self.causal_startup_reported.lock().unwrap();
         if reported.as_ref() != Some(&key) {
             reporter.h_ready(lineage, pin);
             *reported = Some(key);
@@ -507,235 +661,189 @@ impl DaemonState {
 
     pub fn retain_serving_session(
         self: &Arc<Self>,
-        session: Arc<crate::store::topology::LeaderSession>,
+        session: Arc<crate::store::topology::WriterSession>,
     ) {
         // Re-retention must not race an in-flight tick that sampled an old,
         // invalid holder and would replace this verified session afterward.
         {
-            let _stream = self.native_stream.lock().unwrap();
+            let _stream = self.step_lock.lock().unwrap();
             self.replace_serving_session(Some(session));
         }
-        self.start_queue_tick();
-    }
-    /// Stop the native stream before idle release; no queue worker may keep
-    /// the old leader or watcher alive after this returns.
-    pub fn release_checkout_runtime(&self) {
-        self.checkout_runtime_stopped.store(true, Ordering::Release);
-        let _stream = self.native_stream.lock().unwrap();
-        let _maintenance = self.maintenance_stream.lock().unwrap();
-        self.replace_serving_session(None);
-        *self.root_loss_session.lock().unwrap() = None;
+        self.start_worker();
     }
 
-    /// A verified owner is available only after its H has committed, or as an
-    /// independently verified follower. A stale follower during takeover is not
-    /// a ready checkout even if its old Arc remains in the runtime.
-    pub fn checkout_serving_owner(&self) -> Option<Arc<crate::store::topology::LeaderSession>> {
-        let owner = self.serving_session.lock().unwrap().clone()?;
+    /// Offline CLI fixtures must drain worker lanes before inspecting SQLite.
+    /// Production registry release instead uses the nonblocking try-release gate.
+    #[doc(hidden)]
+    pub fn release_checkout_runtime_for_fixture(&self) {
+        let _stream = self.step_lock.lock().unwrap();
+        self.set_runtime_state(RuntimeState::Retired);
+        self.inbox.wake();
+    }
+
+    /// A daemon-local writer session is usable only after its startup reconciliation commits.
+    /// A stale session cannot admit new claims or selected responses.
+    pub fn checkout_serving_owner(&self) -> Option<Arc<crate::store::topology::WriterSession>> {
+        let owner = self.runtime.lock().unwrap().session()?.clone();
         owner.verify().ok()?;
         Some(owner)
     }
 
     pub fn checkout_root_loss_retired(&self) -> bool {
-        self.store.root_path_replaced().is_ok_and(|lost| lost)
-            && self.serving_session.lock().unwrap().is_none()
-            && self.root_loss_session.lock().unwrap().is_none()
+        self.root_lost.load(Ordering::Acquire)
     }
 
-    /// Deterministically pause a takeover after election but before mandatory H.
-    #[doc(hidden)]
-    pub fn set_checkout_takeover_h_hook_for_tests(&self, hook: Arc<dyn Fn() + Send + Sync>) {
-        *self.checkout_takeover_h_hook.lock().unwrap() = Some(hook);
+    fn retired(&self) -> bool {
+        matches!(*self.runtime.lock().unwrap(), RuntimeState::Retired)
+    }
+
+    /// Hold what a worker step holds mid-inventory (the step and the watcher),
+    /// to show readers never wait for either.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn hold_worker_step_for_tests(&self, hold: impl FnOnce()) {
+        let _step = self.step_lock.lock().unwrap();
+        let _watcher = self.watcher_work.lock().unwrap();
+        hold();
+    }
+
+    /// Watcher health as the current watcher published it. A sticky flag, not
+    /// a sample: an inventory in flight never delays or refuses this read.
+    pub fn checkout_watcher_degraded(&self) -> bool {
+        self.watcher_health.degraded()
+    }
+
+    /// One coherent watcher-health witness, for measurement.
+    pub fn checkout_watcher_witness(&self) -> crate::watch::WatcherWitness {
+        self.watcher_health.witness()
     }
 
     /// A pending watcher hint (including the periodic inventory deadline) keeps
-    /// the selected checkout in the catching-up state until its tick acknowledges it.
+    /// the selected checkout in the catching-up state until the worker
+    /// acknowledges it. Reads the published status only (#138 item 2): ingress
+    /// increments the live generation before the worker drains it.
     pub fn checkout_watch_pending(&self) -> bool {
-        let pending = {
-            let work = self.leader_work.lock().unwrap();
-            work.as_ref().map(|(_, scheduler)| {
-                let options = self
-                    .store
-                    .recorded_index_options()
-                    .ok()
-                    .flatten()
-                    .unwrap_or_else(|| self.options.clone());
-                scheduler.accepted_watch_intent(&options)
-            })
+        match &*self.watch_status.lock().unwrap() {
+            Some(status) => {
+                status.other_intent
+                    || status.generation.load(Ordering::SeqCst) != status.acknowledged
+            }
+            // A serving session's first watcher has not run its full inventory.
+            None => self.runtime.lock().unwrap().session().is_some(),
+        }
+    }
+
+    /// A deterministic fixture can submit an accepted source hint through the
+    /// same bounded watcher ingress as notify, without relying on OS delivery.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn submit_watch_event_for_tests(&self, event: notify::Result<notify::Event>) -> bool {
+        let work = self.watcher_work.lock().unwrap();
+        let Some((_, scheduler)) = work.as_ref() else {
+            return false;
         };
-        pending.unwrap_or_else(|| {
-            self.serving_session
-                .lock()
-                .unwrap()
-                .as_ref()
-                .is_some_and(|session| session.is_leader())
-        })
+        scheduler.submit_watch_event_for_tests(event);
+        true
     }
 
     /// Offline snapshot fixtures opt out of the daemon's queue and maintenance ticks.
     /// See #111 for the separate read-during-reconciliation product fix.
+    #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub fn retain_serving_session_without_tick_for_tests(
         self: &Arc<Self>,
-        session: Arc<crate::store::topology::LeaderSession>,
+        session: Arc<crate::store::topology::WriterSession>,
     ) {
         self.replace_serving_session(Some(session));
     }
-    /// A failed initial H has no serving capability and no watcher yet. The
-    /// empty-queue retry must be armed *before* starting the tick; otherwise an
-    /// alive daemon binds HTTP but cannot discover a repaired checkout without
-    /// an explicit request. Back off from the already-failed startup attempt.
-    pub fn retry_failed_serving_startup(self: &Arc<Self>) {
-        self.empty_takeover_retry.store(true, Ordering::Release);
-        *self.recovery_retry_after.lock().unwrap() =
-            Some(Instant::now() + Duration::from_millis(250));
-        self.start_queue_tick();
+    /// Losing the serving session sends the runtime back to startup
+    /// reconciliation (Decision 0009 §2); gaining one makes it Ready.
+    fn replace_serving_session(&self, next: Option<Arc<crate::store::topology::WriterSession>>) {
+        self.set_runtime_state(match next {
+            Some(session) => RuntimeState::Ready(session),
+            None => RuntimeState::Reconciling {
+                attempts: 0,
+                waiting: false,
+            },
+        });
     }
-    fn replace_serving_session(&self, next: Option<Arc<crate::store::topology::LeaderSession>>) {
-        let mut current = self.serving_session.lock().unwrap();
-        let changed = match (&*current, &next) {
+
+    /// The watcher belongs to one serving session: any session change drops it.
+    fn set_runtime_state(&self, next: RuntimeState) {
+        let mut current = self.runtime.lock().unwrap();
+        let changed = match (current.session(), next.session()) {
             (Some(old), Some(next)) => !Arc::ptr_eq(old, next),
             (None, None) => false,
             _ => true,
         };
         if changed {
-            *self.leader_work.lock().unwrap() = None;
+            let mut work = self.watcher_work.lock().unwrap();
+            *work = None;
+            *self.watch_status.lock().unwrap() = None;
+            // The replaced watcher is gone; a new one publishes its own state.
+            self.watcher_health.reset();
         }
         *current = next;
+        drop(current);
+        self.note_state_change();
     }
-    /// A leader checks only the queue at idle. Follower retries require an accepted local ID.
-    fn start_queue_tick(self: &Arc<Self>) {
-        self.start_maintenance_tick();
-        // A synchronous fixture may retain an owner without starting a daemon runtime.
-        // Do not consume the start flag until a Tokio executor can own the tick.
-        if tokio::runtime::Handle::try_current().is_err() {
-            return;
-        }
-        if self.queue_tick_started.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        let weak = Arc::downgrade(self);
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_millis(20));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                interval.tick().await;
-                let Some(state) = weak.upgrade() else {
-                    break;
-                };
-                let worker = state.clone();
-                let result = tokio::task::spawn_blocking(move || worker.queue_tick()).await;
-                // The witness may read phase only after queue_tick released the
-                // native stream, watcher mutex and any SQLite statement.
-                if result.as_ref().is_ok_and(|outcome| outcome.is_ok()) {
-                    state.report_causal_h_ready();
-                }
-                match result {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => best_effort_queue_stderr(
-                        std::io::stderr(),
-                        format_args!("queue tick failed: {error:#}\n"),
-                    ),
-                    Err(error) => best_effort_queue_stderr(
-                        std::io::stderr(),
-                        format_args!("queue tick worker failed: {error:#}\n"),
-                    ),
-                }
-            }
-        });
-    }
-    /// One independent, verified-owner, low-priority lane. It never holds the
-    /// serial native stream or a watcher mutex across a Store writer unit.
-    fn start_maintenance_tick(self: &Arc<Self>) {
-        if tokio::runtime::Handle::try_current().is_err()
-            || self.maintenance_tick_started.swap(true, Ordering::AcqRel)
+    /// Run one maintenance unit on the worker thread, after its higher-priority
+    /// step (Decision 0009 §4), and report a failure at a bounded rate.
+    pub(super) fn run_maintenance_unit(&self) {
+        let _step = self.step_lock.lock().unwrap();
+        let failure = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.maintenance_tick()
+        })) {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(maintenance_error_class(&error)),
+            Err(_) => Some(("worker_join", 0)),
+        };
+        if let Some((category, code)) = failure
+            && self
+                .maintenance_error_limiter
+                .lock()
+                .unwrap()
+                .permit(Instant::now())
         {
-            return;
+            let notice = maintenance_error_notice(category, code);
+            best_effort_queue_stderr(std::io::stderr(), format_args!("{notice}"));
         }
-        let weak = Arc::downgrade(self);
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(20));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                interval.tick().await;
-                let Some(state) = weak.upgrade() else {
-                    break;
-                };
-                let worker = state.clone();
-                let failure =
-                    match tokio::task::spawn_blocking(move || worker.maintenance_tick()).await {
-                        Ok(Ok(())) => None,
-                        Ok(Err(error)) => Some(maintenance_error_class(&error)),
-                        Err(_) => Some(("worker_join", 0)),
-                    };
-                if let Some((category, code)) = failure {
-                    let permitted = state
-                        .maintenance_error_limiter
-                        .lock()
-                        .unwrap()
-                        .permit(Instant::now());
-                    if permitted {
-                        let notice = maintenance_error_notice(category, code);
-                        best_effort_queue_stderr(std::io::stderr(), format_args!("{notice}"));
-                    }
-                }
-            }
-        });
     }
 
+    /// Why maintenance must yield now, from the worker's own published state
+    /// (#138 item 3): it runs on the worker thread, so no lock is probed.
     fn maintenance_priority_reason(
         &self,
-        session: &Arc<crate::store::topology::LeaderSession>,
-        options: &IndexOptions,
+        session: &Arc<crate::store::topology::WriterSession>,
+        _options: &IndexOptions,
     ) -> Option<&'static str> {
-        if self.native_stream.try_lock().is_err() {
-            return Some("native_stream");
+        if self.inbox.wake_pending() {
+            return Some("wake_pending");
         }
-        if self.store.root_path_replaced().unwrap_or(true)
-            || !session.is_leader()
-            || session.verify().is_err()
-        {
-            return Some("root_or_leader");
+        if self.store.root_path_replaced().unwrap_or(true) || session.verify().is_err() {
+            return Some("root_or_writer");
         }
-        if self
-            .pending_requests
-            .try_lock()
-            .map_or(true, |pending| !pending.is_empty())
+        if self.fifo_pending.load(Ordering::Acquire)
+            || !self.pending_requests.lock().unwrap().is_empty()
         {
             return Some("local_fifo");
         }
         if self.store.has_recorded_completion(session).unwrap_or(true) {
             return Some("terminal_ack");
         }
-        if self.serving_session.try_lock().map_or(true, |current| {
-            !current
-                .as_ref()
-                .is_some_and(|owner| Arc::ptr_eq(owner, session))
-        }) {
+        if !matches!(&*self.runtime.lock().unwrap(),
+            RuntimeState::Ready(owner) if Arc::ptr_eq(owner, session))
+        {
             return Some("session_replaced");
         }
-        match self.leader_work.try_lock() {
-            Ok(work) => match work.as_ref() {
-                Some((owner, scheduler))
-                    if owner
-                        .upgrade()
-                        .is_some_and(|owner| Arc::ptr_eq(&owner, session)) =>
-                {
-                    if scheduler.accepted_watch_intent(options) {
-                        Some("accepted_watcher")
-                    } else {
-                        None
-                    }
-                }
-                _ => Some("watcher_replaced"),
-            },
-            Err(_) => Some("watcher_busy"),
+        if self.checkout_watch_pending() {
+            return Some("accepted_watcher");
         }
+        None
     }
 
     fn maintenance_priority(
         &self,
-        session: &Arc<crate::store::topology::LeaderSession>,
+        session: &Arc<crate::store::topology::WriterSession>,
         options: &IndexOptions,
     ) -> bool {
         self.maintenance_priority_reason(session, options).is_none()
@@ -745,12 +853,12 @@ impl DaemonState {
     /// A BUSY/unknown read never blocks or changes foreground work.
     fn maintenance_oldest_age(
         &self,
-        session: &Arc<crate::store::topology::LeaderSession>,
+        session: &Arc<crate::store::topology::WriterSession>,
     ) -> (String, Option<u64>) {
         if !crate::index_coordinator::diagnostics_enabled() {
             return ("disabled".into(), None);
         }
-        let Ok(leader) = session.leader_guard() else {
+        let Ok(leader) = session.writer_guard() else {
             return ("unknown".into(), None);
         };
         match self.store.maintenance_oldest_due_age_secs(leader) {
@@ -762,7 +870,7 @@ impl DaemonState {
 
     fn maintenance_deferred_reason(
         &self,
-        session: &Arc<crate::store::topology::LeaderSession>,
+        session: &Arc<crate::store::topology::WriterSession>,
         options: &IndexOptions,
     ) -> &'static str {
         if let Some(reason) = self.maintenance_priority_reason(session, options) {
@@ -780,7 +888,7 @@ impl DaemonState {
 
     fn maintenance_deferred(
         &self,
-        session: &Arc<crate::store::topology::LeaderSession>,
+        session: &Arc<crate::store::topology::WriterSession>,
         reason: &str,
     ) {
         let (oldest, measured_age) = self.maintenance_oldest_age(session);
@@ -805,7 +913,7 @@ impl DaemonState {
 
     fn gc_tick(
         &self,
-        session: &Arc<crate::store::topology::LeaderSession>,
+        session: &Arc<crate::store::topology::WriterSession>,
         options: &IndexOptions,
     ) -> anyhow::Result<()> {
         if self.gc_last_check.lock().unwrap().elapsed() < Duration::from_secs(3600)
@@ -824,7 +932,7 @@ impl DaemonState {
             return Ok(());
         };
         drop(permit); // Never hold the gate across the whole directory scan.
-        let Ok(leader) = session.leader_guard() else {
+        let Ok(leader) = session.writer_guard() else {
             return Ok(());
         };
         let mut priority = |stage| -> anyhow::Result<()> {
@@ -881,30 +989,25 @@ impl DaemonState {
     }
 
     fn maintenance_tick(&self) -> anyhow::Result<()> {
-        if self.checkout_runtime_stopped.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        let _lane = self.maintenance_stream.lock().unwrap();
-        if self.checkout_runtime_stopped.load(Ordering::Acquire) {
+        if self.retired() {
             return Ok(());
         }
         use crate::store::MaintenanceOutcome;
         if self.retention_last_run.lock().unwrap().elapsed() < Duration::from_secs(60) {
             return Ok(());
         }
-        let session = self
-            .serving_session
-            .try_lock()
-            .ok()
-            .and_then(|held| held.clone());
+        let session = match &*self.runtime.lock().unwrap() {
+            RuntimeState::Ready(session) => Some(session.clone()),
+            _ => None,
+        };
         let Some(session) = session else {
             return Ok(());
         };
         // Read selected options only outside a maintenance writer. A changed
-        // watcher/options binding is intent until native_stream replaces it.
+        // watcher/options binding is intent until the worker replaces it.
         let options = match self.store.recorded_index_options() {
             Ok(Some(options)) => options,
-            Ok(None) => self.options.clone(),
+            Ok(None) => self.config().options.clone(),
             Err(_) => return Ok(()),
         };
         if let Some(reason) = self.maintenance_priority_reason(&session, &options) {
@@ -922,6 +1025,10 @@ impl DaemonState {
                 self.maintenance_oldest_age(&session).0
             ),
         );
+        #[cfg(feature = "test-support")]
+        if let Some(hook) = self.maintenance_hook.lock().unwrap().take() {
+            hook();
+        }
         let result =
             crate::index_coordinator::cooperative_maintenance_unit(&self.store, &session, || {
                 self.maintenance_priority(&session, &options)
@@ -994,114 +1101,119 @@ impl DaemonState {
         // stream. Verify/ack its initial full watcher inventory before claiming
         // a genuine idle maintenance opportunity.
         {
-            let _stream = self.native_stream.lock().unwrap();
-            let session = self.serving_session.lock().unwrap().clone();
+            let _stream = self.step_lock.lock().unwrap();
+            let session = self.runtime.lock().unwrap().session().cloned();
             if let Some(session) = session {
                 let options = self
                     .store
                     .recorded_index_options()?
-                    .unwrap_or_else(|| self.options.clone());
-                let mut work = self.leader_work.lock().unwrap();
+                    .unwrap_or_else(|| self.config().options.clone());
+                let mut work = self.watcher_work.lock().unwrap();
                 if work.is_none() {
-                    let mut scheduler =
-                        crate::index_coordinator::LeaderWork::new(&self.store, &session, &options)?;
-                    // Nothing drains OS events in this fixture, so a late
-                    // notification for a write made before the tick would
-                    // defer maintenance as `accepted_watcher` (#131).
+                    let mut scheduler = crate::index_coordinator::WatcherWork::publishing(
+                        &self.store,
+                        &session,
+                        &options,
+                        self.watcher_health.clone(),
+                    )?;
+                    // A late OS event from before this forced fixture tick must
+                    // not defer pin expiration as accepted watcher work (#131).
                     scheduler.disable_native_watcher_for_tests();
-                    scheduler.reconcile_due(
+                    scheduler.set_waker(self.watch_waker.clone());
+                    let reconciled = scheduler.reconcile_due(
                         &self.store,
                         &session,
                         &options,
                         &Arc::new(AtomicBool::new(false)),
                         true,
-                    )?;
+                    );
+                    self.publish_watch_status(&scheduler, &options);
+                    reconciled?;
                     *work = Some((Arc::downgrade(&session), scheduler));
                 }
             }
         }
         *self.retention_last_run.lock().unwrap() = Instant::now() - Duration::from_secs(60);
+        // The worker is the only writer (Decision 0009 §1): serialize with it.
+        let _step = self.step_lock.lock().unwrap();
         self.maintenance_tick()
-    }
-
-    /// Deliver a watcher event to the serving checkout's scheduler, as the OS
-    /// watcher would, without depending on OS notification latency. Returns
-    /// false until the queue tick has created the scheduler.
-    #[doc(hidden)]
-    pub fn submit_watch_event_for_tests(&self, event: notify::Event) -> bool {
-        match self.leader_work.lock().unwrap().as_ref() {
-            Some((_, scheduler)) => {
-                scheduler.submit_watch_event_for_tests(Ok(event));
-                true
-            }
-            None => false,
-        }
     }
 
     /// Drive the serial root-loss transition in a standalone fixture without
     /// conflating it with the independent low-priority maintenance lane.
     #[doc(hidden)]
     pub fn force_root_transition_tick_for_tests(self: &Arc<Self>) -> anyhow::Result<()> {
-        self.queue_tick()
+        self.worker_step()
     }
 
     /// Inspect the three mutually exclusive roles at a root-loss tick boundary.
     #[doc(hidden)]
     pub fn root_loss_retirement_for_tests(&self) -> (bool, bool, bool) {
         (
-            self.serving_session.lock().unwrap().is_some(),
-            self.leader_work.lock().unwrap().is_some(),
-            self.root_loss_session.lock().unwrap().is_some(),
+            self.runtime.lock().unwrap().session().is_some(),
+            self.watcher_work.lock().unwrap().is_some(),
+            false,
         )
     }
 
-    fn queue_tick(self: &Arc<Self>) -> anyhow::Result<()> {
-        if self.checkout_runtime_stopped.load(Ordering::Acquire) {
+    /// Whether accepted work is waiting for a standalone scheduler that was
+    /// never asked to reconcile. Typed contention defers the decision.
+    fn durable_work_pending(&self, pending_local: bool) -> anyhow::Result<Option<bool>> {
+        if pending_local {
+            return Ok(Some(true));
+        }
+        match self.startup_head() {
+            Ok(head) => Ok(Some(head.is_some())),
+            Err(error) if crate::store::transient_storage_contention(&error) => {
+                *self.recovery_retry_after.lock().unwrap() =
+                    Some(Instant::now() + Duration::from_millis(250));
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn worker_step(self: &Arc<Self>) -> anyhow::Result<()> {
+        #[cfg(feature = "test-support")]
+        let _held = self.worker_hold.read().unwrap();
+        if self.retired() {
             return Ok(());
         }
         #[cfg(test)]
         self.test_queue_before_stream.run();
-        let _stream = self.native_stream.lock().unwrap();
-        if self.checkout_runtime_stopped.load(Ordering::Acquire) {
+        let _stream = self.step_lock.lock().unwrap();
+        #[cfg(test)]
+        self.test_queue_current_phase.store(1, Ordering::Release);
+        if self.retired() {
             return Ok(());
         }
         #[cfg(test)]
         self.test_queue_after_stream.run();
-        // The old pathname must not reach a queue probe, recovery attempt or
-        // capture after its root identity changes. Retire the watcher with its
-        // leader session; the moved spelling opens independently.
+        // A lost captured root has no claim or publication authority. Resolve
+        // its accepted queue rows before releasing local scheduler resources;
+        // until that COMMIT is confirmed the runtime keeps them and makes no
+        // other progress.
         if self.store.root_path_replaced()? {
-            let retained = self
-                .serving_session
-                .lock()
-                .unwrap()
-                .clone()
-                .filter(|session| session.is_leader())
-                .or_else(|| self.store.restricted_owner_for_root_loss())
-                .or_else(|| self.store.orphan_root_loss_owner());
-            if let Some(session) = retained {
-                *self.root_loss_session.lock().unwrap() = Some(session);
-            }
-            // Transfer the sole restricted EX to root-loss authority BEFORE
-            // revoking its selected-read association. Accepted FIFO work must
-            // reach root_changed while an old-owner EX still exists.
-            self.store.revoke_restricted_predecessor();
-            self.replace_serving_session(None);
-            let authority = self.root_loss_session.lock().unwrap().clone();
-            if let Some(session) = authority {
-                self.store.fail_changed_root_requests(&session)?;
-                self.store.clear_orphan_root_loss_owner();
-                *self.root_loss_session.lock().unwrap() = None;
-            }
-            return Ok(());
+            return self.close_for_root_loss();
         }
-        // A real exceptional storage error must not recapture/log every 20 ms.
-        if !self.store.is_root_replaced()
-            && self
-                .recovery_retry_after
-                .lock()
-                .unwrap()
-                .is_some_and(|retry| Instant::now() < retry)
+        // Retirement is due: the worker retires this runtime at this boundary
+        // unless accepted FIFO work cancels it (Decision 0009 §5).
+        if matches!(
+            *self.runtime.lock().unwrap(),
+            RuntimeState::RetireRequested { .. }
+        ) {
+            return self.run_retirement();
+        }
+        // A previously serving writer cannot claim against a damaged index.
+        // Retire its local work; startup reconciliation recreates it.
+        if self.store.is_recreate_pending() && self.runtime.lock().unwrap().session().is_some() {
+            self.replace_serving_session(None);
+        }
+        if self
+            .recovery_retry_after
+            .lock()
+            .unwrap()
+            .is_some_and(|retry| Instant::now() < retry)
         {
             return Ok(());
         }
@@ -1115,14 +1227,10 @@ impl DaemonState {
                 })
                 .is_ok()
             {
-                // Model a transient requests.db read failure without changing a live
-                // queue file or the protected index controls.
                 return true;
             }
             match self.store.request_by_id(id) {
                 Ok(Some(row)) => row.finished_at.is_none(),
-                // A failed or inconclusive read cannot erase the only request-driven
-                // follower retry trigger. Only an observed terminal removes this ID.
                 Ok(None) | Err(_) => true,
             }
         });
@@ -1130,116 +1238,22 @@ impl DaemonState {
         drop(pending);
         #[cfg(test)]
         self.test_queue_after_pending_snapshot.run();
-        // A CLI process or a previous daemon has no ID in this daemon's local
-        // pending vector. Its durable FIFO row must still drive exceptional
-        // recovery; the existing-only read leaves a virgin Ready queue absent.
-        // A failed initial Ready H must be retried before interpreting an
-        // existing queue. A v0 first-writer file can make even its read return
-        // storage_busy; the verified owner may safely repair that virgin file
-        // during mandatory H. Any durable FIFO rows wait for the next tick,
-        // after H, and are never acknowledged by this request-free retry.
-        let retry_initial_h = self.empty_takeover_retry.load(Ordering::Acquire)
-            && self.serving_session.lock().unwrap().is_none()
-            && self.store.is_ready_disposition();
-        let durable_pending = !pending_local
-            && !self.store.is_root_replaced()
-            && !retry_initial_h
-            && self.store.earliest_unfinished_request()?.is_some();
-        let mut externally_repaired = false;
-        if self.store.is_recreate_pending() && !self.store.is_root_replaced() {
-            // Another verified process may have replaced the corrupt index.
-            // Never reuse our stale EX recreation authority in that case: the
-            // strict existing-only read authenticates the same root/new pin
-            // before this daemon's shared disposition is switched to Ready.
-            match self.store.observe_external_ready_recovery() {
-                Ok(Some(_)) => {
-                    *self.recovery_retry_after.lock().unwrap() = None;
-                    externally_repaired = true;
-                }
-                Ok(None) if !pending_local && !durable_pending => {
-                    *self.recovery_retry_after.lock().unwrap() =
-                        Some(Instant::now() + Duration::from_millis(500));
-                    return Ok(());
-                }
-                Ok(None) => {}
-                Err(error)
-                    if error.chain().any(|cause| {
-                        cause
-                            .downcast_ref::<crate::store::topology::StorageBusy>()
-                            .is_some()
-                    }) =>
-                {
-                    *self.recovery_retry_after.lock().unwrap() =
-                        Some(Instant::now() + Duration::from_millis(250));
-                    return Ok(());
-                }
-                Err(error) => {
-                    *self.recovery_retry_after.lock().unwrap() =
-                        Some(Instant::now() + Duration::from_millis(500));
-                    return Err(error);
-                }
+        // Startup reconciliation is the worker's first item: FIFO waits for it.
+        if self.runtime.lock().unwrap().session().is_none() {
+            if !self.startup_due(|| self.durable_work_pending(pending_local))? {
+                return Ok(());
+            }
+            self.run_startup_reconciliation()?;
+            if self.runtime.lock().unwrap().session().is_none() {
+                return Ok(());
             }
         }
-        if self.store.is_recreate_pending()
-            && !pending_local
-            && !durable_pending
-            && !self.store.is_root_replaced()
-        {
-            // Admission may follow an empty snapshot; RootReplaced still has
-            // to fail old-root durable requests below.
-            return Ok(());
-        }
-        if self.store.is_recreate_pending() && (pending_local || durable_pending) {
-            // The native stream excludes the tick while the old owner is removed.
-            // A restricted predecessor's EX must not pin exceptional recreation.
-            self.store.revoke_restricted_predecessor();
-            self.replace_serving_session(None);
-            match self
-                .store
-                .recreate_pending_leader_session(&self.options, &Arc::new(AtomicBool::new(false)))
-            {
-                Ok((_, session)) => {
-                    self.store.fail_changed_root_requests(&session)?;
-                    self.replace_serving_session(Some(session));
-                }
-                Err(error)
-                    if error.chain().any(|cause| {
-                        cause
-                            .downcast_ref::<crate::store::topology::StorageBusy>()
-                            .is_some()
-                    }) =>
-                {
-                    *self.recovery_retry_after.lock().unwrap() =
-                        Some(Instant::now() + Duration::from_millis(250));
-                    return Ok(());
-                }
-                Err(error) => {
-                    *self.recovery_retry_after.lock().unwrap() =
-                        Some(Instant::now() + Duration::from_millis(500));
-                    return Err(error);
-                }
-            }
-        }
-        let retained = self.serving_session.lock().unwrap().clone();
-        if self.store.root_path_replaced()? {
-            let root_loss_owner = retained
-                .as_ref()
-                .filter(|session| session.is_leader())
-                .cloned()
-                .or_else(|| self.store.restricted_owner_for_root_loss())
-                .or_else(|| self.store.orphan_root_loss_owner());
-            if let Some(ref session) = root_loss_owner {
-                self.store.fail_changed_root_requests(session)?;
-            }
-            self.store.clear_orphan_root_loss_owner();
-            self.store.revoke_restricted_predecessor();
-            self.replace_serving_session(None);
-            return Ok(());
-        }
+        let retained = self.runtime.lock().unwrap().session().cloned();
         if let Some(ref session) = retained
-            && session.is_leader()
             && session.verify().is_ok()
         {
+            #[cfg(test)]
+            self.test_queue_current_phase.store(2, Ordering::Release);
             let processed = match crate::index_coordinator::drain_one_request_observed(
                 &self.store,
                 session,
@@ -1250,20 +1264,25 @@ impl DaemonState {
                 Ok(processed) => processed,
                 Err(error) => {
                     // A cached terminal result must be resolved by this same
-                    // incarnation. Otherwise release the failed leader so a
+                    // incarnation. Otherwise release the stale writer so a
                     // successor can reclaim an unfinished running head.
                     if !self.store.has_recorded_completion(session)?
-                        || !crate::index_coordinator::retryable_cli_completion_error(&error)
+                        || !crate::index_coordinator::retryable_completion_error(&error)
                     {
                         self.replace_serving_session(None);
                     }
                     return Err(error);
                 }
             };
+            #[cfg(test)]
+            self.test_queue_current_phase.store(3, Ordering::Release);
             if processed > 0 {
                 *self.packets.lock().unwrap() = PacketCache::default();
                 self.start_dependency_index();
+                self.step_progress.store(true, Ordering::Release);
             }
+            #[cfg(test)]
+            self.test_queue_after_startup_drain.run();
             // A verified drain normally consumes every FIFO head. If one is
             // still queued, the guarded publish-BUSY path deferred it. Avoid
             // recapturing the workspace every 20 ms under sustained readers.
@@ -1280,23 +1299,31 @@ impl DaemonState {
                 && !self.store.has_recorded_completion(session)?
             {
                 // The idle watcher follows the selected head's persisted inputs.
-                // Daemon defaults cannot silently supersede a FIFO head's options.
-                let selected_options = self
-                    .store
-                    .recorded_index_options()?
-                    .unwrap_or_else(|| self.options.clone());
+                // Daemon defaults cannot silently supersede a FIFO head's options;
+                // explicit options a new `serve` registration brought are applied
+                // once, by the next full inventory (Decision 0009 §6).
+                let explicit = self.explicit_pending.lock().unwrap().clone();
+                let selected_options = match &explicit {
+                    Some(options) => IndexOptions::clone(options),
+                    None => self
+                        .store
+                        .recorded_index_options()?
+                        .unwrap_or_else(|| self.config().options.clone()),
+                };
                 {
-                    let mut work = self.leader_work.lock().unwrap();
+                    let mut work = self.watcher_work.lock().unwrap();
                     if !work.as_ref().is_some_and(|(owner, _)| {
                         owner
                             .upgrade()
                             .is_some_and(|owner| Arc::ptr_eq(&owner, session))
                     }) {
-                        let mut scheduler = crate::index_coordinator::LeaderWork::new(
+                        let mut scheduler = crate::index_coordinator::WatcherWork::publishing(
                             &self.store,
                             session,
                             &selected_options,
+                            self.watcher_health.clone(),
                         )?;
+                        #[cfg(feature = "test-support")]
                         if let Some(reporter) = self.causal_witness.lock().unwrap().clone() {
                             scheduler.attach_causal_witness(
                                 reporter,
@@ -1304,19 +1331,43 @@ impl DaemonState {
                                 self.causal_lineage_ordinal.clone(),
                             );
                         }
+                        scheduler.set_waker(self.watch_waker.clone());
+                        self.publish_watch_status(&scheduler, &selected_options);
                         *work = Some((Arc::downgrade(session), scheduler));
                     }
                     if let Some((_, scheduler)) = work.as_mut() {
-                        let accounted = scheduler.reconcile_due(
+                        #[cfg(test)]
+                        self.test_queue_current_phase.store(4, Ordering::Release);
+                        #[cfg(test)]
+                        self.test_queue_before_watcher_reconcile.run();
+                        let reconciled = scheduler.reconcile_due(
                             &self.store,
                             session,
                             &selected_options,
-                            &Arc::new(AtomicBool::new(false)),
+                            &self.watcher_cancel,
                             false,
-                        )?;
+                        );
+                        self.publish_watch_status(scheduler, &selected_options);
+                        let accounted = reconciled?;
+                        // Explicit options are applied once: after a verified
+                        // inventory under them, the recorded head selects again.
+                        if accounted && let Some(applied) = &explicit {
+                            let mut pending = self.explicit_pending.lock().unwrap();
+                            if pending
+                                .as_ref()
+                                .is_some_and(|current| Arc::ptr_eq(current, applied))
+                            {
+                                *pending = None;
+                            }
+                        }
+                        #[cfg(test)]
+                        self.test_queue_current_phase.store(5, Ordering::Release);
+                        #[cfg(test)]
+                        self.test_queue_after_watcher_reconcile.run();
                         // ACK only a verified, acknowledged full inventory.
                         // Neither a failed FIFO probe nor a newer accepted hint
                         // can be called settled. The reporter only try_sends here.
+                        #[cfg(feature = "test-support")]
                         if accounted
                             && let Some(reporter) = self.causal_witness.lock().unwrap().clone()
                             && !scheduler.accepted_watch_intent(&selected_options)
@@ -1326,12 +1377,12 @@ impl DaemonState {
                                 scheduler.accounted_watch_generation(),
                                 scheduler.accounted_watch_pin(),
                             )
-                            && self.store.verify_leader_session(session).is_ok()
+                            && self.store.verify_writer_session(session).is_ok()
                             && self
                                 .store
                                 .index_baseline()
                                 .is_ok_and(|pin| pin == certified_pin)
-                            && self.store.verify_leader_session(session).is_ok()
+                            && self.store.verify_writer_session(session).is_ok()
                         {
                             reporter.watch_ack(lineage, generation, certified_pin, true);
                         }
@@ -1340,231 +1391,41 @@ impl DaemonState {
             }
             return Ok(());
         }
-        if !pending_local && !durable_pending {
-            if externally_repaired
-                || (retained.is_none() && self.empty_takeover_retry.load(Ordering::Acquire))
-                || retained
-                    .as_ref()
-                    .is_some_and(|session| session.verify().is_err())
-            {
-                // Keep this retry trigger even when dropping the old follower.
-                // A new synced incarnation fences old evidence; a pre-COMMIT
-                // error must not strand an empty FIFO with serving_session=None.
-                self.empty_takeover_retry.store(true, Ordering::Release);
-                self.replace_serving_session(None);
-                let takeover =
-                    (|| -> anyhow::Result<Arc<crate::store::topology::LeaderSession>> {
-                        match self.store.leader_session() {
-                            Ok(session) => {
-                                let mut root_loss_lease =
-                                    self.store.root_loss_owner_lease(&session);
-                                self.store.fail_changed_root_requests(&session)?;
-                                let coordinator =
-                                crate::index_coordinator::IndexJobCoordinator::prepare_with_session(
-                                    &self.store, None, session.clone(),
-                                )?;
-                                // A persisted selected head governs takeover, not
-                                // the follower daemon's default index options.
-                                // Malformed recorded options fail closed via `?`.
-                                let selected_options = self
-                                    .store
-                                    .recorded_index_options()?
-                                    .unwrap_or_else(|| self.options.clone());
-                                coordinator.run(
-                                    &selected_options,
-                                    &Arc::new(AtomicBool::new(false)),
-                                    |_| {},
-                                )?;
-                                root_loss_lease.disarm();
-                                Ok(session)
-                            }
-                            Err(error)
-                                if error.to_string().starts_with("storage_busy: ")
-                                    || error.chain().any(|cause| {
-                                        cause
-                                            .downcast_ref::<crate::store::topology::StorageBusy>()
-                                            .is_some()
-                                    }) =>
-                            {
-                                // A live external owner may still hold EX. Its
-                                // follower proof is independently verified.
-                                self.store.follower_session()
-                            }
-                            Err(error) => Err(error),
-                        }
-                    })();
-                // The restricted read association cannot retain a failed EX.
-                // Successful H already replaced it with strict current proof.
-                self.store.revoke_restricted_predecessor();
-                match takeover {
-                    Ok(session) if session.is_leader() => {
-                        self.replace_serving_session(Some(session));
-                        self.empty_takeover_retry.store(false, Ordering::Release);
-                        *self.recovery_retry_after.lock().unwrap() = None;
-                    }
-                    Ok(follower) => {
-                        self.replace_serving_session(Some(follower));
-                        *self.recovery_retry_after.lock().unwrap() =
-                            Some(Instant::now() + Duration::from_millis(250));
-                    }
-                    Err(error) => {
-                        let busy = crate::store::transient_storage_contention(&error);
-                        *self.recovery_retry_after.lock().unwrap() = Some(
-                            Instant::now() + Duration::from_millis(if busy { 250 } else { 500 }),
-                        );
-                        if !busy {
-                            return Err(error);
-                        }
-                    }
-                }
-            }
-            return Ok(());
-        }
-        // A retained follower verifies both the held leader flock and incarnation
-        // without opening index.db. Retry acquisition only after that proof fails.
-        if let Some(ref session) = retained
-            && !session.is_leader()
-            && session.verify().is_ok()
-        {
-            return Ok(());
-        }
-        #[cfg(test)]
-        self.queue_takeover_attempts.fetch_add(1, Ordering::AcqRel);
-        match self.store.leader_session() {
-            Ok(session) => {
-                let mut root_loss_lease = self.store.root_loss_owner_lease(&session);
-                // A new EX may not drain FIFO until its mandatory selected-head
-                // reconciliation has completed under this same incarnation.
-                let mut mandatory_reconcile_incomplete = true;
-                let outcome: anyhow::Result<Option<usize>> = (|| {
-                    self.store.fail_changed_root_requests(&session)?;
-                    // Selected H owns the mandatory takeover inventory. Q1's
-                    // stored options are decoded strictly, but govern only Q1's
-                    // later FIFO publication (or a virgin-head fallback).
-                    let head_before = self.store.earliest_unfinished_request()?;
-                    let head_options = head_before
-                        .as_ref()
-                        .map(|head| head.options(std::path::Path::new(self.store.workspace_root())))
-                        .transpose()?;
-                    let selected_options = self.store.recorded_index_options()?;
-                    let takeover_options = selected_options
-                        .or_else(|| head_options.clone())
-                        .unwrap_or_else(|| self.options.clone());
-                    let coordinator =
-                        crate::index_coordinator::IndexJobCoordinator::prepare_with_session(
-                            &self.store,
-                            None,
-                            session.clone(),
-                        )?;
-                    let before = self.store.index_baseline()?;
-                    if let Some(hook) = self.checkout_takeover_h_hook.lock().unwrap().take() {
-                        hook();
-                    }
-                    if let Err(error) = coordinator.run(
-                        &takeover_options,
-                        &Arc::new(AtomicBool::new(false)),
-                        |_| {},
-                    ) {
-                        // No failed pre-COMMIT H (including a virgin-head H)
-                        // may claim or terminal-fail Q1. Keep its durable FIFO
-                        // row queued and drop this unreconciled EX/session.
-                        self.store.fail_changed_root_requests(&session)?;
-                        self.store.verify_leader_session(&session)?;
-                        if self.store.index_baseline()? != before {
-                            // A possibly committed revision is not inferred
-                            // from a transient error; a new owner retries H.
-                            return Err(error);
-                        }
-                        let busy = crate::store::transient_storage_contention(&error);
-                        *self.recovery_retry_after.lock().unwrap() = Some(
-                            Instant::now() + Duration::from_millis(if busy { 250 } else { 500 }),
-                        );
-                        if busy {
-                            return Ok(None);
-                        }
-                        return Err(error);
-                    }
-                    mandatory_reconcile_incomplete = false;
-                    // Reconciliation is complete, so this verified leader may now
-                    // serve. Retain it before drain commits a terminal ACK; a
-                    // later drain error may still release it for safe reclamation.
-                    self.replace_serving_session(Some(session.clone()));
-                    let mut scheduler = crate::index_coordinator::LeaderWork::new(
-                        &self.store,
-                        &session,
-                        &takeover_options,
-                    )?;
-                    if let Some(reporter) = self.causal_witness.lock().unwrap().clone() {
-                        scheduler.attach_causal_witness(
-                            reporter,
-                            session.incarnation(),
-                            self.causal_lineage_ordinal.clone(),
-                        );
-                    }
-                    *self.leader_work.lock().unwrap() = Some((Arc::downgrade(&session), scheduler));
-                    let processed = crate::index_coordinator::drain_one_request_observed(
-                        &self.store,
-                        &session,
-                        |id, p| {
-                            self.job_progress.lock().unwrap().insert(id.to_owned(), p);
-                        },
-                    )?;
-                    #[cfg(test)]
-                    self.test_queue_after_takeover_drain.run();
-                    if processed > 0 {
-                        *self.packets.lock().unwrap() = PacketCache::default();
-                        self.start_dependency_index();
-                    }
-                    Ok(Some(processed))
-                })();
-                self.store.revoke_restricted_predecessor();
-                let recorded_completion = if outcome.is_ok() || mandatory_reconcile_incomplete {
-                    Ok(false)
-                } else {
-                    self.store.has_recorded_completion(&session)
-                };
-                let keep_owner = matches!(outcome.as_ref(), Ok(Some(_)))
-                    || (!mandatory_reconcile_incomplete
-                        && recorded_completion.as_ref().is_ok_and(|recorded| *recorded)
-                        && outcome
-                            .as_ref()
-                            .is_err_and(crate::index_coordinator::retryable_cli_completion_error));
-                if keep_owner {
-                    // Only a completed mandatory inventory or a verified cached
-                    // FIFO terminal result may retain this exact EX/session.
-                    self.replace_serving_session(Some(session));
-                    root_loss_lease.disarm();
-                } else {
-                    // RetryMandatory Ok(None) and every incomplete-H Err drop
-                    // even a stale retained follower. No old EX/LeaderWork may
-                    // bypass H by taking the retained-owner drain branch.
-                    self.replace_serving_session(None);
-                }
-                recorded_completion?;
-                outcome.map(|_| ())
-            }
-            Err(error) if format!("{error:#}").contains("storage_busy") => Ok(()),
-            Err(error) => Err(error),
-        }
+        Ok(())
     }
     pub fn retained_serving_session(
         &self,
-    ) -> anyhow::Result<Arc<crate::store::topology::LeaderSession>> {
-        self.serving_session
+    ) -> anyhow::Result<Arc<crate::store::topology::WriterSession>> {
+        self.runtime
             .lock()
             .unwrap()
-            .clone()
+            .session()
+            .cloned()
             .context("index_not_ready: no verified daemon serving session")
     }
 
     /// Start a replacement generation without doing filesystem or database work on the caller.
     /// A previous generation can finish, but can never publish over its replacement.
     pub fn start_dependency_index(self: &Arc<Self>) {
-        let Some(options) = self.dependency_options.clone() else {
-            return;
-        };
-        if !self.dependencies.lock().unwrap().request_build() {
-            return;
+        let config = self.config();
+        self.start_dependency_index_for(&config);
+    }
+
+    /// Schedule a catalog build if `config` is still the current version and
+    /// enables the catalog. The check and the schedule share the catalog lock
+    /// with a configuration swap's reset, so they cannot interleave with it.
+    pub(crate) fn start_dependency_index_for(
+        self: &Arc<Self>,
+        config: &Arc<BrowserConfig>,
+    ) -> bool {
+        {
+            let mut index = self.dependencies.lock().unwrap();
+            if !Arc::ptr_eq(&self.config(), config) || config.dependency_options.is_none() {
+                return false;
+            }
+            if !index.request_build() {
+                return !index.stopped;
+            }
         }
         let state = self.clone();
         tokio::spawn(async move {
@@ -1579,12 +1440,18 @@ impl DaemonState {
                 };
                 let worker = state.clone();
                 let worker_cancel = cancel.clone();
-                let options = options.clone();
                 let result = tokio::task::spawn_blocking(move || {
                     let result = (|| {
+                        // Each generation builds with the configuration current
+                        // when it starts; a replaced one bumps the generation.
+                        let config = worker.config();
+                        let options = config
+                            .dependency_options
+                            .clone()
+                            .ok_or_else(|| anyhow::anyhow!("dependency catalog disabled"))?;
                         let revision = worker.store.status()?.revision;
                         Catalog::build(
-                            &worker.options.workspace_root,
+                            &config.options.workspace_root,
                             revision,
                             &options,
                             &worker_cancel,
@@ -1610,6 +1477,7 @@ impl DaemonState {
                 // can launch catalog work, and its previous blocking worker has exited.
             }
         });
+        true
     }
     fn publish_dependency_index(
         &self,
@@ -1661,13 +1529,13 @@ impl DaemonState {
             dependencies.cancel.store(true, Ordering::Release);
             dependencies.generation += 1;
             dependencies.catalog = None;
-            if self.dependency_options.is_some() {
+            if self.config().dependency_options.is_some() {
                 dependencies.state = "failed";
                 dependencies.warnings =
                     vec!["Dependency indexing cancelled during shutdown".into()];
             }
         }
-        if let Some(acp) = &self.acp {
+        if let Some(acp) = self.config().acp.clone() {
             acp.cancel_all();
         }
         self.jobs
@@ -1835,6 +1703,7 @@ async fn db<T: Send + 'static>(
         })?
         .map_err(Into::into)
 }
+#[cfg(feature = "test-support")]
 async fn guard(State(s): State<Arc<DaemonState>>, req: Request, next: Next) -> Response {
     guard_common(&s.token, &s.hosts, &s.origins, req, next).await
 }
@@ -1909,6 +1778,7 @@ async fn guard_common(
         .insert(header::X_CONTENT_TYPE_OPTIONS, "nosniff".parse().unwrap());
     response
 }
+#[cfg(feature = "test-support")]
 pub fn router(state: Arc<DaemonState>) -> Router {
     Router::new()
         .route(
@@ -2097,6 +1967,7 @@ pub fn router(state: Arc<DaemonState>) -> Router {
 }
 // Only endpoints that include a native snapshot need this outer response fence.
 // Durable records and external-source-only routes keep their independent policy.
+#[cfg(feature = "test-support")]
 fn native_response_route(path: &str) -> bool {
     matches!(
         path,
@@ -2118,6 +1989,7 @@ fn native_response_route(path: &str) -> bool {
             | "/api/rust-sources/tree"
     )
 }
+#[cfg(feature = "test-support")]
 async fn evidence_response_guard(
     State(state): State<Arc<DaemonState>>,
     request: Request,
@@ -2126,7 +1998,7 @@ async fn evidence_response_guard(
     if !native_response_route(request.uri().path()) {
         return next.run(request).await;
     }
-    // The snapshot is short: retain its protected leader observation through
+    // The snapshot is short: retain its protected writer observation through
     // serialization. An ordinary same-incarnation publish does not reject an
     // already-materialized coherent unpinned response.
     let admitted = db(state.clone(), |store| {
@@ -2162,6 +2034,7 @@ fn dependency_stale() -> ApiError {
         "Dependency catalog or source changed; refresh the catalog",
     )
 }
+#[cfg(feature = "test-support")]
 async fn dependency_work<T: Send + 'static>(
     f: impl FnOnce() -> Result<T, ApiError> + Send + 'static,
 ) -> Result<T, ApiError> {
@@ -2174,12 +2047,14 @@ async fn dependency_work<T: Send + 'static>(
     })?
 }
 impl DaemonState {
+    #[cfg(feature = "test-support")]
     fn requested_catalog(&self, id: &str) -> Result<Arc<Catalog>, ApiError> {
         let revision = self.store.status()?.revision;
         self.catalog_snapshot(revision)
             .filter(|catalog| catalog.id == id)
             .ok_or_else(dependency_stale)
     }
+    #[cfg(feature = "test-support")]
     fn check_catalog(&self, catalog: &Arc<Catalog>) -> Result<(), ApiError> {
         let current = self.requested_catalog(&catalog.id)?;
         if !Arc::ptr_eq(&current, catalog) {
@@ -2188,9 +2063,11 @@ impl DaemonState {
         Ok(())
     }
 }
+#[cfg(feature = "test-support")]
 async fn dependency_status(State(s): State<Arc<DaemonState>>) -> Result<Response, ApiError> {
     dependency_work(move || dependency_status_response(&s, || {}).map_err(ApiError::from)).await
 }
+#[cfg(feature = "test-support")]
 fn dependency_status_response(
     s: &DaemonState,
     after_capture: impl FnOnce(),
@@ -2225,6 +2102,7 @@ fn dependency_status_response(
     let result = Json(payload).into_response();
     response.finish(result)
 }
+#[cfg(feature = "test-support")]
 async fn dependency_refresh(
     State(s): State<Arc<DaemonState>>,
     body: Bytes,
@@ -2233,7 +2111,7 @@ async fn dependency_refresh(
     if !body.as_object().is_some_and(|object| object.is_empty()) {
         return Err(invalid());
     }
-    if s.dependency_options.is_none() {
+    if s.config().dependency_options.is_none() {
         return Err(ApiError(
             StatusCode::CONFLICT,
             "dependencies_disabled",
@@ -2265,6 +2143,7 @@ struct DependencySymbolsQuery {
 fn dependency_limit() -> usize {
     100
 }
+#[cfg(feature = "test-support")]
 async fn dependency_symbols(
     State(s): State<Arc<DaemonState>>,
     query: Result<Query<DependencySymbolsQuery>, axum::extract::rejection::QueryRejection>,
@@ -2317,6 +2196,7 @@ struct DependencySourceQuery {
     catalog_id: String,
     source_ref: String,
 }
+#[cfg(feature = "test-support")]
 async fn dependency_source(
     State(s): State<Arc<DaemonState>>,
     query: Result<Query<DependencySourceQuery>, axum::extract::rejection::QueryRejection>,
@@ -2349,9 +2229,10 @@ async fn dependency_source(
     }).await
 }
 
+#[cfg(feature = "test-support")]
 async fn rust_source_roots(State(s): State<Arc<DaemonState>>) -> Json<Value> {
     Json(
-        json!({"roots": s.rust_sources.iter().map(|r| json!({"id": r.label, "label": r.label, "path": r.directory.root.to_string_lossy()})).collect::<Vec<_>>()}),
+        json!({"roots": s.config().rust_sources.iter().map(|r| json!({"id": r.label, "label": r.label, "path": r.directory.root.to_string_lossy()})).collect::<Vec<_>>()}),
     )
 }
 #[derive(Deserialize)]
@@ -2400,6 +2281,7 @@ fn rust_source_error(e: std::io::Error) -> ApiError {
         ),
     }
 }
+#[cfg(feature = "test-support")]
 async fn rust_source_tree(
     State(s): State<Arc<DaemonState>>,
     query: Result<Query<RustTreeQuery>, axum::extract::rejection::QueryRejection>,
@@ -2413,7 +2295,8 @@ async fn rust_source_tree(
     }
     let revision = db(s.clone(), |s| s.status()).await?.revision;
     tokio::task::spawn_blocking(move || {
-        let root = s
+        let config = s.config();
+        let root = config
             .rust_sources
             .iter()
             .find(|r| r.label == q.root)
@@ -2441,6 +2324,7 @@ async fn rust_source_tree(
         )
     })?
 }
+#[cfg(feature = "test-support")]
 async fn rust_source_file(
     State(s): State<Arc<DaemonState>>,
     query: Result<Query<RustFileQuery>, axum::extract::rejection::QueryRejection>,
@@ -2450,7 +2334,8 @@ async fn rust_source_file(
         return Err(browse_invalid());
     }
     tokio::task::spawn_blocking(move || {
-        let root = s
+        let config = s.config();
+        let root = config
             .rust_sources
             .iter()
             .find(|r| r.label == q.root)
@@ -2515,6 +2400,7 @@ fn browse_directory_error(e: &std::io::Error) -> ApiError {
     }
 }
 
+#[cfg(feature = "test-support")]
 async fn tree(
     State(s): State<Arc<DaemonState>>,
     query: Result<Query<TreeQuery>, axum::extract::rejection::QueryRejection>,
@@ -2528,16 +2414,18 @@ async fn tree(
     }
     tokio::task::spawn_blocking(move || {
         s.store.verify_root()?;
-        let (mut items, next_offset, truncated) = s
+        let config = s.config();
+        let (mut items, next_offset, truncated) = config
             .browser
             .list(&q.path, q.offset, q.limit)
             .map_err(|e| browse_directory_error(&e))?;
-        let (revision, indexed_workspace) = s.store.tree_metadata(&s.browser.root, &mut items)?;
+        let (revision, indexed_workspace) =
+            s.store.tree_metadata(&config.browser.root, &mut items)?;
         for item in items
             .iter_mut()
             .filter(|e| e.kind == "file" && e.indexed_path.is_none())
         {
-            let absolute = s.browser.root.join(&item.path);
+            let absolute = config.browser.root.join(&item.path);
             let reason = if !absolute.starts_with(&indexed_workspace) {
                 "Outside indexed workspace"
             } else {
@@ -2556,7 +2444,7 @@ async fn tree(
         }
         s.store.verify_root()?;
         Ok(Json(crate::file_tree::Page {
-            root: s.browser.root.to_string_lossy().into_owned(),
+            root: config.browser.root.to_string_lossy().into_owned(),
             indexed_workspace,
             path: q.path,
             revision,
@@ -2613,6 +2501,7 @@ fn browse_invalid() -> ApiError {
         "Invalid browse or sequence request",
     )
 }
+#[cfg(feature = "test-support")]
 async fn files(
     State(s): State<Arc<DaemonState>>,
     query: Result<Query<FilesQuery>, axum::extract::rejection::QueryRejection>,
@@ -2626,6 +2515,7 @@ async fn files(
         db(s, move |s| s.files_at(pin, q.offset, q.limit)).await?,
     ))
 }
+#[cfg(feature = "test-support")]
 async fn methods(
     State(s): State<Arc<DaemonState>>,
     query: Result<Query<SourceQuery>, axum::extract::rejection::QueryRejection>,
@@ -2655,6 +2545,7 @@ struct SequenceRequest {
     #[serde(default)]
     show_all: bool,
 }
+#[cfg(feature = "test-support")]
 async fn sequence(
     State(s): State<Arc<DaemonState>>,
     body: Bytes,
@@ -2714,6 +2605,7 @@ struct ClassesQuery {
 fn class_limit() -> usize {
     100
 }
+#[cfg(feature = "test-support")]
 async fn classes(
     State(s): State<Arc<DaemonState>>,
     query: Result<Query<ClassesQuery>, axum::extract::rejection::QueryRejection>,
@@ -2727,6 +2619,7 @@ async fn classes(
         .await?,
     ))
 }
+#[cfg(feature = "test-support")]
 async fn navigation(
     State(s): State<Arc<DaemonState>>,
     body: Bytes,
@@ -2740,6 +2633,7 @@ async fn navigation(
     Ok(Json(db(s, move |s| s.navigation_at(&request)).await?))
 }
 
+#[cfg(feature = "test-support")]
 async fn class_diagram(
     State(s): State<Arc<DaemonState>>,
     body: Bytes,
@@ -2750,6 +2644,7 @@ async fn class_diagram(
     Ok(Json(db(s, move |s| s.class_diagram_at(&request)).await?))
 }
 
+#[cfg(feature = "test-support")]
 async fn status(
     State(s): State<Arc<DaemonState>>,
     uri: axum::http::Uri,
@@ -2763,13 +2658,6 @@ async fn status(
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct IndexRequest {
     expected_revision: Option<IndexPin>,
-}
-fn now() -> String {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .to_string()
 }
 impl From<crate::store::requests::Request> for IndexJob {
     fn from(row: crate::store::requests::Request) -> Self {
@@ -2806,203 +2694,17 @@ async fn start_index(
             "revision conflict: exceptional recovery has no decodable prior pin"
         )));
     }
-    let options = s.options.clone();
-    let row = db(s.clone(), move |store| {
-        store.enqueue_request(&options, request.expected_revision)
+    let options = s.config().options.clone();
+    let scheduler = s.clone();
+    let row = db(s.clone(), move |_| {
+        scheduler.enqueue_index(&options, request.expected_revision)
     })
     .await?;
     let job = IndexJob::from(row);
     // A later durable admission supersedes the legacy exceptional display slot.
     s.jobs.lock().unwrap().current = None;
-    s.pending_requests.lock().unwrap().push(job.id.clone());
-    // A newly durable browser ACK starts its own attempt immediately, even if
-    // an earlier exceptional storage probe was backed off.
-    *s.recovery_retry_after.lock().unwrap() = None;
-    s.start_queue_tick();
+    s.start_worker();
     Ok((StatusCode::ACCEPTED, Json(job)))
-}
-// Exceptional recovery has no decodable prior pin. Reserve the only job and detach
-// any old daemon owner atomically, then drop that owner before the worker tries EX.
-// An unrelated protected reader remains in control of BUSY; no retry is implicit.
-#[allow(dead_code)]
-fn start_exceptional_index(s: Arc<DaemonState>) -> Result<(StatusCode, Json<IndexJob>), ApiError> {
-    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
-    let job = IndexJob {
-        id: uuid::Uuid::new_v4().to_string(),
-        state: "running".into(),
-        progress: IndexProgress::default(),
-        revision: None,
-        error: None,
-        submitted_at: now(),
-        started_at: Some(now()),
-        finished_at: None,
-    };
-    let old_owner = {
-        let mut jobs = s.jobs.lock().unwrap();
-        if jobs
-            .current
-            .as_ref()
-            .and_then(|id| jobs.jobs.get(id))
-            .is_some_and(|j| j.finished_at.is_none())
-        {
-            return Err(ApiError(
-                StatusCode::CONFLICT,
-                "job_active",
-                "An index job is already active",
-            ));
-        }
-        if !s.store.is_recreate_pending() {
-            return Err(ApiError(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "index_not_ready",
-                "Exceptional recovery disposition changed; retry explicit indexing",
-            ));
-        }
-        // All admission paths touching both locks use jobs -> serving_session.
-        let old_owner = s.serving_session.lock().unwrap().take();
-        jobs.current = Some(job.id.clone());
-        jobs.cancel = cancel.clone();
-        jobs.jobs.insert(job.id.clone(), job.clone());
-        old_owner
-    };
-    drop(old_owner);
-    let id = job.id.clone();
-    tokio::spawn(async move {
-        let worker = s.clone();
-        let worker_id = id.clone();
-        let worker_cancel = cancel.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            crate::index_coordinator::reconcile_workspace(
-                &worker.store,
-                &worker.options,
-                &worker_cancel,
-                |p| {
-                    if let Some(j) = worker.jobs.lock().unwrap().jobs.get_mut(&worker_id) {
-                        j.progress = p;
-                    }
-                },
-            )
-        })
-        .await;
-        let outcome = match result {
-            Ok(result) => result,
-            Err(_) => Err(anyhow::anyhow!("index worker failed")),
-        };
-        finish_exceptional_index_job(&s, &id, outcome, &cancel, |_| {});
-    });
-    Ok((StatusCode::ACCEPTED, Json(job)))
-}
-
-// A successful worker keeps its leader guard inside the returned Arc even across
-// spawn_blocking handoff. Validation and any test barrier run while that Arc lives.
-// Install it before completing the job; never publish a success without an owner.
-#[allow(dead_code)]
-fn finish_exceptional_index_job(
-    s: &Arc<DaemonState>,
-    id: &str,
-    result: anyhow::Result<(IndexPin, Arc<crate::store::topology::LeaderSession>)>,
-    cancel: &CancelFlag,
-    before_install: impl FnOnce(&Arc<crate::store::topology::LeaderSession>),
-) {
-    let result = result.and_then(|(pin, session)| {
-        s.store.verify_leader_session(&session)?;
-        anyhow::ensure!(
-            s.store.status()?.revision == pin,
-            "revision conflict: exceptional recovery pin changed before owner installation"
-        );
-        before_install(&session);
-        s.store.verify_leader_session(&session)?;
-        Ok((pin, session))
-    });
-    let mut abandoned = None;
-    let mut jobs = s.jobs.lock().unwrap();
-    let mut serving = s.serving_session.lock().unwrap();
-    let job = jobs
-        .jobs
-        .get_mut(id)
-        .expect("started exceptional index job");
-    let published = match result {
-        Ok((_pin, session)) if serving.is_some() => {
-            abandoned = Some(session);
-            job.state = "failed".into();
-            job.error = Some(json!({"code":"index_failed","message":"Index job failed"}));
-            false
-        }
-        Ok((pin, session)) => {
-            // A late cancellation cannot undo durable activation. Retain the
-            // verified owner and report the committed revision as completed.
-            *serving = Some(session);
-            job.revision = Some(pin);
-            job.state = "done".into();
-            true
-        }
-        Err(error) if cancel.load(Ordering::Acquire) => {
-            let _ = error;
-            job.state = "failed".into();
-            job.error = Some(json!({"code":"index_failed","message":"Index job failed"}));
-            false
-        }
-        Err(error) => {
-            job.state = "failed".into();
-            let code = if error.to_string().starts_with("revision conflict") {
-                "revision_conflict"
-            } else if error.to_string().starts_with("storage_busy") {
-                "storage_busy"
-            } else {
-                "index_failed"
-            };
-            job.error = Some(json!({"code":code,"message":"Index job failed"}));
-            false
-        }
-    };
-    job.finished_at = Some(now());
-    drop(serving);
-    drop(jobs);
-    drop(abandoned);
-    if published {
-        *s.packets.lock().unwrap() = PacketCache::default();
-        s.start_dependency_index();
-        s.start_queue_tick();
-    }
-}
-
-// A failed publication cannot release cached packet ownership. Only a committed
-// revision transition clears packets; old barriers still block their public reads.
-#[allow(dead_code)]
-fn finish_index_job(
-    s: &Arc<DaemonState>,
-    id: &str,
-    result: anyhow::Result<IndexPin>,
-    cancel: &CancelFlag,
-) {
-    let mut jobs = s.jobs.lock().unwrap();
-    let job = jobs.jobs.get_mut(id).expect("started index job");
-    match result {
-        Ok(revision) => {
-            job.state = "completed".into();
-            job.revision = Some(revision);
-        }
-        Err(error) if cancel.load(Ordering::Acquire) => {
-            let _ = error;
-            job.state = "cancelled".into();
-        }
-        Err(error) => {
-            job.state = "failed".into();
-            let code = if error.to_string().starts_with("revision conflict") {
-                "revision_conflict"
-            } else {
-                "index_failed"
-            };
-            job.error = Some(json!({"code":code,"message":"Index job failed"}));
-        }
-    }
-    job.finished_at = Some(now());
-    let completed = job.state == "completed";
-    drop(jobs);
-    if completed {
-        *s.packets.lock().unwrap() = PacketCache::default();
-        s.start_dependency_index();
-    }
 }
 // The exceptional index-only recovery worker predates requests.db. Until the
 // root/recovery slice moves it into the queue, its current ID remains readable
@@ -3093,6 +2795,7 @@ struct SymbolsQuery {
 fn limit() -> usize {
     50
 }
+#[cfg(feature = "test-support")]
 async fn symbols(
     State(s): State<Arc<DaemonState>>,
     Query(q): Query<SymbolsQuery>,
@@ -3110,6 +2813,7 @@ struct SymbolQuery {
     #[serde(flatten)]
     pin: PinQuery,
 }
+#[cfg(feature = "test-support")]
 async fn symbol(
     State(s): State<Arc<DaemonState>>,
     Query(q): Query<SymbolQuery>,
@@ -3130,6 +2834,7 @@ struct SourceQuery {
     #[serde(flatten)]
     pin: PinQuery,
 }
+#[cfg(feature = "test-support")]
 async fn source(
     State(s): State<Arc<DaemonState>>,
     Query(q): Query<SourceQuery>,
@@ -3149,6 +2854,7 @@ async fn source(
         .ok_or_else(missing)?;
     Ok(Json(json!({"revision":revision,"file":file})))
 }
+#[cfg(feature = "test-support")]
 async fn query(
     State(s): State<Arc<DaemonState>>,
     pin: Result<Query<PinQuery>, axum::extract::rejection::QueryRejection>,
@@ -3164,6 +2870,7 @@ async fn query(
             .ok_or_else(missing)?,
     ))
 }
+#[cfg(feature = "test-support")]
 async fn views(
     State(s): State<Arc<DaemonState>>,
     pin: Result<Query<PinQuery>, axum::extract::rejection::QueryRejection>,
@@ -3172,6 +2879,7 @@ async fn views(
     let expected = pin.pin()?;
     Ok(Json(db(s, move |s| s.saved_views_at(expected)).await?))
 }
+#[cfg(feature = "test-support")]
 async fn view(
     State(s): State<Arc<DaemonState>>,
     Path(id): Path<String>,
@@ -3186,6 +2894,7 @@ async fn view(
             .ok_or_else(missing)?,
     ))
 }
+#[cfg(feature = "test-support")]
 async fn save_view(
     State(s): State<Arc<DaemonState>>,
     Path(id): Path<String>,
@@ -3201,6 +2910,7 @@ async fn save_view(
     v.validate().map_err(|_| invalid())?;
     Ok(Json(db(s, move |s| s.save_view_at(pin, &v)).await?))
 }
+#[cfg(feature = "test-support")]
 async fn delete_view(
     State(s): State<Arc<DaemonState>>,
     Path(id): Path<String>,
@@ -3209,6 +2919,7 @@ async fn delete_view(
     db(s, move |s| s.delete_view(&id)).await?;
     Ok(StatusCode::NO_CONTENT)
 }
+#[cfg(feature = "test-support")]
 async fn annotations(
     State(s): State<Arc<DaemonState>>,
     pin: Result<Query<PinQuery>, axum::extract::rejection::QueryRejection>,
@@ -3219,6 +2930,7 @@ async fn annotations(
         db(s, move |s| s.saved_annotations_at(expected)).await?,
     ))
 }
+#[cfg(feature = "test-support")]
 async fn save_annotation(
     State(s): State<Arc<DaemonState>>,
     Path(id): Path<String>,
@@ -3234,6 +2946,7 @@ async fn save_annotation(
     a.validate().map_err(|_| invalid())?;
     Ok(Json(db(s, move |s| s.save_annotation_at(pin, &a)).await?))
 }
+#[cfg(feature = "test-support")]
 async fn delete_annotation(
     State(s): State<Arc<DaemonState>>,
     Path(id): Path<String>,
@@ -3295,6 +3008,7 @@ fn question_error(e: anyhow::Error) -> ApiError {
         )
     }
 }
+#[cfg(feature = "test-support")]
 async fn question_work<T: Send + 'static>(
     work: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
 ) -> Result<T, ApiError> {
@@ -3309,6 +3023,7 @@ async fn question_work<T: Send + 'static>(
         })?
         .map_err(question_error)
 }
+#[cfg(feature = "test-support")]
 async fn question_preview(
     State(s): State<Arc<DaemonState>>,
     body: Result<Json<QuestionRequest>, axum::extract::rejection::JsonRejection>,
@@ -3348,6 +3063,7 @@ async fn question_preview(
     })
     .await
 }
+#[cfg(feature = "test-support")]
 async fn cached_packet(
     s: Arc<DaemonState>,
     id: String,
@@ -3381,6 +3097,7 @@ async fn cached_packet(
 }
 // Always run the post-materialization fence, even when assembly fails. Preserve
 // the original materialization error, as Store::with_evidence does.
+#[cfg(feature = "test-support")]
 fn finish_packet_result(
     fence: &EvidenceFence,
     result: Result<Response, ApiError>,
@@ -3394,6 +3111,7 @@ fn finish_packet_result(
         }
     }
 }
+#[cfg(feature = "test-support")]
 async fn question_export(
     State(s): State<Arc<DaemonState>>,
     Path(id): Path<String>,
@@ -3405,10 +3123,12 @@ async fn question_export(
     finish_packet_result(&fence, result)
 }
 #[derive(Serialize)]
+#[cfg(feature = "test-support")]
 struct QuestionSelection {
     selection: SelectionEnvelope,
     view: FocusedView,
 }
+#[cfg(feature = "test-support")]
 async fn question_import(
     State(s): State<Arc<DaemonState>>,
     Path(id): Path<String>,
@@ -3426,6 +3146,7 @@ async fn question_import(
     .map(|value| Json(value).into_response());
     finish_packet_result(&fence, result)
 }
+#[cfg(feature = "test-support")]
 async fn question_selection(
     State(s): State<Arc<DaemonState>>,
     Path(id): Path<String>,
@@ -3442,8 +3163,9 @@ async fn question_selection(
 }
 
 // Status only reads the local ledger. No endpoint other than jev-run contacts Jev.
+#[cfg(feature = "test-support")]
 async fn acp_status(State(s): State<Arc<DaemonState>>) -> Result<Json<Value>, ApiError> {
-    let Some(provider) = s.acp.clone() else {
+    let Some(provider) = s.config().acp.clone() else {
         return Ok(Json(json!({"enabled":false,"status":null})));
     };
     let status = tokio::task::spawn_blocking(move || provider.status())
@@ -3491,6 +3213,7 @@ fn acp_error(e: anyhow::Error) -> ApiError {
         ),
     }
 }
+#[cfg(feature = "test-support")]
 async fn question_answer(
     State(s): State<Arc<DaemonState>>,
     Path(id): Path<String>,
@@ -3502,25 +3225,29 @@ async fn question_answer(
         return Err(invalid());
     }
     db(s.clone(), |store| store.status().map(|_| ())).await?;
-    let provider = s.acp.clone().ok_or(ApiError(
+    let provider = s.config().acp.clone().ok_or(ApiError(
         StatusCode::SERVICE_UNAVAILABLE,
         "acp_disabled",
         "Live ACP is disabled",
     ))?;
-    let (packet, fence) = cached_packet(s.clone(), id).await?;
+    let (packet, admission) = cached_packet(s.clone(), id).await?;
+    // The selected packet has been attested. Never retain its DELETE-journal
+    // reader during an external provider call: startup reconciliation may need to COMMIT meanwhile.
+    admission.finish(()).map_err(ApiError::from)?;
+    drop(admission);
     let response = provider.run(&packet).await;
-    // A stale failure must not replace the state of a newer question either.
-    let revision = db(s, |store| Ok(store.status()?.revision)).await;
-    let fence_check = fence.finish(()).map_err(ApiError::from);
-    let revision = revision?;
-    fence_check?;
-    if revision != packet.revision {
+    // Recheck on provider success AND failure. A fresh selected snapshot must
+    // still match the exact pin, source bytes, and graph witnesses.
+    let selected = s.store.evidence_response()?;
+    if selected.status()?.revision != packet.revision {
         return Err(ApiError(
             StatusCode::CONFLICT,
             "revision_conflict",
             "The index revision changed",
         ));
     }
+    selected.validate_selected_view(&packet.context, &packet.source_files)?;
+    let fence = selected.into_fence(EvidenceFencePolicy::ExactPin(packet.revision));
     let result = response.map_err(acp_error).map(|response| {
         Json(
             json!({"packetId":packet.packet_id,"revision":packet.revision,
@@ -3532,8 +3259,9 @@ async fn question_answer(
     finish_packet_result(&fence, result)
 }
 
+#[cfg(feature = "test-support")]
 async fn jev_status(State(s): State<Arc<DaemonState>>) -> Result<Json<Value>, ApiError> {
-    let Some(provider) = s.provider.clone() else {
+    let Some(provider) = s.config().provider.clone() else {
         return Ok(Json(json!({"enabled":false,"budget":null})));
     };
     let budget = db(s, move |_| provider.budget()).await?;
@@ -3580,6 +3308,7 @@ fn live_jev_error(e: anyhow::Error) -> ApiError {
     }
 }
 
+#[cfg(feature = "test-support")]
 async fn question_run(
     State(s): State<Arc<DaemonState>>,
     Path(id): Path<String>,
@@ -3589,26 +3318,29 @@ async fn question_run(
     if !body.is_empty() && body.as_ref() != b"{}" {
         return Err(invalid());
     }
-    db(s.clone(), |store| store.status().map(|_| ())).await?;
-    let provider = s.provider.clone().ok_or(ApiError(
+    let provider = s.config().provider.clone().ok_or(ApiError(
         StatusCode::SERVICE_UNAVAILABLE,
         "jev_disabled",
         "Live Jev is disabled",
     ))?;
-    let (packet, fence) = cached_packet(s.clone(), id).await?;
+    let (packet, admission) = cached_packet(s.clone(), id).await?;
+    // Never retain a DELETE-journal reader across an external provider call.
+    // The packet was fully attested on the selected snapshot before this call.
+    admission.finish(()).map_err(ApiError::from)?;
+    drop(admission);
     let response = provider.run(&packet).await;
-    // Check even failed attempts. Reservations remain accounted on stale results.
-    let revision = db(s.clone(), |store| Ok(store.status()?.revision)).await;
-    let fence_check = fence.finish(()).map_err(ApiError::from);
-    let revision = revision?;
-    fence_check?;
-    if revision != packet.revision {
+    // Recheck even failed attempts. A fresh selected snapshot both admits the
+    // current head and reattests the packet's source and graph witnesses.
+    let selected = s.store.evidence_response()?;
+    if selected.status()?.revision != packet.revision {
         return Err(ApiError(
             StatusCode::CONFLICT,
             "revision_conflict",
             "The index revision changed",
         ));
     }
+    selected.validate_selected_view(&packet.context, &packet.source_files)?;
+    let fence = selected.into_fence(EvidenceFencePolicy::ExactPin(packet.revision));
     let result = match response.map_err(live_jev_error) {
         Err(error) => Err(error),
         Ok(response) => {
@@ -3628,7 +3360,7 @@ async fn question_run(
     finish_packet_result(&fence, result)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-support"))]
 mod live_tests {
     use super::*;
     use crate::indexer::index_workspace_bundle;
@@ -3889,11 +3621,6 @@ mod live_tests {
     }
 
     #[tokio::test]
-    async fn packet_fence_survives_provider_await_and_takeover() {
-        mock_run(false, "takeover").await;
-    }
-
-    #[tokio::test]
     async fn live_response_is_labeled_and_accounted() {
         mock_run(false, "success").await;
     }
@@ -3998,6 +3725,7 @@ mod live_tests {
         let options = IndexOptions::new(workspace.clone());
         let cancel = Arc::new(AtomicBool::new(false));
         let store = Store::open_for_tests(&dir.path().join("state"), &workspace).unwrap();
+        store.settle_foreign_root_requests().unwrap();
         crate::store::topology::assert_topology_fixture(&store, &dir.path().join("state"));
         let (graph, native, capture) =
             index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
@@ -4008,13 +3736,13 @@ mod live_tests {
             .unwrap()
             .id
             .clone();
-        let session = store.leader_session().unwrap();
+        let session = store.writer_session().unwrap();
         store
             .publish_native(
                 &graph,
                 &capture,
                 &native,
-                session.leader_guard().unwrap(),
+                session.writer_guard().unwrap(),
                 store.index_baseline().unwrap(),
                 &cancel,
             )
@@ -4038,7 +3766,9 @@ mod live_tests {
             Some(provider.clone()),
         )
         .unwrap();
-        state.retain_serving_session(session.clone());
+        // The provider fixture drives its own startup reconciliation explicitly; do not race an
+        // unrelated timer watcher for the selected source change.
+        state.retain_serving_session_without_tick_for_tests(session.clone());
         let app = router(state.clone());
         let request = |path: &str, body: Value| {
             axum::http::Request::builder()
@@ -4115,78 +3845,40 @@ mod live_tests {
             return;
         }
         let run = tokio::spawn(app.oneshot(request(&path, json!({}))));
-        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+        tokio::time::timeout(crate::testing::HANG_BACKSTOP, entered.notified())
             .await
             .unwrap();
         if change_snapshot {
-            let (updated, native, captured) = index_workspace_bundle(
-                &IndexOptions::new(workspace.clone()),
-                store.root_id(),
-                &cancel,
-                |_| {},
+            // The provider has admitted the old packet and is paused. Change
+            // captured source so the same daemon-local writer must publish startup reconciliation,
+            // rather than taking the unchanged-head fast path.
+            std::fs::write(
+                workspace.join("a.js"),
+                "function seed() { console.log('changed while provider waits'); }",
             )
             .unwrap();
             let publisher = store.clone();
             let owner = session.clone();
-            let stream_owner = state.clone();
-            let (stream_held, held) = tokio::sync::oneshot::channel();
+            let selected = IndexOptions::new(workspace.clone());
+            let prior = store.status().unwrap().revision;
             let publishing = tokio::task::spawn_blocking(move || {
-                // This synthetic writer bypasses the normal queue worker, so
-                // bind its expected-pin read and publish to the same native
-                // stream as the background watcher. The provider read remains
-                // blocked independently; a leaked SQLite read transaction
-                // still prevents this single publication within the timeout.
-                let _stream = stream_owner.native_stream.lock().unwrap();
-                let _ = stream_held.send(());
-                let expected = publisher.status().unwrap().revision;
-                publisher.publish_native(
-                    &updated,
-                    &captured,
-                    &native,
-                    owner.leader_guard().unwrap(),
-                    expected,
-                    &cancel,
-                )
+                crate::index_coordinator::IndexJobCoordinator::prepare_with_session(
+                    &publisher, None, owner,
+                )?
+                .run_serving(&selected, &cancel, |_| {})
             });
-            // The background watcher may hold the native stream for a while
-            // under load; only the publication itself is bounded below (#131).
-            tokio::time::timeout(std::time::Duration::from_secs(60), held)
-                .await
-                .expect("the background watcher never released the native stream")
-                .unwrap();
-            // The provider is still blocked. This commit must not wait for a
-            // SQLite read transaction held by the cached packet's outer fence.
-            tokio::time::timeout(std::time::Duration::from_secs(5), publishing)
+            // startup reconciliation commits while the provider is blocked. A leaked SQLite read
+            // snapshot would prevent this publication within the timeout.
+            let committed = tokio::time::timeout(crate::testing::HANG_BACKSTOP, publishing)
                 .await
                 .unwrap()
                 .unwrap()
                 .unwrap();
-        }
-        if scenario == "takeover" {
-            use std::io::{Seek, SeekFrom, Write};
-            fn lock_in(dir: &std::path::Path) -> Option<std::path::PathBuf> {
-                for entry in std::fs::read_dir(dir).ok()?.flatten() {
-                    let path = entry.path();
-                    if path.file_name().is_some_and(|name| name == "leader.lock") {
-                        return Some(path);
-                    }
-                    if path.is_dir()
-                        && let Some(found) = lock_in(&path)
-                    {
-                        return Some(found);
-                    }
-                }
-                None
-            }
-            let lock = lock_in(&dir.path().join("state")).unwrap();
-            let mut file = std::fs::OpenOptions::new().write(true).open(lock).unwrap();
-            file.seek(SeekFrom::Start(0)).unwrap();
-            file.write_all(uuid::Uuid::new_v4().to_string().as_bytes())
-                .unwrap();
-            file.sync_all().unwrap();
+            assert_eq!(committed.index_generation, prior.index_generation);
+            assert!(committed.index_revision > prior.index_revision);
         }
         release.notify_one();
-        let response = tokio::time::timeout(std::time::Duration::from_secs(5), run)
+        let response = tokio::time::timeout(crate::testing::HANG_BACKSTOP, run)
             .await
             .unwrap()
             .unwrap()
@@ -4195,13 +3887,6 @@ mod live_tests {
             assert_eq!(response.status(), StatusCode::CONFLICT);
             let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
             assert!(!String::from_utf8_lossy(&body).contains("liveJev"));
-        } else if scenario == "takeover" {
-            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-            let body: Value =
-                serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
-                    .unwrap();
-            assert_eq!(body["error"]["code"], "index_not_ready");
-            assert!(body.get("view").is_none());
         } else if scenario == "invalid_selection" {
             assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
             let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
@@ -4283,7 +3968,7 @@ mod serving_holder_tests {
             "127.0.0.1:7331".parse().unwrap(),
         )
         .unwrap();
-        state.queue_tick().unwrap();
+        state.worker_step().unwrap();
         let done = store.request_by_id(&queued.id).unwrap().unwrap();
         assert_eq!(done.state, "done");
         let pin = done.revision.unwrap();
@@ -4296,7 +3981,7 @@ mod serving_holder_tests {
                 .manifest_path,
             head.manifest_path
         );
-        state.queue_tick().unwrap();
+        state.worker_step().unwrap();
         assert_eq!(
             store.status().unwrap().revision,
             pin,
@@ -4331,21 +4016,21 @@ mod serving_holder_tests {
         let accepted = store.enqueue_request(&options, None).unwrap();
         let (done_tx, done_rx) = std::sync::mpsc::sync_channel(0);
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(0);
-        state.test_queue_after_takeover_drain.set(move || {
-            // The terminal row is committed, but queue_tick has not returned.
+        state.test_queue_after_startup_drain.set(move || {
+            // The terminal row is committed, but the worker step has not returned.
             done_tx.send(()).unwrap();
             release_rx.recv().unwrap();
         });
         let worker = state.clone();
-        let tick = std::thread::spawn(move || worker.queue_tick());
+        let tick = std::thread::spawn(move || worker.worker_step());
         done_rx
-            .recv_timeout(Duration::from_secs(30))
+            .recv_timeout(crate::testing::HANG_BACKSTOP)
             .expect("takeover did not commit the accepted head");
         let observed_row = store.request_by_id(&accepted.id);
         let observed_status = store.status();
         let observed_leader = state
             .retained_serving_session()
-            .is_ok_and(|s| s.is_leader());
+            .is_ok_and(|s| s.verify().is_ok());
         // Release and join even if an observed value is wrong. The old ordering
         // fails below without stranding the worker on this test's channel.
         let release_result = release_tx.send(());
@@ -4362,119 +4047,86 @@ mod serving_holder_tests {
     }
 
     #[tokio::test]
-    async fn verified_holder_needs_no_index_open_and_lost_holder_triggers_takeover() {
+    async fn daemon_local_writer_validates_selected_head_before_draining_queue() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("workspace");
         fs::create_dir(&root).unwrap();
         fs::write(root.join("a.js"), "function a() {}\n").unwrap();
-        let state_root = tmp.path().join("state");
-        let store = Store::open_for_tests(&state_root, &root).unwrap();
+        let store = Store::open_for_tests(&tmp.path().join("state"), &root).unwrap();
         let options = IndexOptions::new(root);
-        let (old_pin, owner) = crate::index_coordinator::reconcile_workspace(
+        let (old_pin, prior) = crate::index_coordinator::reconcile_workspace(
             &store,
             &options,
             &Arc::new(AtomicBool::new(false)),
             |_| {},
         )
         .unwrap();
-        let follower_store = Store::open_for_tests(&state_root, &options.workspace_root).unwrap();
-        let follower = follower_store.follower_session().unwrap();
+        drop(prior);
         let state = new(
-            follower_store.clone(),
+            store.clone(),
             options.clone(),
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
             "127.0.0.1:7331".parse().unwrap(),
         )
         .unwrap();
-        *state.serving_session.lock().unwrap() = Some(follower);
-        let accepted = follower_store.enqueue_request(&options, None).unwrap();
+        let accepted = store.enqueue_request(&options, None).unwrap();
         state
             .pending_requests
             .lock()
             .unwrap()
             .push(accepted.id.clone());
-        for _ in 0..3 {
-            state.queue_tick().unwrap();
-        }
-        assert_eq!(
-            state.queue_takeover_attempts.load(Ordering::Acquire),
-            0,
-            "verified follower must never reopen index.db to probe leadership"
-        );
-        assert_eq!(
-            follower_store
-                .request_by_id(&accepted.id)
-                .unwrap()
-                .unwrap()
-                .state,
-            "queued"
-        );
-        drop(owner);
-        state.queue_tick().unwrap();
-        assert_eq!(state.queue_takeover_attempts.load(Ordering::Acquire), 1);
-        assert!(state.retained_serving_session().unwrap().is_leader());
-        let completed = follower_store.request_by_id(&accepted.id).unwrap().unwrap();
+        state.worker_step().unwrap();
+        let session = state.retained_serving_session().unwrap();
+        store.verify_writer_session(&session).unwrap();
+        let completed = store.request_by_id(&accepted.id).unwrap().unwrap();
         assert_eq!(completed.state, "done");
-        assert!(completed.revision.unwrap().index_revision > old_pin.index_revision);
+        // The selected startup reconciliation must publish before the accepted FIFO request.
+        assert_eq!(
+            completed.revision.unwrap().index_revision,
+            old_pin.index_revision + 2
+        );
     }
+
     #[tokio::test]
-    async fn failed_pending_read_keeps_same_id_for_holder_loss_takeover() {
+    async fn failed_pending_read_preserves_id_until_durable_completion_is_observed() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("workspace");
         fs::create_dir(&root).unwrap();
         fs::write(root.join("a.js"), "function a() {}\n").unwrap();
-        let state_root = tmp.path().join("state");
-        let owner_store = Store::open_for_tests(&state_root, &root).unwrap();
+        let store = Store::open_for_tests(&tmp.path().join("state"), &root).unwrap();
         let options = IndexOptions::new(root);
-        let (_, owner) = crate::index_coordinator::reconcile_workspace(
-            &owner_store,
-            &options,
-            &Arc::new(AtomicBool::new(false)),
-            |_| {},
-        )
-        .unwrap();
-        let follower_store = Store::open_for_tests(&state_root, &options.workspace_root).unwrap();
-        let follower = follower_store.follower_session().unwrap();
         let state = new(
-            follower_store.clone(),
+            store.clone(),
             options.clone(),
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
             "127.0.0.1:7331".parse().unwrap(),
         )
         .unwrap();
-        *state.serving_session.lock().unwrap() = Some(follower);
-        let request = follower_store.enqueue_request(&options, None).unwrap();
+        let request = store.enqueue_request(&options, None).unwrap();
         state
             .pending_requests
             .lock()
             .unwrap()
             .push(request.id.clone());
         state.test_pending_read_failures.store(1, Ordering::Release);
-        state.queue_tick().unwrap();
+        state.worker_step().unwrap();
         assert_eq!(
             *state.pending_requests.lock().unwrap(),
             vec![request.id.clone()]
         );
+        let completed = store.request_by_id(&request.id).unwrap().unwrap();
+        assert_eq!(completed.state, "done");
+        state.worker_step().unwrap();
+        assert!(state.pending_requests.lock().unwrap().is_empty());
+        let done = store.request_by_id(&request.id).unwrap().unwrap();
+        assert_eq!(done.revision, completed.revision);
         assert_eq!(
-            follower_store
-                .request_by_id(&request.id)
-                .unwrap()
-                .unwrap()
-                .state,
-            "queued"
+            (done.id, done.seq, done.state.as_str()),
+            (request.id, request.seq, "done")
         );
-        drop(owner);
-        state.queue_tick().unwrap();
-        assert!(state.retained_serving_session().unwrap().is_leader());
-        assert_eq!(
-            follower_store
-                .request_by_id(&request.id)
-                .unwrap()
-                .unwrap()
-                .state,
-            "done"
-        );
-        assert_eq!(state.queue_takeover_attempts.load(Ordering::Acquire), 1);
+        store
+            .verify_writer_session(&state.retained_serving_session().unwrap())
+            .unwrap();
     }
 
     #[test]
@@ -4490,7 +4142,7 @@ mod serving_holder_tests {
         }
         best_effort_queue_stderr(
             ClosedPipe,
-            format_args!("queue tick failed: storage_busy\n"),
+            format_args!("checkout worker step failed: storage_busy\n"),
         );
         best_effort_queue_stderr(
             ClosedPipe,
@@ -4501,7 +4153,7 @@ mod serving_holder_tests {
     }
 
     #[tokio::test]
-    async fn verified_leader_busy_requeue_gets_bounded_backoff_before_same_ack_retry() {
+    async fn verified_writer_busy_requeue_gets_bounded_backoff_before_same_ack_retry() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("workspace");
         fs::create_dir(&root).unwrap();
@@ -4528,7 +4180,7 @@ mod serving_holder_tests {
         let accepted = store.enqueue_request(&options, None).unwrap();
         store.fail_next_live_publish_commit_busy();
         let retry_started = Instant::now();
-        state.queue_tick().unwrap();
+        state.worker_step().unwrap();
         let retry_finished = Instant::now();
         let scheduled_retry = *state.recovery_retry_after.lock().unwrap();
         assert!(
@@ -4544,15 +4196,23 @@ mod serving_holder_tests {
         );
         assert!(deferred.finished_at.is_none() && deferred.error_code.is_none());
         assert_eq!(store.index_baseline().unwrap(), old_pin);
+        // This is the daemon-owned selected read path, not a second Store or
+        // SQLite opener. A deferred typed BUSY must not hide the prior head.
+        let selected = store.evidence_response().unwrap();
+        let (served_pin, source) = selected.source_at("a.js", Some(old_pin)).unwrap().unwrap();
+        assert_eq!(served_pin, old_pin);
+        assert_eq!(source.text, "function a() {}\n");
+        selected.finish(()).unwrap();
+        drop(selected);
         *state.recovery_retry_after.lock().unwrap() =
-            Some(Instant::now() + Duration::from_secs(10));
-        state.queue_tick().unwrap();
+            Some(Instant::now() + crate::testing::HANG_BACKSTOP);
+        state.worker_step().unwrap();
         assert_eq!(
             store.request_by_id(&accepted.id).unwrap().unwrap().state,
             "queued"
         );
         *state.recovery_retry_after.lock().unwrap() = None;
-        state.queue_tick().unwrap();
+        state.worker_step().unwrap();
         let done = store.request_by_id(&accepted.id).unwrap().unwrap();
         assert_eq!(done.state, "done");
         assert_eq!(done.seq, accepted.seq);
@@ -4562,10 +4222,104 @@ mod serving_holder_tests {
         );
     }
 
+    #[test]
+    fn typed_fifo_head_read_busy_defers_startup_and_retries_same_accepted_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("workspace");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("a.js"), "function a() {}\n").unwrap();
+        let store = Store::open_for_tests(&tmp.path().join("state"), &root).unwrap();
+        let defaults = IndexOptions::new(root.clone());
+        let (old_pin, owner) = crate::index_coordinator::reconcile_workspace(
+            &store,
+            &defaults,
+            &Arc::new(AtomicBool::new(false)),
+            |_| {},
+        )
+        .unwrap();
+        drop(owner);
+        let mut requested = defaults.clone();
+        requested.max_file_bytes = 4096;
+        let accepted = store.enqueue_request(&requested, None).unwrap();
+        let state = new(
+            store.clone(),
+            defaults,
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            "127.0.0.1:7331".parse().unwrap(),
+        )
+        .unwrap();
+        // A local accepted ACK bypasses the earlier !pending_local probe.
+        state
+            .pending_requests
+            .lock()
+            .unwrap()
+            .push(accepted.id.clone());
+        state
+            .test_activation_head_busy_once
+            .store(true, Ordering::Release);
+        let started = Instant::now();
+        state.worker_step().unwrap();
+        let finished = Instant::now();
+        assert!(
+            state
+                .recovery_retry_after
+                .lock()
+                .unwrap()
+                .is_some_and(|at| { at >= started && at <= finished + Duration::from_millis(250) }),
+            "typed FIFO head-read BUSY must schedule the 250ms retry"
+        );
+        assert!(
+            state.runtime.lock().unwrap().session().is_none(),
+            "H must not start with unknown head"
+        );
+        assert_eq!(store.index_baseline().unwrap(), old_pin);
+        let queued = store.request_by_id(&accepted.id).unwrap().unwrap();
+        assert_eq!(
+            (
+                queued.id.as_str(),
+                queued.seq,
+                queued.state.as_str(),
+                queued.options_json.as_str()
+            ),
+            (
+                accepted.id.as_str(),
+                accepted.seq,
+                "queued",
+                accepted.options_json.as_str()
+            )
+        );
+        assert!(queued.finished_at.is_none() && queued.revision.is_none());
+        // The immediate timer tick honors the backoff without claiming Q.
+        *state.recovery_retry_after.lock().unwrap() =
+            Some(Instant::now() + crate::testing::HANG_BACKSTOP);
+        state.worker_step().unwrap();
+        assert_eq!(
+            store.request_by_id(&accepted.id).unwrap().unwrap().state,
+            "queued"
+        );
+        *state.recovery_retry_after.lock().unwrap() = None;
+        state.worker_step().unwrap();
+        let done = store.request_by_id(&accepted.id).unwrap().unwrap();
+        assert_eq!(
+            (
+                done.id.as_str(),
+                done.seq,
+                done.state.as_str(),
+                done.options_json.as_str()
+            ),
+            (
+                accepted.id.as_str(),
+                accepted.seq,
+                "done",
+                accepted.options_json.as_str()
+            )
+        );
+        assert!(done.revision.unwrap().index_revision > old_pin.index_revision);
+    }
+
     #[tokio::test]
     async fn transient_publish_commit_busy_cannot_fail_accepted_takeover_head() {
         use crate::store::topology::{TopologyRoots, WorkspaceIdentity};
-        use std::os::fd::AsRawFd;
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("workspace");
         fs::create_dir(&root).unwrap();
@@ -4583,10 +4337,7 @@ mod serving_holder_tests {
         let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
         let roots =
             TopologyRoots::isolated_for_tests(state_root.join("cache"), state_root.join("data"));
-        let lock = roots.leader_lock(&identity);
-        let old_marker = fs::read(&lock).unwrap();
         let follower_store = Store::open_for_tests(&state_root, &root).unwrap();
-        let follower = follower_store.follower_session().unwrap();
         let state = new(
             follower_store.clone(),
             options.clone(),
@@ -4594,52 +4345,37 @@ mod serving_holder_tests {
             "127.0.0.1:7331".parse().unwrap(),
         )
         .unwrap();
-        *state.serving_session.lock().unwrap() = Some(follower);
         let ack = follower_store.enqueue_request(&options, None).unwrap();
         state.pending_requests.lock().unwrap().push(ack.id.clone());
         let encoded =
             serde_json::to_string(&crate::indexer::ReconcileOptions::from(&options)).unwrap();
         // This legacy fixture emits the plain-string pre-COMMIT BUSY. It is
-        // not the direct typed mandatory-H retry hook.
+        // not the direct typed mandatory startup reconciliation retry hook.
         follower_store.fail_next_live_publish_commit_busy();
         drop(owner);
-        let _ = state.queue_tick();
+        // Plain-string BUSY can be retried inside the same local writer tick.
+        // Typed BUSY has its own test below for a mandatory startup reconciliation backoff.
+        state.worker_step().unwrap();
         let after_busy = follower_store.request_by_id(&ack.id).unwrap().unwrap();
         assert_eq!(
             (
                 after_busy.id.as_str(),
                 after_busy.seq,
-                after_busy.options_json.as_str(),
-                after_busy.state.as_str()
+                after_busy.options_json.as_str()
             ),
-            (ack.id.as_str(), ack.seq, encoded.as_str(), "queued")
+            (ack.id.as_str(), ack.seq, encoded.as_str())
         );
-        assert!(
-            after_busy.revision.is_none()
-                && after_busy.finished_at.is_none()
-                && after_busy.error_code.is_none()
-        );
-        assert_eq!(
-            follower_store.index_baseline().unwrap(),
-            old_pin,
-            "pre-COMMIT BUSY cannot publish any part of mandatory H or Q1"
-        );
-        let first_marker = fs::read(&lock).unwrap();
-        assert_ne!(first_marker, old_marker);
-        assert!(state.retained_serving_session().is_err());
-        assert!(state.leader_work.lock().unwrap().is_none());
-        let probe = fs::OpenOptions::new().read(true).open(&lock).unwrap();
-        assert_eq!(
-            unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-            0
-        );
-        assert_eq!(unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_UN) }, 0);
-        drop(probe);
-        // Advance only the advisory timer; retry must elect a new EX and
-        // reconcile persisted H before claiming this same accepted Q1.
-        *state.recovery_retry_after.lock().unwrap() = Some(Instant::now() - Duration::from_secs(1));
-        state.queue_tick().unwrap();
-        assert_ne!(fs::read(&lock).unwrap(), first_marker);
+        assert_ne!(after_busy.state, "failed", "BUSY cannot fail accepted work");
+        if after_busy.state == "queued" {
+            assert!(after_busy.revision.is_none() && after_busy.finished_at.is_none());
+            assert_eq!(
+                follower_store.index_baseline().unwrap(),
+                old_pin,
+                "pre-COMMIT BUSY cannot publish part of startup reconciliation or Q1"
+            );
+            *state.recovery_retry_after.lock().unwrap() = None;
+            state.worker_step().unwrap();
+        }
         let done = follower_store.request_by_id(&ack.id).unwrap().unwrap();
         assert_eq!(
             (
@@ -4652,22 +4388,26 @@ mod serving_holder_tests {
         );
         assert!(done.finished_at.is_some() && done.error_code.is_none());
         let done_pin = done.revision.unwrap();
-        let h_pin = crate::model::IndexPin {
+        let startup_pin = crate::model::IndexPin {
             index_generation: old_pin.index_generation,
             index_revision: old_pin.index_revision + 1,
         };
-        assert_eq!(done_pin.index_generation, h_pin.index_generation);
-        assert_eq!(done_pin.index_revision, h_pin.index_revision + 1);
+        assert_eq!(done_pin.index_generation, startup_pin.index_generation);
+        assert_eq!(done_pin.index_revision, startup_pin.index_revision + 1);
         assert_eq!(follower_store.status().unwrap().revision, done_pin);
-        assert!(state.retained_serving_session().unwrap().is_leader());
-        // Post-ready historical read authenticates the distinct H publication
+        assert!(state.retained_serving_session().unwrap().verify().is_ok());
+        // Post-ready historical read authenticates the distinct startup reconciliation publication
         // before Q1. Drop the reader before opening native metadata.
         let read = follower_store.evidence_response().unwrap();
         read.validate_pin(old_pin).unwrap();
-        read.validate_pin(h_pin).unwrap();
+        read.validate_pin(startup_pin).unwrap();
         read.validate_pin(done_pin).unwrap();
         assert_eq!(
-            read.source_at("a.js", Some(h_pin)).unwrap().unwrap().1.text,
+            read.source_at("a.js", Some(startup_pin))
+                .unwrap()
+                .unwrap()
+                .1
+                .text,
             "function a() {}\n"
         );
         assert_eq!(
@@ -4685,23 +4425,24 @@ mod serving_holder_tests {
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
         )
         .unwrap();
-        let key = format!("pin:v1:{}:{}", h_pin.index_generation, h_pin.index_revision);
-        let h_json: String = db.query_row(
+        let key = format!(
+            "pin:v1:{}:{}",
+            startup_pin.index_generation, startup_pin.index_revision
+        );
+        let startup_json: String = db.query_row(
             "SELECT reconcile_options FROM native_revisions WHERE id=?1 AND published_index_revision=?2",
-            rusqlite::params![key, h_pin.index_revision as i64],
+            rusqlite::params![key, startup_pin.index_revision as i64],
             |row| row.get(0),
         ).unwrap();
         assert_eq!(
-            serde_json::from_str::<crate::indexer::ReconcileOptions>(&h_json).unwrap(),
+            serde_json::from_str::<crate::indexer::ReconcileOptions>(&startup_json).unwrap(),
             crate::indexer::ReconcileOptions::from(&options),
-            "immutable H pin must retain persisted selected options"
+            "immutable startup reconciliation pin must retain persisted selected options"
         );
     }
 
     #[tokio::test]
-    async fn selected_h_failure_must_not_fail_valid_q1_before_reconciliation() {
-        use crate::store::topology::{TopologyRoots, WorkspaceIdentity};
-        use std::os::fd::AsRawFd;
+    async fn selected_startup_failure_must_not_fail_valid_q1_before_reconciliation() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("workspace");
         fs::create_dir(&root).unwrap();
@@ -4719,13 +4460,7 @@ mod serving_holder_tests {
             |_| {},
         )
         .unwrap();
-        let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
-        let roots =
-            TopologyRoots::isolated_for_tests(state_root.join("cache"), state_root.join("data"));
-        let lock = roots.leader_lock(&identity);
-        let old_marker = fs::read(&lock).unwrap();
         let store = Store::open_for_tests(&state_root, &root).unwrap();
-        let follower = store.follower_session().unwrap();
         let state = new(
             store.clone(),
             IndexOptions::new(root.clone()),
@@ -4733,21 +4468,18 @@ mod serving_holder_tests {
             "127.0.0.1:7331".parse().unwrap(),
         )
         .unwrap();
-        *state.serving_session.lock().unwrap() = Some(follower);
         let q1 = store.enqueue_request(&q1_options, None).unwrap();
         state.pending_requests.lock().unwrap().push(q1.id.clone());
         let encoded =
             serde_json::to_string(&crate::indexer::ReconcileOptions::from(&q1_options)).unwrap();
         assert_eq!(q1.options_json, encoded);
-        // H cannot admit this source, but Q1's own larger limit could.
+        // startup reconciliation cannot admit this source, but Q1's own larger limit could.
         let large = format!("function a() {{}}\n// {}\n", "x".repeat(180));
         assert!(large.len() > 128 && large.len() <= 512);
         fs::write(root.join("a.js"), large).unwrap();
         drop(old_owner);
-        let error = state.queue_tick().unwrap_err();
+        let error = state.worker_step().unwrap_err();
         assert!(format!("{error:#}").contains("unsafe or oversized input"));
-        let marker = fs::read(&lock).unwrap();
-        assert_ne!(marker, old_marker);
         let row = store.request_by_id(&q1.id).unwrap().unwrap();
         assert_eq!(
             (
@@ -4761,20 +4493,11 @@ mod serving_holder_tests {
         assert!(row.revision.is_none() && row.finished_at.is_none() && row.error_code.is_none());
         assert_eq!(store.index_baseline().unwrap(), prior);
         assert!(state.retained_serving_session().is_err());
-        assert!(state.leader_work.lock().unwrap().is_none());
-        let probe = fs::OpenOptions::new().read(true).open(&lock).unwrap();
-        assert_eq!(
-            unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-            0,
-            "failed H owner cannot retain old EX while Q1 is queued"
-        );
-        assert_eq!(unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_UN) }, 0);
+        assert!(state.watcher_work.lock().unwrap().is_none());
     }
 
     #[tokio::test]
-    async fn selected_h_precommit_busy_releases_ex_then_retries_h_before_fifo() {
-        use crate::store::topology::{TopologyRoots, WorkspaceIdentity};
-        use std::os::fd::AsRawFd;
+    async fn selected_startup_precommit_busy_retries_startup_before_fifo() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("workspace");
         fs::create_dir(&root).unwrap();
@@ -4795,13 +4518,7 @@ mod serving_holder_tests {
             |_| {},
         )
         .unwrap();
-        let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
-        let roots =
-            TopologyRoots::isolated_for_tests(state_root.join("cache"), state_root.join("data"));
-        let lock = roots.leader_lock(&identity);
-        let old_marker = fs::read(&lock).unwrap();
         let store = Store::open_for_tests(&state_root, &root).unwrap();
-        let follower = store.follower_session().unwrap();
         let state = new(
             store.clone(),
             IndexOptions::new(root.clone()),
@@ -4809,7 +4526,6 @@ mod serving_holder_tests {
             "127.0.0.1:7331".parse().unwrap(),
         )
         .unwrap();
-        *state.serving_session.lock().unwrap() = Some(follower);
         let q1 = store.enqueue_request(&a, None).unwrap();
         let q2 = store.enqueue_request(&b, None).unwrap();
         assert!(q1.seq < q2.seq && q1.id != q2.id);
@@ -4823,9 +4539,7 @@ mod serving_holder_tests {
         fs::write(&path, "function b() {}\n").unwrap();
         store.fail_next_live_publish_commit_typed_busy();
         drop(old_owner);
-        state.queue_tick().unwrap(); // RetryMandatory, not an ACK or retained owner.
-        let first_marker = fs::read(&lock).unwrap();
-        assert_ne!(first_marker, old_marker);
+        state.worker_step().unwrap(); // RetryMandatory, not an ACK or retained owner.
         for (accepted, options) in [(&q1, &encoded_a), (&q2, &encoded_b)] {
             let row = store.request_by_id(&accepted.id).unwrap().unwrap();
             assert_eq!(
@@ -4848,22 +4562,12 @@ mod serving_holder_tests {
         }
         assert_eq!(store.index_baseline().unwrap(), prior);
         assert!(state.retained_serving_session().is_err());
-        assert!(state.leader_work.lock().unwrap().is_none());
+        assert!(state.watcher_work.lock().unwrap().is_none());
         assert!(state.recovery_retry_after.lock().unwrap().is_some());
-        let probe = fs::OpenOptions::new().read(true).open(&lock).unwrap();
-        assert_eq!(
-            unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-            0,
-            "RetryMandatory must release EX before another tick"
-        );
-        assert_eq!(unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_UN) }, 0);
-        drop(probe);
-        // Only the advisory timer is advanced. Success requires a fresh H
+        // Only the advisory timer is advanced. Success requires a fresh startup reconciliation
         // publication and the same accepted FIFO rows, not elapsed time.
         *state.recovery_retry_after.lock().unwrap() = Some(Instant::now() - Duration::from_secs(1));
-        state.queue_tick().unwrap();
-        let second_marker = fs::read(&lock).unwrap();
-        assert_ne!(second_marker, first_marker);
+        state.worker_step().unwrap();
         let first = store.request_by_id(&q1.id).unwrap().unwrap();
         let second = store.request_by_id(&q2.id).unwrap().unwrap();
         assert_eq!(
@@ -4888,8 +4592,8 @@ mod serving_holder_tests {
         let q1_pin = first.revision.unwrap();
         assert!(q1_pin.index_revision > prior.index_revision + 1);
         assert_eq!(store.status().unwrap().revision, q1_pin);
-        assert!(state.retained_serving_session().unwrap().is_leader());
-        state.queue_tick().unwrap();
+        assert!(state.retained_serving_session().unwrap().verify().is_ok());
+        state.worker_step().unwrap();
         let finished_q1 = store.request_by_id(&q1.id).unwrap().unwrap();
         let finished_q2 = store.request_by_id(&q2.id).unwrap().unwrap();
         assert_eq!(
@@ -4917,7 +4621,7 @@ mod serving_holder_tests {
     }
 
     #[tokio::test]
-    async fn follower_takeover_uses_claimed_clients_options_not_daemon_defaults() {
+    async fn local_writer_uses_claimed_clients_options_not_daemon_defaults() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("workspace");
         fs::create_dir(&root).unwrap();
@@ -4933,7 +4637,6 @@ mod serving_holder_tests {
         )
         .unwrap();
         let follower_store = Store::open_for_tests(&state_root, &root).unwrap();
-        let follower = follower_store.follower_session().unwrap();
         let mut bad_daemon_options = own_options.clone();
         bad_daemon_options.scip_path = Some(root.clone()); // directory is an invalid optional input
         let state = new(
@@ -4943,7 +4646,6 @@ mod serving_holder_tests {
             "127.0.0.1:7331".parse().unwrap(),
         )
         .unwrap();
-        *state.serving_session.lock().unwrap() = Some(follower);
         let client = follower_store.enqueue_request(&own_options, None).unwrap();
         state
             .pending_requests
@@ -4951,107 +4653,61 @@ mod serving_holder_tests {
             .unwrap()
             .push(client.id.clone());
         drop(owner);
-        state.queue_tick().unwrap();
+        state.worker_step().unwrap();
         let done = follower_store.request_by_id(&client.id).unwrap().unwrap();
         assert_eq!(
             done.state, "done",
             "a client's valid inputs may not be failed by unrelated daemon defaults"
         );
         assert!(done.error_code.is_none() && done.revision.is_some());
-        assert!(state.retained_serving_session().unwrap().is_leader());
+        assert!(state.retained_serving_session().unwrap().verify().is_ok());
     }
 
     #[test]
-    fn empty_retry_flag_keeps_verified_follower_until_owner_loss() {
-        use crate::store::topology::{TopologyRoots, WorkspaceIdentity};
-        use std::os::unix::fs::PermissionsExt;
+    fn root_loss_settles_accepted_queue_and_retires_local_writer() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("workspace");
         fs::create_dir(&root).unwrap();
-        let source = root.join("a.js");
-        fs::write(&source, "function before() {}\n").unwrap();
-        let state_root = tmp.path().join("state");
-        let owner_store = Store::open_for_tests(&state_root, &root).unwrap();
-        let mut selected_b = IndexOptions::new(root.clone());
-        selected_b.max_file_bytes = 4096;
-        let (old_pin, owner) = crate::index_coordinator::reconcile_workspace(
-            &owner_store,
-            &selected_b,
-            &Arc::new(AtomicBool::new(false)),
-            |_| {},
-        )
-        .unwrap();
-        let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
-        let roots =
-            TopologyRoots::isolated_for_tests(state_root.join("cache"), state_root.join("data"));
-        let index_db = roots.index_db(&identity);
-        let lock = roots.leader_lock(&identity);
-        let owner_marker = fs::read(&lock).unwrap();
-        let follower_store = Store::open_for_tests(&state_root, &root).unwrap();
-        let follower = follower_store.follower_session().unwrap();
+        fs::write(root.join("a.js"), "function before() {}\n").unwrap();
+        let store = Store::open_for_tests(&tmp.path().join("state"), &root).unwrap();
+        let options = IndexOptions::new(root.clone());
         let state = new(
-            follower_store.clone(),
-            IndexOptions::new(root.clone()),
+            store.clone(),
+            options.clone(),
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
             "127.0.0.1:7331".parse().unwrap(),
         )
         .unwrap();
-        *state.serving_session.lock().unwrap() = Some(follower.clone());
-        // Model a prior empty-FIFO retry that found another verified EX owner.
-        // Even after the backoff expires, a valid follower must not churn its
-        // lock, re-open index.db, or replace the same retained Arc.
-        state.empty_takeover_retry.store(true, Ordering::Release);
-        fs::set_permissions(&index_db, fs::Permissions::from_mode(0o000)).unwrap();
-        assert!(
-            fs::read(&index_db).is_err(),
-            "fixture must deny index.db reads"
-        );
-        for _ in 0..3 {
-            *state.recovery_retry_after.lock().unwrap() =
-                Some(Instant::now() - Duration::from_secs(1));
-            state.queue_tick().unwrap();
-            assert!(Arc::ptr_eq(
-                state.serving_session.lock().unwrap().as_ref().unwrap(),
-                &follower
-            ));
-            assert_eq!(fs::read(&lock).unwrap(), owner_marker);
-            assert!(state.empty_takeover_retry.load(Ordering::Acquire));
-        }
-        fs::set_permissions(&index_db, fs::Permissions::from_mode(0o600)).unwrap();
-        fs::write(&source, "function after() {}\n").unwrap();
-        drop(owner);
-        *state.recovery_retry_after.lock().unwrap() = None;
-        state.queue_tick().unwrap();
-        let leader = state.serving_session.lock().unwrap().clone().unwrap();
-        assert!(leader.is_leader() && !Arc::ptr_eq(&leader, &follower));
-        assert_ne!(fs::read(&lock).unwrap(), owner_marker);
-        assert!(!state.empty_takeover_retry.load(Ordering::Acquire));
-        let current = follower_store.status().unwrap().revision;
-        assert!(current.index_revision > old_pin.index_revision);
+        let accepted = store.enqueue_request(&options, None).unwrap();
+        state.worker_step().unwrap();
         assert_eq!(
-            follower_store
-                .recorded_index_options()
-                .unwrap()
-                .unwrap()
-                .max_file_bytes,
-            4096
+            store.request_by_id(&accepted.id).unwrap().unwrap().state,
+            "done"
         );
-        let read = follower_store.evidence_response().unwrap();
+        let next = store.enqueue_request(&options, None).unwrap();
+        fs::rename(&root, tmp.path().join("former-workspace")).unwrap();
+        fs::create_dir(&root).unwrap();
+        state.worker_step().unwrap();
+        // Normal reads reject a replaced captured root. Inspect only the durable
+        // request row to prove settlement survived loss of that root.
+        let db = rusqlite::Connection::open(store.request_db_path()).unwrap();
+        let (status, error): (String, Option<String>) = db
+            .query_row(
+                "SELECT state, error_code FROM requests WHERE id=?1",
+                [&next.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "failed");
+        assert_eq!(error.as_deref(), Some("root_changed"));
         assert_eq!(
-            read.source_at("a.js", Some(current))
-                .unwrap()
-                .unwrap()
-                .1
-                .text,
-            "function after() {}\n"
+            state.root_loss_retirement_for_tests(),
+            (false, false, false)
         );
-        read.finish(()).unwrap();
-        assert!(follower_store.current_request().unwrap().is_none());
     }
 
     #[test]
-    fn empty_fifo_busy_after_new_marker_retries_selected_b_takeover() {
-        use crate::store::topology::{IndexNotReady, TopologyRoots, WorkspaceIdentity};
+    fn empty_fifo_busy_retries_selected_b_before_read() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("workspace");
         fs::create_dir(&root).unwrap();
@@ -5068,13 +4724,7 @@ mod serving_holder_tests {
             |_| {},
         )
         .unwrap();
-        let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
-        let roots =
-            TopologyRoots::isolated_for_tests(state_root.join("cache"), state_root.join("data"));
-        let leader_lock = roots.leader_lock(&identity);
-        let predecessor_marker = fs::read(&leader_lock).unwrap();
         let follower_store = Store::open_for_tests(&state_root, &root).unwrap();
-        let follower = follower_store.follower_session().unwrap();
         let daemon_defaults_a = IndexOptions::new(root.clone());
         let state = new(
             follower_store.clone(),
@@ -5083,17 +4733,22 @@ mod serving_holder_tests {
             "127.0.0.1:7331".parse().unwrap(),
         )
         .unwrap();
-        *state.serving_session.lock().unwrap() = Some(follower);
         assert!(follower_store.current_request().unwrap().is_none());
         fs::write(&source, "function after_busy() {}\n").unwrap();
-        // This hook fires inside a live transaction immediately before COMMIT.
-        // Election already holds EX and has synced the new incarnation marker.
-        follower_store.fail_next_live_publish_commit_busy();
+        // Typed pre-COMMIT BUSY defers mandatory startup reconciliation without exposing a
+        // partially committed selected revision.
+        follower_store.fail_next_live_publish_commit_typed_busy();
         drop(owner);
+        // A due startup reconciliation admits a local writer even without a
+        // queued request; a bare timer tick has no reason to start one.
+        *state.runtime.lock().unwrap() = RuntimeState::Reconciling {
+            attempts: 0,
+            waiting: false,
+        };
         // Typed pre-COMMIT contention is deferred with a 250ms deadline;
         // inspect the scheduled bound before diagnostic reads can outlast it.
         let retry_started = Instant::now();
-        state.queue_tick().unwrap();
+        state.worker_step().unwrap();
         let retry_finished = Instant::now();
         let scheduled_retry = *state.recovery_retry_after.lock().unwrap();
         assert!(
@@ -5102,50 +4757,31 @@ mod serving_holder_tests {
             }),
             "failed empty-FIFO reconciliation must schedule its bounded 250ms retry"
         );
-        let successor_marker = fs::read(&leader_lock).unwrap();
-        assert_ne!(successor_marker, predecessor_marker);
-        assert_eq!(successor_marker.len(), 36);
-        uuid::Uuid::parse_str(std::str::from_utf8(&successor_marker).unwrap()).unwrap();
         assert_eq!(
             follower_store.index_baseline().unwrap(),
             old_pin,
             "pre-COMMIT BUSY must not publish a partial revision"
         );
-        let refused = follower_store
-            .evidence_response()
-            .err()
-            .expect("old selected read must fence after marker");
-        assert!(
-            refused
-                .chain()
-                .any(|cause| cause.downcast_ref::<IndexNotReady>().is_some()),
-            "{refused:#}"
-        );
         assert!(follower_store.current_request().unwrap().is_none());
         // The reads above may run beyond 250ms under CI load. Hold the same
         // retry branch open for the immediate-tick assertion without a clock race.
         *state.recovery_retry_after.lock().unwrap() =
-            Some(Instant::now() + Duration::from_secs(10));
-        state.queue_tick().unwrap();
-        assert_eq!(
-            fs::read(&leader_lock).unwrap(),
-            successor_marker,
-            "immediate tick must respect retry backoff without marker churn"
-        );
+            Some(Instant::now() + crate::testing::HANG_BACKSTOP);
+        state.worker_step().unwrap();
         *state.recovery_retry_after.lock().unwrap() = None;
-        state.queue_tick().unwrap();
+        state.worker_step().unwrap();
         let selected = follower_store.status().unwrap().revision;
         assert_eq!(selected.index_generation, old_pin.index_generation);
         assert!(selected.index_revision > old_pin.index_revision);
-        assert_ne!(fs::read(&leader_lock).unwrap(), successor_marker);
         assert!(
             state
-                .serving_session
+                .runtime
                 .lock()
                 .unwrap()
-                .as_ref()
+                .session()
                 .unwrap()
-                .is_leader()
+                .verify()
+                .is_ok()
         );
         assert_eq!(
             follower_store
@@ -5169,9 +4805,8 @@ mod serving_holder_tests {
     }
 
     #[tokio::test]
-    async fn failed_mandatory_h_takeover_backs_off_without_failing_fifo_head() {
-        use crate::store::topology::{TopologyRoots, WorkspaceIdentity};
-        use std::os::{fd::AsRawFd, unix::fs::PermissionsExt};
+    async fn failed_startup_reconciliation_backs_off_without_failing_fifo_head() {
+        use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("workspace");
         fs::create_dir(&root).unwrap();
@@ -5187,13 +4822,7 @@ mod serving_holder_tests {
             |_| {},
         )
         .unwrap();
-        let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
-        let roots =
-            TopologyRoots::isolated_for_tests(state_root.join("cache"), state_root.join("data"));
-        let lock = roots.leader_lock(&identity);
-        let old_marker = fs::read(&lock).unwrap();
         let follower_store = Store::open_for_tests(&state_root, &root).unwrap();
-        let follower = follower_store.follower_session().unwrap();
         let state = new(
             follower_store.clone(),
             options.clone(),
@@ -5201,7 +4830,6 @@ mod serving_holder_tests {
             "127.0.0.1:7331".parse().unwrap(),
         )
         .unwrap();
-        *state.serving_session.lock().unwrap() = Some(follower);
         let accepted = follower_store.enqueue_request(&options, None).unwrap();
         state
             .pending_requests
@@ -5218,11 +4846,11 @@ mod serving_holder_tests {
         drop(owner);
         let before_tick = Instant::now();
         let error = state
-            .queue_tick()
-            .expect_err("unreadable selected H must fail before Q1 claim");
+            .worker_step()
+            .expect_err("unreadable selected startup reconciliation must fail before Q1 claim");
         assert!(
             format!("{error:#}").contains("opening input:"),
-            "mandatory H must fail its captured source read"
+            "mandatory startup reconciliation must fail its captured source read"
         );
         let deadline = state
             .recovery_retry_after
@@ -5248,7 +4876,7 @@ mod serving_holder_tests {
                 encoded.as_str(),
                 "queued"
             ),
-            "mandatory H capture failure cannot be attributed to Q1"
+            "mandatory startup reconciliation capture failure cannot be attributed to Q1"
         );
         assert!(
             after_first.revision.is_none()
@@ -5256,30 +4884,15 @@ mod serving_holder_tests {
                 && after_first.error_code.is_none()
         );
         assert_eq!(follower_store.index_baseline().unwrap(), old_pin);
-        let first_marker = fs::read(&lock).unwrap();
-        assert_ne!(first_marker, old_marker);
         assert!(state.retained_serving_session().is_err());
-        assert!(state.leader_work.lock().unwrap().is_none());
-        let probe = fs::OpenOptions::new().read(true).open(&lock).unwrap();
-        assert_eq!(
-            unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-            0
-        );
-        assert_eq!(unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_UN) }, 0);
-        drop(probe);
+        assert!(state.watcher_work.lock().unwrap().is_none());
         // Pin the advisory deadline beyond these immediate calls so CPU load
         // cannot turn a bounded-rate assertion into elapsed-time flakiness.
         *state.recovery_retry_after.lock().unwrap() =
-            Some(Instant::now() + Duration::from_secs(10));
-        let first_attempts = state.queue_takeover_attempts.load(Ordering::Acquire);
+            Some(Instant::now() + crate::testing::HANG_BACKSTOP);
         for _ in 0..3 {
-            state.queue_tick().unwrap();
+            state.worker_step().unwrap();
         }
-        assert_eq!(
-            state.queue_takeover_attempts.load(Ordering::Acquire),
-            first_attempts
-        );
-        assert_eq!(fs::read(&lock).unwrap(), first_marker);
         assert_eq!(
             follower_store
                 .request_by_id(&accepted.id)
@@ -5289,10 +4902,9 @@ mod serving_holder_tests {
             "queued"
         );
         fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).unwrap();
-        // Repair H's source, then advance ONLY the advisory retry timer.
+        // Repair startup reconciliation's source, then advance ONLY the advisory retry timer.
         *state.recovery_retry_after.lock().unwrap() = Some(Instant::now() - Duration::from_secs(1));
-        state.queue_tick().unwrap();
-        assert_ne!(fs::read(&lock).unwrap(), first_marker);
+        state.worker_step().unwrap();
         let done = follower_store.request_by_id(&accepted.id).unwrap().unwrap();
         assert_eq!(
             (
@@ -5305,19 +4917,19 @@ mod serving_holder_tests {
         );
         assert!(done.finished_at.is_some() && done.error_code.is_none());
         let q1_pin = done.revision.unwrap();
-        let h_pin = crate::model::IndexPin {
+        let startup_pin = crate::model::IndexPin {
             index_generation: old_pin.index_generation,
             index_revision: old_pin.index_revision + 1,
         };
-        assert_eq!(q1_pin.index_generation, h_pin.index_generation);
-        assert_eq!(q1_pin.index_revision, h_pin.index_revision + 1);
+        assert_eq!(q1_pin.index_generation, startup_pin.index_generation);
+        assert_eq!(q1_pin.index_revision, startup_pin.index_revision + 1);
         let read = follower_store.evidence_response().unwrap();
-        read.validate_pin(h_pin).unwrap();
+        read.validate_pin(startup_pin).unwrap();
         read.validate_pin(q1_pin).unwrap();
         assert_eq!(read.status().unwrap().revision, q1_pin);
         read.finish(()).unwrap();
         drop(read);
-        assert!(state.retained_serving_session().unwrap().is_leader());
+        assert!(state.retained_serving_session().unwrap().verify().is_ok());
     }
 }
 
@@ -5343,6 +4955,10 @@ mod exceptional_recovery_tests {
         );
         let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
         let old = Store::open_for_tests(&tmp.path().join("state"), &root).unwrap();
+        // An accepted Q0 creates the durable queue witness before damage to
+        // derived index.db. Recovery must retain and drain it ahead of later IDs.
+        old.enqueue_request(&IndexOptions::new(root.clone()), None)
+            .unwrap();
         drop(old);
         std::fs::write(roots.index_db(&identity), b"bad sqlite index header").unwrap();
         let store = Store::open_for_tests(&tmp.path().join("state"), &root).unwrap();
@@ -5354,111 +4970,120 @@ mod exceptional_recovery_tests {
             "127.0.0.1:7331".parse().unwrap(),
         )
         .unwrap();
+        // These tests step the worker by hand: no background worker thread.
+        state.worker_started.store(true, Ordering::Release);
         (tmp, store, state, roots, identity)
     }
 
     #[test]
-    fn idle_daemon_follows_external_repair_then_reconciles_after_owner_exits() {
-        let (_tmp, daemon_store, state, roots, identity) = fixture();
-        let cli = Store::open_for_tests(&_tmp.path().join("state"), &state.options.workspace_root)
-            .unwrap();
-        let (pin, owner) = crate::index_coordinator::enqueue_and_wait(
-            &cli,
-            &state.options,
+    fn damaged_index_without_accepted_head_never_guesses_startup_options() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("a.js"), "function a() {}\n").unwrap();
+        let state_root = tmp.path().join("state");
+        let roots =
+            TopologyRoots::isolated_for_tests(state_root.join("cache"), state_root.join("data"));
+        let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+        let old = Store::open_for_tests(&state_root, &root).unwrap();
+        let options = IndexOptions::new(root.clone());
+        let (_, owner) = crate::index_coordinator::reconcile_workspace(
+            &old,
+            &options,
             &Arc::new(AtomicBool::new(false)),
+            |_| {},
         )
         .unwrap();
-        let index = roots.index_db(&identity);
-        let before = std::fs::read(&index).unwrap();
-        assert!(daemon_store.is_recreate_pending());
-        *state.recovery_retry_after.lock().unwrap() = None;
-        state.queue_tick().unwrap();
-        assert!(!daemon_store.is_recreate_pending());
-        assert_eq!(daemon_store.status().unwrap().revision, pin);
-        assert!(
-            !state.retained_serving_session().unwrap().is_leader(),
-            "while CLI owner holds EX, daemon must follow without publication"
-        );
-        assert_eq!(std::fs::read(&index).unwrap(), before);
+        assert!(old.current_request().unwrap().is_none());
         drop(owner);
-        // A follower normally waits 250ms before re-election. Advance the
-        // fixture explicitly instead of depending on ambient test CPU timing.
-        *state.recovery_retry_after.lock().unwrap() = None;
-        state.queue_tick().unwrap();
+        drop(old);
+        let index = roots.index_db(&identity);
+        let damaged = b"bad sqlite index header";
+        std::fs::write(&index, damaged).unwrap();
+        let store = Store::open_for_tests(&state_root, &root).unwrap();
+        assert!(store.is_recreate_pending());
+        assert!(store.earliest_unfinished_request().unwrap().is_none());
+        let state = new(
+            store.clone(),
+            options,
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            "127.0.0.1:7331".parse().unwrap(),
+        )
+        .unwrap();
+        let started = Instant::now();
+        let error = state.worker_step().unwrap_err();
+        let finished = Instant::now();
         assert!(
-            state.retained_serving_session().unwrap().is_leader(),
-            "after CLI owner exits, verified leader must reconcile before Status opens"
+            error.to_string().starts_with("recovery_required:"),
+            "{error:#}"
         );
-        let after = daemon_store.status().unwrap().revision;
-        assert_eq!(after.index_generation, pin.index_generation);
-        assert!(after.index_revision > pin.index_revision);
-        assert!(roots.leader(&identity).is_err(), "daemon retains lock");
-        let after_bytes = std::fs::read(&index).unwrap();
-        assert_ne!(after_bytes, before);
-        state.queue_tick().unwrap();
-        assert_eq!(
-            daemon_store.status().unwrap().revision,
-            after,
-            "idle reacquisition must publish once, not on every timer tick"
+        assert!(
+            state
+                .recovery_retry_after
+                .lock()
+                .unwrap()
+                .is_some_and(|at| { at >= started && at <= finished + Duration::from_millis(500) })
         );
-        assert_eq!(std::fs::read(&index).unwrap(), after_bytes);
+        assert!(state.runtime.lock().unwrap().session().is_none());
+        assert!(store.current_request().unwrap().is_none());
+        assert_eq!(std::fs::read(index).unwrap(), damaged);
+    }
+
+    #[test]
+    fn damaged_index_reconciles_startup_then_existing_q0_once() {
+        let (_tmp, store, state, roots, identity) = fixture();
+        let index = roots.index_db(&identity);
+        let damaged = std::fs::read(&index).unwrap();
+        let q0 = store.current_request().unwrap().unwrap();
+        assert_eq!(q0.state, "queued");
+        state.worker_step().unwrap();
+        assert!(!store.is_recreate_pending());
+        store
+            .verify_writer_session(&state.retained_serving_session().unwrap())
+            .unwrap();
+        let done = store.request_by_id(&q0.id).unwrap().unwrap();
+        assert_eq!(done.state, "done");
+        let pin = done.revision.unwrap();
+        assert_eq!(pin.index_revision, 2, "startup r1 must precede Q0 r2");
+        assert_ne!(std::fs::read(&index).unwrap(), damaged);
+        state.worker_step().unwrap();
+        assert_eq!(store.status().unwrap().revision, pin);
     }
 
     #[tokio::test]
-    async fn cli_repair_must_refresh_stale_daemon_before_driving_browser_ack() {
-        let (_tmp, daemon_store, state, roots, identity) = fixture();
-        let cli_store =
-            Store::open_for_tests(&_tmp.path().join("state"), &state.options.workspace_root)
-                .unwrap();
-        let (cli_pin, cli_owner) = crate::index_coordinator::enqueue_and_wait(
-            &cli_store,
-            &state.options,
-            &Arc::new(AtomicBool::new(false)),
-        )
-        .unwrap();
-        assert_eq!(
-            cli_pin.index_revision, 2,
-            "CLI must repair at r1 then publish its claimed r2"
-        );
-        assert_eq!(cli_store.current_request().unwrap().unwrap().state, "done");
-        assert!(
-            daemon_store.is_recreate_pending(),
-            "daemon retained its stale corruption classification"
-        );
-        assert!(daemon_store.status().is_err());
-        drop(cli_owner);
-        let free = roots.leader(&identity).unwrap();
-        drop(free);
+    async fn damaged_index_drains_earlier_q0_before_browser_ack() {
+        let (_tmp, store, state, _roots, _identity) = fixture();
+        let q0 = store.current_request().unwrap().unwrap();
         let (code, Json(browser)) = start_index(State(state.clone()), Bytes::new())
             .await
             .unwrap();
         assert_eq!(code, StatusCode::ACCEPTED);
-        let ack = daemon_store.request_by_id(&browser.id).unwrap().unwrap();
-        assert_eq!(ack.state, "queued");
-        assert!(ack.seq > 1);
-        let tick_results = (0..4)
-            .map(|_| state.queue_tick().map_err(|error| format!("{error:#}")))
-            .collect::<Vec<_>>();
-        assert!(
-            tick_results.iter().all(Result::is_ok),
-            "stale daemon must not reclassify already repaired index on every 20 ms tick: {tick_results:?}"
-        );
-        let completed = daemon_store.request_by_id(&browser.id).unwrap().unwrap();
+        let q1 = store.request_by_id(&browser.id).unwrap().unwrap();
+        assert!(q0.seq < q1.seq);
+        assert_eq!(q1.state, "queued");
+        state.worker_step().unwrap();
+        let first = store.request_by_id(&q0.id).unwrap().unwrap();
+        let pending = store.request_by_id(&q1.id).unwrap().unwrap();
         assert_eq!(
-            completed.state, "done",
-            "external CLI repair must not strand accepted browser work"
+            (first.state.as_str(), pending.state.as_str()),
+            ("done", "queued")
         );
-        assert!(completed.revision.unwrap().index_revision > cli_pin.index_revision);
-        assert!(!daemon_store.is_recreate_pending());
+        assert_eq!(first.revision.unwrap().index_revision, 2);
+        state.worker_step().unwrap();
+        let second = store.request_by_id(&q1.id).unwrap().unwrap();
         assert_eq!(
-            daemon_store.status().unwrap().revision,
-            completed.revision.unwrap()
+            (second.id.as_str(), second.seq, second.state.as_str()),
+            (q1.id.as_str(), q1.seq, "done")
         );
-        assert!(state.retained_serving_session().unwrap().is_leader());
-        assert!(
-            roots.leader(&identity).is_err(),
-            "new daemon leader holds the root lock"
+        assert_eq!(second.revision.unwrap().index_revision, 3);
+        assert_eq!(
+            first.revision.unwrap().index_generation,
+            second.revision.unwrap().index_generation
         );
+        assert_eq!(second.options_json, q1.options_json);
+        store
+            .verify_writer_session(&state.retained_serving_session().unwrap())
+            .unwrap();
     }
 
     struct PausedRecoveryFixture {
@@ -5467,7 +5092,7 @@ mod exceptional_recovery_tests {
         state: Arc<DaemonState>,
         roots: TopologyRoots,
         identity: WorkspaceIdentity,
-        old_owner: Option<Arc<crate::store::topology::LeaderSession>>,
+        old_owner: Option<Arc<crate::store::topology::WriterSession>>,
         q2: crate::store::requests::Request,
         q1: crate::store::requests::Request,
         old_generation: uuid::Uuid,
@@ -5519,95 +5144,136 @@ mod exceptional_recovery_tests {
     }
 
     #[tokio::test]
-    async fn browser_q1_then_cli_q2_exceptional_fifo_survives_owner_contention() {
+    async fn browser_q1_then_cli_q2_exceptional_fifo_survives_reader_contention() {
         let (_tmp, store, state, roots, identity) = fixture();
         let reader = roots.index_use_existing(&identity).unwrap();
+        let q0 = store.current_request().unwrap().unwrap();
         let (status, Json(browser)) = start_index(State(state.clone()), Bytes::new())
             .await
             .unwrap();
         assert_eq!(status, StatusCode::ACCEPTED);
         let q1 = store.request_by_id(&browser.id).unwrap().unwrap();
-        assert_eq!(q1.state, "queued");
-        let cli_store =
-            Store::open_for_tests(&_tmp.path().join("state"), &state.options.workspace_root)
-                .unwrap();
-        let options = state.options.clone();
-        let cli = tokio::task::spawn_blocking(move || {
-            crate::index_coordinator::enqueue_and_wait(
-                &cli_store,
-                &options,
-                &Arc::new(AtomicBool::new(false)),
-            )
-        });
-        let q2 = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                if let Some(row) = store.current_request().unwrap()
-                    && row.id != q1.id
-                {
-                    break row;
-                }
-                // This existing-only queue read takes SH; allow the writer
-                // admission/barrier a real turn even in busy verifier lanes.
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("CLI failed to durably ACK while independent reader held");
-        assert!(
-            q2.seq > q1.seq,
-            "actual browser POST must precede CLI ACK in durable FIFO"
-        );
-        assert_eq!(q2.state, "queued");
+        let cli = Store::open_for_tests(
+            &_tmp.path().join("state"),
+            &state.config().options.workspace_root,
+        )
+        .unwrap();
+        let q2 = cli.enqueue_request(&state.config().options, None).unwrap();
+        assert!(q0.seq < q1.seq && q1.seq < q2.seq);
         assert_eq!(
             store.request_by_id(&q1.id).unwrap().unwrap().state,
             "queued"
         );
+        assert_eq!(
+            store.request_by_id(&q2.id).unwrap().unwrap().state,
+            "queued"
+        );
         drop(reader);
-        let cli_result = tokio::time::timeout(std::time::Duration::from_secs(15), cli)
-            .await
-            .expect("accepted CLI did not finish after reader release")
-            .unwrap();
-        let (cli_pin, _)=cli_result.unwrap_or_else(|error| {
-            let browser=store.request_by_id(&q1.id).unwrap().unwrap();
-            let cli_row=store.request_by_id(&q2.id).unwrap().unwrap();
-            panic!("accepted FIFO CLI failed: {error:#}; browser={}/{:?}; cli={}/{:?}; recovery_pending={}; serving_leader={}",
-                browser.state,browser.error_code,cli_row.state,cli_row.error_code,
-                store.is_recreate_pending(),state.retained_serving_session().is_ok_and(|s|s.is_leader()));
-        });
+        state.worker_step().unwrap();
+        let first = store.request_by_id(&q0.id).unwrap().unwrap();
+        assert_eq!(first.state, "done");
+        assert_eq!(
+            store.request_by_id(&q1.id).unwrap().unwrap().state,
+            "queued"
+        );
+        assert_eq!(
+            store.request_by_id(&q2.id).unwrap().unwrap().state,
+            "queued"
+        );
+        state.worker_step().unwrap();
         let browser_done = store.request_by_id(&q1.id).unwrap().unwrap();
+        assert_eq!(browser_done.state, "done");
+        assert_eq!(
+            store.request_by_id(&q2.id).unwrap().unwrap().state,
+            "queued"
+        );
+        state.worker_step().unwrap();
         let cli_done = store.request_by_id(&q2.id).unwrap().unwrap();
         assert_eq!(
-            (browser_done.state.as_str(), cli_done.state.as_str()),
-            ("done", "done")
+            (
+                first.state.as_str(),
+                browser_done.state.as_str(),
+                cli_done.state.as_str()
+            ),
+            ("done", "done", "done")
         );
-        assert_eq!(browser_done.revision.unwrap().index_revision, 2);
-        assert_eq!(cli_done.revision.unwrap().index_revision, 3);
-        assert_eq!(cli_done.revision.unwrap(), cli_pin);
+        assert_eq!(first.revision.unwrap().index_revision, 2);
+        assert_eq!(browser_done.revision.unwrap().index_revision, 3);
+        assert_eq!(cli_done.revision.unwrap().index_revision, 4);
+        assert_eq!(
+            first.revision.unwrap().index_generation,
+            browser_done.revision.unwrap().index_generation
+        );
+        assert_eq!(
+            browser_done.revision.unwrap().index_generation,
+            cli_done.revision.unwrap().index_generation
+        );
+        assert_eq!(
+            (
+                browser_done.id.as_str(),
+                browser_done.seq,
+                browser_done.options_json.as_str()
+            ),
+            (q1.id.as_str(), q1.seq, q1.options_json.as_str())
+        );
+        assert_eq!(
+            (
+                cli_done.id.as_str(),
+                cli_done.seq,
+                cli_done.options_json.as_str()
+            ),
+            (q2.id.as_str(), q2.seq, q2.options_json.as_str())
+        );
     }
 
     #[tokio::test]
     async fn cli_accepted_exceptional_request_without_local_pending_id_must_be_driven() {
-        let (_tmp, store, state, roots, identity) = fixture();
-        let accepted = store.enqueue_request(&state.options, None).unwrap();
+        let (_tmp, store, state, _roots, _identity) = fixture();
+        let q0 = store.current_request().unwrap().unwrap();
+        let accepted = store
+            .enqueue_request(&state.config().options, None)
+            .unwrap();
         assert!(
             state.pending_requests.lock().unwrap().is_empty(),
             "a separate CLI process cannot populate daemon-local pending_requests"
         );
         let original_queue = std::fs::read(store.request_db_path()).unwrap();
-        state.queue_tick().unwrap();
+        state.worker_step().unwrap();
+        assert_eq!(store.request_by_id(&q0.id).unwrap().unwrap().state, "done");
+        assert_eq!(
+            store.request_by_id(&accepted.id).unwrap().unwrap().state,
+            "queued"
+        );
+        state.worker_step().unwrap();
         let row = store.request_by_id(&accepted.id).unwrap().unwrap();
         assert_eq!(
-            row.state, "done",
-            "daemon must reconcile any durable queued CLI row, not only local POST ids"
+            (
+                row.id.as_str(),
+                row.seq,
+                row.options_json.as_str(),
+                row.state.as_str()
+            ),
+            (
+                accepted.id.as_str(),
+                accepted.seq,
+                accepted.options_json.as_str(),
+                "done"
+            ),
+            "next tick must claim durable CLI row without a daemon-local pending ID"
         );
         assert_eq!(row.revision.unwrap(), store.status().unwrap().revision);
+        let prior = store.request_by_id(&q0.id).unwrap().unwrap();
+        assert_eq!(prior.state, "done");
+        assert_eq!(prior.revision.unwrap().index_revision, 2);
         assert_eq!(
             row.revision.unwrap().index_revision,
-            2,
-            "recreation reconciles at r1 before claimed publication at r2"
+            3,
+            "startup r1 and earlier accepted Q0 r2 precede CLI r3"
         );
-        assert!(state.retained_serving_session().unwrap().is_leader());
-        assert!(roots.leader(&identity).is_err(), "new owner remains held");
+        assert!(state.retained_serving_session().unwrap().verify().is_ok());
+        store
+            .verify_writer_session(&state.retained_serving_session().unwrap())
+            .unwrap();
         assert_ne!(
             std::fs::read(store.request_db_path()).unwrap(),
             original_queue,
@@ -5638,9 +5304,9 @@ mod exceptional_recovery_tests {
             "index-only recreation must not replace requests.db"
         );
         let session = f.state.retained_serving_session().unwrap();
-        f.store.verify_leader_session(&session).unwrap();
+        f.store.verify_writer_session(&session).unwrap();
         assert_ne!(session.incarnation(), old_incarnation);
-        assert!(f.roots.leader(&f.identity).is_err());
+        f.store.verify_writer_session(&session).unwrap();
     }
 
     #[test]
@@ -5696,7 +5362,7 @@ mod exceptional_recovery_tests {
         .unwrap();
         // Own the old serving SH without starting the periodic timer. Drive the
         // exact empty-snapshot race with one explicitly paused tick instead.
-        *state.serving_session.lock().unwrap() = Some(old_owner);
+        *state.runtime.lock().unwrap() = RuntimeState::Ready(old_owner);
         let reader = roots.index_use_existing(&identity).unwrap();
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -5705,8 +5371,8 @@ mod exceptional_recovery_tests {
             release_rx.recv().unwrap();
         });
         let worker = state.clone();
-        let idle_tick = tokio::task::spawn_blocking(move || worker.queue_tick());
-        tokio::time::timeout(std::time::Duration::from_secs(5), entered_rx)
+        let idle_tick = tokio::task::spawn_blocking(move || worker.worker_step());
+        tokio::time::timeout(crate::testing::HANG_BACKSTOP, entered_rx)
             .await
             .expect("idle tick did not snapshot empty pending list")
             .unwrap();
@@ -5717,7 +5383,7 @@ mod exceptional_recovery_tests {
             .unwrap()
             .push(request.id.clone());
         release_tx.send(()).unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(5), idle_tick)
+        tokio::time::timeout(crate::testing::HANG_BACKSTOP, idle_tick)
             .await
             .expect("idle tick did not leave the snapshot barrier")
             .unwrap()
@@ -5725,7 +5391,7 @@ mod exceptional_recovery_tests {
         let admitted = store.request_by_id(&request.id).unwrap().unwrap();
         assert_eq!(
             admitted.state, "queued",
-            "old leader drained a recovery request"
+            "idle tick drained a post-snapshot recovery request"
         );
         assert!(admitted.finished_at.is_none());
         assert!(
@@ -5734,8 +5400,8 @@ mod exceptional_recovery_tests {
         );
         let worker = state.clone();
         tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            tokio::task::spawn_blocking(move || worker.queue_tick()),
+            crate::testing::HANG_BACKSTOP,
+            tokio::task::spawn_blocking(move || worker.worker_step()),
         )
         .await
         .expect("recovery tick did not attempt protected EX")
@@ -5750,15 +5416,59 @@ mod exceptional_recovery_tests {
         // Advance the advisory retry deadline without sleeping. The held SH
         // had fenced EX; the durable row remains queued for this next tick.
         *state.recovery_retry_after.lock().unwrap() = None;
+        // A timed-out blocking tick keeps running after Tokio drops its join
+        // handle. Record its last completed phase before reporting a RED.
+        let retry_stage = Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let retry_started = Instant::now();
+        {
+            let stage = retry_stage.clone();
+            state.test_queue_after_stream.set(move || {
+                stage.store(1, Ordering::Release);
+            });
+        }
+        {
+            let stage = retry_stage.clone();
+            state.test_queue_after_pending_snapshot.set(move || {
+                stage.store(2, Ordering::Release);
+            });
+        }
+        {
+            let stage = retry_stage.clone();
+            state.test_queue_after_startup_drain.set(move || {
+                stage.store(3, Ordering::Release);
+            });
+        }
+        let retry_terminal = Arc::new(tokio::sync::Notify::new());
+        store.notify_on_terminal_request_for_tests(&request.id, retry_terminal.clone());
+        let watcher_returned = Arc::new(tokio::sync::Notify::new());
+        {
+            let returned = watcher_returned.clone();
+            state.test_queue_after_watcher_reconcile.set(move || {
+                returned.notify_one();
+            });
+        }
         let worker = state.clone();
-        tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            tokio::task::spawn_blocking(move || worker.queue_tick()),
-        )
-        .await
-        .expect("accepted request did not retry after foreign reader release")
-        .unwrap()
-        .unwrap();
+        let retry_tick = tokio::task::spawn_blocking(move || worker.worker_step());
+        // The accepted ID signals only after its terminal queue COMMIT. The
+        // same tick may then spend a full inventory on the watcher while still
+        // holding the serial stream; bound those two stages separately.
+        tokio::time::timeout(crate::testing::HANG_BACKSTOP, retry_terminal.notified())
+            .await
+            .expect("accepted request retry did not commit its terminal row");
+        tokio::time::timeout(crate::testing::HANG_BACKSTOP, watcher_returned.notified())
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "accepted request watcher timed out at stage {} after {}ms (0=before stream, 1=stream, 2=pending snapshot, 3=after startup reconciliation and Q)",
+                    retry_stage.load(Ordering::Acquire),
+                    retry_started.elapsed().as_millis()
+                )
+            });
+        tokio::time::timeout(crate::testing::HANG_BACKSTOP, retry_tick)
+            .await
+            .expect("accepted request retry tick did not leave stream after watcher")
+            .unwrap()
+            .unwrap();
         let done = store.request_by_id(&request.id).unwrap().unwrap();
         assert_eq!(done.state, "done");
         assert_eq!(done.revision.unwrap().index_revision, 2);
@@ -5820,7 +5530,7 @@ mod exceptional_recovery_tests {
             }
             assert!(ready.is_none(), "reader exited before SH_READY");
         });
-        tokio::time::timeout(std::time::Duration::from_secs(5), ready_rx)
+        tokio::time::timeout(crate::testing::HANG_BACKSTOP, ready_rx)
             .await
             .expect("independent SH reader did not start")
             .unwrap();
@@ -5830,6 +5540,36 @@ mod exceptional_recovery_tests {
             let _ = selected_tx.send(());
             let _ = release_select_rx.recv();
         });
+        // Distinguish a blocked watcher inventory from a later FIFO retry.
+        // A timed-out blocking tick continues after its Tokio join is dropped.
+        let queue_phase = Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let watcher_returned = Arc::new(tokio::sync::Notify::new());
+        {
+            let phase = queue_phase.clone();
+            fixture.state.test_queue_after_startup_drain.set(move || {
+                phase.store(1, Ordering::Release);
+            });
+        }
+        {
+            let phase = queue_phase.clone();
+            fixture
+                .state
+                .test_queue_before_watcher_reconcile
+                .set(move || {
+                    phase.store(2, Ordering::Release);
+                });
+        }
+        {
+            let phase = queue_phase.clone();
+            let returned = watcher_returned.clone();
+            fixture
+                .state
+                .test_queue_after_watcher_reconcile
+                .set(move || {
+                    phase.store(3, Ordering::Release);
+                    returned.notify_one();
+                });
+        }
         fixture
             .state
             .pending_requests
@@ -5839,17 +5579,17 @@ mod exceptional_recovery_tests {
         fixture
             .state
             .retain_serving_session(fixture.old_owner.take().unwrap());
-        tokio::time::timeout(std::time::Duration::from_secs(5), selected_rx)
+        tokio::time::timeout(crate::testing::HANG_BACKSTOP, selected_rx)
             .await
             .expect("20-ms timer did not pause in protected SELECT")
             .unwrap();
         assert_eq!(std::fs::read(&queue_path).unwrap(), queue_bytes);
         assert_eq!(std::fs::read(&fixture.index_path).unwrap(), corrupt_index);
         release_select_tx.send(()).unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::time::timeout(crate::testing::HANG_BACKSTOP, async {
             loop {
                 if fixture.state.retained_serving_session().is_err()
-                    && fixture.state.native_stream.try_lock().is_ok()
+                    && fixture.state.step_lock.try_lock().is_ok()
                 {
                     break;
                 }
@@ -5872,21 +5612,19 @@ mod exceptional_recovery_tests {
                 .unwrap()
                 .contains(&fixture.q1.id)
         );
-        let db = rusqlite::Connection::open(&queue_path).unwrap();
+        // Use the protected queue read; closing a raw SQLite connection on a
+        // live queue inode would drop this process's unrelated SQLite locks.
         for (id, expected) in [(&fixture.q2.id, "running"), (&fixture.q1.id, "queued")] {
-            let (state, finished): (String, Option<String>) = db
-                .query_row(
-                    "SELECT state,finished_at FROM requests WHERE id=?1",
-                    [id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .unwrap();
-            assert_eq!(state, expected);
-            assert!(finished.is_none());
+            let row = fixture.store.request_by_id(id).unwrap().unwrap();
+            assert_eq!(row.state, expected);
+            assert!(row.finished_at.is_none());
         }
-        drop(db);
+        let q1_terminal = Arc::new(tokio::sync::Notify::new());
+        fixture
+            .store
+            .notify_on_terminal_request_for_tests(&fixture.q1.id, q1_terminal.clone());
         child.0.stdin.take().unwrap().write_all(b"x").unwrap();
-        let child_status = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let child_status = tokio::time::timeout(crate::testing::HANG_BACKSTOP, async {
             loop {
                 if let Some(status) = child.0.try_wait().unwrap() {
                     break status;
@@ -5900,35 +5638,97 @@ mod exceptional_recovery_tests {
             child_status.success(),
             "independent SH reader exited unsuccessfully"
         );
-        tokio::time::timeout(std::time::Duration::from_secs(5), drain)
+        tokio::time::timeout(crate::testing::HANG_BACKSTOP, drain)
             .await
             .expect("child output drain did not finish")
             .unwrap();
-        let timeout_result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            loop {
-                if fixture
+        // The serial timer admits one FIFO row per turn, then reconciles the
+        // post-takeover watcher inventory before it may claim the next row.
+        // Bound those two independent stages separately. Both notifications
+        // come from existing transition hooks, not selected-status SH polling.
+        let watcher_returned_in_time =
+            tokio::time::timeout(crate::testing::HANG_BACKSTOP, watcher_returned.notified())
+                .await
+                .is_ok();
+        let timeout_result = if watcher_returned_in_time {
+            Some(
+                tokio::time::timeout(crate::testing::HANG_BACKSTOP, async {
+                    // The accepted ID signals only after its durable terminal COMMIT.
+                    // Do not take repeated SH queue reads while the daemon needs EX.
+                    q1_terminal.notified().await;
+                    loop {
+                        match fixture.store.request_by_id(&fixture.q1.id) {
+                            Ok(Some(row)) => break row,
+                            Err(error) if error.is::<crate::store::topology::StorageBusy>() => {
+                                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                            }
+                            other => {
+                                panic!("accepted Q1 lookup failed after terminal signal: {other:?}")
+                            }
+                        }
+                    }
+                })
+                .await,
+            )
+        } else {
+            None
+        };
+        let observed = if let Some(Ok(row)) = timeout_result {
+            row
+        } else {
+            let last_seen = fixture
+                .store
+                .request_by_id(&fixture.q1.id)
+                .map(|row| row.map(|row| (row.state, row.error_code, row.finished_at.is_some())));
+            let at_deadline = (
+                fixture
+                    .state
+                    .test_queue_current_phase
+                    .load(Ordering::Acquire),
+                fixture.store.test_pending_completion_probe_for_tests(),
+                fixture.state.step_lock.try_lock().is_ok(),
+            );
+            // Failure-only probe: keep a missed watcher or Q1 deadline RED,
+            // then give the writer one quiet second without this test's SH poll.
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            let after_quiet = fixture
+                .store
+                .request_by_id(&fixture.q1.id)
+                .map(|row| row.map(|row| (row.state, row.finished_at.is_some(), row.revision)));
+            let q2 = fixture
+                .store
+                .request_by_id(&fixture.q2.id)
+                .map(|row| row.map(|row| (row.state, row.error_code, row.finished_at.is_some())));
+            let owner = fixture
+                .state
+                .retained_serving_session()
+                .map(|session| session.verify().is_ok());
+            let retry_ms = fixture
+                .state
+                .recovery_retry_after
+                .lock()
+                .unwrap()
+                .map(|at| at.saturating_duration_since(Instant::now()).as_millis());
+            let pending = fixture.state.pending_requests.lock().unwrap().clone();
+            let completion = fixture.store.test_pending_completion_probe_for_tests();
+            panic!(
+                "same accepted Q1 ID did not finish after watcher reconcile: watcher_returned_in_time={watcher_returned_in_time}, last_row={last_seen:?}, q2={q2:?}, pending_recovery={}, owner_valid={owner:?}, retry_ms={retry_ms:?}, pending_ids={pending:?}, at_deadline={at_deadline:?}, after_quiet={after_quiet:?}, queue_phase={} (0=pre-startup reconciliation, 1=after-startup reconciliation/Q, 2=watcher reconcile, 3=watcher returned), live_phase={} (1=stream, 2=drain, 3=after drain, 4=watcher reconcile, 5=after watcher), completion={completion:?}, tick_started={}, step_lock_free={}, index_revision={:?}",
+                fixture.store.is_recreate_pending(),
+                queue_phase.load(Ordering::Acquire),
+                fixture
+                    .state
+                    .test_queue_current_phase
+                    .load(Ordering::Acquire),
+                fixture.state.worker_started.load(Ordering::Acquire),
+                fixture.state.step_lock.try_lock().is_ok(),
+                fixture
                     .store
-                    .request_by_id(&fixture.q1.id)
-                    .unwrap()
-                    .unwrap()
-                    .finished_at
-                    .is_some()
-                {
-                    break;
-                }
-                // Let the daemon's nonblocking EX acquire the use lock; a
-                // tight SH SQLite poll can starve it under all-target load.
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
-        })
-        .await;
-        let observed = fixture
-            .store
-            .request_by_id(&fixture.q1.id)
-            .unwrap()
-            .unwrap();
+                    .status()
+                    .map(|status| status.revision.index_revision)
+            )
+        };
         assert!(
-            timeout_result.is_ok() && observed.finished_at.is_some(),
+            observed.finished_at.is_some(),
             "same accepted Q1 ID did not retry after external SH release: row={}/{:?}, pending_recovery={}",
             observed.state,
             observed.error_code,
@@ -5967,17 +5767,17 @@ mod exceptional_recovery_tests {
         fixture
             .state
             .retain_serving_session(fixture.old_owner.take().unwrap());
-        tokio::time::timeout(std::time::Duration::from_secs(5), selected_rx)
+        tokio::time::timeout(crate::testing::HANG_BACKSTOP, selected_rx)
             .await
             .expect("20-ms timer did not reach protected SELECT")
             .unwrap();
         // This is the genuine daemon timer spawn_blocking worker, paused while
         // its short-lived request connection and shared use guard are both open.
-        assert!(fixture.state.native_stream.try_lock().is_err());
+        assert!(fixture.state.step_lock.try_lock().is_err());
         assert_eq!(std::fs::read(&queue_path).unwrap(), queue_bytes);
         assert_eq!(std::fs::read(&fixture.index_path).unwrap(), corrupt_index);
         release_select_tx.send(()).unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(5), exclusive_rx)
+        tokio::time::timeout(crate::testing::HANG_BACKSTOP, exclusive_rx)
             .await
             .expect("timer recovery did not acquire fresh EX")
             .unwrap();
@@ -5986,7 +5786,7 @@ mod exceptional_recovery_tests {
             "old Arc must be dropped before EX"
         );
         assert!(
-            fixture.state.native_stream.try_lock().is_err(),
+            fixture.state.step_lock.try_lock().is_err(),
             "EX stays inside native stream"
         );
         assert_eq!(std::fs::read(&queue_path).unwrap(), queue_bytes);
@@ -6002,12 +5802,12 @@ mod exceptional_recovery_tests {
         // The production 20-ms timer awaits its first worker; this SECOND call
         // is deliberately injected on the SAME daemon to test the stream gate.
         let state = fixture.state.clone();
-        let injected = tokio::task::spawn_blocking(move || state.queue_tick());
-        tokio::time::timeout(std::time::Duration::from_secs(5), before_rx)
+        let injected = tokio::task::spawn_blocking(move || state.worker_step());
+        tokio::time::timeout(crate::testing::HANG_BACKSTOP, before_rx)
             .await
             .expect("injected same-daemon tick did not reach stream")
             .unwrap();
-        assert!(fixture.state.native_stream.try_lock().is_err());
+        assert!(fixture.state.step_lock.try_lock().is_err());
         assert!(
             matches!(
                 after_rx.try_recv(),
@@ -6017,39 +5817,53 @@ mod exceptional_recovery_tests {
         );
         assert_eq!(std::fs::read(&queue_path).unwrap(), queue_bytes);
         assert_eq!(std::fs::read(&fixture.index_path).unwrap(), corrupt_index);
+        let watcher_returned = Arc::new(tokio::sync::Notify::new());
+        {
+            let returned = watcher_returned.clone();
+            fixture
+                .state
+                .test_queue_after_watcher_reconcile
+                .set(move || {
+                    returned.notify_one();
+                });
+        }
         release_ex_tx.send(()).unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(10), after_rx)
+        // The first worker step keeps the step lock through its Q2 drain and
+        // full post-takeover watcher inventory. The injected tick is eligible
+        // for the stream only after that watcher returns.
+        tokio::time::timeout(crate::testing::HANG_BACKSTOP, watcher_returned.notified())
             .await
-            .expect("injected tick never passed stream after EX")
+            .expect("timer watcher did not reconcile after EX");
+        tokio::time::timeout(crate::testing::HANG_BACKSTOP, after_rx)
+            .await
+            .expect("injected tick never passed stream after watcher")
             .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(10), injected)
+        tokio::time::timeout(crate::testing::HANG_BACKSTOP, injected)
             .await
             .expect("injected same-daemon tick did not finish")
             .unwrap()
             .unwrap();
-        let timeout_result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let mut last_seen = None;
+        let timeout_result = tokio::time::timeout(crate::testing::HANG_BACKSTOP, async {
             loop {
-                if fixture
-                    .store
-                    .request_by_id(&fixture.q1.id)
-                    .unwrap()
-                    .unwrap()
-                    .finished_at
-                    .is_some()
-                {
-                    break;
+                match fixture.store.request_by_id(&fixture.q1.id) {
+                    Ok(Some(row)) if row.finished_at.is_some() => break row,
+                    Ok(Some(row)) => last_seen = Some((row.state, row.error_code)),
+                    Err(error) if error.is::<crate::store::topology::StorageBusy>() => {}
+                    other => panic!("accepted Q1 lookup failed during EX recovery: {other:?}"),
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
         })
         .await;
-        let observed = fixture
-            .store
-            .request_by_id(&fixture.q1.id)
-            .unwrap()
-            .unwrap();
+        let observed = timeout_result.unwrap_or_else(|_| {
+            panic!(
+                "same queued ID never finished after EX: last_row={last_seen:?}, pending_recovery={}",
+                fixture.store.is_recreate_pending()
+            )
+        });
         assert!(
-            timeout_result.is_ok() && observed.finished_at.is_some(),
+            observed.finished_at.is_some(),
             "same queued ID never finished after EX: row={}/{:?}, pending_recovery={}",
             observed.state,
             observed.error_code,
@@ -6059,9 +5873,19 @@ mod exceptional_recovery_tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "test-support")]
     async fn concurrent_posts_queue_two_requests_across_exceptional_recovery() {
         use tower::ServiceExt;
-        let (_tmp, store, state, roots, identity) = fixture();
+        let (_tmp, store, state, _roots, _identity) = fixture();
+        // The fixture has no worker thread (and so no maintenance): drive one
+        // FIFO head per explicit step.
+        let q0 = store.current_request().unwrap().unwrap();
+        assert_eq!(q0.state, "queued");
+        let expected_options = serde_json::to_string(&crate::indexer::ReconcileOptions::from(
+            &state.config().options,
+        ))
+        .unwrap();
+        assert_eq!(q0.options_json, expected_options);
         let app = router(state.clone());
         let mut ids = Vec::new();
         for _ in 0..2 {
@@ -6087,93 +5911,149 @@ mod exceptional_recovery_tests {
             ids.push(ack["id"].as_str().unwrap().to_owned());
         }
         assert_ne!(ids[0], ids[1]);
-        let first = store.request_by_id(&ids[0]).unwrap().unwrap();
-        let second = store.request_by_id(&ids[1]).unwrap().unwrap();
-        assert!(first.seq < second.seq);
         assert!(
             state.jobs.lock().unwrap().jobs.is_empty(),
             "legacy job map must not own queued work"
         );
-        let timeout_result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            loop {
-                if store
-                    .request_by_id(&ids[0])
-                    .unwrap()
-                    .unwrap()
-                    .finished_at
-                    .is_some()
-                    && store
-                        .request_by_id(&ids[1])
-                        .unwrap()
-                        .unwrap()
-                        .finished_at
-                        .is_some()
-                {
-                    break;
-                }
-                // Each request_by_id takes a SQLite read. A tight yield-only
-                // loop can starve the daemon's nonblocking EX recovery while
-                // verifier lanes are busy. Observe at its 20 ms tick cadence.
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
-        })
-        .await;
-        let first_snapshot = store.request_by_id(&ids[0]).unwrap().unwrap();
-        let second_snapshot = store.request_by_id(&ids[1]).unwrap().unwrap();
-        assert!(
-            timeout_result.is_ok()
-                && first_snapshot.finished_at.is_some()
-                && second_snapshot.finished_at.is_some(),
-            "durable FIFO requests did not finish: first={}/{:?}, second={}/{:?}, pending_recovery={}",
-            first_snapshot.state,
-            first_snapshot.error_code,
-            second_snapshot.state,
-            second_snapshot.error_code,
-            store.is_recreate_pending()
-        );
-        let first = store.request_by_id(&ids[0]).unwrap().unwrap();
-        let second = store.request_by_id(&ids[1]).unwrap().unwrap();
+        async fn tick_one(state: Arc<DaemonState>, phase: &'static str) {
+            let work = tokio::task::spawn_blocking(move || state.worker_step());
+            let result = tokio::time::timeout(crate::testing::HANG_BACKSTOP, work)
+                .await
+                .unwrap_or_else(|_| panic!("{phase}: worker_step did not finish (hang)"))
+                .unwrap_or_else(|error| panic!("{phase}: worker_step thread: {error}"));
+            result.unwrap_or_else(|error| panic!("{phase}: worker_step failed: {error:#}"));
+        }
+        let first_queued = store.request_by_id(&ids[0]).unwrap().unwrap();
+        let second_queued = store.request_by_id(&ids[1]).unwrap().unwrap();
+        assert!(q0.seq < first_queued.seq && first_queued.seq < second_queued.seq);
+        assert_eq!(first_queued.state, "queued");
+        assert_eq!(second_queued.state, "queued");
+        assert!(first_queued.started_at.is_none() && second_queued.started_at.is_none());
+        for row in [&first_queued, &second_queued] {
+            assert_eq!(row.options_json, expected_options);
+            assert!(row.revision.is_none() && row.finished_at.is_none());
+        }
+        tick_one(state.clone(), "H+Q0").await;
+        let q0_done = store.request_by_id(&q0.id).unwrap().unwrap();
+        let first_queued_after_startup = store.request_by_id(&ids[0]).unwrap().unwrap();
+        let second_queued_after_startup = store.request_by_id(&ids[1]).unwrap().unwrap();
         assert_eq!(
-            (first.state.as_str(), second.state.as_str()),
-            ("done", "done")
+            (q0_done.id.as_str(), q0_done.seq, q0_done.state.as_str()),
+            (q0.id.as_str(), q0.seq, "done")
+        );
+        let q0_pin = q0_done.revision.unwrap();
+        assert_eq!(
+            q0_pin.index_revision, 2,
+            "startup r1 must precede preexisting Q0 r2"
+        );
+        assert_eq!(
+            store.status().unwrap().revision,
+            q0_pin,
+            "no partial publication after startup reconciliation+Q0"
+        );
+        for (before, after) in [
+            (&first_queued, &first_queued_after_startup),
+            (&second_queued, &second_queued_after_startup),
+        ] {
+            assert_eq!(
+                (
+                    after.id.as_str(),
+                    after.seq,
+                    after.options_json.as_str(),
+                    after.state.as_str()
+                ),
+                (
+                    before.id.as_str(),
+                    before.seq,
+                    before.options_json.as_str(),
+                    "queued"
+                )
+            );
+            assert!(after.revision.is_none() && after.finished_at.is_none());
+        }
+        tick_one(state.clone(), "Q1").await;
+        let first = store.request_by_id(&ids[0]).unwrap().unwrap();
+        let second_still_queued = store.request_by_id(&ids[1]).unwrap().unwrap();
+        assert_eq!(
+            (
+                first.id.as_str(),
+                first.seq,
+                first.options_json.as_str(),
+                first.state.as_str()
+            ),
+            (
+                first_queued.id.as_str(),
+                first_queued.seq,
+                expected_options.as_str(),
+                "done"
+            )
         );
         let first_pin = first.revision.unwrap();
-        let second_pin = second.revision.unwrap();
+        assert_eq!(first_pin.index_generation, q0_pin.index_generation);
+        assert_eq!(first_pin.index_revision, q0_pin.index_revision + 1);
         assert_eq!(
-            first_pin.index_revision, 2,
-            "recovery reconciles at r1 before first FIFO claim publishes r2"
+            store.status().unwrap().revision,
+            first_pin,
+            "no partial Q2 publication"
         );
         assert_eq!(
-            second_pin.index_revision, 3,
-            "second request publishes in FIFO order"
+            (
+                second_still_queued.id.as_str(),
+                second_still_queued.seq,
+                second_still_queued.options_json.as_str(),
+                second_still_queued.state.as_str()
+            ),
+            (
+                second_queued.id.as_str(),
+                second_queued.seq,
+                expected_options.as_str(),
+                "queued"
+            )
         );
-        assert_eq!(
-            first_pin.index_generation, second_pin.index_generation,
-            "no second exceptional index replacement"
-        );
-        assert_eq!(store.status().unwrap().revision, second_pin);
-        let db = rusqlite::Connection::open(store.request_db_path()).unwrap();
-        let count: i64 = db
-            .query_row("SELECT count(*) FROM requests", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(count, 2);
-        let owner = state.retained_serving_session().unwrap();
-        store.verify_leader_session(&owner).unwrap();
         assert!(
-            roots.leader(&identity).is_err(),
-            "one held leader fences both terminal writes"
+            second_still_queued.revision.is_none() && second_still_queued.finished_at.is_none()
         );
+        tick_one(state.clone(), "Q2").await;
+        let second = store.request_by_id(&ids[1]).unwrap().unwrap();
+        assert_eq!(
+            (
+                second.id.as_str(),
+                second.seq,
+                second.options_json.as_str(),
+                second.state.as_str()
+            ),
+            (
+                second_queued.id.as_str(),
+                second_queued.seq,
+                expected_options.as_str(),
+                "done"
+            )
+        );
+        let second_pin = second.revision.unwrap();
+        assert_eq!(second_pin.index_generation, first_pin.index_generation);
+        assert_eq!(second_pin.index_revision, first_pin.index_revision + 1);
+        assert_eq!(store.status().unwrap().revision, second_pin);
+        assert!(store.earliest_unfinished_request().unwrap().is_none());
+        let newest = store.current_request().unwrap().unwrap();
+        assert_eq!(
+            (newest.id.as_str(), newest.seq),
+            (second.id.as_str(), second.seq)
+        );
+        let owner = state.retained_serving_session().unwrap();
+        store.verify_writer_session(&owner).unwrap();
+        store
+            .verify_writer_session(&state.retained_serving_session().unwrap())
+            .unwrap();
         assert!(state.jobs.lock().unwrap().jobs.is_empty());
     }
 
     #[tokio::test]
-    async fn multiple_posts_commit_fifo_while_other_process_holds_leader() {
+    async fn multiple_posts_commit_fifo_with_local_writer() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("workspace");
         std::fs::create_dir(&root).unwrap();
         std::fs::write(root.join("a.js"), "function a() {}\n").unwrap();
         let store = Store::open_for_tests(&tmp.path().join("state"), &root).unwrap();
-        let owner = store.leader_session().unwrap();
         let state = new(
             store.clone(),
             IndexOptions::new(root),
@@ -6199,8 +6079,7 @@ mod exceptional_recovery_tests {
         let b = store.request_by_id(&second.0.id).unwrap().unwrap();
         assert!(a.seq < b.seq);
         assert_eq!(store.current_request().unwrap().unwrap().id, b.id);
-        drop(owner);
-        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        tokio::time::timeout(crate::testing::HANG_BACKSTOP, async {
             loop {
                 if store
                     .request_by_id(&second.0.id)
@@ -6219,148 +6098,15 @@ mod exceptional_recovery_tests {
         assert_eq!(store.request_by_id(&a.id).unwrap().unwrap().state, "done");
         assert_eq!(store.request_by_id(&b.id).unwrap().unwrap().state, "done");
     }
-
-    #[tokio::test]
-    async fn leader_remains_locked_across_worker_result_and_atomic_install() {
-        let (_tmp, store, state, roots, identity) = fixture();
-        let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
-        let options = state.options.clone();
-        let id = uuid::Uuid::new_v4().to_string();
-        {
-            let mut jobs = state.jobs.lock().unwrap();
-            jobs.current = Some(id.clone());
-            jobs.cancel = cancel.clone();
-            jobs.jobs.insert(
-                id.clone(),
-                IndexJob {
-                    id: id.clone(),
-                    state: "running".into(),
-                    progress: IndexProgress::default(),
-                    revision: None,
-                    error: None,
-                    submitted_at: now(),
-                    started_at: Some(now()),
-                    finished_at: None,
-                },
-            );
-        }
-        let result =
-            crate::index_coordinator::reconcile_workspace(&store, &options, &cancel, |_| {})
-                .unwrap();
-        let pin = result.0;
-        let before = &state;
-        finish_exceptional_index_job(&state, &id, Ok(result), &cancel, |session| {
-            assert!(session.is_leader());
-            assert!(before.retained_serving_session().is_err());
-            assert!(
-                roots
-                    .leader(&identity)
-                    .unwrap_err()
-                    .to_string()
-                    .contains("storage_busy")
-            );
-            assert_eq!(store.status().unwrap().revision, pin);
-        });
-        assert_eq!(state.jobs.lock().unwrap().jobs[&id].state, "done");
-        assert_eq!(state.jobs.lock().unwrap().jobs[&id].revision, Some(pin));
-        assert!(state.retained_serving_session().unwrap().is_leader());
-        assert!(
-            roots
-                .leader(&identity)
-                .unwrap_err()
-                .to_string()
-                .contains("storage_busy")
-        );
-    }
-
-    #[tokio::test]
-    async fn cancellation_after_durable_recovery_reports_completed_with_new_owner() {
-        let (_tmp, store, state, roots, identity) = fixture();
-        let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
-        let id = uuid::Uuid::new_v4().to_string();
-        {
-            let mut jobs = state.jobs.lock().unwrap();
-            jobs.current = Some(id.clone());
-            jobs.cancel = cancel.clone();
-            jobs.jobs.insert(
-                id.clone(),
-                IndexJob {
-                    id: id.clone(),
-                    state: "running".into(),
-                    progress: IndexProgress::default(),
-                    revision: None,
-                    error: None,
-                    submitted_at: now(),
-                    started_at: Some(now()),
-                    finished_at: None,
-                },
-            );
-        }
-        let result =
-            crate::index_coordinator::reconcile_workspace(&store, &state.options, &cancel, |_| {})
-                .unwrap();
-        let pin = result.0;
-        cancel.store(true, Ordering::Release);
-        finish_exceptional_index_job(&state, &id, Ok(result), &cancel, |_| {});
-        let job = state.jobs.lock().unwrap().jobs[&id].clone();
-        assert_eq!(job.state, "done");
-        assert_eq!(job.revision, Some(pin));
-        assert!(state.retained_serving_session().unwrap().is_leader());
-        assert_eq!(store.status().unwrap().revision, pin);
-        assert!(
-            roots
-                .leader(&identity)
-                .unwrap_err()
-                .to_string()
-                .contains("storage_busy")
-        );
-    }
-
-    #[tokio::test]
-    async fn failed_worker_never_installs_owner_or_reports_completed() {
-        let (_tmp, store, state, roots, identity) = fixture();
-        let before = std::fs::read(roots.index_db(&identity)).unwrap();
-        let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
-        let id = uuid::Uuid::new_v4().to_string();
-        {
-            let mut jobs = state.jobs.lock().unwrap();
-            jobs.current = Some(id.clone());
-            jobs.jobs.insert(
-                id.clone(),
-                IndexJob {
-                    id: id.clone(),
-                    state: "running".into(),
-                    progress: IndexProgress::default(),
-                    revision: None,
-                    error: None,
-                    submitted_at: now(),
-                    started_at: Some(now()),
-                    finished_at: None,
-                },
-            );
-        }
-        // The Store's own fault tests cover actual post-rename failures. Here
-        // exercise the HTTP handoff for their error result: no false success.
-        finish_exceptional_index_job(
-            &state,
-            &id,
-            Err(anyhow::anyhow!("after rename fsync failed")),
-            &cancel,
-            |_| panic!("failed worker cannot cross install barrier"),
-        );
-        assert_eq!(state.jobs.lock().unwrap().jobs[&id].state, "failed");
-        assert!(state.jobs.lock().unwrap().jobs[&id].revision.is_none());
-        assert!(state.retained_serving_session().is_err());
-        assert!(store.evidence_response().is_err());
-        assert_eq!(std::fs::read(roots.index_db(&identity)).unwrap(), before);
-    }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-support"))]
 mod normal_post_capture_cancellation_tests {
     use super::*;
+    #[cfg(feature = "test-support")]
     use crate::store::topology::{TopologyRoots, WorkspaceIdentity};
     use rusqlite::{OpenFlags, types::Value as SqlValue};
+    #[cfg(feature = "test-support")]
     use std::{fs, time::Duration};
     use tower::ServiceExt;
 
@@ -6505,6 +6251,7 @@ mod normal_post_capture_cancellation_tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "test-support")]
     async fn accepted_job_cannot_be_cancelled_and_full_pair_changes_only_after_leader_drains() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("workspace");
@@ -6528,13 +6275,6 @@ mod normal_post_capture_cancellation_tests {
             |_| {},
         )
         .unwrap();
-        let before = pair_snapshot(&index);
-        fs::write(
-            root.join("one.js"),
-            "function seed() { fresh(); } function fresh() {}\n",
-        )
-        .unwrap();
-        fs::write(root.join("two.js"), "function extra() {}\n").unwrap();
         let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         let state = new(
             store.clone(),
@@ -6543,6 +6283,34 @@ mod normal_post_capture_cancellation_tests {
             "127.0.0.1:7331".parse().unwrap(),
         )
         .unwrap();
+        state.retain_serving_session(owner.clone());
+        tokio::time::timeout(crate::testing::HANG_BACKSTOP, async {
+            while state.checkout_watch_pending() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("initial watcher inventory did not quiesce");
+        let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let held_state = state.clone();
+        let holder = std::thread::spawn(move || {
+            held_state.hold_worker_step_for_tests(|| {
+                held_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+        });
+        tokio::time::timeout(crate::testing::HANG_BACKSTOP, held_rx)
+            .await
+            .expect("worker step was not held")
+            .unwrap();
+        let before = pair_snapshot(&index);
+        fs::write(
+            root.join("one.js"),
+            "function seed() { fresh(); } function fresh() {}\n",
+        )
+        .unwrap();
+        fs::write(root.join("two.js"), "function extra() {}\n").unwrap();
         let app = router(state.clone());
         let (code, accepted) = api(&app, token, "POST", "/api/index", Some(json!({}))).await;
         assert_eq!(code, StatusCode::ACCEPTED, "{accepted}");
@@ -6554,8 +6322,9 @@ mod normal_post_capture_cancellation_tests {
         assert_eq!(rejected["error"]["code"], "request_not_cancellable");
         assert_eq!(pair_snapshot(&index), before);
         assert_eq!(store.request_by_id(id).unwrap().unwrap().state, "queued");
-        drop(owner);
-        let completed = tokio::time::timeout(Duration::from_secs(15), async {
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        let completed = tokio::time::timeout(crate::testing::HANG_BACKSTOP, async {
             loop {
                 let (code, row) = api(&app, token, "GET", &format!("/api/jobs/{id}"), None).await;
                 assert_eq!(code, StatusCode::OK, "{row}");
@@ -6590,7 +6359,7 @@ mod normal_post_capture_cancellation_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-support"))]
 mod dependency_lifecycle_tests {
     use super::*;
     fn catalog(id: &str, revision: IndexPin) -> Catalog {
@@ -6604,22 +6373,8 @@ mod dependency_lifecycle_tests {
         }
     }
     #[tokio::test]
+    #[cfg(feature = "test-support")]
     async fn dependency_status_whole_response_fence() {
-        use std::io::{Seek, SeekFrom, Write};
-        fn find_lock(path: &std::path::Path) -> Option<std::path::PathBuf> {
-            for entry in std::fs::read_dir(path).ok()?.flatten() {
-                let path = entry.path();
-                if path.file_name().is_some_and(|name| name == "leader.lock") {
-                    return Some(path);
-                }
-                if path.is_dir()
-                    && let Some(found) = find_lock(&path)
-                {
-                    return Some(found);
-                }
-            }
-            None
-        }
         async fn call(app: &Router, path: &str) -> (StatusCode, Value) {
             use tower::ServiceExt;
             let request = axum::http::Request::builder()
@@ -6654,7 +6409,6 @@ mod dependency_lifecycle_tests {
             "127.0.0.1:7331".parse().unwrap(),
         )
         .unwrap();
-        let held_session = session.clone();
         state.retain_serving_session(session);
         {
             let mut deps = state.dependencies.lock().unwrap();
@@ -6666,34 +6420,6 @@ mod dependency_lifecycle_tests {
         assert_eq!(valid_status, StatusCode::OK);
         assert_eq!(valid["workspaceRevision"], json!(pin));
         assert_eq!(valid["catalogId"], "matching");
-        let lock = find_lock(&temp.path().join("state")).unwrap();
-        let matching_lock = lock.clone();
-        *state.dependency_capture_hook.lock().unwrap() = Some(Arc::new(move || {
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&matching_lock)
-                .unwrap();
-            file.seek(SeekFrom::Start(0)).unwrap();
-            file.write_all(uuid::Uuid::new_v4().to_string().as_bytes())
-                .unwrap();
-            file.sync_all().unwrap();
-        }));
-        let (refused_status, refused) = call(&app, "/api/dependencies").await;
-        assert_eq!(refused_status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(refused["error"]["code"], "index_not_ready");
-        assert!(refused.get("workspaceRevision").is_none());
-        assert!(refused.get("catalogId").is_none());
-        *state.dependency_capture_hook.lock().unwrap() = None;
-        // The timer may correctly discard its unverified holder while the
-        // intentional lock-incarnation tamper is present. Keep the fixture's
-        // independent flock handle to restore that precise incarnation.
-        let incarnation = held_session.leader_guard().unwrap().incarnation;
-        let mut file = std::fs::OpenOptions::new().write(true).open(&lock).unwrap();
-        file.seek(SeekFrom::Start(0)).unwrap();
-        file.write_all(incarnation.to_string().as_bytes()).unwrap();
-        file.sync_all().unwrap();
-        held_session.verify().unwrap();
-        state.retain_serving_session(held_session.clone());
         let mismatched = IndexPin {
             index_revision: pin.index_revision + 1,
             ..pin
@@ -6729,7 +6455,7 @@ mod dependency_lifecycle_tests {
                     &graph,
                     &capture,
                     &native,
-                    publishing_session.leader_guard().unwrap(),
+                    publishing_session.writer_guard().unwrap(),
                     pin,
                     &cancel,
                 )
@@ -6741,32 +6467,6 @@ mod dependency_lifecycle_tests {
         *state.outer_fence_hook.lock().unwrap() = None;
         let current = store.status().unwrap().revision;
         assert_eq!(current.index_revision, pin.index_revision + 1);
-        let hook_lock = lock.clone();
-        *state.outer_fence_hook.lock().unwrap() = Some(Arc::new(move || {
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&hook_lock)
-                .unwrap();
-            file.seek(SeekFrom::Start(0)).unwrap();
-            file.write_all(uuid::Uuid::new_v4().to_string().as_bytes())
-                .unwrap();
-            file.sync_all().unwrap();
-        }));
-        let (browse_status, browse) = call(&app, "/api/files").await;
-        assert_eq!(browse_status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(browse["error"]["code"], "index_not_ready");
-        assert!(browse.get("revision").is_none());
-        assert!(browse.get("files").is_none());
-        *state.outer_fence_hook.lock().unwrap() = None;
-        // The second intentional incarnation tamper may also be observed by
-        // the timer. Restore from the independently held, exact old owner.
-        let incarnation = held_session.leader_guard().unwrap().incarnation;
-        let mut file = std::fs::OpenOptions::new().write(true).open(&lock).unwrap();
-        file.seek(SeekFrom::Start(0)).unwrap();
-        file.write_all(incarnation.to_string().as_bytes()).unwrap();
-        file.sync_all().unwrap();
-        held_session.verify().unwrap();
-        state.retain_serving_session(held_session);
     }
     #[test]
     fn refresh_bursts_admit_one_worker_and_keep_only_latest_generation() {
@@ -6809,13 +6509,13 @@ mod dependency_lifecycle_tests {
             |_| {},
         )
         .unwrap();
-        let session = store.leader_session().unwrap();
+        let session = store.writer_session().unwrap();
         let pin0 = store
             .publish_native(
                 &graph,
                 &capture,
                 &native,
-                session.leader_guard().unwrap(),
+                session.writer_guard().unwrap(),
                 store.index_baseline().unwrap(),
                 &cancel,
             )
@@ -6853,7 +6553,7 @@ mod dependency_lifecycle_tests {
                 &updated,
                 &captured,
                 &native,
-                session.leader_guard().unwrap(),
+                session.writer_guard().unwrap(),
                 pin0,
                 &cancel,
             )
@@ -7127,7 +6827,7 @@ async fn provision_guard(
 }
 
 /// The provisioned listener has one selection boundary for core checkout routes.
-/// The direct single-checkout router stays available to standalone clients.
+/// The direct single-checkout router is a test-support fixture only.
 async fn provisioned_core(
     State(browser): State<Arc<ProvisionedBrowser>>,
     Path((root_key, suffix)): Path<(String, String)>,
@@ -7149,12 +6849,16 @@ async fn provisioned_core(
     let runtime = {
         let mut registry = browser.registry.lock().await;
         match registry.browser_request_at(&identity, Instant::now()) {
-            Ok(_) => registry.activate(&root_key).map_err(|_| {
-                ApiError(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "store_unavailable",
-                    "Storage is unavailable",
-                )
+            Ok(_) => registry.activate(&root_key).map_err(|error| {
+                if crate::store::transient_storage_contention(&error) {
+                    ApiError::from(error)
+                } else {
+                    ApiError(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "store_unavailable",
+                        "Storage is unavailable",
+                    )
+                }
             }),
             Err(SelectionError::CheckoutCapacity) => Err(ApiError(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -7251,6 +6955,9 @@ async fn selected_evidence_map<T: Send + 'static>(
     let runtime = runtime.clone();
     tokio::task::spawn_blocking(move || {
         let (response, catching_up) = runtime.evidence_response()?;
+        if let Some(hook) = &hook {
+            hook("before_work");
+        }
         let result = work(&response)?;
         if let Some(hook) = hook {
             hook("before_read_finish");
@@ -7278,6 +6985,9 @@ async fn selected_provider_read<T: Send + 'static>(
     let runtime = runtime.clone();
     tokio::task::spawn_blocking(move || {
         let (response, catching_up) = runtime.evidence_response().map_err(ApiError::from)?;
+        if let Some(hook) = &hook {
+            hook("before_work");
+        }
         let value = work(&response)?;
         if let Some(hook) = hook {
             hook("before_read_finish");
@@ -7312,6 +7022,7 @@ async fn selected_provider_preflight(
 ) -> Result<(Option<Arc<QuestionPacket>>, IndexPin, bool), ApiError> {
     let runtime = runtime.clone();
     tokio::task::spawn_blocking(move || {
+        runtime.require_mutation_ready().map_err(question_error)?;
         let (response, catching_up) = runtime.evidence_response().map_err(question_error)?;
         response.require_mutation_ready().map_err(question_error)?;
         let revision = response.status().map_err(question_error)?.revision;
@@ -7344,6 +7055,7 @@ async fn selected_provider_preflight(
         if let Some(hook) = hook {
             hook("before_mutation");
         }
+        runtime.require_mutation_ready().map_err(question_error)?;
         response.finish(()).map_err(question_error)?;
         Ok((packet, revision, catching_up))
     })
@@ -7360,16 +7072,24 @@ async fn selected_provider_preflight(
 async fn selected_provider_postflight(
     runtime: &Arc<crate::daemon::registry::CheckoutRuntime>,
     revision: IndexPin,
+    packet: Option<Arc<QuestionPacket>>,
 ) -> Result<(), ApiError> {
     let runtime = runtime.clone();
     tokio::task::spawn_blocking(move || {
+        runtime.require_mutation_ready()?;
         let (response, _) = runtime.evidence_response()?;
         response.require_mutation_ready()?;
         anyhow::ensure!(
             response.status()?.revision == revision,
             "revision conflict: provider basis changed"
         );
-        response.finish(())
+        // The external call holds no SQLite snapshot. Reattest its original
+        // packet on a fresh selected snapshot, even when the provider failed.
+        if let Some(packet) = packet {
+            response.validate_selected_view(&packet.context, &packet.source_files)?;
+        }
+        response.finish(())?;
+        runtime.require_mutation_ready()
     })
     .await
     .map_err(|_| {
@@ -7410,6 +7130,7 @@ async fn selected_mutation<T: IntoResponse + Send + 'static>(
 ) -> Result<(Response, bool), ApiError> {
     let runtime = runtime.clone();
     tokio::task::spawn_blocking(move || {
+        runtime.require_mutation_ready()?;
         let (response, catching_up) = runtime.evidence_response()?;
         response.require_mutation_ready()?;
         preflight(&response)?;
@@ -7417,6 +7138,7 @@ async fn selected_mutation<T: IntoResponse + Send + 'static>(
         if let Some(hook) = &hook {
             hook("before_mutation");
         }
+        runtime.require_mutation_ready()?;
         response.finish(())?;
         let result = work(&response);
         if let Some(hook) = hook {
@@ -7470,9 +7192,11 @@ async fn provisioned_core_answer(
                 return Err(invalid());
             }
             let state = runtime.browser_scheduler()?;
+            // One configuration version for the whole request (Decision 0009 §6).
+            let config = state.config();
             let (_, revision, catching_up) =
                 selected_provider_preflight(runtime, hook, None).await?;
-            if state.dependency_options.is_none() {
+            if config.dependency_options.is_none() {
                 return Err(ApiError(
                     StatusCode::CONFLICT,
                     "dependencies_disabled",
@@ -7488,9 +7212,18 @@ async fn provisioned_core_answer(
             }
             // Check once more immediately before scheduling work. Once scheduled,
             // a later root or head change cannot undo the requested refresh.
-            selected_provider_postflight(runtime, revision).await?;
-            state.start_dependency_index();
-            let mut response = match selected_provider_postflight(runtime, revision).await {
+            selected_provider_postflight(runtime, revision, None).await?;
+            runtime.require_mutation_ready()?;
+            // Scheduled only for the configuration version this request
+            // checked; a registration in between refuses it.
+            if !state.start_dependency_index_for(&config) {
+                return Err(ApiError(
+                    StatusCode::CONFLICT,
+                    "configuration_changed",
+                    "The checkout configuration changed; retry the refresh",
+                ));
+            }
+            let mut response = match selected_provider_postflight(runtime, revision, None).await {
                 Ok(()) => (StatusCode::ACCEPTED, Json(json!({"state":"loading"}))).into_response(),
                 Err(error) => selected_mutation_error(error, "committed"),
             };
@@ -7520,19 +7253,23 @@ async fn provisioned_core_answer(
                 }
             }
             let state = runtime.browser_scheduler()?;
+            // One configuration version for the whole request (Decision 0009 §6).
+            let config = state.config();
             let (packet, revision, catching_up) =
                 selected_provider_preflight(runtime, hook, Some(id.to_owned())).await?;
             let packet = packet.unwrap();
             if jev {
-                let provider = state.provider.clone().ok_or(ApiError(
+                let provider = config.provider.clone().ok_or(ApiError(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "jev_disabled",
                     "Live Jev is disabled",
                 ))?;
                 // No await before the final current-head check or the provider call.
-                selected_provider_postflight(runtime, revision).await?;
+                selected_provider_postflight(runtime, revision, Some(packet.clone())).await?;
                 let result = provider.run(&packet).await;
-                if let Err(error) = selected_provider_postflight(runtime, revision).await {
+                if let Err(error) =
+                    selected_provider_postflight(runtime, revision, Some(packet.clone())).await
+                {
                     return Ok((selected_mutation_error(error, "unknown"), catching_up));
                 }
                 let response = match result {
@@ -7567,14 +7304,16 @@ async fn provisioned_core_answer(
                     .insert("X-Trellis-Mutation-Outcome", outcome.parse().unwrap());
                 Ok((response, catching_up))
             } else {
-                let provider = state.acp.clone().ok_or(ApiError(
+                let provider = config.acp.clone().ok_or(ApiError(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "acp_disabled",
                     "Live ACP is disabled",
                 ))?;
-                selected_provider_postflight(runtime, revision).await?;
+                selected_provider_postflight(runtime, revision, Some(packet.clone())).await?;
                 let result = provider.run(&packet).await;
-                if let Err(error) = selected_provider_postflight(runtime, revision).await {
+                if let Err(error) =
+                    selected_provider_postflight(runtime, revision, Some(packet.clone())).await
+                {
                     return Ok((selected_mutation_error(error, "unknown"), catching_up));
                 }
                 let response = match result {
@@ -7603,15 +7342,17 @@ async fn provisioned_core_answer(
                 return Err(invalid());
             }
             let state = runtime.browser_scheduler()?;
+            // One configuration version for the whole request (Decision 0009 §6).
+            let config = state.config();
             let jev = suffix == "jev/status";
             let (value, catching_up) = selected_provider_read(runtime, hook, move |_| {
                 if jev {
-                    match &state.provider {
+                    match &config.provider {
                         Some(provider) => Ok(json!({"enabled":true,"budget":provider.budget().map_err(ApiError::from)?})),
                         None => Ok(json!({"enabled":false,"budget":null})),
                     }
                 } else {
-                    match &state.acp {
+                    match &config.acp {
                         Some(provider) => Ok(json!({"enabled":true,"status":provider.status().map_err(acp_error)?})),
                         None => Ok(json!({"enabled":false,"status":null})),
                     }
@@ -7716,8 +7457,10 @@ async fn provisioned_core_answer(
                 return Err(invalid());
             }
             let state = runtime.browser_scheduler()?;
+            // One configuration version for the whole request (Decision 0009 §6).
+            let config = state.config();
             let (payload, catching_up) = selected_provider_read(runtime, hook, move |_| {
-                Ok(json!({"roots":state.rust_sources.iter().map(|r| json!({"id":r.label,"label":r.label,
+                Ok(json!({"roots":config.rust_sources.iter().map(|r| json!({"id":r.label,"label":r.label,
                     "path":r.directory.root.to_string_lossy()})).collect::<Vec<_>>() }))
             }).await?;
             Ok((Json(payload).into_response(), catching_up))
@@ -7731,9 +7474,11 @@ async fn provisioned_core_answer(
                 return Err(browse_invalid());
             }
             let state = runtime.browser_scheduler()?;
+            // One configuration version for the whole request (Decision 0009 §6).
+            let config = state.config();
             let (page, catching_up) = selected_provider_read(runtime, hook, move |r| {
                 let revision = r.status().map_err(ApiError::from)?.revision;
-                let root = state
+                let root = config
                     .rust_sources
                     .iter()
                     .find(|root| root.label == q.root)
@@ -7764,8 +7509,10 @@ async fn provisioned_core_answer(
                 return Err(browse_invalid());
             }
             let state = runtime.browser_scheduler()?;
+            // One configuration version for the whole request (Decision 0009 §6).
+            let config = state.config();
             let (file, catching_up) = selected_provider_read(runtime, hook, move |_| {
-                let root = state
+                let root = config
                     .rust_sources
                     .iter()
                     .find(|root| root.label == q.root)
@@ -7808,18 +7555,20 @@ async fn provisioned_core_answer(
                 return Err(browse_invalid());
             }
             let state = runtime.browser_scheduler()?;
+            // One configuration version for the whole request (Decision 0009 §6).
+            let config = state.config();
             let (page, catching_up) = selected_evidence(runtime, hook, move |response| {
-                let (mut items, next_offset, truncated) = state
+                let (mut items, next_offset, truncated) = config
                     .browser
                     .list(&q.path, q.offset, q.limit)
                     .map_err(BrowseDirectoryError)?;
                 let (revision, indexed_workspace) =
-                    response.tree_metadata(&state.browser.root, &mut items)?;
+                    response.tree_metadata(&config.browser.root, &mut items)?;
                 for item in items
                     .iter_mut()
                     .filter(|item| item.kind == "file" && item.indexed_path.is_none())
                 {
-                    let absolute = state.browser.root.join(&item.path);
+                    let absolute = config.browser.root.join(&item.path);
                     let reason = if !absolute.starts_with(&indexed_workspace) {
                         "Outside indexed workspace"
                     } else {
@@ -7834,7 +7583,7 @@ async fn provisioned_core_answer(
                     item.unindexed_reason = Some(reason.into());
                 }
                 Ok(crate::file_tree::Page {
-                    root: state.browser.root.to_string_lossy().into_owned(),
+                    root: config.browser.root.to_string_lossy().into_owned(),
                     indexed_workspace,
                     path: q.path,
                     revision,
@@ -8229,5 +7978,249 @@ async fn provisioned_core_answer(
             Ok((response, runtime.catching_up()))
         }
         _ => Err(missing()),
+    }
+}
+
+#[cfg(all(test, feature = "test-support", unix))]
+mod selected_provider_postflight_tests {
+    use super::*;
+    use crate::{
+        daemon::registry::{CheckoutOptions, CheckoutRegistry},
+        store::topology::{TopologyRoots, WorkspaceIdentity},
+    };
+    use std::os::unix::fs::PermissionsExt;
+    use tower::ServiceExt;
+
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const SOURCE: &str = "function seed() { console.log('synthetic'); }";
+
+    async fn call(
+        app: &Router,
+        method: &str,
+        path: &str,
+        body: Value,
+    ) -> (StatusCode, axum::http::HeaderMap, Value) {
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header("host", "127.0.0.1:7331")
+                    .header("authorization", format!("Bearer {TOKEN}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes = to_bytes(response.into_body(), 2 * 1024 * 1024)
+            .await
+            .unwrap();
+        let body = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap()
+        };
+        (status, headers, body)
+    }
+
+    async fn selected_provider_case(kind: &'static str, outcome: &'static str, corrupt: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::write(workspace.join("a.js"), SOURCE).unwrap();
+        let identity = WorkspaceIdentity::discover(Some(&workspace), &workspace).unwrap();
+        let roots =
+            TopologyRoots::isolated_for_tests(dir.path().join("cache"), dir.path().join("data"));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut mock_server = None;
+        let registration = if kind == "jev" {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}/", listener.local_addr().unwrap());
+            let entered_mock = entered.clone();
+            let release_mock = release.clone();
+            let mock = Router::new().route("/", post(move |Json(request): Json<Value>| {
+                let entered = entered_mock.clone();
+                let release = release_mock.clone();
+                async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    if outcome == "failure" {
+                        return (StatusCode::BAD_REQUEST, Json(json!({"detail":{"error_type":"max_tokens_exceeded"}}))).into_response();
+                    }
+                    let answers: serde_json::Map<String, Value> = request["questions"].as_object().unwrap()
+                        .keys().map(|key| (key.clone(), json!({"type":"choice","choice":"essential","confidence":0.6,
+                            "probabilities":{"essential":0.7,"supporting":0.2,"incidental":0.1,"uncertain":0.0}}))).collect();
+                    Json(json!({"model":"jev-1.13.0","answers":answers,
+                        "usage":{"input_tokens":1,"output_tokens":1}})).into_response()
+                }
+            }));
+            mock_server = Some(tokio::spawn(async move {
+                axum::serve(listener, mock).await.unwrap();
+            }));
+            let mut registry = CheckoutRegistry::with_roots(roots);
+            registry.set_jev_endpoint_for_tests(endpoint);
+            let options = json!({"jevBudgetDir":dir.path().join("budget"),"jevBudgetCents":10,"jevKey":"synthetic"});
+            registry
+                .register(&identity, CheckoutOptions(options))
+                .unwrap();
+            registry
+        } else {
+            let runner = dir.path().join("runner");
+            std::fs::write(&runner, format!(
+                "#!/bin/sh\ncat >/dev/null\n: > '{}'\nsteps=0\nwhile [ ! -e '{}' ] && [ \"$steps\" -lt 600 ]; do sleep 0.02; steps=$((steps+1)); done\n[ -e '{}' ] || exit 2\ncat '{}'\n",
+                dir.path().join("entered").display(), dir.path().join("release").display(),
+                dir.path().join("release").display(), dir.path().join("response.json").display(),
+            )).unwrap();
+            std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let mut registry = CheckoutRegistry::with_roots(roots);
+            let options = json!({"acpRunner":runner,"acpStateDir":dir.path().join("acp-state"),"acpMaxAttempts":1});
+            registry
+                .register(&identity, CheckoutOptions(options))
+                .unwrap();
+            registry
+        };
+        let registry = Arc::new(tokio::sync::Mutex::new(registration));
+        let app = ProvisionedBrowser::new(
+            registry.clone(),
+            TOKEN.to_owned(),
+            "127.0.0.1:7331".parse().unwrap(),
+        )
+        .unwrap()
+        .router();
+        let prefix = format!("/api/checkouts/{}", identity.root_key);
+        let status = tokio::time::timeout(crate::testing::HANG_BACKSTOP, async {
+            loop {
+                let (code, _, status) =
+                    call(&app, "GET", &format!("{prefix}/status"), Value::Null).await;
+                if code == StatusCode::OK && status["catchingUp"] == false {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let (code, _, symbols) = call(
+            &app,
+            "GET",
+            &format!("{prefix}/symbols?q=seed"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{kind}: {symbols}");
+        let seed = symbols["items"][0]["id"].as_str().unwrap();
+        let (code, _, preview) = call(
+            &app,
+            "POST",
+            &format!("{prefix}/questions/preview"),
+            json!({"seed":seed,"question":"What is logged?","expectedRevision":status["revision"]}),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{kind}: {preview}");
+        let packet = preview["packet"]["packetId"].as_str().unwrap();
+        let pin: IndexPin = serde_json::from_value(status["revision"].clone()).unwrap();
+        if kind == "acp" {
+            let response = if outcome == "success" {
+                json!({"answer":{"packetId":packet,"summary":[{"text":"Logs synthetic.","citations":[{"path":"a.js","startLine":1,"endLine":1,"quote":SOURCE}]}],"branches":[],"limitations":[]},"estimatedUsd":0.01}).to_string()
+            } else {
+                "invalid provider result".to_owned()
+            };
+            std::fs::write(dir.path().join("response.json"), response).unwrap();
+        }
+        let action = if kind == "jev" {
+            "jev-run"
+        } else {
+            "acp-answer"
+        };
+        let task_app = app.clone();
+        let route = format!("{prefix}/questions/{packet}/{action}");
+        let request = tokio::spawn(async move { call(&task_app, "POST", &route, json!({})).await });
+        if kind == "jev" {
+            tokio::time::timeout(crate::testing::HANG_BACKSTOP, entered.notified())
+                .await
+                .unwrap();
+        } else {
+            let marker = dir.path().join("entered");
+            tokio::time::timeout(crate::testing::HANG_BACKSTOP, async {
+                while !marker.exists() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        if corrupt {
+            let runtime = registry.lock().await.runtime(&identity.root_key).unwrap();
+            let state = runtime.browser_scheduler().unwrap();
+            state
+                .store
+                .corrupt_selected_source_for_tests(pin, "a.js")
+                .unwrap();
+            assert_eq!(
+                std::fs::read_to_string(workspace.join("a.js")).unwrap(),
+                SOURCE,
+                "workspace bytes remain untouched and no new startup reconciliation is required"
+            );
+        }
+        if kind == "jev" {
+            release.notify_one();
+        } else {
+            std::fs::write(dir.path().join("release"), b"go\n").unwrap();
+        }
+        let (code, headers, body) = tokio::time::timeout(crate::testing::HANG_BACKSTOP, request)
+            .await
+            .unwrap()
+            .unwrap();
+        if corrupt {
+            assert_eq!(
+                code,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{kind} {outcome}: {body}"
+            );
+            assert_eq!(
+                body["error"]["code"], "incompatible_index",
+                "{kind} {outcome}: {body}"
+            );
+            assert_eq!(
+                headers["X-Trellis-Mutation-Outcome"], "unknown",
+                "{kind} {outcome}"
+            );
+            assert!(
+                body.get("answer").is_none(),
+                "no stale selected answer may escape"
+            );
+        } else {
+            assert_eq!(
+                code,
+                StatusCode::OK,
+                "{kind} clean provider control: {body}"
+            );
+            assert_eq!(headers["X-Trellis-Mutation-Outcome"], "committed");
+            if kind == "jev" {
+                assert_eq!(body["view"]["selectionSource"], "liveJev", "{body}");
+            } else {
+                assert_eq!(body["answer"]["packetId"], packet, "{body}");
+            }
+        }
+        if let Some(server) = mock_server {
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn selected_jev_and_acp_postflight_reattest_stored_packet_on_success_and_failure() {
+        for kind in ["jev", "acp"] {
+            // A real successful provider result is the positive control for
+            // both post-await branches before testing the same-pin corruption.
+            selected_provider_case(kind, "success", false).await;
+            for outcome in ["success", "failure"] {
+                selected_provider_case(kind, outcome, true).await;
+            }
+        }
     }
 }

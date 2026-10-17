@@ -315,7 +315,7 @@ fn candidate_terminal_id_cannot_be_used_as_workspace_sequence_root() {
     }
     let store = crate::common::open_store(state.path(), workspace.path()).unwrap();
     let cancel = Arc::new(AtomicBool::new(false));
-    let (bundle_graph, native, capture) = index_workspace_bundle(
+    let (bundle_graph, _, _) = index_workspace_bundle(
         &IndexOptions::new(workspace.path().to_owned()),
         store.root_id(),
         &cancel,
@@ -326,17 +326,14 @@ fn candidate_terminal_id_cannot_be_used_as_workspace_sequence_root() {
     assert_eq!(bundle_graph.calls.len(), graph.calls.len());
     assert_eq!(bundle_graph.calls[0].range, graph.calls[0].range);
     assert!(!bundle_graph.nodes.iter().any(|node| node.id == id));
-    let session = store.leader_session().unwrap();
-    let revision = store
-        .publish_native(
-            &bundle_graph,
-            &capture,
-            &native,
-            session.leader_guard().unwrap(),
-            store.index_baseline().unwrap(),
-            &cancel,
-        )
-        .unwrap();
+    let (revision, _session) = trellis::index_coordinator::reconcile_workspace(
+        &store,
+        &IndexOptions::new(workspace.path().to_owned()),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    assert_eq!(store.graph().unwrap(), bundle_graph);
     assert!(store.sequence_at(id, revision, false).unwrap().is_none());
     assert!(store.symbol(id).unwrap().is_none());
     assert_eq!(store.graph().unwrap().calls, bundle_graph.calls);

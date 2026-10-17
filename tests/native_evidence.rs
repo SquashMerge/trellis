@@ -639,7 +639,7 @@ fn every_native_kind_rejects_well_shaped_forgery_against_immutable_capture() {
             "revision id",
             Box::new({
                 let h = bad_hash.clone();
-                move |a| a.revision.id = format!("revision:v1:{h}")
+                move |a| a.revision.id = format!("revision:v2:{h}")
             }),
         ),
         (

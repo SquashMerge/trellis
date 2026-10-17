@@ -1,3 +1,4 @@
+#![cfg(feature = "test-support")]
 mod common;
 use axum::{
     Router,
@@ -17,7 +18,7 @@ fn setup() -> (
     tempfile::TempDir,
     Store,
     Router,
-    Arc<trellis::store::topology::LeaderSession>,
+    Arc<trellis::store::topology::WriterSession>,
 ) {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("cwd");
@@ -31,13 +32,13 @@ fn setup() -> (
     let cancel = Arc::new(AtomicBool::new(false));
     let (graph, native, capture) =
         index_workspace_bundle(&opts, store.root_id(), &cancel, |_| {}).unwrap();
-    let session = store.leader_session().unwrap();
+    let session = store.writer_session_for_tests().unwrap();
     store
         .publish_native(
             &graph,
             &capture,
             &native,
-            session.leader_guard().unwrap(),
+            session.writer_guard().unwrap(),
             store.index_baseline().unwrap(),
             &cancel,
         )

@@ -203,10 +203,13 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
     const lanes = {
       setup: [["node", "tools/verify-env.mjs"]],
       rust: [
-        ["cargo", "nextest", "--version"],
         ["cargo", "fmt", "--all", "--", "--check"],
         ["cargo", "clippy", "--locked", "--all-targets", "--", "-D", "warnings"],
-        ["cargo", "nextest", "run", "--locked", "--all-targets", "--no-fail-fast"],
+      ],
+      tests: [
+        ["cargo", "nextest", "--version"],
+        ["cargo", "clippy", "--locked", "--all-targets", "--features", "test-support", "--", "-D", "warnings"],
+        ["cargo", "nextest", "run", "--locked", "--all-targets", "--no-fail-fast", "--features", "test-support"],
       ],
       semantic: [["node", "tools/semantic-contract/test/run.mjs"]],
       cohorts: [["node", "--test", "tools/synthetic-cohorts/test/cohorts.test.mjs"]],
@@ -238,8 +241,8 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
     rmSync(log);
     const failure = runVerify({ FAKE_VERIFY_FAIL_CLIPPY: "1" });
     assert.equal(failure.result.status, 23);
-    assertRan(failure.commands, { ...lanes, rust: lanes.rust.slice(0, 3) });
-    assert.match(failure.result.stderr, /failed lane\(s\): rust$/m);
+    assertRan(failure.commands, { ...lanes, rust: lanes.rust.slice(0, 2), tests: lanes.tests.slice(0, 2) });
+    assert.match(failure.result.stderr, /failed lane\(s\): rust tests$/m);
     assert.match(failure.result.stdout, /^==> verify lane rust \(exit 23\)$/m);
     rmSync(log);
     const semanticFailure = runVerify({ FAKE_VERIFY_FAIL_SEMANTIC: "1" });
@@ -249,12 +252,13 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
     rmSync(log);
     const bothFailure = runVerify({ FAKE_VERIFY_FAIL_CLIPPY: "1", FAKE_VERIFY_FAIL_SEMANTIC: "1" });
     assert.equal(bothFailure.result.status, 23);
-    assertRan(bothFailure.commands, { ...lanes, rust: lanes.rust.slice(0, 3) });
-    assert.match(bothFailure.result.stderr, /failed lane\(s\): rust semantic$/m);
+    assertRan(bothFailure.commands, { ...lanes, rust: lanes.rust.slice(0, 2), tests: lanes.tests.slice(0, 2) });
+    assert.match(bothFailure.result.stderr, /failed lane\(s\): rust tests semantic$/m);
     rmSync(log);
     const noNextest = runVerify({ FAKE_VERIFY_NO_NEXTEST: "1" });
     assert.equal(noNextest.result.status, 127);
-    assertRan(noNextest.commands, { ...lanes, rust: lanes.rust.slice(0, 1) });
+    assertRan(noNextest.commands, { ...lanes, tests: lanes.tests.slice(0, 1) });
+    assert.match(noNextest.result.stderr, /failed lane\(s\): tests$/m);
     assert.match(noNextest.result.stdout, /cargo-nextest is required/);
   } finally {
     rmSync(fakeDir, { recursive: true, force: true });

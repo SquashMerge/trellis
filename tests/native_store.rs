@@ -1,16 +1,19 @@
+#[cfg(feature = "test-support")]
 use rusqlite::Connection;
 use std::{
     fs,
     sync::{Arc, atomic::AtomicBool},
 };
+#[cfg(feature = "test-support")]
 use trellis::{
     indexer::{IndexOptions, index_workspace_bundle},
-    model::{CancelFlag, IndexPin},
-    store::Store,
+    model::IndexPin,
 };
+use trellis::{model::CancelFlag, store::Store};
 
 // Pin every SQL tamper to the admitted revision. Historical versions and
 // projections can retain the same source path or measured symbol ID.
+#[cfg(feature = "test-support")]
 fn live_revision(db: &Connection) -> String {
     db.query_row(
         "SELECT r.id FROM native_revisions r JOIN index_metadata m ON m.index_revision=r.published_index_revision",
@@ -18,6 +21,7 @@ fn live_revision(db: &Connection) -> String {
         |row| row.get(0),
     ).unwrap()
 }
+#[cfg(feature = "test-support")]
 fn live_document_version(db: &Connection, path: &str) -> String {
     db.query_row(
         "SELECT d.document_version_id FROM revision_documents d WHERE d.revision_id=?1 AND d.path=?2",
@@ -25,6 +29,7 @@ fn live_document_version(db: &Connection, path: &str) -> String {
         |row| row.get(0),
     ).unwrap()
 }
+#[cfg(feature = "test-support")]
 fn live_graph_projection(db: &Connection, path: &str) -> String {
     db.query_row(
         "SELECT d.graph_projection_id FROM revision_documents d WHERE d.revision_id=?1 AND d.path=?2",
@@ -32,6 +37,7 @@ fn live_graph_projection(db: &Connection, path: &str) -> String {
         |row| row.get(0),
     ).unwrap()
 }
+#[cfg(feature = "test-support")]
 fn live_class_projection(db: &Connection, path: &str) -> String {
     db.query_row(
         "SELECT d.class_projection_id FROM revision_documents d WHERE d.revision_id=?1 AND d.path=?2",
@@ -42,6 +48,7 @@ fn live_class_projection(db: &Connection, path: &str) -> String {
 // Simulate a prior current-v8 cache whose additive maintenance extension has
 // not yet been installed. The first new publication must preserve this inode,
 // generation, selected pin, and durable request queue.
+#[cfg(feature = "test-support")]
 fn remove_maintenance_extension_for_v8_test(path: &std::path::Path) {
     let db = Connection::open(path).unwrap();
     db.execute_batch(
@@ -92,12 +99,13 @@ fn fixture() -> (tempfile::TempDir, tempfile::TempDir, Store, CancelFlag) {
     let store = Store::open_for_tests(state.path(), root.path()).unwrap();
     (state, root, store, Arc::new(AtomicBool::new(false)))
 }
+#[cfg(feature = "test-support")]
 fn publish(
     store: &Store,
     root: &std::path::Path,
     cancel: &CancelFlag,
     expected: IndexPin,
-    leader: &trellis::store::topology::LeaderGuard,
+    leader: &trellis::store::topology::WriterGuard,
 ) -> anyhow::Result<IndexPin> {
     let (graph, native, capture) = index_workspace_bundle(
         &IndexOptions::new(root.to_owned()),
@@ -118,6 +126,7 @@ fn publish(
     assert_eq!(capture.graph_projection_count(), 1);
     Ok(revision)
 }
+#[cfg(feature = "test-support")]
 fn assert_current_corruption(error: anyhow::Error) {
     assert_eq!(
         error.to_string(),
@@ -125,6 +134,7 @@ fn assert_current_corruption(error: anyhow::Error) {
     );
 }
 #[test]
+#[cfg(feature = "test-support")]
 fn four_languages_normalized_rows_and_pinned_bytes_are_coherent() {
     let (state, root, store, cancel) = fixture();
     assert!(
@@ -135,7 +145,7 @@ fn four_languages_normalized_rows_and_pinned_bytes_are_coherent() {
             .contains("index_not_ready")
     );
     let baseline = store.index_baseline().unwrap();
-    let leader = store.leader().unwrap();
+    let leader = store.publication_for_tests().unwrap();
     let pin = publish(&store, root.path(), &cancel, baseline, &leader).unwrap();
     // A current v8 empty bootstrap is the same generation; only a rebuild rotates it.
     assert_eq!(baseline.index_generation, pin.index_generation);
@@ -286,10 +296,11 @@ fn four_languages_normalized_rows_and_pinned_bytes_are_coherent() {
 }
 
 #[test]
+#[cfg(feature = "test-support")]
 fn invalid_native_and_conflict_never_change_published_pair() {
     let (state, root, store, cancel) = fixture();
     let baseline = store.index_baseline().unwrap();
-    let leader = store.leader().unwrap();
+    let leader = store.publication_for_tests().unwrap();
     let pin = publish(&store, root.path(), &cancel, baseline, &leader).unwrap();
     let path = state
         .path()
@@ -357,13 +368,14 @@ fn invalid_native_and_conflict_never_change_published_pair() {
 }
 
 #[test]
+#[cfg(feature = "test-support")]
 fn empty_workspace_has_native_pair_without_document_rows() {
     let state = tempfile::tempdir().unwrap();
     let root = tempfile::tempdir().unwrap();
     let store = Store::open_for_tests(state.path(), root.path()).unwrap();
     let cancel = Arc::new(AtomicBool::new(false));
     let original = store.index_baseline().unwrap();
-    let leader = store.leader().unwrap();
+    let leader = store.publication_for_tests().unwrap();
     let pin = publish(&store, root.path(), &cancel, original, &leader).unwrap();
     assert_eq!(store.status().unwrap().revision, pin);
     let db = Connection::open(
@@ -406,9 +418,10 @@ fn empty_workspace_has_native_pair_without_document_rows() {
 }
 
 #[test]
+#[cfg(feature = "test-support")]
 fn metadata_status_and_selected_source_reads_do_not_conflate_other_documents() {
     let (state, root, store, cancel) = fixture();
-    let leader = store.leader().unwrap();
+    let leader = store.publication_for_tests().unwrap();
     let pin = publish(
         &store,
         root.path(),
@@ -507,6 +520,7 @@ fn metadata_status_and_selected_source_reads_do_not_conflate_other_documents() {
 }
 
 #[test]
+#[cfg(feature = "test-support")]
 fn status_many_documents_only_checks_paired_metadata_not_every_blob() {
     let state = tempfile::tempdir().unwrap();
     let root = tempfile::tempdir().unwrap();
@@ -522,7 +536,7 @@ fn status_many_documents_only_checks_paired_metadata_not_every_blob() {
     }
     let store = Store::open_for_tests(state.path(), root.path()).unwrap();
     let cancel = Arc::new(AtomicBool::new(false));
-    let leader = store.leader().unwrap();
+    let leader = store.publication_for_tests().unwrap();
     let pin = publish(
         &store,
         root.path(),
@@ -567,10 +581,11 @@ fn status_many_documents_only_checks_paired_metadata_not_every_blob() {
 }
 
 #[test]
+#[cfg(feature = "test-support")]
 fn index_from_another_native_producer_version_is_rebuilt_not_served() {
     for old_version in ["native-v2", "native-v3"] {
         let (state, root, store, cancel) = fixture();
-        let leader = store.leader().unwrap();
+        let leader = store.publication_for_tests().unwrap();
         let first = publish(
             &store,
             root.path(),
@@ -618,7 +633,7 @@ fn index_from_another_native_producer_version_is_rebuilt_not_served() {
         drop(db);
         let store = Store::open_for_tests(state.path(), root.path()).unwrap();
         assert_eq!(store.index_baseline().unwrap(), first);
-        let leader = store.leader().unwrap();
+        let leader = store.publication_for_tests().unwrap();
         for error in [
             store.status().map(|_| ()).unwrap_err(),
             store.graph().map(|_| ()).unwrap_err(),
@@ -663,6 +678,7 @@ fn index_from_another_native_producer_version_is_rebuilt_not_served() {
         );
     }
 }
+#[cfg(feature = "test-support")]
 fn published_db(state: &std::path::Path, root: &std::path::Path) -> std::path::PathBuf {
     state
         .join("cache/indexes")
@@ -675,9 +691,10 @@ fn published_db(state: &std::path::Path, root: &std::path::Path) -> std::path::P
 }
 
 #[test]
+#[cfg(feature = "test-support")]
 fn selected_typed_rows_reject_constraint_preserving_sql_forgery_at_same_pin() {
     let (state, root, store, cancel) = fixture();
-    let leader = store.leader().unwrap();
+    let leader = store.publication_for_tests().unwrap();
     let pin = publish(
         &store,
         root.path(),
@@ -819,10 +836,11 @@ fn selected_typed_rows_reject_constraint_preserving_sql_forgery_at_same_pin() {
 }
 
 #[test]
+#[cfg(feature = "test-support")]
 fn selected_sources_bind_paired_hash_bytes_and_graph_path_without_pin_change() {
     use sha2::{Digest, Sha256};
     let (state, root, store, cancel) = fixture();
-    let leader = store.leader().unwrap();
+    let leader = store.publication_for_tests().unwrap();
     let pin = publish(
         &store,
         root.path(),
@@ -907,9 +925,10 @@ fn selected_sources_bind_paired_hash_bytes_and_graph_path_without_pin_change() {
 }
 
 #[test]
+#[cfg(feature = "test-support")]
 fn direct_native_ranges_regions_and_coverage_reject_selected_sql_edits() {
     let (state, root, store, cancel) = fixture();
-    let leader = store.leader().unwrap();
+    let leader = store.publication_for_tests().unwrap();
     let pin = publish(
         &store,
         root.path(),
@@ -1027,9 +1046,10 @@ fn direct_native_ranges_regions_and_coverage_reject_selected_sql_edits() {
 }
 
 #[test]
+#[cfg(feature = "test-support")]
 fn pinned_graph_call_payload_must_match_native_before_query_and_sequence() {
     let (state, root, store, cancel) = fixture();
-    let leader = store.leader().unwrap();
+    let leader = store.publication_for_tests().unwrap();
     let pin = publish(
         &store,
         root.path(),
@@ -1123,9 +1143,10 @@ fn pinned_graph_call_payload_must_match_native_before_query_and_sequence() {
 }
 
 #[test]
+#[cfg(feature = "test-support")]
 fn extra_fk_valid_native_declaration_with_new_lookup_key_cannot_escape_source_witness() {
     let (state, root, store, cancel) = fixture();
-    let leader = store.leader().unwrap();
+    let leader = store.publication_for_tests().unwrap();
     let pin = publish(
         &store,
         root.path(),
@@ -1180,9 +1201,10 @@ fn extra_fk_valid_native_declaration_with_new_lookup_key_cannot_escape_source_wi
 }
 
 #[test]
+#[cfg(feature = "test-support")]
 fn amplified_selected_ancillary_rows_refuse_before_typed_materialization() {
     let (state, root, store, cancel) = fixture();
-    let leader = store.leader().unwrap();
+    let leader = store.publication_for_tests().unwrap();
     let pin = publish(
         &store,
         root.path(),
@@ -1231,9 +1253,10 @@ fn amplified_selected_ancillary_rows_refuse_before_typed_materialization() {
 }
 
 #[test]
+#[cfg(feature = "test-support")]
 fn single_oversized_fk_valid_native_child_text_refuses_before_materialization() {
     let (state, root, store, cancel) = fixture();
-    let leader = store.leader().unwrap();
+    let leader = store.publication_for_tests().unwrap();
     let pin = publish(
         &store,
         root.path(),
@@ -1277,9 +1300,10 @@ fn single_oversized_fk_valid_native_child_text_refuses_before_materialization() 
 }
 
 #[test]
+#[cfg(feature = "test-support")]
 fn selected_class_payload_oversize_refuses_before_json_decode() {
     let (state, root, store, cancel) = fixture();
-    let leader = store.leader().unwrap();
+    let leader = store.publication_for_tests().unwrap();
     let pin = publish(
         &store,
         root.path(),
@@ -1325,9 +1349,10 @@ fn selected_class_payload_oversize_refuses_before_json_decode() {
 }
 
 #[test]
+#[cfg(feature = "test-support")]
 fn selected_native_text_total_budget_is_not_count_times_single_row_limit() {
     let (state, root, store, cancel) = fixture();
-    let leader = store.leader().unwrap();
+    let leader = store.publication_for_tests().unwrap();
     let pin = publish(
         &store,
         root.path(),
@@ -1380,9 +1405,10 @@ fn selected_native_text_total_budget_is_not_count_times_single_row_limit() {
 }
 
 #[test]
+#[cfg(feature = "test-support")]
 fn graph_node_call_and_region_payloads_each_have_predecode_byte_envelope() {
     let (state, root, store, cancel) = fixture();
-    let leader = store.leader().unwrap();
+    let leader = store.publication_for_tests().unwrap();
     let pin = publish(
         &store,
         root.path(),
@@ -1430,9 +1456,10 @@ fn graph_node_call_and_region_payloads_each_have_predecode_byte_envelope() {
 }
 
 #[test]
+#[cfg(feature = "test-support")]
 fn selected_graph_rows_share_a_source_scoped_aggregate_byte_envelope() {
     let (state, root, store, cancel) = fixture();
-    let leader = store.leader().unwrap();
+    let leader = store.publication_for_tests().unwrap();
     let pin = publish(
         &store,
         root.path(),
@@ -1475,6 +1502,7 @@ fn selected_graph_rows_share_a_source_scoped_aggregate_byte_envelope() {
     assert_current_corruption(closed);
 }
 
+#[cfg(feature = "test-support")]
 fn assert_retained_native_family_parity(
     store: &Store,
     pin: IndexPin,
@@ -1558,6 +1586,7 @@ fn assert_retained_native_family_parity(
 }
 
 #[test]
+#[cfg(feature = "test-support")]
 fn retained_full_rewrite_pins_survive_edits_delete_release_and_reference_safe_gc() {
     use trellis::native_evidence::DocumentKey;
     let (state, root, store, cancel) = fixture();
@@ -1570,7 +1599,7 @@ fn retained_full_rewrite_pins_survive_edits_delete_release_and_reference_safe_gc
         |_| {},
     )
     .unwrap();
-    let leader = store.leader().unwrap();
+    let leader = store.publication_for_tests().unwrap();
     let r1 = publish(
         &store,
         root.path(),
@@ -1641,7 +1670,7 @@ fn retained_full_rewrite_pins_survive_edits_delete_release_and_reference_safe_gc
     drop(leader);
     drop(store);
     let cold = Store::open_for_tests(state.path(), root.path()).unwrap();
-    let cold_leader = cold.leader().unwrap();
+    let cold_leader = cold.publication_for_tests().unwrap();
     // The validated prior head and surviving retained pin remain readable
     // before takeover publication; the released exact pin remains expired.
     assert_eq!(cold.status().unwrap().revision, r3);
@@ -1751,9 +1780,10 @@ fn retained_full_rewrite_pins_survive_edits_delete_release_and_reference_safe_gc
 }
 
 #[test]
+#[cfg(feature = "test-support")]
 fn malformed_and_foreign_release_pins_do_not_write_and_header_gaps_remain_corruption() {
     let (state, root, store, cancel) = fixture();
-    let leader = store.leader().unwrap();
+    let leader = store.publication_for_tests().unwrap();
     let r1 = publish(
         &store,
         root.path(),
@@ -1840,9 +1870,10 @@ fn malformed_and_foreign_release_pins_do_not_write_and_header_gaps_remain_corrup
 }
 
 #[test]
+#[cfg(feature = "test-support")]
 fn retained_graph_header_preserves_distinct_stats_and_diagnostics_and_matches_live_head_bytes() {
     let (state, root, store, cancel) = fixture();
-    let leader = store.leader().unwrap();
+    let leader = store.publication_for_tests().unwrap();
     let initial = store.index_baseline().unwrap();
     let publish_measured = |expected| {
         let (graph, native, capture) = index_workspace_bundle(
@@ -1894,9 +1925,10 @@ fn retained_graph_header_preserves_distinct_stats_and_diagnostics_and_matches_li
 }
 
 #[test]
+#[cfg(feature = "test-support")]
 fn invalid_retained_header_json_refuses_old_pin_without_mutating_sqlite_or_sidecars() {
     let (state, root, store, cancel) = fixture();
-    let leader = store.leader().unwrap();
+    let leader = store.publication_for_tests().unwrap();
     let r1 = publish(
         &store,
         root.path(),
@@ -1950,12 +1982,13 @@ fn invalid_retained_header_json_refuses_old_pin_without_mutating_sqlite_or_sidec
 }
 
 #[test]
+#[cfg(feature = "test-support")]
 fn predecessor_stamps_cover_full_and_unchanged_publications() {
     use std::sync::Mutex;
     use trellis::index_coordinator::IndexJobCoordinator;
     let (state, root, store, cancel) = fixture();
     let options = IndexOptions::new(root.path().to_owned());
-    let session = store.leader_session().unwrap();
+    let session = store.writer_session_for_tests().unwrap();
     let modes = Mutex::new(Vec::new());
     let run = |expected, modes: &Mutex<Vec<String>>| {
         IndexJobCoordinator::prepare_with_session(&store, expected, session.clone())
@@ -2046,10 +2079,11 @@ fn predecessor_stamps_cover_full_and_unchanged_publications() {
 }
 
 #[test]
+#[cfg(feature = "test-support")]
 fn prior_v8_additive_maintenance_keeps_inode_generation_and_unfinished_fifo() {
     use std::os::unix::fs::MetadataExt;
     let (state, root, store, cancel) = fixture();
-    let leader = store.leader().unwrap();
+    let leader = store.publication_for_tests().unwrap();
     let old = publish(
         &store,
         root.path(),
@@ -2058,10 +2092,12 @@ fn prior_v8_additive_maintenance_keeps_inode_generation_and_unfinished_fifo() {
         &leader,
     )
     .unwrap();
+    // First queue publication requires index-use EX, so release the test
+    // writer guard before accepting the retained request.
+    drop(leader);
     let pending = store
         .enqueue_request(&IndexOptions::new(root.path().to_owned()), None)
         .unwrap();
-    drop(leader);
     drop(store);
     let identity =
         trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
@@ -2074,7 +2110,7 @@ fn prior_v8_additive_maintenance_keeps_inode_generation_and_unfinished_fifo() {
     remove_maintenance_extension_for_v8_test(&path);
     let inode = fs::metadata(&path).unwrap().ino();
     let reopened = Store::open_for_tests(state.path(), root.path()).unwrap();
-    let leader = reopened.leader().unwrap();
+    let leader = reopened.publication_for_tests().unwrap();
     assert_eq!(
         reopened.maintenance_oldest_due_age_secs(&leader).unwrap(),
         None
@@ -2099,10 +2135,11 @@ fn prior_v8_additive_maintenance_keeps_inode_generation_and_unfinished_fifo() {
 }
 
 #[test]
+#[cfg(feature = "test-support")]
 fn prior_v8_retention_layout_adds_self_fk_indexes_without_replacing_pin() {
     use std::os::unix::fs::MetadataExt;
     let (state, root, store, cancel) = fixture();
-    let leader = store.leader().unwrap();
+    let leader = store.publication_for_tests().unwrap();
     let old = publish(
         &store,
         root.path(),
@@ -2129,7 +2166,7 @@ fn prior_v8_retention_layout_adds_self_fk_indexes_without_replacing_pin() {
     drop(db);
     let inode = fs::metadata(&path).unwrap().ino();
     let reopened = Store::open_for_tests(state.path(), root.path()).unwrap();
-    let leader = reopened.leader().unwrap();
+    let leader = reopened.publication_for_tests().unwrap();
     let next = publish(&reopened, root.path(), &cancel, old, &leader).unwrap();
     assert_eq!(next.index_generation, old.index_generation);
     assert_eq!(next.index_revision, old.index_revision + 1);
@@ -2153,11 +2190,12 @@ fn prior_v8_retention_layout_adds_self_fk_indexes_without_replacing_pin() {
 }
 
 #[test]
+#[cfg(feature = "test-support")]
 fn prior_v8_released_tombstone_upgrades_without_losing_generation_or_pin() {
     use std::os::unix::fs::MetadataExt;
     let (state, root, store, cancel) = fixture();
     store.set_retention_clock_for_tests(1_000, 0);
-    let leader = store.leader().unwrap();
+    let leader = store.publication_for_tests().unwrap();
     let old = publish(
         &store,
         root.path(),
@@ -2199,7 +2237,7 @@ fn prior_v8_released_tombstone_upgrades_without_losing_generation_or_pin() {
     drop(db);
     let inode = fs::metadata(&path).unwrap().ino();
     let reopened = Store::open_for_tests(state.path(), root.path()).unwrap();
-    let leader = reopened.leader().unwrap();
+    let leader = reopened.publication_for_tests().unwrap();
     let next = publish(&reopened, root.path(), &cancel, head, &leader).unwrap();
     assert_eq!(next.index_generation, head.index_generation);
     assert_eq!(next.index_revision, head.index_revision + 1);
@@ -2226,10 +2264,11 @@ fn prior_v8_released_tombstone_upgrades_without_losing_generation_or_pin() {
 }
 
 #[test]
+#[cfg(feature = "test-support")]
 fn released_supersession_never_reenters_retained_due_inventory() {
     let (state, root, store, cancel) = fixture();
     store.set_retention_clock_for_tests(1_000, 0);
-    let leader = store.leader().unwrap();
+    let leader = store.publication_for_tests().unwrap();
     let r1 = publish(
         &store,
         root.path(),
@@ -2277,10 +2316,11 @@ fn released_supersession_never_reenters_retained_due_inventory() {
 }
 
 #[test]
+#[cfg(feature = "test-support")]
 fn retention_boundary_preserves_younger_manifests_and_collects_only_unreferenced() {
     let (state, root, store, cancel) = fixture();
     store.set_retention_clock_for_tests(1_000, 0);
-    let leader = store.leader().unwrap();
+    let leader = store.publication_for_tests().unwrap();
     let r1 = publish(
         &store,
         root.path(),
@@ -2411,10 +2451,11 @@ fn retention_boundary_preserves_younger_manifests_and_collects_only_unreferenced
 }
 
 #[test]
+#[cfg(feature = "test-support")]
 fn future_supersession_rollback_cannot_expire_unaged_pin() {
     let (_state, root, store, cancel) = fixture();
     store.set_retention_clock_for_tests(1_000, 0);
-    let leader = store.leader().unwrap();
+    let leader = store.publication_for_tests().unwrap();
     let first = publish(
         &store,
         root.path(),
@@ -2454,10 +2495,11 @@ fn future_supersession_rollback_cannot_expire_unaged_pin() {
 }
 
 #[test]
+#[cfg(feature = "test-support")]
 fn backward_step_keeps_young_pin_and_restart_uses_persisted_utc() {
     let (state, root, store, cancel) = fixture();
     store.set_retention_clock_for_tests(1_000, 0);
-    let leader = store.leader().unwrap();
+    let leader = store.publication_for_tests().unwrap();
     let first = publish(
         &store,
         root.path(),
@@ -2474,7 +2516,7 @@ fn backward_step_keeps_young_pin_and_restart_uses_persisted_utc() {
     drop(store);
     let reopened = Store::open_for_tests(state.path(), root.path()).unwrap();
     reopened.set_retention_clock_for_tests(1_900, 0);
-    let leader = reopened.leader().unwrap();
+    let leader = reopened.publication_for_tests().unwrap();
     // Takeover must reconcile before it may read/release the selected history.
     publish(&reopened, root.path(), &cancel, head, &leader).unwrap();
     reopened.maintain_revisions(&leader).unwrap();
@@ -2488,10 +2530,11 @@ fn backward_step_keeps_young_pin_and_restart_uses_persisted_utc() {
 }
 
 #[test]
+#[cfg(feature = "test-support")]
 fn failed_publication_after_additive_v8_upgrade_preserves_old_pin() {
     use std::{os::unix::fs::MetadataExt, sync::atomic::Ordering};
     let (state, root, store, cancel) = fixture();
-    let leader = store.leader().unwrap();
+    let leader = store.publication_for_tests().unwrap();
     let old = publish(
         &store,
         root.path(),
@@ -2500,7 +2543,15 @@ fn failed_publication_after_additive_v8_upgrade_preserves_old_pin() {
         &leader,
     )
     .unwrap();
+    // Keep the accepted request after startup reconciliation, but retire the test writer guard
+    // before the virgin queue's EX-protected first publication.
     drop(leader);
+    let accepted = store
+        .enqueue_request(&IndexOptions::new(root.path().to_owned()), Some(old))
+        .unwrap();
+    assert_eq!(accepted.state, "queued");
+    let queue = store.request_db_path();
+    let queue_inode = fs::metadata(&queue).unwrap().ino();
     drop(store);
     let identity =
         trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
@@ -2513,38 +2564,86 @@ fn failed_publication_after_additive_v8_upgrade_preserves_old_pin() {
     remove_maintenance_extension_for_v8_test(&path);
     let inode = fs::metadata(&path).unwrap().ino();
     let reopened = Store::open_for_tests(state.path(), root.path()).unwrap();
-    let leader = reopened.leader().unwrap();
+    let leader = reopened.publication_for_tests().unwrap();
     let stop = cancel.clone();
     reopened
         .set_publication_before_commit_hook_for_tests(move || stop.store(true, Ordering::Release));
     let error = publish(&reopened, root.path(), &cancel, old, &leader).unwrap_err();
     assert!(error.to_string().contains("cancelled"), "{error:#}");
     assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+
+    // Keep this observer open through the retry: closing an independent SQLite
+    // handle while the Store is live could release the process's SQLite locks.
     let db = Connection::open(&path).unwrap();
-    let extension: i64 = db.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='native_revision_release_debt'", [], |r| r.get(0)).unwrap();
-    assert_eq!(extension, 1, "verified leader installs the v8 extension");
-    let generation: String = db
-        .query_row(
-            "SELECT index_generation FROM index_metadata WHERE singleton=1",
+    let extension = || -> i64 {
+        db.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='native_revision_release_debt'",
             [],
-            |r| r.get(0),
+            |row| row.get(0),
         )
-        .unwrap();
-    assert_eq!(generation, old.index_generation.to_string());
-    drop(db);
+        .unwrap()
+    };
+    let head = || -> (String, i64) {
+        db.query_row(
+            "SELECT index_generation,index_revision FROM index_metadata WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        extension(),
+        0,
+        "cancelled transaction rolls back extension DDL"
+    );
+    assert_eq!(
+        head(),
+        (old.index_generation.to_string(), old.index_revision as i64)
+    );
+    assert_eq!(
+        reopened.source_at("flow.js", Some(old)).unwrap().unwrap().0,
+        old
+    );
+    assert_eq!(fs::metadata(&queue).unwrap().ino(), queue_inode);
+    let queued = reopened.request_by_id(&accepted.id).unwrap().unwrap();
+    assert_eq!(queued.id, accepted.id);
+    assert_eq!(queued.state, "queued");
+
     cancel.store(false, Ordering::Release);
     let next = publish(&reopened, root.path(), &cancel, old, &leader).unwrap();
     assert_eq!(next.index_generation, old.index_generation);
     assert_eq!(next.index_revision, old.index_revision + 1);
     assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+    assert_eq!(
+        extension(),
+        1,
+        "successful retry installs maintenance extension"
+    );
+    assert_eq!(
+        head(),
+        (old.index_generation.to_string(), next.index_revision as i64)
+    );
+    assert_eq!(
+        reopened.source_at("flow.js", Some(old)).unwrap().unwrap().0,
+        old
+    );
+    assert_eq!(fs::metadata(&queue).unwrap().ino(), queue_inode);
+    assert_eq!(
+        reopened.request_by_id(&accepted.id).unwrap().unwrap().state,
+        "queued"
+    );
+    drop(leader);
+    drop(reopened);
+    drop(db);
 }
 
 #[test]
+#[cfg(feature = "test-support")]
 fn expired_pin_rejects_each_selected_store_consumer_before_lookup() {
     use trellis::native_evidence::DocumentKey;
     let (_state, root, store, cancel) = fixture();
     store.set_retention_clock_for_tests(1_000, 0);
-    let leader = store.leader().unwrap();
+    let leader = store.publication_for_tests().unwrap();
     let old = publish(
         &store,
         root.path(),
@@ -2630,10 +2729,11 @@ fn expired_pin_rejects_each_selected_store_consumer_before_lookup() {
 }
 
 #[test]
+#[cfg(feature = "test-support")]
 fn due_release_blocked_by_maintenance_admission_must_not_report_success() {
     let (state, root, store, cancel) = fixture();
     store.set_retention_clock_for_tests(1_000, 0);
-    let leader = store.leader().unwrap();
+    let leader = store.publication_for_tests().unwrap();
     let old = publish(
         &store,
         root.path(),
@@ -2683,6 +2783,7 @@ fn due_release_blocked_by_maintenance_admission_must_not_report_success() {
 }
 
 #[test]
+#[cfg(feature = "test-support")]
 fn v8_pending_partial_manifest_is_strict_and_pin_expired_then_replays_to_exact_tombstone() {
     use trellis::store::MaintenanceOutcome;
     let (state, root, store, cancel) = fixture();
@@ -2694,7 +2795,7 @@ fn v8_pending_partial_manifest_is_strict_and_pin_expired_then_replays_to_exact_t
         .unwrap();
     }
     store.set_retention_clock_for_tests(1_000, 0);
-    let leader = store.leader().unwrap();
+    let leader = store.publication_for_tests().unwrap();
     let old = publish(
         &store,
         root.path(),
@@ -2814,12 +2915,13 @@ fn v8_pending_partial_manifest_is_strict_and_pin_expired_then_replays_to_exact_t
 }
 
 #[test]
+#[cfg(feature = "test-support")]
 fn maintenance_first_delete_priority_change_rolls_back_to_whole_pending_state() {
     use std::sync::atomic::Ordering;
     use trellis::store::MaintenanceOutcome;
     let (state, root, store, cancel) = fixture();
     store.set_retention_clock_for_tests(1_000, 0);
-    let leader = store.leader().unwrap();
+    let leader = store.publication_for_tests().unwrap();
     let old = publish(
         &store,
         root.path(),
@@ -2887,12 +2989,13 @@ fn maintenance_first_delete_priority_change_rolls_back_to_whole_pending_state() 
 }
 
 #[test]
+#[cfg(feature = "test-support")]
 fn maintenance_first_delete_callback_panic_defers_without_partial_release_or_leaked_handler() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use trellis::store::MaintenanceOutcome;
     let (state, root, store, cancel) = fixture();
     store.set_retention_clock_for_tests(1_000, 0);
-    let leader = store.leader().unwrap();
+    let leader = store.publication_for_tests().unwrap();
     let old = publish(
         &store,
         root.path(),
@@ -2981,12 +3084,13 @@ fn maintenance_first_delete_callback_panic_defers_without_partial_release_or_lea
 }
 
 #[test]
+#[cfg(feature = "test-support")]
 fn v8_noop_retention_uses_covering_indexes_and_never_opens_writer() {
     use std::sync::atomic::Ordering;
     use trellis::store::MaintenanceOutcome;
     let (state, root, store, cancel) = fixture();
     store.set_retention_clock_for_tests(1_000, 0);
-    let leader = store.leader().unwrap();
+    let leader = store.publication_for_tests().unwrap();
     let old = publish(
         &store,
         root.path(),
@@ -3062,6 +3166,7 @@ fn v8_noop_retention_uses_covering_indexes_and_never_opens_writer() {
 }
 
 #[test]
+#[cfg(feature = "test-support")]
 fn v8_rejects_missing_debt_wrong_payload_and_dual_release_markers() {
     use trellis::store::MaintenanceOutcome;
     for mutation in [
@@ -3071,7 +3176,7 @@ fn v8_rejects_missing_debt_wrong_payload_and_dual_release_markers() {
     ] {
         let (state, root, store, cancel) = fixture();
         store.set_retention_clock_for_tests(1_000, 0);
-        let leader = store.leader().unwrap();
+        let leader = store.publication_for_tests().unwrap();
         let old = publish(
             &store,
             root.path(),
@@ -3118,11 +3223,12 @@ fn v8_rejects_missing_debt_wrong_payload_and_dual_release_markers() {
 }
 
 #[test]
+#[cfg(feature = "test-support")]
 fn maintenance_index_writer_busy_defers_and_counts_only_confirmed_sqlite_busy() {
     use trellis::store::MaintenanceOutcome;
     let (state, root, store, cancel) = fixture();
     store.set_retention_clock_for_tests(1_000, 0);
-    let leader = store.leader().unwrap();
+    let leader = store.publication_for_tests().unwrap();
     let old = publish(
         &store,
         root.path(),
@@ -3189,11 +3295,12 @@ fn publication_gate_is_shared_by_clones_and_independent_same_root_stores() {
 }
 
 #[test]
+#[cfg(feature = "test-support")]
 fn compatible_pending_debt_replays_after_verified_leader_restart_in_same_generation() {
     use trellis::store::MaintenanceOutcome;
     let (state, root, store, cancel) = fixture();
     store.set_retention_clock_for_tests(1_000, 0);
-    let leader = store.leader().unwrap();
+    let leader = store.publication_for_tests().unwrap();
     let old = publish(
         &store,
         root.path(),
@@ -3219,7 +3326,7 @@ fn compatible_pending_debt_replays_after_verified_leader_restart_in_same_generat
     drop(store);
     let reopened = Store::open_for_tests(state.path(), root.path()).unwrap();
     reopened.set_retention_clock_for_tests(1_901, 0);
-    let session = reopened.leader_session().unwrap();
+    let session = reopened.writer_session_for_tests().unwrap();
     let next = trellis::index_coordinator::IndexJobCoordinator::prepare_with_session(
         &reopened,
         None,
@@ -3239,7 +3346,7 @@ fn compatible_pending_debt_replays_after_verified_leader_restart_in_same_generat
     );
     assert_eq!(
         reopened
-            .maintenance_oldest_due_age_secs(session.leader_guard().unwrap())
+            .maintenance_oldest_due_age_secs(session.writer_guard().unwrap())
             .unwrap(),
         Some(900)
     );
@@ -3247,14 +3354,14 @@ fn compatible_pending_debt_replays_after_verified_leader_restart_in_same_generat
     let probe = reopened.open_maintenance_queue_probe().unwrap();
     assert_eq!(
         reopened
-            .maintenance_step(session.leader_guard().unwrap(), &permit, &probe, || true)
+            .maintenance_step(session.writer_guard().unwrap(), &permit, &probe, || true)
             .unwrap(),
         MaintenanceOutcome::Progress
     );
     drop(probe);
     drop(permit);
     reopened
-        .maintain_revisions(session.leader_guard().unwrap())
+        .maintain_revisions(session.writer_guard().unwrap())
         .unwrap();
     let identity =
         trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
@@ -3281,10 +3388,11 @@ fn compatible_pending_debt_replays_after_verified_leader_restart_in_same_generat
 }
 
 #[test]
+#[cfg(feature = "test-support")]
 fn newer_disposable_schema_is_refused_without_rebuild_or_deletion() {
     use std::os::unix::fs::MetadataExt;
     let (state, root, store, cancel) = fixture();
-    let leader = store.leader().unwrap();
+    let leader = store.publication_for_tests().unwrap();
     let old = publish(
         &store,
         root.path(),
@@ -3330,6 +3438,7 @@ fn newer_disposable_schema_is_refused_without_rebuild_or_deletion() {
 }
 
 #[test]
+#[cfg(feature = "test-support")]
 fn maintenance_releases_thousands_of_js_facts_without_permanent_deferral() {
     use trellis::store::MaintenanceOutcome;
     let (state, root, store, cancel) = fixture();
@@ -3339,7 +3448,7 @@ fn maintenance_releases_thousands_of_js_facts_without_permanent_deferral() {
         .collect();
     fs::write(&source, &body).unwrap();
     store.set_retention_clock_for_tests(1_000, 0);
-    let leader = store.leader().unwrap();
+    let leader = store.publication_for_tests().unwrap();
     let old = publish(
         &store,
         root.path(),
@@ -3412,14 +3521,15 @@ fn maintenance_releases_thousands_of_js_facts_without_permanent_deferral() {
         "{facts} declarations remained pending after {progress} progress units"
     );
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(30),
-        "large-document release and interleaved edit took too long: {:?}",
+        started.elapsed() < trellis::testing::HANG_BACKSTOP,
+        "large-document release and interleaved edit hung: {:?}",
         started.elapsed()
     );
     assert_eq!(store.status().unwrap().revision, new_head);
 }
 
 #[test]
+#[cfg(feature = "test-support")]
 fn large_revision_releases_in_batched_units_while_edits_continue() {
     use trellis::store::MaintenanceOutcome;
     let (state, root, store, cancel) = fixture();
@@ -3431,7 +3541,7 @@ fn large_revision_releases_in_batched_units_while_edits_continue() {
         .unwrap();
     }
     store.set_retention_clock_for_tests(1_000, 0);
-    let leader = store.leader().unwrap();
+    let leader = store.publication_for_tests().unwrap();
     let old = publish(
         &store,
         root.path(),

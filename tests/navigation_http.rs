@@ -1,3 +1,4 @@
+#![cfg(feature = "test-support")]
 //! Synthetic cached-only navigation. No providers or repository programs are executed.
 mod common;
 use axum::{
@@ -26,7 +27,7 @@ fn setup(
     Store,
     Graph,
     Router,
-    Arc<trellis::store::topology::LeaderSession>,
+    Arc<trellis::store::topology::WriterSession>,
 ) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("workspace");
@@ -37,12 +38,12 @@ fn setup(
     let options = IndexOptions::new(root.clone());
     let graph = index_workspace(&options, &cancel(), |_| {}).unwrap();
     let store = crate::common::open_store(&dir.path().join("state"), &root).unwrap();
-    let session = store.leader_session().unwrap();
+    let session = store.writer_session_for_tests().unwrap();
     publish_bundle(
         &store,
         &graph,
         &root,
-        session.leader_guard().unwrap(),
+        session.writer_guard().unwrap(),
         trellis::model::IndexPin {
             index_generation: store.index_baseline().unwrap().index_generation,
             index_revision: 0,
@@ -66,7 +67,7 @@ fn fixture() -> (
     Store,
     Graph,
     Router,
-    Arc<trellis::store::topology::LeaderSession>,
+    Arc<trellis::store::topology::WriterSession>,
 ) {
     setup(&[
         ("A.java", JAVA),
@@ -259,7 +260,7 @@ async fn strict_selectors_validation_and_revision() {
         &store,
         &graph,
         &dir.path().join("workspace"),
-        session.leader_guard().unwrap(),
+        session.writer_guard().unwrap(),
         old_pin,
         &cancel(),
     )
@@ -1113,7 +1114,7 @@ fn publish_bundle(
     store: &trellis::store::Store,
     graph: &trellis::model::Graph,
     workspace: &std::path::Path,
-    leader: &trellis::store::topology::LeaderGuard,
+    leader: &trellis::store::topology::WriterGuard,
     expected: trellis::model::IndexPin,
     cancel: &trellis::model::CancelFlag,
 ) -> anyhow::Result<trellis::model::IndexPin> {
@@ -1289,7 +1290,7 @@ async fn retained_navigation_uses_selected_full_rewrite_source_nodes_and_class_p
         &store,
         &changed,
         &root,
-        session.leader_guard().unwrap(),
+        session.writer_guard().unwrap(),
         old_pin,
         &cancel(),
     )
@@ -1424,7 +1425,7 @@ async fn retained_navigation_uses_selected_full_rewrite_source_nodes_and_class_p
     assert_eq!(cold_member, baseline_member);
     store.set_retention_clock_for_tests(1_900, 900);
     store
-        .release_revision(old_pin, session.leader_guard().unwrap())
+        .release_revision(old_pin, session.writer_guard().unwrap())
         .unwrap();
     let old_request = json!({"expectedRevision":old_pin,"path":"A.java","line":2});
     let (code, body) = call(&app, old_request).await;
@@ -1432,7 +1433,7 @@ async fn retained_navigation_uses_selected_full_rewrite_source_nodes_and_class_p
     assert_eq!(body["error"]["code"], "pin_expired");
     assert_eq!(store.status().unwrap().revision, new_pin);
     store
-        .collect_unreferenced(session.leader_guard().unwrap())
+        .collect_unreferenced(session.writer_guard().unwrap())
         .unwrap();
     assert_eq!(store.status().unwrap().revision, new_pin);
 }

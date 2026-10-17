@@ -1,4 +1,4 @@
-//! Closed application DTO validation and protocol-only, read-only unavailable projections.
+//! Closed application DTO validation and read-only tool envelopes.
 use super::{IdentityError, OpenedWorkspace, wire};
 use crate::daemon::registry::SelectionError;
 use serde_json::{Value, json};
@@ -200,13 +200,7 @@ pub fn failure(id: &Value, code: &str) -> Value {
       "currentBasis":null,"currentContentHash":null}})
 }
 pub fn describe(id: &Value, label: &str) -> Value {
-    json!({"schemaVersion":1,"requestId":id,"evidenceBasis":null,
-      "data":{"workspaceLabel":label,"indexState":"unavailable","progress":null,
-      "watcherDegraded":false,"languages":[],"toolVersion":1,"schemaVersion":1,
-      "limits":{"requestBytes":16384,"responseBytes":65536,"sourceBytes":16384,
-        "sourceLines":200,"defaultLimit":20,"maxLimit":50,"calleeTextBytes":1024,
-        "hintWorkMs":1000,"deadlineMs":5000,"concurrency":4}},
-      "warnings":[],"partial":true,"truncated":false,"truncationReason":null})
+    super::projection::describe(id, label, "unavailable", None, None, None, false)
 }
 pub fn attempted(value: &Value) -> Value {
     if let Some(path) = value.as_str() {
@@ -233,6 +227,15 @@ pub fn selection_failure(id: &Value, error: SelectionError, value: &Value) -> Va
     envelope["error"]["retryable"] = json!(error.retryable());
     envelope["error"]["reason"] = json!(error.reason());
     envelope["error"]["attemptedWorkspace"] = attempted(value);
+    envelope
+}
+/// A `too_many_requests` or `deadline_exceeded` decided before read admission
+/// sampled `catchingUp` (Decision 0009 §7): no answering workspace, only the
+/// bounded attempted one (the selection, or the launch workspace path).
+pub fn admission_failure(id: &Value, code: &str, attempted_workspace: &Value) -> Value {
+    debug_assert!(matches!(code, "too_many_requests" | "deadline_exceeded"));
+    let mut envelope = failure(id, code);
+    envelope["error"]["attemptedWorkspace"] = attempted(attempted_workspace);
     envelope
 }
 pub fn attributed_root(mut envelope: Value, root: &std::path::Path, catching_up: bool) -> Value {

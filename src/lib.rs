@@ -29,6 +29,8 @@ pub mod native_ids;
 pub mod navigation;
 mod rust_sources;
 pub mod store;
+#[doc(hidden)]
+pub mod testing;
 pub mod watch;
 
 pub mod jev;

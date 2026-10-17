@@ -597,13 +597,13 @@ mod tests {
             |_| {},
         )
         .unwrap();
-        let session = store.leader_session().unwrap();
+        let session = store.writer_session().unwrap();
         let revision = store
             .publish_native(
                 &graph,
                 &capture,
                 &native,
-                session.leader_guard().unwrap(),
+                session.writer_guard().unwrap(),
                 store.index_baseline().unwrap(),
                 &cancel,
             )
@@ -643,7 +643,7 @@ mod tests {
         std::fs::write(&acp.runner, "#!/bin/sh\ncat >/dev/null; sleep 60\n").unwrap();
         let cloned = acp.clone();
         let task = tokio::spawn(async move { cloned.run(&p).await });
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(crate::testing::HANG_BACKSTOP, async {
             while acp.status().unwrap().attempts < 3 {
                 tokio::task::yield_now().await;
             }
@@ -652,7 +652,7 @@ mod tests {
         .unwrap();
         acp.cancel_all();
         assert!(
-            tokio::time::timeout(Duration::from_secs(5), task)
+            tokio::time::timeout(crate::testing::HANG_BACKSTOP, task)
                 .await
                 .unwrap()
                 .unwrap()
@@ -800,7 +800,7 @@ mod tests {
         .unwrap();
         let cloned = acp.clone();
         let task = tokio::spawn(async move { cloned.execute(b"{}").await });
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(crate::testing::HANG_BACKSTOP, async {
             while !std::fs::read_to_string(&pidfile)
                 .ok()
                 .is_some_and(|s| s.trim().parse::<i32>().is_ok())
@@ -817,7 +817,7 @@ mod tests {
             .unwrap();
         task.abort();
         let _ = task.await;
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(crate::testing::HANG_BACKSTOP, async {
             loop {
                 if unsafe { libc::kill(pid, 0) } != 0 {
                     break;

@@ -11,8 +11,13 @@ Usage (reference host, quiet slot; scratch must be an absent directory outside t
   python3 tools/stage3-watcher-runner.py --measure --scratch <dir> --exclusive-slot-authorization "<who/when>"
   python3 tools/stage3-watcher-runner.py --summarize --events <dir>/watcher-events.jsonl
 Gate: medium p95 <= 2 s, large p95 <= 5 s, 20 valid samples each, fallback parity.
+Healthy native watching only (owner ruling 2026-10-15, Decision 0009 §5): a series
+whose watcher reports degraded (before it or after any sample) is invalid, never
+trimmed; the run stops and the series must be restarted when watching is healthy.
+Degraded mode (no native watcher: periodic 60 s inventory) has no latency gate.
 """
 import argparse
+import fcntl
 import hashlib
 import json
 import math
@@ -284,18 +289,56 @@ def edit_bytes(raw, language, kind):
     return raw[:first] + replacement + raw[first+len(old):], old.decode(), replacement.decode()
 
 class Daemon:
+    """One phase's Trellis daemon and serve, both children of this runner.
+
+    The runner starts the daemon itself and starts serve only once that daemon
+    listens, so serve attaches to it instead of starting a detached one. As
+    children, neither PID can be reused until it is reaped here, so stop()
+    signals exactly these processes. Construction has no side effects: assign
+    the object first, then start(), so a failed start is still stopped."""
+    GRACE_S = 20
+
     def __init__(self, scratch, label, workspace, home):
         self.workspace, self.home = workspace, home
-        self.stderr_path = scratch / f"{label}-daemon.stderr.log"
-        self.stderr = open(self.stderr_path, "wb", buffering=0)
+        self.stderr_path = scratch / f"{label}-serve.stderr.log"
+        self.daemon_stderr_path = scratch / f"{label}-daemon.stderr.log"
         self.argv = [str(BINARY), "serve", "--workspace", str(workspace), "--bind", "127.0.0.1:0",
                      "--token-file", str(scratch / f"{label}-token")]
-        self.proc = subprocess.Popen(self.argv, cwd=REPO, env=env_for(home),
-                                     stdout=subprocess.DEVNULL, stderr=self.stderr, start_new_session=True)
+        self.daemon = self.proc = None
+        self.daemon_stderr = self.stderr = None
         self.url = None
+
+    def start(self, listen_timeout_s=SETUP_TIMEOUT_S):
+        env = env_for(self.home)
+        self.daemon_stderr = open(self.daemon_stderr_path, "wb", buffering=0)
+        self.daemon = subprocess.Popen([str(BINARY), "daemon"], cwd=REPO, env=env, stdin=subprocess.DEVNULL,
+                                       stdout=subprocess.DEVNULL, stderr=self.daemon_stderr,
+                                       start_new_session=True)
+        deadline = time.monotonic() + listen_timeout_s
+        while not self.listening():
+            need(self.daemon.poll() is None, "runner's daemon exited before listening")
+            need(time.monotonic() < deadline, "runner's daemon did not start listening")
+            time.sleep(.05)
+        self.stderr = open(self.stderr_path, "wb", buffering=0)
+        self.proc = subprocess.Popen(self.argv, cwd=REPO, env=env, stdout=subprocess.DEVNULL,
+                                     stderr=self.stderr, start_new_session=True)
+
+    def listening(self):
+        # The daemon binds its socket only after it holds the election. An lsof
+        # that fails or hangs reads as "not yet", which the deadline bounds.
+        try:
+            result = subprocess.run(["lsof", "-a", "-p", str(self.daemon.pid), "-U", "-Fn"],
+                                    capture_output=True, text=True, timeout=10)
+        except (subprocess.TimeoutExpired, OSError):
+            return False
+        # Linux lsof appends " type=STREAM" to a socket's name; macOS does not.
+        names = [line[1:].split(" type=")[0] for line in result.stdout.splitlines() if line.startswith("n")]
+        return any(name.endswith("/daemon.sock") for name in names)
+
     def ready(self):
         deadline = time.monotonic() + SETUP_TIMEOUT_S
         while time.monotonic() < deadline:
+            need(self.daemon.poll() is None, "runner's daemon exited")
             need(self.proc.poll() is None, f"serve exited: {self.stderr_path.read_text(errors='replace')[-3000:]}")
             match = re.search(r"Trellis: (http://127\.0\.0\.1:\d+)/", self.stderr_path.read_text(errors="replace"))
             if match:
@@ -308,28 +351,135 @@ class Daemon:
                     pass
             time.sleep(.05)
         raise Invalid("serve readiness deadline exceeded")
-    def stop(self):
-        if self.proc.poll() is None:
-            self.proc.terminate()
-            try:
-                self.proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
-                self.proc.wait(timeout=5)
-        self.stderr.close()
 
-def status(workspace, home):
-    # serve announces readiness before the first H publishes. Baseline setup
-    # (untimed) waits for the first published head; sample polling is unchanged.
-    deadline = time.monotonic() + SETUP_TIMEOUT_S
-    while True:
+    def stop(self):
+        # Every step runs even if an earlier one fails or is interrupted; the
+        # first error is raised at the end. Idempotent.
+        errors = []
+        for proc in (self.proc, self.daemon):
+            if proc is not None:
+                try:
+                    stop_child(proc, self.GRACE_S)
+                except BaseException as exc:
+                    errors.append(exc)
+        for handle in (self.stderr, self.daemon_stderr):
+            if handle is not None:
+                try:
+                    handle.close()
+                except BaseException as exc:
+                    errors.append(exc)
         try:
-            result = command([BINARY, "status", "--workspace", workspace], env=env_for(home), timeout=15)
-            return pin_of(json.loads(result.stdout)), result.stdout
-        except subprocess.CalledProcessError:
-            if time.monotonic() >= deadline:
-                raise
-            time.sleep(1)
+            need(election_free(self.home), f"a daemon still holds the election for {self.home}")
+        except BaseException as exc:
+            errors.append(exc)
+        if errors:
+            raise errors[0]
+
+def stop_child(proc, grace_s):
+    # A child is reaped here, so its PID is never reused before the signal.
+    # If the graceful wait is interrupted (a measurement signal raises inside
+    # it), the child is still killed and reaped before the interrupt is
+    # raised: SIGKILL cannot be ignored, so that wait is bounded.
+    if proc.poll() is not None:
+        return
+    interrupted = None
+    try:
+        proc.terminate()
+        proc.wait(timeout=grace_s)
+    except subprocess.TimeoutExpired:
+        pass
+    except BaseException as exc:
+        interrupted = exc
+    if proc.poll() is None:
+        proc.kill()
+        proc.wait(timeout=10)
+    if interrupted is not None:
+        raise interrupted
+
+def election_free(home):
+    # True only if this process can take every daemon lock under the private
+    # HOME: no daemon, ours or one serve started, still holds it.
+    for lock in home.rglob("daemon.lock"):
+        descriptor = os.open(lock, os.O_RDONLY)
+        try:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return False
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+    return True
+
+STATUS_CALL_S = 15
+
+def read_status(workspace, home, timeout_s=STATUS_CALL_S):
+    # One status call, no retry. Raises CalledProcessError, TimeoutExpired or
+    # a decode/validation error; the timed sample polling uses only this.
+    result = command([BINARY, "status", "--workspace", workspace], env=env_for(home), timeout=timeout_s)
+    return pin_of(json.loads(result.stdout)), result.stdout
+
+def baseline_status(workspace, home, log, phase):
+    # Untimed baseline setup only: serve announces readiness before the first
+    # head publishes, and a cold publication can stall a status call or make it
+    # fail with a typed error. Retry both until one monotonic setup deadline,
+    # each call bounded by min(15 s, the time left). Each attempt is journaled
+    # as it finishes (setup_status_attempt), whatever happens next; the
+    # attempts are also returned for the setup record's summary.
+    deadline = time.monotonic() + SETUP_TIMEOUT_S
+    attempts = []
+    def record(began, outcome):
+        attempt = {"attempt": len(attempts) + 1, "seconds": round(time.monotonic() - began, 3), "outcome": outcome}
+        attempts.append(attempt)
+        append(log, "setup_status_attempt", phase=phase, **attempt)
+    while True:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise Invalid(f"{phase} baseline status not ready within {SETUP_TIMEOUT_S}s after "
+                          f"{len(attempts)} attempts (each journaled as setup_status_attempt)")
+        began = time.monotonic()
+        try:
+            pin, raw = read_status(workspace, home, timeout_s=min(STATUS_CALL_S, left))
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            record(began, "timeout" if isinstance(exc, subprocess.TimeoutExpired)
+                   else f"exit {exc.returncode}: {(exc.stderr or '').strip()[-200:]}")
+        except BaseException as exc:
+            record(began, f"{type(exc).__name__}: {str(exc)[:200]}")
+            raise
+        else:
+            record(began, "ok")
+            return pin, raw, attempts
+        time.sleep(max(0, min(1, deadline - time.monotonic())))
+
+WITNESS_FIELDS = {"epoch": int, "native": bool, "degraded": bool, "degradations": int}
+
+def watcher_witness(workspace, home):
+    # The daemon's watcher-health witness, read synchronously with one CLI
+    # status call: the current watcher epoch, whether it holds a native
+    # watcher, whether it is degraded, and a count of every transition to
+    # degraded. Two equal readings mean watching stayed healthy between them;
+    # the degraded bit alone could have returned to healthy unseen. None if
+    # the witness cannot be read, which never counts as healthy.
+    try:
+        result = command([BINARY, "status", "--workspace", workspace], env=env_for(home), timeout=30)
+        witness = json.loads(result.stdout).get("watcher")
+    except (subprocess.SubprocessError, OSError, ValueError, AttributeError):
+        return None
+    if not isinstance(witness, dict) or set(witness) != set(WITNESS_FIELDS):
+        return None
+    if not all(type(witness[key]) is kind for key, kind in WITNESS_FIELDS.items()):
+        return None
+    return witness
+
+def healthy_baseline(witness):
+    return witness is not None and witness["native"] is True and witness["degraded"] is False
+
+def stayed_healthy(baseline, witness):
+    return healthy_baseline(baseline) and witness == baseline
+
+def series_invalid(log, size, reason, sample_index=None):
+    append(log, "series_invalid", size=size, sample_index=sample_index, reason=reason)
+    raise RuntimeError(f"{size} series invalid: {reason}; restart it when watching is healthy")
 
 def wait_selected(workspace, home, previous, write_done_ns, timeout_s=SAMPLE_TIMEOUT_S):
     polls = []
@@ -337,7 +487,9 @@ def wait_selected(workspace, home, previous, write_done_ns, timeout_s=SAMPLE_TIM
     while time.monotonic() < deadline:
         began = time.monotonic_ns()
         try:
-            pin, raw = status(workspace, home)
+            # One call, never the setup retry; bounded by the sample's budget.
+            pin, raw = read_status(workspace, home,
+                                   timeout_s=max(0.001, min(STATUS_CALL_S, deadline - time.monotonic())))
             ended = time.monotonic_ns()
             entry = {"start_ns": began, "return_ns": ended, "pin": pin, "status_sha256": sha(raw.encode())}
             polls.append(entry)
@@ -405,13 +557,28 @@ def measure(args):
                 workspace = scratch / f"{size}-workspace"
                 home = scratch / f"{size}-private-home"
                 active = Daemon(scratch, size, workspace, home)
+                active.start()
                 active.ready()
-                previous, baseline_json = status(workspace, home)
+                previous, baseline_json, setup_attempts = baseline_status(workspace, home, log, size)
                 baseline = selected_check(home, previous, size)
-                append(log, "setup", size=size, daemon_pid=active.proc.pid, daemon_argv=active.argv,
-                       daemon_stderr=str(active.stderr_path), url=active.url,
+                append(log, "setup", size=size, serve_pid=active.proc.pid, serve_argv=active.argv,
+                       serve_stderr=str(active.stderr_path), daemon_pid=active.daemon.pid,
+                       daemon_stderr=str(active.daemon_stderr_path), url=active.url,
                        baseline_pin=previous, baseline_status_sha256=sha(baseline_json.encode()),
-                       baseline_selected=baseline, cold_setup_timing="excluded")
+                       baseline_selected=baseline, cold_setup_timing="excluded",
+                       setup_status_attempts=setup_attempts)
+                # Untimed setup: the current watcher's native setup publishes
+                # shortly after its epoch begins.
+                watching = watcher_witness(workspace, home)
+                settle = time.monotonic() + SETUP_TIMEOUT_S
+                while (watching is not None and not watching["native"] and not watching["degraded"]
+                       and time.monotonic() < settle):
+                    time.sleep(.05)
+                    watching = watcher_witness(workspace, home)
+                append(log, "series_watcher", size=size, witness=watching,
+                       native=healthy_baseline(watching))
+                if not healthy_baseline(watching):
+                    series_invalid(log, size, "no healthy native watcher before the series")
                 edited = set()
                 for n in range(20):
                     language, relative, kind = planned_edit(size, n)
@@ -444,6 +611,7 @@ def measure(args):
                                                          1000 if size == "medium" else 10000)
                         need(path.read_bytes() == after, "source changed during selected checks")
                         need(active.proc.poll() is None, "serve died during watcher sample")
+                        need(active.daemon.poll() is None, "runner's daemon died during watcher sample")
                         sample["valid"] = True
                         previous = pin
                     except BaseException as exc:
@@ -454,20 +622,33 @@ def measure(args):
                         sample["failure"] = f"{type(exc).__name__}: {exc}"
                         append(log, "sample", **sample)
                         raise
+                    witness = watcher_witness(workspace, home)
+                    sample["watcher_witness"] = witness
+                    sample["watcher_degraded_after"] = witness is None or witness["degraded"]
+                    # A new epoch or degradation since the series began means
+                    # watching may not have stayed healthy, even if it reads
+                    # healthy again now.
+                    sample["watcher_witness_ok"] = stayed_healthy(watching, witness)
                     append(log, "sample", **sample)
+                    if sample["watcher_degraded_after"] or not sample["watcher_witness_ok"]:
+                        series_invalid(log, size, "watcher not continuously healthy during the series",
+                                       n + 1)
                 active.stop()
                 active = None
             # Fallback is a distinct untouched medium workspace and independent setup.
             workspace = scratch / "fallback-workspace"
             home = scratch / "fallback-private-home"
             active = Daemon(scratch, "fallback", workspace, home)
+            active.start()
             active.ready()
-            prior, baseline_json = status(workspace, home)
+            prior, baseline_json, setup_attempts = baseline_status(workspace, home, log, "fallback-medium")
             baseline = selected_check(home, prior, "medium")
-            append(log, "setup", size="fallback-medium", daemon_pid=active.proc.pid,
-                   daemon_argv=active.argv, daemon_stderr=str(active.stderr_path), url=active.url,
+            append(log, "setup", size="fallback-medium", serve_pid=active.proc.pid,
+                   serve_argv=active.argv, serve_stderr=str(active.stderr_path),
+                   daemon_pid=active.daemon.pid, daemon_stderr=str(active.daemon_stderr_path), url=active.url,
                    baseline_pin=prior, baseline_status_sha256=sha(baseline_json.encode()),
-                   baseline_selected=baseline, cold_setup_timing="excluded")
+                   baseline_selected=baseline, cold_setup_timing="excluded",
+                   setup_status_attempts=setup_attempts)
             path = workspace / "python/Cmedium0000.py"
             before = path.read_bytes()
             needle = b"def f0(): return 1"
@@ -493,6 +674,7 @@ def measure(args):
                                 selected=selected_check(home, pin, "medium", ("python/Cmedium0000.py", "python", after)))
                 need(path.read_bytes() == after, "fallback source changed unexpectedly")
                 need(active.proc.poll() is None, "serve died during fallback")
+                need(active.daemon.poll() is None, "runner's daemon died during fallback")
                 active.stop()
                 active = None
                 # An independent cold watcher-driven Serve on SAME root, different private index state;
@@ -500,8 +682,9 @@ def measure(args):
                 cold_home = scratch / "cold-private-home"
                 cold_start_ns = time.monotonic_ns()
                 active = Daemon(scratch, "cold-oracle", workspace, cold_home)
+                active.start()
                 active.ready()
-                cold_pin, cold_json = status(workspace, cold_home)
+                cold_pin, cold_json, cold_attempts = baseline_status(workspace, cold_home, log, "cold-oracle")
                 cold_selected_ns = time.monotonic_ns()
                 fallback["independent_cold_start_ns"] = cold_start_ns
                 fallback["independent_cold_first_status_return_ns"] = cold_selected_ns
@@ -510,6 +693,7 @@ def measure(args):
                 fallback["independent_cold_selected"] = selected_check(cold_home, cold_pin, "medium",
                     ("python/Cmedium0000.py", "python", after))
                 fallback["independent_cold_status_sha256"] = sha(cold_json.encode())
+                fallback["independent_cold_status_attempts"] = cold_attempts
                 fallback["warm_digest"] = parity_digest(home, pin)
                 fallback["cold_digest"] = parity_digest(cold_home, cold_pin)
                 need(fallback["warm_digest"] == fallback["cold_digest"], "FULL fallback vs cold native/graph/class parity failed")
@@ -531,25 +715,52 @@ def measure(args):
                    note="partial samples retained, never replace or drop")
             raise
         finally:
-            if active is not None:
-                active.stop()
-            for sig, previous in old_handlers.items():
-                signal.signal(sig, previous)
-            # Even interrupted runs have an explicit conservative summary.
-            try:
-                records = [json.loads(line) for line in events.read_text().splitlines()]
-                append(log, "summary", **summarize_records(records))
-            except Exception as exc:
-                append(log, "summary", pass_gate=False, error=f"summarizer failed: {exc}")
+            close_out(log, events, active, old_handlers)
     print(json.dumps({"events": str(events), "sha256": file_sha(events)}, sort_keys=True))
+
+def close_out(log, events, active, old_handlers):
+    # Teardown, handler restoration and the summary each run even if an
+    # earlier one fails. A teardown failure is journaled as a failure (so the
+    # gate fails) and raised after the summary.
+    teardown = None
+    if active is not None:
+        try:
+            active.stop()
+        except BaseException as exc:
+            teardown = exc
+            try:
+                append(log, "failure", message=f"teardown: {type(exc).__name__}: {exc}",
+                       note="phase processes may remain; never replace or drop")
+            except Exception:
+                pass
+    for sig, previous in old_handlers.items():
+        signal.signal(sig, previous)
+    # Even interrupted runs have an explicit conservative summary.
+    try:
+        records = [json.loads(line) for line in events.read_text().splitlines()]
+        append(log, "summary", **summarize_records(records))
+    except Exception as exc:
+        append(log, "summary", pass_gate=False, error=f"summarizer failed: {exc}")
+    if teardown is not None:
+        raise teardown
 
 def summarize_records(records):
     series = {}
     failures = [r for r in records if r["type"] == "failure"]
+    invalid = [r for r in records if r["type"] == "series_invalid"]
     for size in ("medium", "large"):
         samples = [r for r in records if r["type"] == "sample" and r.get("size") == size]
         ordered = [planned_edit(size, n)[1] for n in range(20)]
-        complete = (len(samples) == 20 and [r["path"] for r in samples] == ordered
+        baseline = [r for r in records if r["type"] == "series_watcher" and r.get("size") == size]
+        # Healthy native watching must be proven for the series and for every
+        # sample, from the recorded witnesses: a sample without the proof does
+        # not count (owner ruling, Decision 0009 §5).
+        healthy = (len(baseline) == 1 and healthy_baseline(baseline[0].get("witness"))
+                   and all(r.get("watcher_degraded_after") is False
+                           and r.get("watcher_witness_ok") is True
+                           and stayed_healthy(baseline[0]["witness"], r.get("watcher_witness"))
+                           for r in samples))
+        complete = (len(samples) == 20 and [r["path"] for r in samples] == ordered and healthy
                     and all(r.get("valid") is True and r.get("mode_expected") == "local"
                             and r.get("mode_note") == MODE_NOTE
                             and r.get("mode_directly_observed") is False for r in samples))
@@ -557,6 +768,7 @@ def summarize_records(records):
         p95 = sorted(times)[18] if complete else None
         limit = 2 if size == "medium" else 5
         series[size] = {"count":len(samples), "valid":sum(r.get("valid") is True for r in samples),
+                        "healthy_watching_proven":healthy,
                         "raw_latencies_seconds":times, "p95_nearest_rank_seconds":p95,
                         "limit_seconds":limit, "pass_gate":bool(complete and p95 <= limit),
                         "mode_expected":"local", "mode_note":MODE_NOTE,
@@ -565,7 +777,8 @@ def summarize_records(records):
                                           for r in samples if not r.get("valid")]}
     fallbacks = [r for r in records if r["type"] == "fallback"]
     local_gate = (len(records) > 0 and records[0]["type"] == "run_header"
-                  and not failures and all(r["pass_gate"] for r in series.values()))
+                  and not failures and not invalid
+                  and all(r["pass_gate"] for r in series.values()))
     fallback_parity = (len(fallbacks) == 1 and fallbacks[0].get("valid") is True
                        and fallbacks[0].get("parity") is True
                        and fallbacks[0].get("mode_expected") == "full"
@@ -584,6 +797,8 @@ def summarize_records(records):
             "fallback_latency_limit_seconds":None, "fallback_mode_expected":"full",
             "fallback_mode_directly_observed":False, "fallback_mode_note":MODE_NOTE,
             "failures":[r.get("message") for r in failures],
+            "invalid_series":[{"size":r.get("size"), "sample_index":r.get("sample_index"),
+                               "reason":r.get("reason")} for r in invalid],
             "local_watcher_latency_gate_pass":local_gate,
             "pass_gate":bool(local_gate and fallback_parity), "owner_review_required":True,
             "note":"Only the local series has latency thresholds. Fallback timing and same-root cold parity are report-only indirect mode evidence; no CLI index samples counted. Owner reviews raw logs before Gate 3."}

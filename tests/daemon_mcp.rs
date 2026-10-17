@@ -1,3 +1,4 @@
+#![cfg(feature = "test-support")]
 //! Real-process MCP socket ownership, framing, and interrupted-session checks.
 use serde_json::{Value, json};
 use std::{
@@ -10,6 +11,12 @@ use std::{
     time::{Duration, Instant},
 };
 use trellis::daemon::protocol;
+
+/// Split a relayed daemon frame, `<relay id> <MCP line>` (Decision 0009 §7).
+fn relayed(line: &str) -> (u64, Value) {
+    let (relay, frame) = line.trim_end().split_once(' ').expect("relay prefix");
+    (relay.parse().unwrap(), serde_json::from_str(frame).unwrap())
+}
 
 struct Peer {
     child: Child,
@@ -67,14 +74,16 @@ impl Peer {
             json!({"jsonrpc":"2.0","id":id,"method":method,"params":params})
         )
         .unwrap();
-        self.lines.recv_timeout(Duration::from_secs(10)).unwrap()
+        self.lines
+            .recv_timeout(trellis::testing::HANG_BACKSTOP)
+            .unwrap()
     }
     // Preserve the leader PID until its client group has stopped.
     // The auto-started daemon is in another session and is cleaned up in Drop.
     fn finish_unreaped(&mut self) {
         self.stdin.take();
         let pid = self.child.id() as libc::pid_t;
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
         loop {
             let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
             let rc = unsafe {
@@ -174,7 +183,7 @@ fn stop_fixture_daemon(home: &Path) {
     if !sent {
         return;
     }
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
     while Instant::now() < deadline {
         if owned_daemon_connection(home, pid).is_none() {
             let _ = fs::remove_file(&marker);
@@ -203,7 +212,7 @@ fn socket_under(home: &Path) -> Option<PathBuf> {
     None
 }
 fn socket_ready(home: &Path) -> PathBuf {
-    let until = Instant::now() + Duration::from_secs(10);
+    let until = Instant::now() + trellis::testing::HANG_BACKSTOP;
     loop {
         if let Some(path) = socket_under(home)
             && UnixStream::connect(&path).is_ok()
@@ -348,15 +357,21 @@ fn concurrent_clients_share_single_socket_and_survive_bad_private_frame() {
         .unwrap()
         .write_all(burst.as_bytes())
         .unwrap();
-    let mut reply = first.lines.recv_timeout(Duration::from_secs(10)).unwrap();
+    let mut reply = first
+        .lines
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .unwrap();
     if reply["id"] == "cancelled" {
         assert_eq!(reply["result"]["isError"], true);
-        reply = first.lines.recv_timeout(Duration::from_secs(10)).unwrap();
+        reply = first
+            .lines
+            .recv_timeout(trellis::testing::HANG_BACKSTOP)
+            .unwrap();
     }
     assert_eq!(reply["id"], "after-cancel");
     let mut invalid = UnixStream::connect(&socket).unwrap();
     invalid
-        .set_read_timeout(Some(Duration::from_secs(2)))
+        .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
         .unwrap();
     invalid
         .write_all(&((protocol::MAX_FRAME as u32) + 1).to_be_bytes())
@@ -564,10 +579,22 @@ fn legacy_mcp_reconnect_restores_handshake_without_new_client() {
     peer.reaped = true;
 }
 
+/// While a call is held at the daemon's send decision, the relay keeps
+/// answering input (Decision 0009 §7): protocol errors locally, at most 16
+/// outstanding requests and 4 outstanding calls (the excess refused at once,
+/// calls in the pre-resolution shape), an outstanding ID refused as a
+/// duplicate, and a cancelled ID reusable. A cancel written in the burst still
+/// suppresses the held call.
 #[test]
 fn cancellation_precedes_invalid_queue_and_sixteen_follow_ons() {
     use std::os::unix::net::UnixListener;
-    for count in [1usize, 16usize, 18usize, 24usize, 25usize, 26usize] {
+    for variant in [
+        "protocol",
+        "requests",
+        "calls",
+        "duplicate",
+        "duplicate-cancel",
+    ] {
         let home = tempfile::tempdir().unwrap();
         let root = checkout(home.path());
         let phase_path = PathBuf::from(format!(
@@ -593,170 +620,154 @@ fn cancellation_precedes_invalid_queue_and_sixteen_follow_ons() {
             "io.modelcontextprotocol/protocolVersion":"2026-07-28",
             "io.modelcontextprotocol/clientCapabilities":{}
         }});
-        writeln!(
-            peer.stdin.as_mut().unwrap(),
-            "{}",
-            json!({
-                "jsonrpc":"2.0","id":"cancel-A","method":"tools/call",
+        let call = |id: Value| {
+            json!({"jsonrpc":"2.0","id":id,"method":"tools/call",
                 "params":{"name":"trellis_workspace_describe",
-                    "arguments":{"schemaVersion":1},"_meta":metadata["_meta"]}
-            })
-        )
-        .unwrap();
-        let (mut phase, _) = listener.accept().unwrap();
-        phase
-            .set_read_timeout(Some(Duration::from_secs(10)))
-            .unwrap();
-        let mut stage = String::new();
-        BufReader::new(phase.try_clone().unwrap())
-            .read_line(&mut stage)
-            .unwrap();
-        assert_eq!(stage, "launch_final\n");
-        let cancel = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":\"cancel-A\"}}\n";
-        let mut burst = if count == 1 {
-            format!("{cancel}{{bad json}}\n{}\n", "x".repeat(16_385))
-        } else {
-            String::new()
+                    "arguments":{"schemaVersion":1},"_meta":metadata["_meta"]}})
         };
-        for n in 0..count {
-            let id = if count >= 25 && (n == 8 || n == 24) {
-                8
-            } else {
-                100 + n
-            };
-            let call = match n {
-                16 | 17 | 24 if n != 24 || count == 26 => {
-                    json!({"jsonrpc":"2.0","id":id,"method":"tools/call",
-                    "params":{"name":"trellis_workspace_describe",
-                        "arguments":{"schemaVersion":1},"_meta":metadata["_meta"]}})
-                }
-                19 => json!({"jsonrpc":"2.0","id":119,"method":"no/such/method","params":metadata}),
-                20 => json!({"jsonrpc":"2.0","id":120,"method":"tools/call",
-                    "params":{"name":"unknown_tool","arguments":{},"_meta":metadata["_meta"]}}),
-                21 => json!({"jsonrpc":"2.0","id":121,"method":"tools/list",
-                    "params":{"cursor":"unexpected","_meta":metadata["_meta"]}}),
-                22 => json!({"jsonrpc":"2.0","id":122,"method":"tools/call",
-                    "params":{"name":"trellis_workspace_describe","arguments":{"schemaVersion":1}}}),
-                23 => json!({"jsonrpc":"2.0","id":123,"method":"tools/call",
-                    "params":{"name":"trellis_workspace_describe","arguments":{"schemaVersion":1},
-                        "_meta":{"io.modelcontextprotocol/protocolVersion":"2099-01-01",
-                            "io.modelcontextprotocol/clientCapabilities":{}}}}),
-                _ => json!({"jsonrpc":"2.0","id":id,"method":"tools/list","params":metadata}),
-            };
-            if count == 26 && n == 24 {
-                burst.push_str("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":8}}\n");
-            }
-            burst.push_str(&call.to_string());
+        let list =
+            |id: u64| json!({"jsonrpc":"2.0","id":id,"method":"tools/list","params":metadata});
+        let cancel = |id: Value| json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":id}});
+        writeln!(peer.stdin.as_mut().unwrap(), "{}", call(json!("cancel-A"))).unwrap();
+        let hold = |listener: &UnixListener| {
+            let (phase, _) = listener.accept().unwrap();
+            phase
+                .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
+                .unwrap();
+            let mut stage = String::new();
+            BufReader::new(phase.try_clone().unwrap())
+                .read_line(&mut stage)
+                .unwrap();
+            assert_eq!(stage, "launch_final\n");
+            phase
+        };
+        let mut held = hold(&listener);
+        let mut burst = String::new();
+        let mut push = |frame: String| {
+            burst.push_str(&frame);
             burst.push('\n');
+        };
+        match variant {
+            "protocol" => {
+                push("{bad json}".into());
+                push("x".repeat(16_385));
+            }
+            "requests" => (100..118).for_each(|id| push(list(id).to_string())),
+            "calls" => (200..204).for_each(|id| push(call(json!(id)).to_string())),
+            "duplicate" => {
+                push(list(8).to_string());
+                push(list(8).to_string());
+            }
+            _ => {
+                push(list(8).to_string());
+                push(list(8).to_string());
+                push(cancel(json!(8)).to_string());
+                push(list(8).to_string());
+            }
         }
-        if count >= 16 {
-            burst.push_str(cancel);
+        // With calls, A must still be outstanding when the fourth arrives: its
+        // cancel follows the refusal instead of riding in the burst.
+        if variant != "calls" {
+            push(cancel(json!("cancel-A")).to_string());
         }
         peer.stdin
             .as_mut()
             .unwrap()
             .write_all(burst.as_bytes())
             .unwrap();
-        if count >= 18 {
-            // The daemon is held at A: overflow replies must come from the thin relay.
-            for id in [116, 117] {
-                let overflow = peer.lines.recv_timeout(Duration::from_secs(10)).unwrap();
-                assert_eq!(overflow["id"], id, "{overflow}");
-                assert_eq!(overflow["result"]["isError"], true, "{overflow}");
-                let envelope = &overflow["result"]["structuredContent"];
-                assert_eq!(envelope["requestId"], id, "{overflow}");
-                assert_eq!(
-                    envelope["error"]["code"], "workspace_selection_failed",
-                    "{overflow}"
-                );
-                assert_eq!(envelope["error"]["reason"], "unavailable", "{overflow}");
-                assert_eq!(envelope["error"]["retryable"], true, "{overflow}");
+        let next = || {
+            peer.lines
+                .recv_timeout(trellis::testing::HANG_BACKSTOP)
+                .unwrap()
+        };
+        // Local answers come while the daemon still holds A.
+        match variant {
+            "protocol" => {
+                let invalid = next();
+                assert_eq!(invalid["id"], Value::Null, "{invalid}");
+                assert_eq!(invalid["error"]["code"], -32700, "{invalid}");
+                let oversized = next();
+                assert_eq!(oversized["id"], Value::Null, "{oversized}");
+                assert_eq!(oversized["error"]["code"], -32600, "{oversized}");
+            }
+            "requests" => {
+                // Both are refused locally; their order is not a contract.
+                let mut refused_ids = Vec::new();
+                for _ in 0..2 {
+                    let refused = next();
+                    assert_eq!(refused["error"]["code"], -32000, "{refused}");
+                    assert_eq!(refused["error"]["data"]["code"], "too_many_requests");
+                    refused_ids.push(refused["id"].as_u64().unwrap());
+                }
+                refused_ids.sort_unstable();
+                assert_eq!(refused_ids, vec![116, 117]);
+            }
+            "calls" => {
+                // A and three more are outstanding: the fourth is refused.
+                let refused = next();
+                assert_eq!(refused["id"], 203, "{refused}");
+                let envelope = &refused["result"]["structuredContent"];
+                assert_eq!(envelope["error"]["code"], "too_many_requests", "{refused}");
+                assert_eq!(envelope["error"]["retryable"], true);
                 assert_eq!(
                     envelope["error"]["attemptedWorkspace"]["value"],
                     json!(root.canonicalize().unwrap())
                 );
-                assert_eq!(envelope["error"]["currentBasis"], Value::Null);
-                assert_eq!(envelope["error"]["currentContentHash"], Value::Null);
-                assert!(envelope.get("workspace").is_none(), "{overflow}");
-                assert!(envelope.get("catchingUp").is_none(), "{overflow}");
-                assert_eq!(
-                    serde_json::from_str::<Value>(
-                        overflow["result"]["content"][0]["text"].as_str().unwrap()
-                    )
-                    .unwrap(),
-                    *envelope
-                );
+                assert!(envelope.get("workspace").is_none(), "{refused}");
+                assert!(envelope.get("catchingUp").is_none(), "{refused}");
+                writeln!(
+                    peer.stdin.as_mut().unwrap(),
+                    "{}",
+                    cancel(json!("cancel-A"))
+                )
+                .unwrap();
             }
-            if count >= 24 {
-                for (id, code) in [
-                    (118, -32000),
-                    (119, -32601),
-                    (120, -32602),
-                    (121, -32602),
-                    (122, -32602),
-                    (123, -32022),
-                ] {
-                    let refused = peer.lines.recv_timeout(Duration::from_secs(10)).unwrap();
-                    assert_eq!(refused["id"], id, "{refused}");
-                    assert_eq!(refused["error"]["code"], code, "{refused}");
-                    assert!(refused.get("result").is_none(), "{refused}");
-                    if id == 118 {
-                        assert_eq!(refused["error"]["data"]["code"], "too_many_requests");
-                    }
-                    if id == 123 {
-                        assert_eq!(refused["error"]["data"]["requested"], "2099-01-01");
-                    }
-                }
-                if count >= 25 {
-                    let duplicate = peer.lines.recv_timeout(Duration::from_secs(10)).unwrap();
-                    assert_eq!(duplicate["id"], 8, "{duplicate}");
-                    if count == 25 {
-                        assert_eq!(duplicate["error"]["code"], -32600, "{duplicate}");
-                        assert!(duplicate.get("result").is_none(), "{duplicate}");
-                    } else {
-                        // The earlier queued ID8 was canceled before this new admission.
-                        assert_eq!(duplicate["result"]["isError"], true, "{duplicate}");
-                        assert_eq!(duplicate["result"]["structuredContent"]["requestId"], 8);
-                        assert_eq!(
-                            duplicate["result"]["structuredContent"]["error"]["reason"],
-                            "unavailable"
-                        );
-                        let extra = peer.lines.recv_timeout(Duration::from_secs(10)).unwrap();
-                        assert_eq!(extra["id"], 125, "{extra}");
-                        assert_eq!(extra["error"]["code"], -32000, "{extra}");
-                    }
+            "duplicate" => {
+                let duplicate = next();
+                assert_eq!(duplicate["id"], 8, "{duplicate}");
+                assert_eq!(duplicate["error"]["code"], -32600, "{duplicate}");
+            }
+            // The cancel removes the original and its duplicate refusal.
+            _ => {}
+        }
+        held.write_all(b"x").unwrap();
+        match variant {
+            "requests" => {
+                for id in 100..116 {
+                    let reply = next();
+                    assert_eq!(reply["id"], id, "{reply}");
+                    assert!(reply["result"].is_object(), "{reply}");
                 }
             }
-        }
-        phase.write_all(b"x").unwrap();
-        if count == 1 {
-            let invalid = peer.lines.recv_timeout(Duration::from_secs(10)).unwrap();
-            assert_eq!(invalid["id"], Value::Null, "{invalid}");
-            assert_eq!(invalid["error"]["code"], -32700, "{invalid}");
-            let oversized = peer.lines.recv_timeout(Duration::from_secs(10)).unwrap();
-            assert_eq!(oversized["id"], Value::Null, "{oversized}");
-            assert_eq!(oversized["error"]["code"], -32600, "{oversized}");
-        }
-        for n in 0..count.min(16) {
-            if count == 26 && n == 8 {
-                continue;
+            "calls" => {
+                let mut answered = Vec::new();
+                for _ in 0..3 {
+                    hold(&listener).write_all(b"x").unwrap();
+                    let reply = next();
+                    assert!(reply["result"].is_object(), "{reply}");
+                    answered.push(reply["id"].as_u64().unwrap());
+                }
+                answered.sort_unstable();
+                assert_eq!(answered, vec![200, 201, 202]);
             }
-            let reply = peer.lines.recv_timeout(Duration::from_secs(10)).unwrap();
-            assert_eq!(
-                reply["id"],
-                if count >= 25 && n == 8 { 8 } else { 100 + n },
-                "cancelled/queued response: {reply}"
-            );
-            assert!(reply["result"].is_object(), "{reply}");
-        }
-        if count >= 25 {
-            let reused = peer.ask(8, "tools/list", metadata.clone());
-            assert_eq!(reused["id"], 8, "{reused}");
-            assert!(reused["result"].is_object(), "{reused}");
+            "duplicate" => {
+                // The original ID8 is answered once the daemon is released.
+                let original = next();
+                assert_eq!(original["id"], 8, "{original}");
+                assert!(original["result"].is_object(), "{original}");
+            }
+            "duplicate-cancel" => {
+                // The cancelled first ID8 and its duplicate are suppressed;
+                // its reuse answers.
+                let reused = next();
+                assert_eq!(reused["id"], 8, "{reused}");
+                assert!(reused["result"].is_object(), "{reused}");
+            }
+            _ => {}
         }
         assert!(
             peer.lines.recv_timeout(Duration::from_millis(200)).is_err(),
-            "canceled A produced stdout"
+            "the cancelled call or a suppressed reply produced stdout"
         );
         peer.finish_unreaped();
         unsafe { libc::kill(-(peer.child.id() as libc::pid_t), libc::SIGKILL) };
@@ -804,7 +815,7 @@ fn duplicate_within_bounded_pending_queue_is_rejected_before_first_completes() {
     .unwrap();
     let (mut phase, _) = listener.accept().unwrap();
     phase
-        .set_read_timeout(Some(Duration::from_secs(10)))
+        .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
         .unwrap();
     let mut stage = String::new();
     BufReader::new(phase.try_clone().unwrap())
@@ -827,7 +838,7 @@ fn duplicate_within_bounded_pending_queue_is_rejected_before_first_completes() {
         .unwrap();
     let duplicate = peer
         .lines
-        .recv_timeout(Duration::from_secs(3))
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
         .expect("second queued ID8 must be rejected before A is released");
     assert_eq!(duplicate["id"], 8, "{duplicate}");
     assert_eq!(duplicate["error"]["code"], -32600, "{duplicate}");
@@ -841,12 +852,19 @@ fn duplicate_within_bounded_pending_queue_is_rejected_before_first_completes() {
         })
     )
     .unwrap();
-    // B can finish after A's cancellation while the old daemon hook stays held.
-    let first = peer.lines.recv_timeout(Duration::from_secs(10)).unwrap();
+    // The relay pipelines both on A's connection (Decision 0009 §7): they are
+    // answered, in order, once A's held send decision is released.
+    phase.write_all(b"x").unwrap();
+    let first = peer
+        .lines
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .unwrap();
     assert_eq!(first["id"], 8, "{first}");
     assert!(first["result"].is_object(), "{first}");
-    phase.write_all(b"x").unwrap();
-    let next = peer.lines.recv_timeout(Duration::from_secs(10)).unwrap();
+    let next = peer
+        .lines
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .unwrap();
     assert_eq!(next["id"], 9, "{next}");
     assert!(next["result"].is_object(), "{next}");
     let reused = peer.ask(8, "tools/list", meta);
@@ -899,7 +917,7 @@ fn stdin_eof_cancels_in_flight_call_without_stdout() {
     .unwrap();
     let (mut phase, _) = listener.accept().unwrap();
     phase
-        .set_read_timeout(Some(Duration::from_secs(10)))
+        .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
         .unwrap();
     let mut stage = String::new();
     BufReader::new(phase.try_clone().unwrap())
@@ -961,7 +979,7 @@ fn canceled_read_is_not_replayed_after_daemon_death() {
     .unwrap();
     let (phase, _) = listener.accept().unwrap();
     phase
-        .set_read_timeout(Some(Duration::from_secs(10)))
+        .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
         .unwrap();
     let mut stage = String::new();
     BufReader::new(phase.try_clone().unwrap())
@@ -1069,12 +1087,14 @@ fn check_legacy_synthetic_reattach_cancel(cancel_id: u64, fail_setup: bool) {
     let fake = std::thread::spawn(move || {
         let (mut socket, _) = listener.accept().unwrap();
         socket
-            .set_read_timeout(Some(Duration::from_secs(10)))
+            .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
             .unwrap();
         let attach: protocol::Request = protocol::read_frame(&mut socket).unwrap();
         assert_eq!(attach.operation, "mcp");
         connected_tx.send(()).unwrap();
-        release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        release_rx
+            .recv_timeout(trellis::testing::HANG_BACKSTOP)
+            .unwrap();
         protocol::write_frame(
             &mut socket,
             &protocol::Reply {
@@ -1089,7 +1109,7 @@ fn check_legacy_synthetic_reattach_cancel(cancel_id: u64, fail_setup: bool) {
         loop {
             line.clear();
             reader.read_line(&mut line).unwrap();
-            let value: Value = serde_json::from_str(&line).unwrap();
+            let (relay, value) = relayed(&line);
             let method = value["method"].as_str().unwrap();
             steps.push(method.to_owned());
             match method {
@@ -1100,7 +1120,7 @@ fn check_legacy_synthetic_reattach_cancel(cancel_id: u64, fail_setup: bool) {
                     }
                     writeln!(
                         socket,
-                        "{}",
+                        "{relay} {}",
                         json!({"jsonrpc":"2.0","id":1,"result":{
                             "protocolVersion":"2025-11-25","capabilities":{"tools":{}},
                             "serverInfo":{"name":"trellis","version":"fixture"}}
@@ -1114,7 +1134,7 @@ fn check_legacy_synthetic_reattach_cancel(cancel_id: u64, fail_setup: bool) {
                     assert_eq!(value["id"], 5);
                     writeln!(
                         socket,
-                        "{}",
+                        "{relay} {}",
                         json!({"jsonrpc":"2.0","id":5,"result":{"tools":[]}})
                     )
                     .unwrap();
@@ -1123,7 +1143,7 @@ fn check_legacy_synthetic_reattach_cancel(cancel_id: u64, fail_setup: bool) {
                     assert_eq!(value["id"], 6);
                     writeln!(
                         socket,
-                        "{}",
+                        "{relay} {}",
                         json!({"jsonrpc":"2.0","id":6,"result":{"isError":false}})
                     )
                     .unwrap();
@@ -1145,10 +1165,15 @@ fn check_legacy_synthetic_reattach_cancel(cancel_id: u64, fail_setup: bool) {
                 .count(),
             1
         );
-        if cancel_id == 5 {
+        if cancel_id == 5
+            && let Some(list) = steps.iter().position(|step| step == "tools/list")
+        {
+            // Decision 0009 §7 (no relay-local queue): a request may reach
+            // the daemon before its cancel is read, but the cancel follows it
+            // and the client sees nothing.
             assert!(
-                !steps.contains(&"tools/list".to_owned()),
-                "canceled ID5 reached daemon: {steps:?}"
+                steps[list..].contains(&"notifications/cancelled".to_owned()),
+                "canceled ID5 reached the daemon without its cancel: {steps:?}"
             );
         }
     });
@@ -1160,7 +1185,9 @@ fn check_legacy_synthetic_reattach_cancel(cancel_id: u64, fail_setup: bool) {
         })
     )
     .unwrap();
-    connected_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    connected_rx
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .unwrap();
     writeln!(
         peer.stdin.as_mut().unwrap(),
         "{}",
@@ -1180,7 +1207,10 @@ fn check_legacy_synthetic_reattach_cancel(cancel_id: u64, fail_setup: bool) {
             "canceled pending ID5 produced stdout"
         );
     } else {
-        let list = peer.lines.recv_timeout(Duration::from_secs(10)).unwrap();
+        let list = peer
+            .lines
+            .recv_timeout(trellis::testing::HANG_BACKSTOP)
+            .unwrap();
         assert_eq!(list["id"], 5, "{list}");
         assert!(list["result"]["tools"].is_array(), "{list}");
     }
@@ -1308,12 +1338,14 @@ fn failed_reattach_drains_pending_cancel_and_stdin_eof_before_failure() {
         let fake = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             stream
-                .set_read_timeout(Some(Duration::from_secs(10)))
+                .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
                 .unwrap();
             let attach: protocol::Request = protocol::read_frame(&mut stream).unwrap();
             assert_eq!(attach.operation, "mcp");
             entered_tx.send(()).unwrap();
-            release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            release_rx
+                .recv_timeout(trellis::testing::HANG_BACKSTOP)
+                .unwrap();
             protocol::write_frame(
                 &mut stream,
                 &protocol::Reply {
@@ -1331,7 +1363,9 @@ fn failed_reattach_drains_pending_cancel_and_stdin_eof_before_failure() {
                 "arguments":{"schemaVersion":1},"_meta":meta["_meta"]}})
         )
         .unwrap();
-        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        entered_rx
+            .recv_timeout(trellis::testing::HANG_BACKSTOP)
+            .unwrap();
         if close_stdin {
             peer.stdin.take();
         } else {
@@ -1435,7 +1469,7 @@ fn partial_daemon_reply_is_typed_and_never_reaches_stdout() {
     let fake = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
+            .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
             .unwrap();
         let attach: protocol::Request = protocol::read_frame(&mut stream).unwrap();
         assert_eq!(attach.operation, "mcp");
@@ -1451,12 +1485,10 @@ fn partial_daemon_reply_is_typed_and_never_reaches_stdout() {
         BufReader::new(stream.try_clone().unwrap())
             .read_line(&mut line)
             .unwrap();
-        assert_eq!(
-            serde_json::from_str::<Value>(&line).unwrap()["method"],
-            "tools/call"
-        );
+        let (relay, request) = relayed(&line);
+        assert_eq!(request["method"], "tools/call");
         stream
-            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":")
+            .write_all(format!("{relay} {{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":").as_bytes())
             .unwrap();
         stream.shutdown(std::net::Shutdown::Write).unwrap();
     });
@@ -1500,7 +1532,7 @@ fn partial_daemon_reply_is_typed_and_never_reaches_stdout() {
         }
     });
     let first = lines
-        .recv_timeout(Duration::from_secs(10))
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
         .expect("typed interrupted result while stdin open");
     let response: Value = serde_json::from_slice(&first).unwrap();
     assert_eq!(response["id"], 1);
@@ -1528,7 +1560,7 @@ fn partial_daemon_reply_is_typed_and_never_reaches_stdout() {
     let failed_attach = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
+            .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
             .unwrap();
         let attach: protocol::Request = protocol::read_frame(&mut stream).unwrap();
         assert_eq!(attach.operation, "mcp");
@@ -1554,7 +1586,8 @@ fn partial_daemon_reply_is_typed_and_never_reaches_stdout() {
     )
     .unwrap();
     let selected: Value =
-        serde_json::from_slice(&lines.recv_timeout(Duration::from_secs(10)).unwrap()).unwrap();
+        serde_json::from_slice(&lines.recv_timeout(trellis::testing::HANG_BACKSTOP).unwrap())
+            .unwrap();
     assert_eq!(selected["id"], 2);
     assert_eq!(selected["result"]["isError"], true, "{selected}");
     let envelope = &selected["result"]["structuredContent"];
@@ -1617,7 +1650,8 @@ fn partial_daemon_reply_is_typed_and_never_reaches_stdout() {
         )
         .unwrap();
         let rejected: Value =
-            serde_json::from_slice(&lines.recv_timeout(Duration::from_secs(10)).unwrap()).unwrap();
+            serde_json::from_slice(&lines.recv_timeout(trellis::testing::HANG_BACKSTOP).unwrap())
+                .unwrap();
         assert_eq!(rejected["id"], id, "{rejected}");
         assert_eq!(rejected["error"]["code"], code, "{rejected}");
         assert!(rejected.get("result").is_none(), "{rejected}");
@@ -1626,7 +1660,7 @@ fn partial_daemon_reply_is_typed_and_never_reaches_stdout() {
         }
     }
     child.stdin.take();
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
     let status = loop {
         if let Some(status) = child.try_wait().unwrap() {
             break status;
@@ -1692,7 +1726,7 @@ fn cancel_after_relay_reads_reply_suppresses_that_reply() {
     let pause = |listener: &UnixListener| {
         let (phase, _) = listener.accept().unwrap();
         phase
-            .set_read_timeout(Some(Duration::from_secs(10)))
+            .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
             .unwrap();
         let mut stage = String::new();
         BufReader::new(phase.try_clone().unwrap())
@@ -1720,7 +1754,10 @@ fn cancel_after_relay_reads_reply_suppresses_that_reply() {
         json!({"jsonrpc":"2.0","id":"after","method":"tools/list","params":{"_meta":meta}}),
     );
     pause(&listener).write_all(b"x").unwrap();
-    let next = peer.lines.recv_timeout(Duration::from_secs(10)).unwrap();
+    let next = peer
+        .lines
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .unwrap();
     assert_eq!(next["id"], "after", "cancelled reply was written: {next}");
     let _ = fs::remove_file(&phase_path);
 }
@@ -1758,7 +1795,7 @@ fn cancel_after_the_relay_decides_cannot_recall_the_reply() {
     let pause = |listener: &UnixListener| {
         let (phase, _) = listener.accept().unwrap();
         phase
-            .set_read_timeout(Some(Duration::from_secs(10)))
+            .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
             .unwrap();
         let mut stage = String::new();
         BufReader::new(phase.try_clone().unwrap())
@@ -1780,17 +1817,411 @@ fn cancel_after_the_relay_decides_cannot_recall_the_reply() {
             "params":{"requestId":"late-A"}}),
     );
     decided.write_all(b"x").unwrap();
-    let reply = peer.lines.recv_timeout(Duration::from_secs(10)).unwrap();
+    let reply = peer
+        .lines
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .unwrap();
     assert_eq!(reply["id"], "late-A", "{reply}");
     send(
         &mut peer,
         json!({"jsonrpc":"2.0","id":"after","method":"tools/list","params":{"_meta":meta}}),
     );
     pause(&listener).write_all(b"x").unwrap();
-    let next = peer.lines.recv_timeout(Duration::from_secs(10)).unwrap();
+    let next = peer
+        .lines
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .unwrap();
     assert_eq!(
         next["id"], "after",
         "the late cancel produced output: {next}"
     );
     let _ = fs::remove_file(&phase_path);
+}
+
+/// Decision 0009 §7: the relay owns the strict client-facing deadline. A call
+/// the daemon holds past it is answered deadline_exceeded in the
+/// pre-resolution shape; the daemon's late reply is dropped, even when the
+/// client has already reused the ID for a new request.
+#[test]
+fn relay_answers_at_its_deadline_and_drops_the_late_reply() {
+    use std::os::unix::net::UnixListener;
+    let home = tempfile::tempdir().unwrap();
+    let root = checkout(home.path());
+    let phase_path = PathBuf::from(format!(
+        "/tmp/trellis-138-deadline-{}.sock",
+        rand::random::<u64>()
+    ));
+    let listener = UnixListener::bind(&phase_path).unwrap();
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_trellis"))
+        .arg("daemon")
+        .env("HOME", home.path())
+        .env("XDG_CACHE_HOME", home.path().join("cache"))
+        .env("XDG_DATA_HOME", home.path().join("data"))
+        .env("TRELLIS_TEST_MCP_PHASE", "launch_final")
+        .env("TRELLIS_TEST_MCP_PHASE_SOCKET", &phase_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _ = socket_ready(home.path());
+    let mut peer = Peer::start_with_env(
+        home.path(),
+        &root,
+        // Long enough that a loaded daemon reaches the hold before the relay
+        // decides; the relay must not cancel the call before it is held.
+        &[("TRELLIS_TEST_MCP_RELAY_DEADLINE_MS", "2000".as_ref())],
+    );
+    let meta = json!({
+        "io.modelcontextprotocol/protocolVersion":"2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities":{}
+    });
+    let call = json!({"jsonrpc":"2.0","id":"A","method":"tools/call",
+        "params":{"name":"trellis_workspace_describe",
+            "arguments":{"schemaVersion":1},"_meta":meta}});
+    writeln!(peer.stdin.as_mut().unwrap(), "{call}").unwrap();
+    // The daemon holds A at its send decision.
+    let (mut held, _) = listener.accept().unwrap();
+    held.set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
+        .unwrap();
+    let mut stage = String::new();
+    BufReader::new(held.try_clone().unwrap())
+        .read_line(&mut stage)
+        .unwrap();
+    assert_eq!(stage, "launch_final\n");
+    let reply = peer
+        .lines
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .expect("the relay did not answer at its deadline");
+    assert_eq!(reply["id"], "A", "{reply}");
+    let envelope = &reply["result"]["structuredContent"];
+    assert_eq!(envelope["error"]["code"], "deadline_exceeded", "{reply}");
+    assert_eq!(envelope["error"]["retryable"], true);
+    assert_eq!(envelope["requestId"], "A");
+    assert!(
+        envelope["error"]["attemptedWorkspace"].is_object(),
+        "{reply}"
+    );
+    assert!(envelope.get("workspace").is_none(), "{reply}");
+    // The client reuses A at once; then the daemon releases the old A.
+    let reuse = json!({"jsonrpc":"2.0","id":"A","method":"tools/list","params":{"_meta":meta}});
+    writeln!(peer.stdin.as_mut().unwrap(), "{reuse}").unwrap();
+    held.write_all(b"x").unwrap();
+    let reused = peer
+        .lines
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .unwrap();
+    assert_eq!(reused["id"], "A", "{reused}");
+    assert!(
+        reused["result"]["tools"].is_array(),
+        "the late reply was written: {reused}"
+    );
+    assert!(
+        peer.lines.recv_timeout(Duration::from_millis(300)).is_err(),
+        "a second reply for A was written"
+    );
+    peer.finish_unreaped();
+    unsafe { libc::kill(-(peer.child.id() as libc::pid_t), libc::SIGKILL) };
+    assert!(peer.child.wait().unwrap().success());
+    peer.reaped = true;
+    daemon.kill().unwrap();
+    daemon.wait().unwrap();
+    fs::remove_file(&phase_path).unwrap();
+}
+
+/// A daemon whose MCP connections pause at `stage` (when set), the phase
+/// listener, and its socket path.
+fn phase_daemon(
+    home: &Path,
+    stage: Option<&str>,
+) -> (
+    std::process::Child,
+    std::os::unix::net::UnixListener,
+    PathBuf,
+) {
+    let phase_path = PathBuf::from(format!(
+        "/tmp/trellis-138-relay-{}.sock",
+        rand::random::<u64>()
+    ));
+    let listener = std::os::unix::net::UnixListener::bind(&phase_path).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_trellis"));
+    command
+        .arg("daemon")
+        .env("HOME", home)
+        .env("XDG_CACHE_HOME", home.join("cache"))
+        .env("XDG_DATA_HOME", home.join("data"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Some(stage) = stage {
+        command
+            .env("TRELLIS_TEST_MCP_PHASE", stage)
+            .env("TRELLIS_TEST_MCP_PHASE_SOCKET", &phase_path);
+    }
+    let daemon = command.spawn().unwrap();
+    let _ = socket_ready(home);
+    (daemon, listener, phase_path)
+}
+
+/// Accept one paused phase connection and check its stage.
+fn paused_at(
+    listener: &std::os::unix::net::UnixListener,
+    stage: &str,
+) -> std::os::unix::net::UnixStream {
+    let (phase, _) = listener.accept().unwrap();
+    phase
+        .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
+        .unwrap();
+    let mut seen = String::new();
+    BufReader::new(phase.try_clone().unwrap())
+        .read_line(&mut seen)
+        .unwrap();
+    assert_eq!(seen, format!("{stage}\n"));
+    phase
+}
+
+fn describe_frame(id: Value) -> Value {
+    json!({"jsonrpc":"2.0","id":id,"method":"tools/call",
+        "params":{"name":"trellis_workspace_describe","arguments":{"schemaVersion":1},
+            "_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities":{}}}})
+}
+
+fn finish_peer(mut peer: Peer, mut daemon: std::process::Child, phase_path: &Path) {
+    peer.finish_unreaped();
+    unsafe { libc::kill(-(peer.child.id() as libc::pid_t), libc::SIGKILL) };
+    let _ = peer.child.wait();
+    peer.reaped = true;
+    daemon.kill().unwrap();
+    daemon.wait().unwrap();
+    let _ = fs::remove_file(phase_path);
+}
+
+/// Decision 0009 §7: the relay decides by each call's own acceptance + 5 s.
+/// Held while writing call A's reply past A's deadline, it answers A
+/// deadline_exceeded instead of the late success; call B, read meanwhile,
+/// expired before it could be forwarded and is decided without the daemon.
+#[test]
+fn relay_decides_by_acceptance_even_when_held_past_the_deadline() {
+    let home = tempfile::tempdir().unwrap();
+    let root = checkout(home.path());
+    let (daemon, listener, phase_path) = phase_daemon(home.path(), None);
+    let deadline = Duration::from_millis(2000);
+    let mut peer = Peer::start_with_env(
+        home.path(),
+        &root,
+        &[
+            ("TRELLIS_TEST_MCP_RELAY_DEADLINE_MS", "2000".as_ref()),
+            ("TRELLIS_TEST_MCP_PHASE", "relay_before_write".as_ref()),
+            ("TRELLIS_TEST_MCP_PHASE_SOCKET", phase_path.as_os_str()),
+        ],
+    );
+    writeln!(
+        peer.stdin.as_mut().unwrap(),
+        "{}",
+        describe_frame(json!("A"))
+    )
+    .unwrap();
+    // The daemon answered A; the relay is held before deciding it.
+    let mut held = paused_at(&listener, "relay_before_write");
+    let written_b = Instant::now();
+    writeln!(
+        peer.stdin.as_mut().unwrap(),
+        "{}",
+        describe_frame(json!("B"))
+    )
+    .unwrap();
+    // Past A's deadline (A was accepted before the hold) and past B's,
+    // allowing B's stdin read ample time to complete.
+    std::thread::sleep(
+        (written_b + deadline + Duration::from_millis(700))
+            .saturating_duration_since(Instant::now()),
+    );
+    held.write_all(b"x").unwrap();
+    for id in ["A", "B"] {
+        let reply = peer
+            .lines
+            .recv_timeout(trellis::testing::HANG_BACKSTOP)
+            .unwrap();
+        assert_eq!(reply["id"], id, "{reply}");
+        let envelope = &reply["result"]["structuredContent"];
+        assert_eq!(envelope["error"]["code"], "deadline_exceeded", "{reply}");
+        assert!(envelope.get("workspace").is_none(), "{reply}");
+    }
+    finish_peer(peer, daemon, &phase_path);
+}
+
+/// #127 per ID: an immediate refusal (the fifth call) is a decided outcome
+/// too, so a cancel the client wrote before it suppresses it.
+#[test]
+fn a_cancel_written_with_a_fifth_call_suppresses_its_refusal() {
+    let home = tempfile::tempdir().unwrap();
+    let root = checkout(home.path());
+    let (daemon, listener, phase_path) = phase_daemon(home.path(), Some("launch_final"));
+    let mut peer = Peer::start(home.path(), &root);
+    // Activate the checkout in this session first: the four timed calls must
+    // not also race a cold activation against their deadline.
+    writeln!(peer.stdin.as_mut().unwrap(), "{}", describe_frame(json!(0))).unwrap();
+    paused_at(&listener, "launch_final")
+        .write_all(b"x")
+        .unwrap();
+    let warm = peer
+        .lines
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .unwrap();
+    assert_eq!(warm["id"], 0, "{warm}");
+    assert!(
+        warm["result"]["structuredContent"]["data"].is_object(),
+        "{warm}"
+    );
+    for id in 1..=4 {
+        writeln!(
+            peer.stdin.as_mut().unwrap(),
+            "{}",
+            describe_frame(json!(id))
+        )
+        .unwrap();
+    }
+    // Four calls are outstanding while the daemon holds the first.
+    let first = paused_at(&listener, "launch_final");
+    let burst = format!(
+        "{}\n{}\n",
+        describe_frame(json!(5)),
+        json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":5}})
+    );
+    peer.stdin
+        .as_mut()
+        .unwrap()
+        .write_all(burst.as_bytes())
+        .unwrap();
+    // Only the first hold matters: the burst arrives while the relay has four
+    // live calls. Later pauses are released at once, so the remaining calls
+    // are not serialized through this thread against their deadlines.
+    let later = listener.try_clone().unwrap();
+    let releaser = std::thread::spawn(move || {
+        for _ in 0..3 {
+            paused_at(&later, "launch_final").write_all(b"x").unwrap();
+        }
+    });
+    let mut first = first;
+    first.write_all(b"x").unwrap();
+    let mut answered = Vec::new();
+    while answered.len() < 4 {
+        let reply = peer
+            .lines
+            .recv_timeout(trellis::testing::HANG_BACKSTOP)
+            .unwrap();
+        assert_ne!(reply["id"], 5, "the cancelled refusal was written: {reply}");
+        assert!(
+            reply["result"]["structuredContent"]["data"].is_object(),
+            "{reply}"
+        );
+        answered.push(reply["id"].as_i64().unwrap());
+    }
+    releaser.join().unwrap();
+    answered.sort_unstable();
+    assert_eq!(answered, vec![1, 2, 3, 4]);
+    assert!(
+        peer.lines.recv_timeout(Duration::from_millis(300)).is_err(),
+        "a reply for the cancelled fifth call"
+    );
+    finish_peer(peer, daemon, &phase_path);
+}
+
+/// Decision 0009 §7: after the relay answers a call at its deadline and the
+/// client reuses the ID for a new call while the daemon's old worker is
+/// still running, the new call is admitted and answered; the old worker's
+/// late outcome never reaches the client.
+#[test]
+fn a_reused_call_id_is_answered_while_the_old_worker_still_runs() {
+    let home = tempfile::tempdir().unwrap();
+    let root = checkout(home.path());
+    let (daemon, listener, phase_path) = phase_daemon(home.path(), Some("call_worker"));
+    let mut peer = Peer::start_with_env(
+        home.path(),
+        &root,
+        &[("TRELLIS_TEST_MCP_RELAY_DEADLINE_MS", "2000".as_ref())],
+    );
+    writeln!(
+        peer.stdin.as_mut().unwrap(),
+        "{}",
+        describe_frame(json!("A"))
+    )
+    .unwrap();
+    let mut old_worker = paused_at(&listener, "call_worker");
+    let expired = peer
+        .lines
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .unwrap();
+    assert_eq!(expired["id"], "A", "{expired}");
+    assert_eq!(
+        expired["result"]["structuredContent"]["error"]["code"], "deadline_exceeded",
+        "{expired}"
+    );
+    writeln!(
+        peer.stdin.as_mut().unwrap(),
+        "{}",
+        describe_frame(json!("A"))
+    )
+    .unwrap();
+    paused_at(&listener, "call_worker").write_all(b"x").unwrap();
+    let reused = peer
+        .lines
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .unwrap();
+    assert_eq!(reused["id"], "A", "{reused}");
+    assert!(
+        reused["result"]["structuredContent"]["data"].is_object(),
+        "the reused call was refused or decided by the old one: {reused}"
+    );
+    old_worker.write_all(b"x").unwrap();
+    assert!(
+        peer.lines.recv_timeout(Duration::from_millis(300)).is_err(),
+        "the old worker's outcome reached the client"
+    );
+    finish_peer(peer, daemon, &phase_path);
+}
+
+/// Decision 0009 §7: the relay checks a call's deadline at its send
+/// decision, after settling input. A timely daemon reply whose settling ends
+/// past the deadline is answered deadline_exceeded, not the success.
+#[test]
+fn a_reply_settled_past_the_deadline_is_not_a_success() {
+    let home = tempfile::tempdir().unwrap();
+    let root = checkout(home.path());
+    let (daemon, listener, phase_path) = phase_daemon(home.path(), None);
+    let mut peer = Peer::start_with_env(
+        home.path(),
+        &root,
+        &[
+            ("TRELLIS_TEST_MCP_RELAY_DEADLINE_MS", "2000".as_ref()),
+            ("TRELLIS_TEST_MCP_PHASE", "relay_after_settle".as_ref()),
+            ("TRELLIS_TEST_MCP_PHASE_SOCKET", phase_path.as_os_str()),
+        ],
+    );
+    let written = Instant::now();
+    writeln!(
+        peer.stdin.as_mut().unwrap(),
+        "{}",
+        describe_frame(json!("A"))
+    )
+    .unwrap();
+    // The daemon answered in time and the relay settled; held before the
+    // send decision until A's deadline (from its acceptance) has passed.
+    let mut held = paused_at(&listener, "relay_after_settle");
+    std::thread::sleep(
+        (written + Duration::from_millis(2000) + Duration::from_millis(500))
+            .saturating_duration_since(Instant::now()),
+    );
+    held.write_all(b"x").unwrap();
+    let reply = peer
+        .lines
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .unwrap();
+    assert_eq!(reply["id"], "A", "{reply}");
+    assert_eq!(
+        reply["result"]["structuredContent"]["error"]["code"], "deadline_exceeded",
+        "a success was sent past its deadline: {reply}"
+    );
+    finish_peer(peer, daemon, &phase_path);
 }

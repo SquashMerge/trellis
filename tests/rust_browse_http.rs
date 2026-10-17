@@ -1,3 +1,4 @@
+#![cfg(feature = "test-support")]
 //! Rust file -> methods -> sequence on cached source, without executing the workspace.
 mod common;
 use axum::{
@@ -63,7 +64,7 @@ async fn rust_methods_sequence_and_source_survive_live_file_removal() {
     let options = IndexOptions::new(workspace.clone());
     let cancel = Arc::new(AtomicBool::new(false));
     let store = crate::common::open_store(&temp.path().join("state"), &workspace).unwrap();
-    let (graph, native, capture) = index_workspace_bundle(
+    let (graph, _, _) = index_workspace_bundle(
         &IndexOptions::new(workspace.clone()),
         store.root_id(),
         &cancel,
@@ -83,18 +84,11 @@ async fn rust_methods_sequence_and_source_survive_live_file_removal() {
             .iter()
             .any(|f| f.path == "helper.js" && f.language == "javascript")
     );
-    let session = store.leader_session().unwrap();
-    store
-        .publish_native(
-            &graph,
-            &capture,
-            &native,
-            session.leader_guard().unwrap(),
-            store.index_baseline().unwrap(),
-            &cancel,
-        )
-        .unwrap();
-    let pin = store.status().unwrap().revision;
+    // The daemon stages its virgin queue before retaining writer SH, then
+    // commits the recorded-options startup reconciliation before it can accept the next browser Q.
+    let (pin, session) =
+        trellis::index_coordinator::reconcile_workspace(&store, &options, &cancel, |_| {}).unwrap();
+    assert_eq!(store.status().unwrap().revision, pin);
     let state = http::new(
         store.clone(),
         options,
@@ -179,7 +173,7 @@ async fn rust_methods_sequence_and_source_survive_live_file_removal() {
     let (code, job) = request(&app, "POST", "/api/index", json!({})).await;
     assert_eq!(code, 202, "{job}");
     let id = job["id"].as_str().unwrap();
-    let completed = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+    let completed = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
             let (code, result) =
                 request(&app, "GET", &format!("/api/jobs/{id}"), Value::Null).await;
@@ -218,6 +212,10 @@ async fn rust_methods_sequence_and_source_survive_live_file_removal() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn daemon_tick_keeps_pinned_and_current_source_available_across_fifty_edits() {
+    use notify::{
+        Event, EventKind,
+        event::{DataChange, ModifyKind},
+    };
     use std::time::{Duration, Instant};
     use trellis::index_coordinator;
 
@@ -266,22 +264,24 @@ async fn daemon_tick_keeps_pinned_and_current_source_available_across_fifty_edit
         let previous = store.status().unwrap().revision;
         let text = format!("pub fn value() -> i32 {{ {edit} }}\n");
         std::fs::write(&source, &text).unwrap();
-        // Deliver the change as the OS watcher would. Publication then does not
-        // depend on notification latency under load; a late native event is a
-        // harmless duplicate (#131).
-        let modified = notify::Event::new(notify::EventKind::Modify(
-            notify::event::ModifyKind::Data(notify::event::DataChange::Content),
-        ))
-        .add_path(source.clone());
-        let delivered_by = Instant::now() + Duration::from_secs(10);
-        while !state.submit_watch_event_for_tests(modified.clone()) {
-            assert!(
-                Instant::now() < delivered_by,
-                "the queue tick never started its scheduler"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        let deadline = Instant::now() + Duration::from_secs(20);
+        // Native OS delivery can coalesce same-size successive writes. Give
+        // this daemon-tick fixture one accepted hint through the real watcher
+        // ingress per edit, rather than depending on the OS callback deadline.
+        tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+            loop {
+                let hint = Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content)))
+                    .add_path(source.clone());
+                if state.submit_watch_event_for_tests(Ok(hint)) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("daemon watcher did not register");
+        // Publication shares a loaded verify host; the hint removes only the
+        // notification latency (#131).
+        let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
         loop {
             let (status_code, status) = request(&app, "GET", "/api/status", Value::Null).await;
             assert_eq!(status_code, 200, "edit {edit}: {status}");
@@ -298,6 +298,15 @@ async fn daemon_tick_keeps_pinned_and_current_source_available_across_fifty_edit
             assert_eq!(
                 pin_code, 200,
                 "edit {edit}, previous {previous:?}: {pinned}"
+            );
+            let prior_text = if edit == 0 {
+                "pub fn value() -> i32 { -1 }\n".to_owned()
+            } else {
+                format!("pub fn value() -> i32 {{ {} }}\n", edit - 1)
+            };
+            assert_eq!(
+                pinned["file"]["text"], prior_text,
+                "prior pin changed at edit {edit}"
             );
             let (current_code, current) =
                 request(&app, "GET", "/api/source?path=lib.rs", Value::Null).await;

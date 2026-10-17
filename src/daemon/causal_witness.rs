@@ -4,21 +4,24 @@
 //! task sends one JSON object per connection, in FIFO order. On a lost event or
 //! transport error the stream stops: later ACKs must not certify a gap.
 use crate::model::IndexPin;
+#[cfg(feature = "test-support")]
 use serde::{Serialize, Serializer};
-use std::{
-    env,
-    path::PathBuf,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::Duration,
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
 };
-use tokio::{io::AsyncWriteExt, net::UnixStream, sync::mpsc};
+#[cfg(feature = "test-support")]
+use std::{env, path::PathBuf, time::Duration};
+use tokio::sync::mpsc;
+#[cfg(feature = "test-support")]
+use tokio::{io::AsyncWriteExt, net::UnixStream};
 use uuid::Uuid;
 
+#[cfg(feature = "test-support")]
 const QUEUE_CAPACITY: usize = 64;
+#[cfg(feature = "test-support")]
 const MAX_RECORD_BYTES: usize = 512;
+#[cfg(feature = "test-support")]
 const IO_DEADLINE: Duration = Duration::from_millis(500);
 
 /// The owner and watcher identities which make generation numbers comparable.
@@ -31,6 +34,7 @@ pub struct Lineage {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg(feature = "test-support")]
 struct Event {
     kind: &'static str,
     root_key: String,
@@ -50,10 +54,12 @@ struct Event {
     stream_seq: u64,
 }
 
+#[cfg(feature = "test-support")]
 fn serialize_uuid<S: Serializer>(value: &Uuid, serializer: S) -> Result<S::Ok, S::Error> {
     serializer.serialize_str(&value.to_string())
 }
 
+#[cfg_attr(not(feature = "test-support"), allow(dead_code))]
 struct QueuedEvent {
     kind: &'static str,
     lineage: Lineage,
@@ -71,6 +77,7 @@ pub struct CausalWitness {
 impl CausalWitness {
     /// Activate only for an absolute socket directly inside the fixture HOME.
     /// Its test owns the private directory and socket; ordinary runs are inert.
+    #[cfg(feature = "test-support")]
     pub fn from_env(root_key: String) -> Option<Arc<Self>> {
         let home = PathBuf::from(env::var_os("HOME")?);
         let socket = PathBuf::from(env::var_os("TRELLIS_TEST_MCP_CAUSAL_SOCKET")?);
@@ -135,6 +142,7 @@ impl CausalWitness {
     }
 }
 
+#[cfg(feature = "test-support")]
 async fn write_events(
     socket: PathBuf,
     root_key: String,
@@ -187,6 +195,7 @@ async fn write_events(
     }
 }
 
+#[cfg(feature = "test-support")]
 async fn write_one(socket: &PathBuf, event: &Event) -> bool {
     let Ok(bytes) = serde_json::to_vec(event) else {
         return false;
@@ -207,6 +216,7 @@ async fn write_one(socket: &PathBuf, event: &Event) -> bool {
     )
 }
 
+#[cfg(feature = "test-support")]
 async fn send_error(
     socket: &PathBuf,
     root_key: &str,
@@ -232,7 +242,7 @@ async fn send_error(
     let _ = write_one(socket, &error).await;
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-support"))]
 mod tests {
     use super::*;
 
@@ -252,12 +262,12 @@ mod tests {
 
     async fn receive_event(listener: &tokio::net::UnixListener) -> serde_json::Value {
         use tokio::io::AsyncReadExt;
-        let (mut peer, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+        let (mut peer, _) = tokio::time::timeout(crate::testing::HANG_BACKSTOP, listener.accept())
             .await
             .unwrap()
             .unwrap();
         let mut bytes = Vec::new();
-        tokio::time::timeout(Duration::from_secs(2), peer.read_to_end(&mut bytes))
+        tokio::time::timeout(crate::testing::HANG_BACKSTOP, peer.read_to_end(&mut bytes))
             .await
             .unwrap()
             .unwrap();
@@ -304,7 +314,7 @@ mod tests {
         }
         assert!(!failed.load(Ordering::Acquire));
         drop(reporter);
-        tokio::time::timeout(Duration::from_secs(2), writer)
+        tokio::time::timeout(crate::testing::HANG_BACKSTOP, writer)
             .await
             .unwrap()
             .unwrap();
@@ -337,7 +347,7 @@ mod tests {
         assert_eq!(event["kind"], "ERROR");
         assert_eq!(event["streamSeq"], 1);
         drop(reporter);
-        tokio::time::timeout(Duration::from_secs(2), writer)
+        tokio::time::timeout(crate::testing::HANG_BACKSTOP, writer)
             .await
             .unwrap()
             .unwrap();
@@ -378,7 +388,7 @@ mod tests {
             failed.clone(),
         ));
         reporter.watch_pending(owner, 1);
-        tokio::time::timeout(Duration::from_secs(2), writer)
+        tokio::time::timeout(crate::testing::HANG_BACKSTOP, writer)
             .await
             .unwrap()
             .unwrap();

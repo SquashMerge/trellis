@@ -1,3 +1,4 @@
+#![cfg(feature = "test-support")]
 //! Synthetic class projection tests. No workspace programs or providers run.
 mod common;
 use axum::{
@@ -54,7 +55,7 @@ fn setup_with(
     Store,
     Graph,
     Router,
-    Arc<trellis::store::topology::LeaderSession>,
+    Arc<trellis::store::topology::WriterSession>,
 ) {
     let dir = tempfile::tempdir().unwrap();
     let workspace = dir.path().join("workspace");
@@ -64,13 +65,13 @@ fn setup_with(
     let options = IndexOptions::new(workspace.clone());
     let graph = index_workspace(&options, &cancel(), |_| {}).unwrap();
     let store = crate::common::open_store(&dir.path().join("state"), &workspace).unwrap();
-    let session = store.leader_session().unwrap();
+    let session = store.writer_session_for_tests().unwrap();
     assert_eq!(
         publish_bundle(
             &store,
             &graph,
             &workspace,
-            session.leader_guard().unwrap(),
+            session.writer_guard().unwrap(),
             trellis::model::IndexPin {
                 index_generation: store.index_baseline().unwrap().index_generation,
                 index_revision: 0
@@ -97,7 +98,7 @@ fn setup() -> (
     Store,
     Graph,
     Router,
-    Arc<trellis::store::topology::LeaderSession>,
+    Arc<trellis::store::topology::WriterSession>,
 ) {
     setup_with(JAVA)
 }
@@ -262,7 +263,7 @@ async fn authentication_strict_requests_revision_and_disconnected_expansion() {
         &store,
         &graph,
         &dir.path().join("workspace"),
-        session.leader_guard().unwrap(),
+        session.writer_guard().unwrap(),
         trellis::model::IndexPin {
             index_generation,
             index_revision: 1,
@@ -354,12 +355,12 @@ fn selected_class_pagination_spans_paths_in_one_revision() {
     let options = IndexOptions::new(workspace.clone());
     let graph = index_workspace(&options, &cancel(), |_| {}).unwrap();
     let store = crate::common::open_store(&dir.path().join("state"), &workspace).unwrap();
-    let session = store.leader_session().unwrap();
+    let session = store.writer_session_for_tests().unwrap();
     let pin = publish_bundle(
         &store,
         &graph,
         &workspace,
-        session.leader_guard().unwrap(),
+        session.writer_guard().unwrap(),
         store.index_baseline().unwrap(),
         &cancel(),
     )
@@ -477,12 +478,12 @@ fn incompatible_index_refuses_without_migrating_durable_data() {
     let db = rusqlite::Connection::open(index_db(&state)).unwrap();
     db.pragma_update(None, "user_version", 2).unwrap();
     drop(db);
-    // The old disposable index is admitted for verified-leader rebaseline,
-    // but its evidence cannot be served or migrated as durable user data.
+    // The incompatible derived index is disposable, but cannot be read before
+    // mandatory reconciliation. Durable saved-view bytes remain untouched.
     let deferred = Store::open_for_tests(&state, &workspace).unwrap();
     let refusal = deferred.status().unwrap_err();
     assert!(
-        refusal.to_string().contains("incompatible_index"),
+        refusal.to_string().contains("index_not_ready"),
         "{refusal:#}"
     );
     assert_eq!(std::fs::read(record).unwrap(), before);
@@ -530,7 +531,7 @@ fn failed_publication_keeps_projection_atomic_with_graph() {
         &store,
         &changed,
         &workspace,
-        session.leader_guard().unwrap(),
+        session.writer_guard().unwrap(),
         prior,
         &abort,
     )
@@ -560,7 +561,7 @@ fn failed_publication_keeps_projection_atomic_with_graph() {
     drop(app);
     drop(session);
 
-    let leader = store.leader().unwrap();
+    let leader = store.publication_for_tests().unwrap();
     let control = store.index_baseline().unwrap();
     assert!(
         publish_bundle(
@@ -578,7 +579,7 @@ fn failed_publication_keeps_projection_atomic_with_graph() {
     );
     drop(leader);
 
-    let leader = store.leader().unwrap();
+    let leader = store.publication_for_tests().unwrap();
     let control = store.index_baseline().unwrap();
     assert!(
         publish_bundle(
@@ -597,18 +598,16 @@ fn failed_publication_keeps_projection_atomic_with_graph() {
     drop(leader);
 
     let prior = store.index_baseline().unwrap();
-    let leader = store.leader().unwrap();
+    let leader = store.publication_for_tests().unwrap();
     let path = index_db(&dir.path().join("state"));
     let db = rusqlite::Connection::open(&path).unwrap();
     db.execute_batch("CREATE TRIGGER fail_projection BEFORE INSERT ON class_relations BEGIN SELECT RAISE(ABORT,'synthetic failure'); END;").unwrap();
     let unchanged = std::fs::read(&path).unwrap();
-    assert!(
-        store
-            .leader()
-            .unwrap_err()
-            .to_string()
-            .contains("incompatible_index")
-    );
+    // A second local WriterGuard is valid: there is no elected leader lock.
+    // Atomic rollback below is guarded by SQLite publication, not election.
+    let concurrent = store.publication_for_tests().unwrap();
+    concurrent.verify().unwrap();
+    drop(concurrent);
     let rejected = publish_bundle(
         &store,
         &graph,
@@ -619,7 +618,10 @@ fn failed_publication_keeps_projection_atomic_with_graph() {
     )
     .unwrap_err();
     assert!(
-        rejected.to_string().contains("revision conflict: expected"),
+        rejected.to_string().contains("incompatible_index")
+            && rejected
+                .to_string()
+                .contains("unknown cache object type, name or shape"),
         "{rejected:#}"
     );
     assert_eq!(std::fs::read(&path).unwrap(), unchanged);
@@ -662,7 +664,8 @@ fn failed_publication_keeps_projection_atomic_with_graph() {
             .contains("incompatible_index")
     );
     db.execute_batch("DROP TRIGGER fail_projection").unwrap();
-    drop(db);
+    // Keep this independent SQLite descriptor open until the Store and writer
+    // guards are gone; closing another handle to a live DB can drop POSIX locks.
     drop(leader);
 
     for closed in [
@@ -678,7 +681,7 @@ fn failed_publication_keeps_projection_atomic_with_graph() {
 
     let control = store.index_baseline().unwrap();
     assert_eq!(control, prior);
-    let leader = store.leader().unwrap();
+    let leader = store.publication_for_tests().unwrap();
     let next = publish_bundle(
         &store,
         &graph,
@@ -707,6 +710,9 @@ fn failed_publication_keeps_projection_atomic_with_graph() {
         serde_json::to_value(store.class_diagram_at(&current).unwrap()).unwrap(),
         before_at_next
     );
+    drop(leader);
+    drop(store);
+    drop(db);
 }
 
 #[tokio::test]
@@ -807,7 +813,7 @@ fn presentation_byte_budget_clips_members_and_paginates_without_skipping_rows() 
         std::fs::write(workspace.join(format!("N{i:03}.java")), text).unwrap();
     }
     let store = crate::common::open_store(&dir.path().join("state"), &workspace).unwrap();
-    let session = store.leader_session().unwrap();
+    let session = store.writer_session_for_tests().unwrap();
     let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
         &IndexOptions::new(workspace.clone()),
         store.root_id(),
@@ -820,7 +826,7 @@ fn presentation_byte_budget_clips_members_and_paginates_without_skipping_rows() 
             &graph,
             &capture,
             &native,
-            session.leader_guard().unwrap(),
+            session.writer_guard().unwrap(),
             store.index_baseline().unwrap(),
             &cancel(),
         )
@@ -1141,7 +1147,7 @@ fn publish_bundle(
     store: &trellis::store::Store,
     graph: &trellis::model::Graph,
     workspace: &std::path::Path,
-    leader: &trellis::store::topology::LeaderGuard,
+    leader: &trellis::store::topology::WriterGuard,
     expected: trellis::model::IndexPin,
     cancel: &trellis::model::CancelFlag,
 ) -> anyhow::Result<trellis::model::IndexPin> {
@@ -1521,7 +1527,7 @@ async fn changed_captured_class_scip_label_recomputes_f_and_new_revision_class_p
     options.scip_path = Some(dir.path().join("labels.scip"));
     options.manifest_path = Some(dir.path().join("labels.json"));
     let store = common::open_store(&dir.path().join("state"), &workspace).unwrap();
-    let session = store.leader_session().unwrap();
+    let session = store.writer_session_for_tests().unwrap();
     let mut observations = Vec::new();
     for version in ["one", "two"] {
         write_class_scip_labels(dir.path(), version);
@@ -1552,7 +1558,7 @@ async fn changed_captured_class_scip_label_recomputes_f_and_new_revision_class_p
                 &graph,
                 &capture,
                 &native,
-                session.leader_guard().unwrap(),
+                session.writer_guard().unwrap(),
                 expected,
                 &cancel(),
             )
@@ -1662,7 +1668,7 @@ async fn normal_size_captured_java_python_cold_oracle_attests_full_published_cat
         std::fs::write(target, source).unwrap();
     }
     let store = crate::common::open_store(&dir.path().join("state"), &workspace).unwrap();
-    let session = store.leader_session().unwrap();
+    let session = store.writer_session_for_tests().unwrap();
     let options = IndexOptions::new(workspace.clone());
     let cancel = cancel();
     let (published_graph, published_native, authenticated_capture) =
@@ -1673,7 +1679,7 @@ async fn normal_size_captured_java_python_cold_oracle_attests_full_published_cat
             &published_graph,
             &authenticated_capture,
             &published_native,
-            session.leader_guard().unwrap(),
+            session.writer_guard().unwrap(),
             store.index_baseline().unwrap(),
             &cancel,
         )
@@ -1898,7 +1904,7 @@ async fn retained_class_page_and_diagram_are_byte_stable_after_full_rewrite() {
         &store,
         &changed,
         &root,
-        session.leader_guard().unwrap(),
+        session.writer_guard().unwrap(),
         old,
         &cancel(),
     )
@@ -2028,7 +2034,7 @@ async fn retained_class_page_and_diagram_are_byte_stable_after_full_rewrite() {
     assert_eq!(diagram["nodes"], cold_diagram["nodes"]);
     store.set_retention_clock_for_tests(1_900, 900);
     store
-        .release_revision(old, session.leader_guard().unwrap())
+        .release_revision(old, session.writer_guard().unwrap())
         .unwrap();
     let (code, body) = call(&app, "GET", &page_route, Value::Null).await;
     assert_eq!(code, StatusCode::CONFLICT, "{body}");

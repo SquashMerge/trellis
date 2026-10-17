@@ -19,7 +19,7 @@ fn fixture(
     Store,
     Graph,
     QuestionRequest,
-    Arc<trellis::store::topology::LeaderSession>,
+    Arc<trellis::store::topology::WriterSession>,
 ) {
     let work = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
@@ -33,19 +33,18 @@ fn fixture(
     let graph = index_workspace(&IndexOptions::new(work.path().into()), &cancel, |_| {}).unwrap();
     // Native measured calls cannot acquire lexical targets from matching names.
     let store = crate::common::open_store(state.path(), work.path()).unwrap();
-    let session = store.leader_session().unwrap();
-    let revision = publish_bundle(
+    let (revision, session) = trellis::index_coordinator::reconcile_workspace(
         &store,
-        &graph,
-        work.path(),
-        session.leader_guard().unwrap(),
-        trellis::model::IndexPin {
-            index_generation: store.index_baseline().unwrap().index_generation,
-            index_revision: 0,
-        },
+        &IndexOptions::new(work.path().to_owned()),
         &cancel,
+        |_| {},
     )
     .unwrap();
+    assert_eq!(
+        store.graph().unwrap(),
+        graph,
+        "published graph must match captured source"
+    );
     let request = serde_json::from_value(serde_json::json!({"seed":graph.nodes.iter().find(|n| n.name == "seed").unwrap().id, "question":"Where is helper called?", "expectedRevision":revision})).unwrap();
     (work, state, store, graph, request, session)
 }
@@ -210,17 +209,17 @@ fn local_literal_only_uncertainty_and_no_budget_filling() {
 }
 #[test]
 fn revision_drift_rejected_snapshot_remains_immutable() {
-    let (_w, _s, store, graph, request, session) = fixture(CODE);
+    let (_w, _s, store, graph, request, _session) = fixture(CODE);
     let p = prepare(&store, request.clone()).unwrap();
-    publish_bundle(
+    let (next, _) = trellis::index_coordinator::reconcile_workspace(
         &store,
-        &graph,
-        _w.path(),
-        session.leader_guard().unwrap(),
-        request.expected_revision,
+        &IndexOptions::new(_w.path().to_owned()),
         &Arc::new(AtomicBool::new(false)),
+        |_| {},
     )
     .unwrap();
+    assert!(next.index_revision > request.expected_revision.index_revision);
+    assert_eq!(store.graph().unwrap(), graph);
     assert!(
         prepare(&store, request)
             .unwrap_err()
@@ -265,7 +264,7 @@ fn candidate_limit_reports_incomplete_evidence() {
 #[test]
 fn assembly_preserves_boundaries_and_never_expands_callbacks() {
     let code = "class Runner {}\nfunction cb() { console.log('callback'); }\nfunction seed(flag) { if (flag) { while (flag) { new Runner(); external(cb); } } }";
-    let (_w, _s, store, graph, mut request, session) = fixture(code);
+    let (_w, _s, store, graph, mut request, _session) = fixture(code);
     let class_id = graph
         .nodes
         .iter()
@@ -280,15 +279,15 @@ fn assembly_preserves_boundaries_and_never_expands_callbacks() {
         .unwrap()
         .id
         .clone();
-    request.expected_revision = publish_bundle(
+    request.expected_revision = trellis::index_coordinator::reconcile_workspace(
         &store,
-        &graph,
-        _w.path(),
-        session.leader_guard().unwrap(),
-        request.expected_revision,
+        &IndexOptions::new(_w.path().to_owned()),
         &Arc::new(AtomicBool::new(false)),
+        |_| {},
     )
-    .unwrap();
+    .unwrap()
+    .0;
+    assert_eq!(store.graph().unwrap(), graph);
     let p = prepare(&store, request).unwrap();
     assert_eq!(p.context.calls.len(), 2);
     let v = assemble(&p, &all(&p, Relevance::Essential), "manual").unwrap();
@@ -490,25 +489,4 @@ fn variable_question_packet_is_source_only_not_an_executable_seed() {
             .unwrap()
             .contains("\"target\"")
     );
-}
-
-fn publish_bundle(
-    store: &trellis::store::Store,
-    graph: &trellis::model::Graph,
-    workspace: &std::path::Path,
-    leader: &trellis::store::topology::LeaderGuard,
-    expected: trellis::model::IndexPin,
-    cancel: &trellis::model::CancelFlag,
-) -> anyhow::Result<trellis::model::IndexPin> {
-    let (indexed, native, capture) = trellis::indexer::index_workspace_bundle(
-        &trellis::indexer::IndexOptions::new(workspace.to_owned()),
-        store.root_id(),
-        cancel,
-        |_| {},
-    )?;
-    assert_eq!(
-        &indexed, graph,
-        "published graph must match captured source"
-    );
-    store.publish_native(&indexed, &capture, &native, leader, expected, cancel)
 }

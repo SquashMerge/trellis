@@ -30,7 +30,7 @@ fn state_and_databases_are_private_and_symlink_safe() {
         0o600
     );
     assert_eq!(
-        fs::metadata(index.join("leader.lock"))
+        fs::metadata(index.with_extension("lock"))
             .unwrap()
             .permissions()
             .mode()

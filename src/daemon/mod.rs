@@ -1,4 +1,5 @@
 //! Per-user daemon election and private Unix socket ownership.
+#[cfg(feature = "test-support")]
 pub mod causal_witness;
 pub mod client;
 pub mod protocol;
@@ -205,17 +206,29 @@ impl Drop for SocketOwner {
 pub async fn run_idle_lifecycle(
     registry: std::sync::Arc<tokio::sync::Mutex<registry::CheckoutRegistry>>,
 ) -> Result<(), registry::SelectionError> {
-    let mut ticks = tokio::time::interval(std::time::Duration::from_millis(250));
-    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Event-driven (Decision 0009 §5): sleep until the next policy deadline
+    // unless a client change, a retirement, drained work or a released lease
+    // signals first. A signal sent while advancing is kept as a permit.
+    let signal = registry.lock().await.lifecycle_signal();
     loop {
-        ticks.tick().await;
-        if registry
-            .lock()
-            .await
-            .advance(std::time::Instant::now())?
-            .exit
-        {
+        let now = std::time::Instant::now();
+        let tick = {
+            let mut registry = registry.lock().await;
+            let tick = registry.advance(now)?;
+            (tick.exit, registry.next_lifecycle_deadline(now))
+        };
+        let (exit, deadline) = tick;
+        if exit {
             return Ok(());
+        }
+        match deadline {
+            Some(deadline) => {
+                tokio::select! {
+                    () = signal.notified() => {}
+                    () = tokio::time::sleep_until(deadline.into()) => {}
+                }
+            }
+            None => signal.notified().await,
         }
     }
 }
@@ -310,7 +323,8 @@ impl BrowserProvisioner {
             .await
     }
 
-    /// Hook for deterministic boundary tests; invoked while registration holds its guard.
+    /// Hook for deterministic boundary tests; every stage runs under the
+    /// registry guard.
     #[doc(hidden)]
     pub async fn register_serve_with_hook(
         &mut self,
@@ -333,11 +347,18 @@ impl BrowserProvisioner {
             .file_name()
             .ok_or_else(|| anyhow::anyhow!("token file needs a name"))?;
         let token_path = parent.canonicalize()?.join(file);
-        // The held guard covers validation, binding, token creation and commit.
+        // One guard covers the conflict check, the configuration build, binding,
+        // token creation and the in-place publication (Decision 0009 §6). The
+        // daemon's provisioning mutex serializes serve registrations, so no
+        // other registration can win between these steps. Nothing waits for a
+        // checkout's index work.
         let mut checked = registry.lock().await;
         checked
             .can_register(identity, &options)
             .map_err(|error| anyhow::anyhow!("{}", error.reason()))?;
+        let config = checked.registration_config(identity, &options)?;
+        // The same successful guard covers validation, binding, token creation
+        // and registration; no other attachment can win between these steps.
         if let Some(hook) = hook.as_mut() {
             hook("validated");
         }
@@ -364,9 +385,7 @@ impl BrowserProvisioner {
                 self.token.as_ref() == Some(&token),
                 "serve token contents changed"
             );
-            checked
-                .register(identity, options)
-                .map_err(|error| anyhow::anyhow!("{}", error.reason()))?;
+            checked.register_in_place(identity, options, config)?;
             return self
                 .address()
                 .ok_or_else(|| anyhow::anyhow!("browser listener closed"));
@@ -381,9 +400,7 @@ impl BrowserProvisioner {
         check_token_path(&token_path, inode)?;
         let browser =
             crate::http::ProvisionedBrowser::new(registry.clone(), token.clone(), address)?;
-        checked
-            .register(identity, options)
-            .map_err(|error| anyhow::anyhow!("{}", error.reason()))?;
+        checked.register_in_place(identity, options, config)?;
         self.listener = Some(listener);
         self.effective_address = Some(address);
         self.browser = Some(browser);
