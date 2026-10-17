@@ -644,28 +644,49 @@ impl EvidenceResponse {
         let selected = self
             .store
             .read_revision_for(&self.db, Some(found.pin), true)?;
-        let mut source_cache = BTreeMap::new();
-        let symbols = found
-            .symbols
-            .into_iter()
-            .map(|symbol| {
+        // Hits from one document may be interleaved with others in rank order.
+        // Visit them document by document so at most one raw BLOB is held (#165).
+        let mut by_document: BTreeMap<&crate::native_evidence::DocumentKey, Vec<usize>> =
+            BTreeMap::new();
+        for (index, symbol) in found.symbols.iter().enumerate() {
+            by_document
+                .entry(&symbol.declaration.document)
+                .or_default()
+                .push(index);
+        }
+        let mut sources: Vec<Option<McpItemSource>> = std::iter::repeat_with(|| None)
+            .take(found.symbols.len())
+            .collect();
+        for indexes in by_document.into_values() {
+            let mut source_cache = BTreeMap::new();
+            for index in indexes {
+                let symbol = &found.symbols[index];
                 let proof = found
                     .provenance
                     .iter()
                     .find(|proof| proof.id == symbol.declaration.provenance_id)
                     .context("store_unavailable: find provenance absent")?;
-                let source = self
-                    .mcp_checked_source(
+                sources[index] = Some(
+                    self.mcp_checked_source(
                         &mut source_cache,
                         &selected,
                         &symbol.declaration,
                         &symbol.content_hash,
                         proof,
                     )?
-                    .item(&symbol.declaration.range)?;
-                Ok(McpFindSymbolWithLines { symbol, source })
+                    .item(&symbol.declaration.range)?,
+                );
+            }
+        }
+        let symbols = found
+            .symbols
+            .into_iter()
+            .zip(sources)
+            .map(|(symbol, source)| McpFindSymbolWithLines {
+                symbol,
+                source: source.expect("every hit belongs to one document group"),
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect();
         Ok(McpFindWithLines {
             symbols,
             scope: found.scope,
@@ -1790,6 +1811,62 @@ mod enriched_read_tests {
                 call.candidate_documents.len(),
                 call.selected.candidates.len()
             );
+        }
+        read.finish(()).unwrap();
+    }
+
+    #[test]
+    fn interleaved_find_hits_keep_rank_lines_and_document_versions() {
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        // Name order ranks the prefix hits xa (a.js), xb (b.js), xc (a.js).
+        std::fs::write(
+            workspace.path().join("a.js"),
+            "function xa() {}\n\nfunction xc() {}\n",
+        )
+        .unwrap();
+        std::fs::write(workspace.path().join("b.js"), "\nfunction xb() {}\n").unwrap();
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let (pin, _owner) = crate::index_coordinator::reconcile_workspace(
+            &store,
+            &IndexOptions::new(workspace.path().to_owned()),
+            &Arc::new(AtomicBool::new(false)),
+            |_| {},
+        )
+        .unwrap();
+        let read = store.evidence_response().unwrap();
+        let found = read.mcp_find_with_lines("x", 20, Some(pin)).unwrap();
+        let hits: Vec<_> = found
+            .symbols
+            .iter()
+            .map(|symbol| {
+                (
+                    symbol.symbol.declaration.name.as_deref().unwrap(),
+                    symbol.source.document.document.path.as_str(),
+                    symbol.source.lines.unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            hits,
+            [
+                ("xa", "a.js", McpLines { start: 1, end: 1 }),
+                ("xb", "b.js", McpLines { start: 2, end: 2 }),
+                ("xc", "a.js", McpLines { start: 3, end: 3 }),
+            ]
+        );
+        assert_eq!(
+            found.symbols[0].source.document,
+            found.symbols[2].source.document
+        );
+        // Each hit's grouped result equals its independently read declaration.
+        for symbol in &found.symbols {
+            let declaration = read
+                .mcp_declaration_with_lines(&symbol.symbol.declaration.syntax_id, Some(pin))
+                .unwrap()
+                .unwrap();
+            assert_eq!(declaration.source.document, symbol.source.document);
+            assert_eq!(declaration.source.lines, symbol.source.lines);
         }
         read.finish(()).unwrap();
     }

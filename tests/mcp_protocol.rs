@@ -7625,7 +7625,6 @@ async fn mcp_wire_valid_basis_and_uint_are_not_silently_dropped() {
             envelope["data"]["text"], "function Target0() {}\n",
             "{legacy}: {envelope}"
         );
-        drop(ask);
         drop(reader);
         drop(client);
         session.join().unwrap().unwrap();
