@@ -202,20 +202,26 @@ a mutable global “current project.” Future registry enumeration must itself 
 
 ## Proposed agent tools
 
-**Phase 1 exposes exactly four MCP tools**, with portable ASCII underscore wire names:
+**Phase 1 exposes exactly five MCP tools**, with portable ASCII underscore wire names in this order:
 
 | Tool | Phase 1 purpose |
 | --- | --- |
 | `trellis_workspace_describe` | Describe the launch checkout, current basis, index state, coverage and limits; no indexing on request |
 | `trellis_find_symbols` | Bounded literal name/ID lookup in the current cached snapshot |
-| `trellis_inspect` | Bounded views of one symbol: first `declaration` and `outgoing_calls`; later `incoming_calls`, `call_paths`, `usages`, `type_hierarchy`, `implementations` and `coverage`; no arbitrary graph query |
+| `trellis_declaration` | One symbol's syntax-tier declaration; no `limit` or `view` input |
+| `trellis_outgoing_calls` | Bounded measured calls of one symbol; optional `limit`, no `view` input |
 | `trellis_read_source` | Bounded cached source range, with hash and exact range |
 
 Every read comes from one snapshot and reports its basis. Pins are optional: a client may send a
 complete `expectedBasis`, or `expectedContentHash` for a source read, and a stale one always conflicts.
-The views first serve syntax-tier evidence and gain semantic evidence as the language stages land. See the
-[MCP contract](mcp-readonly-pilot-contract.md) for exact limits and schemas. No hidden navigation,
-diagram, text-search, artifact, live-file, provider or runtime-control tools belong to this slice.
+Find, declaration and outgoing results use `doc` references into their per-result `documents` table;
+symbols, declaration data and calls include 1-based inclusive source `lines` where selectable. Read
+source with the referenced path, lines, same `expectedBasis` and document `contentHash`, subject to
+source caps. Every tool's deterministic `content[0].text` summary is at most 512 UTF-8 bytes; the
+full schema-valid result is `structuredContent`. These tools first serve syntax-tier evidence and
+gain semantic evidence as the language stages land. Incoming calls and richer navigation remain
+future tools. See the [MCP contract](mcp-readonly-pilot-contract.md) for exact limits and schemas.
+No hidden navigation, diagram, text-search, artifact, live-file, provider or runtime-control tools belong to this slice.
 Tool allowlists and MCP read-only annotations are not a security boundary; the server simply has no
 code path to those operations.
 
@@ -234,7 +240,7 @@ Use grep for discovery: strings, error messages, configuration, comments and unf
 Use structure for narrowing: exact declarations, owner classes, members, hierarchy, source ranges,
 measured calls and diagrams. Then read source to verify the explanation.
 
-A separate next slice after the four-tool pilot adds a **bounded literal scan of indexed snapshot
+A separate next slice after the five-tool pilot adds a **bounded literal scan of indexed snapshot
 text**. FTS is not a prerequisite or an assumed existing facility; benchmark a bounded scan first.
 Regex is later work. Snapshot search does not cover all repository files or automatically execute `rg`. Mimir Hands or another harness can continue to supply approved
 working-tree grep. A future typed `trellis_search_live` can extend coverage with an approved root,
@@ -328,9 +334,10 @@ manifest/hash validation also guards accidental revision reuse.
 
 Deliver the [local topology](local-topology.md): per-checkout index caches, the shared fact cache,
 delta publication by the leader with real-time native refresh, and `trellis mcp` over stdio exposing
-describe -> find_symbols -> inspect (declaration, outgoing and incoming calls) -> read_source. Test with a
-synthetic MCP client across several concurrent worktrees, without Herdr, Mimir, a model or a
-provider. The [MCP contract](mcp-readonly-pilot-contract.md) is the implementation/acceptance gate.
+describe -> find_symbols -> declaration -> outgoing_calls -> read_source. Incoming calls
+remain future work. Test with a synthetic MCP client across several concurrent worktrees,
+without Herdr, Mimir, a model or a provider. The [MCP contract](mcp-readonly-pilot-contract.md)
+is the implementation/acceptance gate.
 In the semantic-index program this is sequenced by
 [#8](https://github.com/SquashMerge/trellis/issues/8), early: storage and delta publication in Stage 2,
 the leader and native refresh in Stage 3, and the syntax-tier MCP server
@@ -371,7 +378,7 @@ Herdr disconnects, restarts, or is not installed.
 Implement real PTY-backed tabs for explicitly requested Trellis-launched direct agents, with bounded
 streaming, input/resize authorization and owned-session lifecycle. Add ACP conversation/tool/approval
 tabs without treating ACP as a terminal transport. Gate Herdr terminal embedding on a verified native
-attach/stream API; association/focus is not an embedded terminal. Keep the four-tool MCP pilot small
+attach/stream API; association/focus is not an embedded terminal. Keep the five-tool MCP pilot small
 and independently shippable. Terminal launch/input is never added to the read-only catalog.
 
 ### Later, only if needed
@@ -383,10 +390,10 @@ Do not begin with a shared-database migration, a Trellis agent manager, or autom
 ## First useful user journey
 
 **Phase 1:** From a direct terminal agent or an already supported MCP client, in any checkout or
-worktree, describe the workspace, find a method, inspect its outgoing calls and read its cached
-source. Edit the file and see the next revision reflect it within the refresh budget. Cite revision
-and uncertainty. Do not run commands or publish anything. Mimir uses this same
-catalog once its separately gated local provider extension is available.
+worktree, describe the workspace, find a method, request its declaration and outgoing calls,
+then read its cached source. Edit the file and see the next revision reflect it within the
+refresh budget. Cite revision and uncertainty. Do not run commands or publish anything. Mimir
+uses this same catalog once its separately gated local provider extension is available.
 
 **Later, after artifact and Mimir bridge slices:** From an existing Mimir or other coding-agent session:
 

@@ -637,14 +637,21 @@ fake tool calls. `_meta` correlation is not a replacement for a versioned tool s
 
 ### 8.3 Tool authority and first pilot
 
-The first catalog is `trellis_workspace_describe`, `trellis_find_symbols`, `trellis_inspect` and
-`trellis_read_source`, served by `trellis mcp` over stdio (MCP `2026-07-28`). The first release of
-`trellis_inspect` offers `declaration` and `outgoing_calls` over syntax-tier evidence;
-later stages ratify and add `incoming_calls` and other views, plus semantic evidence.
-Every result reports its basis
-`{indexGeneration, indexRevision}` and per-item tier and freshness; pins are optional, carry the
-complete basis, and always conflict when stale. No registry, grep scan, artifact write, shell or on-request index operation is part
-of this path. Snapshot text search gets its own bounded literal-scan design; FTS does not exist today.
+The first catalog is `trellis_workspace_describe`, `trellis_find_symbols`,
+`trellis_declaration`, `trellis_outgoing_calls` and `trellis_read_source`, in that order, served by
+`trellis mcp` over stdio (MCP `2026-07-28`). Declaration and outgoing calls are separate syntax-tier
+tools: declaration accepts neither `limit` nor `view`; outgoing calls accepts optional `limit` but
+no `view`. Later stages may add incoming calls and other tools, plus semantic evidence.
+Find, declaration and outgoing data use compact `doc` references into a per-result `documents`
+table, with inclusive 1-based source `lines` on symbols, declaration data and calls. For a bounded
+source read, use the selected document's path and `contentHash`, the returned `lines`, and the same
+`evidenceBasis` pin; read caps still apply. Each tool returns a deterministic `content[0].text`
+summary of at most 512 UTF-8 bytes and the full schema-valid result in `structuredContent`.
+Every result reports its basis `{indexGeneration, indexRevision}` and per-item tier and freshness;
+pins are optional, carry the complete basis, and always conflict when stale. No registry, grep scan,
+artifact write, shell or on-request index operation is part of this path. Snapshot text search gets
+its own bounded literal-scan design; FTS does not exist today. See the
+[MCP contract](docs/mcp-readonly-pilot-contract.md) for exact wire shapes and limits.
 
 There are no agent grants, principals or budgets. stdio has no network surface, so there is no
 Host/Origin exposure and other OS users cannot connect. The boundary is the OS user: any
@@ -789,7 +796,7 @@ an ACP harness registry. It distinguishes the small first tool pilot from the ta
 
 | Slice | Runnable acceptance |
 | --- | --- |
-| A. Per-checkout read-only MCP | `trellis mcp` over stdio in any checkout or worktree; describe/find/inspect/read with revision pins; real-time native refresh by the leader; no ACP, Herdr, registry or grants required |
+| A. Per-checkout read-only MCP | `trellis mcp` over stdio in any checkout or worktree; describe/find/declaration/outgoing calls/read source with basis pins; real-time native refresh by the daemon checkout worker; no ACP, Herdr, registry or grants required |
 | B. Bounded snapshot text search | Literal scan over cached payloads with separate byte/time/result budgets, cancellation and explicit partial results; no FTS assumption |
 | C. Versioned diagram artifacts | Evidence view or clearly authored draft -> CAS update -> local publish -> user opens deep link; stale source stays honest |
 | D. Unified workbench terminals | Real PTY tab for a user-launched direct agent, the same MCP tools, bounded terminal stream and explicit lifecycle/input permissions |

@@ -77,12 +77,19 @@ same portable MCP tools. The local `trellis mcp` stdio protocol layer is shipped
 ACP sessions and embedded terminals are **not implemented yet**. The existing one-shot ACP answer
 feature and authenticated browser `serve` daemon remain separate.
 
-Run `trellis mcp --workspace <path>` for the local, read-only stdio protocol. Its four-tool catalog is
-`trellis_workspace_describe`, `trellis_find_symbols`, `trellis_inspect` and `trellis_read_source`.
-This is protocol-only: describe reports an unavailable index, and all three evidence tools return
-typed `index_not_ready` until [#17](https://github.com/SquashMerge/trellis/issues/17) connects
-eligible snapshots. It does not open a real Store or serve evidence, enroll grants, expose HTTP MCP
-routes or accept authenticated MCP intake. Client interoperability is not certified. Run the native
+Run `trellis mcp --workspace <path>` for the local, read-only stdio daemon client. Its five tools,
+in order, are `trellis_workspace_describe`, `trellis_find_symbols`, `trellis_declaration`,
+`trellis_outgoing_calls` and `trellis_read_source`. The daemon serves evidence from one selected,
+validated cached snapshot; before a valid head is ready, evidence tools return typed
+`index_not_ready`, while describe can report not-ready status. Declaration takes a `symbolId` with
+no `limit` or `view`; outgoing calls takes a `symbolId` and optional `limit`, with no `view`.
+Find, declaration and outgoing results use compact `doc` references into their `documents` table;
+items with selectable source include inclusive 1-based `lines` beside byte ranges. Use the returned
+`evidenceBasis` and document `contentHash` to pin a bounded `trellis_read_source` by path and lines.
+Each tool's `content[0].text` is a deterministic summary of at most 512 UTF-8 bytes; the full,
+schema-valid result is in `structuredContent`. MCP does not execute repository code or trigger
+on-demand indexing, enroll grants, expose an HTTP listener or accept authenticated MCP intake.
+See the [MCP contract](docs/mcp-readonly-pilot-contract.md) for limits and schemas. Run the native
 protocol fixtures with `cargo test --locked --test mcp_protocol`.
 
 Real-time native refresh, snapshot text search, versioned diagram artifacts, the unified terminal
