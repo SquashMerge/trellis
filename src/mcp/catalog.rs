@@ -36,7 +36,7 @@ pub fn list(modern: bool) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mcp::wire::{RESPONSE_BYTES, write_response};
+    use crate::mcp::wire::{CATALOG_BYTES, RESPONSE_BYTES, write_relayed_capped, write_response};
     #[test]
     fn exact_full_catalog_and_bounds() {
         let golden: Value =
@@ -59,9 +59,14 @@ mod tests {
                 json!(-9007199254740991_i64),
             ] {
                 let mut wire = Vec::new();
-                write_response(&mut wire, &json!({"jsonrpc":"2.0","id":id,"result":result}))
-                    .unwrap();
-                assert!(wire.len() <= RESPONSE_BYTES);
+                write_relayed_capped(
+                    &mut wire,
+                    None,
+                    &json!({"jsonrpc":"2.0","id":id,"result":result}),
+                    CATALOG_BYTES,
+                )
+                .unwrap();
+                assert!(wire.len() <= CATALOG_BYTES);
                 assert_eq!(wire.last(), Some(&b'\n'));
             }
         }
@@ -86,26 +91,28 @@ mod tests {
             }
         }
     }
-    /// `tools/list` must fit the response cap with room to spare (#165): a new
-    /// tool or schema change that eats the headroom fails here, not on the wire.
+    /// `tools/list` must fit its own catalog cap with room to spare (#165): a
+    /// new tool or schema change that eats the headroom fails here, not on the wire.
     #[test]
     fn catalog_frame_keeps_named_headroom() {
-        const HEADROOM: usize = 4096;
+        const HEADROOM: usize = 16_384;
         // The largest admitted string ID is 256 bytes as a JSON token.
         let id = json!("\u{0000}".repeat(42) + "aa");
         for modern in [false, true] {
             let mut wire = Vec::new();
-            write_response(
+            write_relayed_capped(
                 &mut wire,
+                None,
                 &json!({"jsonrpc":"2.0","id":id,"result":list(modern)}),
+                CATALOG_BYTES,
             )
             .unwrap();
             assert!(
-                wire.len() <= RESPONSE_BYTES - HEADROOM,
-                "tools/list frame is {} bytes; the catalog budget is {} (response cap {} minus {HEADROOM} headroom)",
+                wire.len() <= CATALOG_BYTES - HEADROOM,
+                "tools/list frame is {} bytes; the catalog budget is {} (catalog cap {} minus {HEADROOM} headroom)",
                 wire.len(),
-                RESPONSE_BYTES - HEADROOM,
-                RESPONSE_BYTES
+                CATALOG_BYTES - HEADROOM,
+                CATALOG_BYTES
             );
         }
     }

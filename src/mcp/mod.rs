@@ -1594,11 +1594,17 @@ fn coordinate(
                 }
                 None => wire::ProtocolError::new(-32601, admission.id.clone()).response(),
             };
+            // Only the static catalog may use its larger cap.
+            let cap = if matches!(admission.action, session::Action::List) {
+                wire::CATALOG_BYTES
+            } else {
+                wire::RESPONSE_BYTES
+            };
             if let Some(value) = session
                 .prepare(admission.token, response)
                 .and_then(|prepared| session.commit(prepared))
             {
-                wire::write_relayed_response(&mut writer, relay, &value)?;
+                wire::write_relayed_capped(&mut writer, relay, &value, cap)?;
             }
         }
     }

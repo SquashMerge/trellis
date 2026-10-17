@@ -84,7 +84,11 @@ fn drain_stdout(lines: Receiver<Vec<u8>>) -> Vec<Vec<u8>> {
         );
         match lines.recv_timeout(remaining) {
             Ok(line) => {
-                assert!(line.len() <= 65_536, "stdout frame exceeds response cap");
+                // The catalog is the largest legal frame (#165).
+                assert!(
+                    line.len() <= trellis::mcp::wire::CATALOG_BYTES,
+                    "stdout frame exceeds catalog cap"
+                );
                 captured.push(line);
                 assert!(captured.len() <= 16, "too many stdout frames after EOF");
             }
@@ -281,10 +285,10 @@ impl Peer {
                 }
                 let end = available.iter().position(|&b| b == b'\n');
                 let take = end.map_or(available.len(), |at| at + 1);
-                if line.len() + take > 65_536 {
+                if line.len() + take > trellis::mcp::wire::CATALOG_BYTES {
                     // Treat an unbounded line as a failed protocol response, never
                     // allocate an attacker-controlled amount of captured stdout.
-                    let _ = tx.send(vec![0; 65_537]);
+                    let _ = tx.send(vec![0; trellis::mcp::wire::CATALOG_BYTES + 1]);
                     break;
                 }
                 line.extend_from_slice(&available[..take]);

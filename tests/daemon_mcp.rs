@@ -52,7 +52,7 @@ impl Peer {
             let mut reader = BufReader::new(stdout);
             let mut line = Vec::new();
             while reader.read_until(b'\n', &mut line).unwrap_or(0) != 0 {
-                assert!(line.len() <= 65_536);
+                assert!(line.len() <= trellis::mcp::wire::CATALOG_BYTES);
                 if tx.send(serde_json::from_slice(&line).unwrap()).is_err() {
                     return;
                 }
@@ -1525,7 +1525,7 @@ fn partial_daemon_reply_is_typed_and_never_reaches_stdout() {
         let mut reader = BufReader::new(stdout);
         let mut line = Vec::new();
         while reader.read_until(b'\n', &mut line).unwrap_or(0) != 0 {
-            assert!(line.len() <= 65_536);
+            assert!(line.len() <= trellis::mcp::wire::CATALOG_BYTES);
             if tx.send(std::mem::take(&mut line)).is_err() {
                 return;
             }
