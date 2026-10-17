@@ -1,0 +1,18 @@
+{
+  "file_cognitive": 4,
+  "file_cyclomatic": 6,
+  "file_sloc": 11,
+  "functions": [
+    {
+      "cognitive": 4,
+      "cyclomatic": 6,
+      "end_line": 11,
+      "exceeds_threshold": null,
+      "name": "calc",
+      "sloc": 11,
+      "start_line": 1
+    }
+  ],
+  "language": "JavaScript",
+  "path": "tests/fixtures/metrics/javascript/example.js"
+}

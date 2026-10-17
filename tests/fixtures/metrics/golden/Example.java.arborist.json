@@ -1,0 +1,18 @@
+{
+  "file_cognitive": 4,
+  "file_cyclomatic": 6,
+  "file_sloc": 13,
+  "functions": [
+    {
+      "cognitive": 4,
+      "cyclomatic": 6,
+      "end_line": 12,
+      "exceeds_threshold": null,
+      "name": "calc",
+      "sloc": 11,
+      "start_line": 2
+    }
+  ],
+  "language": "Java",
+  "path": "tests/fixtures/metrics/java/Example.java"
+}

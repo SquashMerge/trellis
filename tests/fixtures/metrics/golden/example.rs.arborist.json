@@ -1,0 +1,18 @@
+{
+  "file_cognitive": 3,
+  "file_cyclomatic": 5,
+  "file_sloc": 7,
+  "functions": [
+    {
+      "cognitive": 3,
+      "cyclomatic": 5,
+      "end_line": 7,
+      "exceeds_threshold": null,
+      "name": "calc",
+      "sloc": 7,
+      "start_line": 1
+    }
+  ],
+  "language": "Rust",
+  "path": "tests/fixtures/metrics/rust/example.rs"
+}

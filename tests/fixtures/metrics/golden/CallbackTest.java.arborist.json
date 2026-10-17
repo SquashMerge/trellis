@@ -1,0 +1,27 @@
+{
+  "file_cognitive": 3,
+  "file_cyclomatic": 4,
+  "file_sloc": 10,
+  "functions": [
+    {
+      "cognitive": 1,
+      "cyclomatic": 2,
+      "end_line": 5,
+      "exceeds_threshold": null,
+      "name": "testCalc",
+      "sloc": 4,
+      "start_line": 2
+    },
+    {
+      "cognitive": 2,
+      "cyclomatic": 2,
+      "end_line": 9,
+      "exceeds_threshold": null,
+      "name": "calc",
+      "sloc": 4,
+      "start_line": 6
+    }
+  ],
+  "language": "Java",
+  "path": "tests/fixtures/metrics/java/CallbackTest.java"
+}
