@@ -7427,6 +7427,11 @@ async fn provisioned_core_answer(
                         hook("after_read_finish");
                     }
                 };
+                let mut on_progress = || {
+                    if let Some(hook) = &hook {
+                        hook("metrics_read_progress");
+                    }
+                };
                 let mut on_write = |written: usize| {
                     if let Some(hook) = &serialize_hook {
                         hook(if written >= metrics.limit.saturating_sub(80) {
@@ -7436,7 +7441,7 @@ async fn provisioned_core_answer(
                         });
                     }
                 };
-                runtime.metrics_response(
+                let result = runtime.metrics_response(
                     &options,
                     &mut || {
                         if cancellation.load(std::sync::atomic::Ordering::Acquire)
@@ -7466,9 +7471,14 @@ async fn provisioned_core_answer(
                         before_finish: &mut before_finish,
                         after_finish: &mut after_finish,
                         on_write: &mut on_write,
+                        on_progress: &mut on_progress,
                     },
                     metrics.limit,
-                )
+                );
+                if let Some(hook) = &hook {
+                    hook("metrics_worker_done");
+                }
+                result
             })
             .await
             .map_err(|_| {

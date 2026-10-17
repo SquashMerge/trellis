@@ -1543,6 +1543,7 @@ pub struct MetricsResponseHooks<'a> {
     pub before_finish: &'a mut dyn FnMut(),
     pub after_finish: &'a mut dyn FnMut(),
     pub on_write: &'a mut dyn FnMut(usize),
+    pub on_progress: &'a mut dyn FnMut(),
 }
 
 pub struct CheckoutEvidence {
@@ -2126,7 +2127,10 @@ impl CheckoutRuntime {
         let (response, catching_up) = self.evidence_response()?;
         (hooks.before_work)();
         check()?;
-        let payload = response.metrics_at(options, check)?;
+        let payload = response.metrics_at(options, &mut || {
+            (hooks.on_progress)();
+            check()
+        })?;
         let mut writer = Bounded {
             bytes: Vec::new(),
             check,

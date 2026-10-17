@@ -40,6 +40,17 @@ async fn fixture() -> (
     ProvisionedBrowser,
     String,
 ) {
+    fixture_with_startup_hook(None, true).await
+}
+async fn fixture_with_startup_hook(
+    startup_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    wait_ready: bool,
+) -> (
+    tempfile::TempDir,
+    Arc<trellis::daemon::registry::CheckoutRuntime>,
+    ProvisionedBrowser,
+    String,
+) {
     let base = tempfile::tempdir().unwrap();
     let root = base.path().join("checkout");
     fs::create_dir(&root).unwrap();
@@ -51,6 +62,8 @@ async fn fixture() -> (
     )
     .unwrap();
     fs::write(root.join("empty.js"), "// no callable\n").unwrap();
+    fs::create_dir(root.join("zero")).unwrap();
+    fs::write(root.join("zero/empty.js"), "// zero-callable directory\n").unwrap();
     let identity = WorkspaceIdentity::discover(Some(&root), &root)
         .unwrap()
         .attach_marker()
@@ -80,21 +93,26 @@ async fn fixture() -> (
         .register(&identity, CheckoutOptions(serde_json::json!({})))
         .unwrap();
     registry.attach_launch(1, &identity).unwrap();
+    if let Some(hook) = startup_hook {
+        registry.set_next_startup_hook_for_tests(hook);
+    }
     let runtime = registry.activate(&identity.root_key).unwrap();
-    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
-        loop {
-            if let Ok((response, catching_up)) = runtime.evidence_response()
-                && response.status().is_ok()
-                && response.finish(()).is_ok()
-                && !catching_up
-            {
-                break;
+    if wait_ready {
+        tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+            loop {
+                if let Ok((response, catching_up)) = runtime.evidence_response()
+                    && response.status().is_ok()
+                    && response.finish(()).is_ok()
+                    && !catching_up
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
             }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    })
-    .await
-    .unwrap();
+        })
+        .await
+        .unwrap();
+    }
     let browser = ProvisionedBrowser::new(
         Arc::new(tokio::sync::Mutex::new(registry)),
         TOKEN.into(),
@@ -158,7 +176,7 @@ async fn selected_metrics_projection_and_validation() {
     );
     assert_eq!(response["catchingUp"], false);
     assert_eq!(response["payload"]["metricsVersion"], "metrics:v1");
-    assert_eq!(response["payload"]["files"].as_array().unwrap().len(), 3);
+    assert_eq!(response["payload"]["files"].as_array().unwrap().len(), 4);
     assert_eq!(response["payload"]["declarations"], serde_json::json!([]));
     assert_eq!(
         response["payload"]["files"]
@@ -167,7 +185,7 @@ async fn selected_metrics_projection_and_validation() {
             .iter()
             .map(|row| row["path"].as_str().unwrap())
             .collect::<Vec<_>>(),
-        ["deep/extra.js", "empty.js", "sample.js"]
+        ["deep/extra.js", "empty.js", "sample.js", "zero/empty.js"]
     );
     assert_eq!(
         response["payload"]["directories"]
@@ -176,13 +194,45 @@ async fn selected_metrics_projection_and_validation() {
             .iter()
             .map(|row| row["path"].as_str().unwrap())
             .collect::<Vec<_>>(),
-        ["", "deep"]
+        ["", "deep", "zero"]
     );
     assert_eq!(response["payload"]["directories"][0]["declarationCount"], 2);
+    assert_eq!(response["payload"]["directories"][2]["path"], "zero");
+    assert_eq!(response["payload"]["directories"][2]["declarationCount"], 0);
+    assert!(response["payload"]["directories"][2]["metrics"]["loc"].is_null());
     assert_eq!(
         response["payload"]["directories"][0]["metrics"]["cyclomatic"],
         2
     );
+    assert_eq!(
+        response["payload"]["directories"][0]["metrics"]["halstead"]["volume"],
+        18.0
+    );
+    let (status, max) = request(app.clone(), key, "?aggregate=max").await;
+    assert_eq!(status, StatusCode::OK, "{max}");
+    assert_eq!(max["payload"]["directories"][0]["declarationCount"], 2);
+    assert_eq!(
+        max["payload"]["directories"][0]["metrics"]["halstead"]["volume"],
+        10.0
+    );
+    assert_eq!(max["payload"]["directories"][0]["metrics"]["parameters"], 1);
+    assert_eq!(
+        max["payload"]["directories"][1]["metrics"]["halstead"]["volume"],
+        8.0
+    );
+    assert!(max["payload"]["directories"][2]["metrics"]["halstead"]["volume"].is_null());
+    let (status, mean) = request(app.clone(), key, "?aggregate=mean").await;
+    assert_eq!(status, StatusCode::OK, "{mean}");
+    assert_eq!(
+        mean["payload"]["directories"][0]["metrics"]["halstead"]["volume"],
+        9.0
+    );
+    assert_eq!(
+        mean["payload"]["directories"][0]["metrics"]["parameters"],
+        0.5
+    );
+    assert_eq!(mean["payload"]["directories"][1]["metrics"]["loc"], 1.0);
+    assert!(mean["payload"]["directories"][2]["metrics"]["loc"].is_null());
     assert_eq!(
         response["payload"]["directories"][1]["metrics"]["exits"]["returns"],
         1
@@ -230,8 +280,10 @@ async fn selected_metrics_projection_and_validation() {
             StatusCode::FORBIDDEN
         );
     }
-    let (wrong_root, _) = request(app.clone(), &"0".repeat(64), "").await;
-    assert_ne!(wrong_root, StatusCode::OK);
+    let (wrong_root, root_error) = request(app.clone(), &"0".repeat(64), "").await;
+    assert_eq!(wrong_root, StatusCode::BAD_REQUEST, "{root_error}");
+    assert_eq!(root_error["error"]["code"], "workspace_selection_failed");
+    assert_eq!(root_error["error"]["reason"], "not_checkout");
     let generation = response["payload"]["indexGeneration"].as_str().unwrap();
     let revision = response["payload"]["indexRevision"].as_u64().unwrap();
     let source = response["payload"]["files"][0]["sourceSetId"]
@@ -259,6 +311,10 @@ async fn selected_metrics_projection_and_validation() {
         "?scope=file",
         "?metrics=",
         "?metrics=loc,loc",
+        "?metrics=unknown",
+        "?",
+        "?scope=revision&sourceSetId=source-set:v1:path-0000000000000000000000000000000000000000000000000000000000000000",
+        "?scope=file&sourceSetId=source-set:v1:garbage&language=javascript&path=sample.js",
         "?wat=1",
         "?scope=revision&scope=file",
         "?indexGeneration=bad",
@@ -268,12 +324,25 @@ async fn selected_metrics_projection_and_validation() {
         let (status, _) = request(app.clone(), key, query).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{query}");
     }
+    for query in [
+        format!("?scope=declaration&sourceSetId={source}&path=sample.js&sid=sid:v1:not-hex"),
+        format!(
+            "?scope=file&sourceSetId={source}&language=javascript&path=sample.js&sid=sid:v1:00000000000000000000000000000000"
+        ),
+        format!(
+            "?scope=declaration&sourceSetId={source}&language=javascript&path=sample.js&sid=sid:v1:00000000000000000000000000000000"
+        ),
+    ] {
+        let (status, value) = request(app.clone(), key, &query).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {value}");
+        assert_eq!(value["error"]["code"], "invalid_request");
+    }
     assert_eq!(
         admitted.load(std::sync::atomic::Ordering::Relaxed),
         before_invalid,
         "invalid query must be refused before Store admission"
     );
-    let (status, _) = request(
+    let (status, wrong_revision) = request(
         app.clone(),
         key,
         &format!(
@@ -283,6 +352,7 @@ async fn selected_metrics_projection_and_validation() {
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(wrong_revision["error"]["code"], "revision_conflict");
     let (status, wrong_generation) = request(
         app.clone(),
         key,
@@ -310,6 +380,15 @@ async fn selected_metrics_projection_and_validation() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+    let foreign_source = format!("source-set:v1:path-{}", "0".repeat(64));
+    let (status, foreign) = request(
+        app.clone(),
+        key,
+        &format!("?scope=file&sourceSetId={foreign_source}&language=javascript&path=sample.js"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{foreign}");
+    assert_eq!(foreign["error"]["code"], "not_found");
     let sid = file["payload"]["declarations"][0]["sid"].as_str().unwrap();
     let (status, declaration) = request(
         app.clone(),
@@ -385,60 +464,88 @@ async fn selected_metrics_projection_and_validation() {
             .as_array()
             .unwrap()
             .len(),
-        2
+        3
     );
 }
 
 #[tokio::test]
-async fn selected_request_cancelled_on_drop_and_not_published() {
+async fn selected_request_cancelled_during_read_and_serialization() {
     use std::sync::{
         Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicUsize, Ordering},
         mpsc,
     };
-    let (_base, runtime, browser, key) = fixture().await;
-    assert_eq!(runtime.metrics_memo_entries_for_tests().unwrap(), 0);
-    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
-    let (resume_tx, resume_rx) = mpsc::sync_channel(1);
-    let (cancelled_tx, cancelled_rx) = mpsc::sync_channel(1);
-    let resume = Mutex::new(resume_rx);
-    let once = AtomicBool::new(true);
-    browser.set_selected_response_hook_for_tests(Arc::new(move |stage| {
-        if stage == "before_work" && once.swap(false, Ordering::AcqRel) {
-            entered_tx.send(()).unwrap();
-            resume.lock().unwrap().recv().unwrap();
+    for phase in ["read", "serialize"] {
+        let (_base, runtime, browser, key) = fixture().await;
+        assert_eq!(runtime.metrics_memo_entries_for_tests().unwrap(), 0);
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = mpsc::sync_channel(1);
+        let (cancelled_tx, cancelled_rx) = mpsc::sync_channel(1);
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        let resume = Mutex::new(resume_rx);
+        let progress = AtomicUsize::new(0);
+        let once = std::sync::atomic::AtomicBool::new(true);
+        browser.set_selected_response_hook_for_tests(Arc::new(move |stage| {
+            let at_read =
+                stage == "metrics_read_progress" && progress.fetch_add(1, Ordering::Relaxed) == 100;
+            let at_serialize = stage == "metrics_serialize";
+            if ((phase == "read" && at_read) || (phase == "serialize" && at_serialize))
+                && once.swap(false, Ordering::AcqRel)
+            {
+                entered_tx.send(()).unwrap();
+                resume.lock().unwrap().recv().unwrap();
+            }
+            if stage == "metrics_cancelled" {
+                let _ = cancelled_tx.try_send(());
+            }
+            if stage == "metrics_worker_done" {
+                let _ = done_tx.try_send(());
+            }
+        }));
+        let app = browser.router();
+        let worker = tokio::spawn({
+            let key = key.clone();
+            let app = app.clone();
+            async move { request(app, &key, "").await }
+        });
+        tokio::time::timeout(
+            trellis::testing::HANG_BACKSTOP,
+            tokio::task::spawn_blocking(move || entered_rx.recv().unwrap()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        if phase == "read" {
+            assert_eq!(runtime.metrics_memo_entries_for_tests().unwrap(), 0);
         }
-        if stage == "metrics_cancelled" {
-            let _ = cancelled_tx.try_send(());
+        worker.abort();
+        assert!(
+            worker.await.unwrap_err().is_cancelled(),
+            "no partial HTTP response"
+        );
+        resume_tx.send(()).unwrap();
+        tokio::time::timeout(
+            trellis::testing::HANG_BACKSTOP,
+            tokio::task::spawn_blocking(move || cancelled_rx.recv().unwrap()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        tokio::time::timeout(
+            trellis::testing::HANG_BACKSTOP,
+            tokio::task::spawn_blocking(move || done_rx.recv().unwrap()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        if phase == "read" {
+            assert_eq!(runtime.metrics_memo_entries_for_tests().unwrap(), 0);
         }
-    }));
-    let app = browser.router();
-    let worker = tokio::spawn({
-        let key = key.clone();
-        let app = app.clone();
-        async move { request(app, &key, "").await }
-    });
-    tokio::time::timeout(
-        trellis::testing::HANG_BACKSTOP,
-        tokio::task::spawn_blocking(move || entered_rx.recv().unwrap()),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    worker.abort();
-    assert!(worker.await.unwrap_err().is_cancelled());
-    resume_tx.send(()).unwrap();
-    tokio::time::timeout(
-        trellis::testing::HANG_BACKSTOP,
-        tokio::task::spawn_blocking(move || cancelled_rx.recv().unwrap()),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    assert_eq!(runtime.metrics_memo_entries_for_tests().unwrap(), 0);
-    let (status, body) = request(app, &key, "").await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(runtime.metrics_memo_entries_for_tests().unwrap(), 3);
+        // Serialization may keep only source intermediates completed before it began.
+        let (status, body) = request(app, &key, "").await;
+        assert_eq!(status, StatusCode::OK, "{phase}: {body}");
+        assert_eq!(runtime.metrics_memo_entries_for_tests().unwrap(), 4);
+    }
 }
 
 #[tokio::test]
@@ -480,17 +587,22 @@ async fn selected_metrics_atomic_bounds_and_deadlines() {
     // The blocking hook holds the request at each named phase. The test clock
     // expires while the HTTP caller still waits, then releases the worker.
     for (stage, cap) in [
-        ("before_work", 64 * 1024 * 1024),
+        ("metrics_read_progress", 64 * 1024 * 1024),
         ("metrics_serialize_last", full_len + 1),
         ("after_read_finish", 64 * 1024 * 1024),
     ] {
-        let (_base, _runtime, browser, key) = fixture().await;
+        let (_base, runtime, browser, key) = fixture().await;
         let (entered_tx, entered_rx) = mpsc::sync_channel(1);
         let (resume_tx, resume_rx) = mpsc::sync_channel(1);
         let resume = Mutex::new(resume_rx);
         let once = AtomicBool::new(true);
+        let progress = std::sync::atomic::AtomicUsize::new(0);
         browser.set_selected_response_hook_for_tests(Arc::new(move |called| {
-            if called == stage && once.swap(false, Ordering::AcqRel) {
+            let inside_parse = called == "metrics_read_progress"
+                && progress.fetch_add(1, Ordering::Relaxed) == 100;
+            if (called == stage && (stage != "metrics_read_progress" || inside_parse))
+                && once.swap(false, Ordering::AcqRel)
+            {
                 entered_tx.send(()).unwrap();
                 resume.lock().unwrap().recv().unwrap();
             }
@@ -505,10 +617,66 @@ async fn selected_metrics_atomic_bounds_and_deadlines() {
         .await
         .unwrap()
         .unwrap();
+        if stage == "metrics_read_progress" {
+            assert_eq!(runtime.metrics_memo_entries_for_tests().unwrap(), 0);
+        }
         browser.set_metrics_clock_skew_for_tests(1001);
         resume_tx.send(()).unwrap();
         let (status, value) = worker.await.unwrap();
         assert_eq!(status, StatusCode::REQUEST_TIMEOUT, "{stage}: {value}");
         assert_eq!(value["error"]["code"], "deadline_exceeded", "{stage}");
+        if stage == "metrics_read_progress" {
+            assert_eq!(runtime.metrics_memo_entries_for_tests().unwrap(), 0);
+        }
     }
+}
+
+#[tokio::test]
+async fn selected_metrics_reports_catching_up_from_same_admission() {
+    use std::sync::{Mutex, mpsc};
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (resume_tx, resume_rx) = mpsc::sync_channel(1);
+    let resume = Mutex::new(resume_rx);
+    let hook = Arc::new(move || {
+        entered_tx.send(()).unwrap();
+        resume.lock().unwrap().recv().unwrap();
+    });
+    let (_base, runtime, browser, key) = fixture_with_startup_hook(Some(hook), false).await;
+    tokio::time::timeout(
+        trellis::testing::HANG_BACKSTOP,
+        tokio::task::spawn_blocking(move || entered_rx.recv().unwrap()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let app = browser.router();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/checkouts/{key}/metrics"))
+                .header("host", "127.0.0.1:7331")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["X-Trellis-Catching-Up"], "true");
+    let body: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), 64 * 1024 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["catchingUp"], true);
+    assert_eq!(body["payload"]["files"].as_array().unwrap().len(), 4);
+    resume_tx.send(()).unwrap();
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        while runtime.catching_up() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
 }
