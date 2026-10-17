@@ -1,0 +1,675 @@
+{
+  "file_cognitive": 164,
+  "file_cyclomatic": 238,
+  "file_sloc": 384,
+  "functions": [
+    {
+      "cognitive": 0,
+      "cyclomatic": 1,
+      "end_line": 4,
+      "exceeds_threshold": null,
+      "name": "m",
+      "sloc": 1,
+      "start_line": 4
+    },
+    {
+      "cognitive": 0,
+      "cyclomatic": 1,
+      "end_line": 6,
+      "exceeds_threshold": null,
+      "name": "m",
+      "sloc": 1,
+      "start_line": 6
+    },
+    {
+      "cognitive": 0,
+      "cyclomatic": 1,
+      "end_line": 7,
+      "exceeds_threshold": null,
+      "name": "f0",
+      "sloc": 1,
+      "start_line": 7
+    },
+    {
+      "cognitive": 2,
+      "cyclomatic": 3,
+      "end_line": 12,
+      "exceeds_threshold": null,
+      "name": "f1",
+      "sloc": 5,
+      "start_line": 8
+    },
+    {
+      "cognitive": 3,
+      "cyclomatic": 4,
+      "end_line": 18,
+      "exceeds_threshold": null,
+      "name": "f2",
+      "sloc": 6,
+      "start_line": 13
+    },
+    {
+      "cognitive": 3,
+      "cyclomatic": 4,
+      "end_line": 24,
+      "exceeds_threshold": null,
+      "name": "f3",
+      "sloc": 6,
+      "start_line": 19
+    },
+    {
+      "cognitive": 3,
+      "cyclomatic": 4,
+      "end_line": 30,
+      "exceeds_threshold": null,
+      "name": "f4",
+      "sloc": 6,
+      "start_line": 25
+    },
+    {
+      "cognitive": 3,
+      "cyclomatic": 4,
+      "end_line": 36,
+      "exceeds_threshold": null,
+      "name": "f5",
+      "sloc": 6,
+      "start_line": 31
+    },
+    {
+      "cognitive": 3,
+      "cyclomatic": 4,
+      "end_line": 42,
+      "exceeds_threshold": null,
+      "name": "f6",
+      "sloc": 6,
+      "start_line": 37
+    },
+    {
+      "cognitive": 3,
+      "cyclomatic": 4,
+      "end_line": 48,
+      "exceeds_threshold": null,
+      "name": "f7",
+      "sloc": 6,
+      "start_line": 43
+    },
+    {
+      "cognitive": 3,
+      "cyclomatic": 4,
+      "end_line": 54,
+      "exceeds_threshold": null,
+      "name": "f8",
+      "sloc": 6,
+      "start_line": 49
+    },
+    {
+      "cognitive": 3,
+      "cyclomatic": 4,
+      "end_line": 60,
+      "exceeds_threshold": null,
+      "name": "f9",
+      "sloc": 6,
+      "start_line": 55
+    },
+    {
+      "cognitive": 3,
+      "cyclomatic": 4,
+      "end_line": 66,
+      "exceeds_threshold": null,
+      "name": "f10",
+      "sloc": 6,
+      "start_line": 61
+    },
+    {
+      "cognitive": 3,
+      "cyclomatic": 4,
+      "end_line": 72,
+      "exceeds_threshold": null,
+      "name": "f11",
+      "sloc": 6,
+      "start_line": 67
+    },
+    {
+      "cognitive": 3,
+      "cyclomatic": 4,
+      "end_line": 78,
+      "exceeds_threshold": null,
+      "name": "f12",
+      "sloc": 6,
+      "start_line": 73
+    },
+    {
+      "cognitive": 3,
+      "cyclomatic": 4,
+      "end_line": 84,
+      "exceeds_threshold": null,
+      "name": "f13",
+      "sloc": 6,
+      "start_line": 79
+    },
+    {
+      "cognitive": 3,
+      "cyclomatic": 4,
+      "end_line": 90,
+      "exceeds_threshold": null,
+      "name": "f14",
+      "sloc": 6,
+      "start_line": 85
+    },
+    {
+      "cognitive": 3,
+      "cyclomatic": 4,
+      "end_line": 96,
+      "exceeds_threshold": null,
+      "name": "f15",
+      "sloc": 6,
+      "start_line": 91
+    },
+    {
+      "cognitive": 3,
+      "cyclomatic": 4,
+      "end_line": 102,
+      "exceeds_threshold": null,
+      "name": "f16",
+      "sloc": 6,
+      "start_line": 97
+    },
+    {
+      "cognitive": 3,
+      "cyclomatic": 4,
+      "end_line": 108,
+      "exceeds_threshold": null,
+      "name": "f17",
+      "sloc": 6,
+      "start_line": 103
+    },
+    {
+      "cognitive": 3,
+      "cyclomatic": 4,
+      "end_line": 114,
+      "exceeds_threshold": null,
+      "name": "f18",
+      "sloc": 6,
+      "start_line": 109
+    },
+    {
+      "cognitive": 3,
+      "cyclomatic": 4,
+      "end_line": 120,
+      "exceeds_threshold": null,
+      "name": "f19",
+      "sloc": 6,
+      "start_line": 115
+    },
+    {
+      "cognitive": 3,
+      "cyclomatic": 4,
+      "end_line": 126,
+      "exceeds_threshold": null,
+      "name": "f20",
+      "sloc": 6,
+      "start_line": 121
+    },
+    {
+      "cognitive": 3,
+      "cyclomatic": 4,
+      "end_line": 132,
+      "exceeds_threshold": null,
+      "name": "f21",
+      "sloc": 6,
+      "start_line": 127
+    },
+    {
+      "cognitive": 3,
+      "cyclomatic": 4,
+      "end_line": 138,
+      "exceeds_threshold": null,
+      "name": "f22",
+      "sloc": 6,
+      "start_line": 133
+    },
+    {
+      "cognitive": 3,
+      "cyclomatic": 4,
+      "end_line": 144,
+      "exceeds_threshold": null,
+      "name": "f23",
+      "sloc": 6,
+      "start_line": 139
+    },
+    {
+      "cognitive": 2,
+      "cyclomatic": 3,
+      "end_line": 149,
+      "exceeds_threshold": null,
+      "name": "f24",
+      "sloc": 5,
+      "start_line": 145
+    },
+    {
+      "cognitive": 2,
+      "cyclomatic": 3,
+      "end_line": 154,
+      "exceeds_threshold": null,
+      "name": "f25",
+      "sloc": 5,
+      "start_line": 150
+    },
+    {
+      "cognitive": 2,
+      "cyclomatic": 3,
+      "end_line": 159,
+      "exceeds_threshold": null,
+      "name": "f26",
+      "sloc": 5,
+      "start_line": 155
+    },
+    {
+      "cognitive": 2,
+      "cyclomatic": 3,
+      "end_line": 164,
+      "exceeds_threshold": null,
+      "name": "f27",
+      "sloc": 5,
+      "start_line": 160
+    },
+    {
+      "cognitive": 2,
+      "cyclomatic": 3,
+      "end_line": 169,
+      "exceeds_threshold": null,
+      "name": "f28",
+      "sloc": 5,
+      "start_line": 165
+    },
+    {
+      "cognitive": 2,
+      "cyclomatic": 3,
+      "end_line": 174,
+      "exceeds_threshold": null,
+      "name": "f29",
+      "sloc": 5,
+      "start_line": 170
+    },
+    {
+      "cognitive": 2,
+      "cyclomatic": 3,
+      "end_line": 179,
+      "exceeds_threshold": null,
+      "name": "f30",
+      "sloc": 5,
+      "start_line": 175
+    },
+    {
+      "cognitive": 2,
+      "cyclomatic": 3,
+      "end_line": 184,
+      "exceeds_threshold": null,
+      "name": "f31",
+      "sloc": 5,
+      "start_line": 180
+    },
+    {
+      "cognitive": 2,
+      "cyclomatic": 3,
+      "end_line": 189,
+      "exceeds_threshold": null,
+      "name": "f32",
+      "sloc": 5,
+      "start_line": 185
+    },
+    {
+      "cognitive": 2,
+      "cyclomatic": 3,
+      "end_line": 194,
+      "exceeds_threshold": null,
+      "name": "f33",
+      "sloc": 5,
+      "start_line": 190
+    },
+    {
+      "cognitive": 2,
+      "cyclomatic": 3,
+      "end_line": 199,
+      "exceeds_threshold": null,
+      "name": "f34",
+      "sloc": 5,
+      "start_line": 195
+    },
+    {
+      "cognitive": 2,
+      "cyclomatic": 3,
+      "end_line": 204,
+      "exceeds_threshold": null,
+      "name": "f35",
+      "sloc": 5,
+      "start_line": 200
+    },
+    {
+      "cognitive": 2,
+      "cyclomatic": 3,
+      "end_line": 209,
+      "exceeds_threshold": null,
+      "name": "f36",
+      "sloc": 5,
+      "start_line": 205
+    },
+    {
+      "cognitive": 2,
+      "cyclomatic": 3,
+      "end_line": 214,
+      "exceeds_threshold": null,
+      "name": "f37",
+      "sloc": 5,
+      "start_line": 210
+    },
+    {
+      "cognitive": 2,
+      "cyclomatic": 3,
+      "end_line": 219,
+      "exceeds_threshold": null,
+      "name": "f38",
+      "sloc": 5,
+      "start_line": 215
+    },
+    {
+      "cognitive": 2,
+      "cyclomatic": 3,
+      "end_line": 224,
+      "exceeds_threshold": null,
+      "name": "f39",
+      "sloc": 5,
+      "start_line": 220
+    },
+    {
+      "cognitive": 2,
+      "cyclomatic": 3,
+      "end_line": 229,
+      "exceeds_threshold": null,
+      "name": "f40",
+      "sloc": 5,
+      "start_line": 225
+    },
+    {
+      "cognitive": 2,
+      "cyclomatic": 3,
+      "end_line": 234,
+      "exceeds_threshold": null,
+      "name": "f41",
+      "sloc": 5,
+      "start_line": 230
+    },
+    {
+      "cognitive": 2,
+      "cyclomatic": 3,
+      "end_line": 239,
+      "exceeds_threshold": null,
+      "name": "f42",
+      "sloc": 5,
+      "start_line": 235
+    },
+    {
+      "cognitive": 2,
+      "cyclomatic": 3,
+      "end_line": 244,
+      "exceeds_threshold": null,
+      "name": "f43",
+      "sloc": 5,
+      "start_line": 240
+    },
+    {
+      "cognitive": 2,
+      "cyclomatic": 3,
+      "end_line": 249,
+      "exceeds_threshold": null,
+      "name": "f44",
+      "sloc": 5,
+      "start_line": 245
+    },
+    {
+      "cognitive": 2,
+      "cyclomatic": 3,
+      "end_line": 254,
+      "exceeds_threshold": null,
+      "name": "f45",
+      "sloc": 5,
+      "start_line": 250
+    },
+    {
+      "cognitive": 2,
+      "cyclomatic": 3,
+      "end_line": 259,
+      "exceeds_threshold": null,
+      "name": "f46",
+      "sloc": 5,
+      "start_line": 255
+    },
+    {
+      "cognitive": 2,
+      "cyclomatic": 3,
+      "end_line": 264,
+      "exceeds_threshold": null,
+      "name": "f47",
+      "sloc": 5,
+      "start_line": 260
+    },
+    {
+      "cognitive": 2,
+      "cyclomatic": 3,
+      "end_line": 269,
+      "exceeds_threshold": null,
+      "name": "f48",
+      "sloc": 5,
+      "start_line": 265
+    },
+    {
+      "cognitive": 2,
+      "cyclomatic": 3,
+      "end_line": 274,
+      "exceeds_threshold": null,
+      "name": "f49",
+      "sloc": 5,
+      "start_line": 270
+    },
+    {
+      "cognitive": 2,
+      "cyclomatic": 3,
+      "end_line": 279,
+      "exceeds_threshold": null,
+      "name": "f50",
+      "sloc": 5,
+      "start_line": 275
+    },
+    {
+      "cognitive": 2,
+      "cyclomatic": 3,
+      "end_line": 284,
+      "exceeds_threshold": null,
+      "name": "f51",
+      "sloc": 5,
+      "start_line": 280
+    },
+    {
+      "cognitive": 2,
+      "cyclomatic": 3,
+      "end_line": 289,
+      "exceeds_threshold": null,
+      "name": "f52",
+      "sloc": 5,
+      "start_line": 285
+    },
+    {
+      "cognitive": 2,
+      "cyclomatic": 3,
+      "end_line": 294,
+      "exceeds_threshold": null,
+      "name": "f53",
+      "sloc": 5,
+      "start_line": 290
+    },
+    {
+      "cognitive": 2,
+      "cyclomatic": 3,
+      "end_line": 299,
+      "exceeds_threshold": null,
+      "name": "f54",
+      "sloc": 5,
+      "start_line": 295
+    },
+    {
+      "cognitive": 2,
+      "cyclomatic": 3,
+      "end_line": 304,
+      "exceeds_threshold": null,
+      "name": "f55",
+      "sloc": 5,
+      "start_line": 300
+    },
+    {
+      "cognitive": 2,
+      "cyclomatic": 3,
+      "end_line": 309,
+      "exceeds_threshold": null,
+      "name": "f56",
+      "sloc": 5,
+      "start_line": 305
+    },
+    {
+      "cognitive": 2,
+      "cyclomatic": 3,
+      "end_line": 314,
+      "exceeds_threshold": null,
+      "name": "f57",
+      "sloc": 5,
+      "start_line": 310
+    },
+    {
+      "cognitive": 2,
+      "cyclomatic": 3,
+      "end_line": 319,
+      "exceeds_threshold": null,
+      "name": "f58",
+      "sloc": 5,
+      "start_line": 315
+    },
+    {
+      "cognitive": 2,
+      "cyclomatic": 3,
+      "end_line": 324,
+      "exceeds_threshold": null,
+      "name": "f59",
+      "sloc": 5,
+      "start_line": 320
+    },
+    {
+      "cognitive": 2,
+      "cyclomatic": 3,
+      "end_line": 329,
+      "exceeds_threshold": null,
+      "name": "f60",
+      "sloc": 5,
+      "start_line": 325
+    },
+    {
+      "cognitive": 2,
+      "cyclomatic": 3,
+      "end_line": 334,
+      "exceeds_threshold": null,
+      "name": "f61",
+      "sloc": 5,
+      "start_line": 330
+    },
+    {
+      "cognitive": 2,
+      "cyclomatic": 3,
+      "end_line": 339,
+      "exceeds_threshold": null,
+      "name": "f62",
+      "sloc": 5,
+      "start_line": 335
+    },
+    {
+      "cognitive": 2,
+      "cyclomatic": 3,
+      "end_line": 344,
+      "exceeds_threshold": null,
+      "name": "f63",
+      "sloc": 5,
+      "start_line": 340
+    },
+    {
+      "cognitive": 2,
+      "cyclomatic": 3,
+      "end_line": 349,
+      "exceeds_threshold": null,
+      "name": "f64",
+      "sloc": 5,
+      "start_line": 345
+    },
+    {
+      "cognitive": 2,
+      "cyclomatic": 3,
+      "end_line": 354,
+      "exceeds_threshold": null,
+      "name": "f65",
+      "sloc": 5,
+      "start_line": 350
+    },
+    {
+      "cognitive": 2,
+      "cyclomatic": 3,
+      "end_line": 359,
+      "exceeds_threshold": null,
+      "name": "f66",
+      "sloc": 5,
+      "start_line": 355
+    },
+    {
+      "cognitive": 2,
+      "cyclomatic": 3,
+      "end_line": 364,
+      "exceeds_threshold": null,
+      "name": "f67",
+      "sloc": 5,
+      "start_line": 360
+    },
+    {
+      "cognitive": 2,
+      "cyclomatic": 3,
+      "end_line": 369,
+      "exceeds_threshold": null,
+      "name": "f68",
+      "sloc": 5,
+      "start_line": 365
+    },
+    {
+      "cognitive": 2,
+      "cyclomatic": 3,
+      "end_line": 374,
+      "exceeds_threshold": null,
+      "name": "f69",
+      "sloc": 5,
+      "start_line": 370
+    },
+    {
+      "cognitive": 2,
+      "cyclomatic": 3,
+      "end_line": 379,
+      "exceeds_threshold": null,
+      "name": "f70",
+      "sloc": 5,
+      "start_line": 375
+    },
+    {
+      "cognitive": 2,
+      "cyclomatic": 3,
+      "end_line": 384,
+      "exceeds_threshold": null,
+      "name": "f71",
+      "sloc": 5,
+      "start_line": 380
+    }
+  ],
+  "language": "Python",
+  "path": "tools/synthetic-cohorts/templates/medium/python.py"
+}

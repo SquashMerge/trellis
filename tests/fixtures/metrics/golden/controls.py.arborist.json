@@ -1,0 +1,18 @@
+{
+  "file_cognitive": 7,
+  "file_cyclomatic": 7,
+  "file_sloc": 9,
+  "functions": [
+    {
+      "cognitive": 7,
+      "cyclomatic": 7,
+      "end_line": 9,
+      "exceeds_threshold": null,
+      "name": "calc",
+      "sloc": 9,
+      "start_line": 1
+    }
+  ],
+  "language": "Python",
+  "path": "tests/fixtures/metrics/python/controls.py"
+}

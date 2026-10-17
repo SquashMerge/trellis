@@ -1,0 +1,11 @@
+[package]
+name = "trellis-metrics-oracle"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+arborist-metrics = { git = "https://github.com/StrangeDaysTech/arborist-metrics.git", rev = "d246d2e465346cbc2a7cc468d34ddbb7d77d5a0a", default-features = false, features = ["java", "python", "javascript", "rust"] }
+serde_json = "1"

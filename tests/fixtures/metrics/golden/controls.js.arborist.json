@@ -1,0 +1,18 @@
+{
+  "file_cognitive": 6,
+  "file_cyclomatic": 6,
+  "file_sloc": 7,
+  "functions": [
+    {
+      "cognitive": 6,
+      "cyclomatic": 6,
+      "end_line": 7,
+      "exceeds_threshold": null,
+      "name": "calc",
+      "sloc": 7,
+      "start_line": 1
+    }
+  ],
+  "language": "JavaScript",
+  "path": "tests/fixtures/metrics/javascript/controls.js"
+}
