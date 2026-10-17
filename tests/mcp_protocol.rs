@@ -1725,6 +1725,11 @@ async fn warm_relay_serves_both_new_tools_and_rejects_closed_inputs() {
                 json!({"schemaVersion":1,"unexpected":true}),
             ));
             tool(&failed, Some("invalid_request"), !legacy);
+            assert_eq!(
+                failed["result"]["content"][0]["text"],
+                format!("{name} failed: invalid_request: Invalid tool arguments"),
+                "failure summary must identify the called tool"
+            );
             schema_pairs.push(json!({"name":name,
                 "structuredContent":failed["result"]["structuredContent"]}));
         }
