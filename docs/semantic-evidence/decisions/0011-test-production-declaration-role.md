@@ -1,0 +1,17 @@
+# Decision 0011: test and production declaration roles
+
+- **Status:** owner-ratified 2026-10-17 (#168; design input from #169). This decision governs the #168 Factory run.
+- **Amends:** `../contract-v1.md` (#22 `Declaration`) and `../../mcp-readonly-pilot-contract.md` (#24 find, declaration and outgoing hints).
+- **Compatibility:** none needed (pre-release). Recreate the disposable derived index; do not migrate it.
+
+## Decision
+
+1. Every measured native `Declaration` has a required `role: "test" | "production"`. The role is outside the declaration key, `syntaxId` and `lookupKey`; their values do not change. Change the producer version and rebuild the disposable index.
+2. Rust `#[cfg(feature = "test-support")]` is production. A feature gate is not a test build; there is no third role.
+3. Rust `#[cfg(test)]` and `#[cfg(all(test, …))]` mark test code. `#[cfg(any(test, …))]` and `#[cfg(not(test))]` do not. `#[test]` and final-path test attributes such as `#[tokio::test]` also mark test code. An unrelated or negative attribute cannot cancel another positive test marker. Read syntax attributes, not comments, strings, names or expanded macros.
+4. Every declaration nested inside a test declaration inherits `test`, including helpers, impls and methods inside a test module. A production sibling does not inherit it.
+5. All languages classify declarations in #167 test-convention paths as test. Rust also uses points 3–4. Java recognizes JUnit/TestNG `@Test` and JUnit `@ParameterizedTest`, `@RepeatedTest`, `@TestFactory`, `@TestTemplate` methods (simple or qualified terminal annotation name); classes in test paths such as `src/test/` are test. Python recognizes `test_*` functions (including async) and `Test*` classes in test-convention files; nested declarations inherit test. JavaScript/TypeScript use paths only, with no `describe`/`it` or name inference. This decision does not add live TypeScript indexing.
+6. #24 returns `role` on find `Symbol` and the declaration result, as a required `test | production` value distinct from #22 evidence `Role`. Keep the catalog under 256 KiB and passing its 16 KiB headroom test. #167 outgoing hints use stored caller and candidate declaration roles: omit a test candidate for a production caller, including inline Rust test declarations. The path predicate is only a producer classification rule, not an outgoing-hint read rule. `NativeCandidate` gains no field.
+7. Implement this ruling through the #168 Factory run. The documentation slice records the contract; producer, index, MCP, catalog, semantic fixtures and verification follow in later slices.
+
+`find.includeTests` (default true), test-filtered `scopeCoverage`, and production-first ranking within a match tier are later work. #120, #129 and #163 production-only metrics/references using role, and #172, are separate follow-ups after #168. Semantic test discovery (runner configuration, `harness = false`) and frameworks beyond those listed are out of scope.
