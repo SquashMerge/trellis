@@ -93,6 +93,30 @@ fn bind(
     source_only: Vec<Score>,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<Vec<DeclarationMetrics>> {
+    let syntax = if calls.iter().any(|call| {
+        declarations.iter().any(|d| {
+            callable(&d.kind)
+                && d.name.as_deref() == call.spelling.as_deref()
+                && call.owner_syntax_id == d.syntax_id
+        })
+    }) {
+        check()?;
+        let language = declarations
+            .first()
+            .context("corrupt: call without declaration")?
+            .document
+            .language
+            .as_str();
+        let mut parser = Parser::new();
+        parser.set_language(&grammar(language)?)?;
+        let tree = parser
+            .parse(source, None)
+            .context("bounded_work: call syntax parse")?;
+        check()?;
+        Some(tree)
+    } else {
+        None
+    };
     let mut rows = Vec::new();
     for (d, mut metrics) in declarations
         .iter()
@@ -111,11 +135,8 @@ fn bind(
                 .filter(|c| {
                     c.owner_syntax_id == d.syntax_id
                         && c.spelling.as_deref() == Some(name.as_str())
-                        && c.callee_range.as_ref().is_some_and(|range| {
-                            source.get(..range.start).is_some_and(|prefix| {
-                                !prefix.trim_end().ends_with('.')
-                                    && !prefix.trim_end().ends_with("::")
-                            })
+                        && syntax.as_ref().is_some_and(|tree| {
+                            unqualified_call(tree.root_node(), c, &d.document.language)
                         })
                 })
                 .count();
@@ -152,6 +173,37 @@ fn bind(
     }
     Ok(rows)
 }
+fn unqualified_call(root: Node<'_>, call: &Call, language: &str) -> bool {
+    let Some(callee) = &call.callee_range else {
+        return false;
+    };
+    if callee.start >= callee.end || call.range.start > callee.start || callee.end > call.range.end
+    {
+        return false;
+    }
+    let Some(mut node) = root.descendant_for_byte_range(callee.start, callee.end) else {
+        return false;
+    };
+    while let Some(parent) = node.parent() {
+        if node.start_byte() == call.range.start && node.end_byte() == call.range.end {
+            let field = match language {
+                "java" => "name",
+                "javascript" if node.kind() == "new_expression" => "constructor",
+                _ => "function",
+            };
+            let expression = node.child_by_field_name(field);
+            return expression.is_some_and(|expression| {
+                matches!(expression.kind(), "identifier" | "type_identifier")
+                    && expression.start_byte() == callee.start
+                    && expression.end_byte() == callee.end
+                    && (language != "java" || node.child_by_field_name("object").is_none())
+            });
+        }
+        node = parent;
+    }
+    false
+}
+
 pub fn callable(kind: &str) -> bool {
     matches!(
         kind,
@@ -455,14 +507,22 @@ fn score(
                     | "switch_rule"
                     | "switch_block_statement_group"
                     | "match_arm"
-            ) && !source[node.byte_range()]
-                .trim_start()
-                .starts_with("default")
-                && !(kind == "case_clause"
-                    && source[node.byte_range()].trim_start().starts_with("case _"))
-                && !(kind == "match_arm" && source[node.byte_range()].trim_start().starts_with('_'))
-            {
-                s.cyclomatic += 1;
+            ) {
+                let arm = source[node.byte_range()].trim_start();
+                let wildcard = (kind == "case_clause" && arm.starts_with("case _"))
+                    || (kind == "match_arm" && arm.starts_with('_'));
+                let guarded = wildcard
+                    && (node.child_by_field_name("guard").is_some()
+                        || if kind == "case_clause" {
+                            arm.split_once(':')
+                                .is_some_and(|(head, _)| head.contains(" if "))
+                        } else {
+                            arm.split_once("=>")
+                                .is_some_and(|(head, _)| head.contains(" if "))
+                        });
+                if !arm.starts_with("default") && (!wildcard || guarded) {
+                    s.cyclomatic += 1;
+                }
             }
             if matches!(kind, "return_statement" | "return_expression") {
                 s.exits.returns += 1;
@@ -500,9 +560,13 @@ fn score(
             let children: Vec<_> = node.children(&mut cursor).collect();
             if !children.is_empty() {
                 for child in children.into_iter().rev() {
-                    let continuation = kind == "if_statement"
-                        && matches!(child.kind(), "if_statement" | "else_clause");
-                    let else_continuation = kind == "else_clause" && child.kind() == "if_statement";
+                    let continuation = matches!(kind, "if_statement" | "if_expression")
+                        && matches!(
+                            child.kind(),
+                            "if_statement" | "if_expression" | "else_clause"
+                        );
+                    let else_continuation = kind == "else_clause"
+                        && matches!(child.kind(), "if_statement" | "if_expression");
                     stack.push((
                         child,
                         depth
@@ -616,21 +680,23 @@ fn score(
     h.total_operands = operands.values().sum();
     h.vocabulary = h.n1 + h.n2;
     h.length = h.total_operators + h.total_operands;
-    h.volume = round(if h.length == 0 {
+    let volume = if h.length == 0 {
         0.0
     } else {
         h.length as f64 * (h.vocabulary.max(1) as f64).log2()
-    })?;
-    h.difficulty = round(if h.n2 == 0 {
+    };
+    let difficulty = if h.n2 == 0 {
         0.0
     } else {
         (h.n1 as f64 / 2.0) * (h.total_operands as f64 / h.n2 as f64)
-    })?;
-    h.effort = round(h.difficulty * h.volume)?;
-    h.estimated_bugs = round(h.volume / 3000.0)?;
+    };
+    h.volume = round(volume)?;
+    h.difficulty = round(difficulty)?;
+    h.effort = round(difficulty * volume)?;
+    h.estimated_bugs = round(volume / 3000.0)?;
     s.maintainability_index = round(
         ((171.0
-            - 5.2 * h.volume.max(1.0).ln()
+            - 5.2 * volume.max(1.0).ln()
             - 0.23 * s.cyclomatic as f64
             - 16.2 * (s.loc.max(1) as f64).ln())
             * 100.0

@@ -269,9 +269,9 @@ fn hand_checked_python_halstead_lines_and_derived_values() {
     assert_eq!((m.halstead.vocabulary, m.halstead.length), (6, 7));
     assert_eq!(m.halstead.volume, 18.094738);
     assert_eq!(m.halstead.difficulty, 2.0);
-    assert_eq!(m.halstead.effort, 36.189476);
+    assert_eq!(m.halstead.effort, 36.189475);
     assert_eq!(m.halstead.estimated_bugs, 0.006032);
-    assert_eq!(m.maintainability_index, 80.652193);
+    assert_eq!(m.maintainability_index, 80.652194);
 }
 
 #[test]
@@ -1023,35 +1023,21 @@ fn java_javascript_rust_halstead_raw_and_derived_are_hand_checked() {
             "{lang}"
         );
         assert_eq!(score.loc, 1, "{lang}");
-        let h = &score.halstead;
-        let length = expected.2 + expected.3;
-        let vocabulary = expected.0 + expected.1;
+        let expected_derived = match lang {
+            "java" => (20.6797, 2.0, 41.3594, 0.006893, 90.654039),
+            "javascript" => (18.094738, 2.0, 36.189475, 0.006032, 91.060099),
+            "rust" => (8.0, 1.0, 8.0, 0.002667, 93.542049),
+            _ => unreachable!(),
+        };
         assert_eq!(
-            h.volume,
-            ((length as f64 * (vocabulary as f64).log2()) * 1e6).round() / 1e6,
-            "{lang}"
-        );
-        assert_eq!(
-            h.difficulty,
-            (expected.0 as f64 / 2.0 * expected.3 as f64 / expected.1 as f64 * 1e6).round() / 1e6,
-            "{lang}"
-        );
-        assert_eq!(
-            h.effort,
-            (h.difficulty * h.volume * 1e6).round() / 1e6,
-            "{lang}"
-        );
-        assert_eq!(
-            h.estimated_bugs,
-            (h.volume / 3000.0 * 1e6).round() / 1e6,
-            "{lang}"
-        );
-        let mi = ((171.0 - 5.2 * h.volume.max(1.0).ln() - 0.23 * score.cyclomatic as f64) * 100.0
-            / 171.0)
-            .clamp(0.0, 100.0);
-        assert_eq!(
-            score.maintainability_index,
-            (mi * 1e6).round() / 1e6,
+            (
+                score.halstead.volume,
+                score.halstead.difficulty,
+                score.halstead.effort,
+                score.halstead.estimated_bugs,
+                score.maintainability_index
+            ),
+            expected_derived,
             "{lang}"
         );
     }
@@ -1113,5 +1099,221 @@ fn labeled_break_adds_flat_cognitive_without_branch() {
         .metrics;
         assert_eq!(score.cyclomatic, 2, "{lang}");
         assert_eq!(score.cognitive, 2, "{lang}");
+    }
+}
+
+fn native_rows(language: &str, filename: &str, source: &str) -> Vec<metrics::DeclarationMetrics> {
+    use std::{
+        fs,
+        sync::{Arc, atomic::AtomicBool},
+    };
+    use trellis::{
+        capture::Capture, indexer::IndexOptions, model::CancelFlag, native_evidence::from_capture,
+    };
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join(filename), source).unwrap();
+    let identity =
+        trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+            .unwrap();
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let capture = Capture::admit(&IndexOptions::new(root.path().into()), &cancel, &|_| {}).unwrap();
+    let artifact = from_capture(&capture, root.path(), &identity.record_id, &cancel).unwrap();
+    metrics::compute(
+        language,
+        source,
+        &artifact.declarations,
+        &artifact.calls,
+        &artifact.control_regions,
+        &mut || Ok(()),
+    )
+    .unwrap()
+}
+
+#[test]
+fn native_else_continuations_have_one_body_depth() {
+    let python = "def calc(x):\n    if x:\n        return 1\n    else:\n        if x > 1:\n            return 2\n    return 0\n";
+    let rust = "fn calc(x: i32) -> i32 { if x > 0 { 1 } else if x < 0 { -1 } else { 0 } }";
+    for (lang, file, source) in [("python", "case.py", python), ("rust", "case.rs", rust)] {
+        let rows = native_rows(lang, file, source);
+        assert_eq!(rows.len(), 1, "{lang}");
+        assert_eq!(rows[0].metrics.cyclomatic, 3, "{lang}");
+        assert_eq!(rows[0].metrics.cognitive, 4, "{lang}");
+    }
+}
+
+#[test]
+fn guarded_wildcards_are_nondefault_native_arms() {
+    for (lang, file, guarded, plain) in [
+        (
+            "python",
+            "case.py",
+            "def calc(x):\n    match x:\n        case _ if x > 0:\n            return 1\n        case _:\n            return 0\n",
+            "def calc(x):\n    match x:\n        case _:\n            return 0\n",
+        ),
+        (
+            "rust",
+            "case.rs",
+            "fn calc(x: i32) -> i32 { match x { _ if x > 0 => 1, _ => 0 } }",
+            "fn calc(x: i32) -> i32 { match x { _ => 0 } }",
+        ),
+    ] {
+        assert_eq!(
+            native_rows(lang, file, guarded)[0].metrics.cyclomatic,
+            2,
+            "{lang}"
+        );
+        assert_eq!(
+            native_rows(lang, file, plain)[0].metrics.cyclomatic,
+            1,
+            "{lang}"
+        );
+    }
+}
+
+#[test]
+fn native_qualified_comment_gap_is_not_self_recursion() {
+    let qualified = "function calc(x) { obj./* gap */calc(x); }";
+    let mixed = "function calc(x) { calc(x); obj./* gap */calc(x); }";
+    let qualified_row = native_rows("javascript", "case.js", qualified).remove(0);
+    let mixed_row = native_rows("javascript", "case.js", mixed).remove(0);
+    assert_eq!(
+        (
+            qualified_row.metrics.cognitive,
+            qualified_row.metrics.fan_out
+        ),
+        (0, 1)
+    );
+    assert_eq!(
+        (mixed_row.metrics.cognitive, mixed_row.metrics.fan_out),
+        (1, 2)
+    );
+}
+
+#[test]
+fn native_control_aliases_and_boolean_transitions_are_hand_checked() {
+    for (lang, file, source, cc, cognitive) in [
+        (
+            "java",
+            "Controls.java",
+            include_str!("fixtures/metrics/java/Controls.java"),
+            7,
+            7,
+        ),
+        (
+            "python",
+            "controls.py",
+            include_str!("fixtures/metrics/python/controls.py"),
+            7,
+            7,
+        ),
+        (
+            "javascript",
+            "controls.js",
+            include_str!("fixtures/metrics/javascript/controls.js"),
+            6,
+            6,
+        ),
+        (
+            "rust",
+            "controls.rs",
+            include_str!("fixtures/metrics/rust/controls.rs"),
+            6,
+            6,
+        ),
+    ] {
+        let rows = native_rows(lang, file, source);
+        assert_eq!(rows.len(), 1, "{lang}");
+        assert_eq!(rows[0].metrics.cyclomatic, cc, "{lang}");
+        assert_eq!(rows[0].metrics.cognitive, cognitive, "{lang}");
+    }
+}
+
+#[test]
+fn native_test_framework_callbacks_lambdas_and_recursion_are_distinct() {
+    for (lang, file, source, named_start, test_marker, expected_cognitive) in [
+        (
+            "java",
+            "CallbackTest.java",
+            include_str!("fixtures/metrics/java/CallbackTest.java"),
+            "int calc",
+            "@org.junit.jupiter.api.Test",
+            2,
+        ),
+        (
+            "python",
+            "test_callback.py",
+            include_str!("fixtures/metrics/python/test_callback.py"),
+            "def calc",
+            "@pytest.mark.parametrize",
+            2,
+        ),
+        (
+            "javascript",
+            "callback.test.js",
+            include_str!("fixtures/metrics/javascript/callback.test.js"),
+            "function calc",
+            r#"test("calc""#,
+            2,
+        ),
+        (
+            "rust",
+            "callback.rs",
+            include_str!("fixtures/metrics/rust/callback.rs"),
+            "fn calc",
+            "#[test]",
+            3,
+        ),
+    ] {
+        assert!(source.contains(test_marker), "{lang}");
+        let rows = native_rows(lang, file, source);
+        assert!(rows.len() >= 3, "{lang}: {}", rows.len());
+        let callback_start = source
+            .find(match lang {
+                "java" => "@org.junit.jupiter.api.Test",
+                "python" => "def test_calc",
+                "javascript" => "() =>",
+                "rust" => "fn test_calc",
+                _ => unreachable!(),
+            })
+            .unwrap();
+        let callback = rows
+            .iter()
+            .find(|row| row.range.start == callback_start)
+            .unwrap();
+        assert_eq!(
+            (callback.metrics.cyclomatic, callback.metrics.cognitive),
+            (1, 0),
+            "{lang}"
+        );
+        let lambda = rows
+            .iter()
+            .find(|row| {
+                row.range.start > callback.range.start
+                    && row.range.end <= callback.range.end
+                    && row.metrics.cyclomatic == 2
+            })
+            .unwrap();
+        assert_eq!(
+            lambda.metrics.cognitive,
+            if matches!(lang, "javascript" | "rust") {
+                3
+            } else {
+                2
+            },
+            "{lang}"
+        );
+
+        let calc = rows
+            .iter()
+            .find(|row| row.range.start == source.find(named_start).unwrap())
+            .unwrap();
+        assert_eq!(calc.metrics.cyclomatic, 2, "{lang}");
+        assert_eq!(calc.metrics.cognitive, expected_cognitive, "{lang}");
+        assert_eq!(calc.metrics.fan_out, 1, "{lang}");
+        assert!(
+            rows.iter()
+                .any(|row| row.sid != calc.sid && row.metrics.cyclomatic == 2),
+            "{lang}: callback lambda"
+        );
     }
 }
