@@ -2069,6 +2069,66 @@ impl CheckoutRuntime {
         ))
     }
 
+    /// One admitted read, one projection, and one final selected-read fence.
+    pub fn metrics_response(
+        &self,
+        options: &crate::store::MetricsOptions,
+        check: &mut impl FnMut() -> anyhow::Result<()>,
+        before_work: impl FnOnce(),
+        before_finish: impl FnOnce(),
+    ) -> anyhow::Result<(Vec<u8>, bool)> {
+        use serde::Serialize;
+        struct Bounded<'a, F> {
+            bytes: Vec<u8>,
+            check: &'a mut F,
+        }
+        impl<F: FnMut() -> anyhow::Result<()>> std::io::Write for Bounded<'_, F> {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                (self.check)().map_err(std::io::Error::other)?;
+                if data.len() > 64 * 1024 * 1024 - self.bytes.len() {
+                    return Err(std::io::Error::other("response_too_large"));
+                }
+                self.bytes.extend_from_slice(data);
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Envelope<'a> {
+            catching_up: bool,
+            payload: &'a crate::store::MetricsPayload,
+        }
+        let (response, catching_up) = self.evidence_response()?;
+        before_work();
+        check()?;
+        let payload = response.metrics_at(options, check)?;
+        let mut writer = Bounded {
+            bytes: Vec::new(),
+            check,
+        };
+        serde_json::to_writer(
+            &mut writer,
+            &Envelope {
+                catching_up,
+                payload: &payload,
+            },
+        )
+        .map_err(|e| {
+            anyhow::anyhow!(if e.to_string().contains("response_too_large") {
+                "response_too_large"
+            } else {
+                "bounded_work: metrics serialization failed"
+            })
+        })?;
+        (writer.check)()?;
+        before_finish();
+        (writer.check)()?;
+        Ok((response.finish(writer.bytes)?, catching_up))
+    }
+
     pub fn evidence_for_selected(
         &self,
         selected: &SelectedCheckout,

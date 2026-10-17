@@ -1664,6 +1664,29 @@ impl From<anyhow::Error> for ApiError {
                         StatusCode::SERVICE_UNAVAILABLE,
                         "unsafe_index",
                     ),
+                    ("not_found", StatusCode::NOT_FOUND, "not_found"),
+                    (
+                        "invalid_source_syntax",
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        "invalid_source_syntax",
+                    ),
+                    (
+                        "deadline_exceeded",
+                        StatusCode::REQUEST_TIMEOUT,
+                        "deadline_exceeded",
+                    ),
+                    ("cancelled", StatusCode::REQUEST_TIMEOUT, "cancelled"),
+                    (
+                        "bounded_work",
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "bounded_work",
+                    ),
+                    (
+                        "response_too_large",
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "response_too_large",
+                    ),
+                    ("corrupt", StatusCode::SERVICE_UNAVAILABLE, "corrupt"),
                 ] {
                     if text.starts_with(prefix) {
                         return Self(status, code, "Storage is unavailable");
@@ -7176,6 +7199,123 @@ async fn selected_mutation<T: IntoResponse + Send + 'static>(
     .map_err(ApiError::from)
 }
 
+fn metrics_query(uri: &axum::http::Uri) -> Result<crate::store::MetricsOptions, ApiError> {
+    use std::collections::BTreeMap;
+    fn decode(value: &str) -> Result<String, ApiError> {
+        if value.len() > 8192 {
+            return Err(invalid());
+        }
+        let mut bytes = Vec::with_capacity(value.len());
+        let input = value.as_bytes();
+        let mut i = 0;
+        while i < input.len() {
+            match input[i] {
+                b'%' => {
+                    let hex = input.get(i + 1..i + 3).ok_or_else(invalid)?;
+                    let hex = std::str::from_utf8(hex).map_err(|_| invalid())?;
+                    bytes.push(u8::from_str_radix(hex, 16).map_err(|_| invalid())?);
+                    i += 3;
+                }
+                b'+' => {
+                    bytes.push(b' ');
+                    i += 1;
+                }
+                byte => {
+                    bytes.push(byte);
+                    i += 1;
+                }
+            }
+        }
+        String::from_utf8(bytes).map_err(|_| invalid())
+    }
+    let mut fields = BTreeMap::new();
+    if let Some(query) = uri.query() {
+        if query.len() > 8192 {
+            return Err(invalid());
+        }
+        for pair in query.split('&') {
+            let (name, value) = pair.split_once('=').ok_or_else(invalid)?;
+            let name = decode(name)?;
+            if !matches!(
+                name.as_str(),
+                "scope"
+                    | "path"
+                    | "language"
+                    | "sourceSetId"
+                    | "sid"
+                    | "indexGeneration"
+                    | "indexRevision"
+                    | "aggregate"
+                    | "metrics"
+            ) || fields.insert(name, decode(value)?).is_some()
+            {
+                return Err(invalid());
+            }
+        }
+    }
+    let mut options = crate::store::MetricsOptions::default();
+    if let Some(value) = fields.remove("scope") {
+        options.scope = value;
+    }
+    options.path = fields.remove("path");
+    options.language = fields.remove("language");
+    options.source_set_id = fields.remove("sourceSetId");
+    options.sid = fields.remove("sid");
+    if let Some(value) = fields.remove("aggregate") {
+        options.aggregate = value;
+    }
+    let generation = fields.remove("indexGeneration");
+    let revision = fields.remove("indexRevision");
+    match (generation, revision) {
+        (None, None) => (),
+        (Some(generation), Some(revision))
+            if !revision.is_empty() && revision.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            let revision = revision.parse::<u64>().map_err(|_| invalid())?;
+            options.pin = Some(
+                serde_json::from_value(json!({
+                    "indexGeneration": generation, "indexRevision": revision
+                }))
+                .map_err(|_| invalid())?,
+            );
+        }
+        _ => return Err(invalid()),
+    }
+    if let Some(names) = fields.remove("metrics") {
+        if names.is_empty() {
+            return Err(invalid());
+        }
+        options.metrics = names.split(',').map(str::to_owned).collect();
+    }
+    options.validate().map_err(|_| invalid())?;
+    for value in [
+        options.source_set_id.as_deref(),
+        options.path.as_deref(),
+        options.sid.as_deref(),
+    ] {
+        if value.is_some_and(|v| v.contains(['\\', '\0'])) {
+            return Err(invalid());
+        }
+    }
+    if options
+        .source_set_id
+        .as_ref()
+        .is_some_and(|id| !id.starts_with("source-set:v1:") || id.len() <= "source-set:v1:".len())
+        || options.path.as_ref().is_some_and(|path| path.contains(':'))
+        || options
+            .sid
+            .as_ref()
+            .is_some_and(|v| !v.starts_with("sid:v1:") || v.len() <= 7)
+        || options
+            .language
+            .as_ref()
+            .is_some_and(|v| !matches!(v.as_str(), "java" | "python" | "javascript" | "rust"))
+    {
+        return Err(invalid());
+    }
+    Ok(options)
+}
+
 async fn provisioned_core_answer(
     runtime: &Arc<crate::daemon::registry::CheckoutRuntime>,
     method: &axum::http::Method,
@@ -7186,6 +7326,53 @@ async fn provisioned_core_answer(
 ) -> Result<(Response, bool), ApiError> {
     use axum::http::Method;
     match (method, suffix) {
+        (&Method::GET, "metrics") => {
+            let options = metrics_query(uri)?;
+            let runtime = runtime.clone();
+            let (body, catching_up) = tokio::task::spawn_blocking(move || {
+                let duration = if matches!(options.scope.as_str(), "revision" | "directory") {
+                    Duration::from_secs(300)
+                } else {
+                    Duration::from_secs(30)
+                };
+                let deadline = Instant::now() + duration;
+                runtime.metrics_response(
+                    &options,
+                    &mut || {
+                        if Instant::now() >= deadline {
+                            anyhow::bail!("deadline_exceeded");
+                        }
+                        Ok(())
+                    },
+                    || {
+                        if let Some(hook) = &hook {
+                            hook("before_work");
+                        }
+                    },
+                    || {
+                        if let Some(hook) = &hook {
+                            hook("before_read_finish");
+                        }
+                    },
+                )
+            })
+            .await
+            .map_err(|_| {
+                ApiError(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal_error",
+                    "Operation failed",
+                )
+            })??;
+            Ok((
+                (
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    body,
+                )
+                    .into_response(),
+                catching_up,
+            ))
+        }
         (&Method::POST, "dependencies/refresh") => {
             let request: Value = serde_json::from_slice(&body).map_err(|_| invalid())?;
             if !request.as_object().is_some_and(|object| object.is_empty()) {
