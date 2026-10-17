@@ -23,6 +23,7 @@ mod indexer_java;
 mod indexer_python;
 mod indexer_rust;
 pub mod mcp;
+pub mod metrics;
 pub mod model;
 pub mod native_evidence;
 pub mod native_ids;
