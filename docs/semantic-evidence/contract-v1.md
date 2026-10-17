@@ -145,6 +145,8 @@ A changed B document does not itself rejoin. A dependent A fact may retarget B o
 
 ## Records and bindings
 
+[Decision 0011](decisions/0011-test-production-declaration-role.md) requires `Declaration.role` on every measured native and normalized declaration. The producer classifies a declaration as test if its #167 test-convention path, a supported syntax marker, or an enclosing test declaration makes it test; otherwise it is production. Rust `cfg(test)` and a direct `test` operand in `cfg(all(test, …))` mark test; `cfg(any(test, …))`, `cfg(not(test))`, and `cfg(feature = "test-support")` do not mark test by themselves. Rust `#[test]` and path-qualified final `::test` attributes mark test. Java JUnit/TestNG test-method annotations and Python `test_*` functions or `Test*` classes in test-convention files mark test; JavaScript/TypeScript use paths only. Classification is not part of identity. The required lowercase values `test` and `production` are unrelated to the evidence-role `Role` enum above. A producer-version change rebuilds the disposable index without migration.
+
 | Record.field | Type / nullability | Invariant | Failure or disposition |
 |---|---|---|---|
 | `Declaration.syntaxId` | `SyntaxId` | Equals descriptor algorithm. | Digest mismatch invalidates artifact. |
@@ -153,6 +155,7 @@ A changed B document does not itself rejoin. A dependent A fact may retarget B o
 | `.kind` | `Kind` | Agrees with key/header. | Disagreement invalidates declaration. |
 | `.name` | `Text?` | Named declarations non-null; anonymous/module null. | Wrong nullability invalid. |
 | `.lookupKey` | `Text?` | Non-null exactly when name is non-null, derived by language rule. | Wrong derivation/nullability invalid. |
+| `.role` | `test \| production` | Required measured declaration classification under [Decision 0011](decisions/0011-test-production-declaration-role.md); distinct from the evidence `Role` enum. It is outside the key, `syntaxId` and `lookupKey`. | Missing or unknown role invalidates the declaration. |
 | `.ancestors` | `Key[]` | Outermost to immediate parent. | Wrong order/key invalidates ID. |
 | `.key` | `Key` | Current declaration key. | Inconsistent descriptor invalid. |
 | `.range` | `Range` | Contains nameRange; only empty module may be empty. | Invalid range rejects artifact. |
@@ -297,7 +300,7 @@ The first-release `outgoing_calls` **wire projection only** may show bounded `na
 
 These hints are not `DeclarationBinding`, `CallBinding`, `Target`, `possibleDispatch`, resolution, exact join, call edge or completeness evidence. A hint never sets `GraphEdge.to`, `CallItem.targetId` or a resolved disposition, and never authorizes graph traversal. The underlying call and shown declaration each retain their own native provenance and coverage; the *name-match relation itself* has no producer provenance and must not borrow the call's provenance as semantic proof. The projection may include both source facts' provenance/coverage but must not invent a hint-specific producer fact. Candidate presence, absence or clipping does not create any warning outside the exact warnings-v1 rules. `nativeCandidates` is always explicitly non-exhaustive as a possible-callee universe, even if every currently indexed lexical match fits. #40 still owns outgoing graph traversal using only admitted exact semantic bindings, not these hints. No change to #26's in-flight authored corpus schemas, fixtures, counts or checker is required.
 
-**Owner amendment (2026-10-17, #167):** for a selected declaration outside test code, a matching declaration in test code is not eligible. Until #168 adds a per-declaration test/production role, test code is identified by the test-convention paths in the #24 contract. #24's ordering ranks hints nearer the calling document first. Neither change makes a hint evidence of anything.
+**Owner amendment (2026-10-17, #167; [Decision 0011](decisions/0011-test-production-declaration-role.md)):** for a selected production declaration, a matching test declaration is not eligible. Use the stored caller and candidate `Declaration.role`, not their paths, to decide eligibility; this includes inline Rust tests. #24's ordering ranks hints nearer the calling document first. Neither change makes a hint evidence of anything.
 
 For member invocation `obj.foo()`, the measured member-name `foo` can be this single identifier only if `Call.calleeRange` spans exactly that source token and full `Call.spelling` is `foo`. Captured compound expression `obj.foo` must not be split or suffix-matched into a hint; missing token proof yields no hint. #38 owns source-adapter token capture and tests; this clarification does not alter #26's active authored corpus contract.
 
