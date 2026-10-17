@@ -703,6 +703,10 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
             let view = args.and_then(|a| a.get("view")).and_then(|v| v.as_str());
             let root = answering.root();
             let id = &id;
+            // The coordinator stamped `deadline = accepted + call_deadline`.
+            let accepted = deadline
+                .checked_sub(workspace.call_deadline)
+                .unwrap_or(deadline);
             let tool_read: Option<EvidenceToolRead> = match (name.as_str(), view, args) {
                 _ if !tool.valid_arguments || envelope["error"]["code"] != "index_not_ready" => {
                     None
@@ -744,7 +748,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                                 symbol_id,
                                 limit,
                                 expected,
-                                &|| runtime.mcp_hint_clock_now(),
+                                &|| runtime.mcp_hint_clock_now(accepted),
                                 deadline,
                             )? {
                                 Some(found) => {

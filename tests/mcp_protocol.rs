@@ -6429,6 +6429,12 @@ fn mcp_outgoing_fixture_with_budget(
     mcp_outgoing_wire_fixture(files, owner, limit, advance_hints, false, false).0
 }
 
+/// A fixed delay between freezing the hint clock and sending the call, so a
+/// test can show the hint budget does not depend on acceptance timing (#131).
+/// Each nextest test runs in its own process, so this is per test.
+static OUTGOING_ACCEPT_DELAY_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 fn mcp_outgoing_wire_fixture(
     files: &[(&str, &str)],
     owner: &str,
@@ -6582,6 +6588,10 @@ fn mcp_outgoing_wire_fixture(
     } else {
         None
     };
+    let delay = OUTGOING_ACCEPT_DELAY_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if delay > 0 {
+        std::thread::sleep(Duration::from_millis(delay));
+    }
     writeln!(
         client,
         "{}",
@@ -7215,8 +7225,21 @@ async fn mcp_outgoing_response_bytes_call_prefix_before_global_hints() {
     assert!(serde_json::to_vec(&reply).unwrap().len() < 65_536);
 }
 
+/// #131: the same near-deadline budget, with the call accepted 300 ms after
+/// the hint clock was frozen. The hint budget is anchored to acceptance, so
+/// the delay cannot move the cap and leak an optional hint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_outgoing_near_call_deadline_is_independent_of_acceptance_delay() {
+    OUTGOING_ACCEPT_DELAY_MS.store(300, std::sync::atomic::Ordering::Relaxed);
+    mcp_outgoing_near_call_deadline_preserves_required_call_without_optional_work_body().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mcp_outgoing_near_call_deadline_preserves_required_call_without_optional_work() {
+    mcp_outgoing_near_call_deadline_preserves_required_call_without_optional_work_body().await;
+}
+
+async fn mcp_outgoing_near_call_deadline_preserves_required_call_without_optional_work_body() {
     // Required calls finish before the hint budget starts. The row gate advances
     // the virtual clock into the reserved send-decision window, without crossing
     // the overall deadline. Only optional hints may be abandoned.
