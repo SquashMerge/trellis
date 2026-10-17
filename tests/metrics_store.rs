@@ -53,6 +53,49 @@ fn index_path(state: &std::path::Path) -> std::path::PathBuf {
         .unwrap()
         .join("index.db")
 }
+fn unavailable_fan_in() -> serde_json::Value {
+    serde_json::json!({"value": null, "unavailable": "call resolution not yet produced (#40/#68)"})
+}
+fn assert_owned_calls(
+    db: &rusqlite::Connection,
+    path: &str,
+    rows: &[trellis::store::MetricsDeclarationRow],
+) {
+    let source =
+        "function first() { return 1; }\nfunction second() { first(); first(); return 2; }\n";
+    let persisted: Vec<(String, String, i64, i64)> = db.prepare(
+        "SELECT d.name,d.syntax_id,d.start_byte,d.end_byte FROM native_version_declarations d          JOIN document_versions v ON v.id=d.version_id WHERE v.path=?1 AND d.name IN ('first','second') ORDER BY d.name"
+    ).unwrap().query_map([path], |r| Ok((r.get(0)?, r.get(1)?, r.get::<_,i64>(2)?, r.get::<_,i64>(3)?)))
+        .unwrap().map(Result::unwrap).collect();
+    assert_eq!(persisted.len(), 2);
+    assert_eq!(rows.len(), 2);
+    for (name, sid, start, end) in persisted {
+        let expected_start = source.find(&format!("function {name}")).unwrap();
+        let expected_end = source[expected_start..].find('}').unwrap() + expected_start + 1;
+        assert_eq!(
+            (start, end),
+            (expected_start as i64, expected_end as i64),
+            "{name} persisted range"
+        );
+        let row = rows
+            .iter()
+            .find(|row| {
+                row.sid == sid && row.range.start == start as usize && row.range.end == end as usize
+            })
+            .unwrap_or_else(|| panic!("missing persisted {name} sid/range"));
+        assert_eq!(row.path, path);
+        assert_eq!(
+            row.metrics["fanOut"],
+            if name == "first" { 0 } else { 2 },
+            "{name} call ownership"
+        );
+        assert_eq!(
+            row.metrics["fanIn"],
+            unavailable_fan_in(),
+            "{name} unavailable fan-in"
+        );
+    }
+}
 fn bytes(value: &impl serde::Serialize) -> Vec<u8> {
     serde_json::to_vec(value).unwrap()
 }
@@ -276,31 +319,9 @@ fn pinned_payloads_native_ids_and_aggregate_values() {
         bytes(&response.metrics_at(&file, &mut || Ok(())).unwrap())
     );
     let db = rusqlite::Connection::open(index_path(state.path())).unwrap();
-    let persisted: Vec<String> = db.prepare("SELECT syntax_id FROM native_version_declarations d JOIN document_versions v ON v.id=d.version_id WHERE v.path='src/a.js' AND d.kind IN ('function','method','constructor','anonymousFunction') ORDER BY syntax_id")
-        .unwrap().query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
-    assert_eq!(
-        rows.declarations
-            .iter()
-            .map(|d| d.sid.clone())
-            .collect::<std::collections::BTreeSet<_>>(),
-        persisted.into_iter().collect()
-    );
-    assert_eq!(
-        rows.declarations
-            .iter()
-            .map(|d| d.metrics["fanOut"].as_u64().unwrap())
-            .sum::<u64>(),
-        2
-    );
-    assert!(
-        rows.declarations
-            .iter()
-            .all(|d| d.metrics["fanIn"]["value"].is_null()
-                && d.metrics["fanIn"]["unavailable"]
-                    == "call resolution not yet produced (#40/#68)")
-    );
+    assert_owned_calls(&db, "src/a.js", &rows.declarations);
     assert_eq!(rows.files[0].metrics["fanOut"], 2);
-    assert!(rows.files[0].metrics["fanIn"]["value"].is_null());
+    assert_eq!(rows.files[0].metrics["fanIn"], unavailable_fan_in());
     let mut directory = options("directory", "src");
     directory.pin = Some(pin);
     directory.source_set_id = Some(source_set.clone());
@@ -317,7 +338,7 @@ fn pinned_payloads_native_ids_and_aggregate_values() {
         .unwrap();
     assert_eq!(dir.declaration_count, 3);
     assert_eq!(dir.metrics["fanOut"], serde_json::json!(0.666667));
-    assert!(dir.metrics["fanIn"]["value"].is_null());
+    assert_eq!(dir.metrics["fanIn"], unavailable_fan_in());
     assert_eq!(
         revision
             .directories
@@ -326,6 +347,21 @@ fn pinned_payloads_native_ids_and_aggregate_values() {
             .unwrap()
             .metrics["fanOut"],
         serde_json::json!(0.666667)
+    );
+    assert_eq!(
+        revision
+            .directories
+            .iter()
+            .find(|d| d.path.is_empty())
+            .unwrap()
+            .metrics["fanIn"],
+        unavailable_fan_in()
+    );
+    assert!(
+        subtree
+            .files
+            .iter()
+            .all(|f| f.metrics["fanIn"] == unavailable_fan_in())
     );
     let all_locs: f64 = subtree
         .files
@@ -397,7 +433,7 @@ fn selected_fact_corruption_is_typed_and_atomic() {
 
 #[test]
 fn source_only_memo_rebinds_native_calls_for_new_path_and_pin() {
-    let (_state, root, store, first_pin) = fixture();
+    let (state, root, store, first_pin) = fixture();
     let first = store.evidence_response().unwrap();
     let mut file = options("file", "src/a.js");
     file.source_set_id = Some(
@@ -411,6 +447,10 @@ fn source_only_memo_rebinds_native_calls_for_new_path_and_pin() {
     file.language = Some("javascript".into());
     file.pin = Some(first_pin);
     let original = first.metrics_at(&file, &mut || Ok(())).unwrap();
+    let db = rusqlite::Connection::open(index_path(state.path())).unwrap();
+    assert_owned_calls(&db, "src/a.js", &original.declarations);
+    assert_eq!(original.files[0].metrics["fanIn"], unavailable_fan_in());
+    drop(db);
     let memo_before = store.metrics_memo_entries_for_tests();
     assert!(memo_before >= 1);
     drop(first);
@@ -440,18 +480,44 @@ fn source_only_memo_rebinds_native_calls_for_new_path_and_pin() {
     assert_eq!(rebound.declarations.len(), original.declarations.len());
     assert_ne!(rebound.declarations[0].sid, original.declarations[0].sid);
     assert_eq!(rebound.files[0].metrics["fanOut"], 2);
-    assert_eq!(
-        rebound
-            .declarations
-            .iter()
-            .map(|d| d.metrics["fanOut"].as_u64().unwrap())
-            .sum::<u64>(),
-        2
-    );
+    let db = rusqlite::Connection::open(index_path(state.path())).unwrap();
+    assert_owned_calls(&db, "src/c.js", &rebound.declarations);
+    assert_eq!(rebound.files[0].metrics["fanIn"], unavailable_fan_in());
+    let mut directory = options("directory", "src");
+    directory.source_set_id = file.source_set_id.clone();
+    directory.pin = Some(second_pin);
+    directory.aggregate = "mean".into();
+    let subtree = second.metrics_at(&directory, &mut || Ok(())).unwrap();
+    let aggregate = subtree
+        .directories
+        .iter()
+        .find(|d| d.path == "src")
+        .unwrap();
+    assert_eq!(aggregate.declaration_count, 5);
+    assert_eq!(aggregate.metrics["fanOut"], serde_json::json!(0.8));
+    assert_eq!(aggregate.metrics["fanIn"], unavailable_fan_in());
     assert!(
-        rebound
-            .declarations
+        subtree
+            .files
             .iter()
-            .all(|d| d.metrics["fanIn"]["value"].is_null())
+            .all(|row| row.metrics["fanIn"] == unavailable_fan_in())
+    );
+    let revision = second
+        .metrics_at(
+            &MetricsOptions {
+                pin: Some(second_pin),
+                ..Default::default()
+            },
+            &mut || Ok(()),
+        )
+        .unwrap();
+    assert_eq!(
+        revision
+            .directories
+            .iter()
+            .find(|d| d.path.is_empty())
+            .unwrap()
+            .metrics["fanIn"],
+        unavailable_fan_in()
     );
 }
