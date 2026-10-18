@@ -1,8 +1,11 @@
 use trellis::metrics::{self, Accumulator, MetricsMemo, SourceInput};
-use trellis::native_evidence::{Call, Declaration, DocumentKey, Header, Key, Range};
+use trellis::native_evidence::{
+    Call, Declaration, DeclarationRole, DocumentKey, Header, Key, Range,
+};
 
 fn declaration(lang: &str, len: usize) -> Declaration {
     Declaration {
+        role: DeclarationRole::Production,
         syntax_id: "sid:v1:test".into(),
         document: DocumentKey {
             source_set_id: "set".into(),
