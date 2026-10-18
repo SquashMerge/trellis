@@ -576,6 +576,7 @@ async function admitted(
   const declarations = ["r1", "r2"].map((id) => ({
     ref: `d${id}`,
     nativeId: null,
+    role: "production",
     document,
     revisionId: id,
     parentRef: null,

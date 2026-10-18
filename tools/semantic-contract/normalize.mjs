@@ -443,6 +443,7 @@ export function assignKeys(loaded, registry = identityRegistry()) {
       entries.set(row.ref, { key, ancestors, range: entry.range });
       pending.delete(row.ref);
       const out = {
+        role: row.role,
         syntaxId,
         document: row.document,
         revisionId: row.revisionId,

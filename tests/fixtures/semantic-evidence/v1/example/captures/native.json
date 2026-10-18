@@ -1,1 +1,2180 @@
-{"formatVersion":1,"producerId":"native","extractionInputs":[],"declarations":[{"ref":"r0:unchanged:same","nativeId":null,"document":{"sourceSetId":"main","language":"javascript","path":"src/unchanged.js"},"revisionId":"r0","parentRef":null,"kind":"function","name":"same","range":{"encoding":"utf8","start":0,"end":41},"nameRange":{"encoding":"utf8","start":16,"end":20},"header":{"kind":"function","name":"same","modifiers":[],"typeParameters":[],"parameters":[],"resultType":null,"bases":[]},"signature":null,"witnesses":[{"field":"name","witness":{"range":{"encoding":"utf8","start":16,"end":20},"text":"same"}},{"field":"header.name","witness":{"range":{"encoding":"utf8","start":16,"end":20},"text":"same"}}]},{"ref":"r0:unchanged:hidden","nativeId":null,"document":{"sourceSetId":"main","language":"javascript","path":"src/unchanged.js"},"revisionId":"r0","parentRef":null,"kind":"function","name":"hidden","range":{"encoding":"utf8","start":42,"end":80},"nameRange":{"encoding":"utf8","start":58,"end":64},"header":{"kind":"function","name":"hidden","modifiers":[],"typeParameters":[],"parameters":[],"resultType":null,"bases":[]},"signature":null,"witnesses":[{"field":"name","witness":{"range":{"encoding":"utf8","start":58,"end":64},"text":"hidden"}},{"field":"header.name","witness":{"range":{"encoding":"utf8","start":58,"end":64},"text":"hidden"}}]},{"ref":"r0:changed:change","nativeId":null,"document":{"sourceSetId":"main","language":"javascript","path":"src/changed.js"},"revisionId":"r0","parentRef":null,"kind":"type","name":"change","range":{"encoding":"utf8","start":0,"end":47},"nameRange":{"encoding":"utf8","start":13,"end":19},"header":{"kind":"type","name":"change","modifiers":[],"typeParameters":[],"parameters":[],"resultType":null,"bases":["Base"]},"signature":null,"witnesses":[{"field":"name","witness":{"range":{"encoding":"utf8","start":13,"end":19},"text":"change"}},{"field":"header.name","witness":{"range":{"encoding":"utf8","start":13,"end":19},"text":"change"}},{"field":"header.bases[0]","witness":{"range":{"encoding":"utf8","start":28,"end":32},"text":"Base"}}]},{"ref":"r0:zero:zero","nativeId":null,"document":{"sourceSetId":"main","language":"javascript","path":"src/zero.js"},"revisionId":"r0","parentRef":null,"kind":"function","name":"zero","range":{"encoding":"utf8","start":0,"end":36},"nameRange":{"encoding":"utf8","start":16,"end":20},"header":{"kind":"function","name":"zero","modifiers":[],"typeParameters":[],"parameters":[],"resultType":null,"bases":[]},"signature":null,"witnesses":[{"field":"name","witness":{"range":{"encoding":"utf8","start":16,"end":20},"text":"zero"}},{"field":"header.name","witness":{"range":{"encoding":"utf8","start":16,"end":20},"text":"zero"}}]},{"ref":"r0:foreign:foreign","nativeId":null,"document":{"sourceSetId":"main","language":"javascript","path":"src/foreign.js"},"revisionId":"r0","parentRef":null,"kind":"function","name":"foreign","range":{"encoding":"utf8","start":0,"end":39},"nameRange":{"encoding":"utf8","start":16,"end":23},"header":{"kind":"function","name":"foreign","modifiers":[],"typeParameters":[],"parameters":[],"resultType":null,"bases":[]},"signature":null,"witnesses":[{"field":"name","witness":{"range":{"encoding":"utf8","start":16,"end":23},"text":"foreign"}},{"field":"header.name","witness":{"range":{"encoding":"utf8","start":16,"end":23},"text":"foreign"}}]},{"ref":"r1:unchanged:same","nativeId":null,"document":{"sourceSetId":"main","language":"javascript","path":"src/unchanged.js"},"revisionId":"r1","parentRef":null,"kind":"function","name":"same","range":{"encoding":"utf8","start":0,"end":41},"nameRange":{"encoding":"utf8","start":16,"end":20},"header":{"kind":"function","name":"same","modifiers":[],"typeParameters":[],"parameters":[],"resultType":null,"bases":[]},"signature":null,"witnesses":[{"field":"name","witness":{"range":{"encoding":"utf8","start":16,"end":20},"text":"same"}},{"field":"header.name","witness":{"range":{"encoding":"utf8","start":16,"end":20},"text":"same"}}]},{"ref":"r1:unchanged:hidden","nativeId":null,"document":{"sourceSetId":"main","language":"javascript","path":"src/unchanged.js"},"revisionId":"r1","parentRef":null,"kind":"function","name":"hidden","range":{"encoding":"utf8","start":42,"end":80},"nameRange":{"encoding":"utf8","start":58,"end":64},"header":{"kind":"function","name":"hidden","modifiers":[],"typeParameters":[],"parameters":[],"resultType":null,"bases":[]},"signature":null,"witnesses":[{"field":"name","witness":{"range":{"encoding":"utf8","start":58,"end":64},"text":"hidden"}},{"field":"header.name","witness":{"range":{"encoding":"utf8","start":58,"end":64},"text":"hidden"}}]},{"ref":"r1:changed:change","nativeId":null,"document":{"sourceSetId":"main","language":"javascript","path":"src/changed.js"},"revisionId":"r1","parentRef":null,"kind":"type","name":"change","range":{"encoding":"utf8","start":0,"end":47},"nameRange":{"encoding":"utf8","start":13,"end":19},"header":{"kind":"type","name":"change","modifiers":[],"typeParameters":[],"parameters":[],"resultType":null,"bases":["Base"]},"signature":null,"witnesses":[{"field":"name","witness":{"range":{"encoding":"utf8","start":13,"end":19},"text":"change"}},{"field":"header.name","witness":{"range":{"encoding":"utf8","start":13,"end":19},"text":"change"}},{"field":"header.bases[0]","witness":{"range":{"encoding":"utf8","start":28,"end":32},"text":"Base"}}]},{"ref":"r1:zero:zero","nativeId":null,"document":{"sourceSetId":"main","language":"javascript","path":"src/zero.js"},"revisionId":"r1","parentRef":null,"kind":"function","name":"zero","range":{"encoding":"utf8","start":0,"end":36},"nameRange":{"encoding":"utf8","start":16,"end":20},"header":{"kind":"function","name":"zero","modifiers":[],"typeParameters":[],"parameters":[],"resultType":null,"bases":[]},"signature":null,"witnesses":[{"field":"name","witness":{"range":{"encoding":"utf8","start":16,"end":20},"text":"zero"}},{"field":"header.name","witness":{"range":{"encoding":"utf8","start":16,"end":20},"text":"zero"}}]},{"ref":"r1:foreign:foreign","nativeId":null,"document":{"sourceSetId":"main","language":"javascript","path":"src/foreign.js"},"revisionId":"r1","parentRef":null,"kind":"function","name":"foreign","range":{"encoding":"utf8","start":0,"end":39},"nameRange":{"encoding":"utf8","start":16,"end":23},"header":{"kind":"function","name":"foreign","modifiers":[],"typeParameters":[],"parameters":[],"resultType":null,"bases":[]},"signature":null,"witnesses":[{"field":"name","witness":{"range":{"encoding":"utf8","start":16,"end":23},"text":"foreign"}},{"field":"header.name","witness":{"range":{"encoding":"utf8","start":16,"end":23},"text":"foreign"}}]},{"ref":"r2:unchanged:same","nativeId":null,"document":{"sourceSetId":"main","language":"javascript","path":"src/unchanged.js"},"revisionId":"r2","parentRef":null,"kind":"function","name":"same","range":{"encoding":"utf8","start":0,"end":41},"nameRange":{"encoding":"utf8","start":16,"end":20},"header":{"kind":"function","name":"same","modifiers":[],"typeParameters":[],"parameters":[],"resultType":null,"bases":[]},"signature":null,"witnesses":[{"field":"name","witness":{"range":{"encoding":"utf8","start":16,"end":20},"text":"same"}},{"field":"header.name","witness":{"range":{"encoding":"utf8","start":16,"end":20},"text":"same"}}]},{"ref":"r2:unchanged:hidden","nativeId":null,"document":{"sourceSetId":"main","language":"javascript","path":"src/unchanged.js"},"revisionId":"r2","parentRef":null,"kind":"function","name":"hidden","range":{"encoding":"utf8","start":42,"end":80},"nameRange":{"encoding":"utf8","start":58,"end":64},"header":{"kind":"function","name":"hidden","modifiers":[],"typeParameters":[],"parameters":[],"resultType":null,"bases":[]},"signature":null,"witnesses":[{"field":"name","witness":{"range":{"encoding":"utf8","start":58,"end":64},"text":"hidden"}},{"field":"header.name","witness":{"range":{"encoding":"utf8","start":58,"end":64},"text":"hidden"}}]},{"ref":"r2:changed:change","nativeId":null,"document":{"sourceSetId":"main","language":"javascript","path":"src/changed.js"},"revisionId":"r2","parentRef":null,"kind":"type","name":"change","range":{"encoding":"utf8","start":0,"end":47},"nameRange":{"encoding":"utf8","start":13,"end":19},"header":{"kind":"type","name":"change","modifiers":[],"typeParameters":[],"parameters":[],"resultType":null,"bases":["Base"]},"signature":null,"witnesses":[{"field":"name","witness":{"range":{"encoding":"utf8","start":13,"end":19},"text":"change"}},{"field":"header.name","witness":{"range":{"encoding":"utf8","start":13,"end":19},"text":"change"}},{"field":"header.bases[0]","witness":{"range":{"encoding":"utf8","start":28,"end":32},"text":"Base"}}]},{"ref":"r2:zero:zero","nativeId":null,"document":{"sourceSetId":"main","language":"javascript","path":"src/zero.js"},"revisionId":"r2","parentRef":null,"kind":"function","name":"zero","range":{"encoding":"utf8","start":0,"end":36},"nameRange":{"encoding":"utf8","start":16,"end":20},"header":{"kind":"function","name":"zero","modifiers":[],"typeParameters":[],"parameters":[],"resultType":null,"bases":[]},"signature":null,"witnesses":[{"field":"name","witness":{"range":{"encoding":"utf8","start":16,"end":20},"text":"zero"}},{"field":"header.name","witness":{"range":{"encoding":"utf8","start":16,"end":20},"text":"zero"}}]},{"ref":"r2:foreign:foreign","nativeId":null,"document":{"sourceSetId":"main","language":"javascript","path":"src/foreign.js"},"revisionId":"r2","parentRef":null,"kind":"function","name":"foreign","range":{"encoding":"utf8","start":0,"end":49},"nameRange":{"encoding":"utf8","start":16,"end":23},"header":{"kind":"function","name":"foreign","modifiers":[],"typeParameters":[],"parameters":[],"resultType":null,"bases":[]},"signature":null,"witnesses":[{"field":"name","witness":{"range":{"encoding":"utf8","start":16,"end":23},"text":"foreign"}},{"field":"header.name","witness":{"range":{"encoding":"utf8","start":16,"end":23},"text":"foreign"}}]},{"ref":"r0:anchors:unique:first","nativeId":null,"document":{"sourceSetId":"main","language":"javascript","path":"src/anchors.js"},"revisionId":"r0","parentRef":null,"kind":"function","name":"unique","range":{"encoding":"utf8","start":0,"end":31},"nameRange":{"encoding":"utf8","start":9,"end":15},"header":{"kind":"function","name":"unique","modifiers":[],"typeParameters":[],"parameters":[],"resultType":null,"bases":[]},"signature":null,"witnesses":[{"field":"name","witness":{"range":{"encoding":"utf8","start":9,"end":15},"text":"unique"}},{"field":"header.name","witness":{"range":{"encoding":"utf8","start":9,"end":15},"text":"unique"}}]},{"ref":"r0:anchors:unique:second","nativeId":null,"document":{"sourceSetId":"main","language":"javascript","path":"src/anchors.js"},"revisionId":"r0","parentRef":null,"kind":"function","name":"unique","range":{"encoding":"utf8","start":32,"end":69},"nameRange":{"encoding":"utf8","start":47,"end":53},"header":{"kind":"function","name":"unique","modifiers":["async"],"typeParameters":[],"parameters":[],"resultType":null,"bases":[]},"signature":null,"witnesses":[{"field":"name","witness":{"range":{"encoding":"utf8","start":47,"end":53},"text":"unique"}},{"field":"header.name","witness":{"range":{"encoding":"utf8","start":47,"end":53},"text":"unique"}},{"field":"header.modifiers[0]","witness":{"range":{"encoding":"utf8","start":32,"end":37},"text":"async"}}]},{"ref":"r0:anchors:anchor:first","nativeId":null,"document":{"sourceSetId":"main","language":"javascript","path":"src/anchors.js"},"revisionId":"r0","parentRef":null,"kind":"function","name":"anchor","range":{"encoding":"utf8","start":70,"end":101},"nameRange":{"encoding":"utf8","start":79,"end":85},"header":{"kind":"function","name":"anchor","modifiers":[],"typeParameters":[],"parameters":[],"resultType":null,"bases":[]},"signature":null,"witnesses":[{"field":"name","witness":{"range":{"encoding":"utf8","start":79,"end":85},"text":"anchor"}},{"field":"header.name","witness":{"range":{"encoding":"utf8","start":79,"end":85},"text":"anchor"}}]},{"ref":"r0:anchors:anchor:second","nativeId":null,"document":{"sourceSetId":"main","language":"javascript","path":"src/anchors.js"},"revisionId":"r0","parentRef":null,"kind":"function","name":"anchor","range":{"encoding":"utf8","start":102,"end":133},"nameRange":{"encoding":"utf8","start":111,"end":117},"header":{"kind":"function","name":"anchor","modifiers":[],"typeParameters":[],"parameters":[],"resultType":null,"bases":[]},"signature":null,"witnesses":[{"field":"name","witness":{"range":{"encoding":"utf8","start":111,"end":117},"text":"anchor"}},{"field":"header.name","witness":{"range":{"encoding":"utf8","start":111,"end":117},"text":"anchor"}}]},{"ref":"r0:anchors:gone","nativeId":null,"document":{"sourceSetId":"main","language":"javascript","path":"src/anchors.js"},"revisionId":"r0","parentRef":null,"kind":"function","name":"gone","range":{"encoding":"utf8","start":134,"end":163},"nameRange":{"encoding":"utf8","start":143,"end":147},"header":{"kind":"function","name":"gone","modifiers":[],"typeParameters":[],"parameters":[],"resultType":null,"bases":[]},"signature":null,"witnesses":[{"field":"name","witness":{"range":{"encoding":"utf8","start":143,"end":147},"text":"gone"}},{"field":"header.name","witness":{"range":{"encoding":"utf8","start":143,"end":147},"text":"gone"}}]},{"ref":"r0:anchors:alter","nativeId":null,"document":{"sourceSetId":"main","language":"javascript","path":"src/anchors.js"},"revisionId":"r0","parentRef":null,"kind":"function","name":"alter","range":{"encoding":"utf8","start":164,"end":194},"nameRange":{"encoding":"utf8","start":173,"end":178},"header":{"kind":"function","name":"alter","modifiers":[],"typeParameters":[],"parameters":[],"resultType":null,"bases":[]},"signature":null,"witnesses":[{"field":"name","witness":{"range":{"encoding":"utf8","start":173,"end":178},"text":"alter"}},{"field":"header.name","witness":{"range":{"encoding":"utf8","start":173,"end":178},"text":"alter"}}]},{"ref":"r1:anchors:unique:first","nativeId":null,"document":{"sourceSetId":"main","language":"javascript","path":"src/anchors.js"},"revisionId":"r1","parentRef":null,"kind":"function","name":"unique","range":{"encoding":"utf8","start":0,"end":31},"nameRange":{"encoding":"utf8","start":9,"end":15},"header":{"kind":"function","name":"unique","modifiers":[],"typeParameters":[],"parameters":[],"resultType":null,"bases":[]},"signature":null,"witnesses":[{"field":"name","witness":{"range":{"encoding":"utf8","start":9,"end":15},"text":"unique"}},{"field":"header.name","witness":{"range":{"encoding":"utf8","start":9,"end":15},"text":"unique"}}]},{"ref":"r1:anchors:unique:second","nativeId":null,"document":{"sourceSetId":"main","language":"javascript","path":"src/anchors.js"},"revisionId":"r1","parentRef":null,"kind":"function","name":"unique","range":{"encoding":"utf8","start":32,"end":69},"nameRange":{"encoding":"utf8","start":47,"end":53},"header":{"kind":"function","name":"unique","modifiers":["async"],"typeParameters":[],"parameters":[],"resultType":null,"bases":[]},"signature":null,"witnesses":[{"field":"name","witness":{"range":{"encoding":"utf8","start":47,"end":53},"text":"unique"}},{"field":"header.name","witness":{"range":{"encoding":"utf8","start":47,"end":53},"text":"unique"}},{"field":"header.modifiers[0]","witness":{"range":{"encoding":"utf8","start":32,"end":37},"text":"async"}}]},{"ref":"r1:anchors:anchor:first","nativeId":null,"document":{"sourceSetId":"main","language":"javascript","path":"src/anchors.js"},"revisionId":"r1","parentRef":null,"kind":"function","name":"anchor","range":{"encoding":"utf8","start":70,"end":101},"nameRange":{"encoding":"utf8","start":79,"end":85},"header":{"kind":"function","name":"anchor","modifiers":[],"typeParameters":[],"parameters":[],"resultType":null,"bases":[]},"signature":null,"witnesses":[{"field":"name","witness":{"range":{"encoding":"utf8","start":79,"end":85},"text":"anchor"}},{"field":"header.name","witness":{"range":{"encoding":"utf8","start":79,"end":85},"text":"anchor"}}]},{"ref":"r1:anchors:anchor:second","nativeId":null,"document":{"sourceSetId":"main","language":"javascript","path":"src/anchors.js"},"revisionId":"r1","parentRef":null,"kind":"function","name":"anchor","range":{"encoding":"utf8","start":102,"end":133},"nameRange":{"encoding":"utf8","start":111,"end":117},"header":{"kind":"function","name":"anchor","modifiers":[],"typeParameters":[],"parameters":[],"resultType":null,"bases":[]},"signature":null,"witnesses":[{"field":"name","witness":{"range":{"encoding":"utf8","start":111,"end":117},"text":"anchor"}},{"field":"header.name","witness":{"range":{"encoding":"utf8","start":111,"end":117},"text":"anchor"}}]},{"ref":"r1:anchors:gone","nativeId":null,"document":{"sourceSetId":"main","language":"javascript","path":"src/anchors.js"},"revisionId":"r1","parentRef":null,"kind":"function","name":"gone","range":{"encoding":"utf8","start":134,"end":163},"nameRange":{"encoding":"utf8","start":143,"end":147},"header":{"kind":"function","name":"gone","modifiers":[],"typeParameters":[],"parameters":[],"resultType":null,"bases":[]},"signature":null,"witnesses":[{"field":"name","witness":{"range":{"encoding":"utf8","start":143,"end":147},"text":"gone"}},{"field":"header.name","witness":{"range":{"encoding":"utf8","start":143,"end":147},"text":"gone"}}]},{"ref":"r1:anchors:alter","nativeId":null,"document":{"sourceSetId":"main","language":"javascript","path":"src/anchors.js"},"revisionId":"r1","parentRef":null,"kind":"function","name":"alter","range":{"encoding":"utf8","start":164,"end":194},"nameRange":{"encoding":"utf8","start":173,"end":178},"header":{"kind":"function","name":"alter","modifiers":[],"typeParameters":[],"parameters":[],"resultType":null,"bases":[]},"signature":null,"witnesses":[{"field":"name","witness":{"range":{"encoding":"utf8","start":173,"end":178},"text":"alter"}},{"field":"header.name","witness":{"range":{"encoding":"utf8","start":173,"end":178},"text":"alter"}}]},{"ref":"r2:anchors:unique:first","nativeId":null,"document":{"sourceSetId":"main","language":"javascript","path":"src/anchors.js"},"revisionId":"r2","parentRef":null,"kind":"function","name":"unique","range":{"encoding":"utf8","start":0,"end":31},"nameRange":{"encoding":"utf8","start":9,"end":15},"header":{"kind":"function","name":"unique","modifiers":[],"typeParameters":[],"parameters":[],"resultType":null,"bases":[]},"signature":null,"witnesses":[{"field":"name","witness":{"range":{"encoding":"utf8","start":9,"end":15},"text":"unique"}},{"field":"header.name","witness":{"range":{"encoding":"utf8","start":9,"end":15},"text":"unique"}}]},{"ref":"r2:anchors:anchor:first","nativeId":null,"document":{"sourceSetId":"main","language":"javascript","path":"src/anchors.js"},"revisionId":"r2","parentRef":null,"kind":"function","name":"anchor","range":{"encoding":"utf8","start":32,"end":63},"nameRange":{"encoding":"utf8","start":41,"end":47},"header":{"kind":"function","name":"anchor","modifiers":[],"typeParameters":[],"parameters":[],"resultType":null,"bases":[]},"signature":null,"witnesses":[{"field":"name","witness":{"range":{"encoding":"utf8","start":41,"end":47},"text":"anchor"}},{"field":"header.name","witness":{"range":{"encoding":"utf8","start":41,"end":47},"text":"anchor"}}]},{"ref":"r2:anchors:anchor:second","nativeId":null,"document":{"sourceSetId":"main","language":"javascript","path":"src/anchors.js"},"revisionId":"r2","parentRef":null,"kind":"function","name":"anchor","range":{"encoding":"utf8","start":64,"end":95},"nameRange":{"encoding":"utf8","start":73,"end":79},"header":{"kind":"function","name":"anchor","modifiers":[],"typeParameters":[],"parameters":[],"resultType":null,"bases":[]},"signature":null,"witnesses":[{"field":"name","witness":{"range":{"encoding":"utf8","start":73,"end":79},"text":"anchor"}},{"field":"header.name","witness":{"range":{"encoding":"utf8","start":73,"end":79},"text":"anchor"}}]},{"ref":"r2:anchors:alter","nativeId":null,"document":{"sourceSetId":"main","language":"javascript","path":"src/anchors.js"},"revisionId":"r2","parentRef":null,"kind":"function","name":"alter","range":{"encoding":"utf8","start":96,"end":132},"nameRange":{"encoding":"utf8","start":111,"end":116},"header":{"kind":"function","name":"alter","modifiers":["async"],"typeParameters":[],"parameters":[],"resultType":null,"bases":[]},"signature":null,"witnesses":[{"field":"name","witness":{"range":{"encoding":"utf8","start":111,"end":116},"text":"alter"}},{"field":"header.name","witness":{"range":{"encoding":"utf8","start":111,"end":116},"text":"alter"}},{"field":"header.modifiers[0]","witness":{"range":{"encoding":"utf8","start":96,"end":101},"text":"async"}}]},{"ref":"r2:foreign:target","nativeId":null,"document":{"sourceSetId":"main","language":"javascript","path":"src/foreign.js"},"revisionId":"r2","parentRef":null,"kind":"function","name":"target","range":{"encoding":"utf8","start":50,"end":88},"nameRange":{"encoding":"utf8","start":66,"end":72},"header":{"kind":"function","name":"target","modifiers":[],"typeParameters":[],"parameters":[],"resultType":null,"bases":[]},"signature":null,"witnesses":[{"field":"name","witness":{"range":{"encoding":"utf8","start":66,"end":72},"text":"target"}},{"field":"header.name","witness":{"range":{"encoding":"utf8","start":66,"end":72},"text":"target"}}]}],"calls":[{"ref":"r0:unchanged:call","nativeId":null,"document":{"sourceSetId":"main","language":"javascript","path":"src/unchanged.js"},"revisionId":"r0","ownerRef":"r0:unchanged:same","range":{"encoding":"utf8","start":32,"end":38},"calleeRange":{"encoding":"utf8","start":32,"end":36},"spelling":"same","regionRefs":[],"witnesses":[{"field":"spelling","witness":{"range":{"encoding":"utf8","start":32,"end":36},"text":"same"}}]},{"ref":"r1:unchanged:call","nativeId":null,"document":{"sourceSetId":"main","language":"javascript","path":"src/unchanged.js"},"revisionId":"r1","ownerRef":"r1:unchanged:same","range":{"encoding":"utf8","start":32,"end":38},"calleeRange":{"encoding":"utf8","start":32,"end":36},"spelling":"same","regionRefs":[],"witnesses":[{"field":"spelling","witness":{"range":{"encoding":"utf8","start":32,"end":36},"text":"same"}}]},{"ref":"r2:unchanged:call","nativeId":null,"document":{"sourceSetId":"main","language":"javascript","path":"src/unchanged.js"},"revisionId":"r2","ownerRef":"r2:unchanged:same","range":{"encoding":"utf8","start":32,"end":38},"calleeRange":{"encoding":"utf8","start":32,"end":36},"spelling":"same","regionRefs":[],"witnesses":[{"field":"spelling","witness":{"range":{"encoding":"utf8","start":32,"end":36},"text":"same"}}]},{"ref":"r2:foreign:call","nativeId":null,"document":{"sourceSetId":"main","language":"javascript","path":"src/foreign.js"},"revisionId":"r2","ownerRef":"r2:foreign:foreign","range":{"encoding":"utf8","start":28,"end":36},"calleeRange":{"encoding":"utf8","start":28,"end":34},"spelling":"target","regionRefs":[],"witnesses":[{"field":"spelling","witness":{"range":{"encoding":"utf8","start":28,"end":34},"text":"target"}}]}],"controls":[],"references":[{"ref":"r0:unchanged:reference","nativeId":null,"document":{"sourceSetId":"main","language":"javascript","path":"src/unchanged.js"},"revisionId":"r0","ownerRef":"r0:unchanged:same","range":{"encoding":"utf8","start":32,"end":36},"spelling":"same","witnesses":[{"field":"spelling","witness":{"range":{"encoding":"utf8","start":32,"end":36},"text":"same"}}]},{"ref":"r1:unchanged:reference","nativeId":null,"document":{"sourceSetId":"main","language":"javascript","path":"src/unchanged.js"},"revisionId":"r1","ownerRef":"r1:unchanged:same","range":{"encoding":"utf8","start":32,"end":36},"spelling":"same","witnesses":[{"field":"spelling","witness":{"range":{"encoding":"utf8","start":32,"end":36},"text":"same"}}]},{"ref":"r2:unchanged:reference","nativeId":null,"document":{"sourceSetId":"main","language":"javascript","path":"src/unchanged.js"},"revisionId":"r2","ownerRef":"r2:unchanged:same","range":{"encoding":"utf8","start":32,"end":36},"spelling":"same","witnesses":[{"field":"spelling","witness":{"range":{"encoding":"utf8","start":32,"end":36},"text":"same"}}]}]}
+{
+  "formatVersion": 1,
+  "producerId": "native",
+  "extractionInputs": [],
+  "declarations": [
+    {
+      "role": "production",
+      "ref": "r0:unchanged:same",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/unchanged.js"
+      },
+      "revisionId": "r0",
+      "parentRef": null,
+      "kind": "function",
+      "name": "same",
+      "range": {
+        "encoding": "utf8",
+        "start": 0,
+        "end": 41
+      },
+      "nameRange": {
+        "encoding": "utf8",
+        "start": 16,
+        "end": 20
+      },
+      "header": {
+        "kind": "function",
+        "name": "same",
+        "modifiers": [],
+        "typeParameters": [],
+        "parameters": [],
+        "resultType": null,
+        "bases": []
+      },
+      "signature": null,
+      "witnesses": [
+        {
+          "field": "name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 16,
+              "end": 20
+            },
+            "text": "same"
+          }
+        },
+        {
+          "field": "header.name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 16,
+              "end": 20
+            },
+            "text": "same"
+          }
+        }
+      ]
+    },
+    {
+      "role": "production",
+      "ref": "r0:unchanged:hidden",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/unchanged.js"
+      },
+      "revisionId": "r0",
+      "parentRef": null,
+      "kind": "function",
+      "name": "hidden",
+      "range": {
+        "encoding": "utf8",
+        "start": 42,
+        "end": 80
+      },
+      "nameRange": {
+        "encoding": "utf8",
+        "start": 58,
+        "end": 64
+      },
+      "header": {
+        "kind": "function",
+        "name": "hidden",
+        "modifiers": [],
+        "typeParameters": [],
+        "parameters": [],
+        "resultType": null,
+        "bases": []
+      },
+      "signature": null,
+      "witnesses": [
+        {
+          "field": "name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 58,
+              "end": 64
+            },
+            "text": "hidden"
+          }
+        },
+        {
+          "field": "header.name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 58,
+              "end": 64
+            },
+            "text": "hidden"
+          }
+        }
+      ]
+    },
+    {
+      "role": "production",
+      "ref": "r0:changed:change",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/changed.js"
+      },
+      "revisionId": "r0",
+      "parentRef": null,
+      "kind": "type",
+      "name": "change",
+      "range": {
+        "encoding": "utf8",
+        "start": 0,
+        "end": 47
+      },
+      "nameRange": {
+        "encoding": "utf8",
+        "start": 13,
+        "end": 19
+      },
+      "header": {
+        "kind": "type",
+        "name": "change",
+        "modifiers": [],
+        "typeParameters": [],
+        "parameters": [],
+        "resultType": null,
+        "bases": [
+          "Base"
+        ]
+      },
+      "signature": null,
+      "witnesses": [
+        {
+          "field": "name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 13,
+              "end": 19
+            },
+            "text": "change"
+          }
+        },
+        {
+          "field": "header.name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 13,
+              "end": 19
+            },
+            "text": "change"
+          }
+        },
+        {
+          "field": "header.bases[0]",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 28,
+              "end": 32
+            },
+            "text": "Base"
+          }
+        }
+      ]
+    },
+    {
+      "role": "production",
+      "ref": "r0:zero:zero",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/zero.js"
+      },
+      "revisionId": "r0",
+      "parentRef": null,
+      "kind": "function",
+      "name": "zero",
+      "range": {
+        "encoding": "utf8",
+        "start": 0,
+        "end": 36
+      },
+      "nameRange": {
+        "encoding": "utf8",
+        "start": 16,
+        "end": 20
+      },
+      "header": {
+        "kind": "function",
+        "name": "zero",
+        "modifiers": [],
+        "typeParameters": [],
+        "parameters": [],
+        "resultType": null,
+        "bases": []
+      },
+      "signature": null,
+      "witnesses": [
+        {
+          "field": "name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 16,
+              "end": 20
+            },
+            "text": "zero"
+          }
+        },
+        {
+          "field": "header.name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 16,
+              "end": 20
+            },
+            "text": "zero"
+          }
+        }
+      ]
+    },
+    {
+      "role": "production",
+      "ref": "r0:foreign:foreign",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/foreign.js"
+      },
+      "revisionId": "r0",
+      "parentRef": null,
+      "kind": "function",
+      "name": "foreign",
+      "range": {
+        "encoding": "utf8",
+        "start": 0,
+        "end": 39
+      },
+      "nameRange": {
+        "encoding": "utf8",
+        "start": 16,
+        "end": 23
+      },
+      "header": {
+        "kind": "function",
+        "name": "foreign",
+        "modifiers": [],
+        "typeParameters": [],
+        "parameters": [],
+        "resultType": null,
+        "bases": []
+      },
+      "signature": null,
+      "witnesses": [
+        {
+          "field": "name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 16,
+              "end": 23
+            },
+            "text": "foreign"
+          }
+        },
+        {
+          "field": "header.name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 16,
+              "end": 23
+            },
+            "text": "foreign"
+          }
+        }
+      ]
+    },
+    {
+      "role": "production",
+      "ref": "r1:unchanged:same",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/unchanged.js"
+      },
+      "revisionId": "r1",
+      "parentRef": null,
+      "kind": "function",
+      "name": "same",
+      "range": {
+        "encoding": "utf8",
+        "start": 0,
+        "end": 41
+      },
+      "nameRange": {
+        "encoding": "utf8",
+        "start": 16,
+        "end": 20
+      },
+      "header": {
+        "kind": "function",
+        "name": "same",
+        "modifiers": [],
+        "typeParameters": [],
+        "parameters": [],
+        "resultType": null,
+        "bases": []
+      },
+      "signature": null,
+      "witnesses": [
+        {
+          "field": "name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 16,
+              "end": 20
+            },
+            "text": "same"
+          }
+        },
+        {
+          "field": "header.name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 16,
+              "end": 20
+            },
+            "text": "same"
+          }
+        }
+      ]
+    },
+    {
+      "role": "production",
+      "ref": "r1:unchanged:hidden",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/unchanged.js"
+      },
+      "revisionId": "r1",
+      "parentRef": null,
+      "kind": "function",
+      "name": "hidden",
+      "range": {
+        "encoding": "utf8",
+        "start": 42,
+        "end": 80
+      },
+      "nameRange": {
+        "encoding": "utf8",
+        "start": 58,
+        "end": 64
+      },
+      "header": {
+        "kind": "function",
+        "name": "hidden",
+        "modifiers": [],
+        "typeParameters": [],
+        "parameters": [],
+        "resultType": null,
+        "bases": []
+      },
+      "signature": null,
+      "witnesses": [
+        {
+          "field": "name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 58,
+              "end": 64
+            },
+            "text": "hidden"
+          }
+        },
+        {
+          "field": "header.name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 58,
+              "end": 64
+            },
+            "text": "hidden"
+          }
+        }
+      ]
+    },
+    {
+      "role": "production",
+      "ref": "r1:changed:change",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/changed.js"
+      },
+      "revisionId": "r1",
+      "parentRef": null,
+      "kind": "type",
+      "name": "change",
+      "range": {
+        "encoding": "utf8",
+        "start": 0,
+        "end": 47
+      },
+      "nameRange": {
+        "encoding": "utf8",
+        "start": 13,
+        "end": 19
+      },
+      "header": {
+        "kind": "type",
+        "name": "change",
+        "modifiers": [],
+        "typeParameters": [],
+        "parameters": [],
+        "resultType": null,
+        "bases": [
+          "Base"
+        ]
+      },
+      "signature": null,
+      "witnesses": [
+        {
+          "field": "name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 13,
+              "end": 19
+            },
+            "text": "change"
+          }
+        },
+        {
+          "field": "header.name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 13,
+              "end": 19
+            },
+            "text": "change"
+          }
+        },
+        {
+          "field": "header.bases[0]",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 28,
+              "end": 32
+            },
+            "text": "Base"
+          }
+        }
+      ]
+    },
+    {
+      "role": "production",
+      "ref": "r1:zero:zero",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/zero.js"
+      },
+      "revisionId": "r1",
+      "parentRef": null,
+      "kind": "function",
+      "name": "zero",
+      "range": {
+        "encoding": "utf8",
+        "start": 0,
+        "end": 36
+      },
+      "nameRange": {
+        "encoding": "utf8",
+        "start": 16,
+        "end": 20
+      },
+      "header": {
+        "kind": "function",
+        "name": "zero",
+        "modifiers": [],
+        "typeParameters": [],
+        "parameters": [],
+        "resultType": null,
+        "bases": []
+      },
+      "signature": null,
+      "witnesses": [
+        {
+          "field": "name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 16,
+              "end": 20
+            },
+            "text": "zero"
+          }
+        },
+        {
+          "field": "header.name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 16,
+              "end": 20
+            },
+            "text": "zero"
+          }
+        }
+      ]
+    },
+    {
+      "role": "production",
+      "ref": "r1:foreign:foreign",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/foreign.js"
+      },
+      "revisionId": "r1",
+      "parentRef": null,
+      "kind": "function",
+      "name": "foreign",
+      "range": {
+        "encoding": "utf8",
+        "start": 0,
+        "end": 39
+      },
+      "nameRange": {
+        "encoding": "utf8",
+        "start": 16,
+        "end": 23
+      },
+      "header": {
+        "kind": "function",
+        "name": "foreign",
+        "modifiers": [],
+        "typeParameters": [],
+        "parameters": [],
+        "resultType": null,
+        "bases": []
+      },
+      "signature": null,
+      "witnesses": [
+        {
+          "field": "name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 16,
+              "end": 23
+            },
+            "text": "foreign"
+          }
+        },
+        {
+          "field": "header.name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 16,
+              "end": 23
+            },
+            "text": "foreign"
+          }
+        }
+      ]
+    },
+    {
+      "role": "production",
+      "ref": "r2:unchanged:same",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/unchanged.js"
+      },
+      "revisionId": "r2",
+      "parentRef": null,
+      "kind": "function",
+      "name": "same",
+      "range": {
+        "encoding": "utf8",
+        "start": 0,
+        "end": 41
+      },
+      "nameRange": {
+        "encoding": "utf8",
+        "start": 16,
+        "end": 20
+      },
+      "header": {
+        "kind": "function",
+        "name": "same",
+        "modifiers": [],
+        "typeParameters": [],
+        "parameters": [],
+        "resultType": null,
+        "bases": []
+      },
+      "signature": null,
+      "witnesses": [
+        {
+          "field": "name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 16,
+              "end": 20
+            },
+            "text": "same"
+          }
+        },
+        {
+          "field": "header.name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 16,
+              "end": 20
+            },
+            "text": "same"
+          }
+        }
+      ]
+    },
+    {
+      "role": "production",
+      "ref": "r2:unchanged:hidden",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/unchanged.js"
+      },
+      "revisionId": "r2",
+      "parentRef": null,
+      "kind": "function",
+      "name": "hidden",
+      "range": {
+        "encoding": "utf8",
+        "start": 42,
+        "end": 80
+      },
+      "nameRange": {
+        "encoding": "utf8",
+        "start": 58,
+        "end": 64
+      },
+      "header": {
+        "kind": "function",
+        "name": "hidden",
+        "modifiers": [],
+        "typeParameters": [],
+        "parameters": [],
+        "resultType": null,
+        "bases": []
+      },
+      "signature": null,
+      "witnesses": [
+        {
+          "field": "name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 58,
+              "end": 64
+            },
+            "text": "hidden"
+          }
+        },
+        {
+          "field": "header.name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 58,
+              "end": 64
+            },
+            "text": "hidden"
+          }
+        }
+      ]
+    },
+    {
+      "role": "production",
+      "ref": "r2:changed:change",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/changed.js"
+      },
+      "revisionId": "r2",
+      "parentRef": null,
+      "kind": "type",
+      "name": "change",
+      "range": {
+        "encoding": "utf8",
+        "start": 0,
+        "end": 47
+      },
+      "nameRange": {
+        "encoding": "utf8",
+        "start": 13,
+        "end": 19
+      },
+      "header": {
+        "kind": "type",
+        "name": "change",
+        "modifiers": [],
+        "typeParameters": [],
+        "parameters": [],
+        "resultType": null,
+        "bases": [
+          "Base"
+        ]
+      },
+      "signature": null,
+      "witnesses": [
+        {
+          "field": "name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 13,
+              "end": 19
+            },
+            "text": "change"
+          }
+        },
+        {
+          "field": "header.name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 13,
+              "end": 19
+            },
+            "text": "change"
+          }
+        },
+        {
+          "field": "header.bases[0]",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 28,
+              "end": 32
+            },
+            "text": "Base"
+          }
+        }
+      ]
+    },
+    {
+      "role": "production",
+      "ref": "r2:zero:zero",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/zero.js"
+      },
+      "revisionId": "r2",
+      "parentRef": null,
+      "kind": "function",
+      "name": "zero",
+      "range": {
+        "encoding": "utf8",
+        "start": 0,
+        "end": 36
+      },
+      "nameRange": {
+        "encoding": "utf8",
+        "start": 16,
+        "end": 20
+      },
+      "header": {
+        "kind": "function",
+        "name": "zero",
+        "modifiers": [],
+        "typeParameters": [],
+        "parameters": [],
+        "resultType": null,
+        "bases": []
+      },
+      "signature": null,
+      "witnesses": [
+        {
+          "field": "name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 16,
+              "end": 20
+            },
+            "text": "zero"
+          }
+        },
+        {
+          "field": "header.name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 16,
+              "end": 20
+            },
+            "text": "zero"
+          }
+        }
+      ]
+    },
+    {
+      "role": "production",
+      "ref": "r2:foreign:foreign",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/foreign.js"
+      },
+      "revisionId": "r2",
+      "parentRef": null,
+      "kind": "function",
+      "name": "foreign",
+      "range": {
+        "encoding": "utf8",
+        "start": 0,
+        "end": 49
+      },
+      "nameRange": {
+        "encoding": "utf8",
+        "start": 16,
+        "end": 23
+      },
+      "header": {
+        "kind": "function",
+        "name": "foreign",
+        "modifiers": [],
+        "typeParameters": [],
+        "parameters": [],
+        "resultType": null,
+        "bases": []
+      },
+      "signature": null,
+      "witnesses": [
+        {
+          "field": "name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 16,
+              "end": 23
+            },
+            "text": "foreign"
+          }
+        },
+        {
+          "field": "header.name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 16,
+              "end": 23
+            },
+            "text": "foreign"
+          }
+        }
+      ]
+    },
+    {
+      "role": "production",
+      "ref": "r0:anchors:unique:first",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/anchors.js"
+      },
+      "revisionId": "r0",
+      "parentRef": null,
+      "kind": "function",
+      "name": "unique",
+      "range": {
+        "encoding": "utf8",
+        "start": 0,
+        "end": 31
+      },
+      "nameRange": {
+        "encoding": "utf8",
+        "start": 9,
+        "end": 15
+      },
+      "header": {
+        "kind": "function",
+        "name": "unique",
+        "modifiers": [],
+        "typeParameters": [],
+        "parameters": [],
+        "resultType": null,
+        "bases": []
+      },
+      "signature": null,
+      "witnesses": [
+        {
+          "field": "name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 9,
+              "end": 15
+            },
+            "text": "unique"
+          }
+        },
+        {
+          "field": "header.name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 9,
+              "end": 15
+            },
+            "text": "unique"
+          }
+        }
+      ]
+    },
+    {
+      "role": "production",
+      "ref": "r0:anchors:unique:second",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/anchors.js"
+      },
+      "revisionId": "r0",
+      "parentRef": null,
+      "kind": "function",
+      "name": "unique",
+      "range": {
+        "encoding": "utf8",
+        "start": 32,
+        "end": 69
+      },
+      "nameRange": {
+        "encoding": "utf8",
+        "start": 47,
+        "end": 53
+      },
+      "header": {
+        "kind": "function",
+        "name": "unique",
+        "modifiers": [
+          "async"
+        ],
+        "typeParameters": [],
+        "parameters": [],
+        "resultType": null,
+        "bases": []
+      },
+      "signature": null,
+      "witnesses": [
+        {
+          "field": "name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 47,
+              "end": 53
+            },
+            "text": "unique"
+          }
+        },
+        {
+          "field": "header.name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 47,
+              "end": 53
+            },
+            "text": "unique"
+          }
+        },
+        {
+          "field": "header.modifiers[0]",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 32,
+              "end": 37
+            },
+            "text": "async"
+          }
+        }
+      ]
+    },
+    {
+      "role": "production",
+      "ref": "r0:anchors:anchor:first",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/anchors.js"
+      },
+      "revisionId": "r0",
+      "parentRef": null,
+      "kind": "function",
+      "name": "anchor",
+      "range": {
+        "encoding": "utf8",
+        "start": 70,
+        "end": 101
+      },
+      "nameRange": {
+        "encoding": "utf8",
+        "start": 79,
+        "end": 85
+      },
+      "header": {
+        "kind": "function",
+        "name": "anchor",
+        "modifiers": [],
+        "typeParameters": [],
+        "parameters": [],
+        "resultType": null,
+        "bases": []
+      },
+      "signature": null,
+      "witnesses": [
+        {
+          "field": "name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 79,
+              "end": 85
+            },
+            "text": "anchor"
+          }
+        },
+        {
+          "field": "header.name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 79,
+              "end": 85
+            },
+            "text": "anchor"
+          }
+        }
+      ]
+    },
+    {
+      "role": "production",
+      "ref": "r0:anchors:anchor:second",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/anchors.js"
+      },
+      "revisionId": "r0",
+      "parentRef": null,
+      "kind": "function",
+      "name": "anchor",
+      "range": {
+        "encoding": "utf8",
+        "start": 102,
+        "end": 133
+      },
+      "nameRange": {
+        "encoding": "utf8",
+        "start": 111,
+        "end": 117
+      },
+      "header": {
+        "kind": "function",
+        "name": "anchor",
+        "modifiers": [],
+        "typeParameters": [],
+        "parameters": [],
+        "resultType": null,
+        "bases": []
+      },
+      "signature": null,
+      "witnesses": [
+        {
+          "field": "name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 111,
+              "end": 117
+            },
+            "text": "anchor"
+          }
+        },
+        {
+          "field": "header.name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 111,
+              "end": 117
+            },
+            "text": "anchor"
+          }
+        }
+      ]
+    },
+    {
+      "role": "production",
+      "ref": "r0:anchors:gone",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/anchors.js"
+      },
+      "revisionId": "r0",
+      "parentRef": null,
+      "kind": "function",
+      "name": "gone",
+      "range": {
+        "encoding": "utf8",
+        "start": 134,
+        "end": 163
+      },
+      "nameRange": {
+        "encoding": "utf8",
+        "start": 143,
+        "end": 147
+      },
+      "header": {
+        "kind": "function",
+        "name": "gone",
+        "modifiers": [],
+        "typeParameters": [],
+        "parameters": [],
+        "resultType": null,
+        "bases": []
+      },
+      "signature": null,
+      "witnesses": [
+        {
+          "field": "name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 143,
+              "end": 147
+            },
+            "text": "gone"
+          }
+        },
+        {
+          "field": "header.name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 143,
+              "end": 147
+            },
+            "text": "gone"
+          }
+        }
+      ]
+    },
+    {
+      "role": "production",
+      "ref": "r0:anchors:alter",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/anchors.js"
+      },
+      "revisionId": "r0",
+      "parentRef": null,
+      "kind": "function",
+      "name": "alter",
+      "range": {
+        "encoding": "utf8",
+        "start": 164,
+        "end": 194
+      },
+      "nameRange": {
+        "encoding": "utf8",
+        "start": 173,
+        "end": 178
+      },
+      "header": {
+        "kind": "function",
+        "name": "alter",
+        "modifiers": [],
+        "typeParameters": [],
+        "parameters": [],
+        "resultType": null,
+        "bases": []
+      },
+      "signature": null,
+      "witnesses": [
+        {
+          "field": "name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 173,
+              "end": 178
+            },
+            "text": "alter"
+          }
+        },
+        {
+          "field": "header.name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 173,
+              "end": 178
+            },
+            "text": "alter"
+          }
+        }
+      ]
+    },
+    {
+      "role": "production",
+      "ref": "r1:anchors:unique:first",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/anchors.js"
+      },
+      "revisionId": "r1",
+      "parentRef": null,
+      "kind": "function",
+      "name": "unique",
+      "range": {
+        "encoding": "utf8",
+        "start": 0,
+        "end": 31
+      },
+      "nameRange": {
+        "encoding": "utf8",
+        "start": 9,
+        "end": 15
+      },
+      "header": {
+        "kind": "function",
+        "name": "unique",
+        "modifiers": [],
+        "typeParameters": [],
+        "parameters": [],
+        "resultType": null,
+        "bases": []
+      },
+      "signature": null,
+      "witnesses": [
+        {
+          "field": "name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 9,
+              "end": 15
+            },
+            "text": "unique"
+          }
+        },
+        {
+          "field": "header.name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 9,
+              "end": 15
+            },
+            "text": "unique"
+          }
+        }
+      ]
+    },
+    {
+      "role": "production",
+      "ref": "r1:anchors:unique:second",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/anchors.js"
+      },
+      "revisionId": "r1",
+      "parentRef": null,
+      "kind": "function",
+      "name": "unique",
+      "range": {
+        "encoding": "utf8",
+        "start": 32,
+        "end": 69
+      },
+      "nameRange": {
+        "encoding": "utf8",
+        "start": 47,
+        "end": 53
+      },
+      "header": {
+        "kind": "function",
+        "name": "unique",
+        "modifiers": [
+          "async"
+        ],
+        "typeParameters": [],
+        "parameters": [],
+        "resultType": null,
+        "bases": []
+      },
+      "signature": null,
+      "witnesses": [
+        {
+          "field": "name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 47,
+              "end": 53
+            },
+            "text": "unique"
+          }
+        },
+        {
+          "field": "header.name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 47,
+              "end": 53
+            },
+            "text": "unique"
+          }
+        },
+        {
+          "field": "header.modifiers[0]",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 32,
+              "end": 37
+            },
+            "text": "async"
+          }
+        }
+      ]
+    },
+    {
+      "role": "production",
+      "ref": "r1:anchors:anchor:first",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/anchors.js"
+      },
+      "revisionId": "r1",
+      "parentRef": null,
+      "kind": "function",
+      "name": "anchor",
+      "range": {
+        "encoding": "utf8",
+        "start": 70,
+        "end": 101
+      },
+      "nameRange": {
+        "encoding": "utf8",
+        "start": 79,
+        "end": 85
+      },
+      "header": {
+        "kind": "function",
+        "name": "anchor",
+        "modifiers": [],
+        "typeParameters": [],
+        "parameters": [],
+        "resultType": null,
+        "bases": []
+      },
+      "signature": null,
+      "witnesses": [
+        {
+          "field": "name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 79,
+              "end": 85
+            },
+            "text": "anchor"
+          }
+        },
+        {
+          "field": "header.name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 79,
+              "end": 85
+            },
+            "text": "anchor"
+          }
+        }
+      ]
+    },
+    {
+      "role": "production",
+      "ref": "r1:anchors:anchor:second",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/anchors.js"
+      },
+      "revisionId": "r1",
+      "parentRef": null,
+      "kind": "function",
+      "name": "anchor",
+      "range": {
+        "encoding": "utf8",
+        "start": 102,
+        "end": 133
+      },
+      "nameRange": {
+        "encoding": "utf8",
+        "start": 111,
+        "end": 117
+      },
+      "header": {
+        "kind": "function",
+        "name": "anchor",
+        "modifiers": [],
+        "typeParameters": [],
+        "parameters": [],
+        "resultType": null,
+        "bases": []
+      },
+      "signature": null,
+      "witnesses": [
+        {
+          "field": "name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 111,
+              "end": 117
+            },
+            "text": "anchor"
+          }
+        },
+        {
+          "field": "header.name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 111,
+              "end": 117
+            },
+            "text": "anchor"
+          }
+        }
+      ]
+    },
+    {
+      "role": "production",
+      "ref": "r1:anchors:gone",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/anchors.js"
+      },
+      "revisionId": "r1",
+      "parentRef": null,
+      "kind": "function",
+      "name": "gone",
+      "range": {
+        "encoding": "utf8",
+        "start": 134,
+        "end": 163
+      },
+      "nameRange": {
+        "encoding": "utf8",
+        "start": 143,
+        "end": 147
+      },
+      "header": {
+        "kind": "function",
+        "name": "gone",
+        "modifiers": [],
+        "typeParameters": [],
+        "parameters": [],
+        "resultType": null,
+        "bases": []
+      },
+      "signature": null,
+      "witnesses": [
+        {
+          "field": "name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 143,
+              "end": 147
+            },
+            "text": "gone"
+          }
+        },
+        {
+          "field": "header.name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 143,
+              "end": 147
+            },
+            "text": "gone"
+          }
+        }
+      ]
+    },
+    {
+      "role": "production",
+      "ref": "r1:anchors:alter",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/anchors.js"
+      },
+      "revisionId": "r1",
+      "parentRef": null,
+      "kind": "function",
+      "name": "alter",
+      "range": {
+        "encoding": "utf8",
+        "start": 164,
+        "end": 194
+      },
+      "nameRange": {
+        "encoding": "utf8",
+        "start": 173,
+        "end": 178
+      },
+      "header": {
+        "kind": "function",
+        "name": "alter",
+        "modifiers": [],
+        "typeParameters": [],
+        "parameters": [],
+        "resultType": null,
+        "bases": []
+      },
+      "signature": null,
+      "witnesses": [
+        {
+          "field": "name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 173,
+              "end": 178
+            },
+            "text": "alter"
+          }
+        },
+        {
+          "field": "header.name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 173,
+              "end": 178
+            },
+            "text": "alter"
+          }
+        }
+      ]
+    },
+    {
+      "role": "production",
+      "ref": "r2:anchors:unique:first",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/anchors.js"
+      },
+      "revisionId": "r2",
+      "parentRef": null,
+      "kind": "function",
+      "name": "unique",
+      "range": {
+        "encoding": "utf8",
+        "start": 0,
+        "end": 31
+      },
+      "nameRange": {
+        "encoding": "utf8",
+        "start": 9,
+        "end": 15
+      },
+      "header": {
+        "kind": "function",
+        "name": "unique",
+        "modifiers": [],
+        "typeParameters": [],
+        "parameters": [],
+        "resultType": null,
+        "bases": []
+      },
+      "signature": null,
+      "witnesses": [
+        {
+          "field": "name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 9,
+              "end": 15
+            },
+            "text": "unique"
+          }
+        },
+        {
+          "field": "header.name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 9,
+              "end": 15
+            },
+            "text": "unique"
+          }
+        }
+      ]
+    },
+    {
+      "role": "production",
+      "ref": "r2:anchors:anchor:first",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/anchors.js"
+      },
+      "revisionId": "r2",
+      "parentRef": null,
+      "kind": "function",
+      "name": "anchor",
+      "range": {
+        "encoding": "utf8",
+        "start": 32,
+        "end": 63
+      },
+      "nameRange": {
+        "encoding": "utf8",
+        "start": 41,
+        "end": 47
+      },
+      "header": {
+        "kind": "function",
+        "name": "anchor",
+        "modifiers": [],
+        "typeParameters": [],
+        "parameters": [],
+        "resultType": null,
+        "bases": []
+      },
+      "signature": null,
+      "witnesses": [
+        {
+          "field": "name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 41,
+              "end": 47
+            },
+            "text": "anchor"
+          }
+        },
+        {
+          "field": "header.name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 41,
+              "end": 47
+            },
+            "text": "anchor"
+          }
+        }
+      ]
+    },
+    {
+      "role": "production",
+      "ref": "r2:anchors:anchor:second",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/anchors.js"
+      },
+      "revisionId": "r2",
+      "parentRef": null,
+      "kind": "function",
+      "name": "anchor",
+      "range": {
+        "encoding": "utf8",
+        "start": 64,
+        "end": 95
+      },
+      "nameRange": {
+        "encoding": "utf8",
+        "start": 73,
+        "end": 79
+      },
+      "header": {
+        "kind": "function",
+        "name": "anchor",
+        "modifiers": [],
+        "typeParameters": [],
+        "parameters": [],
+        "resultType": null,
+        "bases": []
+      },
+      "signature": null,
+      "witnesses": [
+        {
+          "field": "name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 73,
+              "end": 79
+            },
+            "text": "anchor"
+          }
+        },
+        {
+          "field": "header.name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 73,
+              "end": 79
+            },
+            "text": "anchor"
+          }
+        }
+      ]
+    },
+    {
+      "role": "production",
+      "ref": "r2:anchors:alter",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/anchors.js"
+      },
+      "revisionId": "r2",
+      "parentRef": null,
+      "kind": "function",
+      "name": "alter",
+      "range": {
+        "encoding": "utf8",
+        "start": 96,
+        "end": 132
+      },
+      "nameRange": {
+        "encoding": "utf8",
+        "start": 111,
+        "end": 116
+      },
+      "header": {
+        "kind": "function",
+        "name": "alter",
+        "modifiers": [
+          "async"
+        ],
+        "typeParameters": [],
+        "parameters": [],
+        "resultType": null,
+        "bases": []
+      },
+      "signature": null,
+      "witnesses": [
+        {
+          "field": "name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 111,
+              "end": 116
+            },
+            "text": "alter"
+          }
+        },
+        {
+          "field": "header.name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 111,
+              "end": 116
+            },
+            "text": "alter"
+          }
+        },
+        {
+          "field": "header.modifiers[0]",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 96,
+              "end": 101
+            },
+            "text": "async"
+          }
+        }
+      ]
+    },
+    {
+      "role": "production",
+      "ref": "r2:foreign:target",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/foreign.js"
+      },
+      "revisionId": "r2",
+      "parentRef": null,
+      "kind": "function",
+      "name": "target",
+      "range": {
+        "encoding": "utf8",
+        "start": 50,
+        "end": 88
+      },
+      "nameRange": {
+        "encoding": "utf8",
+        "start": 66,
+        "end": 72
+      },
+      "header": {
+        "kind": "function",
+        "name": "target",
+        "modifiers": [],
+        "typeParameters": [],
+        "parameters": [],
+        "resultType": null,
+        "bases": []
+      },
+      "signature": null,
+      "witnesses": [
+        {
+          "field": "name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 66,
+              "end": 72
+            },
+            "text": "target"
+          }
+        },
+        {
+          "field": "header.name",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 66,
+              "end": 72
+            },
+            "text": "target"
+          }
+        }
+      ]
+    }
+  ],
+  "calls": [
+    {
+      "ref": "r0:unchanged:call",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/unchanged.js"
+      },
+      "revisionId": "r0",
+      "ownerRef": "r0:unchanged:same",
+      "range": {
+        "encoding": "utf8",
+        "start": 32,
+        "end": 38
+      },
+      "calleeRange": {
+        "encoding": "utf8",
+        "start": 32,
+        "end": 36
+      },
+      "spelling": "same",
+      "regionRefs": [],
+      "witnesses": [
+        {
+          "field": "spelling",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 32,
+              "end": 36
+            },
+            "text": "same"
+          }
+        }
+      ]
+    },
+    {
+      "ref": "r1:unchanged:call",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/unchanged.js"
+      },
+      "revisionId": "r1",
+      "ownerRef": "r1:unchanged:same",
+      "range": {
+        "encoding": "utf8",
+        "start": 32,
+        "end": 38
+      },
+      "calleeRange": {
+        "encoding": "utf8",
+        "start": 32,
+        "end": 36
+      },
+      "spelling": "same",
+      "regionRefs": [],
+      "witnesses": [
+        {
+          "field": "spelling",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 32,
+              "end": 36
+            },
+            "text": "same"
+          }
+        }
+      ]
+    },
+    {
+      "ref": "r2:unchanged:call",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/unchanged.js"
+      },
+      "revisionId": "r2",
+      "ownerRef": "r2:unchanged:same",
+      "range": {
+        "encoding": "utf8",
+        "start": 32,
+        "end": 38
+      },
+      "calleeRange": {
+        "encoding": "utf8",
+        "start": 32,
+        "end": 36
+      },
+      "spelling": "same",
+      "regionRefs": [],
+      "witnesses": [
+        {
+          "field": "spelling",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 32,
+              "end": 36
+            },
+            "text": "same"
+          }
+        }
+      ]
+    },
+    {
+      "ref": "r2:foreign:call",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/foreign.js"
+      },
+      "revisionId": "r2",
+      "ownerRef": "r2:foreign:foreign",
+      "range": {
+        "encoding": "utf8",
+        "start": 28,
+        "end": 36
+      },
+      "calleeRange": {
+        "encoding": "utf8",
+        "start": 28,
+        "end": 34
+      },
+      "spelling": "target",
+      "regionRefs": [],
+      "witnesses": [
+        {
+          "field": "spelling",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 28,
+              "end": 34
+            },
+            "text": "target"
+          }
+        }
+      ]
+    }
+  ],
+  "controls": [],
+  "references": [
+    {
+      "ref": "r0:unchanged:reference",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/unchanged.js"
+      },
+      "revisionId": "r0",
+      "ownerRef": "r0:unchanged:same",
+      "range": {
+        "encoding": "utf8",
+        "start": 32,
+        "end": 36
+      },
+      "spelling": "same",
+      "witnesses": [
+        {
+          "field": "spelling",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 32,
+              "end": 36
+            },
+            "text": "same"
+          }
+        }
+      ]
+    },
+    {
+      "ref": "r1:unchanged:reference",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/unchanged.js"
+      },
+      "revisionId": "r1",
+      "ownerRef": "r1:unchanged:same",
+      "range": {
+        "encoding": "utf8",
+        "start": 32,
+        "end": 36
+      },
+      "spelling": "same",
+      "witnesses": [
+        {
+          "field": "spelling",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 32,
+              "end": 36
+            },
+            "text": "same"
+          }
+        }
+      ]
+    },
+    {
+      "ref": "r2:unchanged:reference",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/unchanged.js"
+      },
+      "revisionId": "r2",
+      "ownerRef": "r2:unchanged:same",
+      "range": {
+        "encoding": "utf8",
+        "start": 32,
+        "end": 36
+      },
+      "spelling": "same",
+      "witnesses": [
+        {
+          "field": "spelling",
+          "witness": {
+            "range": {
+              "encoding": "utf8",
+              "start": 32,
+              "end": 36
+            },
+            "text": "same"
+          }
+        }
+      ]
+    }
+  ]
+}

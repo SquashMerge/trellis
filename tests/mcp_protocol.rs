@@ -1611,6 +1611,8 @@ async fn warm_relay_serves_both_new_tools_and_rejects_closed_inputs() {
     let root = checkout(temp.path());
     fs::write(root.join("a.js"), "function Owner() { Target(); }\n").unwrap();
     fs::write(root.join("b.js"), "function Target() {}\n").unwrap();
+    fs::create_dir(root.join("tests")).unwrap();
+    fs::write(root.join("tests/checks.rs"), "fn TestHelper() {}\n").unwrap();
     let root_key = trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root)
         .unwrap()
         .root_key;
@@ -1658,6 +1660,10 @@ async fn warm_relay_serves_both_new_tools_and_rejects_closed_inputs() {
         tool(&found, None, !legacy);
         schema_pairs.push(json!({"name":"trellis_find_symbols",
             "structuredContent":found["result"]["structuredContent"]}));
+        assert_eq!(
+            found["result"]["structuredContent"]["data"]["symbols"][0]["role"],
+            "production"
+        );
         let id = found["result"]["structuredContent"]["data"]["symbols"][0]["symbolId"].clone();
         let target_find = peer.ask(call(
             legacy,
@@ -1681,7 +1687,40 @@ async fn warm_relay_serves_both_new_tools_and_rejects_closed_inputs() {
         ));
         tool(&selected_target, None, !legacy);
         let target_data = &selected_target["result"]["structuredContent"]["data"];
+        assert_eq!(target_data["declaration"]["role"], "production");
         let target_version = emitted_document(target_data, target_data);
+        let test_find = peer.ask(call(
+            legacy,
+            json!(15),
+            "trellis_find_symbols",
+            json!({"schemaVersion":1,"query":"TestHelper","expectedBasis":pin}),
+        ));
+        tool(&test_find, None, !legacy);
+        schema_pairs.push(json!({"name":"trellis_find_symbols",
+            "structuredContent":test_find["result"]["structuredContent"]}));
+        let test_symbol = test_find["result"]["structuredContent"]["data"]["symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|symbol| symbol["name"] == "TestHelper")
+            .unwrap();
+        assert_eq!(
+            test_symbol["role"], "test",
+            "test symbol in both MCP transports"
+        );
+        let test_declaration = peer.ask(call(
+            legacy,
+            json!(16),
+            "trellis_declaration",
+            json!({"schemaVersion":1,"symbolId":test_symbol["symbolId"],"expectedBasis":pin}),
+        ));
+        tool(&test_declaration, None, !legacy);
+        schema_pairs.push(json!({"name":"trellis_declaration",
+            "structuredContent":test_declaration["result"]["structuredContent"]}));
+        assert_eq!(
+            test_declaration["result"]["structuredContent"]["data"]["declaration"]["role"],
+            "test"
+        );
         for (number, name) in [(4, "trellis_declaration"), (5, "trellis_outgoing_calls")] {
             let reply = peer.ask(call(
                 legacy,
@@ -1701,6 +1740,7 @@ async fn warm_relay_serves_both_new_tools_and_rejects_closed_inputs() {
             );
             if name == "trellis_declaration" {
                 assert_eq!(data["declaration"]["syntaxId"], id);
+                assert_eq!(data["declaration"]["role"], "production");
             } else {
                 assert_eq!(data["calls"].as_array().unwrap().len(), 1);
                 assert_eq!(data["calls"][0]["calleeText"], "Target");

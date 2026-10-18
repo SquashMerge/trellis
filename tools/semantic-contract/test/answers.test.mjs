@@ -23,6 +23,7 @@ const header = {
 };
 const declaration = {
   syntaxId: sid,
+    role: "production",
   document,
   revisionId: "r2",
   kind: "function",

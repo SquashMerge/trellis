@@ -1178,7 +1178,7 @@ fn index_delete_journal_no_wal() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        8
+        9
     );
     drop(db);
     let bytes = fs::read(&index).unwrap();
@@ -1857,7 +1857,7 @@ fn forget_rechecks_sqlite_schema_after_confirmation() {
 }
 
 #[test]
-fn gc_classifies_current_schema8_but_refuses_spoofed_shapes() {
+fn gc_classifies_current_schema9_but_refuses_spoofed_shapes() {
     let (temp, roots) = common::fixture();
     let work = root(temp.path());
     let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
@@ -1880,7 +1880,7 @@ fn gc_classifies_current_schema8_but_refuses_spoofed_shapes() {
         (entry.status, entry.reason)
     };
     assert_eq!(inspect(), ("unknown", "recent_open"));
-    // v8's CHECK forbids spoofing an old extractor on the current layout.
+    // v9's CHECK forbids spoofing an old extractor on the current layout.
     assert!(
         db.execute(
             "UPDATE index_metadata SET extractor_version='native-v1'",
@@ -1904,7 +1904,7 @@ fn gc_classifies_current_schema8_but_refuses_spoofed_shapes() {
     assert_eq!(inspect(), ("unknown", "recent_open"));
     db.pragma_update(None, "user_version", 7).unwrap();
     assert_eq!(inspect(), ("unknown", "unknown_index_shape"));
-    db.pragma_update(None, "user_version", 8).unwrap();
+    db.pragma_update(None, "user_version", 9).unwrap();
     assert_eq!(inspect(), ("unknown", "recent_open"));
     db.execute("UPDATE index_metadata SET root_inode='1'", [])
         .unwrap();
@@ -2632,6 +2632,12 @@ fn automatic_gc_reports_but_never_deletes_older_or_alternate_historical_indexes(
             "native-v4-class-compose-v1",
             include_str!("fixtures/gc-legacy/v8-native-class-late.sql"),
         ),
+        (
+            "exact-v8",
+            8_i64,
+            "native-v4-delta-v1",
+            include_str!("fixtures/gc-legacy/v8-current.sql"),
+        ),
     ] {
         let workspace = temp.path().join(name);
         fs::create_dir(&workspace).unwrap();
@@ -2658,6 +2664,12 @@ fn automatic_gc_reports_but_never_deletes_older_or_alternate_historical_indexes(
         let stat = fs::metadata(&path).unwrap();
         candidates.push((identity, path.clone(), stat.ino(), fs::read(path).unwrap()));
     }
+    let exact_v8_root = temp.path().join("exact-v8");
+    let exact_v8 = WorkspaceIdentity::discover(Some(&exact_v8_root), &exact_v8_root).unwrap();
+    assert!(candidates.iter().any(
+        |(identity, path, _, _)| identity.root_key == exact_v8.root_key
+            && *path == roots.index_db(&exact_v8)
+    ));
     let current_root = temp.path().join("current-gc");
     fs::create_dir(&current_root).unwrap();
     drop(common::open_store(temp.path(), &current_root).unwrap());
