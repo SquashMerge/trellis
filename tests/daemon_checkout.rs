@@ -3062,6 +3062,80 @@ async fn cli_index_stops_waiting_on_a_persistently_failing_worker() {
     .expect("the accepted request did not complete after the fault cleared");
 }
 
+/// #179: a serving writer that fails its check cannot claim the waiting
+/// request. That is a worker fault, so the waiting CLI index is woken and
+/// answers with the error instead of waiting forever, and the request
+/// completes once the check passes again.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn cli_index_stops_waiting_when_the_serving_writer_fails_its_check() {
+    struct Restore(std::path::PathBuf, Vec<u8>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let _ = fs::write(&self.0, &self.1);
+        }
+    }
+    let base = tempfile::tempdir().unwrap();
+    let root = base.path().join("checked");
+    fs::create_dir(&root).unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success()
+    );
+    fs::write(root.join("a.js"), "function a() {}\n").unwrap();
+    let topology = roots(base.path());
+    let checkout = identity(&root);
+    let queue = topology.requests_db(&checkout);
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(1, &checkout).unwrap();
+    let runtime = registry.activate(&checkout.root_key).unwrap();
+    ready(&runtime).await;
+    let scheduler = runtime.browser_scheduler().unwrap();
+    scheduler.set_step_fault_grace_for_tests(Duration::from_millis(300));
+    let (release_hold, holder) = hold_worker(scheduler.clone()).await;
+    let indexer = runtime.clone();
+    let options = trellis::indexer::IndexOptions::new(root.clone());
+    let waiter = tokio::task::spawn_blocking(move || indexer.cli_index(&options));
+    let id = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        loop {
+            if let [row] = queue_rows(&queue).as_slice() {
+                break row.split(':').next().unwrap().to_owned();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("request was not accepted");
+    // An invalid marker fails the writer's check until it is restored.
+    let marker = root.join(".git/trellis/workspace-id");
+    let restore = Restore(marker.clone(), fs::read(&marker).unwrap());
+    fs::write(&marker, b"x").unwrap();
+    drop(release_hold);
+    holder.join().unwrap();
+    let error = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, waiter)
+        .await
+        .expect("waiting client was not answered")
+        .unwrap()
+        .expect_err("a writer failing its check cannot complete the request");
+    // The fault wakes the waiter. Its own re-read may meet the same check
+    // first; either way it answers with the check's error, never a hang.
+    let message = format!("{error:#}");
+    assert!(message.contains("invalid workspace-id marker"), "{message}");
+    assert_eq!(queue_rows(&queue), vec![format!("{id}:queued/")]);
+    drop(restore);
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        while queue_rows(&queue) != vec![format!("{id}:done/")] {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the accepted request did not complete after the check passed");
+}
+
 /// Decision 0008 §3, T04: a client already waiting on a request whose root is
 /// then lost gets `root_changed`, never `not_found`, even though eligible GC
 /// later deletes the index; a fresh lookup after GC gets `not_found`.

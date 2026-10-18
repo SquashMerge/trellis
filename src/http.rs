@@ -246,9 +246,11 @@ pub struct DaemonState {
     worker_hold: std::sync::RwLock<()>,
     /// The last step made progress, so more work may be ready at once.
     step_progress: AtomicBool,
-    /// Since when the worker's steps have failed with no success since, and
-    /// the first error. A CLI index waiter gives up after a grace (#179).
+    /// Since when the worker's steps have failed with no real progress since,
+    /// and the first error. A CLI index waiter gives up after a grace (#179).
     step_fault: Mutex<Option<(Instant, String)>>,
+    /// This step committed startup reconciliation or processed a request.
+    step_recovered: AtomicBool,
     /// Fail every startup reconciliation attempt with this error.
     #[cfg(feature = "test-support")]
     fail_startup: Mutex<Option<String>>,
@@ -497,6 +499,7 @@ pub fn new_with_config(
         worker_hold: std::sync::RwLock::new(()),
         step_progress: AtomicBool::new(false),
         step_fault: Mutex::new(None),
+        step_recovered: AtomicBool::new(false),
         #[cfg(feature = "test-support")]
         fail_startup: Mutex::new(None),
         #[cfg(feature = "test-support")]
@@ -1262,9 +1265,14 @@ impl DaemonState {
             }
         }
         let retained = self.runtime.lock().unwrap().session().cloned();
-        if let Some(ref session) = retained
-            && session.verify().is_ok()
-        {
+        // A writer that fails its check cannot claim accepted work. That is a
+        // step failure, so a waiting CLI index can see the fault (#179).
+        if let Some(ref session) = retained {
+            session
+                .verify()
+                .context("serving writer session failed its check")?;
+        }
+        if let Some(ref session) = retained {
             #[cfg(test)]
             self.test_queue_current_phase.store(2, Ordering::Release);
             let processed = match crate::index_coordinator::drain_one_request_observed(
@@ -1293,6 +1301,7 @@ impl DaemonState {
                 *self.packets.lock().unwrap() = PacketCache::default();
                 self.start_dependency_index();
                 self.step_progress.store(true, Ordering::Release);
+                self.step_recovered.store(true, Ordering::Release);
             }
             #[cfg(test)]
             self.test_queue_after_startup_drain.run();

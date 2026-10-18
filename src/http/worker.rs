@@ -282,6 +282,7 @@ impl DaemonState {
                 *self.startup_backoff.lock().unwrap() = STARTUP_BACKOFF_FIRST;
                 *self.recovery_retry_after.lock().unwrap() = None;
                 self.step_progress.store(true, Ordering::Release);
+                self.step_recovered.store(true, Ordering::Release);
                 Ok(())
             }
             Err(error) => {
@@ -388,8 +389,8 @@ const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
 const STEP_FAULT_GRACE: Duration = Duration::from_secs(60);
 
 impl DaemonState {
-    /// Publish whether the last step failed. Only a change from succeeding to
-    /// failing, or back, wakes request waiters to re-check.
+    /// Publish whether the last step failed, or recovered by making real
+    /// progress. Only a change of state wakes request waiters to re-check.
     fn note_step_outcome(&self, error: Option<String>) {
         let mut fault = self.step_fault.lock().unwrap();
         match (fault.is_some(), error) {
@@ -399,14 +400,6 @@ impl DaemonState {
         }
         drop(fault);
         self.store.wake_request_waiters();
-    }
-
-    /// The worker's next attempt is deferred to a retry time still ahead.
-    fn waiting_out_retry(&self) -> bool {
-        self.recovery_retry_after
-            .lock()
-            .unwrap()
-            .is_some_and(|retry| Instant::now() < retry)
     }
 
     /// Since when every worker step has failed, with the first error.
@@ -905,11 +898,12 @@ fn worker_loop(weak: std::sync::Weak<DaemonState>, inbox: Arc<WorkerInbox>) {
         }
         let step = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| state.worker_step()));
         state.publish_fifo_pending();
+        // Only a step that recorded real progress recovers from a fault. A
+        // step that deferred, skipped or found nothing to do leaves it as is.
+        let recovered = state.step_recovered.swap(false, Ordering::AcqRel);
         match &step {
-            // A step that only waited out a retry backoff attempted nothing,
-            // so it is not a recovery.
-            Ok(Ok(())) if state.waiting_out_retry() => {}
-            Ok(Ok(())) => state.note_step_outcome(None),
+            Ok(Ok(())) if recovered => state.note_step_outcome(None),
+            Ok(Ok(())) => {}
             Ok(Err(error)) => state.note_step_outcome(Some(format!("{error:#}"))),
             Err(_) => state.note_step_outcome(Some("panicked".to_owned())),
         }

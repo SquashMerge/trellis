@@ -2412,6 +2412,12 @@ fn cli_index_waits_past_sixty_seconds_for_its_reply() {
     });
     let mut stream = stream.unwrap();
     stream.set_nonblocking(false).unwrap();
+    stream
+        .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(trellis::testing::HANG_BACKSTOP))
+        .unwrap();
     let request: protocol::Request = protocol::read_frame(&mut stream).unwrap();
     assert_eq!(request.operation, "index");
     // The old bound would have expired a second before this check.
@@ -2431,7 +2437,12 @@ fn cli_index_waits_past_sixty_seconds_for_its_reply() {
     .unwrap();
     let mut stdout = index.0.stdout.take().unwrap();
     let mut stderr = index.0.stderr.take().unwrap();
-    let status = index.0.wait().unwrap();
+    let mut status = None;
+    trellis::testing::wait_until("the CLI exiting after its reply", || {
+        status = index.0.try_wait().unwrap();
+        status.is_some()
+    });
+    let status = status.unwrap();
     let (mut out, mut err) = (String::new(), String::new());
     std::io::Read::read_to_string(&mut stdout, &mut out).unwrap();
     std::io::Read::read_to_string(&mut stderr, &mut err).unwrap();
