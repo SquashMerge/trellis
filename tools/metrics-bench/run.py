@@ -102,6 +102,10 @@ def main():
     parser.add_argument("--resume-index", action="store_true", help="resume an already enqueued index after a failed CLI wait")
     parser.add_argument("--reuse-home", type=Path, help="existing indexed HOME; do not enqueue/index again")
     parser.add_argument("--pin", help="complete generation:decimal-revision pin for a reused index")
+    parser.add_argument("--token-file", type=Path, help="existing private token file for reused HOME")
+    parser.add_argument("--file-on-error", action="store_true", help="time a pinned file even if full revision fails; never call it a full response")
+    parser.add_argument("--file-only", action="store_true", help="one bounded pinned file retry, no revision request")
+    parser.add_argument("--file-path", help="exact relative Java file for --file-only")
     args = parser.parse_args()
     binary = args.binary.resolve(strict=True)
     generated = args.generated.resolve(strict=True)
@@ -111,6 +115,10 @@ def main():
         parser.error("cohort source count differs from canonical manifest")
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    if args.file_path and not args.file_only:
+        parser.error("--file-path requires --file-only")
+    if args.file_only and not args.pin:
+        parser.error("--file-only requires --pin and --reuse-home")
     if bool(args.reuse_home) != bool(args.pin):
         parser.error("--reuse-home and --pin must be supplied together")
     home = args.reuse_home.resolve() if args.reuse_home else output_dir / (args.cohort + "-" + args.transport + "-home")
@@ -131,8 +139,9 @@ def main():
           "serveLog": str(serve_log)}, output)
     serve = None
     try:
-        token_path = (output_dir / (args.cohort + "-http-token") if args.reuse_home
-                      else output_dir / (args.cohort + "-" + args.transport + "-token"))
+        token_path = (args.token_file.resolve() if args.token_file else
+                      (home.parent / (args.cohort + "-http-token") if args.reuse_home
+                       else output_dir / (args.cohort + "-" + args.transport + "-token")))
         command = [str(binary), "serve", "--workspace", str(root),
                    "--bind", "127.0.0.1:0", "--token-file", str(token_path)]
         with serve_log.open("wb") as log:
@@ -171,9 +180,14 @@ def main():
             requested_pin = args.pin.rsplit(":", 1)
             if len(requested_pin) != 2 or not requested_pin[1].isdecimal():
                 raise RuntimeError("invalid reuse pin")
-            if status["data"].get("revision") != {"indexGeneration": requested_pin[0],
-                                                    "indexRevision": int(requested_pin[1])}:
-                raise RuntimeError("reused index no longer has requested head pin")
+            head = status["data"].get("revision", {})
+            if (head.get("indexGeneration") != requested_pin[0]
+                    or not isinstance(head.get("indexRevision"), int)
+                    or head["indexRevision"] < int(requested_pin[1])):
+                raise RuntimeError("reused index generation changed or selected pin is newer than head")
+            # A new watcher revision may become head on startup. The supplied
+            # retained pin is checked by the real metrics request, not inferred
+            # absent merely because head moved forward.
         elif not args.resume_index:
             admitted = http(base_url.replace("/metrics", "/index"), token, "POST")
             emit({"event": "indexAdmission", **admitted}, output)
@@ -204,28 +218,50 @@ def main():
             if not args.reuse_home:
                 raise RuntimeError("index job exceeded 7200-second setup backstop")
         pin = (args.pin.rsplit(":", 1)[0], int(args.pin.rsplit(":", 1)[1])) if args.pin else None
-        for phase in ("cold", "warm"):
-            if args.transport == "http":
-                suffix = "" if pin is None else "?" + urllib.parse.urlencode(
-                    {"indexGeneration": pin[0], "indexRevision": pin[1]})
-                result = http(base_url + suffix, token)
-            else:
-                arguments = ["metrics", "--json", "--workspace", str(root)]
-                if pin is not None:
-                    arguments += ["--pin", pin[0] + ":" + str(pin[1])]
-                result = cli(binary, env, arguments, 335)
-            result, payload = summarize(result, expected, "revision")
-            result.update({"event": "revision", "phase": phase,
-                           "daemonMemo": "fresh (require restarted daemon for --reuse-home)" if phase == "cold" else "same daemon and pin"})
-            emit(result, output)
-            if payload is None:
-                raise RuntimeError("full revision response failed; see typed result")
-            if pin is not None and list(pin) != result["pin"]:
-                raise RuntimeError("warm pin changed")
-            pin = result["pin"]
-            if phase == "cold":
-                first = next((row for row in payload["files"]
-                              if row["language"] == "java"), None)
+        revision_failed = False
+        first = None
+        if args.file_only:
+            state = http(base_url.replace("/metrics", "/jobs/current"), token)
+            emit({"event": "fileRetryJobState", **state}, output)
+            if state.get("status") != 200 or (state.get("data") is not None
+                                                  and state["data"].get("finishedAt") is None):
+                raise RuntimeError("job not terminal before file retry")
+            candidate = root / args.file_path if args.file_path else next(root.glob("java/*.java"), None)
+            if candidate is None or not candidate.is_file() or candidate.parent != root / "java":
+                raise RuntimeError("no selected Java file for pinned file retry")
+            first = {"sourceSetId": "source-set:v1:path-" + key,
+                     "language": "java", "path": candidate.relative_to(root).as_posix()}
+        else:
+            for phase in ("cold", "warm"):
+                if args.transport == "http":
+                    suffix = "" if pin is None else "?" + urllib.parse.urlencode(
+                        {"indexGeneration": pin[0], "indexRevision": pin[1]})
+                    result = http(base_url + suffix, token)
+                else:
+                    arguments = ["metrics", "--json", "--workspace", str(root)]
+                    if pin is not None:
+                        arguments += ["--pin", pin[0] + ":" + str(pin[1])]
+                    result = cli(binary, env, arguments, 335)
+                result, payload = summarize(result, expected, "revision")
+                result.update({"event": "revision", "phase": phase,
+                               "daemonMemo": "fresh (require restarted daemon for --reuse-home)" if phase == "cold" else "same daemon and pin"})
+                emit(result, output)
+                if payload is None:
+                    if args.file_on_error and pin is not None:
+                        revision_failed = True
+                        candidate = next(root.glob("java/*.java"), None)
+                        if candidate is None:
+                            raise RuntimeError("no Java file for independent file request")
+                        first = {"sourceSetId": "source-set:v1:path-" + key,
+                                 "language": "java", "path": candidate.relative_to(root).as_posix()}
+                        break  # No warm measurement after a failed cold full revision.
+                    raise RuntimeError("full revision response failed; see typed result")
+                if pin is not None and list(pin) != result["pin"]:
+                    raise RuntimeError("warm pin changed")
+                pin = result["pin"]
+                if phase == "cold":
+                    first = next((row for row in payload["files"]
+                                  if row["language"] == "java"), None)
         if not first:
             raise RuntimeError("no Java file row")
         if args.transport == "http":
@@ -239,10 +275,14 @@ def main():
                                        "--source-set-id", first["sourceSetId"],
                                        "--language", first["language"], "--path", first["path"]], 45)
         result, payload = summarize(result, expected, "file")
-        result.update({"event": "file", "phase": "after warm", "selectedPath": first["path"]})
+        result.update({"event": "file", "phase": "standalone retry" if args.file_only else
+                       ("after failed cold" if revision_failed else "after warm"),
+                       "selectedPath": first["path"]})
         emit(result, output)
-        if payload is None or result["pin"] != pin:
+        if payload is None or result["pin"] != list(pin):
             raise RuntimeError("full file response failed")
+        if revision_failed:
+            raise RuntimeError("full revision failed; independent file result recorded above")
     except Exception as error:
         emit({"event": "failure", "error": repr(error)}, output)
         return 2
