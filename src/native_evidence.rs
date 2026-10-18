@@ -1071,7 +1071,9 @@ fn attribute_tokens(text: &str) -> Vec<&str> {
     while offset < text.len() {
         let rest = &text[offset..];
         if rest.starts_with("//") {
-            break;
+            // A line comment ends at its newline; the attribute may continue after it.
+            offset += rest.find('\n').map_or(rest.len(), |end| end + 1);
+            continue;
         }
         if rest.starts_with("/*") {
             offset += rest.find("*/").map_or(rest.len(), |end| end + 2);

@@ -1293,7 +1293,11 @@ fn declaration_roles_follow_syntax_paths_and_inherit_without_changing_identity()
     let sources = [
         (
             "src.rs",
-            "fn normal() {}\n#[cfg(test)] mod inner { fn helper() {} struct Thing; impl Thing { fn method(&self) {} } }\nfn after() {}\n#[cfg(all(feature = \"x\", test))] fn all_test() {}\n#[cfg(any(test, feature = \"x\"))] fn any_test() {}\n#[cfg(not(test))] fn not_test() {}\n#[cfg(feature = \"test-support\")] fn support() {}\n#[test] fn standalone() {}\n#[tokio::test] fn qualified() {}\n#[cfg(test)] /* note */ fn after_block_comment() {}\nfn unmarked_after_comment() {}\n// #[test] fn commented() {}\nconst TEXT: &str = \"#[test]\";\n#[tokio::test(flavor = \"multi_thread\")] fn with_args() {}\n#[serde(rename = \"test\")] fn serde_named() {}\nmod gated { #![cfg(test)] fn gated_helper() {} }\n",
+            "fn normal() {}\n#[cfg(test)] mod inner { fn helper() {} struct Thing; impl Thing { fn method(&self) {} } }\nfn after() {}\n#[cfg(all(feature = \"x\", test))] fn all_test() {}\n#[cfg(any(test, feature = \"x\"))] fn any_test() {}\n#[cfg(not(test))] fn not_test() {}\n#[cfg(feature = \"test-support\")] fn support() {}\n#[test] fn standalone() {}\n#[tokio::test] fn qualified() {}\n#[cfg(test)] /* note */ fn after_block_comment() {}\nfn unmarked_after_comment() {}\n// #[test] fn commented() {}\nconst TEXT: &str = \"#[test]\";\n#[tokio::test(flavor = \"multi_thread\")] fn with_args() {}\n#[serde(rename = \"test\")] fn serde_named() {}\nmod gated { #![cfg(test)] fn gated_helper() {} }\n#[tokio::test // note\n(flavor = \"multi_thread\")] fn commented_args() {}\n#[cfg( // note\n test)] fn commented_cfg() {}\n",
+        ),
+        (
+            "inner_commented.rs",
+            "#![cfg( // note\n test)]\nfn commented_file_helper() {}\n",
         ),
         (
             "inner.rs",
@@ -1397,7 +1401,14 @@ fn declaration_roles_follow_syntax_paths_and_inherit_without_changing_identity()
                 "function:with_args",
                 "namespace:gated",
                 "function:gated_helper",
+                "function:commented_args",
+                "function:commented_cfg",
             ],
+        ),
+        (
+            "inner_commented.rs",
+            DeclarationRole::Test,
+            &["module:", "function:commented_file_helper"],
         ),
         (
             "inner.rs",
