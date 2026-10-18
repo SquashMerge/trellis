@@ -9445,3 +9445,174 @@ async fn mcp_source_linked_selected_deadline_after_admission_keeps_resolved_shap
     drop(client);
     session.join().unwrap().unwrap();
 }
+
+// Incoming calls are checked through the actual MCP tools/call path rather than
+// through the store reader or projection in isolation.
+async fn incoming_many_documents_fixture(long_name: bool, limit: Option<usize>) -> (Value, Value) {
+    let temp = tempfile::tempdir().unwrap();
+    let root = checkout(temp.path());
+    let name = if long_name {
+        format!("Target{}", "Q".repeat(3_800))
+    } else {
+        "Target".to_owned()
+    };
+    fs::write(root.join("target.js"), format!("function {name}() {{}}\n")).unwrap();
+    for number in 0..21 {
+        fs::write(
+            root.join(format!("caller{number:02}.js")),
+            format!("function Caller{number:02}() {{ {name}(); }}\n"),
+        )
+        .unwrap();
+    }
+    let root_key = trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root)
+        .unwrap()
+        .root_key;
+    let (mut peer, witness) = Peer::start_with_causal_witness(Some(&root));
+    tool(
+        &peer.ask(call(
+            false,
+            json!(1),
+            "trellis_workspace_describe",
+            json!({"schemaVersion":1}),
+        )),
+        None,
+        true,
+    );
+    let pin = await_settled_golden_h(&witness, &root_key).await;
+    let found = peer.ask(call(
+        false,
+        json!(2),
+        "trellis_find_symbols",
+        json!({"schemaVersion":1,"query":"Target","expectedBasis":pin}),
+    ));
+    tool(&found, None, true);
+    let symbol_id = found["result"]["structuredContent"]["data"]["symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|symbol| symbol["name"] == name)
+        .unwrap()["symbolId"]
+        .clone();
+    let declaration = peer.ask(call(
+        false,
+        json!(3),
+        "trellis_declaration",
+        json!({"schemaVersion":1,"symbolId":symbol_id,"expectedBasis":pin}),
+    ));
+    tool(&declaration, None, true);
+    let mut args = json!({"schemaVersion":1,"symbolId":symbol_id,"expectedBasis":pin});
+    if let Some(limit) = limit {
+        args["limit"] = json!(limit);
+    }
+    let incoming = peer.ask(call(false, json!(4), "trellis_incoming_calls", args));
+    tool(&incoming, None, true);
+    assert!(peer.finish().0.success());
+    (declaration, incoming)
+}
+
+fn assert_incoming_emitted_proof_closure(declaration: &Value, incoming: &Value) {
+    use std::collections::BTreeSet;
+    let selected = &declaration["result"]["structuredContent"]["data"];
+    let selected_version = emitted_document(selected, selected);
+    let data = &incoming["result"]["structuredContent"]["data"];
+    let docs = data["documents"].as_array().unwrap();
+    let calls = data["callers"].as_array().unwrap();
+    assert_eq!(
+        docs.len(),
+        calls.len(),
+        "each distinct emitted caller owns one document"
+    );
+    assert!(
+        docs.iter()
+            .all(|doc| doc["document"]["path"] != "target.js"),
+        "selected declaration is proof closure, not a caller document ref"
+    );
+    let referenced: BTreeSet<_> = calls
+        .iter()
+        .map(|call| call["doc"].as_u64().unwrap() as usize)
+        .collect();
+    assert_eq!(referenced, (0..docs.len()).collect());
+    let mut expected_proofs: BTreeSet<_> = docs
+        .iter()
+        .map(|doc| doc["provenanceId"].as_str().unwrap())
+        .collect();
+    expected_proofs.insert(selected_version["provenanceId"].as_str().unwrap());
+    let actual_proofs: BTreeSet<_> = data["provenance"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|proof| proof["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        actual_proofs, expected_proofs,
+        "selected + emitted callers only"
+    );
+    let mut expected_paths: BTreeSet<_> = docs
+        .iter()
+        .map(|doc| doc["document"]["path"].as_str().unwrap())
+        .collect();
+    expected_paths.insert("target.js");
+    let actual_paths: BTreeSet<_> = data["coverage"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["documentPath"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        actual_paths, expected_paths,
+        "coverage includes selected and emitted sites only"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn incoming_default_twenty_and_limit_one_keep_exact_required_closure() {
+    for (limit, expected) in [(None, 20), (Some(1), 1)] {
+        let (declaration, response) = incoming_many_documents_fixture(false, limit).await;
+        let envelope = &response["result"]["structuredContent"];
+        let data = &envelope["data"];
+        assert_eq!(data["callers"].as_array().unwrap().len(), expected);
+        assert_eq!(envelope["truncationReason"], "limit");
+        assert_eq!(envelope["truncated"], true);
+        assert_incoming_emitted_proof_closure(&declaration, &response);
+        let docs = data["documents"].as_array().unwrap();
+        assert_eq!(docs[0]["document"]["path"], "caller00.js");
+        assert_eq!(
+            docs.last().unwrap()["document"]["path"],
+            format!("caller{:02}.js", expected - 1)
+        );
+        assert!(
+            !docs
+                .iter()
+                .any(|doc| doc["document"]["path"] == "caller20.js")
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn incoming_byte_clipping_overrides_limit_and_discards_omitted_proofs() {
+    let (declaration, response) = incoming_many_documents_fixture(true, Some(20)).await;
+    let envelope = &response["result"]["structuredContent"];
+    let data = &envelope["data"];
+    let count = data["callers"].as_array().unwrap().len();
+    assert!(
+        count > 0 && count < 20,
+        "required list must clip before 20: {count}"
+    );
+    assert_eq!(
+        envelope["truncationReason"], "response_bytes",
+        "byte clipping must take priority over the 21st-hit limit lookahead"
+    );
+    assert_eq!(envelope["truncated"], true);
+    assert_incoming_emitted_proof_closure(&declaration, &response);
+    let docs = data["documents"].as_array().unwrap();
+    assert_eq!(
+        docs.last().unwrap()["document"]["path"],
+        format!("caller{:02}.js", count - 1)
+    );
+    assert!(
+        !docs
+            .iter()
+            .any(|doc| doc["document"]["path"] == format!("caller{count:02}.js"))
+    );
+    assert!(serde_json::to_vec(&response).unwrap().len() < 65_536);
+}
