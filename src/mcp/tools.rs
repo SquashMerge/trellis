@@ -3,7 +3,7 @@ use super::{IdentityError, OpenedWorkspace, wire};
 use crate::daemon::registry::SelectionError;
 use serde_json::{Value, json};
 
-const TOOLS: [&str; 5] = super::catalog::NAMES;
+const TOOLS: [&str; 6] = super::catalog::NAMES;
 #[derive(Debug)]
 pub struct PreparedTool {
     pub name: String,
@@ -68,7 +68,7 @@ fn valid_path(s: &str) -> bool {
 /// Argument validation is independent of workspace state. A malformed UInt is an invalid
 /// request even if its numeric value would exceed a narrower application cap.
 pub fn validate(name: &str, args: Option<&Value>) -> Result<(), &'static str> {
-    if !TOOLS.contains(&name) && name != "trellis_incoming_calls" {
+    if !TOOLS.contains(&name) {
         return Err("invalid_request");
     }
     let Some(o) = args.and_then(Value::as_object) else {
@@ -438,7 +438,7 @@ mod tests {
         match name {
             "trellis_workspace_describe" => json!({"schemaVersion":1}),
             "trellis_find_symbols" => json!({"schemaVersion":1,"query":"a"}),
-            "trellis_declaration" | "trellis_outgoing_calls" => {
+            "trellis_declaration" | "trellis_outgoing_calls" | "trellis_incoming_calls" => {
                 json!({"schemaVersion":1,"symbolId":sid()})
             }
             _ => json!({"schemaVersion":1,"path":"src/a.rs","startLine":1,"endLine":1}),
@@ -508,7 +508,7 @@ mod tests {
         let mut v = good(n);
         v["query"] = json!(null);
         check(n, &v, "invalid_request");
-        for name in [TOOLS[1], TOOLS[3]] {
+        for name in [TOOLS[1], TOOLS[3], TOOLS[4]] {
             let original = good(name);
             for (number, expected) in [
                 (json!(0), Some("range_too_large")),
@@ -560,7 +560,7 @@ mod tests {
     }
     #[test]
     fn source_path_hash_and_line_matrix() {
-        let n = TOOLS[4];
+        let n = TOOLS[5];
         for path in [
             "",
             "/a",
@@ -791,9 +791,9 @@ mod tests {
         );
     }
     #[test]
-    fn incoming_is_prepared_but_not_yet_catalogued() {
+    fn incoming_is_prepared_and_catalogued() {
         let name = "trellis_incoming_calls";
-        assert!(!TOOLS.contains(&name));
+        assert!(TOOLS.contains(&name));
         let mut valid = json!({"schemaVersion":1,"symbolId":sid(),"limit":20,
             "expectedBasis":pin()});
         assert_eq!(validate(name, Some(&valid)), Ok(()));
