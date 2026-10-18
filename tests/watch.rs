@@ -465,7 +465,8 @@ fn edits_creates_renames_atomic_saves_and_deletes_match_cold_full() {
 }
 
 fn cli(root: &std::path::Path, home: &std::path::Path, command: &str) -> std::process::Command {
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_trellis"));
+    let mut child =
+        trellis::testing::owned(std::process::Command::new(env!("CARGO_BIN_EXE_trellis")));
     child
         .env("HOME", home)
         .env_remove("XDG_CACHE_HOME")

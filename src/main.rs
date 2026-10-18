@@ -968,6 +968,25 @@ async fn run_daemon() -> Result<()> {
     let (browser_shutdown, _) = tokio::sync::watch::channel(false);
     let idle = daemon::run_idle_lifecycle(registry.clone());
     tokio::pin!(idle);
+    // A test-elected daemon ends with the test process that owns it (#130),
+    // even when the test never stops it or is killed before its guards run.
+    let owner_gone = async {
+        #[cfg(feature = "test-support")]
+        if let Some(pid) = std::env::var(trellis::testing::OWNER_PID_ENV)
+            .ok()
+            .and_then(|pid| pid.parse::<libc::pid_t>().ok())
+            .filter(|pid| *pid > 1)
+        {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                if !trellis::testing::process_running(pid) {
+                    return;
+                }
+            }
+        }
+        std::future::pending::<()>().await
+    };
+    tokio::pin!(owner_gone);
     // A single injected accept fault tests that the elected socket survives it.
     #[cfg(feature = "test-support")]
     let mut injected_accept_errno =
@@ -979,6 +998,7 @@ async fn run_daemon() -> Result<()> {
     loop {
         tokio::select! {
             result = &mut idle => { result.map_err(|e| anyhow::anyhow!("{}", e.reason()))?; break; }
+            () = &mut owner_gone => break,
             accepted = async {
                 #[cfg(feature = "test-support")]
                 if let Some(errno) = injected_accept_errno {

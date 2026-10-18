@@ -47,7 +47,7 @@ impl Peer {
     }
     fn start_with_env(home: &Path, root: &Path, extra: &[(&str, &std::ffi::OsStr)]) -> Self {
         let stderr = home.join(format!("stderr-{}.log", rand::random::<u64>()));
-        let mut child = Command::new(env!("CARGO_BIN_EXE_trellis"))
+        let mut child = trellis::testing::owned(Command::new(env!("CARGO_BIN_EXE_trellis")))
             .arg("mcp")
             .arg("--workspace")
             .arg(root)
@@ -430,7 +430,7 @@ fn concurrent_clients_share_single_socket_and_survive_bad_private_frame() {
 fn daemon_death_interrupts_session_and_next_launch_recovers() {
     let home = tempfile::tempdir().unwrap();
     let root = checkout(home.path());
-    let mut daemon = Command::new(env!("CARGO_BIN_EXE_trellis"))
+    let mut daemon = trellis::testing::owned(Command::new(env!("CARGO_BIN_EXE_trellis")))
         .arg("daemon")
         .env("HOME", home.path())
         .env("XDG_CACHE_HOME", home.path().join("cache"))
@@ -529,7 +529,7 @@ fn legacy_mcp_reconnect_restores_handshake_without_new_client() {
         ],
     );
     let linked = linked.canonicalize().unwrap();
-    let mut daemon = Command::new(env!("CARGO_BIN_EXE_trellis"))
+    let mut daemon = trellis::testing::owned(Command::new(env!("CARGO_BIN_EXE_trellis")))
         .arg("daemon")
         .env("HOME", home.path())
         .env("XDG_CACHE_HOME", home.path().join("cache"))
@@ -618,7 +618,7 @@ fn cancellation_precedes_invalid_queue_and_sixteen_follow_ons() {
             rand::random::<u64>()
         ));
         let listener = UnixListener::bind(&phase_path).unwrap();
-        let mut daemon = Command::new(env!("CARGO_BIN_EXE_trellis"))
+        let mut daemon = trellis::testing::owned(Command::new(env!("CARGO_BIN_EXE_trellis")))
             .arg("daemon")
             .env("HOME", home.path())
             .env("XDG_CACHE_HOME", home.path().join("cache"))
@@ -805,7 +805,7 @@ fn duplicate_within_bounded_pending_queue_is_rejected_before_first_completes() {
         rand::random::<u64>()
     ));
     let listener = UnixListener::bind(&phase_path).unwrap();
-    let mut daemon = Command::new(env!("CARGO_BIN_EXE_trellis"))
+    let mut daemon = trellis::testing::owned(Command::new(env!("CARGO_BIN_EXE_trellis")))
         .arg("daemon")
         .env("HOME", home.path())
         .env("XDG_CACHE_HOME", home.path().join("cache"))
@@ -906,7 +906,7 @@ fn stdin_eof_cancels_in_flight_call_without_stdout() {
         rand::random::<u64>()
     ));
     let listener = UnixListener::bind(&phase_path).unwrap();
-    let mut daemon = Command::new(env!("CARGO_BIN_EXE_trellis"))
+    let mut daemon = trellis::testing::owned(Command::new(env!("CARGO_BIN_EXE_trellis")))
         .arg("daemon")
         .env("HOME", home.path())
         .env("XDG_CACHE_HOME", home.path().join("cache"))
@@ -965,7 +965,7 @@ fn canceled_read_is_not_replayed_after_daemon_death() {
         rand::random::<u64>()
     ));
     let listener = UnixListener::bind(&phase_path).unwrap();
-    let mut daemon = Command::new(env!("CARGO_BIN_EXE_trellis"))
+    let mut daemon = trellis::testing::owned(Command::new(env!("CARGO_BIN_EXE_trellis")))
         .arg("daemon")
         .env("HOME", home.path())
         .env("XDG_CACHE_HOME", home.path().join("cache"))
@@ -1047,7 +1047,7 @@ fn legacy_cancel_during_failed_synthetic_reattach_is_silent() {
 fn check_legacy_synthetic_reattach_cancel(cancel_id: u64, fail_setup: bool) {
     let home = tempfile::tempdir().unwrap();
     let root = checkout(home.path());
-    let mut daemon = Command::new(env!("CARGO_BIN_EXE_trellis"))
+    let mut daemon = trellis::testing::owned(Command::new(env!("CARGO_BIN_EXE_trellis")))
         .arg("daemon")
         .env("HOME", home.path())
         .env("XDG_CACHE_HOME", home.path().join("cache"))
@@ -1257,7 +1257,7 @@ fn check_legacy_synthetic_reattach_cancel(cancel_id: u64, fail_setup: bool) {
 fn legacy_await_initialized_refuses_tool_after_daemon_death() {
     let home = tempfile::tempdir().unwrap();
     let root = checkout(home.path());
-    let mut daemon = Command::new(env!("CARGO_BIN_EXE_trellis"))
+    let mut daemon = trellis::testing::owned(Command::new(env!("CARGO_BIN_EXE_trellis")))
         .arg("daemon")
         .env("HOME", home.path())
         .env("XDG_CACHE_HOME", home.path().join("cache"))
@@ -1312,7 +1312,7 @@ fn failed_reattach_drains_pending_cancel_and_stdin_eof_before_failure() {
     for close_stdin in [false, true] {
         let home = tempfile::tempdir().unwrap();
         let root = checkout(home.path());
-        let mut daemon = Command::new(env!("CARGO_BIN_EXE_trellis"))
+        let mut daemon = trellis::testing::owned(Command::new(env!("CARGO_BIN_EXE_trellis")))
             .arg("daemon")
             .env("HOME", home.path())
             .env("XDG_CACHE_HOME", home.path().join("cache"))
@@ -1449,7 +1449,7 @@ fn partial_daemon_reply_is_typed_and_never_reaches_stdout() {
     let root = checkout(home.path());
     // Start once to create the production private directory, then replace its
     // stale socket under the same singleton lock with a controlled socket peer.
-    let mut daemon = Command::new(env!("CARGO_BIN_EXE_trellis"))
+    let mut daemon = trellis::testing::owned(Command::new(env!("CARGO_BIN_EXE_trellis")))
         .arg("daemon")
         .env("HOME", home.path())
         .env("XDG_CACHE_HOME", home.path().join("cache"))
@@ -1508,7 +1508,7 @@ fn partial_daemon_reply_is_typed_and_never_reaches_stdout() {
             .unwrap();
         stream.shutdown(std::net::Shutdown::Write).unwrap();
     });
-    let mut child = Command::new(env!("CARGO_BIN_EXE_trellis"))
+    let mut child = trellis::testing::owned(Command::new(env!("CARGO_BIN_EXE_trellis")))
         .arg("mcp")
         .arg("--workspace")
         .arg(&root)
@@ -1869,7 +1869,7 @@ fn relay_answers_at_its_deadline_and_drops_the_late_reply() {
         rand::random::<u64>()
     ));
     let listener = UnixListener::bind(&phase_path).unwrap();
-    let mut daemon = Command::new(env!("CARGO_BIN_EXE_trellis"))
+    let mut daemon = trellis::testing::owned(Command::new(env!("CARGO_BIN_EXE_trellis")))
         .arg("daemon")
         .env("HOME", home.path())
         .env("XDG_CACHE_HOME", home.path().join("cache"))
@@ -1961,7 +1961,7 @@ fn phase_daemon(
         rand::random::<u64>()
     ));
     let listener = std::os::unix::net::UnixListener::bind(&phase_path).unwrap();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_trellis"));
+    let mut command = trellis::testing::owned(Command::new(env!("CARGO_BIN_EXE_trellis")));
     command
         .arg("daemon")
         .env("HOME", home)
