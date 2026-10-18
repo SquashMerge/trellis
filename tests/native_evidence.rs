@@ -1525,3 +1525,98 @@ fn declaration_roles_follow_syntax_paths_and_inherit_without_changing_identity()
         DeclarationRole::Production
     );
 }
+
+#[test]
+fn verified_callee_keys_decode_only_complete_measured_tokens() {
+    use std::{
+        fs,
+        sync::{Arc, atomic::AtomicBool},
+    };
+    use trellis::{
+        capture::Capture,
+        indexer::IndexOptions,
+        model::CancelFlag,
+        native_evidence::{from_capture, verified_callee_lookup},
+    };
+    let root = tempfile::tempdir().unwrap();
+    let identity =
+        trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+            .unwrap();
+    for (path, text) in [
+        (
+            "A.java",
+            "class A { void foo() {} void go() { obj.foo(); (obj.foo())(); } }",
+        ),
+        (
+            "a.rs",
+            "fn r#match() {} fn go() { obj.r#match(); (foo())(); }",
+        ),
+        (
+            "a.py",
+            "def foo():\n    pass\ndef go():\n    obj.foo()\n    (foo())()\n",
+        ),
+        (
+            "a.js",
+            r"function \u{54}arget() {} function go() { obj.\u{54}arget(); obj.\u0054arget(); obj[Target](); }",
+        ),
+    ] {
+        fs::write(root.path().join(path), text).unwrap();
+    }
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let capture = Capture::admit(&IndexOptions::new(root.path().into()), &cancel, &|_| {}).unwrap();
+    let artifact = from_capture(&capture, root.path(), &identity.record_id, &cancel).unwrap();
+    for (path, spelling, expected) in [
+        ("A.java", "foo", "foo"),
+        ("a.rs", "r#match", "match"),
+        ("a.py", "foo", "foo"),
+        ("a.js", r"\u{54}arget", "Target"),
+    ] {
+        let source = capture.files.iter().find(|f| f.path == path).unwrap();
+        let call = artifact
+            .calls
+            .iter()
+            .find(|c| {
+                c.document.path == path
+                    && c.spelling.as_deref() == Some(spelling)
+                    && c.callee_range.is_some()
+            })
+            .unwrap();
+        assert_eq!(
+            verified_callee_lookup(&source.language, call, &source.text).as_deref(),
+            Some(expected),
+            "{path}"
+        );
+        let mut altered = call.clone();
+        altered.spelling = Some(format!("obj.{spelling}"));
+        assert_eq!(
+            verified_callee_lookup(&source.language, &altered, &source.text),
+            None
+        );
+        assert_eq!(
+            &source.text[call.callee_range.as_ref().unwrap().start
+                ..call.callee_range.as_ref().unwrap().end],
+            spelling
+        );
+    }
+    let js = capture.files.iter().find(|f| f.path == "a.js").unwrap();
+    let four_digit = artifact
+        .calls
+        .iter()
+        .find(|c| c.document.path == "a.js" && c.spelling.as_deref() == Some(r"\u0054arget"))
+        .unwrap();
+    assert_eq!(
+        verified_callee_lookup("javascript", four_digit, &js.text).as_deref(),
+        Some("Target")
+    );
+    for (path, name, key) in [
+        ("a.rs", "r#match", "match"),
+        ("a.js", r"\u{54}arget", "Target"),
+    ] {
+        let declaration = artifact
+            .declarations
+            .iter()
+            .find(|d| d.document.path == path && d.name.as_deref() == Some(name))
+            .unwrap();
+        assert_eq!(declaration.lookup_key.as_deref(), Some(key));
+    }
+}

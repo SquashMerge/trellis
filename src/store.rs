@@ -2820,6 +2820,68 @@ impl std::error::Error for SqliteContention {}
 
 const HOT_INDEX_JOURNAL: &str = "recovery_required: hot index journal";
 
+/// SQLite refused a read-only connection because `index.db-journal` looked hot.
+#[derive(Debug)]
+struct HotIndexJournal;
+
+impl std::fmt::Display for HotIndexJournal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(HOT_INDEX_JOURNAL)
+    }
+}
+
+impl std::error::Error for HotIndexJournal {}
+
+/// A read-only hot-journal verdict can be a false positive (SQLite ticket
+/// #3883, #183): SQLite saw a live writer's journal, then the writer rolled
+/// back, deleting it and dropping RESERVED before SQLite looked for a RESERVED
+/// holder, so the vanished journal read as hot. If the journal is no longer
+/// hot by SQLite's own test (a non-empty first byte), the verdict was
+/// contention: wait as a busy handler would and retry `read`, then report typed
+/// contention once `busy_wait` (or the read scope's deadline) is spent. A
+/// journal that is still hot keeps the verdict.
+fn retry_stale_hot_journal<T>(
+    index: &Path,
+    busy_wait: Duration,
+    mut read: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    let deadline = Instant::now() + busy_wait;
+    let mut attempt = 0;
+    loop {
+        match read() {
+            Err(error)
+                if error.downcast_ref::<HotIndexJournal>().is_some()
+                    && !sqlite_journal_may_be_hot(index)? =>
+            {
+                let waited = if read_deadline().is_some() {
+                    read_deadline_busy(attempt)
+                } else {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    let pause = Duration::from_millis((1_u64 << attempt.clamp(0, 4)).min(20));
+                    std::thread::sleep(pause.min(remaining));
+                    !remaining.is_zero()
+                };
+                if !waited {
+                    return Err(SqliteContention(()).into());
+                }
+                attempt += 1;
+            }
+            other => return other,
+        }
+    }
+}
+
+/// Take the read snapshot of a deferred transaction on a read-only index
+/// connection: its first read acquires SHARED, the one point where SQLite's
+/// hot-journal check runs. Later reads in the transaction keep that lock.
+/// `busy_wait` matches the connection's own SQLite busy wait.
+fn begin_read_snapshot(db: &Connection, index: &Path, busy_wait: Duration) -> Result<()> {
+    retry_stale_hot_journal(index, busy_wait, || {
+        storage_result(db.pragma_query_value(None, "schema_version", |row| row.get::<_, i64>(0)))
+            .map(|_| ())
+    })
+}
+
 /// Whether `index.db-journal` may be hot: starting with SQLite's journal
 /// magic. A journal shorter than the magic is cold. An otherwise unreadable
 /// journal counts, so its recovery attempt reports a typed deferral instead of
@@ -2842,12 +2904,25 @@ fn hot_index_journal_present(index: &Path) -> Result<bool> {
     }
 }
 
+/// SQLite's hot test on `index.db-journal` without its lock check: present
+/// with a non-zero first byte. An unreadable journal counts as hot.
+fn sqlite_journal_may_be_hot(index: &Path) -> Result<bool> {
+    use std::io::Read;
+    let journal = index.with_file_name("index.db-journal");
+    let mut first = [0u8; 1];
+    match std::fs::File::open(&journal).and_then(|mut file| file.read(&mut first)) {
+        Ok(read) => Ok(read == 1 && first[0] != 0),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Ok(true),
+    }
+}
+
 fn storage_result<T>(result: rusqlite::Result<T>) -> Result<T> {
     match result {
         Err(rusqlite::Error::SqliteFailure(info, _))
             if info.extended_code == rusqlite::ffi::SQLITE_READONLY_ROLLBACK =>
         {
-            anyhow::bail!(HOT_INDEX_JOURNAL)
+            Err(HotIndexJournal.into())
         }
         Err(rusqlite::Error::SqliteFailure(info, _))
             if matches!(
@@ -3057,6 +3132,210 @@ mod sqlite_contention_type_tests {
                 .any(|cause| cause.downcast_ref::<rusqlite::Error>().is_some())
         );
         writer.execute_batch("ROLLBACK").unwrap();
+    }
+
+    /// Pauses the next read-only connection right after SQLite's hot-journal
+    /// check saw `-journal` exist, before it checks for a RESERVED holder.
+    static JOURNAL_SEEN_GATE: std::sync::Mutex<
+        Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+    > = std::sync::Mutex::new(None);
+    static GATED_BASE_VFS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+    unsafe extern "C" fn gated_access(
+        _vfs: *mut rusqlite::ffi::sqlite3_vfs,
+        name: *const std::ffi::c_char,
+        flags: std::ffi::c_int,
+        out: *mut std::ffi::c_int,
+    ) -> std::ffi::c_int {
+        let base = *GATED_BASE_VFS.get().unwrap() as *mut rusqlite::ffi::sqlite3_vfs;
+        let rc = unsafe { ((*base).xAccess.unwrap())(base, name, flags, out) };
+        let journal = unsafe { std::ffi::CStr::from_ptr(name) }
+            .to_bytes()
+            .ends_with(b"-journal");
+        if journal
+            && unsafe { *out } != 0
+            && let Some((seen, resume)) = JOURNAL_SEEN_GATE.lock().unwrap().take()
+        {
+            seen.send(()).unwrap();
+            resume.recv().unwrap();
+        }
+        rc
+    }
+
+    /// The default VFS with only `xAccess` wrapped, registered once.
+    fn gated_vfs() -> &'static str {
+        const NAME: &std::ffi::CStr = c"trellis-gated-journal-access";
+        GATED_BASE_VFS.get_or_init(|| unsafe {
+            let base = rusqlite::ffi::sqlite3_vfs_find(std::ptr::null());
+            let mut gated = *base;
+            gated.zName = NAME.as_ptr();
+            gated.xAccess = Some(gated_access);
+            let gated = Box::leak(Box::new(gated));
+            assert_eq!(
+                rusqlite::ffi::sqlite3_vfs_register(gated, 0),
+                rusqlite::ffi::SQLITE_OK
+            );
+            base as usize
+        });
+        NAME.to_str().unwrap()
+    }
+
+    /// Runs `read` on a read-only gated connection while `writer` holds a live
+    /// journal; once SQLite's hot-journal check has seen it, `writer` rolls
+    /// back, deleting the journal and dropping RESERVED without ever needing
+    /// EXCLUSIVE.
+    fn read_racing_writer_rollback<T: Send + 'static>(
+        read: impl FnOnce(&Connection, &Path) -> T + Send + 'static,
+    ) -> T {
+        // One gate serves every test in this binary: race one reader at a time.
+        static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let journal = dir.path().join("index.db-journal");
+        let writer = rusqlite::Connection::open(&path).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode=DELETE; CREATE TABLE witness(id INTEGER);
+                 INSERT INTO witness VALUES (1);",
+            )
+            .unwrap();
+        writer
+            .execute_batch("BEGIN IMMEDIATE; UPDATE witness SET id=2")
+            .unwrap();
+        assert!(journal.exists(), "the writer's live journal");
+        let vfs = gated_vfs();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        *JOURNAL_SEEN_GATE.lock().unwrap() = Some((seen_tx, resume_rx));
+        let reader_path = path.clone();
+        let reader = std::thread::spawn(move || {
+            let reader = rusqlite::Connection::open_with_flags_and_vfs(
+                &reader_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                vfs,
+            )
+            .unwrap();
+            reader.busy_timeout(Duration::from_secs(5)).unwrap();
+            read(&reader, &reader_path)
+        });
+        seen_rx
+            .recv_timeout(crate::testing::HANG_BACKSTOP)
+            .expect("reader reached the hot-journal check");
+        writer.execute_batch("ROLLBACK").unwrap();
+        assert!(!journal.exists(), "rollback deleted the journal");
+        resume_tx.send(()).unwrap();
+        reader.join().unwrap()
+    }
+
+    type Attempts = Vec<std::result::Result<i64, String>>;
+
+    /// One retried read of the witness row, recording every attempt.
+    fn retried_read(
+        budget: Duration,
+    ) -> impl FnOnce(&Connection, &Path) -> (Result<i64>, Attempts) + Send + 'static {
+        move |reader, path| {
+            let mut attempts = vec![];
+            let result = retry_stale_hot_journal(path, budget, || {
+                let read = storage_result(
+                    reader.query_row("SELECT id FROM witness", [], |r| r.get::<_, i64>(0)),
+                );
+                attempts.push(read.as_ref().map(|id| *id).map_err(|e| e.to_string()));
+                read
+            });
+            (result, attempts)
+        }
+    }
+
+    /// #183: a reader racing a writer's rollback gets SQLite's false-positive
+    /// hot-journal verdict (SQLite ticket #3883). With the journal gone it is
+    /// contention: the read retries and sees the rolled-back data.
+    #[test]
+    fn stale_hot_journal_verdict_racing_a_writer_rollback_is_retried() {
+        let (result, attempts) = read_racing_writer_rollback(retried_read(Duration::from_secs(5)));
+        assert_eq!(
+            attempts,
+            vec![Err(HOT_INDEX_JOURNAL.to_string()), Ok(1)],
+            "the first read saw the false positive, the retry read"
+        );
+        assert_eq!(result.unwrap(), 1);
+    }
+
+    /// A read transaction's snapshot is where its hot-journal check runs: it
+    /// retries the stale verdict and later reads in it need no retry.
+    #[test]
+    fn read_snapshot_retries_a_stale_hot_journal_verdict() {
+        let id = read_racing_writer_rollback(|reader, path| {
+            reader.execute_batch("BEGIN DEFERRED").unwrap();
+            begin_read_snapshot(reader, path, Duration::from_secs(5)).unwrap();
+            let id = storage_result(
+                reader.query_row("SELECT id FROM witness", [], |r| r.get::<_, i64>(0)),
+            );
+            reader.execute_batch("COMMIT").unwrap();
+            id
+        });
+        assert_eq!(id.unwrap(), 1);
+    }
+
+    /// Maintenance's zero-wait probes take their snapshot with no budget: the
+    /// stale verdict becomes contention, which defers the maintenance unit.
+    #[test]
+    fn zero_wait_read_snapshot_defers_a_stale_hot_journal_verdict() {
+        let error = read_racing_writer_rollback(|reader, path| {
+            reader.execute_batch("BEGIN DEFERRED").unwrap();
+            begin_read_snapshot(reader, path, Duration::ZERO)
+        })
+        .unwrap_err();
+        assert!(
+            error.downcast_ref::<SqliteContention>().is_some(),
+            "{error:#}"
+        );
+        assert!(maintenance_contention(&error));
+    }
+
+    /// With no wait budget left, the stale verdict is typed contention, never
+    /// a recovery requirement.
+    #[test]
+    fn stale_hot_journal_verdict_without_budget_is_typed_contention() {
+        let (result, attempts) = read_racing_writer_rollback(retried_read(Duration::ZERO));
+        assert_eq!(attempts, vec![Err(HOT_INDEX_JOURNAL.to_string())]);
+        let error = result.unwrap_err();
+        assert!(
+            error.downcast_ref::<SqliteContention>().is_some(),
+            "{error:#}"
+        );
+        assert!(transient_storage_contention(&error));
+    }
+
+    /// A journal SQLite still finds hot, with no writer, keeps the typed
+    /// recovery requirement at once.
+    #[test]
+    fn persistent_hot_journal_keeps_its_recovery_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let writer = rusqlite::Connection::open(&path).unwrap();
+        writer
+            .execute_batch("PRAGMA journal_mode=DELETE; CREATE TABLE witness(id INTEGER)")
+            .unwrap();
+        drop(writer);
+        std::fs::write(dir.path().join("index.db-journal"), [0xd9u8; 512]).unwrap();
+        let reader = rusqlite::Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let mut attempts = 0;
+        let error = retry_stale_hot_journal(&path, Duration::from_secs(5), || {
+            attempts += 1;
+            storage_result(
+                reader.query_row("SELECT count(*) FROM witness", [], |r| r.get::<_, i64>(0)),
+            )
+        })
+        .unwrap_err();
+        assert_eq!(attempts, 1);
+        assert!(error.downcast_ref::<HotIndexJournal>().is_some());
+        assert_eq!(error.to_string(), HOT_INDEX_JOURNAL);
     }
 
     #[test]
@@ -7092,7 +7371,12 @@ impl Store {
         self.identity.verify()?;
         let use_guard = self.roots.index_use_existing(&self.identity)?;
         let path = self.roots.index_db(&self.identity);
-        let db = match open_index(&path, writable) {
+        let opened = if writable {
+            open_index(&path, writable)
+        } else {
+            retry_stale_hot_journal(&path, Duration::from_secs(5), || open_index(&path, false))
+        };
+        let db = match opened {
             Ok(db) => db,
             Err(error)
                 if self.disposition() == RecoveryDisposition::Rebuild
@@ -7580,6 +7864,11 @@ impl Store {
         self.ensure_not_recreate_pending()?;
         let mut db = self.cache()?;
         let tx = storage_result(db.transaction())?;
+        begin_read_snapshot(
+            &tx,
+            &self.roots.index_db(&self.identity),
+            Duration::from_secs(5),
+        )?;
         self.recovery_baseline(&tx)
     }
     // Only publication callers may defer retained/header checks: the selected
@@ -7588,6 +7877,11 @@ impl Store {
         self.ensure_not_recreate_pending()?;
         let mut db = self.cache()?;
         let tx = storage_result(db.transaction())?;
+        begin_read_snapshot(
+            &tx,
+            &self.roots.index_db(&self.identity),
+            Duration::from_secs(5),
+        )?;
         self.recovery_baseline_preflight(&tx)
     }
     #[cfg(feature = "test-support")]
@@ -7634,6 +7928,11 @@ impl Store {
     pub fn recorded_index_options(&self) -> Result<Option<crate::indexer::IndexOptions>> {
         let mut db = self.cache()?;
         let tx = storage_result(db.transaction())?;
+        begin_read_snapshot(
+            &tx,
+            &self.roots.index_db(&self.identity),
+            Duration::from_secs(5),
+        )?;
         let schema: u32 =
             storage_result(tx.pragma_query_value(None, "user_version", |row| row.get(0)))?;
         if schema != DATABASE_SCHEMA_VERSION {
@@ -7759,6 +8058,11 @@ impl Store {
         writer.belongs_to(&self.identity)?;
         let db = self.cache()?;
         storage_result(db.execute_batch("BEGIN DEFERRED"))?;
+        begin_read_snapshot(
+            &db,
+            &self.roots.index_db(&self.identity),
+            Duration::from_secs(5),
+        )?;
         let selected = self.read_revision_for(&db, Some(committed_pin), true)?;
         ensure!(
             selected.pin == committed_pin,
@@ -7840,6 +8144,11 @@ impl Store {
             .cache()
             .map_err(|error| self.report_live_read_failure(error))?;
         storage_result(db.execute_batch("BEGIN DEFERRED"))?;
+        begin_read_snapshot(
+            &db,
+            &self.roots.index_db(&self.identity),
+            Duration::from_secs(5),
+        )?;
         let schema: u32 =
             storage_result(db.pragma_query_value(None, "user_version", |row| row.get(0)))?;
         if schema != DATABASE_SCHEMA_VERSION {
@@ -8361,6 +8670,11 @@ impl Store {
     ) -> Result<T> {
         let db = self.cache()?;
         db.execute_batch("BEGIN DEFERRED")?;
+        begin_read_snapshot(
+            &db,
+            &self.roots.index_db(&self.identity),
+            Duration::from_secs(5),
+        )?;
         let baseline = self.recovery_baseline_preflight(&db)?;
         ensure!(
             baseline.compatible && baseline.pin().is_some_and(|p| p.index_revision > 0),
@@ -10256,6 +10570,8 @@ impl Store {
                 false,
                 Duration::ZERO,
             )?;
+            storage_result(db.execute_batch("BEGIN DEFERRED"))?;
+            begin_read_snapshot(&db, &self.roots.index_db(&self.identity), Duration::ZERO)?;
             if !has_revision_release_debt(&db)? {
                 guard.verify()?;
                 return Ok(None);
@@ -10401,6 +10717,15 @@ impl Store {
             }
             Err(error) => return Err(error),
         };
+        let snapshot = storage_result(db.execute_batch("BEGIN DEFERRED"))
+            .and_then(|()| begin_read_snapshot(&db, &path, Duration::ZERO));
+        if let Err(error) = snapshot {
+            if maintenance_contention(&error) {
+                self.record_maintenance_busy(&error);
+                return Ok(MaintenanceOutcome::Deferred);
+            }
+            return Err(error);
+        }
         if !has_revision_release_debt(&db)? {
             guard.verify()?;
             return Ok(MaintenanceOutcome::Idle);
@@ -10634,6 +10959,12 @@ impl Store {
         let origin = clock.origin_wall;
         drop(clock);
         let db = self.cache()?;
+        storage_result(db.execute_batch("BEGIN DEFERRED"))?;
+        begin_read_snapshot(
+            &db,
+            &self.roots.index_db(&self.identity),
+            Duration::from_secs(5),
+        )?;
         let head = ReadRevision::current(&db)?.pin;
         ensure!(
             pin.index_generation == head.index_generation
@@ -10670,6 +11001,8 @@ impl Store {
                 false,
                 Duration::ZERO,
             )?;
+            storage_result(db.execute_batch("BEGIN DEFERRED"))?;
+            begin_read_snapshot(&db, &self.roots.index_db(&self.identity), Duration::ZERO)?;
             let exact: Option<(String, i64, i64, i64)> = db
                 .query_row(
                     "SELECT state,
