@@ -1783,7 +1783,22 @@ impl CheckoutRuntime {
                         "cli_index_wait",
                         &format!("id={} state={} seen={seen}", accepted.id, row.state),
                     );
-                    resources.store.wait_terminal_change(seen);
+                    // A long index waits as long as it takes. Only a worker
+                    // whose every step has failed for the grace ends the wait
+                    // (#179); the accepted request stays queued for its retry.
+                    if let Some((since, error)) = resources.scheduler.step_fault() {
+                        let give_up = since + resources.scheduler.step_fault_grace();
+                        if Instant::now() >= give_up {
+                            anyhow::bail!(
+                                "outcome_unknown: request {} is still {}; the checkout worker has been failing: {error}; inspect job status",
+                                accepted.id,
+                                row.state
+                            );
+                        }
+                        resources.store.wait_terminal_change_until(seen, give_up);
+                    } else {
+                        resources.store.wait_terminal_change(seen);
+                    }
                     crate::index_coordinator::diagnostic_marker(
                         "-",
                         "cli_index_woke",

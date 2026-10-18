@@ -5938,6 +5938,25 @@ impl Store {
         );
     }
 
+    /// As `wait_terminal_change`, returning at `deadline` at the latest.
+    pub fn wait_terminal_change_until(&self, seen: u64, deadline: Instant) {
+        let gate = &self.publication_gate;
+        let commits = gate.terminal_commits.lock().unwrap();
+        let timeout = deadline.saturating_duration_since(Instant::now());
+        drop(
+            gate.terminal_changed
+                .wait_timeout_while(commits, timeout, |current| *current == seen)
+                .unwrap(),
+        );
+    }
+
+    /// Wake request waiters to re-check without a terminal COMMIT: the
+    /// worker's fault state changed (#179). The generation still advances, so
+    /// a waiter that recorded it before re-reading cannot miss the wake.
+    pub(crate) fn wake_request_waiters(&self) {
+        self.publication_gate.notify_terminal();
+    }
+
     /// The waiting count is registered before waiting, giving new publications
     /// priority over the next maintenance unit. The permit is owned across ACK.
     pub fn enter_publication(

@@ -379,8 +379,50 @@ pub(super) struct WatchStatus {
 const STEP_RETRY: Duration = Duration::from_millis(250);
 /// Retention runs at most this often while idle (a deferral shortens it).
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
+/// A CLI index waiter stops waiting once every worker step has failed for
+/// this long (#179). A long index that is still making progress has no bound.
+const STEP_FAULT_GRACE: Duration = Duration::from_secs(60);
 
 impl DaemonState {
+    /// Publish whether the last step failed. Only a change from succeeding to
+    /// failing, or back, wakes request waiters to re-check.
+    fn note_step_outcome(&self, error: Option<String>) {
+        let mut fault = self.step_fault.lock().unwrap();
+        match (fault.is_some(), error) {
+            (false, Some(error)) => *fault = Some((Instant::now(), error)),
+            (true, None) => *fault = None,
+            _ => return,
+        }
+        drop(fault);
+        self.store.wake_request_waiters();
+    }
+
+    /// Since when every worker step has failed, with the first error.
+    pub fn step_fault(&self) -> Option<(Instant, String)> {
+        self.step_fault.lock().unwrap().clone()
+    }
+
+    /// How long a CLI index waiter tolerates a failing worker.
+    pub fn step_fault_grace(&self) -> Duration {
+        #[cfg(feature = "test-support")]
+        if let Some(grace) = *self.step_fault_grace.lock().unwrap() {
+            return grace;
+        }
+        STEP_FAULT_GRACE
+    }
+
+    /// Fail every worker step with `error` until set back to `None`.
+    #[cfg(feature = "test-support")]
+    pub fn fail_steps_for_tests(&self, error: Option<&str>) {
+        *self.fail_steps.lock().unwrap() = error.map(str::to_owned);
+        self.inbox.wake();
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn set_step_fault_grace_for_tests(&self, grace: Duration) {
+        *self.step_fault_grace.lock().unwrap() = Some(grace);
+    }
+
     /// Start this checkout's worker thread, or wake it if it is running. A
     /// synchronous fixture without a Tokio runtime drives `worker_step` itself.
     pub(super) fn start_worker(self: &Arc<Self>) {
@@ -850,6 +892,11 @@ fn worker_loop(weak: std::sync::Weak<DaemonState>, inbox: Arc<WorkerInbox>) {
         }
         let step = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| state.worker_step()));
         state.publish_fifo_pending();
+        state.note_step_outcome(match &step {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(format!("{error:#}")),
+            Err(_) => Some("panicked".to_owned()),
+        });
         deadline = match step {
             Ok(Ok(())) => {
                 // The witness reads phase only after the step released its locks.

@@ -553,13 +553,10 @@ fn send_daemon(request: &protocol::Request, read_only: bool) -> Result<serde_jso
         return checked_reply(reply);
     }
     // Index replies only once its request is terminal, and that takes as long
-    // as the checkout needs (#179). Its wait ends with the reply or with the
-    // daemon's connection; the requests.db row stays the answer either way.
-    let reply_bound = Duration::from_secs(60);
-    #[cfg(feature = "test-support")]
-    let reply_bound =
-        metrics_test_duration("TRELLIS_TEST_CLI_REPLY_BOUND_MS").unwrap_or(reply_bound);
-    let reply_bound = (request.operation != "index").then_some(reply_bound);
+    // as the checkout needs (#179). The daemon ends the wait itself if its
+    // worker keeps failing; a daemon exit ends it too. Either way the
+    // requests.db row stays the answer.
+    let reply_bound = (request.operation != "index").then_some(Duration::from_secs(60));
     let mut first = Some(
         client::connect_or_start(&socket, start_daemon, Duration::from_secs(5))
             .map_err(|_| anyhow::anyhow!("daemon_unavailable"))?,

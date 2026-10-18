@@ -3000,6 +3000,58 @@ async fn gc_abandons_unserviced_pending_request_and_later_lookup_is_not_found() 
     );
 }
 
+/// #179: a CLI index waits as long as its request takes, but not on a worker
+/// whose every step keeps failing. After the grace it answers
+/// `outcome_unknown`, and its accepted request stays queued for the worker's
+/// retry, which completes it once the fault clears.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn cli_index_stops_waiting_on_a_persistently_failing_worker() {
+    let base = tempfile::tempdir().unwrap();
+    let root = base.path().join("faulty");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("a.js"), "function a() {}\n").unwrap();
+    let topology = roots(base.path());
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(CheckoutRegistry::with_roots(
+        topology.clone(),
+    )));
+    let checkout = identity(&root);
+    let queue = topology.requests_db(&checkout);
+    let runtime = {
+        let mut registry = registry.lock().await;
+        registry.attach_launch(1, &checkout).unwrap();
+        registry.activate(&checkout.root_key).unwrap()
+    };
+    ready(&runtime).await;
+    let scheduler = runtime.browser_scheduler().unwrap();
+    scheduler.set_step_fault_grace_for_tests(Duration::from_millis(300));
+    scheduler.fail_steps_for_tests(Some("storage_full: injected"));
+    let indexer = runtime.clone();
+    let options = trellis::indexer::IndexOptions::new(root.clone());
+    let error = tokio::time::timeout(
+        trellis::testing::HANG_BACKSTOP,
+        tokio::task::spawn_blocking(move || indexer.cli_index(&options)),
+    )
+    .await
+    .expect("waiting client was not answered")
+    .unwrap()
+    .expect_err("a failing worker cannot complete the request");
+    let message = format!("{error:#}");
+    assert!(message.starts_with("outcome_unknown"), "{message}");
+    assert!(message.contains("storage_full: injected"), "{message}");
+    let [row] = queue_rows(&queue).try_into().unwrap();
+    assert!(row.ends_with(":queued/"), "{row}");
+    scheduler.fail_steps_for_tests(None);
+    let id = row.split(':').next().unwrap().to_owned();
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        while queue_rows(&queue) != vec![format!("{id}:done/")] {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the accepted request did not complete after the fault cleared");
+}
+
 /// Decision 0008 §3, T04: a client already waiting on a request whose root is
 /// then lost gets `root_changed`, never `not_found`, even though eligible GC
 /// later deletes the index; a fresh lookup after GC gets `not_found`.

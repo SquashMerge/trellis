@@ -2331,36 +2331,53 @@ fn metrics_client_discards_partial_chunks_after_absolute_result_deadline() {
     server.join().unwrap();
 }
 
+/// #179: the CLI once gave up on every index reply after 60 seconds with
+/// `outcome_unknown`. With the daemon stopped, the reply can only come later.
 #[test]
-fn cli_index_waits_past_the_cli_reply_bound_for_its_terminal_request() {
-    // #179: an index that outlasts the 60-second reply bound under load ended
-    // in outcome_unknown. Shrink that bound so any real index outlasts it.
+fn cli_index_waits_past_sixty_seconds_for_its_reply() {
+    struct Resume(i32);
+    impl Drop for Resume {
+        fn drop(&mut self) {
+            unsafe { libc::kill(self.0, libc::SIGCONT) };
+        }
+    }
     let temp = short_temp();
     let home = temp.path().join("home");
     fs::create_dir(&home).unwrap();
     let _daemon = AutoDaemonGuard::for_home(&home);
-    let root = checkout(temp.path(), "slowindex");
-    fs::create_dir(root.join("src")).unwrap();
-    for number in 0..200 {
-        fs::write(
-            root.join(format!("src/f{number:03}.js")),
-            format!("function f{number:03}(x) {{ return x + 1; }}\n"),
-        )
+    let root = checkout(temp.path(), "stalled");
+    run(&home, "index", &root);
+    let daemon: i32 = fs::read_to_string(home.join("auto-daemon.pid"))
+        .unwrap()
+        .parse()
         .unwrap();
-    }
-    let indexed = cli(&home)
-        .arg("index")
-        .arg("--workspace")
-        .arg(&root)
-        .env("TRELLIS_TEST_CLI_REPLY_BOUND_MS", "1")
-        .output()
-        .unwrap();
-    assert!(
-        indexed.status.success(),
-        "{}",
-        String::from_utf8_lossy(&indexed.stderr)
+    // Dropped before the daemon guard, so a stopped daemon still gets its TERM.
+    let resume = Resume(daemon);
+    assert_eq!(unsafe { libc::kill(daemon, libc::SIGSTOP) }, 0);
+    let mut index = Owned(
+        cli(&home)
+            .arg("index")
+            .arg("--workspace")
+            .arg(&root)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
     );
-    let response: Value = serde_json::from_slice(&indexed.stdout).unwrap();
+    std::thread::sleep(Duration::from_millis(60_500));
+    assert!(
+        index.0.try_wait().unwrap().is_none(),
+        "index stopped waiting for its reply"
+    );
+    drop(resume);
+    let stdout = index.0.stdout.take().unwrap();
+    let mut stderr = index.0.stderr.take().unwrap();
+    let response: Value = serde_json::from_reader(stdout).unwrap_or_else(|error| {
+        let mut message = String::new();
+        let _ = std::io::Read::read_to_string(&mut stderr, &mut message);
+        panic!("{error}: {message}")
+    });
+    assert!(index.0.wait().unwrap().success());
     assert_eq!(
         response["status"]["revision"]["indexGeneration"],
         response["publishedRevision"]["indexGeneration"],
