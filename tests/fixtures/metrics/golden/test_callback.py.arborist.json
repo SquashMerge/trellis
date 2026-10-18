@@ -1,0 +1,27 @@
+{
+  "file_cognitive": 2,
+  "file_cyclomatic": 3,
+  "file_sloc": 9,
+  "functions": [
+    {
+      "cognitive": 0,
+      "cyclomatic": 1,
+      "end_line": 6,
+      "exceeds_threshold": null,
+      "name": "test_calc",
+      "sloc": 3,
+      "start_line": 4
+    },
+    {
+      "cognitive": 2,
+      "cyclomatic": 2,
+      "end_line": 11,
+      "exceeds_threshold": null,
+      "name": "calc",
+      "sloc": 4,
+      "start_line": 8
+    }
+  ],
+  "language": "Python",
+  "path": "tests/fixtures/metrics/python/test_callback.py"
+}

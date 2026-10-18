@@ -1,0 +1,27 @@
+{
+  "file_cognitive": 6,
+  "file_cyclomatic": 4,
+  "file_sloc": 8,
+  "functions": [
+    {
+      "cognitive": 3,
+      "cyclomatic": 2,
+      "end_line": 5,
+      "exceeds_threshold": null,
+      "name": "test_calc",
+      "sloc": 4,
+      "start_line": 2
+    },
+    {
+      "cognitive": 3,
+      "cyclomatic": 2,
+      "end_line": 8,
+      "exceeds_threshold": null,
+      "name": "calc",
+      "sloc": 3,
+      "start_line": 6
+    }
+  ],
+  "language": "Rust",
+  "path": "tests/fixtures/metrics/rust/callback.rs"
+}

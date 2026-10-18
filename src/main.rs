@@ -39,6 +39,8 @@ enum Command {
     Status(WorkspaceArgs),
     /// Search indexed symbol names and IDs (literal substring).
     Symbols(SymbolsArgs),
+    /// Compute pinned source complexity metrics without writing the index.
+    Metrics(MetricsArgs),
     /// Query a bounded static call view. This is not a runtime sequence.
     Query(QueryArgs),
     /// Export the normalized snapshot graph as JSON, including indexed source.
@@ -150,6 +152,29 @@ struct QueryArgs {
     exclude_path: Vec<String>,
 }
 #[derive(Args)]
+struct MetricsArgs {
+    #[command(flatten)]
+    workspace: WorkspaceArgs,
+    #[arg(long)]
+    json: bool,
+    #[arg(long)]
+    pin: Option<String>,
+    #[arg(long, default_value = "revision")]
+    scope: String,
+    #[arg(long)]
+    source_set_id: Option<String>,
+    #[arg(long)]
+    language: Option<String>,
+    #[arg(long)]
+    path: Option<String>,
+    #[arg(long)]
+    sid: Option<String>,
+    #[arg(long, default_value = "sum")]
+    aggregate: String,
+    #[arg(long)]
+    metrics: Option<String>,
+}
+#[derive(Args)]
 struct ExportArgs {
     #[command(flatten)]
     workspace: WorkspaceArgs,
@@ -249,6 +274,7 @@ async fn main() -> Result<()> {
         | Command::Status(_)
         | Command::Symbols(_)
         | Command::Query(_)
+        | Command::Metrics(_)
         | Command::Export(_)) => dispatch_cli(&command)?,
     }
     Ok(())
@@ -490,6 +516,42 @@ fn checked_reply(reply: protocol::Reply) -> Result<serde_json::Value> {
 
 fn send_daemon(request: &protocol::Request, read_only: bool) -> Result<serde_json::Value> {
     let socket = socket_path()?;
+    if request.operation == "metrics" {
+        let started = Instant::now();
+        let ingress_window = Duration::from_secs(20);
+        #[cfg(feature = "test-support")]
+        let ingress_window = metrics_test_duration("TRELLIS_TEST_METRICS_CLIENT_INGRESS_MS")
+            .unwrap_or(ingress_window);
+        let ingress = started + ingress_window;
+        let work = if matches!(
+            request.payload["args"]["scope"].as_str(),
+            Some("revision" | "directory")
+        ) {
+            Duration::from_secs(300)
+        } else {
+            Duration::from_secs(30)
+        };
+        #[cfg(feature = "test-support")]
+        let work = metrics_test_duration("TRELLIS_TEST_METRICS_CLIENT_WORK_MS").unwrap_or(work);
+        let error_window = Duration::from_millis(500);
+        #[cfg(feature = "test-support")]
+        let error_window =
+            metrics_test_duration("TRELLIS_TEST_METRICS_CLIENT_ERROR_MS").unwrap_or(error_window);
+        let transfer_window = Duration::from_secs(30);
+        #[cfg(feature = "test-support")]
+        let transfer_window = metrics_test_duration("TRELLIS_TEST_METRICS_CLIENT_TRANSFER_MS")
+            .unwrap_or(transfer_window);
+        let end = ingress + work + error_window + transfer_window;
+        let reply = client::call_metrics(request, ingress, end, |timeout| {
+            client::connect_or_start_metrics(
+                || std::os::unix::net::UnixStream::connect(&socket),
+                start_daemon,
+                timeout,
+            )
+        })
+        .map_err(|error| anyhow::anyhow!("{}", error.code()))?;
+        return checked_reply(reply);
+    }
     let mut first = Some(
         client::connect_or_start(&socket, start_daemon, Duration::from_secs(5))
             .map_err(|_| anyhow::anyhow!("daemon_unavailable"))?,
@@ -541,6 +603,90 @@ fn dispatch_cli(command: &Command) -> Result<()> {
                 true,
             )
         }
+        Command::Metrics(args) => {
+            let mut options = trellis::store::MetricsOptions {
+                scope: args.scope.clone(),
+                source_set_id: args.source_set_id.clone(),
+                language: args.language.clone(),
+                path: args.path.clone(),
+                sid: args.sid.clone(),
+                aggregate: args.aggregate.clone(),
+                ..Default::default()
+            };
+            if let Some(names) = &args.metrics {
+                ensure!(
+                    !names.is_empty(),
+                    "invalid_argument: empty metrics selection"
+                );
+                options.metrics = names.split(',').map(str::to_owned).collect();
+            }
+            if let Some(pin) = &args.pin {
+                let (generation, revision) = pin
+                    .rsplit_once(':')
+                    .context("invalid_argument: pin requires generation:revision")?;
+                ensure!(
+                    !revision.is_empty() && revision.bytes().all(|byte| byte.is_ascii_digit()),
+                    "invalid_argument: invalid revision"
+                );
+                let revision = revision
+                    .parse::<u64>()
+                    .map_err(|_| anyhow::anyhow!("invalid_argument: invalid revision"))?;
+                options.pin = Some(
+                    serde_json::from_value(serde_json::json!({
+                        "indexGeneration": generation, "indexRevision": revision
+                    }))
+                    .map_err(|error| anyhow::anyhow!("invalid_argument: invalid pin: {error}"))?,
+                );
+            }
+            options
+                .validate()
+                .map_err(|error| anyhow::anyhow!("invalid_argument: {error}"))?;
+            ensure!(
+                options.source_set_id.as_deref().is_none_or(|id| id
+                    .starts_with("source-set:v1:path-")
+                    && id.len() == 83
+                    && id[19..]
+                        .bytes()
+                        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())),
+                "invalid_argument: source set ID"
+            );
+            ensure!(
+                options
+                    .sid
+                    .as_deref()
+                    .is_none_or(|sid| sid.starts_with("sid:v1:")
+                        && sid.len() == 39
+                        && sid[7..]
+                            .bytes()
+                            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())),
+                "invalid_argument: sid"
+            );
+            ensure!(
+                options
+                    .path
+                    .as_deref()
+                    .is_none_or(|path| !path.contains([':', '\\', '\0'])),
+                "invalid_argument: path"
+            );
+            ensure!(
+                options.language.as_deref().is_none_or(|language| matches!(
+                    language,
+                    "java" | "python" | "javascript" | "rust"
+                )),
+                "invalid_argument: language"
+            );
+            (
+                "metrics",
+                &args.workspace,
+                serde_json::json!({
+                    "scope": options.scope, "sourceSetId": options.source_set_id,
+                    "language": options.language, "path": options.path,
+                    "sid": options.sid, "aggregate": options.aggregate,
+                    "metrics": options.metrics, "pin": options.pin
+                }),
+                true,
+            )
+        }
         Command::Export(args) => ("export", &args.workspace, serde_json::json!({}), true),
         Command::Index(args) => (
             "index",
@@ -554,6 +700,14 @@ fn dispatch_cli(command: &Command) -> Result<()> {
         _ => unreachable!(),
     };
     let (roots, identity) = workspace.resolve_unattached()?;
+    if let Command::Metrics(args) = command
+        && args.metrics.is_none()
+    {
+        payload
+            .as_object_mut()
+            .expect("metrics args object")
+            .remove("metrics");
+    }
     if let Command::Index(args) = command {
         ensure!(
             (1..=16_777_216).contains(&args.max_file_bytes.unwrap_or(2_097_152)),
@@ -601,6 +755,34 @@ fn dispatch_cli(command: &Command) -> Result<()> {
         serde_json::to_writer_pretty(&mut file, &value)?;
         file.write_all(b"\n")?;
         file.flush()?;
+    } else if let Command::Metrics(args) = command {
+        if args.json {
+            print_json(&value)?;
+        } else {
+            let payload = &value["payload"];
+            println!(
+                "metrics {}:{} ({}, {}, catchingUp={})",
+                payload["indexGeneration"].as_str().unwrap_or("?"),
+                payload["indexRevision"],
+                payload["scope"].as_str().unwrap_or("?"),
+                payload["aggregate"].as_str().unwrap_or("?"),
+                value["catchingUp"]
+            );
+            for kind in ["declarations", "files", "directories"] {
+                if let Some(rows) = payload[kind].as_array() {
+                    for row in rows {
+                        println!(
+                            "{} {} {} {} {}",
+                            kind,
+                            row["sourceSetId"].as_str().unwrap_or("?"),
+                            row["path"].as_str().unwrap_or("?"),
+                            row["sid"].as_str().unwrap_or(""),
+                            row["metrics"]
+                        );
+                    }
+                }
+            }
+        }
     } else {
         print_json(&value)?;
     }
@@ -821,6 +1003,7 @@ async fn run_daemon() -> Result<()> {
                         continue;
                     }
                 };
+                let accepted_at = Instant::now();
                 let stream = stream.into_std()?;
                 stream.set_nonblocking(false)?;
                 let registry = registry.clone();
@@ -828,7 +1011,7 @@ async fn run_daemon() -> Result<()> {
                 let id = next_session.fetch_add(1, Ordering::Relaxed);
                 let browser_shutdown = browser_shutdown.clone();
                 tokio::task::spawn_blocking(move || {
-                    let _ = dispatch_connection(stream, id, registry, browser, browser_shutdown);
+                    let _ = dispatch_connection(stream, id, registry, browser, browser_shutdown, accepted_at);
                 });
             }
         }
@@ -873,10 +1056,51 @@ fn dispatch_connection(
     registry: Arc<tokio::sync::Mutex<registry::CheckoutRegistry>>,
     browser: Arc<tokio::sync::Mutex<daemon::BrowserProvisioner>>,
     browser_shutdown: tokio::sync::watch::Sender<bool>,
+    accepted_at: Instant,
 ) -> Result<()> {
     let runtime = tokio::runtime::Handle::current();
     stream.set_read_timeout(Some(Duration::from_secs(15)))?;
-    let request: protocol::Request = protocol::read_frame(&mut stream)?;
+    use std::io::{Cursor, Read};
+    let mut first = [0u8; 1];
+    stream.read_exact(&mut first)?;
+    let prefaced = first[0] == 0xff;
+    let ingress_deadline = accepted_at + Duration::from_secs(20);
+    #[cfg(feature = "test-support")]
+    let ingress_deadline = std::env::var("TRELLIS_TEST_METRICS_INGRESS_DEADLINE_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|milliseconds| accepted_at + Duration::from_millis(milliseconds))
+        .unwrap_or(ingress_deadline);
+    let request: protocol::Request = if prefaced {
+        protocol::read_prefaced_frame_until(&mut stream, ingress_deadline)?
+    } else {
+        protocol::read_frame(&mut Cursor::new(first).chain(&mut stream))?
+    };
+    if prefaced {
+        ensure!(
+            request.operation == "metrics",
+            "invalid prefaced daemon operation"
+        );
+        #[cfg(feature = "test-support")]
+        if let Some(delay) = metrics_test_duration("TRELLIS_TEST_METRICS_ACK_DELAY_MS") {
+            std::thread::sleep(delay);
+        }
+        protocol::write_frame_until(
+            &mut stream,
+            &protocol::Reply {
+                id: request.id,
+                payload: serde_json::json!({"admitted": true}),
+            },
+            ingress_deadline,
+        )?;
+        #[cfg(feature = "test-support")]
+        metrics_test_phase(b"A");
+    } else {
+        ensure!(
+            request.operation != "metrics",
+            "metrics admission preface required"
+        );
+    }
     if request.operation == "mcp" {
         let relayed = request
             .payload
@@ -979,10 +1203,32 @@ fn dispatch_connection(
     // One deadline for the whole CLI read (#142): activation contention, the
     // wait for startup reconciliation and every SQLite busy wait share it, so
     // they cannot stack. When it passes the read fails typed.
-    let request_deadline = Instant::now() + CLI_READ_WAIT;
+    let metrics = request.operation == "metrics";
+    let metrics_work = if matches!(
+        request.payload["args"]["scope"].as_str(),
+        Some("revision" | "directory")
+    ) {
+        Duration::from_secs(300)
+    } else {
+        Duration::from_secs(30)
+    };
+    #[cfg(feature = "test-support")]
+    let metrics_work =
+        metrics_test_duration("TRELLIS_TEST_METRICS_WORK_DEADLINE_MS").unwrap_or(metrics_work);
+    #[cfg(feature = "test-support")]
+    let metrics_work = if matches!(
+        request.payload["args"]["scope"].as_str(),
+        Some("file" | "declaration")
+    ) {
+        metrics_test_duration_file("TRELLIS_TEST_METRICS_FILE_WORK_DEADLINE_MS_FILE")
+            .unwrap_or(metrics_work)
+    } else {
+        metrics_work
+    };
+    let request_deadline = Instant::now() + if metrics { metrics_work } else { CLI_READ_WAIT };
     let read_scope = matches!(
         request.operation.as_str(),
-        "status" | "symbols" | "query" | "export"
+        "status" | "symbols" | "query" | "export" | "metrics"
     );
     let run = || -> Result<serde_json::Value> {
         let root: PathBuf = serde_json::from_value(
@@ -1033,10 +1279,20 @@ fn dispatch_connection(
         ensure!(
             matches!(
                 request.operation.as_str(),
-                "status" | "symbols" | "query" | "export" | "index"
+                "status" | "symbols" | "query" | "export" | "index" | "metrics"
             ),
             "unknown daemon operation"
         );
+        let metrics_options = if metrics {
+            Some(metrics_options_from_request(
+                request
+                    .payload
+                    .get("args")
+                    .context("invalid_argument: missing args")?,
+            )?)
+        } else {
+            None
+        };
         let identity = if request.operation == "status" {
             identity.attach_existing_marker_readonly()?
         } else {
@@ -1088,6 +1344,124 @@ fn dispatch_connection(
                     exclude_paths: serde_json::from_value(args["excludePaths"].clone())?,
                 }),
                 "export" => checkout.cli_export(),
+                "metrics" => {
+                    let options = metrics_options.as_ref().expect("metrics options validated");
+                    let mut before_work = || {
+                        #[cfg(feature = "test-support")]
+                        metrics_test_phase(b"W");
+                        #[cfg(feature = "test-support")]
+                        if let Ok(gate) = std::env::var("TRELLIS_TEST_METRICS_WORK_GATE") {
+                            use std::io::Write;
+                            let gate = PathBuf::from(gate);
+                            if let Ok(mut started) = std::fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(gate.join("started"))
+                            {
+                                let _ = started.write_all(b"x");
+                            }
+                            while !gate.join("release").exists()
+                                && Instant::now() < request_deadline
+                            {
+                                std::thread::sleep(Duration::from_millis(20));
+                            }
+                        }
+                        #[cfg(feature = "test-support")]
+                        if let Ok(delay) = std::env::var("TRELLIS_TEST_METRICS_WORK_DELAY_MS")
+                            && let Ok(milliseconds) = delay.parse::<u64>()
+                        {
+                            std::thread::sleep(Duration::from_millis(milliseconds).min(
+                                request_deadline.saturating_duration_since(Instant::now())
+                                    + Duration::from_millis(100),
+                            ));
+                        }
+                    };
+                    #[cfg(feature = "test-support")]
+                    let mut delayed_parse = false;
+                    let mut on_progress = || {
+                        #[cfg(feature = "test-support")]
+                        if !delayed_parse
+                            && trellis::metrics::in_parser_progress_for_tests()
+                            && let Ok(delay) = std::env::var("TRELLIS_TEST_METRICS_PARSE_DELAY_MS")
+                            && let Ok(milliseconds) = delay.parse::<u64>()
+                        {
+                            delayed_parse = true;
+                            if let Ok(path) = std::env::var("TRELLIS_TEST_METRICS_PARSE_HIT_FILE") {
+                                let _ = std::fs::write(path, b"parse");
+                            }
+                            std::thread::sleep(Duration::from_millis(milliseconds).min(
+                                request_deadline.saturating_duration_since(Instant::now())
+                                    + Duration::from_millis(100),
+                            ));
+                        }
+                    };
+                    #[cfg(feature = "test-support")]
+                    let serialize_threshold =
+                        std::env::var("TRELLIS_TEST_METRICS_SERIALIZE_DELAY_AT_BYTES")
+                            .ok()
+                            .or_else(|| {
+                                std::env::var("TRELLIS_TEST_METRICS_SERIALIZE_DELAY_AT_BYTES_FILE")
+                                    .ok()
+                                    .and_then(|path| std::fs::read_to_string(path).ok())
+                            })
+                            .and_then(|value| value.trim().parse::<usize>().ok());
+                    #[cfg(feature = "test-support")]
+                    let serialize_delay = std::env::var("TRELLIS_TEST_METRICS_SERIALIZE_DELAY_MS")
+                        .ok()
+                        .and_then(|value| value.parse::<u64>().ok());
+                    #[cfg(feature = "test-support")]
+                    let mut delayed_serialize = false;
+                    let mut on_write = |written: usize| {
+                        #[cfg(feature = "test-support")]
+                        if !delayed_serialize
+                            && serialize_threshold.is_some_and(|threshold| written >= threshold)
+                            && let Some(milliseconds) = serialize_delay
+                        {
+                            delayed_serialize = true;
+                            if let Ok(path) =
+                                std::env::var("TRELLIS_TEST_METRICS_SERIALIZE_HIT_FILE")
+                            {
+                                let _ = std::fs::write(path, b"serialize");
+                            }
+                            std::thread::sleep(Duration::from_millis(milliseconds).min(
+                                request_deadline.saturating_duration_since(Instant::now())
+                                    + Duration::from_millis(100),
+                            ));
+                        }
+                        let _ = written;
+                    };
+                    #[cfg(feature = "test-support")]
+                    let limit = std::env::var("TRELLIS_TEST_METRICS_LIMIT_FILE")
+                        .ok()
+                        .and_then(|path| std::fs::read_to_string(path).ok())
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                        .unwrap_or(64 * 1024 * 1024)
+                        .min(64 * 1024 * 1024);
+                    #[cfg(not(feature = "test-support"))]
+                    let limit = 64 * 1024 * 1024;
+                    let (body, _) = checkout.metrics_response(
+                        options,
+                        &mut || {
+                            if Instant::now() >= request_deadline {
+                                anyhow::bail!("deadline_exceeded");
+                            }
+                            Ok(())
+                        },
+                        registry::MetricsResponseHooks {
+                            before_work: &mut before_work,
+                            before_finish: &mut || {},
+                            after_finish: &mut || {},
+                            on_write: &mut on_write,
+                            on_progress: &mut on_progress,
+                        },
+                        limit,
+                    )?;
+                    let value = serde_json::from_slice(&body)?;
+                    if Instant::now() >= request_deadline {
+                        anyhow::bail!("deadline_exceeded");
+                    }
+                    Ok(value)
+                }
                 "index" => {
                     let mut options = IndexOptions::new(identity.root.clone());
                     options.scip_path = serde_json::from_value(args["scip"].clone())?;
@@ -1132,14 +1506,43 @@ fn dispatch_connection(
     if !serve {
         runtime.block_on(async { registry.lock().await.disconnect(session) });
     }
+    #[cfg(feature = "test-support")]
+    if metrics
+        && result.as_ref().err().is_some_and(|error| {
+            let message = error.to_string();
+            message.contains("deadline_exceeded") || message.contains("cancelled")
+        })
+        && let Some(delay) = metrics_test_duration_file("TRELLIS_TEST_METRICS_ERROR_DELAY_MS_FILE")
+            .or_else(|| metrics_test_duration("TRELLIS_TEST_METRICS_ERROR_DELAY_MS"))
+    {
+        std::thread::sleep(delay);
+    }
+    let expired_success = metrics && result.is_ok() && Instant::now() >= request_deadline;
     let reply = protocol::Reply {
         id: request.id,
         payload: match result {
+            Ok(_) if expired_success => serde_json::json!({"error": "deadline_exceeded"}),
             Ok(value) => serde_json::json!({"result": value}),
             Err(error) => serde_json::json!({"error": format!("{error:#}")}),
         },
     };
-    write_daemon_reply(&mut stream, &reply)?;
+    if metrics {
+        let transfer_window = Duration::from_secs(30);
+        #[cfg(feature = "test-support")]
+        let transfer_window =
+            metrics_test_duration_file("TRELLIS_TEST_METRICS_TRANSFER_DEADLINE_MS_FILE")
+                .or_else(|| metrics_test_duration("TRELLIS_TEST_METRICS_TRANSFER_DEADLINE_MS"))
+                .unwrap_or(transfer_window);
+        let transfer_deadline = Instant::now() + transfer_window;
+        if Instant::now() >= request_deadline + Duration::from_millis(500)
+            && result_is_deadline(&reply.payload)
+        {
+            return Ok(());
+        }
+        write_daemon_reply_until(&mut stream, &reply, transfer_deadline)?;
+    } else {
+        write_daemon_reply(&mut stream, &reply)?;
+    }
     if serve {
         // This control connection only observes the daemon process lifetime:
         // it ends when the client closes it or the daemon stops, signalled by
@@ -1183,6 +1586,221 @@ fn write_daemon_reply(
                     payload: serde_json::json!({"chunk": hex::encode(chunk), "more": more}),
                 },
             )?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+fn metrics_test_duration(name: &str) -> Option<Duration> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+}
+
+#[cfg(feature = "test-support")]
+fn metrics_test_duration_file(name: &str) -> Option<Duration> {
+    std::env::var(name)
+        .ok()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_millis)
+}
+
+#[cfg(feature = "test-support")]
+fn metrics_test_phase(mark: &[u8]) {
+    use std::io::Write;
+    if let Ok(path) = std::env::var("TRELLIS_TEST_METRICS_PHASE_ORDER_FILE")
+        && let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+    {
+        let _ = file.write_all(mark);
+    }
+}
+
+fn result_is_deadline(payload: &serde_json::Value) -> bool {
+    payload["error"]
+        .as_str()
+        .is_some_and(|value| value.contains("deadline_exceeded") || value.contains("cancelled"))
+}
+
+fn metrics_options_from_request(
+    args: &serde_json::Value,
+) -> Result<trellis::store::MetricsOptions> {
+    fn field<T: serde::de::DeserializeOwned>(args: &serde_json::Value, name: &str) -> Result<T> {
+        serde_json::from_value(args[name].clone())
+            .map_err(|error| anyhow::anyhow!("invalid_argument: {name}: {error}"))
+    }
+    let fields = args
+        .as_object()
+        .context("invalid_argument: metrics args object")?;
+    ensure!(
+        fields.keys().all(|key| matches!(
+            key.as_str(),
+            "scope" | "aggregate" | "sourceSetId" | "language" | "path" | "sid" | "metrics" | "pin"
+        )),
+        "invalid_argument: unknown metrics option"
+    );
+    ensure!(
+        fields
+            .get("metrics")
+            .is_none_or(|value| value.as_array().is_some_and(|names| !names.is_empty())),
+        "invalid_argument: empty metrics selection"
+    );
+    let options = trellis::store::MetricsOptions {
+        scope: args["scope"]
+            .as_str()
+            .context("invalid_argument: scope")?
+            .to_owned(),
+        aggregate: args["aggregate"]
+            .as_str()
+            .context("invalid_argument: aggregate")?
+            .to_owned(),
+        source_set_id: field(args, "sourceSetId")?,
+        language: field(args, "language")?,
+        path: field(args, "path")?,
+        sid: field(args, "sid")?,
+        metrics: if args.get("metrics").is_some() {
+            field(args, "metrics")?
+        } else {
+            vec![]
+        },
+        pin: field(args, "pin")?,
+    };
+    options
+        .validate()
+        .map_err(|error| anyhow::anyhow!("invalid_argument: {error}"))?;
+    ensure!(
+        options.source_set_id.as_deref().is_none_or(|id| {
+            id.starts_with("source-set:v1:path-")
+                && id.len() == 83
+                && id[19..]
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        }),
+        "invalid_argument: source set ID"
+    );
+    ensure!(
+        options.sid.as_deref().is_none_or(|sid| {
+            sid.starts_with("sid:v1:")
+                && sid.len() == 39
+                && sid[7..]
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        }),
+        "invalid_argument: sid"
+    );
+    ensure!(
+        options
+            .path
+            .as_deref()
+            .is_none_or(|path| !path.contains([':', '\\', '\0'])),
+        "invalid_argument: path"
+    );
+    ensure!(
+        options
+            .language
+            .as_deref()
+            .is_none_or(|language| matches!(language, "java" | "python" | "javascript" | "rust")),
+        "invalid_argument: language"
+    );
+    Ok(options)
+}
+
+fn write_daemon_reply_until(
+    stream: &mut std::os::unix::net::UnixStream,
+    reply: &protocol::Reply,
+    deadline: Instant,
+) -> Result<()> {
+    // The selected response was fully materialized and fenced before transfer.
+    struct TransferBytes {
+        bytes: Vec<u8>,
+        deadline: Instant,
+    }
+    impl std::io::Write for TransferBytes {
+        fn write(&mut self, part: &[u8]) -> std::io::Result<usize> {
+            if Instant::now() >= self.deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "metrics transfer deadline exceeded",
+                ));
+            }
+            if part.len() > (64 * 1024 * 1024 + 4096_usize).saturating_sub(self.bytes.len()) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "metrics transfer too large",
+                ));
+            }
+            self.bytes.extend_from_slice(part);
+            if Instant::now() >= self.deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "metrics transfer deadline exceeded",
+                ));
+            }
+            Ok(part.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut serialized = TransferBytes {
+        bytes: Vec::new(),
+        deadline,
+    };
+    serde_json::to_writer(&mut serialized, &reply.payload)?;
+    let payload = serialized.bytes;
+    if Instant::now() >= deadline {
+        anyhow::bail!("deadline_exceeded");
+    }
+    const CHUNK_BYTES: usize = 450_000;
+    let chunk_bytes = CHUNK_BYTES;
+    #[cfg(feature = "test-support")]
+    let forced_chunks = std::env::var("TRELLIS_TEST_METRICS_FORCE_CHUNK_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| (1..=CHUNK_BYTES).contains(value));
+    #[cfg(feature = "test-support")]
+    let chunk_bytes = forced_chunks.unwrap_or(chunk_bytes);
+    #[cfg(feature = "test-support")]
+    let last_chunk_delay = metrics_test_duration("TRELLIS_TEST_METRICS_LAST_CHUNK_DELAY_MS");
+    #[cfg(feature = "test-support")]
+    let small_frame = forced_chunks.is_none() && payload.len() + 64 <= protocol::MAX_FRAME;
+    #[cfg(not(feature = "test-support"))]
+    let small_frame = payload.len() + 64 <= protocol::MAX_FRAME;
+    if small_frame {
+        protocol::write_frame_until(stream, reply, deadline)?;
+    } else {
+        for (index, chunk) in payload.chunks(chunk_bytes).enumerate() {
+            let more = (index + 1) * chunk_bytes < payload.len();
+            #[cfg(feature = "test-support")]
+            if !more && let Some(delay) = last_chunk_delay {
+                std::thread::sleep(delay.min(
+                    deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(100),
+                ));
+            }
+            protocol::write_frame_until(
+                stream,
+                &protocol::Reply {
+                    id: reply.id,
+                    payload: serde_json::json!({"chunk": hex::encode(chunk), "more": more}),
+                },
+                deadline,
+            )?;
+            #[cfg(feature = "test-support")]
+            if let Ok(path) = std::env::var("TRELLIS_TEST_METRICS_CHUNK_COUNT_FILE") {
+                use std::io::Write;
+                if let Ok(mut file) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                {
+                    let _ = file.write_all(b"x");
+                }
+            }
         }
     }
     Ok(())

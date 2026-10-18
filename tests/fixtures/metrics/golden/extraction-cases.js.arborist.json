@@ -1,0 +1,99 @@
+{
+  "file_cognitive": 3,
+  "file_cyclomatic": 13,
+  "file_sloc": 17,
+  "functions": [
+    {
+      "cognitive": 0,
+      "cyclomatic": 1,
+      "end_line": 1,
+      "exceeds_threshold": null,
+      "name": "actual",
+      "sloc": 1,
+      "start_line": 1
+    },
+    {
+      "cognitive": 0,
+      "cyclomatic": 1,
+      "end_line": 2,
+      "exceeds_threshold": null,
+      "name": "key",
+      "sloc": 1,
+      "start_line": 2
+    },
+    {
+      "cognitive": 0,
+      "cyclomatic": 1,
+      "end_line": 3,
+      "exceeds_threshold": null,
+      "name": "a",
+      "sloc": 1,
+      "start_line": 3
+    },
+    {
+      "cognitive": 0,
+      "cyclomatic": 1,
+      "end_line": 4,
+      "exceeds_threshold": null,
+      "name": "b",
+      "sloc": 1,
+      "start_line": 4
+    },
+    {
+      "cognitive": 0,
+      "cyclomatic": 1,
+      "end_line": 5,
+      "exceeds_threshold": null,
+      "name": "sink",
+      "sloc": 1,
+      "start_line": 5
+    },
+    {
+      "cognitive": 0,
+      "cyclomatic": 1,
+      "end_line": 6,
+      "exceeds_threshold": null,
+      "name": "f",
+      "sloc": 1,
+      "start_line": 6
+    },
+    {
+      "cognitive": 0,
+      "cyclomatic": 1,
+      "end_line": 6,
+      "exceeds_threshold": null,
+      "name": "method",
+      "sloc": 1,
+      "start_line": 6
+    },
+    {
+      "cognitive": 0,
+      "cyclomatic": 1,
+      "end_line": 8,
+      "exceeds_threshold": null,
+      "name": "[key()]",
+      "sloc": 1,
+      "start_line": 8
+    },
+    {
+      "cognitive": 3,
+      "cyclomatic": 4,
+      "end_line": 13,
+      "exceeds_threshold": null,
+      "name": "branching",
+      "sloc": 5,
+      "start_line": 9
+    },
+    {
+      "cognitive": 0,
+      "cyclomatic": 1,
+      "end_line": 17,
+      "exceeds_threshold": null,
+      "name": "callbacks",
+      "sloc": 4,
+      "start_line": 14
+    }
+  ],
+  "language": "JavaScript",
+  "path": "tests/fixtures/extraction/edge-fixture/cases.js"
+}

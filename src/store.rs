@@ -225,6 +225,7 @@ pub struct Store {
     // selected reconciliation was observed committed under the synced EX.
     reconciled_writer: Arc<Mutex<Option<uuid::Uuid>>>,
     retention_clock: Arc<Mutex<RetentionClock>>,
+    metrics_memo: Arc<Mutex<crate::metrics::MetricsMemo>>,
     #[cfg(feature = "test-support")]
     test_after_claim_hook: Arc<TestOneShotHook>,
     maintenance_before_writer_hook: Arc<TestOneShotHook>,
@@ -628,6 +629,121 @@ impl ReadRevision {
         })
     }
 }
+
+/// Validated transport options for one pinned metrics projection.
+#[derive(Debug, Clone)]
+pub struct MetricsOptions {
+    pub pin: Option<IndexPin>,
+    pub scope: String,
+    pub source_set_id: Option<String>,
+    pub language: Option<String>,
+    pub path: Option<String>,
+    pub sid: Option<String>,
+    pub aggregate: String,
+    /// Empty means all metrics; transport rejects an explicitly empty list.
+    pub metrics: Vec<String>,
+}
+impl Default for MetricsOptions {
+    fn default() -> Self {
+        Self {
+            pin: None,
+            scope: "revision".into(),
+            source_set_id: None,
+            language: None,
+            path: None,
+            sid: None,
+            aggregate: "sum".into(),
+            metrics: vec![],
+        }
+    }
+}
+impl MetricsOptions {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            matches!(
+                self.scope.as_str(),
+                "revision" | "directory" | "file" | "declaration"
+            ),
+            "invalid scope"
+        );
+        ensure!(
+            matches!(self.aggregate.as_str(), "sum" | "max" | "mean"),
+            "invalid aggregate"
+        );
+        ensure!(
+            self.metrics
+                .iter()
+                .all(|m| crate::metrics::METRIC_ORDER.contains(&m.as_str()))
+                && self.metrics.iter().collect::<BTreeSet<_>>().len() == self.metrics.len(),
+            "invalid metrics"
+        );
+        let located = self.scope != "revision";
+        ensure!(
+            self.source_set_id.is_some() == located && self.path.is_some() == located,
+            "invalid metrics selector"
+        );
+        ensure!(
+            self.language.is_some() == (self.scope == "file"),
+            "invalid metrics language"
+        );
+        ensure!(
+            self.sid.is_some() == (self.scope == "declaration"),
+            "invalid metrics sid"
+        );
+        if let Some(path) = &self.path {
+            ensure!(
+                !path.starts_with('/')
+                    && !path
+                        .split('/')
+                        .any(|s| s == "." || s == ".." || s.is_empty())
+                    || (self.scope == "directory" && path.is_empty()),
+                "invalid metrics path"
+            );
+        }
+        Ok(())
+    }
+}
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MetricsFileRow {
+    pub source_set_id: String,
+    pub language: String,
+    pub path: String,
+    pub declaration_count: usize,
+    pub metrics: serde_json::Value,
+}
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MetricsDirectoryRow {
+    pub source_set_id: String,
+    pub path: String,
+    pub declaration_count: usize,
+    pub metrics: serde_json::Value,
+}
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MetricsDeclarationRow {
+    pub source_set_id: String,
+    pub language: String,
+    pub path: String,
+    pub sid: String,
+    pub range: crate::native_evidence::Range,
+    pub metrics: serde_json::Value,
+}
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MetricsPayload {
+    pub metrics_version: &'static str,
+    pub index_generation: String,
+    pub index_revision: u64,
+    pub scope: String,
+    pub aggregate: String,
+    pub selected_metrics: Vec<String>,
+    pub declarations: Vec<MetricsDeclarationRow>,
+    pub files: Vec<MetricsFileRow>,
+    pub directories: Vec<MetricsDirectoryRow>,
+}
+
 /// One coherent native read snapshot retained until its owned result passes T03.
 pub struct EvidenceResponse {
     store: Store,
@@ -652,7 +768,287 @@ impl ReadFence {
 }
 type TreeOverlays = Vec<(usize, String, usize)>;
 
+// Adapt the read helpers' boolean progress seam without erasing the caller's
+// original typed cancellation/deadline error.
+struct MetricsReadCheck<'a> {
+    check: std::cell::RefCell<&'a mut dyn FnMut() -> Result<()>>,
+    failure: std::cell::RefCell<Option<anyhow::Error>>,
+}
+impl MetricsReadCheck<'_> {
+    fn check(&self) -> Result<()> {
+        (*self.check.borrow_mut())()
+    }
+    fn expired(&self) -> bool {
+        if self.failure.borrow().is_some() {
+            return true;
+        }
+        match self.check() {
+            Ok(()) => false,
+            Err(error) => {
+                *self.failure.borrow_mut() = Some(error);
+                true
+            }
+        }
+    }
+    fn result<T>(&self, result: Result<T>) -> Result<T> {
+        if let Some(error) = self.failure.borrow_mut().take() {
+            return Err(error);
+        }
+        result
+    }
+}
+
 impl EvidenceResponse {
+    /// Compute metrics from one selected revision in this response's read transaction.
+    pub fn metrics_at(
+        &self,
+        options: &MetricsOptions,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<MetricsPayload> {
+        options.validate()?;
+        let progress = MetricsReadCheck {
+            check: std::cell::RefCell::new(check),
+            failure: std::cell::RefCell::new(None),
+        };
+        progress.check()?;
+        let selected = self.store.read_revision_for(&self.db, options.pin, true)?;
+        let selected_metrics: Vec<String> = crate::metrics::METRIC_ORDER
+            .iter()
+            .filter(|name| {
+                options.metrics.is_empty() || options.metrics.iter().any(|m| m == **name)
+            })
+            .map(|name| (*name).to_owned())
+            .collect();
+        let names: Vec<&str> = selected_metrics.iter().map(String::as_str).collect();
+        use crate::native_evidence::DocumentKey;
+        let mut stmt = self.db.prepare(
+            "SELECT source_set_id,language,path FROM revision_documents
+            WHERE revision_id=?1 ORDER BY source_set_id,language,path",
+        )?;
+        let mut documents = Vec::new();
+        let mut cursor = stmt.query([&selected.key])?;
+        while let Some(row) = cursor.next()? {
+            progress.check()?;
+            documents.push(DocumentKey {
+                source_set_id: row.get(0)?,
+                language: row.get(1)?,
+                path: row.get(2)?,
+            });
+        }
+        progress.check()?;
+        // Existence is decided from the manifest, not from callable rows.
+        let included: Vec<&DocumentKey> = documents
+            .iter()
+            .filter(|key| match options.scope.as_str() {
+                "revision" => true,
+                "directory" => {
+                    options.source_set_id.as_ref() == Some(&key.source_set_id)
+                        && options.path.as_ref().is_some_and(|path| {
+                            path.is_empty() || key.path.starts_with(&format!("{path}/"))
+                        })
+                }
+                "file" => {
+                    options.source_set_id.as_ref() == Some(&key.source_set_id)
+                        && options.language.as_ref() == Some(&key.language)
+                        && options.path.as_ref() == Some(&key.path)
+                }
+                "declaration" => {
+                    options.source_set_id.as_ref() == Some(&key.source_set_id)
+                        && options.path.as_ref() == Some(&key.path)
+                }
+                _ => false,
+            })
+            .collect();
+        if options.scope != "revision" && included.is_empty() {
+            anyhow::bail!("not_found: metrics selector");
+        }
+        let mut declarations = Vec::new();
+        let mut files = Vec::new();
+        let mut directories: BTreeMap<(String, String), crate::metrics::Accumulator> =
+            BTreeMap::new();
+        for key in included {
+            progress.check()?;
+            // Read and attest only the selected version; no checkout filesystem access.
+            let expired = || progress.expired();
+            let source = progress
+                .result(
+                    Store::selected_source_row_bounded_for_inner(
+                        &self.db,
+                        &key.path,
+                        256 * 1024 * 1024,
+                        &selected,
+                        Some(&expired),
+                    )
+                    .map_err(selected_integrity)
+                    .map_err(|error| self.store.report_selected_failure(error)),
+                )?
+                .context("incompatible_index: selected metrics source missing")?;
+            progress.result(
+                self.store.attest_selected_document_optional_for(
+                    &self.db, &key.path, &selected, &expired,
+                ),
+            )?;
+            ensure!(
+                source.language == key.language,
+                "incompatible_index: metrics language mismatch"
+            );
+            let scope = v8_native_scope_for(&self.db, key, &selected)?
+                .context("incompatible_index: selected metrics manifest missing")?;
+            let native_declarations = progress.result(
+                read_native_declarations_v8_optional(&self.db, &scope, None, true, &expired)
+                    .map_err(selected_integrity),
+            )?;
+            progress.check()?;
+            let calls = progress.result(
+                read_native_calls_v8_inner(&self.db, &scope, None, Some(&expired))
+                    .map_err(selected_integrity),
+            )?;
+            progress.check()?;
+            let regions = progress.result(
+                read_native_control_regions_v8_inner(&self.db, &scope, None, Some(&expired))
+                    .map_err(selected_integrity),
+            )?;
+            progress.check()?;
+            let rows = crate::metrics::compute_memoized(
+                &mut self.store.metrics_memo.lock().unwrap(),
+                crate::metrics::SourceInput {
+                    language: &key.language,
+                    content_hash: &source.hash,
+                    text: &source.text,
+                },
+                &native_declarations,
+                &calls,
+                &regions,
+                &mut || progress.check(),
+            )?;
+            let mut file_fold = crate::metrics::Accumulator::default();
+            let mut parents = vec![String::new()];
+            let mut directory = String::new();
+            for segment in key
+                .path
+                .split('/')
+                .collect::<Vec<_>>()
+                .split_last()
+                .map(|(_, parents)| parents)
+                .unwrap_or(&[])
+            {
+                if !directory.is_empty() {
+                    directory.push('/');
+                }
+                directory.push_str(segment);
+                parents.push(directory.clone());
+            }
+            if options.scope == "directory" {
+                let selected_path = options.path.as_deref().unwrap_or_default();
+                parents.retain(|path| {
+                    selected_path.is_empty()
+                        || path == selected_path
+                        || path.starts_with(&format!("{selected_path}/"))
+                });
+            }
+            for path in &parents {
+                directories
+                    .entry((key.source_set_id.clone(), path.clone()))
+                    .or_default();
+            }
+            for row in &rows {
+                progress.check()?;
+                file_fold.push(&row.metrics)?;
+                for path in &parents {
+                    directories
+                        .get_mut(&(key.source_set_id.clone(), path.clone()))
+                        .expect("inserted directory")
+                        .push(&row.metrics)?;
+                }
+            }
+            for row in rows {
+                if options.scope == "file"
+                    || (options.scope == "declaration" && options.sid.as_ref() == Some(&row.sid))
+                {
+                    let mut projected = serde_json::to_value(&row.metrics)?;
+                    projected
+                        .as_object_mut()
+                        .expect("metric score object")
+                        .retain(|name, _| selected_metrics.iter().any(|selected| selected == name));
+                    declarations.push(MetricsDeclarationRow {
+                        source_set_id: row.source_set_id,
+                        language: row.language,
+                        path: row.path,
+                        sid: row.sid,
+                        range: row.range,
+                        metrics: projected,
+                    });
+                }
+            }
+            if options.scope != "declaration" {
+                files.push(MetricsFileRow {
+                    source_set_id: key.source_set_id.clone(),
+                    language: key.language.clone(),
+                    path: key.path.clone(),
+                    declaration_count: file_fold.count(),
+                    metrics: file_fold.project(&options.aggregate, &names)?,
+                });
+            }
+        }
+        if options.scope == "declaration" {
+            if declarations.is_empty() {
+                anyhow::bail!("not_found: metrics declaration");
+            }
+            ensure!(
+                declarations.len() == 1,
+                "incompatible_index: ambiguous metrics declaration"
+            );
+        }
+        declarations.sort_by(|a, b| {
+            (
+                &a.source_set_id,
+                &a.language,
+                &a.path,
+                a.range.start,
+                a.range.end,
+                &a.sid,
+            )
+                .cmp(&(
+                    &b.source_set_id,
+                    &b.language,
+                    &b.path,
+                    b.range.start,
+                    b.range.end,
+                    &b.sid,
+                ))
+        });
+        files.sort_by(|a, b| {
+            (&a.source_set_id, &a.language, &a.path).cmp(&(&b.source_set_id, &b.language, &b.path))
+        });
+        let directory_rows = if matches!(options.scope.as_str(), "revision" | "directory") {
+            directories
+                .into_iter()
+                .map(|((source_set_id, path), fold)| {
+                    progress.check()?;
+                    Ok(MetricsDirectoryRow {
+                        source_set_id,
+                        path,
+                        declaration_count: fold.count(),
+                        metrics: fold.project(&options.aggregate, &names)?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            vec![]
+        };
+        progress.check()?;
+        Ok(MetricsPayload {
+            metrics_version: crate::metrics::VERSION,
+            index_generation: selected.pin.index_generation.to_string(),
+            index_revision: selected.pin.index_revision,
+            scope: options.scope.clone(),
+            aggregate: options.aggregate.clone(),
+            selected_metrics,
+            declarations,
+            files,
+            directories: directory_rows,
+        })
+    }
     pub fn finish<T>(&self, value: T) -> Result<T> {
         self.fence.verify(&self.store, Some(&self.db))?;
         Ok(value)
@@ -5841,6 +6237,9 @@ impl Store {
             aborted_staged_index: Arc::new(Mutex::new(None)),
             writer_counters: Arc::new(Mutex::new(None)),
             reconciled_writer: Arc::new(Mutex::new(None)),
+            metrics_memo: Arc::new(Mutex::new(crate::metrics::MetricsMemo::new(
+                64 * 1024 * 1024,
+            ))),
             retention_clock: Arc::new(Mutex::new(RetentionClock {
                 origin_wall: publication_second()?,
                 origin_mono: 0,
@@ -7457,6 +7856,12 @@ impl Store {
 
     pub fn evidence_response(&self) -> Result<EvidenceResponse> {
         self.evidence_response_daemon_local()
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn metrics_memo_entries_for_tests(&self) -> usize {
+        self.metrics_memo.lock().unwrap().len()
     }
 
     fn with_evidence<T>(&self, read: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
