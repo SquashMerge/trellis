@@ -178,7 +178,7 @@ fn fixture_daemon_diagnostic(home: &Path, expected: &Path) -> String {
 }
 
 fn cli(home: &Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_trellis"));
+    let mut command = trellis::testing::owned(Command::new(env!("CARGO_BIN_EXE_trellis")));
     command
         .env("HOME", home)
         .env("TRELLIS_TEST_DAEMON_PID_FILE", home.join("auto-daemon.pid"))
@@ -1657,6 +1657,7 @@ async fn serve_first_carries_jev_credential_to_new_daemon() {
     let home = temp.path().join("home");
     fs::create_dir(&home).unwrap();
     let root = checkout(temp.path(), "serve-first");
+    let _daemon = AutoDaemonGuard::for_home(&home);
     let token = home.join("token");
     let bind = free_address();
     let mut command = serve(&home, &root, bind, &token);
@@ -1670,6 +1671,48 @@ async fn serve_first_carries_jev_credential_to_new_daemon() {
     ready(&reqwest::Client::new(), bind, &mut child.0, &home).await;
     let indexed = run(&home, "index", &root);
     assert!(indexed["status"]["catchingUp"].is_boolean());
+}
+
+/// A test-elected daemon outlives its electing CLI but not its owning test
+/// process (#130), so an unguarded or killed test cannot leak it. The owner
+/// has exited but is not yet reaped when the daemon must notice it is gone.
+#[test]
+fn elected_daemon_exits_after_its_test_owner_process_ends() {
+    let temp = short_temp();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let root = checkout(temp.path(), "owner");
+    let _daemon = AutoDaemonGuard::for_home(&home);
+    // A stand-in owner whose lifetime this test controls.
+    let mut owner = Owned(Command::new("sleep").arg("30").spawn().unwrap());
+    let output = cli(&home)
+        .env(trellis::testing::OWNER_PID_ENV, owner.0.id().to_string())
+        .arg("index")
+        .arg("--workspace")
+        .arg(&root)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let daemon: i32 = fs::read_to_string(home.join("auto-daemon.pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    // The electing CLI has exited; with its owner alive the daemon stays up
+    // across several watchdog checks (its idle delay is 30 minutes).
+    std::thread::sleep(Duration::from_millis(2500));
+    assert!(
+        trellis::testing::process_running(daemon),
+        "daemon exited while its owner was alive"
+    );
+    // Killed but deliberately not reaped until the daemon has exited.
+    owner.0.kill().unwrap();
+    trellis::testing::wait_until("daemon exit after its owner ended", || {
+        !trellis::testing::process_running(daemon)
+    });
 }
 
 #[test]

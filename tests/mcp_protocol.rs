@@ -271,7 +271,7 @@ impl Peer {
     ) -> Self {
         let stderr_path = home.path().join("mcp-stderr.log");
         let stderr = fs::File::create(&stderr_path).unwrap();
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_trellis"));
+        let mut cmd = trellis::testing::owned(Command::new(env!("CARGO_BIN_EXE_trellis")));
         cmd.arg("mcp")
             .current_dir(cwd.unwrap_or(home.path()))
             .env("HOME", home.path())
@@ -412,7 +412,7 @@ fn marker_for_other_fixture_daemon_does_not_target_this_private_socket() {
     .unwrap()
     .unwrap();
     let other = tempfile::tempdir().unwrap();
-    let mut decoy = Command::new(env!("CARGO_BIN_EXE_trellis"))
+    let mut decoy = trellis::testing::owned(Command::new(env!("CARGO_BIN_EXE_trellis")))
         .arg("daemon")
         .env("HOME", other.path())
         .env("XDG_CACHE_HOME", other.path().join("cache"))
@@ -1142,7 +1142,7 @@ fn legacy_title_recovery_max_id_and_root_selection() {
     // Topology overlap is refused before marker attachment.
     let overlap = tmp.path().join("managed-home");
     fs::create_dir_all(overlap.join(".git")).unwrap();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_trellis"));
+    let mut command = trellis::testing::owned(Command::new(env!("CARGO_BIN_EXE_trellis")));
     command
         .arg("mcp")
         .arg("--workspace")
@@ -1557,7 +1557,7 @@ async fn wire_lines_remain_when_source_line_or_byte_cap_refuses() {
     }
     fs::write(root.join("lines.js"), "function BigLines() {}\n").unwrap();
     let home = peer._home.path().to_path_buf();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_trellis"));
+    let mut command = trellis::testing::owned(Command::new(env!("CARGO_BIN_EXE_trellis")));
     command
         .arg("index")
         .arg("--workspace")
@@ -3160,7 +3160,7 @@ async fn catching_up_reports_pending_work_then_witnessed_readiness_on_same_check
         .unwrap()
         .root_key;
     let home = peer._home.path().to_path_buf();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_trellis"));
+    let mut command = trellis::testing::owned(Command::new(env!("CARGO_BIN_EXE_trellis")));
     command
         .arg("index")
         .arg("--workspace")
@@ -3300,7 +3300,7 @@ async fn selected_options_replacement_reissues_ready_for_new_watch_epoch() {
         .root_key;
     let home = peer._home.path().to_path_buf();
     let index = |size: Option<u64>| {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_trellis"));
+        let mut command = trellis::testing::owned(Command::new(env!("CARGO_BIN_EXE_trellis")));
         command
             .arg("index")
             .arg("--workspace")

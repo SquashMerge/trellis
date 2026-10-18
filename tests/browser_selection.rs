@@ -49,7 +49,7 @@ async fn selected_json(
 }
 
 fn command(home: &std::path::Path) -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_trellis"));
+    let mut cmd = trellis::testing::owned(Command::new(env!("CARGO_BIN_EXE_trellis")));
     cmd.env("HOME", home)
         .env_remove("XDG_CACHE_HOME")
         .env_remove("XDG_DATA_HOME");
