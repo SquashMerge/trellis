@@ -531,6 +531,7 @@ fn every_nullable_native_field_requires_presence_even_when_null() {
     check(&header, &["name", "resultType"]);
     check(
         &Declaration {
+            role: trellis::native_evidence::DeclarationRole::Production,
             syntax_id: "id".into(),
             document: doc.clone(),
             revision_id: "r".into(),
@@ -1270,5 +1271,224 @@ fn unreadable_required_input_fails_closed() {
     assert!(
         result.is_err(),
         "unreadable required input was treated as absent"
+    );
+}
+
+#[test]
+fn declaration_roles_follow_syntax_paths_and_inherit_without_changing_identity() {
+    use std::{
+        fs,
+        sync::{Arc, atomic::AtomicBool},
+    };
+    use trellis::{
+        indexer::{IndexOptions, index_workspace_with_native},
+        model::CancelFlag,
+        native_evidence::DeclarationRole,
+    };
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir(root.path().join("tests")).unwrap();
+    fs::create_dir(root.path().join("__tests__")).unwrap();
+    let id = trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+        .unwrap();
+    let sources = [
+        (
+            "src.rs",
+            "fn normal() {}\n#[cfg(test)] mod inner { fn helper() {} struct Thing; impl Thing { fn method(&self) {} } }\nfn after() {}\n#[cfg(all(feature = \"x\", test))] fn all_test() {}\n#[cfg(any(test, feature = \"x\"))] fn any_test() {}\n#[cfg(not(test))] fn not_test() {}\n#[cfg(feature = \"test-support\")] fn support() {}\n#[test] fn standalone() {}\n#[tokio::test] fn qualified() {}\n#[cfg(test)] /* note */ fn after_block_comment() {}\nfn unmarked_after_comment() {}\n// #[test] fn commented() {}\nconst TEXT: &str = \"#[test]\";\n",
+        ),
+        (
+            "A.java",
+            "class A { @Test void outside() {} @org.testng.annotations.Test void testng() {} @org.junit.jupiter.params.ParameterizedTest void parameterized() {} @RepeatedTest void repeated() {} @TestFactory void factory() {} @TestTemplate void template() {} void normal() {} }",
+        ),
+        ("tests/Widget.java", "class Widget { void ordinary() {} }"),
+        (
+            "tests/checks.rs",
+            "struct Helper; fn ordinary() { let value = 1; }",
+        ),
+        (
+            "test_sample.py",
+            "class TestSuite:\n    def helper(self): pass\nasync def test_async(): pass\ndef test_free(): pass\ndef normal(): pass\n",
+        ),
+        (
+            "normal.py",
+            "def test_named(): pass\nclass TestNamed: pass\n",
+        ),
+        (
+            "thing.js",
+            "function test_name() { describe('x', () => {}); }",
+        ),
+        ("__tests__/thing.js", "function ordinary() {}"),
+    ];
+    for (name, text) in sources {
+        fs::write(root.path().join(name), text).unwrap();
+    }
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let extract = || {
+        index_workspace_with_native(
+            &IndexOptions::new(root.path().into()),
+            &id.record_id,
+            &cancel,
+            |_| {},
+        )
+        .unwrap()
+        .1
+    };
+    let before = extract();
+    // Exhaustive source-authored expectations include every synthetic, anonymous,
+    // nested and non-callable row, not only name-bearing functions.
+    let expected = [
+        (
+            "A.java",
+            DeclarationRole::Production,
+            &["module:", "type:A", "method:normal"][..],
+        ),
+        (
+            "A.java",
+            DeclarationRole::Test,
+            &[
+                "method:outside",
+                "method:testng",
+                "method:parameterized",
+                "method:repeated",
+                "method:factory",
+                "method:template",
+            ],
+        ),
+        (
+            "tests/Widget.java",
+            DeclarationRole::Test,
+            &["module:", "type:Widget", "method:ordinary"],
+        ),
+        (
+            "src.rs",
+            DeclarationRole::Production,
+            &[
+                "module:",
+                "function:normal",
+                "function:after",
+                "function:any_test",
+                "function:not_test",
+                "function:support",
+                "function:unmarked_after_comment",
+                "variable:TEXT",
+            ],
+        ),
+        (
+            "src.rs",
+            DeclarationRole::Test,
+            &[
+                "namespace:inner",
+                "function:helper",
+                "type:Thing",
+                "implementation:",
+                "method:method",
+                "function:all_test",
+                "function:standalone",
+                "function:qualified",
+                "function:after_block_comment",
+            ],
+        ),
+        (
+            "tests/checks.rs",
+            DeclarationRole::Test,
+            &["module:", "type:Helper", "function:ordinary"],
+        ),
+        (
+            "normal.py",
+            DeclarationRole::Production,
+            &["module:", "function:test_named", "type:TestNamed"],
+        ),
+        (
+            "test_sample.py",
+            DeclarationRole::Test,
+            &[
+                "module:",
+                "type:TestSuite",
+                "function:helper",
+                "function:test_async",
+                "function:test_free",
+                "function:normal",
+            ],
+        ),
+        (
+            "__tests__/thing.js",
+            DeclarationRole::Test,
+            &["module:", "function:ordinary"],
+        ),
+        (
+            "thing.js",
+            DeclarationRole::Production,
+            &["module:", "function:test_name", "anonymousFunction:"],
+        ),
+    ];
+    let mut expected_rows = expected
+        .iter()
+        .flat_map(|(path, role, rows)| {
+            rows.iter().map(move |row| {
+                let (kind, name) = row.split_once(':').unwrap();
+                (
+                    (*path).to_owned(),
+                    kind.to_owned(),
+                    (!name.is_empty()).then(|| name.to_owned()),
+                    serde_json::to_string(role).unwrap(),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut actual_rows = before
+        .declarations
+        .iter()
+        .map(|d| {
+            (
+                d.document.path.clone(),
+                d.kind.clone(),
+                d.name.clone(),
+                serde_json::to_string(&d.role).unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    expected_rows.sort();
+    actual_rows.sort();
+    assert_eq!(
+        actual_rows, expected_rows,
+        "every emitted declaration has the source-expected role"
+    );
+    assert_eq!(before.declarations.len(), expected_rows.len());
+    // An attribute changes the measured role, never the stable declaration identity.
+    let identities = |artifact: &trellis::native_evidence::Artifact| {
+        let mut rows = artifact
+            .declarations
+            .iter()
+            .map(|d| {
+                (
+                    serde_json::to_string(&d.document).unwrap(),
+                    d.syntax_id.clone(),
+                    serde_json::to_string(&d.key).unwrap(),
+                    d.lookup_key.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        rows.sort();
+        rows
+    };
+    let baseline = identities(&before);
+    assert_eq!(baseline.len(), before.declarations.len());
+    let original = fs::read_to_string(root.path().join("src.rs")).unwrap();
+    fs::write(
+        root.path().join("src.rs"),
+        original.replace("#[cfg(test)]", "#[cfg(any(test))]"),
+    )
+    .unwrap();
+    let after = extract();
+    let changed = identities(&after);
+    assert_eq!(changed.len(), after.declarations.len());
+    assert_eq!(baseline, changed);
+    assert_eq!(
+        after
+            .declarations
+            .iter()
+            .find(|d| d.document.path == "src.rs" && d.name.as_deref() == Some("helper"))
+            .unwrap()
+            .role,
+        DeclarationRole::Production
     );
 }

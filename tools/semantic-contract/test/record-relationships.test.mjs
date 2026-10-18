@@ -112,6 +112,7 @@ function authoredDeclarations(text = source) {
     declarations.push({
       ref: name,
       nativeId: null,
+    role: "production",
       document,
       revisionId: "r1",
       parentRef: null,
@@ -161,6 +162,7 @@ function authoredDeclarations(text = source) {
     declarations.push({
       ref,
       nativeId: null,
+    role: "production",
       document,
       revisionId: "r1",
       parentRef: parent,
@@ -635,6 +637,7 @@ async function specimen(t, change = {}) {
   const loaded = await loadFixture(root);
   const normalizedDeclarations = [...nativeRows, ...nextRows].map((d) => ({
     syntaxId: idFor(d.ref),
+    role: "production",
     document,
     revisionId: d.revisionId,
     kind: d.kind,
@@ -1650,6 +1653,7 @@ impl${variant === "generic" ? "<T>" : ""} ${variant === "inherent" ? "" : "Face 
       return {
         ref,
         nativeId: null,
+        role: "production",
         document: rowDoc,
         revisionId: "r1",
         parentRef,
@@ -1910,6 +1914,7 @@ impl${variant === "generic" ? "<T>" : ""} ${variant === "inherent" ? "" : "Face 
   const loaded = await loadFixture(root);
   const normalized = rows.map((d) => ({
     syntaxId: ids.get(d.ref),
+    role: "production",
     document: d.document,
     revisionId: "r1",
     kind: d.kind,

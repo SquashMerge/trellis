@@ -83,6 +83,7 @@ const callId = occurrence(mainId, "call", 0),
 const declaration = (ref, name, start, end, nameStart) => ({
   ref,
   nativeId: null,
+    role: "production",
   document,
   revisionId: "r1",
   parentRef: null,
@@ -752,6 +753,7 @@ async function specimen(
   );
   const asDeclaration = (name, begin, end, nameStart) => ({
     syntaxId: syntax(name),
+    role: "production",
     document,
     revisionId: "r1",
     kind: "function",
@@ -786,6 +788,7 @@ async function specimen(
     const childId = `sid:v1:${domain("syntax", { sourceSet: "main", path: document.path, language: "javascript", ancestors: [parentKey], declaration: childKey })}`;
     records.declarations.push({
       syntaxId: childId,
+    role: "production",
       document,
       revisionId: "r1",
       kind: "field",

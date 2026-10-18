@@ -328,7 +328,7 @@ fn mcp_failure(
         };
         let modern = value.pointer("/params/_meta").is_some();
         return json!({"jsonrpc":"2.0","id":id,
-            "result":crate::mcp::tools::result(envelope, modern)});
+            "result":crate::mcp::tools::result(name, envelope, modern)});
     }
     json!({"jsonrpc":"2.0","id":id,
         "error":{"code":-32603,"message":"Internal error","data":{"code":code}}})
@@ -732,7 +732,8 @@ fn spawn_reply_reader(
                         }
                         let end = available.iter().position(|&b| b == b'\n');
                         let take = end.map_or(available.len(), |at| at + 1);
-                        if line.len() + take > crate::mcp::wire::RESPONSE_BYTES + 32 {
+                        // The daemon's largest frame is its catalog (#165).
+                        if line.len() + take > crate::mcp::wire::CATALOG_BYTES + 32 {
                             return Err(io::Error::new(
                                 io::ErrorKind::InvalidData,
                                 "MCP response too large",
@@ -803,7 +804,7 @@ fn relay_admission_failure(
         .unwrap_or_else(|| json!(workspace.root));
     let modern = value.pointer("/params/_meta").is_some();
     json!({"jsonrpc":"2.0","id":id,"result":crate::mcp::tools::result(
-        crate::mcp::tools::admission_failure(&id, code, &attempted), modern)})
+        name, crate::mcp::tools::admission_failure(&id, code, &attempted), modern)})
 }
 
 /// What a fence established about the client's input (#127, Decision 0009 §7).
@@ -2186,7 +2187,7 @@ mod reply_gate_tests {
 #[cfg(test)]
 mod relay_failure_tests {
     use super::*;
-    use serde_json::{Value, json};
+    use serde_json::json;
 
     #[test]
     fn unresolved_tool_input_keeps_closed_application_and_selection_precedence() {
@@ -2220,13 +2221,15 @@ mod relay_failure_tests {
             assert!(envelope["error"]["attemptedWorkspace"].is_object());
             assert!(envelope.get("workspace").is_none());
             assert!(envelope.get("catchingUp").is_none());
+            let summary = reply["result"]["content"][0]["text"].as_str().unwrap();
             assert_eq!(
-                serde_json::from_str::<Value>(
-                    reply["result"]["content"][0]["text"].as_str().unwrap()
+                summary,
+                format!(
+                    "trellis_workspace_describe failed: {code}: {}",
+                    envelope["error"]["message"].as_str().unwrap()
                 )
-                .unwrap(),
-                *envelope
             );
+            assert!(summary.len() <= 512);
         }
         let legacy = json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
             "params":{"name":"trellis_workspace_describe","arguments":{"schemaVersion":1}}});

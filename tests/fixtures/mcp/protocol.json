@@ -14,7 +14,8 @@
   "names": [
     "trellis_workspace_describe",
     "trellis_find_symbols",
-    "trellis_inspect",
+    "trellis_declaration",
+    "trellis_outgoing_calls",
     "trellis_read_source"
   ],
   "validArguments": [
@@ -27,8 +28,11 @@
     },
     {
       "schemaVersion": 1,
-      "symbolId": "sid:v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-      "view": "declaration"
+      "symbolId": "sid:v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "schemaVersion": 1,
+      "symbolId": "sid:v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     },
     {
       "schemaVersion": 1,
@@ -45,7 +49,10 @@
       "data": {
         "workspaceLabel": "$LABEL",
         "indexState": "indexing",
-        "progress": {"completed": 0, "total": null},
+        "progress": {
+          "completed": 0,
+          "total": null
+        },
         "watcherDegraded": false,
         "languages": [],
         "toolVersion": 1,

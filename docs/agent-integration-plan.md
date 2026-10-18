@@ -1,11 +1,12 @@
 # Coding-agent integration plan
 
-Status: **not implemented.** The per-checkout index and stdio MCP direction is accepted by the owner
-(2026-09-23), with its mechanics proposed until Stage 1 of the semantic-index program ratifies them.
-The registry, artifact, Herdr, terminal and ACP parts below remain proposals with their own later
-slices; Stage 1 does not ratify them.
-Revised 2026-09-23 for the [local topology](local-topology.md): agents use a per-checkout stdio MCP
-server with no grants.
+Status: **per-checkout indexes, the native watcher and the five-tool stdio MCP daemon client are
+implemented.** The owner accepted this direction on 2026-09-23; the historical Stage 1–4 sequence
+below does not replace the implemented [local topology](local-topology.md) or the normative
+[MCP contract](mcp-readonly-pilot-contract.md). The registry, artifact, Herdr, terminal and ACP parts
+below remain proposals with their own later slices.
+Revised for the current topology: agents launch a local stdio MCP client of the per-user daemon,
+with no agent grants.
 This work inspected Trellis, the local Mimir checkout,
 and the installed Herdr CLI/schema. It did not start or prompt Herdr/Mimir coding agents,
 call project-configured providers, change either runtime, index projects, or change the
@@ -48,15 +49,16 @@ Herdr discovery must not silently edit any agent's MCP configuration.
 
 ### Portable server configuration
 
-The agent client launches `trellis mcp` in the checkout it works in. The server discovers that
-workspace (explicit `--workspace`, Git top level, working directory) and serves only that checkout's
-index, a pure cache in the per-user cache directory. It needs no daemon, port, descriptor, token or grant, and it exits with
-its client. There is no project registry or `--project PROJECT_ID` prerequisite. See the
-[MCP contract](mcp-readonly-pilot-contract.md) for tool schemas, pins, errors and tests, and the
-[local topology](local-topology.md) for storage, workspace identity, the fact cache, the leader,
-real-time native refresh and cleanup.
+The agent client launches `trellis mcp` in its selected checkout (or passes `--workspace`). The
+stdio process selects that checkout by [workspace discovery](local-topology.md#t01--discovery-and-identity)
+and connects to (or starts) the per-user daemon for selected reads.
+The checkout's index is a pure cache in the per-user cache directory; there is no MCP network
+listener, agent token or grant, project registry or `--project PROJECT_ID` prerequisite. The stdio
+client exits with its agent client. See the [MCP contract](mcp-readonly-pilot-contract.md) for tool
+schemas, pins, errors and tests, and the [local topology](local-topology.md) for storage, workspace
+identity, the fact cache, daemon checkout worker, native refresh and cleanup.
 
-Illustrative configuration, **not a current working command**:
+Illustrative agent configuration (client-specific format; not a compatibility guarantee):
 
 ```json
 { "mcpServers": { "trellis": { "command": "trellis", "args": ["mcp"] } } }
@@ -98,10 +100,11 @@ sequences, Java/Python class diagrams including hierarchy, and source/member nav
 Method candidates retain their original IDs/ranges and uncertainty. Same-class Java candidates
 are **not** compiler bindings. Unresolved graph edges remain unresolved.
 
-Missing: a portable tool server, bounded snapshot grep, uniform revision guards, per-checkout
-indexes, a file watcher and delta publication, versioned diagram artifacts, artifact
-notifications, and deep links. Existing saved views are raw graph queries, not a general
-sequence/class/authored-diagram artifact system. Their writes have no artifact CAS/ownership.
+Also shipped: the per-user daemon, per-checkout indexes, native watcher/delta publication,
+revision guards and the five-tool stdio MCP client. Still missing: bounded snapshot grep,
+versioned diagram artifacts, artifact notifications and deep links. Existing saved views are raw
+graph queries, not a general sequence/class/authored-diagram artifact system. Their writes have
+no artifact CAS/ownership.
 Incoming **call** hierarchy is not implemented; class relations/hierarchy are a different capability.
 Current Trellis ACP is a tools-disabled evidence-answer adapter, not the agent manager to extend.
 
@@ -183,9 +186,9 @@ No terminal implementation or agent launch is part of this documentation change 
 
 Each checkout's index is keyed by its path; its durable views and notes are keyed by a workspace UUID
 kept in its Git directory. `evidenceBasis` is `{indexGeneration, indexRevision}`; the generation is
-new whenever the index is rebuilt. These are proposed fields, not current store columns. Separate worktrees are
-separate workspaces with separate indexes; they share only content-addressed extraction results. No
-global registry, stable project catalog or workspace picker is needed for agents.
+new whenever the index is rebuilt. These are wire fields, not promises about store column names.
+Separate worktrees are separate workspaces with separate indexes; they share only content-addressed
+extraction results. No global registry, stable project catalog or workspace picker is needed for agents.
 
 A future browser project picker can list known checkouts without merging databases. See
 [multi-project viability](multi-project-viability.md). A moved checkout keeps its UUID, so its saved
@@ -202,20 +205,26 @@ a mutable global “current project.” Future registry enumeration must itself 
 
 ## Proposed agent tools
 
-**Phase 1 exposes exactly four MCP tools**, with portable ASCII underscore wire names:
+**Phase 1 exposes exactly five MCP tools**, with portable ASCII underscore wire names in this order:
 
 | Tool | Phase 1 purpose |
 | --- | --- |
 | `trellis_workspace_describe` | Describe the launch checkout, current basis, index state, coverage and limits; no indexing on request |
 | `trellis_find_symbols` | Bounded literal name/ID lookup in the current cached snapshot |
-| `trellis_inspect` | Bounded views of one symbol: first `declaration` and `outgoing_calls`; later `incoming_calls`, `call_paths`, `usages`, `type_hierarchy`, `implementations` and `coverage`; no arbitrary graph query |
+| `trellis_declaration` | One symbol's syntax-tier declaration; no `limit` or `view` input |
+| `trellis_outgoing_calls` | Bounded measured calls of one symbol; optional `limit`, no `view` input |
 | `trellis_read_source` | Bounded cached source range, with hash and exact range |
 
 Every read comes from one snapshot and reports its basis. Pins are optional: a client may send a
 complete `expectedBasis`, or `expectedContentHash` for a source read, and a stale one always conflicts.
-The views first serve syntax-tier evidence and gain semantic evidence as the language stages land. See the
-[MCP contract](mcp-readonly-pilot-contract.md) for exact limits and schemas. No hidden navigation,
-diagram, text-search, artifact, live-file, provider or runtime-control tools belong to this slice.
+Find, declaration and outgoing results use `doc` references into their per-result `documents` table;
+symbols, declaration data and calls include 1-based inclusive source `lines` where selectable. Read
+source with the referenced path, lines, same `expectedBasis` and document `contentHash`, subject to
+source caps. Every tool's deterministic `content[0].text` summary is at most 512 UTF-8 bytes; the
+full schema-valid result is `structuredContent`. These tools serve syntax-tier evidence; any
+future semantic extension needs its own ratified contract. Incoming calls and richer navigation
+remain future tools. See the [MCP contract](mcp-readonly-pilot-contract.md) for exact limits and schemas.
+No hidden navigation, diagram, text-search, artifact, live-file, provider or runtime-control tools belong to this slice.
 Tool allowlists and MCP read-only annotations are not a security boundary; the server simply has no
 code path to those operations.
 
@@ -225,8 +234,9 @@ Later tools may add `trellis_search_text`, `trellis_navigate`, `trellis_diagram_
 Artifact reads and conceptual drafts will need their own version/authorization contract.
 
 Return original IDs/ranges, evidence basis, certainty, warnings and explicit truncation. A capped
-result is not “no results.” Uniform guards require implementation: `/api/symbols` and `/api/query`
-do not currently require an expected revision. Agents never use the browser's owner HTTP routes.
+result is not “no results.” MCP basis and source-hash guards are implemented; the separate browser
+`/api/symbols` and `/api/query` routes do not require an expected revision. Agents never use the
+browser's owner HTTP routes.
 
 ### Structured tools complement grep
 
@@ -234,7 +244,7 @@ Use grep for discovery: strings, error messages, configuration, comments and unf
 Use structure for narrowing: exact declarations, owner classes, members, hierarchy, source ranges,
 measured calls and diagrams. Then read source to verify the explanation.
 
-A separate next slice after the four-tool pilot adds a **bounded literal scan of indexed snapshot
+A separate next slice after the five-tool pilot adds a **bounded literal scan of indexed snapshot
 text**. FTS is not a prerequisite or an assumed existing facility; benchmark a bounded scan first.
 Regex is later work. Snapshot search does not cover all repository files or automatically execute `rg`. Mimir Hands or another harness can continue to supply approved
 working-tree grep. A future typed `trellis_search_live` can extend coverage with an approved root,
@@ -291,11 +301,12 @@ MVP authored-graph bounds: 64 nodes, 128 edges, 256 KiB payload, bounded labels/
 IDs, dangling edges, enum values and group cycles; reject unknown fields. Existing deterministic
 class/sequence bounds are not increased by this proposal.
 
-Trellis currently retains only the current index. Freeze the rendered DTO/graph and provenance with
-an artifact if it must remain viewable after reindexing. Old source links become stale/unavailable
-unless separate evidence retention is implemented. Do not claim historical source retention or
-silently resolve an old symbol by name. Explicit restore/re-registration must rotate store generation;
-manifest/hash validation also guards accidental revision reuse.
+The index retains its current head plus recently superseded revisions for a bounded time; this is
+not durable artifact history. Freeze the rendered DTO/graph and provenance with an artifact if it
+must remain viewable after reindexing. Old source links become stale/unavailable when their source
+revision is released unless separate evidence retention is implemented. Do not claim historical
+source retention or silently resolve an old symbol by name. Explicit restore/re-registration must
+rotate store generation; manifest/hash validation also guards accidental revision reuse.
 
 ## Security and lifecycle rules
 
@@ -326,15 +337,16 @@ manifest/hash validation also guards accidental revision reuse.
 
 ### Phase 1 — per-checkout read-only MCP
 
-Deliver the [local topology](local-topology.md): per-checkout index caches, the shared fact cache,
-delta publication by the leader with real-time native refresh, and `trellis mcp` over stdio exposing
-describe -> find_symbols -> inspect (declaration, outgoing and incoming calls) -> read_source. Test with a
-synthetic MCP client across several concurrent worktrees, without Herdr, Mimir, a model or a
-provider. The [MCP contract](mcp-readonly-pilot-contract.md) is the implementation/acceptance gate.
-In the semantic-index program this is sequenced by
-[#8](https://github.com/SquashMerge/trellis/issues/8), early: storage and delta publication in Stage 2,
-the leader and native refresh in Stage 3, and the syntax-tier MCP server
-and its startup wiring in Stage 4. The semantic stages then add evidence to the same tools.
+The implemented [local topology](local-topology.md) has per-checkout index caches, the shared fact
+cache and native refresh/delta publication owned by the per-user daemon's checkout worker.
+`trellis mcp` exposes describe -> find_symbols -> declaration -> outgoing_calls -> read_source
+through that daemon. Incoming calls remain future work. The
+[MCP contract](mcp-readonly-pilot-contract.md) is the current wire/acceptance contract; MCP
+protocol fixtures test it without Herdr, Mimir, a model or a provider.
+Historically, [#8](https://github.com/SquashMerge/trellis/issues/8) sequenced storage/publication
+in Stage 2, native refresh in Stage 3, and syntax-tier MCP/startup wiring in Stage 4. That earlier
+stage plan does not imply a current per-checkout leader. Any later semantic enrichment needs
+a separately ratified contract.
 
 No registry, text scan, deterministic preview, artifacts, producer execution, live reads, ACP
 provider extension or new semantic-resolution claims are in Phase 1.
@@ -371,7 +383,7 @@ Herdr disconnects, restarts, or is not installed.
 Implement real PTY-backed tabs for explicitly requested Trellis-launched direct agents, with bounded
 streaming, input/resize authorization and owned-session lifecycle. Add ACP conversation/tool/approval
 tabs without treating ACP as a terminal transport. Gate Herdr terminal embedding on a verified native
-attach/stream API; association/focus is not an embedded terminal. Keep the four-tool MCP pilot small
+attach/stream API; association/focus is not an embedded terminal. Keep the five-tool MCP pilot small
 and independently shippable. Terminal launch/input is never added to the read-only catalog.
 
 ### Later, only if needed
@@ -383,10 +395,10 @@ Do not begin with a shared-database migration, a Trellis agent manager, or autom
 ## First useful user journey
 
 **Phase 1:** From a direct terminal agent or an already supported MCP client, in any checkout or
-worktree, describe the workspace, find a method, inspect its outgoing calls and read its cached
-source. Edit the file and see the next revision reflect it within the refresh budget. Cite revision
-and uncertainty. Do not run commands or publish anything. Mimir uses this same
-catalog once its separately gated local provider extension is available.
+worktree, describe the workspace, find a method, request its declaration and outgoing calls,
+then read its cached source. Edit the file and see the next revision reflect it within the
+refresh budget. Cite revision and uncertainty. Do not run commands or publish anything. Mimir
+uses this same catalog once its separately gated local provider extension is available.
 
 **Later, after artifact and Mimir bridge slices:** From an existing Mimir or other coding-agent session:
 
@@ -401,7 +413,8 @@ without Herdr, the same workflow works normally.
 
 ## Acceptance gates
 
-Phase 1 must pass the concrete [MCP acceptance tests](mcp-readonly-pilot-contract.md#acceptance-tests).
+Phase 1 follows the [MCP contract checks](mcp-readonly-pilot-contract.md#hand-reviewed-contract-checks-not-executed-tests)
+and its executable protocol fixtures.
 The following additional gates apply as the later capabilities are delivered, not to enlarge Phase 1:
 
 - Same file names, symbol IDs and revisions in two projects/worktrees cannot cross-contaminate.

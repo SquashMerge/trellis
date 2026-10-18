@@ -130,6 +130,7 @@ function declarations(text, rev = "r1", doc = document, entries = names) {
           ? `${rev}:${name}`
           : `${rev}:${doc.sourceSetId}:${doc.path}:${name}`,
       nativeId: null,
+    role: "production",
       document: doc,
       revisionId: rev,
       parentRef: null,
@@ -618,6 +619,7 @@ async function specimen(
   records.declarations = allDeclarations
     .map((d) => ({
       syntaxId: syntax(d.name, d.document),
+      role: "production",
       document: d.document,
       revisionId: d.revisionId,
       kind: "function",

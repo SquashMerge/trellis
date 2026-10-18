@@ -3,9 +3,10 @@ use super::{IdentityError, OpenedWorkspace, wire};
 use crate::daemon::registry::SelectionError;
 use serde_json::{Value, json};
 
-const TOOLS: [&str; 4] = super::catalog::NAMES;
+const TOOLS: [&str; 5] = super::catalog::NAMES;
 #[derive(Debug)]
 pub struct PreparedTool {
+    pub name: String,
     pub response: Value,
     /// False for invalid application fields: their errors precede workspace verification.
     pub valid_arguments: bool,
@@ -85,16 +86,19 @@ pub fn validate(name: &str, args: Option<&Value>) -> Result<(), &'static str> {
             ],
             &["schemaVersion", "query"],
         ),
-        "trellis_inspect" => (
+        "trellis_declaration" => (
+            &["schemaVersion", "symbolId", "expectedBasis", "workspace"],
+            &["schemaVersion", "symbolId"],
+        ),
+        "trellis_outgoing_calls" => (
             &[
                 "schemaVersion",
                 "symbolId",
-                "view",
                 "limit",
                 "expectedBasis",
                 "workspace",
             ],
-            &["schemaVersion", "symbolId", "view"],
+            &["schemaVersion", "symbolId"],
         ),
         _ => (
             &[
@@ -124,7 +128,7 @@ pub fn validate(name: &str, args: Option<&Value>) -> Result<(), &'static str> {
             }
             limit(o)
         }
-        "trellis_inspect" => {
+        "trellis_declaration" | "trellis_outgoing_calls" => {
             let sid = string(o.get("symbolId")).ok_or("invalid_request")?;
             if sid.len() > 8192
                 || sid.len() != 39
@@ -135,10 +139,10 @@ pub fn validate(name: &str, args: Option<&Value>) -> Result<(), &'static str> {
             {
                 return Err("invalid_request");
             }
-            match string(o.get("view")) {
-                Some("declaration") if !o.contains_key("limit") => Ok(()),
-                Some("outgoing_calls") => limit(o),
-                _ => Err("invalid_request"),
+            if name == "trellis_outgoing_calls" {
+                limit(o)
+            } else {
+                Ok(())
             }
         }
         _ => {
@@ -247,19 +251,81 @@ pub fn attributed(envelope: Value, workspace: &OpenedWorkspace, catching_up: boo
     attributed_root(envelope, workspace.root(), catching_up)
 }
 pub fn resolved_root_changed(
+    name: &str,
     id: &Value,
     root: &std::path::Path,
     catching_up: bool,
     modern: bool,
 ) -> Value {
     result(
+        name,
         attributed_root(failure(id, "root_changed"), root, catching_up),
         modern,
     )
 }
-pub fn result(envelope: Value, modern: bool) -> Value {
-    let text = serde_json::to_string(&envelope).expect("bounded tool envelope");
+/// Keep the full, schema-valid envelope in structuredContent. Text is only a
+/// bounded display summary, not a second JSON representation of the evidence.
+pub fn result(name: &str, envelope: Value, modern: bool) -> Value {
     let error = envelope.get("error").is_some();
+    let text = if error {
+        format!(
+            "{name} failed: {}: {}",
+            envelope["error"]["code"]
+                .as_str()
+                .expect("typed failure code"),
+            envelope["error"]["message"]
+                .as_str()
+                .expect("sanitized failure message")
+        )
+    } else {
+        let (count, items) = match name {
+            "trellis_workspace_describe" => (1, "workspace"),
+            "trellis_find_symbols" => (
+                envelope["data"]["symbols"]
+                    .as_array()
+                    .expect("find symbols")
+                    .len(),
+                "symbols",
+            ),
+            "trellis_declaration" => (1, "declaration"),
+            "trellis_outgoing_calls" => (
+                envelope["data"]["calls"]
+                    .as_array()
+                    .expect("outgoing calls")
+                    .len(),
+                "calls",
+            ),
+            "trellis_read_source" => (
+                (envelope["data"]["endLine"]
+                    .as_u64()
+                    .expect("source end line")
+                    - envelope["data"]["startLine"]
+                        .as_u64()
+                        .expect("source start line")
+                    + 1) as usize,
+                "lines",
+            ),
+            _ => unreachable!("known tool name"),
+        };
+        let truncation = if envelope["truncated"] == true {
+            format!(
+                ", truncated: {}",
+                envelope["truncationReason"]
+                    .as_str()
+                    .expect("truncation reason")
+            )
+        } else {
+            String::new()
+        };
+        // A count of one takes the singular item word (#167): "1 symbol", "1 call".
+        let items = if count == 1 {
+            items.strip_suffix('s').unwrap_or(items)
+        } else {
+            items
+        };
+        format!("{name}: {count} {items}{truncation}; full result in structuredContent.")
+    };
+    assert!(text.len() <= 512, "tool summary exceeds 512 UTF-8 bytes");
     let mut value = json!({"isError":error,"structuredContent":envelope,
         "content":[{"type":"text","text":text}]});
     if modern {
@@ -273,7 +339,7 @@ fn identity_error(error: IdentityError) -> &'static str {
         IdentityError::StoreUnavailable => "store_unavailable",
     }
 }
-/// Construct each envelope once and copy that same value to the text representation.
+/// Build one envelope; the text is a display summary of the structured result.
 pub fn prepare(
     name: &str,
     args: Option<&Value>,
@@ -316,7 +382,8 @@ pub fn prepare(
         ),
     };
     PreparedTool {
-        response: result(envelope, modern),
+        name: name.to_owned(),
+        response: result(name, envelope, modern),
         valid_arguments,
         id: id.clone(),
         modern,
@@ -330,6 +397,7 @@ pub fn final_check(prepared: &mut PreparedTool, workspace: &OpenedWorkspace) {
         && let Err(error) = workspace.check()
     {
         prepared.response = result(
+            &prepared.name,
             attributed(
                 failure(&prepared.id, identity_error(error)),
                 workspace,
@@ -363,7 +431,9 @@ mod tests {
         match name {
             "trellis_workspace_describe" => json!({"schemaVersion":1}),
             "trellis_find_symbols" => json!({"schemaVersion":1,"query":"a"}),
-            "trellis_inspect" => json!({"schemaVersion":1,"symbolId":sid(),"view":"declaration"}),
+            "trellis_declaration" | "trellis_outgoing_calls" => {
+                json!({"schemaVersion":1,"symbolId":sid()})
+            }
             _ => json!({"schemaVersion":1,"path":"src/a.rs","startLine":1,"endLine":1}),
         }
     }
@@ -431,14 +501,8 @@ mod tests {
         let mut v = good(n);
         v["query"] = json!(null);
         check(n, &v, "invalid_request");
-        for name in [TOOLS[1], TOOLS[2]] {
-            let original = if name == TOOLS[2] {
-                let mut v = good(name);
-                v["view"] = json!("outgoing_calls");
-                v
-            } else {
-                good(name)
-            };
+        for name in [TOOLS[1], TOOLS[3]] {
+            let original = good(name);
             for (number, expected) in [
                 (json!(0), Some("range_too_large")),
                 (json!(1), None),
@@ -472,6 +536,9 @@ mod tests {
         let mut v = good(n);
         v["limit"] = json!(1);
         check(n, &v, "invalid_request");
+        let mut v = good(TOOLS[3]);
+        v["view"] = json!("outgoing_calls");
+        check(TOOLS[3], &v, "invalid_request");
         for wrong in [
             "sid:v1:ABCDEF0123456789abcdef0123456789",
             "sid:v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -486,7 +553,7 @@ mod tests {
     }
     #[test]
     fn source_path_hash_and_line_matrix() {
-        let n = TOOLS[3];
+        let n = TOOLS[4];
         for path in [
             "",
             "/a",
@@ -563,11 +630,12 @@ mod tests {
                     assert_eq!(result.get("resultType").is_some(), modern);
                     assert_eq!(result["isError"], name != TOOLS[0]);
                     assert_eq!(
-                        serde_json::from_str::<Value>(
-                            result["content"][0]["text"].as_str().unwrap()
-                        )
-                        .unwrap(),
-                        result["structuredContent"]
+                        result["content"][0]["text"],
+                        if name == TOOLS[0] {
+                            format!("{name}: 1 workspace; full result in structuredContent.")
+                        } else {
+                            format!("{name} failed: index_not_ready: Index is not ready")
+                        }
                     );
                     assert_eq!(result["structuredContent"]["requestId"], *id);
                     if name != TOOLS[0] {
@@ -606,14 +674,17 @@ mod tests {
                         "root_changed",
                         "store_unavailable",
                     ] {
-                        let tool = super::result(super::failure(id, code), modern);
+                        let tool = super::result(name, super::failure(id, code), modern);
+                        let failure = &tool["structuredContent"]["error"];
                         assert_eq!(
-                            serde_json::from_str::<Value>(
-                                tool["content"][0]["text"].as_str().unwrap()
+                            tool["content"][0]["text"],
+                            format!(
+                                "{name} failed: {}: {}",
+                                failure["code"].as_str().unwrap(),
+                                failure["message"].as_str().unwrap()
                             )
-                            .unwrap(),
-                            tool["structuredContent"]
                         );
+                        assert!(tool["content"][0]["text"].as_str().unwrap().len() <= 512);
                         let mut wire = Vec::new();
                         write_response(&mut wire, &json!({"jsonrpc":"2.0","id":id,"result":tool}))
                             .unwrap();
@@ -711,5 +782,36 @@ mod tests {
             invalid.response["structuredContent"]["error"]["code"],
             "invalid_request"
         );
+    }
+    #[test]
+    fn summary_uses_the_singular_for_one_item() {
+        let success = |data: Value| json!({"schemaVersion":1,"requestId":1,"data":data,"truncated":false,"truncationReason":null});
+        for (name, data, text) in [
+            ("trellis_find_symbols", json!({"symbols":[{}]}), "1 symbol"),
+            ("trellis_find_symbols", json!({"symbols":[]}), "0 symbols"),
+            ("trellis_outgoing_calls", json!({"calls":[{}]}), "1 call"),
+            (
+                "trellis_outgoing_calls",
+                json!({"calls":[{},{}]}),
+                "2 calls",
+            ),
+            (
+                "trellis_read_source",
+                json!({"startLine":4,"endLine":4}),
+                "1 line",
+            ),
+            (
+                "trellis_read_source",
+                json!({"startLine":4,"endLine":5}),
+                "2 lines",
+            ),
+            ("trellis_declaration", json!({}), "1 declaration"),
+            ("trellis_workspace_describe", json!({}), "1 workspace"),
+        ] {
+            assert_eq!(
+                result(name, success(data), true)["content"][0]["text"],
+                format!("{name}: {text}; full result in structuredContent.")
+            );
+        }
     }
 }

@@ -20,3 +20,17 @@ test("the MCP catalog is a valid tools/list result for the MCP SDK", () => {
     assert.equal(tool.outputSchema.type, "object", `${tool.name} outputSchema`);
   }
 });
+
+
+test("find and declaration schemas require closed declaration roles", () => {
+  const defs = tools.flatMap((tool) => Object.values(tool.outputSchema?.$defs ?? {}));
+  for (const name of ["Symbol", "Declaration"]) {
+    // Find Symbol uses symbolId; Declaration uses syntaxId.
+    const matches = defs.filter((definition) => definition?.properties?.role &&
+      (name === "Symbol" ? definition.properties.symbolId : definition.properties.syntaxId));
+    assert.equal(matches.length, 1, name);
+    assert.deepEqual(matches[0].properties.role.enum, ["test", "production"]);
+    assert.ok(matches[0].required.includes("role"));
+    assert.equal(matches[0].additionalProperties, false);
+  }
+});

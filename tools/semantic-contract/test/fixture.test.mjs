@@ -391,6 +391,7 @@ async function authorJavaCorpus(root) {
     decls.push({
       ref,
       nativeId: null,
+    role: "production",
       document: doc,
       revisionId: "r1",
       parentRef: parentRef ?? (kind === "type" ? "unit" : null),
@@ -617,6 +618,7 @@ async function authorJavaCorpus(root) {
   decls.push({
     ref: "unit",
     nativeId: null,
+    role: "production",
     document: doc,
     revisionId: "r1",
     parentRef: null,

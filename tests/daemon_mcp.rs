@@ -12,6 +12,22 @@ use std::{
 };
 use trellis::daemon::protocol;
 
+/// Every reply, including every tool result, stays within the response cap;
+/// only a `tools/list` catalog may use its separate, larger cap (#165).
+fn assert_reply_cap(raw: &[u8]) {
+    let value: Value = serde_json::from_slice(raw).expect("one JSON reply");
+    let cap = if value.pointer("/result/tools").is_some_and(Value::is_array) {
+        trellis::mcp::wire::CATALOG_BYTES
+    } else {
+        trellis::mcp::wire::RESPONSE_BYTES
+    };
+    assert!(
+        raw.len() <= cap,
+        "{}-byte reply exceeds its {cap}-byte cap",
+        raw.len()
+    );
+}
+
 /// Split a relayed daemon frame, `<relay id> <MCP line>` (Decision 0009 §7).
 fn relayed(line: &str) -> (u64, Value) {
     let (relay, frame) = line.trim_end().split_once(' ').expect("relay prefix");
@@ -52,7 +68,7 @@ impl Peer {
             let mut reader = BufReader::new(stdout);
             let mut line = Vec::new();
             while reader.read_until(b'\n', &mut line).unwrap_or(0) != 0 {
-                assert!(line.len() <= 65_536);
+                assert_reply_cap(&line);
                 if tx.send(serde_json::from_slice(&line).unwrap()).is_err() {
                     return;
                 }
@@ -1525,7 +1541,7 @@ fn partial_daemon_reply_is_typed_and_never_reaches_stdout() {
         let mut reader = BufReader::new(stdout);
         let mut line = Vec::new();
         while reader.read_until(b'\n', &mut line).unwrap_or(0) != 0 {
-            assert!(line.len() <= 65_536);
+            assert_reply_cap(&line);
             if tx.send(std::mem::take(&mut line)).is_err() {
                 return;
             }
@@ -1604,11 +1620,12 @@ fn partial_daemon_reply_is_typed_and_never_reaches_stdout() {
         "unverified checkout attributed: {selected}"
     );
     assert!(envelope.get("catchingUp").is_none(), "{selected}");
+    let summary = selected["result"]["content"][0]["text"].as_str().unwrap();
     assert_eq!(
-        serde_json::from_str::<Value>(selected["result"]["content"][0]["text"].as_str().unwrap())
-            .unwrap(),
-        *envelope
+        summary,
+        "trellis_workspace_describe failed: workspace_selection_failed: Workspace selection failed"
     );
+    assert!(summary.len() <= 512);
     failed_attach.join().unwrap();
     // Even though attach now fails, prior modern mode still defines protocol errors.
     let metadata = json!({

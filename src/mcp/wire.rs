@@ -4,6 +4,9 @@ use std::io::{self, BufRead, Write};
 
 pub const REQUEST_BYTES: usize = 16_384;
 pub const RESPONSE_BYTES: usize = 65_536;
+/// The static, server-authored `tools/list` catalog has its own cap (#165);
+/// every other response, including every tool result, stays within `RESPONSE_BYTES`.
+pub const CATALOG_BYTES: usize = 262_144;
 pub const SAFE_INTEGER: i64 = 9_007_199_254_740_991;
 
 /// A frame is complete only after LF. Oversized frames are drained, not retained.
@@ -61,10 +64,20 @@ pub fn write_relayed_response(
     relay: Option<u64>,
     response: &Value,
 ) -> io::Result<()> {
+    write_relayed_capped(writer, relay, response, RESPONSE_BYTES)
+}
+
+/// As [`write_relayed_response`], under an explicit cap (the catalog's).
+pub fn write_relayed_capped(
+    writer: &mut impl Write,
+    relay: Option<u64>,
+    response: &Value,
+    cap: usize,
+) -> io::Result<()> {
     if let Some(relay) = relay {
         write!(writer, "{relay} ")?;
     }
-    write_response(writer, response)
+    write_capped(writer, response, cap)
 }
 
 fn read_capped_frame(reader: &mut impl BufRead, cap: usize) -> io::Result<Frame> {
@@ -270,8 +283,11 @@ pub fn decode(frame: Frame) -> Result<Option<Request>, ProtocolError> {
 }
 /// The only stdout writer; includes LF in the complete response budget.
 pub fn write_response(writer: &mut impl Write, response: &Value) -> io::Result<()> {
+    write_capped(writer, response, RESPONSE_BYTES)
+}
+fn write_capped(writer: &mut impl Write, response: &Value, cap: usize) -> io::Result<()> {
     let mut encoded = serde_json::to_vec(response).map_err(io::Error::other)?;
-    if encoded.len() + 1 > RESPONSE_BYTES {
+    if encoded.len() + 1 > cap {
         return Err(io::Error::other("response too large"));
     }
     encoded.push(b'\n');
@@ -282,6 +298,19 @@ pub fn write_response(writer: &mut impl Write, response: &Value) -> io::Result<(
 mod tests {
     use super::*;
     use std::io::BufReader;
+    #[test]
+    fn only_an_explicit_catalog_cap_admits_frames_past_the_response_cap() {
+        // A frame of exactly RESPONSE_BYTES + 1 bytes including LF.
+        let over = json!("x".repeat(RESPONSE_BYTES - 2));
+        let mut out = Vec::new();
+        assert!(write_response(&mut out, &over).is_err());
+        assert!(write_relayed_response(&mut out, None, &over).is_err());
+        assert!(out.is_empty());
+        write_relayed_capped(&mut out, Some(7), &over, CATALOG_BYTES).unwrap();
+        assert_eq!(out.len(), "7 ".len() + RESPONSE_BYTES + 1);
+        let past = json!("x".repeat(CATALOG_BYTES - 2));
+        assert!(write_relayed_capped(&mut Vec::new(), None, &past, CATALOG_BYTES).is_err());
+    }
     #[test]
     fn framing_and_recovery() {
         let input = format!(

@@ -3123,14 +3123,15 @@ fn assert_fixture_declaration(
     assert_native_version_witness(native, &row[0], path, language);
     assert_eq!(row[2], serde_json::json!(owner), "{name}: native owner");
     assert_eq!(row[3], kind, "{name}: native declaration kind");
-    assert_eq!(row[4], name, "{name}: native measured name");
+    assert_eq!(row[4], "production", "{name}: native role");
+    assert_eq!(row[5], name, "{name}: native measured name");
     assert_eq!(
-        row[10], symbol["range"]["startByte"],
+        row[11], symbol["range"]["startByte"],
         "{name}: native start"
     );
-    assert_eq!(row[11], symbol["range"]["endByte"], "{name}: native end");
-    let start = row[10].as_u64().unwrap() as usize;
-    let end = row[11].as_u64().unwrap() as usize;
+    assert_eq!(row[12], symbol["range"]["endByte"], "{name}: native end");
+    let start = row[11].as_u64().unwrap() as usize;
+    let end = row[12].as_u64().unwrap() as usize;
     assert!(
         source
             .get(start..end)
@@ -4543,7 +4544,7 @@ async fn saved_items_real_index_matrix() {
         .unwrap()
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(index_version, 8, "derived v8 index inspection is separate");
+    assert_eq!(index_version, 9, "derived v9 index inspection is separate");
 
     let edited_view_body = serde_json::json!({
         "id":"real-view","title":"Edited","query":{"seed":seed}
