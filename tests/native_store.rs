@@ -3849,3 +3849,163 @@ fn incoming_call_index_uses_captured_version_and_nullable_measured_keys() {
     assert_eq!(key, "go", "published key must not follow live source edits");
     assert_eq!(store.status().unwrap().revision, pin);
 }
+
+#[test]
+#[cfg(feature = "test-support")]
+fn incoming_read_keeps_reverse_roles_scope_and_required_lines() {
+    use trellis::native_evidence::DeclarationRole;
+    let (state, root, store, cancel) = fixture();
+    fs::write(root.path().join("flow.js"),
+        "function Target() { Target(); }\nfunction Other() { Target(); function Nested() { Target(); } }\n").unwrap();
+    fs::write(
+        root.path().join("near.js"),
+        "function Near() { Target(); }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.path().join("near.test.js"),
+        "function Tester() { Target(); }\n",
+    )
+    .unwrap();
+    fs::create_dir(root.path().join("far")).unwrap();
+    fs::write(
+        root.path().join("far/far.js"),
+        "function Far() { Target(); }\n",
+    )
+    .unwrap();
+    fs::write(root.path().join("far/target.js"), "function Target() {}\n").unwrap();
+    let leader = store.publication_for_tests().unwrap();
+    let pin = publish(
+        &store,
+        root.path(),
+        &cancel,
+        store.index_baseline().unwrap(),
+        &leader,
+    )
+    .unwrap();
+    let read = store.evidence_response().unwrap();
+    let target = read
+        .mcp_find("Target", 20, Some(pin))
+        .unwrap()
+        .symbols
+        .into_iter()
+        .find(|s| {
+            s.declaration.document.path == "flow.js"
+                && s.declaration.name.as_deref() == Some("Target")
+        })
+        .unwrap()
+        .declaration;
+    assert_eq!(target.role, DeclarationRole::Production);
+    let incoming = read
+        .mcp_incoming_with_lines(&target.syntax_id, 3, Some(pin))
+        .unwrap()
+        .unwrap();
+    assert_eq!(incoming.same_name_declarations, 2);
+    assert!(incoming.has_more);
+    assert_eq!(incoming.calls.len(), 3);
+    assert_eq!(incoming.calls[0].caller.syntax_id, target.syntax_id);
+    assert_eq!(incoming.calls[0].call.document.path, "flow.js");
+    assert_eq!(incoming.calls[1].caller.name.as_deref(), Some("Other"));
+    assert_eq!(incoming.calls[2].caller.name.as_deref(), Some("Nested"));
+    assert!(
+        incoming
+            .calls
+            .iter()
+            .all(|call| call.callee_text == "Target"
+                && call.source.lines.is_some()
+                && call.call.owner_syntax_id == call.caller.syntax_id)
+    );
+    let all = read
+        .mcp_incoming_with_lines(&target.syntax_id, 20, Some(pin))
+        .unwrap()
+        .unwrap();
+    assert!(!all.has_more);
+    assert_eq!(
+        all.calls
+            .iter()
+            .map(|c| c.call.document.path.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "flow.js",
+            "flow.js",
+            "flow.js",
+            "near.js",
+            "far/far.js",
+            "near.test.js"
+        ]
+    );
+    assert_eq!(all.calls.last().unwrap().caller.role, DeclarationRole::Test);
+    assert_eq!(all.scope[3][0], 5);
+    assert!(all.scope[..3].iter().all(|counts| *counts == [0; 5]));
+    let java = read
+        .mcp_find("Demo", 20, Some(pin))
+        .unwrap()
+        .symbols
+        .into_iter()
+        .find(|s| s.declaration.name.as_deref() == Some("Demo"))
+        .unwrap()
+        .declaration;
+    let no_calls = read
+        .mcp_incoming_with_lines(&java.syntax_id, 20, Some(pin))
+        .unwrap()
+        .unwrap();
+    assert!(no_calls.calls.is_empty());
+    assert_eq!(no_calls.same_name_declarations, 1);
+    assert_eq!(no_calls.scope[0][0], 1);
+    assert!(no_calls.scope[1..].iter().all(|counts| *counts == [0; 5]));
+    let wrong = IndexPin {
+        index_generation: uuid::Uuid::nil(),
+        index_revision: pin.index_revision,
+    };
+    assert!(
+        read.mcp_incoming_with_lines("sid:v1:00000000000000000000000000000000", 1, Some(wrong))
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("revision conflict")
+    );
+    read.finish(()).unwrap();
+    drop(state);
+}
+
+#[test]
+#[cfg(feature = "test-support")]
+fn incoming_read_fails_on_corrupt_zero_hit_scope() {
+    let (_state, root, store, cancel) = fixture();
+    fs::write(root.path().join("flow.js"), "function Target() {}\n").unwrap();
+    let leader = store.publication_for_tests().unwrap();
+    let pin = publish(
+        &store,
+        root.path(),
+        &cancel,
+        store.index_baseline().unwrap(),
+        &leader,
+    )
+    .unwrap();
+    let selected = store.evidence_response().unwrap();
+    let target = selected
+        .mcp_find("Target", 20, Some(pin))
+        .unwrap()
+        .symbols
+        .into_iter()
+        .find(|s| s.declaration.name.as_deref() == Some("Target"))
+        .unwrap()
+        .declaration
+        .syntax_id;
+    selected.finish(()).unwrap();
+    drop(selected);
+    // Change only the manifest tuple. The required native tuple no longer
+    // agrees, even though there are no reverse hits in this document.
+    store
+        .mcp_set_coverage_for_tests(&leader, "flow.js", true, "partial")
+        .unwrap();
+    let read = store.evidence_response().unwrap();
+    let error = read
+        .mcp_incoming_with_lines(&target, 20, Some(pin))
+        .err()
+        .unwrap();
+    assert!(
+        error.to_string().contains("incompatible_index"),
+        "{error:#}"
+    );
+}

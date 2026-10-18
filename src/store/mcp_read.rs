@@ -712,7 +712,6 @@ impl EvidenceResponse {
         symbol_id: &str,
         expected: Option<IndexPin>,
     ) -> Result<Option<McpDeclaration>> {
-        use crate::native_evidence::Provenance;
         #[cfg(feature = "test-support")]
         if self
             .store
@@ -729,11 +728,20 @@ impl EvidenceResponse {
             expected.is_none_or(|pin| pin == selected.pin),
             "revision conflict: expected basis differs from admitted head"
         );
-        let Some(scope) = v8_owner_scope_for(&self.db, symbol_id, &selected)? else {
+        self.mcp_declaration_selected(symbol_id, &selected)
+    }
+
+    fn mcp_declaration_selected(
+        &self,
+        symbol_id: &str,
+        selected: &ReadRevision,
+    ) -> Result<Option<McpDeclaration>> {
+        use crate::native_evidence::Provenance;
+        let Some(scope) = v8_owner_scope_for(&self.db, symbol_id, selected)? else {
             return Ok(None);
         };
         self.store
-            .attest_selected_document_for(&self.db, &scope.key.path, &selected)?;
+            .attest_selected_document_for(&self.db, &scope.key.path, selected)?;
         let declaration = read_native_declarations_v8(&self.db, &scope, None, true)?
             .into_iter()
             .find(|row| row.syntax_id == symbol_id)
@@ -1376,6 +1384,279 @@ impl EvidenceResponse {
             },
             calls,
             has_more: outgoing.has_more,
+        }))
+    }
+}
+
+/// Required syntax-tier reverse hits and their selected document evidence.
+pub struct McpIncomingCallWithLines {
+    pub call: crate::native_evidence::Call,
+    pub caller: crate::native_evidence::Declaration,
+    pub content_hash: String,
+    pub source: McpItemSource,
+    pub callee_text: String,
+    pub coverage: crate::native_evidence::Coverage,
+    pub provenance: crate::native_evidence::Provenance,
+}
+
+pub struct McpIncomingWithLines {
+    pub selected: McpDeclarationWithLines,
+    pub calls: Vec<McpIncomingCallWithLines>,
+    pub same_name_declarations: u64,
+    /// Per language (java, rust, python, javascript): selected, complete,
+    /// partial, failed, unselected. Includes zero-hit scope documents.
+    pub scope: [[u64; 5]; 4],
+    pub has_more: bool,
+}
+
+impl EvidenceResponse {
+    pub fn mcp_incoming_with_lines(
+        &self,
+        symbol_id: &str,
+        limit: usize,
+        expected: Option<IndexPin>,
+    ) -> Result<Option<McpIncomingWithLines>> {
+        use crate::native_evidence::{DeclarationRole, DocumentKey, Provenance};
+        let selected = self.store.read_revision_for(&self.db, None, true)?;
+        ensure!(
+            expected.is_none_or(|pin| pin == selected.pin),
+            "revision conflict: expected basis differs from admitted head"
+        );
+        let Some(owner) = self.mcp_declaration_selected(symbol_id, &selected)? else {
+            return Ok(None);
+        };
+        let selected_key = &owner.declaration.document;
+        let mut scope_counts = [[0_u64; 5]; 4];
+        let language_index = match selected_key.language.as_str() {
+            "java" => 0,
+            "rust" => 1,
+            "python" => 2,
+            "javascript" => 3,
+            _ => anyhow::bail!("store_unavailable: invalid selected language"),
+        };
+        let keys = self.db.prepare(
+            "SELECT path FROM revision_documents WHERE revision_id=?1 AND source_set_id=?2 AND language=?3 ORDER BY path"
+        )?.query_map(params![selected.key, selected_key.source_set_id, selected_key.language], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut scopes = BTreeMap::new();
+        let mut coverages = BTreeMap::new();
+        for path in keys {
+            let key = DocumentKey {
+                source_set_id: selected_key.source_set_id.clone(),
+                language: selected_key.language.clone(),
+                path,
+            };
+            let scope = v8_native_scope_for(&self.db, &key, &selected)?
+                .context("store_unavailable: incoming scope absent")?;
+            let coverage = read_native_coverage_v8(&self.db, &scope)?;
+            ensure!(
+                coverage.revision_id == scope.native_revision_id
+                    && coverage.producer_id == scope.producer_id
+                    && coverage.language == key.language
+                    && coverage.source_set_id == key.source_set_id
+                    && coverage.document_path == key.path,
+                "store_unavailable: incoming coverage identity mismatch"
+            );
+            let valid = match coverage.state.as_str() {
+                "notRequested" => {
+                    !coverage.requested && !coverage.selected && coverage.diagnostic.is_none()
+                }
+                "omitted" | "unsupported" => {
+                    coverage.requested && !coverage.selected && coverage.diagnostic.is_some()
+                }
+                "failed" | "partial" => {
+                    coverage.requested && coverage.selected && coverage.diagnostic.is_some()
+                }
+                "complete" => {
+                    coverage.requested && coverage.selected && coverage.diagnostic.is_none()
+                }
+                _ => false,
+            };
+            let manifest: (bool, String) = self.db.query_row(
+                "SELECT coverage_selected,coverage_state FROM revision_documents WHERE revision_id=?1 AND document_version_id=?2 AND source_set_id=?3 AND language=?4 AND path=?5",
+                params![selected.key, scope.version_id, key.source_set_id, key.language, key.path],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            ensure!(
+                valid && manifest.0 == coverage.selected && manifest.1 == coverage.state,
+                "store_unavailable: inconsistent incoming coverage tuple"
+            );
+            let counts = &mut scope_counts[language_index];
+            if coverage.selected {
+                counts[0] += 1;
+                counts[match coverage.state.as_str() {
+                    "complete" => 1,
+                    "partial" => 2,
+                    _ => 3,
+                }] += 1;
+            } else {
+                counts[4] += 1;
+            }
+            coverages.insert(scope.version_id.clone(), coverage);
+            scopes.insert(scope.version_id.clone(), scope);
+        }
+        let proof = owner
+            .provenance
+            .iter()
+            .find(|p| p.id == owner.declaration.provenance_id)
+            .context("store_unavailable: incoming selected provenance absent")?;
+        let selected_source =
+            self.mcp_document_version(&selected, &owner.declaration, &owner.content_hash, proof)?;
+        let owner_lines = selected_source.item(&owner.declaration.range)?;
+        let mut calls = Vec::new();
+        let mut same_name_declarations = 0;
+        let mut has_more = false;
+        if let Some(lookup) = owner.declaration.lookup_key.as_deref() {
+            // Count declarations across every eligible selected version, not calls
+            // or only the limited response prefix.
+            for (version, scope) in &scopes {
+                if !matches!(coverages[version].state.as_str(), "complete" | "partial") {
+                    continue;
+                }
+                let count: i64 = self.db.query_row(
+                    "SELECT count(*) FROM native_version_declarations WHERE version_id=?1 AND lookup_key=?2 AND name IS NOT NULL",
+                    params![version, lookup], |r| r.get(0)
+                )?;
+                same_name_declarations += u64::try_from(count)?;
+                ensure!(
+                    scope.key.source_set_id == selected_key.source_set_id,
+                    "store_unavailable: incoming selected scope mismatch"
+                );
+            }
+            // This uses the exact three-key native-call index. The manifest
+            // selects one immutable version; no historical call is a fallback.
+            let rows = self.db.prepare(
+                "SELECT c.version_id,c.id,c.owner_syntax_id,m.path,d.role,c.start_byte,c.end_byte
+                 FROM native_version_calls c
+                 JOIN revision_documents m ON m.document_version_id=c.version_id AND m.revision_id=?1
+                 JOIN native_version_declarations d ON d.version_id=c.version_id AND d.syntax_id=c.owner_syntax_id
+                 WHERE c.source_set_id=?2 AND c.language=?3 AND c.callee_lookup_key=?4
+                   AND m.source_set_id=c.source_set_id AND m.language=c.language
+                   AND m.coverage_selected=1 AND m.coverage_state IN ('complete','partial')"
+            )?.query_map(params![selected.key, selected_key.source_set_id, selected_key.language, lookup], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?, r.get::<_, String>(4)?, r.get::<_, i64>(5)?, r.get::<_, i64>(6)?))
+            })?.collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut ranked = Vec::new();
+            for (version, id, caller_id, path, stored_role, start, end) in rows {
+                let scope = scopes
+                    .get(&version)
+                    .context("store_unavailable: incoming call scope absent")?;
+                ensure!(
+                    scope.key.path == path
+                        && matches!(coverages[&version].state.as_str(), "complete" | "partial"),
+                    "store_unavailable: incoming call scope mismatch"
+                );
+                let role = DeclarationRole::from_stored(&stored_role)?;
+                ranked.push((
+                    u8::from(role == DeclarationRole::Test),
+                    mcp_hint_proximity(&selected_key.path, &path),
+                    path,
+                    start,
+                    end,
+                    id,
+                    version,
+                    caller_id,
+                    role,
+                ));
+            }
+            ranked.sort_by(|a, b| {
+                (&a.0, &a.1, &a.2, &a.3, &a.4, &a.5).cmp(&(&b.0, &b.1, &b.2, &b.3, &b.4, &b.5))
+            });
+            has_more = ranked.len() > limit;
+            let mut loaded = BTreeMap::new();
+            for (_, _, _, _, _, id, version, caller_id, role) in ranked.into_iter().take(limit + 1)
+            {
+                let scope = &scopes[&version];
+                if !loaded.contains_key(&version) {
+                    self.store.attest_selected_document_for(
+                        &self.db,
+                        &scope.key.path,
+                        &selected,
+                    )?;
+                    let declarations = read_native_declarations_v8(&self.db, scope, None, true)?
+                        .into_iter()
+                        .map(|d| (d.syntax_id.clone(), d))
+                        .collect::<BTreeMap<_, _>>();
+                    let measured = read_native_calls_v8(&self.db, scope, None)?
+                        .into_iter()
+                        .map(|c| (c.id.clone(), c))
+                        .collect::<BTreeMap<_, _>>();
+                    let hash: String = self.db.query_row(
+                        "SELECT content_hash FROM document_versions WHERE id=?1 AND source_set_id=?2 AND language=?3 AND path=?4",
+                        params![version, scope.key.source_set_id, scope.key.language, scope.key.path], |r| r.get(0)
+                    )?;
+                    loaded.insert(version.clone(), (declarations, measured, hash));
+                }
+                let (declarations, measured, hash) = &loaded[&version];
+                let caller = declarations
+                    .get(&caller_id)
+                    .context("store_unavailable: incoming caller absent")?;
+                let call = measured
+                    .get(&id)
+                    .context("store_unavailable: incoming call absent")?;
+                ensure!(
+                    caller.role == role
+                        && caller.document == scope.key
+                        && caller.revision_id == scope.native_revision_id
+                        && caller.provenance_id == scope.proof_id()
+                        && call.owner_syntax_id == caller.syntax_id
+                        && call.document == scope.key
+                        && call.revision_id == scope.native_revision_id
+                        && call.provenance_id == scope.proof_id(),
+                    "store_unavailable: incoming call or caller proof mismatch"
+                );
+                let provenance = Provenance {
+                    id: scope.proof_id(),
+                    producer_id: scope.producer_id.clone(),
+                    document: scope.key.clone(),
+                    revision_id: scope.native_revision_id.clone(),
+                    content_hash: hash.clone(),
+                    evidence_kind: "measuredSyntax".into(),
+                    basis: None,
+                    freshness: "fresh".into(),
+                    derived_from: None,
+                };
+                let checked = self.mcp_document_version(&selected, caller, hash, &provenance)?;
+                let bytes = &checked.lines.bytes;
+                let text = std::str::from_utf8(bytes)
+                    .map_err(|_| anyhow::anyhow!("store_unavailable: incoming source encoding"))?;
+                ensure!(
+                    crate::native_evidence::verified_callee_lookup(&scope.key.language, call, text)
+                        .as_deref()
+                        == Some(lookup),
+                    "store_unavailable: incoming call lookup mismatch"
+                );
+                let range = call
+                    .callee_range
+                    .as_ref()
+                    .context("store_unavailable: incoming callee range absent")?;
+                let callee_text = text
+                    .get(range.start..range.end)
+                    .context("store_unavailable: incoming callee outside source")?
+                    .to_owned();
+                if calls.len() < limit {
+                    calls.push(McpIncomingCallWithLines {
+                        call: call.clone(),
+                        caller: caller.clone(),
+                        content_hash: hash.clone(),
+                        source: checked.item(&call.range)?,
+                        callee_text,
+                        coverage: coverages[&version].clone(),
+                        provenance,
+                    });
+                }
+            }
+        }
+        Ok(Some(McpIncomingWithLines {
+            selected: McpDeclarationWithLines {
+                selected: owner,
+                source: owner_lines,
+            },
+            calls,
+            same_name_declarations,
+            scope: scope_counts,
+            has_more,
         }))
     }
 }
