@@ -27,7 +27,7 @@ const LANGUAGES: [&str; 4] = ["java", "rust", "python", "javascript"];
 pub(crate) const PRODUCER: &str = "trellis.native.syntax";
 /// Native producer descriptor version. Any change that can alter a native measured field or
 /// projection, or that starts reading another input, must change it (Decision 0003).
-pub(crate) const NATIVE_VERSION: &str = "native-v5";
+pub(crate) const NATIVE_VERSION: &str = "native-v6";
 /// The native producer's declared extraction-input inventory (Decision 0003), keyed by its
 /// descriptor `(id, version)` and language. `extract` measures one document from only its own
 /// bytes, language and path; the tree-sitter grammars and Unicode normalization tables it uses
@@ -1071,7 +1071,9 @@ fn attribute_tokens(text: &str) -> Vec<&str> {
     while offset < text.len() {
         let rest = &text[offset..];
         if rest.starts_with("//") {
-            break;
+            // A line comment ends at its newline; the attribute may continue after it.
+            offset += rest.find('\n').map_or(rest.len(), |end| end + 1);
+            continue;
         }
         if rest.starts_with("/*") {
             offset += rest.find("*/").map_or(rest.len(), |end| end + 2);
@@ -1145,7 +1147,15 @@ fn rust_test_attribute(n: Node<'_>, file: &SourceFile) -> bool {
     while t.get(index + 1) == Some(&":") && t.get(index + 2) == Some(&":") {
         index += 3;
     }
-    t.get(index) == Some(&"test") && t.get(index + 1) == Some(&"]")
+    // A final-path test attribute may take arguments: `#[tokio::test(flavor = "…")]`.
+    t.get(index) == Some(&"test") && matches!(t.get(index + 1), Some(&"]") | Some(&"("))
+}
+/// An inner `#![cfg(test)]`-style attribute among `n`'s own children marks
+/// its enclosing file or module body as test code.
+fn rust_inner_test(n: Node<'_>, file: &SourceFile) -> bool {
+    child_nodes(n)
+        .into_iter()
+        .any(|child| child.kind() == "inner_attribute_item" && rust_test_attribute(child, file))
 }
 fn java_test_method(n: Node<'_>, file: &SourceFile) -> bool {
     if n.kind() != "method_declaration" {
@@ -1185,6 +1195,13 @@ fn local_test_marker(n: Node<'_>, file: &SourceFile) -> bool {
                 || (n.kind() == "class_definition"
                     && named.as_deref().is_some_and(|s| s.starts_with("Test")))
         }
+        "rust" => match n.kind() {
+            "source_file" | "declaration_list" => rust_inner_test(n, file),
+            "mod_item" => n
+                .child_by_field_name("body")
+                .is_some_and(|body| rust_inner_test(body, file)),
+            _ => false,
+        },
         _ => false,
     }
 }
@@ -1584,9 +1601,11 @@ fn extract_known_with_progress(
         ordinal: 0,
     };
     let module_id=ids.stable(&json!({"sourceSet":a.source_set.id,"path":f.path,"language":f.language,"ancestors":[],"declaration":module_key}))?;
+    // A file-level inner `#![cfg(test)]` makes the whole document test code.
+    let file_test = test_path(&f.path) || local_test_marker(tree.root_node(), f);
     a.declarations.push(Declaration {
         syntax_id: module_id.clone(),
-        role: declaration_role(test_path(&f.path)),
+        role: declaration_role(file_test),
         document: key.clone(),
         revision_id: a.revision.id.clone(),
         kind: "module".into(),
@@ -1632,7 +1651,7 @@ fn extract_known_with_progress(
         &[],
         &[],
         0,
-        (test_path(&f.path), false),
+        (file_test, false),
     )?;
     state.finish_occurrences()?;
     crate::store::optional_hint_check(progress)?;
@@ -2562,8 +2581,8 @@ mod occurrence_identity_tests {
         };
         assert_eq!(
             witness(&a),
-            "699962d67808217642edc089fa7d5d33f4ead9aa9ca2677ae5b2421bf3fdc0af",
-            "native-v5 witness includes declaration role"
+            "80b64e65fe108a98090e2342cef5432805a89b18ef2446862ca6b2b7fcd049d3",
+            "native-v6 witness includes declaration role and the producer version"
         );
         assert_eq!(
             witness(&a),
