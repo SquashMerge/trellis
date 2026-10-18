@@ -678,6 +678,98 @@ fn index_from_another_native_producer_version_is_rebuilt_not_served() {
         );
     }
 }
+#[test]
+#[cfg(feature = "test-support")]
+fn physical_v8_native_v4_index_recreates_before_role_column_read() {
+    use std::os::unix::fs::MetadataExt;
+    use trellis::native_evidence::DeclarationRole;
+    let (state, root, prior, cancel) = fixture();
+    let old_root_id = prior.root_id().to_owned();
+    prior
+        .enqueue_request(&IndexOptions::new(root.path().to_owned()), None)
+        .unwrap();
+    let path = published_db(state.path(), root.path());
+    drop(prior);
+    fs::remove_file(&path).unwrap();
+    let identity =
+        trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+            .unwrap();
+    let old = Connection::open(&path).unwrap();
+    old.execute_batch(include_str!("fixtures/gc-legacy/v8-current.sql"))
+        .unwrap();
+    old.pragma_update(None, "user_version", 8_i64).unwrap();
+    old.execute(
+        "INSERT INTO index_metadata(singleton,schema_version,extractor_version,root_spelling,root_device,root_inode,index_generation,index_revision,last_opened_at,indexed_at,stats,diagnostics) VALUES (1,8,'native-v4-delta-v1',?1,?2,?3,?4,0,0,'','{}','[]')",
+        rusqlite::params![identity.root.to_str().unwrap(),identity.device.to_string(),identity.inode.to_string(),uuid::Uuid::new_v4().to_string()],
+    ).unwrap();
+    old.execute("INSERT INTO native_producers(id,version,executable_hash,kind,position_encoding) VALUES ('trellis.native.syntax','native-v4',?1,'native','utf8')", ["0".repeat(64)]).unwrap();
+    let columns: Vec<String> = old
+        .prepare("PRAGMA table_info(native_version_declarations)")
+        .unwrap()
+        .query_map([], |row| row.get(1))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert!(
+        !columns.iter().any(|name| name == "role"),
+        "fixture must be physical v8 without role"
+    );
+    drop(old);
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    let old_inode = fs::metadata(&path).unwrap().ino();
+    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    assert_eq!(store.root_id(), old_root_id);
+    assert_eq!(
+        Connection::open(&path)
+            .unwrap()
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        8
+    );
+    assert!(
+        store
+            .status()
+            .unwrap_err()
+            .to_string()
+            .contains("recovery_required")
+    );
+    let (pin, _session) = trellis::index_coordinator::reconcile_workspace(
+        &store,
+        &IndexOptions::new(root.path().to_owned()),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    assert_ne!(
+        fs::metadata(&path).unwrap().ino(),
+        old_inode,
+        "disposable index must recreate, not migrate"
+    );
+    let rebuilt = Connection::open(&path).unwrap();
+    assert_eq!(
+        rebuilt
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        9
+    );
+    let stamp: String = rebuilt
+        .query_row("SELECT extractor_version FROM index_metadata", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(stamp, "native-v5-delta-v1");
+    let version: String = rebuilt
+        .query_row("SELECT version FROM native_producers", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, "native-v5");
+    let roles = store
+        .native_declarations_at(pin, "javascript", "hello")
+        .unwrap();
+    assert_eq!(roles.len(), 1);
+    assert_eq!(roles[0].role, DeclarationRole::Production);
+}
+
 #[cfg(feature = "test-support")]
 fn published_db(state: &std::path::Path, root: &std::path::Path) -> std::path::PathBuf {
     state

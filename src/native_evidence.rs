@@ -1951,7 +1951,17 @@ impl ParserState<'_> {
                 )?;
                 continue;
             }
-            if self.file.language == "rust" && child.kind() == "line_comment" {
+            if self.file.language == "rust"
+                && matches!(child.kind(), "line_comment" | "block_comment")
+            {
+                self.walk(
+                    child,
+                    &owner,
+                    &ancestry,
+                    &regions,
+                    depth + 1,
+                    (test_context, false),
+                )?;
                 continue;
             }
             self.walk(

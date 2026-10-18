@@ -1277,7 +1277,6 @@ fn unreadable_required_input_fails_closed() {
 #[test]
 fn declaration_roles_follow_syntax_paths_and_inherit_without_changing_identity() {
     use std::{
-        collections::BTreeMap,
         fs,
         sync::{Arc, atomic::AtomicBool},
     };
@@ -1294,13 +1293,17 @@ fn declaration_roles_follow_syntax_paths_and_inherit_without_changing_identity()
     let sources = [
         (
             "src.rs",
-            "fn normal() {}\n#[cfg(test)] mod inner { fn helper() {} struct Thing; impl Thing { fn method(&self) {} } }\nfn after() {}\n#[cfg(all(feature = \"x\", test))] fn all_test() {}\n#[cfg(any(test, feature = \"x\"))] fn any_test() {}\n#[cfg(not(test))] fn not_test() {}\n#[cfg(feature = \"test-support\")] fn support() {}\n#[test] fn standalone() {}\n#[tokio::test] fn qualified() {}\n// #[test] fn commented() {}\nconst TEXT: &str = \"#[test]\";\n",
+            "fn normal() {}\n#[cfg(test)] mod inner { fn helper() {} struct Thing; impl Thing { fn method(&self) {} } }\nfn after() {}\n#[cfg(all(feature = \"x\", test))] fn all_test() {}\n#[cfg(any(test, feature = \"x\"))] fn any_test() {}\n#[cfg(not(test))] fn not_test() {}\n#[cfg(feature = \"test-support\")] fn support() {}\n#[test] fn standalone() {}\n#[tokio::test] fn qualified() {}\n#[cfg(test)] /* note */ fn after_block_comment() {}\nfn unmarked_after_comment() {}\n// #[test] fn commented() {}\nconst TEXT: &str = \"#[test]\";\n",
         ),
         (
             "A.java",
-            "class A { @Test void outside() {} @org.junit.jupiter.params.ParameterizedTest void parameterized() {} @RepeatedTest void repeated() {} @TestFactory void factory() {} @TestTemplate void template() {} void normal() {} }",
+            "class A { @Test void outside() {} @org.testng.annotations.Test void testng() {} @org.junit.jupiter.params.ParameterizedTest void parameterized() {} @RepeatedTest void repeated() {} @TestFactory void factory() {} @TestTemplate void template() {} void normal() {} }",
         ),
         ("tests/Widget.java", "class Widget { void ordinary() {} }"),
+        (
+            "tests/checks.rs",
+            "struct Helper; fn ordinary() { let value = 1; }",
+        ),
         (
             "test_sample.py",
             "class TestSuite:\n    def helper(self): pass\nasync def test_async(): pass\ndef test_free(): pass\ndef normal(): pass\n",
@@ -1330,73 +1333,145 @@ fn declaration_roles_follow_syntax_paths_and_inherit_without_changing_identity()
         .1
     };
     let before = extract();
-    let role = |path: &str, name: &str| {
-        before
-            .declarations
-            .iter()
-            .find(|d| d.document.path == path && d.name.as_deref() == Some(name))
-            .unwrap_or_else(|| panic!("missing {path}/{name}"))
-            .role
-    };
-    for name in [
-        "inner",
-        "helper",
-        "Thing",
-        "method",
-        "all_test",
-        "standalone",
-        "qualified",
-    ] {
-        assert_eq!(role("src.rs", name), DeclarationRole::Test, "{name}");
-    }
-    for name in ["normal", "after", "any_test", "not_test", "support", "TEXT"] {
-        assert_eq!(role("src.rs", name), DeclarationRole::Production, "{name}");
-    }
-    for name in [
-        "outside",
-        "parameterized",
-        "repeated",
-        "factory",
-        "template",
-    ] {
-        assert_eq!(role("A.java", name), DeclarationRole::Test, "{name}");
-    }
-    assert_eq!(role("A.java", "normal"), DeclarationRole::Production);
-    assert_eq!(role("tests/Widget.java", "ordinary"), DeclarationRole::Test);
-    for name in ["TestSuite", "helper", "test_async", "test_free"] {
-        assert_eq!(
-            role("test_sample.py", name),
+    // Exhaustive source-authored expectations include every synthetic, anonymous,
+    // nested and non-callable row, not only name-bearing functions.
+    let expected = [
+        (
+            "A.java",
+            DeclarationRole::Production,
+            &["module:", "type:A", "method:normal"][..],
+        ),
+        (
+            "A.java",
             DeclarationRole::Test,
-            "{name}"
-        );
-    }
-    assert_eq!(role("test_sample.py", "normal"), DeclarationRole::Test);
-    for name in ["test_named", "TestNamed"] {
-        assert_eq!(role("normal.py", name), DeclarationRole::Production);
-    }
-    assert_eq!(role("thing.js", "test_name"), DeclarationRole::Production);
-    assert_eq!(
-        role("__tests__/thing.js", "ordinary"),
-        DeclarationRole::Test
-    );
-    assert!(
-        before
-            .declarations
-            .iter()
-            .all(|d| matches!(d.role, DeclarationRole::Test | DeclarationRole::Production))
-    );
-    // An attribute changes the measured role, never the stable declaration identity.
-    let baseline: BTreeMap<_, _> = before
+            &[
+                "method:outside",
+                "method:testng",
+                "method:parameterized",
+                "method:repeated",
+                "method:factory",
+                "method:template",
+            ],
+        ),
+        (
+            "tests/Widget.java",
+            DeclarationRole::Test,
+            &["module:", "type:Widget", "method:ordinary"],
+        ),
+        (
+            "src.rs",
+            DeclarationRole::Production,
+            &[
+                "module:",
+                "function:normal",
+                "function:after",
+                "function:any_test",
+                "function:not_test",
+                "function:support",
+                "function:unmarked_after_comment",
+                "variable:TEXT",
+            ],
+        ),
+        (
+            "src.rs",
+            DeclarationRole::Test,
+            &[
+                "namespace:inner",
+                "function:helper",
+                "type:Thing",
+                "implementation:",
+                "method:method",
+                "function:all_test",
+                "function:standalone",
+                "function:qualified",
+                "function:after_block_comment",
+            ],
+        ),
+        (
+            "tests/checks.rs",
+            DeclarationRole::Test,
+            &["module:", "type:Helper", "function:ordinary"],
+        ),
+        (
+            "normal.py",
+            DeclarationRole::Production,
+            &["module:", "function:test_named", "type:TestNamed"],
+        ),
+        (
+            "test_sample.py",
+            DeclarationRole::Test,
+            &[
+                "module:",
+                "type:TestSuite",
+                "function:helper",
+                "function:test_async",
+                "function:test_free",
+                "function:normal",
+            ],
+        ),
+        (
+            "__tests__/thing.js",
+            DeclarationRole::Test,
+            &["module:", "function:ordinary"],
+        ),
+        (
+            "thing.js",
+            DeclarationRole::Production,
+            &["module:", "function:test_name", "anonymousFunction:"],
+        ),
+    ];
+    let mut expected_rows = expected
+        .iter()
+        .flat_map(|(path, role, rows)| {
+            rows.iter().map(move |row| {
+                let (kind, name) = row.split_once(':').unwrap();
+                (
+                    (*path).to_owned(),
+                    kind.to_owned(),
+                    (!name.is_empty()).then(|| name.to_owned()),
+                    serde_json::to_string(role).unwrap(),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut actual_rows = before
         .declarations
         .iter()
-        .filter(|d| d.document.path == "src.rs")
         .map(|d| {
             (
+                d.document.path.clone(),
+                d.kind.clone(),
                 d.name.clone(),
-                (d.syntax_id.clone(), d.key.clone(), d.lookup_key.clone()),
+                serde_json::to_string(&d.role).unwrap(),
             )
         })
-        .collect();
+        .collect::<Vec<_>>();
+    expected_rows.sort();
+    actual_rows.sort();
+    assert_eq!(
+        actual_rows, expected_rows,
+        "every emitted declaration has the source-expected role"
+    );
+    assert_eq!(before.declarations.len(), expected_rows.len());
+    // An attribute changes the measured role, never the stable declaration identity.
+    let identities = |artifact: &trellis::native_evidence::Artifact| {
+        let mut rows = artifact
+            .declarations
+            .iter()
+            .map(|d| {
+                (
+                    serde_json::to_string(&d.document).unwrap(),
+                    d.syntax_id.clone(),
+                    serde_json::to_string(&d.key).unwrap(),
+                    d.lookup_key.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        rows.sort();
+        rows
+    };
+    let baseline = identities(&before);
+    assert_eq!(baseline.len(), before.declarations.len());
     let original = fs::read_to_string(root.path().join("src.rs")).unwrap();
     fs::write(
         root.path().join("src.rs"),
@@ -1404,17 +1479,8 @@ fn declaration_roles_follow_syntax_paths_and_inherit_without_changing_identity()
     )
     .unwrap();
     let after = extract();
-    let changed: BTreeMap<_, _> = after
-        .declarations
-        .iter()
-        .filter(|d| d.document.path == "src.rs")
-        .map(|d| {
-            (
-                d.name.clone(),
-                (d.syntax_id.clone(), d.key.clone(), d.lookup_key.clone()),
-            )
-        })
-        .collect();
+    let changed = identities(&after);
+    assert_eq!(changed.len(), after.declarations.len());
     assert_eq!(baseline, changed);
     assert_eq!(
         after
