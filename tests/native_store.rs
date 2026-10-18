@@ -654,7 +654,7 @@ fn index_from_another_native_producer_version_is_rebuilt_not_served() {
         let version: String = db
             .query_row("SELECT version FROM native_producers", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, "native-v7");
+        assert_eq!(version, "native-v8");
         let calls: Vec<String> = db
             .prepare("SELECT id FROM native_version_calls")
             .unwrap()
@@ -762,7 +762,7 @@ fn physical_v8_native_v4_index_recreates_before_role_column_read() {
     let version: String = rebuilt
         .query_row("SELECT version FROM native_producers", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, "native-v7");
+    assert_eq!(version, "native-v8");
     let roles = store
         .native_declarations_at(pin, "javascript", "hello")
         .unwrap();
@@ -4546,5 +4546,107 @@ fn incoming_four_languages_restrict_to_measured_name_and_order_near_before_test(
         );
         assert!(!incoming.has_more);
         read.finish(()).unwrap();
+    }
+}
+
+#[test]
+#[cfg(feature = "test-support")]
+fn escaped_javascript_declarations_publish_without_losing_later_facts() {
+    // Each case uses a fresh real SQLite publication. A rejected declaration used to
+    // abort the whole document before either the declaration or later calls reached it.
+    for (source, selected_key, selected_name, later_key, later_call_key) in [
+        (
+            "function \\u{0000054}arget() {}\nfunction Normal() {}\nfunction Caller() { Target(); Normal(); }\n",
+            "Target",
+            "\\u{0000054}arget",
+            "Normal",
+            "Target",
+        ),
+        (
+            "class A { d\\u0065lete() {} normal() {} }\nfunction Caller() { normal(); const a = new A(); a.delete(); a.d\\u0065lete(); }\n",
+            "d\\u0065lete",
+            "d\\u0065lete",
+            "normal",
+            "normal",
+        ),
+    ] {
+        let state = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("a.js"), source).unwrap();
+        let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let leader = store.publication_for_tests().unwrap();
+        let pin = publish(
+            &store,
+            root.path(),
+            &cancel,
+            store.index_baseline().unwrap(),
+            &leader,
+        )
+        .unwrap();
+        assert_eq!(store.status().unwrap().revision, pin);
+        let db = Connection::open(published_db(state.path(), root.path())).unwrap();
+        let version = live_document_version(&db, "a.js");
+        let stored: (String, String) = db.query_row(
+            "SELECT name, lookup_key FROM native_version_declarations WHERE version_id=?1 AND lookup_key=?2",
+            rusqlite::params![version, selected_key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(stored, (selected_name.to_owned(), selected_key.to_owned()));
+        let selected = store
+            .native_declarations_at(pin, "javascript", selected_key)
+            .unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].name.as_deref(), Some(selected_name));
+        let later = store
+            .native_declarations_at(pin, "javascript", later_key)
+            .unwrap();
+        assert_eq!(
+            later.len(),
+            1,
+            "declarations after escaped name must be indexed"
+        );
+        let caller = store
+            .native_declarations_at(pin, "javascript", "Caller")
+            .unwrap();
+        assert_eq!(caller.len(), 1);
+        let calls = store.native_calls_at(pin, &caller[0].syntax_id).unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.spelling.as_deref() == Some(later_call_key))
+        );
+        let published_calls: i64 = db.query_row(
+            "SELECT count(*) FROM native_version_calls WHERE version_id=?1 AND callee_lookup_key=?2",
+            rusqlite::params![version, later_call_key],
+            |row| row.get(0),
+        ).unwrap();
+        assert!(
+            published_calls > 0,
+            "calls after escaped name must reach SQLite"
+        );
+        if selected_key.contains('\\') {
+            // Neither an ordinary keyword member nor its escaped spelling can
+            // produce the declaration's raw fallback key.
+            let measured: Vec<(String, Option<String>)> = db
+                .prepare(
+                    "SELECT spelling,callee_lookup_key FROM native_version_calls \
+                     WHERE version_id=?1 AND spelling IN (?2,?3) ORDER BY spelling",
+                )
+                .unwrap()
+                .query_map(rusqlite::params![version, selected_name, "delete"], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert_eq!(
+                measured,
+                vec![
+                    (selected_name.to_owned(), None),
+                    ("delete".to_owned(), Some("delete".to_owned())),
+                ]
+            );
+        }
     }
 }

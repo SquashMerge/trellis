@@ -9616,3 +9616,106 @@ async fn incoming_byte_clipping_overrides_limit_and_discards_omitted_proofs() {
     );
     assert!(serde_json::to_vec(&response).unwrap().len() < 65_536);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn incoming_escaped_javascript_declarations_keep_wire_labels_and_later_calls() {
+    for (source, selected_name, expected_callee, later_name) in [
+        (
+            "function \\u{0000054}arget() {}\nfunction Normal() {}\nfunction Caller() { Target(); Normal(); }\n",
+            "\\u{0000054}arget",
+            Some("Target"),
+            "Normal",
+        ),
+        (
+            "class A { d\\u0065lete() {} normal() {} }\nfunction Caller() { normal(); const a = new A(); a.delete(); a.d\\u0065lete(); }\n",
+            "d\\u0065lete",
+            None,
+            "normal",
+        ),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = checkout(temp.path());
+        fs::write(root.join("a.js"), source).unwrap();
+        let root_key = trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root)
+            .unwrap()
+            .root_key;
+        let (mut peer, witness) = Peer::start_with_causal_witness(Some(&root));
+        tool(
+            &peer.ask(call(
+                false,
+                json!(1),
+                "trellis_workspace_describe",
+                json!({"schemaVersion":1}),
+            )),
+            None,
+            true,
+        );
+        let pin = await_settled_golden_h(&witness, &root_key).await;
+        let find = |peer: &mut Peer, request_id: i64, query: &str| {
+            let reply = peer.ask(call(
+                false,
+                json!(request_id),
+                "trellis_find_symbols",
+                json!({"schemaVersion":1,"query":query,"expectedBasis":pin}),
+            ));
+            tool(&reply, None, true);
+            reply["result"]["structuredContent"]["data"]["symbols"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|symbol| symbol["name"] == query)
+                .unwrap_or_else(|| panic!("missing published {query}: {reply}"))["symbolId"]
+                .clone()
+        };
+        let selected_id = find(&mut peer, 2, selected_name);
+        let later_id = find(&mut peer, 3, later_name);
+        let selected = peer.ask(call(
+            false,
+            json!(4),
+            "trellis_declaration",
+            json!({"schemaVersion":1,"symbolId":selected_id,"expectedBasis":pin}),
+        ));
+        tool(&selected, None, true);
+        let decl = &selected["result"]["structuredContent"]["data"]["declaration"];
+        assert_eq!(decl["name"], selected_name);
+        assert_eq!(decl["syntaxId"], selected_id);
+        let incoming = peer.ask(call(
+            false,
+            json!(5),
+            "trellis_incoming_calls",
+            json!({"schemaVersion":1,"symbolId":selected_id,"expectedBasis":pin}),
+        ));
+        tool(&incoming, None, true);
+        let data = &incoming["result"]["structuredContent"]["data"];
+        assert_eq!(data["symbolId"], selected_id);
+        assert!(
+            data["displayKey"].as_str().unwrap().contains(selected_name),
+            "{incoming}"
+        );
+        assert_eq!(data["match"]["basis"], "name");
+        let callers = data["callers"].as_array().unwrap();
+        match expected_callee {
+            Some(callee) => {
+                assert_eq!(callers.len(), 1, "{incoming}");
+                assert_eq!(callers[0]["calleeText"], callee);
+                assert_eq!(callers[0]["matchedBy"], "name");
+            }
+            None => assert!(callers.is_empty(), "{incoming}"),
+        }
+        let caller_id = find(&mut peer, 6, "Caller");
+        let later_incoming = peer.ask(call(
+            false,
+            json!(7),
+            "trellis_incoming_calls",
+            json!({"schemaVersion":1,"symbolId":later_id,"expectedBasis":pin}),
+        ));
+        tool(&later_incoming, None, true);
+        let later_callers = later_incoming["result"]["structuredContent"]["data"]["callers"]
+            .as_array()
+            .unwrap();
+        assert_eq!(later_callers.len(), 1, "{later_incoming}");
+        assert_eq!(later_callers[0]["calleeText"], later_name);
+        assert_eq!(later_callers[0]["ownerSyntaxId"], caller_id);
+        assert!(peer.finish().0.success());
+    }
+}

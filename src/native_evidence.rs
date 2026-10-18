@@ -27,7 +27,7 @@ const LANGUAGES: [&str; 4] = ["java", "rust", "python", "javascript"];
 pub(crate) const PRODUCER: &str = "trellis.native.syntax";
 /// Native producer descriptor version. Any change that can alter a native measured field or
 /// projection, or that starts reading another input, must change it (Decision 0003).
-pub(crate) const NATIVE_VERSION: &str = "native-v7";
+pub(crate) const NATIVE_VERSION: &str = "native-v8";
 /// The native producer's declared extraction-input inventory (Decision 0003), keyed by its
 /// descriptor `(id, version)` and language. `extract` measures one document from only its own
 /// bytes, language and path; the tree-sitter grammars and Unicode normalization tables it uses
@@ -526,16 +526,27 @@ fn javascript_identifier(name: &str) -> Result<String> {
         );
         let code = if chars.peek() == Some(&'{') {
             chars.next();
-            let mut digits = String::new();
+            let mut code = 0u32;
+            let mut saw_digit = false;
             loop {
                 match chars.next() {
                     Some('}') => break,
-                    Some(c) if digits.len() < 6 && c.is_ascii_hexdigit() => digits.push(c),
+                    Some(c) if c.is_ascii_hexdigit() => {
+                        saw_digit = true;
+                        let digit = c
+                            .to_digit(16)
+                            .context("invalid JavaScript identifier escape")?;
+                        code = code
+                            .checked_mul(16)
+                            .and_then(|n| n.checked_add(digit))
+                            .filter(|n| *n <= 0x10FFFF)
+                            .context("invalid JavaScript identifier escape")?;
+                    }
                     _ => anyhow::bail!("invalid JavaScript identifier escape"),
                 }
             }
-            ensure!(!digits.is_empty(), "invalid JavaScript identifier escape");
-            u32::from_str_radix(&digits, 16)?
+            ensure!(saw_digit, "invalid JavaScript identifier escape");
+            code
         } else {
             let digits: String = chars.by_ref().take(4).collect();
             ensure!(digits.len() == 4, "invalid JavaScript identifier escape");
@@ -563,6 +574,17 @@ fn javascript_identifier(name: &str) -> Result<String> {
         "invalid decoded JavaScript identifier"
     );
     Ok(decoded)
+}
+
+// A declaration's measured spelling stays indexed even if an escaped JavaScript
+// identifier cannot decode to a complete standalone token (for example, a
+// keyword spelled with escapes). Calls use lookup().ok(), never this raw fallback.
+fn declaration_lookup(language: &str, name: &str) -> Result<String> {
+    match lookup(language, name) {
+        Ok(key) => Ok(key),
+        Err(_) if language == "javascript" && name.contains('\\') => Ok(name.to_owned()),
+        Err(error) => Err(error),
+    }
 }
 
 /// A name-match key requires the entire parser-measured callee token and its
@@ -1948,7 +1970,7 @@ impl ParserState<'_> {
                 name: named.as_ref().map(|v| v.0.clone()),
                 lookup_key: named
                     .as_ref()
-                    .map(|v| lookup(&self.file.language, &v.0))
+                    .map(|v| declaration_lookup(&self.file.language, &v.0))
                     .transpose()?,
                 ancestors: ancestry.clone(),
                 key: key.clone(),
@@ -2289,7 +2311,8 @@ impl Artifact {
             }
             if let Some(n) = &d.name {
                 ensure!(
-                    d.lookup_key.as_deref() == Some(lookup(&d.document.language, n)?.as_str()),
+                    d.lookup_key.as_deref()
+                        == Some(declaration_lookup(&d.document.language, n)?.as_str()),
                     "native lookup normalization mismatch"
                 );
             }
@@ -2654,8 +2677,8 @@ mod occurrence_identity_tests {
         };
         assert_eq!(
             witness(&a),
-            "36f16d75947089fd1fa3d91280afab0730e9ad56d4f7ec3af58c64c497897dc0",
-            "native-v7 witness includes declaration role and the producer version"
+            "c465bc7cbd360dd051f09f6a66bda6d7f491bbc93385ce3175c71652be247382",
+            "native-v8 witness includes declaration role and the producer version"
         );
         assert_eq!(
             witness(&a),

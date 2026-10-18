@@ -1620,3 +1620,61 @@ fn verified_callee_keys_decode_only_complete_measured_tokens() {
         assert_eq!(declaration.lookup_key.as_deref(), Some(key));
     }
 }
+
+fn assert_javascript_declaration_lookup(source: &str, name: &str, key: &str) {
+    use std::{
+        fs,
+        sync::{Arc, atomic::AtomicBool},
+    };
+    use trellis::{
+        capture::Capture, indexer::IndexOptions, model::CancelFlag, native_evidence::from_capture,
+    };
+
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("a.js"), source).unwrap();
+    let identity =
+        trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+            .unwrap();
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let capture = Capture::admit(&IndexOptions::new(root.path().into()), &cancel, &|_| {}).unwrap();
+    // from_capture also validates the independently rebuilt artifact. Store
+    // publication and incoming reads are exercised separately.
+    let artifact = from_capture(&capture, root.path(), &identity.record_id, &cancel).unwrap();
+    let declaration = artifact
+        .declarations
+        .iter()
+        .find(|d| d.document.path == "a.js" && d.name.as_deref() == Some(name))
+        .expect("parser-measured escaped declaration");
+    assert_eq!(declaration.lookup_key.as_deref(), Some(key));
+    let range = declaration.name_range.as_ref().unwrap();
+    assert_eq!(&source[range.start..range.end], name);
+}
+
+#[test]
+fn javascript_leading_zero_escape_declaration_decodes_for_matching() {
+    assert_javascript_declaration_lookup(
+        r"function \u{0000054}arget() {}",
+        r"\u{0000054}arget",
+        "Target",
+    );
+}
+
+#[test]
+fn javascript_escaped_reserved_method_declaration_keeps_raw_key() {
+    assert_javascript_declaration_lookup(
+        r"class A { d\u0065lete() {} }",
+        r"d\u0065lete",
+        r"d\u0065lete",
+    );
+}
+
+#[test]
+fn javascript_brace_escape_accepts_leading_zeros_and_bounds_code_point() {
+    use trellis::native_evidence::lookup;
+    assert_eq!(
+        lookup("javascript", r"\u{00000000000000000054}arget").unwrap(),
+        "Target"
+    );
+    assert!(lookup("javascript", r"\u{110000}arget").is_err());
+    assert!(lookup("javascript", r"\u{0000000000110000}arget").is_err());
+}
