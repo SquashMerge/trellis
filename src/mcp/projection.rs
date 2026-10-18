@@ -920,8 +920,6 @@ pub fn outgoing(
 }
 
 /// Project a name-matched reverse lookup without implying a semantic binding.
-// The later MCP integration slice wires this prepared projection into dispatch.
-#[allow(dead_code)]
 pub fn incoming(
     id: &Value,
     result: crate::store::mcp_read::McpIncomingWithLines,

@@ -497,6 +497,12 @@ fn tool(v: &Value, code: Option<&str>, modern: bool) {
                 calls.as_array().unwrap().len(),
                 "calls",
             )
+        } else if let Some(callers) = data.get("callers") {
+            (
+                "trellis_incoming_calls",
+                callers.as_array().unwrap().len(),
+                "calls",
+            )
         } else {
             (
                 "trellis_read_source",
@@ -850,7 +856,7 @@ fn both_modes_full_catalog_tools_and_lifecycle() {
         let response = peer.ask(list);
         let catalog: Value =
             serde_json::from_str(include_str!("fixtures/mcp/catalog.json")).unwrap();
-        assert_eq!(catalog.as_array().unwrap().len(), 5);
+        assert_eq!(catalog.as_array().unwrap().len(), 6);
         let expected_list = |id: Value| {
             let result = if legacy {
                 json!({"tools":catalog})
@@ -1031,7 +1037,7 @@ fn framing_ids_negotiation_and_application_validation() {
     for spelling in [r#""\u00e9""#, r#""é""#, r#""\ud83d\ude00""#, r#""😀""#] {
         peer.send_raw(format!(r#"{{"jsonrpc":"2.0","id":{spelling},"method":"tools/list","params":{{"_meta":{}}}}}"#,fixture()["modernMeta"]).as_bytes());
         let v = peer.reply();
-        assert_eq!(v["result"]["tools"].as_array().unwrap().len(), 5);
+        assert_eq!(v["result"]["tools"].as_array().unwrap().len(), 6);
     }
     for n in ["1e0", "1.0", "-0", "9007199254740991", "-9007199254740991"] {
         peer.send_raw(format!(r#"{{"jsonrpc":"2.0","id":{n},"method":"server/discover","params":{{"_meta":{}}}}}"#,fixture()["modernMeta"]).as_bytes());
@@ -1136,7 +1142,7 @@ fn legacy_title_recovery_max_id_and_root_selection() {
             .as_array()
             .unwrap()
             .len(),
-        5
+        6
     );
     assert!(peer.finish().0.success());
     // Topology overlap is refused before marker attachment.
@@ -1689,6 +1695,28 @@ async fn warm_relay_serves_both_new_tools_and_rejects_closed_inputs() {
         let target_data = &selected_target["result"]["structuredContent"]["data"];
         assert_eq!(target_data["declaration"]["role"], "production");
         let target_version = emitted_document(target_data, target_data);
+        let incoming = peer.ask(call(
+            legacy,
+            json!(17),
+            "trellis_incoming_calls",
+            json!({"schemaVersion":1,"symbolId":target_id,"expectedBasis":pin}),
+        ));
+        tool(&incoming, None, !legacy);
+        schema_pairs.push(json!({"name":"trellis_incoming_calls",
+            "structuredContent":incoming["result"]["structuredContent"]}));
+        let incoming_data = &incoming["result"]["structuredContent"]["data"];
+        assert_eq!(incoming_data["match"]["basis"], "name");
+        assert_eq!(incoming_data["callers"].as_array().unwrap().len(), 1);
+        assert_eq!(incoming_data["callers"][0]["matchedBy"], "name");
+        assert_eq!(incoming_data["callers"][0]["callerRole"], "production");
+        assert!(incoming_data["callers"][0]["binding"].is_null());
+        assert!(incoming_data["callers"][0]["targetId"].is_null());
+        assert_eq!(incoming_data["scopeCoverage"].as_array().unwrap().len(), 4);
+        assert_eq!(incoming_data["documents"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            incoming["result"]["structuredContent"]["evidenceBasis"],
+            pin
+        );
         let test_find = peer.ask(call(
             legacy,
             json!(15),
@@ -1766,6 +1794,39 @@ async fn warm_relay_serves_both_new_tools_and_rejects_closed_inputs() {
             tool(
                 &peer.ask(call(legacy, json!(number), name, args)),
                 Some("invalid_request"),
+                !legacy,
+            );
+        }
+        for (number, arguments, code) in [
+            (
+                30,
+                json!({"schemaVersion":1,"symbolId":target_id,"view":"incoming_calls"}),
+                "invalid_request",
+            ),
+            (
+                31,
+                json!({"schemaVersion":1,"symbolId":target_id,"limit":51}),
+                "range_too_large",
+            ),
+            (
+                32,
+                json!({"schemaVersion":1,"symbolId":target_id,"expectedBasis":null}),
+                "invalid_request",
+            ),
+            (
+                33,
+                json!({"schemaVersion":1,"symbolId":target_id,"workspace":null}),
+                "invalid_request",
+            ),
+        ] {
+            tool(
+                &peer.ask(call(
+                    legacy,
+                    json!(number),
+                    "trellis_incoming_calls",
+                    arguments,
+                )),
+                Some(code),
                 !legacy,
             );
         }
@@ -1877,7 +1938,7 @@ async fn golden_tool_envelopes_and_maximum_ids_both_modes() {
                     let expected = match index {
                         1 => golden_settled_empty_find(&id, workspace, published),
                         2 => golden_settled_failure(&id, workspace, "not_found", published.clone()),
-                        3 | 4 => {
+                        3..=5 => {
                             golden_settled_failure(&id, workspace, "not_found", published.clone())
                         }
                         _ => unreachable!("fixed golden tool order"),
@@ -2697,7 +2758,7 @@ fn per_call_linked_worktree_selection_and_closed_failures() {
 #[test]
 fn catalog_rejects_contradictory_unresolved_and_resolved_failures() {
     let catalog: Value = serde_json::from_str(include_str!("fixtures/mcp/catalog.json")).unwrap();
-    assert_eq!(catalog.as_array().unwrap().len(), 5);
+    assert_eq!(catalog.as_array().unwrap().len(), 6);
     for entry in catalog.as_array().unwrap() {
         let defs = &entry["outputSchema"]["$defs"];
         assert_eq!(
