@@ -3160,7 +3160,8 @@ async fn a_stale_worker_fault_never_ends_a_new_cli_index_wait_early() {
     scheduler.set_step_fault_grace_for_tests(grace);
     scheduler.fail_watcher_for_tests(Some("watcher: injected"));
     trellis::testing::wait_until("a watcher fault", || scheduler.step_fault().is_some());
-    // Held, the worker can neither clear the fault nor refresh it.
+    // Held outside any step, the worker can neither clear the fault nor
+    // refresh it, and is not running a step that could complete the request.
     let (release_hold, holder) = hold_worker(scheduler.clone()).await;
     scheduler.fail_watcher_for_tests(None);
     tokio::time::sleep(grace + Duration::from_millis(200)).await;
@@ -3174,11 +3175,17 @@ async fn a_stale_worker_fault_never_ends_a_new_cli_index_wait_early() {
     });
     let indexer = runtime.clone();
     let options = trellis::indexer::IndexOptions::new(root.clone());
-    let waiter = tokio::task::spawn_blocking(move || indexer.cli_index(&options));
-    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, waiting_rx)
-        .await
-        .expect("the CLI index did not start waiting")
-        .unwrap();
+    let mut waiter = tokio::task::spawn_blocking(move || indexer.cli_index(&options));
+    // The hook runs only after the waiter has judged the fault and chosen to
+    // wait; the worker, held outside any step, has done nothing meanwhile.
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        tokio::select! {
+            waiting = waiting_rx => waiting.unwrap(),
+            answered = &mut waiter => panic!("answered without waiting: {answered:?}"),
+        }
+    })
+    .await
+    .expect("the CLI index did not start waiting");
     drop(release_hold);
     holder.join().unwrap();
     let response = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, waiter)
@@ -3186,6 +3193,77 @@ async fn a_stale_worker_fault_never_ends_a_new_cli_index_wait_early() {
         .expect("waiting client was not answered")
         .unwrap()
         .expect("a healthy worker completes the request");
+    assert!(response["publishedRevision"].is_object(), "{response}");
+    let [row] = queue_rows(&queue).try_into().unwrap();
+    assert!(row.ends_with(":done/"), "{row}");
+}
+
+/// #179: after an earlier fault, a worker inside a long step may be completing
+/// the request, so the waiter keeps waiting past the grace until that step
+/// ends, and here the step completes it.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn a_cli_index_waits_past_the_grace_while_a_worker_step_runs() {
+    let base = tempfile::tempdir().unwrap();
+    let root = base.path().join("long");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("a.js"), "function a() {}\n").unwrap();
+    let topology = roots(base.path());
+    let checkout = identity(&root);
+    let queue = topology.requests_db(&checkout);
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(1, &checkout).unwrap();
+    let runtime = registry.activate(&checkout.root_key).unwrap();
+    ready(&runtime).await;
+    let scheduler = runtime.browser_scheduler().unwrap();
+    let grace = Duration::from_millis(300);
+    scheduler.set_step_fault_grace_for_tests(grace);
+    scheduler.fail_watcher_for_tests(Some("watcher: injected"));
+    trellis::testing::wait_until("a watcher fault", || scheduler.step_fault().is_some());
+    // Hold the worker inside its next step, as a long index would.
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let holder = {
+        let scheduler = scheduler.clone();
+        std::thread::spawn(move || {
+            scheduler.hold_worker_step_for_tests(|| {
+                held_tx.send(()).unwrap();
+                let _ = release_rx.recv();
+            })
+        })
+    };
+    held_rx.recv().unwrap();
+    scheduler.fail_watcher_for_tests(None);
+    trellis::testing::wait_until("the worker inside a step", || scheduler.step_running());
+    let (waiting_tx, waiting_rx) = tokio::sync::oneshot::channel();
+    scheduler.on_cli_index_wait_for_tests(move || {
+        let _ = waiting_tx.send(());
+    });
+    let indexer = runtime.clone();
+    let options = trellis::indexer::IndexOptions::new(root.clone());
+    let mut waiter = tokio::task::spawn_blocking(move || indexer.cli_index(&options));
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        tokio::select! {
+            waiting = waiting_rx => waiting.unwrap(),
+            answered = &mut waiter => panic!("answered without waiting: {answered:?}"),
+        }
+    })
+    .await
+    .expect("the CLI index did not start waiting");
+    // Well past the grace, the step is still running and the waiter waits.
+    tokio::time::sleep(grace * 3).await;
+    assert!(scheduler.step_fault().is_some() && scheduler.step_running());
+    assert!(
+        !waiter.is_finished(),
+        "the waiter gave up during a running step"
+    );
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
+    let response = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, waiter)
+        .await
+        .expect("waiting client was not answered")
+        .unwrap()
+        .expect("the running worker completes the request");
     assert!(response["publishedRevision"].is_object(), "{response}");
     let [row] = queue_rows(&queue).try_into().unwrap();
     assert!(row.ends_with(":done/"), "{row}");

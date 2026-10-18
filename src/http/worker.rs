@@ -380,6 +380,20 @@ pub(super) struct WatchStatus {
     pub(super) other_intent: bool,
 }
 
+/// Marks the worker inside a step until dropped, on every exit.
+pub(super) struct StepRunning<'a>(&'a AtomicBool);
+impl<'a> StepRunning<'a> {
+    pub(super) fn enter(running: &'a AtomicBool) -> Self {
+        running.store(true, Ordering::Release);
+        Self(running)
+    }
+}
+impl Drop for StepRunning<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 /// A failed or panicked step is retried after this delay.
 const STEP_RETRY: Duration = Duration::from_millis(250);
 /// Retention runs at most this often while idle (a deferral shortens it).
@@ -400,6 +414,11 @@ impl DaemonState {
         }
         drop(fault);
         self.store.wake_request_waiters();
+    }
+
+    /// The worker is inside a step, which may be completing a request.
+    pub fn step_running(&self) -> bool {
+        self.step_running.load(Ordering::Acquire)
     }
 
     /// Since when every worker step has failed, with the first error.
@@ -927,6 +946,11 @@ fn worker_loop(weak: std::sync::Weak<DaemonState>, inbox: Arc<WorkerInbox>) {
             Ok(Ok(())) => {}
             Ok(Err(error)) => state.note_step_outcome(Some(format!("{error:#}"))),
             Err(_) => state.note_step_outcome(Some("panicked".to_owned())),
+        }
+        // A waiter whose grace passed while this step ran re-checks now that
+        // it has ended (the step's running mark is already cleared).
+        if state.step_fault().is_some() {
+            state.store.wake_request_waiters();
         }
         deadline = match step {
             Ok(Ok(())) => {

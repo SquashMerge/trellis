@@ -1787,23 +1787,36 @@ impl CheckoutRuntime {
                         &format!("id={} state={} seen={seen}", accepted.id, row.state),
                     );
                     // A long index waits as long as it takes. Only a worker
-                    // whose every step has failed for the grace ends the wait
+                    // that has been failing for the grace, and is not inside a
+                    // step that may yet complete the request, ends the wait
                     // (#179); the accepted request stays queued for its retry.
+                    let give_up = resources.scheduler.step_fault().map(|(since, error)| {
+                        (
+                            since.max(waiting_since) + resources.scheduler.step_fault_grace(),
+                            error,
+                        )
+                    });
+                    let due = give_up
+                        .as_ref()
+                        .is_some_and(|(give_up, _)| Instant::now() >= *give_up);
+                    if let Some((_, error)) = &give_up
+                        && due
+                        && !resources.scheduler.step_running()
+                    {
+                        anyhow::bail!(
+                            "outcome_unknown: request {} is still {}; the checkout worker has been failing: {error}; inspect job status",
+                            accepted.id,
+                            row.state
+                        );
+                    }
                     #[cfg(feature = "test-support")]
                     resources.scheduler.run_cli_index_wait_hook();
-                    if let Some((since, error)) = resources.scheduler.step_fault() {
-                        let give_up =
-                            since.max(waiting_since) + resources.scheduler.step_fault_grace();
-                        if Instant::now() >= give_up {
-                            anyhow::bail!(
-                                "outcome_unknown: request {} is still {}; the checkout worker has been failing: {error}; inspect job status",
-                                accepted.id,
-                                row.state
-                            );
+                    match give_up {
+                        // A running step's end wakes this waiter to re-check.
+                        Some((give_up, _)) if !due => {
+                            resources.store.wait_terminal_change_until(seen, give_up)
                         }
-                        resources.store.wait_terminal_change_until(seen, give_up);
-                    } else {
-                        resources.store.wait_terminal_change(seen);
+                        _ => resources.store.wait_terminal_change(seen),
                     }
                     crate::index_coordinator::diagnostic_marker(
                         "-",

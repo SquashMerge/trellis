@@ -251,6 +251,9 @@ pub struct DaemonState {
     step_fault: Mutex<Option<(Instant, String)>>,
     /// This step committed startup reconciliation or processed a request.
     step_recovered: AtomicBool,
+    /// The worker is inside a step: a waiter never gives up on a fault while
+    /// the worker may be completing its request (#179).
+    step_running: AtomicBool,
     /// Fail every startup reconciliation attempt with this error.
     #[cfg(feature = "test-support")]
     fail_startup: Mutex<Option<String>>,
@@ -506,6 +509,7 @@ pub fn new_with_config(
         step_progress: AtomicBool::new(false),
         step_fault: Mutex::new(None),
         step_recovered: AtomicBool::new(false),
+        step_running: AtomicBool::new(false),
         #[cfg(feature = "test-support")]
         fail_startup: Mutex::new(None),
         #[cfg(feature = "test-support")]
@@ -1205,6 +1209,7 @@ impl DaemonState {
         if self.retired() {
             return Ok(());
         }
+        let _running = worker::StepRunning::enter(&self.step_running);
         #[cfg(test)]
         self.test_queue_before_stream.run();
         let _stream = self.step_lock.lock().unwrap();
