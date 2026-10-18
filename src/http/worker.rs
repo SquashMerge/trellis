@@ -229,10 +229,6 @@ impl DaemonState {
         if let Some(hook) = self.startup_hook.lock().unwrap().take() {
             hook();
         }
-        #[cfg(feature = "test-support")]
-        if let Some(error) = self.fail_startup.lock().unwrap().clone() {
-            anyhow::bail!("{error}");
-        }
         if let RuntimeState::Reconciling { attempts, .. } = &mut *self.runtime.lock().unwrap() {
             *attempts += 1;
         }
@@ -282,7 +278,6 @@ impl DaemonState {
                 *self.startup_backoff.lock().unwrap() = STARTUP_BACKOFF_FIRST;
                 *self.recovery_retry_after.lock().unwrap() = None;
                 self.step_progress.store(true, Ordering::Release);
-                self.step_recovered.store(true, Ordering::Release);
                 Ok(())
             }
             Err(error) => {
@@ -380,95 +375,12 @@ pub(super) struct WatchStatus {
     pub(super) other_intent: bool,
 }
 
-/// Marks the worker inside a step until dropped, on every exit.
-pub(super) struct StepRunning<'a>(&'a AtomicBool);
-impl<'a> StepRunning<'a> {
-    pub(super) fn enter(running: &'a AtomicBool) -> Self {
-        running.store(true, Ordering::Release);
-        Self(running)
-    }
-}
-impl Drop for StepRunning<'_> {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
-    }
-}
-
 /// A failed or panicked step is retried after this delay.
 const STEP_RETRY: Duration = Duration::from_millis(250);
 /// Retention runs at most this often while idle (a deferral shortens it).
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
-/// A CLI index waiter stops waiting once every worker step has failed for
-/// this long (#179). A long index that is still making progress has no bound.
-const STEP_FAULT_GRACE: Duration = Duration::from_secs(60);
 
 impl DaemonState {
-    /// Publish whether the last step failed, or recovered by making real
-    /// progress. Only a change of state wakes request waiters to re-check.
-    fn note_step_outcome(&self, error: Option<String>) {
-        let mut fault = self.step_fault.lock().unwrap();
-        match (fault.is_some(), error) {
-            (false, Some(error)) => *fault = Some((Instant::now(), error)),
-            (true, None) => *fault = None,
-            _ => return,
-        }
-        drop(fault);
-        self.store.wake_request_waiters();
-    }
-
-    /// The worker is inside a step, which may be completing a request.
-    pub fn step_running(&self) -> bool {
-        self.step_running.load(Ordering::Acquire)
-    }
-
-    /// Since when every worker step has failed, with the first error.
-    pub fn step_fault(&self) -> Option<(Instant, String)> {
-        self.step_fault.lock().unwrap().clone()
-    }
-
-    /// How long a CLI index waiter tolerates a failing worker.
-    pub fn step_fault_grace(&self) -> Duration {
-        #[cfg(feature = "test-support")]
-        if let Some(grace) = *self.step_fault_grace.lock().unwrap() {
-            return grace;
-        }
-        STEP_FAULT_GRACE
-    }
-
-    /// Fail every startup reconciliation attempt with `error` until set back
-    /// to `None`.
-    #[cfg(feature = "test-support")]
-    pub fn fail_startup_for_tests(&self, error: Option<&str>) {
-        *self.fail_startup.lock().unwrap() = error.map(str::to_owned);
-        self.inbox.wake();
-    }
-
-    /// Fail every watcher reconciliation with `error` until set back to `None`.
-    #[cfg(feature = "test-support")]
-    pub fn fail_watcher_for_tests(&self, error: Option<&str>) {
-        *self.fail_watcher.lock().unwrap() = error.map(str::to_owned);
-        self.inbox.wake();
-    }
-
-    /// Run `hook` once, as the next CLI index waiter first blocks.
-    #[cfg(feature = "test-support")]
-    pub fn on_cli_index_wait_for_tests(&self, hook: impl FnOnce() + Send + 'static) {
-        *self.cli_index_wait_hook.lock().unwrap() = Some(Box::new(hook));
-    }
-
-    #[cfg(feature = "test-support")]
-    pub(crate) fn run_cli_index_wait_hook(&self) {
-        let hook = self.cli_index_wait_hook.lock().unwrap().take();
-        if let Some(hook) = hook {
-            hook();
-        }
-    }
-
-    #[cfg(feature = "test-support")]
-    pub fn set_step_fault_grace_for_tests(&self, grace: Duration) {
-        *self.step_fault_grace.lock().unwrap() = Some(grace);
-    }
-
     /// Start this checkout's worker thread, or wake it if it is running. A
     /// synchronous fixture without a Tokio runtime drives `worker_step` itself.
     pub(super) fn start_worker(self: &Arc<Self>) {
@@ -938,20 +850,6 @@ fn worker_loop(weak: std::sync::Weak<DaemonState>, inbox: Arc<WorkerInbox>) {
         }
         let step = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| state.worker_step()));
         state.publish_fifo_pending();
-        // Only a step that recorded real progress recovers from a fault. A
-        // step that deferred, skipped or found nothing to do leaves it as is.
-        let recovered = state.step_recovered.swap(false, Ordering::AcqRel);
-        match &step {
-            Ok(Ok(())) if recovered => state.note_step_outcome(None),
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => state.note_step_outcome(Some(format!("{error:#}"))),
-            Err(_) => state.note_step_outcome(Some("panicked".to_owned())),
-        }
-        // A waiter whose grace passed while this step ran re-checks now that
-        // it has ended (the step's running mark is already cleared).
-        if state.step_fault().is_some() {
-            state.store.wake_request_waiters();
-        }
         deadline = match step {
             Ok(Ok(())) => {
                 // The witness reads phase only after the step released its locks.

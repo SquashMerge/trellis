@@ -2374,36 +2374,34 @@ fn metrics_client_discards_partial_chunks_after_absolute_result_deadline() {
     server.join().unwrap();
 }
 
-/// #179: the CLI once gave up on every index reply 60 seconds after sending
-/// its request, with `outcome_unknown`. This test answers as the daemon, so
-/// its clock starts only once the whole request has arrived and the CLI is
-/// reading its reply, not at the CLI's launch.
-#[test]
-fn cli_index_waits_past_sixty_seconds_for_its_reply() {
+/// Plays the daemon for one `trellis index` (#179): binds the fixture socket,
+/// starts the CLI and returns once its whole request has arrived, so a
+/// caller's clock starts at the CLI's reply wait, not at its launch.
+fn fake_daemon_index(
+    home: &Path,
+    root: &Path,
+    configure: impl FnOnce(&mut Command),
+) -> (
+    Owned,
+    std::os::unix::net::UnixStream,
+    trellis::daemon::protocol::Request,
+) {
     use std::os::unix::fs::PermissionsExt;
-    use trellis::daemon::protocol;
-    let temp = short_temp();
-    let home = temp.path().join("home");
-    fs::create_dir(&home).unwrap();
-    // Only if the CLI failed to reach this test's socket and elected one.
-    let _daemon = AutoDaemonGuard::for_home(&home);
-    let root = checkout(temp.path(), "stalled");
-    let socket = fixture_socket_paths(&home).socket;
+    let socket = fixture_socket_paths(home).socket;
     let dir = socket.parent().unwrap();
     fs::create_dir_all(dir).unwrap();
     fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
     let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
     listener.set_nonblocking(true).unwrap();
-    let mut index = Owned(
-        cli(&home)
-            .arg("index")
-            .arg("--workspace")
-            .arg(&root)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap(),
-    );
+    let mut command = cli(home);
+    command
+        .arg("index")
+        .arg("--workspace")
+        .arg(root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    configure(&mut command);
+    let mut index = Owned(command.spawn().unwrap());
     let mut stream = None;
     trellis::testing::wait_until("the CLI connecting", || {
         assert!(index.0.try_wait().unwrap().is_none(), "index exited early");
@@ -2418,8 +2416,36 @@ fn cli_index_waits_past_sixty_seconds_for_its_reply() {
     stream
         .set_write_timeout(Some(trellis::testing::HANG_BACKSTOP))
         .unwrap();
-    let request: protocol::Request = protocol::read_frame(&mut stream).unwrap();
+    let request: trellis::daemon::protocol::Request =
+        trellis::daemon::protocol::read_frame(&mut stream).unwrap();
     assert_eq!(request.operation, "index");
+    (index, stream, request)
+}
+
+/// Wait for a CLI child to exit; return its status, stdout and stderr.
+fn finished(index: &mut Owned) -> (std::process::ExitStatus, String, String) {
+    let mut status = None;
+    trellis::testing::wait_until("the CLI exiting", || {
+        status = index.0.try_wait().unwrap();
+        status.is_some()
+    });
+    let (mut out, mut err) = (String::new(), String::new());
+    std::io::Read::read_to_string(&mut index.0.stdout.take().unwrap(), &mut out).unwrap();
+    std::io::Read::read_to_string(&mut index.0.stderr.take().unwrap(), &mut err).unwrap();
+    (status.unwrap(), out, err)
+}
+
+/// #179: the CLI once gave up on every index reply 60 seconds after sending
+/// its request, with `outcome_unknown`. An index may take longer.
+#[test]
+fn cli_index_waits_past_sixty_seconds_for_its_reply() {
+    let temp = short_temp();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    // Only if the CLI failed to reach this test's socket and elected one.
+    let _daemon = AutoDaemonGuard::for_home(&home);
+    let root = checkout(temp.path(), "stalled");
+    let (mut index, mut stream, request) = fake_daemon_index(&home, &root, |_| {});
     // The old bound would have expired a second before this check.
     std::thread::sleep(Duration::from_secs(61));
     assert!(
@@ -2427,27 +2453,34 @@ fn cli_index_waits_past_sixty_seconds_for_its_reply() {
         "index stopped waiting for its reply"
     );
     let result = serde_json::json!({"publishedRevision": "answered after 61 s"});
-    protocol::write_frame(
+    trellis::daemon::protocol::write_frame(
         &mut stream,
-        &protocol::Reply {
+        &trellis::daemon::protocol::Reply {
             id: request.id,
             payload: serde_json::json!({"result": result}),
         },
     )
     .unwrap();
-    let mut stdout = index.0.stdout.take().unwrap();
-    let mut stderr = index.0.stderr.take().unwrap();
-    let mut status = None;
-    trellis::testing::wait_until("the CLI exiting after its reply", || {
-        status = index.0.try_wait().unwrap();
-        status.is_some()
-    });
-    let status = status.unwrap();
-    let (mut out, mut err) = (String::new(), String::new());
-    std::io::Read::read_to_string(&mut stdout, &mut out).unwrap();
-    std::io::Read::read_to_string(&mut stderr, &mut err).unwrap();
+    let (status, out, err) = finished(&mut index);
     assert!(status.success(), "{err}");
     assert_eq!(serde_json::from_str::<Value>(&out).unwrap(), result);
+}
+
+/// #179: the index wait is still bounded. Its backstop (10 minutes, shrunk
+/// here) ends a wait with no reply as `outcome_unknown`.
+#[test]
+fn cli_index_reply_wait_ends_at_its_backstop() {
+    let temp = short_temp();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let _daemon = AutoDaemonGuard::for_home(&home);
+    let root = checkout(temp.path(), "silent");
+    let (mut index, _stream, _request) = fake_daemon_index(&home, &root, |command| {
+        command.env("TRELLIS_TEST_INDEX_REPLY_BOUND_MS", "500");
+    });
+    let (status, _, err) = finished(&mut index);
+    assert!(!status.success());
+    assert!(err.contains("outcome_unknown"), "{err}");
 }
 
 #[test]

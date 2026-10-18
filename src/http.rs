@@ -246,25 +246,6 @@ pub struct DaemonState {
     worker_hold: std::sync::RwLock<()>,
     /// The last step made progress, so more work may be ready at once.
     step_progress: AtomicBool,
-    /// Since when the worker's steps have failed with no real progress since,
-    /// and the first error. A CLI index waiter gives up after a grace (#179).
-    step_fault: Mutex<Option<(Instant, String)>>,
-    /// This step committed startup reconciliation or processed a request.
-    step_recovered: AtomicBool,
-    /// The worker is inside a step: a waiter never gives up on a fault while
-    /// the worker may be completing its request (#179).
-    step_running: AtomicBool,
-    /// Fail every startup reconciliation attempt with this error.
-    #[cfg(feature = "test-support")]
-    fail_startup: Mutex<Option<String>>,
-    /// Fail every watcher reconciliation with this error.
-    #[cfg(feature = "test-support")]
-    fail_watcher: Mutex<Option<String>>,
-    /// Runs once as a CLI index waiter first blocks.
-    #[cfg(feature = "test-support")]
-    cli_index_wait_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
-    #[cfg(feature = "test-support")]
-    step_fault_grace: Mutex<Option<Duration>>,
     /// Published watcher intent; readers never take the watcher's lock.
     watch_status: Mutex<Option<worker::WatchStatus>>,
     /// Read and enqueue admission leases held against release.
@@ -507,17 +488,6 @@ pub fn new_with_config(
         #[cfg(feature = "test-support")]
         worker_hold: std::sync::RwLock::new(()),
         step_progress: AtomicBool::new(false),
-        step_fault: Mutex::new(None),
-        step_recovered: AtomicBool::new(false),
-        step_running: AtomicBool::new(false),
-        #[cfg(feature = "test-support")]
-        fail_startup: Mutex::new(None),
-        #[cfg(feature = "test-support")]
-        fail_watcher: Mutex::new(None),
-        #[cfg(feature = "test-support")]
-        cli_index_wait_hook: Mutex::new(None),
-        #[cfg(feature = "test-support")]
-        step_fault_grace: Mutex::new(None),
         watch_status: Mutex::new(None),
         leases: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         fifo_pending,
@@ -1209,7 +1179,6 @@ impl DaemonState {
         if self.retired() {
             return Ok(());
         }
-        let _running = worker::StepRunning::enter(&self.step_running);
         #[cfg(test)]
         self.test_queue_before_stream.run();
         let _stream = self.step_lock.lock().unwrap();
@@ -1280,14 +1249,9 @@ impl DaemonState {
             }
         }
         let retained = self.runtime.lock().unwrap().session().cloned();
-        // A writer that fails its check cannot claim accepted work. That is a
-        // step failure, so a waiting CLI index can see the fault (#179).
-        if let Some(ref session) = retained {
-            session
-                .verify()
-                .context("serving writer session failed its check")?;
-        }
-        if let Some(ref session) = retained {
+        if let Some(ref session) = retained
+            && session.verify().is_ok()
+        {
             #[cfg(test)]
             self.test_queue_current_phase.store(2, Ordering::Release);
             let processed = match crate::index_coordinator::drain_one_request_observed(
@@ -1316,7 +1280,6 @@ impl DaemonState {
                 *self.packets.lock().unwrap() = PacketCache::default();
                 self.start_dependency_index();
                 self.step_progress.store(true, Ordering::Release);
-                self.step_recovered.store(true, Ordering::Release);
             }
             #[cfg(test)]
             self.test_queue_after_startup_drain.run();
@@ -1377,10 +1340,6 @@ impl DaemonState {
                         self.test_queue_current_phase.store(4, Ordering::Release);
                         #[cfg(test)]
                         self.test_queue_before_watcher_reconcile.run();
-                        #[cfg(feature = "test-support")]
-                        if let Some(error) = self.fail_watcher.lock().unwrap().clone() {
-                            anyhow::bail!("{error}");
-                        }
                         let reconciled = scheduler.reconcile_due(
                             &self.store,
                             session,
@@ -1390,11 +1349,6 @@ impl DaemonState {
                         );
                         self.publish_watch_status(scheduler, &selected_options);
                         let accounted = reconciled?;
-                        // A completed inventory is real progress; one that was
-                        // not due or was deferred is not.
-                        if accounted {
-                            self.step_recovered.store(true, Ordering::Release);
-                        }
                         // Explicit options are applied once: after a verified
                         // inventory under them, the recorded head selects again.
                         if accounted && let Some(applied) = &explicit {

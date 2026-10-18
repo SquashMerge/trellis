@@ -1740,9 +1740,6 @@ impl CheckoutRuntime {
         // checkout worker may reconcile and claim this row. A CLI waiter
         // never creates a second writer or re-enqueues an uncertain job.
         let accepted = resources.scheduler.enqueue_index(options, None)?;
-        // A fault older than this waiter tolerates no less than the full grace
-        // from here, so a stale fault never ends a new wait early (#179).
-        let waiting_since = Instant::now();
         let mut busy_deadline = Instant::now() + Duration::from_secs(30);
         loop {
             // Record the terminal-commit count before re-reading, so a COMMIT
@@ -1786,38 +1783,7 @@ impl CheckoutRuntime {
                         "cli_index_wait",
                         &format!("id={} state={} seen={seen}", accepted.id, row.state),
                     );
-                    // A long index waits as long as it takes. Only a worker
-                    // that has been failing for the grace, and is not inside a
-                    // step that may yet complete the request, ends the wait
-                    // (#179); the accepted request stays queued for its retry.
-                    let give_up = resources.scheduler.step_fault().map(|(since, error)| {
-                        (
-                            since.max(waiting_since) + resources.scheduler.step_fault_grace(),
-                            error,
-                        )
-                    });
-                    let due = give_up
-                        .as_ref()
-                        .is_some_and(|(give_up, _)| Instant::now() >= *give_up);
-                    if let Some((_, error)) = &give_up
-                        && due
-                        && !resources.scheduler.step_running()
-                    {
-                        anyhow::bail!(
-                            "outcome_unknown: request {} is still {}; the checkout worker has been failing: {error}; inspect job status",
-                            accepted.id,
-                            row.state
-                        );
-                    }
-                    #[cfg(feature = "test-support")]
-                    resources.scheduler.run_cli_index_wait_hook();
-                    match give_up {
-                        // A running step's end wakes this waiter to re-check.
-                        Some((give_up, _)) if !due => {
-                            resources.store.wait_terminal_change_until(seen, give_up)
-                        }
-                        _ => resources.store.wait_terminal_change(seen),
-                    }
+                    resources.store.wait_terminal_change(seen);
                     crate::index_coordinator::diagnostic_marker(
                         "-",
                         "cli_index_woke",

@@ -514,6 +514,9 @@ fn checked_reply(reply: protocol::Reply) -> Result<serde_json::Value> {
         .context("invalid daemon reply")
 }
 
+/// How long `trellis index` waits for its terminal reply (#179).
+const INDEX_REPLY_BOUND: Duration = Duration::from_secs(10 * 60);
+
 fn send_daemon(request: &protocol::Request, read_only: bool) -> Result<serde_json::Value> {
     let socket = socket_path()?;
     if request.operation == "metrics" {
@@ -552,11 +555,22 @@ fn send_daemon(request: &protocol::Request, read_only: bool) -> Result<serde_jso
         .map_err(|error| anyhow::anyhow!("{}", error.code()))?;
         return checked_reply(reply);
     }
-    // Index replies only once its request is terminal, and that takes as long
-    // as the checkout needs (#179). The daemon ends the wait itself if its
-    // worker keeps failing; a daemon exit ends it too. Either way the
-    // requests.db row stays the answer.
-    let reply_bound = (request.operation != "index").then_some(Duration::from_secs(60));
+    // Index replies only once its request is terminal, which takes as long as
+    // the checkout needs (#179). Its bound is a liveness backstop: a checkout
+    // Trellis cannot index within it is a performance defect to fix. On
+    // expiry the requests.db row stays the answer.
+    let reply_bound = if request.operation == "index" {
+        INDEX_REPLY_BOUND
+    } else {
+        Duration::from_secs(60)
+    };
+    #[cfg(feature = "test-support")]
+    let reply_bound = match request.operation.as_str() {
+        "index" => {
+            metrics_test_duration("TRELLIS_TEST_INDEX_REPLY_BOUND_MS").unwrap_or(reply_bound)
+        }
+        _ => reply_bound,
+    };
     let mut first = Some(
         client::connect_or_start(&socket, start_daemon, Duration::from_secs(5))
             .map_err(|_| anyhow::anyhow!("daemon_unavailable"))?,
@@ -567,7 +581,7 @@ fn send_daemon(request: &protocol::Request, read_only: bool) -> Result<serde_jso
         } else {
             client::connect_or_start(&socket, start_daemon, Duration::from_secs(5))?
         };
-        stream.set_read_timeout(reply_bound)?;
+        stream.set_read_timeout(Some(reply_bound))?;
         stream.set_write_timeout(Some(Duration::from_secs(5)))?;
         Ok(stream)
     })
