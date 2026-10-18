@@ -1033,20 +1033,11 @@ impl EvidenceResponse {
                 item.omitted = None;
                 continue;
             }
-            let Some(range) = &item.call.callee_range else {
-                continue;
-            };
-            let Some(spelling) = item.call.spelling.as_deref() else {
-                continue;
-            };
-            let Some(token) = source.text.get(range.start..range.end) else {
-                continue;
-            };
-            // The full measured spelling is the token, not a member expression suffix.
-            if token != spelling {
-                continue;
-            }
-            let Ok(lookup) = crate::native_evidence::lookup(&scope.key.language, token) else {
+            let Some(lookup) = crate::native_evidence::verified_callee_lookup(
+                &scope.key.language,
+                &item.call,
+                &source.text,
+            ) else {
                 continue;
             };
             let mut statement = match self.db.prepare(

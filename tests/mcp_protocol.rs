@@ -7708,6 +7708,26 @@ async fn mcp_wire_valid_basis_and_uint_are_not_silently_dropped() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_outgoing_measured_escaped_identifier_matches_decoded_declaration() {
+    let reply = mcp_outgoing_fixture(
+        &[(
+            "a.js",
+            "function Target() {}\nfunction Owner() { obj.\\u{54}arget(); }\n",
+        )],
+        "Owner",
+        None,
+    );
+    tool(&reply, None, true);
+    let call = &reply["result"]["structuredContent"]["data"]["calls"][0];
+    assert_eq!(call["calleeText"], "\\u{54}arget");
+    assert_eq!(
+        call["nativeCandidates"]["items"].as_array().unwrap().len(),
+        1,
+        "{reply}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mcp_outgoing_nested_owner_and_compound_member_exclusion() {
     let reply = mcp_outgoing_fixture(
         &[(
