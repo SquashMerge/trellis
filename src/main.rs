@@ -466,6 +466,16 @@ fn start_daemon() -> std::io::Result<client::StartOutcome> {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+    // Only tests run test-support builds, so this daemon's owner is the test
+    // process: this CLI's parent. The daemon outlives this CLI on purpose, but
+    // not the test (#130), whether or not the test tracks its PID.
+    #[cfg(feature = "test-support")]
+    if std::env::var_os("TRELLIS_TEST_OWNER_PID").is_none() {
+        command.env(
+            "TRELLIS_TEST_OWNER_PID",
+            std::os::unix::process::parent_id().to_string(),
+        );
+    }
     // A fixture may keep an auto-started daemon's diagnostics.
     #[cfg(feature = "test-support")]
     if let Some(path) = std::env::var_os("TRELLIS_TEST_DAEMON_STDERR") {
@@ -968,6 +978,27 @@ async fn run_daemon() -> Result<()> {
     let (browser_shutdown, _) = tokio::sync::watch::channel(false);
     let idle = daemon::run_idle_lifecycle(registry.clone());
     tokio::pin!(idle);
+    // A test-elected daemon ends with the test process that owns it (#130),
+    // even when the test never stops it or is killed before its guards run.
+    let owner_gone = async {
+        #[cfg(feature = "test-support")]
+        if let Some(pid) = std::env::var("TRELLIS_TEST_OWNER_PID")
+            .ok()
+            .and_then(|pid| pid.parse::<libc::pid_t>().ok())
+            .filter(|pid| *pid > 1)
+        {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                if unsafe { libc::kill(pid, 0) } == -1
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                {
+                    return;
+                }
+            }
+        }
+        std::future::pending::<()>().await
+    };
+    tokio::pin!(owner_gone);
     // A single injected accept fault tests that the elected socket survives it.
     #[cfg(feature = "test-support")]
     let mut injected_accept_errno =
@@ -979,6 +1010,7 @@ async fn run_daemon() -> Result<()> {
     loop {
         tokio::select! {
             result = &mut idle => { result.map_err(|e| anyhow::anyhow!("{}", e.reason()))?; break; }
+            () = &mut owner_gone => break,
             accepted = async {
                 #[cfg(feature = "test-support")]
                 if let Some(errno) = injected_accept_errno {
