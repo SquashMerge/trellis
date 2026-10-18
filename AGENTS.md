@@ -56,7 +56,7 @@ Clean up operation-scoped requests on every exit, including dropped futures, wit
   - use repeat loops (about 20 runs under modest CPU load) only for failures that have actually been intermittent.
 
   A failure inside a loop is a defect to report with its log, not something to retry until it passes.
-- **Before submitting,** run `./tools/verify` and `cargo fmt --all -- --check`. Run `cargo clippy --locked --all-targets -- -D warnings` on the CI toolchain (currently Rust 1.99).
+- **Before submitting,** run `./tools/verify` and `cargo fmt --all -- --check`. Run `cargo clippy --locked --all-targets -- -D warnings` on the toolchain pinned in `rust-toolchain.toml`, which CI also uses. Don't override it with `RUSTUP_TOOLCHAIN` or `+toolchain`.
 
 ## Where decisions live
 

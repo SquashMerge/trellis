@@ -1,0 +1,6 @@
+# The one Rust toolchain for local builds, Factory runs and CI. rustup reads
+# this file in every directory of the checkout and installs it if missing.
+# Bump it here and in .github/workflows/rust.yml together.
+[toolchain]
+channel = "1.99.1"
+components = ["rustfmt", "clippy"]

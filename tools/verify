@@ -5,6 +5,9 @@
 # first failed lane's status.
 set -eu
 
+# Record the toolchain (pinned by rust-toolchain.toml) in every verify log.
+rustc --version
+
 # Bootstrap ignored Node packages and pinned Chromium before parallel lanes.
 # Capture only the absolute browser path; setup diagnostics go to stderr.
 PLAYWRIGHT_BROWSERS_PATH=$(node tools/verify-env.mjs)
