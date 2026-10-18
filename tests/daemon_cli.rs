@@ -2332,6 +2332,43 @@ fn metrics_client_discards_partial_chunks_after_absolute_result_deadline() {
 }
 
 #[test]
+fn cli_index_waits_past_the_cli_reply_bound_for_its_terminal_request() {
+    // #179: an index that outlasts the 60-second reply bound under load ended
+    // in outcome_unknown. Shrink that bound so any real index outlasts it.
+    let temp = short_temp();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let _daemon = AutoDaemonGuard::for_home(&home);
+    let root = checkout(temp.path(), "slowindex");
+    fs::create_dir(root.join("src")).unwrap();
+    for number in 0..200 {
+        fs::write(
+            root.join(format!("src/f{number:03}.js")),
+            format!("function f{number:03}(x) {{ return x + 1; }}\n"),
+        )
+        .unwrap();
+    }
+    let indexed = cli(&home)
+        .arg("index")
+        .arg("--workspace")
+        .arg(&root)
+        .env("TRELLIS_TEST_CLI_REPLY_BOUND_MS", "1")
+        .output()
+        .unwrap();
+    assert!(
+        indexed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+    let response: Value = serde_json::from_slice(&indexed.stdout).unwrap();
+    assert_eq!(
+        response["status"]["revision"]["indexGeneration"],
+        response["publishedRevision"]["indexGeneration"],
+        "{response}"
+    );
+}
+
+#[test]
 fn metrics_real_daemon_work_over_sixty_seconds_returns_complete_multiframe_revision() {
     struct ReleaseGate(std::path::PathBuf);
     impl Drop for ReleaseGate {
