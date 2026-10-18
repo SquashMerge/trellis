@@ -825,7 +825,10 @@ pub struct McpOutgoingCall {
     pub content_hash: String,
     pub callee_text: Option<String>,
     pub callee_text_truncated: bool,
+    /// At most eight verified hints, in rank order.
     pub candidates: Vec<McpOutgoingCandidate>,
+    /// Distinct eligible matches left unexamined after eight hints passed, or
+    /// `None` when the hint budget ran out.
     pub omitted: Option<usize>,
 }
 
@@ -1047,7 +1050,8 @@ impl EvidenceResponse {
                 continue;
             };
             let mut statement = match self.db.prepare(
-                "SELECT d.version_id,d.syntax_id,m.source_set_id,m.language,m.path
+                "SELECT d.version_id,d.syntax_id,m.source_set_id,m.language,m.path,
+                        d.start_byte,d.end_byte
                  FROM native_version_declarations d JOIN revision_documents m
                    ON m.document_version_id=d.version_id AND m.revision_id=?1
                  WHERE m.source_set_id=?2 AND m.language=?3 AND d.lookup_key=?4",
@@ -1072,7 +1076,9 @@ impl EvidenceResponse {
                 }
                 Err(error) => return Err(error.into()),
             };
-            let mut candidates = BTreeMap::<String, McpOutgoingCandidate>::new();
+            // Rank the cheap lexical rows first, then verify in rank order only
+            // until eight hints pass (#170); later matches are left unexamined.
+            let mut ranked = Vec::new();
             let mut timed_out = false;
             loop {
                 if progress.expired() {
@@ -1101,10 +1107,39 @@ impl EvidenceResponse {
                     language: row.get(3)?,
                     path: row.get(4)?,
                 };
+                let (start, end): (i64, i64) = (row.get(5)?, row.get(6)?);
                 // Test code is not an eligible hint for non-test code; skip it
                 // before verification so it costs no hint budget.
                 if !owner_is_test && mcp_test_path(&key.path) {
                     continue;
+                }
+                ranked.push((
+                    mcp_hint_proximity(&scope.key.path, &key.path),
+                    key.path.clone(),
+                    start,
+                    end,
+                    id,
+                    version,
+                    key,
+                ));
+            }
+            if timed_out || progress.expired() {
+                item.omitted = None;
+                continue;
+            }
+            ranked.sort_by(|a, b| (a.0, &a.1, a.2, a.3, &a.4).cmp(&(b.0, &b.1, b.2, b.3, &b.4)));
+            let mut candidates = BTreeMap::<String, McpOutgoingCandidate>::new();
+            let mut unexamined = std::collections::BTreeSet::new();
+            for (_, _, _, _, id, version, key) in ranked {
+                if candidates.len() == 8 {
+                    if !candidates.contains_key(&id) {
+                        unexamined.insert(id);
+                    }
+                    continue;
+                }
+                if progress.expired() {
+                    timed_out = true;
+                    break;
                 }
                 let candidate = (|| -> Result<Option<McpOutgoingCandidate>> {
                     optional_hint_check(Some(&|| progress.expired()))?;
@@ -1257,7 +1292,8 @@ impl EvidenceResponse {
                 };
                 key(a).cmp(&key(b))
             });
-            item.omitted = Some(item.candidates.len().saturating_sub(8));
+            // Distinct eligible matches left unexamined once eight hints passed.
+            item.omitted = Some(unexamined.len());
         }
         Ok(Some(McpOutgoing {
             owner,
@@ -2010,6 +2046,82 @@ mod enriched_read_tests {
             )
         );
         read.finish(()).unwrap();
+    }
+
+    #[test]
+    fn malformed_top_ranked_hint_is_skipped_and_the_next_valid_one_shown() {
+        // Proximity ranks src/near.js (same directory) above lib/far.js. After
+        // the near match is made malformed, rank-first verification (#170)
+        // skips it, shows the far match, and does not count the failed one.
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        for (path, text) in [
+            ("src/owner.js", "function Owner() { Target(); }\n"),
+            ("src/near.js", "function Target() {}\n"),
+            ("lib/far.js", "function Target() {}\n"),
+        ] {
+            let path = workspace.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let (pin, _owner) = crate::index_coordinator::reconcile_workspace(
+            &store,
+            &IndexOptions::new(workspace.path().to_owned()),
+            &Arc::new(AtomicBool::new(false)),
+            |_| {},
+        )
+        .unwrap();
+        let base = std::time::Instant::now();
+        let hints = || {
+            let read = store.evidence_response().unwrap();
+            let owner = read
+                .mcp_find_with_lines("Owner", 20, Some(pin))
+                .unwrap()
+                .symbols
+                .into_iter()
+                .find(|symbol| symbol.symbol.declaration.name.as_deref() == Some("Owner"))
+                .unwrap();
+            let outgoing = read
+                .mcp_outgoing(
+                    &owner.symbol.declaration.syntax_id,
+                    20,
+                    Some(pin),
+                    &|| base,
+                    base + std::time::Duration::from_secs(5),
+                )
+                .unwrap()
+                .unwrap();
+            read.finish(()).unwrap();
+            let call = &outgoing.calls[0];
+            (
+                call.candidates
+                    .iter()
+                    .map(|c| c.declaration.document.path.clone())
+                    .collect::<Vec<_>>(),
+                call.omitted,
+            )
+        };
+        assert_eq!(
+            hints(),
+            (vec!["src/near.js".into(), "lib/far.js".into()], Some(0))
+        );
+        let db = store.cache_write().unwrap();
+        db.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        assert_eq!(
+            db.execute(
+                "DELETE FROM native_version_headers WHERE syntax_id IN
+                (SELECT d.syntax_id FROM native_version_declarations d
+                 JOIN document_versions v ON v.id=d.version_id
+                 WHERE d.name='Target' AND v.path='src/near.js')",
+                [],
+            )
+            .unwrap(),
+            1
+        );
+        db.pragma_update(None, "foreign_keys", "ON").unwrap();
+        drop(db);
+        assert_eq!(hints(), (vec!["lib/far.js".into()], Some(0)));
     }
 
     #[test]

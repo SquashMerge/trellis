@@ -8071,6 +8071,46 @@ async fn mcp_outgoing_mid_attestation_expiry_keeps_required_calls_and_prior_hint
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_outgoing_verifies_only_the_eight_top_ranked_hints() {
+    // Twelve eligible matches in twelve documents. The gate releases exactly
+    // eight version verifications; a ninth attempt fails its gate connection.
+    // Rank-first verification (#170) never makes that ninth attempt, so the
+    // eight top-ranked hints are shown and the other four are unexamined.
+    let targets: Vec<(String, String)> = (0..12)
+        .map(|i| (format!("b{i:02}.js"), "function Target() {}\n".to_owned()))
+        .collect();
+    let mut files: Vec<(&str, &str)> = targets
+        .iter()
+        .map(|(path, text)| (path.as_str(), text.as_str()))
+        .collect();
+    files.push(("a.js", "function Owner() { Target(); }\n"));
+    let reply = mcp_outgoing_fixture_with_budget(
+        &files,
+        "Owner",
+        None,
+        Some(vec![("outgoing_hint_verify_version", 0); 8]),
+    );
+    tool(&reply, None, true);
+    let data = &reply["result"]["structuredContent"]["data"];
+    let hints = &data["calls"][0]["nativeCandidates"];
+    let shown: Vec<_> = hints["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|hint| emitted_document(data, hint)["document"]["path"].clone())
+        .collect();
+    assert_eq!(
+        shown,
+        (0..8)
+            .map(|i| json!(format!("b{i:02}.js")))
+            .collect::<Vec<_>>(),
+        "{reply}"
+    );
+    assert_eq!(hints["omitted"], 4, "{reply}");
+    assert_eq!(reply["result"]["structuredContent"]["truncated"], false);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mcp_outgoing_same_version_attested_once_for_repeated_calls() {
     // This gate has one release. A second verification attempt fails its gate
     // connection, so both candidates can survive only with per-version reuse.

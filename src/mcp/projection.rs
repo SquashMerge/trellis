@@ -832,7 +832,7 @@ pub fn outgoing(
                 "range":call.range,"calleeRange":call.callee_range,
                 "calleeText":text,"calleeTextTruncated":item.selected.callee_text_truncated,
                 "displayKey":label,"nativeCandidates":{"items":suggestions,
-                    "omitted":item.selected.omitted.map(|_| item.selected.candidates.len().saturating_sub(n)),
+                    "omitted":item.selected.omitted.map(|unexamined| unexamined + item.selected.candidates.len().saturating_sub(n)),
                     "complete":false},"binding":null,"disposition":"unresolved",
                 "targetId":null,"boundaryReason":"missingEvidence",
                 "evidenceTier":"syntax","semanticBasis":null,"freshness":"fresh","staleBecause":[]}));
