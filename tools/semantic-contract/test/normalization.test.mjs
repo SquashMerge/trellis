@@ -141,6 +141,7 @@ const span = (start, end) => ({ encoding: "utf8", start, end });
 const row = (s, ref = "decl") => ({
   ref,
   nativeId: "opaque",
+    role: "production",
   document: s.document,
   revisionId: "r1",
   parentRef: null,
@@ -702,6 +703,7 @@ async function invocationFixture(t) {
   const declaration = (ref, name, start, end, nameStart) => ({
     ref,
     nativeId: null,
+    role: "production",
     document: s.document,
     revisionId: "r1",
     parentRef: null,
@@ -1898,6 +1900,7 @@ test("unchanged caller with changed target bytes has a possiblyStale proof; v1 s
     native.declarations.push({
       ref,
       nativeId: null,
+    role: "production",
       document: targetDoc,
       revisionId: rev,
       parentRef: null,
@@ -2542,6 +2545,7 @@ test("equal-name overload ordinals follow measured source order, not native row 
   const make = (ref, start) => ({
     ref,
     nativeId: ref,
+    role: "production",
     document: s.document,
     revisionId: "r1",
     parentRef: null,

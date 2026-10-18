@@ -147,6 +147,7 @@ export const types = Object.freeze({
     bases: array("Text"),
   }),
   Declaration: object({
+    role: enumOf("test", "production"),
     syntaxId: "SyntaxId",
     document: "DocumentKey",
     revisionId: "Text",
@@ -467,6 +468,7 @@ export const types = Object.freeze({
     ownerRef: "Text",
   }),
   NativeDeclaration: object({
+    role: enumOf("test", "production"),
     ref: "Text",
     nativeId: nullable("Text"),
     document: "DocumentKey",

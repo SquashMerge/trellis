@@ -84,6 +84,7 @@ const callId = occurrence(mainId, "call", 0),
 const declaration = (ref, name, start, end, nameStart) => ({
   ref,
   nativeId: null,
+    role: "production",
   document,
   revisionId: "r1",
   parentRef: null,
@@ -811,6 +812,7 @@ async function specimen(
   );
   const asDeclaration = (name, begin, end, nameStart) => ({
     syntaxId: syntax(name),
+    role: "production",
     document,
     revisionId: "r1",
     kind: "function",
@@ -1625,6 +1627,7 @@ test("captured directed relationship counts once and rejects wrong direction or 
       const type = (ref, name, begin, end, bases = []) => ({
         ref,
         nativeId: null,
+    role: "production",
         document,
         revisionId: "r1",
         parentRef: null,
@@ -1983,6 +1986,7 @@ async function generatedCorpus(
     decls.push({
       ref,
       nativeId: null,
+      role: "production",
       document: doc,
       revisionId: "r1",
       parentRef,

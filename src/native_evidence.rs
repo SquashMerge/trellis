@@ -27,7 +27,7 @@ const LANGUAGES: [&str; 4] = ["java", "rust", "python", "javascript"];
 pub(crate) const PRODUCER: &str = "trellis.native.syntax";
 /// Native producer descriptor version. Any change that can alter a native measured field or
 /// projection, or that starts reading another input, must change it (Decision 0003).
-pub(crate) const NATIVE_VERSION: &str = "native-v4";
+pub(crate) const NATIVE_VERSION: &str = "native-v5";
 /// The native producer's declared extraction-input inventory (Decision 0003), keyed by its
 /// descriptor `(id, version)` and language. `extract` measures one document from only its own
 /// bytes, language and path; the tree-sitter grammars and Unicode normalization tables it uses
@@ -360,9 +360,31 @@ pub struct Header {
     pub result_type: Option<String>,
     pub bases: Vec<String>,
 }
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DeclarationRole {
+    Test,
+    Production,
+}
+impl DeclarationRole {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Test => "test",
+            Self::Production => "production",
+        }
+    }
+    pub(crate) fn from_stored(value: &str) -> Result<Self> {
+        match value {
+            "test" => Ok(Self::Test),
+            "production" => Ok(Self::Production),
+            _ => anyhow::bail!("store_unavailable: invalid declaration role"),
+        }
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Declaration {
+    pub role: DeclarationRole,
     pub syntax_id: String,
     pub document: DocumentKey,
     pub revision_id: String,
@@ -1003,6 +1025,170 @@ fn is_region(n: Node<'_>) -> bool {
             | "ternary_expression"
     )
 }
+fn declaration_role(test: bool) -> DeclarationRole {
+    if test {
+        DeclarationRole::Test
+    } else {
+        DeclarationRole::Production
+    }
+}
+
+pub(crate) fn test_path(path: &str) -> bool {
+    let (dirs, name) = path.rsplit_once('/').unwrap_or(("", path));
+    if dirs
+        .split('/')
+        .any(|dir| matches!(dir, "tests" | "test" | "__tests__" | "spec"))
+    {
+        return true;
+    }
+    // `*.test.*` / `*.spec.*`: any inner dot segment, so multi-dot names such
+    // as `component.integration.test.ts` match too.
+    let segments: Vec<&str> = name.split('.').collect();
+    if segments.len() > 2
+        && segments[1..segments.len() - 1]
+            .iter()
+            .any(|segment| matches!(*segment, "test" | "spec"))
+    {
+        return true;
+    }
+    match name.rsplit_once('.') {
+        Some((stem, "rs")) => {
+            stem == "tests" || stem.ends_with("_tests") || stem.ends_with("_test")
+        }
+        Some((stem, "py")) => {
+            stem.starts_with("test_") || stem.ends_with("_test") || stem == "conftest"
+        }
+        Some((stem, "java")) => stem.ends_with("Test") || stem.ends_with("Tests"),
+        _ => false,
+    }
+}
+
+// Attribute syntax is inspected only inside parser-recognized attribute nodes. Tokenize
+// the small source span, excluding strings and comments, rather than scanning items.
+fn attribute_tokens(text: &str) -> Vec<&str> {
+    let mut tokens = Vec::new();
+    let mut offset = 0;
+    while offset < text.len() {
+        let rest = &text[offset..];
+        if rest.starts_with("//") {
+            break;
+        }
+        if rest.starts_with("/*") {
+            offset += rest.find("*/").map_or(rest.len(), |end| end + 2);
+            continue;
+        }
+        let ch = rest.chars().next().unwrap();
+        if ch == '"' || ch == '\'' {
+            let delimiter = ch;
+            offset += ch.len_utf8();
+            while offset < text.len() {
+                let next = text[offset..].chars().next().unwrap();
+                offset += next.len_utf8();
+                if next == '\\' && offset < text.len() {
+                    offset += text[offset..].chars().next().unwrap().len_utf8();
+                } else if next == delimiter {
+                    break;
+                }
+            }
+            continue;
+        }
+        if ch.is_ascii_alphabetic() || ch == '_' {
+            let end = rest
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(rest.len());
+            tokens.push(&text[offset..offset + end]);
+            offset += end;
+        } else {
+            if !ch.is_whitespace() {
+                tokens.push(&text[offset..offset + ch.len_utf8()]);
+            }
+            offset += ch.len_utf8();
+        }
+    }
+    tokens
+}
+fn rust_test_attribute(n: Node<'_>, file: &SourceFile) -> bool {
+    let Some(text) = file.text.get(n.start_byte()..n.end_byte()) else {
+        return false;
+    };
+    let tokens = attribute_tokens(text);
+    let Some(open) = tokens.iter().position(|token| *token == "[") else {
+        return false;
+    };
+    let t = &tokens[open + 1..];
+    if t.first() == Some(&"cfg") && t.get(1) == Some(&"(") {
+        if t.get(2) == Some(&"test") && t.get(3) == Some(&")") {
+            return true;
+        }
+        if t.get(2) != Some(&"all") || t.get(3) != Some(&"(") {
+            return false;
+        }
+        let mut depth = 0;
+        for index in 4..t.len() {
+            match t[index] {
+                "(" => depth += 1,
+                ")" if depth == 0 => break,
+                ")" => depth -= 1,
+                "test"
+                    if depth == 0
+                        && matches!(t.get(index.wrapping_sub(1)), Some(&"(") | Some(&","))
+                        && matches!(t.get(index + 1), Some(&",") | Some(&")")) =>
+                {
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        return false;
+    }
+    let mut index = 0;
+    while t.get(index + 1) == Some(&":") && t.get(index + 2) == Some(&":") {
+        index += 3;
+    }
+    t.get(index) == Some(&"test") && t.get(index + 1) == Some(&"]")
+}
+fn java_test_method(n: Node<'_>, file: &SourceFile) -> bool {
+    if n.kind() != "method_declaration" {
+        return false;
+    }
+    let Some(modifiers) = child_nodes(n).into_iter().find(|c| c.kind() == "modifiers") else {
+        return false;
+    };
+    child_nodes(modifiers)
+        .into_iter()
+        .filter(|c| matches!(c.kind(), "annotation" | "marker_annotation"))
+        .any(|annotation| {
+            let Some(name) = annotation
+                .child_by_field_name("name")
+                .or_else(|| child_nodes(annotation).into_iter().next())
+            else {
+                return false;
+            };
+            let Some(value) = file.text.get(name.start_byte()..name.end_byte()) else {
+                return false;
+            };
+            matches!(
+                value.rsplit('.').next(),
+                Some(
+                    "Test" | "ParameterizedTest" | "RepeatedTest" | "TestFactory" | "TestTemplate"
+                )
+            )
+        })
+}
+fn local_test_marker(n: Node<'_>, file: &SourceFile) -> bool {
+    match file.language.as_str() {
+        "java" => java_test_method(n, file),
+        "python" if test_path(&file.path) => {
+            let named = name(n, file).map(|(name, _)| name);
+            (matches!(n.kind(), "function_definition")
+                && named.as_deref().is_some_and(|s| s.starts_with("test_")))
+                || (n.kind() == "class_definition"
+                    && named.as_deref().is_some_and(|s| s.starts_with("Test")))
+        }
+        _ => false,
+    }
+}
+
 fn child_nodes(n: Node<'_>) -> Vec<Node<'_>> {
     let mut cursor = n.walk();
     n.named_children(&mut cursor).collect()
@@ -1400,6 +1586,7 @@ fn extract_known_with_progress(
     let module_id=ids.stable(&json!({"sourceSet":a.source_set.id,"path":f.path,"language":f.language,"ancestors":[],"declaration":module_key}))?;
     a.declarations.push(Declaration {
         syntax_id: module_id.clone(),
+        role: declaration_role(test_path(&f.path)),
         document: key.clone(),
         revision_id: a.revision.id.clone(),
         kind: "module".into(),
@@ -1439,7 +1626,14 @@ fn extract_known_with_progress(
         opaque_rust: false,
         progress,
     };
-    state.walk(tree.root_node(), &module_id, &[], &[], 0)?;
+    state.walk(
+        tree.root_node(),
+        &module_id,
+        &[],
+        &[],
+        0,
+        (test_path(&f.path), false),
+    )?;
     state.finish_occurrences()?;
     crate::store::optional_hint_check(progress)?;
     let observed_roles = [
@@ -1608,6 +1802,7 @@ impl ParserState<'_> {
         ancestors: &[Key],
         regions: &[String],
         depth: usize,
+        test_flags: (bool, bool),
     ) -> Result<()> {
         crate::store::optional_hint_check(self.progress)?;
         ensure!(
@@ -1631,6 +1826,7 @@ impl ParserState<'_> {
             self.opaque_rust = true;
             return Ok(());
         }
+        let test_context = test_flags.0 || test_flags.1 || local_test_marker(n, self.file);
         let mut owner = owner.to_owned();
         let mut ancestry = ancestors.to_vec();
         let mut regions = regions.to_vec();
@@ -1653,6 +1849,7 @@ impl ParserState<'_> {
             self.saw_definition |= k != "module";
             self.artifact.declarations.push(Declaration {
                 syntax_id: id.clone(),
+                role: declaration_role(test_context),
                 document: self.document.clone(),
                 revision_id: self.artifact.revision.id.clone(),
                 kind: k.into(),
@@ -1740,8 +1937,42 @@ impl ParserState<'_> {
                 provenance_id: self.proof_id.clone(),
             });
         }
+        let mut marked = false;
         for child in child_nodes(n) {
-            self.walk(child, &owner, &ancestry, &regions, depth + 1)?;
+            if self.file.language == "rust" && child.kind() == "attribute_item" {
+                marked |= rust_test_attribute(child, self.file);
+                self.walk(
+                    child,
+                    &owner,
+                    &ancestry,
+                    &regions,
+                    depth + 1,
+                    (test_context, false),
+                )?;
+                continue;
+            }
+            if self.file.language == "rust"
+                && matches!(child.kind(), "line_comment" | "block_comment")
+            {
+                self.walk(
+                    child,
+                    &owner,
+                    &ancestry,
+                    &regions,
+                    depth + 1,
+                    (test_context, false),
+                )?;
+                continue;
+            }
+            self.walk(
+                child,
+                &owner,
+                &ancestry,
+                &regions,
+                depth + 1,
+                (test_context, marked),
+            )?;
+            marked = false;
         }
         Ok(())
     }
@@ -2331,8 +2562,8 @@ mod occurrence_identity_tests {
         };
         assert_eq!(
             witness(&a),
-            "c960e8af8036a2010da269b8d9f1c44c1e0778a179ea4467f8d0fe7375d409ca",
-            "native witness bytes must retain the legacy canonical digest"
+            "699962d67808217642edc089fa7d5d33f4ead9aa9ca2677ae5b2421bf3fdc0af",
+            "native-v5 witness includes declaration role"
         );
         assert_eq!(
             witness(&a),
@@ -2701,5 +2932,20 @@ mod revision_digest_tests {
                 docs.len()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod declaration_role_tests {
+    use super::test_path;
+
+    #[test]
+    fn typescript_test_path_is_convention_only() {
+        assert!(test_path("src/button.integration.test.ts"));
+        assert!(test_path("src/button.spec.ts"));
+        assert!(!test_path("src/button.ts"));
+        assert!(test_path("tests/case.rs"));
+        assert!(test_path("src/conftest.py"));
+        assert!(!test_path("src/testing.rs"));
     }
 }

@@ -556,6 +556,7 @@ async function relationshipSpecimen(
   const declaration = {
     ref: "child",
     nativeId: null,
+    role: "production",
     document: s.document,
     revisionId: "r1",
     parentRef: null,

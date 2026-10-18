@@ -4,6 +4,7 @@ import { readFile, mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { loadFixture } from "../load.mjs";
+import { validate } from "../formats.mjs";
 import { createHash } from "node:crypto";
 import {
   checkMeasurement,
@@ -91,6 +92,7 @@ const witness = (field, start, end, text) => ({
 const nativeDeclaration = (ref, name, start, end, nameStart) => ({
   ref,
   nativeId: null,
+    role: "production",
   document: doc,
   revisionId: "r1",
   parentRef: null,
@@ -223,6 +225,7 @@ function sample() {
     target = identity("target");
   const decl = (name, start, end, nameStart, id) => ({
     syntaxId: id,
+    role: "production",
     document: doc,
     revisionId: "r1",
     kind: "function",
@@ -842,6 +845,7 @@ function lexical(language, spelling, expected) {
   const declaration = {
     ref: "go",
     nativeId: null,
+    role: "production",
     document: key,
     revisionId: "r1",
     parentRef: null,
@@ -875,6 +879,7 @@ function lexical(language, spelling, expected) {
   });
   const row = {
     syntaxId: id,
+    role: "production",
     document: key,
     revisionId: "r1",
     kind,
@@ -1023,6 +1028,7 @@ function nested() {
   const outer = {
     ref: "outer",
     nativeId: null,
+    role: "production",
     document: key,
     revisionId: "r1",
     parentRef: null,
@@ -1088,6 +1094,7 @@ function nested() {
   });
   const record = (row, id, ancestors) => ({
     syntaxId: id,
+    role: "production",
     document: key,
     revisionId: "r1",
     kind: row.kind,
@@ -1279,6 +1286,7 @@ test("declared sibling ordinal comes from numeric source order, never adapter or
       });
       return {
         syntaxId: identity,
+    role: "production",
         document: key,
         revisionId: "r1",
         kind: "function",
@@ -1490,6 +1498,7 @@ test("document module owns top-level measured calls; only empty module may have 
     module = {
       ref: "module",
       nativeId: null,
+    role: "production",
       document: doc,
       revisionId: "r1",
       parentRef: null,
@@ -1557,6 +1566,7 @@ test("document module owns top-level measured calls; only empty module may have 
     declarations: [
       {
         syntaxId: id,
+    role: "production",
         document: doc,
         revisionId: "r1",
         kind: "module",
@@ -1639,6 +1649,7 @@ function javaSignatures() {
     const row = {
       ref,
       nativeId: null,
+    role: "production",
       document: key,
       revisionId: "r1",
       parentRef: null,
@@ -1664,6 +1675,7 @@ function javaSignatures() {
       });
     const out = {
       syntaxId: id,
+    role: "production",
       document: key,
       revisionId: "r1",
       kind,
@@ -1883,6 +1895,7 @@ function equalSpanModule() {
   const module = {
     ref: "module",
     nativeId: null,
+    role: "production",
     document: doc,
     revisionId: "r1",
     parentRef: null,
@@ -1920,6 +1933,7 @@ function equalSpanModule() {
       });
     return {
       syntaxId: id,
+    role: "production",
       document: doc,
       revisionId: "r1",
       kind: row.kind,
@@ -2142,6 +2156,7 @@ function relocatedInner(place) {
   const decl = (ref, name, start, end, parentRef) => ({
     ref,
     nativeId: null,
+    role: "production",
     document: doc,
     revisionId: "r1",
     parentRef,
@@ -2208,6 +2223,7 @@ function relocatedInner(place) {
       id = ids[row.ref];
     return {
       syntaxId: id,
+      role: "production",
       document: doc,
       revisionId: "r1",
       kind: "function",
@@ -2400,6 +2416,7 @@ function insertedSibling(inserted) {
   }
   const declaration = {
     syntaxId: mainId,
+    role: "production",
     document: doc,
     revisionId: "r1",
     kind: "function",
@@ -2868,6 +2885,7 @@ function crossSnapshotOwner(axis) {
   const moduleRow = (ref, document, revisionId) => ({
     ref,
     nativeId: null,
+    role: "production",
     document,
     revisionId,
     parentRef: null,
@@ -2889,6 +2907,7 @@ function crossSnapshotOwner(axis) {
     });
     return {
       syntaxId: id,
+    role: "production",
       document,
       revisionId,
       kind: "module",
@@ -3160,6 +3179,7 @@ function foreignOwnerControl() {
     module = {
       ref: "module",
       nativeId: null,
+    role: "production",
       document: doc,
       revisionId: "r1",
       parentRef: null,
@@ -3191,6 +3211,7 @@ function foreignOwnerControl() {
   });
   s.records.declarations.push({
     syntaxId: moduleId,
+    role: "production",
     document: doc,
     revisionId: "r1",
     kind: "module",
@@ -3269,3 +3290,29 @@ const foreignControls = registerControls(
   })),
 );
 for (const row of foreignControls) test(row.id, () => runControl(row));
+
+
+test("declaration role is required, closed, and outside measured identity", () => {
+  const specimen = sample();
+  const raw = specimen.loaded.native.declarations[0];
+  const record = specimen.records.declarations.find((row) => row.name === raw.name);
+  assert.equal(raw.role, "production");
+  assert.equal(record.role, "production");
+  for (const [type, row] of [["NativeDeclaration", raw], ["Declaration", record]]) {
+    for (const bad of [undefined, "unknown"]) {
+      const changed = structuredClone(row);
+      if (bad === undefined) delete changed.role;
+      else changed.role = bad;
+      assert.throws(() => validate(type, changed), (error) => error.field === `${type}.role`);
+    }
+  }
+  const tsPathOnly = structuredClone(raw);
+  tsPathOnly.document.path = "src/widget.test.ts";
+  tsPathOnly.role = "test";
+  validate("NativeDeclaration", tsPathOnly);
+  assert.equal(tsPathOnly.role, "test"); // Path-only contract vector, not live TS indexing.
+  const expected = specimen.ids.main;
+  specimen.loaded.native.declarations[0].role = "test";
+  specimen.records.declarations.find((row) => row.name === raw.name).role = "test";
+  assert.equal(checkMeasurement(specimen.loaded, specimen.records).identityByRef.get("main"), expected);
+});

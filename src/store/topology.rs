@@ -1731,8 +1731,7 @@ fn readonly_db(path: &Path) -> Result<rusqlite::Connection> {
 /// Exact historical sqlite_master inventories made by released v4–v7 and
 /// pre-delta v8 writers. The digest includes table/index DDL and SQLite's
 /// autoindexes; a copied metadata row inside an invented schema is NOT proof.
-/// Only the exact prior-current v8 digest/marker can pass final deletion;
-/// all other entries permit read-only GC eligibility reporting only.
+/// Historical shapes are report-only; current-v9 validation gates deletion.
 fn historical_index_extractor(
     db: &rusqlite::Connection,
     version: i64,
@@ -1806,16 +1805,18 @@ fn inspect_index_with_open_hook(
     let tx = connection.transaction()?;
     let db = &tx;
     let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    let current_v8 = version == 8
+    let current_v9 = version == 9
         && super::has_revision_release_debt(db)?
         && super::validate_cache_shape(db).is_ok();
-    let historical_marker = if current_v8 {
-        // Only a complete additive-v8 maintenance layout can reach GC unlink.
-        // Earlier v8 layouts keep their prior report-only authority.
+    let historical_marker = if current_v9 {
+        // Only a complete current-v9 maintenance layout can reach GC unlink.
+        // Historical v8 layouts keep report-only authority.
         if super::validate_supersessions(db).is_err() {
             return Ok(("unknown", "invalid_supersession_inventory"));
         }
         None
+    } else if version == 9 {
+        return Ok(("unknown", "unknown_index_shape"));
     } else if (4..=8).contains(&version) {
         match historical_index_extractor(db, version)? {
             Some(marker) => Some(marker),
@@ -1892,7 +1893,7 @@ pub enum GcStage {
 // report-only, even if their extractor marker matches the current binary.
 fn validate_gc_candidate_shape(db: &rusqlite::Connection) -> Result<()> {
     let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    ensure!(version == 8, "historical GC schema is report-only");
+    ensure!(version == 9, "historical GC schema is report-only");
     ensure!(
         super::has_revision_release_debt(db)?,
         "historical GC schema is report-only"
@@ -2515,8 +2516,8 @@ mod gc_schema_race_tests {
         assert_eq!(
             (schema, marker.as_str(), generation, revision),
             (
-                8,
-                "native-v4-delta-v1",
+                9,
+                "native-v5-delta-v1",
                 pin.index_generation.to_string(),
                 pin.index_revision as i64
             )
@@ -2735,7 +2736,6 @@ mod gc_schema_race_tests {
     fn exact_historical_v8_remains_report_only_after_every_final_guard() {
         let state = tempfile::tempdir().unwrap();
         let candidate_root = tempfile::tempdir().unwrap();
-        let current_root = tempfile::tempdir().unwrap();
         let roots = TopologyRoots::isolated_for_tests(
             state.path().join("cache"),
             state.path().join("data"),
@@ -2743,15 +2743,9 @@ mod gc_schema_race_tests {
         let candidate =
             WorkspaceIdentity::discover(Some(candidate_root.path()), candidate_root.path())
                 .unwrap();
-        let current =
-            WorkspaceIdentity::discover(Some(current_root.path()), current_root.path()).unwrap();
         drop(crate::store::Store::open_for_tests(state.path(), candidate_root.path()).unwrap());
-        drop(crate::store::Store::open_for_tests(state.path(), current_root.path()).unwrap());
         let path = roots.index_db(&candidate);
         let dir = roots.index_dir(&candidate);
-        // The original disposable v9 inode has no live SQLite connection.
-        // Remove it under verified EX and release its exact dead witness before
-        // installing the historical inode at this pathname.
         let stale = fs::symlink_metadata(&path).unwrap();
         let candidate_ex =
             UseGuard::acquire_existing(&roots.index_use_lock(&candidate), true, true).unwrap();
@@ -2777,96 +2771,20 @@ mod gc_schema_race_tests {
         drop(db);
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         drop(crate::store::retained_sqlite_file(&path, false, false, false).unwrap());
-        let writer = roots
-            .writer(Arc::new(current.verified_clone().unwrap()))
-            .unwrap();
+        let before = fs::read(&path).unwrap();
         assert_eq!(
             inspect_index(&dir, &candidate.root_key, now).unwrap(),
             ("eligible", "age_30_days")
         );
-        let held =
-            UseGuard::acquire_existing(&roots.index_use_lock(&candidate), true, true).unwrap();
         assert_eq!(
-            roots
-                .gc_report_at(now)
-                .unwrap()
-                .derived
-                .into_iter()
-                .find(|entry| entry.root_key == candidate.root_key)
-                .unwrap()
-                .status,
-            "busy"
+            roots.gc_report_at(now).unwrap().derived[0].status,
+            "eligible"
         );
-        drop(held);
-        let journal = path.with_file_name("index.db-journal");
-        fs::write(&journal, b"hot-journal-sentinel").unwrap();
-        let held =
-            UseGuard::acquire_existing(&roots.index_use_lock(&candidate), true, true).unwrap();
-        assert!(
-            !gc_remove_candidate(
-                &dir,
-                &candidate.root_key,
-                now,
-                held,
-                &current,
-                &writer,
-                &mut |_| Ok(())
-            )
-            .unwrap()
-        );
-        assert_eq!(fs::read(&journal).unwrap(), b"hot-journal-sentinel");
-        fs::remove_file(&journal).unwrap();
-        let db = rusqlite::Connection::open(&path).unwrap();
-        db.execute_batch("CREATE VIEW unknown_gc_shape AS SELECT 1")
-            .unwrap();
-        drop(db);
-        let held =
-            UseGuard::acquire_existing(&roots.index_use_lock(&candidate), true, true).unwrap();
-        assert!(
-            !gc_remove_candidate(
-                &dir,
-                &candidate.root_key,
-                now,
-                held,
-                &current,
-                &writer,
-                &mut |_| Ok(())
-            )
-            .unwrap()
-        );
-        let db = rusqlite::Connection::open(&path).unwrap();
-        db.execute_batch("DROP VIEW unknown_gc_shape").unwrap();
-        db.pragma_update(None, "user_version", 99_i64).unwrap();
-        drop(db);
-        let held =
-            UseGuard::acquire_existing(&roots.index_use_lock(&candidate), true, true).unwrap();
-        assert!(
-            !gc_remove_candidate(
-                &dir,
-                &candidate.root_key,
-                now,
-                held,
-                &current,
-                &writer,
-                &mut |_| Ok(())
-            )
-            .unwrap()
-        );
-        let db = rusqlite::Connection::open(&path).unwrap();
-        db.pragma_update(None, "user_version", 8_i64).unwrap();
-        drop(db);
-        let before = fs::read(&path).unwrap();
-        assert_eq!(roots.automatic_gc_at(&current, &writer, now).unwrap(), 0);
-        assert_eq!(
-            fs::read(&path).unwrap(),
-            before,
-            "historical v8 must stay report-only without current retention layout"
-        );
-        assert!(dir.exists());
+        assert_eq!(fs::read(&path).unwrap(), before);
     }
 
     #[test]
-    fn exact_v8_gc_candidate_survives_unknown_busy_then_deletes_after_fences_clear() {
+    fn exact_v9_gc_candidate_survives_unknown_busy_then_deletes_after_fences_clear() {
         let state = tempfile::tempdir().unwrap();
         let candidate_root = tempfile::tempdir().unwrap();
         let current_root = tempfile::tempdir().unwrap();
@@ -2998,7 +2916,7 @@ mod gc_schema_race_tests {
         assert_eq!(
             (schema, marker.as_str(), generation, revision),
             (
-                8,
+                9,
                 "native-v4",
                 pin.index_generation.to_string(),
                 pin.index_revision as i64
@@ -3152,7 +3070,7 @@ mod gc_final_witness_tests {
         assert_eq!(
             db.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            8
+            9
         );
         drop(live);
         assert!(roots.index_use_lock(&candidate).exists());

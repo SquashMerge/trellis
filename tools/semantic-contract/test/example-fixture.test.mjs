@@ -30,6 +30,9 @@ const root = fileURLToPath(
 const fixture = await loadFixture(root);
 const normalized = normalizeFixture(fixture);
 const { records } = normalized;
+assert.equal(fixture.native.declarations.length, 32);
+assert.ok(fixture.native.declarations.every((row) => row.role === "production"));
+assert.ok(records.declarations.every((row) => row.role === "production"));
 const answers = materializeAnswers(fixture.answers, normalized);
 const coverage = checkCoverage(fixture, records);
 const measurement = checkMeasurement(fixture, records);

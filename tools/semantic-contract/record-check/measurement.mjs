@@ -485,6 +485,7 @@ export function checkMeasurement(
           declaration: key,
         });
         const value = {
+          role: row.role,
           syntaxId: id,
           document: row.document,
           revisionId: row.revisionId,

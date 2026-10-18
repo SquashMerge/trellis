@@ -21,6 +21,7 @@ function addTargetDeclaration(s, document, revisionId, sourceFile) {
   artifact.declarations.push({
     ref: `target-${revisionId}`,
     nativeId: null,
+    role: "production",
     document,
     revisionId,
     parentRef: null,
@@ -652,6 +653,7 @@ test("BASIS.RAW_RELATIONSHIP binds a separate relationship proof to the captured
   native.declarations.push({
     ref: "go-declaration",
     nativeId: null,
+    role: "production",
     document: s.document,
     revisionId: "r1",
     parentRef: null,

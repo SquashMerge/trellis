@@ -1011,7 +1011,7 @@ impl EvidenceResponse {
         // connection or lock transition is needed for these candidate SELECTs.
         let _progress_guard =
             (!calls.is_empty()).then(|| install_optional_hint_progress(&self.db, &progress));
-        let owner_is_test = mcp_test_path(&scope.key.path);
+        let owner_is_test = owner.declaration.role == crate::native_evidence::DeclarationRole::Test;
         // One admitted snapshot: verify and decode each selected version only once.
         // A failed optional verification is never cached as trusted evidence.
         let mut verified_versions = BTreeMap::<
@@ -1051,7 +1051,7 @@ impl EvidenceResponse {
             };
             let mut statement = match self.db.prepare(
                 "SELECT d.version_id,d.syntax_id,m.source_set_id,m.language,m.path,
-                        d.start_byte,d.end_byte
+                        d.start_byte,d.end_byte,d.role
                  FROM native_version_declarations d JOIN revision_documents m
                    ON m.document_version_id=d.version_id AND m.revision_id=?1
                  WHERE m.source_set_id=?2 AND m.language=?3 AND d.lookup_key=?4",
@@ -1110,7 +1110,11 @@ impl EvidenceResponse {
                 let (start, end): (i64, i64) = (row.get(5)?, row.get(6)?);
                 // Test code is not an eligible hint for non-test code; skip it
                 // before verification so it costs no hint budget.
-                if !owner_is_test && mcp_test_path(&key.path) {
+                if !owner_is_test
+                    && crate::native_evidence::DeclarationRole::from_stored(
+                        &row.get::<_, String>(7)?,
+                    )? == crate::native_evidence::DeclarationRole::Test
+                {
                     continue;
                 }
                 ranked.push((
@@ -1385,39 +1389,6 @@ impl EvidenceResponse {
     }
 }
 
-/// Whether a root-relative path is test code by path convention alone (#167):
-/// a `tests`, `test`, `__tests__` or `spec` directory, or a test file name.
-/// Inline test modules inside production files are not detected.
-pub(crate) fn mcp_test_path(path: &str) -> bool {
-    let (dirs, name) = path.rsplit_once('/').unwrap_or(("", path));
-    if dirs
-        .split('/')
-        .any(|dir| matches!(dir, "tests" | "test" | "__tests__" | "spec"))
-    {
-        return true;
-    }
-    // `*.test.*` / `*.spec.*`: any inner dot segment, so multi-dot names such
-    // as `component.integration.test.ts` match too.
-    let segments: Vec<&str> = name.split('.').collect();
-    if segments.len() > 2
-        && segments[1..segments.len() - 1]
-            .iter()
-            .any(|segment| matches!(*segment, "test" | "spec"))
-    {
-        return true;
-    }
-    match name.rsplit_once('.') {
-        Some((stem, "rs")) => {
-            stem == "tests" || stem.ends_with("_tests") || stem.ends_with("_test")
-        }
-        Some((stem, "py")) => {
-            stem.starts_with("test_") || stem.ends_with("_test") || stem == "conftest"
-        }
-        Some((stem, "java")) => stem.ends_with("Test") || stem.ends_with("Tests"),
-        _ => false,
-    }
-}
-
 /// Hint rank by location relative to the calling document: the same document,
 /// then the same directory, then elsewhere (#167).
 fn mcp_hint_proximity(owner: &str, candidate: &str) -> u8 {
@@ -1485,7 +1456,7 @@ mod outgoing_tests {
         };
         let declaration: Declaration = serde_json::from_value(json!({
             "syntaxId":format!("sid:v1:{}","a".repeat(32)),"document":document,
-            "revisionId":"revision:v2:test","kind":"function","name":"Target",
+            "revisionId":"revision:v2:test","kind":"function","role":"production","name":"Target",
             "lookupKey":"Target","ancestors":[],
             "key":{"kind":"function","name":"Target","signature":null,"ordinal":0},
             "range":{"start":0,"end":20},"nameRange":null,
@@ -1617,6 +1588,58 @@ mod enriched_read_tests {
     use super::*;
     use crate::indexer::IndexOptions;
     use std::sync::{Arc, atomic::AtomicBool};
+
+    #[test]
+    fn stored_roles_hide_inline_rust_test_helpers_from_production_calls() {
+        use crate::native_evidence::DeclarationRole;
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("lib.rs"),
+            "fn ProdCaller() { Target(); }\n#[cfg(test)] mod tests { fn Target() {} fn TestCaller() { Target(); } }\n"
+        ).unwrap();
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let (pin, _) = crate::index_coordinator::reconcile_workspace(
+            &store,
+            &IndexOptions::new(workspace.path().to_owned()),
+            &Arc::new(AtomicBool::new(false)),
+            |_| {},
+        )
+        .unwrap();
+        let read = store.evidence_response().unwrap();
+        let find = |name: &str| {
+            read.mcp_find_with_lines(name, 20, Some(pin))
+                .unwrap()
+                .symbols
+                .into_iter()
+                .find(|row| row.symbol.declaration.name.as_deref() == Some(name))
+                .unwrap()
+                .symbol
+                .declaration
+        };
+        assert_eq!(find("Target").role, DeclarationRole::Test);
+        let base = std::time::Instant::now();
+        for (name, role, hints) in [
+            ("ProdCaller", DeclarationRole::Production, 0),
+            ("TestCaller", DeclarationRole::Test, 1),
+        ] {
+            let owner = find(name);
+            assert_eq!(owner.role, role);
+            let outgoing = read
+                .mcp_outgoing_with_lines(
+                    &owner.syntax_id,
+                    20,
+                    Some(pin),
+                    &|| base,
+                    base + std::time::Duration::from_secs(5),
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(outgoing.calls.len(), 1);
+            assert_eq!(outgoing.calls[0].selected.candidates.len(), hints, "{name}");
+            assert_eq!(outgoing.calls[0].selected.omitted, Some(0));
+        }
+        read.finish(()).unwrap();
+    }
 
     #[test]
     fn distinct_document_candidate_is_verified_and_budgeted_in_enriched_outgoing() {
@@ -2145,7 +2168,7 @@ mod enriched_read_tests {
             "web/component.integration.test.ts",
             "web/a.b.spec.js",
         ] {
-            assert!(mcp_test_path(path), "{path}");
+            assert!(crate::native_evidence::test_path(path), "{path}");
         }
         for path in [
             "src/store.rs",
@@ -2161,7 +2184,7 @@ mod enriched_read_tests {
             "web/a.testing.js",
             "src/a.b.rs",
         ] {
-            assert!(!mcp_test_path(path), "{path}");
+            assert!(!crate::native_evidence::test_path(path), "{path}");
         }
     }
 }
