@@ -1305,6 +1305,13 @@
                   "type": "null"
                 }
               ]
+            },
+            "role": {
+              "type": "string",
+              "enum": [
+                "test",
+                "production"
+              ]
             }
           },
           "required": [
@@ -1319,7 +1326,8 @@
             "freshness",
             "staleBecause",
             "doc",
-            "lines"
+            "lines",
+            "role"
           ],
           "type": "object"
         },
@@ -2108,6 +2116,13 @@
             },
             "syntaxId": {
               "$ref": "#/$defs/SyntaxId"
+            },
+            "role": {
+              "type": "string",
+              "enum": [
+                "test",
+                "production"
+              ]
             }
           },
           "required": [
@@ -2119,7 +2134,8 @@
             "key",
             "range",
             "nameRange",
-            "header"
+            "header",
+            "role"
           ],
           "type": "object"
         },

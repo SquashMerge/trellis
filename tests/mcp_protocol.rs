@@ -1658,6 +1658,10 @@ async fn warm_relay_serves_both_new_tools_and_rejects_closed_inputs() {
         tool(&found, None, !legacy);
         schema_pairs.push(json!({"name":"trellis_find_symbols",
             "structuredContent":found["result"]["structuredContent"]}));
+        assert_eq!(
+            found["result"]["structuredContent"]["data"]["symbols"][0]["role"],
+            "production"
+        );
         let id = found["result"]["structuredContent"]["data"]["symbols"][0]["symbolId"].clone();
         let target_find = peer.ask(call(
             legacy,
@@ -1681,6 +1685,7 @@ async fn warm_relay_serves_both_new_tools_and_rejects_closed_inputs() {
         ));
         tool(&selected_target, None, !legacy);
         let target_data = &selected_target["result"]["structuredContent"]["data"];
+        assert_eq!(target_data["declaration"]["role"], "production");
         let target_version = emitted_document(target_data, target_data);
         for (number, name) in [(4, "trellis_declaration"), (5, "trellis_outgoing_calls")] {
             let reply = peer.ask(call(
@@ -1701,6 +1706,7 @@ async fn warm_relay_serves_both_new_tools_and_rejects_closed_inputs() {
             );
             if name == "trellis_declaration" {
                 assert_eq!(data["declaration"]["syntaxId"], id);
+                assert_eq!(data["declaration"]["role"], "production");
             } else {
                 assert_eq!(data["calls"].as_array().unwrap().len(), 1);
                 assert_eq!(data["calls"][0]["calleeText"], "Target");

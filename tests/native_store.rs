@@ -147,7 +147,7 @@ fn four_languages_normalized_rows_and_pinned_bytes_are_coherent() {
     let baseline = store.index_baseline().unwrap();
     let leader = store.publication_for_tests().unwrap();
     let pin = publish(&store, root.path(), &cancel, baseline, &leader).unwrap();
-    // A current v8 empty bootstrap is the same generation; only a rebuild rotates it.
+    // A current v9 empty bootstrap is the same generation; only a rebuild rotates it.
     assert_eq!(baseline.index_generation, pin.index_generation);
     assert_eq!(
         store.status().unwrap().evidence_format.as_deref(),
@@ -246,7 +246,7 @@ fn four_languages_normalized_rows_and_pinned_bytes_are_coherent() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        8
+        9
     );
     let count: i64 = db
         .query_row(
@@ -654,7 +654,7 @@ fn index_from_another_native_producer_version_is_rebuilt_not_served() {
         let version: String = db
             .query_row("SELECT version FROM native_producers", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, "native-v4");
+        assert_eq!(version, "native-v5");
         let calls: Vec<String> = db
             .prepare("SELECT id FROM native_version_calls")
             .unwrap()
@@ -1166,8 +1166,8 @@ fn extra_fk_valid_native_declaration_with_new_lookup_key_cannot_escape_source_wi
         .unwrap();
     let fake = "sid:v1:ffffffffffffffffffffffffffffffff";
     let version = live_document_version(&db, "flow.js");
-    db.execute("INSERT INTO native_version_declarations(version_id,syntax_id,owner_syntax_id,kind,name,lookup_key,key_signature_present,key_type_parameter_count,key_variadic,key_ordinal,start_byte,end_byte,name_start,name_end)
-        SELECT version_id,?1,owner_syntax_id,kind,'phantom','phantom',key_signature_present,key_type_parameter_count,key_variadic,key_ordinal,start_byte,end_byte,name_start,name_end
+    db.execute("INSERT INTO native_version_declarations(version_id,syntax_id,owner_syntax_id,kind,role,name,lookup_key,key_signature_present,key_type_parameter_count,key_variadic,key_ordinal,start_byte,end_byte,name_start,name_end)
+        SELECT version_id,?1,owner_syntax_id,kind,role,'phantom','phantom',key_signature_present,key_type_parameter_count,key_variadic,key_ordinal,start_byte,end_byte,name_start,name_end
         FROM native_version_declarations WHERE version_id=?2 AND syntax_id=?3",
         rusqlite::params![fake,version,original]).unwrap();
     db.execute(
@@ -3624,4 +3624,61 @@ fn large_revision_releases_in_batched_units_while_edits_continue() {
         "candidate cleanup must batch, not need one unit per document"
     );
     assert_eq!(store.status().unwrap().revision, head);
+}
+
+#[test]
+#[cfg(feature = "test-support")]
+fn declaration_roles_round_trip_and_invalid_stored_role_fails_typed_read() {
+    use trellis::native_evidence::DeclarationRole;
+    let (state, root, store, cancel) = fixture();
+    fs::write(
+        root.path().join("tests_role.rs"),
+        "fn production() {}\n#[cfg(test)] mod tests { fn inline_helper() {} }\n",
+    )
+    .unwrap();
+    let leader = store.publication_for_tests().unwrap();
+    let pin = publish(
+        &store,
+        root.path(),
+        &cancel,
+        store.index_baseline().unwrap(),
+        &leader,
+    )
+    .unwrap();
+    let test_rows = store
+        .native_declarations_at(pin, "rust", "inline_helper")
+        .unwrap();
+    assert_eq!(test_rows.len(), 1);
+    assert_eq!(test_rows[0].role, DeclarationRole::Test);
+    let production_rows = store
+        .native_declarations_at(pin, "rust", "production")
+        .unwrap();
+    assert_eq!(production_rows.len(), 1);
+    assert_eq!(production_rows[0].role, DeclarationRole::Production);
+    let db = Connection::open(published_db(state.path(), root.path())).unwrap();
+    db.execute_batch("PRAGMA ignore_check_constraints=ON")
+        .unwrap();
+    db.execute(
+        "UPDATE native_version_declarations SET role='unknown' WHERE syntax_id=?1",
+        [&test_rows[0].syntax_id],
+    )
+    .unwrap();
+    let error = store
+        .native_declarations_at(pin, "rust", "inline_helper")
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("incompatible_index"),
+        "{error:#}"
+    );
+    assert!(
+        error.to_string().contains("invalid declaration role"),
+        "{error:#}"
+    );
+    assert!(
+        db.execute(
+            "UPDATE native_version_declarations SET role=NULL WHERE syntax_id=?1",
+            [&test_rows[0].syntax_id]
+        )
+        .is_err()
+    );
 }

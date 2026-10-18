@@ -531,6 +531,7 @@ fn every_nullable_native_field_requires_presence_even_when_null() {
     check(&header, &["name", "resultType"]);
     check(
         &Declaration {
+            role: trellis::native_evidence::DeclarationRole::Production,
             syntax_id: "id".into(),
             document: doc.clone(),
             revision_id: "r".into(),
@@ -1270,5 +1271,158 @@ fn unreadable_required_input_fails_closed() {
     assert!(
         result.is_err(),
         "unreadable required input was treated as absent"
+    );
+}
+
+#[test]
+fn declaration_roles_follow_syntax_paths_and_inherit_without_changing_identity() {
+    use std::{
+        collections::BTreeMap,
+        fs,
+        sync::{Arc, atomic::AtomicBool},
+    };
+    use trellis::{
+        indexer::{IndexOptions, index_workspace_with_native},
+        model::CancelFlag,
+        native_evidence::DeclarationRole,
+    };
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir(root.path().join("tests")).unwrap();
+    fs::create_dir(root.path().join("__tests__")).unwrap();
+    let id = trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+        .unwrap();
+    let sources = [
+        (
+            "src.rs",
+            "fn normal() {}\n#[cfg(test)] mod inner { fn helper() {} struct Thing; impl Thing { fn method(&self) {} } }\nfn after() {}\n#[cfg(all(feature = \"x\", test))] fn all_test() {}\n#[cfg(any(test, feature = \"x\"))] fn any_test() {}\n#[cfg(not(test))] fn not_test() {}\n#[cfg(feature = \"test-support\")] fn support() {}\n#[test] fn standalone() {}\n#[tokio::test] fn qualified() {}\n// #[test] fn commented() {}\nconst TEXT: &str = \"#[test]\";\n",
+        ),
+        (
+            "A.java",
+            "class A { @Test void outside() {} @org.junit.jupiter.params.ParameterizedTest void parameterized() {} @RepeatedTest void repeated() {} @TestFactory void factory() {} @TestTemplate void template() {} void normal() {} }",
+        ),
+        ("tests/Widget.java", "class Widget { void ordinary() {} }"),
+        (
+            "test_sample.py",
+            "class TestSuite:\n    def helper(self): pass\nasync def test_async(): pass\ndef test_free(): pass\ndef normal(): pass\n",
+        ),
+        (
+            "normal.py",
+            "def test_named(): pass\nclass TestNamed: pass\n",
+        ),
+        (
+            "thing.js",
+            "function test_name() { describe('x', () => {}); }",
+        ),
+        ("__tests__/thing.js", "function ordinary() {}"),
+    ];
+    for (name, text) in sources {
+        fs::write(root.path().join(name), text).unwrap();
+    }
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let extract = || {
+        index_workspace_with_native(
+            &IndexOptions::new(root.path().into()),
+            &id.record_id,
+            &cancel,
+            |_| {},
+        )
+        .unwrap()
+        .1
+    };
+    let before = extract();
+    let role = |path: &str, name: &str| {
+        before
+            .declarations
+            .iter()
+            .find(|d| d.document.path == path && d.name.as_deref() == Some(name))
+            .unwrap_or_else(|| panic!("missing {path}/{name}"))
+            .role
+    };
+    for name in [
+        "inner",
+        "helper",
+        "Thing",
+        "method",
+        "all_test",
+        "standalone",
+        "qualified",
+    ] {
+        assert_eq!(role("src.rs", name), DeclarationRole::Test, "{name}");
+    }
+    for name in ["normal", "after", "any_test", "not_test", "support", "TEXT"] {
+        assert_eq!(role("src.rs", name), DeclarationRole::Production, "{name}");
+    }
+    for name in [
+        "outside",
+        "parameterized",
+        "repeated",
+        "factory",
+        "template",
+    ] {
+        assert_eq!(role("A.java", name), DeclarationRole::Test, "{name}");
+    }
+    assert_eq!(role("A.java", "normal"), DeclarationRole::Production);
+    assert_eq!(role("tests/Widget.java", "ordinary"), DeclarationRole::Test);
+    for name in ["TestSuite", "helper", "test_async", "test_free"] {
+        assert_eq!(
+            role("test_sample.py", name),
+            DeclarationRole::Test,
+            "{name}"
+        );
+    }
+    assert_eq!(role("test_sample.py", "normal"), DeclarationRole::Test);
+    for name in ["test_named", "TestNamed"] {
+        assert_eq!(role("normal.py", name), DeclarationRole::Production);
+    }
+    assert_eq!(role("thing.js", "test_name"), DeclarationRole::Production);
+    assert_eq!(
+        role("__tests__/thing.js", "ordinary"),
+        DeclarationRole::Test
+    );
+    assert!(
+        before
+            .declarations
+            .iter()
+            .all(|d| matches!(d.role, DeclarationRole::Test | DeclarationRole::Production))
+    );
+    // An attribute changes the measured role, never the stable declaration identity.
+    let baseline: BTreeMap<_, _> = before
+        .declarations
+        .iter()
+        .filter(|d| d.document.path == "src.rs")
+        .map(|d| {
+            (
+                d.name.clone(),
+                (d.syntax_id.clone(), d.key.clone(), d.lookup_key.clone()),
+            )
+        })
+        .collect();
+    let original = fs::read_to_string(root.path().join("src.rs")).unwrap();
+    fs::write(
+        root.path().join("src.rs"),
+        original.replace("#[cfg(test)]", "#[cfg(any(test))]"),
+    )
+    .unwrap();
+    let after = extract();
+    let changed: BTreeMap<_, _> = after
+        .declarations
+        .iter()
+        .filter(|d| d.document.path == "src.rs")
+        .map(|d| {
+            (
+                d.name.clone(),
+                (d.syntax_id.clone(), d.key.clone(), d.lookup_key.clone()),
+            )
+        })
+        .collect();
+    assert_eq!(baseline, changed);
+    assert_eq!(
+        after
+            .declarations
+            .iter()
+            .find(|d| d.document.path == "src.rs" && d.name.as_deref() == Some("helper"))
+            .unwrap()
+            .role,
+        DeclarationRole::Production
     );
 }

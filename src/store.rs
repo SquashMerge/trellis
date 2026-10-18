@@ -489,8 +489,8 @@ SELECT COALESCE(length(CAST(x.projection_id AS BLOB)),0)+COALESCE(length(CAST(x.
 UNION ALL
 SELECT COALESCE(length(CAST(x.projection_id AS BLOB)),0)+COALESCE(length(CAST(x.id AS BLOB)),0)+COALESCE(length(CAST(x.owner AS BLOB)),0)+COALESCE(length(CAST(x.target AS BLOB)),0)+COALESCE(length(CAST(x.payload AS BLOB)),0) AS row_bytes FROM class_relations x WHERE x.projection_id=?2
 )"#;
-const DATABASE_SCHEMA_VERSION: u32 = 8;
-const EXTRACTOR_VERSION: &str = "native-v4-delta-v1";
+const DATABASE_SCHEMA_VERSION: u32 = 9;
+const EXTRACTOR_VERSION: &str = "native-v5-delta-v1";
 const EVIDENCE_FORMAT: &str = "terminal-native-graph-v1";
 // The original v8 supersession extension stays byte-for-byte compatible.
 const SUPERSESSION_SCHEMA_V8: &str = "CREATE TABLE native_revision_supersessions(revision_id TEXT PRIMARY KEY REFERENCES native_revisions(id),superseded_at INTEGER NOT NULL CHECK(superseded_at BETWEEN 0 AND 9007199254740991));";
@@ -515,7 +515,7 @@ CREATE INDEX native_version_regions_parent ON native_version_control_regions(ver
 const REVISION_HEADER_INDEX_SCHEMA_V8: &str = "CREATE INDEX native_revisions_header_cover ON native_revisions(source_set_id,published_index_revision,id);";
 
 const CACHE_SCHEMA_V8: &str = r#"
-CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=8), extractor_version TEXT NOT NULL CHECK(extractor_version='native-v4-delta-v1'), root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL, reconcile_options TEXT);
+CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=9), extractor_version TEXT NOT NULL CHECK(extractor_version='native-v5-delta-v1'), root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL, reconcile_options TEXT);
 CREATE TABLE native_producers(id TEXT NOT NULL,version TEXT NOT NULL,executable_hash TEXT NOT NULL CHECK(length(executable_hash)=64),kind TEXT NOT NULL CHECK(kind='native'),position_encoding TEXT NOT NULL CHECK(position_encoding='utf8'),PRIMARY KEY(id,version));
 CREATE TABLE native_producer_languages(producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,language TEXT NOT NULL,inventory_authenticated INTEGER NOT NULL CHECK(inventory_authenticated IN (0,1)),ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(producer_id,producer_version,language),UNIQUE(producer_id,producer_version,ordinal),FOREIGN KEY(producer_id,producer_version) REFERENCES native_producers(id,version) DEFERRABLE INITIALLY DEFERRED);
 CREATE TABLE native_producer_inputs(producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,language TEXT NOT NULL,component_name TEXT NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(producer_id,producer_version,language,component_name),UNIQUE(producer_id,producer_version,language,ordinal),FOREIGN KEY(producer_id,producer_version,language) REFERENCES native_producer_languages(producer_id,producer_version,language) DEFERRABLE INITIALLY DEFERRED);
@@ -546,7 +546,7 @@ CREATE INDEX revision_documents_version ON revision_documents(document_version_i
 CREATE INDEX revision_documents_graph ON revision_documents(graph_projection_id,revision_id);
 CREATE INDEX revision_documents_class ON revision_documents(class_projection_id,revision_id);
 CREATE TABLE native_version_coverage_roles(version_id TEXT NOT NULL REFERENCES document_versions(id) DEFERRABLE INITIALLY DEFERRED,role_kind TEXT NOT NULL CHECK(role_kind IN ('supported','observed')),role TEXT NOT NULL CHECK(role IN ('definition','call')),ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(version_id,role_kind,ordinal),UNIQUE(version_id,role_kind,role));
-CREATE TABLE native_version_declarations(version_id TEXT NOT NULL REFERENCES document_versions(id) DEFERRABLE INITIALLY DEFERRED,syntax_id TEXT NOT NULL,owner_syntax_id TEXT,kind TEXT NOT NULL,name TEXT,lookup_key TEXT,key_signature_present INTEGER NOT NULL CHECK(key_signature_present IN (0,1)),key_type_parameter_count INTEGER,key_variadic INTEGER,key_ordinal INTEGER NOT NULL CHECK(key_ordinal>=0),start_byte INTEGER NOT NULL,end_byte INTEGER NOT NULL,name_start INTEGER,name_end INTEGER,CHECK(start_byte>=0 AND end_byte>=start_byte),CHECK((name IS NULL)=(lookup_key IS NULL) AND (name IS NULL)=(name_start IS NULL) AND (name_start IS NULL)=(name_end IS NULL)),CHECK(name_start IS NULL OR (name_start>=start_byte AND name_end<=end_byte AND name_end>name_start)),CHECK((key_signature_present=0 AND key_type_parameter_count IS NULL AND key_variadic IS NULL) OR (key_signature_present=1 AND key_type_parameter_count>=0 AND key_variadic IN (0,1))),PRIMARY KEY(version_id,syntax_id),FOREIGN KEY(version_id,owner_syntax_id) REFERENCES native_version_declarations(version_id,syntax_id) DEFERRABLE INITIALLY DEFERRED);
+CREATE TABLE native_version_declarations(version_id TEXT NOT NULL REFERENCES document_versions(id) DEFERRABLE INITIALLY DEFERRED,syntax_id TEXT NOT NULL,owner_syntax_id TEXT,kind TEXT NOT NULL,role TEXT NOT NULL CHECK(role IN ('test','production')),name TEXT,lookup_key TEXT,key_signature_present INTEGER NOT NULL CHECK(key_signature_present IN (0,1)),key_type_parameter_count INTEGER,key_variadic INTEGER,key_ordinal INTEGER NOT NULL CHECK(key_ordinal>=0),start_byte INTEGER NOT NULL,end_byte INTEGER NOT NULL,name_start INTEGER,name_end INTEGER,CHECK(start_byte>=0 AND end_byte>=start_byte),CHECK((name IS NULL)=(lookup_key IS NULL) AND (name IS NULL)=(name_start IS NULL) AND (name_start IS NULL)=(name_end IS NULL)),CHECK(name_start IS NULL OR (name_start>=start_byte AND name_end<=end_byte AND name_end>name_start)),CHECK((key_signature_present=0 AND key_type_parameter_count IS NULL AND key_variadic IS NULL) OR (key_signature_present=1 AND key_type_parameter_count>=0 AND key_variadic IN (0,1))),PRIMARY KEY(version_id,syntax_id),FOREIGN KEY(version_id,owner_syntax_id) REFERENCES native_version_declarations(version_id,syntax_id) DEFERRABLE INITIALLY DEFERRED);
 CREATE INDEX native_version_declarations_lookup ON native_version_declarations(lookup_key,version_id,syntax_id);
 CREATE TABLE native_version_declaration_ancestors(version_id TEXT NOT NULL,syntax_id TEXT NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),kind TEXT NOT NULL,name TEXT,sibling_ordinal INTEGER NOT NULL CHECK(sibling_ordinal>=0),signature_present INTEGER NOT NULL CHECK(signature_present IN (0,1)),type_parameter_count INTEGER,variadic INTEGER,CHECK((signature_present=0 AND type_parameter_count IS NULL AND variadic IS NULL) OR (signature_present=1 AND type_parameter_count>=0 AND variadic IN (0,1))),PRIMARY KEY(version_id,syntax_id,ordinal),FOREIGN KEY(version_id,syntax_id) REFERENCES native_version_declarations(version_id,syntax_id) DEFERRABLE INITIALLY DEFERRED);
 CREATE TABLE native_version_own_signature_types(version_id TEXT NOT NULL,syntax_id TEXT NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),type_name TEXT NOT NULL,PRIMARY KEY(version_id,syntax_id,ordinal),FOREIGN KEY(version_id,syntax_id) REFERENCES native_version_declarations(version_id,syntax_id) DEFERRABLE INITIALLY DEFERRED);
@@ -3883,8 +3883,8 @@ fn write_native(
             })
             .transpose()?;
         let sig = d.key.signature.as_ref();
-        immutable.insert(db,"INSERT INTO native_version_declarations VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",params![
-            version,d.syntax_id,owner,d.kind,d.name,d.lookup_key,sig.is_some(),sig.map(|s|s.type_parameter_count as i64),
+        immutable.insert(db,"INSERT INTO native_version_declarations VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",params![
+            version,d.syntax_id,owner,d.kind,d.role.as_str(),d.name,d.lookup_key,sig.is_some(),sig.map(|s|s.type_parameter_count as i64),
             sig.map(|s|s.variadic),d.key.ordinal as i64,d.range.start as i64,d.range.end as i64,
             d.name_range.as_ref().map(|r|r.start as i64),d.name_range.as_ref().map(|r|r.end as i64),
         ])?;
@@ -4015,7 +4015,7 @@ fn write_native(
 /// Bounded readiness check for a pair installed by the verified writer. This does not
 /// attest every stored BLOB after out-of-band SQLite mutation. Ordinary Store open stays
 /// bounded; pinned source reads verify the selected BLOB inside their read snapshot.
-/// Schema-8 revision zero is a deliberately empty bootstrap, not a published
+/// Schema-9 revision zero is a deliberately empty bootstrap, not a published
 /// native pair. Refuse any staged evidence that appears before the first commit.
 fn validate_v8_bootstrap(db: &Connection) -> Result<()> {
     let (indexed_at, options): (String, Option<String>) = db.query_row(
@@ -5202,10 +5202,11 @@ fn read_native_declarations_v8_inner(
     let proof = scope.proof_id();
     let mut result = Vec::new();
     let mut recorded_owners: BTreeMap<String, Option<String>> = BTreeMap::new();
-    for row in db.prepare("SELECT syntax_id,owner_syntax_id,kind,name,lookup_key,key_signature_present,key_type_parameter_count,key_variadic,key_ordinal,start_byte,end_byte,name_start,name_end FROM native_version_declarations WHERE version_id=?1 ORDER BY syntax_id")?
-      .query_map([v],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,String>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,Option<String>>(4)?,r.get::<_,bool>(5)?,r.get::<_,Option<i64>>(6)?,r.get::<_,Option<bool>>(7)?,r.get::<_,i64>(8)?,r.get::<_,i64>(9)?,r.get::<_,i64>(10)?,r.get::<_,Option<i64>>(11)?,r.get::<_,Option<i64>>(12)?)))? {
+    for row in db.prepare("SELECT syntax_id,owner_syntax_id,kind,role,name,lookup_key,key_signature_present,key_type_parameter_count,key_variadic,key_ordinal,start_byte,end_byte,name_start,name_end FROM native_version_declarations WHERE version_id=?1 ORDER BY syntax_id")?
+      .query_map([v],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,Option<String>>(4)?,r.get::<_,Option<String>>(5)?,r.get::<_,bool>(6)?,r.get::<_,Option<i64>>(7)?,r.get::<_,Option<bool>>(8)?,r.get::<_,i64>(9)?,r.get::<_,i64>(10)?,r.get::<_,i64>(11)?,r.get::<_,Option<i64>>(12)?,r.get::<_,Option<i64>>(13)?)))? {
         optional_hint_check(progress)?;
-        let (id,owner,kind,name,lookup,present,count,variadic,ordinal,start,end,name_start,name_end)=row?;
+        let (id,owner,kind,role,name,lookup,present,count,variadic,ordinal,start,end,name_start,name_end)=row?;
+        let role = crate::native_evidence::DeclarationRole::from_stored(&role)?;
         ensure!(recorded_owners.insert(id.clone(),owner).is_none(),"duplicate native declaration");
         let key=Key{kind:kind.clone(),name:name.clone(),signature:decode_signature(&mut own_types,&id,present,count,variadic)?,ordinal:usize::try_from(ordinal)?};
         let mut a=Vec::new();
@@ -5218,7 +5219,7 @@ fn read_native_declarations_v8_inner(
         }
         let name_range=name_start.zip(name_end).map(|(start,end)|->Result<Range>{Ok(Range{start:usize::try_from(start)?,end:usize::try_from(end)?})}).transpose()?;
         ensure!(name_start.is_some()==name_end.is_some(),"half native name range");
-        result.push(Declaration{syntax_id:id.clone(),document:scope.key.clone(),revision_id:scope.native_revision_id.clone(),kind,name,lookup_key:lookup,ancestors:a,key,
+        result.push(Declaration{role,syntax_id:id.clone(),document:scope.key.clone(),revision_id:scope.native_revision_id.clone(),kind,name,lookup_key:lookup,ancestors:a,key,
             range:Range{start:usize::try_from(start)?,end:usize::try_from(end)?},name_range,header:headers.remove(&id).context("missing native header")?,provenance_id:proof.clone()});
     }
     ensure!(
@@ -6092,7 +6093,7 @@ impl Store {
             topology::TopologyRoots::isolated_for_tests(state.join("cache"), state.join("data"));
         Self::open_with_stage_hook(roots, identity, before_publish)
     }
-    /// Build a private schema-8 bootstrap only; the caller must validate and publish it.
+    /// Build a private schema-9 bootstrap only; the caller must validate and publish it.
     /// The returned guard unlinks only its own stage inode if it is not published.
     fn cleanup_failed_staged_index(
         &self,
@@ -6195,7 +6196,7 @@ impl Store {
                 let age = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
                 ensure!(age <= 9_007_199_254_740_991, "invalid_open_age");
                 db.execute(
-                    "INSERT INTO index_metadata VALUES(1,8,?1,?2,?3,?4,?5,0,?6,'',?7,?8,NULL)",
+                    "INSERT INTO index_metadata VALUES(1,9,?1,?2,?3,?4,?5,0,?6,'',?7,?8,NULL)",
                     params![
                         EXTRACTOR_VERSION,
                         self.workspace_root,
@@ -9617,7 +9618,7 @@ impl Store {
             let old_key = format!("pin:v1:{}:{}", prior.index_generation, prior.index_revision);
             stamp_predecessor(&tx, &old_key, publication_time.as_secs() as i64)?;
         }
-        tx.execute("UPDATE index_metadata SET schema_version=8,extractor_version=?1,index_generation=?2,index_revision=?3,indexed_at=?4,stats=?5,diagnostics=?6,reconcile_options=?7 WHERE singleton=1",
+        tx.execute("UPDATE index_metadata SET schema_version=9,extractor_version=?1,index_generation=?2,index_revision=?3,indexed_at=?4,stats=?5,diagnostics=?6,reconcile_options=?7 WHERE singleton=1",
             params![EXTRACTOR_VERSION, revision.index_generation.to_string(), revision.index_revision as i64,timestamp,json(&stats)?,json(&graph.diagnostics)?,json(capture.reconcile_options())?])?;
         immutable.counters.record(
             "manifest",
@@ -15613,8 +15614,8 @@ mod sqlite_schema_race_tests {
         assert_eq!(
             (schema, marker.as_str(), generation, revision),
             (
-                8,
-                "native-v4-delta-v1",
+                9,
+                "native-v5-delta-v1",
                 old.index_generation.to_string(),
                 old.index_revision as i64
             )
@@ -15622,7 +15623,7 @@ mod sqlite_schema_race_tests {
         assert_eq!(
             db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
                 .unwrap(),
-            8
+            9
         );
         let forged: i64 = db
             .query_row(

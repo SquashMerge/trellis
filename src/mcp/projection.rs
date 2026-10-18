@@ -216,7 +216,7 @@ pub fn find(
         let symbols: Vec<Value> = result.symbols[..n].iter().map(|symbol| {
             let d = &symbol.symbol.declaration;
             Ok(json!({"symbolId":d.syntax_id,"name":d.name,"displayKey":display_key(d),
-                "kind":d.kind,"doc":document_ref(&refs, &symbol.source.document).ok_or("store_unavailable: missing document ref")?,
+                "kind":d.kind,"role":d.role,"doc":document_ref(&refs, &symbol.source.document).ok_or("store_unavailable: missing document ref")?,
                 "range":d.range,"nameRange":d.name_range,
                 "lines":symbol.source.lines.map(|lines| json!({"start":lines.start,"end":lines.end})),
                 "evidenceTier":"syntax","semanticBasis":null,"freshness":"fresh","staleBecause":[]}))
@@ -345,7 +345,7 @@ mod find_tests {
             let proof_id = format!("proof:{source_set}:{path}");
             let declaration: Declaration = serde_json::from_value(json!({
                 "syntaxId": format!("sid:{i}"), "document":document,
-                "revisionId":"revision:v1:test", "kind":"function", "name":name,
+                "revisionId":"revision:v1:test", "kind":"function", "role":"production", "name":name,
                 "lookupKey":null, "ancestors":[],
                 "key":{"kind":"function","name":name,"signature":null,"ordinal":0},
                 "range":{"start":0,"end":10}, "nameRange":null,
@@ -990,7 +990,7 @@ mod outgoing_tests {
         };
         let declaration: Declaration = serde_json::from_value(json!({
             "syntaxId":format!("sid:v1:{}","a".repeat(32)),"document":document,
-            "revisionId":"revision:v2:test","kind":"function","name":"Owner",
+            "revisionId":"revision:v2:test","kind":"function","role":"production","name":"Owner",
             "lookupKey":"Owner","ancestors":[],
             "key":{"kind":"function","name":"Owner","signature":null,"ordinal":0},
             "range":{"start":0,"end":20},"nameRange":null,

@@ -623,7 +623,7 @@ fn full_reconcile_replaces_persisted_source_and_input_inventory() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        8
+        9
     );
     let files = db
         .prepare("SELECT path FROM revision_documents WHERE revision_id=?1 ORDER BY path")
@@ -1860,7 +1860,7 @@ fn extractor_and_typed_mismatch_rebuild_in_place_and_failed_rebuild_stays_closed
             []
         )
         .is_err(),
-        "v8 metadata must physically forbid unsupported extractor markers"
+        "v9 metadata must physically forbid unsupported extractor markers"
     );
     db.execute("UPDATE index_metadata SET stats='not-json'", [])
         .unwrap();
