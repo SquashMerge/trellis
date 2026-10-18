@@ -4411,3 +4411,140 @@ fn incoming_read_separates_two_valid_source_set_roots() {
     }
     assert_ne!(source_sets[0], source_sets[1]);
 }
+
+#[test]
+#[cfg(feature = "test-support")]
+fn incoming_four_languages_restrict_to_measured_name_and_order_near_before_test() {
+    // Each case exercises the same reverse-query contract on a real published snapshot.
+    for (extension, target, near, other, far, test) in [
+        (
+            "java",
+            "class Target { void go() { go(); this.go(); (go())(); } }",
+            "class Near { void go() { new Target().go(); } }",
+            "class Other { void go() { new Target().go(); } }",
+            "class Far { void go() { new Target().go(); } }",
+            "class Tester { void go() { new Target().go(); } }",
+        ),
+        (
+            "rs",
+            "fn target() { target(); obj.target(); (target())(); }",
+            "fn near() { obj.target(); }",
+            "fn other() { obj.target(); }",
+            "fn far() { obj.target(); }",
+            "fn tester() { obj.target(); }",
+        ),
+        (
+            "py",
+            "def target():\n    target()\n    obj.target()\n    (target())()\n",
+            "def near():\n    obj.target()\n",
+            "def other():\n    obj.target()\n",
+            "def far():\n    obj.target()\n",
+            "def tester():\n    obj.target()\n",
+        ),
+        (
+            "js",
+            "function target() { target(); obj.target(); (target())(); }",
+            "function near() { obj.target(); }",
+            "function other() { obj.target(); }",
+            "function far() { obj.target(); }",
+            "function tester() { obj.target(); }",
+        ),
+    ] {
+        let (_state, root, store, cancel) = fixture();
+        fs::create_dir(root.path().join("far")).unwrap();
+        fs::create_dir(root.path().join("tests")).unwrap();
+        for (path, body) in [
+            (format!("target.{extension}"), target),
+            (format!("near.{extension}"), near),
+            (format!("other.{extension}"), other),
+            (format!("far/far.{extension}"), far),
+            (format!("tests/caller.test.{extension}"), test),
+        ] {
+            fs::write(root.path().join(path), body).unwrap();
+        }
+        let leader = store.publication_for_tests().unwrap();
+        let pin = publish(
+            &store,
+            root.path(),
+            &cancel,
+            store.index_baseline().unwrap(),
+            &leader,
+        )
+        .unwrap();
+        let read = store.evidence_response().unwrap();
+        let selected = read
+            .mcp_find(
+                if extension == "java" { "go" } else { "target" },
+                20,
+                Some(pin),
+            )
+            .unwrap()
+            .symbols
+            .into_iter()
+            .find(|symbol| {
+                symbol.declaration.document.path == format!("target.{extension}")
+                    && symbol.declaration.name.as_deref()
+                        == Some(if extension == "java" { "go" } else { "target" })
+            })
+            .unwrap()
+            .declaration;
+        let incoming = read
+            .mcp_incoming_with_lines(&selected.syntax_id, 20, Some(pin))
+            .unwrap()
+            .unwrap();
+        let paths: Vec<_> = incoming
+            .calls
+            .iter()
+            .map(|item| item.call.document.path.as_str())
+            .collect();
+        assert!(
+            paths.iter().any(|p| *p == format!("target.{extension}")),
+            "{extension}: recursion {paths:?}"
+        );
+        assert!(
+            paths.iter().any(|p| *p == format!("near.{extension}")),
+            "{extension}: same-directory {paths:?}"
+        );
+        assert!(
+            paths.iter().any(|p| *p == format!("far/far.{extension}")),
+            "{extension}: distant {paths:?}"
+        );
+        assert!(
+            paths
+                .iter()
+                .any(|p| *p == format!("tests/caller.test.{extension}")),
+            "{extension}: test {paths:?}"
+        );
+        assert_eq!(
+            paths.len(),
+            7,
+            "{extension}: only the seven measured inner/member calls {paths:?}"
+        );
+        assert_eq!(
+            paths
+                .iter()
+                .filter(|p| **p == format!("target.{extension}"))
+                .count(),
+            3,
+            "{extension}: direct recursion, member token, inner call, not compound outer call"
+        );
+        assert_eq!(
+            incoming.same_name_declarations,
+            if extension == "java" { 6 } else { 1 }
+        );
+        assert!(
+            incoming
+                .calls
+                .iter()
+                .all(|item| item.callee_text == if extension == "java" { "go" } else { "target" }),
+            "{extension}: {paths:?}"
+        );
+        assert_eq!(
+            incoming.calls.last().unwrap().caller.role,
+            trellis::native_evidence::DeclarationRole::Test,
+            "{extension}: {paths:?}"
+        );
+        assert!(!incoming.has_more);
+        read.finish(()).unwrap();
+    }
+}
