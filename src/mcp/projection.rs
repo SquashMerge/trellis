@@ -919,6 +919,159 @@ pub fn outgoing(
     Ok(Some(last))
 }
 
+/// Project a name-matched reverse lookup without implying a semantic binding.
+// The later MCP integration slice wires this prepared projection into dispatch.
+#[allow(dead_code)]
+pub fn incoming(
+    id: &Value,
+    result: crate::store::mcp_read::McpIncomingWithLines,
+    root: &std::path::Path,
+    catching_up: bool,
+    modern: bool,
+) -> Result<Option<Value>, &'static str> {
+    use std::collections::BTreeMap;
+    let owner = &result.selected.selected;
+    let basis = json!({"indexGeneration":owner.pin.index_generation.to_string(),
+        "indexRevision":owner.pin.index_revision});
+    let incomplete = result.scope.iter().any(|row| row[2] != 0 || row[3] != 0);
+    let build = |count: usize| -> Result<Value, &'static str> {
+        let (documents, refs) = document_table(
+            result.calls[..count]
+                .iter()
+                .map(|item| &item.source.document),
+        )?;
+        let mut coverage = BTreeMap::new();
+        let mut provenance = BTreeMap::new();
+        for row in &owner.coverage {
+            coverage.insert(
+                (
+                    row.producer_id.clone(),
+                    row.language.clone(),
+                    row.source_set_id.clone(),
+                    row.document_path.clone(),
+                    row.revision_id.clone(),
+                ),
+                row.clone(),
+            );
+        }
+        for row in &owner.provenance {
+            provenance.insert(row.id.clone(), row.clone());
+        }
+        let mut callers = Vec::new();
+        for item in &result.calls[..count] {
+            let call = &item.call;
+            let version = &item.source.document;
+            if call.document != version.document
+                || call.revision_id != version.revision_id
+                || call.provenance_id != version.provenance_id
+                || item.caller.document != version.document
+                || item.caller.revision_id != version.revision_id
+                || item.caller.provenance_id != version.provenance_id
+                || item.provenance.id != version.provenance_id
+                || item.provenance.content_hash != version.content_hash
+                || item.content_hash != version.content_hash
+                || item.coverage.document_path != version.document.path
+                || item.coverage.source_set_id != version.document.source_set_id
+                || item.coverage.revision_id != version.revision_id
+            {
+                return Err("store_unavailable: incoming proof mismatch");
+            }
+            let callee_range = call
+                .callee_range
+                .as_ref()
+                .ok_or("store_unavailable: missing callee range")?;
+            coverage.insert(
+                (
+                    item.coverage.producer_id.clone(),
+                    item.coverage.language.clone(),
+                    item.coverage.source_set_id.clone(),
+                    item.coverage.document_path.clone(),
+                    item.coverage.revision_id.clone(),
+                ),
+                item.coverage.clone(),
+            );
+            provenance.insert(item.provenance.id.clone(), item.provenance.clone());
+            callers.push(
+                json!({"callId":call.id,"ownerSyntaxId":call.owner_syntax_id,
+                "callerDisplayKey":display_key(&item.caller),"callerRole":item.caller.role,
+                "doc":document_ref(&refs, version).ok_or("store_unavailable: missing caller ref")?,
+                "lines":item.source.lines.map(|lines| json!({"start":lines.start,"end":lines.end})),
+                "range":call.range,"calleeRange":callee_range,"calleeText":item.callee_text,
+                "matchedBy":"name","binding":null,"disposition":"unresolved","targetId":null,
+                "boundaryReason":"missingEvidence","evidenceTier":"syntax","semanticBasis":null,
+                "freshness":"fresh","staleBecause":[]}),
+            );
+        }
+        let mut coverage: Vec<_> = coverage.into_values().collect();
+        let language_order = |language: &str| match language {
+            "java" => 0,
+            "rust" => 1,
+            "python" => 2,
+            _ => 3,
+        };
+        coverage.sort_by(|a, b| {
+            (
+                &a.producer_id,
+                language_order(&a.language),
+                &a.source_set_id,
+                &a.document_path,
+                &a.revision_id,
+            )
+                .cmp(&(
+                    &b.producer_id,
+                    language_order(&b.language),
+                    &b.source_set_id,
+                    &b.document_path,
+                    &b.revision_id,
+                ))
+        });
+        let truncated = count < result.calls.len() || result.has_more;
+        let reason = if count < result.calls.len() {
+            Some("response_bytes")
+        } else if result.has_more {
+            Some("limit")
+        } else {
+            None
+        };
+        let mut warnings = Vec::new();
+        if incomplete {
+            warnings.push(json!({"code":"coverageIncomplete",
+                "message":"Selected syntax coverage is incomplete","provenanceId":null}));
+        }
+        warnings.push(json!({"code":"syntaxOnly",
+            "message":"Only syntax evidence is available","provenanceId":null}));
+        Ok(
+            json!({"schemaVersion":1,"requestId":id,"workspace":root,"catchingUp":catching_up,
+            "evidenceBasis":basis,"data":{
+                "symbolId":owner.declaration.syntax_id,"displayKey":display_key(&owner.declaration),
+                "match":{"basis":"name","sameNameDeclarations":result.same_name_declarations,
+                    "limitations":["aliases","functionValues","reExports","dynamicDispatch",
+                        "opaqueMacros","sameNameDeclarations"]},
+                "callers":callers,"documents":documents,"coverage":coverage,
+                "scopeCoverage":language_status(&result.scope),
+                "provenance":provenance.into_values().collect::<Vec<_>>()},
+            "warnings":warnings,"partial":incomplete || truncated || count > 0,
+            "truncated":truncated,"truncationReason":reason}),
+        )
+    };
+    let fits = |envelope: &Value| {
+        let frame = json!({"jsonrpc":"2.0","id":id,
+            "result":super::tools::result("trellis_incoming_calls", envelope.clone(), modern)});
+        serde_json::to_vec(&frame).is_ok_and(|bytes| bytes.len() < super::wire::RESPONSE_BYTES)
+    };
+    if !fits(&build(0)?) {
+        return Ok(None);
+    }
+    let mut count = 0;
+    while count < result.calls.len() && fits(&build(count + 1)?) {
+        count += 1;
+    }
+    if count == 0 && !result.calls.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(build(count)?))
+}
+
 #[cfg(test)]
 mod outgoing_tests {
     use super::*;
@@ -929,7 +1082,7 @@ mod outgoing_tests {
         McpOutgoingWithLines,
     };
 
-    fn with_lines(result: McpOutgoing) -> McpOutgoingWithLines {
+    pub(super) fn with_lines(result: McpOutgoing) -> McpOutgoingWithLines {
         let owner_doc = McpDocumentVersion {
             document: result.owner.declaration.document.clone(),
             revision_id: result.owner.declaration.revision_id.clone(),
@@ -982,7 +1135,7 @@ mod outgoing_tests {
     ) -> Option<Value> {
         outgoing(id, with_lines(result), root, catching_up, modern).unwrap()
     }
-    fn owner() -> McpDeclaration {
+    pub(super) fn owner() -> McpDeclaration {
         let document = DocumentKey {
             source_set_id: "source-set:v1:test".into(),
             language: "javascript".into(),
@@ -1157,7 +1310,7 @@ mod outgoing_tests {
         );
         assert_eq!(clipped["data"]["calls"][0]["targetId"], Value::Null);
     }
-    fn required_call(clipped: bool) -> McpOutgoingCall {
+    pub(super) fn required_call(clipped: bool) -> McpOutgoingCall {
         let owner = owner();
         McpOutgoingCall {
             call: serde_json::from_value(json!({
@@ -1379,6 +1532,174 @@ pub fn source(
     let frame = json!({"jsonrpc":"2.0","id":id,
         "result":super::tools::result("trellis_read_source", envelope.clone(), modern)});
     (serde_json::to_vec(&frame).ok()?.len() < super::wire::RESPONSE_BYTES).then_some(envelope)
+}
+
+#[cfg(test)]
+mod incoming_tests {
+    use super::outgoing_tests::{owner, required_call, with_lines};
+    use super::*;
+    use crate::store::mcp_read::{McpIncomingCallWithLines, McpIncomingWithLines};
+
+    fn fixture(calls: usize, has_more: bool, diagnostic: usize) -> McpIncomingWithLines {
+        let outgoing = with_lines(crate::store::mcp_read::McpOutgoing {
+            owner: owner(),
+            calls: (0..calls).map(|_| required_call(false)).collect(),
+            has_more,
+        });
+        let mut selected = outgoing.owner;
+        selected.selected.coverage[0].state = "complete".into();
+        selected.selected.coverage[0].diagnostic = Some("x".repeat(diagnostic));
+        let calls = outgoing
+            .calls
+            .into_iter()
+            .enumerate()
+            .map(|(i, item)| {
+                let mut call = item.selected.call;
+                call.id = format!("cid:v1:{i}");
+                McpIncomingCallWithLines {
+                    call,
+                    caller: selected.selected.declaration.clone(),
+                    content_hash: selected.selected.content_hash.clone(),
+                    source: item.source,
+                    callee_text: "Target".into(),
+                    coverage: selected.selected.coverage[0].clone(),
+                    provenance: selected.selected.provenance[0].clone(),
+                }
+            })
+            .collect();
+        McpIncomingWithLines {
+            selected,
+            calls,
+            same_name_declarations: 3,
+            scope: [[0; 5], [0; 5], [0; 5], [2, 2, 0, 0, 4]],
+            has_more,
+        }
+    }
+    fn project(result: McpIncomingWithLines, modern: bool) -> Option<Value> {
+        incoming(
+            &json!(1),
+            result,
+            std::path::Path::new("/workspace"),
+            false,
+            modern,
+        )
+        .unwrap()
+    }
+    #[test]
+    fn incoming_empty_and_required_item_closed_shape() {
+        for modern in [false, true] {
+            let empty = project(fixture(0, false, 0), modern).unwrap();
+            let data = &empty["data"];
+            assert_eq!(data.as_object().unwrap().len(), 8);
+            assert_eq!(data["documents"], json!([]));
+            assert_eq!(data["coverage"].as_array().unwrap().len(), 1);
+            assert_eq!(data["provenance"].as_array().unwrap().len(), 1);
+            assert_eq!(
+                data["match"]["limitations"],
+                json!([
+                    "aliases",
+                    "functionValues",
+                    "reExports",
+                    "dynamicDispatch",
+                    "opaqueMacros",
+                    "sameNameDeclarations"
+                ])
+            );
+            assert_eq!(data["match"]["sameNameDeclarations"], 3);
+            assert_eq!(
+                data["scopeCoverage"][3]["coverage"],
+                json!({"selected":2,
+                "complete":2,"partial":0,"failed":0,"unselected":4})
+            );
+            assert_eq!(empty["partial"], false);
+            assert_eq!(empty["warnings"].as_array().unwrap().len(), 1);
+            assert_eq!(empty["warnings"][0]["code"], "syntaxOnly");
+            let full = project(fixture(1, false, 0), modern).unwrap();
+            let caller = &full["data"]["callers"][0];
+            assert_eq!(caller.as_object().unwrap().len(), 18);
+            assert_eq!(caller["callerRole"], "production");
+            assert_eq!(caller["callerDisplayKey"], "a.js#Owner");
+            assert_eq!(caller["calleeText"], "Target");
+            assert_eq!(caller["binding"], Value::Null);
+            assert_eq!(caller["matchedBy"], "name");
+            assert_eq!(full["partial"], true);
+            assert_eq!(full["data"]["documents"].as_array().unwrap().len(), 1);
+            assert_eq!(full["data"]["callers"][0]["doc"], 0);
+            assert_eq!(full["warnings"].as_array().unwrap().len(), 1);
+            let frame = json!({"jsonrpc":"2.0","id":1,
+                "result":crate::mcp::tools::result("trellis_incoming_calls",full,modern)});
+            assert!(serde_json::to_vec(&frame).unwrap().len() <= crate::mcp::wire::RESPONSE_BYTES);
+        }
+    }
+    #[test]
+    fn incoming_scope_and_limit_are_independent_of_emitted_calls() {
+        let mut result = fixture(1, true, 0);
+        result.scope[3] = [2, 1, 1, 0, 4];
+        result.calls[0].caller.role = crate::native_evidence::DeclarationRole::Test;
+        let envelope = project(result, true).unwrap();
+        assert_eq!(envelope["warnings"][0]["code"], "coverageIncomplete");
+        assert_eq!(envelope["warnings"][1]["code"], "syntaxOnly");
+        assert_eq!(envelope["data"]["callers"][0]["callerRole"], "test");
+        assert_eq!(envelope["truncationReason"], "limit");
+        assert_eq!(
+            envelope["data"]["scopeCoverage"][3]["coverage"]["partial"],
+            1
+        );
+    }
+    #[test]
+    fn incoming_byte_clipping_keeps_order_and_scope() {
+        for modern in [false, true] {
+            let mut result = fixture(50, false, 0);
+            for (index, item) in result.calls.iter_mut().enumerate() {
+                item.callee_text = format!("{index:02}{}", "t".repeat(1000));
+            }
+            let envelope = project(result, modern).unwrap();
+            let items = envelope["data"]["callers"].as_array().unwrap();
+            assert!(!items.is_empty());
+            assert!(items.len() < 50);
+            assert_eq!(envelope["truncationReason"], "response_bytes");
+            assert_eq!(
+                envelope["data"]["scopeCoverage"][3]["coverage"]["complete"],
+                2
+            );
+            assert_eq!(envelope["data"]["documents"].as_array().unwrap().len(), 1);
+            assert_eq!(envelope["data"]["coverage"].as_array().unwrap().len(), 1);
+            for (index, item) in items.iter().enumerate() {
+                assert_eq!(item["callId"], format!("cid:v1:{index}"));
+                assert_eq!(
+                    item["calleeText"],
+                    format!("{index:02}{}", "t".repeat(1000))
+                );
+            }
+            let frame = json!({"jsonrpc":"2.0","id":1,
+                "result":crate::mcp::tools::result("trellis_incoming_calls",envelope,modern)});
+            assert!(serde_json::to_vec(&frame).unwrap().len() < crate::mcp::wire::RESPONSE_BYTES);
+        }
+    }
+    #[test]
+    fn incoming_exact_wire_budget_and_first_item_refusal() {
+        for modern in [false, true] {
+            let fits = |n| project(fixture(0, false, n), modern).is_some();
+            let (mut low, mut high) = (0, crate::mcp::wire::RESPONSE_BYTES);
+            while low + 1 < high {
+                let mid = low + (high - low) / 2;
+                if fits(mid) { low = mid } else { high = mid }
+            }
+            assert!(fits(low));
+            assert!(!fits(high));
+            let exact = project(fixture(0, false, low), modern).unwrap();
+            let frame = json!({"jsonrpc":"2.0","id":1,
+                "result":crate::mcp::tools::result("trellis_incoming_calls",exact,modern)});
+            assert_eq!(
+                serde_json::to_vec(&frame).unwrap().len() + 1,
+                crate::mcp::wire::RESPONSE_BYTES
+            );
+            assert!(project(fixture(1, false, low), modern).is_none());
+            let mut result = fixture(1, false, 0);
+            result.calls[0].callee_text = "x".repeat(crate::mcp::wire::RESPONSE_BYTES);
+            assert!(project(result, modern).is_none());
+        }
+    }
 }
 
 #[cfg(test)]

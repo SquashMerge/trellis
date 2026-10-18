@@ -68,7 +68,7 @@ fn valid_path(s: &str) -> bool {
 /// Argument validation is independent of workspace state. A malformed UInt is an invalid
 /// request even if its numeric value would exceed a narrower application cap.
 pub fn validate(name: &str, args: Option<&Value>) -> Result<(), &'static str> {
-    if !TOOLS.contains(&name) {
+    if !TOOLS.contains(&name) && name != "trellis_incoming_calls" {
         return Err("invalid_request");
     }
     let Some(o) = args.and_then(Value::as_object) else {
@@ -90,7 +90,7 @@ pub fn validate(name: &str, args: Option<&Value>) -> Result<(), &'static str> {
             &["schemaVersion", "symbolId", "expectedBasis", "workspace"],
             &["schemaVersion", "symbolId"],
         ),
-        "trellis_outgoing_calls" => (
+        "trellis_outgoing_calls" | "trellis_incoming_calls" => (
             &[
                 "schemaVersion",
                 "symbolId",
@@ -128,7 +128,7 @@ pub fn validate(name: &str, args: Option<&Value>) -> Result<(), &'static str> {
             }
             limit(o)
         }
-        "trellis_declaration" | "trellis_outgoing_calls" => {
+        "trellis_declaration" | "trellis_outgoing_calls" | "trellis_incoming_calls" => {
             let sid = string(o.get("symbolId")).ok_or("invalid_request")?;
             if sid.len() > 8192
                 || sid.len() != 39
@@ -139,7 +139,7 @@ pub fn validate(name: &str, args: Option<&Value>) -> Result<(), &'static str> {
             {
                 return Err("invalid_request");
             }
-            if name == "trellis_outgoing_calls" {
+            if name != "trellis_declaration" {
                 limit(o)
             } else {
                 Ok(())
@@ -288,6 +288,13 @@ pub fn result(name: &str, envelope: Value, modern: bool) -> Value {
                 "symbols",
             ),
             "trellis_declaration" => (1, "declaration"),
+            "trellis_incoming_calls" => (
+                envelope["data"]["callers"]
+                    .as_array()
+                    .expect("incoming callers")
+                    .len(),
+                "calls",
+            ),
             "trellis_outgoing_calls" => (
                 envelope["data"]["calls"]
                     .as_array()
@@ -784,12 +791,49 @@ mod tests {
         );
     }
     #[test]
+    fn incoming_is_prepared_but_not_yet_catalogued() {
+        let name = "trellis_incoming_calls";
+        assert!(!TOOLS.contains(&name));
+        let mut valid = json!({"schemaVersion":1,"symbolId":sid(),"limit":20,
+            "expectedBasis":pin()});
+        assert_eq!(validate(name, Some(&valid)), Ok(()));
+        for field in ["view", "semanticProducerId", "other"] {
+            valid[field] = json!("invalid");
+            check(name, &valid, "invalid_request");
+            valid.as_object_mut().unwrap().remove(field);
+        }
+        for field in ["workspace", "expectedBasis", "limit"] {
+            valid[field] = Value::Null;
+            check(name, &valid, "invalid_request");
+            valid.as_object_mut().unwrap().remove(field);
+        }
+        for limit_value in [json!(0), json!(51), json!(51_u64)] {
+            valid["limit"] = limit_value;
+            check(name, &valid, "range_too_large");
+        }
+        for limit_value in [json!(-1), json!(1.5), json!("1")] {
+            valid["limit"] = limit_value;
+            check(name, &valid, "invalid_request");
+        }
+        valid.as_object_mut().unwrap().remove("limit");
+        valid["symbolId"] = json!("sid:v1:BAD");
+        check(name, &valid, "invalid_request");
+        valid["symbolId"] = json!("x".repeat(8193));
+        check(name, &valid, "invalid_request");
+        valid["symbolId"] = json!(sid());
+        let (_dir, workspace) = context();
+        let prepared = prepare(name, Some(&valid), &json!(1), true, &workspace);
+        assert!(prepared.valid_arguments);
+    }
+    #[test]
     fn summary_uses_the_singular_for_one_item() {
         let success = |data: Value| json!({"schemaVersion":1,"requestId":1,"data":data,"truncated":false,"truncationReason":null});
         for (name, data, text) in [
             ("trellis_find_symbols", json!({"symbols":[{}]}), "1 symbol"),
             ("trellis_find_symbols", json!({"symbols":[]}), "0 symbols"),
             ("trellis_outgoing_calls", json!({"calls":[{}]}), "1 call"),
+            ("trellis_incoming_calls", json!({"callers":[{}]}), "1 call"),
+            ("trellis_incoming_calls", json!({"callers":[]}), "0 calls"),
             (
                 "trellis_outgoing_calls",
                 json!({"calls":[{},{}]}),
