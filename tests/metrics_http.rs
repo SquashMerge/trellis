@@ -653,6 +653,7 @@ async fn selected_metrics_atomic_bounds_and_deadlines() {
             );
             assert_eq!(runtime.metrics_memo_entries_for_tests().unwrap(), 0);
             browser.set_metrics_clock_skew_for_tests(0);
+            browser.set_metrics_controls_for_tests(64 * 1024 * 1024, None, false);
             let (status, body) = request(browser.clone().router(), &key, &query).await;
             assert_eq!(status, StatusCode::OK, "following parser request: {body}");
             assert_eq!(runtime.metrics_memo_entries_for_tests().unwrap(), 1);
