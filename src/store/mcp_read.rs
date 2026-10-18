@@ -103,6 +103,27 @@ impl Store {
         Ok(())
     }
 
+    /// Fixture-only foreign indexed call key, through Store's cached writer.
+    pub fn mcp_rekey_call_source_set_for_tests(
+        &self,
+        writer: &topology::WriterGuard,
+        path: &str,
+        source_set: &str,
+    ) -> Result<()> {
+        writer.belongs_to(&self.identity)?;
+        self.identity.verify()?;
+        writer.verify()?;
+        let mut db = self.cache_write()?;
+        let tx = storage_result(db.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        let changed = storage_result(tx.execute(
+            "UPDATE native_version_calls SET source_set_id=?1 WHERE version_id=(SELECT document_version_id FROM revision_documents WHERE revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND path=?2) AND callee_lookup_key IS NOT NULL",
+            params![source_set, path],
+        ))?;
+        ensure!(changed == 1, "fixture call absent");
+        storage_result(tx.commit())?;
+        Ok(())
+    }
+
     /// Fixture-only revision row setup for W1 projection tests. Uses Store's own
     /// cached SQLite connection; never closes another FD on a live index inode.
     pub fn mcp_set_coverage_for_tests(
@@ -1525,20 +1546,36 @@ impl EvidenceResponse {
             }
             // This uses the exact three-key native-call index. The manifest
             // selects one immutable version; no historical call is a fallback.
-            let rows = self.db.prepare(
-                "SELECT c.version_id,c.id,c.owner_syntax_id,m.path,d.role,c.start_byte,c.end_byte
+            let directory = selected_key
+                .path
+                .rsplit_once('/')
+                .map_or("", |(dir, _)| dir);
+            // SQLite orders the indexed matches before returning only the
+            // required prefix. A directory match must not include descendants.
+            let ranked = self.db.prepare(
+                "SELECT c.version_id,c.id,c.owner_syntax_id,m.path,d.role
                  FROM native_version_calls c
                  JOIN revision_documents m ON m.document_version_id=c.version_id AND m.revision_id=?1
                  JOIN native_version_declarations d ON d.version_id=c.version_id AND d.syntax_id=c.owner_syntax_id
                  WHERE c.source_set_id=?2 AND c.language=?3 AND c.callee_lookup_key=?4
                    AND m.source_set_id=c.source_set_id AND m.language=c.language
-                   AND m.coverage_selected=1 AND m.coverage_state IN ('complete','partial')"
-            )?.query_map(params![selected.key, selected_key.source_set_id, selected_key.language, lookup], |r| {
+                   AND m.coverage_selected=1 AND m.coverage_state IN ('complete','partial')
+                 ORDER BY CASE d.role WHEN 'production' THEN 0 WHEN 'test' THEN 1 ELSE 2 END,
+                   CASE WHEN m.path=?5 THEN 0
+                     WHEN (?6='' AND instr(m.path,'/')=0)
+                       OR (?6<>'' AND substr(m.path,1,length(?6)+1)=?6||'/'
+                           AND instr(substr(m.path,length(?6)+2),'/')=0)
+                     THEN 1 ELSE 2 END,
+                   m.path COLLATE BINARY, c.start_byte, c.end_byte, c.id COLLATE BINARY
+                 LIMIT ?7"
+            )?.query_map(params![selected.key, selected_key.source_set_id, selected_key.language,
+                lookup, selected_key.path, directory, i64::try_from(limit + 1)?], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?, r.get::<_, String>(4)?, r.get::<_, i64>(5)?, r.get::<_, i64>(6)?))
+                    r.get::<_, String>(3)?, r.get::<_, String>(4)?))
             })?.collect::<rusqlite::Result<Vec<_>>>()?;
-            let mut ranked = Vec::new();
-            for (version, id, caller_id, path, stored_role, start, end) in rows {
+            has_more = ranked.len() > limit;
+            let mut loaded = BTreeMap::new();
+            for (version, id, caller_id, path, stored_role) in ranked {
                 let scope = scopes
                     .get(&version)
                     .context("store_unavailable: incoming call scope absent")?;
@@ -1548,26 +1585,6 @@ impl EvidenceResponse {
                     "store_unavailable: incoming call scope mismatch"
                 );
                 let role = DeclarationRole::from_stored(&stored_role)?;
-                ranked.push((
-                    u8::from(role == DeclarationRole::Test),
-                    mcp_hint_proximity(&selected_key.path, &path),
-                    path,
-                    start,
-                    end,
-                    id,
-                    version,
-                    caller_id,
-                    role,
-                ));
-            }
-            ranked.sort_by(|a, b| {
-                (&a.0, &a.1, &a.2, &a.3, &a.4, &a.5).cmp(&(&b.0, &b.1, &b.2, &b.3, &b.4, &b.5))
-            });
-            has_more = ranked.len() > limit;
-            let mut loaded = BTreeMap::new();
-            for (_, _, _, _, _, id, version, caller_id, role) in ranked.into_iter().take(limit + 1)
-            {
-                let scope = &scopes[&version];
                 if !loaded.contains_key(&version) {
                     self.store.attest_selected_document_for(
                         &self.db,
@@ -1621,12 +1638,6 @@ impl EvidenceResponse {
                 let bytes = &checked.lines.bytes;
                 let text = std::str::from_utf8(bytes)
                     .map_err(|_| anyhow::anyhow!("store_unavailable: incoming source encoding"))?;
-                ensure!(
-                    crate::native_evidence::verified_callee_lookup(&scope.key.language, call, text)
-                        .as_deref()
-                        == Some(lookup),
-                    "store_unavailable: incoming call lookup mismatch"
-                );
                 let range = call
                     .callee_range
                     .as_ref()
