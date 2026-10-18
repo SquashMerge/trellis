@@ -2874,8 +2874,9 @@ fn retry_stale_hot_journal<T>(
 /// Take the read snapshot of a deferred transaction on a read-only index
 /// connection: its first read acquires SHARED, the one point where SQLite's
 /// hot-journal check runs. Later reads in the transaction keep that lock.
-fn begin_read_snapshot(db: &Connection, index: &Path) -> Result<()> {
-    retry_stale_hot_journal(index, Duration::from_secs(5), || {
+/// `busy_wait` matches the connection's own SQLite busy wait.
+fn begin_read_snapshot(db: &Connection, index: &Path, busy_wait: Duration) -> Result<()> {
+    retry_stale_hot_journal(index, busy_wait, || {
         storage_result(db.pragma_query_value(None, "schema_version", |row| row.get::<_, i64>(0)))
             .map(|_| ())
     })
@@ -3267,7 +3268,7 @@ mod sqlite_contention_type_tests {
     fn read_snapshot_retries_a_stale_hot_journal_verdict() {
         let id = read_racing_writer_rollback(|reader, path| {
             reader.execute_batch("BEGIN DEFERRED").unwrap();
-            begin_read_snapshot(reader, path).unwrap();
+            begin_read_snapshot(reader, path, Duration::from_secs(5)).unwrap();
             let id = storage_result(
                 reader.query_row("SELECT id FROM witness", [], |r| r.get::<_, i64>(0)),
             );
@@ -3275,6 +3276,22 @@ mod sqlite_contention_type_tests {
             id
         });
         assert_eq!(id.unwrap(), 1);
+    }
+
+    /// Maintenance's zero-wait probes take their snapshot with no budget: the
+    /// stale verdict becomes contention, which defers the maintenance unit.
+    #[test]
+    fn zero_wait_read_snapshot_defers_a_stale_hot_journal_verdict() {
+        let error = read_racing_writer_rollback(|reader, path| {
+            reader.execute_batch("BEGIN DEFERRED").unwrap();
+            begin_read_snapshot(reader, path, Duration::ZERO)
+        })
+        .unwrap_err();
+        assert!(
+            error.downcast_ref::<SqliteContention>().is_some(),
+            "{error:#}"
+        );
+        assert!(maintenance_contention(&error));
     }
 
     /// With no wait budget left, the stale verdict is typed contention, never
@@ -7847,7 +7864,11 @@ impl Store {
         self.ensure_not_recreate_pending()?;
         let mut db = self.cache()?;
         let tx = storage_result(db.transaction())?;
-        begin_read_snapshot(&tx, &self.roots.index_db(&self.identity))?;
+        begin_read_snapshot(
+            &tx,
+            &self.roots.index_db(&self.identity),
+            Duration::from_secs(5),
+        )?;
         self.recovery_baseline(&tx)
     }
     // Only publication callers may defer retained/header checks: the selected
@@ -7856,7 +7877,11 @@ impl Store {
         self.ensure_not_recreate_pending()?;
         let mut db = self.cache()?;
         let tx = storage_result(db.transaction())?;
-        begin_read_snapshot(&tx, &self.roots.index_db(&self.identity))?;
+        begin_read_snapshot(
+            &tx,
+            &self.roots.index_db(&self.identity),
+            Duration::from_secs(5),
+        )?;
         self.recovery_baseline_preflight(&tx)
     }
     #[cfg(feature = "test-support")]
@@ -7903,7 +7928,11 @@ impl Store {
     pub fn recorded_index_options(&self) -> Result<Option<crate::indexer::IndexOptions>> {
         let mut db = self.cache()?;
         let tx = storage_result(db.transaction())?;
-        begin_read_snapshot(&tx, &self.roots.index_db(&self.identity))?;
+        begin_read_snapshot(
+            &tx,
+            &self.roots.index_db(&self.identity),
+            Duration::from_secs(5),
+        )?;
         let schema: u32 =
             storage_result(tx.pragma_query_value(None, "user_version", |row| row.get(0)))?;
         if schema != DATABASE_SCHEMA_VERSION {
@@ -8029,7 +8058,11 @@ impl Store {
         writer.belongs_to(&self.identity)?;
         let db = self.cache()?;
         storage_result(db.execute_batch("BEGIN DEFERRED"))?;
-        begin_read_snapshot(&db, &self.roots.index_db(&self.identity))?;
+        begin_read_snapshot(
+            &db,
+            &self.roots.index_db(&self.identity),
+            Duration::from_secs(5),
+        )?;
         let selected = self.read_revision_for(&db, Some(committed_pin), true)?;
         ensure!(
             selected.pin == committed_pin,
@@ -8111,7 +8144,11 @@ impl Store {
             .cache()
             .map_err(|error| self.report_live_read_failure(error))?;
         storage_result(db.execute_batch("BEGIN DEFERRED"))?;
-        begin_read_snapshot(&db, &self.roots.index_db(&self.identity))?;
+        begin_read_snapshot(
+            &db,
+            &self.roots.index_db(&self.identity),
+            Duration::from_secs(5),
+        )?;
         let schema: u32 =
             storage_result(db.pragma_query_value(None, "user_version", |row| row.get(0)))?;
         if schema != DATABASE_SCHEMA_VERSION {
@@ -8633,7 +8670,11 @@ impl Store {
     ) -> Result<T> {
         let db = self.cache()?;
         db.execute_batch("BEGIN DEFERRED")?;
-        begin_read_snapshot(&db, &self.roots.index_db(&self.identity))?;
+        begin_read_snapshot(
+            &db,
+            &self.roots.index_db(&self.identity),
+            Duration::from_secs(5),
+        )?;
         let baseline = self.recovery_baseline_preflight(&db)?;
         ensure!(
             baseline.compatible && baseline.pin().is_some_and(|p| p.index_revision > 0),
@@ -10529,6 +10570,8 @@ impl Store {
                 false,
                 Duration::ZERO,
             )?;
+            storage_result(db.execute_batch("BEGIN DEFERRED"))?;
+            begin_read_snapshot(&db, &self.roots.index_db(&self.identity), Duration::ZERO)?;
             if !has_revision_release_debt(&db)? {
                 guard.verify()?;
                 return Ok(None);
@@ -10674,6 +10717,15 @@ impl Store {
             }
             Err(error) => return Err(error),
         };
+        let snapshot = storage_result(db.execute_batch("BEGIN DEFERRED"))
+            .and_then(|()| begin_read_snapshot(&db, &path, Duration::ZERO));
+        if let Err(error) = snapshot {
+            if maintenance_contention(&error) {
+                self.record_maintenance_busy(&error);
+                return Ok(MaintenanceOutcome::Deferred);
+            }
+            return Err(error);
+        }
         if !has_revision_release_debt(&db)? {
             guard.verify()?;
             return Ok(MaintenanceOutcome::Idle);
@@ -10907,6 +10959,12 @@ impl Store {
         let origin = clock.origin_wall;
         drop(clock);
         let db = self.cache()?;
+        storage_result(db.execute_batch("BEGIN DEFERRED"))?;
+        begin_read_snapshot(
+            &db,
+            &self.roots.index_db(&self.identity),
+            Duration::from_secs(5),
+        )?;
         let head = ReadRevision::current(&db)?.pin;
         ensure!(
             pin.index_generation == head.index_generation
@@ -10943,6 +11001,8 @@ impl Store {
                 false,
                 Duration::ZERO,
             )?;
+            storage_result(db.execute_batch("BEGIN DEFERRED"))?;
+            begin_read_snapshot(&db, &self.roots.index_db(&self.identity), Duration::ZERO)?;
             let exact: Option<(String, i64, i64, i64)> = db
                 .query_row(
                     "SELECT state,
