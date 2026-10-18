@@ -178,7 +178,7 @@ fn fixture_daemon_diagnostic(home: &Path, expected: &Path) -> String {
 }
 
 fn cli(home: &Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_trellis"));
+    let mut command = trellis::testing::owned(Command::new(env!("CARGO_BIN_EXE_trellis")));
     command
         .env("HOME", home)
         .env("TRELLIS_TEST_DAEMON_PID_FILE", home.join("auto-daemon.pid"))
@@ -1674,18 +1674,19 @@ async fn serve_first_carries_jev_credential_to_new_daemon() {
 }
 
 /// A test-elected daemon outlives its electing CLI but not its owning test
-/// process (#130), so an unguarded or killed test cannot leak it.
+/// process (#130), so an unguarded or killed test cannot leak it. The owner
+/// has exited but is not yet reaped when the daemon must notice it is gone.
 #[test]
 fn elected_daemon_exits_after_its_test_owner_process_ends() {
     let temp = short_temp();
     let home = temp.path().join("home");
     fs::create_dir(&home).unwrap();
     let root = checkout(temp.path(), "owner");
-    let alive = |pid: i32| unsafe { libc::kill(pid, 0) } == 0;
+    let _daemon = AutoDaemonGuard::for_home(&home);
     // A stand-in owner whose lifetime this test controls.
-    let mut owner = Command::new("sleep").arg("30").spawn().unwrap();
+    let mut owner = Owned(Command::new("sleep").arg("30").spawn().unwrap());
     let output = cli(&home)
-        .env("TRELLIS_TEST_OWNER_PID", owner.id().to_string())
+        .env(trellis::testing::OWNER_PID_ENV, owner.0.id().to_string())
         .arg("index")
         .arg("--workspace")
         .arg(&root)
@@ -1700,21 +1701,18 @@ fn elected_daemon_exits_after_its_test_owner_process_ends() {
         .unwrap()
         .parse()
         .unwrap();
-    let _cleanup = AutoDaemonGuard::for_home(&home);
     // The electing CLI has exited; with its owner alive the daemon stays up
     // across several watchdog checks (its idle delay is 30 minutes).
     std::thread::sleep(Duration::from_millis(2500));
-    assert!(alive(daemon), "daemon exited while its owner was alive");
-    owner.kill().unwrap();
-    owner.wait().unwrap();
-    let started = Instant::now();
-    while alive(daemon) {
-        assert!(
-            started.elapsed() < trellis::testing::HANG_BACKSTOP,
-            "daemon outlived its owner"
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    assert!(
+        trellis::testing::process_running(daemon),
+        "daemon exited while its owner was alive"
+    );
+    // Killed but deliberately not reaped until the daemon has exited.
+    owner.0.kill().unwrap();
+    trellis::testing::wait_until("daemon exit after its owner ended", || {
+        !trellis::testing::process_running(daemon)
+    });
 }
 
 #[test]

@@ -466,16 +466,6 @@ fn start_daemon() -> std::io::Result<client::StartOutcome> {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-    // Only tests run test-support builds, so this daemon's owner is the test
-    // process: this CLI's parent. The daemon outlives this CLI on purpose, but
-    // not the test (#130), whether or not the test tracks its PID.
-    #[cfg(feature = "test-support")]
-    if std::env::var_os("TRELLIS_TEST_OWNER_PID").is_none() {
-        command.env(
-            "TRELLIS_TEST_OWNER_PID",
-            std::os::unix::process::parent_id().to_string(),
-        );
-    }
     // A fixture may keep an auto-started daemon's diagnostics.
     #[cfg(feature = "test-support")]
     if let Some(path) = std::env::var_os("TRELLIS_TEST_DAEMON_STDERR") {
@@ -982,16 +972,14 @@ async fn run_daemon() -> Result<()> {
     // even when the test never stops it or is killed before its guards run.
     let owner_gone = async {
         #[cfg(feature = "test-support")]
-        if let Some(pid) = std::env::var("TRELLIS_TEST_OWNER_PID")
+        if let Some(pid) = std::env::var(trellis::testing::OWNER_PID_ENV)
             .ok()
             .and_then(|pid| pid.parse::<libc::pid_t>().ok())
             .filter(|pid| *pid > 1)
         {
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
-                if unsafe { libc::kill(pid, 0) } == -1
-                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-                {
+                if !trellis::testing::process_running(pid) {
                     return;
                 }
             }

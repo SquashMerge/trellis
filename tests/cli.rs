@@ -252,7 +252,7 @@ impl Drop for FixtureDaemon {
 }
 
 fn isolated_command(home: &std::path::Path) -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_trellis"));
+    let mut cmd = trellis::testing::owned(Command::new(env!("CARGO_BIN_EXE_trellis")));
     // ProjectDirs uses inherited XDG roots before HOME on Linux.
     cmd.env("HOME", home)
         .env_remove("XDG_CACHE_HOME")
@@ -1613,7 +1613,7 @@ fn cli_refuses_remote_bind_and_invalid_limits() {
         .output()
         .unwrap();
     assert!(!output.status.success());
-    let output = Command::new(env!("CARGO_BIN_EXE_trellis"))
+    let output = trellis::testing::owned(Command::new(env!("CARGO_BIN_EXE_trellis")))
         .arg("--help")
         .output()
         .unwrap();
