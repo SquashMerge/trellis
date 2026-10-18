@@ -2654,8 +2654,8 @@ mod occurrence_identity_tests {
         };
         assert_eq!(
             witness(&a),
-            "80b64e65fe108a98090e2342cef5432805a89b18ef2446862ca6b2b7fcd049d3",
-            "native-v6 witness includes declaration role and the producer version"
+            "36f16d75947089fd1fa3d91280afab0730e9ad56d4f7ec3af58c64c497897dc0",
+            "native-v7 witness includes declaration role and the producer version"
         );
         assert_eq!(
             witness(&a),
