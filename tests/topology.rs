@@ -208,11 +208,13 @@ fn marker_race_and_durability() {
             String::from_utf8_lossy(&result.stdout)
         );
         let output = String::from_utf8_lossy(&result.stdout);
+        // With one test thread libtest prints `test marker_child ... ` before
+        // the test runs, so the marker can follow it on the same line (#184).
         ids.push(
             output
                 .lines()
-                .find_map(|line| line.strip_prefix("MARKER_ID="))
-                .unwrap()
+                .find_map(|line| line.split_once("MARKER_ID=").map(|(_, id)| id))
+                .unwrap_or_else(|| panic!("child printed no marker ID: {output}"))
                 .to_owned(),
         );
     }
