@@ -514,7 +514,9 @@ fn checked_reply(reply: protocol::Reply) -> Result<serde_json::Value> {
         .context("invalid daemon reply")
 }
 
-/// How long `trellis index` waits for its terminal reply (#179).
+/// How long `trellis index` waits on a silent daemon for its terminal reply
+/// (#179). Like every CLI read bound it limits inactivity per socket read, not
+/// the whole reply: a liveness backstop, not a deadline.
 const INDEX_REPLY_BOUND: Duration = Duration::from_secs(10 * 60);
 
 fn send_daemon(request: &protocol::Request, read_only: bool) -> Result<serde_json::Value> {
