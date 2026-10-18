@@ -103,6 +103,31 @@ impl Store {
         Ok(())
     }
 
+    /// Fixture-only invalid keyed caller role, using Store's cached writer.
+    pub fn mcp_corrupt_caller_role_for_tests(
+        &self,
+        writer: &topology::WriterGuard,
+        name: &str,
+    ) -> Result<()> {
+        writer.belongs_to(&self.identity)?;
+        self.identity.verify()?;
+        writer.verify()?;
+        let mut db = self.cache_write()?;
+        db.pragma_update(None, "ignore_check_constraints", "ON")?;
+        let result = (|| -> Result<()> {
+            let tx = storage_result(db.transaction_with_behavior(TransactionBehavior::Immediate))?;
+            let changed = storage_result(tx.execute(
+                "UPDATE native_version_declarations SET role='invalid' WHERE name=?1 AND version_id IN (SELECT document_version_id FROM revision_documents WHERE revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1))",
+                [name],
+            ))?;
+            ensure!(changed == 1, "fixture caller absent");
+            storage_result(tx.commit())?;
+            Ok(())
+        })();
+        db.pragma_update(None, "ignore_check_constraints", "OFF")?;
+        result
+    }
+
     /// Fixture-only foreign indexed call key, through Store's cached writer.
     pub fn mcp_rekey_call_source_set_for_tests(
         &self,
@@ -1544,6 +1569,26 @@ impl EvidenceResponse {
                     "store_unavailable: incoming selected scope mismatch"
                 );
             }
+            // A selected indexed call with a denormalized key that disagrees
+            // with its selected version is corrupt, not a negative name match.
+            let mismatched: bool = self.db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM revision_documents m
+                 JOIN native_version_calls c ON c.version_id=m.document_version_id
+                 WHERE m.revision_id=?1 AND m.source_set_id=?2 AND m.language=?3
+                   AND c.callee_lookup_key=?4
+                   AND (c.source_set_id<>m.source_set_id OR c.language<>m.language))",
+                params![
+                    selected.key,
+                    selected_key.source_set_id,
+                    selected_key.language,
+                    lookup
+                ],
+                |r| r.get(0),
+            )?;
+            ensure!(
+                !mismatched,
+                "store_unavailable: incoming indexed call scope mismatch"
+            );
             // This uses the exact three-key native-call index. The manifest
             // selects one immutable version; no historical call is a fallback.
             let directory = selected_key
@@ -1560,7 +1605,7 @@ impl EvidenceResponse {
                  WHERE c.source_set_id=?2 AND c.language=?3 AND c.callee_lookup_key=?4
                    AND m.source_set_id=c.source_set_id AND m.language=c.language
                    AND m.coverage_selected=1 AND m.coverage_state IN ('complete','partial')
-                 ORDER BY CASE d.role WHEN 'production' THEN 0 WHEN 'test' THEN 1 ELSE 2 END,
+                 ORDER BY CASE d.role WHEN 'production' THEN 1 WHEN 'test' THEN 2 ELSE 0 END,
                    CASE WHEN m.path=?5 THEN 0
                      WHEN (?6='' AND instr(m.path,'/')=0)
                        OR (?6<>'' AND substr(m.path,1,length(?6)+1)=?6||'/'

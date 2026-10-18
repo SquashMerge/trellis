@@ -4175,7 +4175,7 @@ fn incoming_read_excludes_other_language_and_prior_revision() {
 
 #[test]
 #[cfg(feature = "test-support")]
-fn incoming_read_uses_selected_source_set_key() {
+fn incoming_read_rejects_mismatched_indexed_source_set() {
     let (_state, root, store, cancel) = fixture();
     fs::write(root.path().join("flow.js"), "function Target() {}\n").unwrap();
     fs::write(
@@ -4212,18 +4212,22 @@ fn incoming_read_uses_selected_source_set_key() {
         1
     );
     drop(first);
-    // The indexed key belongs to a foreign source set. The selected
-    // manifest still names the original set, so it must not be returned.
+    // This single-column edit is corrupt, unlike a valid second source set.
+    // A mismatched indexed call must fail typed, not become a false zero hit.
     store
         .mcp_rekey_call_source_set_for_tests(&leader, "foreign.js", "source-set:v1:foreign")
         .unwrap();
     let read = store.evidence_response().unwrap();
-    let found = read
+    let error = read
         .mcp_incoming_with_lines(&target, 20, Some(pin))
-        .unwrap()
+        .err()
         .unwrap();
-    assert!(found.calls.is_empty());
-    assert_eq!(found.same_name_declarations, 1);
+    assert!(
+        error
+            .to_string()
+            .contains("incoming indexed call scope mismatch"),
+        "{error:#}"
+    );
     read.finish(()).unwrap();
 }
 
@@ -4280,4 +4284,130 @@ fn incoming_read_non_root_directory_does_not_rank_descendants_as_siblings() {
         ["pkg/near.js", "elsewhere.js", "pkg/sub/deep.js"]
     );
     read.finish(()).unwrap();
+}
+
+#[test]
+#[cfg(feature = "test-support")]
+fn incoming_read_invalid_role_after_limited_valid_hits_fails_typed() {
+    let (_state, root, store, cancel) = fixture();
+    fs::write(root.path().join("target.js"), "function Target() {}\n").unwrap();
+    for n in 0..4 {
+        fs::write(
+            root.path().join(format!("caller{n}.js")),
+            format!("function Caller{n}() {{ Target(); }}\n"),
+        )
+        .unwrap();
+    }
+    fs::write(
+        root.path().join("bad.js"),
+        "function BadCaller() { Target(); }\n",
+    )
+    .unwrap();
+    let leader = store.publication_for_tests().unwrap();
+    let pin = publish(
+        &store,
+        root.path(),
+        &cancel,
+        store.index_baseline().unwrap(),
+        &leader,
+    )
+    .unwrap();
+    let initial = store.evidence_response().unwrap();
+    let target = initial
+        .mcp_find("Target", 20, Some(pin))
+        .unwrap()
+        .symbols
+        .into_iter()
+        .find(|s| s.declaration.name.as_deref() == Some("Target"))
+        .unwrap()
+        .declaration
+        .syntax_id;
+    assert_eq!(
+        initial
+            .mcp_incoming_with_lines(&target, 2, Some(pin))
+            .unwrap()
+            .unwrap()
+            .calls
+            .len(),
+        2
+    );
+    drop(initial);
+    store
+        .mcp_corrupt_caller_role_for_tests(&leader, "BadCaller")
+        .unwrap();
+    let read = store.evidence_response().unwrap();
+    let outcome = read.mcp_incoming_with_lines(&target, 2, Some(pin));
+    assert!(
+        outcome.is_err(),
+        "malformed keyed role must fail despite the limit"
+    );
+    let error = outcome.err().unwrap();
+    assert!(
+        error.to_string().contains("invalid declaration role"),
+        "{error:#}"
+    );
+}
+
+#[test]
+#[cfg(feature = "test-support")]
+fn incoming_read_separates_two_valid_source_set_roots() {
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    // The native producer assigns one source set per revision. Two real roots
+    // give two valid source sets without inventing a multi-set native revision.
+    let mut source_sets = Vec::new();
+    for (caller_count, name) in [(1, "First"), (2, "Second")] {
+        let state = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let mut text = "function Target() {}\n".to_owned();
+        for n in 0..caller_count {
+            text.push_str(&format!("function {name}{n}() {{ Target(); }}\n"));
+        }
+        fs::write(root.path().join("flow.js"), text).unwrap();
+        let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+        let leader = store.publication_for_tests().unwrap();
+        let pin = publish(
+            &store,
+            root.path(),
+            &cancel,
+            store.index_baseline().unwrap(),
+            &leader,
+        )
+        .unwrap();
+        let read = store.evidence_response().unwrap();
+        let target = read
+            .mcp_find("Target", 20, Some(pin))
+            .unwrap()
+            .symbols
+            .into_iter()
+            .find(|s| s.declaration.name.as_deref() == Some("Target"))
+            .unwrap()
+            .declaration
+            .syntax_id;
+        let result = read
+            .mcp_incoming_with_lines(&target, 20, Some(pin))
+            .unwrap()
+            .unwrap();
+        source_sets.push(
+            result
+                .selected
+                .selected
+                .declaration
+                .document
+                .source_set_id
+                .clone(),
+        );
+        assert_eq!(result.calls.len(), caller_count);
+        assert_eq!(result.same_name_declarations, 1);
+        assert_eq!(result.scope[3], [1, 1, 0, 0, 0]);
+        assert!(result.calls.iter().all(|c| {
+            c.caller
+                .name
+                .as_deref()
+                .is_some_and(|caller| caller.starts_with(name))
+        }));
+        assert!(result.calls.iter().all(|c| c.call.document.source_set_id
+            == result.selected.selected.declaration.document.source_set_id));
+        read.finish(()).unwrap();
+    }
+    assert_ne!(source_sets[0], source_sets[1]);
 }
