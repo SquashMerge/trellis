@@ -249,9 +249,9 @@ pub struct DaemonState {
     /// Since when the worker's steps have failed with no success since, and
     /// the first error. A CLI index waiter gives up after a grace (#179).
     step_fault: Mutex<Option<(Instant, String)>>,
-    /// Fail every worker step with this error.
+    /// Fail every startup reconciliation attempt with this error.
     #[cfg(feature = "test-support")]
-    fail_steps: Mutex<Option<String>>,
+    fail_startup: Mutex<Option<String>>,
     #[cfg(feature = "test-support")]
     step_fault_grace: Mutex<Option<Duration>>,
     /// Published watcher intent; readers never take the watcher's lock.
@@ -498,7 +498,7 @@ pub fn new_with_config(
         step_progress: AtomicBool::new(false),
         step_fault: Mutex::new(None),
         #[cfg(feature = "test-support")]
-        fail_steps: Mutex::new(None),
+        fail_startup: Mutex::new(None),
         #[cfg(feature = "test-support")]
         step_fault_grace: Mutex::new(None),
         watch_status: Mutex::new(None),
@@ -1191,10 +1191,6 @@ impl DaemonState {
         let _held = self.worker_hold.read().unwrap();
         if self.retired() {
             return Ok(());
-        }
-        #[cfg(feature = "test-support")]
-        if let Some(error) = self.fail_steps.lock().unwrap().clone() {
-            anyhow::bail!("{error}");
         }
         #[cfg(test)]
         self.test_queue_before_stream.run();

@@ -3001,31 +3001,41 @@ async fn gc_abandons_unserviced_pending_request_and_later_lookup_is_not_found() 
 }
 
 /// #179: a CLI index waits as long as its request takes, but not on a worker
-/// whose every step keeps failing. After the grace it answers
+/// that keeps failing. Startup reconciliation fails on every attempt here, so
+/// the worker also wakes inside each backoff without attempting anything;
+/// those wakes must not restart the grace. After it the waiter answers
 /// `outcome_unknown`, and its accepted request stays queued for the worker's
 /// retry, which completes it once the fault clears.
 #[cfg(feature = "test-support")]
 #[tokio::test]
 async fn cli_index_stops_waiting_on_a_persistently_failing_worker() {
+    struct ClearFault(std::sync::Arc<trellis::http::DaemonState>);
+    impl Drop for ClearFault {
+        fn drop(&mut self) {
+            self.0.fail_startup_for_tests(None);
+        }
+    }
     let base = tempfile::tempdir().unwrap();
     let root = base.path().join("faulty");
     fs::create_dir(&root).unwrap();
     fs::write(root.join("a.js"), "function a() {}\n").unwrap();
     let topology = roots(base.path());
-    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(CheckoutRegistry::with_roots(
-        topology.clone(),
-    )));
     let checkout = identity(&root);
     let queue = topology.requests_db(&checkout);
-    let runtime = {
-        let mut registry = registry.lock().await;
-        registry.attach_launch(1, &checkout).unwrap();
-        registry.activate(&checkout.root_key).unwrap()
-    };
-    ready(&runtime).await;
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(1, &checkout).unwrap();
+    // Hold the first startup attempt until the fault is injected.
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let held = std::sync::Mutex::new(held);
+    registry.set_next_startup_hook_for_tests(std::sync::Arc::new(move || {
+        let _ = held.lock().unwrap().recv();
+    }));
+    let runtime = registry.activate(&checkout.root_key).unwrap();
     let scheduler = runtime.browser_scheduler().unwrap();
-    scheduler.set_step_fault_grace_for_tests(Duration::from_millis(300));
-    scheduler.fail_steps_for_tests(Some("storage_full: injected"));
+    let fault = ClearFault(scheduler.clone());
+    scheduler.set_step_fault_grace_for_tests(Duration::from_millis(1500));
+    scheduler.fail_startup_for_tests(Some("storage_full: injected"));
+    drop(release);
     let indexer = runtime.clone();
     let options = trellis::indexer::IndexOptions::new(root.clone());
     let error = tokio::time::timeout(
@@ -3041,7 +3051,7 @@ async fn cli_index_stops_waiting_on_a_persistently_failing_worker() {
     assert!(message.contains("storage_full: injected"), "{message}");
     let [row] = queue_rows(&queue).try_into().unwrap();
     assert!(row.ends_with(":queued/"), "{row}");
-    scheduler.fail_steps_for_tests(None);
+    drop(fault);
     let id = row.split(':').next().unwrap().to_owned();
     tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         while queue_rows(&queue) != vec![format!("{id}:done/")] {

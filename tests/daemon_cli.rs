@@ -2374,29 +2374,26 @@ fn metrics_client_discards_partial_chunks_after_absolute_result_deadline() {
     server.join().unwrap();
 }
 
-/// #179: the CLI once gave up on every index reply after 60 seconds with
-/// `outcome_unknown`. With the daemon stopped, the reply can only come later.
+/// #179: the CLI once gave up on every index reply 60 seconds after sending
+/// its request, with `outcome_unknown`. This test answers as the daemon, so
+/// its clock starts only once the whole request has arrived and the CLI is
+/// reading its reply, not at the CLI's launch.
 #[test]
 fn cli_index_waits_past_sixty_seconds_for_its_reply() {
-    struct Resume(i32);
-    impl Drop for Resume {
-        fn drop(&mut self) {
-            unsafe { libc::kill(self.0, libc::SIGCONT) };
-        }
-    }
+    use std::os::unix::fs::PermissionsExt;
+    use trellis::daemon::protocol;
     let temp = short_temp();
     let home = temp.path().join("home");
     fs::create_dir(&home).unwrap();
+    // Only if the CLI failed to reach this test's socket and elected one.
     let _daemon = AutoDaemonGuard::for_home(&home);
     let root = checkout(temp.path(), "stalled");
-    run(&home, "index", &root);
-    let daemon: i32 = fs::read_to_string(home.join("auto-daemon.pid"))
-        .unwrap()
-        .parse()
-        .unwrap();
-    // Dropped before the daemon guard, so a stopped daemon still gets its TERM.
-    let resume = Resume(daemon);
-    assert_eq!(unsafe { libc::kill(daemon, libc::SIGSTOP) }, 0);
+    let socket = fixture_socket_paths(&home).socket;
+    let dir = socket.parent().unwrap();
+    fs::create_dir_all(dir).unwrap();
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
     let mut index = Owned(
         cli(&home)
             .arg("index")
@@ -2407,25 +2404,39 @@ fn cli_index_waits_past_sixty_seconds_for_its_reply() {
             .spawn()
             .unwrap(),
     );
-    std::thread::sleep(Duration::from_millis(60_500));
+    let mut stream = None;
+    trellis::testing::wait_until("the CLI connecting", || {
+        assert!(index.0.try_wait().unwrap().is_none(), "index exited early");
+        stream = listener.accept().ok().map(|(stream, _)| stream);
+        stream.is_some()
+    });
+    let mut stream = stream.unwrap();
+    stream.set_nonblocking(false).unwrap();
+    let request: protocol::Request = protocol::read_frame(&mut stream).unwrap();
+    assert_eq!(request.operation, "index");
+    // The old bound would have expired a second before this check.
+    std::thread::sleep(Duration::from_secs(61));
     assert!(
         index.0.try_wait().unwrap().is_none(),
         "index stopped waiting for its reply"
     );
-    drop(resume);
-    let stdout = index.0.stdout.take().unwrap();
+    let result = serde_json::json!({"publishedRevision": "answered after 61 s"});
+    protocol::write_frame(
+        &mut stream,
+        &protocol::Reply {
+            id: request.id,
+            payload: serde_json::json!({"result": result}),
+        },
+    )
+    .unwrap();
+    let mut stdout = index.0.stdout.take().unwrap();
     let mut stderr = index.0.stderr.take().unwrap();
-    let response: Value = serde_json::from_reader(stdout).unwrap_or_else(|error| {
-        let mut message = String::new();
-        let _ = std::io::Read::read_to_string(&mut stderr, &mut message);
-        panic!("{error}: {message}")
-    });
-    assert!(index.0.wait().unwrap().success());
-    assert_eq!(
-        response["status"]["revision"]["indexGeneration"],
-        response["publishedRevision"]["indexGeneration"],
-        "{response}"
-    );
+    let status = index.0.wait().unwrap();
+    let (mut out, mut err) = (String::new(), String::new());
+    std::io::Read::read_to_string(&mut stdout, &mut out).unwrap();
+    std::io::Read::read_to_string(&mut stderr, &mut err).unwrap();
+    assert!(status.success(), "{err}");
+    assert_eq!(serde_json::from_str::<Value>(&out).unwrap(), result);
 }
 
 #[test]

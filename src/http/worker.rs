@@ -229,6 +229,10 @@ impl DaemonState {
         if let Some(hook) = self.startup_hook.lock().unwrap().take() {
             hook();
         }
+        #[cfg(feature = "test-support")]
+        if let Some(error) = self.fail_startup.lock().unwrap().clone() {
+            anyhow::bail!("{error}");
+        }
         if let RuntimeState::Reconciling { attempts, .. } = &mut *self.runtime.lock().unwrap() {
             *attempts += 1;
         }
@@ -397,6 +401,14 @@ impl DaemonState {
         self.store.wake_request_waiters();
     }
 
+    /// The worker's next attempt is deferred to a retry time still ahead.
+    fn waiting_out_retry(&self) -> bool {
+        self.recovery_retry_after
+            .lock()
+            .unwrap()
+            .is_some_and(|retry| Instant::now() < retry)
+    }
+
     /// Since when every worker step has failed, with the first error.
     pub fn step_fault(&self) -> Option<(Instant, String)> {
         self.step_fault.lock().unwrap().clone()
@@ -411,10 +423,11 @@ impl DaemonState {
         STEP_FAULT_GRACE
     }
 
-    /// Fail every worker step with `error` until set back to `None`.
+    /// Fail every startup reconciliation attempt with `error` until set back
+    /// to `None`.
     #[cfg(feature = "test-support")]
-    pub fn fail_steps_for_tests(&self, error: Option<&str>) {
-        *self.fail_steps.lock().unwrap() = error.map(str::to_owned);
+    pub fn fail_startup_for_tests(&self, error: Option<&str>) {
+        *self.fail_startup.lock().unwrap() = error.map(str::to_owned);
         self.inbox.wake();
     }
 
@@ -892,11 +905,14 @@ fn worker_loop(weak: std::sync::Weak<DaemonState>, inbox: Arc<WorkerInbox>) {
         }
         let step = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| state.worker_step()));
         state.publish_fifo_pending();
-        state.note_step_outcome(match &step {
-            Ok(Ok(())) => None,
-            Ok(Err(error)) => Some(format!("{error:#}")),
-            Err(_) => Some("panicked".to_owned()),
-        });
+        match &step {
+            // A step that only waited out a retry backoff attempted nothing,
+            // so it is not a recovery.
+            Ok(Ok(())) if state.waiting_out_retry() => {}
+            Ok(Ok(())) => state.note_step_outcome(None),
+            Ok(Err(error)) => state.note_step_outcome(Some(format!("{error:#}"))),
+            Err(_) => state.note_step_outcome(Some("panicked".to_owned())),
+        }
         deadline = match step {
             Ok(Ok(())) => {
                 // The witness reads phase only after the step released its locks.
