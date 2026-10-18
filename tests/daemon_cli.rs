@@ -1790,7 +1790,7 @@ fn metrics_client_rejects_wrong_admission_and_partial_result() {
         operation: "metrics".into(),
         payload: serde_json::json!({}),
     };
-    for partial in [false, true] {
+    for case in ["wrong_id", "not_admitted", "partial_result"] {
         let (left, mut right) = UnixStream::pair().unwrap();
         let peer = std::thread::spawn(move || {
             use std::io::{Read, Write};
@@ -1801,12 +1801,12 @@ fn metrics_client_rejects_wrong_admission_and_partial_result() {
             protocol::write_frame(
                 &mut right,
                 &protocol::Reply {
-                    id: if partial { 17 } else { 18 },
-                    payload: serde_json::json!({"admitted": true}),
+                    id: if case == "wrong_id" { 18 } else { 17 },
+                    payload: serde_json::json!({"admitted": case != "not_admitted"}),
                 },
             )
             .unwrap();
-            if partial {
+            if case == "partial_result" {
                 right.write_all(&[0, 0, 0, 42, b'{']).unwrap();
             }
         });
@@ -2015,10 +2015,35 @@ fn metrics_admission_near_ingress_limit_still_allows_later_complete_result() {
 
 #[tokio::test]
 async fn metrics_cli_json_matches_authenticated_selected_http_envelope() {
+    async fn http_metrics(
+        client: &reqwest::Client,
+        address: SocketAddr,
+        key: &str,
+        token: &str,
+        query: &str,
+    ) -> Value {
+        let response = client
+            .get(format!(
+                "http://{address}/api/checkouts/{key}/metrics{query}"
+            ))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK, "{query}");
+        response.json().await.unwrap()
+    }
     let temp = short_temp();
     let home = temp.path().join("home");
     fs::create_dir(&home).unwrap();
     let root = checkout(temp.path(), "metricshttp");
+    fs::create_dir(root.join("src")).unwrap();
+    let source = root.join("src/math.js");
+    fs::write(
+        &source,
+        "function one(a) {\n  if (a) return a;\n  return 0;\n}\nfunction two(b) {\n  if (b) return b;\n  if (b > 1) return 2;\n  return 0;\n}\n",
+    )
+    .unwrap();
     let address = free_address();
     let token = temp.path().join("token");
     let mut served = detached(serve(&home, &root, address, &token));
@@ -2029,38 +2054,233 @@ async fn metrics_cli_json_matches_authenticated_selected_http_envelope() {
         .unwrap()
         .root_key;
     let auth = fs::read_to_string(&token).unwrap();
-    let response = client
-        .get(format!("http://{address}/api/checkouts/{key}/metrics"))
-        .bearer_auth(auth.trim())
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(
-        response.status(),
-        reqwest::StatusCode::OK,
-        "{}",
-        response.text().await.unwrap_or_default()
-    );
-    let http: Value = response.json().await.unwrap();
+    let token = auth.trim();
+    let http = http_metrics(&client, address, &key, token, "").await;
     let generation = http["payload"]["indexGeneration"].as_str().unwrap();
     let revision = http["payload"]["indexRevision"].as_u64().unwrap();
     let pin = format!("{generation}:{revision}");
-    let cli = cli(&home)
+    let initial = cli(&home)
         .args(["metrics", "--json", "--workspace"])
         .arg(&root)
         .args(["--pin", &pin])
         .output()
         .unwrap();
     assert!(
-        cli.status.success(),
+        initial.status.success(),
         "{}",
-        String::from_utf8_lossy(&cli.stderr)
+        String::from_utf8_lossy(&initial.stderr)
     );
-    let daemon: Value = serde_json::from_slice(&cli.stdout).unwrap();
-    assert_eq!(daemon["payload"], http["payload"]);
-    assert!(daemon["catchingUp"].is_boolean());
-}
+    let initial: Value = serde_json::from_slice(&initial.stdout).unwrap();
+    assert_eq!(initial["payload"], http["payload"]);
+    assert!(initial["catchingUp"].is_boolean());
+    let file = http["payload"]["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|file| file["path"] == "src/math.js")
+        .unwrap();
+    let source_set = file["sourceSetId"].as_str().unwrap();
+    assert_eq!(file["language"], "javascript");
 
+    // The old pin must still select the same source after a newer head is published.
+    fs::write(&source, "function newer() { return 99; }\n").unwrap();
+    run(&home, "index", &root);
+    let file_query = format!(
+        "?scope=file&sourceSetId={source_set}&language=javascript&path=src/math.js&aggregate=mean&metrics=loc,cyclomatic,fanIn"
+    );
+    let pinned_file_query =
+        format!("{file_query}&indexGeneration={generation}&indexRevision={revision}");
+    let head = http_metrics(&client, address, &key, token, &file_query).await;
+    assert_ne!(head["payload"]["indexRevision"], revision);
+    assert_eq!(head["payload"]["files"][0]["declarationCount"], 1);
+    let pinned_file = http_metrics(&client, address, &key, token, &pinned_file_query).await;
+    let selected = cli(&home)
+        .args(["metrics", "--json", "--workspace"])
+        .arg(&root)
+        .args([
+            "--scope",
+            "file",
+            "--pin",
+            &pin,
+            "--source-set-id",
+            source_set,
+            "--language",
+            "javascript",
+            "--path",
+            "src/math.js",
+            "--aggregate",
+            "mean",
+            "--metrics",
+            "loc,cyclomatic,fanIn",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        selected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&selected.stderr)
+    );
+    let selected: Value = serde_json::from_slice(&selected.stdout).unwrap();
+    assert_eq!(selected["payload"], pinned_file["payload"]);
+    assert_eq!(selected["payload"]["indexGeneration"], generation);
+    assert_eq!(selected["payload"]["indexRevision"], revision);
+    assert_eq!(selected["payload"]["files"][0]["sourceSetId"], source_set);
+    assert_eq!(selected["payload"]["files"][0]["language"], "javascript");
+    assert_eq!(selected["payload"]["files"][0]["path"], "src/math.js");
+    assert_eq!(selected["payload"]["files"][0]["declarationCount"], 2);
+    assert_eq!(selected["payload"]["files"][0]["metrics"]["loc"], 4.5);
+    assert_eq!(
+        selected["payload"]["files"][0]["metrics"]["cyclomatic"],
+        2.5
+    );
+    assert_eq!(
+        selected["payload"]["files"][0]["metrics"]["fanIn"]["value"],
+        Value::Null
+    );
+    assert_eq!(
+        selected["payload"]["files"][0]["metrics"]["fanIn"]["unavailable"],
+        "call resolution not yet produced (#40/#68)"
+    );
+    assert_eq!(
+        selected["payload"]["declarations"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let first = &selected["payload"]["declarations"][0];
+    assert_eq!(first["metrics"]["loc"], 4);
+    assert_eq!(first["metrics"]["cyclomatic"], 2);
+    assert_eq!(selected["payload"]["declarations"][1]["metrics"]["loc"], 5);
+    assert_eq!(
+        selected["payload"]["declarations"][1]["metrics"]["cyclomatic"],
+        3
+    );
+    let sid = first["sid"].as_str().unwrap();
+    assert!(sid.starts_with("sid:v1:"));
+
+    let directory_query = format!(
+        "?scope=directory&sourceSetId={source_set}&path=src&aggregate=mean&metrics=loc,cyclomatic,fanIn&indexGeneration={generation}&indexRevision={revision}"
+    );
+    let http_directory = http_metrics(&client, address, &key, token, &directory_query).await;
+    let directory = cli(&home)
+        .args(["metrics", "--json", "--workspace"])
+        .arg(&root)
+        .args([
+            "--scope",
+            "directory",
+            "--pin",
+            &pin,
+            "--source-set-id",
+            source_set,
+            "--path",
+            "src",
+            "--aggregate",
+            "mean",
+            "--metrics",
+            "loc,cyclomatic,fanIn",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        directory.status.success(),
+        "{}",
+        String::from_utf8_lossy(&directory.stderr)
+    );
+    let directory: Value = serde_json::from_slice(&directory.stdout).unwrap();
+    assert_eq!(directory["payload"], http_directory["payload"]);
+    assert_eq!(directory["payload"]["files"].as_array().unwrap().len(), 1);
+    let subtree = directory["payload"]["directories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["path"] == "src")
+        .unwrap();
+    assert_eq!(subtree["sourceSetId"], source_set);
+    assert_eq!(subtree["declarationCount"], 2);
+    assert_eq!(subtree["metrics"]["loc"], 4.5);
+    assert_eq!(subtree["metrics"]["cyclomatic"], 2.5);
+    assert_eq!(directory["payload"]["declarations"], serde_json::json!([]));
+
+    let declaration_query = format!(
+        "?scope=declaration&sourceSetId={source_set}&path=src/math.js&sid={sid}&aggregate=mean&metrics=loc,cyclomatic,fanIn&indexGeneration={generation}&indexRevision={revision}"
+    );
+    let http_declaration = http_metrics(&client, address, &key, token, &declaration_query).await;
+    let declaration = cli(&home)
+        .args(["metrics", "--json", "--workspace"])
+        .arg(&root)
+        .args([
+            "--scope",
+            "declaration",
+            "--pin",
+            &pin,
+            "--source-set-id",
+            source_set,
+            "--path",
+            "src/math.js",
+            "--sid",
+            sid,
+            "--aggregate",
+            "mean",
+            "--metrics",
+            "loc,cyclomatic,fanIn",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        declaration.status.success(),
+        "{}",
+        String::from_utf8_lossy(&declaration.stderr)
+    );
+    let declaration: Value = serde_json::from_slice(&declaration.stdout).unwrap();
+    assert_eq!(declaration["payload"], http_declaration["payload"]);
+    assert_eq!(
+        declaration["payload"]["declarations"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(declaration["payload"]["declarations"][0], *first);
+    assert_eq!(declaration["payload"]["files"], serde_json::json!([]));
+    assert_eq!(declaration["payload"]["directories"], serde_json::json!([]));
+
+    let text = cli(&home)
+        .args(["metrics", "--workspace"])
+        .arg(&root)
+        .args([
+            "--scope",
+            "file",
+            "--pin",
+            &pin,
+            "--source-set-id",
+            source_set,
+            "--language",
+            "javascript",
+            "--path",
+            "src/math.js",
+            "--aggregate",
+            "mean",
+            "--metrics",
+            "loc,cyclomatic,fanIn",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        text.status.success(),
+        "{}",
+        String::from_utf8_lossy(&text.stderr)
+    );
+    let text = String::from_utf8(text.stdout).unwrap();
+    assert!(text.contains(&pin));
+    assert!(text.contains("catchingUp="));
+    assert!(text.contains(source_set) && text.contains("src/math.js"));
+    assert!(
+        text.contains("\"loc\":4.5") && text.contains("\"cyclomatic\":2.5"),
+        "{text}"
+    );
+    assert!(text.contains("call resolution not yet produced (#40/#68)"));
+}
 #[test]
 fn metrics_client_discards_partial_chunks_after_absolute_result_deadline() {
     use std::os::unix::net::UnixStream;
@@ -2480,4 +2700,315 @@ fn metrics_reconnect_keeps_original_ingress_deadline() {
     assert_eq!(result.unwrap_err(), client::CallError::DaemonUnavailable);
     assert_eq!(connects, 1, "reconnect reset the original ingress budget");
     server.join().unwrap();
+}
+
+#[test]
+fn metrics_connect_attempt_rejects_late_first_connect_and_late_starter() {
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use trellis::daemon::client::{self, StartOutcome};
+    let (stream, _peer) = UnixStream::pair().unwrap();
+    let mut stream = Some(stream);
+    let first = client::connect_or_start_metrics(
+        || {
+            std::thread::sleep(Duration::from_millis(90));
+            Ok(stream.take().unwrap())
+        },
+        || panic!("a successful first connect must not start the daemon"),
+        Duration::from_millis(40),
+    );
+    assert_eq!(first.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+
+    let mut starter_called = false;
+    let first_failed = client::connect_or_start_metrics(
+        || {
+            std::thread::sleep(Duration::from_millis(90));
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        },
+        || {
+            starter_called = true;
+            Ok(StartOutcome::Started)
+        },
+        Duration::from_millis(40),
+    );
+    assert_eq!(
+        first_failed.unwrap_err().kind(),
+        std::io::ErrorKind::TimedOut
+    );
+    assert!(
+        !starter_called,
+        "a late failed first connect must not start the daemon"
+    );
+
+    let temp = short_temp();
+    let socket = temp.path().join("late.sock");
+    let mut listener = None;
+    let started = client::connect_or_start_metrics(
+        || UnixStream::connect(&socket),
+        || {
+            std::thread::sleep(Duration::from_millis(90));
+            listener = Some(UnixListener::bind(&socket)?);
+            Ok(StartOutcome::Started)
+        },
+        Duration::from_millis(40),
+    );
+    assert_eq!(started.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+    assert!(listener.is_some());
+    assert!(
+        UnixStream::connect(&socket).is_ok(),
+        "late starter did bind"
+    );
+}
+
+#[test]
+fn metrics_file_and_declaration_work_deadlines_are_typed() {
+    use std::os::unix::net::UnixStream;
+    use trellis::daemon::protocol::{self, Reply, Request};
+    let temp = short_temp();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let _daemon = AutoDaemonGuard::for_home(&home);
+    let root = checkout(temp.path(), "metricsfiledeadline");
+    let source_set = format!(
+        "source-set:v1:path-{}",
+        trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root)
+            .unwrap()
+            .root_key
+    );
+    let budget_file = temp.path().join("file-work-budget");
+    let error_delay_file = temp.path().join("error-transition-delay");
+    let indexed = cli(&home)
+        .arg("index")
+        .arg("--workspace")
+        .arg(&root)
+        .env(
+            "TRELLIS_TEST_METRICS_FILE_WORK_DEADLINE_MS_FILE",
+            &budget_file,
+        )
+        .env(
+            "TRELLIS_TEST_METRICS_ERROR_DELAY_MS_FILE",
+            &error_delay_file,
+        )
+        .env("TRELLIS_TEST_METRICS_WORK_DELAY_MS", "800")
+        .output()
+        .unwrap();
+    assert!(
+        indexed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+    let file = cli(&home)
+        .args(["metrics", "--json", "--workspace"])
+        .arg(&root)
+        .args([
+            "--scope",
+            "file",
+            "--source-set-id",
+            &source_set,
+            "--language",
+            "javascript",
+            "--path",
+            "sample.js",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        file.status.success(),
+        "{}",
+        String::from_utf8_lossy(&file.stderr)
+    );
+    let file: Value = serde_json::from_slice(&file.stdout).unwrap();
+    let sid = file["payload"]["declarations"][0]["sid"].as_str().unwrap();
+    assert!(sid.starts_with("sid:v1:"));
+    fs::write(&budget_file, "500").unwrap();
+    // Only file/declaration use the shortened 30-second class. Revision keeps
+    // its independent 300-second class under the same daemon test hook.
+    let revision = cli(&home)
+        .args(["metrics", "--json", "--workspace"])
+        .arg(&root)
+        .output()
+        .unwrap();
+    assert!(
+        revision.status.success(),
+        "{}",
+        String::from_utf8_lossy(&revision.stderr)
+    );
+    for scope in ["file", "declaration"] {
+        let mut command = cli(&home);
+        command
+            .args(["metrics", "--json", "--workspace"])
+            .arg(&root)
+            .args([
+                "--scope",
+                scope,
+                "--source-set-id",
+                &source_set,
+                "--path",
+                "sample.js",
+            ]);
+        if scope == "file" {
+            command.args(["--language", "javascript"]);
+        } else {
+            command.args(["--sid", sid]);
+        }
+        let output = command.output().unwrap();
+        assert!(!output.status.success(), "{scope} exceeded its work budget");
+        assert!(output.stdout.is_empty(), "{scope} emitted partial success");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("deadline_exceeded"),
+            "{scope}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    // Measure the typed transition from a real matching admission frame,
+    // excluding CLI process startup and requiring the error inside the grace.
+    fs::write(&error_delay_file, "50").unwrap();
+    let mut stream = UnixStream::connect(fixture_socket_paths(&home).socket).unwrap();
+    let ingress = Instant::now() + Duration::from_secs(5);
+    let request = Request {
+        id: 79,
+        operation: "metrics".into(),
+        payload: serde_json::json!({"workspace": root,
+            "args": {"scope": "file", "sourceSetId": source_set,
+                "language": "javascript", "path": "sample.js", "aggregate": "sum"}}),
+    };
+    protocol::write_preface_until(&mut stream, ingress).unwrap();
+    protocol::write_frame_until(&mut stream, &request, ingress).unwrap();
+    let admission: Reply = protocol::read_frame_until(&mut stream, ingress).unwrap();
+    assert_eq!(admission.id, request.id);
+    assert_eq!(admission.payload, serde_json::json!({"admitted": true}));
+    let work_started = Instant::now();
+    let error: Reply =
+        protocol::read_frame_until(&mut stream, work_started + Duration::from_secs(2)).unwrap();
+    assert_eq!(error.id, request.id);
+    assert!(
+        error.payload["error"]
+            .as_str()
+            .unwrap()
+            .contains("deadline_exceeded")
+    );
+    assert!(
+        work_started.elapsed() < Duration::from_millis(1100),
+        "500ms work + 500ms transition was exceeded: {:?}",
+        work_started.elapsed()
+    );
+    // A transition held beyond the fixed 500ms grace must disconnect rather
+    // than publish a typed error or a partial success after expiry.
+    fs::write(&error_delay_file, "600").unwrap();
+    let mut late = UnixStream::connect(fixture_socket_paths(&home).socket).unwrap();
+    let ingress = Instant::now() + Duration::from_secs(5);
+    protocol::write_preface_until(&mut late, ingress).unwrap();
+    protocol::write_frame_until(&mut late, &request, ingress).unwrap();
+    let admission: Reply = protocol::read_frame_until(&mut late, ingress).unwrap();
+    assert_eq!(admission.payload, serde_json::json!({"admitted": true}));
+    let work_started = Instant::now();
+    assert!(
+        protocol::read_frame_until::<Reply>(&mut late, work_started + Duration::from_secs(2))
+            .is_err(),
+        "over-budget error transition wrote a late reply"
+    );
+    assert!(
+        work_started.elapsed() < Duration::from_millis(1600),
+        "over-budget transition did not disconnect promptly"
+    );
+    assert!(run(&home, "status", &root)["catchingUp"].is_boolean());
+}
+
+#[test]
+fn metrics_real_near_ingress_ack_and_late_multiframe_preserve_original_end() {
+    let temp = short_temp();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let _daemon = AutoDaemonGuard::for_home(&home);
+    let root = checkout(temp.path(), "metricslate");
+    let phase = temp.path().join("phase-order");
+    let chunks = temp.path().join("sent-chunks");
+    let transfer_budget = temp.path().join("transfer-budget");
+    let indexed = cli(&home)
+        .arg("index")
+        .arg("--workspace")
+        .arg(&root)
+        .env("TRELLIS_TEST_METRICS_INGRESS_DEADLINE_MS", "5000")
+        .env("TRELLIS_TEST_METRICS_ACK_DELAY_MS", "3700")
+        .env("TRELLIS_TEST_METRICS_WORK_DEADLINE_MS", "3500")
+        .env("TRELLIS_TEST_METRICS_WORK_DELAY_MS", "2800")
+        .env("TRELLIS_TEST_METRICS_TRANSFER_DEADLINE_MS", "3500")
+        .env(
+            "TRELLIS_TEST_METRICS_TRANSFER_DEADLINE_MS_FILE",
+            &transfer_budget,
+        )
+        .env("TRELLIS_TEST_METRICS_FORCE_CHUNK_BYTES", "300")
+        .env("TRELLIS_TEST_METRICS_LAST_CHUNK_DELAY_MS", "2800")
+        .env("TRELLIS_TEST_METRICS_PHASE_ORDER_FILE", &phase)
+        .env("TRELLIS_TEST_METRICS_CHUNK_COUNT_FILE", &chunks)
+        .output()
+        .unwrap();
+    assert!(
+        indexed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+    let metrics = || {
+        cli(&home)
+            .args(["metrics", "--json", "--workspace"])
+            .arg(&root)
+            .env("TRELLIS_TEST_METRICS_CLIENT_INGRESS_MS", "5000")
+            .env("TRELLIS_TEST_METRICS_CLIENT_WORK_MS", "3500")
+            .env("TRELLIS_TEST_METRICS_CLIENT_ERROR_MS", "500")
+            .env("TRELLIS_TEST_METRICS_CLIENT_TRANSFER_MS", "3500")
+            .output()
+            .unwrap()
+    };
+    let began = Instant::now();
+    let complete = metrics();
+    let received = began.elapsed();
+    assert!(
+        complete.status.success(),
+        "{}",
+        String::from_utf8_lossy(&complete.stderr)
+    );
+    assert!(
+        received > Duration::from_millis(7_500),
+        "final frame arrived before the no-ingress end budget: {received:?}"
+    );
+    assert!(
+        received < Duration::from_millis(12_500),
+        "final frame exceeded the original additive end budget: {received:?}"
+    );
+    assert_eq!(
+        fs::read(&phase).unwrap(),
+        b"AW",
+        "work ran before admitted ACK"
+    );
+    assert!(
+        fs::read(&chunks).unwrap().len() > 1,
+        "success was not multi-frame"
+    );
+    let envelope: Value = serde_json::from_slice(&complete.stdout).unwrap();
+    assert_eq!(envelope["payload"]["files"].as_array().unwrap().len(), 1);
+    assert!(envelope["catchingUp"].is_boolean());
+
+    // Shortening only the server's transfer window leaves earlier chunks on
+    // the socket, but the delayed final chunk cannot become a partial success.
+    fs::write(&transfer_budget, "500").unwrap();
+    fs::remove_file(&chunks).unwrap();
+    let began = Instant::now();
+    let incomplete = metrics();
+    assert!(!incomplete.status.success());
+    assert!(
+        incomplete.stdout.is_empty(),
+        "partial chunks became CLI output"
+    );
+    assert!(
+        String::from_utf8_lossy(&incomplete.stderr).contains("daemon_unavailable"),
+        "{}",
+        String::from_utf8_lossy(&incomplete.stderr)
+    );
+    assert!(
+        !fs::read(&chunks).unwrap().is_empty(),
+        "no partial frame was sent"
+    );
+    assert!(
+        began.elapsed() < Duration::from_millis(12_500),
+        "transfer stall was unbounded"
+    );
 }

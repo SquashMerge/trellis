@@ -53,6 +53,44 @@ pub fn connect_or_start(
     }
 }
 
+/// Metrics uses the caller's remaining ingress budget, capped at five seconds.
+/// Start the attempt clock before the first connect or daemon election; a
+/// late successful connect/start never admits a request.
+pub fn connect_or_start_metrics(
+    mut connect: impl FnMut() -> io::Result<UnixStream>,
+    mut start: impl FnMut() -> io::Result<StartOutcome>,
+    timeout: Duration,
+) -> io::Result<UnixStream> {
+    let deadline = Instant::now() + timeout;
+    let expired = || io::Error::new(io::ErrorKind::TimedOut, "daemon unavailable");
+    if let Ok(stream) = connect() {
+        if Instant::now() >= deadline {
+            return Err(expired());
+        }
+        return Ok(stream);
+    }
+    if Instant::now() >= deadline {
+        return Err(expired());
+    }
+    let _ = start()?;
+    loop {
+        if Instant::now() >= deadline {
+            return Err(expired());
+        }
+        if let Ok(stream) = connect() {
+            if Instant::now() >= deadline {
+                return Err(expired());
+            }
+            return Ok(stream);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(expired());
+        }
+        thread::sleep(remaining.min(Duration::from_millis(20)));
+    }
+}
+
 pub fn call(
     request: &Request,
     read_only: bool,

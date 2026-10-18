@@ -518,7 +518,11 @@ fn send_daemon(request: &protocol::Request, read_only: bool) -> Result<serde_jso
     let socket = socket_path()?;
     if request.operation == "metrics" {
         let started = Instant::now();
-        let ingress = started + Duration::from_secs(20);
+        let ingress_window = Duration::from_secs(20);
+        #[cfg(feature = "test-support")]
+        let ingress_window = metrics_test_duration("TRELLIS_TEST_METRICS_CLIENT_INGRESS_MS")
+            .unwrap_or(ingress_window);
+        let ingress = started + ingress_window;
         let work = if matches!(
             request.payload["args"]["scope"].as_str(),
             Some("revision" | "directory")
@@ -527,9 +531,23 @@ fn send_daemon(request: &protocol::Request, read_only: bool) -> Result<serde_jso
         } else {
             Duration::from_secs(30)
         };
-        let end = ingress + work + Duration::from_millis(500) + Duration::from_secs(30);
+        #[cfg(feature = "test-support")]
+        let work = metrics_test_duration("TRELLIS_TEST_METRICS_CLIENT_WORK_MS").unwrap_or(work);
+        let error_window = Duration::from_millis(500);
+        #[cfg(feature = "test-support")]
+        let error_window =
+            metrics_test_duration("TRELLIS_TEST_METRICS_CLIENT_ERROR_MS").unwrap_or(error_window);
+        let transfer_window = Duration::from_secs(30);
+        #[cfg(feature = "test-support")]
+        let transfer_window = metrics_test_duration("TRELLIS_TEST_METRICS_CLIENT_TRANSFER_MS")
+            .unwrap_or(transfer_window);
+        let end = ingress + work + error_window + transfer_window;
         let reply = client::call_metrics(request, ingress, end, |timeout| {
-            client::connect_or_start(&socket, start_daemon, timeout)
+            client::connect_or_start_metrics(
+                || std::os::unix::net::UnixStream::connect(&socket),
+                start_daemon,
+                timeout,
+            )
         })
         .map_err(|error| anyhow::anyhow!("{}", error.code()))?;
         return checked_reply(reply);
@@ -1063,6 +1081,10 @@ fn dispatch_connection(
             request.operation == "metrics",
             "invalid prefaced daemon operation"
         );
+        #[cfg(feature = "test-support")]
+        if let Some(delay) = metrics_test_duration("TRELLIS_TEST_METRICS_ACK_DELAY_MS") {
+            std::thread::sleep(delay);
+        }
         protocol::write_frame_until(
             &mut stream,
             &protocol::Reply {
@@ -1071,6 +1093,8 @@ fn dispatch_connection(
             },
             ingress_deadline,
         )?;
+        #[cfg(feature = "test-support")]
+        metrics_test_phase(b"A");
     } else {
         ensure!(
             request.operation != "metrics",
@@ -1189,11 +1213,18 @@ fn dispatch_connection(
         Duration::from_secs(30)
     };
     #[cfg(feature = "test-support")]
-    let metrics_work = std::env::var("TRELLIS_TEST_METRICS_WORK_DEADLINE_MS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .map(Duration::from_millis)
-        .unwrap_or(metrics_work);
+    let metrics_work =
+        metrics_test_duration("TRELLIS_TEST_METRICS_WORK_DEADLINE_MS").unwrap_or(metrics_work);
+    #[cfg(feature = "test-support")]
+    let metrics_work = if matches!(
+        request.payload["args"]["scope"].as_str(),
+        Some("file" | "declaration")
+    ) {
+        metrics_test_duration_file("TRELLIS_TEST_METRICS_FILE_WORK_DEADLINE_MS_FILE")
+            .unwrap_or(metrics_work)
+    } else {
+        metrics_work
+    };
     let request_deadline = Instant::now() + if metrics { metrics_work } else { CLI_READ_WAIT };
     let read_scope = matches!(
         request.operation.as_str(),
@@ -1317,6 +1348,8 @@ fn dispatch_connection(
                     let options = metrics_options.as_ref().expect("metrics options validated");
                     let mut before_work = || {
                         #[cfg(feature = "test-support")]
+                        metrics_test_phase(b"W");
+                        #[cfg(feature = "test-support")]
                         if let Ok(gate) = std::env::var("TRELLIS_TEST_METRICS_WORK_GATE") {
                             use std::io::Write;
                             let gate = PathBuf::from(gate);
@@ -1337,7 +1370,10 @@ fn dispatch_connection(
                         if let Ok(delay) = std::env::var("TRELLIS_TEST_METRICS_WORK_DELAY_MS")
                             && let Ok(milliseconds) = delay.parse::<u64>()
                         {
-                            std::thread::sleep(Duration::from_millis(milliseconds));
+                            std::thread::sleep(Duration::from_millis(milliseconds).min(
+                                request_deadline.saturating_duration_since(Instant::now())
+                                    + Duration::from_millis(100),
+                            ));
                         }
                     };
                     #[cfg(feature = "test-support")]
@@ -1470,6 +1506,17 @@ fn dispatch_connection(
     if !serve {
         runtime.block_on(async { registry.lock().await.disconnect(session) });
     }
+    #[cfg(feature = "test-support")]
+    if metrics
+        && result.as_ref().err().is_some_and(|error| {
+            let message = error.to_string();
+            message.contains("deadline_exceeded") || message.contains("cancelled")
+        })
+        && let Some(delay) = metrics_test_duration_file("TRELLIS_TEST_METRICS_ERROR_DELAY_MS_FILE")
+            .or_else(|| metrics_test_duration("TRELLIS_TEST_METRICS_ERROR_DELAY_MS"))
+    {
+        std::thread::sleep(delay);
+    }
     let expired_success = metrics && result.is_ok() && Instant::now() >= request_deadline;
     let reply = protocol::Reply {
         id: request.id,
@@ -1480,7 +1527,13 @@ fn dispatch_connection(
         },
     };
     if metrics {
-        let transfer_deadline = Instant::now() + Duration::from_secs(30);
+        let transfer_window = Duration::from_secs(30);
+        #[cfg(feature = "test-support")]
+        let transfer_window =
+            metrics_test_duration_file("TRELLIS_TEST_METRICS_TRANSFER_DEADLINE_MS_FILE")
+                .or_else(|| metrics_test_duration("TRELLIS_TEST_METRICS_TRANSFER_DEADLINE_MS"))
+                .unwrap_or(transfer_window);
+        let transfer_deadline = Instant::now() + transfer_window;
         if Instant::now() >= request_deadline + Duration::from_millis(500)
             && result_is_deadline(&reply.payload)
         {
@@ -1536,6 +1589,36 @@ fn write_daemon_reply(
         }
     }
     Ok(())
+}
+
+#[cfg(feature = "test-support")]
+fn metrics_test_duration(name: &str) -> Option<Duration> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+}
+
+#[cfg(feature = "test-support")]
+fn metrics_test_duration_file(name: &str) -> Option<Duration> {
+    std::env::var(name)
+        .ok()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_millis)
+}
+
+#[cfg(feature = "test-support")]
+fn metrics_test_phase(mark: &[u8]) {
+    use std::io::Write;
+    if let Ok(path) = std::env::var("TRELLIS_TEST_METRICS_PHASE_ORDER_FILE")
+        && let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+    {
+        let _ = file.write_all(mark);
+    }
 }
 
 fn result_is_deadline(payload: &serde_json::Value) -> bool {
@@ -1673,19 +1756,51 @@ fn write_daemon_reply_until(
     if Instant::now() >= deadline {
         anyhow::bail!("deadline_exceeded");
     }
-    if payload.len() + 64 <= protocol::MAX_FRAME {
+    const CHUNK_BYTES: usize = 450_000;
+    let chunk_bytes = CHUNK_BYTES;
+    #[cfg(feature = "test-support")]
+    let forced_chunks = std::env::var("TRELLIS_TEST_METRICS_FORCE_CHUNK_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| (1..=CHUNK_BYTES).contains(value));
+    #[cfg(feature = "test-support")]
+    let chunk_bytes = forced_chunks.unwrap_or(chunk_bytes);
+    #[cfg(feature = "test-support")]
+    let last_chunk_delay = metrics_test_duration("TRELLIS_TEST_METRICS_LAST_CHUNK_DELAY_MS");
+    #[cfg(feature = "test-support")]
+    let small_frame = forced_chunks.is_none() && payload.len() + 64 <= protocol::MAX_FRAME;
+    #[cfg(not(feature = "test-support"))]
+    let small_frame = payload.len() + 64 <= protocol::MAX_FRAME;
+    if small_frame {
         protocol::write_frame_until(stream, reply, deadline)?;
     } else {
-        const CHUNK_BYTES: usize = 450_000;
-        for (index, chunk) in payload.chunks(CHUNK_BYTES).enumerate() {
+        for (index, chunk) in payload.chunks(chunk_bytes).enumerate() {
+            let more = (index + 1) * chunk_bytes < payload.len();
+            #[cfg(feature = "test-support")]
+            if !more && let Some(delay) = last_chunk_delay {
+                std::thread::sleep(delay.min(
+                    deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(100),
+                ));
+            }
             protocol::write_frame_until(
                 stream,
                 &protocol::Reply {
                     id: reply.id,
-                    payload: serde_json::json!({"chunk": hex::encode(chunk), "more": (index + 1) * CHUNK_BYTES < payload.len()}),
+                    payload: serde_json::json!({"chunk": hex::encode(chunk), "more": more}),
                 },
                 deadline,
             )?;
+            #[cfg(feature = "test-support")]
+            if let Ok(path) = std::env::var("TRELLIS_TEST_METRICS_CHUNK_COUNT_FILE") {
+                use std::io::Write;
+                if let Ok(mut file) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                {
+                    let _ = file.write_all(b"x");
+                }
+            }
         }
     }
     Ok(())
