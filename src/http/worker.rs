@@ -424,6 +424,27 @@ impl DaemonState {
         self.inbox.wake();
     }
 
+    /// Fail every watcher reconciliation with `error` until set back to `None`.
+    #[cfg(feature = "test-support")]
+    pub fn fail_watcher_for_tests(&self, error: Option<&str>) {
+        *self.fail_watcher.lock().unwrap() = error.map(str::to_owned);
+        self.inbox.wake();
+    }
+
+    /// Run `hook` once, as the next CLI index waiter first blocks.
+    #[cfg(feature = "test-support")]
+    pub fn on_cli_index_wait_for_tests(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.cli_index_wait_hook.lock().unwrap() = Some(Box::new(hook));
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn run_cli_index_wait_hook(&self) {
+        let hook = self.cli_index_wait_hook.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
     #[cfg(feature = "test-support")]
     pub fn set_step_fault_grace_for_tests(&self, grace: Duration) {
         *self.step_fault_grace.lock().unwrap() = Some(grace);

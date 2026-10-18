@@ -1740,6 +1740,9 @@ impl CheckoutRuntime {
         // checkout worker may reconcile and claim this row. A CLI waiter
         // never creates a second writer or re-enqueues an uncertain job.
         let accepted = resources.scheduler.enqueue_index(options, None)?;
+        // A fault older than this waiter tolerates no less than the full grace
+        // from here, so a stale fault never ends a new wait early (#179).
+        let waiting_since = Instant::now();
         let mut busy_deadline = Instant::now() + Duration::from_secs(30);
         loop {
             // Record the terminal-commit count before re-reading, so a COMMIT
@@ -1786,8 +1789,11 @@ impl CheckoutRuntime {
                     // A long index waits as long as it takes. Only a worker
                     // whose every step has failed for the grace ends the wait
                     // (#179); the accepted request stays queued for its retry.
+                    #[cfg(feature = "test-support")]
+                    resources.scheduler.run_cli_index_wait_hook();
                     if let Some((since, error)) = resources.scheduler.step_fault() {
-                        let give_up = since + resources.scheduler.step_fault_grace();
+                        let give_up =
+                            since.max(waiting_since) + resources.scheduler.step_fault_grace();
                         if Instant::now() >= give_up {
                             anyhow::bail!(
                                 "outcome_unknown: request {} is still {}; the checkout worker has been failing: {error}; inspect job status",

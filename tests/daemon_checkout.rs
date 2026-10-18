@@ -3097,19 +3097,21 @@ async fn cli_index_stops_waiting_when_the_serving_writer_fails_its_check() {
     let scheduler = runtime.browser_scheduler().unwrap();
     scheduler.set_step_fault_grace_for_tests(Duration::from_millis(300));
     let (release_hold, holder) = hold_worker(scheduler.clone()).await;
+    let (waiting_tx, waiting_rx) = tokio::sync::oneshot::channel();
+    scheduler.on_cli_index_wait_for_tests(move || {
+        let _ = waiting_tx.send(());
+    });
     let indexer = runtime.clone();
     let options = trellis::indexer::IndexOptions::new(root.clone());
     let waiter = tokio::task::spawn_blocking(move || indexer.cli_index(&options));
-    let id = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
-        loop {
-            if let [row] = queue_rows(&queue).as_slice() {
-                break row.split(':').next().unwrap().to_owned();
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("request was not accepted");
+    // The waiter has read its queued row and is about to block, so only a
+    // wake from the worker's fault can make it read again.
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, waiting_rx)
+        .await
+        .expect("the CLI index did not start waiting")
+        .unwrap();
+    let [row] = queue_rows(&queue).try_into().unwrap();
+    let id = row.split(':').next().unwrap().to_owned();
     // An invalid marker fails the writer's check until it is restored.
     let marker = root.join(".git/trellis/workspace-id");
     let restore = Restore(marker.clone(), fs::read(&marker).unwrap());
@@ -3134,6 +3136,83 @@ async fn cli_index_stops_waiting_when_the_serving_writer_fails_its_check() {
     })
     .await
     .expect("the accepted request did not complete after the check passed");
+}
+
+/// #179: a fault that is already older than the grace when a CLI index starts
+/// waiting gives that waiter the full grace, so a healthy worker completes
+/// the request instead of the waiter answering `outcome_unknown` at once.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn a_stale_worker_fault_never_ends_a_new_cli_index_wait_early() {
+    let base = tempfile::tempdir().unwrap();
+    let root = base.path().join("stale");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("a.js"), "function a() {}\n").unwrap();
+    let topology = roots(base.path());
+    let checkout = identity(&root);
+    let queue = topology.requests_db(&checkout);
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(1, &checkout).unwrap();
+    let runtime = registry.activate(&checkout.root_key).unwrap();
+    ready(&runtime).await;
+    let scheduler = runtime.browser_scheduler().unwrap();
+    let grace = Duration::from_secs(3);
+    scheduler.set_step_fault_grace_for_tests(grace);
+    scheduler.fail_watcher_for_tests(Some("watcher: injected"));
+    trellis::testing::wait_until("a watcher fault", || scheduler.step_fault().is_some());
+    // Held, the worker can neither clear the fault nor refresh it.
+    let (release_hold, holder) = hold_worker(scheduler.clone()).await;
+    scheduler.fail_watcher_for_tests(None);
+    tokio::time::sleep(grace + Duration::from_millis(200)).await;
+    assert!(
+        scheduler.step_fault().is_some(),
+        "the fault is stale, not gone"
+    );
+    let (waiting_tx, waiting_rx) = tokio::sync::oneshot::channel();
+    scheduler.on_cli_index_wait_for_tests(move || {
+        let _ = waiting_tx.send(());
+    });
+    let indexer = runtime.clone();
+    let options = trellis::indexer::IndexOptions::new(root.clone());
+    let waiter = tokio::task::spawn_blocking(move || indexer.cli_index(&options));
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, waiting_rx)
+        .await
+        .expect("the CLI index did not start waiting")
+        .unwrap();
+    drop(release_hold);
+    holder.join().unwrap();
+    let response = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, waiter)
+        .await
+        .expect("waiting client was not answered")
+        .unwrap()
+        .expect("a healthy worker completes the request");
+    assert!(response["publishedRevision"].is_object(), "{response}");
+    let [row] = queue_rows(&queue).try_into().unwrap();
+    assert!(row.ends_with(":done/"), "{row}");
+}
+
+/// #179: a completed watcher inventory is real progress, so it clears a fault
+/// left by a transient watcher failure.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn a_completed_watcher_inventory_clears_a_worker_fault() {
+    let base = tempfile::tempdir().unwrap();
+    let root = base.path().join("watched");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("a.js"), "function a() {}\n").unwrap();
+    let topology = roots(base.path());
+    let checkout = identity(&root);
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(1, &checkout).unwrap();
+    let runtime = registry.activate(&checkout.root_key).unwrap();
+    ready(&runtime).await;
+    let scheduler = runtime.browser_scheduler().unwrap();
+    scheduler.fail_watcher_for_tests(Some("watcher: injected"));
+    trellis::testing::wait_until("a watcher fault", || scheduler.step_fault().is_some());
+    scheduler.fail_watcher_for_tests(None);
+    // An edit gives the watcher an inventory to complete.
+    fs::write(root.join("b.js"), "function b() {}\n").unwrap();
+    trellis::testing::wait_until("the fault clearing", || scheduler.step_fault().is_none());
 }
 
 /// Decision 0008 §3, T04: a client already waiting on a request whose root is

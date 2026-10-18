@@ -254,6 +254,12 @@ pub struct DaemonState {
     /// Fail every startup reconciliation attempt with this error.
     #[cfg(feature = "test-support")]
     fail_startup: Mutex<Option<String>>,
+    /// Fail every watcher reconciliation with this error.
+    #[cfg(feature = "test-support")]
+    fail_watcher: Mutex<Option<String>>,
+    /// Runs once as a CLI index waiter first blocks.
+    #[cfg(feature = "test-support")]
+    cli_index_wait_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(feature = "test-support")]
     step_fault_grace: Mutex<Option<Duration>>,
     /// Published watcher intent; readers never take the watcher's lock.
@@ -502,6 +508,10 @@ pub fn new_with_config(
         step_recovered: AtomicBool::new(false),
         #[cfg(feature = "test-support")]
         fail_startup: Mutex::new(None),
+        #[cfg(feature = "test-support")]
+        fail_watcher: Mutex::new(None),
+        #[cfg(feature = "test-support")]
+        cli_index_wait_hook: Mutex::new(None),
         #[cfg(feature = "test-support")]
         step_fault_grace: Mutex::new(None),
         watch_status: Mutex::new(None),
@@ -1362,6 +1372,10 @@ impl DaemonState {
                         self.test_queue_current_phase.store(4, Ordering::Release);
                         #[cfg(test)]
                         self.test_queue_before_watcher_reconcile.run();
+                        #[cfg(feature = "test-support")]
+                        if let Some(error) = self.fail_watcher.lock().unwrap().clone() {
+                            anyhow::bail!("{error}");
+                        }
                         let reconciled = scheduler.reconcile_due(
                             &self.store,
                             session,
@@ -1371,6 +1385,11 @@ impl DaemonState {
                         );
                         self.publish_watch_status(scheduler, &selected_options);
                         let accounted = reconciled?;
+                        // A completed inventory is real progress; one that was
+                        // not due or was deferred is not.
+                        if accounted {
+                            self.step_recovered.store(true, Ordering::Release);
+                        }
                         // Explicit options are applied once: after a verified
                         // inventory under them, the recorded head selects again.
                         if accounted && let Some(applied) = &explicit {
