@@ -264,14 +264,14 @@ fn hand_checked_python_halstead_lines_and_derived_values() {
             m.halstead.total_operators,
             m.halstead.total_operands
         ),
-        (3, 3, 3, 4)
+        (2, 2, 2, 2)
     );
-    assert_eq!((m.halstead.vocabulary, m.halstead.length), (6, 7));
-    assert_eq!(m.halstead.volume, 18.094738);
-    assert_eq!(m.halstead.difficulty, 2.0);
-    assert_eq!(m.halstead.effort, 36.189475);
-    assert_eq!(m.halstead.estimated_bugs, 0.006032);
-    assert_eq!(m.maintainability_index, 80.652194);
+    assert_eq!((m.halstead.vocabulary, m.halstead.length), (4, 4));
+    assert_eq!(m.halstead.volume, 8.0);
+    assert_eq!(m.halstead.difficulty, 1.0);
+    assert_eq!(m.halstead.effort, 8.0);
+    assert_eq!(m.halstead.estimated_bugs, 0.002667);
+    assert_eq!(m.maintainability_index, 83.134143);
 }
 
 #[test]
@@ -523,7 +523,38 @@ fn else_if_continuation_is_flat_not_nested() {
     .remove(0)
     .metrics;
     assert_eq!(score.cyclomatic, 3);
-    assert_eq!(score.cognitive, 4);
+    assert_eq!(score.cognitive, 3);
+}
+
+#[test]
+fn native_else_if_chains_charge_only_one_flat_increment_per_continuation() {
+    for (lang, file, source) in [
+        (
+            "java",
+            "Case.java",
+            "class C { int calc(int x) { if (x > 0) return 1; else if (x < 0) return -1; else return 0; } }",
+        ),
+        (
+            "javascript",
+            "case.js",
+            "function calc(x) { if (x > 0) return 1; else if (x < 0) return -1; else return 0; }",
+        ),
+        (
+            "rust",
+            "case.rs",
+            "fn calc(x: i32) -> i32 { if x > 0 { 1 } else if x < 0 { -1 } else { 0 } }",
+        ),
+        (
+            "python",
+            "case.py",
+            "def calc(x):\n    if x > 0:\n        return 1\n    elif x < 0:\n        return -1\n    else:\n        return 0\n",
+        ),
+    ] {
+        let rows = native_rows(lang, file, source);
+        assert_eq!(rows.len(), 1, "{lang}");
+        assert_eq!(rows[0].metrics.cyclomatic, 3, "{lang}");
+        assert_eq!(rows[0].metrics.cognitive, 3, "{lang}");
+    }
 }
 
 #[test]
@@ -772,13 +803,13 @@ fn interpolated_literal_chunks_are_operands_without_delimiter_operators() {
         .unwrap()
         .remove(0)
         .metrics;
-        assert_eq!((score.halstead.n1, score.halstead.n2), (2, 4), "{lang}");
+        assert_eq!((score.halstead.n1, score.halstead.n2), (1, 3), "{lang}");
         assert_eq!(
             (
                 score.halstead.total_operators,
                 score.halstead.total_operands
             ),
-            (2, 5),
+            (1, 3),
             "{lang}"
         );
     }
@@ -992,15 +1023,15 @@ fn java_javascript_rust_halstead_raw_and_derived_are_hand_checked() {
             "java",
             "class C { int calc(int x) { return x + 1; } }",
             "int calc",
-            (3, 3, 4, 4),
+            (2, 2, 2, 2),
         ),
         (
             "javascript",
             "function calc(x) { return x + 1; }",
             "function calc",
-            (3, 3, 3, 4),
+            (2, 2, 2, 2),
         ),
-        ("rust", "fn calc() { return 1; }", "fn calc", (2, 2, 2, 2)),
+        ("rust", "fn calc() { return 1; }", "fn calc", (1, 1, 1, 1)),
     ];
     for (lang, source, begin, expected) in cases {
         let mut decl = declaration(lang, source.len());
@@ -1024,9 +1055,8 @@ fn java_javascript_rust_halstead_raw_and_derived_are_hand_checked() {
         );
         assert_eq!(score.loc, 1, "{lang}");
         let expected_derived = match lang {
-            "java" => (20.6797, 2.0, 41.3594, 0.006893, 90.654039),
-            "javascript" => (18.094738, 2.0, 36.189475, 0.006032, 91.060099),
-            "rust" => (8.0, 1.0, 8.0, 0.002667, 93.542049),
+            "java" | "javascript" => (8.0, 1.0, 8.0, 0.002667, 93.542049),
+            "rust" => (2.0, 0.5, 1.0, 0.000667, 97.757681),
             _ => unreachable!(),
         };
         assert_eq!(
@@ -1041,6 +1071,57 @@ fn java_javascript_rust_halstead_raw_and_derived_are_hand_checked() {
             "{lang}"
         );
     }
+}
+
+#[test]
+fn native_callable_headers_do_not_enter_halstead_but_retain_physical_lines() {
+    for (lang, file, short, long) in [
+        (
+            "java",
+            "Case.java",
+            "class C { int calc() { return 1; } }",
+            "class C { int calc(\n    int unused, String other\n) { return 1; } }",
+        ),
+        (
+            "python",
+            "case.py",
+            "def calc():\n    return 1\n",
+            "def calc(\n    unused, other\n):\n    return 1\n",
+        ),
+        (
+            "javascript",
+            "case.js",
+            "function calc() { return 1; }",
+            "function calc(\n    unused, other\n) { return 1; }",
+        ),
+        (
+            "rust",
+            "case.rs",
+            "fn calc() { return 1; }",
+            "fn calc(\n    unused: i32, other: i32\n) { return 1; }",
+        ),
+    ] {
+        let original = native_rows(lang, file, short).remove(0).metrics;
+        let changed = native_rows(lang, file, long).remove(0).metrics;
+        assert_eq!(original.halstead, changed.halstead, "{lang}");
+        assert_eq!(changed.loc, original.loc + 2, "{lang}");
+        assert_eq!(changed.sloc, original.sloc + 2, "{lang}");
+        assert_eq!(original.comment_lines, 0, "{lang}");
+        assert_eq!(changed.comment_lines, 0, "{lang}");
+    }
+}
+
+#[test]
+fn bodyless_java_interface_method_has_no_halstead_tokens() {
+    let source = "interface C { int calc(int x); }";
+    let rows = native_rows("java", "Case.java", source);
+    let row = rows
+        .iter()
+        .find(|r| r.range.start == source.find("int calc").unwrap())
+        .unwrap();
+    assert_eq!(row.metrics.halstead.length, 0);
+    assert_eq!(row.metrics.sloc, 1);
+    assert_eq!(row.metrics.loc, 1);
 }
 
 #[test]
@@ -1137,7 +1218,11 @@ fn native_else_continuations_have_one_body_depth() {
         let rows = native_rows(lang, file, source);
         assert_eq!(rows.len(), 1, "{lang}");
         assert_eq!(rows[0].metrics.cyclomatic, 3, "{lang}");
-        assert_eq!(rows[0].metrics.cognitive, 4, "{lang}");
+        assert_eq!(
+            rows[0].metrics.cognitive,
+            if lang == "rust" { 3 } else { 4 },
+            "{lang}"
+        );
     }
 }
 

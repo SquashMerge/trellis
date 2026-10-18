@@ -424,6 +424,68 @@ fn compute_source(
     }
     Ok(result)
 }
+// Native callable ranges are declaration ranges. Find the executable body within that
+// declaration before counting Halstead leaves; the full range still supplies line counts.
+fn callable_body(
+    root: Node<'_>,
+    source: &str,
+    d: &Declaration,
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<Range> {
+    let mut stack = vec![root];
+    let mut selected = None;
+    let mut visits = 0;
+    while let Some(node) = stack.pop() {
+        check()?;
+        visits += 1;
+        ensure!(visits <= 2_000_000, "bounded_work: body traversal");
+        if node.end_byte() <= d.range.start || node.start_byte() >= d.range.end {
+            continue;
+        }
+        if node.start_byte() == d.range.start
+            && node.end_byte() == d.range.end
+            && node.child_by_field_name("body").is_none()
+            && node
+                .child_by_field_name("name")
+                .is_some_and(|name| d.name.as_deref() == Some(&source[name.byte_range()]))
+        {
+            return Ok(Range {
+                start: d.range.end,
+                end: d.range.end,
+            });
+        }
+        if let Some(body) = node.child_by_field_name("body")
+            && node.start_byte() >= d.range.start
+            && node.end_byte() <= d.range.end
+            && node
+                .child_by_field_name("name")
+                .is_none_or(|name| d.name.as_deref() == Some(&source[name.byte_range()]))
+        {
+            let exact = node.start_byte() == d.range.start && node.end_byte() == d.range.end;
+            if exact {
+                return Ok(Range {
+                    start: body.start_byte(),
+                    end: body.end_byte(),
+                });
+            }
+            if selected.is_none() {
+                selected = Some(Range {
+                    start: body.start_byte(),
+                    end: body.end_byte(),
+                });
+            }
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.children(&mut cursor));
+    }
+    selected.with_context(|| {
+        format!(
+            "corrupt: callable body not found: {} {} {:?} {:?}",
+            d.document.language, d.document.path, d.name, d.range
+        )
+    })
+}
+
 fn score(
     language: &str,
     source: &str,
@@ -433,6 +495,7 @@ fn score(
     newline_offsets: &[usize],
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<Score> {
+    let body = callable_body(root, source, d, check)?;
     let mut s = empty();
     let mut code_lines = std::collections::BTreeSet::new();
     let mut comments = std::collections::BTreeSet::new();
@@ -477,7 +540,9 @@ fn score(
             )
         }) {
             let token = &source[node.byte_range()];
-            *operands.entry(token.to_owned()).or_default() += 1;
+            if node.start_byte() >= body.start && node.end_byte() <= body.end {
+                *operands.entry(token.to_owned()).or_default() += 1;
+            }
             let lo = node.start_byte().max(d.range.start);
             let hi = node.end_byte().min(d.range.end);
             if lo < hi {
@@ -525,7 +590,11 @@ fn score(
             if kind == "elif_clause" {
                 s.cognitive += 1;
                 s.cyclomatic += 1;
-            } else if kind == "else_clause" {
+            } else if kind == "else_clause"
+                && !node
+                    .named_children(&mut node.walk())
+                    .any(|child| matches!(child.kind(), "if_statement" | "if_expression"))
+            {
                 s.cognitive += 1;
             }
             if matches!(
@@ -645,9 +714,12 @@ fn score(
         }
         if token == "else"
             && language != "python"
-            && node
-                .parent()
-                .is_none_or(|parent| parent.kind() != "else_clause")
+            && node.parent().is_none_or(|parent| {
+                parent.kind() != "else_clause"
+                    && !parent
+                        .named_children(&mut parent.walk())
+                        .any(|child| matches!(child.kind(), "if_statement" | "if_expression"))
+            })
         {
             s.cognitive += 1;
         }
@@ -665,10 +737,12 @@ fn score(
             || kind.contains("float")
             || kind.contains("character")
             || matches!(kind, "true" | "false" | "null" | "True" | "False" | "None");
-        if operand {
-            *operands.entry(token.to_owned()).or_default() += 1;
-        } else {
-            *operators.entry(token.to_owned()).or_default() += 1;
+        if lo >= body.start && hi <= body.end {
+            if operand {
+                *operands.entry(token.to_owned()).or_default() += 1;
+            } else {
+                *operators.entry(token.to_owned()).or_default() += 1;
+            }
         }
         if matches!(token, "&&" | "||") || (language == "python" && matches!(token, "and" | "or")) {
             s.cyclomatic += 1;

@@ -213,28 +213,29 @@ async fn selected_metrics_projection_and_validation() {
         response["payload"]["directories"][0]["metrics"]["cyclomatic"],
         2
     );
+    // Body-only leaves are `return` and one operand per function: V = 2 each.
     assert_eq!(
         response["payload"]["directories"][0]["metrics"]["halstead"]["volume"],
-        18.0
+        4.0
     );
     let (status, max) = request(app.clone(), key, "?aggregate=max").await;
     assert_eq!(status, StatusCode::OK, "{max}");
     assert_eq!(max["payload"]["directories"][0]["declarationCount"], 2);
     assert_eq!(
         max["payload"]["directories"][0]["metrics"]["halstead"]["volume"],
-        10.0
+        2.0
     );
     assert_eq!(max["payload"]["directories"][0]["metrics"]["parameters"], 1);
     assert_eq!(
         max["payload"]["directories"][1]["metrics"]["halstead"]["volume"],
-        8.0
+        2.0
     );
     assert!(max["payload"]["directories"][2]["metrics"]["halstead"]["volume"].is_null());
     let (status, mean) = request(app.clone(), key, "?aggregate=mean").await;
     assert_eq!(status, StatusCode::OK, "{mean}");
     assert_eq!(
         mean["payload"]["directories"][0]["metrics"]["halstead"]["volume"],
-        9.0
+        2.0
     );
     assert_eq!(
         mean["payload"]["directories"][0]["metrics"]["parameters"],
@@ -253,7 +254,7 @@ async fn selected_metrics_projection_and_validation() {
     assert_eq!(response["payload"]["files"][2]["metrics"]["parameters"], 1);
     assert_eq!(
         response["payload"]["files"][2]["metrics"]["halstead"]["volume"],
-        10.0
+        2.0
     );
 
     let (repeat_status, repeated) = request(app.clone(), key, "").await;
