@@ -1180,7 +1180,7 @@ fn index_delete_journal_no_wal() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        9
+        10
     );
     drop(db);
     let bytes = fs::read(&index).unwrap();
@@ -1882,7 +1882,7 @@ fn gc_classifies_current_schema9_but_refuses_spoofed_shapes() {
         (entry.status, entry.reason)
     };
     assert_eq!(inspect(), ("unknown", "recent_open"));
-    // v9's CHECK forbids spoofing an old extractor on the current layout.
+    // v10's CHECK forbids spoofing an old extractor on the current layout.
     assert!(
         db.execute(
             "UPDATE index_metadata SET extractor_version='native-v1'",
@@ -1907,6 +1907,8 @@ fn gc_classifies_current_schema9_but_refuses_spoofed_shapes() {
     db.pragma_update(None, "user_version", 7).unwrap();
     assert_eq!(inspect(), ("unknown", "unknown_index_shape"));
     db.pragma_update(None, "user_version", 9).unwrap();
+    assert_eq!(inspect(), ("unknown", "unknown_index_schema"));
+    db.pragma_update(None, "user_version", 10).unwrap();
     assert_eq!(inspect(), ("unknown", "recent_open"));
     db.execute("UPDATE index_metadata SET root_inode='1'", [])
         .unwrap();

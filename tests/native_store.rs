@@ -147,7 +147,7 @@ fn four_languages_normalized_rows_and_pinned_bytes_are_coherent() {
     let baseline = store.index_baseline().unwrap();
     let leader = store.publication_for_tests().unwrap();
     let pin = publish(&store, root.path(), &cancel, baseline, &leader).unwrap();
-    // A current v9 empty bootstrap is the same generation; only a rebuild rotates it.
+    // A current v10 empty bootstrap is the same generation; only a rebuild rotates it.
     assert_eq!(baseline.index_generation, pin.index_generation);
     assert_eq!(
         store.status().unwrap().evidence_format.as_deref(),
@@ -246,7 +246,7 @@ fn four_languages_normalized_rows_and_pinned_bytes_are_coherent() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        9
+        10
     );
     let count: i64 = db
         .query_row(
@@ -751,14 +751,14 @@ fn physical_v8_native_v4_index_recreates_before_role_column_read() {
         rebuilt
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        9
+        10
     );
     let stamp: String = rebuilt
         .query_row("SELECT extractor_version FROM index_metadata", [], |row| {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(stamp, "native-v5-delta-v1");
+    assert_eq!(stamp, "native-v6-delta-v1");
     let version: String = rebuilt
         .query_row("SELECT version FROM native_producers", [], |row| row.get(0))
         .unwrap();
@@ -3505,7 +3505,7 @@ fn newer_disposable_schema_is_refused_without_rebuild_or_deletion() {
         .join("index.db");
     Connection::open(&path)
         .unwrap()
-        .execute_batch("PRAGMA user_version=10")
+        .execute_batch("PRAGMA user_version=11")
         .unwrap();
     let inode = fs::metadata(&path).unwrap().ino();
     let error = Store::open_for_tests(state.path(), root.path()).unwrap_err();
@@ -3525,7 +3525,7 @@ fn newer_disposable_schema_is_refused_without_rebuild_or_deletion() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(version, 10);
+    assert_eq!(version, 11);
     assert_eq!(generation, old.index_generation.to_string());
 }
 
@@ -3773,4 +3773,79 @@ fn declaration_roles_round_trip_and_invalid_stored_role_fails_typed_read() {
         )
         .is_err()
     );
+}
+
+#[test]
+#[cfg(feature = "test-support")]
+fn incoming_call_index_uses_captured_version_and_nullable_measured_keys() {
+    let (state, root, store, cancel) = fixture();
+    fs::write(
+        root.path().join("flow.js"),
+        "function go() {} function caller() { go(); obj.go(); (obj.go)(); }
+",
+    )
+    .unwrap();
+    let leader = store.publication_for_tests().unwrap();
+    let pin = publish(
+        &store,
+        root.path(),
+        &cancel,
+        store.index_baseline().unwrap(),
+        &leader,
+    )
+    .unwrap();
+    let db = Connection::open(published_db(state.path(), root.path())).unwrap();
+    let columns: Vec<String> = db
+        .prepare("PRAGMA index_info(native_version_calls_incoming)")
+        .unwrap()
+        .query_map([], |row| row.get(2))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(columns, ["source_set_id", "language", "callee_lookup_key"]);
+    type CallIndexRow = (String, String, Option<String>, Option<String>, String);
+    let rows: Vec<CallIndexRow> = db
+        .prepare("SELECT c.source_set_id,c.language,c.callee_lookup_key,c.spelling,v.path FROM native_version_calls c JOIN document_versions v ON v.id=c.version_id ORDER BY v.path,c.ordinal")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert!(rows.iter().all(|(set, language, _, _, path)| {
+        set == &format!("source-set:v1:{}", store.root_id())
+            && language
+                == match path.rsplit('.').next().unwrap() {
+                    "js" => "javascript",
+                    "rs" => "rust",
+                    "py" => "python",
+                    "java" => "java",
+                    other => panic!("unexpected language: {other}"),
+                }
+    }));
+    let js: Vec<_> = rows.iter().filter(|row| row.4 == "flow.js").collect();
+    assert!(
+        js.iter()
+            .any(|row| row.2.as_deref() == Some("go") && row.3.as_deref() == Some("go"))
+    );
+    assert!(js.iter().any(|row| {
+        row.2.is_none()
+            && row
+                .3
+                .as_deref()
+                .is_some_and(|spelling| spelling.contains("obj"))
+    }));
+    drop(db);
+    fs::write(
+        root.path().join("flow.js"),
+        "function changed() {}
+",
+    )
+    .unwrap();
+    let stored = Connection::open(published_db(state.path(), root.path())).unwrap();
+    let key: String = stored.query_row(
+        "SELECT callee_lookup_key FROM native_version_calls c JOIN document_versions v ON v.id=c.version_id WHERE v.path='flow.js' AND c.callee_lookup_key='go' LIMIT 1",
+        [], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(key, "go", "published key must not follow live source edits");
+    assert_eq!(store.status().unwrap().revision, pin);
 }
