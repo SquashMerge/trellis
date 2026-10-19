@@ -795,6 +795,29 @@ impl Capture {
         capture.verify(cancel)?;
         Ok(capture)
     }
+    /// Confirm that the complete captured walk and selected inputs belong to
+    /// these effective watcher options and this accepted request root.
+    pub(crate) fn covers_watcher_request(
+        &self,
+        options: &IndexOptions,
+        root_device: &str,
+        root_inode: &str,
+        cancel: &CancelFlag,
+    ) -> bool {
+        #[cfg(unix)]
+        if self.root_stamp.dev.to_string() != root_device
+            || self.root_stamp.ino.to_string() != root_inode
+        {
+            return false;
+        }
+        #[cfg(not(unix))]
+        let _ = (root_device, root_inode);
+        (self.admission_root == options.workspace_root
+            || std::fs::canonicalize(&options.workspace_root).ok() == Some(self.root.clone()))
+            && self.reconcile_options == crate::indexer::ReconcileOptions::from(options)
+            && self.verify(cancel).is_ok()
+    }
+
     /// A capture may feed exactly one graph projection. Cross-link validation is not projection.
     pub fn graph_projection_count(&self) -> usize {
         self.graph_projections.load(Ordering::Relaxed)

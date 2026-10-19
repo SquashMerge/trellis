@@ -3078,3 +3078,79 @@ async fn waiting_client_gets_root_changed_for_lost_root_then_gc_lookup_is_not_fo
         "{body}"
     );
 }
+
+/// A CLI queue read may pass its first root check before rename, then lose
+/// the pathname to legitimate GC before it acquires SH. The protected second
+/// root check must preserve the accepted request's root_changed outcome.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn root_loss_between_cli_queue_check_and_shared_use_returns_root_changed() {
+    let base = tempfile::tempdir().unwrap();
+    let (current, lost) = (base.path().join("current"), base.path().join("lost"));
+    for root in [&current, &lost] {
+        fs::create_dir(root).unwrap();
+        fs::write(root.join("a.js"), "function source() {}\n").unwrap();
+    }
+    let topology = roots(base.path());
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(CheckoutRegistry::with_roots(
+        topology.clone(),
+    )));
+    let lost_id = identity(&lost);
+    let key = lost_id.root_key.clone();
+    let queue = topology.requests_db(&lost_id);
+    let runtime = {
+        let mut registry = registry.lock().await;
+        registry.attach_launch(1, &lost_id).unwrap();
+        registry.activate(&key).unwrap()
+    };
+    ready(&runtime).await;
+    let scheduler = runtime.browser_scheduler().unwrap();
+    let (release_hold, holder) = hold_worker(scheduler.clone()).await;
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_read, held_read) = std::sync::mpsc::sync_channel::<()>(1);
+    scheduler.set_queue_root_verify_after_enqueue_for_tests(move || {
+        let _ = entered_tx.send(());
+        held_read.recv().unwrap();
+    });
+    let options = trellis::indexer::IndexOptions::new(lost.clone());
+    let indexer = runtime.clone();
+    let waiter = tokio::task::spawn_blocking(move || indexer.cli_index(&options));
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, entered_rx)
+        .await
+        .expect("CLI read did not pass its first root check")
+        .unwrap();
+    let accepted = queue_rows(&queue);
+    assert_eq!(accepted.len(), 1);
+    let id = accepted[0].split(':').next().unwrap().to_owned();
+    assert_eq!(accepted, vec![format!("{id}:queued/")]);
+    fs::rename(&lost, base.path().join("moved")).unwrap();
+    fs::create_dir(&lost).unwrap();
+    fs::write(lost.join("a.js"), "function replacement() {}\n").unwrap();
+    drop(release_hold);
+    holder.join().unwrap();
+    retired(&scheduler).await;
+    assert_eq!(
+        queue_rows(&queue),
+        vec![format!("{id}:failed/root_changed")]
+    );
+    assert!(
+        !waiter.is_finished(),
+        "CLI read must remain paused before SH"
+    );
+    let gc = {
+        let mut registry = registry.lock().await;
+        registry.disconnect(1);
+        release_when_idle(&mut registry, &key).await;
+        registry.attach_launch(2, &identity(&current)).unwrap();
+        registry.activate(&identity(&current).root_key).unwrap()
+    };
+    ready(&gc).await;
+    gc_until_deleted(&gc, &queue).await;
+    release_read.send(()).unwrap();
+    let error = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, waiter)
+        .await
+        .expect("CLI waiter did not leave protected queue read")
+        .unwrap()
+        .expect_err("old-root request cannot succeed");
+    assert!(error.to_string().starts_with("root_changed"), "{error:#}");
+}

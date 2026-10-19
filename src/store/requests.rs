@@ -779,6 +779,14 @@ impl Store {
             Err(error) => Err(error),
         }
     }
+    /// Pause a queue read after the first root check and before acquiring SH.
+    /// The next protected check must reject a root replacement in that gap.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn set_after_queue_root_verify_hook_for_tests(&self, hook: impl FnOnce() + Send + 'static) {
+        self.test_queue_after_root_verify_hook.set(hook);
+    }
+
     fn request_connection_for_root_loss(
         &self,
         old_root: bool,
@@ -789,12 +797,19 @@ impl Store {
         self.test_queue_before_shared_hook.run();
         if !old_root {
             self.identity.verify()?;
+            #[cfg(feature = "test-support")]
+            self.test_queue_after_root_verify_hook.run();
         }
         let guard = if old_root {
             self.roots.index_use_existing_without_root(&self.identity)?
         } else {
             self.roots.index_use(&self.identity)?
         };
+        // A root change while acquiring SH must win over a missing queue.
+        // Once SH is held, GC cannot unlink this queue before the read ends.
+        if !old_root {
+            self.identity.verify()?;
+        }
         // A waiter may have obtained SH only after the EX replacement
         // published: check the same atomic state while protected, before RW
         // open/create or SQLite journal recovery.
@@ -1645,6 +1660,8 @@ impl Store {
         };
         let changed=tx.execute("UPDATE requests SET state=?1,result_generation=?2,result_revision=?3,error_code=?4,finished_at=?5 WHERE seq=?6 AND state='running' AND claim_incarnation=?7 AND root_device=?8 AND root_inode=?9",params![if code.is_some(){"failed"}else{"done"},generation,revision,code,now(),request.seq,session.incarnation().to_string(),self.identity.device.to_string(),self.identity.inode.to_string()])?;
         ensure!(changed == 1, "storage_busy: request claim changed");
+        #[cfg(test)]
+        self.test_before_request_terminal_commit_hook.run();
         tx.commit()?;
         #[cfg(feature = "test-support")]
         if self

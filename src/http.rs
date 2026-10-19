@@ -745,6 +745,20 @@ impl DaemonState {
         true
     }
 
+    /// Arm a queue-read race only after CLI enqueue has committed. Enqueue
+    /// itself opens the queue, so arming earlier would pause the wrong read.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn set_queue_root_verify_after_enqueue_for_tests(
+        &self,
+        hook: impl FnOnce() + Send + 'static,
+    ) {
+        let store = self.store.clone();
+        self.store.set_after_enqueue_commit_hook_for_tests(move || {
+            store.set_after_queue_root_verify_hook_for_tests(hook);
+        });
+    }
+
     /// Offline snapshot fixtures opt out of the daemon's queue and maintenance ticks.
     /// See #111 for the separate read-during-reconciliation product fix.
     #[cfg(any(test, feature = "test-support"))]
@@ -1254,9 +1268,65 @@ impl DaemonState {
         {
             #[cfg(test)]
             self.test_queue_current_phase.store(2, Ordering::Release);
-            let processed = match crate::index_coordinator::drain_one_request_observed(
+            // A completed row leaves one watcher obligation ahead of the next claim.
+            // Skip debounce at this gate, but retain the watcher's retry deadline.
+            {
+                let explicit = self.explicit_pending.lock().unwrap().clone();
+                let selected = explicit
+                    .as_ref()
+                    .map(|options| IndexOptions::clone(options))
+                    .unwrap_or(
+                        self.store
+                            .recorded_index_options()?
+                            .unwrap_or_else(|| self.config().options.clone()),
+                    );
+                let gate_due =
+                    self.watcher_work
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .is_some_and(|(owner, work)| {
+                            owner
+                                .upgrade()
+                                .is_some_and(|owner| Arc::ptr_eq(&owner, session))
+                                && work.gate_pending(&selected)
+                        });
+                if gate_due {
+                    #[cfg(test)]
+                    self.test_queue_before_watcher_reconcile.run();
+                    let mut guard = self.watcher_work.lock().unwrap();
+                    let pending = if let Some((owner, work)) = guard.as_mut()
+                        && owner
+                            .upgrade()
+                            .is_some_and(|owner| Arc::ptr_eq(&owner, session))
+                        && work.gate_pending(&selected)
+                    {
+                        let accounted = work.reconcile_queue_gate(
+                            &self.store,
+                            session,
+                            &selected,
+                            &self.watcher_cancel,
+                        )?;
+                        self.publish_watch_status(work, &selected);
+                        if accounted {
+                            self.finalize_watcher_gate(work, &selected, explicit.as_ref());
+                        }
+                        !accounted || work.gate_pending(&selected)
+                    } else {
+                        false
+                    };
+                    drop(guard);
+                    #[cfg(test)]
+                    self.test_queue_after_watcher_reconcile.run();
+                    if pending {
+                        return Ok(());
+                    }
+                }
+            }
+            let processed = match crate::index_coordinator::drain_one_request_with_watcher(
                 &self.store,
                 session,
+                &self.watcher_work,
                 |id, p| {
                     self.job_progress.lock().unwrap().insert(id.to_owned(), p);
                 },
@@ -1336,29 +1406,37 @@ impl DaemonState {
                         *work = Some((Arc::downgrade(session), scheduler));
                     }
                     if let Some((_, scheduler)) = work.as_mut() {
+                        if processed > 0 {
+                            scheduler.set_queue_gate();
+                        }
                         #[cfg(test)]
                         self.test_queue_current_phase.store(4, Ordering::Release);
                         #[cfg(test)]
                         self.test_queue_before_watcher_reconcile.run();
-                        let reconciled = scheduler.reconcile_due(
-                            &self.store,
-                            session,
-                            &selected_options,
-                            &self.watcher_cancel,
-                            false,
-                        );
+                        let reconciled = if scheduler.gate_pending(&selected_options) {
+                            scheduler.reconcile_queue_gate(
+                                &self.store,
+                                session,
+                                &selected_options,
+                                &self.watcher_cancel,
+                            )
+                        } else {
+                            scheduler.reconcile_due(
+                                &self.store,
+                                session,
+                                &selected_options,
+                                &self.watcher_cancel,
+                                false,
+                            )
+                        };
                         self.publish_watch_status(scheduler, &selected_options);
                         let accounted = reconciled?;
-                        // Explicit options are applied once: after a verified
-                        // inventory under them, the recorded head selects again.
-                        if accounted && let Some(applied) = &explicit {
-                            let mut pending = self.explicit_pending.lock().unwrap();
-                            if pending
-                                .as_ref()
-                                .is_some_and(|current| Arc::ptr_eq(current, applied))
-                            {
-                                *pending = None;
-                            }
+                        if accounted {
+                            self.finalize_watcher_gate(
+                                scheduler,
+                                &selected_options,
+                                explicit.as_ref(),
+                            );
                         }
                         #[cfg(test)]
                         self.test_queue_current_phase.store(5, Ordering::Release);
@@ -1367,25 +1445,6 @@ impl DaemonState {
                         // ACK only a verified, acknowledged full inventory.
                         // Neither a failed FIFO probe nor a newer accepted hint
                         // can be called settled. The reporter only try_sends here.
-                        #[cfg(feature = "test-support")]
-                        if accounted
-                            && let Some(reporter) = self.causal_witness.lock().unwrap().clone()
-                            && !scheduler.accepted_watch_intent(&selected_options)
-                            && matches!(self.store.earliest_unfinished_request(), Ok(None))
-                            && let (Some(lineage), Some(generation), Some(certified_pin)) = (
-                                scheduler.causal_lineage(),
-                                scheduler.accounted_watch_generation(),
-                                scheduler.accounted_watch_pin(),
-                            )
-                            && self.store.verify_writer_session(session).is_ok()
-                            && self
-                                .store
-                                .index_baseline()
-                                .is_ok_and(|pin| pin == certified_pin)
-                            && self.store.verify_writer_session(session).is_ok()
-                        {
-                            reporter.watch_ack(lineage, generation, certified_pin, true);
-                        }
                     }
                 }
             }
@@ -1393,6 +1452,45 @@ impl DaemonState {
         }
         Ok(())
     }
+    fn finalize_watcher_gate(
+        &self,
+        work: &crate::index_coordinator::WatcherWork,
+        selected: &IndexOptions,
+        explicit: Option<&Arc<IndexOptions>>,
+    ) {
+        // A later registration must not be cleared by an older completed gate.
+        if let Some(applied) = explicit {
+            let mut pending = self.explicit_pending.lock().unwrap();
+            if pending
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, applied))
+            {
+                *pending = None;
+            }
+        }
+        #[cfg(not(feature = "test-support"))]
+        let _ = (work, selected);
+        #[cfg(feature = "test-support")]
+        if let Some(reporter) = self.causal_witness.lock().unwrap().clone()
+            && !work.accepted_watch_intent(selected)
+            && matches!(self.store.earliest_unfinished_request(), Ok(None))
+            && let (Some(lineage), Some(generation), Some(certified_pin)) = (
+                work.causal_lineage(),
+                work.accounted_watch_generation(),
+                work.accounted_watch_pin(),
+            )
+            && let Ok(session) = self.retained_serving_session()
+            && self.store.verify_writer_session(&session).is_ok()
+            && self
+                .store
+                .index_baseline()
+                .is_ok_and(|pin| pin == certified_pin)
+            && self.store.verify_writer_session(&session).is_ok()
+        {
+            reporter.watch_ack(lineage, generation, certified_pin, true);
+        }
+    }
+
     pub fn retained_serving_session(
         &self,
     ) -> anyhow::Result<Arc<crate::store::topology::WriterSession>> {
