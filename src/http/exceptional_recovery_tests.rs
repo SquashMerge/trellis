@@ -1155,3 +1155,461 @@ async fn multiple_posts_commit_fifo_with_local_writer() {
     assert_eq!(store.request_by_id(&a.id).unwrap().unwrap().state, "done");
     assert_eq!(store.request_by_id(&b.id).unwrap().unwrap().state, "done");
 }
+
+fn serving_queue_watch_fixture() -> (tempfile::TempDir, Store, Arc<DaemonState>, IndexOptions) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("workspace");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("a.js"), "function a() {}\n").unwrap();
+    let store = Store::open_for_tests(&tmp.path().join("state"), &root).unwrap();
+    let options = IndexOptions::new(root);
+    let (_, owner) = crate::index_coordinator::reconcile_workspace(
+        &store,
+        &options,
+        &Arc::new(AtomicBool::new(false)),
+        |_| {},
+    )
+    .unwrap();
+    let state = new(
+        store.clone(),
+        options.clone(),
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+        "127.0.0.1:7331".parse().unwrap(),
+    )
+    .unwrap();
+    state.worker_started.store(true, Ordering::Release);
+    *state.runtime.lock().unwrap() = RuntimeState::Ready(owner.clone());
+    let mut watcher = crate::index_coordinator::WatcherWork::new(&store, &owner, &options).unwrap();
+    watcher.disable_native_watcher_for_tests();
+    watcher.set_waker(state.watch_waker.clone());
+    *state.watcher_work.lock().unwrap() = Some((Arc::downgrade(&owner), watcher));
+    (tmp, store, state, options)
+}
+
+#[test]
+fn queued_row_certifies_existing_full_batch_without_watcher_republication() {
+    let (_tmp, store, state, options) = serving_queue_watch_fixture();
+    let first = store.enqueue_request(&options, None).unwrap();
+    let second = store.enqueue_request(&options, None).unwrap();
+    let baseline = store.status().unwrap().revision;
+    state.worker_step().unwrap();
+    let terminal = store.request_by_id(&first.id).unwrap().unwrap();
+    let pin = terminal.revision.unwrap();
+    assert_eq!(terminal.state, "done");
+    assert_eq!(pin.index_revision, baseline.index_revision + 1);
+    assert_eq!(store.status().unwrap().revision, pin);
+    assert_eq!(
+        store.request_by_id(&second.id).unwrap().unwrap().state,
+        "queued"
+    );
+    let guard = state.watcher_work.lock().unwrap();
+    let work = &guard.as_ref().unwrap().1;
+    assert_eq!(work.accounted_watch_generation(), Some(1));
+    assert_eq!(work.accounted_watch_pin(), Some(pin));
+    drop(guard);
+    state.worker_step().unwrap();
+    assert_eq!(
+        store.request_by_id(&second.id).unwrap().unwrap().state,
+        "done"
+    );
+}
+
+#[test]
+fn later_full_intent_reconciles_before_next_fifo_claim_without_debounce() {
+    let (_tmp, store, state, options) = serving_queue_watch_fixture();
+    let first = store.enqueue_request(&options, None).unwrap();
+    let second = store.enqueue_request(&options, None).unwrap();
+    let work = state.watcher_work.lock().unwrap();
+    work.as_ref()
+        .unwrap()
+        .1
+        .submit_watch_event_for_tests(Ok(notify::Event::new(notify::EventKind::Create(
+            notify::event::CreateKind::File,
+        ))
+        .add_path(options.workspace_root.join("new.js"))));
+    drop(work);
+    // This pre-admission create belongs to the exact admitted full source inventory.
+    std::fs::write(
+        options.workspace_root.join("new.js"),
+        "function fresh() {}\n",
+    )
+    .unwrap();
+    state.worker_step().unwrap();
+    assert_eq!(
+        store.request_by_id(&first.id).unwrap().unwrap().state,
+        "done"
+    );
+    assert_eq!(
+        store.request_by_id(&second.id).unwrap().unwrap().state,
+        "queued"
+    );
+    assert!(
+        !state
+            .watcher_work
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .1
+            .accepted_watch_intent(&options)
+    );
+}
+
+#[test]
+fn post_row_nonurgent_create_gate_precedes_next_fifo_claim() {
+    let (_tmp, store, state, options) = serving_queue_watch_fixture();
+    let first = store.enqueue_request(&options, None).unwrap();
+    let second = store.enqueue_request(&options, None).unwrap();
+    let incoming = options.workspace_root.join("new.js");
+    let watch = state.clone();
+    state.test_queue_after_startup_drain.set(move || {
+        std::fs::write(&incoming, "function later() {}\n").unwrap();
+        watch
+            .watcher_work
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .1
+            .submit_watch_event_for_tests(Ok(notify::Event::new(notify::EventKind::Create(
+                notify::event::CreateKind::File,
+            ))
+            .add_path(incoming)));
+    });
+    state.worker_step().unwrap();
+    let first_done = store.request_by_id(&first.id).unwrap().unwrap();
+    assert_eq!(first_done.state, "done");
+    assert_eq!(
+        store.request_by_id(&second.id).unwrap().unwrap().state,
+        "queued"
+    );
+    let gate_pin = store.status().unwrap().revision;
+    assert!(gate_pin.index_revision > first_done.revision.unwrap().index_revision);
+    assert!(
+        !state
+            .watcher_work
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .1
+            .accepted_watch_intent(&options)
+    );
+    state.worker_step().unwrap();
+    let last = store.request_by_id(&second.id).unwrap().unwrap();
+    assert_eq!(last.state, "done");
+    assert!(last.revision.unwrap().index_revision > gate_pin.index_revision);
+}
+
+#[test]
+fn failed_nonurgent_full_gate_retries_before_next_fifo_claim() {
+    let (_tmp, store, state, options) = serving_queue_watch_fixture();
+    let first = store.enqueue_request(&options, None).unwrap();
+    let second = store.enqueue_request(&options, None).unwrap();
+    let incoming = options.workspace_root.join("new.js");
+    let watch = state.clone();
+    state.test_queue_after_startup_drain.set(move || {
+        std::fs::write(&incoming, [0xff, 0xfe]).unwrap();
+        watch
+            .watcher_work
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .1
+            .submit_watch_event_for_tests(Ok(notify::Event::new(notify::EventKind::Create(
+                notify::event::CreateKind::File,
+            ))
+            .add_path(incoming)));
+    });
+    assert!(
+        state.worker_step().is_err(),
+        "the full gate must reject unreadable source text"
+    );
+    let first_pin = store
+        .request_by_id(&first.id)
+        .unwrap()
+        .unwrap()
+        .revision
+        .unwrap();
+    assert_eq!(
+        store.request_by_id(&second.id).unwrap().unwrap().state,
+        "queued"
+    );
+    std::fs::write(
+        options.workspace_root.join("new.js"),
+        "function recovered() {}\n",
+    )
+    .unwrap();
+    state.worker_step().unwrap();
+    assert_eq!(
+        store.request_by_id(&second.id).unwrap().unwrap().state,
+        "queued",
+        "retry delay cannot admit Q1"
+    );
+    state
+        .watcher_work
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .1
+        .expire_retry_for_tests();
+    let observed = store.clone();
+    let second_id = second.id.clone();
+    state.test_queue_after_watcher_reconcile.set(move || {
+        assert_eq!(
+            observed.request_by_id(&second_id).unwrap().unwrap().state,
+            "queued"
+        );
+        assert!(observed.status().unwrap().revision.index_revision > first_pin.index_revision);
+    });
+    state.worker_step().unwrap();
+    assert_eq!(
+        store.request_by_id(&second.id).unwrap().unwrap().state,
+        "done"
+    );
+}
+
+/// The guarded browser route and the blocking CLI route admit the same FIFO
+/// work. Each row can certify a full watcher batch only at its own terminal
+/// pin; an unfinished successor cannot borrow that certificate.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn browser_and_cli_routes_share_certified_watcher_gate() {
+    use crate::daemon::registry::CheckoutRegistry;
+    use tower::ServiceExt;
+
+    async fn hold_worker(
+        state: Arc<DaemonState>,
+    ) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _hold = state.hold_worker_for_tests();
+            entered_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        tokio::time::timeout(crate::testing::HANG_BACKSTOP, entered_rx)
+            .await
+            .expect("worker hold did not enter")
+            .unwrap();
+        (release_tx, holder)
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("workspace");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("a.js"), "function initial() {}\n").unwrap();
+    let identity = WorkspaceIdentity::discover(Some(&root), &root)
+        .unwrap()
+        .attach_marker()
+        .unwrap();
+    let roots = TopologyRoots::isolated_for_tests(
+        tmp.path().join("state/cache"),
+        tmp.path().join("state/data"),
+    );
+    let mut registry = CheckoutRegistry::with_roots(roots);
+    registry.attach_launch(1, &identity).unwrap();
+    let runtime = registry.activate(&identity.root_key).unwrap();
+    let state = runtime.browser_scheduler().unwrap();
+    // Startup readiness is owner-published on this condition variable, not
+    // inferred from a sleep or from a sampled worker flag.
+    let startup = state.clone();
+    tokio::time::timeout(
+        crate::testing::HANG_BACKSTOP,
+        tokio::task::spawn_blocking(move || {
+            let mut current = startup.runtime.lock().unwrap();
+            while current.session().is_none() {
+                current = startup.state_changed.wait(current).unwrap();
+            }
+        }),
+    )
+    .await
+    .expect("startup did not become ready")
+    .unwrap();
+    let (release_browser, browser_holder) = hold_worker(state.clone()).await;
+    let owner = state.retained_serving_session().unwrap();
+    let options = state.config().options.clone();
+    let mut watcher = crate::index_coordinator::WatcherWork::publishing(
+        &state.store,
+        &owner,
+        &options,
+        state.watcher_health.clone(),
+    )
+    .unwrap();
+    watcher.disable_native_watcher_for_tests();
+    watcher.set_waker(state.watch_waker.clone());
+    let browser_generation = watcher.generation_handle().load(Ordering::SeqCst);
+    state.publish_watch_status(&watcher, &options);
+    *state.watcher_work.lock().unwrap() = Some((Arc::downgrade(&owner), watcher));
+    assert!(state.store.earliest_unfinished_request().unwrap().is_none());
+
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/api/index")
+        .header("host", state.hosts[0].as_str())
+        .header("origin", state.origins[0].as_str())
+        .header("authorization", format!("Bearer {}", state.token))
+        .header("content-type", "application/json")
+        .body(Body::from("{}"))
+        .unwrap();
+    let response = router(state.clone()).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let accepted: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+            .unwrap();
+    let browser_id = accepted["id"].as_str().unwrap().to_owned();
+    let browser_queued = state.store.request_by_id(&browser_id).unwrap().unwrap();
+    assert_eq!(browser_queued.state, "queued");
+    let browser_terminal = Arc::new(tokio::sync::Notify::new());
+    state
+        .store
+        .notify_on_terminal_request_for_tests(&browser_id, browser_terminal.clone());
+    release_browser.send(()).unwrap();
+    browser_holder.join().unwrap();
+    tokio::time::timeout(crate::testing::HANG_BACKSTOP, browser_terminal.notified())
+        .await
+        .expect("browser row did not commit");
+    let (release_cli, cli_holder) = hold_worker(state.clone()).await;
+    let browser_done = state.store.request_by_id(&browser_id).unwrap().unwrap();
+    assert_eq!(browser_done.state, "done");
+    let browser_pin = browser_done.revision.unwrap();
+    {
+        let work = state.watcher_work.lock().unwrap();
+        let work = &work.as_ref().unwrap().1;
+        assert_eq!(work.accounted_watch_generation(), Some(browser_generation));
+        assert_eq!(work.accounted_watch_pin(), Some(browser_pin));
+        assert_eq!(work.full_capture_attempts_for_tests(), 0);
+    }
+    assert_eq!(state.store.status().unwrap().revision, browser_pin);
+
+    // A new watcher epoch has its own initial full inventory. The previous
+    // completed-row gate must not be borrowed by the later CLI request.
+    let mut cli_watcher = crate::index_coordinator::WatcherWork::publishing(
+        &state.store,
+        &owner,
+        &options,
+        state.watcher_health.clone(),
+    )
+    .unwrap();
+    cli_watcher.disable_native_watcher_for_tests();
+    cli_watcher.set_waker(state.watch_waker.clone());
+    state.publish_watch_status(&cli_watcher, &options);
+    *state.watcher_work.lock().unwrap() = Some((Arc::downgrade(&owner), cli_watcher));
+    let new_file = root.join("new.js");
+    std::fs::write(&new_file, "function later() {}\n").unwrap();
+    assert!(
+        state.submit_watch_event_for_tests(Ok(notify::Event::new(notify::EventKind::Create(
+            notify::event::CreateKind::File
+        ))
+        .add_path(new_file),))
+    );
+    let cli_generation = state
+        .watcher_work
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .1
+        .generation_handle()
+        .load(Ordering::SeqCst);
+    assert!(
+        cli_generation >= 2,
+        "accepted CLI event advanced its watcher epoch"
+    );
+    let (enqueued_tx, enqueued_rx) = tokio::sync::oneshot::channel();
+    state
+        .store
+        .set_after_enqueue_commit_hook_for_tests(move || {
+            let _ = enqueued_tx.send(());
+        });
+    let cli_runtime = runtime.clone();
+    let cli_options = options.clone();
+    let cli = tokio::task::spawn_blocking(move || cli_runtime.cli_index(&cli_options));
+    tokio::time::timeout(crate::testing::HANG_BACKSTOP, enqueued_rx)
+        .await
+        .expect("CLI did not durably enqueue")
+        .unwrap();
+    let cli_queued = state.store.earliest_unfinished_request().unwrap().unwrap();
+    assert_eq!(cli_queued.state, "queued");
+    assert!(browser_queued.seq < cli_queued.seq);
+    let trailing = state.enqueue_index(&options, None).unwrap();
+    let next = state.store.request_by_id(&trailing.id).unwrap().unwrap();
+    assert_eq!(next.state, "queued");
+    assert!(cli_queued.seq < next.seq);
+
+    // Hold the worker after CLI terminal confirmation but before it may
+    // reconcile the watcher or claim the next FIFO row.
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_step, step_wait) = std::sync::mpsc::channel();
+    state.test_queue_after_startup_drain.set(move || {
+        let _ = entered_tx.send(());
+        let _ = step_wait.recv();
+    });
+    release_cli.send(()).unwrap();
+    cli_holder.join().unwrap();
+    tokio::time::timeout(crate::testing::HANG_BACKSTOP, entered_rx)
+        .await
+        .expect("CLI step did not reach post-terminal hook")
+        .unwrap();
+    let cli_done = state.store.request_by_id(&cli_queued.id).unwrap().unwrap();
+    let cli_pin = cli_done.revision.unwrap();
+    assert_eq!(cli_done.state, "done");
+    assert!(cli_pin.index_revision > browser_pin.index_revision);
+    let next_still_queued = state.store.request_by_id(&next.id).unwrap().unwrap();
+    assert_eq!(next_still_queued.state, "queued");
+    assert!(next_still_queued.started_at.is_none());
+    assert_eq!(
+        state
+            .store
+            .earliest_unfinished_request()
+            .unwrap()
+            .unwrap()
+            .id,
+        next.id
+    );
+    {
+        let work = state.watcher_work.lock().unwrap();
+        let work = &work.as_ref().unwrap().1;
+        assert_eq!(work.accounted_watch_generation(), Some(cli_generation));
+        assert_eq!(work.accounted_watch_pin(), Some(cli_pin));
+        assert_eq!(work.full_capture_attempts_for_tests(), 0);
+    }
+    // An internal ACK covers this batch, but the public WATCH_ACK requires an
+    // empty FIFO. The queued next row is the witness guard's negative premise.
+    assert_eq!(state.store.status().unwrap().revision, cli_pin);
+    release_step.send(()).unwrap();
+    let cli_result = tokio::time::timeout(crate::testing::HANG_BACKSTOP, cli)
+        .await
+        .expect("CLI did not finish")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        cli_result["publishedRevision"],
+        serde_json::to_value(cli_pin).unwrap()
+    );
+    let next_terminal = Arc::new(tokio::sync::Notify::new());
+    state
+        .store
+        .notify_on_terminal_request_for_tests(&next.id, next_terminal.clone());
+    if state.store.request_by_id(&next.id).unwrap().unwrap().state != "done" {
+        tokio::time::timeout(crate::testing::HANG_BACKSTOP, next_terminal.notified())
+            .await
+            .expect("successor did not finish");
+    }
+    let next_done = state.store.request_by_id(&next.id).unwrap().unwrap();
+    assert_eq!(next_done.state, "done");
+    assert!(next_done.revision.unwrap().index_revision > cli_pin.index_revision);
+    assert_eq!(
+        state
+            .watcher_work
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .1
+            .full_capture_attempts_for_tests(),
+        0,
+    );
+}

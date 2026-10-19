@@ -211,6 +211,7 @@ impl IndexJobCoordinator {
                 unchanged_fast: false,
                 cutoff: || Ok(()),
             },
+            || {},
         )
     }
 
@@ -233,6 +234,7 @@ impl IndexJobCoordinator {
                 unchanged_fast: true,
                 cutoff: || Ok(()),
             },
+            || {},
         )
     }
 
@@ -256,10 +258,12 @@ impl IndexJobCoordinator {
                 unchanged_fast: false,
                 cutoff,
             },
+            || {},
         )?;
         Ok((pin, self.publication.take().expect("publication admitted")))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_with_capture(
         &mut self,
         options: &IndexOptions,
@@ -271,6 +275,7 @@ impl IndexJobCoordinator {
             crate::native_evidence::FullNativeStage,
         ),
         admission: PublicationAdmission<impl FnMut() -> Result<()>>,
+        before_capture: impl FnOnce(),
     ) -> Result<IndexPin> {
         let PublicationAdmission {
             capture: admitted,
@@ -289,7 +294,10 @@ impl IndexJobCoordinator {
         self.store.begin_writer_publication(&self.session)?;
         let capture = match admitted {
             Some(capture) => capture,
-            None => Capture::admit(options, cancel, &progress)?,
+            None => {
+                before_capture();
+                Capture::admit(options, cancel, &progress)?
+            }
         };
         report("capture", phase_start.elapsed());
         phase_start = std::time::Instant::now();
@@ -413,10 +421,23 @@ impl std::fmt::Display for CutoffChanged {
 }
 impl std::error::Error for CutoffChanged {}
 
+struct RequestCoverage {
+    request: crate::store::requests::Request,
+    batch: crate::watch::DirtyBatch,
+    identity: Arc<std::sync::atomic::AtomicU64>,
+    options: IndexOptions,
+    pin: Option<IndexPin>,
+    verified: bool,
+}
+
 /// The elected owner alone drives the advisory watcher and the durable FIFO.
 /// This is an in-memory scheduler, not a second request queue.
 pub struct WatcherWork {
     watch: crate::watch::WatchSignals,
+    request_coverage: Option<RequestCoverage>,
+    queue_gate: bool,
+    #[cfg(all(test, feature = "test-support"))]
+    full_capture_attempts: usize,
     /// Shared with every watcher this owner creates; read without its lock.
     health: Arc<crate::watch::WatcherHealth>,
     last_inventory: std::time::Instant,
@@ -487,6 +508,10 @@ impl WatcherWork {
         Ok(Self {
             health,
             watch,
+            request_coverage: None,
+            queue_gate: false,
+            #[cfg(all(test, feature = "test-support"))]
+            full_capture_attempts: 0,
             last_inventory: std::time::Instant::now(),
             retry_after: None,
             last_accounted_generation: None,
@@ -555,7 +580,9 @@ impl WatcherWork {
     }
 
     fn options_differ(&self, options: &IndexOptions) -> bool {
-        self.options.workspace_root != options.workspace_root
+        (self.options.workspace_root != options.workspace_root
+            && std::fs::canonicalize(&self.options.workspace_root).ok()
+                != std::fs::canonicalize(&options.workspace_root).ok())
             || self.options.scip_path != options.scip_path
             || self.options.manifest_path != options.manifest_path
             || self.options.max_file_bytes != options.max_file_bytes
@@ -613,6 +640,78 @@ impl WatcherWork {
 
     pub fn accounted_watch_generation(&self) -> Option<u64> {
         self.last_accounted_generation
+    }
+
+    #[cfg(all(test, feature = "test-support"))]
+    pub(crate) fn full_capture_attempts_for_tests(&self) -> usize {
+        self.full_capture_attempts
+    }
+
+    fn snapshot_request(
+        &mut self,
+        request: &crate::store::requests::Request,
+        options: &IndexOptions,
+    ) -> Option<RequestCoverage> {
+        if self.options_differ(options) {
+            return None;
+        }
+        let batch = self.watch.drain();
+        if !self.accepted_watch_intent(options) {
+            return None;
+        }
+        Some(RequestCoverage {
+            request: request.clone(),
+            batch,
+            identity: self.watch.generation_handle(),
+            options: options.clone(),
+            pin: None,
+            verified: false,
+        })
+    }
+
+    fn confirm_request(&mut self, store: &Store, session: &WriterSession, id: &str) -> Result<()> {
+        if self.request_coverage.is_none() {
+            return Ok(());
+        }
+        let row = store.request_by_id(id)?;
+        let certificate = self.request_coverage.take().expect("coverage checked");
+        let Some(pin) = certificate.pin else {
+            return Ok(());
+        };
+        if row.as_ref().is_none_or(|row| {
+            row.id != certificate.request.id
+                || row.seq != certificate.request.seq
+                || row.claim_incarnation != certificate.request.claim_incarnation
+                || row.root_device != certificate.request.root_device
+                || row.root_inode != certificate.request.root_inode
+                || row.state != "done"
+                || row.revision != Some(pin)
+                || row.error_code.is_some()
+                || row.finished_at.is_none()
+        }) || !certificate.verified
+            || session.incarnation().to_string()
+                != certificate
+                    .request
+                    .claim_incarnation
+                    .as_deref()
+                    .unwrap_or_default()
+            || self.options_differ(&certificate.options)
+            || !Arc::ptr_eq(&self.watch.generation_handle(), &certificate.identity)
+            || store.verify_writer_session(session).is_err()
+            || !store.index_baseline().is_ok_and(|current| current == pin)
+        {
+            return Ok(());
+        }
+        if self.watch.acknowledge(&certificate.batch) {
+            self.last_accounted_generation = Some(certificate.batch.generation);
+            self.last_accounted_pin = Some(pin);
+            self.last_inventory = std::time::Instant::now();
+            self.retry_after = None;
+        } else {
+            self.last_accounted_pin = None;
+            self.watch.require_full();
+        }
+        Ok(())
     }
 
     /// Captured while the publication permit still covered the acknowledged
@@ -675,11 +774,47 @@ impl WatcherWork {
         self.last_inventory = std::time::Instant::now() + std::time::Duration::from_secs(3600);
     }
 
+    #[doc(hidden)]
+    pub fn expire_retry_for_tests(&mut self) {
+        self.retry_after = Some(std::time::Instant::now());
+    }
+
+    #[doc(hidden)]
+    pub fn periodic_inventory_due_for_tests(&self) -> bool {
+        std::time::Instant::now().duration_since(self.last_inventory) >= PERIODIC_INVENTORY
+    }
+
     /// Advance only the inventory deadline in a test. The next ordinary tick
     /// still uses the production admission and publication fences.
     #[doc(hidden)]
     pub fn force_periodic_inventory_for_tests(&mut self) {
         self.last_inventory = std::time::Instant::now() - std::time::Duration::from_secs(60);
+    }
+
+    pub(crate) fn set_queue_gate(&mut self) {
+        self.queue_gate = true;
+    }
+
+    pub(crate) fn gate_pending(&self, options: &IndexOptions) -> bool {
+        self.queue_gate && self.accepted_watch_intent(options)
+    }
+
+    pub(crate) fn reconcile_queue_gate(
+        &mut self,
+        store: &Store,
+        session: &Arc<WriterSession>,
+        options: &IndexOptions,
+        cancel: &CancelFlag,
+    ) -> Result<bool> {
+        self.reconcile_due_with_mode(
+            store,
+            session,
+            options,
+            cancel,
+            false,
+            true,
+            (|_, _| {}, |_| {}),
+        )
     }
 
     /// A full capture always checks root, writer and selected publication fences.
@@ -723,6 +858,23 @@ impl WatcherWork {
             impl FnOnce(&crate::watch::WatchSignals),
         ),
     ) -> Result<bool> {
+        self.reconcile_due_with_mode(store, session, options, cancel, force, false, cutoffs)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn reconcile_due_with_mode(
+        &mut self,
+        store: &Store,
+        session: &Arc<WriterSession>,
+        options: &IndexOptions,
+        cancel: &CancelFlag,
+        force: bool,
+        skip_debounce: bool,
+        cutoffs: (
+            impl FnOnce(&Capture, &crate::watch::WatchSignals),
+            impl FnOnce(&crate::watch::WatchSignals),
+        ),
+    ) -> Result<bool> {
         let (observe, after_cutoff) = cutoffs;
         store.verify_writer_session(session)?;
         // The durable FIFO head may have different selected inputs from this
@@ -739,6 +891,7 @@ impl WatcherWork {
                 next.set_waker(waker.clone());
             }
             self.watch = next;
+            self.request_coverage = None;
             self.options = options.clone();
             self.last_accounted_generation = None;
             self.last_accounted_pin = None;
@@ -778,7 +931,7 @@ impl WatcherWork {
         if !force
             && !periodic
             && ((self.watch.degraded() && self.last_accounted_generation == Some(batch.generation))
-                || !self.watch.batch_ready_at(now))
+                || (!skip_debounce && !self.watch.batch_ready_at(now)))
         {
             return Ok(false);
         }
@@ -796,6 +949,10 @@ impl WatcherWork {
                     publication.waited_for().as_micros()
                 ),
             );
+            #[cfg(all(test, feature = "test-support"))]
+            {
+                self.full_capture_attempts += 1;
+            }
             let captured = Capture::admit(options, cancel, &|_| {})?;
             observe(&captured, &self.watch);
             // Reject a hinted edit before checking the admitted bytes against
@@ -857,8 +1014,13 @@ impl WatcherWork {
                     self.watch.require_full();
                 }
                 drop(publication);
-                self.last_inventory = std::time::Instant::now();
-                self.retry_after = None;
+                if accounted {
+                    self.last_inventory = std::time::Instant::now();
+                    self.retry_after = None;
+                    if !self.accepted_watch_intent(options) {
+                        self.queue_gate = false;
+                    }
+                }
                 Ok(accounted)
             }
             Err(error) if error.is::<CutoffChanged>() => {
@@ -932,6 +1094,7 @@ pub fn drain_requests_observed_with_native(
         native_observe,
         usize::MAX,
         None,
+        None,
     )
 }
 
@@ -950,9 +1113,32 @@ pub fn drain_one_request_observed(
         |_, _, _| {},
         1,
         None,
+        None,
     )
 }
 
+pub(crate) type OwningWatcher =
+    std::sync::Mutex<Option<(std::sync::Weak<WriterSession>, WatcherWork)>>;
+
+pub(crate) fn drain_one_request_with_watcher(
+    store: &Store,
+    session: &Arc<WriterSession>,
+    watcher: &OwningWatcher,
+    progress: impl Fn(&str, IndexProgress) + Sync,
+) -> Result<usize> {
+    drain_requests_observed_with_cancel(
+        store,
+        session,
+        &Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        progress,
+        |_, _, _| {},
+        1,
+        None,
+        Some(watcher),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn drain_requests_observed_with_cancel(
     store: &Store,
     session: &Arc<WriterSession>,
@@ -965,6 +1151,7 @@ fn drain_requests_observed_with_cancel(
     ) + Sync,
     max_completed: usize,
     cutoff_seq: Option<i64>,
+    watcher: Option<&OwningWatcher>,
 ) -> Result<usize> {
     if store.root_path_replaced()? {
         store.fail_changed_root_requests()?;
@@ -975,6 +1162,22 @@ fn drain_requests_observed_with_cancel(
     // A prior attempt may have published but failed its queue terminal write. Resolve
     // that exact cached result before any new claim or native publication.
     let mut completed = usize::from(store.retry_recorded_completion(session)?);
+    if completed > 0
+        && let Some(watcher) = watcher
+    {
+        let mut guard = watcher.lock().unwrap();
+        if let Some((owner, work)) = guard.as_mut()
+            && owner
+                .upgrade()
+                .is_some_and(|owner| Arc::ptr_eq(&owner, session))
+            && let Some(id) = work
+                .request_coverage
+                .as_ref()
+                .map(|cert| cert.request.id.clone())
+        {
+            work.confirm_request(store, session, &id)?;
+        }
+    }
     if completed >= max_completed {
         return Ok(completed);
     }
@@ -1008,21 +1211,63 @@ fn drain_requests_observed_with_cancel(
                 session.clone(),
             )?;
             before_publish = Some(coordinator.expected.pin());
+            let candidate = std::cell::RefCell::new(None::<RequestCoverage>);
             let result = coordinator.run_with_capture(
                 &options,
                 cancel,
                 |p| progress(&request.id, p),
-                |_| {},
+                |capture| {
+                    if let Some(cert) = candidate.borrow_mut().as_mut() {
+                        cert.verified = capture.covers_watcher_request(
+                            &cert.options,
+                            &request.root_device,
+                            &request.root_inode,
+                            cancel,
+                        );
+                    }
+                },
                 |key, stage| native_observe(&request.id, key, stage),
                 PublicationAdmission {
                     capture: None,
                     unchanged_fast: true,
                     cutoff: || Ok(()),
                 },
+                || {
+                    if let Some(watcher) = watcher {
+                        let mut guard = watcher.lock().unwrap();
+                        if let Some((owner, work)) = guard.as_mut()
+                            && owner
+                                .upgrade()
+                                .is_some_and(|owner| Arc::ptr_eq(&owner, session))
+                        {
+                            *candidate.borrow_mut() = work.snapshot_request(&request, &options);
+                        }
+                    }
+                },
             );
             // A post-COMMIT error can be ambiguous. Retain the permit through
             // terminal ACK, cached completion or typed busy requeue even then.
             publication = coordinator.publication.take();
+            if let Some(watcher) = watcher {
+                let mut guard = watcher.lock().unwrap();
+                if let Some((owner, work)) = guard.as_mut()
+                    && owner
+                        .upgrade()
+                        .is_some_and(|owner| Arc::ptr_eq(&owner, session))
+                {
+                    if let Ok(pin) = &result
+                        && work
+                            .last_accounted_pin
+                            .is_some_and(|accounted| accounted != *pin)
+                    {
+                        work.last_accounted_pin = None;
+                    }
+                    work.request_coverage = candidate.into_inner().and_then(|mut cert| {
+                        cert.pin = result.as_ref().ok().copied();
+                        (cert.verified && cert.pin.is_some()).then_some(cert)
+                    });
+                }
+            }
             result
         })();
         // Ctrl-C stops this CLI waiter, not any accepted client's durable work.
@@ -1070,6 +1315,16 @@ fn drain_requests_observed_with_cancel(
         // No unverified worker can mark a request terminal. On fencing loss leave it running
         // for the next daemon activation to reclaim after complete root reconciliation.
         store.record_and_finish_request(session, &request, outcome)?;
+        if let Some(watcher) = watcher {
+            let mut guard = watcher.lock().unwrap();
+            if let Some((owner, work)) = guard.as_mut()
+                && owner
+                    .upgrade()
+                    .is_some_and(|owner| Arc::ptr_eq(&owner, session))
+            {
+                work.confirm_request(store, session, &request.id)?;
+            }
+        }
         drop(publication);
         completed += 1;
         if completed >= max_completed {

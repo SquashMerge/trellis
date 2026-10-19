@@ -234,6 +234,8 @@ pub struct Store {
     writer_before_metadata_hook: Arc<TestOneShotHook>,
     #[cfg(test)]
     test_queue_before_shared_hook: Arc<TestOneShotHook>,
+    #[cfg(feature = "test-support")]
+    test_queue_after_root_verify_hook: Arc<TestOneShotHook>,
     #[cfg(test)]
     test_queue_select_hook: Arc<TestOneShotHook>,
     #[cfg(any(test, feature = "test-support"))]
@@ -6003,6 +6005,8 @@ impl Store {
             writer_before_metadata_hook: Arc::new(TestOneShotHook::default()),
             #[cfg(test)]
             test_queue_before_shared_hook: Arc::new(TestOneShotHook::default()),
+            #[cfg(feature = "test-support")]
+            test_queue_after_root_verify_hook: Arc::new(TestOneShotHook::default()),
             #[cfg(test)]
             test_queue_select_hook: Arc::new(TestOneShotHook::default()),
             #[cfg(any(test, feature = "test-support"))]
