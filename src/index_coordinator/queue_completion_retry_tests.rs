@@ -198,7 +198,9 @@ fn cached_done_acks_only_original_watcher_batch_after_confirmed_terminal() {
     let first = store.enqueue_request(&options, None).unwrap();
     let second = store.enqueue_request(&options, None).unwrap();
     store.inject_queue_finish_failure(false);
-    let error = drain_one_request_with_watcher(&store, &session, &watcher, |_, _| {}).unwrap_err();
+    let error =
+        drain_one_request_with_watcher(&store, &session, &watcher, |_, _| {}, |claim| claim())
+            .unwrap_err();
     assert!(error.to_string().contains("storage_busy"), "{error:#}");
     let published = store.status().unwrap().revision;
     {
@@ -228,7 +230,8 @@ fn cached_done_acks_only_original_watcher_batch_after_confirmed_terminal() {
         "queued"
     );
     assert_eq!(
-        drain_one_request_with_watcher(&store, &session, &watcher, |_, _| {}).unwrap(),
+        drain_one_request_with_watcher(&store, &session, &watcher, |_, _| {}, |claim| claim())
+            .unwrap(),
         1
     );
     let binding = watcher.lock().unwrap();
@@ -255,7 +258,8 @@ fn newer_intent_during_cached_completion_is_not_acked_as_old_batch() {
     let watcher = std::sync::Mutex::new(Some((Arc::downgrade(&session), watcher)));
     store.enqueue_request(&options, None).unwrap();
     store.inject_queue_finish_failure(false);
-    drain_one_request_with_watcher(&store, &session, &watcher, |_, _| {}).unwrap_err();
+    drain_one_request_with_watcher(&store, &session, &watcher, |_, _| {}, |claim| claim())
+        .unwrap_err();
     watcher
         .lock()
         .unwrap()
@@ -265,7 +269,8 @@ fn newer_intent_during_cached_completion_is_not_acked_as_old_batch() {
         .watch
         .require_full();
     assert_eq!(
-        drain_one_request_with_watcher(&store, &session, &watcher, |_, _| {}).unwrap(),
+        drain_one_request_with_watcher(&store, &session, &watcher, |_, _| {}, |claim| claim())
+            .unwrap(),
         1
     );
     let binding = watcher.lock().unwrap();
@@ -287,7 +292,8 @@ fn differently_configured_request_does_not_ack_existing_full_watch() {
     different.max_file_bytes /= 2;
     let row = store.enqueue_request(&different, None).unwrap();
     assert_eq!(
-        drain_one_request_with_watcher(&store, &session, &watcher, |_, _| {}).unwrap(),
+        drain_one_request_with_watcher(&store, &session, &watcher, |_, _| {}, |claim| claim())
+            .unwrap(),
         1
     );
     assert_eq!(store.request_by_id(&row.id).unwrap().unwrap().state, "done");
@@ -315,7 +321,8 @@ fn periodic_full_inventory_is_certified_by_matching_request_capture() {
     let watcher = std::sync::Mutex::new(Some((Arc::downgrade(&session), watcher)));
     let row = store.enqueue_request(&options, None).unwrap();
     assert_eq!(
-        drain_one_request_with_watcher(&store, &session, &watcher, |_, _| {}).unwrap(),
+        drain_one_request_with_watcher(&store, &session, &watcher, |_, _| {}, |claim| claim())
+            .unwrap(),
         1
     );
     let pin = store
@@ -342,14 +349,24 @@ fn failed_and_cached_failed_rows_keep_watcher_full_due() {
         let row = store.enqueue_request(&options, None).unwrap();
         if cached {
             store.inject_queue_finish_failure(false);
-            assert!(drain_one_request_with_watcher(&store, &session, &watcher, |_, _| {}).is_err());
+            assert!(
+                drain_one_request_with_watcher(
+                    &store,
+                    &session,
+                    &watcher,
+                    |_, _| {},
+                    |claim| claim()
+                )
+                .is_err()
+            );
             assert_eq!(
                 store.request_by_id(&row.id).unwrap().unwrap().state,
                 "running"
             );
         }
         assert_eq!(
-            drain_one_request_with_watcher(&store, &session, &watcher, |_, _| {}).unwrap(),
+            drain_one_request_with_watcher(&store, &session, &watcher, |_, _| {}, |claim| claim())
+                .unwrap(),
             1
         );
         assert_eq!(
@@ -391,7 +408,8 @@ fn drifted_source_set_and_selected_input_do_not_ack_request() {
             fs::write(&file, "function changed() {}\n").unwrap();
         });
         let observed =
-            drain_one_request_with_watcher(&store, &session, &watcher, |_, _| {}).unwrap();
+            drain_one_request_with_watcher(&store, &session, &watcher, |_, _| {}, |claim| claim())
+                .unwrap();
         assert!(
             fired.load(std::sync::atomic::Ordering::SeqCst),
             "publication hook did not run"
@@ -429,7 +447,9 @@ fn drifted_selected_non_source_input_does_not_ack_request() {
         touched.store(true, std::sync::atomic::Ordering::SeqCst);
         fs::write(&manifest, "{\"name\":\"after\"}\n").unwrap();
     });
-    let observed = drain_one_request_with_watcher(&store, &session, &watcher, |_, _| {}).unwrap();
+    let observed =
+        drain_one_request_with_watcher(&store, &session, &watcher, |_, _| {}, |claim| claim())
+            .unwrap();
     assert!(fired.load(std::sync::atomic::Ordering::SeqCst));
     assert_eq!(observed, 0);
     assert_eq!(
@@ -457,7 +477,8 @@ fn changed_watcher_root_cannot_certify_matching_request() {
     let watcher = std::sync::Mutex::new(Some((Arc::downgrade(&session), work)));
     let row = store.enqueue_request(&options, None).unwrap();
     assert_eq!(
-        drain_one_request_with_watcher(&store, &session, &watcher, |_, _| {}).unwrap(),
+        drain_one_request_with_watcher(&store, &session, &watcher, |_, _| {}, |claim| claim())
+            .unwrap(),
         1
     );
     assert_eq!(store.request_by_id(&row.id).unwrap().unwrap().state, "done");

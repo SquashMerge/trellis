@@ -4,7 +4,7 @@ use crate::{
     capture::Capture,
     indexer::{self, IndexOptions},
     model::{CancelFlag, IndexPin, IndexProgress},
-    store::{PublishPermit, RecoveryBaseline, Store, topology::WriterSession},
+    store::{PublishPermit, RecoveryBaseline, Store, requests::Request, topology::WriterSession},
 };
 use anyhow::{Result, ensure};
 use std::sync::{Arc, atomic::Ordering};
@@ -438,6 +438,8 @@ pub struct WatcherWork {
     queue_gate: bool,
     #[cfg(all(test, feature = "test-support"))]
     full_capture_attempts: usize,
+    #[cfg(all(test, feature = "test-support"))]
+    reconcile_now_for_tests: Option<std::time::Instant>,
     /// Shared with every watcher this owner creates; read without its lock.
     health: Arc<crate::watch::WatcherHealth>,
     last_inventory: std::time::Instant,
@@ -512,6 +514,8 @@ impl WatcherWork {
             queue_gate: false,
             #[cfg(all(test, feature = "test-support"))]
             full_capture_attempts: 0,
+            #[cfg(all(test, feature = "test-support"))]
+            reconcile_now_for_tests: None,
             last_inventory: std::time::Instant::now(),
             retry_after: None,
             last_accounted_generation: None,
@@ -645,6 +649,11 @@ impl WatcherWork {
     #[cfg(all(test, feature = "test-support"))]
     pub(crate) fn full_capture_attempts_for_tests(&self) -> usize {
         self.full_capture_attempts
+    }
+
+    #[cfg(all(test, feature = "test-support"))]
+    pub(crate) fn set_reconcile_now_for_tests(&mut self, now: Option<std::time::Instant>) {
+        self.reconcile_now_for_tests = now;
     }
 
     fn snapshot_request(
@@ -800,8 +809,27 @@ impl WatcherWork {
         self.queue_gate = true;
     }
 
+    pub(crate) fn clear_queue_gate(&mut self) {
+        self.queue_gate = false;
+    }
+
     pub(crate) fn gate_pending(&self, options: &IndexOptions) -> bool {
         self.queue_gate && self.accepted_watch_intent(options)
+    }
+
+    /// Accepted ingress and the queue claim share the callback's liveness lock.
+    /// If a full intent arrived after reconciliation, retain the gate and let
+    /// the owner reconcile it before retrying this claim.
+    pub(crate) fn claim_if_gate_clear(
+        &mut self,
+        options: &IndexOptions,
+        claim: impl FnOnce() -> Result<Option<Request>>,
+    ) -> Result<Option<Option<Request>>> {
+        let _ingress = self.watch.lock_ingress();
+        if self.gate_pending(options) {
+            return Ok(None);
+        }
+        Ok(Some(claim()?))
     }
 
     pub(crate) fn reconcile_queue_gate(
@@ -908,6 +936,8 @@ impl WatcherWork {
             }
         }
         let now = std::time::Instant::now();
+        #[cfg(all(test, feature = "test-support"))]
+        let now = self.reconcile_now_for_tests.unwrap_or(now);
         let periodic = now.duration_since(self.last_inventory) >= PERIODIC_INVENTORY;
         let batch = self.watch.drain();
         // Retirement's attempt never captures past its cutoff; the capture's
@@ -1100,6 +1130,7 @@ pub fn drain_requests_observed_with_native(
         usize::MAX,
         None,
         None,
+        |claim| claim(),
     )
 }
 
@@ -1119,6 +1150,7 @@ pub fn drain_one_request_observed(
         1,
         None,
         None,
+        |claim| claim(),
     )
 }
 
@@ -1130,6 +1162,7 @@ pub(crate) fn drain_one_request_with_watcher(
     session: &Arc<WriterSession>,
     watcher: &OwningWatcher,
     progress: impl Fn(&str, IndexProgress) + Sync,
+    before_claim: impl Fn(&dyn Fn() -> Result<Option<Request>>) -> Result<Option<Request>>,
 ) -> Result<usize> {
     drain_requests_observed_with_cancel(
         store,
@@ -1140,6 +1173,7 @@ pub(crate) fn drain_one_request_with_watcher(
         1,
         None,
         Some(watcher),
+        before_claim,
     )
 }
 
@@ -1157,6 +1191,7 @@ fn drain_requests_observed_with_cancel(
     max_completed: usize,
     cutoff_seq: Option<i64>,
     watcher: Option<&OwningWatcher>,
+    before_claim: impl Fn(&dyn Fn() -> Result<Option<Request>>) -> Result<Option<Request>>,
 ) -> Result<usize> {
     if store.root_path_replaced()? {
         store.fail_changed_root_requests()?;
@@ -1198,9 +1233,21 @@ fn drain_requests_observed_with_cancel(
         {
             break;
         }
-        let Some(request) = store.claim_request(session)? else {
+        // Cached completion is confirmed above. Recheck the gate at the
+        // owning preclaim transition rather than relying on a worker sample.
+        let Some(request) = before_claim(&|| store.claim_request(session))? else {
             break;
         };
+        if let Some(watcher) = watcher {
+            let mut guard = watcher.lock().unwrap();
+            if let Some((owner, work)) = guard.as_mut()
+                && owner
+                    .upgrade()
+                    .is_some_and(|owner| Arc::ptr_eq(&owner, session))
+            {
+                work.clear_queue_gate();
+            }
+        }
         #[cfg(feature = "test-support")]
         store.run_after_claim_hook_for_tests();
         // Capture the authenticated expected pin from the same publication
