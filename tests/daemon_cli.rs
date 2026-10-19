@@ -2436,8 +2436,8 @@ fn finished(index: &mut Owned) -> (std::process::ExitStatus, String, String) {
 }
 
 /// The generic CLI reply bound (60 s in production) that once also ended
-/// index and metrics waits. The #179 tests lower it so they can outlive it
-/// without waiting a minute (#201).
+/// index waits. The #179 index test lowers it so it can outlive it without
+/// waiting a minute (#201).
 const LOWERED_CLI_REPLY_BOUND: Duration = Duration::from_secs(2);
 
 /// Run `command` with the generic CLI reply bound lowered; return how long to
@@ -2502,8 +2502,14 @@ fn cli_index_reply_wait_ends_at_its_backstop() {
     assert!(err.contains("outcome_unknown"), "{err}");
 }
 
+/// Metrics goes through `call_metrics`, with its own ingress, work and transfer
+/// deadlines, not the generic CLI reply bound. This proves one request survives
+/// held daemon work without reconnecting or recomputing, and returns a complete
+/// multi-frame revision. The metrics deadlines themselves are covered by tests
+/// that set `TRELLIS_TEST_METRICS_CLIENT_*`, such as
+/// `metrics_real_near_ingress_ack_and_late_multiframe_preserve_original_end`.
 #[test]
-fn metrics_real_daemon_work_past_the_cli_reply_bound_returns_complete_multiframe_revision() {
+fn metrics_held_daemon_work_returns_complete_multiframe_revision() {
     struct ReleaseGate(std::path::PathBuf);
     impl Drop for ReleaseGate {
         fn drop(&mut self) {
@@ -2542,9 +2548,7 @@ fn metrics_real_daemon_work_past_the_cli_reply_bound_returns_complete_multiframe
     );
     let release = ReleaseGate(gate.join("release"));
     let start = Instant::now();
-    let mut metrics = cli(&home);
-    let past_bound = lower_cli_reply_bound(&mut metrics);
-    let mut process = metrics
+    let mut process = cli(&home)
         .args(["metrics", "--json", "--workspace"])
         .arg(&root)
         .stdout(Stdio::piped())
@@ -2566,9 +2570,8 @@ fn metrics_real_daemon_work_past_the_cli_reply_bound_returns_complete_multiframe
         );
         std::thread::sleep(Duration::from_millis(20));
     }
-    // Release only after the old generic socket read bound (60 s in
-    // production, lowered here) would have fired.
-    std::thread::sleep(past_bound);
+    let held = Duration::from_millis(2_500);
+    std::thread::sleep(held);
     fs::write(&release.0, b"release").unwrap();
     let result = process.wait_with_output().unwrap();
     assert!(
@@ -2576,7 +2579,7 @@ fn metrics_real_daemon_work_past_the_cli_reply_bound_returns_complete_multiframe
         "{}",
         String::from_utf8_lossy(&result.stderr)
     );
-    assert!(start.elapsed() > past_bound);
+    assert!(start.elapsed() > held);
     let envelope: Value = serde_json::from_slice(&result.stdout).unwrap();
     assert_eq!(
         envelope["payload"]["files"].as_array().unwrap().len(),
