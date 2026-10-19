@@ -273,23 +273,29 @@ async function openTools(page) {
   if(!await page.locator("#secondary-tools").evaluate(node=>node.open)) await page.locator("#secondary-tools > summary").click();
 }
 // The outcome of the page's next request to `suffix` after `trigger`: its
-// response status and body, its failure, or that none came within the hang
-// backstop and how many such requests the page issued. A wait never ends in a
-// bare timeout that hides a refusal or a request that was never sent (#131).
+// response status and complete body, its failure, or that none came within the
+// hang backstop and how many such requests the page issued. A wait never ends in
+// a bare timeout that hides a refusal or a request that was never sent (#131).
+// Only a fully read body yields `status`; a response whose body read fails or
+// stalls past the backstop is reported with `responseStatus` instead.
 async function nextPageApi(page, suffix, trigger) {
   const path = browserPath(page,suffix), matches = request => new URL(request.url()).pathname === path;
   const started = Date.now();
   let settle, issued = 0;
   const outcome = new Promise(resolveOutcome => { settle = resolveOutcome; });
   const onRequest = request => { if (matches(request)) issued++; };
+  // Settle with plain values only: a promise would lock the outcome to it, so a
+  // later failure or the backstop could no longer end the wait.
+  let responseStatus;
   const onResponse = response => {
-    if (!matches(response.request())) return;
-    settle(response.text().then(body => ({status:response.status(), body:body.slice(0,2000)}),
-      error => ({status:response.status(), body:`unreadable: ${error.message}`})));
+    if (!matches(response.request()) || responseStatus !== undefined) return;
+    responseStatus = response.status();
+    response.text().then(body => settle({status:responseStatus, body:body.slice(0,2000)}),
+      error => settle({responseStatus, bodyFailure:error.message}));
   };
-  const onFailed = request => { if (matches(request)) settle({failure:request.failure()?.errorText ?? "unknown"}); };
+  const onFailed = request => { if (matches(request)) settle({responseStatus, failure:request.failure()?.errorText ?? "unknown"}); };
   page.on("request",onRequest);page.on("response",onResponse);page.on("requestfailed",onFailed);
-  const timer = setTimeout(() => settle({noResponse:true}), HANG_BACKSTOP_MS);
+  const timer = setTimeout(() => settle(responseStatus === undefined ? {noResponse:true} : {responseStatus, bodyPending:true}), HANG_BACKSTOP_MS);
   try { await trigger(); return {suffix, ...await outcome, issued, elapsedMs:Date.now()-started}; }
   finally { clearTimeout(timer); page.off("request",onRequest); page.off("response",onResponse); page.off("requestfailed",onFailed); }
 }
