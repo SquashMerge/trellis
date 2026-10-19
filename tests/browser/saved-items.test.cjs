@@ -293,22 +293,14 @@ async function nextPageApi(page, suffix, trigger) {
   try { await trigger(); return {suffix, ...await outcome, issued, elapsedMs:Date.now()-started}; }
   finally { clearTimeout(timer); page.off("request",onRequest); page.off("response",onResponse); page.off("requestfailed",onFailed); }
 }
-// Repeat `trigger` until its request answers 200. Only the daemon's typed
-// transient refusals (contention, or no published head yet) are retried, as a
-// user would; each is logged. Anything else fails with what was observed and
-// the serve log.
+// `trigger`'s request must answer 200. The page shows any refusal to the user
+// and never retries it, so neither does the test: a refusal, a failed or
+// aborted request, or none at all fails with what was observed and the serve
+// log. A response slower than 5 s is logged even when it passes.
 async function pageApiAnswered(page, suffix, trigger) {
-  for (const deadline = Date.now()+HANG_BACKSTOP_MS;;) {
-    const outcome = await nextPageApi(page,suffix,trigger);
-    if (outcome.elapsedMs > 5000) console.error(`slow ${suffix}: ${JSON.stringify(outcome).slice(0,500)}`);
-    if (outcome.status === 200) return outcome;
-    let code = null; try { code = JSON.parse(outcome.body).error?.code ?? null; } catch {}
-    if (outcome.status === 503 && ["storage_busy","index_not_ready"].includes(code) && Date.now() < deadline) {
-      console.error(`retrying ${suffix} after a typed refusal: ${JSON.stringify(outcome)}`);
-      await delay(25); continue;
-    }
-    assert.fail(`${suffix} was not answered: ${JSON.stringify(outcome)}; serve log: ${page.serveLog?.() ?? "unavailable"}`);
-  }
+  const outcome = await nextPageApi(page,suffix,trigger);
+  if (outcome.elapsedMs > 5000) console.error(`slow ${suffix}: ${JSON.stringify(outcome).slice(0,500)}`);
+  if (outcome.status !== 200) assert.fail(`${suffix} was not answered: ${JSON.stringify(outcome)}; serve log: ${page.serveLog?.() ?? "unavailable"}`);
 }
 async function selectSymbol(page, name) {
   await page.locator("#search").fill(name);
