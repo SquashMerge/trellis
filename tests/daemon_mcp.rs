@@ -2045,7 +2045,10 @@ fn relay_decides_by_acceptance_even_when_held_past_the_deadline() {
     // Activate the checkout first, in another session (#187). A cold
     // activation slower than A's 2 s deadline expires A before the daemon
     // answers, so the relay never reaches the hold this test is about.
+    // The whole warm-up shares one hang backstop, well under nextest's kill.
     let mut warm = Peer::start(home.path(), &root);
+    let until = Instant::now() + trellis::testing::HANG_BACKSTOP;
+    let mut last = None;
     for attempt in 0.. {
         writeln!(
             warm.stdin.as_mut().unwrap(),
@@ -2053,16 +2056,23 @@ fn relay_decides_by_acceptance_even_when_held_past_the_deadline() {
             describe_frame(json!(attempt))
         )
         .unwrap();
-        let reply = warm
+        let Ok(reply) = warm
             .lines
-            .recv_timeout(trellis::testing::HANG_BACKSTOP)
-            .unwrap();
+            .recv_timeout(until.saturating_duration_since(Instant::now()))
+        else {
+            panic!("warm-up describe {attempt} was not answered (hang); last reply: {last:?}");
+        };
         let envelope = &reply["result"]["structuredContent"];
         if envelope["data"].is_object() {
             break;
         }
         // Only the activation outlasting the call deadline is retried.
         assert_eq!(envelope["error"]["code"], "deadline_exceeded", "{reply}");
+        assert!(
+            Instant::now() < until,
+            "warm-up activation never answered describe (hang); last reply: {reply}"
+        );
+        last = Some(reply);
     }
     drop(warm);
     let deadline = Duration::from_millis(2000);

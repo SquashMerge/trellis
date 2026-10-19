@@ -572,17 +572,34 @@ impl WorkspaceIdentity {
     /// Resolve the common Git directory without creating any managed storage.
     /// Both the held root and its pathname must still designate this checkout.
     pub fn git_common_dir(&self) -> Result<PathBuf> {
-        self.git_common_dir_with_executable(Path::new("git"))
+        self.git_common_dir_by(None)
+    }
+    /// The lookup waits at most its own bound, and never past `by` (#131):
+    /// a caller's deadline caps the wait, and reaching either is `unavailable`.
+    pub fn git_common_dir_by(&self, by: Option<std::time::Instant>) -> Result<PathBuf> {
+        self.git_common_dir_with_executable_by(Path::new("git"), by)
     }
     /// Alternate executable permits a deterministic stalled-child fixture.
     #[doc(hidden)]
     pub fn git_common_dir_with_executable(&self, executable: &Path) -> Result<PathBuf> {
+        self.git_common_dir_with_executable_by(executable, None)
+    }
+    fn git_common_dir_with_executable_by(
+        &self,
+        executable: &Path,
+        by: Option<std::time::Instant>,
+    ) -> Result<PathBuf> {
         self.verify_readonly()?;
         ensure!(
             self.git_dir.is_some(),
             "not_checkout: missing Git directory"
         );
-        let deadline = std::time::Instant::now() + Duration::from_millis(750);
+        let bound = std::time::Instant::now() + Duration::from_millis(750);
+        let deadline = by.map_or(bound, |by| by.min(bound));
+        ensure!(
+            std::time::Instant::now() < deadline,
+            "unavailable: Git common-directory lookup timed out"
+        );
         let mut child = std::process::Command::new(executable)
             .arg("-C")
             .arg(&self.root)

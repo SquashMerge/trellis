@@ -3099,6 +3099,178 @@ fn a_stalled_final_check_does_not_hold_other_calls() {
     assert!(peer.finish().0.success());
 }
 
+/// Serve every phase pause on `listener` from a thread until the test ends.
+/// `hold` sees each pause's stage and returns when to release it (`None`: at
+/// once).
+fn serve_pauses(
+    listener: &std::os::unix::net::UnixListener,
+    mut hold: impl FnMut(&str) -> Option<std::time::Instant> + Send + 'static,
+) {
+    let listener = listener.try_clone().unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let mut stage = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut stage)
+                .unwrap();
+            if let Some(at) = hold(stage.trim_end()) {
+                std::thread::sleep(at.saturating_duration_since(std::time::Instant::now()));
+            }
+            let _ = stream.write_all(b"x");
+        }
+    });
+}
+
+fn describe_frame(id: Value, workspace: Option<&Path>) -> Vec<u8> {
+    let mut arguments = json!({"schemaVersion":1});
+    if let Some(workspace) = workspace {
+        arguments["workspace"] = json!(workspace);
+    }
+    serde_json::to_vec(&call(false, id, "trellis_workspace_describe", arguments)).unwrap()
+}
+
+/// #195 review: every final check attempt is bounded by its call's deadline.
+/// A's lookup always outlasts its bound; a recheck released 150 ms before A's
+/// deadline must not run a full 750 ms lookup, so A is `deadline_exceeded`
+/// within its 5 s deadline plus a stated 400 ms tolerance.
+#[test]
+fn a_persistently_unavailable_final_check_is_decided_by_its_deadline() {
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
+    use std::time::Instant;
+    let temp = tempfile::tempdir().unwrap();
+    let (main, linked) = git_linked_fixture(temp.path());
+    let stalled = temp.path().join("stall-git");
+    let path = stalling_git_path(temp.path(), &stalled, false);
+    let socket = temp.path().join("phase.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let written: Arc<Mutex<Option<Instant>>> = Arc::default();
+    let held = Arc::new(AtomicBool::new(false));
+    let (flag, start, late) = (stalled.clone(), written.clone(), held.clone());
+    serve_pauses(&listener, move |stage| {
+        let start = (*start.lock().unwrap())?;
+        if stage == "selected_final" {
+            fs::write(&flag, b"").unwrap();
+        } else if stage == "final_recheck"
+            && Instant::now() >= start + Duration::from_secs(4)
+            && !late.swap(true, Ordering::AcqRel)
+        {
+            return Some(start + Duration::from_millis(4850));
+        }
+        None
+    });
+    let mut peer = Peer::start_with_phase_env(
+        Some(&main),
+        Some(("selected_final,final_recheck", &socket)),
+        // The relay's own 5 s decision would mask the daemon's: observe the
+        // daemon coordinator's decision directly.
+        &[
+            ("PATH", path.as_os_str()),
+            ("TRELLIS_TEST_MCP_RELAY_DEADLINE_MS", "10000".as_ref()),
+        ],
+    );
+    // Warm both checkouts so A does not race a cold activation.
+    tool(
+        &peer.ask(serde_json::from_slice(&describe_frame(json!(0), None)).unwrap()),
+        None,
+        true,
+    );
+    let warm = peer.ask(serde_json::from_slice(&describe_frame(json!(1), Some(&linked))).unwrap());
+    tool(&warm, None, true);
+    *written.lock().unwrap() = Some(Instant::now());
+    peer.send_raw(&describe_frame(json!("A"), Some(&linked)));
+    let reply = peer.reply();
+    let elapsed = written.lock().unwrap().unwrap().elapsed();
+    let _ = fs::remove_file(&stalled);
+    assert!(
+        held.load(Ordering::Acquire),
+        "no recheck reached A's last second: {reply}"
+    );
+    tool(&reply, Some("deadline_exceeded"), true);
+    assert!(
+        elapsed < Duration::from_millis(5400),
+        "A was decided {elapsed:?} after it was written"
+    );
+    assert!(peer.finish().0.success());
+}
+
+/// #195 review: no decision waits on a parked recheck. A is parked with a
+/// lookup that always outlasts its bound; B is written while A's recheck is
+/// held and admitted only 4.4 s after acceptance. A recheck that ran before
+/// B's decision, unbounded, would take B past its deadline; B must be
+/// answered with its own result.
+#[test]
+fn a_call_finishing_near_its_deadline_is_not_held_behind_a_recheck() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    };
+    use std::time::Instant;
+    let temp = tempfile::tempdir().unwrap();
+    let (main, linked) = git_linked_fixture(temp.path());
+    let stalled = temp.path().join("stall-git");
+    let path = stalling_git_path(temp.path(), &stalled, false);
+    let socket = temp.path().join("phase.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let armed = Arc::new(AtomicBool::new(false));
+    let (paused, paused_at) = mpsc::channel::<()>();
+    let (release, release_at) = mpsc::channel::<Instant>();
+    let (flag, arm) = (stalled.clone(), armed.clone());
+    let mut first = true;
+    serve_pauses(&listener, move |stage| {
+        if !arm.load(Ordering::Acquire) {
+            return None;
+        }
+        if stage == "selected_final" {
+            fs::write(&flag, b"").unwrap();
+        } else if stage == "final_recheck" && std::mem::take(&mut first) {
+            paused.send(()).unwrap();
+            return Some(release_at.recv().unwrap());
+        }
+        None
+    });
+    let mut peer = Peer::start_with_phase_env(
+        Some(&main),
+        Some(("selected_final,final_recheck", &socket)),
+        // The relay's own 5 s decision would mask the daemon's: observe the
+        // daemon coordinator's decision directly.
+        &[
+            ("PATH", path.as_os_str()),
+            ("TRELLIS_TEST_MCP_RELAY_DEADLINE_MS", "10000".as_ref()),
+        ],
+    );
+    tool(
+        &peer.ask(serde_json::from_slice(&describe_frame(json!(0), None)).unwrap()),
+        None,
+        true,
+    );
+    let warm = peer.ask(serde_json::from_slice(&describe_frame(json!(1), Some(&linked))).unwrap());
+    tool(&warm, None, true);
+    armed.store(true, Ordering::Release);
+    peer.send_raw(&describe_frame(json!("A"), Some(&linked)));
+    // A is parked and its first recheck is held: write B now.
+    paused_at
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .expect("A's final check was never parked");
+    let written_b = Instant::now();
+    peer.send_raw(&describe_frame(json!("B"), None));
+    release
+        .send(written_b + Duration::from_millis(4400))
+        .unwrap();
+    let mut replies = [peer.reply(), peer.reply()];
+    let _ = fs::remove_file(&stalled);
+    replies.sort_by_key(|reply| reply["id"].as_str().unwrap_or_default().to_owned());
+    let [a, b] = replies;
+    assert_eq!((a["id"].as_str(), b["id"].as_str()), (Some("A"), Some("B")));
+    tool(&b, None, true);
+    tool(&a, Some("deadline_exceeded"), true);
+    assert!(peer.finish().0.success());
+}
+
 #[test]
 fn capacity_witness_final_drift_refuses_stale_capacity_attribution() {
     let temp = tempfile::tempdir().unwrap();

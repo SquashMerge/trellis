@@ -1507,14 +1507,19 @@ pub struct SelectedCheckout {
 }
 impl SelectedCheckout {
     pub fn before_answer(&self) -> Result<(), SelectionError> {
+        self.before_answer_by(None)
+    }
+    /// `before_answer` whose Git lookups never wait past `by` (#131); one
+    /// that cannot finish by then is `Unavailable`.
+    pub fn before_answer_by(&self, by: Option<Instant>) -> Result<(), SelectionError> {
         self.launch
             .verify_readonly()
             .map_err(|_| SelectionError::IdentityChanged)?;
         self.identity
             .verify_readonly()
             .map_err(|_| SelectionError::IdentityChanged)?;
-        if common_identity(&self.launch)? != self.launch_common
-            || common_identity(&self.identity)? != self.selected_common
+        if common_identity_by(&self.launch, by)? != self.launch_common
+            || common_identity_by(&self.identity, by)? != self.selected_common
             || self.launch_common != self.selected_common
         {
             return Err(SelectionError::IdentityChanged);
@@ -2175,8 +2180,14 @@ impl CheckoutRuntime {
 }
 
 fn common_identity(identity: &WorkspaceIdentity) -> Result<(u64, u64), SelectionError> {
+    common_identity_by(identity, None)
+}
+fn common_identity_by(
+    identity: &WorkspaceIdentity,
+    by: Option<Instant>,
+) -> Result<(u64, u64), SelectionError> {
     let path = identity
-        .git_common_dir()
+        .git_common_dir_by(by)
         .map_err(|_| SelectionError::Unavailable)?;
     let metadata = fs::metadata(path).map_err(|_| SelectionError::Unavailable)?;
     Ok((metadata.dev(), metadata.ino()))
