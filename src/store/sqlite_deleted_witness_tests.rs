@@ -223,19 +223,25 @@ fn isolated_filesystem_returns_allocated_blocks_only_after_verified_release() {
         attached: bool,
     }
     impl Mounted {
+        // A system daemon can briefly hold a fresh volume busy (#131):
+        // retry, then force, keeping every attempt's message.
         fn detach(&mut self) -> Result<()> {
-            let outcome = Command::new("/usr/bin/hdiutil")
-                .arg("detach")
-                .arg(&self.path)
-                .arg("-quiet")
-                .output()?;
-            ensure!(
-                outcome.status.success(),
-                "hdiutil detach: {}",
-                String::from_utf8_lossy(&outcome.stderr)
-            );
-            self.attached = false;
-            Ok(())
+            let mut failures = Vec::new();
+            for attempt in 0..4 {
+                let mut command = Command::new("/usr/bin/hdiutil");
+                command.arg("detach").arg(&self.path);
+                if attempt == 3 {
+                    command.arg("-force");
+                }
+                let outcome = command.output()?;
+                if outcome.status.success() {
+                    self.attached = false;
+                    return Ok(());
+                }
+                failures.push(String::from_utf8_lossy(&outcome.stderr).trim().to_owned());
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            anyhow::bail!("hdiutil detach: {failures:?}")
         }
     }
     impl Drop for Mounted {

@@ -73,7 +73,29 @@ test.before(async () => {
   copyFileSync(built, binary);
   assert.ok(existsSync(binary), `fixed suite binary is unavailable at ${binary}`);
 }, {timeout:960000});
-test.after(() => { if (suiteBinaryDir) rmSync(suiteBinaryDir, {recursive:true, force:true}); });
+test.after(async () => {
+  await stopSuiteDaemons();
+  if (suiteBinaryDir) rmSync(suiteBinaryDir, {recursive:true, force:true});
+});
+// The CLI `index` each test runs elects a user-level daemon from the suite's
+// own binary copy, and that daemon outlives serve by design. The suite stops
+// exactly the daemons it started: no other process runs this run-unique
+// binary (#130). They are not our children, so exit is observed by signal 0.
+async function stopSuiteDaemons() {
+  if (!binary) return;
+  const commands = new Set([binary, realpathSync(binary)].map(path => `${path} daemon`));
+  const listed = await run("ps", ["-axww", "-o", "pid=,args="], {timeout:10000});
+  const pids = listed.stdout.split("\n").map(line => line.trim().match(/^(\d+) (.*)$/))
+    .filter(match => match && commands.has(match[2])).map(match => Number(match[1]));
+  const alive = pid => { try { process.kill(pid,0); return true; } catch { return false; } };
+  for (const pid of pids) try { process.kill(pid,"SIGTERM"); } catch {}
+  for (const deadline = Date.now()+HANG_BACKSTOP_MS; pids.some(alive); await delay(25)) {
+    if (Date.now() > deadline) {
+      for (const pid of pids.filter(alive)) try { process.kill(pid,"SIGKILL"); } catch {}
+      throw new Error(`suite daemons ignored SIGTERM: ${pids.filter(alive).join(",")}`);
+    }
+  }
+}
 
 function isolatedEnv(paths) {
   const env = {...process.env,
@@ -333,7 +355,7 @@ function insertLegacy(dbPath, kind, id, seed) {
 
 for (const kind of ["view","note"]) test(`real browser ${kind} save, edit, stale replay, orphan, and legacy safety`, {timeout:180000}, async t => {
   const paths=fixture();let server,browser,context,page;const pageErrors=[];
-  t.after(async()=>{try{await context?.close();}catch{}try{await browser?.close();}catch{}await stopDaemon(server);rmSync(paths.temp,{recursive:true,force:true,maxRetries:10,retryDelay:100});});
+  t.after(async()=>{try{await context?.close();}catch{}try{await browser?.close();}catch{}await stopDaemon(server);await stopSuiteDaemons();rmSync(paths.temp,{recursive:true,force:true,maxRetries:10,retryDelay:100});});
   const indexed=await run(binary,["index","--workspace",paths.workspace],{env:paths.env,timeout:30000});
   const initialPin=JSON.parse(indexed.stdout).status.revision;
   // Serve registers in place on the indexed checkout (Decision 0009 §6): no

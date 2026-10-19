@@ -245,7 +245,28 @@ impl Peer {
         cwd: Option<&Path>,
         phase: Option<(&str, &Path)>,
     ) -> Self {
-        Self::start_with_fixture_home(tempfile::tempdir().unwrap(), workspace, cwd, phase, None)
+        Self::start_with_fixture_home(
+            tempfile::tempdir().unwrap(),
+            workspace,
+            cwd,
+            phase,
+            None,
+            &[],
+        )
+    }
+    fn start_with_phase_env(
+        workspace: Option<&Path>,
+        phase: Option<(&str, &Path)>,
+        env: &[(&str, &std::ffi::OsStr)],
+    ) -> Self {
+        Self::start_with_fixture_home(
+            tempfile::tempdir().unwrap(),
+            workspace,
+            None,
+            phase,
+            None,
+            env,
+        )
     }
     fn start_with_causal_witness(workspace: Option<&Path>) -> (Self, tokio::net::UnixListener) {
         use std::os::unix::fs::PermissionsExt;
@@ -259,7 +280,7 @@ impl Peer {
             fs::metadata(home.path()).unwrap().permissions().mode() & 0o077,
             0
         );
-        let peer = Self::start_with_fixture_home(home, workspace, None, None, Some(&socket));
+        let peer = Self::start_with_fixture_home(home, workspace, None, None, Some(&socket), &[]);
         (peer, listener)
     }
     fn start_with_fixture_home(
@@ -268,6 +289,7 @@ impl Peer {
         cwd: Option<&Path>,
         phase: Option<(&str, &Path)>,
         causal_socket: Option<&Path>,
+        env: &[(&str, &std::ffi::OsStr)],
     ) -> Self {
         let stderr_path = home.path().join("mcp-stderr.log");
         let stderr = fs::File::create(&stderr_path).unwrap();
@@ -281,6 +303,7 @@ impl Peer {
                 "TRELLIS_TEST_DAEMON_PID_FILE",
                 home.path().join("auto-daemon.pid"),
             )
+            .envs(env.iter().copied())
             .process_group(0)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -2955,6 +2978,65 @@ fn final_resolved_drift_is_attributed_for_five_tools_and_both_modes() {
             }
         }
     }
+}
+
+/// #131: a final selected check whose Git lookup outlives its bound (a loaded
+/// host) proves no root change. The call retries within its deadline and
+/// answers; it was `root_changed`.
+#[test]
+fn final_selected_check_survives_a_slow_git_lookup() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    let (main, linked) = git_linked_fixture(temp.path());
+    let search = std::env::var_os("PATH").unwrap();
+    let git = std::env::split_paths(&search)
+        .map(|dir| dir.join("git"))
+        .find(|path| path.is_file())
+        .expect("git on PATH");
+    // The first Git run after `slow` appears outlasts the 750 ms lookup bound.
+    let slow = temp.path().join("slow-next-git");
+    let bin = temp.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    fs::write(
+        bin.join("git"),
+        format!(
+            "#!/bin/sh\nif rm '{}' 2>/dev/null; then exec sleep 3; fi\nexec '{}' \"$@\"\n",
+            slow.display(),
+            git.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(bin.join("git"), fs::Permissions::from_mode(0o755)).unwrap();
+    let path =
+        std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&search))).unwrap();
+    let socket = temp.path().join("phase.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let mut peer = Peer::start_with_phase_env(
+        Some(&main),
+        Some(("selected_final", &socket)),
+        &[("PATH", path.as_os_str())],
+    );
+    peer.send_raw(
+        serde_json::to_string(&call(
+            false,
+            json!(1),
+            "trellis_workspace_describe",
+            json!({"schemaVersion":1,"workspace":linked}),
+        ))
+        .unwrap()
+        .as_bytes(),
+    );
+    phase_barrier(&listener, "selected_final", || {
+        fs::write(&slow, b"").unwrap()
+    });
+    let reply = peer.reply();
+    assert!(!slow.exists(), "the final check ran no Git lookup");
+    tool(&reply, None, true);
+    assert_eq!(
+        reply["result"]["structuredContent"]["workspace"],
+        json!(linked)
+    );
+    assert!(peer.finish().0.success());
 }
 
 #[test]

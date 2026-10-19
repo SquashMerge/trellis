@@ -770,6 +770,9 @@ impl Store {
                     .downcast_ref::<std::io::Error>()
                     .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
             {
+                // The NotFound may be the root's own, lost under the open: that
+                // is the root's change, never a vanished queue (#131).
+                self.identity.verify()?;
                 ensure!(
                     self.request_file_witness.lock().unwrap().is_none(),
                     "incompatible_queue: previously observed requests.db disappeared"

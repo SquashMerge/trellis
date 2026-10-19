@@ -5,6 +5,7 @@ pub mod session;
 pub mod tools;
 pub mod wire;
 
+use crate::daemon::registry::SelectionError;
 use crate::store::topology::WorkspaceIdentity;
 use std::os::unix::fs::MetadataExt;
 
@@ -489,6 +490,25 @@ fn catching_up(
         .as_ref()
         .and_then(|(registry, _)| registry.blocking_lock().runtime(key))
         .is_none_or(|runtime| runtime.catching_up())
+}
+
+/// The selected checkout's final check before a call is answered (#131).
+/// Only a proven missing or replaced root is `root_changed`. An identity
+/// lookup that could not finish, such as a Git subprocess slower than its
+/// bound on a loaded host, proves nothing: it is retried within the call's
+/// deadline, and still `Unavailable` past it the call is `deadline_exceeded`.
+fn final_selection(
+    witness: &crate::daemon::registry::SelectedCheckout,
+    deadline: std::time::Instant,
+) -> Result<(), SelectionError> {
+    loop {
+        match witness.before_answer() {
+            Err(SelectionError::Unavailable) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            checked => return checked,
+        }
+    }
 }
 
 /// An opt-in, bounded fixture barrier at an actual coordinator boundary.
@@ -1383,14 +1403,18 @@ fn coordinate(
                         catching_up,
                     } => {
                         phase_hook("selected_final")?;
-                        if witness.before_answer().is_err() {
-                            result = tools::resolved_root_changed(
-                                &call.name,
-                                &call.id,
-                                &witness.identity.root,
-                                *catching_up,
-                                call.modern,
-                            );
+                        match final_selection(witness, call.deadline) {
+                            Ok(()) => {}
+                            Err(SelectionError::Unavailable) => result = deadline_answer(call),
+                            Err(_) => {
+                                result = tools::resolved_root_changed(
+                                    &call.name,
+                                    &call.id,
+                                    &witness.identity.root,
+                                    *catching_up,
+                                    call.modern,
+                                );
+                            }
                         }
                     }
                     Finals::Capacity {
@@ -1398,14 +1422,18 @@ fn coordinate(
                         catching_up,
                     } => {
                         phase_hook("capacity_final")?;
-                        if witness.before_answer().is_err() {
-                            result = tools::resolved_root_changed(
-                                &call.name,
-                                &call.id,
-                                &witness.identity.root,
-                                *catching_up,
-                                call.modern,
-                            );
+                        match final_selection(witness, call.deadline) {
+                            Ok(()) => {}
+                            Err(SelectionError::Unavailable) => result = deadline_answer(call),
+                            Err(_) => {
+                                result = tools::resolved_root_changed(
+                                    &call.name,
+                                    &call.id,
+                                    &witness.identity.root,
+                                    *catching_up,
+                                    call.modern,
+                                );
+                            }
                         }
                     }
                 }
