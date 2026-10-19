@@ -2435,24 +2435,43 @@ fn finished(index: &mut Owned) -> (std::process::ExitStatus, String, String) {
     (status.unwrap(), out, err)
 }
 
-/// #179: the CLI once gave up on every index reply 60 seconds after sending
-/// its request, with `outcome_unknown`. An index may take longer.
+/// The generic CLI reply bound (60 s in production) that once also ended
+/// index and metrics waits. The #179 tests lower it so they can outlive it
+/// without waiting a minute (#201).
+const LOWERED_CLI_REPLY_BOUND: Duration = Duration::from_secs(2);
+
+/// Run `command` with the generic CLI reply bound lowered; return how long to
+/// wait so that bound has really passed.
+fn lower_cli_reply_bound(command: &mut Command) -> Duration {
+    command.env(
+        "TRELLIS_TEST_CLI_REPLY_BOUND_MS",
+        LOWERED_CLI_REPLY_BOUND.as_millis().to_string(),
+    );
+    LOWERED_CLI_REPLY_BOUND + Duration::from_millis(500)
+}
+
+/// #179: the CLI once gave up on every index reply at the generic CLI reply
+/// bound (60 s) after sending its request, with `outcome_unknown`. An index
+/// may take longer. The bound is lowered here (#201).
 #[test]
-fn cli_index_waits_past_sixty_seconds_for_its_reply() {
+fn cli_index_waits_past_the_cli_reply_bound_for_its_reply() {
     let temp = short_temp();
     let home = temp.path().join("home");
     fs::create_dir(&home).unwrap();
     // Only if the CLI failed to reach this test's socket and elected one.
     let _daemon = AutoDaemonGuard::for_home(&home);
     let root = checkout(temp.path(), "stalled");
-    let (mut index, mut stream, request) = fake_daemon_index(&home, &root, |_| {});
-    // The old bound would have expired a second before this check.
-    std::thread::sleep(Duration::from_secs(61));
+    let mut past_bound = Duration::ZERO;
+    let (mut index, mut stream, request) = fake_daemon_index(&home, &root, |command| {
+        past_bound = lower_cli_reply_bound(command);
+    });
+    // The old bound would have expired half a second before this check.
+    std::thread::sleep(past_bound);
     assert!(
         index.0.try_wait().unwrap().is_none(),
         "index stopped waiting for its reply"
     );
-    let result = serde_json::json!({"publishedRevision": "answered after 61 s"});
+    let result = serde_json::json!({"publishedRevision": "answered past the bound"});
     trellis::daemon::protocol::write_frame(
         &mut stream,
         &trellis::daemon::protocol::Reply {
@@ -2484,7 +2503,7 @@ fn cli_index_reply_wait_ends_at_its_backstop() {
 }
 
 #[test]
-fn metrics_real_daemon_work_over_sixty_seconds_returns_complete_multiframe_revision() {
+fn metrics_real_daemon_work_past_the_cli_reply_bound_returns_complete_multiframe_revision() {
     struct ReleaseGate(std::path::PathBuf);
     impl Drop for ReleaseGate {
         fn drop(&mut self) {
@@ -2497,7 +2516,9 @@ fn metrics_real_daemon_work_over_sixty_seconds_returns_complete_multiframe_revis
     let _daemon = AutoDaemonGuard::for_home(&home);
     let root = checkout(temp.path(), "metricslarge");
     fs::create_dir(root.join("src")).unwrap();
-    const FILES: usize = 4_000;
+    // About 578 reply bytes a file: enough files for a multi-frame reply
+    // (asserted below), and few enough to index quickly (#201).
+    const FILES: usize = 2_500;
     for number in 0..FILES {
         fs::write(
             root.join(format!("src/f{number:04}.js")),
@@ -2521,7 +2542,9 @@ fn metrics_real_daemon_work_over_sixty_seconds_returns_complete_multiframe_revis
     );
     let release = ReleaseGate(gate.join("release"));
     let start = Instant::now();
-    let mut process = cli(&home)
+    let mut metrics = cli(&home);
+    let past_bound = lower_cli_reply_bound(&mut metrics);
+    let mut process = metrics
         .args(["metrics", "--json", "--workspace"])
         .arg(&root)
         .stdout(Stdio::piped())
@@ -2543,8 +2566,9 @@ fn metrics_real_daemon_work_over_sixty_seconds_returns_complete_multiframe_revis
         );
         std::thread::sleep(Duration::from_millis(20));
     }
-    // Release only after the old 60-second socket read bound would have fired.
-    std::thread::sleep(Duration::from_millis(60_500));
+    // Release only after the old generic socket read bound (60 s in
+    // production, lowered here) would have fired.
+    std::thread::sleep(past_bound);
     fs::write(&release.0, b"release").unwrap();
     let result = process.wait_with_output().unwrap();
     assert!(
@@ -2552,7 +2576,7 @@ fn metrics_real_daemon_work_over_sixty_seconds_returns_complete_multiframe_revis
         "{}",
         String::from_utf8_lossy(&result.stderr)
     );
-    assert!(start.elapsed() > Duration::from_secs(60));
+    assert!(start.elapsed() > past_bound);
     let envelope: Value = serde_json::from_slice(&result.stdout).unwrap();
     assert_eq!(
         envelope["payload"]["files"].as_array().unwrap().len(),

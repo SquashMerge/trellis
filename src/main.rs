@@ -519,6 +519,11 @@ fn checked_reply(reply: protocol::Reply) -> Result<serde_json::Value> {
 /// the whole reply: a liveness backstop, not a deadline.
 const INDEX_REPLY_BOUND: Duration = Duration::from_secs(10 * 60);
 
+/// How long every other non-metrics CLI call waits on a silent daemon, per
+/// socket read. Tests lower it with `TRELLIS_TEST_CLI_REPLY_BOUND_MS` to prove
+/// a call outlives it without waiting a minute (#201).
+const CLI_REPLY_BOUND: Duration = Duration::from_secs(60);
+
 fn send_daemon(request: &protocol::Request, read_only: bool) -> Result<serde_json::Value> {
     let socket = socket_path()?;
     if request.operation == "metrics" {
@@ -564,14 +569,14 @@ fn send_daemon(request: &protocol::Request, read_only: bool) -> Result<serde_jso
     let reply_bound = if request.operation == "index" {
         INDEX_REPLY_BOUND
     } else {
-        Duration::from_secs(60)
+        CLI_REPLY_BOUND
     };
     #[cfg(feature = "test-support")]
     let reply_bound = match request.operation.as_str() {
         "index" => {
             metrics_test_duration("TRELLIS_TEST_INDEX_REPLY_BOUND_MS").unwrap_or(reply_bound)
         }
-        _ => reply_bound,
+        _ => metrics_test_duration("TRELLIS_TEST_CLI_REPLY_BOUND_MS").unwrap_or(reply_bound),
     };
     let mut first = Some(
         client::connect_or_start(&socket, start_daemon, Duration::from_secs(5))
