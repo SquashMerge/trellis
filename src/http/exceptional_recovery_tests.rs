@@ -1381,30 +1381,19 @@ fn ingress_after_final_gate_sample_publishes_before_claim_commit() {
 fn covered_row_without_successor_keeps_idle_nonurgent_debounce() {
     let (_tmp, store, state, options) = serving_queue_watch_fixture();
     let row = store.enqueue_request(&options, None).unwrap();
-    let incoming = state.clone();
-    let source = options.workspace_root.join("idle.js");
-    state.test_queue_after_startup_drain.set(move || {
-        std::fs::write(&source, "function idle() {}\n").unwrap();
-        incoming
-            .watcher_work
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .1
-            .submit_watch_event_for_tests(Ok(notify::Event::new(notify::EventKind::Create(
-                notify::event::CreateKind::File,
-            ))
-            .add_path(source)));
-    });
     state.worker_step().unwrap();
-    let row_pin = store
-        .request_by_id(&row.id)
-        .unwrap()
-        .unwrap()
-        .revision
-        .unwrap();
+    let completed = store.request_by_id(&row.id).unwrap().unwrap();
+    assert_eq!(completed.state, "done");
+    assert!(completed.finished_at.is_some());
+    assert!(store.earliest_unfinished_request().unwrap().is_none());
+    let row_pin = completed.revision.unwrap();
     assert_eq!(store.status().unwrap().revision, row_pin);
+
+    // This edit arrives in idle, after the covered row's terminal COMMIT.
+    // Check the deadline against ingress, not a later wall-clock sample: a
+    // slow worker step cannot make an ordinary debounce look like a gate.
+    let source = options.workspace_root.join("idle.js");
+    std::fs::write(&source, "function idle() {}\n").unwrap();
     let guard = state.watcher_work.lock().unwrap();
     let work = &guard.as_ref().unwrap().1;
     assert_eq!(
@@ -1412,12 +1401,24 @@ fn covered_row_without_successor_keeps_idle_nonurgent_debounce() {
         Some(row_pin),
         "the completed row must certify the original batch"
     );
-    assert!(work.accepted_watch_intent(&options));
     assert_eq!(work.full_capture_attempts_for_tests(), 0);
+    let admitted_after = Instant::now();
+    work.submit_watch_event_for_tests(Ok(notify::Event::new(notify::EventKind::Create(
+        notify::event::CreateKind::File,
+    ))
+    .add_path(source)));
+    assert!(work.accepted_watch_intent(&options));
     assert!(
-        work.next_due() > Instant::now(),
+        !work.gate_pending(&options),
+        "idle ingress must not arm the FIFO queue gate"
+    );
+    // The full intent stays pending, but its next idle capture waits for the
+    // nonurgent 75 ms quiet period. This remains valid after scheduling delays.
+    assert!(
+        work.next_due() >= admitted_after + Duration::from_millis(75),
         "idle nonurgent event must retain debounce"
     );
+    assert_eq!(work.full_capture_attempts_for_tests(), 0);
 }
 
 #[test]
