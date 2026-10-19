@@ -258,6 +258,7 @@ async function seedId(server, token, name) {
 async function connect(page, server, token) {
   const {base,rootKey} = server;
   page.checkoutRootKey = rootKey;
+  page.serveLog = () => server.stderr().replaceAll(token,"[redacted]").slice(-4000);
   await page.goto(`${base}/`,{waitUntil:"domcontentloaded"});
   await page.locator("#token").fill(token);
   await page.locator("#connect-form button").click();
@@ -271,13 +272,47 @@ async function openTools(page) {
   await page.locator("#tools-panel").waitFor({state:"visible"});
   if(!await page.locator("#secondary-tools").evaluate(node=>node.open)) await page.locator("#secondary-tools > summary").click();
 }
+// The outcome of the page's next request to `suffix` after `trigger`: its
+// response status and complete body, its failure, or that none came within the
+// hang backstop and how many such requests the page issued. A wait never ends in
+// a bare timeout that hides a refusal or a request that was never sent (#131).
+// Only a fully read body yields `status`; a response whose body read fails or
+// stalls past the backstop is reported with `responseStatus` instead.
+async function nextPageApi(page, suffix, trigger) {
+  const path = browserPath(page,suffix), matches = request => new URL(request.url()).pathname === path;
+  const started = Date.now();
+  let settle, issued = 0;
+  const outcome = new Promise(resolveOutcome => { settle = resolveOutcome; });
+  const onRequest = request => { if (matches(request)) issued++; };
+  // Settle with plain values only: a promise would lock the outcome to it, so a
+  // later failure or the backstop could no longer end the wait.
+  let responseStatus;
+  const onResponse = response => {
+    if (!matches(response.request()) || responseStatus !== undefined) return;
+    responseStatus = response.status();
+    response.text().then(body => settle({status:responseStatus, body:body.slice(0,2000)}),
+      error => settle({responseStatus, bodyFailure:error.message}));
+  };
+  const onFailed = request => { if (matches(request)) settle({responseStatus, failure:request.failure()?.errorText ?? "unknown"}); };
+  page.on("request",onRequest);page.on("response",onResponse);page.on("requestfailed",onFailed);
+  const timer = setTimeout(() => settle(responseStatus === undefined ? {noResponse:true} : {responseStatus, bodyPending:true}), HANG_BACKSTOP_MS);
+  try { await trigger(); return {suffix, ...await outcome, issued, elapsedMs:Date.now()-started}; }
+  finally { clearTimeout(timer); page.off("request",onRequest); page.off("response",onResponse); page.off("requestfailed",onFailed); }
+}
+// `trigger`'s request must answer 200. The page shows any refusal to the user
+// and never retries it, so neither does the test: a refusal, a failed or
+// aborted request, or none at all fails with what was observed and the serve
+// log. A response slower than 5 s is logged even when it passes.
+async function pageApiAnswered(page, suffix, trigger) {
+  const outcome = await nextPageApi(page,suffix,trigger);
+  if (outcome.elapsedMs > 5000) console.error(`slow ${suffix}: ${JSON.stringify(outcome).slice(0,500)}`);
+  if (outcome.status !== 200) assert.fail(`${suffix} was not answered: ${JSON.stringify(outcome)}; serve log: ${page.serveLog?.() ?? "unavailable"}`);
+}
 async function selectSymbol(page, name) {
   await page.locator("#search").fill(name);
-  const symbols=page.waitForResponse(response=>new URL(response.url()).pathname===browserPath(page,"symbols")&&response.status()===200);
-  await page.locator("#search-form").evaluate(form=>form.requestSubmit()); await symbols;
+  await pageApiAnswered(page,"symbols",() => page.locator("#search-form").evaluate(form=>form.requestSubmit()));
   const pick=page.locator("#symbols button.symbol").filter({hasText:name}).first();await pick.waitFor({state:"visible"});
-  const query=page.waitForResponse(response=>new URL(response.url()).pathname===browserPath(page,"query")&&response.status()===200);
-  await pick.click();await query;
+  await pageApiAnswered(page,"query",() => pick.click());
 }
 const row = (page, kind, id) => page.locator(`li[data-saved-kind="${kind}"][data-saved-id="${id}"]`);
 // Bounded snapshot of a saved row and page notice for failure messages (#131).
