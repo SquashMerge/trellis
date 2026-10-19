@@ -862,3 +862,28 @@ fn captured_writer_is_reverified_after_root_replacement_before_publish() {
     assert!(format!("{error:#}").contains("root_changed"), "{error:#}");
     assert!(store.status().is_err());
 }
+
+#[test]
+fn full_publication_rebuilds_and_compares_the_artifact_once() {
+    let state = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    fs::write(
+        work.path().join("main.js"),
+        "function a() { b(); } function b() {}\n",
+    )
+    .unwrap();
+    let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+    let options = IndexOptions::new(work.path().to_owned());
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let job = IndexJobCoordinator::prepare(&store, None).unwrap();
+    let _session = job.session();
+    let before = crate::native_evidence::full_validations_for_tests();
+    let pin = job.run_observed(&options, &cancel, |_| {}, |_| {}).unwrap();
+    // Measurement validates the artifact against its capture; publication
+    // keeps the bundle checks without repeating that rebuild.
+    assert_eq!(
+        crate::native_evidence::full_validations_for_tests() - before,
+        1
+    );
+    assert_eq!(store.status().unwrap().revision, pin);
+}

@@ -387,7 +387,8 @@ impl IndexJobCoordinator {
         )?;
         report("measure", phase_start.elapsed());
         phase_start = std::time::Instant::now();
-        let graph = indexer::project_native(options, &capture, &native, cancel, &progress)?;
+        let graph =
+            indexer::project_native(options, &capture, native.artifact(), cancel, &progress)?;
         report("compose", phase_start.elapsed());
         phase_start = std::time::Instant::now();
         capture.verify(cancel)?;
@@ -397,9 +398,8 @@ impl IndexJobCoordinator {
         report("attest", phase_start.elapsed());
         phase_start = std::time::Instant::now();
         cutoff()?;
-        let published = self.store.publish_native_recovery(
+        let published = self.store.publish_validated_native_recovery(
             &graph,
-            &capture,
             &native,
             self.session.writer_guard()?,
             self.expected.clone(),
