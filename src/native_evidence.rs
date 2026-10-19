@@ -27,7 +27,7 @@ const LANGUAGES: [&str; 4] = ["java", "rust", "python", "javascript"];
 pub(crate) const PRODUCER: &str = "trellis.native.syntax";
 /// Native producer descriptor version. Any change that can alter a native measured field or
 /// projection, or that starts reading another input, must change it (Decision 0003).
-pub(crate) const NATIVE_VERSION: &str = "native-v6";
+pub(crate) const NATIVE_VERSION: &str = "native-v8";
 /// The native producer's declared extraction-input inventory (Decision 0003), keyed by its
 /// descriptor `(id, version)` and language. `extract` measures one document from only its own
 /// bytes, language and path; the tree-sitter grammars and Unicode normalization tables it uses
@@ -496,14 +496,109 @@ pub fn lookup(language: &str, name: &str) -> Result<String> {
     text(name)?;
     Ok(match language {
         "rust" => ComposingNormalizerBorrowed::new_nfc()
-            .normalize(name)
+            .normalize(name.strip_prefix("r#").unwrap_or(name))
             .into_owned(),
         "python" => ComposingNormalizerBorrowed::new_nfkc()
             .normalize(name)
             .into_owned(),
-        "java" | "javascript" => name.to_owned(),
+        "java" => name.to_owned(),
+        "javascript" => javascript_identifier(name)?,
         _ => anyhow::bail!("unsupported native language"),
     })
+}
+
+// Only decode escapes within a parser-measured identifier. Reparse the decoded
+// token to reject invalid code points or a split expression after decoding.
+fn javascript_identifier(name: &str) -> Result<String> {
+    if !name.contains('\\') {
+        return Ok(name.to_owned());
+    }
+    let mut decoded = String::new();
+    let mut chars = name.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            decoded.push(ch);
+            continue;
+        }
+        ensure!(
+            chars.next() == Some('u'),
+            "invalid JavaScript identifier escape"
+        );
+        let code = if chars.peek() == Some(&'{') {
+            chars.next();
+            let mut code = 0u32;
+            let mut saw_digit = false;
+            loop {
+                match chars.next() {
+                    Some('}') => break,
+                    Some(c) if c.is_ascii_hexdigit() => {
+                        saw_digit = true;
+                        let digit = c
+                            .to_digit(16)
+                            .context("invalid JavaScript identifier escape")?;
+                        code = code
+                            .checked_mul(16)
+                            .and_then(|n| n.checked_add(digit))
+                            .filter(|n| *n <= 0x10FFFF)
+                            .context("invalid JavaScript identifier escape")?;
+                    }
+                    _ => anyhow::bail!("invalid JavaScript identifier escape"),
+                }
+            }
+            ensure!(saw_digit, "invalid JavaScript identifier escape");
+            code
+        } else {
+            let digits: String = chars.by_ref().take(4).collect();
+            ensure!(digits.len() == 4, "invalid JavaScript identifier escape");
+            u32::from_str_radix(&digits, 16)?
+        };
+        decoded.push(char::from_u32(code).context("invalid JavaScript identifier code point")?);
+    }
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&tree_sitter_javascript::LANGUAGE.into())?;
+    let tree = parser
+        .parse(&decoded, None)
+        .context("JavaScript identifier parse failed")?;
+    let root = tree.root_node();
+    let token = root
+        .named_child(0)
+        .context("missing JavaScript identifier")?;
+    ensure!(
+        !root.has_error()
+            && root.named_child_count() == 1
+            && token.kind() == "expression_statement"
+            && token.named_child_count() == 1
+            && token
+                .named_child(0)
+                .is_some_and(|n| n.kind() == "identifier" && n.byte_range() == (0..decoded.len())),
+        "invalid decoded JavaScript identifier"
+    );
+    Ok(decoded)
+}
+
+// A declaration's measured spelling stays indexed even if an escaped JavaScript
+// identifier cannot decode to a complete standalone token (for example, a
+// keyword spelled with escapes). Calls use lookup().ok(), never this raw fallback.
+fn declaration_lookup(language: &str, name: &str) -> Result<String> {
+    match lookup(language, name) {
+        Ok(key) => Ok(key),
+        Err(_) if language == "javascript" && name.contains('\\') => Ok(name.to_owned()),
+        Err(error) => Err(error),
+    }
+}
+
+/// A name-match key requires the entire parser-measured callee token and its
+/// exact selected captured bytes; expressions cannot supply a guessed suffix.
+pub fn verified_callee_lookup(language: &str, call: &Call, source: &str) -> Option<String> {
+    let range = call.callee_range.as_ref()?;
+    let spelling = call.spelling.as_deref()?;
+    let token = source.get(range.start..range.end)?;
+    if language == "java" && token.contains('\\') {
+        return None;
+    }
+    (token == spelling)
+        .then(|| lookup(language, token).ok())
+        .flatten()
 }
 
 // Each absent input is explicit, never indistinguishable from a present empty file.
@@ -1875,7 +1970,7 @@ impl ParserState<'_> {
                 name: named.as_ref().map(|v| v.0.clone()),
                 lookup_key: named
                     .as_ref()
-                    .map(|v| lookup(&self.file.language, &v.0))
+                    .map(|v| declaration_lookup(&self.file.language, &v.0))
                     .transpose()?,
                 ancestors: ancestry.clone(),
                 key: key.clone(),
@@ -2216,7 +2311,8 @@ impl Artifact {
             }
             if let Some(n) = &d.name {
                 ensure!(
-                    d.lookup_key.as_deref() == Some(lookup(&d.document.language, n)?.as_str()),
+                    d.lookup_key.as_deref()
+                        == Some(declaration_lookup(&d.document.language, n)?.as_str()),
                     "native lookup normalization mismatch"
                 );
             }
@@ -2581,8 +2677,8 @@ mod occurrence_identity_tests {
         };
         assert_eq!(
             witness(&a),
-            "80b64e65fe108a98090e2342cef5432805a89b18ef2446862ca6b2b7fcd049d3",
-            "native-v6 witness includes declaration role and the producer version"
+            "c465bc7cbd360dd051f09f6a66bda6d7f491bbc93385ce3175c71652be247382",
+            "native-v8 witness includes declaration role and the producer version"
         );
         assert_eq!(
             witness(&a),

@@ -497,6 +497,12 @@ fn tool(v: &Value, code: Option<&str>, modern: bool) {
                 calls.as_array().unwrap().len(),
                 "calls",
             )
+        } else if let Some(callers) = data.get("callers") {
+            (
+                "trellis_incoming_calls",
+                callers.as_array().unwrap().len(),
+                "calls",
+            )
         } else {
             (
                 "trellis_read_source",
@@ -850,7 +856,7 @@ fn both_modes_full_catalog_tools_and_lifecycle() {
         let response = peer.ask(list);
         let catalog: Value =
             serde_json::from_str(include_str!("fixtures/mcp/catalog.json")).unwrap();
-        assert_eq!(catalog.as_array().unwrap().len(), 5);
+        assert_eq!(catalog.as_array().unwrap().len(), 6);
         let expected_list = |id: Value| {
             let result = if legacy {
                 json!({"tools":catalog})
@@ -1031,7 +1037,7 @@ fn framing_ids_negotiation_and_application_validation() {
     for spelling in [r#""\u00e9""#, r#""é""#, r#""\ud83d\ude00""#, r#""😀""#] {
         peer.send_raw(format!(r#"{{"jsonrpc":"2.0","id":{spelling},"method":"tools/list","params":{{"_meta":{}}}}}"#,fixture()["modernMeta"]).as_bytes());
         let v = peer.reply();
-        assert_eq!(v["result"]["tools"].as_array().unwrap().len(), 5);
+        assert_eq!(v["result"]["tools"].as_array().unwrap().len(), 6);
     }
     for n in ["1e0", "1.0", "-0", "9007199254740991", "-9007199254740991"] {
         peer.send_raw(format!(r#"{{"jsonrpc":"2.0","id":{n},"method":"server/discover","params":{{"_meta":{}}}}}"#,fixture()["modernMeta"]).as_bytes());
@@ -1136,7 +1142,7 @@ fn legacy_title_recovery_max_id_and_root_selection() {
             .as_array()
             .unwrap()
             .len(),
-        5
+        6
     );
     assert!(peer.finish().0.success());
     // Topology overlap is refused before marker attachment.
@@ -1689,6 +1695,28 @@ async fn warm_relay_serves_both_new_tools_and_rejects_closed_inputs() {
         let target_data = &selected_target["result"]["structuredContent"]["data"];
         assert_eq!(target_data["declaration"]["role"], "production");
         let target_version = emitted_document(target_data, target_data);
+        let incoming = peer.ask(call(
+            legacy,
+            json!(17),
+            "trellis_incoming_calls",
+            json!({"schemaVersion":1,"symbolId":target_id,"expectedBasis":pin}),
+        ));
+        tool(&incoming, None, !legacy);
+        schema_pairs.push(json!({"name":"trellis_incoming_calls",
+            "structuredContent":incoming["result"]["structuredContent"]}));
+        let incoming_data = &incoming["result"]["structuredContent"]["data"];
+        assert_eq!(incoming_data["match"]["basis"], "name");
+        assert_eq!(incoming_data["callers"].as_array().unwrap().len(), 1);
+        assert_eq!(incoming_data["callers"][0]["matchedBy"], "name");
+        assert_eq!(incoming_data["callers"][0]["callerRole"], "production");
+        assert!(incoming_data["callers"][0]["binding"].is_null());
+        assert!(incoming_data["callers"][0]["targetId"].is_null());
+        assert_eq!(incoming_data["scopeCoverage"].as_array().unwrap().len(), 4);
+        assert_eq!(incoming_data["documents"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            incoming["result"]["structuredContent"]["evidenceBasis"],
+            pin
+        );
         let test_find = peer.ask(call(
             legacy,
             json!(15),
@@ -1766,6 +1794,39 @@ async fn warm_relay_serves_both_new_tools_and_rejects_closed_inputs() {
             tool(
                 &peer.ask(call(legacy, json!(number), name, args)),
                 Some("invalid_request"),
+                !legacy,
+            );
+        }
+        for (number, arguments, code) in [
+            (
+                30,
+                json!({"schemaVersion":1,"symbolId":target_id,"view":"incoming_calls"}),
+                "invalid_request",
+            ),
+            (
+                31,
+                json!({"schemaVersion":1,"symbolId":target_id,"limit":51}),
+                "range_too_large",
+            ),
+            (
+                32,
+                json!({"schemaVersion":1,"symbolId":target_id,"expectedBasis":null}),
+                "invalid_request",
+            ),
+            (
+                33,
+                json!({"schemaVersion":1,"symbolId":target_id,"workspace":null}),
+                "invalid_request",
+            ),
+        ] {
+            tool(
+                &peer.ask(call(
+                    legacy,
+                    json!(number),
+                    "trellis_incoming_calls",
+                    arguments,
+                )),
+                Some(code),
                 !legacy,
             );
         }
@@ -1877,7 +1938,7 @@ async fn golden_tool_envelopes_and_maximum_ids_both_modes() {
                     let expected = match index {
                         1 => golden_settled_empty_find(&id, workspace, published),
                         2 => golden_settled_failure(&id, workspace, "not_found", published.clone()),
-                        3 | 4 => {
+                        3..=5 => {
                             golden_settled_failure(&id, workspace, "not_found", published.clone())
                         }
                         _ => unreachable!("fixed golden tool order"),
@@ -2697,7 +2758,7 @@ fn per_call_linked_worktree_selection_and_closed_failures() {
 #[test]
 fn catalog_rejects_contradictory_unresolved_and_resolved_failures() {
     let catalog: Value = serde_json::from_str(include_str!("fixtures/mcp/catalog.json")).unwrap();
-    assert_eq!(catalog.as_array().unwrap().len(), 5);
+    assert_eq!(catalog.as_array().unwrap().len(), 6);
     for entry in catalog.as_array().unwrap() {
         let defs = &entry["outputSchema"]["$defs"];
         assert_eq!(
@@ -7708,6 +7769,26 @@ async fn mcp_wire_valid_basis_and_uint_are_not_silently_dropped() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_outgoing_measured_escaped_identifier_matches_decoded_declaration() {
+    let reply = mcp_outgoing_fixture(
+        &[(
+            "a.js",
+            "function Target() {}\nfunction Owner() { obj.\\u{54}arget(); }\n",
+        )],
+        "Owner",
+        None,
+    );
+    tool(&reply, None, true);
+    let call = &reply["result"]["structuredContent"]["data"]["calls"][0];
+    assert_eq!(call["calleeText"], "\\u{54}arget");
+    assert_eq!(
+        call["nativeCandidates"]["items"].as_array().unwrap().len(),
+        1,
+        "{reply}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mcp_outgoing_nested_owner_and_compound_member_exclusion() {
     let reply = mcp_outgoing_fixture(
         &[(
@@ -9363,4 +9444,278 @@ async fn mcp_source_linked_selected_deadline_after_admission_keeps_resolved_shap
     drop(reader);
     drop(client);
     session.join().unwrap().unwrap();
+}
+
+// Incoming calls are checked through the actual MCP tools/call path rather than
+// through the store reader or projection in isolation.
+async fn incoming_many_documents_fixture(long_name: bool, limit: Option<usize>) -> (Value, Value) {
+    let temp = tempfile::tempdir().unwrap();
+    let root = checkout(temp.path());
+    let name = if long_name {
+        format!("Target{}", "Q".repeat(3_800))
+    } else {
+        "Target".to_owned()
+    };
+    fs::write(root.join("target.js"), format!("function {name}() {{}}\n")).unwrap();
+    for number in 0..21 {
+        fs::write(
+            root.join(format!("caller{number:02}.js")),
+            format!("function Caller{number:02}() {{ {name}(); }}\n"),
+        )
+        .unwrap();
+    }
+    let root_key = trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root)
+        .unwrap()
+        .root_key;
+    let (mut peer, witness) = Peer::start_with_causal_witness(Some(&root));
+    tool(
+        &peer.ask(call(
+            false,
+            json!(1),
+            "trellis_workspace_describe",
+            json!({"schemaVersion":1}),
+        )),
+        None,
+        true,
+    );
+    let pin = await_settled_golden_h(&witness, &root_key).await;
+    let found = peer.ask(call(
+        false,
+        json!(2),
+        "trellis_find_symbols",
+        json!({"schemaVersion":1,"query":"Target","expectedBasis":pin}),
+    ));
+    tool(&found, None, true);
+    let symbol_id = found["result"]["structuredContent"]["data"]["symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|symbol| symbol["name"] == name)
+        .unwrap()["symbolId"]
+        .clone();
+    let declaration = peer.ask(call(
+        false,
+        json!(3),
+        "trellis_declaration",
+        json!({"schemaVersion":1,"symbolId":symbol_id,"expectedBasis":pin}),
+    ));
+    tool(&declaration, None, true);
+    let mut args = json!({"schemaVersion":1,"symbolId":symbol_id,"expectedBasis":pin});
+    if let Some(limit) = limit {
+        args["limit"] = json!(limit);
+    }
+    let incoming = peer.ask(call(false, json!(4), "trellis_incoming_calls", args));
+    tool(&incoming, None, true);
+    assert!(peer.finish().0.success());
+    (declaration, incoming)
+}
+
+fn assert_incoming_emitted_proof_closure(declaration: &Value, incoming: &Value) {
+    use std::collections::BTreeSet;
+    let selected = &declaration["result"]["structuredContent"]["data"];
+    let selected_version = emitted_document(selected, selected);
+    let data = &incoming["result"]["structuredContent"]["data"];
+    let docs = data["documents"].as_array().unwrap();
+    let calls = data["callers"].as_array().unwrap();
+    assert_eq!(
+        docs.len(),
+        calls.len(),
+        "each distinct emitted caller owns one document"
+    );
+    assert!(
+        docs.iter()
+            .all(|doc| doc["document"]["path"] != "target.js"),
+        "selected declaration is proof closure, not a caller document ref"
+    );
+    let referenced: BTreeSet<_> = calls
+        .iter()
+        .map(|call| call["doc"].as_u64().unwrap() as usize)
+        .collect();
+    assert_eq!(referenced, (0..docs.len()).collect());
+    let mut expected_proofs: BTreeSet<_> = docs
+        .iter()
+        .map(|doc| doc["provenanceId"].as_str().unwrap())
+        .collect();
+    expected_proofs.insert(selected_version["provenanceId"].as_str().unwrap());
+    let actual_proofs: BTreeSet<_> = data["provenance"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|proof| proof["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        actual_proofs, expected_proofs,
+        "selected + emitted callers only"
+    );
+    let mut expected_paths: BTreeSet<_> = docs
+        .iter()
+        .map(|doc| doc["document"]["path"].as_str().unwrap())
+        .collect();
+    expected_paths.insert("target.js");
+    let actual_paths: BTreeSet<_> = data["coverage"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["documentPath"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        actual_paths, expected_paths,
+        "coverage includes selected and emitted sites only"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn incoming_default_twenty_and_limit_one_keep_exact_required_closure() {
+    for (limit, expected) in [(None, 20), (Some(1), 1)] {
+        let (declaration, response) = incoming_many_documents_fixture(false, limit).await;
+        let envelope = &response["result"]["structuredContent"];
+        let data = &envelope["data"];
+        assert_eq!(data["callers"].as_array().unwrap().len(), expected);
+        assert_eq!(envelope["truncationReason"], "limit");
+        assert_eq!(envelope["truncated"], true);
+        assert_incoming_emitted_proof_closure(&declaration, &response);
+        let docs = data["documents"].as_array().unwrap();
+        assert_eq!(docs[0]["document"]["path"], "caller00.js");
+        assert_eq!(
+            docs.last().unwrap()["document"]["path"],
+            format!("caller{:02}.js", expected - 1)
+        );
+        assert!(
+            !docs
+                .iter()
+                .any(|doc| doc["document"]["path"] == "caller20.js")
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn incoming_byte_clipping_overrides_limit_and_discards_omitted_proofs() {
+    let (declaration, response) = incoming_many_documents_fixture(true, Some(20)).await;
+    let envelope = &response["result"]["structuredContent"];
+    let data = &envelope["data"];
+    let count = data["callers"].as_array().unwrap().len();
+    assert!(
+        count > 0 && count < 20,
+        "required list must clip before 20: {count}"
+    );
+    assert_eq!(
+        envelope["truncationReason"], "response_bytes",
+        "byte clipping must take priority over the 21st-hit limit lookahead"
+    );
+    assert_eq!(envelope["truncated"], true);
+    assert_incoming_emitted_proof_closure(&declaration, &response);
+    let docs = data["documents"].as_array().unwrap();
+    assert_eq!(
+        docs.last().unwrap()["document"]["path"],
+        format!("caller{:02}.js", count - 1)
+    );
+    assert!(
+        !docs
+            .iter()
+            .any(|doc| doc["document"]["path"] == format!("caller{count:02}.js"))
+    );
+    assert!(serde_json::to_vec(&response).unwrap().len() < 65_536);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn incoming_escaped_javascript_declarations_keep_wire_labels_and_later_calls() {
+    for (source, selected_name, expected_callee, later_name) in [
+        (
+            "function \\u{0000054}arget() {}\nfunction Normal() {}\nfunction Caller() { Target(); Normal(); }\n",
+            "\\u{0000054}arget",
+            Some("Target"),
+            "Normal",
+        ),
+        (
+            "class A { d\\u0065lete() {} normal() {} }\nfunction Caller() { normal(); const a = new A(); a.delete(); a.d\\u0065lete(); }\n",
+            "d\\u0065lete",
+            None,
+            "normal",
+        ),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = checkout(temp.path());
+        fs::write(root.join("a.js"), source).unwrap();
+        let root_key = trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root)
+            .unwrap()
+            .root_key;
+        let (mut peer, witness) = Peer::start_with_causal_witness(Some(&root));
+        tool(
+            &peer.ask(call(
+                false,
+                json!(1),
+                "trellis_workspace_describe",
+                json!({"schemaVersion":1}),
+            )),
+            None,
+            true,
+        );
+        let pin = await_settled_golden_h(&witness, &root_key).await;
+        let find = |peer: &mut Peer, request_id: i64, query: &str| {
+            let reply = peer.ask(call(
+                false,
+                json!(request_id),
+                "trellis_find_symbols",
+                json!({"schemaVersion":1,"query":query,"expectedBasis":pin}),
+            ));
+            tool(&reply, None, true);
+            reply["result"]["structuredContent"]["data"]["symbols"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|symbol| symbol["name"] == query)
+                .unwrap_or_else(|| panic!("missing published {query}: {reply}"))["symbolId"]
+                .clone()
+        };
+        let selected_id = find(&mut peer, 2, selected_name);
+        let later_id = find(&mut peer, 3, later_name);
+        let selected = peer.ask(call(
+            false,
+            json!(4),
+            "trellis_declaration",
+            json!({"schemaVersion":1,"symbolId":selected_id,"expectedBasis":pin}),
+        ));
+        tool(&selected, None, true);
+        let decl = &selected["result"]["structuredContent"]["data"]["declaration"];
+        assert_eq!(decl["name"], selected_name);
+        assert_eq!(decl["syntaxId"], selected_id);
+        let incoming = peer.ask(call(
+            false,
+            json!(5),
+            "trellis_incoming_calls",
+            json!({"schemaVersion":1,"symbolId":selected_id,"expectedBasis":pin}),
+        ));
+        tool(&incoming, None, true);
+        let data = &incoming["result"]["structuredContent"]["data"];
+        assert_eq!(data["symbolId"], selected_id);
+        assert!(
+            data["displayKey"].as_str().unwrap().contains(selected_name),
+            "{incoming}"
+        );
+        assert_eq!(data["match"]["basis"], "name");
+        let callers = data["callers"].as_array().unwrap();
+        match expected_callee {
+            Some(callee) => {
+                assert_eq!(callers.len(), 1, "{incoming}");
+                assert_eq!(callers[0]["calleeText"], callee);
+                assert_eq!(callers[0]["matchedBy"], "name");
+            }
+            None => assert!(callers.is_empty(), "{incoming}"),
+        }
+        let caller_id = find(&mut peer, 6, "Caller");
+        let later_incoming = peer.ask(call(
+            false,
+            json!(7),
+            "trellis_incoming_calls",
+            json!({"schemaVersion":1,"symbolId":later_id,"expectedBasis":pin}),
+        ));
+        tool(&later_incoming, None, true);
+        let later_callers = later_incoming["result"]["structuredContent"]["data"]["callers"]
+            .as_array()
+            .unwrap();
+        assert_eq!(later_callers.len(), 1, "{later_incoming}");
+        assert_eq!(later_callers[0]["calleeText"], later_name);
+        assert_eq!(later_callers[0]["ownerSyntaxId"], caller_id);
+        assert!(peer.finish().0.success());
+    }
 }
