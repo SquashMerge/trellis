@@ -3869,9 +3869,45 @@ fn write_native(
         .iter()
         .map(|source| ((source.language.as_str(), source.path.as_str()), source))
         .collect();
+    // Projection IDs and native witnesses are pure per-document values. They
+    // are computed on workers before the insert loop, under the same reuse
+    // conditions, and each is consumed below exactly where it was computed
+    // before, so every earlier check still runs first. SQL stays here.
+    let projection_of = |file: &SourceFile| -> Option<Result<V8DocumentProjection>> {
+        let grouped = rows.get(file.path.as_str())?;
+        Some(v8_document_projection(file, a, grouped))
+    };
+    let witness_of = |file: &SourceFile| -> Option<Result<String>> {
+        Some(publication_native_witness(
+            documents.get(file.path.as_str())?,
+            &a.producer,
+            coverages.get(file.path.as_str())?,
+            rows.get(file.path.as_str())?,
+        ))
+    };
+    let mut precomputed = crate::parallel::map_ordered(
+        &graph.files,
+        crate::parallel::default_workers(),
+        cancel,
+        |_, file| {
+            let projection = if reuse.existing_ids.contains_key(&file.path) {
+                None
+            } else {
+                projection_of(file)
+            };
+            let witness = if reuse.for_path(&file.path).native {
+                None
+            } else {
+                witness_of(file)
+            };
+            (projection, witness)
+        },
+    )
+    .into_iter();
     let mut projections = BTreeMap::new();
     for (ordinal, file) in graph.files.iter().enumerate() {
         check_cancel(cancel)?;
+        let (mut projection, mut witness) = precomputed.next().flatten().unwrap_or_default();
         let doc = documents
             .get(file.path.as_str())
             .context("native document missing")?;
@@ -3902,7 +3938,9 @@ fn write_native(
                 class_hash: existing.class_hash.clone(),
             }
         } else {
-            v8_document_projection(file, a, grouped)?
+            projection
+                .take()
+                .unwrap_or_else(|| v8_document_projection(file, a, grouped))?
         };
         let context = crate::native_evidence::native_extraction_context(
             &a.producer,
@@ -3924,14 +3962,17 @@ fn write_native(
                     a.producer.version,
                     file.text.len() as i64,
                     file.text.as_bytes(),
-                    publication_native_witness(
-                        doc,
-                        &a.producer,
-                        coverages
-                            .get(file.path.as_str())
-                            .context("missing native coverage")?,
-                        grouped,
-                    )?,
+                    match witness.take() {
+                        Some(witness) => witness?,
+                        None => publication_native_witness(
+                            doc,
+                            &a.producer,
+                            coverages
+                                .get(file.path.as_str())
+                                .context("missing native coverage")?,
+                            grouped,
+                        )?,
+                    },
                 ],
             )?;
         }
