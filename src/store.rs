@@ -620,6 +620,32 @@ impl DerefMut for PublicationConnection {
     }
 }
 
+/// How often this thread computed each per-snapshot or per-file selected value.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SelectedReadCounts {
+    producer_hashes: usize,
+    source_reads: usize,
+    attestations: usize,
+}
+#[cfg(test)]
+thread_local! {
+    static SELECTED_READ_COUNTS: std::cell::Cell<SelectedReadCounts> =
+        std::cell::Cell::new(SelectedReadCounts::default());
+}
+#[cfg(test)]
+fn count_selected_read(update: impl FnOnce(&mut SelectedReadCounts)) {
+    SELECTED_READ_COUNTS.with(|counts| {
+        let mut value = counts.get();
+        update(&mut value);
+        counts.set(value);
+    });
+}
+#[cfg(test)]
+fn take_selected_read_counts() -> SelectedReadCounts {
+    SELECTED_READ_COUNTS.with(|counts| counts.take())
+}
+
 /// Immutable revision chosen inside an admitted read transaction. This is not
 /// a surrogate for control metadata: status, root and schema remain live-only.
 struct ReadRevision {
@@ -4436,6 +4462,8 @@ fn revision_producer_binding(db: &Connection, revision_key: &str) -> Result<(Str
 }
 
 fn selected_producer_hash(db: &Connection, selected: &ReadRevision) -> Result<String> {
+    #[cfg(test)]
+    count_selected_read(|counts| counts.producer_hashes += 1);
     let (executable, derived) = revision_producer_binding(db, &selected.key)?;
     let origin: String = db.query_row(
         "SELECT executable_hash FROM native_producers LIMIT 1",
@@ -10856,6 +10884,8 @@ impl Store {
         selected: &ReadRevision,
         progress: Option<&dyn Fn() -> bool>,
     ) -> Result<()> {
+        #[cfg(test)]
+        count_selected_read(|counts| counts.attestations += 1);
         use crate::native_evidence::DocumentKey;
         optional_hint_check(progress)?;
         let sql = "SELECT m.source_set_id,m.language,m.path,m.document_version_id,m.graph_projection_id,
@@ -12043,6 +12073,8 @@ impl Store {
         selected: &ReadRevision,
         progress: Option<&dyn Fn() -> bool>,
     ) -> Result<Option<SourceFile>> {
+        #[cfg(test)]
+        count_selected_read(|counts| counts.source_reads += 1);
         optional_hint_check(progress)?;
         let selected_sql = "FROM revision_documents m JOIN document_versions d
             ON d.id=m.document_version_id AND d.source_set_id=m.source_set_id
@@ -13025,6 +13057,8 @@ mod sqlite_schema_race_tests;
 
 #[cfg(test)]
 mod selected_source_budget_tests;
+#[cfg(test)]
+mod selected_read_once_tests;
 
 #[cfg(test)]
 mod busy_contention_classifier_tests;
