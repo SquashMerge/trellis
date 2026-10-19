@@ -435,12 +435,13 @@ struct RequestCoverage {
 pub struct WatcherWork {
     watch: crate::watch::WatchSignals,
     request_coverage: Option<RequestCoverage>,
-    /// Armed when a row completes with a successor queued (T04). The gate gets
-    /// one watcher attempt per row; intent accepted after that attempt is
-    /// before the next row's own cutoff, so that row's capture covers it.
+    /// Armed when a row completes with a successor queued (T04, #136 owner
+    /// amendment). The gate is spent once one full capture has started under
+    /// the current options; intent accepted after that is before the next
+    /// row's own cutoff, so that row's capture covers it.
     queue_gate: bool,
     gate_attempted: bool,
-    #[cfg(all(test, feature = "test-support"))]
+    /// Full watcher captures started; a gate attempt counts only if one did.
     full_capture_attempts: usize,
     #[cfg(all(test, feature = "test-support"))]
     reconcile_now_for_tests: Option<std::time::Instant>,
@@ -517,7 +518,6 @@ impl WatcherWork {
             request_coverage: None,
             queue_gate: false,
             gate_attempted: false,
-            #[cfg(all(test, feature = "test-support"))]
             full_capture_attempts: 0,
             #[cfg(all(test, feature = "test-support"))]
             reconcile_now_for_tests: None,
@@ -840,9 +840,9 @@ impl WatcherWork {
         self.gate_attempted = false;
     }
 
-    /// An armed gate holds the next claim for its one watcher attempt, and
-    /// again only if the effective options changed since: a registration is
-    /// one-off, so continuous edits cannot hold the FIFO.
+    /// An armed gate holds the next claim until one capture has started under
+    /// the current effective options. A registration is one-off, so
+    /// continuous edits cannot hold the FIFO.
     pub(crate) fn gate_pending(&self, options: &IndexOptions) -> bool {
         self.queue_gate
             && (self.options_differ(options)
@@ -872,10 +872,11 @@ impl WatcherWork {
         options: &IndexOptions,
         cancel: &CancelFlag,
     ) -> Result<bool> {
-        // Spent even if the attempt fails or is deferred: the next row's
-        // capture covers what it left, as a failed watcher step would.
-        self.gate_attempted = true;
-        self.reconcile_due_with_mode(
+        // Spent once a capture started, even if it failed: the next row's
+        // capture covers what it left. A deferral with no capture, such as
+        // retry backoff, leaves the gate pending until the delay passes.
+        let started = self.full_capture_attempts;
+        let reconciled = self.reconcile_due_with_mode(
             store,
             session,
             options,
@@ -883,7 +884,11 @@ impl WatcherWork {
             false,
             true,
             (|_, _| {}, |_| {}),
-        )
+        );
+        if self.full_capture_attempts != started {
+            self.gate_attempted = true;
+        }
+        reconciled
     }
 
     /// A full capture always checks root, writer and selected publication fences.
@@ -961,6 +966,8 @@ impl WatcherWork {
             }
             self.watch = next;
             self.request_coverage = None;
+            // New options need their own capture before an armed gate opens.
+            self.gate_attempted = false;
             self.options = options.clone();
             self.last_accounted_generation = None;
             self.last_accounted_pin = None;
@@ -1020,10 +1027,7 @@ impl WatcherWork {
                     publication.waited_for().as_micros()
                 ),
             );
-            #[cfg(all(test, feature = "test-support"))]
-            {
-                self.full_capture_attempts += 1;
-            }
+            self.full_capture_attempts += 1;
             let captured = Capture::admit(options, cancel, &|_| {})?;
             observe(&captured, &self.watch);
             // Reject a hinted edit before checking the admitted bytes against

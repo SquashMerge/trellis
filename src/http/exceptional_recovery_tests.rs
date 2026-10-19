@@ -1432,6 +1432,61 @@ fn registration_after_the_preclaim_sample_is_inventoried_before_the_claim() {
     );
 }
 
+#[cfg(feature = "test-support")]
+#[test]
+fn registration_during_retry_backoff_is_inventoried_before_the_claim() {
+    let (_tmp, store, state, options) = serving_queue_watch_fixture();
+    let first = store.enqueue_request(&options, None).unwrap();
+    let next = store.enqueue_request(&options, None).unwrap();
+    state.worker_step().unwrap();
+    assert_eq!(
+        store.request_by_id(&first.id).unwrap().unwrap().state,
+        "done"
+    );
+    // The watcher is in retry backoff when a `serve` registration arrives.
+    // Swapping in the new options captures nothing yet, so the gate is not
+    // spent: Q1 waits for the new options' capture (#136 owner amendment).
+    state
+        .watcher_work
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .1
+        .defer_retry_for_tests();
+    let mut registered = options.clone();
+    registered.max_file_bytes /= 2;
+    *state.explicit_pending.lock().unwrap() = Some(Arc::new(registered));
+    state.worker_step().unwrap();
+    assert_eq!(
+        store.request_by_id(&next.id).unwrap().unwrap().state,
+        "queued",
+        "Q1 was claimed with no capture under the new options"
+    );
+    assert!(state.explicit_pending.lock().unwrap().is_some());
+
+    state
+        .watcher_work
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .1
+        .expire_retry_for_tests();
+    let observed = state.clone();
+    store.set_after_claim_hook_for_tests(move || {
+        assert!(
+            observed.explicit_pending.lock().unwrap().is_none(),
+            "Q1 was claimed before the new options' full inventory"
+        );
+    });
+    state.worker_step().unwrap();
+    assert_eq!(
+        store.request_by_id(&next.id).unwrap().unwrap().state,
+        "done"
+    );
+}
+
 /// Each time the gate reconciles, another edit arrives before Q1's claim.
 #[cfg(feature = "test-support")]
 fn edit_after_every_gate_reconcile(
