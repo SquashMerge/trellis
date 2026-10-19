@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::Path,
+    path::{Path, PathBuf},
 };
 use tree_sitter::Node;
 
@@ -623,7 +623,42 @@ pub fn from_capture(
     root_id: &str,
     cancel: &CancelFlag,
 ) -> Result<Artifact> {
-    from_capture_observed(capture, root, root_id, cancel, |_, _| {})
+    Ok(from_capture_observed(capture, root, root_id, cancel, |_, _| {})?.into_artifact())
+}
+
+/// An artifact that has passed `Artifact::validate` against exactly this
+/// capture, root and root id. Publication accepts it without repeating the
+/// full rebuild and comparison; only this module constructs one, and it
+/// offers no mutable access to the artifact.
+pub(crate) struct ValidatedArtifact<'c> {
+    artifact: Artifact,
+    capture: &'c Capture,
+    root: PathBuf,
+    root_id: String,
+}
+
+impl<'c> ValidatedArtifact<'c> {
+    pub(crate) fn artifact(&self) -> &Artifact {
+        &self.artifact
+    }
+    pub(crate) fn capture(&self) -> &'c Capture {
+        self.capture
+    }
+    pub(crate) fn validated_for(&self, root: &Path, root_id: &str) -> bool {
+        self.root == root && self.root_id == root_id
+    }
+    pub(crate) fn into_artifact(self) -> Artifact {
+        self.artifact
+    }
+}
+
+#[cfg(test)]
+static FULL_VALIDATIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Full rebuild-and-compare validations run by this process.
+#[cfg(test)]
+pub(crate) fn full_validations_for_tests() -> usize {
+    FULL_VALIDATIONS.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// Call-scoped evidence from the full native pipeline. `Measured` fires only
@@ -635,13 +670,13 @@ pub enum FullNativeStage {
     Validated,
 }
 
-pub(crate) fn from_capture_observed(
-    capture: &Capture,
+pub(crate) fn from_capture_observed<'c>(
+    capture: &'c Capture,
     root: &Path,
     root_id: &str,
     cancel: &CancelFlag,
     observe: impl Fn(&DocumentKey, FullNativeStage),
-) -> Result<Artifact> {
+) -> Result<ValidatedArtifact<'c>> {
     let artifact = build_native_observed(capture, root, root_id, &|key| {
         observe(key, FullNativeStage::Measured);
     })?;
@@ -649,7 +684,12 @@ pub(crate) fn from_capture_observed(
     for document in &artifact.revision.documents {
         observe(&document.key, FullNativeStage::Validated);
     }
-    Ok(artifact)
+    Ok(ValidatedArtifact {
+        artifact,
+        capture,
+        root: root.to_owned(),
+        root_id: root_id.to_owned(),
+    })
 }
 
 /// The full captured revision header is shared by full and selected measurement.
@@ -2126,6 +2166,8 @@ impl Artifact {
     ) -> Result<()> {
         capture.verify(cancel)?;
         self.validate_structure(&capture.files)?;
+        #[cfg(test)]
+        FULL_VALIDATIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let expected = build_native(capture, root, root_id)?;
         capture.verify(cancel)?;
         expected.validate_structure(&capture.files)?;

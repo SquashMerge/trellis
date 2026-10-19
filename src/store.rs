@@ -7780,23 +7780,22 @@ impl Store {
         self.attest_post_acquisition_reconciliation_guard(leader, pin)?;
         Ok(pin)
     }
-    pub(crate) fn publish_native_recovery(
+    pub(crate) fn publish_validated_native_recovery(
         &self,
         graph: &Graph,
-        capture: &crate::capture::Capture,
-        native: &crate::native_evidence::Artifact,
+        native: &crate::native_evidence::ValidatedArtifact<'_>,
         leader: &topology::WriterGuard,
         expected: RecoveryBaseline,
         cancel: &CancelFlag,
     ) -> Result<IndexPin> {
-        self.publish_native_expected(
+        self.validate_validated_native_bundle(graph, native, cancel)?;
+        self.publish_inner_expected(
             graph,
-            capture,
-            native,
+            native.capture(),
+            native.artifact(),
             leader,
             ExpectedPublication::Recovery(Box::new(expected)),
             cancel,
-            false,
         )
     }
     #[allow(dead_code)] // Test seam for the original full-artifact selective rollback matrix.
@@ -7914,6 +7913,31 @@ impl Store {
                 cancel,
             )?;
         }
+        self.validate_bundle_projection(graph, capture, native, cancel)
+    }
+    /// The artifact already passed its one full rebuild-and-compare against
+    /// this capture. The capture freshness check and every bundle check still
+    /// run here; only the repeated rebuild is skipped.
+    fn validate_validated_native_bundle(
+        &self,
+        graph: &Graph,
+        native: &crate::native_evidence::ValidatedArtifact<'_>,
+        cancel: &CancelFlag,
+    ) -> Result<()> {
+        ensure!(
+            native.validated_for(Path::new(&self.workspace_root), &self.identity.record_id),
+            "native_evidence_required: artifact was validated for another root"
+        );
+        native.capture().verify(cancel)?;
+        self.validate_bundle_projection(graph, native.capture(), native.artifact(), cancel)
+    }
+    fn validate_bundle_projection(
+        &self,
+        graph: &Graph,
+        capture: &crate::capture::Capture,
+        native: &crate::native_evidence::Artifact,
+        cancel: &CancelFlag,
+    ) -> Result<()> {
         ensure!(
             capture.graph_projection_count() == 1,
             "native_evidence_required: capture must have one graph projection"
