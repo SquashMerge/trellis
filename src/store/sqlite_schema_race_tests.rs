@@ -708,3 +708,29 @@ fn second_connection_adds_view_after_admission_before_status_and_leader_snapshot
         );
     }
 }
+
+#[test]
+fn publication_connection_runs_with_the_publication_page_cache() {
+    let (_state, _work, store, graph, capture, native, old, cancel, session) = ready();
+    let seen = RefCell::new(Vec::new());
+    store
+        .publish_inner_checked(
+            (&graph, &capture, &native),
+            session.writer_guard().unwrap(),
+            old,
+            &cancel,
+            |stage, connection| {
+                let kib: i64 = connection.pragma_query_value(None, "cache_size", |r| r.get(0))?;
+                seen.borrow_mut()
+                    .push((stage == PublishStage::BeforeCommit, kib));
+                Ok(())
+            },
+        )
+        .unwrap();
+    let seen = seen.into_inner();
+    assert!(seen.iter().any(|(commit, _)| *commit), "{seen:?}");
+    assert!(
+        seen.iter().all(|(_, kib)| *kib == -PUBLICATION_CACHE_KIB),
+        "every publication stage must run with the publication cache: {seen:?}"
+    );
+}
