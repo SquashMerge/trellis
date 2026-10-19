@@ -1507,26 +1507,74 @@ pub struct SelectedCheckout {
 }
 impl SelectedCheckout {
     pub fn before_answer(&self) -> Result<(), SelectionError> {
-        self.launch
-            .verify_readonly()
-            .map_err(|_| SelectionError::IdentityChanged)?;
-        self.identity
-            .verify_readonly()
-            .map_err(|_| SelectionError::IdentityChanged)?;
-        if common_identity(&self.launch)? != self.launch_common
-            || common_identity(&self.identity)? != self.selected_common
+        self.before_answer_by(None)
+    }
+    /// `before_answer` whose Git lookups never wait past `by` (#131); one
+    /// that cannot finish by then is `Unavailable`.
+    pub fn before_answer_by(&self, by: Option<Instant>) -> Result<(), SelectionError> {
+        let dirs = self.common_dirs_by(by)?;
+        self.verify_at_send(&dirs)
+    }
+    /// The slow part of the final check (#131): discover both checkouts'
+    /// common Git directories, each lookup waiting at most until `by`.
+    pub fn common_dirs_by(&self, by: Option<Instant>) -> Result<CommonDirs, SelectionError> {
+        self.launch.verify_readonly().map_err(identity_fault)?;
+        self.identity.verify_readonly().map_err(identity_fault)?;
+        let discover = |identity: &WorkspaceIdentity| {
+            identity
+                .git_common_dir_by(by)
+                .map_err(|_| SelectionError::Unavailable)
+        };
+        Ok(CommonDirs {
+            launch: discover(&self.launch)?,
+            selected: discover(&self.identity)?,
+        })
+    }
+    /// The send-time part of the final check (#131), filesystem calls only:
+    /// both roots still verify, and the discovered common directories are
+    /// still the captured one. A discovered directory that has gone is a
+    /// proven change; any other I/O error proves nothing and is `Unavailable`.
+    /// A Git pointer re-pointed in place, with every root and
+    /// common-directory inode unchanged, is not seen here.
+    pub fn verify_at_send(&self, dirs: &CommonDirs) -> Result<(), SelectionError> {
+        self.launch.verify_readonly().map_err(identity_fault)?;
+        self.identity.verify_readonly().map_err(identity_fault)?;
+        let inode = |path: &Path| {
+            fs::metadata(path)
+                .map(|metadata| (metadata.dev(), metadata.ino()))
+                .map_err(|error| io_fault(&error))
+        };
+        if inode(&dirs.launch)? != self.launch_common
+            || inode(&dirs.selected)? != self.selected_common
             || self.launch_common != self.selected_common
         {
             return Err(SelectionError::IdentityChanged);
         }
-        self.launch
-            .verify_readonly()
-            .map_err(|_| SelectionError::IdentityChanged)?;
-        self.identity
-            .verify_readonly()
-            .map_err(|_| SelectionError::IdentityChanged)?;
         Ok(())
     }
+}
+/// A final check's failure is a proven change unless it is an I/O error
+/// other than a missing path, such as `EACCES` or `EIO` (#131): that proves
+/// nothing, so the check is `Unavailable` and runs again.
+fn identity_fault(error: anyhow::Error) -> SelectionError {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .map_or(SelectionError::IdentityChanged, io_fault)
+}
+fn io_fault(error: &std::io::Error) -> SelectionError {
+    match error.kind() {
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory => {
+            SelectionError::IdentityChanged
+        }
+        _ => SelectionError::Unavailable,
+    }
+}
+/// Common Git directories a final check discovered, for its send-time part.
+#[derive(Debug, Clone)]
+pub struct CommonDirs {
+    launch: PathBuf,
+    selected: PathBuf,
 }
 impl std::ops::Deref for SelectedCheckout {
     type Target = WorkspaceIdentity;
@@ -2175,8 +2223,14 @@ impl CheckoutRuntime {
 }
 
 fn common_identity(identity: &WorkspaceIdentity) -> Result<(u64, u64), SelectionError> {
+    common_identity_by(identity, None)
+}
+fn common_identity_by(
+    identity: &WorkspaceIdentity,
+    by: Option<Instant>,
+) -> Result<(u64, u64), SelectionError> {
     let path = identity
-        .git_common_dir()
+        .git_common_dir_by(by)
         .map_err(|_| SelectionError::Unavailable)?;
     let metadata = fs::metadata(path).map_err(|_| SelectionError::Unavailable)?;
     Ok((metadata.dev(), metadata.ino()))

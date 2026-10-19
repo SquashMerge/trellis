@@ -5,6 +5,7 @@ pub mod session;
 pub mod tools;
 pub mod wire;
 
+use crate::daemon::registry::SelectionError;
 use crate::store::topology::WorkspaceIdentity;
 use std::os::unix::fs::MetadataExt;
 
@@ -491,12 +492,19 @@ fn catching_up(
         .is_none_or(|runtime| runtime.catching_up())
 }
 
+/// How soon a final selected check that could not finish is started again
+/// (#131), while the coordinator keeps deciding the connection's other calls.
+const FINAL_RECHECK_TICK: std::time::Duration = std::time::Duration::from_millis(10);
+
 /// An opt-in, bounded fixture barrier at an actual coordinator boundary.
 /// Normal MCP calls do not connect to or wait for a test socket.
 #[cfg(feature = "test-support")]
 pub(crate) fn phase_hook(stage: &str) -> std::io::Result<()> {
     use std::io::{Read, Write};
-    if std::env::var("TRELLIS_TEST_MCP_PHASE").ok().as_deref() != Some(stage) {
+    // One stage, or several separated by commas.
+    if !std::env::var("TRELLIS_TEST_MCP_PHASE")
+        .is_ok_and(|stages| stages.split(',').any(|named| named == stage))
+    {
         return Ok(());
     }
     let path = std::env::var_os("TRELLIS_TEST_MCP_PHASE_SOCKET").ok_or_else(|| {
@@ -569,6 +577,52 @@ enum Input {
     /// completed it (protocol acceptance), and its position in the input.
     Frame(wire::Frame, Option<u64>, std::time::Instant, u64),
     Done(u64, std::io::Result<CallOutcome>),
+    /// A call's final selected-root check, run off the coordinator (#131).
+    FinalChecked(u64, CheckedResult),
+}
+
+type CheckedResult = std::io::Result<
+    Result<crate::daemon::registry::CommonDirs, crate::daemon::registry::SelectionError>,
+>;
+
+/// A selected call's send-time identity gate (#131): the common directories
+/// its helper discovered, compared again on the coordinator just before the
+/// call's response is committed.
+struct SendGate {
+    witness: crate::daemon::registry::SelectedCheckout,
+    dirs: crate::daemon::registry::CommonDirs,
+    catching_up: bool,
+    capacity: bool,
+}
+
+/// A finished selected call whose final identity check is running, or due to
+/// start again (#131). At most one check runs per call.
+struct FinalCheck {
+    outcome: CallOutcome,
+    running: bool,
+    retry_at: Option<std::time::Instant>,
+}
+
+/// Start the slow part of `token`'s final selected-root check, discovering
+/// both common Git directories, on its own thread; its result reaches the
+/// coordinator's inbox. The thread holds no registry or session
+/// lock, and a result for a call decided meanwhile is ignored.
+fn start_final_check(
+    token: u64,
+    witness: &crate::daemon::registry::SelectedCheckout,
+    deadline: std::time::Instant,
+    stage: &'static str,
+    inbox: &std::sync::mpsc::Sender<Input>,
+) -> bool {
+    let (witness, inbox) = (witness.clone(), inbox.clone());
+    std::thread::Builder::new()
+        .name("mcp-final-check".into())
+        .spawn(move || {
+            let checked = phase_hook(stage).map(|()| witness.common_dirs_by(Some(deadline)));
+            // The coordinator may have ended: nobody waits for this result.
+            let _ = inbox.send(Input::FinalChecked(token, checked));
+        })
+        .is_ok()
 }
 
 /// A worker's finished call: the tool result and the fences the send decision
@@ -1291,7 +1345,8 @@ fn coordinate(
     let fence = |inbox: &mut Inbox,
                  session: &mut session::Session,
                  arrivals: &mut VecDeque<impl_receive::Outcome>,
-                 completed: &mut VecDeque<(u64, std::io::Result<CallOutcome>)>|
+                 completed: &mut VecDeque<(u64, std::io::Result<CallOutcome>)>,
+                 checked: &mut VecDeque<(u64, CheckedResult)>|
      -> bool {
         let until = inbox.decision();
         while let Some(input) = inbox.settled(until) {
@@ -1302,6 +1357,7 @@ fn coordinate(
                     }
                 }
                 Input::Done(token, outcome) => completed.push_back((token, outcome)),
+                Input::FinalChecked(token, result) => checked.push_back((token, result)),
             }
         }
         if inbox.ended {
@@ -1334,9 +1390,22 @@ fn coordinate(
     };
     // Requests handled at the last fence and not yet decided.
     let mut arrivals: VecDeque<impl_receive::Outcome> = VecDeque::new();
+    // Selected calls awaiting their final identity check, and the checks'
+    // results not yet taken in (#131).
+    let mut checks: HashMap<u64, FinalCheck> = HashMap::new();
+    let mut checked: VecDeque<(u64, CheckedResult)> = VecDeque::new();
     loop {
-        if arrivals.is_empty() && completed.is_empty() {
-            let next = in_flight.values().map(|call| call.deadline).min();
+        if arrivals.is_empty() && completed.is_empty() && checked.is_empty() {
+            let retry = checks
+                .values()
+                .filter(|check| !check.running)
+                .filter_map(|check| check.retry_at)
+                .min();
+            let next = in_flight
+                .values()
+                .map(|call| call.deadline)
+                .chain(retry)
+                .min();
             match inbox.wait(next) {
                 Some(Input::Frame(frame, relay, accepted, _)) => {
                     if receive(frame, relay, accepted, &mut session, &mut arrivals) {
@@ -1345,6 +1414,7 @@ fn coordinate(
                     }
                 }
                 Some(Input::Done(token, outcome)) => completed.push_back((token, outcome)),
+                Some(Input::FinalChecked(token, result)) => checked.push_back((token, result)),
                 None if inbox.ended => {
                     session.eof();
                     cancel_dropped(&session, &mut in_flight);
@@ -1354,7 +1424,21 @@ fn coordinate(
             }
         }
         // Blocking steps come before the fence: each finished call's final
-        // root check, and the test pause points.
+        // root check, and the test pause points. Only a proven missing or
+        // replaced root is `root_changed`.
+        //
+        // A selected call's identity check is split (Decision 0009 §7, owner
+        // interpretation 2026-10-19). Its slow part, discovering the common Git
+        // directories, runs on its own thread once the call's work finished,
+        // so no call's decision waits on another call's lookup. Its comparison
+        // runs on the coordinator at the call's send, filesystem calls only
+        // (`verify_at_send`), so it is never stale. Not seen at send: a Git
+        // pointer re-pointed in place with every root and common-directory
+        // inode unchanged, outside ordinary checkout and writes. A lookup that cannot
+        // finish by the call's deadline (`Unavailable`, such as a Git
+        // subprocess slower than its bound on a loaded host) proves nothing:
+        // it is started again after a tick, and the call is
+        // `deadline_exceeded` once its deadline passes (#131).
         let mut finished = Vec::new();
         while let Some((token, outcome)) = completed.pop_front() {
             let Some(call) = in_flight.get(&token) else {
@@ -1362,59 +1446,114 @@ fn coordinate(
                 continue;
             };
             let outcome = outcome?;
+            let selected = match &outcome.finals {
+                Finals::Selected { witness, .. } if Instant::now() < call.deadline => {
+                    Some((witness.clone(), "selected_final"))
+                }
+                Finals::Capacity { witness, .. } if Instant::now() < call.deadline => {
+                    Some((witness.clone(), "capacity_final"))
+                }
+                _ => None,
+            };
+            if let Some((witness, stage)) = selected {
+                let running = start_final_check(token, &witness, call.deadline, stage, &sender);
+                let retry_at = (!running).then(|| Instant::now() + FINAL_RECHECK_TICK);
+                checks.insert(
+                    token,
+                    FinalCheck {
+                        outcome,
+                        running,
+                        retry_at,
+                    },
+                );
+                continue;
+            }
             let mut result = outcome.result;
-            if Instant::now() < call.deadline {
-                match &outcome.finals {
-                    Finals::None => {}
-                    Finals::Launch { catching_up } => {
-                        phase_hook("launch_final")?;
-                        if workspace.check().is_err() {
-                            result = tools::resolved_root_changed(
-                                &call.name,
-                                &call.id,
-                                workspace.root(),
-                                *catching_up,
-                                call.modern,
-                            );
-                        }
-                    }
-                    Finals::Selected {
-                        witness,
-                        catching_up,
-                    } => {
-                        phase_hook("selected_final")?;
-                        if witness.before_answer().is_err() {
-                            result = tools::resolved_root_changed(
-                                &call.name,
-                                &call.id,
-                                &witness.identity.root,
-                                *catching_up,
-                                call.modern,
-                            );
-                        }
-                    }
-                    Finals::Capacity {
-                        witness,
-                        catching_up,
-                    } => {
-                        phase_hook("capacity_final")?;
-                        if witness.before_answer().is_err() {
-                            result = tools::resolved_root_changed(
-                                &call.name,
-                                &call.id,
-                                &witness.identity.root,
-                                *catching_up,
-                                call.modern,
-                            );
-                        }
-                    }
+            if Instant::now() < call.deadline
+                && let Finals::Launch { catching_up } = &outcome.finals
+            {
+                phase_hook("launch_final")?;
+                if workspace.check().is_err() {
+                    result = tools::resolved_root_changed(
+                        &call.name,
+                        &call.id,
+                        workspace.root(),
+                        *catching_up,
+                        call.modern,
+                    );
                 }
             }
             #[cfg(feature = "test-support")]
             if let Some(hook) = &workspace.hooks.send_decision {
                 hook(&call.id);
             }
-            finished.push((token, result));
+            finished.push((token, result, None));
+        }
+        while let Some((token, result)) = checked.pop_front() {
+            let result = result?;
+            let (Some(mut check), Some(call)) = (checks.remove(&token), in_flight.get(&token))
+            else {
+                // Its call was decided, cancelled or expired meanwhile.
+                continue;
+            };
+            let (Finals::Selected {
+                witness,
+                catching_up,
+            }
+            | Finals::Capacity {
+                witness,
+                catching_up,
+            }) = &check.outcome.finals
+            else {
+                unreachable!("only selected calls have final checks")
+            };
+            let gate = match result {
+                Ok(dirs) => Some(SendGate {
+                    witness: witness.clone(),
+                    dirs,
+                    catching_up: *catching_up,
+                    capacity: matches!(check.outcome.finals, Finals::Capacity { .. }),
+                }),
+                Err(SelectionError::Unavailable) => {
+                    if Instant::now() < call.deadline {
+                        check.running = false;
+                        check.retry_at = Some(Instant::now() + FINAL_RECHECK_TICK);
+                        checks.insert(token, check);
+                    }
+                    // Past its deadline, the expiry below answers it.
+                    continue;
+                }
+                Err(_) => {
+                    check.outcome.result = tools::resolved_root_changed(
+                        &call.name,
+                        &call.id,
+                        &witness.identity.root,
+                        *catching_up,
+                        call.modern,
+                    );
+                    None
+                }
+            };
+            #[cfg(feature = "test-support")]
+            if let Some(hook) = &workspace.hooks.send_decision {
+                hook(&call.id);
+            }
+            finished.push((token, check.outcome.result, gate));
+        }
+        let now = Instant::now();
+        checks.retain(|token, _| in_flight.get(token).is_some_and(|call| now < call.deadline));
+        for (token, check) in &mut checks {
+            if check.running || check.retry_at.is_some_and(|at| now < at) {
+                continue;
+            }
+            let (Finals::Selected { witness, .. } | Finals::Capacity { witness, .. }) =
+                &check.outcome.finals
+            else {
+                unreachable!("only selected calls have final checks")
+            };
+            let deadline = in_flight[token].deadline;
+            check.running = start_final_check(*token, witness, deadline, "final_recheck", &sender);
+            check.retry_at = (!check.running).then(|| now + FINAL_RECHECK_TICK);
         }
         #[cfg(feature = "test-support")]
         if let Some(hook) = &workspace.hooks.immediate_decision {
@@ -1429,8 +1568,14 @@ fn coordinate(
         // The fence for every decision below. Requests it handles are decided
         // after the next one.
         let deciding = std::mem::take(&mut arrivals);
-        if fence(&mut inbox, &mut session, &mut arrivals, &mut completed) {
-            for (token, _) in &finished {
+        if fence(
+            &mut inbox,
+            &mut session,
+            &mut arrivals,
+            &mut completed,
+            &mut checked,
+        ) {
+            for (token, _, _) in &finished {
                 if let Some(call) = in_flight.get(token) {
                     call.cancel
                         .store(true, std::sync::atomic::Ordering::Release);
@@ -1444,13 +1589,55 @@ fn coordinate(
         if let Some(hook) = &workspace.hooks.fence_handled {
             hook(deciding.len() + arrivals.len());
         }
-        // Each decision: cancelled (not pending) -> deadline -> outcome.
-        for (token, result) in finished {
+        // Each decision: cancelled (not pending) -> deadline -> outcome. A
+        // selected call's identity is compared again here, at its send, with
+        // filesystem calls only: its helper's success may be stale after
+        // whatever the coordinator did since, such as writing to a slow
+        // client (#131). A comparison that fails with an I/O error proving
+        // nothing (`Unavailable`) leaves the call pending: its final check
+        // starts again after a tick, until its deadline.
+        for (token, result, gate) in finished {
             let Some(call) = in_flight.remove(&token) else {
                 continue;
             };
+            phase_hook("call_send")?;
             let result = if Instant::now() >= call.deadline {
                 deadline_answer(&call)
+            } else if let Some(gate) = gate {
+                match gate.witness.verify_at_send(&gate.dirs) {
+                    Ok(()) => result,
+                    Err(SelectionError::Unavailable) => {
+                        let (witness, catching_up) = (gate.witness, gate.catching_up);
+                        let finals = if gate.capacity {
+                            Finals::Capacity {
+                                witness,
+                                catching_up,
+                            }
+                        } else {
+                            Finals::Selected {
+                                witness,
+                                catching_up,
+                            }
+                        };
+                        checks.insert(
+                            token,
+                            FinalCheck {
+                                outcome: CallOutcome { result, finals },
+                                running: false,
+                                retry_at: Some(Instant::now() + FINAL_RECHECK_TICK),
+                            },
+                        );
+                        in_flight.insert(token, call);
+                        continue;
+                    }
+                    Err(_) => tools::resolved_root_changed(
+                        &call.name,
+                        &call.id,
+                        &gate.witness.identity.root,
+                        gate.catching_up,
+                        call.modern,
+                    ),
+                }
             } else {
                 result
             };

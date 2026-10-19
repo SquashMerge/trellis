@@ -1985,7 +1985,26 @@ fn paused_at(
     listener: &std::os::unix::net::UnixListener,
     stage: &str,
 ) -> std::os::unix::net::UnixStream {
-    let (phase, _) = listener.accept().unwrap();
+    try_paused_at(listener, stage)
+        .unwrap_or_else(|| panic!("no connection paused at {stage} (hang)"))
+}
+
+/// The paused phase connection at `stage`, or `None` if none arrives within
+/// the hang backstop: a hold that never comes names its step instead of
+/// blocking in `accept` until nextest kills the test (#187).
+fn try_paused_at(
+    listener: &std::os::unix::net::UnixListener,
+    stage: &str,
+) -> Option<std::os::unix::net::UnixStream> {
+    let accepting = listener.try_clone().unwrap();
+    let (accepted, arrival) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = accepted.send(accepting.accept());
+    });
+    let (phase, _) = arrival
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .ok()?
+        .unwrap();
     phase
         .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
         .unwrap();
@@ -1994,7 +2013,7 @@ fn paused_at(
         .read_line(&mut seen)
         .unwrap();
     assert_eq!(seen, format!("{stage}\n"));
-    phase
+    Some(phase)
 }
 
 fn describe_frame(id: Value) -> Value {
@@ -2023,6 +2042,39 @@ fn relay_decides_by_acceptance_even_when_held_past_the_deadline() {
     let home = tempfile::tempdir().unwrap();
     let root = checkout(home.path());
     let (daemon, listener, phase_path) = phase_daemon(home.path(), None);
+    // Activate the checkout first, in another session (#187). A cold
+    // activation slower than A's 2 s deadline expires A before the daemon
+    // answers, so the relay never reaches the hold this test is about.
+    // The whole warm-up shares one hang backstop, well under nextest's kill.
+    let mut warm = Peer::start(home.path(), &root);
+    let until = Instant::now() + trellis::testing::HANG_BACKSTOP;
+    let mut last = None;
+    for attempt in 0.. {
+        writeln!(
+            warm.stdin.as_mut().unwrap(),
+            "{}",
+            describe_frame(json!(attempt))
+        )
+        .unwrap();
+        let Ok(reply) = warm
+            .lines
+            .recv_timeout(until.saturating_duration_since(Instant::now()))
+        else {
+            panic!("warm-up describe {attempt} was not answered (hang); last reply: {last:?}");
+        };
+        let envelope = &reply["result"]["structuredContent"];
+        if envelope["data"].is_object() {
+            break;
+        }
+        // Only the activation outlasting the call deadline is retried.
+        assert_eq!(envelope["error"]["code"], "deadline_exceeded", "{reply}");
+        assert!(
+            Instant::now() < until,
+            "warm-up activation never answered describe (hang); last reply: {reply}"
+        );
+        last = Some(reply);
+    }
+    drop(warm);
     let deadline = Duration::from_millis(2000);
     let mut peer = Peer::start_with_env(
         home.path(),
@@ -2040,7 +2092,10 @@ fn relay_decides_by_acceptance_even_when_held_past_the_deadline() {
     )
     .unwrap();
     // The daemon answered A; the relay is held before deciding it.
-    let mut held = paused_at(&listener, "relay_before_write");
+    let Some(mut held) = try_paused_at(&listener, "relay_before_write") else {
+        let decided: Vec<Value> = peer.lines.try_iter().collect();
+        panic!("the relay never held A's daemon reply; decided without it: {decided:?}");
+    };
     let written_b = Instant::now();
     writeln!(
         peer.stdin.as_mut().unwrap(),

@@ -3000,6 +3000,26 @@ async fn gc_abandons_unserviced_pending_request_and_later_lookup_is_not_found() 
     );
 }
 
+/// #131: a queue read while the root is missing (moved, not yet replaced) is
+/// that root's change. The root's own NotFound is not a vanished requests.db.
+#[test]
+fn queue_read_during_root_loss_is_root_changed_not_a_vanished_queue() {
+    let base = tempfile::tempdir().unwrap();
+    let root = base.path().join("lost");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("a.js"), "function lost() {}\n").unwrap();
+    let store = trellis::store::Store::open_for_tests(&base.path().join("state"), &root).unwrap();
+    let accepted = store
+        .enqueue_request(&trellis::indexer::IndexOptions::new(root.clone()), None)
+        .unwrap();
+    assert!(store.request_by_id(&accepted.id).unwrap().is_some());
+    fs::rename(&root, base.path().join("moved")).unwrap();
+    let error = store
+        .request_by_id(&accepted.id)
+        .expect_err("a lost root cannot answer its queue");
+    assert!(error.to_string().starts_with("root_changed"), "{error:#}");
+}
+
 /// Decision 0008 §3, T04: a client already waiting on a request whose root is
 /// then lost gets `root_changed`, never `not_found`, even though eligible GC
 /// later deletes the index; a fresh lookup after GC gets `not_found`.

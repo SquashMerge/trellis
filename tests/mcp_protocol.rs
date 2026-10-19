@@ -245,7 +245,28 @@ impl Peer {
         cwd: Option<&Path>,
         phase: Option<(&str, &Path)>,
     ) -> Self {
-        Self::start_with_fixture_home(tempfile::tempdir().unwrap(), workspace, cwd, phase, None)
+        Self::start_with_fixture_home(
+            tempfile::tempdir().unwrap(),
+            workspace,
+            cwd,
+            phase,
+            None,
+            &[],
+        )
+    }
+    fn start_with_phase_env(
+        workspace: Option<&Path>,
+        phase: Option<(&str, &Path)>,
+        env: &[(&str, &std::ffi::OsStr)],
+    ) -> Self {
+        Self::start_with_fixture_home(
+            tempfile::tempdir().unwrap(),
+            workspace,
+            None,
+            phase,
+            None,
+            env,
+        )
     }
     fn start_with_causal_witness(workspace: Option<&Path>) -> (Self, tokio::net::UnixListener) {
         use std::os::unix::fs::PermissionsExt;
@@ -259,7 +280,7 @@ impl Peer {
             fs::metadata(home.path()).unwrap().permissions().mode() & 0o077,
             0
         );
-        let peer = Self::start_with_fixture_home(home, workspace, None, None, Some(&socket));
+        let peer = Self::start_with_fixture_home(home, workspace, None, None, Some(&socket), &[]);
         (peer, listener)
     }
     fn start_with_fixture_home(
@@ -268,6 +289,7 @@ impl Peer {
         cwd: Option<&Path>,
         phase: Option<(&str, &Path)>,
         causal_socket: Option<&Path>,
+        env: &[(&str, &std::ffi::OsStr)],
     ) -> Self {
         let stderr_path = home.path().join("mcp-stderr.log");
         let stderr = fs::File::create(&stderr_path).unwrap();
@@ -281,6 +303,7 @@ impl Peer {
                 "TRELLIS_TEST_DAEMON_PID_FILE",
                 home.path().join("auto-daemon.pid"),
             )
+            .envs(env.iter().copied())
             .process_group(0)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -2955,6 +2978,491 @@ fn final_resolved_drift_is_attributed_for_five_tools_and_both_modes() {
             }
         }
     }
+}
+
+/// A PATH whose `git` outlasts the 750 ms lookup bound while `flag` exists:
+/// only the first run after it appears when `once`, every run otherwise.
+fn stalling_git_path(temp: &Path, flag: &Path, once: bool) -> std::ffi::OsString {
+    use std::os::unix::fs::PermissionsExt;
+    let search = std::env::var_os("PATH").unwrap();
+    let git = std::env::split_paths(&search)
+        .map(|dir| dir.join("git"))
+        .find(|path| path.is_file())
+        .expect("git on PATH");
+    let armed = if once {
+        format!("rm '{}' 2>/dev/null", flag.display())
+    } else {
+        format!("[ -e '{}' ]", flag.display())
+    };
+    let bin = temp.join("bin");
+    fs::create_dir(&bin).unwrap();
+    fs::write(
+        bin.join("git"),
+        format!(
+            "#!/bin/sh\nif {armed}; then exec sleep 3; fi\nexec '{}' \"$@\"\n",
+            git.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(bin.join("git"), fs::Permissions::from_mode(0o755)).unwrap();
+    std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&search))).unwrap()
+}
+
+/// #131: a final selected check whose Git lookup outlives its bound (a loaded
+/// host) proves no root change. The call retries within its deadline and
+/// answers; it was `root_changed`.
+#[test]
+fn final_selected_check_survives_a_slow_git_lookup() {
+    let temp = tempfile::tempdir().unwrap();
+    let (main, linked) = git_linked_fixture(temp.path());
+    let slow = temp.path().join("slow-next-git");
+    let path = stalling_git_path(temp.path(), &slow, true);
+    let socket = temp.path().join("phase.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let mut peer = Peer::start_with_phase_env(
+        Some(&main),
+        Some(("selected_final", &socket)),
+        &[("PATH", path.as_os_str())],
+    );
+    peer.send_raw(
+        serde_json::to_string(&call(
+            false,
+            json!(1),
+            "trellis_workspace_describe",
+            json!({"schemaVersion":1,"workspace":linked}),
+        ))
+        .unwrap()
+        .as_bytes(),
+    );
+    phase_barrier(&listener, "selected_final", || {
+        fs::write(&slow, b"").unwrap()
+    });
+    let reply = peer.reply();
+    assert!(!slow.exists(), "the final check ran no Git lookup");
+    tool(&reply, None, true);
+    assert_eq!(
+        reply["result"]["structuredContent"]["workspace"],
+        json!(linked)
+    );
+    assert!(peer.finish().0.success());
+}
+
+/// #131 review: a final selected check that keeps stalling waits off the
+/// connection's decision path. Call B, finished while A's check stalls, is
+/// answered at once; A is `deadline_exceeded` at its own deadline. A check
+/// retried in place would answer A first and B only after A's deadline.
+#[test]
+fn a_stalled_final_check_does_not_hold_other_calls() {
+    let temp = tempfile::tempdir().unwrap();
+    let (main, linked) = git_linked_fixture(temp.path());
+    let stalled = temp.path().join("stall-git");
+    let path = stalling_git_path(temp.path(), &stalled, false);
+    let socket = temp.path().join("phase.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let mut peer = Peer::start_with_phase_env(
+        Some(&main),
+        Some(("selected_final", &socket)),
+        &[("PATH", path.as_os_str())],
+    );
+    let describe = |id: Value, workspace: Option<&Path>| {
+        let mut arguments = json!({"schemaVersion":1});
+        if let Some(workspace) = workspace {
+            arguments["workspace"] = json!(workspace);
+        }
+        serde_json::to_string(&call(false, id, "trellis_workspace_describe", arguments)).unwrap()
+    };
+    // Warm both checkouts so neither later call races a cold activation.
+    tool(
+        &peer.ask(serde_json::from_str(&describe(json!(0), None)).unwrap()),
+        None,
+        true,
+    );
+    peer.send_raw(describe(json!(1), Some(&linked)).as_bytes());
+    phase_barrier(&listener, "selected_final", || {});
+    tool(&peer.reply(), None, true);
+    // A reaches its final check; B is read and finishes while A's lookups stall.
+    peer.send_raw(describe(json!("A"), Some(&linked)).as_bytes());
+    phase_barrier(&listener, "selected_final", || {
+        fs::write(&stalled, b"").unwrap();
+        peer.send_raw(describe(json!("B"), None).as_bytes());
+    });
+    let first = peer.reply();
+    let second = peer.reply();
+    fs::remove_file(&stalled).unwrap();
+    assert_eq!(
+        first["id"], "B",
+        "B waited behind A's stalled check: {first}"
+    );
+    tool(&first, None, true);
+    assert_eq!(second["id"], "A", "{second}");
+    tool(&second, Some("deadline_exceeded"), true);
+    assert!(peer.finish().0.success());
+}
+
+/// Serve every phase pause on `listener` until the test ends, each on its own
+/// thread so one held pause never delays another. `hold` sees each pause's
+/// stage and returns when to release it (`None`: at once).
+fn serve_pauses(
+    listener: &std::os::unix::net::UnixListener,
+    hold: impl FnMut(&str) -> Option<std::time::Instant> + Send + 'static,
+) {
+    let listener = listener.try_clone().unwrap();
+    let hold = std::sync::Arc::new(std::sync::Mutex::new(hold));
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let hold = hold.clone();
+            std::thread::spawn(move || {
+                let mut stage = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut stage)
+                    .unwrap();
+                let at = (hold.lock().unwrap())(stage.trim_end());
+                if let Some(at) = at {
+                    std::thread::sleep(at.saturating_duration_since(std::time::Instant::now()));
+                }
+                let _ = stream.write_all(b"x");
+            });
+        }
+    });
+}
+
+fn describe_frame(id: Value, workspace: Option<&Path>) -> Vec<u8> {
+    let mut arguments = json!({"schemaVersion":1});
+    if let Some(workspace) = workspace {
+        arguments["workspace"] = json!(workspace);
+    }
+    serde_json::to_vec(&call(false, id, "trellis_workspace_describe", arguments)).unwrap()
+}
+
+/// #195 review: every final check attempt is bounded by its call's deadline.
+/// A's lookup always outlasts its bound; a recheck released 150 ms before A's
+/// deadline must not run a full 750 ms lookup, so A is `deadline_exceeded`
+/// within its 5 s deadline plus a stated 400 ms tolerance.
+#[test]
+fn a_persistently_unavailable_final_check_is_decided_by_its_deadline() {
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
+    use std::time::Instant;
+    let temp = tempfile::tempdir().unwrap();
+    let (main, linked) = git_linked_fixture(temp.path());
+    let stalled = temp.path().join("stall-git");
+    let path = stalling_git_path(temp.path(), &stalled, false);
+    let socket = temp.path().join("phase.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let written: Arc<Mutex<Option<Instant>>> = Arc::default();
+    let held = Arc::new(AtomicBool::new(false));
+    let (flag, start, late) = (stalled.clone(), written.clone(), held.clone());
+    serve_pauses(&listener, move |stage| {
+        let start = (*start.lock().unwrap())?;
+        if stage == "selected_final" {
+            fs::write(&flag, b"").unwrap();
+        } else if stage == "final_recheck"
+            && Instant::now() >= start + Duration::from_secs(4)
+            && !late.swap(true, Ordering::AcqRel)
+        {
+            return Some(start + Duration::from_millis(4850));
+        }
+        None
+    });
+    let mut peer = Peer::start_with_phase_env(
+        Some(&main),
+        Some(("selected_final,final_recheck", &socket)),
+        // The relay's own 5 s decision would mask the daemon's: observe the
+        // daemon coordinator's decision directly.
+        &[
+            ("PATH", path.as_os_str()),
+            ("TRELLIS_TEST_MCP_RELAY_DEADLINE_MS", "10000".as_ref()),
+        ],
+    );
+    // Warm both checkouts so A does not race a cold activation.
+    tool(
+        &peer.ask(serde_json::from_slice(&describe_frame(json!(0), None)).unwrap()),
+        None,
+        true,
+    );
+    let warm = peer.ask(serde_json::from_slice(&describe_frame(json!(1), Some(&linked))).unwrap());
+    tool(&warm, None, true);
+    *written.lock().unwrap() = Some(Instant::now());
+    peer.send_raw(&describe_frame(json!("A"), Some(&linked)));
+    let reply = peer.reply();
+    let elapsed = written.lock().unwrap().unwrap().elapsed();
+    let _ = fs::remove_file(&stalled);
+    assert!(
+        held.load(Ordering::Acquire),
+        "no recheck reached A's last second: {reply}"
+    );
+    tool(&reply, Some("deadline_exceeded"), true);
+    assert!(
+        elapsed < Duration::from_millis(5400),
+        "A was decided {elapsed:?} after it was written"
+    );
+    assert!(peer.finish().0.success());
+}
+
+/// #195 review: no decision waits on a parked recheck. A is parked with a
+/// lookup that always outlasts its bound; B is written while A's recheck is
+/// held and admitted only 4.4 s after acceptance. A recheck that ran before
+/// B's decision, unbounded, would take B past its deadline; B must be
+/// answered with its own result.
+#[test]
+fn a_call_finishing_near_its_deadline_is_not_held_behind_a_recheck() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    };
+    use std::time::Instant;
+    let temp = tempfile::tempdir().unwrap();
+    let (main, linked) = git_linked_fixture(temp.path());
+    let stalled = temp.path().join("stall-git");
+    let path = stalling_git_path(temp.path(), &stalled, false);
+    let socket = temp.path().join("phase.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let armed = Arc::new(AtomicBool::new(false));
+    let (paused, paused_at) = mpsc::channel::<()>();
+    let (release, release_at) = mpsc::channel::<Instant>();
+    let (flag, arm) = (stalled.clone(), armed.clone());
+    let mut first = true;
+    serve_pauses(&listener, move |stage| {
+        if !arm.load(Ordering::Acquire) {
+            return None;
+        }
+        if stage == "selected_final" {
+            fs::write(&flag, b"").unwrap();
+        } else if stage == "final_recheck" && std::mem::take(&mut first) {
+            paused.send(()).unwrap();
+            return Some(release_at.recv().unwrap());
+        }
+        None
+    });
+    let mut peer = Peer::start_with_phase_env(
+        Some(&main),
+        Some(("selected_final,final_recheck", &socket)),
+        // The relay's own 5 s decision would mask the daemon's: observe the
+        // daemon coordinator's decision directly.
+        &[
+            ("PATH", path.as_os_str()),
+            ("TRELLIS_TEST_MCP_RELAY_DEADLINE_MS", "10000".as_ref()),
+        ],
+    );
+    tool(
+        &peer.ask(serde_json::from_slice(&describe_frame(json!(0), None)).unwrap()),
+        None,
+        true,
+    );
+    let warm = peer.ask(serde_json::from_slice(&describe_frame(json!(1), Some(&linked))).unwrap());
+    tool(&warm, None, true);
+    armed.store(true, Ordering::Release);
+    peer.send_raw(&describe_frame(json!("A"), Some(&linked)));
+    // A is parked and its first recheck is held: write B now.
+    paused_at
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .expect("A's final check was never parked");
+    let written_b = Instant::now();
+    peer.send_raw(&describe_frame(json!("B"), None));
+    release
+        .send(written_b + Duration::from_millis(4400))
+        .unwrap();
+    let mut replies = [peer.reply(), peer.reply()];
+    let _ = fs::remove_file(&stalled);
+    replies.sort_by_key(|reply| reply["id"].as_str().unwrap_or_default().to_owned());
+    let [a, b] = replies;
+    assert_eq!((a["id"].as_str(), b["id"].as_str()), (Some("A"), Some("B")));
+    tool(&b, None, true);
+    tool(&a, Some("deadline_exceeded"), true);
+    assert!(peer.finish().0.success());
+}
+
+/// #195 re-review: no call's send decision waits on another call's final
+/// identity lookup. B is accepted first and its worker held until 4.4 s after
+/// it was written; A, accepted just after, has its final check stalled by Git
+/// and held at `hold_stage` until 4.5 s. A check run on the coordinator would
+/// keep B's decision past B's deadline; B must be answered with its result.
+fn earlier_call_is_decided_while_a_later_final_check_stalls(hold_stage: &'static str) {
+    use std::sync::{Arc, Mutex};
+    use std::time::Instant;
+    let temp = tempfile::tempdir().unwrap();
+    let (main, linked) = git_linked_fixture(temp.path());
+    let stalled = temp.path().join("stall-git");
+    let path = stalling_git_path(temp.path(), &stalled, false);
+    let socket = temp.path().join("phase.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let written_b: Arc<Mutex<Option<Instant>>> = Arc::default();
+    let (b_held, b_held_at) = std::sync::mpsc::channel::<()>();
+    let (flag, start) = (stalled.clone(), written_b.clone());
+    let (mut b_pending, mut a_pending) = (true, true);
+    serve_pauses(&listener, move |stage| {
+        let start = (*start.lock().unwrap())?;
+        if stage == "call_worker" && std::mem::take(&mut b_pending) {
+            b_held.send(()).unwrap();
+            return Some(start + Duration::from_millis(4400));
+        }
+        if stage == "selected_final" {
+            fs::write(&flag, b"").unwrap();
+        }
+        // A recheck is held once one starts after 3.6 s, so it overlaps B.
+        let due =
+            hold_stage != "final_recheck" || Instant::now() >= start + Duration::from_millis(3600);
+        if stage == hold_stage && due && std::mem::take(&mut a_pending) {
+            return Some(start + Duration::from_millis(4500));
+        }
+        None
+    });
+    let mut peer = Peer::start_with_phase_env(
+        Some(&main),
+        Some(("call_worker,selected_final,final_recheck", &socket)),
+        &[
+            ("PATH", path.as_os_str()),
+            ("TRELLIS_TEST_MCP_RELAY_DEADLINE_MS", "10000".as_ref()),
+        ],
+    );
+    tool(
+        &peer.ask(serde_json::from_slice(&describe_frame(json!(0), None)).unwrap()),
+        None,
+        true,
+    );
+    let warm = peer.ask(serde_json::from_slice(&describe_frame(json!(1), Some(&linked))).unwrap());
+    tool(&warm, None, true);
+    *written_b.lock().unwrap() = Some(Instant::now());
+    peer.send_raw(&describe_frame(json!("B"), None));
+    b_held_at
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .expect("B's worker never started");
+    peer.send_raw(&describe_frame(json!("A"), Some(&linked)));
+    let first = peer.reply();
+    let second = peer.reply();
+    let _ = fs::remove_file(&stalled);
+    let (b, a) = if first["id"] == "B" {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    assert_eq!((b["id"].as_str(), a["id"].as_str()), (Some("B"), Some("A")));
+    tool(&b, None, true);
+    tool(&a, Some("deadline_exceeded"), true);
+    assert!(peer.finish().0.success());
+}
+
+#[test]
+fn an_earlier_call_is_decided_while_a_later_recheck_stalls() {
+    earlier_call_is_decided_while_a_later_final_check_stalls("final_recheck");
+}
+
+#[test]
+fn an_earlier_call_is_decided_while_a_later_first_final_check_stalls() {
+    earlier_call_is_decided_while_a_later_final_check_stalls("selected_final");
+}
+
+/// #195 re-review: a selected call's identity is compared again at its send.
+/// B's helper finds its checkout intact; the coordinator is then held at B's
+/// send (standing in for any blocking work, such as writing to a slow client)
+/// while B's root is moved away. B must answer `root_changed`, never the
+/// success its earlier check saw.
+#[test]
+fn a_root_replaced_after_its_final_check_is_root_changed_at_send() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let (main, linked) = git_linked_fixture(temp.path());
+    let moved = temp.path().join("moved-linked");
+    let socket = temp.path().join("phase.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let armed = Arc::new(AtomicBool::new(false));
+    let (arm, root, away) = (armed.clone(), linked.clone(), moved.clone());
+    serve_pauses(&listener, move |stage| {
+        if stage == "call_send" && arm.swap(false, Ordering::AcqRel) {
+            fs::rename(&root, &away).unwrap();
+        }
+        None
+    });
+    let mut peer = Peer::start_with_phase_env(Some(&main), Some(("call_send", &socket)), &[]);
+    tool(
+        &peer.ask(serde_json::from_slice(&describe_frame(json!(0), None)).unwrap()),
+        None,
+        true,
+    );
+    let warm = peer.ask(serde_json::from_slice(&describe_frame(json!(1), Some(&linked))).unwrap());
+    tool(&warm, None, true);
+    armed.store(true, Ordering::Release);
+    let reply =
+        peer.ask(serde_json::from_slice(&describe_frame(json!("B"), Some(&linked))).unwrap());
+    assert!(moved.exists(), "B's send was never held: {reply}");
+    fs::rename(&moved, &linked).unwrap();
+    tool(&reply, Some("root_changed"), true);
+    assert_eq!(
+        reply["result"]["structuredContent"]["workspace"],
+        json!(linked)
+    );
+    assert!(peer.finish().0.success());
+}
+
+#[test]
+fn an_unreadable_common_dir_at_send_is_retried_not_root_changed() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let (main, linked) = git_linked_fixture(temp.path());
+    let common = main.join(".git");
+    let socket = temp.path().join("phase.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let (armed, faulted, rechecked) = (
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let (arm, fault, recheck, dir) = (
+        armed.clone(),
+        faulted.clone(),
+        rechecked.clone(),
+        common.clone(),
+    );
+    serve_pauses(&listener, move |stage| {
+        // B's send-time stat of its common Git directory fails with EACCES,
+        // an I/O error that proves nothing; its retried lookup then succeeds.
+        if stage == "call_send" && arm.swap(false, Ordering::AcqRel) {
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)).unwrap();
+            fault.store(
+                fs::metadata(dir.join("HEAD"))
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied),
+                Ordering::Release,
+            );
+        } else if stage == "final_recheck" && fault.load(Ordering::Acquire) {
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+            recheck.store(true, Ordering::Release);
+        }
+        None
+    });
+    let mut peer =
+        Peer::start_with_phase_env(Some(&main), Some(("call_send,final_recheck", &socket)), &[]);
+    tool(
+        &peer.ask(serde_json::from_slice(&describe_frame(json!(0), None)).unwrap()),
+        None,
+        true,
+    );
+    let warm = peer.ask(serde_json::from_slice(&describe_frame(json!(1), Some(&linked))).unwrap());
+    tool(&warm, None, true);
+    armed.store(true, Ordering::Release);
+    let reply =
+        peer.ask(serde_json::from_slice(&describe_frame(json!("B"), Some(&linked))).unwrap());
+    fs::set_permissions(&common, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        faulted.load(Ordering::Acquire),
+        "the fault was not injected (running as root?): {reply}"
+    );
+    assert!(
+        rechecked.load(Ordering::Acquire),
+        "B was never rechecked: {reply}"
+    );
+    tool(&reply, None, true);
+    assert!(peer.finish().0.success());
 }
 
 #[test]
