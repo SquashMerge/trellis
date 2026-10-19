@@ -1487,6 +1487,62 @@ fn registration_during_retry_backoff_is_inventoried_before_the_claim() {
     );
 }
 
+#[cfg(feature = "test-support")]
+#[test]
+fn registration_after_a_successful_gate_is_inventoried_before_the_claim() {
+    let (_tmp, store, state, options) = serving_queue_watch_fixture();
+    let first = store.enqueue_request(&options, None).unwrap();
+    let next = store.enqueue_request(&options, None).unwrap();
+    state.worker_step().unwrap();
+    let first_pin = store
+        .request_by_id(&first.id)
+        .unwrap()
+        .unwrap()
+        .revision
+        .unwrap();
+    let early = options.workspace_root.join("early.js");
+    std::fs::write(&early, "function early() {}\n").unwrap();
+    assert!(
+        state.submit_watch_event_for_tests(Ok(notify::Event::new(notify::EventKind::Create(
+            notify::event::CreateKind::File
+        ))
+        .add_path(early)))
+    );
+    // The gate's capture succeeds; then a `serve` registration lands before
+    // Q1's claim. The spent gate must still hold the claim for the new
+    // options' capture (#136 owner amendment).
+    let mut registered = options.clone();
+    registered.max_file_bytes /= 2;
+    let registered = Arc::new(registered);
+    let registration = state.clone();
+    let observed = store.clone();
+    let next_id = next.id.clone();
+    state.test_queue_after_watcher_reconcile.set(move || {
+        assert_eq!(
+            observed.request_by_id(&next_id).unwrap().unwrap().state,
+            "queued"
+        );
+        assert_eq!(
+            observed.status().unwrap().revision.index_revision,
+            first_pin.index_revision + 1,
+            "the gate's capture published the earlier edit"
+        );
+        *registration.explicit_pending.lock().unwrap() = Some(registered);
+    });
+    let observed = state.clone();
+    store.set_after_claim_hook_for_tests(move || {
+        assert!(
+            observed.explicit_pending.lock().unwrap().is_none(),
+            "Q1 was claimed before the new options' full inventory"
+        );
+    });
+    state.worker_step().unwrap();
+    assert_eq!(
+        store.request_by_id(&next.id).unwrap().unwrap().state,
+        "done"
+    );
+}
+
 /// Each time the gate reconciles, another edit arrives before Q1's claim.
 #[cfg(feature = "test-support")]
 fn edit_after_every_gate_reconcile(

@@ -435,13 +435,14 @@ struct RequestCoverage {
 pub struct WatcherWork {
     watch: crate::watch::WatchSignals,
     request_coverage: Option<RequestCoverage>,
-    /// Armed when a row completes with a successor queued (T04, #136 owner
-    /// amendment). The gate is spent once one full capture has started under
-    /// the current options; intent accepted after that is before the next
-    /// row's own cutoff, so that row's capture covers it.
+    /// Armed when a row completes with a successor queued, until the next
+    /// claim or an empty queue (T04, #136 owner amendment). The gate is spent
+    /// once one full capture has started under the current options; intent
+    /// accepted after that is before the next row's own cutoff, so that row's
+    /// capture covers it.
     queue_gate: bool,
     gate_attempted: bool,
-    /// Full watcher captures started; a gate attempt counts only if one did.
+    #[cfg(all(test, feature = "test-support"))]
     full_capture_attempts: usize,
     #[cfg(all(test, feature = "test-support"))]
     reconcile_now_for_tests: Option<std::time::Instant>,
@@ -518,6 +519,7 @@ impl WatcherWork {
             request_coverage: None,
             queue_gate: false,
             gate_attempted: false,
+            #[cfg(all(test, feature = "test-support"))]
             full_capture_attempts: 0,
             #[cfg(all(test, feature = "test-support"))]
             reconcile_now_for_tests: None,
@@ -872,11 +874,7 @@ impl WatcherWork {
         options: &IndexOptions,
         cancel: &CancelFlag,
     ) -> Result<bool> {
-        // Spent once a capture started, even if it failed: the next row's
-        // capture covers what it left. A deferral with no capture, such as
-        // retry backoff, leaves the gate pending until the delay passes.
-        let started = self.full_capture_attempts;
-        let reconciled = self.reconcile_due_with_mode(
+        self.reconcile_due_with_mode(
             store,
             session,
             options,
@@ -884,11 +882,7 @@ impl WatcherWork {
             false,
             true,
             (|_, _| {}, |_| {}),
-        );
-        if self.full_capture_attempts != started {
-            self.gate_attempted = true;
-        }
-        reconciled
+        )
     }
 
     /// A full capture always checks root, writer and selected publication fences.
@@ -1027,7 +1021,14 @@ impl WatcherWork {
                     publication.waited_for().as_micros()
                 ),
             );
-            self.full_capture_attempts += 1;
+            #[cfg(all(test, feature = "test-support"))]
+            {
+                self.full_capture_attempts += 1;
+            }
+            // Spent once a capture starts, even if it fails: the next row's
+            // capture covers what it left. A deferral with no capture, such
+            // as retry backoff, leaves an armed gate pending.
+            self.gate_attempted = true;
             let captured = Capture::admit(options, cancel, &|_| {})?;
             observe(&captured, &self.watch);
             // Reject a hinted edit before checking the admitted bytes against
@@ -1089,12 +1090,12 @@ impl WatcherWork {
                     self.watch.require_full();
                 }
                 drop(publication);
+                // An armed gate stays armed until the next claim: its attempt
+                // is spent, but an options change before the claim still
+                // needs its own capture first.
                 if accounted {
                     self.last_inventory = std::time::Instant::now();
                     self.retry_after = None;
-                    if !self.accepted_watch_intent(options) {
-                        self.queue_gate = false;
-                    }
                 }
                 Ok(accounted)
             }
