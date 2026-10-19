@@ -333,6 +333,8 @@ pub struct DaemonState {
     #[cfg(test)]
     test_queue_after_startup_drain: crate::store::TestOneShotHook,
     #[cfg(test)]
+    test_queue_before_preclaim: crate::store::TestOneShotHook,
+    #[cfg(test)]
     test_queue_before_watcher_reconcile: crate::store::TestOneShotHook,
     #[cfg(test)]
     test_queue_after_watcher_reconcile: crate::store::TestOneShotHook,
@@ -571,6 +573,8 @@ pub fn new_with_config(
         #[cfg(test)]
         test_queue_after_startup_drain: crate::store::TestOneShotHook::default(),
         #[cfg(test)]
+        test_queue_before_preclaim: crate::store::TestOneShotHook::default(),
+        #[cfg(test)]
         test_queue_before_watcher_reconcile: crate::store::TestOneShotHook::default(),
         #[cfg(test)]
         test_queue_after_watcher_reconcile: crate::store::TestOneShotHook::default(),
@@ -743,6 +747,20 @@ impl DaemonState {
         };
         scheduler.submit_watch_event_for_tests(event);
         true
+    }
+
+    /// Arm a queue-read race only after CLI enqueue has committed. Enqueue
+    /// itself opens the queue, so arming earlier would pause the wrong read.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn set_queue_root_verify_after_enqueue_for_tests(
+        &self,
+        hook: impl FnOnce() + Send + 'static,
+    ) {
+        let store = self.store.clone();
+        self.store.set_after_enqueue_commit_hook_for_tests(move || {
+            store.set_after_queue_root_verify_hook_for_tests(hook);
+        });
     }
 
     /// Offline snapshot fixtures opt out of the daemon's queue and maintenance ticks.
@@ -1173,6 +1191,74 @@ impl DaemonState {
         }
     }
 
+    /// The watcher's effective options: explicit options a new `serve`
+    /// registration brought, else the FIFO head's persisted inputs, else the
+    /// daemon defaults (Decision 0009 §6).
+    fn selected_watch_options(
+        &self,
+        explicit: Option<&Arc<IndexOptions>>,
+    ) -> anyhow::Result<IndexOptions> {
+        Ok(match explicit {
+            Some(options) => IndexOptions::clone(options),
+            None => self
+                .store
+                .recorded_index_options()?
+                .unwrap_or_else(|| self.config().options.clone()),
+        })
+    }
+
+    // Store's cached terminal completion is settled before this callback runs.
+    // The claim fence samples the gate again at the owning transition.
+    fn reconcile_preclaim_gate(
+        &self,
+        session: &Arc<crate::store::topology::WriterSession>,
+    ) -> anyhow::Result<bool> {
+        let explicit = self.explicit_pending.lock().unwrap().clone();
+        let selected = self.selected_watch_options(explicit.as_ref())?;
+        // A registration here is unseen by this sample; the claim fence sees it.
+        #[cfg(test)]
+        self.test_queue_before_preclaim.run();
+        let gate_due = self
+            .watcher_work
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|(owner, work)| {
+                owner
+                    .upgrade()
+                    .is_some_and(|owner| Arc::ptr_eq(&owner, session))
+                    && work.gate_pending(&selected)
+            });
+        if !gate_due {
+            return Ok(true);
+        }
+        #[cfg(test)]
+        self.test_queue_before_watcher_reconcile.run();
+        let mut guard = self.watcher_work.lock().unwrap();
+        let pending = if let Some((owner, work)) = guard.as_mut()
+            && owner
+                .upgrade()
+                .is_some_and(|owner| Arc::ptr_eq(&owner, session))
+            && work.gate_pending(&selected)
+        {
+            let accounted =
+                work.reconcile_queue_gate(&self.store, session, &selected, &self.watcher_cancel)?;
+            self.publish_watch_status(work, &selected);
+            if accounted {
+                self.finalize_watcher_gate(work, &selected, explicit.as_ref());
+            }
+            // The gate's attempt is spent; a failed one defers this claim to
+            // the next step, which claims unless the options changed again.
+            !accounted || work.gate_pending(&selected)
+        } else {
+            false
+        };
+        drop(guard);
+        #[cfg(test)]
+        self.test_queue_after_watcher_reconcile.run();
+        Ok(!pending)
+    }
+
     fn worker_step(self: &Arc<Self>) -> anyhow::Result<()> {
         #[cfg(feature = "test-support")]
         let _held = self.worker_hold.read().unwrap();
@@ -1254,15 +1340,53 @@ impl DaemonState {
         {
             #[cfg(test)]
             self.test_queue_current_phase.store(2, Ordering::Release);
-            let processed = match crate::index_coordinator::drain_one_request_observed(
+            let gate_deferred = std::cell::Cell::new(false);
+            let gate_error = std::cell::Cell::new(false);
+            let processed = match crate::index_coordinator::drain_one_request_with_watcher(
                 &self.store,
                 session,
+                &self.watcher_work,
                 |id, p| {
                     self.job_progress.lock().unwrap().insert(id.to_owned(), p);
+                },
+                |claim| loop {
+                    let claim_ready = self
+                        .reconcile_preclaim_gate(session)
+                        .inspect_err(|_| gate_error.set(true))?;
+                    if !claim_ready {
+                        gate_deferred.set(true);
+                        return Ok(None);
+                    }
+                    let mut guard = self.watcher_work.lock().unwrap();
+                    if let Some((owner, work)) = guard.as_mut()
+                        && owner
+                            .upgrade()
+                            .is_some_and(|owner| Arc::ptr_eq(&owner, session))
+                    {
+                        // A `serve` registration publishes its options under
+                        // this lock: hold it, and the callback's ingress lock,
+                        // through claim_request's durable COMMIT. A registration
+                        // is then either seen here or follows the claim. Each
+                        // retry spends the gate's attempt or applies new options.
+                        let explicit = self.explicit_pending.lock().unwrap();
+                        let current = self
+                            .selected_watch_options(explicit.as_ref())
+                            .inspect_err(|_| gate_error.set(true))?;
+                        if let Some(request) = work.claim_if_gate_clear(&current, claim)? {
+                            return Ok(request);
+                        }
+                        continue;
+                    }
+                    return claim();
                 },
             ) {
                 Ok(processed) => processed,
                 Err(error) => {
+                    // A failed gate capture retains this watcher and its retry
+                    // deadline; only request/completion failures retire the writer.
+                    if gate_error.get() {
+                        return Err(error);
+                    }
                     // A cached terminal result must be resolved by this same
                     // incarnation. Otherwise release the stale writer so a
                     // successor can reclaim an unfinished running head.
@@ -1287,6 +1411,7 @@ impl DaemonState {
             // still queued, the guarded publish-BUSY path deferred it. Avoid
             // recapturing the workspace every 20 ms under sustained readers.
             if processed == 0
+                && !gate_deferred.get()
                 && self
                     .store
                     .earliest_unfinished_request()
@@ -1303,13 +1428,7 @@ impl DaemonState {
                 // explicit options a new `serve` registration brought are applied
                 // once, by the next full inventory (Decision 0009 §6).
                 let explicit = self.explicit_pending.lock().unwrap().clone();
-                let selected_options = match &explicit {
-                    Some(options) => IndexOptions::clone(options),
-                    None => self
-                        .store
-                        .recorded_index_options()?
-                        .unwrap_or_else(|| self.config().options.clone()),
-                };
+                let selected_options = self.selected_watch_options(explicit.as_ref())?;
                 {
                     let mut work = self.watcher_work.lock().unwrap();
                     if !work.as_ref().is_some_and(|(owner, _)| {
@@ -1336,29 +1455,41 @@ impl DaemonState {
                         *work = Some((Arc::downgrade(session), scheduler));
                     }
                     if let Some((_, scheduler)) = work.as_mut() {
+                        let successor_waiting = self.store.earliest_unfinished_request()?.is_some();
+                        if processed > 0 && successor_waiting {
+                            scheduler.set_queue_gate();
+                        } else if !successor_waiting {
+                            // With no successor, a later idle edit uses ordinary debounce.
+                            scheduler.clear_queue_gate();
+                        }
                         #[cfg(test)]
                         self.test_queue_current_phase.store(4, Ordering::Release);
                         #[cfg(test)]
                         self.test_queue_before_watcher_reconcile.run();
-                        let reconciled = scheduler.reconcile_due(
-                            &self.store,
-                            session,
-                            &selected_options,
-                            &self.watcher_cancel,
-                            false,
-                        );
+                        let reconciled = if scheduler.gate_pending(&selected_options) {
+                            scheduler.reconcile_queue_gate(
+                                &self.store,
+                                session,
+                                &selected_options,
+                                &self.watcher_cancel,
+                            )
+                        } else {
+                            scheduler.reconcile_due(
+                                &self.store,
+                                session,
+                                &selected_options,
+                                &self.watcher_cancel,
+                                false,
+                            )
+                        };
                         self.publish_watch_status(scheduler, &selected_options);
                         let accounted = reconciled?;
-                        // Explicit options are applied once: after a verified
-                        // inventory under them, the recorded head selects again.
-                        if accounted && let Some(applied) = &explicit {
-                            let mut pending = self.explicit_pending.lock().unwrap();
-                            if pending
-                                .as_ref()
-                                .is_some_and(|current| Arc::ptr_eq(current, applied))
-                            {
-                                *pending = None;
-                            }
+                        if accounted {
+                            self.finalize_watcher_gate(
+                                scheduler,
+                                &selected_options,
+                                explicit.as_ref(),
+                            );
                         }
                         #[cfg(test)]
                         self.test_queue_current_phase.store(5, Ordering::Release);
@@ -1367,25 +1498,6 @@ impl DaemonState {
                         // ACK only a verified, acknowledged full inventory.
                         // Neither a failed FIFO probe nor a newer accepted hint
                         // can be called settled. The reporter only try_sends here.
-                        #[cfg(feature = "test-support")]
-                        if accounted
-                            && let Some(reporter) = self.causal_witness.lock().unwrap().clone()
-                            && !scheduler.accepted_watch_intent(&selected_options)
-                            && matches!(self.store.earliest_unfinished_request(), Ok(None))
-                            && let (Some(lineage), Some(generation), Some(certified_pin)) = (
-                                scheduler.causal_lineage(),
-                                scheduler.accounted_watch_generation(),
-                                scheduler.accounted_watch_pin(),
-                            )
-                            && self.store.verify_writer_session(session).is_ok()
-                            && self
-                                .store
-                                .index_baseline()
-                                .is_ok_and(|pin| pin == certified_pin)
-                            && self.store.verify_writer_session(session).is_ok()
-                        {
-                            reporter.watch_ack(lineage, generation, certified_pin, true);
-                        }
                     }
                 }
             }
@@ -1393,6 +1505,45 @@ impl DaemonState {
         }
         Ok(())
     }
+    fn finalize_watcher_gate(
+        &self,
+        work: &crate::index_coordinator::WatcherWork,
+        selected: &IndexOptions,
+        explicit: Option<&Arc<IndexOptions>>,
+    ) {
+        // A later registration must not be cleared by an older completed gate.
+        if let Some(applied) = explicit {
+            let mut pending = self.explicit_pending.lock().unwrap();
+            if pending
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, applied))
+            {
+                *pending = None;
+            }
+        }
+        #[cfg(not(feature = "test-support"))]
+        let _ = (work, selected);
+        #[cfg(feature = "test-support")]
+        if let Some(reporter) = self.causal_witness.lock().unwrap().clone()
+            && !work.accepted_watch_intent(selected)
+            && matches!(self.store.earliest_unfinished_request(), Ok(None))
+            && let (Some(lineage), Some(generation), Some(certified_pin)) = (
+                work.causal_lineage(),
+                work.accounted_watch_generation(),
+                work.accounted_watch_pin(),
+            )
+            && let Ok(session) = self.retained_serving_session()
+            && self.store.verify_writer_session(&session).is_ok()
+            && self
+                .store
+                .index_baseline()
+                .is_ok_and(|pin| pin == certified_pin)
+            && self.store.verify_writer_session(&session).is_ok()
+        {
+            reporter.watch_ack(lineage, generation, certified_pin, true);
+        }
+    }
+
     pub fn retained_serving_session(
         &self,
     ) -> anyhow::Result<Arc<crate::store::topology::WriterSession>> {

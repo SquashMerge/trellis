@@ -1023,3 +1023,49 @@ fn accepted_watcher_intent_before_debounce_preempts_writer_unit() {
         trellis::store::MaintenanceOutcome::Progress
     );
 }
+
+#[test]
+fn failed_ack_keeps_periodic_inventory_due_until_certified_full_ack() {
+    let state = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let source = workspace.path().join("a.js");
+    fs::write(&source, "function before() {}\n").unwrap();
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    let options = IndexOptions::new(workspace.path().to_owned());
+    let cancel = Arc::new(AtomicBool::new(false));
+    let owner =
+        index_coordinator::establish_serving_session(&store, Some(&options), &cancel).unwrap();
+    let mut work = WatcherWork::new(&store, &owner, &options).unwrap();
+    work.disable_native_watcher_for_tests();
+    work.force_periodic_inventory_for_tests();
+    assert!(work.periodic_inventory_due_for_tests());
+    assert!(
+        !work
+            .reconcile_due_with_cutoffs(
+                &store,
+                &owner,
+                &options,
+                &cancel,
+                false,
+                (
+                    |_, _| {},
+                    |watch| {
+                        watch.submit_event(Ok(notify::Event::new(notify::EventKind::Modify(
+                            notify::event::ModifyKind::Data(notify::event::DataChange::Content),
+                        ))
+                        .add_path(source.clone())));
+                    }
+                ),
+            )
+            .unwrap()
+    );
+    assert!(
+        work.periodic_inventory_due_for_tests(),
+        "unacknowledged full work cannot reset the periodic marker"
+    );
+    assert!(
+        work.reconcile_due(&store, &owner, &options, &cancel, true)
+            .unwrap()
+    );
+    assert!(!work.periodic_inventory_due_for_tests());
+}
