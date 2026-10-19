@@ -518,6 +518,9 @@ CREATE INDEX native_version_regions_parent ON native_version_control_regions(ver
 "#;
 // Additive v8 index: validation can read headers without loading source_inventory.
 const REVISION_HEADER_INDEX_SCHEMA_V8: &str = "CREATE INDEX native_revisions_header_cover ON native_revisions(source_set_id,published_index_revision,id);";
+// Additive v8 index: per-file (revision_id,path) lookups are point reads, not revision scans.
+const REVISION_DOCUMENT_PATH_INDEX_SCHEMA_V8: &str =
+    "CREATE INDEX revision_documents_path ON revision_documents(revision_id,path);";
 
 const CACHE_SCHEMA_V8: &str = r#"
 CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=10), extractor_version TEXT NOT NULL CHECK(extractor_version='native-v6-delta-v1'), root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL, reconcile_options TEXT);
@@ -1999,6 +2002,10 @@ fn validate_cache_shape(db: &Connection) -> Result<()> {
     if actual == objects(&expected)? {
         return Ok(());
     }
+    expected.execute_batch(REVISION_DOCUMENT_PATH_INDEX_SCHEMA_V8)?;
+    if actual == objects(&expected)? {
+        return Ok(());
+    }
     let without_binding = Connection::open_in_memory()?;
     without_binding.execute_batch(CACHE_SCHEMA_V8)?;
     without_binding.execute_batch(SUPERSESSION_SCHEMA_V8)?;
@@ -2014,6 +2021,10 @@ fn validate_cache_shape(db: &Connection) -> Result<()> {
         return Ok(());
     }
     without_binding.execute_batch(REVISION_HEADER_INDEX_SCHEMA_V8)?;
+    if actual == objects(&without_binding)? {
+        return Ok(());
+    }
+    without_binding.execute_batch(REVISION_DOCUMENT_PATH_INDEX_SCHEMA_V8)?;
     control_ensure!(
         actual == objects(&without_binding)?,
         "incompatible_index: unknown cache object type, name or shape"
@@ -2044,6 +2055,13 @@ fn has_retention_fk_indexes(db: &Connection) -> Result<bool> {
 fn has_revision_header_cover(db: &Connection) -> Result<bool> {
     Ok(db.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='native_revisions_header_cover')",
+        [], |r| r.get(0),
+    )?)
+}
+
+fn has_revision_document_path_index(db: &Connection) -> Result<bool> {
+    Ok(db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='revision_documents_path')",
         [], |r| r.get(0),
     )?)
 }
@@ -2278,6 +2296,9 @@ fn install_supersessions(db: &Connection, now: i64) -> Result<()> {
     }
     if !has_revision_header_cover(db)? {
         db.execute_batch(REVISION_HEADER_INDEX_SCHEMA_V8)?;
+    }
+    if !has_revision_document_path_index(db)? {
+        db.execute_batch(REVISION_DOCUMENT_PATH_INDEX_SCHEMA_V8)?;
     }
     if missing_supersessions {
         db.execute(
@@ -3484,7 +3505,9 @@ impl ImmutableAppend {
         Ok(table)
     }
     fn key(db: &Connection, values: &[&dyn rusqlite::ToSql], i: usize) -> Result<String> {
-        Ok(db.query_row("SELECT CAST(?1 AS TEXT)", [values[i]], |row| row.get(0))?)
+        Ok(db
+            .prepare_cached("SELECT CAST(?1 AS TEXT)")?
+            .query_row([values[i]], |row| row.get(0))?)
     }
     fn group(
         table: &str,
@@ -3565,11 +3588,11 @@ impl ImmutableAppend {
             .collect::<Vec<_>>()
             .join(" AND ");
         let key_values = keys.iter().map(|i| values[*i]).collect::<Vec<_>>();
-        let exists: i64 = db.query_row(
-            &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE {key_predicate})"),
-            key_values.as_slice(),
-            |row| row.get(0),
-        )?;
+        let exists: i64 = db
+            .prepare_cached(&format!(
+                "SELECT EXISTS(SELECT 1 FROM {table} WHERE {key_predicate})"
+            ))?
+            .query_row(key_values.as_slice(), |row| row.get(0))?;
         let inserted = if exists != 0 {
             if !matches!(
                 table,
@@ -3582,21 +3605,19 @@ impl ImmutableAppend {
                 self.counters.reused_occurrence_reads += 1;
             }
             let all = (0..columns.len()).collect::<Vec<_>>();
-            let exact: i64 = db.query_row(
-                &format!(
+            let exact: i64 = db
+                .prepare_cached(&format!(
                     "SELECT EXISTS(SELECT 1 FROM {table} WHERE {})",
                     predicate(&all)
-                ),
-                values,
-                |row| row.get(0),
-            )?;
+                ))?
+                .query_row(values, |row| row.get(0))?;
             control_ensure!(
                 exact == 1,
                 format!("incompatible_index: immutable {table} differs from captured evidence")
             );
             0
         } else {
-            db.execute(sql, values)?
+            db.prepare_cached(sql)?.execute(values)?
         };
         if inserted != 0 {
             let family = if table.starts_with("native_") || table == "document_versions" {
@@ -3843,6 +3864,11 @@ fn write_native(
         .iter()
         .map(|coverage| (coverage.document_path.as_str(), coverage))
         .collect();
+    let captured_by_key: HashMap<(&str, &str), &crate::model::SourceFile> = capture
+        .files
+        .iter()
+        .map(|source| ((source.language.as_str(), source.path.as_str()), source))
+        .collect();
     let mut projections = BTreeMap::new();
     for (ordinal, file) in graph.files.iter().enumerate() {
         check_cancel(cancel)?;
@@ -3855,10 +3881,10 @@ fn write_native(
                 && doc.byte_length == file.text.len(),
             "native document bytes differ from captured graph"
         );
-        let source = capture
-            .files
-            .iter()
-            .find(|source| source == &file)
+        let source = captured_by_key
+            .get(&(file.language.as_str(), file.path.as_str()))
+            .copied()
+            .filter(|source| *source == file)
             .context("native source missing immutable capture")?;
         ensure!(
             source.hash == file.hash,
@@ -4105,6 +4131,12 @@ fn write_native(
             ],
         )?;
     }
+    let documents_by_key: BTreeMap<_, _> = a
+        .revision
+        .documents
+        .iter()
+        .map(|document| (&document.key, document))
+        .collect();
     for c in &a.calls {
         check_cancel(cancel)?;
         if reuse.for_path(&c.document.path).native {
@@ -4114,11 +4146,9 @@ fn write_native(
             .get(&c.document.path)
             .context("native call missing document")?
             .version_id;
-        let document = a
-            .revision
-            .documents
-            .iter()
-            .find(|document| document.key == c.document)
+        let document = documents_by_key
+            .get(&c.document)
+            .copied()
             .context("native call missing validated document")?;
         let source: Vec<u8> = db.query_row(
             "SELECT source_bytes FROM document_versions WHERE id=?1 AND source_set_id=?2 AND language=?3 AND path=?4",
@@ -6349,6 +6379,7 @@ impl Store {
                 db.execute_batch(RETENTION_SCHEMA_V8)?;
                 db.execute_batch(RETENTION_FK_INDEX_SCHEMA_V8)?;
                 db.execute_batch(REVISION_HEADER_INDEX_SCHEMA_V8)?;
+                db.execute_batch(REVISION_DOCUMENT_PATH_INDEX_SCHEMA_V8)?;
                 let age = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
                 ensure!(age <= 9_007_199_254_740_991, "invalid_open_age");
                 db.execute(
@@ -9603,17 +9634,31 @@ impl Store {
             graph.files.len() == native.revision.documents.len(),
             "graph/native document cardinality mismatch"
         );
+        let mut documents_by_key: HashMap<(&str, &str), Vec<_>> = HashMap::new();
+        for doc in &native.revision.documents {
+            documents_by_key
+                .entry((doc.key.language.as_str(), doc.key.path.as_str()))
+                .or_default()
+                .push(doc);
+        }
+        let mut captured_by_key: HashMap<(&str, &str), Vec<_>> = HashMap::new();
+        for source in &capture.files {
+            captured_by_key
+                .entry((source.language.as_str(), source.path.as_str()))
+                .or_default()
+                .push(source);
+        }
         for file in &graph.files {
+            let key = (file.language.as_str(), file.path.as_str());
             ensure!(
-                native
-                    .revision
-                    .documents
-                    .iter()
-                    .any(|doc| doc.key.path == file.path
-                        && doc.key.language == file.language
-                        && doc.content_hash == file.hash
-                        && doc.byte_length == file.text.len()
-                        && capture.files.iter().any(|source| source == file)),
+                documents_by_key
+                    .get(&key)
+                    .is_some_and(|docs| docs.iter().any(|doc| {
+                        doc.content_hash == file.hash && doc.byte_length == file.text.len()
+                    }))
+                    && captured_by_key
+                        .get(&key)
+                        .is_some_and(|sources| sources.contains(&file)),
                 "graph/native captured source mismatch"
             );
         }
@@ -9648,6 +9693,9 @@ impl Store {
             }
             if !has_revision_header_cover(&tx)? {
                 tx.execute_batch(REVISION_HEADER_INDEX_SCHEMA_V8)?;
+            }
+            if !has_revision_document_path_index(&tx)? {
+                tx.execute_batch(REVISION_DOCUMENT_PATH_INDEX_SCHEMA_V8)?;
             }
         } else {
             install_supersessions(&tx, self.retention_time()?.as_secs() as i64)?;
@@ -9693,6 +9741,8 @@ impl Store {
         }
         // The active manifest is full-rewrite, but old same-generation manifests
         // and their immutable version/projection trees remain for retained pins.
+        // ImmutableAppend issues a few statement shapes per table for every row.
+        tx.set_prepared_statement_cache_capacity(512);
         let mut immutable = ImmutableAppend::default();
         let classify_immutable = |error| match target {
             PublicationTarget::Live => self.report_live_read_failure(error),

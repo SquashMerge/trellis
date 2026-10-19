@@ -33,6 +33,42 @@ fn selected_capture_and_reconcile_use_the_revision_index() {
 }
 
 #[test]
+fn per_file_manifest_lookup_uses_the_path_index() {
+    let db = Connection::open_in_memory().unwrap();
+    db.execute_batch(CACHE_SCHEMA_V8).unwrap();
+    db.execute_batch(SUPERSESSION_SCHEMA_V8).unwrap();
+    db.execute_batch(RETENTION_SCHEMA_V8).unwrap();
+    db.execute_batch(RETENTION_FK_INDEX_SCHEMA_V8).unwrap();
+    db.execute_batch(REVISION_HEADER_INDEX_SCHEMA_V8).unwrap();
+    db.pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)
+        .unwrap();
+    // The shape without the path index stays accepted until the leader adds it.
+    validate_cache_shape(&db).unwrap();
+    db.execute_batch(REVISION_DOCUMENT_PATH_INDEX_SCHEMA_V8)
+        .unwrap();
+    validate_cache_shape(&db).unwrap();
+    for sql in [
+        "SELECT EXISTS(SELECT 1 FROM revision_documents WHERE revision_id=?2 AND path=?1)",
+        "SELECT d.source_bytes FROM revision_documents m JOIN document_versions d
+         ON d.id=m.document_version_id WHERE m.revision_id=?2 AND m.path=?1",
+    ] {
+        let plan: Vec<String> = db
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap()
+            .query_map(["a.rs", "revision"], |row| row.get(3))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("revision_documents_path")
+                    && step.contains("(revision_id=? AND path=?)")),
+            "per-file lookup must not scan the revision's manifest: {plan:?}"
+        );
+    }
+}
+
+#[test]
 fn header_and_changing_manifest_plan_avoid_wide_revision_scans() {
     let db = Connection::open_in_memory().unwrap();
     db.execute_batch(CACHE_SCHEMA_V8).unwrap();
