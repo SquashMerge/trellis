@@ -435,7 +435,11 @@ struct RequestCoverage {
 pub struct WatcherWork {
     watch: crate::watch::WatchSignals,
     request_coverage: Option<RequestCoverage>,
+    /// Armed when a row completes with a successor queued (T04). The gate gets
+    /// one watcher attempt per row; intent accepted after that attempt is
+    /// before the next row's own cutoff, so that row's capture covers it.
     queue_gate: bool,
+    gate_attempted: bool,
     #[cfg(all(test, feature = "test-support"))]
     full_capture_attempts: usize,
     #[cfg(all(test, feature = "test-support"))]
@@ -512,6 +516,7 @@ impl WatcherWork {
             watch,
             request_coverage: None,
             queue_gate: false,
+            gate_attempted: false,
             #[cfg(all(test, feature = "test-support"))]
             full_capture_attempts: 0,
             #[cfg(all(test, feature = "test-support"))]
@@ -716,11 +721,31 @@ impl WatcherWork {
             self.last_accounted_pin = Some(pin);
             self.last_inventory = std::time::Instant::now();
             self.retry_after = None;
+            #[cfg(feature = "test-support")]
+            self.report_request_ack(store, certificate.batch.generation, pin);
         } else {
             self.last_accounted_pin = None;
             self.watch.require_full();
         }
         Ok(())
+    }
+
+    /// A request's covered generation settles like a watcher inventory: the
+    /// fixture witness announces it, then ACKs it once the FIFO is empty.
+    #[cfg(feature = "test-support")]
+    fn report_request_ack(&mut self, store: &Store, generation: u64, pin: IndexPin) {
+        let (Some(reporter), Some(lineage)) = (self.witness.clone(), self.causal_lineage()) else {
+            return;
+        };
+        if self.witness_reported_generation != Some(generation) {
+            reporter.watch_pending(lineage, generation);
+            self.witness_reported_generation = Some(generation);
+        }
+        if !self.accepted_watch_intent(&self.options)
+            && matches!(store.earliest_unfinished_request(), Ok(None))
+        {
+            reporter.watch_ack(lineage, generation, pin, true);
+        }
     }
 
     /// Captured while the publication permit still covered the acknowledged
@@ -807,19 +832,27 @@ impl WatcherWork {
 
     pub(crate) fn set_queue_gate(&mut self) {
         self.queue_gate = true;
+        self.gate_attempted = false;
     }
 
     pub(crate) fn clear_queue_gate(&mut self) {
         self.queue_gate = false;
+        self.gate_attempted = false;
     }
 
+    /// An armed gate holds the next claim for its one watcher attempt, and
+    /// again only if the effective options changed since: a registration is
+    /// one-off, so continuous edits cannot hold the FIFO.
     pub(crate) fn gate_pending(&self, options: &IndexOptions) -> bool {
-        self.queue_gate && self.accepted_watch_intent(options)
+        self.queue_gate
+            && (self.options_differ(options)
+                || (!self.gate_attempted && self.accepted_watch_intent(options)))
     }
 
-    /// Accepted ingress and the queue claim share the callback's liveness lock.
-    /// If a full intent arrived after reconciliation, retain the gate and let
-    /// the owner reconcile it before retrying this claim.
+    /// Accepted ingress and the queue claim share the callback's liveness lock,
+    /// and the caller holds the registration lock that chose `options`. If
+    /// the gate became pending after its sample, the owner reconciles it
+    /// before retrying this claim.
     pub(crate) fn claim_if_gate_clear(
         &mut self,
         options: &IndexOptions,
@@ -839,6 +872,9 @@ impl WatcherWork {
         options: &IndexOptions,
         cancel: &CancelFlag,
     ) -> Result<bool> {
+        // Spent even if the attempt fails or is deferred: the next row's
+        // capture covers what it left, as a failed watcher step would.
+        self.gate_attempted = true;
         self.reconcile_due_with_mode(
             store,
             session,

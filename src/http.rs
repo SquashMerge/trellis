@@ -1191,33 +1191,31 @@ impl DaemonState {
         }
     }
 
+    /// The watcher's effective options: explicit options a new `serve`
+    /// registration brought, else the FIFO head's persisted inputs, else the
+    /// daemon defaults (Decision 0009 §6).
+    fn selected_watch_options(
+        &self,
+        explicit: Option<&Arc<IndexOptions>>,
+    ) -> anyhow::Result<IndexOptions> {
+        Ok(match explicit {
+            Some(options) => IndexOptions::clone(options),
+            None => self
+                .store
+                .recorded_index_options()?
+                .unwrap_or_else(|| self.config().options.clone()),
+        })
+    }
+
     // Store's cached terminal completion is settled before this callback runs.
-    // Sample the gate again at the final owning transition to a FIFO claim.
+    // The claim fence samples the gate again at the owning transition.
     fn reconcile_preclaim_gate(
         &self,
         session: &Arc<crate::store::topology::WriterSession>,
-    ) -> anyhow::Result<(bool, IndexOptions)> {
+    ) -> anyhow::Result<bool> {
         let explicit = self.explicit_pending.lock().unwrap().clone();
-        let selected = explicit
-            .as_ref()
-            .map(|options| IndexOptions::clone(options))
-            .unwrap_or(
-                self.store
-                    .recorded_index_options()?
-                    .unwrap_or_else(|| self.config().options.clone()),
-            );
-        // The first sample is only advisory: ingress may arrive before claim.
-        let _early_gate =
-            self.watcher_work
-                .lock()
-                .unwrap()
-                .as_ref()
-                .is_some_and(|(owner, work)| {
-                    owner
-                        .upgrade()
-                        .is_some_and(|owner| Arc::ptr_eq(&owner, session))
-                        && work.gate_pending(&selected)
-                });
+        let selected = self.selected_watch_options(explicit.as_ref())?;
+        // A registration here is unseen by this sample; the claim fence sees it.
         #[cfg(test)]
         self.test_queue_before_preclaim.run();
         let gate_due = self
@@ -1232,7 +1230,7 @@ impl DaemonState {
                     && work.gate_pending(&selected)
             });
         if !gate_due {
-            return Ok((true, selected));
+            return Ok(true);
         }
         #[cfg(test)]
         self.test_queue_before_watcher_reconcile.run();
@@ -1248,10 +1246,9 @@ impl DaemonState {
             self.publish_watch_status(work, &selected);
             if accounted {
                 self.finalize_watcher_gate(work, &selected, explicit.as_ref());
-                // Keep this successor's gate armed until its claim commits.
-                // Ingress after reconciliation must re-enter the watcher first.
-                work.set_queue_gate();
             }
+            // The gate's attempt is spent; a failed one defers this claim to
+            // the next step, which claims unless the options changed again.
             !accounted || work.gate_pending(&selected)
         } else {
             false
@@ -1259,7 +1256,7 @@ impl DaemonState {
         drop(guard);
         #[cfg(test)]
         self.test_queue_after_watcher_reconcile.run();
-        Ok((!pending, selected))
+        Ok(!pending)
     }
 
     fn worker_step(self: &Arc<Self>) -> anyhow::Result<()> {
@@ -1353,7 +1350,7 @@ impl DaemonState {
                     self.job_progress.lock().unwrap().insert(id.to_owned(), p);
                 },
                 |claim| loop {
-                    let (claim_ready, selected) = self
+                    let claim_ready = self
                         .reconcile_preclaim_gate(session)
                         .inspect_err(|_| gate_error.set(true))?;
                     if !claim_ready {
@@ -1366,10 +1363,16 @@ impl DaemonState {
                             .upgrade()
                             .is_some_and(|owner| Arc::ptr_eq(&owner, session))
                     {
-                        // The callback and synthetic ingress take this same lock.
-                        // Keep it through claim_request's durable COMMIT, not only
-                        // through the final sample. A later event re-enters the gate.
-                        if let Some(request) = work.claim_if_gate_clear(&selected, claim)? {
+                        // A `serve` registration publishes its options under
+                        // this lock: hold it, and the callback's ingress lock,
+                        // through claim_request's durable COMMIT. A registration
+                        // is then either seen here or follows the claim. Each
+                        // retry spends the gate's attempt or applies new options.
+                        let explicit = self.explicit_pending.lock().unwrap();
+                        let current = self
+                            .selected_watch_options(explicit.as_ref())
+                            .inspect_err(|_| gate_error.set(true))?;
+                        if let Some(request) = work.claim_if_gate_clear(&current, claim)? {
                             return Ok(request);
                         }
                         continue;
@@ -1425,13 +1428,7 @@ impl DaemonState {
                 // explicit options a new `serve` registration brought are applied
                 // once, by the next full inventory (Decision 0009 §6).
                 let explicit = self.explicit_pending.lock().unwrap().clone();
-                let selected_options = match &explicit {
-                    Some(options) => IndexOptions::clone(options),
-                    None => self
-                        .store
-                        .recorded_index_options()?
-                        .unwrap_or_else(|| self.config().options.clone()),
-                };
+                let selected_options = self.selected_watch_options(explicit.as_ref())?;
                 {
                     let mut work = self.watcher_work.lock().unwrap();
                     if !work.as_ref().is_some_and(|(owner, _)| {

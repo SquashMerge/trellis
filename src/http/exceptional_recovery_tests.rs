@@ -1317,7 +1317,7 @@ fn ingress_after_early_gate_sample_reconciles_before_claim() {
 
 #[cfg(feature = "test-support")]
 #[test]
-fn ingress_after_final_gate_sample_publishes_before_claim_commit() {
+fn ingress_after_the_gate_attempt_is_covered_by_the_next_row() {
     let (_tmp, store, state, options) = serving_queue_watch_fixture();
     let first = store.enqueue_request(&options, None).unwrap();
     let next = store.enqueue_request(&options, None).unwrap();
@@ -1362,14 +1362,157 @@ fn ingress_after_final_gate_sample_publishes_before_claim_commit() {
             .add_path(late)))
         );
     });
+    // The gate's one attempt published the earlier intent. Intent after it
+    // precedes Q1's own cutoff: it must not hold the claim (no re-gating
+    // under continuous edits), and Q1's capture covers it.
     let observed = store.clone();
     store.set_after_claim_hook_for_tests(move || {
-        assert!(
-            observed.status().unwrap().revision.index_revision > first_pin.index_revision + 1,
-            "accepted post-gate full intent must publish before Q1 claim COMMIT"
+        assert_eq!(
+            observed.status().unwrap().revision.index_revision,
+            first_pin.index_revision + 1,
+            "only the gate's attempt publishes before Q1's claim"
         );
     });
     state.worker_step().unwrap();
+    let done = store.request_by_id(&next.id).unwrap().unwrap();
+    assert_eq!(done.state, "done");
+    assert_eq!(
+        done.revision.unwrap().index_revision,
+        first_pin.index_revision + 2
+    );
+    let guard = state.watcher_work.lock().unwrap();
+    let work = &guard.as_ref().unwrap().1;
+    assert_eq!(work.accounted_watch_pin(), done.revision);
+    assert!(!work.accepted_watch_intent(&options));
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn registration_after_the_preclaim_sample_is_inventoried_before_the_claim() {
+    let (_tmp, store, state, options) = serving_queue_watch_fixture();
+    let first = store.enqueue_request(&options, None).unwrap();
+    let next = store.enqueue_request(&options, None).unwrap();
+    state.worker_step().unwrap();
+    assert_eq!(
+        store.request_by_id(&first.id).unwrap().unwrap().state,
+        "done"
+    );
+    assert_eq!(
+        store.request_by_id(&next.id).unwrap().unwrap().state,
+        "queued"
+    );
+    let mut registered = options.clone();
+    registered.max_file_bytes /= 2;
+    let registered = Arc::new(registered);
+    // A `serve` registration lands after the gate sampled the old options
+    // and before Q1's claim: the claim fence must see it (Q2 -> watcher -> Q1).
+    let registration = state.clone();
+    let applied = registered.clone();
+    state.test_queue_before_preclaim.set(move || {
+        *registration.explicit_pending.lock().unwrap() = Some(applied);
+    });
+    let observed = state.clone();
+    let expected = registered.clone();
+    store.set_after_claim_hook_for_tests(move || {
+        assert!(
+            observed.explicit_pending.lock().unwrap().is_none(),
+            "Q1 was claimed before the new options' full inventory"
+        );
+        let guard = observed.watcher_work.lock().unwrap();
+        let work = &guard.as_ref().unwrap().1;
+        // Switching options resets the watcher's accounting; it is set again
+        // only by a verified full inventory under the new options.
+        assert!(!work.accepted_watch_intent(&expected));
+        assert!(work.accounted_watch_generation().is_some());
+    });
+    state.worker_step().unwrap();
+    assert_eq!(
+        store.request_by_id(&next.id).unwrap().unwrap().state,
+        "done"
+    );
+}
+
+/// Each time the gate reconciles, another edit arrives before Q1's claim.
+#[cfg(feature = "test-support")]
+fn edit_after_every_gate_reconcile(
+    state: &Arc<DaemonState>,
+    store: &Store,
+    options: &IndexOptions,
+    next: String,
+    remaining: usize,
+) {
+    if remaining == 0 {
+        return;
+    }
+    let (hook_state, hook_store, hook_options) = (state.clone(), store.clone(), options.clone());
+    state.test_queue_after_watcher_reconcile.set(move || {
+        // After Q1's claim this hook runs under the watcher lock: stop there.
+        if hook_store.request_by_id(&next).unwrap().unwrap().state != "queued" {
+            return;
+        }
+        let source = hook_options
+            .workspace_root
+            .join(format!("churn-{remaining}.js"));
+        std::fs::write(&source, "function churn() {}\n").unwrap();
+        assert!(
+            hook_state.submit_watch_event_for_tests(Ok(notify::Event::new(
+                notify::EventKind::Create(notify::event::CreateKind::File)
+            )
+            .add_path(source)))
+        );
+        edit_after_every_gate_reconcile(
+            &hook_state,
+            &hook_store,
+            &hook_options,
+            next,
+            remaining - 1,
+        );
+    });
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn continuous_edits_get_one_gate_capture_before_the_next_row() {
+    let (_tmp, store, state, options) = serving_queue_watch_fixture();
+    let first = store.enqueue_request(&options, None).unwrap();
+    let next = store.enqueue_request(&options, None).unwrap();
+    state.worker_step().unwrap();
+    assert_eq!(
+        store.request_by_id(&first.id).unwrap().unwrap().state,
+        "done"
+    );
+    let early = options.workspace_root.join("early.js");
+    std::fs::write(&early, "function early() {}\n").unwrap();
+    assert!(
+        state.submit_watch_event_for_tests(Ok(notify::Event::new(notify::EventKind::Create(
+            notify::event::CreateKind::File
+        ))
+        .add_path(early)))
+    );
+    let attempts = |state: &DaemonState| {
+        state
+            .watcher_work
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .1
+            .full_capture_attempts_for_tests()
+    };
+    let before = attempts(&state);
+    edit_after_every_gate_reconcile(&state, &store, &options, next.id.clone(), 5);
+    let observed = state.clone();
+    let claimed = Arc::new(std::sync::Mutex::new(None));
+    let at_claim = claimed.clone();
+    store.set_after_claim_hook_for_tests(move || {
+        *at_claim.lock().unwrap() = Some(attempts(&observed));
+    });
+    state.worker_step().unwrap();
+    assert_eq!(
+        *claimed.lock().unwrap(),
+        Some(before + 1),
+        "edits after the gate's attempt must not re-gate Q1's claim"
+    );
     assert_eq!(
         store.request_by_id(&next.id).unwrap().unwrap().state,
         "done"
@@ -1569,7 +1712,7 @@ fn post_row_nonurgent_create_gate_precedes_next_fifo_claim() {
 }
 
 #[test]
-fn failed_nonurgent_full_gate_retries_before_next_fifo_claim() {
+fn failed_nonurgent_full_gate_is_spent_then_next_row_covers_it() {
     let (_tmp, store, state, options) = serving_queue_watch_fixture();
     let first = store.enqueue_request(&options, None).unwrap();
     let second = store.enqueue_request(&options, None).unwrap();
@@ -1608,6 +1751,9 @@ fn failed_nonurgent_full_gate_retries_before_next_fifo_claim() {
         "function recovered() {}\n",
     )
     .unwrap();
+    // The failed attempt spent the gate, as a failed watcher step would on
+    // main: the next step claims Q1 at once, inside the retry delay, and Q1's
+    // own capture covers the repaired source and acknowledges the intent.
     state
         .watcher_work
         .lock()
@@ -1617,33 +1763,17 @@ fn failed_nonurgent_full_gate_retries_before_next_fifo_claim() {
         .1
         .defer_retry_for_tests();
     state.worker_step().unwrap();
+    let done = store.request_by_id(&second.id).unwrap().unwrap();
+    assert_eq!(done.state, "done", "a failed gate cannot hold Q1");
     assert_eq!(
-        store.request_by_id(&second.id).unwrap().unwrap().state,
-        "queued",
-        "retry delay cannot admit Q1"
+        done.revision.unwrap().index_revision,
+        first_pin.index_revision + 1,
+        "no watcher publication ran between the rows"
     );
-    state
-        .watcher_work
-        .lock()
-        .unwrap()
-        .as_mut()
-        .unwrap()
-        .1
-        .expire_retry_for_tests();
-    let observed = store.clone();
-    let second_id = second.id.clone();
-    state.test_queue_after_watcher_reconcile.set(move || {
-        assert_eq!(
-            observed.request_by_id(&second_id).unwrap().unwrap().state,
-            "queued"
-        );
-        assert!(observed.status().unwrap().revision.index_revision > first_pin.index_revision);
-    });
-    state.worker_step().unwrap();
-    assert_eq!(
-        store.request_by_id(&second.id).unwrap().unwrap().state,
-        "done"
-    );
+    let guard = state.watcher_work.lock().unwrap();
+    let work = &guard.as_ref().unwrap().1;
+    assert_eq!(work.accounted_watch_pin(), done.revision);
+    assert!(!work.accepted_watch_intent(&options));
 }
 
 #[cfg(feature = "test-support")]
@@ -1685,20 +1815,16 @@ fn deferred_full_gate_clears_only_matching_explicit_registration() {
     )
     .unwrap();
     *state.recovery_retry_after.lock().unwrap() = None;
-    let retry = state.clone();
-    let gate_ran = Arc::new(AtomicBool::new(false));
-    let entered = gate_ran.clone();
-    state.test_queue_before_watcher_reconcile.set(move || {
-        entered.store(true, Ordering::SeqCst);
-        retry
-            .watcher_work
-            .lock()
-            .unwrap()
-            .as_mut()
-            .unwrap()
-            .1
-            .expire_retry_for_tests();
-    });
+    // The gate's one attempt is spent; its failure is retried by the ordinary
+    // watcher step once the retry delay passes.
+    state
+        .watcher_work
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .1
+        .expire_retry_for_tests();
     let before_count = state
         .watcher_work
         .lock()
@@ -1708,10 +1834,6 @@ fn deferred_full_gate_clears_only_matching_explicit_registration() {
         .1
         .full_capture_attempts_for_tests();
     state.worker_step().unwrap();
-    assert!(
-        gate_ran.load(Ordering::SeqCst),
-        "deferred gate was not entered"
-    );
     assert!(
         state
             .watcher_work
