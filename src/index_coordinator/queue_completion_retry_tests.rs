@@ -414,6 +414,37 @@ fn drifted_source_set_and_selected_input_do_not_ack_request() {
 }
 
 #[test]
+fn drifted_selected_non_source_input_does_not_ack_request() {
+    let (_tmp, store, options, _baseline, session) = fixture();
+    let manifest = options.workspace_root.join("package.json");
+    fs::write(&manifest, "{\"name\":\"before\"}\n").unwrap();
+    let mut work = WatcherWork::new(&store, &session, &options).unwrap();
+    work.disable_native_watcher_for_tests();
+    work.force_periodic_inventory_for_tests();
+    let watcher = std::sync::Mutex::new(Some((Arc::downgrade(&session), work)));
+    let row = store.enqueue_request(&options, None).unwrap();
+    let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let touched = fired.clone();
+    store.set_publication_before_commit_hook_for_tests(move || {
+        touched.store(true, std::sync::atomic::Ordering::SeqCst);
+        fs::write(&manifest, "{\"name\":\"after\"}\n").unwrap();
+    });
+    let observed = drain_one_request_with_watcher(&store, &session, &watcher, |_, _| {}).unwrap();
+    assert!(fired.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(observed, 0);
+    assert_eq!(
+        store.request_by_id(&row.id).unwrap().unwrap().state,
+        "queued"
+    );
+    let guard = watcher.lock().unwrap();
+    let work = &guard.as_ref().unwrap().1;
+    assert_eq!(work.acknowledged_generation(), 0);
+    assert_eq!(work.accounted_watch_pin(), None);
+    assert!(work.periodic_inventory_due_for_tests());
+    assert!(work.accepted_watch_intent(&options));
+}
+
+#[test]
 fn changed_watcher_root_cannot_certify_matching_request() {
     let (_tmp, store, options, _baseline, session) = fixture();
     let other_root = options.workspace_root.parent().unwrap().join("other");
