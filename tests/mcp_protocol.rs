@@ -3356,6 +3356,51 @@ fn an_earlier_call_is_decided_while_a_later_first_final_check_stalls() {
     earlier_call_is_decided_while_a_later_final_check_stalls("selected_final");
 }
 
+/// #195 re-review: a selected call's identity is compared again at its send.
+/// B's helper finds its checkout intact; the coordinator is then held at B's
+/// send (standing in for any blocking work, such as writing to a slow client)
+/// while B's root is moved away. B must answer `root_changed`, never the
+/// success its earlier check saw.
+#[test]
+fn a_root_replaced_after_its_final_check_is_root_changed_at_send() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let (main, linked) = git_linked_fixture(temp.path());
+    let moved = temp.path().join("moved-linked");
+    let socket = temp.path().join("phase.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let armed = Arc::new(AtomicBool::new(false));
+    let (arm, root, away) = (armed.clone(), linked.clone(), moved.clone());
+    serve_pauses(&listener, move |stage| {
+        if stage == "call_send" && arm.swap(false, Ordering::AcqRel) {
+            fs::rename(&root, &away).unwrap();
+        }
+        None
+    });
+    let mut peer = Peer::start_with_phase_env(Some(&main), Some(("call_send", &socket)), &[]);
+    tool(
+        &peer.ask(serde_json::from_slice(&describe_frame(json!(0), None)).unwrap()),
+        None,
+        true,
+    );
+    let warm = peer.ask(serde_json::from_slice(&describe_frame(json!(1), Some(&linked))).unwrap());
+    tool(&warm, None, true);
+    armed.store(true, Ordering::Release);
+    let reply =
+        peer.ask(serde_json::from_slice(&describe_frame(json!("B"), Some(&linked))).unwrap());
+    assert!(moved.exists(), "B's send was never held: {reply}");
+    fs::rename(&moved, &linked).unwrap();
+    tool(&reply, Some("root_changed"), true);
+    assert_eq!(
+        reply["result"]["structuredContent"]["workspace"],
+        json!(linked)
+    );
+    assert!(peer.finish().0.success());
+}
+
 #[test]
 fn capacity_witness_final_drift_refuses_stale_capacity_attribution() {
     let temp = tempfile::tempdir().unwrap();

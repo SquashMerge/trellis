@@ -1512,26 +1512,59 @@ impl SelectedCheckout {
     /// `before_answer` whose Git lookups never wait past `by` (#131); one
     /// that cannot finish by then is `Unavailable`.
     pub fn before_answer_by(&self, by: Option<Instant>) -> Result<(), SelectionError> {
+        let dirs = self.common_dirs_by(by)?;
+        self.verify_at_send(&dirs)
+    }
+    /// The slow part of the final check (#131): discover both checkouts'
+    /// common Git directories, each lookup waiting at most until `by`.
+    pub fn common_dirs_by(&self, by: Option<Instant>) -> Result<CommonDirs, SelectionError> {
         self.launch
             .verify_readonly()
             .map_err(|_| SelectionError::IdentityChanged)?;
         self.identity
             .verify_readonly()
             .map_err(|_| SelectionError::IdentityChanged)?;
-        if common_identity_by(&self.launch, by)? != self.launch_common
-            || common_identity_by(&self.identity, by)? != self.selected_common
+        let discover = |identity: &WorkspaceIdentity| {
+            identity
+                .git_common_dir_by(by)
+                .map_err(|_| SelectionError::Unavailable)
+        };
+        Ok(CommonDirs {
+            launch: discover(&self.launch)?,
+            selected: discover(&self.identity)?,
+        })
+    }
+    /// The send-time part of the final check (#131), filesystem calls only:
+    /// both roots still verify, and the discovered common directories are
+    /// still the captured one. A discovered directory that has gone is a
+    /// proven change. A Git pointer re-pointed in place, with every root and
+    /// common-directory inode unchanged, is not seen here.
+    pub fn verify_at_send(&self, dirs: &CommonDirs) -> Result<(), SelectionError> {
+        self.launch
+            .verify_readonly()
+            .map_err(|_| SelectionError::IdentityChanged)?;
+        self.identity
+            .verify_readonly()
+            .map_err(|_| SelectionError::IdentityChanged)?;
+        let inode = |path: &Path| {
+            fs::metadata(path)
+                .map(|metadata| (metadata.dev(), metadata.ino()))
+                .map_err(|_| SelectionError::IdentityChanged)
+        };
+        if inode(&dirs.launch)? != self.launch_common
+            || inode(&dirs.selected)? != self.selected_common
             || self.launch_common != self.selected_common
         {
             return Err(SelectionError::IdentityChanged);
         }
-        self.launch
-            .verify_readonly()
-            .map_err(|_| SelectionError::IdentityChanged)?;
-        self.identity
-            .verify_readonly()
-            .map_err(|_| SelectionError::IdentityChanged)?;
         Ok(())
     }
+}
+/// Common Git directories a final check discovered, for its send-time part.
+#[derive(Debug, Clone)]
+pub struct CommonDirs {
+    launch: PathBuf,
+    selected: PathBuf,
 }
 impl std::ops::Deref for SelectedCheckout {
     type Target = WorkspaceIdentity;

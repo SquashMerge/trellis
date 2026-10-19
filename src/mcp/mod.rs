@@ -578,13 +578,21 @@ enum Input {
     Frame(wire::Frame, Option<u64>, std::time::Instant, u64),
     Done(u64, std::io::Result<CallOutcome>),
     /// A call's final selected-root check, run off the coordinator (#131).
-    FinalChecked(
-        u64,
-        std::io::Result<Result<(), crate::daemon::registry::SelectionError>>,
-    ),
+    FinalChecked(u64, CheckedResult),
 }
 
-type CheckedResult = std::io::Result<Result<(), crate::daemon::registry::SelectionError>>;
+type CheckedResult = std::io::Result<
+    Result<crate::daemon::registry::CommonDirs, crate::daemon::registry::SelectionError>,
+>;
+
+/// A selected call's send-time identity gate (#131): the common directories
+/// its helper discovered, compared again on the coordinator just before the
+/// call's response is committed.
+struct SendGate {
+    witness: crate::daemon::registry::SelectedCheckout,
+    dirs: crate::daemon::registry::CommonDirs,
+    catching_up: bool,
+}
 
 /// A finished selected call whose final identity check is running, or due to
 /// start again (#131). At most one check runs per call.
@@ -594,8 +602,9 @@ struct FinalCheck {
     retry_at: Option<std::time::Instant>,
 }
 
-/// Start `token`'s final selected-root check on its own thread; its result
-/// reaches the coordinator's inbox. The thread holds no registry or session
+/// Start the slow part of `token`'s final selected-root check, discovering
+/// both common Git directories, on its own thread; its result reaches the
+/// coordinator's inbox. The thread holds no registry or session
 /// lock, and a result for a call decided meanwhile is ignored.
 fn start_final_check(
     token: u64,
@@ -608,7 +617,7 @@ fn start_final_check(
     std::thread::Builder::new()
         .name("mcp-final-check".into())
         .spawn(move || {
-            let checked = phase_hook(stage).map(|()| witness.before_answer_by(Some(deadline)));
+            let checked = phase_hook(stage).map(|()| witness.common_dirs_by(Some(deadline)));
             // The coordinator may have ended: nobody waits for this result.
             let _ = inbox.send(Input::FinalChecked(token, checked));
         })
@@ -1417,12 +1426,14 @@ fn coordinate(
         // root check, and the test pause points. Only a proven missing or
         // replaced root is `root_changed`.
         //
-        // A selected call's identity check may wait on Git, so it runs on its
-        // own thread (Decision 0009 §7, owner interpretation 2026-10-19): it
-        // still starts only after the call's work finished, its result still
-        // gates that call's send decision, and the check-to-send window is the
-        // synchronous check's. Only the thread doing the lookup moved, so no
-        // call's decision waits on another call's lookup. A lookup that cannot
+        // A selected call's identity check is split (Decision 0009 §7, owner
+        // interpretation 2026-10-19). Its slow part, discovering the common Git
+        // directories, runs on its own thread once the call's work finished,
+        // so no call's decision waits on another call's lookup. Its comparison
+        // runs on the coordinator at the call's send, filesystem calls only
+        // (`verify_at_send`), so it is never stale. Not seen at send: a Git
+        // pointer re-pointed in place with every root and common-directory
+        // inode unchanged, outside ordinary checkout and writes. A lookup that cannot
         // finish by the call's deadline (`Unavailable`, such as a Git
         // subprocess slower than its bound on a loaded host) proves nothing:
         // it is started again after a tick, and the call is
@@ -1475,7 +1486,7 @@ fn coordinate(
             if let Some(hook) = &workspace.hooks.send_decision {
                 hook(&call.id);
             }
-            finished.push((token, result));
+            finished.push((token, result, None));
         }
         while let Some((token, result)) = checked.pop_front() {
             let result = result?;
@@ -1495,8 +1506,12 @@ fn coordinate(
             else {
                 unreachable!("only selected calls have final checks")
             };
-            match result {
-                Ok(()) => {}
+            let gate = match result {
+                Ok(dirs) => Some(SendGate {
+                    witness: witness.clone(),
+                    dirs,
+                    catching_up: *catching_up,
+                }),
                 Err(SelectionError::Unavailable) => {
                     if Instant::now() < call.deadline {
                         check.running = false;
@@ -1514,13 +1529,14 @@ fn coordinate(
                         *catching_up,
                         call.modern,
                     );
+                    None
                 }
-            }
+            };
             #[cfg(feature = "test-support")]
             if let Some(hook) = &workspace.hooks.send_decision {
                 hook(&call.id);
             }
-            finished.push((token, check.outcome.result));
+            finished.push((token, check.outcome.result, gate));
         }
         let now = Instant::now();
         checks.retain(|token, _| in_flight.get(token).is_some_and(|call| now < call.deadline));
@@ -1557,7 +1573,7 @@ fn coordinate(
             &mut completed,
             &mut checked,
         ) {
-            for (token, _) in &finished {
+            for (token, _, _) in &finished {
                 if let Some(call) = in_flight.get(token) {
                     call.cancel
                         .store(true, std::sync::atomic::Ordering::Release);
@@ -1571,13 +1587,28 @@ fn coordinate(
         if let Some(hook) = &workspace.hooks.fence_handled {
             hook(deciding.len() + arrivals.len());
         }
-        // Each decision: cancelled (not pending) -> deadline -> outcome.
-        for (token, result) in finished {
+        // Each decision: cancelled (not pending) -> deadline -> outcome. A
+        // selected call's identity is compared again here, at its send, with
+        // filesystem calls only: its helper's success may be stale after
+        // whatever the coordinator did since, such as writing to a slow
+        // client (#131).
+        for (token, result, gate) in finished {
             let Some(call) = in_flight.remove(&token) else {
                 continue;
             };
+            phase_hook("call_send")?;
             let result = if Instant::now() >= call.deadline {
                 deadline_answer(&call)
+            } else if let Some(gate) = gate
+                && gate.witness.verify_at_send(&gate.dirs).is_err()
+            {
+                tools::resolved_root_changed(
+                    &call.name,
+                    &call.id,
+                    &gate.witness.identity.root,
+                    gate.catching_up,
+                    call.modern,
+                )
             } else {
                 result
             };
