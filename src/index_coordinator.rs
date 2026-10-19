@@ -438,6 +438,8 @@ pub struct WatcherWork {
     queue_gate: bool,
     #[cfg(all(test, feature = "test-support"))]
     full_capture_attempts: usize,
+    #[cfg(all(test, feature = "test-support"))]
+    reconcile_now_for_tests: Option<std::time::Instant>,
     /// Shared with every watcher this owner creates; read without its lock.
     health: Arc<crate::watch::WatcherHealth>,
     last_inventory: std::time::Instant,
@@ -512,6 +514,8 @@ impl WatcherWork {
             queue_gate: false,
             #[cfg(all(test, feature = "test-support"))]
             full_capture_attempts: 0,
+            #[cfg(all(test, feature = "test-support"))]
+            reconcile_now_for_tests: None,
             last_inventory: std::time::Instant::now(),
             retry_after: None,
             last_accounted_generation: None,
@@ -645,6 +649,11 @@ impl WatcherWork {
     #[cfg(all(test, feature = "test-support"))]
     pub(crate) fn full_capture_attempts_for_tests(&self) -> usize {
         self.full_capture_attempts
+    }
+
+    #[cfg(all(test, feature = "test-support"))]
+    pub(crate) fn set_reconcile_now_for_tests(&mut self, now: Option<std::time::Instant>) {
+        self.reconcile_now_for_tests = now;
     }
 
     fn snapshot_request(
@@ -927,6 +936,8 @@ impl WatcherWork {
             }
         }
         let now = std::time::Instant::now();
+        #[cfg(all(test, feature = "test-support"))]
+        let now = self.reconcile_now_for_tests.unwrap_or(now);
         let periodic = now.duration_since(self.last_inventory) >= PERIODIC_INVENTORY;
         let batch = self.watch.drain();
         // Retirement's attempt never captures past its cutoff; the capture's
