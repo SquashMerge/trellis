@@ -492,8 +492,8 @@ fn catching_up(
         .is_none_or(|runtime| runtime.catching_up())
 }
 
-/// How soon the coordinator retries a final selected check that could not
-/// finish (#131), while it keeps deciding the connection's other calls.
+/// How soon a final selected check that could not finish is started again
+/// (#131), while the coordinator keeps deciding the connection's other calls.
 const FINAL_RECHECK_TICK: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// An opt-in, bounded fixture barrier at an actual coordinator boundary.
@@ -577,6 +577,42 @@ enum Input {
     /// completed it (protocol acceptance), and its position in the input.
     Frame(wire::Frame, Option<u64>, std::time::Instant, u64),
     Done(u64, std::io::Result<CallOutcome>),
+    /// A call's final selected-root check, run off the coordinator (#131).
+    FinalChecked(
+        u64,
+        std::io::Result<Result<(), crate::daemon::registry::SelectionError>>,
+    ),
+}
+
+type CheckedResult = std::io::Result<Result<(), crate::daemon::registry::SelectionError>>;
+
+/// A finished selected call whose final identity check is running, or due to
+/// start again (#131). At most one check runs per call.
+struct FinalCheck {
+    outcome: CallOutcome,
+    running: bool,
+    retry_at: Option<std::time::Instant>,
+}
+
+/// Start `token`'s final selected-root check on its own thread; its result
+/// reaches the coordinator's inbox. The thread holds no registry or session
+/// lock, and a result for a call decided meanwhile is ignored.
+fn start_final_check(
+    token: u64,
+    witness: &crate::daemon::registry::SelectedCheckout,
+    deadline: std::time::Instant,
+    stage: &'static str,
+    inbox: &std::sync::mpsc::Sender<Input>,
+) -> bool {
+    let (witness, inbox) = (witness.clone(), inbox.clone());
+    std::thread::Builder::new()
+        .name("mcp-final-check".into())
+        .spawn(move || {
+            let checked = phase_hook(stage).map(|()| witness.before_answer_by(Some(deadline)));
+            // The coordinator may have ended: nobody waits for this result.
+            let _ = inbox.send(Input::FinalChecked(token, checked));
+        })
+        .is_ok()
 }
 
 /// A worker's finished call: the tool result and the fences the send decision
@@ -1299,7 +1335,8 @@ fn coordinate(
     let fence = |inbox: &mut Inbox,
                  session: &mut session::Session,
                  arrivals: &mut VecDeque<impl_receive::Outcome>,
-                 completed: &mut VecDeque<(u64, std::io::Result<CallOutcome>)>|
+                 completed: &mut VecDeque<(u64, std::io::Result<CallOutcome>)>,
+                 checked: &mut VecDeque<(u64, CheckedResult)>|
      -> bool {
         let until = inbox.decision();
         while let Some(input) = inbox.settled(until) {
@@ -1310,6 +1347,7 @@ fn coordinate(
                     }
                 }
                 Input::Done(token, outcome) => completed.push_back((token, outcome)),
+                Input::FinalChecked(token, result) => checked.push_back((token, result)),
             }
         }
         if inbox.ended {
@@ -1342,17 +1380,22 @@ fn coordinate(
     };
     // Requests handled at the last fence and not yet decided.
     let mut arrivals: VecDeque<impl_receive::Outcome> = VecDeque::new();
-    // Finished calls whose final selected check could not finish yet, and
-    // those a later recheck settled, decided after the next fence (#131).
-    let mut rechecks: Vec<(u64, CallOutcome)> = Vec::new();
-    let mut rechecked: Vec<(u64, serde_json::Value)> = Vec::new();
+    // Selected calls awaiting their final identity check, and the checks'
+    // results not yet taken in (#131).
+    let mut checks: HashMap<u64, FinalCheck> = HashMap::new();
+    let mut checked: VecDeque<(u64, CheckedResult)> = VecDeque::new();
     loop {
-        if arrivals.is_empty() && completed.is_empty() && rechecked.is_empty() {
-            let mut next = in_flight.values().map(|call| call.deadline).min();
-            if !rechecks.is_empty() {
-                let tick = Instant::now() + FINAL_RECHECK_TICK;
-                next = Some(next.map_or(tick, |deadline| deadline.min(tick)));
-            }
+        if arrivals.is_empty() && completed.is_empty() && checked.is_empty() {
+            let retry = checks
+                .values()
+                .filter(|check| !check.running)
+                .filter_map(|check| check.retry_at)
+                .min();
+            let next = in_flight
+                .values()
+                .map(|call| call.deadline)
+                .chain(retry)
+                .min();
             match inbox.wait(next) {
                 Some(Input::Frame(frame, relay, accepted, _)) => {
                     if receive(frame, relay, accepted, &mut session, &mut arrivals) {
@@ -1361,6 +1404,7 @@ fn coordinate(
                     }
                 }
                 Some(Input::Done(token, outcome)) => completed.push_back((token, outcome)),
+                Some(Input::FinalChecked(token, result)) => checked.push_back((token, result)),
                 None if inbox.ended => {
                     session.eof();
                     cancel_dropped(&session, &mut in_flight);
@@ -1371,78 +1415,127 @@ fn coordinate(
         }
         // Blocking steps come before the fence: each finished call's final
         // root check, and the test pause points. Only a proven missing or
-        // replaced root is `root_changed`. A selected identity lookup that
-        // cannot finish by the call's own deadline (`Unavailable`, such as a
-        // Git subprocess slower than its bound on a loaded host) proves
-        // nothing: its call is parked in `rechecks`, checked again only after
-        // this pass's decisions are written, and `deadline_exceeded` once its
-        // deadline passes (#131). Every check is bounded by its call's
-        // deadline, so a call that finishes while another call's send-time
-        // check runs waits at most that check's remaining bound: inherent to
-        // the serialized send decision (Decision 0009 §7).
-        let mut finished = std::mem::take(&mut rechecked);
+        // replaced root is `root_changed`.
+        //
+        // A selected call's identity check may wait on Git, so it runs on its
+        // own thread (Decision 0009 §7, owner interpretation 2026-10-19): it
+        // still starts only after the call's work finished, its result still
+        // gates that call's send decision, and the check-to-send window is the
+        // synchronous check's. Only the thread doing the lookup moved, so no
+        // call's decision waits on another call's lookup. A lookup that cannot
+        // finish by the call's deadline (`Unavailable`, such as a Git
+        // subprocess slower than its bound on a loaded host) proves nothing:
+        // it is started again after a tick, and the call is
+        // `deadline_exceeded` once its deadline passes (#131).
+        let mut finished = Vec::new();
         while let Some((token, outcome)) = completed.pop_front() {
             let Some(call) = in_flight.get(&token) else {
                 // Already decided at its deadline, or cancelled.
                 continue;
             };
             let outcome = outcome?;
-            let mut result = outcome.result;
-            let mut unproven = false;
-            if Instant::now() < call.deadline {
-                match &outcome.finals {
-                    Finals::None => {}
-                    Finals::Launch { catching_up } => {
-                        phase_hook("launch_final")?;
-                        if workspace.check().is_err() {
-                            result = tools::resolved_root_changed(
-                                &call.name,
-                                &call.id,
-                                workspace.root(),
-                                *catching_up,
-                                call.modern,
-                            );
-                        }
-                    }
-                    Finals::Selected {
-                        witness,
-                        catching_up,
-                    }
-                    | Finals::Capacity {
-                        witness,
-                        catching_up,
-                    } => {
-                        phase_hook(if matches!(outcome.finals, Finals::Selected { .. }) {
-                            "selected_final"
-                        } else {
-                            "capacity_final"
-                        })?;
-                        match witness.before_answer_by(Some(call.deadline)) {
-                            Ok(()) => {}
-                            Err(SelectionError::Unavailable) => unproven = true,
-                            Err(_) => {
-                                result = tools::resolved_root_changed(
-                                    &call.name,
-                                    &call.id,
-                                    &witness.identity.root,
-                                    *catching_up,
-                                    call.modern,
-                                );
-                            }
-                        }
-                    }
+            let selected = match &outcome.finals {
+                Finals::Selected { witness, .. } if Instant::now() < call.deadline => {
+                    Some((witness.clone(), "selected_final"))
                 }
-            }
-            if unproven {
-                let finals = outcome.finals;
-                rechecks.push((token, CallOutcome { result, finals }));
+                Finals::Capacity { witness, .. } if Instant::now() < call.deadline => {
+                    Some((witness.clone(), "capacity_final"))
+                }
+                _ => None,
+            };
+            if let Some((witness, stage)) = selected {
+                let running = start_final_check(token, &witness, call.deadline, stage, &sender);
+                let retry_at = (!running).then(|| Instant::now() + FINAL_RECHECK_TICK);
+                checks.insert(
+                    token,
+                    FinalCheck {
+                        outcome,
+                        running,
+                        retry_at,
+                    },
+                );
                 continue;
+            }
+            let mut result = outcome.result;
+            if Instant::now() < call.deadline
+                && let Finals::Launch { catching_up } = &outcome.finals
+            {
+                phase_hook("launch_final")?;
+                if workspace.check().is_err() {
+                    result = tools::resolved_root_changed(
+                        &call.name,
+                        &call.id,
+                        workspace.root(),
+                        *catching_up,
+                        call.modern,
+                    );
+                }
             }
             #[cfg(feature = "test-support")]
             if let Some(hook) = &workspace.hooks.send_decision {
                 hook(&call.id);
             }
             finished.push((token, result));
+        }
+        while let Some((token, result)) = checked.pop_front() {
+            let result = result?;
+            let (Some(mut check), Some(call)) = (checks.remove(&token), in_flight.get(&token))
+            else {
+                // Its call was decided, cancelled or expired meanwhile.
+                continue;
+            };
+            let (Finals::Selected {
+                witness,
+                catching_up,
+            }
+            | Finals::Capacity {
+                witness,
+                catching_up,
+            }) = &check.outcome.finals
+            else {
+                unreachable!("only selected calls have final checks")
+            };
+            match result {
+                Ok(()) => {}
+                Err(SelectionError::Unavailable) => {
+                    if Instant::now() < call.deadline {
+                        check.running = false;
+                        check.retry_at = Some(Instant::now() + FINAL_RECHECK_TICK);
+                        checks.insert(token, check);
+                    }
+                    // Past its deadline, the expiry below answers it.
+                    continue;
+                }
+                Err(_) => {
+                    check.outcome.result = tools::resolved_root_changed(
+                        &call.name,
+                        &call.id,
+                        &witness.identity.root,
+                        *catching_up,
+                        call.modern,
+                    );
+                }
+            }
+            #[cfg(feature = "test-support")]
+            if let Some(hook) = &workspace.hooks.send_decision {
+                hook(&call.id);
+            }
+            finished.push((token, check.outcome.result));
+        }
+        let now = Instant::now();
+        checks.retain(|token, _| in_flight.get(token).is_some_and(|call| now < call.deadline));
+        for (token, check) in &mut checks {
+            if check.running || check.retry_at.is_some_and(|at| now < at) {
+                continue;
+            }
+            let (Finals::Selected { witness, .. } | Finals::Capacity { witness, .. }) =
+                &check.outcome.finals
+            else {
+                unreachable!("only selected calls have final checks")
+            };
+            let deadline = in_flight[token].deadline;
+            check.running = start_final_check(*token, witness, deadline, "final_recheck", &sender);
+            check.retry_at = (!check.running).then(|| now + FINAL_RECHECK_TICK);
         }
         #[cfg(feature = "test-support")]
         if let Some(hook) = &workspace.hooks.immediate_decision {
@@ -1457,7 +1550,13 @@ fn coordinate(
         // The fence for every decision below. Requests it handles are decided
         // after the next one.
         let deciding = std::mem::take(&mut arrivals);
-        if fence(&mut inbox, &mut session, &mut arrivals, &mut completed) {
+        if fence(
+            &mut inbox,
+            &mut session,
+            &mut arrivals,
+            &mut completed,
+            &mut checked,
+        ) {
             for (token, _) in &finished {
                 if let Some(call) = in_flight.get(token) {
                     call.cancel
@@ -1652,51 +1751,6 @@ fn coordinate(
                 .and_then(|prepared| session.commit(prepared))
             {
                 wire::write_relayed_capped(&mut writer, relay, &value, cap)?;
-            }
-        }
-        // Parked final checks run last, so no call decided above waits on
-        // them. A settled one is decided after the next fence; one past its
-        // deadline is left to the expiry above on the next pass.
-        for (token, outcome) in std::mem::take(&mut rechecks) {
-            let Some(call) = in_flight.get(&token) else {
-                continue;
-            };
-            if Instant::now() >= call.deadline {
-                rechecks.push((token, outcome));
-                continue;
-            }
-            let (Finals::Selected {
-                witness,
-                catching_up,
-            }
-            | Finals::Capacity {
-                witness,
-                catching_up,
-            }) = &outcome.finals
-            else {
-                unreachable!("only selected final checks are parked")
-            };
-            phase_hook("final_recheck")?;
-            let checked = witness.before_answer_by(Some(call.deadline));
-            #[cfg(feature = "test-support")]
-            if !matches!(checked, Err(SelectionError::Unavailable))
-                && let Some(hook) = &workspace.hooks.send_decision
-            {
-                hook(&call.id);
-            }
-            match checked {
-                Ok(()) => rechecked.push((token, outcome.result)),
-                Err(SelectionError::Unavailable) => rechecks.push((token, outcome)),
-                Err(_) => rechecked.push((
-                    token,
-                    tools::resolved_root_changed(
-                        &call.name,
-                        &call.id,
-                        &witness.identity.root,
-                        *catching_up,
-                        call.modern,
-                    ),
-                )),
             }
         }
     }

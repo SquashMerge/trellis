@@ -3099,25 +3099,30 @@ fn a_stalled_final_check_does_not_hold_other_calls() {
     assert!(peer.finish().0.success());
 }
 
-/// Serve every phase pause on `listener` from a thread until the test ends.
-/// `hold` sees each pause's stage and returns when to release it (`None`: at
-/// once).
+/// Serve every phase pause on `listener` until the test ends, each on its own
+/// thread so one held pause never delays another. `hold` sees each pause's
+/// stage and returns when to release it (`None`: at once).
 fn serve_pauses(
     listener: &std::os::unix::net::UnixListener,
-    mut hold: impl FnMut(&str) -> Option<std::time::Instant> + Send + 'static,
+    hold: impl FnMut(&str) -> Option<std::time::Instant> + Send + 'static,
 ) {
     let listener = listener.try_clone().unwrap();
+    let hold = std::sync::Arc::new(std::sync::Mutex::new(hold));
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { return };
-            let mut stage = String::new();
-            BufReader::new(stream.try_clone().unwrap())
-                .read_line(&mut stage)
-                .unwrap();
-            if let Some(at) = hold(stage.trim_end()) {
-                std::thread::sleep(at.saturating_duration_since(std::time::Instant::now()));
-            }
-            let _ = stream.write_all(b"x");
+            let hold = hold.clone();
+            std::thread::spawn(move || {
+                let mut stage = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut stage)
+                    .unwrap();
+                let at = (hold.lock().unwrap())(stage.trim_end());
+                if let Some(at) = at {
+                    std::thread::sleep(at.saturating_duration_since(std::time::Instant::now()));
+                }
+                let _ = stream.write_all(b"x");
+            });
         }
     });
 }
@@ -3269,6 +3274,86 @@ fn a_call_finishing_near_its_deadline_is_not_held_behind_a_recheck() {
     tool(&b, None, true);
     tool(&a, Some("deadline_exceeded"), true);
     assert!(peer.finish().0.success());
+}
+
+/// #195 re-review: no call's send decision waits on another call's final
+/// identity lookup. B is accepted first and its worker held until 4.4 s after
+/// it was written; A, accepted just after, has its final check stalled by Git
+/// and held at `hold_stage` until 4.5 s. A check run on the coordinator would
+/// keep B's decision past B's deadline; B must be answered with its result.
+fn earlier_call_is_decided_while_a_later_final_check_stalls(hold_stage: &'static str) {
+    use std::sync::{Arc, Mutex};
+    use std::time::Instant;
+    let temp = tempfile::tempdir().unwrap();
+    let (main, linked) = git_linked_fixture(temp.path());
+    let stalled = temp.path().join("stall-git");
+    let path = stalling_git_path(temp.path(), &stalled, false);
+    let socket = temp.path().join("phase.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let written_b: Arc<Mutex<Option<Instant>>> = Arc::default();
+    let (b_held, b_held_at) = std::sync::mpsc::channel::<()>();
+    let (flag, start) = (stalled.clone(), written_b.clone());
+    let (mut b_pending, mut a_pending) = (true, true);
+    serve_pauses(&listener, move |stage| {
+        let start = (*start.lock().unwrap())?;
+        if stage == "call_worker" && std::mem::take(&mut b_pending) {
+            b_held.send(()).unwrap();
+            return Some(start + Duration::from_millis(4400));
+        }
+        if stage == "selected_final" {
+            fs::write(&flag, b"").unwrap();
+        }
+        // A recheck is held once one starts after 3.6 s, so it overlaps B.
+        let due =
+            hold_stage != "final_recheck" || Instant::now() >= start + Duration::from_millis(3600);
+        if stage == hold_stage && due && std::mem::take(&mut a_pending) {
+            return Some(start + Duration::from_millis(4500));
+        }
+        None
+    });
+    let mut peer = Peer::start_with_phase_env(
+        Some(&main),
+        Some(("call_worker,selected_final,final_recheck", &socket)),
+        &[
+            ("PATH", path.as_os_str()),
+            ("TRELLIS_TEST_MCP_RELAY_DEADLINE_MS", "10000".as_ref()),
+        ],
+    );
+    tool(
+        &peer.ask(serde_json::from_slice(&describe_frame(json!(0), None)).unwrap()),
+        None,
+        true,
+    );
+    let warm = peer.ask(serde_json::from_slice(&describe_frame(json!(1), Some(&linked))).unwrap());
+    tool(&warm, None, true);
+    *written_b.lock().unwrap() = Some(Instant::now());
+    peer.send_raw(&describe_frame(json!("B"), None));
+    b_held_at
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .expect("B's worker never started");
+    peer.send_raw(&describe_frame(json!("A"), Some(&linked)));
+    let first = peer.reply();
+    let second = peer.reply();
+    let _ = fs::remove_file(&stalled);
+    let (b, a) = if first["id"] == "B" {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    assert_eq!((b["id"].as_str(), a["id"].as_str()), (Some("B"), Some("A")));
+    tool(&b, None, true);
+    tool(&a, Some("deadline_exceeded"), true);
+    assert!(peer.finish().0.success());
+}
+
+#[test]
+fn an_earlier_call_is_decided_while_a_later_recheck_stalls() {
+    earlier_call_is_decided_while_a_later_final_check_stalls("final_recheck");
+}
+
+#[test]
+fn an_earlier_call_is_decided_while_a_later_first_final_check_stalls() {
+    earlier_call_is_decided_while_a_later_final_check_stalls("selected_final");
 }
 
 #[test]
