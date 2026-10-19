@@ -4,10 +4,9 @@ This is a manual report, **not a CI performance gate**. It measures complete `re
 
 ## Generate and index once
 
-From a Trellis checkout with Python 3, Node.js, Rust 1.99, native build prerequisites, and enough temporary disk space for the large index (over 15 GiB was observed):
+From a Trellis checkout with Python 3, Node.js, the Rust toolchain pinned in `rust-toolchain.toml`, native build prerequisites, and enough temporary disk space for the large index (over 15 GiB was observed):
 
 ```sh
-export RUSTUP_TOOLCHAIN=1.99
 export CARGO_TARGET_DIR=/tmp/trellis-factory-120-bench-target
 mkdir -p /tmp/trellis-factory-120-metrics-bench
 node tools/synthetic-cohorts/generate.mjs --out /tmp/trellis-factory-120-metrics-bench/generated

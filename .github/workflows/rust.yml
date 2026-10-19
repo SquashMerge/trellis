@@ -20,8 +20,10 @@ jobs:
         with:
           node-version: 24
       - run: npm ci --prefix runtime/acp --ignore-scripts
-      - uses: dtolnay/rust-toolchain@stable
+      # Keep in step with rust-toolchain.toml, which every local build uses.
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.99.1
           components: rustfmt, clippy
       # The synthetic-cohorts composition helper builds its tree-sitter grammars
       # in its own target directory under the OS temp dir; cache it with the
