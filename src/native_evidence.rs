@@ -67,6 +67,29 @@ impl Drop for ExtractionAuthFaultGuard {
         EXTRACTION_AUTH_FAULT.with(|fault| *fault.borrow_mut() = None);
     }
 }
+/// The calling thread's injected fault, so parallel workers see the same
+/// fault as the sequential code would.
+#[cfg(test)]
+pub(crate) type ExtractionAuthFaultSnapshot = Option<(String, String, ExtractionAuthFault)>;
+#[cfg(test)]
+pub(crate) fn extraction_auth_fault_snapshot() -> ExtractionAuthFaultSnapshot {
+    EXTRACTION_AUTH_FAULT.with(|slot| slot.borrow().clone())
+}
+/// Install `snapshot` on this thread until the returned scope drops.
+#[cfg(test)]
+pub(crate) fn enter_extraction_auth_fault(
+    snapshot: &ExtractionAuthFaultSnapshot,
+) -> ExtractionAuthFaultScope {
+    ExtractionAuthFaultScope(EXTRACTION_AUTH_FAULT.with(|slot| slot.replace(snapshot.clone())))
+}
+#[cfg(test)]
+pub(crate) struct ExtractionAuthFaultScope(ExtractionAuthFaultSnapshot);
+#[cfg(test)]
+impl Drop for ExtractionAuthFaultScope {
+    fn drop(&mut self) {
+        EXTRACTION_AUTH_FAULT.with(|slot| *slot.borrow_mut() = self.0.take());
+    }
+}
 #[cfg(test)]
 pub(crate) fn inject_extraction_auth_fault(
     revision: &str,
@@ -677,7 +700,7 @@ pub(crate) fn from_capture_observed<'c>(
     cancel: &CancelFlag,
     observe: impl Fn(&DocumentKey, FullNativeStage),
 ) -> Result<ValidatedArtifact<'c>> {
-    let artifact = build_native_observed(capture, root, root_id, &|key| {
+    let artifact = build_native_observed(capture, root, root_id, cancel, &|key| {
         observe(key, FullNativeStage::Measured);
     })?;
     artifact.validate(capture, root, root_id, cancel)?;
@@ -856,26 +879,116 @@ fn native_revision_digest(
     hex::encode(hasher.finalize())
 }
 
-fn build_native(capture: &Capture, root: &Path, root_id: &str) -> Result<Artifact> {
-    build_native_observed(capture, root, root_id, &|_| {})
+/// Rows whose IDs are minted together before their checks run in order.
+const MINT_CHUNK: usize = 16 * 1024;
+
+fn build_native(
+    capture: &Capture,
+    root: &Path,
+    root_id: &str,
+    cancel: &CancelFlag,
+) -> Result<Artifact> {
+    build_native_observed(capture, root, root_id, cancel, &|_| {})
 }
 
 fn build_native_observed(
     capture: &Capture,
     root: &Path,
     root_id: &str,
+    cancel: &CancelFlag,
     on_extract: &impl Fn(&DocumentKey),
 ) -> Result<Artifact> {
-    let (mut artifact, files) = build_native_header(capture, root, root_id)?;
-    let mut ids = IdentityRegistry::default();
-    for (index, f) in files.into_iter().enumerate() {
-        // The revision header was built from this exact sorted file sequence.
-        // Keep a concrete document witness, rather than scanning the full
-        // revision header once per file.
-        let document = artifact.revision.documents[index].clone();
-        extract_known(&mut artifact, f, &document, &mut ids)?;
-        on_extract(&document.key);
+    build_native_with(
+        capture,
+        root,
+        root_id,
+        cancel,
+        on_extract,
+        ExtractionPlan::default(),
+        &|_| Ok(()),
+    )
+}
+
+/// How full extraction is spread over workers: files are extracted in
+/// chunks of `chunk`, each on up to `workers` threads, and merged in
+/// revision order after each chunk.
+#[derive(Clone, Copy, Debug)]
+struct ExtractionPlan {
+    workers: usize,
+    chunk: usize,
+}
+impl Default for ExtractionPlan {
+    fn default() -> Self {
+        let workers = crate::parallel::default_workers();
+        Self {
+            workers,
+            chunk: workers * 16,
+        }
     }
+}
+
+/// One file's facts, measured into its own header-only artifact with its
+/// own first-insertion-ordered identity registry.
+struct FileFacts {
+    shell: Artifact,
+    ids: IdentityRegistry,
+    result: Result<()>,
+}
+
+/// Every file is extracted by the same document-local function as before;
+/// results are merged strictly in the revision's sorted order, so the
+/// artifact, its minted IDs and the first reported error are those of a
+/// sequential build. `before_file` is a test hook; production passes a no-op.
+fn build_native_with(
+    capture: &Capture,
+    root: &Path,
+    root_id: &str,
+    cancel: &CancelFlag,
+    on_extract: &impl Fn(&DocumentKey),
+    plan: ExtractionPlan,
+    before_file: &(dyn Fn(&SourceFile) -> Result<()> + Sync),
+) -> Result<Artifact> {
+    let (mut artifact, files) = build_native_header(capture, root, root_id)?;
+    // The revision header was built from this exact sorted file sequence, so
+    // file i is document i. Workers measure into a header-only shell.
+    let documents = std::mem::take(&mut artifact.revision.documents);
+    let shell = artifact.clone();
+    let pairs: Vec<(&SourceFile, &Document)> = files.into_iter().zip(&documents).collect();
+    let mut ids = IdentityRegistry::default();
+    for chunk in pairs.chunks(plan.chunk.max(1)) {
+        ensure!(
+            !cancel.load(std::sync::atomic::Ordering::Acquire),
+            "indexing cancelled"
+        );
+        let measured =
+            crate::parallel::map_ordered(chunk, plan.workers, cancel, |_, (f, document)| {
+                let mut facts = FileFacts {
+                    shell: shell.clone(),
+                    ids: IdentityRegistry::logged(),
+                    result: Ok(()),
+                };
+                facts.result = before_file(f)
+                    .and_then(|()| extract_known(&mut facts.shell, f, document, &mut facts.ids));
+                facts
+            });
+        for (facts, (_, document)) in measured.into_iter().zip(chunk) {
+            let facts = facts.context("indexing cancelled")?;
+            // IDs minted before a failure are admitted first: a collision with
+            // an earlier file precedes this file's own failure, as it did when
+            // one registry measured every file in turn.
+            ids.absorb(facts.ids)?;
+            facts.result?;
+            let shell = facts.shell;
+            artifact.coverage.extend(shell.coverage);
+            artifact.provenance.extend(shell.provenance);
+            artifact.declarations.extend(shell.declarations);
+            artifact.calls.extend(shell.calls);
+            artifact.control_regions.extend(shell.control_regions);
+            on_extract(&document.key);
+        }
+    }
+    drop(pairs);
+    artifact.revision.documents = documents;
     Ok(artifact)
 }
 
@@ -2168,7 +2281,7 @@ impl Artifact {
         self.validate_structure(&capture.files)?;
         #[cfg(test)]
         FULL_VALIDATIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let expected = build_native(capture, root, root_id)?;
+        let expected = build_native(capture, root, root_id, cancel)?;
         capture.verify(cancel)?;
         expected.validate_structure(&capture.files)?;
         ensure!(
@@ -2301,78 +2414,97 @@ impl Artifact {
             );
             ensure!(proof.id == expected, "native proof digest mismatch");
         }
+        // The pure part of every ID (input checks, canonical bytes, digest) is
+        // minted on workers, a chunk at a time. Each row's checks still run
+        // here in order, and the minted ID is admitted at the point where it
+        // was computed before, so errors and their order are unchanged.
+        let workers = crate::parallel::default_workers();
+        let never = std::sync::atomic::AtomicBool::new(false);
+        let stable_input = |d: &Declaration| {
+            crate::native_ids::mint_stable(
+                &json!({"sourceSet":self.source_set.id,"path":d.document.path,"language":d.document.language,"ancestors":d.ancestors,"declaration":d.key}),
+            )
+        };
         let mut declarations = BTreeMap::new();
         let mut identity = IdentityRegistry::default();
-        for d in &self.declarations {
-            let file = docs
-                .get(&d.document)
-                .context("native declaration dangling document")?;
-            ensure!(
-                d.revision_id == self.revision.id
-                    && proofs.contains(&d.provenance_id)
-                    && matches!(
-                        d.kind.as_str(),
-                        "module"
-                            | "namespace"
-                            | "type"
-                            | "implementation"
-                            | "function"
-                            | "method"
-                            | "constructor"
-                            | "field"
-                            | "variable"
-                            | "parameter"
-                            | "typeParameter"
-                            | "alias"
-                            | "anonymousFunction"
-                    )
-                    && d.kind == d.key.kind
-                    && d.name == d.key.name
-                    && d.header.kind == d.kind
-                    && d.header.name == d.name,
-                "native declaration mismatch"
-            );
-            ensure!(
-                d.name.is_some() == d.lookup_key.is_some()
-                    && d.name.is_some() == d.name_range.is_some(),
-                "native name nullability"
-            );
-            span(
-                &file.text,
-                &d.range,
-                d.kind == "module" && file.text.is_empty(),
-            )?;
-            if let Some(r) = &d.name_range {
-                span(&file.text, r, false)?;
+        for chunk in self.declarations.chunks(MINT_CHUNK) {
+            let mut minted =
+                crate::parallel::map_ordered(chunk, workers, &never, |_, d| stable_input(d))
+                    .into_iter();
+            for d in chunk {
+                let file = docs
+                    .get(&d.document)
+                    .context("native declaration dangling document")?;
                 ensure!(
-                    r.start >= d.range.start
-                        && r.end <= d.range.end
-                        && d.name.as_deref() == file.text.get(r.start..r.end),
-                    "native name not source-measured"
+                    d.revision_id == self.revision.id
+                        && proofs.contains(&d.provenance_id)
+                        && matches!(
+                            d.kind.as_str(),
+                            "module"
+                                | "namespace"
+                                | "type"
+                                | "implementation"
+                                | "function"
+                                | "method"
+                                | "constructor"
+                                | "field"
+                                | "variable"
+                                | "parameter"
+                                | "typeParameter"
+                                | "alias"
+                                | "anonymousFunction"
+                        )
+                        && d.kind == d.key.kind
+                        && d.name == d.key.name
+                        && d.header.kind == d.kind
+                        && d.header.name == d.name,
+                    "native declaration mismatch"
+                );
+                ensure!(
+                    d.name.is_some() == d.lookup_key.is_some()
+                        && d.name.is_some() == d.name_range.is_some(),
+                    "native name nullability"
+                );
+                span(
+                    &file.text,
+                    &d.range,
+                    d.kind == "module" && file.text.is_empty(),
+                )?;
+                if let Some(r) = &d.name_range {
+                    span(&file.text, r, false)?;
+                    ensure!(
+                        r.start >= d.range.start
+                            && r.end <= d.range.end
+                            && d.name.as_deref() == file.text.get(r.start..r.end),
+                        "native name not source-measured"
+                    );
+                }
+                if let Some(n) = &d.name {
+                    ensure!(
+                        d.lookup_key.as_deref()
+                            == Some(declaration_lookup(&d.document.language, n)?.as_str()),
+                        "native lookup normalization mismatch"
+                    );
+                }
+                if d.document.language != "java"
+                    || !matches!(d.kind.as_str(), "method" | "constructor")
+                {
+                    ensure!(d.key.signature.is_none(), "unexpected native signature");
+                }
+                if d.kind == "module" {
+                    ensure!(
+                        d.name.is_none() && d.ancestors.is_empty(),
+                        "invalid native module"
+                    );
+                }
+                let expected =
+                    identity.admit(minted.next().flatten().unwrap_or_else(|| stable_input(d))?)?;
+                ensure!(
+                    d.syntax_id == expected
+                        && declarations.insert(d.syntax_id.clone(), d).is_none(),
+                    "native stable ID collision/duplicate"
                 );
             }
-            if let Some(n) = &d.name {
-                ensure!(
-                    d.lookup_key.as_deref()
-                        == Some(declaration_lookup(&d.document.language, n)?.as_str()),
-                    "native lookup normalization mismatch"
-                );
-            }
-            if d.document.language != "java" || !matches!(d.kind.as_str(), "method" | "constructor")
-            {
-                ensure!(d.key.signature.is_none(), "unexpected native signature");
-            }
-            if d.kind == "module" {
-                ensure!(
-                    d.name.is_none() && d.ancestors.is_empty(),
-                    "invalid native module"
-                );
-            }
-            let expected=identity.stable(&json!({"sourceSet":self.source_set.id,"path":d.document.path,"language":d.document.language,"ancestors":d.ancestors,"declaration":d.key}))?;
-            ensure!(
-                d.syntax_id == expected && declarations.insert(d.syntax_id.clone(), d).is_none(),
-                "native stable ID collision/duplicate"
-            );
         }
         let mut siblings: BTreeMap<Vec<u8>, Vec<&Declaration>> = BTreeMap::new();
         for d in &self.declarations {
@@ -2429,82 +2561,98 @@ impl Artifact {
                 }
             }
         }
+        let occurrence_of = |document: &DocumentKey, owner: &str, kind: &str, ordinal: usize| {
+            let file = docs
+                .get(document)
+                .context("native occurrence dangling document")?;
+            let context =
+                native_extraction_context(&self.producer, &document.language, &self.revision)?;
+            crate::native_ids::mint_occurrence(&occurrence_input(
+                &file.hash,
+                &context,
+                &self.producer,
+                owner,
+                kind,
+                ordinal,
+            ))
+        };
+        let call_occurrence =
+            |c: &Call| occurrence_of(&c.document, &c.owner_syntax_id, "call", c.ordinal);
+        let region_occurrence = |r: &ControlRegion| {
+            occurrence_of(&r.document, &r.owner_syntax_id, "control", r.ordinal)
+        };
         let mut occurrence = IdentityRegistry::default();
         let mut calls = BTreeSet::new();
-        for c in &self.calls {
-            let file = docs
-                .get(&c.document)
-                .context("native call dangling document")?;
-            let owner = declarations
-                .get(&c.owner_syntax_id)
-                .context("native call dangling owner")?;
-            ensure!(
-                owner.document == c.document
-                    && c.revision_id == self.revision.id
-                    && proofs.contains(&c.provenance_id)
-                    && calls.insert(c.id.clone()),
-                "native call ownership/duplicate"
-            );
-            span(&file.text, &c.range, false)?;
-            if let Some(r) = &c.callee_range {
-                span(&file.text, r, false)?;
+        for chunk in self.calls.chunks(MINT_CHUNK) {
+            let mut minted =
+                crate::parallel::map_ordered(chunk, workers, &never, |_, c| call_occurrence(c))
+                    .into_iter();
+            for c in chunk {
+                let file = docs
+                    .get(&c.document)
+                    .context("native call dangling document")?;
+                let owner = declarations
+                    .get(&c.owner_syntax_id)
+                    .context("native call dangling owner")?;
                 ensure!(
-                    r.start >= c.range.start
-                        && r.end <= c.range.end
-                        && c.spelling.as_deref() == file.text.get(r.start..r.end),
-                    "callee not measured in call"
+                    owner.document == c.document
+                        && c.revision_id == self.revision.id
+                        && proofs.contains(&c.provenance_id)
+                        && calls.insert(c.id.clone()),
+                    "native call ownership/duplicate"
+                );
+                span(&file.text, &c.range, false)?;
+                if let Some(r) = &c.callee_range {
+                    span(&file.text, r, false)?;
+                    ensure!(
+                        r.start >= c.range.start
+                            && r.end <= c.range.end
+                            && c.spelling.as_deref() == file.text.get(r.start..r.end),
+                        "callee not measured in call"
+                    );
+                }
+                if let Some(s) = &c.spelling {
+                    text(s)?;
+                }
+                let minted = minted
+                    .next()
+                    .flatten()
+                    .unwrap_or_else(|| call_occurrence(c))?;
+                ensure!(
+                    c.id == occurrence.admit(minted)?,
+                    "native call occurrence mismatch"
                 );
             }
-            if let Some(s) = &c.spelling {
-                text(s)?;
-            }
-            let context =
-                native_extraction_context(&self.producer, &c.document.language, &self.revision)?;
-            ensure!(
-                c.id == occurrence.occurrence(&occurrence_input(
-                    &file.hash,
-                    &context,
-                    &self.producer,
-                    &c.owner_syntax_id,
-                    "call",
-                    c.ordinal
-                ))?,
-                "native call occurrence mismatch"
-            );
         }
         let mut regions = BTreeMap::new();
-        for region in &self.control_regions {
-            let file = docs
-                .get(&region.document)
-                .context("native control dangling document")?;
-            let owner = declarations
-                .get(&region.owner_syntax_id)
-                .context("native control dangling owner")?;
-            ensure!(
-                owner.document == region.document
-                    && region.revision_id == self.revision.id
-                    && proofs.contains(&region.provenance_id),
-                "native control ownership"
-            );
-            span(&file.text, &region.range, false)?;
-            let context = native_extraction_context(
-                &self.producer,
-                &region.document.language,
-                &self.revision,
-            )?;
-            ensure!(
-                region.id
-                    == occurrence.occurrence(&occurrence_input(
-                        &file.hash,
-                        &context,
-                        &self.producer,
-                        &region.owner_syntax_id,
-                        "control",
-                        region.ordinal
-                    ))?
-                    && regions.insert(region.id.clone(), region).is_none(),
-                "native control occurrence mismatch"
-            );
+        for chunk in self.control_regions.chunks(MINT_CHUNK) {
+            let mut minted =
+                crate::parallel::map_ordered(chunk, workers, &never, |_, r| region_occurrence(r))
+                    .into_iter();
+            for region in chunk {
+                let file = docs
+                    .get(&region.document)
+                    .context("native control dangling document")?;
+                let owner = declarations
+                    .get(&region.owner_syntax_id)
+                    .context("native control dangling owner")?;
+                ensure!(
+                    owner.document == region.document
+                        && region.revision_id == self.revision.id
+                        && proofs.contains(&region.provenance_id),
+                    "native control ownership"
+                );
+                span(&file.text, &region.range, false)?;
+                let minted = minted
+                    .next()
+                    .flatten()
+                    .unwrap_or_else(|| region_occurrence(region))?;
+                ensure!(
+                    region.id == occurrence.admit(minted)?
+                        && regions.insert(region.id.clone(), region).is_none(),
+                    "native control occurrence mismatch"
+                );
+            }
         }
         for region in &self.control_regions {
             if let Some(parent) = &region.parent_id {
@@ -3104,5 +3252,273 @@ mod declaration_role_tests {
         assert!(test_path("tests/case.rs"));
         assert!(test_path("src/conftest.py"));
         assert!(!test_path("src/testing.rs"));
+    }
+}
+
+#[cfg(test)]
+mod parallel_extraction_tests {
+    use super::*;
+    use crate::{indexer::IndexOptions, store::Store};
+    use std::{
+        cell::RefCell,
+        fs,
+        sync::{
+            Arc, Condvar, Mutex,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+    };
+
+    struct Fixture {
+        _state: tempfile::TempDir,
+        _workspace: tempfile::TempDir,
+        root: PathBuf,
+        root_id: String,
+        capture: Capture,
+        cancel: CancelFlag,
+    }
+
+    fn fixture(files: &[(&str, String)]) -> Fixture {
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        for (path, text) in files {
+            let path = workspace.path().join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, text).unwrap();
+        }
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let root_id = store.root_id().to_owned();
+        let root = fs::canonicalize(workspace.path()).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let capture = Capture::admit(
+            &IndexOptions::new(workspace.path().to_owned()),
+            &cancel,
+            &|_| {},
+        )
+        .unwrap();
+        Fixture {
+            _state: state,
+            _workspace: workspace,
+            root,
+            root_id,
+            capture,
+            cancel,
+        }
+    }
+
+    fn build(
+        f: &Fixture,
+        plan: ExtractionPlan,
+        on_extract: &impl Fn(&DocumentKey),
+        before_file: &(dyn Fn(&SourceFile) -> Result<()> + Sync),
+    ) -> Result<Artifact> {
+        build_native_with(
+            &f.capture,
+            &f.root,
+            &f.root_id,
+            &f.cancel,
+            on_extract,
+            plan,
+            before_file,
+        )
+    }
+
+    const SEQUENTIAL: ExtractionPlan = ExtractionPlan {
+        workers: 1,
+        chunk: usize::MAX,
+    };
+    const PARALLEL: ExtractionPlan = ExtractionPlan {
+        workers: 4,
+        chunk: 3,
+    };
+
+    fn java(names: &[&str]) -> Vec<(String, String)> {
+        names
+            .iter()
+            .map(|n| {
+                (
+                    format!("src/{n}.java"),
+                    format!("class {n} {{ void go() {{ helper(); }} void helper() {{}} }}\n"),
+                )
+            })
+            .collect()
+    }
+
+    fn file_name(file: &SourceFile) -> &str {
+        file.path.rsplit('/').next().unwrap()
+    }
+
+    /// Several files in each of the four languages, with calls, control
+    /// regions and nested declarations, spread over several chunks.
+    #[test]
+    fn parallel_and_sequential_builds_are_identical() {
+        let mut files = Vec::new();
+        for i in 0..4 {
+            files.push((
+                format!("java/C{i}.java"),
+                format!("class C{i} {{ int go(int x) {{ if (x > {i}) {{ return helper(x); }} for (int j = 0; j < x; j++) {{ helper(j); }} return 0; }} int helper(int y) {{ return y; }} class Inner {{ void run() {{ go(1); }} }} }}\n"),
+            ));
+            files.push((
+                format!("rust/m{i}.rs"),
+                format!("pub fn go{i}(x: u32) -> u32 {{ if x > {i} {{ helper(x) }} else {{ 0 }} }}\nfn helper(y: u32) -> u32 {{ y }}\nimpl S {{ fn run(&self) {{ go{i}(1); }} }}\nstruct S;\n#[cfg(test)]\nmod tests {{ #[test] fn t() {{ super::go{i}(2); }} }}\n"),
+            ));
+            files.push((
+                format!("py/p{i}.py"),
+                format!("def go{i}(x):\n    if x > {i}:\n        return helper(x)\n    return 0\n\ndef helper(y):\n    return y\n\nclass K:\n    def run(self):\n        go{i}(1)\n"),
+            ));
+            files.push((
+                format!("js/j{i}.js"),
+                format!("function go{i}(x) {{ if (x > {i}) {{ return helper(x); }} return 0; }}\nfunction helper(y) {{ return y; }}\nclass K {{ run() {{ go{i}(1); }} }}\n"),
+            ));
+        }
+        let files: Vec<(&str, String)> =
+            files.iter().map(|(p, t)| (p.as_str(), t.clone())).collect();
+        let f = fixture(&files);
+        let observed = |plan| {
+            let keys = RefCell::new(Vec::new());
+            let artifact = build(
+                &f,
+                plan,
+                &|key: &DocumentKey| keys.borrow_mut().push(key.clone()),
+                &|_| Ok(()),
+            )
+            .unwrap();
+            (artifact, keys.into_inner())
+        };
+        let (sequential, sequential_keys) = observed(SEQUENTIAL);
+        let (parallel, parallel_keys) = observed(PARALLEL);
+        assert_eq!(sequential.revision.documents.len(), 16);
+        for language in LANGUAGES {
+            assert!(
+                sequential
+                    .calls
+                    .iter()
+                    .any(|c| c.document.language == language)
+                    && sequential
+                        .control_regions
+                        .iter()
+                        .any(|r| r.document.language == language),
+                "fixture measures calls and regions in {language}"
+            );
+        }
+        assert_eq!(parallel, sequential);
+        assert_eq!(
+            serde_json::to_vec(&parallel).unwrap(),
+            serde_json::to_vec(&sequential).unwrap()
+        );
+        // The Measured observer fires once per document, in revision order.
+        let order: Vec<_> = sequential
+            .revision
+            .documents
+            .iter()
+            .map(|d| d.key.clone())
+            .collect();
+        assert_eq!(sequential_keys, order);
+        assert_eq!(parallel_keys, order);
+        // The production path agrees and still validates.
+        let production = from_capture(&f.capture, &f.root, &f.root_id, &f.cancel).unwrap();
+        assert_eq!(production, sequential);
+    }
+
+    /// The earlier failing file is held until a later one has failed and
+    /// been stored. With two workers, one is held on B.java and the other
+    /// measures every other file in turn, so once F.java starts, D.java's
+    /// failure has completed. B.java's error is still the one reported.
+    #[test]
+    fn the_first_failing_file_in_order_is_reported() {
+        let files = java(&["A", "B", "C", "D", "E", "F"]);
+        let files: Vec<(&str, String)> =
+            files.iter().map(|(p, t)| (p.as_str(), t.clone())).collect();
+        let f = fixture(&files);
+        let events = (Mutex::new(Vec::<String>::new()), Condvar::new());
+        let record = |event: String| {
+            events.0.lock().unwrap().push(event);
+            events.1.notify_all();
+        };
+        let hook = |file: &SourceFile| -> Result<()> {
+            let name = file_name(file).to_owned();
+            match name.as_str() {
+                "B.java" => {
+                    // The timeout is a liveness backstop only.
+                    let (guard, waited) = events
+                        .1
+                        .wait_timeout_while(
+                            events.0.lock().unwrap(),
+                            std::time::Duration::from_secs(60),
+                            |events| !events.iter().any(|e| e == "started F.java"),
+                        )
+                        .unwrap();
+                    assert!(!waited.timed_out(), "F.java never started");
+                    drop(guard);
+                }
+                "D.java" => {}
+                _ => {
+                    record(format!("started {name}"));
+                    return Ok(());
+                }
+            }
+            record(format!("failed {name}"));
+            anyhow::bail!("injected extraction failure: {name}")
+        };
+        let error = build(
+            &f,
+            ExtractionPlan {
+                workers: 2,
+                chunk: 6,
+            },
+            &|_| {},
+            &hook,
+        )
+        .unwrap_err();
+        let events = events.0.into_inner().unwrap();
+        let at = |event: &str| events.iter().position(|e| e == event).unwrap();
+        assert!(at("failed D.java") < at("started F.java"));
+        assert!(at("started F.java") < at("failed B.java"));
+        assert_eq!(error.to_string(), "injected extraction failure: B.java");
+        let sequential = build(&f, SEQUENTIAL, &|_| {}, &|file| {
+            ensure!(
+                !matches!(file_name(file), "B.java" | "D.java"),
+                "injected extraction failure: {}",
+                file_name(file)
+            );
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(sequential.to_string(), error.to_string());
+    }
+
+    /// Cancelling during the first chunk stops extraction before any later
+    /// chunk starts, with the typed cancellation error.
+    #[test]
+    fn cancellation_stops_extraction() {
+        let files = java(&["A", "B", "C", "D", "E", "F"]);
+        let files: Vec<(&str, String)> =
+            files.iter().map(|(p, t)| (p.as_str(), t.clone())).collect();
+        let f = fixture(&files);
+        let started = AtomicUsize::new(0);
+        let measured = AtomicUsize::new(0);
+        let error = build(
+            &f,
+            ExtractionPlan {
+                workers: 2,
+                chunk: 2,
+            },
+            &|_| {
+                measured.fetch_add(1, Ordering::SeqCst);
+            },
+            &|file| {
+                started.fetch_add(1, Ordering::SeqCst);
+                if file_name(file) == "A.java" {
+                    f.cancel.store(true, Ordering::SeqCst);
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("indexing cancelled"),
+            "{error:#}"
+        );
+        assert!(started.load(Ordering::SeqCst) <= 2, "a later chunk started");
+        assert!(measured.load(Ordering::SeqCst) <= 2);
     }
 }

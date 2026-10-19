@@ -266,29 +266,98 @@ fn validate_occurrence(value: &Value) -> Result<()> {
 #[derive(Default)]
 pub struct IdentityRegistry {
     handles: BTreeMap<String, (Vec<u8>, String)>,
+    /// First-insertion order, kept only by a per-document registry that is
+    /// later absorbed into a full one (`IdentityRegistry::logged`).
+    order: Option<Vec<String>>,
 }
+
+/// The pure part of one identity: its validated canonical bytes, full
+/// digest and handle. `IdentityRegistry::admit` applies the collision rule.
+pub(crate) struct Minted {
+    handle: String,
+    bytes: Vec<u8>,
+    full: String,
+}
+
+const STABLE_DOMAIN: &[u8] = b"trellis.syntax.v1\0";
+const OCCURRENCE_DOMAIN: &[u8] = b"trellis.occurrence.v2\0";
+
+fn mint(domain: &[u8], value: &Value, prefix: &str) -> Minted {
+    let bytes = canonical(value);
+    let full = digest(domain, &bytes);
+    let handle = format!("{}{}", prefix, &full[..32]);
+    Minted {
+        handle,
+        bytes,
+        full,
+    }
+}
+
+/// Validate and mint a SyntaxId without registering it.
+pub(crate) fn mint_stable(input: &Value) -> Result<Minted> {
+    validate_stable(input)?;
+    Ok(mint(STABLE_DOMAIN, input, "sid:v1:"))
+}
+
+/// Validate and mint an occurrence ID without registering it.
+pub(crate) fn mint_occurrence(input: &Value) -> Result<Minted> {
+    validate_occurrence(input)?;
+    Ok(mint(OCCURRENCE_DOMAIN, input, "occ:v2:"))
+}
+
 impl IdentityRegistry {
+    /// A registry that records first-insertion order, for `absorb`.
+    pub(crate) fn logged() -> Self {
+        Self {
+            handles: BTreeMap::new(),
+            order: Some(Vec::new()),
+        }
+    }
     pub fn register(&mut self, domain: &[u8], value: &Value, prefix: &str) -> Result<String> {
-        let bytes = canonical(value);
-        let full = digest(domain, &bytes);
-        let handle = format!("{}{}", prefix, &full[..32]);
+        self.admit(mint(domain, value, prefix))
+    }
+    /// Register a minted identity; a handle seen before must carry the
+    /// same canonical bytes and digest.
+    pub(crate) fn admit(&mut self, minted: Minted) -> Result<String> {
+        let Minted {
+            handle,
+            bytes,
+            full,
+        } = minted;
         if let Some((prior, prior_full)) = self.handles.get(&handle) {
             ensure!(
                 prior == &bytes && prior_full == &full,
                 "native identity handle collision: {handle}"
             );
         } else {
+            if let Some(order) = &mut self.order {
+                order.push(handle.clone());
+            }
             self.handles.insert(handle.clone(), (bytes, full));
         }
         Ok(handle)
     }
+    /// Admit every identity of a logged registry in its first-insertion
+    /// order, as if each had been registered here directly in that order.
+    pub(crate) fn absorb(&mut self, mut other: IdentityRegistry) -> Result<()> {
+        for handle in other.order.take().unwrap_or_default() {
+            let (bytes, full) = other
+                .handles
+                .remove(&handle)
+                .expect("logged identity is registered");
+            self.admit(Minted {
+                handle,
+                bytes,
+                full,
+            })?;
+        }
+        Ok(())
+    }
     pub fn stable(&mut self, input: &Value) -> Result<String> {
-        validate_stable(input)?;
-        self.register(b"trellis.syntax.v1\0", input, "sid:v1:")
+        self.admit(mint_stable(input)?)
     }
     pub fn occurrence(&mut self, input: &Value) -> Result<String> {
-        validate_occurrence(input)?;
-        self.register(b"trellis.occurrence.v2\0", input, "occ:v2:")
+        self.admit(mint_occurrence(input)?)
     }
 }
 
