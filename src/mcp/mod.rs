@@ -825,6 +825,25 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                         )
                     }))
                 }
+                ("trellis_incoming_calls", Some(args)) => {
+                    let symbol_id = args["symbolId"].as_str().expect("validated incoming ID");
+                    let limit = args
+                        .get("limit")
+                        .map_or(20, |v| wire::uint(v).expect("validated limit") as usize);
+                    let expected = validated_expected_basis(args);
+                    Some(Box::new(move |_, response, sampled| {
+                        Ok(
+                            match response.mcp_incoming_with_lines(symbol_id, limit, expected)? {
+                                Some(found) => {
+                                    projection::incoming(id, found, root, sampled, modern)
+                                        .map_err(|error| anyhow::anyhow!(error))?
+                                        .unwrap_or_else(|| tools::failure(id, "range_too_large"))
+                                }
+                                None => tools::failure(id, "not_found"),
+                            },
+                        )
+                    }))
+                }
                 ("trellis_read_source", Some(args)) => {
                     let path = args["path"].as_str().expect("validated source path");
                     let start = wire::uint(&args["startLine"]).expect("validated source start");
