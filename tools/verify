@@ -48,8 +48,18 @@ checks() {
 lanes="rust tests semantic cohorts checks"
 logs=$(mktemp -d "${TMPDIR:-/tmp}/trellis-verify.XXXXXX")
 trap 'rm -rf "$logs"' EXIT
+started=$(date +%s)
 for lane in $lanes; do
-  (set -e; "$lane") >"$logs/$lane" 2>&1 &
+  # The inner subshell keeps errexit (it is not the left side of || or &&);
+  # the outer one records the lane's wall time whatever its outcome.
+  (
+    set +e
+    start=$(date +%s)
+    (set -e; "$lane")
+    code=$?
+    echo "<== verify lane $lane took $(($(date +%s) - start)) s"
+    exit "$code"
+  ) >"$logs/$lane" 2>&1 &
   eval "pid_$lane=$!"
 done
 
@@ -65,6 +75,7 @@ for lane in $lanes; do
     failed="$failed $lane"
   fi
 done
+echo "verify: lanes took $(($(date +%s) - started)) s"
 if [ "$status" -ne 0 ]; then
   echo "verify: failed lane(s):$failed" >&2
 fi
