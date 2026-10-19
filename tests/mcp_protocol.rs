@@ -2980,35 +2980,43 @@ fn final_resolved_drift_is_attributed_for_five_tools_and_both_modes() {
     }
 }
 
-/// #131: a final selected check whose Git lookup outlives its bound (a loaded
-/// host) proves no root change. The call retries within its deadline and
-/// answers; it was `root_changed`.
-#[test]
-fn final_selected_check_survives_a_slow_git_lookup() {
+/// A PATH whose `git` outlasts the 750 ms lookup bound while `flag` exists:
+/// only the first run after it appears when `once`, every run otherwise.
+fn stalling_git_path(temp: &Path, flag: &Path, once: bool) -> std::ffi::OsString {
     use std::os::unix::fs::PermissionsExt;
-    let temp = tempfile::tempdir().unwrap();
-    let (main, linked) = git_linked_fixture(temp.path());
     let search = std::env::var_os("PATH").unwrap();
     let git = std::env::split_paths(&search)
         .map(|dir| dir.join("git"))
         .find(|path| path.is_file())
         .expect("git on PATH");
-    // The first Git run after `slow` appears outlasts the 750 ms lookup bound.
-    let slow = temp.path().join("slow-next-git");
-    let bin = temp.path().join("bin");
+    let armed = if once {
+        format!("rm '{}' 2>/dev/null", flag.display())
+    } else {
+        format!("[ -e '{}' ]", flag.display())
+    };
+    let bin = temp.join("bin");
     fs::create_dir(&bin).unwrap();
     fs::write(
         bin.join("git"),
         format!(
-            "#!/bin/sh\nif rm '{}' 2>/dev/null; then exec sleep 3; fi\nexec '{}' \"$@\"\n",
-            slow.display(),
+            "#!/bin/sh\nif {armed}; then exec sleep 3; fi\nexec '{}' \"$@\"\n",
             git.display()
         ),
     )
     .unwrap();
     fs::set_permissions(bin.join("git"), fs::Permissions::from_mode(0o755)).unwrap();
-    let path =
-        std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&search))).unwrap();
+    std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&search))).unwrap()
+}
+
+/// #131: a final selected check whose Git lookup outlives its bound (a loaded
+/// host) proves no root change. The call retries within its deadline and
+/// answers; it was `root_changed`.
+#[test]
+fn final_selected_check_survives_a_slow_git_lookup() {
+    let temp = tempfile::tempdir().unwrap();
+    let (main, linked) = git_linked_fixture(temp.path());
+    let slow = temp.path().join("slow-next-git");
+    let path = stalling_git_path(temp.path(), &slow, true);
     let socket = temp.path().join("phase.sock");
     let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
     let mut peer = Peer::start_with_phase_env(
@@ -3036,6 +3044,58 @@ fn final_selected_check_survives_a_slow_git_lookup() {
         reply["result"]["structuredContent"]["workspace"],
         json!(linked)
     );
+    assert!(peer.finish().0.success());
+}
+
+/// #131 review: a final selected check that keeps stalling waits off the
+/// connection's decision path. Call B, finished while A's check stalls, is
+/// answered at once; A is `deadline_exceeded` at its own deadline. A check
+/// retried in place would answer A first and B only after A's deadline.
+#[test]
+fn a_stalled_final_check_does_not_hold_other_calls() {
+    let temp = tempfile::tempdir().unwrap();
+    let (main, linked) = git_linked_fixture(temp.path());
+    let stalled = temp.path().join("stall-git");
+    let path = stalling_git_path(temp.path(), &stalled, false);
+    let socket = temp.path().join("phase.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let mut peer = Peer::start_with_phase_env(
+        Some(&main),
+        Some(("selected_final", &socket)),
+        &[("PATH", path.as_os_str())],
+    );
+    let describe = |id: Value, workspace: Option<&Path>| {
+        let mut arguments = json!({"schemaVersion":1});
+        if let Some(workspace) = workspace {
+            arguments["workspace"] = json!(workspace);
+        }
+        serde_json::to_string(&call(false, id, "trellis_workspace_describe", arguments)).unwrap()
+    };
+    // Warm both checkouts so neither later call races a cold activation.
+    tool(
+        &peer.ask(serde_json::from_str(&describe(json!(0), None)).unwrap()),
+        None,
+        true,
+    );
+    peer.send_raw(describe(json!(1), Some(&linked)).as_bytes());
+    phase_barrier(&listener, "selected_final", || {});
+    tool(&peer.reply(), None, true);
+    // A reaches its final check; B is read and finishes while A's lookups stall.
+    peer.send_raw(describe(json!("A"), Some(&linked)).as_bytes());
+    phase_barrier(&listener, "selected_final", || {
+        fs::write(&stalled, b"").unwrap();
+        peer.send_raw(describe(json!("B"), None).as_bytes());
+    });
+    let first = peer.reply();
+    let second = peer.reply();
+    fs::remove_file(&stalled).unwrap();
+    assert_eq!(
+        first["id"], "B",
+        "B waited behind A's stalled check: {first}"
+    );
+    tool(&first, None, true);
+    assert_eq!(second["id"], "A", "{second}");
+    tool(&second, Some("deadline_exceeded"), true);
     assert!(peer.finish().0.success());
 }
 

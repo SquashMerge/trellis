@@ -492,24 +492,9 @@ fn catching_up(
         .is_none_or(|runtime| runtime.catching_up())
 }
 
-/// The selected checkout's final check before a call is answered (#131).
-/// Only a proven missing or replaced root is `root_changed`. An identity
-/// lookup that could not finish, such as a Git subprocess slower than its
-/// bound on a loaded host, proves nothing: it is retried within the call's
-/// deadline, and still `Unavailable` past it the call is `deadline_exceeded`.
-fn final_selection(
-    witness: &crate::daemon::registry::SelectedCheckout,
-    deadline: std::time::Instant,
-) -> Result<(), SelectionError> {
-    loop {
-        match witness.before_answer() {
-            Err(SelectionError::Unavailable) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            checked => return checked,
-        }
-    }
-}
+/// How soon the coordinator retries a final selected check that could not
+/// finish (#131), while it keeps deciding the connection's other calls.
+const FINAL_RECHECK_TICK: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// An opt-in, bounded fixture barrier at an actual coordinator boundary.
 /// Normal MCP calls do not connect to or wait for a test socket.
@@ -1354,9 +1339,15 @@ fn coordinate(
     };
     // Requests handled at the last fence and not yet decided.
     let mut arrivals: VecDeque<impl_receive::Outcome> = VecDeque::new();
+    // Finished calls whose final selected check could not finish yet (#131).
+    let mut rechecks: Vec<(u64, CallOutcome)> = Vec::new();
     loop {
         if arrivals.is_empty() && completed.is_empty() {
-            let next = in_flight.values().map(|call| call.deadline).min();
+            let mut next = in_flight.values().map(|call| call.deadline).min();
+            if !rechecks.is_empty() {
+                let tick = Instant::now() + FINAL_RECHECK_TICK;
+                next = Some(next.map_or(tick, |deadline| deadline.min(tick)));
+            }
             match inbox.wait(next) {
                 Some(Input::Frame(frame, relay, accepted, _)) => {
                     if receive(frame, relay, accepted, &mut session, &mut arrivals) {
@@ -1374,70 +1365,80 @@ fn coordinate(
             }
         }
         // Blocking steps come before the fence: each finished call's final
-        // root check, and the test pause points.
+        // root check, and the test pause points. Only a proven missing or
+        // replaced root is `root_changed`. A selected identity lookup that
+        // could not finish (`Unavailable`, such as a Git subprocess slower
+        // than its bound on a loaded host) proves nothing: its call waits in
+        // `rechecks` and is checked again on a later pass, so other calls are
+        // still decided meanwhile, and it is `deadline_exceeded` once its own
+        // deadline passes (#131).
         let mut finished = Vec::new();
+        // Newly finished calls go first: a recheck's lookup never delays them.
+        let mut checking: Vec<(u64, CallOutcome, bool)> = Vec::new();
         while let Some((token, outcome)) = completed.pop_front() {
+            if !in_flight.contains_key(&token) {
+                // Already decided at its deadline, or cancelled.
+                continue;
+            }
+            checking.push((token, outcome?, true));
+        }
+        checking.extend(
+            std::mem::take(&mut rechecks)
+                .into_iter()
+                .map(|(token, outcome)| (token, outcome, false)),
+        );
+        for (token, outcome, first) in checking {
             let Some(call) = in_flight.get(&token) else {
                 // Already decided at its deadline, or cancelled.
                 continue;
             };
-            let outcome = outcome?;
-            let mut result = outcome.result;
+            let (mut changed, mut unproven) = (None, false);
             if Instant::now() < call.deadline {
                 match &outcome.finals {
                     Finals::None => {}
                     Finals::Launch { catching_up } => {
                         phase_hook("launch_final")?;
                         if workspace.check().is_err() {
-                            result = tools::resolved_root_changed(
-                                &call.name,
-                                &call.id,
-                                workspace.root(),
-                                *catching_up,
-                                call.modern,
-                            );
+                            changed = Some((workspace.root().to_owned(), *catching_up));
                         }
                     }
                     Finals::Selected {
                         witness,
                         catching_up,
-                    } => {
-                        phase_hook("selected_final")?;
-                        match final_selection(witness, call.deadline) {
-                            Ok(()) => {}
-                            Err(SelectionError::Unavailable) => result = deadline_answer(call),
-                            Err(_) => {
-                                result = tools::resolved_root_changed(
-                                    &call.name,
-                                    &call.id,
-                                    &witness.identity.root,
-                                    *catching_up,
-                                    call.modern,
-                                );
-                            }
-                        }
                     }
-                    Finals::Capacity {
+                    | Finals::Capacity {
                         witness,
                         catching_up,
                     } => {
-                        phase_hook("capacity_final")?;
-                        match final_selection(witness, call.deadline) {
+                        if first {
+                            phase_hook(if matches!(outcome.finals, Finals::Selected { .. }) {
+                                "selected_final"
+                            } else {
+                                "capacity_final"
+                            })?;
+                        }
+                        match witness.before_answer() {
                             Ok(()) => {}
-                            Err(SelectionError::Unavailable) => result = deadline_answer(call),
-                            Err(_) => {
-                                result = tools::resolved_root_changed(
-                                    &call.name,
-                                    &call.id,
-                                    &witness.identity.root,
-                                    *catching_up,
-                                    call.modern,
-                                );
-                            }
+                            Err(SelectionError::Unavailable) => unproven = true,
+                            Err(_) => changed = Some((witness.identity.root.clone(), *catching_up)),
                         }
                     }
                 }
             }
+            if unproven {
+                rechecks.push((token, outcome));
+                continue;
+            }
+            let result = match changed {
+                Some((root, catching_up)) => tools::resolved_root_changed(
+                    &call.name,
+                    &call.id,
+                    &root,
+                    catching_up,
+                    call.modern,
+                ),
+                None => outcome.result,
+            };
             #[cfg(feature = "test-support")]
             if let Some(hook) = &workspace.hooks.send_decision {
                 hook(&call.id);
