@@ -251,6 +251,7 @@ fn newer_intent_during_cached_completion_is_not_acked_as_old_batch() {
     let (_tmp, store, options, _baseline, session) = fixture();
     let mut watcher = WatcherWork::new(&store, &session, &options).unwrap();
     watcher.disable_native_watcher_for_tests();
+    watcher.force_periodic_inventory_for_tests();
     let watcher = std::sync::Mutex::new(Some((Arc::downgrade(&session), watcher)));
     store.enqueue_request(&options, None).unwrap();
     store.inject_queue_finish_failure(false);
@@ -271,6 +272,7 @@ fn newer_intent_during_cached_completion_is_not_acked_as_old_batch() {
     let work = &binding.as_ref().unwrap().1;
     assert_eq!(work.acknowledged_generation(), 0);
     assert_eq!(work.accounted_watch_pin(), None);
+    assert!(work.periodic_inventory_due_for_tests());
     assert!(work.accepted_watch_intent(&options));
 }
 
@@ -279,6 +281,7 @@ fn differently_configured_request_does_not_ack_existing_full_watch() {
     let (_tmp, store, options, _baseline, session) = fixture();
     let mut watcher = WatcherWork::new(&store, &session, &options).unwrap();
     watcher.disable_native_watcher_for_tests();
+    watcher.force_periodic_inventory_for_tests();
     let watcher = std::sync::Mutex::new(Some((Arc::downgrade(&session), watcher)));
     let mut different = options.clone();
     different.max_file_bytes /= 2;
@@ -292,6 +295,7 @@ fn differently_configured_request_does_not_ack_existing_full_watch() {
     let work = &binding.as_ref().unwrap().1;
     assert_eq!(work.acknowledged_generation(), 0);
     assert_eq!(work.accounted_watch_pin(), None);
+    assert!(work.periodic_inventory_due_for_tests());
     assert!(work.accepted_watch_intent(&different));
 }
 
@@ -324,4 +328,112 @@ fn periodic_full_inventory_is_certified_by_matching_request_capture() {
     let work = &binding.as_ref().unwrap().1;
     assert_eq!(work.accounted_watch_pin(), Some(pin));
     assert!(!work.periodic_inventory_due_for_tests());
+}
+
+#[test]
+fn failed_and_cached_failed_rows_keep_watcher_full_due() {
+    for cached in [false, true] {
+        let (_tmp, store, options, _baseline, session) = fixture();
+        let mut work = WatcherWork::new(&store, &session, &options).unwrap();
+        work.disable_native_watcher_for_tests();
+        work.force_periodic_inventory_for_tests();
+        let watcher = std::sync::Mutex::new(Some((Arc::downgrade(&session), work)));
+        fs::write(options.workspace_root.join("bad.js"), [0xff, 0xfe]).unwrap();
+        let row = store.enqueue_request(&options, None).unwrap();
+        if cached {
+            store.inject_queue_finish_failure(false);
+            assert!(drain_one_request_with_watcher(&store, &session, &watcher, |_, _| {}).is_err());
+            assert_eq!(
+                store.request_by_id(&row.id).unwrap().unwrap().state,
+                "running"
+            );
+        }
+        assert_eq!(
+            drain_one_request_with_watcher(&store, &session, &watcher, |_, _| {}).unwrap(),
+            1
+        );
+        assert_eq!(
+            store.request_by_id(&row.id).unwrap().unwrap().state,
+            "failed"
+        );
+        let guard = watcher.lock().unwrap();
+        let work = &guard.as_ref().unwrap().1;
+        assert_eq!(work.acknowledged_generation(), 0);
+        assert_eq!(work.accounted_watch_pin(), None);
+        assert!(work.periodic_inventory_due_for_tests());
+        assert!(work.accepted_watch_intent(&options));
+    }
+}
+
+#[test]
+fn drifted_source_set_and_selected_input_do_not_ack_request() {
+    for source_set in [false, true] {
+        let (_tmp, store, options, _baseline, session) = fixture();
+        let mut work = WatcherWork::new(&store, &session, &options).unwrap();
+        work.disable_native_watcher_for_tests();
+        work.force_periodic_inventory_for_tests();
+        let watcher = std::sync::Mutex::new(Some((Arc::downgrade(&session), work)));
+        fs::write(
+            options.workspace_root.join("b.js"),
+            "function before() {}\n",
+        )
+        .unwrap();
+        let row = store.enqueue_request(&options, None).unwrap();
+        let file = if source_set {
+            options.workspace_root.join("later.js")
+        } else {
+            options.workspace_root.join("a.js")
+        };
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let touched = fired.clone();
+        store.set_publication_before_commit_hook_for_tests(move || {
+            touched.store(true, std::sync::atomic::Ordering::SeqCst);
+            fs::write(&file, "function changed() {}\n").unwrap();
+        });
+        let observed =
+            drain_one_request_with_watcher(&store, &session, &watcher, |_, _| {}).unwrap();
+        assert!(
+            fired.load(std::sync::atomic::Ordering::SeqCst),
+            "publication hook did not run"
+        );
+        let terminal = store.request_by_id(&row.id).unwrap().unwrap();
+        if source_set {
+            assert_eq!(observed, 1);
+            assert_eq!(terminal.state, "failed");
+        } else {
+            assert_eq!(observed, 0);
+            assert_eq!(terminal.state, "queued");
+        }
+        let guard = watcher.lock().unwrap();
+        let work = &guard.as_ref().unwrap().1;
+        assert_eq!(work.acknowledged_generation(), 0);
+        assert_eq!(work.accounted_watch_pin(), None);
+        assert!(work.periodic_inventory_due_for_tests());
+        assert!(work.accepted_watch_intent(&options));
+    }
+}
+
+#[test]
+fn changed_watcher_root_cannot_certify_matching_request() {
+    let (_tmp, store, options, _baseline, session) = fixture();
+    let other_root = options.workspace_root.parent().unwrap().join("other");
+    fs::create_dir(&other_root).unwrap();
+    let mut other = options.clone();
+    other.workspace_root = other_root;
+    let mut work = WatcherWork::new(&store, &session, &other).unwrap();
+    work.disable_native_watcher_for_tests();
+    work.force_periodic_inventory_for_tests();
+    let watcher = std::sync::Mutex::new(Some((Arc::downgrade(&session), work)));
+    let row = store.enqueue_request(&options, None).unwrap();
+    assert_eq!(
+        drain_one_request_with_watcher(&store, &session, &watcher, |_, _| {}).unwrap(),
+        1
+    );
+    assert_eq!(store.request_by_id(&row.id).unwrap().unwrap().state, "done");
+    let guard = watcher.lock().unwrap();
+    let work = &guard.as_ref().unwrap().1;
+    assert_eq!(work.acknowledged_generation(), 0);
+    assert_eq!(work.accounted_watch_pin(), None);
+    assert!(work.periodic_inventory_due_for_tests());
+    assert!(work.accepted_watch_intent(&options));
 }

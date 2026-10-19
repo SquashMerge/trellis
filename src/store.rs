@@ -228,6 +228,8 @@ pub struct Store {
     metrics_memo: Arc<Mutex<crate::metrics::MetricsMemo>>,
     #[cfg(feature = "test-support")]
     test_after_claim_hook: Arc<TestOneShotHook>,
+    #[cfg(test)]
+    test_before_request_terminal_commit_hook: Arc<TestOneShotHook>,
     maintenance_before_writer_hook: Arc<TestOneShotHook>,
     maintenance_after_first_delete_hook: Arc<TestOneShotHook>,
     publication_before_commit_hook: Arc<TestOneShotHook>,
@@ -5999,6 +6001,8 @@ impl Store {
             })),
             #[cfg(feature = "test-support")]
             test_after_claim_hook: Arc::new(TestOneShotHook::default()),
+            #[cfg(test)]
+            test_before_request_terminal_commit_hook: Arc::new(TestOneShotHook::default()),
             maintenance_before_writer_hook: Arc::new(TestOneShotHook::default()),
             maintenance_after_first_delete_hook: Arc::new(TestOneShotHook::default()),
             publication_before_commit_hook: Arc::new(TestOneShotHook::default()),
@@ -7381,6 +7385,15 @@ impl Store {
             return true;
         }
         false
+    }
+
+    #[cfg(feature = "test-support")]
+    #[cfg(test)]
+    pub fn set_before_request_terminal_commit_hook_for_tests(
+        &self,
+        hook: impl FnOnce() + Send + 'static,
+    ) {
+        self.test_before_request_terminal_commit_hook.set(hook);
     }
 
     #[cfg(feature = "test-support")]

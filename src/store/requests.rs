@@ -1660,6 +1660,8 @@ impl Store {
         };
         let changed=tx.execute("UPDATE requests SET state=?1,result_generation=?2,result_revision=?3,error_code=?4,finished_at=?5 WHERE seq=?6 AND state='running' AND claim_incarnation=?7 AND root_device=?8 AND root_inode=?9",params![if code.is_some(){"failed"}else{"done"},generation,revision,code,now(),request.seq,session.incarnation().to_string(),self.identity.device.to_string(),self.identity.inode.to_string()])?;
         ensure!(changed == 1, "storage_busy: request claim changed");
+        #[cfg(test)]
+        self.test_before_request_terminal_commit_hook.run();
         tx.commit()?;
         #[cfg(feature = "test-support")]
         if self

@@ -780,6 +780,11 @@ impl WatcherWork {
     }
 
     #[doc(hidden)]
+    pub fn defer_retry_for_tests(&mut self) {
+        self.retry_after = Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
+    }
+
+    #[doc(hidden)]
     pub fn periodic_inventory_due_for_tests(&self) -> bool {
         std::time::Instant::now().duration_since(self.last_inventory) >= PERIODIC_INVENTORY
     }

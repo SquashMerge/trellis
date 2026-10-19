@@ -60,12 +60,12 @@ fn serialize_uuid<S: Serializer>(value: &Uuid, serializer: S) -> Result<S::Ok, S
 }
 
 #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
-struct QueuedEvent {
-    kind: &'static str,
+pub(crate) struct QueuedEvent {
+    pub(crate) kind: &'static str,
     lineage: Lineage,
-    watch_generation: Option<u64>,
-    pin: Option<IndexPin>,
-    queue_empty: Option<bool>,
+    pub(crate) watch_generation: Option<u64>,
+    pub(crate) pin: Option<IndexPin>,
+    pub(crate) queue_empty: Option<bool>,
 }
 
 /// Clone the `Arc<CausalWitness>` into each producer; it holds no root owner.
@@ -75,6 +75,18 @@ pub struct CausalWitness {
 }
 
 impl CausalWitness {
+    #[cfg(all(test, feature = "test-support"))]
+    pub(crate) fn in_memory_for_tests() -> (Arc<Self>, mpsc::Receiver<QueuedEvent>) {
+        let (sender, receiver) = mpsc::channel(QUEUE_CAPACITY);
+        (
+            Arc::new(Self {
+                sender,
+                failed: Arc::new(AtomicBool::new(false)),
+            }),
+            receiver,
+        )
+    }
+
     /// Activate only for an absolute socket directly inside the fixture HOME.
     /// Its test owns the private directory and socket; ordinary runs are inert.
     #[cfg(feature = "test-support")]

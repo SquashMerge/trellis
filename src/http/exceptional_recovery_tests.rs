@@ -1341,6 +1341,14 @@ fn failed_nonurgent_full_gate_retries_before_next_fifo_claim() {
         "function recovered() {}\n",
     )
     .unwrap();
+    state
+        .watcher_work
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .1
+        .defer_retry_for_tests();
     state.worker_step().unwrap();
     assert_eq!(
         store.request_by_id(&second.id).unwrap().unwrap().state,
@@ -1371,6 +1379,246 @@ fn failed_nonurgent_full_gate_retries_before_next_fifo_claim() {
     );
 }
 
+#[cfg(feature = "test-support")]
+#[test]
+fn deferred_full_gate_clears_only_matching_explicit_registration() {
+    let (_tmp, store, state, options) = serving_queue_watch_fixture();
+    let owner = state.retained_serving_session().unwrap();
+    let mut explicit = options.clone();
+    explicit.max_file_bytes /= 2;
+    let applied = Arc::new(explicit.clone());
+    *state.explicit_pending.lock().unwrap() = Some(applied.clone());
+    // Pin the fixture watcher to the explicit selection before the injected
+    // failure. An options-triggered watcher replacement would start native
+    // ingress and race this test's controlled source repair.
+    let mut watcher =
+        crate::index_coordinator::WatcherWork::new(&store, &owner, &explicit).unwrap();
+    watcher.disable_native_watcher_for_tests();
+    watcher.set_waker(state.watch_waker.clone());
+    *state.watcher_work.lock().unwrap() = Some((Arc::downgrade(&owner), watcher));
+    let invalid = options.workspace_root.join("invalid.js");
+    std::fs::write(&invalid, [0xff, 0xfe]).unwrap();
+    state
+        .watcher_work
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .1
+        .set_queue_gate();
+    assert!(state.worker_step().is_err());
+    assert!(Arc::ptr_eq(
+        state.explicit_pending.lock().unwrap().as_ref().unwrap(),
+        &applied
+    ));
+    std::fs::write(
+        &invalid,
+        "function valid() {}
+",
+    )
+    .unwrap();
+    *state.recovery_retry_after.lock().unwrap() = None;
+    let retry = state.clone();
+    let gate_ran = Arc::new(AtomicBool::new(false));
+    let entered = gate_ran.clone();
+    state.test_queue_before_watcher_reconcile.set(move || {
+        entered.store(true, Ordering::SeqCst);
+        retry
+            .watcher_work
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .1
+            .expire_retry_for_tests();
+    });
+    let before_count = state
+        .watcher_work
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .1
+        .full_capture_attempts_for_tests();
+    state.worker_step().unwrap();
+    assert!(
+        gate_ran.load(Ordering::SeqCst),
+        "deferred gate was not entered"
+    );
+    assert!(
+        state
+            .watcher_work
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .1
+            .full_capture_attempts_for_tests()
+            > before_count,
+        "the deferred retry must capture before checking explicit finalization"
+    );
+    assert!(state.explicit_pending.lock().unwrap().is_none());
+    assert!(store.earliest_unfinished_request().unwrap().is_none());
+    store.verify_writer_session(&owner).unwrap();
+
+    let newer = Arc::new(explicit);
+    *state.explicit_pending.lock().unwrap() = Some(applied);
+    let state_for_hook = state.clone();
+    let registered = newer.clone();
+    let ran = Arc::new(AtomicBool::new(false));
+    let hook_ran = ran.clone();
+    state.test_queue_before_watcher_reconcile.set(move || {
+        hook_ran.store(true, Ordering::SeqCst);
+        *state_for_hook.explicit_pending.lock().unwrap() = Some(registered);
+    });
+    {
+        let mut guard = state.watcher_work.lock().unwrap();
+        let work = &mut guard.as_mut().unwrap().1;
+        work.submit_watch_event_for_tests(Ok(notify::Event::new(notify::EventKind::Modify(
+            notify::event::ModifyKind::Any,
+        ))
+        .add_path(options.workspace_root.join("a.js"))));
+        work.set_queue_gate();
+    }
+    state.worker_step().unwrap();
+    assert!(
+        ran.load(Ordering::SeqCst),
+        "the deferred pre-claim gate must run"
+    );
+    assert!(Arc::ptr_eq(
+        state.explicit_pending.lock().unwrap().as_ref().unwrap(),
+        &newer
+    ));
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn empty_fifo_deferred_retry_emits_exact_causal_ack() {
+    let (_tmp, store, state, options) = serving_queue_watch_fixture();
+    let (reporter, mut events) =
+        crate::daemon::causal_witness::CausalWitness::in_memory_for_tests();
+    *state.causal_witness.lock().unwrap() = Some(reporter.clone());
+    let owner = state.retained_serving_session().unwrap();
+    let invalid = options.workspace_root.join("invalid.js");
+    std::fs::write(&invalid, [0xff, 0xfe]).unwrap();
+    {
+        let mut guard = state.watcher_work.lock().unwrap();
+        let work = &mut guard.as_mut().unwrap().1;
+        work.attach_causal_witness(
+            reporter,
+            owner.incarnation(),
+            state.causal_lineage_ordinal.clone(),
+        );
+        work.submit_watch_event_for_tests(Ok(notify::Event::new(notify::EventKind::Create(
+            notify::event::CreateKind::File,
+        ))
+        .add_path(invalid.clone())));
+        work.set_queue_gate();
+    }
+    assert!(state.worker_step().is_err());
+    let mut pending = false;
+    while let Ok(event) = events.try_recv() {
+        pending |= event.kind == "WATCH_PENDING";
+        assert_ne!(event.kind, "WATCH_ACK");
+    }
+    assert!(pending);
+    std::fs::write(&invalid, "function recovered() {}\n").unwrap();
+    state
+        .watcher_work
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .1
+        .expire_retry_for_tests();
+    state.worker_step().unwrap();
+    assert!(store.earliest_unfinished_request().unwrap().is_none());
+    let pin = store.status().unwrap().revision;
+    let mut ack = false;
+    while let Ok(event) = events.try_recv() {
+        if event.kind == "WATCH_ACK" {
+            ack = true;
+            assert_eq!(event.pin, Some(pin));
+            assert_eq!(event.queue_empty, Some(true));
+            assert!(event.watch_generation.is_some());
+        }
+    }
+    assert!(
+        ack,
+        "successful empty-FIFO retry must settle pending causal witness"
+    );
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn admitted_watch_events_respect_request_cutoff_and_fifo_gate() {
+    for after_admission in [false, true] {
+        for full in [false, true] {
+            let (_tmp, store, state, options) = serving_queue_watch_fixture();
+            let first = store.enqueue_request(&options, None).unwrap();
+            let second = store.enqueue_request(&options, None).unwrap();
+            let injected_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let target = if full {
+                options.workspace_root.join("new.js")
+            } else {
+                options.workspace_root.join("a.js")
+            };
+            let watcher = state.clone();
+            let observed_generation = injected_generation.clone();
+            let inject = move || {
+                std::fs::write(&target, "function changed() {}\n").unwrap();
+                let kind = if full {
+                    notify::EventKind::Create(notify::event::CreateKind::File)
+                } else {
+                    notify::EventKind::Modify(notify::event::ModifyKind::Any)
+                };
+                let guard = watcher.watcher_work.lock().unwrap();
+                let work = &guard.as_ref().unwrap().1;
+                work.submit_watch_event_for_tests(Ok(notify::Event::new(kind).add_path(target)));
+                observed_generation.store(
+                    work.generation_handle().load(Ordering::SeqCst),
+                    Ordering::SeqCst,
+                );
+            };
+            if after_admission {
+                store.set_before_request_terminal_commit_hook_for_tests(inject);
+            } else {
+                store.set_after_claim_hook_for_tests(inject);
+            }
+            state.worker_step().unwrap();
+            let row = store.request_by_id(&first.id).unwrap().unwrap();
+            assert_eq!(row.state, "done");
+            assert_eq!(
+                store.request_by_id(&second.id).unwrap().unwrap().state,
+                "queued"
+            );
+            let guard = state.watcher_work.lock().unwrap();
+            let work = &guard.as_ref().unwrap().1;
+            let generation = injected_generation.load(Ordering::SeqCst);
+            assert!(generation > 1, "injected watch event was accepted");
+            assert!(work.generation_handle().load(Ordering::SeqCst) >= generation);
+            if after_admission {
+                assert_ne!(work.accounted_watch_pin(), row.revision);
+                assert!(
+                    store.status().unwrap().revision.index_revision
+                        > row.revision.unwrap().index_revision
+                );
+            } else {
+                assert_eq!(
+                    work.accounted_watch_generation(),
+                    Some(work.generation_handle().load(Ordering::SeqCst))
+                );
+                assert_eq!(work.accounted_watch_pin(), row.revision);
+            }
+            drop(guard);
+            state.worker_step().unwrap();
+            assert_eq!(
+                store.request_by_id(&second.id).unwrap().unwrap().state,
+                "done"
+            );
+        }
+    }
+}
 /// The guarded browser route and the blocking CLI route admit the same FIFO
 /// work. Each row can certify a full watcher batch only at its own terminal
 /// pin; an unfinished successor cannot borrow that certificate.
@@ -1430,6 +1678,9 @@ async fn browser_and_cli_routes_share_certified_watcher_gate() {
     .unwrap();
     let (release_browser, browser_holder) = hold_worker(state.clone()).await;
     let owner = state.retained_serving_session().unwrap();
+    let (reporter, mut events) =
+        crate::daemon::causal_witness::CausalWitness::in_memory_for_tests();
+    state.set_causal_witness_runtime(reporter.clone(), Arc::downgrade(&runtime));
     let options = state.config().options.clone();
     let mut watcher = crate::index_coordinator::WatcherWork::publishing(
         &state.store,
@@ -1439,6 +1690,11 @@ async fn browser_and_cli_routes_share_certified_watcher_gate() {
     )
     .unwrap();
     watcher.disable_native_watcher_for_tests();
+    watcher.attach_causal_witness(
+        reporter.clone(),
+        owner.incarnation(),
+        state.causal_lineage_ordinal.clone(),
+    );
     watcher.set_waker(state.watch_waker.clone());
     let browser_generation = watcher.generation_handle().load(Ordering::SeqCst);
     state.publish_watch_status(&watcher, &options);
@@ -1475,6 +1731,7 @@ async fn browser_and_cli_routes_share_certified_watcher_gate() {
     let browser_done = state.store.request_by_id(&browser_id).unwrap().unwrap();
     assert_eq!(browser_done.state, "done");
     let browser_pin = browser_done.revision.unwrap();
+    while events.try_recv().is_ok() {} // The prior browser epoch is settled.
     {
         let work = state.watcher_work.lock().unwrap();
         let work = &work.as_ref().unwrap().1;
@@ -1494,6 +1751,11 @@ async fn browser_and_cli_routes_share_certified_watcher_gate() {
     )
     .unwrap();
     cli_watcher.disable_native_watcher_for_tests();
+    cli_watcher.attach_causal_witness(
+        reporter.clone(),
+        owner.incarnation(),
+        state.causal_lineage_ordinal.clone(),
+    );
     cli_watcher.set_waker(state.watch_waker.clone());
     state.publish_watch_status(&cli_watcher, &options);
     *state.watcher_work.lock().unwrap() = Some((Arc::downgrade(&owner), cli_watcher));
@@ -1518,6 +1780,19 @@ async fn browser_and_cli_routes_share_certified_watcher_gate() {
         cli_generation >= 2,
         "accepted CLI event advanced its watcher epoch"
     );
+    // Seed the fixture's pending premise without changing the worker's
+    // production reporter behavior. Its exact lineage is the attached watcher.
+    let lineage = state
+        .watcher_work
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .1
+        .causal_lineage()
+        .unwrap();
+    reporter.watch_pending(lineage, cli_generation);
+
     let (enqueued_tx, enqueued_rx) = tokio::sync::oneshot::channel();
     state
         .store
@@ -1579,6 +1854,20 @@ async fn browser_and_cli_routes_share_certified_watcher_gate() {
     // An internal ACK covers this batch, but the public WATCH_ACK requires an
     // empty FIFO. The queued next row is the witness guard's negative premise.
     assert_eq!(state.store.status().unwrap().revision, cli_pin);
+    let mut pending_seen = false;
+    while let Ok(event) = events.try_recv() {
+        assert_ne!(
+            event.kind, "WATCH_ACK",
+            "unfinished successor must block public ACK"
+        );
+        if event.watch_generation == Some(cli_generation) {
+            pending_seen |= event.kind == "WATCH_PENDING";
+        }
+    }
+    assert!(
+        pending_seen,
+        "causal reporter did not observe CLI watcher intent"
+    );
     release_step.send(()).unwrap();
     let cli_result = tokio::time::timeout(crate::testing::HANG_BACKSTOP, cli)
         .await
