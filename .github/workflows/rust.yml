@@ -11,6 +11,8 @@ permissions:
 jobs:
   test:
     strategy:
+      # One platform's failure must not cancel the other's result.
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
@@ -37,8 +39,9 @@ jobs:
       - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
         with:
           tool: cargo-nextest@0.9.148
-      # verify builds two target directories: the default build (`target`) and
-      # the test-support build (`target-test-support`), which is the larger.
+      # verify builds two target directories: the default build (`target`: both
+      # clippy runs and the browser suite's debug binary) and the test-support
+      # build (`target-test-support`: the tests), which is the larger.
       # Caches are saved only from pushes to the long-lived branches, so a pull
       # request restores its base branch's warm cache and never evicts it
       # (GitHub scopes a PR's cache reads to its own, base and default branch).

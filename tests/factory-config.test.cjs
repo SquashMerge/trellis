@@ -174,6 +174,8 @@ if [ "$1" = tools/verify-env.mjs ]; then
   printf '%s\n' "$FAKE_BROWSER_ROOT"
   exit 0
 fi
+# verify hands the browser suite the binary it built (#192).
+if [ "$1" = tests/browser/saved-items.test.cjs ] && [ -z "\${TRELLIS_SUITE_BINARY:-}" ]; then exit 37; fi
 if [ "\${FAKE_VERIFY_NO_NEXTEST:-0}" = 1 ] && [ "$1" = nextest ]; then exit 101; fi
 if [ "\${FAKE_VERIFY_FAIL_CLIPPY:-0}" = 1 ] && [ "$1" = clippy ]; then exit 23; fi
 if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contract/test/run.mjs ]; then exit 29; fi
@@ -205,10 +207,12 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
       rust: [
         ["cargo", "fmt", "--all", "--", "--check"],
         ["cargo", "clippy", "--locked", "--all-targets", "--", "-D", "warnings"],
+        ["cargo", "clippy", "--locked", "--all-targets", "--features", "test-support", "--", "-D", "warnings"],
+        ["cargo", "build", "--locked", "--bin", "trellis"],
+        ["node", "tests/browser/saved-items.test.cjs"],
       ],
       tests: [
         ["cargo", "nextest", "--version"],
-        ["cargo", "clippy", "--locked", "--all-targets", "--features", "test-support", "--", "-D", "warnings"],
         ["cargo", "nextest", "run", "--locked", "--all-targets", "--no-fail-fast", "--features", "test-support"],
       ],
       semantic: [["node", "tools/semantic-contract/test/run.mjs"]],
@@ -217,7 +221,6 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
         ["node", "--test", "runtime/acp/runner.test.mjs"],
         ["node", "--test", "tests/mcp-catalog-sdk.test.mjs"],
         ["node", "--test", "tests/factory-config.test.cjs"],
-        ["node", "tests/browser/saved-items.test.cjs"],
         ["node", "docs/semantic-evidence/check-policy.mjs"],
         ["node", "--check", "web/app.js"],
         ["node", "--test", "tests/question-ui.test.cjs", "tests/browse-ui.test.cjs", "tests/sequence-ui.test.cjs", "tests/token-ui.test.cjs", "tests/external-source-ui.test.cjs", "tests/dependency-ui.test.cjs", "tests/shell-ui.test.cjs", "tests/classes-ui.test.cjs", "tests/navigation-ui.test.cjs"],
@@ -242,8 +245,8 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
     rmSync(log);
     const failure = runVerify({ FAKE_VERIFY_FAIL_CLIPPY: "1" });
     assert.equal(failure.result.status, 23);
-    assertRan(failure.commands, { ...lanes, rust: lanes.rust.slice(0, 2), tests: lanes.tests.slice(0, 2) });
-    assert.match(failure.result.stderr, /failed lane\(s\): rust tests$/m);
+    assertRan(failure.commands, { ...lanes, rust: lanes.rust.slice(0, 2) });
+    assert.match(failure.result.stderr, /failed lane\(s\): rust$/m);
     assert.match(failure.result.stdout, /^==> verify lane rust \(exit 23\)$/m);
     rmSync(log);
     const semanticFailure = runVerify({ FAKE_VERIFY_FAIL_SEMANTIC: "1" });
@@ -253,8 +256,8 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
     rmSync(log);
     const bothFailure = runVerify({ FAKE_VERIFY_FAIL_CLIPPY: "1", FAKE_VERIFY_FAIL_SEMANTIC: "1" });
     assert.equal(bothFailure.result.status, 23);
-    assertRan(bothFailure.commands, { ...lanes, rust: lanes.rust.slice(0, 2), tests: lanes.tests.slice(0, 2) });
-    assert.match(bothFailure.result.stderr, /failed lane\(s\): rust tests semantic$/m);
+    assertRan(bothFailure.commands, { ...lanes, rust: lanes.rust.slice(0, 2) });
+    assert.match(bothFailure.result.stderr, /failed lane\(s\): rust semantic$/m);
     rmSync(log);
     const noNextest = runVerify({ FAKE_VERIFY_NO_NEXTEST: "1" });
     assert.equal(noNextest.result.status, 127);

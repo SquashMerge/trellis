@@ -13,20 +13,30 @@ rustc --version
 PLAYWRIGHT_BROWSERS_PATH=$(node tools/verify-env.mjs)
 export PLAYWRIGHT_BROWSERS_PATH
 
-# The production build is linted without test hooks. Tests run once, with
-# the test-support hooks compiled in, in their own target directory so the
-# two lanes build concurrently without sharing Cargo's build lock.
+# Each Cargo target directory belongs to one lane, so no lane waits on
+# another's build lock. The rust lane owns `target`: it lints the production
+# build, lints again with the test-support hooks (off the tests lane's
+# critical path), then builds the debug binary the browser suite runs. The
+# tests lane owns `target-test-support` and runs the tests once, with the
+# test-support hooks compiled in.
+target_dir=${CARGO_TARGET_DIR:-target}
+case $target_dir in
+  /*) ;;
+  *) target_dir=$PWD/$target_dir ;;
+esac
 rust() {
   cargo fmt --all -- --check
   cargo clippy --locked --all-targets -- -D warnings
+  cargo clippy --locked --all-targets --features test-support -- -D warnings
+  cargo build --locked --bin trellis
+  TRELLIS_SUITE_BINARY="$target_dir/debug/trellis" node tests/browser/saved-items.test.cjs
 }
 tests() {
   if ! cargo nextest --version >/dev/null 2>&1; then
     echo "verify: cargo-nextest is required (brew install cargo-nextest, or cargo install cargo-nextest --locked)" >&2
     exit 127
   fi
-  CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target}-test-support" cargo clippy --locked --all-targets --features test-support -- -D warnings
-  CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target}-test-support" cargo nextest run --locked --all-targets --no-fail-fast --features test-support
+  CARGO_TARGET_DIR="$target_dir-test-support" cargo nextest run --locked --all-targets --no-fail-fast --features test-support
 }
 semantic() {
   node tools/semantic-contract/test/run.mjs
@@ -39,7 +49,6 @@ checks() {
   node --test tests/mcp-catalog-sdk.test.mjs
   python3 tools/stage3-watcher-runner-test.py
   node --test tests/factory-config.test.cjs
-  node tests/browser/saved-items.test.cjs
   node docs/semantic-evidence/check-policy.mjs
   node --check web/app.js
   node --test tests/question-ui.test.cjs tests/browse-ui.test.cjs tests/sequence-ui.test.cjs tests/token-ui.test.cjs tests/external-source-ui.test.cjs tests/dependency-ui.test.cjs tests/shell-ui.test.cjs tests/classes-ui.test.cjs tests/navigation-ui.test.cjs
@@ -48,8 +57,18 @@ checks() {
 lanes="rust tests semantic cohorts checks"
 logs=$(mktemp -d "${TMPDIR:-/tmp}/trellis-verify.XXXXXX")
 trap 'rm -rf "$logs"' EXIT
+started=$(date +%s)
 for lane in $lanes; do
-  (set -e; "$lane") >"$logs/$lane" 2>&1 &
+  # The inner subshell keeps errexit (it is not the left side of || or &&);
+  # the outer one records the lane's wall time whatever its outcome.
+  (
+    set +e
+    start=$(date +%s)
+    (set -e; "$lane")
+    code=$?
+    echo "<== verify lane $lane took $(($(date +%s) - start)) s"
+    exit "$code"
+  ) >"$logs/$lane" 2>&1 &
   eval "pid_$lane=$!"
 done
 
@@ -65,6 +84,7 @@ for lane in $lanes; do
     failed="$failed $lane"
   fi
 done
+echo "verify: lanes took $(($(date +%s) - started)) s"
 if [ "$status" -ne 0 ]; then
   echo "verify: failed lane(s):$failed" >&2
 fi

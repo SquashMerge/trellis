@@ -59,14 +59,21 @@ function run(command, args, {cwd = ROOT, env = process.env, timeout = 180000} = 
   });
 }
 
-test.before(async () => {
+// tools/verify builds the binary before this suite and names it in
+// TRELLIS_SUITE_BINARY; run alone, the suite builds it.
+async function builtBinary() {
+  const prebuilt = process.env.TRELLIS_SUITE_BINARY;
+  if (prebuilt) return resolve(prebuilt);
   const metadata = await run("cargo", ["metadata", "--no-deps", "--format-version", "1"], {timeout:60000});
   const target = JSON.parse(metadata.stdout).target_directory;
   assert.equal(typeof target, "string");
   await run("cargo", ["build", "--locked", "--bin", "trellis"], {timeout:900000});
-  const built = join(target, "debug", process.platform === "win32" ? "trellis.exe" : "trellis");
+  return join(target, "debug", process.platform === "win32" ? "trellis.exe" : "trellis");
+}
+test.before(async () => {
+  const built = await builtBinary();
   assert.ok(existsSync(built), `built Trellis binary is unavailable at ${built}`);
-  // tools/verify runs Cargo tests and browser acceptance concurrently. Cargo may
+  // tools/verify runs Cargo builds and browser acceptance concurrently. Cargo may
   // replace its target executable between these two real-browser scenarios.
   suiteBinaryDir = mkdtempSync(join(tmpdir(), "trellis-saved-binary-"));
   binary = join(suiteBinaryDir, basename(built));
