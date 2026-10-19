@@ -1518,12 +1518,8 @@ impl SelectedCheckout {
     /// The slow part of the final check (#131): discover both checkouts'
     /// common Git directories, each lookup waiting at most until `by`.
     pub fn common_dirs_by(&self, by: Option<Instant>) -> Result<CommonDirs, SelectionError> {
-        self.launch
-            .verify_readonly()
-            .map_err(|_| SelectionError::IdentityChanged)?;
-        self.identity
-            .verify_readonly()
-            .map_err(|_| SelectionError::IdentityChanged)?;
+        self.launch.verify_readonly().map_err(identity_fault)?;
+        self.identity.verify_readonly().map_err(identity_fault)?;
         let discover = |identity: &WorkspaceIdentity| {
             identity
                 .git_common_dir_by(by)
@@ -1537,19 +1533,16 @@ impl SelectedCheckout {
     /// The send-time part of the final check (#131), filesystem calls only:
     /// both roots still verify, and the discovered common directories are
     /// still the captured one. A discovered directory that has gone is a
-    /// proven change. A Git pointer re-pointed in place, with every root and
+    /// proven change; any other I/O error proves nothing and is `Unavailable`.
+    /// A Git pointer re-pointed in place, with every root and
     /// common-directory inode unchanged, is not seen here.
     pub fn verify_at_send(&self, dirs: &CommonDirs) -> Result<(), SelectionError> {
-        self.launch
-            .verify_readonly()
-            .map_err(|_| SelectionError::IdentityChanged)?;
-        self.identity
-            .verify_readonly()
-            .map_err(|_| SelectionError::IdentityChanged)?;
+        self.launch.verify_readonly().map_err(identity_fault)?;
+        self.identity.verify_readonly().map_err(identity_fault)?;
         let inode = |path: &Path| {
             fs::metadata(path)
                 .map(|metadata| (metadata.dev(), metadata.ino()))
-                .map_err(|_| SelectionError::IdentityChanged)
+                .map_err(|error| io_fault(&error))
         };
         if inode(&dirs.launch)? != self.launch_common
             || inode(&dirs.selected)? != self.selected_common
@@ -1558,6 +1551,23 @@ impl SelectedCheckout {
             return Err(SelectionError::IdentityChanged);
         }
         Ok(())
+    }
+}
+/// A final check's failure is a proven change unless it is an I/O error
+/// other than a missing path, such as `EACCES` or `EIO` (#131): that proves
+/// nothing, so the check is `Unavailable` and runs again.
+fn identity_fault(error: anyhow::Error) -> SelectionError {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .map_or(SelectionError::IdentityChanged, io_fault)
+}
+fn io_fault(error: &std::io::Error) -> SelectionError {
+    match error.kind() {
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory => {
+            SelectionError::IdentityChanged
+        }
+        _ => SelectionError::Unavailable,
     }
 }
 /// Common Git directories a final check discovered, for its send-time part.

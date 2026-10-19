@@ -592,6 +592,7 @@ struct SendGate {
     witness: crate::daemon::registry::SelectedCheckout,
     dirs: crate::daemon::registry::CommonDirs,
     catching_up: bool,
+    capacity: bool,
 }
 
 /// A finished selected call whose final identity check is running, or due to
@@ -1511,6 +1512,7 @@ fn coordinate(
                     witness: witness.clone(),
                     dirs,
                     catching_up: *catching_up,
+                    capacity: matches!(check.outcome.finals, Finals::Capacity { .. }),
                 }),
                 Err(SelectionError::Unavailable) => {
                     if Instant::now() < call.deadline {
@@ -1591,7 +1593,9 @@ fn coordinate(
         // selected call's identity is compared again here, at its send, with
         // filesystem calls only: its helper's success may be stale after
         // whatever the coordinator did since, such as writing to a slow
-        // client (#131).
+        // client (#131). A comparison that fails with an I/O error proving
+        // nothing (`Unavailable`) leaves the call pending: its final check
+        // starts again after a tick, until its deadline.
         for (token, result, gate) in finished {
             let Some(call) = in_flight.remove(&token) else {
                 continue;
@@ -1599,16 +1603,41 @@ fn coordinate(
             phase_hook("call_send")?;
             let result = if Instant::now() >= call.deadline {
                 deadline_answer(&call)
-            } else if let Some(gate) = gate
-                && gate.witness.verify_at_send(&gate.dirs).is_err()
-            {
-                tools::resolved_root_changed(
-                    &call.name,
-                    &call.id,
-                    &gate.witness.identity.root,
-                    gate.catching_up,
-                    call.modern,
-                )
+            } else if let Some(gate) = gate {
+                match gate.witness.verify_at_send(&gate.dirs) {
+                    Ok(()) => result,
+                    Err(SelectionError::Unavailable) => {
+                        let (witness, catching_up) = (gate.witness, gate.catching_up);
+                        let finals = if gate.capacity {
+                            Finals::Capacity {
+                                witness,
+                                catching_up,
+                            }
+                        } else {
+                            Finals::Selected {
+                                witness,
+                                catching_up,
+                            }
+                        };
+                        checks.insert(
+                            token,
+                            FinalCheck {
+                                outcome: CallOutcome { result, finals },
+                                running: false,
+                                retry_at: Some(Instant::now() + FINAL_RECHECK_TICK),
+                            },
+                        );
+                        in_flight.insert(token, call);
+                        continue;
+                    }
+                    Err(_) => tools::resolved_root_changed(
+                        &call.name,
+                        &call.id,
+                        &gate.witness.identity.root,
+                        gate.catching_up,
+                        call.modern,
+                    ),
+                }
             } else {
                 result
             };

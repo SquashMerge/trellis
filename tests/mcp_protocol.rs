@@ -3402,6 +3402,70 @@ fn a_root_replaced_after_its_final_check_is_root_changed_at_send() {
 }
 
 #[test]
+fn an_unreadable_common_dir_at_send_is_retried_not_root_changed() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let (main, linked) = git_linked_fixture(temp.path());
+    let common = main.join(".git");
+    let socket = temp.path().join("phase.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let (armed, faulted, rechecked) = (
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let (arm, fault, recheck, dir) = (
+        armed.clone(),
+        faulted.clone(),
+        rechecked.clone(),
+        common.clone(),
+    );
+    serve_pauses(&listener, move |stage| {
+        // B's send-time stat of its common Git directory fails with EACCES,
+        // an I/O error that proves nothing; its retried lookup then succeeds.
+        if stage == "call_send" && arm.swap(false, Ordering::AcqRel) {
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)).unwrap();
+            fault.store(
+                fs::metadata(dir.join("HEAD"))
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied),
+                Ordering::Release,
+            );
+        } else if stage == "final_recheck" && fault.load(Ordering::Acquire) {
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+            recheck.store(true, Ordering::Release);
+        }
+        None
+    });
+    let mut peer =
+        Peer::start_with_phase_env(Some(&main), Some(("call_send,final_recheck", &socket)), &[]);
+    tool(
+        &peer.ask(serde_json::from_slice(&describe_frame(json!(0), None)).unwrap()),
+        None,
+        true,
+    );
+    let warm = peer.ask(serde_json::from_slice(&describe_frame(json!(1), Some(&linked))).unwrap());
+    tool(&warm, None, true);
+    armed.store(true, Ordering::Release);
+    let reply =
+        peer.ask(serde_json::from_slice(&describe_frame(json!("B"), Some(&linked))).unwrap());
+    fs::set_permissions(&common, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        faulted.load(Ordering::Acquire),
+        "the fault was not injected (running as root?): {reply}"
+    );
+    assert!(
+        rechecked.load(Ordering::Acquire),
+        "B was never rechecked: {reply}"
+    );
+    tool(&reply, None, true);
+    assert!(peer.finish().0.success());
+}
+
+#[test]
 fn capacity_witness_final_drift_refuses_stale_capacity_attribution() {
     let temp = tempfile::tempdir().unwrap();
     let (main, first) = git_linked_fixture(temp.path());
