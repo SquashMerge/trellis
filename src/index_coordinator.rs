@@ -4,7 +4,7 @@ use crate::{
     capture::Capture,
     indexer::{self, IndexOptions},
     model::{CancelFlag, IndexPin, IndexProgress},
-    store::{PublishPermit, RecoveryBaseline, Store, topology::WriterSession},
+    store::{PublishPermit, RecoveryBaseline, Store, requests::Request, topology::WriterSession},
 };
 use anyhow::{Result, ensure};
 use std::sync::{Arc, atomic::Ordering};
@@ -808,6 +808,21 @@ impl WatcherWork {
         self.queue_gate && self.accepted_watch_intent(options)
     }
 
+    /// Accepted ingress and the queue claim share the callback's liveness lock.
+    /// If a full intent arrived after reconciliation, retain the gate and let
+    /// the owner reconcile it before retrying this claim.
+    pub(crate) fn claim_if_gate_clear(
+        &mut self,
+        options: &IndexOptions,
+        claim: impl FnOnce() -> Result<Option<Request>>,
+    ) -> Result<Option<Option<Request>>> {
+        let _ingress = self.watch.lock_ingress();
+        if self.gate_pending(options) {
+            return Ok(None);
+        }
+        Ok(Some(claim()?))
+    }
+
     pub(crate) fn reconcile_queue_gate(
         &mut self,
         store: &Store,
@@ -1104,7 +1119,7 @@ pub fn drain_requests_observed_with_native(
         usize::MAX,
         None,
         None,
-        || Ok(true),
+        |claim| claim(),
     )
 }
 
@@ -1124,7 +1139,7 @@ pub fn drain_one_request_observed(
         1,
         None,
         None,
-        || Ok(true),
+        |claim| claim(),
     )
 }
 
@@ -1136,7 +1151,7 @@ pub(crate) fn drain_one_request_with_watcher(
     session: &Arc<WriterSession>,
     watcher: &OwningWatcher,
     progress: impl Fn(&str, IndexProgress) + Sync,
-    before_claim: impl Fn() -> Result<bool>,
+    before_claim: impl Fn(&dyn Fn() -> Result<Option<Request>>) -> Result<Option<Request>>,
 ) -> Result<usize> {
     drain_requests_observed_with_cancel(
         store,
@@ -1165,7 +1180,7 @@ fn drain_requests_observed_with_cancel(
     max_completed: usize,
     cutoff_seq: Option<i64>,
     watcher: Option<&OwningWatcher>,
-    before_claim: impl Fn() -> Result<bool>,
+    before_claim: impl Fn(&dyn Fn() -> Result<Option<Request>>) -> Result<Option<Request>>,
 ) -> Result<usize> {
     if store.root_path_replaced()? {
         store.fail_changed_root_requests()?;
@@ -1209,10 +1224,7 @@ fn drain_requests_observed_with_cancel(
         }
         // Cached completion is confirmed above. Recheck the gate at the
         // owning preclaim transition rather than relying on a worker sample.
-        if !before_claim()? {
-            break;
-        }
-        let Some(request) = store.claim_request(session)? else {
+        let Some(request) = before_claim(&|| store.claim_request(session))? else {
             break;
         };
         if let Some(watcher) = watcher {

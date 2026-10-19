@@ -1196,7 +1196,7 @@ impl DaemonState {
     fn reconcile_preclaim_gate(
         &self,
         session: &Arc<crate::store::topology::WriterSession>,
-    ) -> anyhow::Result<bool> {
+    ) -> anyhow::Result<(bool, IndexOptions)> {
         let explicit = self.explicit_pending.lock().unwrap().clone();
         let selected = explicit
             .as_ref()
@@ -1232,7 +1232,7 @@ impl DaemonState {
                     && work.gate_pending(&selected)
             });
         if !gate_due {
-            return Ok(true);
+            return Ok((true, selected));
         }
         #[cfg(test)]
         self.test_queue_before_watcher_reconcile.run();
@@ -1248,6 +1248,9 @@ impl DaemonState {
             self.publish_watch_status(work, &selected);
             if accounted {
                 self.finalize_watcher_gate(work, &selected, explicit.as_ref());
+                // Keep this successor's gate armed until its claim commits.
+                // Ingress after reconciliation must re-enter the watcher first.
+                work.set_queue_gate();
             }
             !accounted || work.gate_pending(&selected)
         } else {
@@ -1256,7 +1259,7 @@ impl DaemonState {
         drop(guard);
         #[cfg(test)]
         self.test_queue_after_watcher_reconcile.run();
-        Ok(!pending)
+        Ok((!pending, selected))
     }
 
     fn worker_step(self: &Arc<Self>) -> anyhow::Result<()> {
@@ -1349,12 +1352,29 @@ impl DaemonState {
                 |id, p| {
                     self.job_progress.lock().unwrap().insert(id.to_owned(), p);
                 },
-                || {
-                    let claim_ready = self
+                |claim| loop {
+                    let (claim_ready, selected) = self
                         .reconcile_preclaim_gate(session)
                         .inspect_err(|_| gate_error.set(true))?;
-                    gate_deferred.set(!claim_ready);
-                    Ok(claim_ready)
+                    if !claim_ready {
+                        gate_deferred.set(true);
+                        return Ok(None);
+                    }
+                    let mut guard = self.watcher_work.lock().unwrap();
+                    if let Some((owner, work)) = guard.as_mut()
+                        && owner
+                            .upgrade()
+                            .is_some_and(|owner| Arc::ptr_eq(&owner, session))
+                    {
+                        // The callback and synthetic ingress take this same lock.
+                        // Keep it through claim_request's durable COMMIT, not only
+                        // through the final sample. A later event re-enters the gate.
+                        if let Some(request) = work.claim_if_gate_clear(&selected, claim)? {
+                            return Ok(request);
+                        }
+                        continue;
+                    }
+                    return claim();
                 },
             ) {
                 Ok(processed) => processed,

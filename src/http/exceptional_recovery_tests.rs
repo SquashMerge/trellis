@@ -1317,6 +1317,67 @@ fn ingress_after_early_gate_sample_reconciles_before_claim() {
 
 #[cfg(feature = "test-support")]
 #[test]
+fn ingress_after_final_gate_sample_publishes_before_claim_commit() {
+    let (_tmp, store, state, options) = serving_queue_watch_fixture();
+    let first = store.enqueue_request(&options, None).unwrap();
+    let next = store.enqueue_request(&options, None).unwrap();
+    state.worker_step().unwrap();
+    let first_pin = store
+        .request_by_id(&first.id)
+        .unwrap()
+        .unwrap()
+        .revision
+        .unwrap();
+    assert_eq!(
+        store.request_by_id(&next.id).unwrap().unwrap().state,
+        "queued"
+    );
+
+    let early = options.workspace_root.join("early.js");
+    std::fs::write(&early, "function early() {}\n").unwrap();
+    state.submit_watch_event_for_tests(Ok(notify::Event::new(notify::EventKind::Create(
+        notify::event::CreateKind::File,
+    ))
+    .add_path(early)));
+
+    let incoming = state.clone();
+    let observed = store.clone();
+    let next_id = next.id.clone();
+    let late = options.workspace_root.join("after-gate.js");
+    // The prior reconciliation and final sample have ended; Q1 is still queued.
+    state.test_queue_after_watcher_reconcile.set(move || {
+        assert_eq!(
+            observed.request_by_id(&next_id).unwrap().unwrap().state,
+            "queued"
+        );
+        assert_eq!(
+            observed.status().unwrap().revision.index_revision,
+            first_pin.index_revision + 1
+        );
+        std::fs::write(&late, "function afterGate() {}\n").unwrap();
+        assert!(
+            incoming.submit_watch_event_for_tests(Ok(notify::Event::new(
+                notify::EventKind::Create(notify::event::CreateKind::File)
+            )
+            .add_path(late)))
+        );
+    });
+    let observed = store.clone();
+    store.set_after_claim_hook_for_tests(move || {
+        assert!(
+            observed.status().unwrap().revision.index_revision > first_pin.index_revision + 1,
+            "accepted post-gate full intent must publish before Q1 claim COMMIT"
+        );
+    });
+    state.worker_step().unwrap();
+    assert_eq!(
+        store.request_by_id(&next.id).unwrap().unwrap().state,
+        "done"
+    );
+}
+
+#[cfg(feature = "test-support")]
+#[test]
 fn covered_row_without_successor_keeps_idle_nonurgent_debounce() {
     let (_tmp, store, state, options) = serving_queue_watch_fixture();
     let row = store.enqueue_request(&options, None).unwrap();

@@ -165,23 +165,6 @@ struct Signal {
     received_at: Instant,
 }
 
-// Both the real notify callback and deterministic injected events use this exact ingress.
-#[allow(clippy::too_many_arguments)]
-fn submit(
-    sender: &SyncSender<Signal>,
-    generation: &AtomicU64,
-    overflow: &AtomicBool,
-    waker: &std::sync::OnceLock<Waker>,
-    root: &Path,
-    selected: &BTreeSet<PathBuf>,
-    executable: Option<&Path>,
-    event: notify::Result<Event>,
-) {
-    if relevant(&event, root, selected, executable) {
-        accept(sender, generation, overflow, waker, event);
-    }
-}
-
 /// Whether an event can affect the checkout. This may read file metadata, so
 /// a callback runs it before taking its liveness lock.
 fn relevant(
@@ -727,6 +710,14 @@ impl WatchSignals {
         Arc::clone(&self.generation)
     }
 
+    /// Keep native and synthetic accepted ingress behind the final queue gate
+    /// through the durable FIFO claim. Classification happens outside this lock.
+    pub(crate) fn lock_ingress(&self) -> std::sync::MutexGuard<'_, bool> {
+        self.live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     pub fn acknowledged_generation(&self) -> u64 {
         self.acknowledged_generation
     }
@@ -776,16 +767,23 @@ impl WatchSignals {
     /// Feed the same bounded ingress used by notify's actual callback. A
     /// runtime error or a dropped signal forces a full inventory.
     pub fn submit_event(&self, event: notify::Result<Event>) {
-        submit(
-            &self.sender,
-            &self.generation,
-            &self.overflow,
-            &self.waker,
+        if relevant(
+            &event,
             &self.root,
             &self.captured_inputs,
             self.executable.as_deref(),
-            event,
-        );
+        ) {
+            // Fixture ingress uses the callback's claim fence, including
+            // after a test disables native delivery. Classification stays outside.
+            let _ingress = self.lock_ingress();
+            accept(
+                &self.sender,
+                &self.generation,
+                &self.overflow,
+                &self.waker,
+                event,
+            );
+        }
     }
 
     /// Nonblocking, bounded drain: never wait for a continuously active producer.
