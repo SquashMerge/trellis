@@ -1256,6 +1256,208 @@ fn later_full_intent_reconciles_before_next_fifo_claim_without_debounce() {
 }
 
 #[test]
+fn ingress_after_early_gate_sample_reconciles_before_claim() {
+    let (_tmp, store, state, options) = serving_queue_watch_fixture();
+    let first = store.enqueue_request(&options, None).unwrap();
+    let next = store.enqueue_request(&options, None).unwrap();
+    state.worker_step().unwrap();
+    let first_pin = store
+        .request_by_id(&first.id)
+        .unwrap()
+        .unwrap()
+        .revision
+        .unwrap();
+    assert_eq!(
+        state
+            .watcher_work
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .1
+            .accounted_watch_pin(),
+        Some(first_pin)
+    );
+    let source = options.workspace_root.join("late.js");
+    let incoming = state.clone();
+    let observed = store.clone();
+    let next_id = next.id.clone();
+    state.test_queue_before_preclaim.set(move || {
+        assert_eq!(
+            observed.request_by_id(&next_id).unwrap().unwrap().state,
+            "queued"
+        );
+        std::fs::write(&source, "function late() {}\n").unwrap();
+        incoming
+            .watcher_work
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .1
+            .submit_watch_event_for_tests(Ok(notify::Event::new(notify::EventKind::Create(
+                notify::event::CreateKind::File,
+            ))
+            .add_path(source)));
+    });
+    let observed = store.clone();
+    let next_id = next.id.clone();
+    state.test_queue_after_watcher_reconcile.set(move || {
+        assert_eq!(
+            observed.request_by_id(&next_id).unwrap().unwrap().state,
+            "queued"
+        );
+        assert!(observed.status().unwrap().revision.index_revision > first_pin.index_revision);
+    });
+    state.worker_step().unwrap();
+    let next_done = store.request_by_id(&next.id).unwrap().unwrap();
+    assert_eq!(next_done.state, "done");
+    assert!(next_done.revision.unwrap().index_revision > first_pin.index_revision + 1);
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn covered_row_without_successor_keeps_idle_nonurgent_debounce() {
+    let (_tmp, store, state, options) = serving_queue_watch_fixture();
+    let row = store.enqueue_request(&options, None).unwrap();
+    let incoming = state.clone();
+    let source = options.workspace_root.join("idle.js");
+    state.test_queue_after_startup_drain.set(move || {
+        std::fs::write(&source, "function idle() {}\n").unwrap();
+        incoming
+            .watcher_work
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .1
+            .submit_watch_event_for_tests(Ok(notify::Event::new(notify::EventKind::Create(
+                notify::event::CreateKind::File,
+            ))
+            .add_path(source)));
+    });
+    state.worker_step().unwrap();
+    let row_pin = store
+        .request_by_id(&row.id)
+        .unwrap()
+        .unwrap()
+        .revision
+        .unwrap();
+    assert_eq!(store.status().unwrap().revision, row_pin);
+    let guard = state.watcher_work.lock().unwrap();
+    let work = &guard.as_ref().unwrap().1;
+    assert_eq!(
+        work.accounted_watch_pin(),
+        Some(row_pin),
+        "the completed row must certify the original batch"
+    );
+    assert!(work.accepted_watch_intent(&options));
+    assert_eq!(work.full_capture_attempts_for_tests(), 0);
+    assert!(
+        work.next_due() > Instant::now(),
+        "idle nonurgent event must retain debounce"
+    );
+}
+
+#[test]
+fn cached_q1_completion_precedes_later_watcher_gate_publication() {
+    let (_tmp, store, state, options) = serving_queue_watch_fixture();
+    let covered = store.enqueue_request(&options, None).unwrap();
+    let cached = store.enqueue_request(&options, None).unwrap();
+    let successor = store.enqueue_request(&options, None).unwrap();
+    state.worker_step().unwrap();
+    assert_eq!(
+        store.request_by_id(&covered.id).unwrap().unwrap().state,
+        "done"
+    );
+    store.inject_queue_finish_failure(false);
+    let error = state.worker_step().unwrap_err();
+    assert!(error.to_string().contains("storage_busy"), "{error:#}");
+    assert_eq!(
+        store.request_by_id(&cached.id).unwrap().unwrap().state,
+        "running"
+    );
+    assert_eq!(
+        store.request_by_id(&successor.id).unwrap().unwrap().state,
+        "queued"
+    );
+    let cached_pin = store.status().unwrap().revision;
+    let owner = state.retained_serving_session().unwrap();
+    assert!(store.has_recorded_completion(&owner).unwrap());
+    // Model a previously completed row's gate still armed while Q1's exact
+    // terminal write is unresolved. Store retry must win even in this state.
+    state
+        .watcher_work
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .1
+        .set_queue_gate();
+    let source = options.workspace_root.join("after-cached.js");
+    std::fs::write(&source, "function newer() {}\n").unwrap();
+    state
+        .watcher_work
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .1
+        .submit_watch_event_for_tests(Ok(notify::Event::new(notify::EventKind::Create(
+            notify::event::CreateKind::File,
+        ))
+        .add_path(source)));
+    assert!(
+        state
+            .watcher_work
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .1
+            .gate_pending(&options),
+        "cached completion must be tested with an armed watcher gate"
+    );
+    let observed = store.clone();
+    let cached_id = cached.id.clone();
+    let successor_id = successor.id.clone();
+    state.test_queue_before_watcher_reconcile.set(move || {
+        let confirmed = observed.request_by_id(&cached_id).unwrap().unwrap();
+        assert_eq!(
+            confirmed.state, "done",
+            "gate must wait for cached terminal COMMIT"
+        );
+        assert_eq!(confirmed.revision, Some(cached_pin));
+        assert_eq!(observed.status().unwrap().revision, cached_pin);
+        assert_eq!(
+            observed
+                .request_by_id(&successor_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            "queued"
+        );
+    });
+    state.worker_step().unwrap();
+    assert_eq!(
+        store.request_by_id(&cached.id).unwrap().unwrap().revision,
+        Some(cached_pin)
+    );
+    assert!(!store.has_recorded_completion(&owner).unwrap());
+    let watcher_pin = store.status().unwrap().revision;
+    assert!(watcher_pin.index_revision > cached_pin.index_revision);
+    assert_eq!(
+        store.request_by_id(&successor.id).unwrap().unwrap().state,
+        "queued"
+    );
+    state.worker_step().unwrap();
+    assert_eq!(
+        store.request_by_id(&successor.id).unwrap().unwrap().state,
+        "done"
+    );
+}
+
+#[test]
 fn post_row_nonurgent_create_gate_precedes_next_fifo_claim() {
     let (_tmp, store, state, options) = serving_queue_watch_fixture();
     let first = store.enqueue_request(&options, None).unwrap();

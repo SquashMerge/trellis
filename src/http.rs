@@ -333,6 +333,8 @@ pub struct DaemonState {
     #[cfg(test)]
     test_queue_after_startup_drain: crate::store::TestOneShotHook,
     #[cfg(test)]
+    test_queue_before_preclaim: crate::store::TestOneShotHook,
+    #[cfg(test)]
     test_queue_before_watcher_reconcile: crate::store::TestOneShotHook,
     #[cfg(test)]
     test_queue_after_watcher_reconcile: crate::store::TestOneShotHook,
@@ -570,6 +572,8 @@ pub fn new_with_config(
         test_queue_after_pending_snapshot: crate::store::TestOneShotHook::default(),
         #[cfg(test)]
         test_queue_after_startup_drain: crate::store::TestOneShotHook::default(),
+        #[cfg(test)]
+        test_queue_before_preclaim: crate::store::TestOneShotHook::default(),
         #[cfg(test)]
         test_queue_before_watcher_reconcile: crate::store::TestOneShotHook::default(),
         #[cfg(test)]
@@ -1187,6 +1191,74 @@ impl DaemonState {
         }
     }
 
+    // Store's cached terminal completion is settled before this callback runs.
+    // Sample the gate again at the final owning transition to a FIFO claim.
+    fn reconcile_preclaim_gate(
+        &self,
+        session: &Arc<crate::store::topology::WriterSession>,
+    ) -> anyhow::Result<bool> {
+        let explicit = self.explicit_pending.lock().unwrap().clone();
+        let selected = explicit
+            .as_ref()
+            .map(|options| IndexOptions::clone(options))
+            .unwrap_or(
+                self.store
+                    .recorded_index_options()?
+                    .unwrap_or_else(|| self.config().options.clone()),
+            );
+        // The first sample is only advisory: ingress may arrive before claim.
+        let _early_gate =
+            self.watcher_work
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|(owner, work)| {
+                    owner
+                        .upgrade()
+                        .is_some_and(|owner| Arc::ptr_eq(&owner, session))
+                        && work.gate_pending(&selected)
+                });
+        #[cfg(test)]
+        self.test_queue_before_preclaim.run();
+        let gate_due = self
+            .watcher_work
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|(owner, work)| {
+                owner
+                    .upgrade()
+                    .is_some_and(|owner| Arc::ptr_eq(&owner, session))
+                    && work.gate_pending(&selected)
+            });
+        if !gate_due {
+            return Ok(true);
+        }
+        #[cfg(test)]
+        self.test_queue_before_watcher_reconcile.run();
+        let mut guard = self.watcher_work.lock().unwrap();
+        let pending = if let Some((owner, work)) = guard.as_mut()
+            && owner
+                .upgrade()
+                .is_some_and(|owner| Arc::ptr_eq(&owner, session))
+            && work.gate_pending(&selected)
+        {
+            let accounted =
+                work.reconcile_queue_gate(&self.store, session, &selected, &self.watcher_cancel)?;
+            self.publish_watch_status(work, &selected);
+            if accounted {
+                self.finalize_watcher_gate(work, &selected, explicit.as_ref());
+            }
+            !accounted || work.gate_pending(&selected)
+        } else {
+            false
+        };
+        drop(guard);
+        #[cfg(test)]
+        self.test_queue_after_watcher_reconcile.run();
+        Ok(!pending)
+    }
+
     fn worker_step(self: &Arc<Self>) -> anyhow::Result<()> {
         #[cfg(feature = "test-support")]
         let _held = self.worker_hold.read().unwrap();
@@ -1268,61 +1340,8 @@ impl DaemonState {
         {
             #[cfg(test)]
             self.test_queue_current_phase.store(2, Ordering::Release);
-            // A completed row leaves one watcher obligation ahead of the next claim.
-            // Skip debounce at this gate, but retain the watcher's retry deadline.
-            {
-                let explicit = self.explicit_pending.lock().unwrap().clone();
-                let selected = explicit
-                    .as_ref()
-                    .map(|options| IndexOptions::clone(options))
-                    .unwrap_or(
-                        self.store
-                            .recorded_index_options()?
-                            .unwrap_or_else(|| self.config().options.clone()),
-                    );
-                let gate_due =
-                    self.watcher_work
-                        .lock()
-                        .unwrap()
-                        .as_ref()
-                        .is_some_and(|(owner, work)| {
-                            owner
-                                .upgrade()
-                                .is_some_and(|owner| Arc::ptr_eq(&owner, session))
-                                && work.gate_pending(&selected)
-                        });
-                if gate_due {
-                    #[cfg(test)]
-                    self.test_queue_before_watcher_reconcile.run();
-                    let mut guard = self.watcher_work.lock().unwrap();
-                    let pending = if let Some((owner, work)) = guard.as_mut()
-                        && owner
-                            .upgrade()
-                            .is_some_and(|owner| Arc::ptr_eq(&owner, session))
-                        && work.gate_pending(&selected)
-                    {
-                        let accounted = work.reconcile_queue_gate(
-                            &self.store,
-                            session,
-                            &selected,
-                            &self.watcher_cancel,
-                        )?;
-                        self.publish_watch_status(work, &selected);
-                        if accounted {
-                            self.finalize_watcher_gate(work, &selected, explicit.as_ref());
-                        }
-                        !accounted || work.gate_pending(&selected)
-                    } else {
-                        false
-                    };
-                    drop(guard);
-                    #[cfg(test)]
-                    self.test_queue_after_watcher_reconcile.run();
-                    if pending {
-                        return Ok(());
-                    }
-                }
-            }
+            let gate_deferred = std::cell::Cell::new(false);
+            let gate_error = std::cell::Cell::new(false);
             let processed = match crate::index_coordinator::drain_one_request_with_watcher(
                 &self.store,
                 session,
@@ -1330,9 +1349,21 @@ impl DaemonState {
                 |id, p| {
                     self.job_progress.lock().unwrap().insert(id.to_owned(), p);
                 },
+                || {
+                    let claim_ready = self
+                        .reconcile_preclaim_gate(session)
+                        .inspect_err(|_| gate_error.set(true))?;
+                    gate_deferred.set(!claim_ready);
+                    Ok(claim_ready)
+                },
             ) {
                 Ok(processed) => processed,
                 Err(error) => {
+                    // A failed gate capture retains this watcher and its retry
+                    // deadline; only request/completion failures retire the writer.
+                    if gate_error.get() {
+                        return Err(error);
+                    }
                     // A cached terminal result must be resolved by this same
                     // incarnation. Otherwise release the stale writer so a
                     // successor can reclaim an unfinished running head.
@@ -1357,6 +1388,7 @@ impl DaemonState {
             // still queued, the guarded publish-BUSY path deferred it. Avoid
             // recapturing the workspace every 20 ms under sustained readers.
             if processed == 0
+                && !gate_deferred.get()
                 && self
                     .store
                     .earliest_unfinished_request()
@@ -1406,8 +1438,12 @@ impl DaemonState {
                         *work = Some((Arc::downgrade(session), scheduler));
                     }
                     if let Some((_, scheduler)) = work.as_mut() {
-                        if processed > 0 {
+                        let successor_waiting = self.store.earliest_unfinished_request()?.is_some();
+                        if processed > 0 && successor_waiting {
                             scheduler.set_queue_gate();
+                        } else if !successor_waiting {
+                            // With no successor, a later idle edit uses ordinary debounce.
+                            scheduler.clear_queue_gate();
                         }
                         #[cfg(test)]
                         self.test_queue_current_phase.store(4, Ordering::Release);

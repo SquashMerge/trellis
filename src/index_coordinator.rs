@@ -800,6 +800,10 @@ impl WatcherWork {
         self.queue_gate = true;
     }
 
+    pub(crate) fn clear_queue_gate(&mut self) {
+        self.queue_gate = false;
+    }
+
     pub(crate) fn gate_pending(&self, options: &IndexOptions) -> bool {
         self.queue_gate && self.accepted_watch_intent(options)
     }
@@ -1100,6 +1104,7 @@ pub fn drain_requests_observed_with_native(
         usize::MAX,
         None,
         None,
+        || Ok(true),
     )
 }
 
@@ -1119,6 +1124,7 @@ pub fn drain_one_request_observed(
         1,
         None,
         None,
+        || Ok(true),
     )
 }
 
@@ -1130,6 +1136,7 @@ pub(crate) fn drain_one_request_with_watcher(
     session: &Arc<WriterSession>,
     watcher: &OwningWatcher,
     progress: impl Fn(&str, IndexProgress) + Sync,
+    before_claim: impl Fn() -> Result<bool>,
 ) -> Result<usize> {
     drain_requests_observed_with_cancel(
         store,
@@ -1140,6 +1147,7 @@ pub(crate) fn drain_one_request_with_watcher(
         1,
         None,
         Some(watcher),
+        before_claim,
     )
 }
 
@@ -1157,6 +1165,7 @@ fn drain_requests_observed_with_cancel(
     max_completed: usize,
     cutoff_seq: Option<i64>,
     watcher: Option<&OwningWatcher>,
+    before_claim: impl Fn() -> Result<bool>,
 ) -> Result<usize> {
     if store.root_path_replaced()? {
         store.fail_changed_root_requests()?;
@@ -1198,9 +1207,24 @@ fn drain_requests_observed_with_cancel(
         {
             break;
         }
+        // Cached completion is confirmed above. Recheck the gate at the
+        // owning preclaim transition rather than relying on a worker sample.
+        if !before_claim()? {
+            break;
+        }
         let Some(request) = store.claim_request(session)? else {
             break;
         };
+        if let Some(watcher) = watcher {
+            let mut guard = watcher.lock().unwrap();
+            if let Some((owner, work)) = guard.as_mut()
+                && owner
+                    .upgrade()
+                    .is_some_and(|owner| Arc::ptr_eq(&owner, session))
+            {
+                work.clear_queue_gate();
+            }
+        }
         #[cfg(feature = "test-support")]
         store.run_after_claim_hook_for_tests();
         // Capture the authenticated expected pin from the same publication
