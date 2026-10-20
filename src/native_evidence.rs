@@ -649,10 +649,14 @@ pub fn from_capture(
     Ok(from_capture_observed(capture, root, root_id, cancel, |_, _| {})?.into_artifact())
 }
 
-/// An artifact that has passed `Artifact::validate` against exactly this
-/// capture, root and root id. Publication accepts it without repeating the
-/// full rebuild and comparison; only this module constructs one, and it
-/// offers no mutable access to the artifact.
+/// An artifact this process just built, by `build_native`, from exactly this
+/// capture, root and root id, and that passed the structural validation
+/// against it. Only `from_capture_observed` constructs one, from its own
+/// build, and it offers no mutable access to the artifact. Because the
+/// artifact is the build itself, it is not rebuilt and compared again
+/// (#199 I-4b): `build_native` determinism is a verify test instead. Any
+/// other artifact (a plain `Artifact` handed to the store) still runs the
+/// full `Artifact::validate`, rebuild and comparison included.
 pub(crate) struct ValidatedArtifact<'c> {
     artifact: Artifact,
     capture: &'c Capture,
@@ -686,7 +690,7 @@ pub(crate) fn full_validations_for_tests() -> usize {
 
 /// Call-scoped evidence from the full native pipeline. `Measured` fires only
 /// after extraction of that captured document; `Validated` fires only after
-/// the independent full-bundle rebuild and comparison have succeeded.
+/// the structural validation of the whole built artifact has succeeded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FullNativeStage {
     Measured,
@@ -703,7 +707,7 @@ pub(crate) fn from_capture_observed<'c>(
     let artifact = build_native_observed(capture, root, root_id, cancel, &|key| {
         observe(key, FullNativeStage::Measured);
     })?;
-    artifact.validate(capture, root, root_id, cancel)?;
+    artifact.validate_own_build(capture, cancel)?;
     for document in &artifact.revision.documents {
         observe(&document.key, FullNativeStage::Validated);
     }
@@ -2266,6 +2270,15 @@ impl Artifact {
         );
         self.validate_structure(&capture.files)?;
         capture.verify(cancel)
+    }
+    /// The artifact is this process's own `build_native` output for exactly
+    /// this capture, so rebuilding it would only re-check determinism, which
+    /// the `native_build_is_deterministic` verify test covers. Every
+    /// structural check and the capture freshness check still run. Only
+    /// `from_capture_observed` calls this.
+    fn validate_own_build(&self, capture: &Capture, cancel: &CancelFlag) -> Result<()> {
+        capture.verify(cancel)?;
+        self.validate_structure(&capture.files)
     }
     /// Reconstruct the native syntax from already-admitted immutable buffers; no source file
     /// is opened or hashed again. Comparison forbids well-shaped fabricated evidence.

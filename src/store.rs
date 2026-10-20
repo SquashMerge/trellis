@@ -8445,9 +8445,11 @@ impl Store {
         }
         self.validate_bundle_projection(graph, capture, native, cancel)
     }
-    /// The artifact already passed its one full rebuild-and-compare against
-    /// this capture. The capture freshness check and every bundle check still
-    /// run here; only the repeated rebuild is skipped.
+    /// The artifact is this process's own build from this capture
+    /// (`ValidatedArtifact`), so it is never rebuilt and compared (#199 I-4b).
+    /// The capture freshness check and every bundle check still run here. A
+    /// plain `Artifact` from any other caller goes through
+    /// `validate_native_bundle_with_mode`, which runs the full rebuild.
     fn validate_validated_native_bundle(
         &self,
         graph: &Graph,
