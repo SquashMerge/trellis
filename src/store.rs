@@ -672,6 +672,24 @@ struct WitnessInputs {
     revision: crate::native_evidence::Revision,
 }
 
+/// One selected document's manifest row, after its SQL row and byte budgets
+/// passed and before the rows they bound are read.
+struct SelectedHeader {
+    path: String,
+    language: String,
+    version_id: String,
+    graph_id: String,
+    class_id: String,
+    graph_hash: String,
+    class_hash: Option<String>,
+    hash: String,
+    bytes: i64,
+    scope: V8NativeScope,
+    /// The source, native and class ancillary rows, graph rows and F this
+    /// document's rows hold, in stored bytes, as its budgets measured them.
+    stored_bytes: u64,
+}
+
 /// One selected document's stored rows, read from one snapshot by
 /// `Store::fetch_selected_document` and not yet compared with its source.
 struct FetchedDocument {
@@ -693,19 +711,6 @@ struct FetchedDocument {
     class_rows: Vec<(String, String, String, String, String)>,
     relation_rows: Vec<(String, String, Option<String>, String)>,
     stored_f: Option<String>,
-}
-
-impl FetchedDocument {
-    /// The source and stored row text this fetch holds, to bound read-ahead.
-    fn bytes(&self) -> usize {
-        self.file.text.len()
-            + self.node_rows.iter().map(|r| r.3.len()).sum::<usize>()
-            + self.call_rows.iter().map(|r| r.4.len()).sum::<usize>()
-            + self.region_rows.iter().map(|r| r.3.len()).sum::<usize>()
-            + self.class_rows.iter().map(|r| r.4.len()).sum::<usize>()
-            + self.relation_rows.iter().map(|r| r.3.len()).sum::<usize>()
-            + self.stored_f.as_ref().map_or(0, String::len)
-    }
 }
 
 /// One selected document's source and native rows, as authenticated by its
@@ -985,9 +990,14 @@ enum MetricsDocumentFailure {
 /// How often a metrics worker polls the caller's check, in progress steps.
 /// A single-document request runs inline and checks at every step.
 const METRICS_WORKER_CHECK_EVERY: u32 = 64;
-/// Fetch up to this many documents (or bytes) ahead of the metrics workers.
+/// At most this many documents are read into one chunk for the workers.
 const METRICS_FETCH_DOCUMENTS: usize = 64;
-const METRICS_FETCH_BYTES: usize = 64 * 1024 * 1024;
+/// Read-ahead budget across the chunk being read and the chunk the workers
+/// hold, charged as each document's stored bytes (source, native and class
+/// ancillary rows, graph rows and F) as its existing SQL budgets measured them.
+/// Each of the two chunks is charged at most half of it; a document charged
+/// more than half is read and computed alone.
+const METRICS_FETCH_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Test overrides for one metrics request on this thread.
 #[cfg(test)]
@@ -1110,7 +1120,7 @@ impl EvidenceResponse {
         #[cfg(test)]
         let fetch_bytes = METRICS_TEST_PLAN
             .get()
-            .map_or(fetch_bytes, |plan| plan.fetch_bytes as usize);
+            .map_or(fetch_bytes, |plan| plan.fetch_bytes);
         let expired = || progress.expired();
         let check_every = if workers == 1 {
             1
@@ -1269,47 +1279,98 @@ impl EvidenceResponse {
             type Fetched = std::result::Result<FetchedDocument, MetricsDocumentFailure>;
             let mut remaining = included.iter();
             let mut exhausted = false;
+            // A document whose rows did not fit beside what is already held.
+            let mut carried: Option<(&DocumentKey, SelectedHeader)> = None;
             let mut pending: Option<(
                 Vec<&DocumentKey>,
                 std::thread::ScopedJoinHandle<'_, Vec<Option<_>>>,
             )> = None;
+            // The read-ahead charge of the chunk the workers hold, for the trace.
             #[cfg(test)]
             let mut pending_bytes = 0u64;
+            let chunk_bytes = fetch_bytes / 2;
             loop {
-                // Fetch the next chunk while the workers compute the previous one.
+                // Read the next chunk while the workers compute the previous one.
+                // Each chunk is charged at most half the budget, so the two held
+                // at once stay within it. Each document's budgets are read first
+                // and its rows only if its charge fits in this chunk. A document
+                // over half the budget is read and computed alone.
                 let mut keys: Vec<&DocumentKey> = Vec::new();
                 let mut fetched: Vec<std::sync::Mutex<Option<Fetched>>> = Vec::new();
-                let mut bytes = 0usize;
-                while !exhausted && keys.len() < METRICS_FETCH_DOCUMENTS && bytes < fetch_bytes {
-                    let Some(key) = remaining.next() else {
+                let mut bytes = 0u64;
+                let mut alone = false;
+                while keys.len() < METRICS_FETCH_DOCUMENTS {
+                    let (key, header) = match carried.take() {
+                        Some(carry) => carry,
+                        None => {
+                            if exhausted {
+                                break;
+                            }
+                            let Some(&key) = remaining.next() else {
+                                exhausted = true;
+                                break;
+                            };
+                            let header = if progress.expired() {
+                                Err(MetricsDocumentFailure::Stopped)
+                            } else {
+                                self.store
+                                    .fetch_selected_header(
+                                        &self.db,
+                                        &key.path,
+                                        &selected,
+                                        Some(&expired),
+                                    )
+                                    .map_err(MetricsDocumentFailure::Attest)
+                            };
+                            match header {
+                                Ok(header) => (key, header),
+                                Err(failure) => {
+                                    // Nothing after a failed document is read.
+                                    keys.push(key);
+                                    fetched.push(std::sync::Mutex::new(Some(Err(failure))));
+                                    exhausted = true;
+                                    break;
+                                }
+                            }
+                        }
+                    };
+                    let charge = header.stored_bytes;
+                    let oversized = charge > chunk_bytes;
+                    if !keys.is_empty() && (oversized || bytes.saturating_add(charge) > chunk_bytes)
+                    {
+                        // Start the next chunk with it.
+                        carried = Some((key, header));
+                        break;
+                    }
+                    if oversized && pending.is_some() {
+                        // Accept the chunk the workers hold before reading it.
+                        carried = Some((key, header));
+                        break;
+                    }
+                    keys.push(key);
+                    let item = self
+                        .store
+                        .fetch_selected_rows(&self.db, header, &selected, Some(&expired))
+                        .map_err(MetricsDocumentFailure::Attest);
+                    let failed = item.is_err();
+                    fetched.push(std::sync::Mutex::new(Some(item)));
+                    bytes = bytes.saturating_add(charge);
+                    #[cfg(test)]
+                    {
+                        METRICS_FETCH_TRACE.with_borrow_mut(|trace| trace.charges.push(charge));
+                        trace_metrics_resident(
+                            fetched.len() + pending.as_ref().map_or(0, |(keys, _)| keys.len()),
+                            bytes.saturating_add(pending_bytes),
+                        );
+                    }
+                    if failed {
                         exhausted = true;
                         break;
-                    };
-                    keys.push(*key);
-                    let item = if progress.expired() {
-                        Err(MetricsDocumentFailure::Stopped)
-                    } else {
-                        self.store
-                            .fetch_selected_document(&self.db, &key.path, &selected, Some(&expired))
-                            .map_err(MetricsDocumentFailure::Attest)
-                    };
-                    match &item {
-                        Ok(document) => {
-                            bytes = bytes.saturating_add(document.bytes());
-                            #[cfg(test)]
-                            METRICS_FETCH_TRACE.with_borrow_mut(|trace| {
-                                trace.charges.push(document.bytes() as u64)
-                            });
-                        }
-                        // Nothing after a failed document is read.
-                        Err(_) => exhausted = true,
                     }
-                    fetched.push(std::sync::Mutex::new(Some(item)));
-                    #[cfg(test)]
-                    trace_metrics_resident(
-                        fetched.len() + pending.as_ref().map_or(0, |(keys, _)| keys.len()),
-                        bytes as u64 + pending_bytes,
-                    );
+                    if oversized {
+                        alone = true;
+                        break;
+                    }
                 }
                 if let Some((keys, handle)) = pending.take() {
                     #[cfg(test)]
@@ -1324,6 +1385,9 @@ impl EvidenceResponse {
                     }
                 }
                 if keys.is_empty() {
+                    if carried.is_some() {
+                        continue;
+                    }
                     return Ok(());
                 }
                 let run = {
@@ -1341,14 +1405,15 @@ impl EvidenceResponse {
                         })
                     }
                 };
-                if workers == 1 {
+                if workers == 1 || alone {
+                    // Nothing else is read while this chunk is held.
                     for (key, outcome) in keys.into_iter().zip(run()) {
                         accept(key, outcome)?;
                     }
                 } else {
                     #[cfg(test)]
                     {
-                        pending_bytes = bytes as u64;
+                        pending_bytes = bytes;
                     }
                     pending = Some((keys, scope.spawn(run)));
                 }
@@ -11314,21 +11379,23 @@ impl Store {
         selected: &ReadRevision,
         progress: Option<&dyn Fn() -> bool>,
     ) -> Result<AttestedDocument> {
-        let fetched = self.fetch_selected_document(db, path, selected, progress)?;
+        let header = self.fetch_selected_header(db, path, selected, progress)?;
+        let fetched = self.fetch_selected_rows(db, header, selected, progress)?;
         Self::attest_fetched(fetched, progress)
     }
     /// Read, in this snapshot and in order, everything attestation compares
-    /// for one selected document. Each SQL row and byte budget is checked
-    /// before the rows it bounds are read, and stored rows are decoded and
-    /// structurally checked as they are read. Nothing is compared with the
-    /// source here: `attest_fetched` does that, off the connection.
-    fn fetch_selected_document(
+    /// for one selected document: first its manifest row and the SQL row and
+    /// byte budgets (`fetch_selected_header`), then, only after those budgets
+    /// pass, the rows they bound (`fetch_selected_rows`). Stored rows are
+    /// decoded and structurally checked as they are read. Nothing is compared
+    /// with the source here: `attest_fetched` does that, off the connection.
+    fn fetch_selected_header(
         &self,
         db: &Connection,
         path: &str,
         selected: &ReadRevision,
         progress: Option<&dyn Fn() -> bool>,
-    ) -> Result<FetchedDocument> {
+    ) -> Result<SelectedHeader> {
         #[cfg(test)]
         count_selected_read(|counts| counts.attestations += 1);
         use crate::native_evidence::DocumentKey;
@@ -11507,6 +11574,46 @@ impl Store {
                         .min(512 * 1024 * 1024),
             "incompatible_index: selected graph row byte budget exceeded"
         );
+        // Everything the rows below will hold, as the budgets above measured it.
+        let stored_bytes = [bytes, total_bytes, graph_total, f_length.unwrap_or(0)]
+            .iter()
+            .map(|&n| u64::try_from(n).unwrap_or(0))
+            .sum();
+        Ok(SelectedHeader {
+            path: path.to_owned(),
+            language,
+            version_id,
+            graph_id,
+            class_id,
+            graph_hash,
+            class_hash,
+            hash,
+            bytes,
+            scope,
+            stored_bytes,
+        })
+    }
+    fn fetch_selected_rows(
+        &self,
+        db: &Connection,
+        header: SelectedHeader,
+        selected: &ReadRevision,
+        progress: Option<&dyn Fn() -> bool>,
+    ) -> Result<FetchedDocument> {
+        let SelectedHeader {
+            path,
+            language,
+            version_id,
+            graph_id,
+            class_id,
+            graph_hash,
+            class_hash,
+            hash,
+            bytes,
+            scope,
+            stored_bytes: _,
+        } = header;
+        let path = path.as_str();
         let file = Self::selected_source_row_bounded_for_inner(
             db,
             path,
