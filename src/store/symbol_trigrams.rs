@@ -90,6 +90,9 @@ impl Search<'_> {
         let Some(expression) = match_expression(query) else {
             return ranked(db, &self.sql(self.source), values).map(unranked);
         };
+        // Decision 0013: whether the query can occur in an ID is decided from the
+        // query alone, before FTS5 runs.
+        let id_shaped = can_match_an_id(query);
         let mut values = values.to_vec();
         values.push(&expression);
         let alias = self.source.rsplit(' ').next().unwrap_or_default();
@@ -101,7 +104,7 @@ impl Search<'_> {
             p = self.match_parameter,
         );
         let hits = ranked(db, &self.sql(&names), &values)?;
-        if !can_match_an_id(query) || names_decide(&hits, limit) {
+        if !id_shaped || names_decide(&hits, limit) {
             return Ok(unranked(hits));
         }
         #[cfg(test)]
