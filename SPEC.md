@@ -118,7 +118,7 @@ Build one vertical slice before the Tauri shell or provider integrations:
    CPU and SQLite work must not block the async request executor. Source lookups may pin
    an expected revision; mismatches return conflicts rather than wrong source spans.
 5. A small browser inspection client exercises this API. It is an integration harness,
-   not the production React canvas or a successful sequence-diagram usefulness test.
+   not a production structure renderer or a successful sequence-diagram usefulness test.
 
 Default state lives outside the indexed repository. Scanning respects ignores, excludes
 build/dependency/state directories and does not follow symlinks. The service has no
@@ -147,7 +147,7 @@ API and inspector checks passed. The product-level diagram and provider gates re
 | --- | --- | --- |
 | 1. Read | File/method browsing, static sequences, class diagrams; portable MCP tools for direct terminal/optional Herdr agents or optional ACP sessions | Measured extraction + per-checkout stdio MCP; neither terminal embedding nor ACP is required for MCP |
 | 2. Data | DB connection, ERD, `mapsTo` links from entity types to tables | Phase 1 model, driver sandboxing |
-| 3. Author | Edit on canvas, diff revisions, agent writes the code | Phases 1–2 plus a real identity story |
+| 3. Author (later; not scheduled) | Edit Mermaid, diff its structure, ask an agent to change code, then re-index | Phases 1–2 plus revision-bound identities, an explicit change request and approval path |
 
 **Non-goals.** No text editor — the agents edit. No debugger. No attempt to be an IDE.
 The file viewer is read-only with syntax highlighting and jump-to-symbol.
@@ -165,9 +165,9 @@ Trellis asks:
   structure to traverse.
 - **Latency.** A sequence diagram is a recursive expansion. Resolved live, that is
   hundreds of round trips serialised by depth. Interactive means under 100ms.
-- **Some facts are not in the code.** Layout pins, hidden nodes, notes, agent-inferred
-  edges, ORM mappings, provenance. These are annotations keyed to symbols and need
-  somewhere durable to live.
+- **Some facts are not in the code.** Saved view selections, hidden-node choices,
+  notes, accepted agent-inferred edges, ORM mappings and provenance are annotations
+  keyed to symbols. Renderer positions do not need to be pinned or stored.
 - **The database schema is not in the repository at all.**
 
 ### The discipline that keeps this honest
@@ -188,8 +188,10 @@ The store is split in two, physically:
 
 With identical source bytes, pinned extraction tools, semantic-index artifacts and
 database snapshots, deleting the index must reproduce the same normalized semantic
-graph. Preserve accepted agent output and layout decisions in the durable store.
-SQLite file bytes and renderer pixels are not the determinism contract.
+graph. Preserve accepted agent output, saved views, notes and non-positional user
+choices under their durable-state contracts. Re-indexing may change renderer
+coordinates; this decision does not migrate or delete stored records. SQLite
+file bytes and renderer pixels are not the determinism contract.
 
 ## 3. Stack
 
@@ -207,8 +209,8 @@ cancellable core services; externally run agents stay externally owned.
 | Store | SQLite (rusqlite), WAL |
 | ACP | official Rust library, behind a thin local adapter |
 | Front end | React + TypeScript, Vite |
-| Canvas | React Flow (xyflow) |
-| Graph layout | ELK.js, `layered`, in a worker |
+| Structure rendering target | Generated Mermaid, rendered by a locally served, pinned Pele release; migrate one view at a time |
+| Diagram layout | Pele; positions are not pinned across revisions |
 | Terminal UI | xterm.js |
 
 **Current development mode: a plain daemon with an embedded browser front end.**
@@ -693,35 +695,36 @@ receives an inbox event/deep link; publication must not steal focus, run a provi
 
 ## 9. Rendering
 
-Three renderers over one model, not one renderer with three modes. Class diagrams and
-ERDs are node-link graphs and share almost everything. Sequence diagrams are not graphs
-— they are lifelines on one axis and time on the other.
+**Target: generate Mermaid from the revision-bound structure model and render it with a
+locally served, exact-version-pinned Pele asset.** Mermaid is both the rendered source
+and an export format; it does not define evidence. Start with a read-only sequence
+slice. Class diagrams and later ERD, event, state, C4 and treemap views each need a
+measured model and their own acceptance before migration. The present hand-written
+sequence/class SVG remains usable until its replacement passes the corresponding
+interaction and evidence-parity tests. A future packaged shell or frontend framework
+is not a prerequisite.
 
-| Surface | Pick |
+| Concern | Rule |
 | --- | --- |
-| Class diagram and ERD | React Flow (xyflow); custom nodes are plain HTML, and it is already an editor for Phase 3 |
-| Graph layout | ELK.js `layered` in a worker |
-| Sequence diagram | Hand-written SVG, ~400 lines, owning every click target |
-| Export | Mermaid, SVG, PNG |
-
-**Mermaid is an export format, not a rendering strategy.** Generating Mermaid for
-pasting into pull requests is a real feature. Rendering *through* Mermaid gives no
-stable element identity, no click-to-source, and no control over activation bars or
-`alt`/`loop` frames.
+| Projection | Each view projects its admitted DTO to Mermaid text; do not infer calls, targets, dispatch, runtime traces, return values or control paths from the renderer's capabilities. |
+| Layout | Pele lays out each result. Positions are **not pinned** and may move after re-indexing; selection and source evidence remain revision-bound. |
+| Source identity | Map rendered elements to original measured symbol/call/control IDs and source ranges. Pele's own `data-id` is positional renderer metadata, not a Trellis ID; pin/test its output and fail closed when the mapping changes. A prototype `alt` frame had no native `data-id`. |
+| Read behavior | Keep click and keyboard navigation, deliberate collapse/expand, source-inspector detail, original guards and alternates, unknown/partial labels, and snapshot checks. Unsupported DTO shapes must keep a safe fallback or fail visibly, never silently disappear. |
+| Browser safety | App-owned options, local assets under the existing CSP, bounded Mermaid/SVG/work, text-only repository labels, `textContent` error display and DESIGN.md tokens. |
 
 **Cap diagram size as a product rule.** Past roughly 150 boxes a class diagram is a
 poster. Default to a seeded query with a depth limit, expand-neighbours on each node,
-and collapse the frontier into package-level nodes. Enforcing this also keeps SVG fast
-enough that no WebGL renderer is ever needed.
+and collapse the frontier into package-level nodes. Limits and omissions remain visible.
 
-**Preserve the mental map.** Once a user drags a node its position is pinned and layout
-never moves it again. When re-indexing adds nodes, lay out only the new ones against
-fixed old ones. A diagram that reshuffles after every save is one users stop opening.
-
-**Sequence layout.** Lifelines are columns ordered by first appearance; messages are
-rows in `ordinal` order; `control` becomes nested `alt`/`loop`/`try` frames drawn as
-labelled rectangles spanning the participating columns. Self-calls get a loop-back arrow
-and an activation bar. Every arrow carries its edge id so clicking opens the call site.
+**Sequence fidelity.** Lifelines, messages, notes and control frames must reflect the
+measured SequenceView, in call order. Display unresolved or terminal calls as such;
+do not draw a resolved target, self-call activation duration, return arrow or observed
+runtime order without supporting evidence. Preserve every source-bearing guard,
+alternate, exit and source action. A small Pele 1.6.0 feasibility probe for #182
+rendered a real indexed DTO and clicked one call, but did not prove all existing
+sequence interactions or a published-Store read. Migrate only after those tests pass.
+The loopback asset-size tradeoff is accepted; still measure actual deployed bytes and
+browser load/render behavior at normal size.
 
 ## 10. Database and ERD
 
@@ -757,41 +760,35 @@ default.
 Nearly free follow-on: diff the live schema against the repo's migration files and show
 drift on the ERD.
 
-## 11. Phase 3 — diagram to code
+## 11. Later direction — Mermaid edits to agent change requests (not scheduled)
 
-Model-driven round-trip engineering failed for thirty years because diagrams
-underspecify code, generators filled the gap with templates, and templates produced code
-nobody wanted to own. Protected regions were the symptom, not the cure.
+Phase 1 structure views are **read-only**. If authoring is scheduled later,
+users may edit the generated Mermaid text directly or through GUI controls that
+edit that text. The edited diagram is a proposal, not measured evidence or a
+request for Trellis to write source files. Do not generate code from the picture.
 
-What changed is gap-filling: an agent reading the surrounding codebase infers
-conventions, naming, error handling and test style, so it does not need a complete
-specification. What has not changed is acceptance — you still cannot tell by looking
-whether the generated code matches the diagram.
-
-**So do not generate from the diagram. Generate from the diff, and verify by
-re-indexing.**
-
-1. The user edits the canvas. Compute a semantic changeset against the model, not a
-   picture: `addMethod(Invoice, applyDiscount(Money) -> Money)`,
-   `extractInterface(PaymentGateway, [authorize, capture])`,
+1. Parse the original revision-bound Mermaid and the user's edited Mermaid into
+   structural models and compare their *structure*, not whitespace, statement
+   position or layout. For example: `addMethod(Invoice, applyDiscount(Money) -> Money)`,
+   `extractInterface(PaymentGateway, [authorize, capture])`, or
    `addColumn(invoice, discount_cents, bigint not null default 0)`.
-2. Split it. Use an LSP refactoring only when the chosen server supports it and its
-   document/configuration basis is valid. Preview and explicitly approve edits; reject stale
-   versions. Rename/move/extract/change-signature support is not universal or automatically exact.
-3. The remainder goes to the agent as an explicit instruction list, fetched through the
-   MCP server rather than pasted into a prompt.
-4. Re-index the touched files.
-5. Diff the measured model against the model the user drew. Report per change: applied,
-   partially applied, or diverged.
+2. Anchor existing elements to stable indexed symbol/call identities and their
+   current source evidence. Treat new elements and uncertain matches explicitly;
+   reject stale bases or ambiguous structural changes instead of guessing intent.
+   Define a bounded, typed change-request vocabulary per diagram type when that
+   type's authoring phase is scheduled. An edit remains user-proposed intent.
+3. Preview the structured request and require explicit approval before handing it
+   to an agent through an accepted agent path. The agent edits the repository;
+   Trellis does not. Use LSP refactoring only when the chosen server supports it
+   and its document/configuration basis is valid. Never silently run a provider.
+4. Re-index after the agent's edits. Compare the new measured model with the
+   user's proposed structure; report applied, partially applied and diverged
+   changes, retaining source and revision evidence for each.
 
-Step 5 is the whole thing — a predicted-versus-measured loop where the intended model is
-the prediction, the re-indexed model is the measurement, and the residual is what the
-user sees. Without it this is a code generator people abandon after the third surprise.
-With it, partial application is a visible, actionable state, and the divergences become
-the next instruction to the agent.
-
-Two hard rules. Never regenerate a file wholesale — every change is an edit to existing
-code. Never introduce protected regions or generated-code markers.
+Never regenerate a file wholesale or introduce protected regions or generated-code
+markers. This direction does not ship GUI editing, a structural diff protocol or
+an agent handoff in Phase 1. Phases 2–3 require their own product criteria and
+permission review before implementation.
 
 ## 12. Build order and current integration slices
 
