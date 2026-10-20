@@ -811,7 +811,17 @@ fn standalone_takeover_replays_original_relative_presentation_from_another_cwd()
         String::from_utf8_lossy(&indexed.stderr)
     );
     let initial: Value = serde_json::from_slice(&indexed.stdout).unwrap();
-    assert_eq!(initial["publishedRevision"]["indexRevision"], 2);
+    // Startup reconciliation publishes r1. If its capture already used the
+    // accepted request's SCIP options, the request is unchanged and completes
+    // at r1 (Decision 0006 §3); otherwise it publishes r2 for the new inputs.
+    assert!(
+        (1..=2).contains(
+            &initial["publishedRevision"]["indexRevision"]
+                .as_u64()
+                .unwrap()
+        ),
+        "{initial}"
+    );
     let indexes = if cfg!(target_os = "macos") {
         home.join("Library/Caches/dev.squashmerge.trellis/indexes")
     } else {
@@ -853,11 +863,7 @@ fn standalone_takeover_replays_original_relative_presentation_from_another_cwd()
         String::from_utf8_lossy(&status.stderr)
     );
     let status: Value = serde_json::from_slice(&status.stdout).unwrap();
-    assert_eq!(status["revision"]["indexRevision"], 2);
-    assert_eq!(
-        status["revision"]["indexGeneration"],
-        initial["publishedRevision"]["indexGeneration"]
-    );
+    assert_eq!(status["revision"], initial["publishedRevision"]);
     let export = command(&root, &home, "export")
         .current_dir(&second_cwd)
         .output()
