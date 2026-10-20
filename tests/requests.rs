@@ -1239,13 +1239,6 @@ fn executable_drift_claim_child() {
     if stage == "new" {
         // The rebuilt image's first claimed publication, as at daemon startup.
         let previous = store.index_baseline().unwrap();
-        if std::env::var("TRELLIS_DRIFT_CLAIM_EDIT").is_ok() {
-            fs::write(
-                options.workspace_root.join("a.js"),
-                std::env::var("TRELLIS_DRIFT_CLAIM_EDIT").unwrap(),
-            )
-            .unwrap();
-        }
         // Mandatory startup reconciliation, observed by its mode.
         let modes = Mutex::new(Vec::new());
         trellis::index_coordinator::IndexJobCoordinator::prepare(&store, None)
@@ -1530,8 +1523,10 @@ fn asserted_claim_under_real_executable_drift(body_edit: bool, drift: bool) {
                 if let Some(hash) = extractor {
                     command.env("TRELLIS_TEST_EXTRACTOR_HASH", hash);
                 }
+                // The edit is written here: its text exceeds Linux's
+                // per-string environment limit.
                 if let Some(edit) = edit {
-                    command.env("TRELLIS_DRIFT_CLAIM_EDIT", edit);
+                    fs::write(workspace.path().join("a.js"), edit).unwrap();
                 }
                 let next = command.output().unwrap();
                 assert!(
