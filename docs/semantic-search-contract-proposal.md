@@ -40,7 +40,7 @@ Each item below ends with its open questions. The decisions they add up to are:
 | D10 | Size budget | int8 vectors at ≤1024 dimensions; a size cap on `vectors.db`; FTS5 measured against #199. Whether search waits for #199's size items is an owner decision |
 | D11 | Remote embedding (voyage-code-4) | Out of scope until the owner opts in; it would need its own contract change |
 | D12 | FTS5 and #199 item 5 (Q-8) | Two tables: a trigram prefilter for W2 (every hit still verified by W2's literal rule) and a split-identifier table for search |
-| D13 | Hybrid ordering | A fixed, deterministic fusion and tie-break rule (§1), part of the contract; changing it is a contract change. BM25 is scored over a head-only FTS5 table. The query transformation is total. Ranking is stable only for the same embedded vector set (or bound to it with `vectorSet`: owner choice) |
+| D13 | Hybrid ordering | A fixed, deterministic fusion and tie-break rule (§1), part of the contract; changing it is a contract change. BM25 is scored over a head-only FTS5 table. The query transformation is total. No cross-call output promise by default; an optional `vectorSet` can promise only the same ordered hits, under stated conditions (owner choice). Cache-key reuse doesn't imply byte-identical vectors |
 
 ## 1. New MCP tool and catalog version
 
@@ -130,25 +130,37 @@ tool, not a `view` of another tool, and not an `inspect` union.
   - **Proposed:** ordering is deterministic only when all of these are equal:
     - the index snapshot and the request;
     - `modelId`;
-    - the inference runtime build;
-    - the **cached vector values** used in the call: the same card hashes *and* the same vector
-      bytes for each.
+    - the inference runtime build and its numerical backend;
+    - the **vector values** used in the call: the same card hashes *and* the same cached vector
+      bytes for each, and the same query-vector bytes.
 
     A vector re-embedded for the same card hash (after eviction, repair, or under another runtime
     build) can have different bytes, and so a different similarity and rank, without any change
     in membership. Ranking is explicitly not stable across cache changes at one pin, and the
     result makes no equality promise across calls. `searchIndex.embedded` and `state` let a caller
     see that the cache was incomplete.
-  - **Alternative, for the owner (open question 6):** bind each result to the cached **values**
+  - **Alternative, for the owner (open question 6):** bind each result to the vector **values**
     it used, adding `searchIndex.vectorSet: Hash`.
     - **Value digest.** Each cache row stores a `valueDigest`, the SHA-256 of its vector blob,
-      computed when the row is written. This is an identity for equality, not an integrity check;
-      T00 asks for none.
+      computed when the row is written. The query vector, embedded on demand in this call, gets
+      its own `queryVectorDigest`, the SHA-256 of its bytes. These are identities for equality,
+      not integrity checks; T00 asks for none.
     - **`vectorSet`.** SHA-256 over the domain `trellis.search-vector-set.v1\0` and the canonical
-      JSON of: `modelId`, the inference runtime build identity, and the sorted
-      `(cardHash, valueDigest)` pairs used in this call.
-    - **Promise.** Equal `evidenceBasis`, equal request and equal `vectorSet` give equal output.
-      The query vector is covered by the same model and runtime identity.
+      JSON of:
+      - `modelId`;
+      - the inference runtime build identity and its numerical backend (for example CPU or Metal,
+        and its precision);
+      - `queryVectorDigest`;
+      - the sorted `(cardHash, valueDigest)` pairs used in this call.
+    - **Promise: ordered hits only, under stated conditions.** If `evidenceBasis`, the request and
+      `vectorSet` are all equal, the similarity computation over those exact bytes uses the
+      contract's fixed arithmetic. The emitted **ordered hit list** (each hit's `symbolId`, `rank`
+      and `matchedBy`) is then equal.
+    - **Not the whole envelope.** `searchIndex.state` (a background job can start or stop),
+      `catchingUp`, the request ID and anything else sampled at admission can still differ.
+    - **No promise that the same query embeds to the same bytes.** Re-embedding a query on another
+      backend can change `queryVectorDigest`, and then nothing is promised. `vectorSet` makes the
+      difference visible; it doesn't prevent it.
     - **Cost and limits.** Combining stored digests costs one hash pass per call, not a re-hash
       of the vectors. It detects drift; it doesn't make vectors immutable. That would mean storing
       them in `index.db` (open question 13).
@@ -181,21 +193,32 @@ tool, not a `view` of another tool, and not an `inspect` union.
   4. If no term remains (punctuation-only, underscore-only or stopword-only input), **the lexical
      arm is empty**, and no FTS5 query runs. The result comes from the vector arm alone, or has
      zero hits. This is the only query-shape fallback; it is decided before FTS5 is touched.
-  5. **Store errors are never a fallback.** An expression built this way can't be a syntax error.
-     Any SQLite or FTS5 error from running it (corruption, a schema mismatch, I/O, a malformed
-     FTS5 index) is a store fault. The call fails with the existing typed failure
-     (`store_unavailable`), per T00 and W8. It never retries with raw text, and it never returns a
-     vector-only result as if the lexical arm had succeeded.
+  5. **Errors after FTS5 runs are never a fallback.** An expression built this way can't be a
+     syntax error: terms contain only L\*/N\*/Co characters, so no NUL or quote ever reaches the
+     parser. Errors from running it are classified like every other Trellis read (see **Error
+     classes** below). None of them is answered by retrying with raw text, or by a vector-only
+     result presented as if the lexical arm had succeeded.
 
   The W2 trigram prefilter (§11) has its own total rule:
-  - **Query limitations only.** The whole query becomes one FTS5 string literal with `"` doubled,
-    and the prefilter is used only when the query has at least three Unicode characters. A query
-    the prefilter can't represent (fewer than three characters) uses W2's literal scan. That is
-    decided from the query alone, before FTS5 runs.
-  - **Store faults are typed failures.** A SQLite or FTS5 error while running the prefilter
-    (corruption, schema, I/O) is a store fault, not a query limitation. It fails W2's call with
-    `store_unavailable`, per T00 and W8, and is never answered by a successful literal-scan
-    fallback.
+  - **Query limitations, decided before FTS5.** The prefilter is used only for a *representable*
+    query: one with at least three Unicode characters and no U+0000. W2 admits U+0000 in its
+    literal query, but an FTS5 string literal can't carry it (FTS5's parser ends the string at the
+    NUL and reports `unterminated string` on a healthy table). Every other query uses W2's
+    literal scan, decided from the query alone. A representable query becomes one FTS5 string
+    literal with `"` doubled.
+  - **After FTS5 runs,** errors follow the error classes below. They are never answered by a
+    successful literal-scan fallback.
+
+  **Error classes** (both FTS5 paths, and the vector-cache read):
+  - **Contention is not an invalid store.** `SQLITE_BUSY` or `SQLITE_LOCKED` from another Trellis
+    process or connection follows the existing rule (CLAUDE.md, AGENTS.md): it becomes the
+    internal typed `storage_busy`, with a bounded wait and retry inside the call. If contention
+    outlasts the call's five-second deadline, the call returns W8's existing retryable
+    `deadline_exceeded`, as Trellis already maps exhausted read contention for MCP. Cancellation
+    suppresses output as usual. No new wire code is added.
+  - **`store_unavailable` is for actual store faults only:** corruption (`SQLITE_CORRUPT`,
+    `SQLITE_NOTADB`, a malformed FTS5 index), a schema mismatch, and I/O, permission or
+    unsafe-file errors. These are W8's nonretryable "unsafe/unreadable/invalid store", per T00.
 - **Summary text:** `trellis_search_symbols: <n> hits; full result in structuredContent.`, with the
   item word `hits`.
 - **Bounds:** W2's 65,536-byte response cap, its longest-fitting-prefix rule, and the five-second
@@ -227,9 +250,9 @@ its fixture are closed. The catalog adds about 13 KB to a 73 KB compact catalog.
    lexical arm limited to exact phrase, literal and identifier matches? The ordering rule above
    stays deterministic whichever constants are chosen.
 6. **Ranking stability across cache changes.** Should results make no equality promise across
-   calls (proposed), or carry `searchIndex.vectorSet`, a hash of the cached vector *values* used
-   plus model and runtime identity, so that equal basis, request and `vectorSet` promise equal
-   output?
+   calls (proposed), or carry `searchIndex.vectorSet`? That hashes the cached and query vector
+   *values* used, plus model, runtime and backend identity, so that equal basis, request and
+   `vectorSet` promise the same ordered hits (not the same whole envelope).
 
 ## 2. Card content and native extraction
 
@@ -388,8 +411,10 @@ other tools.
   searches again at the new head. Search does not promise that its hits stay verifiable at its
   basis.
 - **Vectors.** Vectors are looked up by the card hash stored *in that snapshot*. A vector embedded
-  for an identical card at another revision is the same vector, so no cross-revision evidence is
-  involved. A missing vector only lowers `embedded` (§3).
+  for an identical card at another revision is reused by its cache key `(modelId, cardHash)`, so no
+  cross-revision evidence is involved. Reusing a key does not mean the bytes are identical to a
+  past or future embedding of that card: a re-embedding after eviction, or under another runtime,
+  may differ (§1). A missing vector only lowers `embedded` (§3).
 - **Ranking.** The ranking is global within that snapshot. It is never stitched across revisions,
   and a later publication never moves an in-flight answer.
 
@@ -485,6 +510,10 @@ typed, and needs no new rule; the plan's citation should be fixed.
     "unsafe/unreadable/invalid store" returns `store_unavailable`. A lexical-only success here would
     be a best-effort answer. The daemon may then recreate `vectors.db` as disposable derived state,
     outside the read.
+  - **Contention is neither case.** `SQLITE_BUSY` or `SQLITE_LOCKED` on `vectors.db` (for example
+    while the embedding job writes) is the internal `storage_busy`, with a bounded wait and retry,
+    then W8's retryable `deadline_exceeded` (§1, error classes). It is never `store_unavailable`
+    and never a lexical-only success.
   - **Alternative, for the owner:** classify `vectors.db` as wholly optional, so that a
     database-level failure answers lexical-only with `searchIndex.state:"unavailable"`. That keeps
     search available on a damaged cache, but it is an explicit exception to T00's corrupt-failure
@@ -492,8 +521,11 @@ typed, and needs no new rule; the plan's citation should be fixed.
   - No per-vector checksum: under T00 and CLAUDE.md, Trellis trusts what it wrote and validated.
     This narrows the plan's proposed vector-blob checksum.
 
-**Why.** Vectors are pure functions of `(model, card text)`, so sharing them per user, like
-facts, avoids re-embedding for each worktree or rebuild. Keeping them out of `index.db` avoids
+**Why.** A vector is keyed by `(modelId, card text)`, and any vector stored under that key is a
+valid embedding of that card for that model. Sharing them per user, like facts, avoids
+re-embedding for each worktree or rebuild. The key identifies *what* was embedded, not
+byte-identical output: two embeddings of one key on different runtimes may differ in the last bits
+(§1). Keeping them out of `index.db` avoids
 adding to the size problem #199 is working on.
 
 **Open questions.**
@@ -680,13 +712,13 @@ scores (§5).
   trigram folding can't diverge from W2's ASCII-only `lower`. Every prefiltered candidate is still
   checked with W2's literal ASCII-`lower`/`instr` rule. The query is ASCII-`lower`ed the same way
   before it is quoted.
-  - **Literal-scan fallback, for query limitations only.** A query with fewer than three Unicode
-    characters can't form a trigram, so it uses the literal scan. That is decided from the query
-    alone, before FTS5 runs.
-  - **Store faults are typed failures.** A SQLite or FTS5 error while running the prefilter
-    (corruption, schema mismatch, I/O, a malformed FTS5 index) is a store fault. It fails the call
-    with `store_unavailable` under T00 and W8. It is never answered by a successful literal-scan
-    result.
+  - **Literal-scan fallback, for query limitations only.** It is decided from the query alone,
+    before FTS5 runs. A query takes the literal scan when it has fewer than three Unicode
+    characters (no trigram) or contains U+0000 (an FTS5 string literal can't carry a NUL).
+  - **After FTS5 runs,** errors follow §1's error classes and never fall back. Contention
+    (`SQLITE_BUSY`/`LOCKED`) is the internal `storage_busy`, retried within the deadline, and then
+    `deadline_exceeded`. Actual corruption, schema mismatch and I/O faults are
+    `store_unavailable`.
   - W2's output stays byte-identical for **all** valid 1–256-byte queries that it answers. Its
     256-byte query limit is unchanged; it is a byte limit, independent of trigram eligibility.
 - **For search:** a head-only table with tokenizer `porter unicode61 remove_diacritics 2`
