@@ -2479,7 +2479,8 @@ fn real_native_snapshot(home: &std::path::Path) -> Value {
     let mut all_rows = serde_json::Map::new();
     // Generation-specific binding control is checked separately; compare the
     // actual native/graph/class evidence across independent CLI/daemon roots.
-    let mut names = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name!='native_binding_epoch' AND name!='native_revision_supersessions' AND (name LIKE 'native_%' OR name IN ('document_versions','revision_documents','revision_capture_inputs','graph_projections','graph_nodes','graph_calls','graph_regions','class_projections','classes','class_relations')) ORDER BY name").unwrap();
+    // Decision 0013's trigram prefilter tables are derived search state.
+    let mut names = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE '%trigrams%' AND name!='native_binding_epoch' AND name!='native_revision_supersessions' AND (name LIKE 'native_%' OR name IN ('document_versions','revision_documents','revision_capture_inputs','graph_projections','graph_nodes','graph_calls','graph_regions','class_projections','classes','class_relations')) ORDER BY name").unwrap();
     for name in names.query_map([], |r| r.get::<_, String>(0)).unwrap() {
         let name = name.unwrap();
         let (predicate, alias) = match name.as_str() {

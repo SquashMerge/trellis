@@ -715,7 +715,8 @@ fn sqlite_snapshot(
         .unwrap();
     assert_eq!(violations, 0, "all retained revision FKs must remain valid");
     let tables: Vec<String> = db
-        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name!='index_metadata' ORDER BY name")
+        // Decision 0013's trigram prefilter tables are derived search state, not evidence.
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name!='index_metadata' AND name NOT LIKE '%trigrams%' ORDER BY name")
         .unwrap()
         .query_map([], |row| row.get::<_, String>(0))
         .unwrap()

@@ -129,6 +129,24 @@ pub(crate) fn with_literal_scan<T>(read: impl FnOnce() -> T) -> T {
 }
 
 #[cfg(test)]
+impl super::Store {
+    /// Overwrite both trigram tables' FTS5 structure records with garbage.
+    pub(crate) fn corrupt_symbol_trigrams_for_tests(&self) -> Result<()> {
+        let db = self.cache_write()?;
+        for table in ["native_declaration_trigrams", "graph_node_trigrams"] {
+            anyhow::ensure!(
+                db.execute(
+                    &format!("UPDATE {table}_data SET block=x'ffffffffffffffff' WHERE id=10"),
+                    [],
+                )? == 1,
+                "trigram structure record absent"
+            );
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -303,23 +321,5 @@ mod tests {
         }
         assert_eq!(rows("sid:v1:"), [1, 2]);
         assert_eq!(rows("absent"), Vec::<i64>::new());
-    }
-}
-
-#[cfg(test)]
-impl super::Store {
-    /// Overwrite both trigram tables' FTS5 structure records with garbage.
-    pub(crate) fn corrupt_symbol_trigrams_for_tests(&self) -> Result<()> {
-        let db = self.cache_write()?;
-        for table in ["native_declaration_trigrams", "graph_node_trigrams"] {
-            anyhow::ensure!(
-                db.execute(
-                    &format!("UPDATE {table}_data SET block=x'ffffffffffffffff' WHERE id=10"),
-                    [],
-                )? == 1,
-                "trigram structure record absent"
-            );
-        }
-        Ok(())
     }
 }
