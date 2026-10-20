@@ -20,7 +20,16 @@ use std::{
 };
 
 #[cfg(test)]
-type TestMetricsDocumentHook = Arc<dyn Fn(&str) + Send + Sync>;
+type TestMetricsDocumentHook = Arc<dyn Fn(&str, MetricsDocumentStage) + Send + Sync>;
+/// When a metrics document's test hook runs.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MetricsDocumentStage {
+    /// Its attestation and metrics work is starting.
+    Start,
+    /// That work has returned, with success or failure.
+    Done,
+}
 #[derive(Default)]
 pub(crate) struct TestOneShotHook(Mutex<Option<Box<dyn FnOnce() + Send>>>);
 impl std::fmt::Debug for TestOneShotHook {
@@ -980,6 +989,40 @@ const METRICS_WORKER_CHECK_EVERY: u32 = 64;
 const METRICS_FETCH_DOCUMENTS: usize = 64;
 const METRICS_FETCH_BYTES: usize = 64 * 1024 * 1024;
 
+/// Test overrides for one metrics request on this thread.
+#[cfg(test)]
+#[derive(Clone, Copy)]
+struct MetricsTestPlan {
+    workers: usize,
+    fetch_bytes: u64,
+}
+/// What one metrics request on this thread held between its reads and
+/// its acceptance of each document.
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct MetricsFetchTrace {
+    /// Each fetched document's read-ahead charge, in manifest order.
+    charges: Vec<u64>,
+    /// The most documents read and not yet accepted at once.
+    max_resident_documents: usize,
+    /// The most read-ahead charge held at once.
+    max_resident_bytes: u64,
+}
+#[cfg(test)]
+thread_local! {
+    static METRICS_TEST_PLAN: std::cell::Cell<Option<MetricsTestPlan>> =
+        const { std::cell::Cell::new(None) };
+    static METRICS_FETCH_TRACE: std::cell::RefCell<MetricsFetchTrace> =
+        std::cell::RefCell::default();
+}
+#[cfg(test)]
+fn trace_metrics_resident(documents: usize, bytes: u64) {
+    METRICS_FETCH_TRACE.with_borrow_mut(|trace| {
+        trace.max_resident_documents = trace.max_resident_documents.max(documents);
+        trace.max_resident_bytes = trace.max_resident_bytes.max(bytes);
+    });
+}
+
 impl EvidenceResponse {
     /// Compute metrics from one selected revision in this response's read transaction.
     pub fn metrics_at(
@@ -1059,6 +1102,15 @@ impl EvidenceResponse {
         } else {
             1
         };
+        #[cfg(test)]
+        let workers = METRICS_TEST_PLAN
+            .get()
+            .map_or(workers, |plan| plan.workers.min(included.len().max(1)));
+        let fetch_bytes = METRICS_FETCH_BYTES;
+        #[cfg(test)]
+        let fetch_bytes = METRICS_TEST_PLAN
+            .get()
+            .map_or(fetch_bytes, |plan| plan.fetch_bytes as usize);
         let expired = || progress.expired();
         let check_every = if workers == 1 {
             1
@@ -1066,12 +1118,10 @@ impl EvidenceResponse {
             METRICS_WORKER_CHECK_EVERY
         };
         let store = &self.store;
-        let compute =
+        let compute_document =
             |fetched: FetchedDocument,
              key: &DocumentKey|
              -> std::result::Result<crate::metrics::Computed, MetricsDocumentFailure> {
-                #[cfg(test)]
-                store.run_metrics_document_hook(&key.path);
                 let calls = std::cell::Cell::new(0);
                 let expired = || progress.expired_every(&calls, check_every);
                 // Metrics use the source and native rows exactly as attestation read them.
@@ -1110,6 +1160,14 @@ impl EvidenceResponse {
                 )
                 .map_err(MetricsDocumentFailure::Other)
             };
+        let compute = |fetched: FetchedDocument, key: &DocumentKey| {
+            #[cfg(test)]
+            store.run_metrics_document_hook(&key.path, MetricsDocumentStage::Start);
+            let outcome = compute_document(fetched, key);
+            #[cfg(test)]
+            store.run_metrics_document_hook(&key.path, MetricsDocumentStage::Done);
+            outcome
+        };
         let mut accept = |key: &DocumentKey,
                           outcome: Option<
             std::result::Result<crate::metrics::Computed, MetricsDocumentFailure>,
@@ -1215,15 +1273,14 @@ impl EvidenceResponse {
                 Vec<&DocumentKey>,
                 std::thread::ScopedJoinHandle<'_, Vec<Option<_>>>,
             )> = None;
+            #[cfg(test)]
+            let mut pending_bytes = 0u64;
             loop {
                 // Fetch the next chunk while the workers compute the previous one.
                 let mut keys: Vec<&DocumentKey> = Vec::new();
                 let mut fetched: Vec<std::sync::Mutex<Option<Fetched>>> = Vec::new();
                 let mut bytes = 0usize;
-                while !exhausted
-                    && keys.len() < METRICS_FETCH_DOCUMENTS
-                    && bytes < METRICS_FETCH_BYTES
-                {
+                while !exhausted && keys.len() < METRICS_FETCH_DOCUMENTS && bytes < fetch_bytes {
                     let Some(key) = remaining.next() else {
                         exhausted = true;
                         break;
@@ -1237,13 +1294,28 @@ impl EvidenceResponse {
                             .map_err(MetricsDocumentFailure::Attest)
                     };
                     match &item {
-                        Ok(document) => bytes = bytes.saturating_add(document.bytes()),
+                        Ok(document) => {
+                            bytes = bytes.saturating_add(document.bytes());
+                            #[cfg(test)]
+                            METRICS_FETCH_TRACE.with_borrow_mut(|trace| {
+                                trace.charges.push(document.bytes() as u64)
+                            });
+                        }
                         // Nothing after a failed document is read.
                         Err(_) => exhausted = true,
                     }
                     fetched.push(std::sync::Mutex::new(Some(item)));
+                    #[cfg(test)]
+                    trace_metrics_resident(
+                        fetched.len() + pending.as_ref().map_or(0, |(keys, _)| keys.len()),
+                        bytes as u64 + pending_bytes,
+                    );
                 }
                 if let Some((keys, handle)) = pending.take() {
+                    #[cfg(test)]
+                    {
+                        pending_bytes = 0;
+                    }
                     let outcomes = handle
                         .join()
                         .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
@@ -1274,6 +1346,10 @@ impl EvidenceResponse {
                         accept(key, outcome)?;
                     }
                 } else {
+                    #[cfg(test)]
+                    {
+                        pending_bytes = bytes as u64;
+                    }
                     pending = Some((keys, scope.spawn(run)));
                 }
             }
@@ -8029,14 +8105,17 @@ impl Store {
     }
 
     #[cfg(test)]
-    fn set_metrics_document_hook(&self, hook: impl Fn(&str) + Send + Sync + 'static) {
+    fn set_metrics_document_hook(
+        &self,
+        hook: impl Fn(&str, MetricsDocumentStage) + Send + Sync + 'static,
+    ) {
         *self.test_metrics_document_hook.lock().unwrap() = Some(Arc::new(hook));
     }
     #[cfg(test)]
-    fn run_metrics_document_hook(&self, path: &str) {
+    fn run_metrics_document_hook(&self, path: &str, stage: MetricsDocumentStage) {
         let hook = self.test_metrics_document_hook.lock().unwrap().clone();
         if let Some(hook) = hook {
-            hook(path);
+            hook(path, stage);
         }
     }
 
