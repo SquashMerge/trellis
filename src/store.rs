@@ -2474,6 +2474,9 @@ fn read_deadline_busy(attempt: i32) -> bool {
     true
 }
 
+/// Page cache of a read-only index connection, in KiB (SQLite's negative form).
+const READ_CACHE_KIB: i64 = -64 * 1024;
+
 fn open_index_marker_probe(
     path: &Path,
     writable: bool,
@@ -2501,6 +2504,13 @@ fn open_index_marker_probe(
         storage_result(db.pragma_update(None, "synchronous", "FULL"))?;
     } else {
         storage_result(db.pragma_update(None, "query_only", "ON"))?;
+        // One selected document's attestation reads the same graph and native
+        // pages several times (row budgets, byte budgets, then decoding). A
+        // page cache that holds a document's working set serves those repeats
+        // from memory. Negative is KiB; pages are allocated only as used, and
+        // the cache is freed with the per-request connection. No mmap: an
+        // mmap'd I/O error would be a signal, not a typed error.
+        storage_result(db.pragma_update(None, "cache_size", READ_CACHE_KIB))?;
     }
     let mode: String = storage_result(db.pragma_query_value(None, "journal_mode", |r| r.get(0)))?;
     ensure!(mode == "delete", "incompatible_index: journal mode");
