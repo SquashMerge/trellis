@@ -954,12 +954,13 @@ fn replacement_writer_never_recreates_deleted_accepted_queue_on_enqueue() {
     assert_eq!(fs::read(&index).unwrap(), index_before);
 }
 
-/// Rows a published revision adds: its header, manifest, capture inputs and
-/// producer binding, plus the immutable versions and projections.
-fn revision_row_counts(store: &Store) -> Vec<(&'static str, i64)> {
+/// Rows a published revision adds (its header, manifest, capture inputs and
+/// producer binding, plus the immutable versions and projections) and the
+/// head's `indexed_at`, which only a publication advances.
+fn revision_row_counts(store: &Store) -> Vec<(&'static str, String)> {
     let db =
         rusqlite::Connection::open(store.request_db_path().with_file_name("index.db")).unwrap();
-    [
+    let mut state: Vec<(&'static str, String)> = [
         "native_revisions",
         "revision_documents",
         "revision_capture_inputs",
@@ -971,12 +972,21 @@ fn revision_row_counts(store: &Store) -> Vec<(&'static str, i64)> {
     ]
     .into_iter()
     .map(|table| {
-        let count = db
+        let count: i64 = db
             .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
             .unwrap();
-        (table, count)
+        (table, count.to_string())
     })
-    .collect()
+    .collect();
+    let indexed_at: String = db
+        .query_row(
+            "SELECT indexed_at FROM index_metadata WHERE singleton=1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    state.push(("index_metadata.indexed_at", indexed_at));
+    state
 }
 
 #[test]

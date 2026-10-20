@@ -12,11 +12,11 @@ use std::{
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::{Arc, atomic::AtomicBool},
+    sync::{Arc, Mutex, atomic::AtomicBool},
     time::Duration,
 };
 use trellis::{
-    daemon::registry::CheckoutRegistry,
+    daemon::registry::{CheckoutRegistry, CheckoutRuntime},
     indexer::IndexOptions,
     store::{
         Store,
@@ -107,20 +107,49 @@ fn run_child_until_hook_then_kill(child_test: &str, state: &Path, root: &Path) -
     line.trim_end()[at..].to_owned()
 }
 
+/// Records every tracked row's state at each FIFO claim, then re-arms for the
+/// next claim. The worker runs the after-claim hook after the claim COMMITs and
+/// before it starts the row's work, so each entry is an event-ordered snapshot
+/// of the claim boundary. Unlike millisecond timestamps, it cannot pass a
+/// reversed or overlapping claim order.
+fn record_claims(
+    runtime: Arc<CheckoutRuntime>,
+    store: Store,
+    tracked: Arc<Vec<String>>,
+    log: Arc<Mutex<Vec<Vec<String>>>>,
+) {
+    let next = runtime.clone();
+    runtime.set_after_claim_hook_for_tests(move || {
+        let states = tracked
+            .iter()
+            .map(|id| store.request_by_id(id).unwrap().unwrap().state)
+            .collect();
+        log.lock().unwrap().push(states);
+        record_claims(next, store, tracked, log);
+    });
+}
+
 /// Activate a fresh daemon checkout runtime on the durable state and wait,
 /// bounded only by the hang backstop, until `last` reaches a terminal row.
+/// `on_activate` runs while startup reconciliation is held, so before any claim.
 async fn restart_daemon_until_terminal(
     state: &Path,
     root: &Path,
     last: &str,
-) -> (
-    CheckoutRegistry,
-    Arc<trellis::daemon::registry::CheckoutRuntime>,
-) {
+    on_activate: impl FnOnce(&Arc<CheckoutRuntime>),
+) -> (CheckoutRegistry, Arc<CheckoutRuntime>) {
     let id = identity(root);
     let mut registry = CheckoutRegistry::with_roots(roots(state));
     registry.attach_launch(1, &id).unwrap();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let release_rx = Mutex::new(release_rx);
+    registry.set_next_startup_hook_for_tests(Arc::new(move || {
+        // Returns at once on a retry, after the sender is dropped.
+        let _ = release_rx.lock().unwrap().recv();
+    }));
     let runtime = registry.activate(&id.root_key).unwrap();
+    on_activate(&runtime);
+    drop(release_tx);
     // Until the runtime has recovered the checkout, a reader's open or read may
     // be a typed refusal; keep polling, bounded only by the hang backstop.
     let finished = || -> anyhow::Result<bool> {
@@ -199,7 +228,13 @@ async fn killed_daemon_with_accepted_queue_restarts_to_one_fifo_terminal_result_
     assert_eq!(states, ["done", "running", "queued", "queued"]);
     let dead_claim = at_death[1].claim_incarnation.clone().unwrap();
 
-    let (_registry, _runtime) = restart_daemon_until_terminal(&state, &root, &accepted[3].id).await;
+    let tracked = Arc::new(accepted.iter().map(|r| r.id.clone()).collect::<Vec<_>>());
+    let claims = Arc::new(Mutex::new(Vec::new()));
+    let (_registry, _runtime) =
+        restart_daemon_until_terminal(&state, &root, &accepted[3].id, |runtime| {
+            record_claims(runtime.clone(), store.clone(), tracked, claims.clone())
+        })
+        .await;
 
     let drained: Vec<Request> = accepted
         .iter()
@@ -215,23 +250,19 @@ async fn killed_daemon_with_accepted_queue_restarts_to_one_fifo_terminal_result_
     assert_eq!(drained[0].claim_incarnation, at_death[0].claim_incarnation);
     // The dead daemon's running claim was reclaimed by the new incarnation.
     assert_ne!(drained[1].claim_incarnation.as_deref(), Some(&*dead_claim));
-    // Terminal results follow FIFO (seq) order: each row finishes before the
-    // next is claimed. These unchanged rows complete at the same head
-    // (Decision 0006 §3), so revisions never move backwards.
-    let revisions: Vec<u64> = drained
-        .iter()
-        .map(|r| r.revision.unwrap().index_revision)
-        .collect();
-    assert!(
-        revisions.windows(2).all(|pair| pair[0] <= pair[1]),
-        "terminal revisions move backwards: {revisions:?}"
-    );
-    let millis = |value: &Option<String>| value.as_deref().unwrap().parse::<u128>().unwrap();
-    assert!(
-        drained
-            .windows(2)
-            .all(|pair| millis(&pair[0].finished_at) <= millis(&pair[1].started_at)),
-        "terminal results out of FIFO order: {drained:?}"
+    // These unchanged rows complete at the same head (Decision 0006 §3).
+    assert!(drained.iter().all(|r| r.revision == drained[0].revision));
+    // FIFO: the restarted daemon reclaims the running row first, and claims
+    // each later row only once every earlier row is terminal.
+    let row = |states: [&str; 4]| states.map(str::to_owned).to_vec();
+    assert_eq!(
+        *claims.lock().unwrap(),
+        vec![
+            row(["done", "running", "queued", "queued"]),
+            row(["done", "done", "running", "queued"]),
+            row(["done", "done", "done", "running"]),
+        ],
+        "claim-boundary snapshots"
     );
     assert!(store.earliest_unfinished_request().unwrap().is_none());
 }
@@ -365,7 +396,8 @@ async fn killed_mid_index_commit_recovers(torn_header: bool) {
     );
 
     // The queue resumes: the restarted daemon reclaims and finishes the request.
-    let (_registry, _runtime) = restart_daemon_until_terminal(&state, &root, &accepted.id).await;
+    let (_registry, _runtime) =
+        restart_daemon_until_terminal(&state, &root, &accepted.id, |_| {}).await;
     let store = Store::open(roots(&state), identity(&root)).unwrap();
     let done = store.request_by_id(&accepted.id).unwrap().unwrap();
     assert_eq!(done.state, "done", "{done:?}");
@@ -452,7 +484,8 @@ async fn killed_before_index_commit_leaves_cold_journal_then_queue_resumes() {
         index_revision: fields[1].parse().unwrap(),
     };
 
-    let (_registry, _runtime) = restart_daemon_until_terminal(&state, &root, &accepted.id).await;
+    let (_registry, _runtime) =
+        restart_daemon_until_terminal(&state, &root, &accepted.id, |_| {}).await;
     let store = Store::open(roots(&state), identity(&root)).unwrap();
     let done = store.request_by_id(&accepted.id).unwrap().unwrap();
     assert_eq!(done.state, "done", "{done:?}");
