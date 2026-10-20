@@ -586,8 +586,9 @@ test("real Chromium validates pinned SVG and source note identity under unchange
       const path = new URL(route.request().url()).pathname;
       const assets = {"/vendor/pele-1.6.0.js":"web/vendor/pele-1.6.0.js", "/sequence-pele.js":"web/sequence-pele.js"};
       if (assets[path]) return route.fulfill({status:200, contentType:"text/javascript; charset=utf-8", body:fs.readFileSync(assets[path])});
+      if (path === "/test.css") return route.fulfill({status:200, contentType:"text/css", body:"#diagram { width:240px; height:110px; overflow:auto }"});
       return route.fulfill({status:200, contentType:"text/html; charset=utf-8", body:
-        `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'"><script src="/vendor/pele-1.6.0.js"></script><script src="/sequence-pele.js"></script><div id="diagram"></div>`});
+        `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'"><script src="/vendor/pele-1.6.0.js"></script><script src="/sequence-pele.js"></script><link rel="stylesheet" href="/test.css"><div id="diagram"></div>`});
     });
     await page.goto("http://127.0.0.1:43987/");
     await page.evaluate(() => document.addEventListener("securitypolicyviolation", event =>
@@ -614,29 +615,130 @@ test("real Chromium validates pinned SVG and source note identity under unchange
       assert.equal(actual.keyboard, true, language);
       assert.deepEqual(actual.csp, [], language);
     }
+    // Mutate actual Pele output, then run the production validator rather than
+    // merely inspecting static fixture markup. No partial DOM may be installed.
+    const mutated = await page.evaluate(async view => {
+      const container = document.querySelector("#diagram");
+      const originalRender = window.pele.render;
+      const source = window.TrellisPeleSequence.project(view).source;
+      const actual = originalRender(source, {}).svg;
+      const cases = {
+        guard:actual.replace(/(<text class="pele-frame-label"[^>]*>)([^<]+)(<\/text>)/g,
+          (whole, open, label, close) => label === "[alternate path]" ? whole : `${open}[changed guard]${close}`),
+        alternate:actual.replace(/(<text class="pele-frame-label"[^>]*>)[^<]+/, "$1[changed alternate]"),
+        altIdentity:actual.replace('class="pele-frame pele-frame-alt"', 'class="pele-frame pele-frame-alt" data-id="i7"'),
+        positionalNotes:actual.replace(/class="pele-note" data-id="i(\d+)"/g, (_, n) => `class="pele-note" data-id="i${Number(n) + 10}"`)
+      };
+      const results = {};
+      for (const [name, svg] of Object.entries(cases)) {
+        let selected = false;
+        const previous = container.firstElementChild;
+        window.pele = {render:() => ({svg})};
+        const outcome = await window.TrellisPeleSequence.render(container, view, null, new Set(), {onSelect:() => selected=true});
+        results[name] = {status:outcome.status, reason:outcome.reason, unchanged:container.firstElementChild === previous, selected};
+      }
+      window.pele = {render:originalRender};
+      return results;
+    }, peleFixture("rust"));
+    for (const [name, expected] of Object.entries({guard:/frame header/, alternate:/frame header/, altIdentity:/frame identity/, positionalNotes:/note order/})) {
+      assert.equal(mutated[name].status, "unsupported", name);
+      assert.match(mutated[name].reason, expected, name);
+      assert.equal(mutated[name].unchanged, true, name);
+      assert.equal(mutated[name].selected, false, name);
+    }
     const groupView = peleFixture("rust");
     const first = groupView.steps[0], last = groupView.steps[2];
-    groupView.steps = [{...first, id:"group-first", kind:"group", label:"measured chain", callId:null,
-      children:[first, {...last, id:"group-second"}], alternate:[]}];
+    const nested = groupView.steps[1];
+    const groupLabel = "GROUP".repeat(36), childLabel = "ENTRY".repeat(36);
+    groupView.steps = [
+      {...first, id:"group-alpha", kind:"group", label:groupLabel, callId:null,
+        children:[{...first, label:childLabel}, last], alternate:[]},
+      {...nested.children[0], id:"group-beta", kind:"group", label:"second measured chain", callId:null,
+        children:[nested.children[0], nested.alternate[0]], alternate:[]}
+    ];
     const group = await page.evaluate(async view => {
+      window.groupView = view;
+      window.groupSelected = null;
       const container = document.querySelector("#diagram");
-      const result = await window.TrellisPeleSequence.render(container, view, null, new Set(), {});
-      const toggle = container.querySelector("button.sequence-group-control");
-      if (result.status !== "rendered" || !toggle) return {status:result.status, reason:result.reason};
-      const collapsed = container.querySelectorAll('.pele-note[data-trellis-step-id]').length;
-      const previewCallId = container.querySelector('.pele-note[data-trellis-step-id]')?.getAttribute("data-trellis-preview-call-id");
+      const projection = window.TrellisPeleSequence.project(view);
+      const originalLabel = view.steps[0].label, originalChildLabel = view.steps[0].children[0].label;
+      const result = await window.TrellisPeleSequence.render(container, view, null, new Set(),
+        {onSelect:step => window.groupSelected=step});
+      const note = container.querySelector('.pele-note[data-trellis-step-id="group-alpha"]');
+      const second = container.querySelector('.pele-note[data-trellis-step-id="group-beta"]');
+      const toggle = note?.querySelector("button.sequence-group-control");
+      const secondToggle = second?.querySelector("button.sequence-group-control");
+      if (result.status !== "rendered" || !toggle || !secondToggle) return {status:result.status, reason:result.reason};
+      const text = note.textContent.replace(/\s+/g, "");
+      note.dispatchEvent(new MouseEvent("click", {bubbles:true}));
+      const originalSelection = window.groupSelected === view.steps[0];
+      window.groupSelected = null;
+      container.scrollTop = 24; container.scrollLeft = 35;
+      const before = [container.scrollTop, container.scrollLeft];
       toggle.click();
-      for (let i=0; i<20 && container.querySelector("button")?.getAttribute("aria-expanded") !== "true"; i++)
+      for (let i=0; i<50 && container.querySelector('[data-trellis-step-id="group-alpha"] button')?.getAttribute("aria-expanded") !== "true"; i++)
         await new Promise(resolve => setTimeout(resolve, 10));
-      return {status:result.status, collapsed, previewCallId, expanded:container.querySelectorAll('.pele-note[data-trellis-step-id]').length,
-        toggle:container.querySelector("button")?.getAttribute("aria-expanded"), csp:window.cspViolations || []};
+      const successor = container.querySelector('[data-trellis-step-id="group-alpha"] button');
+      return {status:result.status, collapsed:2,
+        longEvidence:projection.source.includes("first measured entry: ENTRY") &&
+          projection.source.includes(view.steps[0].children[0].callId) &&
+          projection.source.includes("+1 calls collapsed (entry preview)"),
+        visibleEvidence:text.includes("ENTRY") && text.includes("+1callscollapsed(entrypreview)") &&
+          text.includes(view.steps[0].children[0].callId),
+        unchanged:originalLabel === view.steps[0].label && originalChildLabel === view.steps[0].children[0].label,
+        identityBound:toggle.parentElement.localName === "foreignObject" && toggle.parentElement.parentElement === note &&
+          secondToggle.parentElement.parentElement === second && toggle.getAttribute("aria-controls") === note.id &&
+          secondToggle.getAttribute("aria-controls") === second.id && note.getAttribute("aria-describedby") === toggle.id,
+        originalSelection, noToggleSelection:window.groupSelected === null,
+        previewCallId:note.getAttribute("data-trellis-preview-call-id"),
+        expanded:container.querySelectorAll('.pele-note[data-trellis-step-id]').length,
+        focused:document.activeElement === successor,
+        scroll:[container.scrollTop, container.scrollLeft], before, csp:window.cspViolations || []};
     }, groupView);
     assert.equal(group.status, "rendered", group.reason);
-    assert.equal(group.collapsed, 1);
+    for (const key of ["longEvidence", "visibleEvidence", "unchanged", "identityBound", "originalSelection", "noToggleSelection", "focused"])
+      assert.equal(group[key], true, key);
     assert.equal(group.previewCallId, first.callId);
-    assert.equal(group.expanded, 3);
-    assert.equal(group.toggle, "true");
+    assert.equal(group.expanded, 4);
+    assert.deepEqual(group.scroll, group.before);
     assert.deepEqual(group.csp, []);
+    const secondToggle = page.locator('button.sequence-group-control[data-trellis-step-id="group-beta"]');
+    await secondToggle.focus();
+    const beforeEnter = await page.evaluate(() => {
+      const c = document.querySelector("#diagram"); c.scrollTop = 31; c.scrollLeft = 28;
+      return [c.scrollTop, c.scrollLeft];
+    });
+    await secondToggle.press("Enter");
+    assert.deepEqual(await page.evaluate(() => {
+      const c = document.querySelector("#diagram");
+      return {expanded:c.querySelectorAll('.pele-note[data-trellis-step-id]').length,
+        focus:document.activeElement?.dataset.trellisStepId, scroll:[c.scrollTop,c.scrollLeft],
+        selected:window.groupSelected === null};
+    }), {expanded:6, focus:"group-beta", scroll:beforeEnter, selected:true});
+    const firstToggle = page.locator('button.sequence-group-control[data-trellis-step-id="group-alpha"]');
+    await firstToggle.focus();
+    await firstToggle.press("Space");
+    assert.equal(await page.locator('.pele-note[data-trellis-step-id]').count(), 4);
+    assert.equal(await page.evaluate(() => document.activeElement?.dataset.trellisStepId), "group-alpha");
+    await secondToggle.focus();
+    await secondToggle.press("Space");
+    assert.equal(await page.locator('.pele-note[data-trellis-step-id]').count(), 2);
+    assert.equal(await page.evaluate(() => document.activeElement?.dataset.trellisStepId), "group-beta");
+    const controlView = peleFixture("rust");
+    const measured = controlView.steps[0], measuredNext = controlView.steps[2];
+    controlView.steps = [
+      {...measured, id:"loop-1", kind:"loop", label:"possible iterations", callId:null,
+        children:[{...measured, id:"loop-call"}], alternate:[]},
+      {...measured, id:"try-1", kind:"try", label:"try: paths and cleanup unknown", callId:null,
+        children:[{...measuredNext, id:"try-call"}], alternate:[{...measured, id:"handler-call"}]}
+    ];
+    const controls = await page.evaluate(async view => {
+      const container = document.querySelector("#diagram");
+      const result = await window.TrellisPeleSequence.render(container, view, null, new Set(), {});
+      return {status:result.status, loops:container.querySelectorAll(".pele-frame-loop").length,
+        rects:container.querySelectorAll(".pele-rect").length, notes:container.querySelectorAll('.pele-note[data-trellis-step-id]').length};
+    }, controlView);
+    assert.deepEqual(controls, {status:"rendered", loops:1, rects:1, notes:5});
     const emptyView = peleFixture("rust"); emptyView.steps = [];
     const empty = await page.evaluate(view => window.TrellisPeleSequence.render(
       document.querySelector("#diagram"), view, null, new Set(), {}), emptyView);

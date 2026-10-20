@@ -5,7 +5,7 @@
   const SVG_NS = "http://www.w3.org/2000/svg";
   const kinds = new Set(["call", "group", "branch", "loop", "try", "effect", "return", "throw", "await", "note", "boundary", "definition"]);
   const tags = new Set(["svg", "g", "path", "rect", "text", "tspan"]);
-  const attrs = new Set(["xmlns", "class", "viewBox", "width", "height", "fill", "role", "aria-roledescription", "transform", "stroke", "font-size", "data-id", "d", "x", "y", "rx", "text-anchor", "font-weight", "stroke-dasharray", "xml:space"]);
+  const attrs = new Set(["xmlns", "class", "viewBox", "width", "height", "fill", "fill-opacity", "role", "aria-roledescription", "transform", "stroke", "font-size", "data-id", "d", "x", "y", "rx", "text-anchor", "font-weight", "stroke-dasharray", "xml:space"]);
   function unsupported(reason) { const error = new Error(reason); error.code = "unsupported"; throw error; }
   const encode = value => Array.from(String(value)).map(c => /[A-Za-z0-9 ._-]/.test(c) ? c : `U+${c.codePointAt(0).toString(16).toUpperCase()}`).join("");
   function witness(step) {
@@ -20,18 +20,32 @@
   }
   function project(view, expanded = new Set(), options = {}) {
     if (!view || !view.seed || !Array.isArray(view.steps) || !Array.isArray(view.participants) || !view.revision) unsupported("Invalid sequence view");
-    const seen = new Set(), rows = [], frames = [], noteOrder = [null], lines = ["sequenceDiagram", `participant S as ${encode(view.seed.name || view.seed.id)}`, "Note over S: Static possible paths - target and timing unknown"];
+    const seen = new Set(), rows = [], frames = [], frameHeaders = [], noteOrder = [null], lines = ["sequenceDiagram", `participant S as ${encode(view.seed.name || view.seed.id)}`, "Note over S: Static possible paths - target and timing unknown"];
     let separators = 1;
     const add = (step, preview) => {
       const ordinal = rows.length + 1;
       if (ordinal > 200) unsupported("Too many source notes");
       let label = step.label || step.kind;
       if (step.kind === "call") label += " - measured syntax; target unverified";
-      if (preview) label += ` - ${preview.label} - +${step.children.length - 1} calls collapsed (entry preview)`;
-      // A compact label never changes the original evidence object retained in rows.
-      if (!options.showDetails && label.length > 160) label = label.slice(0, 159) + "...";
+      const shorten = (text, max) => text.length > max ? text.slice(0, Math.max(1, max - 3)) + "..." : text;
+      let displayLabel;
+      if (preview) {
+        // Source labels are encoded separately; the app-generated count and
+        // original call ID stay literal and visible for long measured names.
+        const entryId = preview.callId || preview.id;
+        if (typeof entryId !== "string" || !/^[A-Za-z0-9:_-]+$/.test(entryId)) unsupported("Unrepresentable preview identity");
+        const suffix = ` +${step.children.length - 1} calls collapsed (entry preview)`;
+        const fixed = ` - first measured entry:  - call ${entryId} -${suffix}`;
+        const room = Math.max(24, 160 - fixed.length);
+        const groupLimit = Math.max(12, Math.floor(room / 2));
+        const entryLimit = Math.max(12, room - groupLimit);
+        displayLabel = `${encode(shorten(label, groupLimit))} - first measured entry: ${encode(shorten(preview.label, entryLimit))} - call ${entryId} -${suffix}`;
+      } else {
+        if (!options.showDetails) label = shorten(label, 160);
+        displayLabel = encode(label);
+      }
       const marker = `[${String(ordinal).padStart(3, "0")}]`;
-      const display = `${marker} ${encode(step.kind)} ${encode(label)}`;
+      const display = `${marker} ${encode(step.kind)} ${displayLabel}`;
       lines.push(`Note right of S: ${display}`);
       const row = {ordinal, marker, display, step, id:step.id, callId:step.callId, path:step.path, range:step.range, revision:view.revision, previewEntryCallId:preview?.callId, preview};
       rows.push(row); noteOrder.push(row);
@@ -59,6 +73,7 @@
         if (frame) {
           lines.push(frame === "rect" ? "rect" : `${frame} ${encode(step.label)}`);
           frames.push(frame);
+          if (frame !== "rect") frameHeaders.push({kind:frame, header:`[${encode(step.label)}]`, alternate:frame === "alt" ? "[alternate path]" : null});
         }
         add(step, preview);
         if (!collapsed) {
@@ -76,7 +91,10 @@
     visit(view.steps, 0);
     const source = lines.join("\n") + "\n";
     if (new TextEncoder().encode(source).length > 512 * 1024) unsupported("Mermaid source too large");
-    return {source, rows, frames, separators, noteOrder};
+    // Pele numbers every Mermaid statement, including operators and end, but
+    // not the declaration or participant. These gaps are part of the pinned API.
+    const noteIds = lines.slice(2).flatMap((line, i) => line.startsWith("Note ") ? [`i${i}`] : []);
+    return {source, rows, frames, frameHeaders, noteIds, separators, noteOrder};
   }
   function validatedSvg(raw, projection) {
     if (typeof raw !== "string" || new TextEncoder().encode(raw).length > 8 * 1024 * 1024) unsupported("SVG output too large");
@@ -104,14 +122,21 @@
     const ids = new Set();
     for (const [i, note] of notes.entries()) {
       const id = note.getAttribute("data-id");
-      if (!/^i\d+$/.test(id || "") || ids.has(id) || i && Number(id.slice(1)) <= Number(notes[i-1].getAttribute("data-id").slice(1))) unsupported("Changed Pele note order");
+      if (id !== projection.noteIds[i] || ids.has(id)) unsupported("Changed Pele note order");
       ids.add(id);
-      const marker = i === 0 ? "Static possible paths" : projection.noteOrder[i]?.marker || "handlers / cleanup (see guards)";
       const expected = i === 0 ? "Static possible paths - target and timing unknown" : projection.noteOrder[i]?.display || "handlers / cleanup (see guards)";
       if (!note.textContent.replace(/\s+/g, "").includes(expected.replace(/\s+/g, ""))) unsupported("Changed Pele note text");
     }
     const observed = [...root.querySelectorAll(".pele-frame")].map(n => n.classList.contains("pele-frame-alt") ? "alt" : n.classList.contains("pele-frame-opt") ? "opt" : n.classList.contains("pele-frame-loop") ? "loop" : "unknown");
     if (observed.join("|") !== projection.frames.filter(x => x !== "rect").join("|") || root.querySelectorAll(".pele-rect").length !== projection.frames.filter(x => x === "rect").length) unsupported("Changed Pele control frames");
+    for (const [i, frame] of [...root.querySelectorAll(".pele-frame")].entries()) {
+      const expected = projection.frameHeaders[i];
+      if (frame.hasAttribute("data-id") || frame.querySelector("[data-id]")) unsupported("Unexpected Pele frame identity");
+      if (frame.querySelector(".pele-frame-kind")?.textContent !== expected.kind) unsupported("Changed Pele frame kind");
+      const labels = [...frame.querySelectorAll(".pele-frame-label")].map(n => n.textContent.replace(/\s+/g, ""));
+      const wanted = (expected.alternate ? [expected.alternate, expected.header] : [expected.header]).map(n => n.replace(/\s+/g, ""));
+      if (labels.join("|") !== wanted.join("|")) unsupported("Changed Pele frame header");
+    }
     // The alt frame has no native ID; its original header is the numbered note.
     return {root, notes};
   }
@@ -150,12 +175,29 @@
         note.addEventListener("click", select);
         note.addEventListener("keydown", e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); select(); } });
         if (step.kind === "group") {
+          // Attach the HTML action to its already verified SVG note. Geometry
+          // places it only; ordinal/original-object witnesses own identity.
+          const rect = note.querySelector("rect");
+          const x = Number(rect?.getAttribute("x")), y = Number(rect?.getAttribute("y"));
+          const width = Number(rect?.getAttribute("width"));
+          if (!rect || ![x, y, width].every(Number.isFinite) || width <= 0) unsupported("Changed Pele group geometry");
+          const foreign = document.createElementNS(SVG_NS, "foreignObject");
+          foreign.setAttribute("x", String(x + width + 4)); foreign.setAttribute("y", String(y));
+          foreign.setAttribute("width", "126"); foreign.setAttribute("height", "32");
+          const noteId = `trellis-pele-group-note-${row.ordinal}`;
+          const toggleId = `trellis-pele-group-toggle-${row.ordinal}`;
+          note.id = noteId; note.setAttribute("aria-describedby", toggleId);
           const toggle = document.createElement("button"); toggle.type = "button"; toggle.className = "sequence-group-control";
+          toggle.id = toggleId; toggle.setAttribute("aria-controls", noteId);
           toggle.textContent = expandedGroups.has(row.id) ? "Collapse call chain" : "Expand call chain";
           toggle.setAttribute("aria-label", `${toggle.textContent}: ${step.label}`);
           toggle.setAttribute("aria-expanded", String(expandedGroups.has(row.id)));
           toggle.dataset.trellisStepId = row.id;
-          toggle.addEventListener("click", async () => {
+          // Native button Enter/Space dispatches click. Do not bubble those
+          // keys or the click into the separately selectable group note.
+          toggle.addEventListener("keydown", event => event.stopPropagation());
+          toggle.addEventListener("click", async event => {
+            event.stopPropagation();
             if (!current() || projection.rows[i] !== row) return;
             const top = container.scrollTop, left = container.scrollLeft;
             if (expandedGroups.has(row.id)) expandedGroups.delete(row.id); else expandedGroups.add(row.id);
@@ -163,12 +205,21 @@
             if (!current() || outcome.status !== "rendered") return;
             outcome.controls.get(row.id)?.focus({preventScroll:true}); container.scrollTop = top; container.scrollLeft = left;
           });
+          foreign.append(toggle); note.append(foreign);
           controls.set(row.id, toggle);
         }
       }
       if (!current()) return {status:"stale"};
+      if (controls.size) {
+        // Pele's viewBox fits its own notes; reserve measured-end space for
+        // adjacent controls, without tying any identity to pixel positions.
+        const dimensions = root.getAttribute("viewBox")?.split(/\s+/).map(Number);
+        if (dimensions?.length !== 4 || !dimensions.every(Number.isFinite) || dimensions[2] <= 0) unsupported("Changed Pele viewBox");
+        dimensions[2] += 140;
+        root.setAttribute("viewBox", dimensions.join(" "));
+        root.setAttribute("width", String(dimensions[2]));
+      }
       const fragment = document.createDocumentFragment(); fragment.append(root); // Adopt the validated node itself; cloning would drop selection listeners.
-      for (const button of controls.values()) fragment.append(button);
       container.replaceChildren(fragment);
       return {status:"rendered", controls, source:projection.source};
     } catch (error) {
