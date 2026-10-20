@@ -127,38 +127,75 @@ tool, not a `view` of another tool, and not an `inspect` union.
     `vectors.db`, which is external, filled asynchronously and evictable. Two calls at the same
     basis can therefore return different vector candidates, `rank`, `matchedBy` and `embedded`
     counts while the background job fills the cache or eviction removes entries.
-  - **Proposed:** ordering is deterministic for equal index snapshot, request, `modelId`,
-    inference runtime build **and the same set of embedded card hashes**. Ranking is explicitly
-    not stable across cache changes at one pin. `searchIndex.embedded` and `state` let a caller see
-    that the cache was incomplete. Vector similarities can also differ in the last bits across
-    runtimes or hardware.
-  - **Alternative, for the owner (open question 6):** bind each result to its cache state, adding
-    `searchIndex.vectorSet: Hash`. This is SHA-256 over the domain `trellis.search-vector-set.v1\0`
-    and the sorted card hashes that had a vector in this call, with `modelId`. Equal `evidenceBasis`
-    plus equal `vectorSet` would then promise equal output. It costs one hash over up to the
-    candidate count per call, and lets a client detect cache drift. It still doesn't make vectors
-    immutable; making them part of publication would mean storing them in `index.db` (open
-    question 13).
+  - **Proposed:** ordering is deterministic only when all of these are equal:
+    - the index snapshot and the request;
+    - `modelId`;
+    - the inference runtime build;
+    - the **cached vector values** used in the call: the same card hashes *and* the same vector
+      bytes for each.
+
+    A vector re-embedded for the same card hash (after eviction, repair, or under another runtime
+    build) can have different bytes, and so a different similarity and rank, without any change
+    in membership. Ranking is explicitly not stable across cache changes at one pin, and the
+    result makes no equality promise across calls. `searchIndex.embedded` and `state` let a caller
+    see that the cache was incomplete.
+  - **Alternative, for the owner (open question 6):** bind each result to the cached **values**
+    it used, adding `searchIndex.vectorSet: Hash`.
+    - **Value digest.** Each cache row stores a `valueDigest`, the SHA-256 of its vector blob,
+      computed when the row is written. This is an identity for equality, not an integrity check;
+      T00 asks for none.
+    - **`vectorSet`.** SHA-256 over the domain `trellis.search-vector-set.v1\0` and the canonical
+      JSON of: `modelId`, the inference runtime build identity, and the sorted
+      `(cardHash, valueDigest)` pairs used in this call.
+    - **Promise.** Equal `evidenceBasis`, equal request and equal `vectorSet` give equal output.
+      The query vector is covered by the same model and runtime identity.
+    - **Cost and limits.** Combining stored digests costs one hash pass per call, not a re-hash
+      of the vectors. It detects drift; it doesn't make vectors immutable. That would mean storing
+      them in `index.db` (open question 13).
+    - **Weaker variant.** Hash membership only, without `valueDigest`. That would signal drift in
+      *which* cards had vectors, but it could promise nothing about equal output, so it isn't
+      proposed.
 - **Query transformation (deterministic and total).** Any valid 1–1024-byte query maps to a
   lexical arm as follows. Raw caller text never reaches FTS5's query parser.
-  1. Take maximal runs of Unicode letters, digits and `_` (the `unicode61` token-character
-     classes). Every other character, including quotes, `*`, `^`, `:`, `(`, `)`, `+`, `-` and
-     whitespace, is only a separator.
-  2. Split each run at `_` and camelCase boundaries. Keep the whole run and its parts, then apply
-     ASCII lowercasing. Drop parts shorter than 2 characters and a fixed, versioned stopword list.
-     Deduplicate in first-occurrence order, and keep at most 32 tokens.
-  3. Emit each token as an FTS5 string literal: `"` + token + `"`. Tokens contain no `"` after
-     step 1, and any `"` would be doubled anyway. Join them with ` OR `, and bind the expression as
-     a SQL parameter to `MATCH`. A quoted string literal is never an FTS5 operator or column
-     filter, so the words `AND`, `OR`, `NOT` and `NEAR` inside the query are plain tokens.
-  4. If no token remains (punctuation-only or stopword-only input), **the lexical arm is empty**,
-     and no FTS5 query runs. The result comes from the vector arm alone, or has zero hits.
-  5. FTS5 should never report a syntax error for an expression built this way. If it reports any
-     error anyway, the call fails `store_unavailable`; it never retries with raw text.
+  - **Tokenizer, fixed by the contract.** The search table uses `tokenize = "porter unicode61
+    remove_diacritics 2"`, with `unicode61`'s default `categories "L* N* Co"` and no `tokenchars` or
+    `separators` options. Under those defaults, the token characters are the Unicode general
+    categories L\* (letters), N\* (numbers) and Co (private use). Every other character is a
+    separator, **including `_`**. Trellis applies the same splitter (steps 1–2) to card text before
+    inserting it and to the query. So every term Trellis emits is exactly one `unicode61` token on
+    both sides, and FTS5's own case folding, diacritic removal and porter stemming then apply
+    identically to both.
 
-  The W2 trigram prefilter (§11) has its own total rule: the whole query becomes one FTS5 string
-  literal with `"` doubled, only when it has at least three Unicode characters. Otherwise, or on
-  any FTS5 error, it uses W2's literal scan.
+  The steps:
+  1. Take maximal runs of `unicode61` token characters (L\*, N\*, Co). Everything else is a
+     separator, including `_`, quotes, `*`, `^`, `:`, `(`, `)`, `+`, `-` and whitespace. So
+     `read_revision_for` gives three runs, `__` gives none, and `readRevisionFor` gives one.
+  2. Split each run at camelCase and letter–digit boundaries. Keep the whole run and its parts.
+     Drop terms shorter than 2 characters and those on a fixed, versioned stopword list.
+     Deduplicate in first-occurrence order, and keep at most 32 terms. Each term consists only of
+     token characters, so it is exactly one FTS5 token; a term can't tokenize to nothing.
+  3. Emit each term as an FTS5 string literal: `"` + term + `"`. Terms contain no `"`, and any
+     `"` would be doubled anyway. Join them with ` OR `, and bind the expression as a SQL
+     parameter to `MATCH`. A quoted string literal is never an FTS5 operator or column filter, so
+     the words `AND`, `OR`, `NOT` and `NEAR` inside the query are plain terms.
+  4. If no term remains (punctuation-only, underscore-only or stopword-only input), **the lexical
+     arm is empty**, and no FTS5 query runs. The result comes from the vector arm alone, or has
+     zero hits. This is the only query-shape fallback; it is decided before FTS5 is touched.
+  5. **Store errors are never a fallback.** An expression built this way can't be a syntax error.
+     Any SQLite or FTS5 error from running it (corruption, a schema mismatch, I/O, a malformed
+     FTS5 index) is a store fault. The call fails with the existing typed failure
+     (`store_unavailable`), per T00 and W8. It never retries with raw text, and it never returns a
+     vector-only result as if the lexical arm had succeeded.
+
+  The W2 trigram prefilter (§11) has its own total rule:
+  - **Query limitations only.** The whole query becomes one FTS5 string literal with `"` doubled,
+    and the prefilter is used only when the query has at least three Unicode characters. A query
+    the prefilter can't represent (fewer than three characters) uses W2's literal scan. That is
+    decided from the query alone, before FTS5 runs.
+  - **Store faults are typed failures.** A SQLite or FTS5 error while running the prefilter
+    (corruption, schema, I/O) is a store fault, not a query limitation. It fails W2's call with
+    `store_unavailable`, per T00 and W8, and is never answered by a successful literal-scan
+    fallback.
 - **Summary text:** `trellis_search_symbols: <n> hits; full result in structuredContent.`, with the
   item word `hits`.
 - **Bounds:** W2's 65,536-byte response cap, its longest-fitting-prefix rule, and the five-second
@@ -189,9 +226,10 @@ its fixture are closed. The catalog adds about 13 KB to a 73 KB compact catalog.
    precision on the benchmark (#211). Should the contract fix a tuned rule instead, for example a
    lexical arm limited to exact phrase, literal and identifier matches? The ordering rule above
    stays deterministic whichever constants are chosen.
-6. **Ranking stability across cache changes.** Should ranking be stable only for the same
-   embedded set (proposed), or should results carry `searchIndex.vectorSet` so equal basis plus
-   equal vector set promises equal output?
+6. **Ranking stability across cache changes.** Should results make no equality promise across
+   calls (proposed), or carry `searchIndex.vectorSet`, a hash of the cached vector *values* used
+   plus model and runtime identity, so that equal basis, request and `vectorSet` promise equal
+   output?
 
 ## 2. Card content and native extraction
 
@@ -640,12 +678,20 @@ scores (§5).
   at least three Unicode characters. For example, `éa` is three UTF-8 bytes but two characters and
   forms no trigram. Index an ASCII-`lower`ed copy of the name and ID with `case_sensitive 1`, so
   trigram folding can't diverge from W2's ASCII-only `lower`. Every prefiltered candidate is still
-  checked with W2's literal ASCII-`lower`/`instr` rule. Any query the prefilter can't serve
-  exactly (fewer than three characters, or any other unsupported case) falls back to the literal
-  scan. W2's output stays byte-identical for **all** valid 1–256-byte queries. W2's 256-byte query
-  limit is unchanged; it is a byte limit, independent of trigram eligibility.
-- **For search:** a head-only split-identifier table (camelCase and snake_case split, porter
-  stemming) over the card's measured fields, queried only through the transformation in §1.
+  checked with W2's literal ASCII-`lower`/`instr` rule. The query is ASCII-`lower`ed the same way
+  before it is quoted.
+  - **Literal-scan fallback, for query limitations only.** A query with fewer than three Unicode
+    characters can't form a trigram, so it uses the literal scan. That is decided from the query
+    alone, before FTS5 runs.
+  - **Store faults are typed failures.** A SQLite or FTS5 error while running the prefilter
+    (corruption, schema mismatch, I/O, a malformed FTS5 index) is a store fault. It fails the call
+    with `store_unavailable` under T00 and W8. It is never answered by a successful literal-scan
+    result.
+  - W2's output stays byte-identical for **all** valid 1–256-byte queries that it answers. Its
+    256-byte query limit is unchanged; it is a byte limit, independent of trigram eligibility.
+- **For search:** a head-only table with tokenizer `porter unicode61 remove_diacritics 2`
+  (default token characters, so `_` is a separator). It holds the card's measured fields after
+  Trellis's camelCase split, and is queried only through the transformation in §1.
 
 One table can't serve both semantics exactly, so this proposal doesn't share one.
 
