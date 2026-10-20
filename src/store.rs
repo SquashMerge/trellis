@@ -226,6 +226,11 @@ pub struct Store {
     reconciled_writer: Arc<Mutex<Option<uuid::Uuid>>>,
     retention_clock: Arc<Mutex<RetentionClock>>,
     metrics_memo: Arc<Mutex<crate::metrics::MetricsMemo>>,
+    /// Set only on an `EvidenceResponse`'s own Store, which is used only with
+    /// that response's read snapshot: the pin it admitted and that revision's
+    /// header values. A later read of the same pin in the response shares
+    /// them after repeating its own status and pin checks.
+    admitted: Option<(IndexPin, Arc<SelectedHeaders>)>,
     #[cfg(feature = "test-support")]
     test_after_claim_hook: Arc<TestOneShotHook>,
     #[cfg(test)]
@@ -662,7 +667,7 @@ struct ReadRevision {
     key: String,
     /// Header rows of this immutable selected revision, read once per snapshot
     /// and shared by every document attested in it.
-    headers: SelectedHeaders,
+    headers: Arc<SelectedHeaders>,
 }
 #[derive(Default)]
 struct SelectedHeaders {
@@ -680,7 +685,7 @@ impl ReadRevision {
         Self {
             pin,
             key,
-            headers: SelectedHeaders::default(),
+            headers: Arc::default(),
         }
     }
     /// `selected_producer_hash`, computed once for this selected revision.
@@ -6107,6 +6112,7 @@ impl Store {
             metrics_memo: Arc::new(Mutex::new(crate::metrics::MetricsMemo::new(
                 64 * 1024 * 1024,
             ))),
+            admitted: None,
             retention_clock: Arc::new(Mutex::new(RetentionClock {
                 origin_wall: publication_second()?,
                 origin_mono: 0,
@@ -7761,8 +7767,10 @@ impl Store {
         }
         let selected = self.read_revision_for(&db, None, true)?;
         self.identity.verify()?;
+        let mut store = self.clone();
+        store.admitted = Some((selected.pin, selected.headers));
         Ok(EvidenceResponse {
-            store: self.clone(),
+            store,
             db,
             fence: ReadFence(selected.pin),
         })
@@ -7794,8 +7802,18 @@ impl Store {
         before_finish: impl FnOnce() -> Result<()>,
         observe_finish: impl FnOnce(&Result<()>),
     ) -> Result<T> {
+        self.with_evidence_response(|response| read(&response.db), before_finish, observe_finish)
+    }
+    /// `with_evidence`, reading through the response's own Store, which shares
+    /// the admitted revision's header values with reads of the same pin.
+    fn with_evidence_response<T>(
+        &self,
+        read: impl FnOnce(&EvidenceResponse) -> Result<T>,
+        before_finish: impl FnOnce() -> Result<()>,
+        observe_finish: impl FnOnce(&Result<()>),
+    ) -> Result<T> {
         let response = self.evidence_response()?;
-        let value = read(&response.db);
+        let value = read(&response);
         let hook = before_finish();
         let fence = response.finish(());
         observe_finish(&fence);
@@ -10118,7 +10136,14 @@ impl Store {
             None => anyhow::bail!("revision conflict: missing native pin"),
             Some(false) => {}
         }
-        let selected = ReadRevision::new(pin, key);
+        let mut selected = ReadRevision::new(pin, key);
+        // Within one response's snapshot, the admitted pin's successful
+        // producer binding is shared; every check above ran again.
+        if let Some((admitted, headers)) = &self.admitted
+            && *admitted == pin
+        {
+            selected.headers = headers.clone();
+        }
         selected
             .producer_hash(db)
             .map_err(selected_integrity)
@@ -12356,7 +12381,15 @@ impl Store {
             (1..=200).contains(&limit) && offset <= i64::MAX as usize,
             "invalid catalog pagination"
         );
-        self.with_evidence(|tx| self.files_in(tx, expected, offset, limit, false))
+        self.with_evidence_response(
+            |response| {
+                response
+                    .store
+                    .files_in(&response.db, expected, offset, limit, false)
+            },
+            || Ok(()),
+            |_| {},
+        )
     }
     fn files_in(
         &self,
