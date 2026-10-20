@@ -226,6 +226,11 @@ pub struct Store {
     reconciled_writer: Arc<Mutex<Option<uuid::Uuid>>>,
     retention_clock: Arc<Mutex<RetentionClock>>,
     metrics_memo: Arc<Mutex<crate::metrics::MetricsMemo>>,
+    /// Set only on an `EvidenceResponse`'s own Store, which is used only with
+    /// that response's read snapshot: the pin it admitted and that revision's
+    /// header values. A later read of the same pin in the response shares
+    /// them after repeating its own status and pin checks.
+    admitted: Option<(IndexPin, Arc<SelectedHeaders>)>,
     #[cfg(feature = "test-support")]
     test_after_claim_hook: Arc<TestOneShotHook>,
     #[cfg(test)]
@@ -620,13 +625,78 @@ impl DerefMut for PublicationConnection {
     }
 }
 
+/// How often this thread computed each per-snapshot or per-file selected value.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SelectedReadCounts {
+    producer_hashes: usize,
+    source_reads: usize,
+    attestations: usize,
+}
+#[cfg(test)]
+thread_local! {
+    static SELECTED_READ_COUNTS: std::cell::Cell<SelectedReadCounts> =
+        std::cell::Cell::new(SelectedReadCounts::default());
+}
+#[cfg(test)]
+fn count_selected_read(update: impl FnOnce(&mut SelectedReadCounts)) {
+    SELECTED_READ_COUNTS.with(|counts| {
+        let mut value = counts.get();
+        update(&mut value);
+        counts.set(value);
+    });
+}
+#[cfg(test)]
+fn take_selected_read_counts() -> SelectedReadCounts {
+    SELECTED_READ_COUNTS.with(|counts| counts.take())
+}
+
+/// One selected document's source and native rows, as authenticated by its
+/// attestation in the caller's snapshot.
+struct AttestedDocument {
+    file: SourceFile,
+    declarations: Vec<crate::native_evidence::Declaration>,
+    calls: Vec<crate::native_evidence::Call>,
+    regions: Vec<crate::native_evidence::ControlRegion>,
+}
+
 /// Immutable revision chosen inside an admitted read transaction. This is not
 /// a surrogate for control metadata: status, root and schema remain live-only.
 struct ReadRevision {
     pin: IndexPin,
     key: String,
+    /// Header rows of this immutable selected revision, read once per snapshot
+    /// and shared by every document attested in it.
+    headers: Arc<SelectedHeaders>,
+}
+#[derive(Default)]
+struct SelectedHeaders {
+    producer_hash: OnceLock<String>,
+    witness: OnceLock<WitnessHeaders>,
+}
+/// The producer, source set and revision a selected witness is measured under.
+struct WitnessHeaders {
+    producer: crate::native_evidence::Producer,
+    source_set: crate::native_evidence::SourceSet,
+    revision: crate::native_evidence::Revision,
 }
 impl ReadRevision {
+    fn new(pin: IndexPin, key: String) -> Self {
+        Self {
+            pin,
+            key,
+            headers: Arc::default(),
+        }
+    }
+    /// `selected_producer_hash`, computed once for this selected revision.
+    /// A failure is not memoized: it fails the read and is recomputed if retried.
+    fn producer_hash(&self, db: &Connection) -> Result<String> {
+        if let Some(hash) = self.headers.producer_hash.get() {
+            return Ok(hash.clone());
+        }
+        let hash = selected_producer_hash(db, self)?;
+        Ok(self.headers.producer_hash.get_or_init(|| hash).clone())
+    }
     fn current(db: &Connection) -> Result<Self> {
         let (generation, revision): (String, i64) = db.query_row(
             "SELECT index_generation,index_revision FROM index_metadata WHERE singleton=1",
@@ -636,10 +706,10 @@ impl ReadRevision {
         let pin: IndexPin = serde_json::from_value(
             serde_json::json!({"indexGeneration": generation, "indexRevision": revision}),
         )?;
-        Ok(Self {
+        Ok(Self::new(
             pin,
-            key: format!("pin:v1:{}:{}", pin.index_generation, pin.index_revision),
-        })
+            format!("pin:v1:{}:{}", pin.index_generation, pin.index_revision),
+        ))
     }
 }
 
@@ -882,56 +952,27 @@ impl EvidenceResponse {
         for key in included {
             progress.check()?;
             // Read and attest only the selected version; no checkout filesystem access.
+            // Metrics use the source and native rows exactly as attestation read them.
             let expired = || progress.expired();
-            let source = progress
-                .result(
-                    Store::selected_source_row_bounded_for_inner(
-                        &self.db,
-                        &key.path,
-                        256 * 1024 * 1024,
-                        &selected,
-                        Some(&expired),
-                    )
-                    .map_err(selected_integrity)
-                    .map_err(|error| self.store.report_selected_failure(error)),
-                )?
-                .context("incompatible_index: selected metrics source missing")?;
-            progress.result(
-                self.store.attest_selected_document_optional_for(
+            let attested = progress
+                .result(self.store.attest_selected_document_loaded_for(
                     &self.db, &key.path, &selected, &expired,
-                ),
-            )?;
+                ))?;
             ensure!(
-                source.language == key.language,
+                attested.file.language == key.language,
                 "incompatible_index: metrics language mismatch"
             );
-            let scope = v8_native_scope_for(&self.db, key, &selected)?
-                .context("incompatible_index: selected metrics manifest missing")?;
-            let native_declarations = progress.result(
-                read_native_declarations_v8_optional(&self.db, &scope, None, true, &expired)
-                    .map_err(selected_integrity),
-            )?;
-            progress.check()?;
-            let calls = progress.result(
-                read_native_calls_v8_inner(&self.db, &scope, None, Some(&expired))
-                    .map_err(selected_integrity),
-            )?;
-            progress.check()?;
-            let regions = progress.result(
-                read_native_control_regions_v8_inner(&self.db, &scope, None, Some(&expired))
-                    .map_err(selected_integrity),
-            )?;
             progress.check()?;
             let rows = crate::metrics::compute_memoized(
                 &mut self.store.metrics_memo.lock().unwrap(),
                 crate::metrics::SourceInput {
                     language: &key.language,
-                    content_hash: &source.hash,
-                    text: &source.text,
+                    content_hash: &attested.file.hash,
+                    text: &attested.file.text,
                 },
-                &native_declarations,
-                &calls,
-                &regions,
+                &attested.declarations,
+                &attested.calls,
+                &attested.regions,
                 &mut || progress.check(),
             )?;
             let mut file_fold = crate::metrics::Accumulator::default();
@@ -4436,6 +4477,8 @@ fn revision_producer_binding(db: &Connection, revision_key: &str) -> Result<(Str
 }
 
 fn selected_producer_hash(db: &Connection, selected: &ReadRevision) -> Result<String> {
+    #[cfg(test)]
+    count_selected_read(|counts| counts.producer_hashes += 1);
     let (executable, derived) = revision_producer_binding(db, &selected.key)?;
     let origin: String = db.query_row(
         "SELECT executable_hash FROM native_producers LIMIT 1",
@@ -6069,6 +6112,7 @@ impl Store {
             metrics_memo: Arc::new(Mutex::new(crate::metrics::MetricsMemo::new(
                 64 * 1024 * 1024,
             ))),
+            admitted: None,
             retention_clock: Arc::new(Mutex::new(RetentionClock {
                 origin_wall: publication_second()?,
                 origin_mono: 0,
@@ -7723,8 +7767,10 @@ impl Store {
         }
         let selected = self.read_revision_for(&db, None, true)?;
         self.identity.verify()?;
+        let mut store = self.clone();
+        store.admitted = Some((selected.pin, selected.headers));
         Ok(EvidenceResponse {
-            store: self.clone(),
+            store,
             db,
             fence: ReadFence(selected.pin),
         })
@@ -7756,8 +7802,18 @@ impl Store {
         before_finish: impl FnOnce() -> Result<()>,
         observe_finish: impl FnOnce(&Result<()>),
     ) -> Result<T> {
+        self.with_evidence_response(|response| read(&response.db), before_finish, observe_finish)
+    }
+    /// `with_evidence`, reading through the response's own Store, which shares
+    /// the admitted revision's header values with reads of the same pin.
+    fn with_evidence_response<T>(
+        &self,
+        read: impl FnOnce(&EvidenceResponse) -> Result<T>,
+        before_finish: impl FnOnce() -> Result<()>,
+        observe_finish: impl FnOnce(&Result<()>),
+    ) -> Result<T> {
         let response = self.evidence_response()?;
-        let value = read(&response.db);
+        let value = read(&response);
         let hook = before_finish();
         let fence = response.finish(());
         observe_finish(&fence);
@@ -10080,8 +10136,16 @@ impl Store {
             None => anyhow::bail!("revision conflict: missing native pin"),
             Some(false) => {}
         }
-        let selected = ReadRevision { pin, key };
-        selected_producer_hash(db, &selected)
+        let mut selected = ReadRevision::new(pin, key);
+        // Within one response's snapshot, the admitted pin's successful
+        // producer binding is shared; every check above ran again.
+        if let Some((admitted, headers)) = &self.admitted
+            && *admitted == pin
+        {
+            selected.headers = headers.clone();
+        }
+        selected
+            .producer_hash(db)
             .map_err(selected_integrity)
             .map_err(|error| self.report_selected_failure(error))?;
         Ok(selected)
@@ -10731,16 +10795,18 @@ impl Store {
     }
 
     /// Reparse exactly one selected, paired source in this SQLite snapshot.
-    /// This never rereads a workspace path or projects the whole graph.
+    /// This never rereads a workspace path or projects the whole graph. `file`
+    /// is the selected source the caller read and hash-checked in this snapshot.
     fn selected_native_witness_for_inner(
         &self,
         db: &Connection,
         path: &str,
+        file: &SourceFile,
         selected: &ReadRevision,
         progress: Option<&dyn Fn() -> bool>,
     ) -> Result<crate::native_evidence::Artifact> {
         optional_hint_check(progress)?;
-        use crate::native_evidence::{Document, DocumentKey, Producer, Revision, SourceSet};
+        use crate::native_evidence::{Document, DocumentKey};
         let (source_set_id, revision_id): (String, String) = db
             .query_row(
                 "SELECT m.source_set_id,r.native_revision_id FROM revision_documents m
@@ -10755,48 +10821,30 @@ impl Store {
             source_set_id == format!("source-set:v1:{}", self.root_id()),
             "incompatible_index: selected source set mismatch"
         );
-        let file = Self::selected_source_row_bounded_for_inner(
-            db,
-            path,
-            256 * 1024 * 1024,
-            selected,
-            progress,
-        )?
-        .context("incompatible_index: selected graph source absent")?;
-        let mut producer:Producer=db.query_row(
-            "SELECT id,version,executable_hash,kind,position_encoding FROM native_producers LIMIT 1",[],
-            |r|Ok(Producer{id:r.get(0)?,version:r.get(1)?,executable_hash:r.get(2)?,kind:r.get(3)?,languages:vec![],position_encoding:r.get(4)?}),
-        )?;
-        producer.executable_hash = selected_producer_hash(db, selected)?;
-        producer.languages=db.prepare(
-            "SELECT language FROM native_producer_languages WHERE producer_id=?1 AND producer_version=?2 ORDER BY ordinal"
-        )?.query_map(params![producer.id,producer.version],|r|r.get::<_,String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut source_set: SourceSet = db.query_row(
-            "SELECT id,root_id FROM native_source_sets WHERE id=?1",
-            [&source_set_id],
-            |r| {
-                Ok(SourceSet {
-                    id: r.get(0)?,
-                    root_id: r.get(1)?,
-                    languages: vec![],
-                    dependencies: vec![],
-                })
-            },
-        )?;
-        source_set.languages=db.prepare(
-            "SELECT language FROM native_source_set_languages WHERE source_set_id=?1 ORDER BY ordinal"
-        )?.query_map([&source_set_id],|r|r.get::<_,String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        source_set.dependencies=db.prepare(
-            "SELECT dependency_id FROM native_source_set_dependencies WHERE source_set_id=?1 ORDER BY ordinal"
-        )?.query_map([&source_set_id],|r|r.get::<_,String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut revision:Revision=db.query_row(
-            "SELECT native_revision_id,source_set_id,toolchain_hash,config_hash,dependency_hash FROM native_revisions WHERE native_revision_id=?1 AND id=?2",
-            params![revision_id, selected.key],|r|Ok(Revision{id:r.get(0)?,source_set_id:r.get(1)?,
-                documents:vec![],toolchain_hash:r.get(2)?,config_hash:r.get(3)?,dependency_hash:r.get(4)?}),
-        )?;
+        ensure!(
+            file.path == path,
+            "incompatible_index: selected graph source absent"
+        );
+        // Every document of one selected revision shares its producer, source
+        // set and revision header; read them once per snapshot.
+        let fresh;
+        let headers = match selected.headers.witness.get() {
+            Some(headers)
+                if headers.source_set.id == source_set_id && headers.revision.id == revision_id =>
+            {
+                headers
+            }
+            Some(_) => {
+                fresh = Self::selected_witness_headers(db, selected, &source_set_id, &revision_id)?;
+                &fresh
+            }
+            None => {
+                let headers =
+                    Self::selected_witness_headers(db, selected, &source_set_id, &revision_id)?;
+                selected.headers.witness.get_or_init(|| headers)
+            }
+        };
+        let mut revision = headers.revision.clone();
         revision.documents.push(Document {
             key: DocumentKey {
                 source_set_id,
@@ -10808,9 +10856,61 @@ impl Store {
             byte_length: file.text.len(),
         });
         crate::native_evidence::selected_source_witness_with_progress(
-            &file, producer, source_set, revision, progress,
+            file,
+            headers.producer.clone(),
+            headers.source_set.clone(),
+            revision,
+            progress,
         )
         .context("incompatible_index: selected source extraction failed")
+    }
+
+    fn selected_witness_headers(
+        db: &Connection,
+        selected: &ReadRevision,
+        source_set_id: &str,
+        revision_id: &str,
+    ) -> Result<WitnessHeaders> {
+        use crate::native_evidence::{Producer, Revision, SourceSet};
+        let mut producer:Producer=db.query_row(
+            "SELECT id,version,executable_hash,kind,position_encoding FROM native_producers LIMIT 1",[],
+            |r|Ok(Producer{id:r.get(0)?,version:r.get(1)?,executable_hash:r.get(2)?,kind:r.get(3)?,languages:vec![],position_encoding:r.get(4)?}),
+        )?;
+        producer.executable_hash = selected.producer_hash(db)?;
+        producer.languages=db.prepare(
+            "SELECT language FROM native_producer_languages WHERE producer_id=?1 AND producer_version=?2 ORDER BY ordinal"
+        )?.query_map(params![producer.id,producer.version],|r|r.get::<_,String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut source_set: SourceSet = db.query_row(
+            "SELECT id,root_id FROM native_source_sets WHERE id=?1",
+            [source_set_id],
+            |r| {
+                Ok(SourceSet {
+                    id: r.get(0)?,
+                    root_id: r.get(1)?,
+                    languages: vec![],
+                    dependencies: vec![],
+                })
+            },
+        )?;
+        source_set.languages=db.prepare(
+            "SELECT language FROM native_source_set_languages WHERE source_set_id=?1 ORDER BY ordinal"
+        )?.query_map([source_set_id],|r|r.get::<_,String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        source_set.dependencies=db.prepare(
+            "SELECT dependency_id FROM native_source_set_dependencies WHERE source_set_id=?1 ORDER BY ordinal"
+        )?.query_map([source_set_id],|r|r.get::<_,String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let revision:Revision=db.query_row(
+            "SELECT native_revision_id,source_set_id,toolchain_hash,config_hash,dependency_hash FROM native_revisions WHERE native_revision_id=?1 AND id=?2",
+            params![revision_id, selected.key],|r|Ok(Revision{id:r.get(0)?,source_set_id:r.get(1)?,
+                documents:vec![],toolchain_hash:r.get(2)?,config_hash:r.get(3)?,dependency_hash:r.get(4)?}),
+        )?;
+        Ok(WitnessHeaders {
+            producer,
+            source_set,
+            revision,
+        })
     }
 
     /// Authenticate one selected document's normalized records and graph DTOs
@@ -10845,7 +10945,19 @@ impl Store {
         selected: &ReadRevision,
         expired: &dyn Fn() -> bool,
     ) -> Result<()> {
-        self.attest_selected_document_inner(db, path, selected, Some(expired))
+        self.attest_selected_document_loaded_for(db, path, selected, expired)
+            .map(drop)
+    }
+    /// Attest one selected document and return the source and native rows it
+    /// authenticated, so a caller can use them without reading them again.
+    fn attest_selected_document_loaded_for(
+        &self,
+        db: &Connection,
+        path: &str,
+        selected: &ReadRevision,
+        expired: &dyn Fn() -> bool,
+    ) -> Result<AttestedDocument> {
+        self.attest_selected_document_loaded(db, path, selected, Some(expired))
             .map_err(selected_integrity)
             .map_err(|error| self.report_selected_failure(error))
     }
@@ -10856,6 +10968,18 @@ impl Store {
         selected: &ReadRevision,
         progress: Option<&dyn Fn() -> bool>,
     ) -> Result<()> {
+        self.attest_selected_document_loaded(db, path, selected, progress)
+            .map(drop)
+    }
+    fn attest_selected_document_loaded(
+        &self,
+        db: &Connection,
+        path: &str,
+        selected: &ReadRevision,
+        progress: Option<&dyn Fn() -> bool>,
+    ) -> Result<AttestedDocument> {
+        #[cfg(test)]
+        count_selected_read(|counts| counts.attestations += 1);
         use crate::native_evidence::DocumentKey;
         optional_hint_check(progress)?;
         let sql = "SELECT m.source_set_id,m.language,m.path,m.document_version_id,m.graph_projection_id,
@@ -11044,18 +11168,24 @@ impl Store {
             file.hash == hash && file.language == language && file.text.len() == bytes as usize,
             "incompatible_index: selected source identity mismatch"
         );
-        let witness = self.selected_native_witness_for_inner(db, path, selected, progress)?;
+        let witness =
+            self.selected_native_witness_for_inner(db, path, &file, selected, progress)?;
         let coverage = read_native_coverage_v8(db, &scope)?;
         ensure!(
             witness.coverage == vec![coverage],
             "incompatible_index: selected native coverage differs from source"
         );
-        let mut declarations = read_native_declarations_v8_inner(db, &scope, None, true, progress)?;
+        // The store's query order (by syntax_id) is what callers receive; the
+        // comparison sorts both sides without reordering the returned rows.
+        let native_declarations =
+            read_native_declarations_v8_inner(db, &scope, None, true, progress)?;
+        let mut declarations: Vec<&crate::native_evidence::Declaration> =
+            native_declarations.iter().collect();
         optional_hint_check(progress)?;
         let mut expected = Vec::new();
         for declaration in &witness.declarations {
             optional_hint_check(progress)?;
-            expected.push(declaration.clone());
+            expected.push(declaration);
         }
         declarations.sort_by(|a, b| a.syntax_id.cmp(&b.syntax_id));
         expected.sort_by(|a, b| a.syntax_id.cmp(&b.syntax_id));
@@ -11066,21 +11196,21 @@ impl Store {
         optional_hint_check(progress)?;
         // Decode each version's calls and regions once, ordered (owner, ordinal)
         // by the store's byte-order query, and compare whole lists.
-        let calls = read_native_calls_v8_inner(db, &scope, None, progress)?;
+        let native_calls = read_native_calls_v8_inner(db, &scope, None, progress)?;
         let mut expected_calls = witness.calls.clone();
         expected_calls
             .sort_by(|a, b| (&a.owner_syntax_id, a.ordinal).cmp(&(&b.owner_syntax_id, b.ordinal)));
         ensure!(
-            calls == expected_calls,
+            native_calls == expected_calls,
             "incompatible_index: selected native calls differ from source"
         );
         optional_hint_check(progress)?;
-        let regions = read_native_control_regions_v8_inner(db, &scope, None, progress)?;
+        let native_regions = read_native_control_regions_v8_inner(db, &scope, None, progress)?;
         let mut expected_regions = witness.control_regions.clone();
         expected_regions
             .sort_by(|a, b| (&a.owner_syntax_id, a.ordinal).cmp(&(&b.owner_syntax_id, b.ordinal)));
         ensure!(
-            regions == expected_regions,
+            native_regions == expected_regions,
             "incompatible_index: selected native regions differ from source"
         );
         let mut nodes = Vec::new();
@@ -11243,7 +11373,12 @@ impl Store {
                 && Some(ids.class_hash) == class_hash,
             "incompatible_index: selected projection fingerprint mismatch"
         );
-        Ok(())
+        Ok(AttestedDocument {
+            file: graph.files.swap_remove(0),
+            declarations: native_declarations,
+            calls: native_calls,
+            regions: native_regions,
+        })
     }
 
     /// Class DTOs are selected presentation projections; compare only this
@@ -12043,6 +12178,8 @@ impl Store {
         selected: &ReadRevision,
         progress: Option<&dyn Fn() -> bool>,
     ) -> Result<Option<SourceFile>> {
+        #[cfg(test)]
+        count_selected_read(|counts| counts.source_reads += 1);
         optional_hint_check(progress)?;
         let selected_sql = "FROM revision_documents m JOIN document_versions d
             ON d.id=m.document_version_id AND d.source_set_id=m.source_set_id
@@ -12244,7 +12381,15 @@ impl Store {
             (1..=200).contains(&limit) && offset <= i64::MAX as usize,
             "invalid catalog pagination"
         );
-        self.with_evidence(|tx| self.files_in(tx, expected, offset, limit, false))
+        self.with_evidence_response(
+            |response| {
+                response
+                    .store
+                    .files_in(&response.db, expected, offset, limit, false)
+            },
+            || Ok(()),
+            |_| {},
+        )
     }
     fn files_in(
         &self,
@@ -12267,8 +12412,11 @@ impl Store {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )?
             .collect::<rusqlite::Result<_>>()?;
+        // The extra row only decides whether a next page exists; it isn't
+        // returned, so only the returned rows are attested and counted.
+        let next = (source_rows.len() > limit).then_some(offset + limit);
         let mut items = Vec::new();
-        for (path, language, projection_id) in source_rows {
+        for (path, language, projection_id) in source_rows.into_iter().take(limit) {
             self.attest_selected_document_for(tx, &path, &selected)?;
             let methods: i64 = tx.query_row(
                 "SELECT count(*) FROM graph_nodes WHERE projection_id=?1
@@ -12278,8 +12426,6 @@ impl Store {
             )?;
             items.push(serde_json::json!({"path":path,"language":language,"methodCount":methods}));
         }
-        let next = (items.len() > limit).then_some(offset + limit);
-        items.truncate(limit);
         Ok(serde_json::json!({"revision":revision,"items":items,"nextOffset":next}))
     }
 
@@ -13023,6 +13169,8 @@ mod rebaseline_fault_tests;
 #[cfg(test)]
 mod sqlite_schema_race_tests;
 
+#[cfg(test)]
+mod selected_read_once_tests;
 #[cfg(test)]
 mod selected_source_budget_tests;
 
