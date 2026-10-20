@@ -233,6 +233,8 @@ pub struct Store {
     maintenance_before_writer_hook: Arc<TestOneShotHook>,
     maintenance_after_first_delete_hook: Arc<TestOneShotHook>,
     publication_before_commit_hook: Arc<TestOneShotHook>,
+    /// The publication page cache in KiB; only tests lower it.
+    publication_cache_kib: Arc<std::sync::atomic::AtomicI64>,
     writer_before_metadata_hook: Arc<TestOneShotHook>,
     #[cfg(test)]
     test_queue_before_shared_hook: Arc<TestOneShotHook>,
@@ -593,6 +595,9 @@ impl DerefMut for IndexConnection {
 }
 // Only the live variant owns a new shared-use guard. The stage variant keeps
 // the caller's verified exclusive leader guard alive across its transaction.
+/// Page cache for a publication's connection, in KiB (256 MiB).
+const PUBLICATION_CACHE_KIB: i64 = 256 * 1024;
+
 enum PublicationConnection {
     Live(IndexConnection),
     Stage(ProtectedSqliteConnection),
@@ -6077,6 +6082,9 @@ impl Store {
             maintenance_before_writer_hook: Arc::new(TestOneShotHook::default()),
             maintenance_after_first_delete_hook: Arc::new(TestOneShotHook::default()),
             publication_before_commit_hook: Arc::new(TestOneShotHook::default()),
+            publication_cache_kib: Arc::new(std::sync::atomic::AtomicI64::new(
+                PUBLICATION_CACHE_KIB,
+            )),
             writer_before_metadata_hook: Arc::new(TestOneShotHook::default()),
             #[cfg(test)]
             test_queue_before_shared_hook: Arc::new(TestOneShotHook::default()),
@@ -9638,6 +9646,11 @@ impl Store {
             after_preflight == admitted_version,
             "incompatible_index: cache changed during reuse authentication"
         );
+        // A publication is one transaction; with SQLite's default ~2 MiB cache its
+        // dirty pages spill to the file mid-transaction (#209). This connection is
+        // opened per publication, so the larger cache lasts only as long as it does.
+        let cache_kib = self.publication_cache_kib.load(Ordering::Acquire);
+        storage_result(db.pragma_update(None, "cache_size", -cache_kib))?;
         during_tx(PublishStage::BeforeTransaction, &db)?;
         let tx = storage_result(db.transaction_with_behavior(TransactionBehavior::Immediate))?;
         let current = match target {
@@ -10242,6 +10255,13 @@ impl Store {
     #[doc(hidden)]
     pub fn set_writer_before_metadata_hook_for_tests(&self, hook: impl FnOnce() + Send + 'static) {
         self.writer_before_metadata_hook.set(hook);
+    }
+
+    /// Lower the publication page cache so a test publication spills dirty
+    /// pages before COMMIT, as a publication larger than the cache does.
+    #[doc(hidden)]
+    pub fn set_publication_cache_kib_for_tests(&self, kib: i64) {
+        self.publication_cache_kib.store(kib, Ordering::Release);
     }
 
     /// Deterministic rollback after a complete index rebuild but before COMMIT.

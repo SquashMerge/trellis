@@ -239,8 +239,10 @@ fn index_commit_hot_journal_daemon_child() {
         trellis::index_coordinator::reconcile_workspace(&store, &options, &cancel(), |_| {})
             .unwrap();
     // Change every file so the request's index publication rewrites enough
-    // pages that SQLite spills them into index.db before COMMIT.
+    // pages that SQLite spills them into index.db before COMMIT. A small
+    // publication cache stands in for a publication larger than the real one.
     rewrite_workspace(&root, "after");
+    store.set_publication_cache_kib_for_tests(2000);
     let journal = index_db(&state, &root).with_file_name("index.db-journal");
     store.set_publication_before_commit_hook_for_tests(move || {
         let header = fs::read(&journal).map(|bytes| bytes[..8].to_vec());
