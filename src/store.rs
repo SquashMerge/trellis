@@ -656,6 +656,49 @@ fn take_selected_read_counts() -> SelectedReadCounts {
     SELECTED_READ_COUNTS.with(|counts| counts.take())
 }
 
+/// What `selected_source_witness_with_progress` reparses one selected source under.
+struct WitnessInputs {
+    producer: crate::native_evidence::Producer,
+    source_set: crate::native_evidence::SourceSet,
+    revision: crate::native_evidence::Revision,
+}
+
+/// One selected document's stored rows, read from one snapshot by
+/// `Store::fetch_selected_document` and not yet compared with its source.
+struct FetchedDocument {
+    language: String,
+    version_id: String,
+    graph_id: String,
+    class_id: String,
+    graph_hash: String,
+    class_hash: Option<String>,
+    file: SourceFile,
+    witness: WitnessInputs,
+    coverage: crate::native_evidence::Coverage,
+    declarations: Vec<crate::native_evidence::Declaration>,
+    calls: Vec<crate::native_evidence::Call>,
+    regions: Vec<crate::native_evidence::ControlRegion>,
+    node_rows: Vec<(String, String, String, String)>,
+    call_rows: Vec<(String, String, Option<String>, String, String)>,
+    region_rows: Vec<(String, String, String, String)>,
+    class_rows: Vec<(String, String, String, String, String)>,
+    relation_rows: Vec<(String, String, Option<String>, String)>,
+    stored_f: Option<String>,
+}
+
+impl FetchedDocument {
+    /// The source and stored row text this fetch holds, to bound read-ahead.
+    fn bytes(&self) -> usize {
+        self.file.text.len()
+            + self.node_rows.iter().map(|r| r.3.len()).sum::<usize>()
+            + self.call_rows.iter().map(|r| r.4.len()).sum::<usize>()
+            + self.region_rows.iter().map(|r| r.3.len()).sum::<usize>()
+            + self.class_rows.iter().map(|r| r.4.len()).sum::<usize>()
+            + self.relation_rows.iter().map(|r| r.3.len()).sum::<usize>()
+            + self.stored_f.as_ref().map_or(0, String::len)
+    }
+}
+
 /// One selected document's source and native rows, as authenticated by its
 /// attestation in the caller's snapshot.
 struct AttestedDocument {
@@ -857,46 +900,82 @@ impl ReadFence {
 type TreeOverlays = Vec<(usize, String, usize)>;
 
 // Adapt the read helpers' boolean progress seam without erasing the caller's
-// original typed cancellation/deadline error.
+// original typed cancellation/deadline error. The request thread and the
+// metrics workers share it: the caller's check runs on whichever thread asks,
+// one at a time, and its first failure stops every later check.
 struct MetricsReadCheck<'a> {
-    check: std::cell::RefCell<&'a mut dyn FnMut() -> Result<()>>,
-    failure: std::cell::RefCell<Option<anyhow::Error>>,
+    check: Mutex<&'a mut (dyn FnMut() -> Result<()> + Send)>,
+    failure: Mutex<Option<anyhow::Error>>,
+    stopped: AtomicBool,
 }
 impl MetricsReadCheck<'_> {
-    fn check(&self) -> Result<()> {
-        (*self.check.borrow_mut())()
-    }
+    /// The caller's check; its failure is kept for `result` to report.
     fn expired(&self) -> bool {
-        if self.failure.borrow().is_some() {
+        if self.stopped.load(Ordering::Acquire) {
             return true;
         }
-        match self.check() {
+        let mut check = self.check.lock().unwrap_or_else(|e| e.into_inner());
+        if self.stopped.load(Ordering::Acquire) {
+            return true;
+        }
+        match (*check)() {
             Ok(()) => false,
             Err(error) => {
-                *self.failure.borrow_mut() = Some(error);
+                self.failure
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get_or_insert(error);
+                self.stopped.store(true, Ordering::Release);
                 true
             }
         }
     }
+    fn check(&self) -> Result<()> {
+        if self.expired() {
+            return self.result(Err(anyhow::anyhow!("cancelled")));
+        }
+        Ok(())
+    }
+    /// The caller's check failure, if one happened, else `result`.
     fn result<T>(&self, result: Result<T>) -> Result<T> {
-        if let Some(error) = self.failure.borrow_mut().take() {
+        if let Some(error) = self
+            .failure
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
             return Err(error);
         }
         result
     }
 }
 
+/// Why one revision document did not produce metrics.
+enum MetricsDocumentFailure {
+    /// Attestation failed; reported as a selected-read failure.
+    Attest(anyhow::Error),
+    /// Any other failure.
+    Other(anyhow::Error),
+    /// The caller's check failed before this document's work.
+    Stopped,
+}
+
+/// Fetch up to this many documents (or bytes) ahead of the metrics workers.
+const METRICS_FETCH_DOCUMENTS: usize = 64;
+const METRICS_FETCH_BYTES: usize = 64 * 1024 * 1024;
+
 impl EvidenceResponse {
     /// Compute metrics from one selected revision in this response's read transaction.
     pub fn metrics_at(
         &self,
         options: &MetricsOptions,
-        check: &mut impl FnMut() -> Result<()>,
+        check: &mut (impl FnMut() -> Result<()> + Send),
     ) -> Result<MetricsPayload> {
         options.validate()?;
         let progress = MetricsReadCheck {
-            check: std::cell::RefCell::new(check),
-            failure: std::cell::RefCell::new(None),
+            check: Mutex::new(check),
+            failure: Mutex::new(None),
+            stopped: AtomicBool::new(false),
         };
         progress.check()?;
         let selected = self.store.read_revision_for(&self.db, options.pin, true)?;
@@ -954,33 +1033,87 @@ impl EvidenceResponse {
         let mut files = Vec::new();
         let mut directories: BTreeMap<(String, String), crate::metrics::Accumulator> =
             BTreeMap::new();
-        for key in included {
-            progress.check()?;
-            #[cfg(test)]
-            self.store.run_metrics_document_hook(&key.path);
-            // Read and attest only the selected version; no checkout filesystem access.
-            // Metrics use the source and native rows exactly as attestation read them.
-            let expired = || progress.expired();
-            let attested = progress
-                .result(self.store.attest_selected_document_loaded_for(
-                    &self.db, &key.path, &selected, &expired,
-                ))?;
-            ensure!(
-                attested.file.language == key.language,
-                "incompatible_index: metrics language mismatch"
-            );
-            progress.check()?;
-            let rows = crate::metrics::compute_memoized(
-                &mut self.store.metrics_memo.lock().unwrap(),
-                crate::metrics::SourceInput {
+        // Read and attest only the selected version; no checkout filesystem access.
+        // Every SQL read runs in order on this request's connection and snapshot.
+        // The source comparison and metrics run on workers, a chunk behind the
+        // reads, and are accepted strictly in manifest order: the first failure
+        // in that order is the one reported, and nothing after it is accepted.
+        let workers = if included.len() > 1 {
+            crate::parallel::default_workers()
+        } else {
+            1
+        };
+        let expired = || progress.expired();
+        let store = &self.store;
+        let compute =
+            |fetched: FetchedDocument,
+             key: &DocumentKey|
+             -> std::result::Result<crate::metrics::Computed, MetricsDocumentFailure> {
+                #[cfg(test)]
+                store.run_metrics_document_hook(&key.path);
+                let expired = || progress.expired();
+                // Metrics use the source and native rows exactly as attestation read them.
+                let attested = Store::attest_fetched(fetched, Some(&expired))
+                    .map_err(MetricsDocumentFailure::Attest)?;
+                if attested.file.language != key.language {
+                    return Err(MetricsDocumentFailure::Other(anyhow::anyhow!(
+                        "incompatible_index: metrics language mismatch"
+                    )));
+                }
+                if progress.expired() {
+                    return Err(MetricsDocumentFailure::Stopped);
+                }
+                let source = crate::metrics::SourceInput {
                     language: &key.language,
                     content_hash: &attested.file.hash,
                     text: &attested.file.text,
-                },
-                &attested.declarations,
-                &attested.calls,
-                &attested.regions,
-                &mut || progress.check(),
+                };
+                let cached = store
+                    .metrics_memo
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .lookup(&source);
+                crate::metrics::compute_with_cached(
+                    cached,
+                    source,
+                    &attested.declarations,
+                    &attested.calls,
+                    &attested.regions,
+                    &mut || {
+                        if progress.expired() {
+                            anyhow::bail!("cancelled")
+                        }
+                        Ok(())
+                    },
+                )
+                .map_err(MetricsDocumentFailure::Other)
+            };
+        let mut accept = |key: &DocumentKey,
+                          outcome: Option<
+            std::result::Result<crate::metrics::Computed, MetricsDocumentFailure>,
+        >|
+         -> Result<()> {
+            let computed = match outcome {
+                Some(Ok(computed)) => computed,
+                Some(Err(MetricsDocumentFailure::Attest(error))) => {
+                    return progress.result(Err(self
+                        .store
+                        .report_selected_failure(selected_integrity(error))));
+                }
+                Some(Err(MetricsDocumentFailure::Other(error))) => {
+                    return progress.result(Err(error));
+                }
+                // A document a worker never started was skipped after a check failed.
+                Some(Err(MetricsDocumentFailure::Stopped)) | None => {
+                    return progress.result(Err(anyhow::anyhow!("cancelled")));
+                }
+            };
+            let rows = computed.commit(
+                &mut self
+                    .store
+                    .metrics_memo
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()),
             )?;
             let mut file_fold = crate::metrics::Accumulator::default();
             let mut parents = vec![String::new()];
@@ -1050,7 +1183,79 @@ impl EvidenceResponse {
                     metrics: file_fold.project(&options.aggregate, &names)?,
                 });
             }
-        }
+            Ok(())
+        };
+        std::thread::scope(|scope| -> Result<()> {
+            type Fetched = std::result::Result<FetchedDocument, MetricsDocumentFailure>;
+            let mut remaining = included.iter();
+            let mut exhausted = false;
+            let mut pending: Option<(
+                Vec<&DocumentKey>,
+                std::thread::ScopedJoinHandle<'_, Vec<Option<_>>>,
+            )> = None;
+            loop {
+                // Fetch the next chunk while the workers compute the previous one.
+                let mut keys: Vec<&DocumentKey> = Vec::new();
+                let mut fetched: Vec<std::sync::Mutex<Option<Fetched>>> = Vec::new();
+                let mut bytes = 0usize;
+                while !exhausted
+                    && keys.len() < METRICS_FETCH_DOCUMENTS
+                    && bytes < METRICS_FETCH_BYTES
+                {
+                    let Some(key) = remaining.next() else {
+                        exhausted = true;
+                        break;
+                    };
+                    keys.push(*key);
+                    let item = if progress.expired() {
+                        Err(MetricsDocumentFailure::Stopped)
+                    } else {
+                        self.store
+                            .fetch_selected_document(&self.db, &key.path, &selected, Some(&expired))
+                            .map_err(MetricsDocumentFailure::Attest)
+                    };
+                    match &item {
+                        Ok(document) => bytes = bytes.saturating_add(document.bytes()),
+                        // Nothing after a failed document is read.
+                        Err(_) => exhausted = true,
+                    }
+                    fetched.push(std::sync::Mutex::new(Some(item)));
+                }
+                if let Some((keys, handle)) = pending.take() {
+                    let outcomes = handle
+                        .join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                    for (key, outcome) in keys.into_iter().zip(outcomes) {
+                        accept(key, outcome)?;
+                    }
+                }
+                if keys.is_empty() {
+                    return Ok(());
+                }
+                let run = {
+                    let compute = &compute;
+                    let stopped = &progress.stopped;
+                    let keys = keys.clone();
+                    move || {
+                        crate::parallel::map_ordered(&fetched, workers, stopped, |index, item| {
+                            let item = item
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .take()
+                                .expect("each fetched document is computed once");
+                            item.and_then(|document| compute(document, keys[index]))
+                        })
+                    }
+                };
+                if workers == 1 {
+                    for (key, outcome) in keys.into_iter().zip(run()) {
+                        accept(key, outcome)?;
+                    }
+                } else {
+                    pending = Some((keys, scope.spawn(run)));
+                }
+            }
+        })?;
         if options.scope == "declaration" {
             if declarations.is_empty() {
                 anyhow::bail!("not_found: metrics declaration");
@@ -2511,6 +2716,8 @@ fn open_index_marker_probe(
         // the cache is freed with the per-request connection. No mmap: an
         // mmap'd I/O error would be a signal, not a typed error.
         storage_result(db.pragma_update(None, "cache_size", READ_CACHE_KIB))?;
+        // Attestation's per-document statements stay prepared for the request.
+        db.set_prepared_statement_cache_capacity(64);
     }
     let mode: String = storage_result(db.pragma_query_value(None, "journal_mode", |r| r.get(0)))?;
     ensure!(mode == "delete", "incompatible_index: journal mode");
@@ -10825,17 +11032,17 @@ impl Store {
         Ok(())
     }
 
-    /// Reparse exactly one selected, paired source in this SQLite snapshot.
-    /// This never rereads a workspace path or projects the whole graph. `file`
-    /// is the selected source the caller read and hash-checked in this snapshot.
-    fn selected_native_witness_for_inner(
+    /// The producer, source set and revision header one selected, paired
+    /// source is reparsed under, read in this SQLite snapshot. `file` is the
+    /// selected source the caller read and hash-checked in this snapshot.
+    fn selected_witness_inputs(
         &self,
         db: &Connection,
         path: &str,
         file: &SourceFile,
         selected: &ReadRevision,
         progress: Option<&dyn Fn() -> bool>,
-    ) -> Result<crate::native_evidence::Artifact> {
+    ) -> Result<WitnessInputs> {
         optional_hint_check(progress)?;
         use crate::native_evidence::{Document, DocumentKey};
         let (source_set_id, revision_id): (String, String) = db
@@ -10886,14 +11093,11 @@ impl Store {
             content_hash: file.hash.clone(),
             byte_length: file.text.len(),
         });
-        crate::native_evidence::selected_source_witness_with_progress(
-            file,
-            headers.producer.clone(),
-            headers.source_set.clone(),
+        Ok(WitnessInputs {
+            producer: headers.producer.clone(),
+            source_set: headers.source_set.clone(),
             revision,
-            progress,
-        )
-        .context("incompatible_index: selected source extraction failed")
+        })
     }
 
     fn selected_witness_headers(
@@ -11009,6 +11213,21 @@ impl Store {
         selected: &ReadRevision,
         progress: Option<&dyn Fn() -> bool>,
     ) -> Result<AttestedDocument> {
+        let fetched = self.fetch_selected_document(db, path, selected, progress)?;
+        Self::attest_fetched(fetched, progress)
+    }
+    /// Read, in this snapshot and in order, everything attestation compares
+    /// for one selected document. Each SQL row and byte budget is checked
+    /// before the rows it bounds are read, and stored rows are decoded and
+    /// structurally checked as they are read. Nothing is compared with the
+    /// source here: `attest_fetched` does that, off the connection.
+    fn fetch_selected_document(
+        &self,
+        db: &Connection,
+        path: &str,
+        selected: &ReadRevision,
+        progress: Option<&dyn Fn() -> bool>,
+    ) -> Result<FetchedDocument> {
         #[cfg(test)]
         count_selected_read(|counts| counts.attestations += 1);
         use crate::native_evidence::DocumentKey;
@@ -11199,17 +11418,122 @@ impl Store {
             file.hash == hash && file.language == language && file.text.len() == bytes as usize,
             "incompatible_index: selected source identity mismatch"
         );
-        let witness =
-            self.selected_native_witness_for_inner(db, path, &file, selected, progress)?;
+        let witness = self.selected_witness_inputs(db, path, &file, selected, progress)?;
         let coverage = read_native_coverage_v8(db, &scope)?;
+        let declarations = read_native_declarations_v8_inner(db, &scope, None, true, progress)?;
+        optional_hint_check(progress)?;
+        let calls = read_native_calls_v8_inner(db, &scope, None, progress)?;
+        optional_hint_check(progress)?;
+        let regions = read_native_control_regions_v8_inner(db, &scope, None, progress)?;
+        let mut node_rows = Vec::new();
+        for row in db
+            .prepare_cached(
+                "SELECT id,name,path,payload FROM graph_nodes WHERE projection_id=?1 ORDER BY id",
+            )?
+            .query_map([&graph_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            })?
+        {
+            optional_hint_check(progress)?;
+            node_rows.push(row?);
+        }
+        let mut call_rows = Vec::new();
+        for row in db.prepare_cached("SELECT id,caller,target,path,payload FROM graph_calls WHERE projection_id=?1 ORDER BY id")?
+            .query_map([&graph_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?)))? {
+            optional_hint_check(progress)?;
+            call_rows.push(row?);
+        }
+        let mut region_rows = Vec::new();
+        for row in db.prepare_cached("SELECT id,owner,path,payload FROM graph_regions WHERE projection_id=?1 ORDER BY id")?
+            .query_map([&graph_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?)))? {
+            optional_hint_check(progress)?;
+            region_rows.push(row?);
+        }
+        let mut class_rows = Vec::new();
+        for row in db.prepare_cached("SELECT id,name,qualified_name,path,payload FROM classes WHERE projection_id=?1 ORDER BY id")?
+            .query_map([&class_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?)))? {
+            optional_hint_check(progress)?;
+            class_rows.push(row?);
+        }
+        let mut relation_rows = Vec::new();
+        for row in db.prepare_cached("SELECT id,owner,target,payload FROM class_relations WHERE projection_id=?1 ORDER BY id")?
+            .query_map([&class_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,String>(3)?)))? {
+            optional_hint_check(progress)?;
+            relation_rows.push(row?);
+        }
+        optional_hint_check(progress)?;
+        let stored_f: Option<String> = db
+            .prepare_cached("SELECT class_extraction_payload FROM graph_projections WHERE id=?1")?
+            .query_row([&graph_id], |r| r.get(0))?;
+        Ok(FetchedDocument {
+            language,
+            version_id,
+            graph_id,
+            class_id,
+            graph_hash,
+            class_hash,
+            file,
+            witness,
+            coverage,
+            declarations,
+            calls,
+            regions,
+            node_rows,
+            call_rows,
+            region_rows,
+            class_rows,
+            relation_rows,
+            stored_f,
+        })
+    }
+
+    /// Authenticate one fetched document against its source: reparse it,
+    /// then compare the stored native rows, graph and class DTOs, F and the
+    /// projection fingerprint with what the source yields. This touches no
+    /// SQLite handle, so it may run on a worker thread.
+    fn attest_fetched(
+        fetched: FetchedDocument,
+        progress: Option<&dyn Fn() -> bool>,
+    ) -> Result<AttestedDocument> {
+        let FetchedDocument {
+            language,
+            version_id,
+            graph_id,
+            class_id,
+            graph_hash,
+            class_hash,
+            file,
+            witness,
+            coverage,
+            declarations: native_declarations,
+            calls: native_calls,
+            regions: native_regions,
+            node_rows,
+            call_rows,
+            region_rows,
+            class_rows: stored_class_rows,
+            relation_rows,
+            stored_f,
+        } = fetched;
+        let witness = crate::native_evidence::selected_source_witness_with_progress(
+            &file,
+            witness.producer,
+            witness.source_set,
+            witness.revision,
+            progress,
+        )
+        .context("incompatible_index: selected source extraction failed")?;
         ensure!(
             witness.coverage == vec![coverage],
             "incompatible_index: selected native coverage differs from source"
         );
         // The store's query order (by syntax_id) is what callers receive; the
         // comparison sorts both sides without reordering the returned rows.
-        let native_declarations =
-            read_native_declarations_v8_inner(db, &scope, None, true, progress)?;
         let mut declarations: Vec<&crate::native_evidence::Declaration> =
             native_declarations.iter().collect();
         optional_hint_check(progress)?;
@@ -11225,9 +11549,8 @@ impl Store {
             "incompatible_index: selected native declarations differ from source"
         );
         optional_hint_check(progress)?;
-        // Decode each version's calls and regions once, ordered (owner, ordinal)
-        // by the store's byte-order query, and compare whole lists.
-        let native_calls = read_native_calls_v8_inner(db, &scope, None, progress)?;
+        // Each version's calls and regions were decoded once, ordered (owner,
+        // ordinal) by the store's byte-order query; compare whole lists.
         let mut expected_calls = witness.calls.clone();
         expected_calls
             .sort_by(|a, b| (&a.owner_syntax_id, a.ordinal).cmp(&(&b.owner_syntax_id, b.ordinal)));
@@ -11236,7 +11559,6 @@ impl Store {
             "incompatible_index: selected native calls differ from source"
         );
         optional_hint_check(progress)?;
-        let native_regions = read_native_control_regions_v8_inner(db, &scope, None, progress)?;
         let mut expected_regions = witness.control_regions.clone();
         expected_regions
             .sort_by(|a, b| (&a.owner_syntax_id, a.ordinal).cmp(&(&b.owner_syntax_id, b.ordinal)));
@@ -11245,21 +11567,8 @@ impl Store {
             "incompatible_index: selected native regions differ from source"
         );
         let mut nodes = Vec::new();
-        for row in db
-            .prepare(
-                "SELECT id,name,path,payload FROM graph_nodes WHERE projection_id=?1 ORDER BY id",
-            )?
-            .query_map([&graph_id], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
-                ))
-            })?
-        {
+        for (id, name, path, payload) in node_rows {
             optional_hint_check(progress)?;
-            let (id, name, path, payload) = row?;
             let node: Symbol = serde_json::from_str(&payload)?;
             ensure!(
                 node.id == id && node.name == name && node.path == path && path == file.path,
@@ -11268,44 +11577,54 @@ impl Store {
             nodes.push(node);
         }
         let mut calls = Vec::new();
-        for row in db.prepare("SELECT id,caller,target,path,payload FROM graph_calls WHERE projection_id=?1 ORDER BY id")?
-            .query_map([&graph_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?)))? {
+        for (id, caller, target, path, payload) in call_rows {
             optional_hint_check(progress)?;
-            let (id,caller,target,path,payload)=row?;
-            let call:CallSite=serde_json::from_str(&payload)?;
-            ensure!(call.id==id && call.caller==caller && call.path==path && path==file.path && target.is_none(),
-                "incompatible_index: selected graph call materialization differs");
+            let call: CallSite = serde_json::from_str(&payload)?;
+            ensure!(
+                call.id == id
+                    && call.caller == caller
+                    && call.path == path
+                    && path == file.path
+                    && target.is_none(),
+                "incompatible_index: selected graph call materialization differs"
+            );
             calls.push(call);
         }
         let mut regions = Vec::new();
-        for row in db.prepare("SELECT id,owner,path,payload FROM graph_regions WHERE projection_id=?1 ORDER BY id")?
-            .query_map([&graph_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?)))? {
+        for (id, owner, path, payload) in region_rows {
             optional_hint_check(progress)?;
-            let (id,owner,path,payload)=row?;
-            let region:ControlRegion=serde_json::from_str(&payload)?;
-            ensure!(region.id==id && region.owner==owner && region.path==path && path==file.path,
-                "incompatible_index: selected graph region materialization differs");
+            let region: ControlRegion = serde_json::from_str(&payload)?;
+            ensure!(
+                region.id == id
+                    && region.owner == owner
+                    && region.path == path
+                    && path == file.path,
+                "incompatible_index: selected graph region materialization differs"
+            );
             regions.push(region);
         }
         let mut class_rows = Vec::new();
-        for row in db.prepare("SELECT id,name,qualified_name,path,payload FROM classes WHERE projection_id=?1 ORDER BY id")?
-            .query_map([&class_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?)))? {
+        for (id, name, qualified, path, payload) in stored_class_rows {
             optional_hint_check(progress)?;
-            let (id,name,qualified,path,payload)=row?;
-            let class:crate::classes::ClassDefinition=serde_json::from_str(&payload)?;
-            ensure!(class.symbol.id==id && class.symbol.name==name && class.symbol.path==path
-                && class.qualified_name==qualified && path==file.path,
-                "incompatible_index: selected class materialization differs");
+            let class: crate::classes::ClassDefinition = serde_json::from_str(&payload)?;
+            ensure!(
+                class.symbol.id == id
+                    && class.symbol.name == name
+                    && class.symbol.path == path
+                    && class.qualified_name == qualified
+                    && path == file.path,
+                "incompatible_index: selected class materialization differs"
+            );
             class_rows.push(class);
         }
         let mut class_relations = Vec::new();
-        for row in db.prepare("SELECT id,owner,target,payload FROM class_relations WHERE projection_id=?1 ORDER BY id")?
-            .query_map([&class_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,String>(3)?)))? {
+        for (id, owner, target, payload) in relation_rows {
             optional_hint_check(progress)?;
-            let (id,owner,target,payload)=row?;
-            let relation:crate::classes::ClassRelation=serde_json::from_str(&payload)?;
-            ensure!(relation.id==id && relation.owner==owner && relation.target==target,
-                "incompatible_index: selected class relation materialization differs");
+            let relation: crate::classes::ClassRelation = serde_json::from_str(&payload)?;
+            ensure!(
+                relation.id == id && relation.owner == owner && relation.target == target,
+                "incompatible_index: selected class relation materialization differs"
+            );
             class_relations.push(relation);
         }
         optional_hint_check(progress)?;
@@ -11352,11 +11671,6 @@ impl Store {
             &witness,
             &Arc::new(std::sync::atomic::AtomicBool::new(false)),
             progress,
-        )?;
-        let stored_f: Option<String> = db.query_row(
-            "SELECT class_extraction_payload FROM graph_projections WHERE id=?1",
-            [&graph_id],
-            |r| r.get(0),
         )?;
         if matches!(language.as_str(), "java" | "python") {
             optional_hint_check(progress)?;
