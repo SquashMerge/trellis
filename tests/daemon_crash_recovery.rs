@@ -382,6 +382,92 @@ async fn killed_mid_index_commit_recovers(torn_header: bool) {
     );
 }
 
+#[test]
+fn index_write_cold_journal_daemon_child() {
+    let Some((state, root)) = child_paths() else {
+        return;
+    };
+    let store = Store::open(roots(&state), identity(&root)).unwrap();
+    let options = IndexOptions::new(root.clone());
+    let (head, session) =
+        trellis::index_coordinator::reconcile_workspace(&store, &options, &cancel(), |_| {})
+            .unwrap();
+    // The default publication cache holds this rewrite, so SQLite writes no
+    // page into index.db and its FULL-sync journal header stays zeroed.
+    rewrite_workspace(&root, "after");
+    let journal = index_db(&state, &root).with_file_name("index.db-journal");
+    store.set_publication_before_commit_hook_for_tests(move || {
+        let header = fs::read(&journal).map(|bytes| bytes[..8].to_vec());
+        announce_and_wait_for_kill(&format!(
+            "HOOKED {} {} {}",
+            head.index_generation,
+            head.index_revision,
+            matches!(header, Ok(bytes) if bytes == [0u8; 8])
+        ));
+    });
+    let _ = trellis::index_coordinator::drain_requests(&store, &session);
+    unreachable!("the publication hook never returns");
+}
+
+/// #220: a writer killed inside an index write transaction, before its commit
+/// phase, leaves a cold journal (zeroed header, index.db untouched). SQLite
+/// ignores it; the restarted daemon must reconcile and resume the queue, not
+/// refuse every writable open with `recovery_required`.
+#[tokio::test]
+async fn killed_before_index_commit_leaves_cold_journal_then_queue_resumes() {
+    let base = tempfile::tempdir().unwrap();
+    let state = base.path().join("state");
+    let root = base.path().join("work");
+    fs::create_dir(&root).unwrap();
+    rewrite_workspace(&root, "before");
+    let store = Store::open(roots(&state), identity(&root)).unwrap();
+    let accepted = store
+        .enqueue_request(&IndexOptions::new(root.clone()), None)
+        .unwrap();
+    drop(store);
+
+    let announced =
+        run_child_until_hook_then_kill("index_write_cold_journal_daemon_child", &state, &root);
+    let fields: Vec<&str> = announced.split(' ').collect();
+    assert_eq!(fields.len(), 3, "{announced}");
+    assert_eq!(
+        fields[2], "true",
+        "journal header was not zeroed inside the transaction"
+    );
+    let index = index_db(&state, &root);
+    let journal = index.with_file_name("index.db-journal");
+    let left = fs::read(&journal).expect("the killed writer must leave its journal");
+    assert!(left.len() > 8, "journal holds page images: {}", left.len());
+    assert_eq!(left[..8], [0u8; 8], "the killed writer left a cold journal");
+    let prior = trellis::model::IndexPin {
+        index_generation: fields[0].parse().unwrap(),
+        index_revision: fields[1].parse().unwrap(),
+    };
+
+    let (_registry, _runtime) = restart_daemon_until_terminal(&state, &root, &accepted.id).await;
+    let store = Store::open(roots(&state), identity(&root)).unwrap();
+    let done = store.request_by_id(&accepted.id).unwrap().unwrap();
+    assert_eq!(done.state, "done", "{done:?}");
+    assert!(
+        !journal.exists(),
+        "the resumed write transaction consumed the cold journal"
+    );
+    let (pin, source) = store
+        .source_at("m0.js", Some(prior))
+        .unwrap()
+        .expect("the prior head is intact");
+    assert_eq!(pin, prior);
+    assert!(source.text.contains("before_0_0") && !source.text.contains("after_0_0"));
+    let committed = done.revision.unwrap();
+    assert!(committed.index_revision > prior.index_revision);
+    let (served, after) = store.symbols_at("after_0_0", 5).unwrap();
+    assert!(served.index_revision >= committed.index_revision);
+    assert!(
+        after.iter().any(|symbol| symbol.name == "after_0_0"),
+        "the resumed publication indexed the rewritten tree"
+    );
+}
+
 /// A journal shorter than SQLite's magic is cold, never a hot journal to roll
 /// back: first activation of an index with a corrupt header takes the same
 /// path as with no journal at all, never `recovery_deferred`.
