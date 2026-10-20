@@ -1237,19 +1237,26 @@ fn executable_drift_claim_child() {
     let options = IndexOptions::new(workspace);
     let stage = std::env::var("TRELLIS_DRIFT_CLAIM_STAGE").unwrap_or_else(|_| "old".into());
     if stage == "new" {
+        // The rebuilt image's first claimed publication, as at daemon startup.
         let previous = store.index_baseline().unwrap();
+        if std::env::var("TRELLIS_DRIFT_CLAIM_EDIT").is_ok() {
+            fs::write(
+                options.workspace_root.join("a.js"),
+                std::env::var("TRELLIS_DRIFT_CLAIM_EDIT").unwrap(),
+            )
+            .unwrap();
+        }
+        // Mandatory startup reconciliation, observed by its mode.
         let modes = Mutex::new(Vec::new());
-        let (fresh, _session) = reconcile_workspace(
-            &store,
-            &options,
-            &Arc::new(AtomicBool::new(false)),
-            |progress| {
-                if progress.phase.starts_with("mode:") {
-                    modes.lock().unwrap().push(progress.phase);
+        trellis::index_coordinator::IndexJobCoordinator::prepare(&store, None)
+            .unwrap()
+            .run_serving(&options, &Arc::new(AtomicBool::new(false)), |p| {
+                if p.phase.starts_with("mode:") {
+                    modes.lock().unwrap().push(p.phase);
                 }
-            },
-        )
-        .unwrap();
+            })
+            .unwrap();
+        let fresh = store.status().unwrap().revision;
         assert_eq!(fresh.index_generation, previous.index_generation);
         assert_eq!(fresh.index_revision, previous.index_revision + 1);
         for path in ["a.js", "b.js"] {
@@ -1262,18 +1269,31 @@ fn executable_drift_claim_child() {
         let (producer_sha, binding_sha): (String, String) = db.query_row(
             "SELECT producer_sha,binding_sha FROM revision_producer_bindings WHERE revision_id=?1",
             [&id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
-        let manifests: i64 = db
+        let manifest: Vec<String> = db
+            .prepare(
+                "SELECT path||' '||document_version_id||' '||graph_projection_id||' '||
+                 coalesce(class_projection_id,'-')||' '||coverage_state
+                 FROM revision_documents WHERE revision_id=?1 ORDER BY ordinal",
+            )
+            .unwrap()
+            .query_map([&id], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let extractor: Option<String> = db
             .query_row(
-                "SELECT count(*) FROM revision_documents WHERE revision_id=?1",
+                "SELECT json_extract(payload,'$.hash') FROM revision_capture_inputs
+                 WHERE revision_id=?1 AND input_key='extractor:trellis.native.syntax'",
                 [&id],
                 |r| r.get(0),
             )
-            .unwrap();
-        assert_eq!(manifests, 2);
+            .ok();
+        // The published result; the pin is reported separately.
+        let graph = serde_json::to_value(store.graph_at(Some(fresh)).unwrap()).unwrap();
         let result = serde_json::json!({"modes":modes.into_inner().unwrap(),
-            "producerSha":producer_sha,"bindingSha":binding_sha,
+            "producerSha":producer_sha,"bindingSha":binding_sha,"extractor":extractor,
             "generation":fresh.index_generation.to_string(),"revision":fresh.index_revision,
-            "selectedDocuments":manifests});
+            "manifest":manifest,"graph":graph});
         fs::write(proof, serde_json::to_vec(&result).unwrap()).unwrap();
         return;
     }
@@ -1427,20 +1447,23 @@ fn asserted_claim_under_real_executable_drift(body_edit: bool, drift: bool) {
             break;
         }
     }
-    let executing_hash = if drift {
-        // Replace the binary pathname atomically while the old inode executes.
-        // The next normal claimed capture hashes the changed current_exe pathname.
+    // Replace the binary pathname atomically while the old inode executes.
+    // The next normal claimed capture hashes the changed current_exe pathname.
+    let drift_binary = |marker: &[u8]| {
         let replacement = state.path().join("native-drift-replacement");
         fs::copy(&binary, &replacement).unwrap();
         let mut bytes = fs::OpenOptions::new()
             .append(true)
             .open(&replacement)
             .unwrap();
-        bytes.write_all(b"TRELLIS-TEST-PRODUCER-DRIFT-V1").unwrap();
+        bytes.write_all(marker).unwrap();
         bytes.sync_all().unwrap();
         drop(bytes);
         fs::rename(&replacement, &binary).unwrap();
         hex::encode(Sha256::digest(fs::read(&binary).unwrap()))
+    };
+    let executing_hash = if drift {
+        drift_binary(b"TRELLIS-TEST-PRODUCER-DRIFT-V1")
     } else {
         hex::encode(Sha256::digest(fs::read(&binary).unwrap()))
     };
@@ -1491,41 +1514,74 @@ fn asserted_claim_under_real_executable_drift(body_edit: bool, drift: bool) {
     );
     if drift {
         assert_ne!(old_hash, executing_hash);
-        let next_proof = state.path().join("drift-proof-new.json");
-        let next = Command::new(&binary)
-            .arg("--exact")
-            .arg("executable_drift_claim_child")
-            .arg("--nocapture")
-            .env("TRELLIS_DRIFT_CLAIM_STATE", state.path())
-            .env("TRELLIS_DRIFT_CLAIM_WORKSPACE", workspace.path())
-            .env("TRELLIS_DRIFT_CLAIM_PROOF", &next_proof)
-            .env("TRELLIS_DRIFT_CLAIM_STAGE", "new")
-            .output()
-            .unwrap();
-        assert!(
-            next.status.success(),
-            "new image failed: stdout={} stderr={}",
-            String::from_utf8_lossy(&next.stdout),
-            String::from_utf8_lossy(&next.stderr)
-        );
-        let remeasured: serde_json::Value =
-            serde_json::from_slice(&fs::read(&next_proof).unwrap()).unwrap();
+        let rebuilt =
+            |label: &str, executable: &str, extractor: Option<&str>, edit: Option<String>| {
+                let next_proof = state.path().join(format!("drift-proof-{label}.json"));
+                let mut command = Command::new(&binary);
+                command
+                    .arg("--exact")
+                    .arg("executable_drift_claim_child")
+                    .arg("--nocapture")
+                    .env("TRELLIS_DRIFT_CLAIM_STATE", state.path())
+                    .env("TRELLIS_DRIFT_CLAIM_WORKSPACE", workspace.path())
+                    .env("TRELLIS_DRIFT_CLAIM_PROOF", &next_proof)
+                    .env("TRELLIS_DRIFT_CLAIM_STAGE", "new")
+                    .env_remove("TRELLIS_TEST_EXTRACTOR_HASH");
+                if let Some(hash) = extractor {
+                    command.env("TRELLIS_TEST_EXTRACTOR_HASH", hash);
+                }
+                if let Some(edit) = edit {
+                    command.env("TRELLIS_DRIFT_CLAIM_EDIT", edit);
+                }
+                let next = command.output().unwrap();
+                assert!(
+                    next.status.success(),
+                    "new image failed: stdout={} stderr={}",
+                    String::from_utf8_lossy(&next.stdout),
+                    String::from_utf8_lossy(&next.stderr)
+                );
+                let proof: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&next_proof).unwrap()).unwrap();
+                assert_eq!(proof["producerSha"], executable);
+                assert_eq!(proof["generation"], result["generation"]);
+                assert_eq!(proof["bindingSha"].as_str().unwrap().len(), 64);
+                assert_eq!(proof["manifest"].as_array().unwrap().len(), 2);
+                proof
+            };
+        // Decision 0005 (2026-10 amendment): the rebuilt image has the same
+        // extractor producer hash, so it keeps the validated facts. It
+        // publishes a new revision bound to its own executable SHA.
+        let reused = rebuilt("reused", &executing_hash, None, None);
+        assert_eq!(reused["modes"], serde_json::json!(["mode:unchanged"]));
+        assert_eq!(reused["revision"], claimed_revision + 1);
+        // A changed producer hash forces full re-extraction of every document,
+        // and that re-extraction publishes the same facts and projections.
+        let changed = "f".repeat(64);
+        let remeasured = rebuilt("remeasured", &executing_hash, Some(&changed), None);
         assert_eq!(remeasured["modes"], serde_json::json!(["mode:full"]));
-        assert_eq!(remeasured["producerSha"], executing_hash);
-        assert_eq!(remeasured["generation"], result["generation"]);
-        assert_eq!(remeasured["revision"], claimed_revision + 1);
-        assert_eq!(remeasured["selectedDocuments"], 2);
-        assert_eq!(remeasured["bindingSha"].as_str().unwrap().len(), 64);
+        assert_eq!(remeasured["revision"], claimed_revision + 2);
+        assert_eq!(remeasured["extractor"], changed);
+        assert_ne!(reused["extractor"], changed);
+        assert_eq!(remeasured["manifest"], reused["manifest"]);
+        assert_eq!(remeasured["graph"], reused["graph"]);
+        // Rebuild again with that same producer hash: a body edit stays local.
+        let second_hash = drift_binary(b"TRELLIS-TEST-PRODUCER-DRIFT-V2");
+        assert_ne!(second_hash, executing_hash);
+        let edited = rebuilt("local", &second_hash, Some(&changed), Some(local("7")));
+        assert_eq!(edited["modes"], serde_json::json!(["mode:local"]));
+        assert_eq!(edited["revision"], claimed_revision + 3);
     }
 }
 
+#[cfg(feature = "test-support")]
 #[test]
-fn unchanged_explicit_claim_with_real_executable_drift_remeasures_every_document() {
+fn rebuilt_executable_reuses_facts_only_while_the_extractor_hash_is_unchanged() {
     asserted_claim_under_real_executable_drift(false, true);
 }
 
+#[cfg(feature = "test-support")]
 #[test]
-fn body_edit_explicit_claim_with_real_executable_drift_cannot_use_local_reuse() {
+fn body_edit_then_rebuilt_executable_reuses_facts_only_while_the_extractor_hash_is_unchanged() {
     asserted_claim_under_real_executable_drift(true, true);
 }
 

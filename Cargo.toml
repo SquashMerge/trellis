@@ -40,6 +40,10 @@ tree-sitter-python = "0.25"
 tree-sitter-rust = "0.24"
 uuid = { version = "1", features = ["v4"] }
 
+[build-dependencies]
+# build.rs hashes the native extraction inputs (build/extractor_inputs.rs).
+sha2 = "0.10"
+
 [dev-dependencies]
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }

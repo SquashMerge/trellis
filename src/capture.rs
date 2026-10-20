@@ -115,10 +115,24 @@ impl Stamp {
 #[serde(deny_unknown_fields, tag = "state", rename_all = "camelCase")]
 pub enum CaptureInputObservation {
     Absent,
-    Present { stat: CaptureStat, hash: String },
-    Directory { stat: CaptureStat },
-    Root { stat: CaptureStat },
+    Present {
+        stat: CaptureStat,
+        hash: String,
+    },
+    Directory {
+        stat: CaptureStat,
+    },
+    Root {
+        stat: CaptureStat,
+    },
+    /// The executing native extractor's build-time producer hash
+    /// (`EXTRACTOR_INPUT_KEY`), not a filesystem observation.
+    Extractor {
+        hash: String,
+    },
 }
+/// The persisted input key that records the native extractor producer hash.
+pub(crate) const EXTRACTOR_INPUT_KEY: &str = "extractor:trellis.native.syntax";
 fn stamp(meta: &fs::Metadata) -> Stamp {
     #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
@@ -1088,6 +1102,14 @@ impl Capture {
                 );
             }
         }
+        // The producer hash of the extraction code this executable runs. A
+        // rebuilt executable with an equal hash keeps the selected facts.
+        result.insert(
+            EXTRACTOR_INPUT_KEY.into(),
+            CaptureInputObservation::Extractor {
+                hash: crate::native_evidence::extractor_hash(),
+            },
+        );
         Ok(result)
     }
 }

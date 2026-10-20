@@ -28,6 +28,19 @@ pub(crate) const PRODUCER: &str = "trellis.native.syntax";
 /// Native producer descriptor version. Any change that can alter a native measured field or
 /// projection, or that starts reading another input, must change it (Decision 0003).
 pub(crate) const NATIVE_VERSION: &str = "native-v8";
+/// The build-time producer hash of this executable's extraction inputs: the
+/// listed extraction modules and crates (`build/extractor_inputs.rs`). Each
+/// revision records it; an executable rebuild with an equal hash keeps the
+/// selected head's validated facts instead of re-extracting (Decision 0005).
+pub(crate) fn extractor_hash() -> String {
+    // Test-support builds may stand in a different producer hash, so a test
+    // can drive a real rebuilt executable through the changed-producer path.
+    #[cfg(feature = "test-support")]
+    if let Ok(hash) = std::env::var("TRELLIS_TEST_EXTRACTOR_HASH") {
+        return hash;
+    }
+    env!("TRELLIS_EXTRACTOR_HASH").to_owned()
+}
 /// The native producer's declared extraction-input inventory (Decision 0003), keyed by its
 /// descriptor `(id, version)` and language. `extract` measures one document from only its own
 /// bytes, language and path; the tree-sitter grammars and Unicode normalization tables it uses
@@ -717,6 +730,18 @@ pub(crate) fn from_capture_observed<'c>(
         root: root.to_owned(),
         root_id: root_id.to_owned(),
     })
+}
+
+/// The captured revision header alone, measuring no document. Used when an
+/// executable rebuild with an unchanged extractor hash keeps every selected
+/// document's validated facts (Decision 0005).
+pub(crate) fn captured_revision_header(
+    capture: &Capture,
+    root: &Path,
+    root_id: &str,
+) -> Result<(SourceSet, Revision)> {
+    let (artifact, _) = build_native_header(capture, root, root_id)?;
+    Ok((artifact.source_set, artifact.revision))
 }
 
 /// The full captured revision header is shared by full and selected measurement.
