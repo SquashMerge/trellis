@@ -11,13 +11,14 @@
   {
    "id": "q01",
    "category": "concept",
-   "query": "retry a database operation when SQLite reports the database is busy or locked",
+   "query": "back off and wait while another connection holds the SQLite lock, up to the time limit of the current lookup",
    "answers": [
     {
      "language": "rust",
      "path": "src/store.rs",
      "qualifiedName": "read_deadline_busy",
      "kind": "function",
+     "startLine": 2411,
      "declarationId": "sid:v1:77ec9348ac721bc3e3769fedd9015df8"
     },
     {
@@ -25,41 +26,30 @@
      "path": "src/store.rs",
      "qualifiedName": "with_read_deadline",
      "kind": "function",
+     "startLine": 2394,
      "declarationId": "sid:v1:7a1a778d520221de4defdd5549d96916"
-    },
-    {
-     "language": "rust",
-     "path": "src/store.rs",
-     "qualifiedName": "retry_stale_hot_journal",
-     "kind": "function",
-     "declarationId": "sid:v1:088e5c4fef1362cc64953045aa146831"
     }
    ]
   },
   {
    "id": "q02",
    "category": "concept",
-   "query": "check that a caller's expected index generation and revision still match before answering",
+   "query": "check that the generation-and-number snapshot a caller asked for is still published and available",
    "answers": [
     {
      "language": "rust",
      "path": "src/store.rs",
      "qualifiedName": "implementation@59.read_revision_for",
      "kind": "method",
+     "startLine": 10000,
      "declarationId": "sid:v1:fb5d0a1f6f279e2a4b7fe376db65d3a2"
-    },
-    {
-     "language": "rust",
-     "path": "src/mcp/mod.rs",
-     "qualifiedName": "validated_expected_basis",
-     "kind": "function",
-     "declarationId": "sid:v1:2650cdf504442be3531d989a52bb9616"
     },
     {
      "language": "rust",
      "path": "src/store.rs",
      "qualifiedName": "implementation@36.validate_pin",
      "kind": "method",
+     "startLine": 1067,
      "declarationId": "sid:v1:e37b40839ba6c9dead57f8bdbfd872fe"
     }
    ]
@@ -74,6 +64,7 @@
      "path": "src/store/topology.rs",
      "qualifiedName": "implementation@4.discover_unattached",
      "kind": "method",
+     "startLine": 384,
      "declarationId": "sid:v1:91a075de618291d2675c91b16035948f"
     }
    ]
@@ -81,13 +72,14 @@
   {
    "id": "q04",
    "category": "concept",
-   "query": "parse a .git file that points at a separate git directory",
+   "query": "follow the gitdir: redirect file of a linked worktree to its metadata directory",
    "answers": [
     {
      "language": "rust",
      "path": "src/store/topology.rs",
      "qualifiedName": "parse_git_pointer",
      "kind": "function",
+     "startLine": 693,
      "declarationId": "sid:v1:8e7b9e53db2b1e9ebe00b019eae676cb"
     },
     {
@@ -95,6 +87,7 @@
      "path": "src/store/topology.rs",
      "qualifiedName": "resolve_git_dir",
      "kind": "function",
+     "startLine": 678,
      "declarationId": "sid:v1:ed101fec6f09894e9bfaf72862da9716"
     }
    ]
@@ -102,13 +95,14 @@
   {
    "id": "q05",
    "category": "concept",
-   "query": "create the per-checkout UUID marker file and make it durable with fsync",
+   "query": "create the per-checkout UUID file in the git directory and fsync it and its parent directories",
    "answers": [
     {
      "language": "rust",
      "path": "src/store/topology.rs",
      "qualifiedName": "marker_at",
      "kind": "function",
+     "startLine": 856,
      "declarationId": "sid:v1:d361205e8469aa223f157cb59d324bae"
     },
     {
@@ -116,6 +110,7 @@
      "path": "src/store/topology.rs",
      "qualifiedName": "durable_marker",
      "kind": "function",
+     "startLine": 838,
      "declarationId": "sid:v1:988d770df28d6f263bf9f5e1a4adf236"
     }
    ]
@@ -123,13 +118,14 @@
   {
    "id": "q06",
    "category": "concept",
-   "query": "compute the stable 128-bit identifier of a declaration from its ancestors and path",
+   "query": "compute the 128-bit identifier of a declaration from its ancestors and path",
    "answers": [
     {
      "language": "rust",
      "path": "src/native_ids.rs",
      "qualifiedName": "implementation@0.stable",
      "kind": "method",
+     "startLine": 285,
      "declarationId": "sid:v1:a46c8aade7910e2e98358284baeaf762"
     },
     {
@@ -137,6 +133,7 @@
      "path": "src/native_ids.rs",
      "qualifiedName": "implementation@0.register",
      "kind": "method",
+     "startLine": 271,
      "declarationId": "sid:v1:2c1531f37e3a5c9aa48ab28a3562ba2e"
     }
    ]
@@ -144,13 +141,14 @@
   {
    "id": "q07",
    "category": "concept",
-   "query": "limit the size of a JSON-RPC string request id after re-serializing it",
+   "query": "enforce the 256-byte cap on a JSON-RPC request id by counting its escaped form",
    "answers": [
     {
      "language": "rust",
      "path": "src/mcp/wire.rs",
      "qualifiedName": "compact_string_token_len",
      "kind": "function",
+     "startLine": 188,
      "declarationId": "sid:v1:480e391eae4a079e3e155e2b55387277"
     }
    ]
@@ -165,6 +163,7 @@
      "path": "src/mcp/projection.rs",
      "qualifiedName": "find",
      "kind": "function",
+     "startLine": 178,
      "declarationId": "sid:v1:3868defcddedd31254f962ffcd0ffeb5"
     },
     {
@@ -172,6 +171,7 @@
      "path": "src/mcp/projection.rs",
      "qualifiedName": "outgoing",
      "kind": "function",
+     "startLine": 739,
      "declarationId": "sid:v1:b1925d802c7d2090f25263215d35a622"
     },
     {
@@ -179,6 +179,7 @@
      "path": "src/mcp/projection.rs",
      "qualifiedName": "incoming",
      "kind": "function",
+     "startLine": 923,
      "declarationId": "sid:v1:448878176799eb7e49fe89cce316df72"
     }
    ]
@@ -186,41 +187,29 @@
   {
    "id": "q09",
    "category": "concept",
-   "query": "turn a byte range into 1-based inclusive line numbers by counting newlines",
+   "query": "turn byte offsets into 1-based inclusive line numbers by counting newlines",
    "answers": [
     {
      "language": "rust",
      "path": "src/store/mcp_read.rs",
      "qualifiedName": "implementation@2.range",
      "kind": "method",
+     "startLine": 230,
      "declarationId": "sid:v1:dbb030fb833f697bdf8bb6b301373b2f"
-    },
-    {
-     "language": "rust",
-     "path": "src/store/mcp_read.rs",
-     "qualifiedName": "mcp_lf_range",
-     "kind": "function",
-     "declarationId": "sid:v1:98c67de0f581f89c2d373a54fca42ed0"
-    },
-    {
-     "language": "rust",
-     "path": "src/store/mcp_read.rs",
-     "qualifiedName": "mcp_lf_lines",
-     "kind": "function",
-     "declarationId": "sid:v1:c1e2b402fc4e2a541b4a18b0969cc6ce"
     }
    ]
   },
   {
    "id": "q10",
    "category": "concept",
-   "query": "verify a cached source file's hash and length before returning a slice of it",
+   "query": "verify a cached file's hash and length before returning a slice of its bytes",
    "answers": [
     {
      "language": "rust",
      "path": "src/store/mcp_read.rs",
      "qualifiedName": "implementation@5.mcp_checked_source",
      "kind": "method",
+     "startLine": 374,
      "declarationId": "sid:v1:9702633a967b345d46bdd6583c66fb1c"
     },
     {
@@ -228,6 +217,7 @@
      "path": "src/store/mcp_read.rs",
      "qualifiedName": "implementation@3.mcp_source",
      "kind": "method",
+     "startLine": 298,
      "declarationId": "sid:v1:abfb12250845198e709c7067bb15463d"
     }
    ]
@@ -242,6 +232,7 @@
      "path": "src/store/mcp_read.rs",
      "qualifiedName": "implementation@6.mcp_find",
      "kind": "method",
+     "startLine": 476,
      "declarationId": "sid:v1:6a8a6d3745da157937afca3f5195b153"
     }
    ]
@@ -249,13 +240,14 @@
   {
    "id": "q12",
    "category": "concept",
-   "query": "release old published revisions after the supersession grace period",
+   "query": "drop old published snapshots once the 15-minute grace after they were superseded has passed",
    "answers": [
     {
      "language": "rust",
      "path": "src/store.rs",
      "qualifiedName": "retention_due",
      "kind": "function",
+     "startLine": 2271,
      "declarationId": "sid:v1:4b4b49bdada431bf477e7d29de1c0a17"
     },
     {
@@ -263,6 +255,7 @@
      "path": "src/store.rs",
      "qualifiedName": "implementation@59.release_revision",
      "kind": "method",
+     "startLine": 10514,
      "declarationId": "sid:v1:f0961270f6053c6f1850819a215d283e"
     }
    ]
@@ -270,14 +263,23 @@
   {
    "id": "q13",
    "category": "concept",
-   "query": "decide whether a derived index directory is old or orphaned enough to garbage collect",
+   "query": "decide whether a derived cache directory is old or orphaned enough to garbage collect",
    "answers": [
     {
      "language": "rust",
      "path": "src/store/topology.rs",
      "qualifiedName": "classify_index_age",
      "kind": "function",
+     "startLine": 1642,
      "declarationId": "sid:v1:8df3e06e765b99e2af38b0725ac9a769"
+    },
+    {
+     "language": "rust",
+     "path": "src/store/topology.rs",
+     "qualifiedName": "inspect_index_with_open_hook",
+     "kind": "function",
+     "startLine": 1813,
+     "declarationId": "sid:v1:cba230bb939cfc4c6d114b17b8a7b470"
     }
    ]
   },
@@ -291,6 +293,7 @@
      "path": "src/store/topology.rs",
      "qualifiedName": "implementation@16.forget_with_confirmation",
      "kind": "method",
+     "startLine": 2181,
      "declarationId": "sid:v1:5bce329d5d92819189be92a6d106c7b0"
     },
     {
@@ -298,6 +301,7 @@
      "path": "src/store/topology.rs",
      "qualifiedName": "implementation@11.db",
      "kind": "method",
+     "startLine": 1178,
      "declarationId": "sid:v1:7fcb7c442375b9ead82ca3a6c6d9d78d"
     }
    ]
@@ -312,6 +316,7 @@
      "path": "src/watch.rs",
      "qualifiedName": "implementation@4.next_deadline",
      "kind": "method",
+     "startLine": 823,
      "declarationId": "sid:v1:e61d7b59f03e755e3a72f37654dd47f8"
     },
     {
@@ -319,6 +324,7 @@
      "path": "src/watch.rs",
      "qualifiedName": "implementation@4.batch_ready_at",
      "kind": "method",
+     "startLine": 833,
      "declarationId": "sid:v1:6a62c0676e4e6cd60a93715b8caa9fcb"
     }
    ]
@@ -333,6 +339,7 @@
      "path": "src/daemon/mod.rs",
      "qualifiedName": "implementation@1.acquire",
      "kind": "method",
+     "startLine": 134,
      "declarationId": "sid:v1:6c351b8f1b31ac06970ee7acba657d4f"
     }
    ]
@@ -347,6 +354,7 @@
      "path": "src/mcp/mod.rs",
      "qualifiedName": "coordinate",
      "kind": "function",
+     "startLine": 1259,
      "declarationId": "sid:v1:9d7380b352ef6eb397e9be39354b3a9c"
     },
     {
@@ -354,6 +362,7 @@
      "path": "src/daemon/client.rs",
      "qualifiedName": "implementation@4.handle",
      "kind": "method",
+     "startLine": 999,
      "declarationId": "sid:v1:a8691ead2496ed5f1601519c955d8e35"
     }
    ]
@@ -366,22 +375,32 @@
     {
      "language": "rust",
      "path": "src/daemon/client.rs",
-     "qualifiedName": "relay_call_deadline",
+     "qualifiedName": "implementation@4.decide",
+     "kind": "method",
+     "startLine": 1307,
+     "declarationId": "sid:v1:67b62e48f4fe69eba0917b80e4bbb6ab"
+    },
+    {
+     "language": "rust",
+     "path": "src/mcp/mod.rs",
+     "qualifiedName": "coordinate",
      "kind": "function",
-     "declarationId": "sid:v1:234f0a86fa884a9da96e2599f3e23fd3"
+     "startLine": 1259,
+     "declarationId": "sid:v1:9d7380b352ef6eb397e9be39354b3a9c"
     }
    ]
   },
   {
    "id": "q20",
    "category": "concept",
-   "query": "decide if a declaration is test code or production code",
+   "query": "decide whether a function is spec or fixture-only code or ships in production",
    "answers": [
     {
      "language": "rust",
      "path": "src/native_evidence.rs",
      "qualifiedName": "declaration_role",
      "kind": "function",
+     "startLine": 1163,
      "declarationId": "sid:v1:ecf052252d398412cf6722d32aaf9f12"
     },
     {
@@ -389,6 +408,7 @@
      "path": "src/native_evidence.rs",
      "qualifiedName": "test_path",
      "kind": "function",
+     "startLine": 1171,
      "declarationId": "sid:v1:70adaa3da06fa1e6f21695e15877d12b"
     },
     {
@@ -396,6 +416,7 @@
      "path": "src/native_evidence.rs",
      "qualifiedName": "local_test_marker",
      "kind": "function",
+     "startLine": 1323,
      "declarationId": "sid:v1:97a61b7c8d6353ff5661a67cd703e4c9"
     }
    ]
@@ -403,34 +424,29 @@
   {
    "id": "q21",
    "category": "concept",
-   "query": "reserve money from the spending ledger before calling the remote model",
+   "query": "set aside part of the spending cap before calling the remote model",
    "answers": [
     {
      "language": "rust",
      "path": "src/live_jev.rs",
      "qualifiedName": "implementation@0.reserve",
      "kind": "method",
+     "startLine": 325,
      "declarationId": "sid:v1:521473208a2f0ffd6eb84b4414705943"
-    },
-    {
-     "language": "rust",
-     "path": "src/acp.rs",
-     "qualifiedName": "implementation@0.reserve",
-     "kind": "method",
-     "declarationId": "sid:v1:708bd6a4f8fb09a6ed93fc604c18971d"
     }
    ]
   },
   {
    "id": "q22",
    "category": "concept",
-   "query": "escape control characters when writing canonical JSON bytes",
+   "query": "escape control characters when writing the normalized JSON bytes that get hashed",
    "answers": [
     {
      "language": "rust",
      "path": "src/native_ids.rs",
      "qualifiedName": "canonical_string_into",
      "kind": "function",
+     "startLine": 51,
      "declarationId": "sid:v1:8e3aa381418c0613130396108f39d62e"
     }
    ]
@@ -438,13 +454,14 @@
   {
    "id": "q24",
    "category": "concept",
-   "query": "find call sites whose callee name matches the selected function, nearest files first",
+   "query": "find call sites whose callee name matches the selected function, production callers before tests, then nearby files",
    "answers": [
     {
      "language": "rust",
      "path": "src/store/mcp_read.rs",
      "qualifiedName": "implementation@14.mcp_incoming_with_lines",
      "kind": "method",
+     "startLine": 1459,
      "declarationId": "sid:v1:9c0f61e64c2e2aac188f4df3cb2e174a"
     }
    ]
@@ -452,13 +469,14 @@
   {
    "id": "q25",
    "category": "concept",
-   "query": "pick which files the source walker admits and which directories it skips",
+   "query": "pick which files get admitted for indexing and which directories are skipped",
    "answers": [
     {
      "language": "rust",
      "path": "src/capture.rs",
      "qualifiedName": "walk",
      "kind": "function",
+     "startLine": 364,
      "declarationId": "sid:v1:d241ddd048bd06b10b3500ac9371f777"
     },
     {
@@ -466,6 +484,7 @@
      "path": "src/capture.rs",
      "qualifiedName": "source",
      "kind": "function",
+     "startLine": 358,
      "declarationId": "sid:v1:76e6f8fcba65b4e1a769949d59128102"
     }
    ]
@@ -473,13 +492,14 @@
   {
    "id": "q26",
    "category": "concept",
-   "query": "detect that the checkout root directory was moved or replaced while serving a read",
+   "query": "detect that the opened checkout directory was moved or swapped for another directory while serving a read",
    "answers": [
     {
      "language": "rust",
      "path": "src/store/topology.rs",
      "qualifiedName": "implementation@4.root_path_replaced_from",
      "kind": "method",
+     "startLine": 513,
      "declarationId": "sid:v1:63385da53ea1f63081069eeb7c7a3f51"
     },
     {
@@ -487,6 +507,7 @@
      "path": "src/store/topology.rs",
      "qualifiedName": "implementation@4.verify",
      "kind": "method",
+     "startLine": 522,
      "declarationId": "sid:v1:bff61e5d037a73f3fb36bc222cd6ce60"
     }
    ]
@@ -501,6 +522,7 @@
      "path": "src/mcp/session.rs",
      "qualifiedName": "implementation@1.validate",
      "kind": "method",
+     "startLine": 121,
      "declarationId": "sid:v1:6629d2b3fe5471b3894bcba64b1118f4"
     }
    ]
@@ -508,13 +530,14 @@
   {
    "id": "q28",
    "category": "concept",
-   "query": "suppress a response after the client sends a cancellation notification",
+   "query": "suppress a response after the client says it no longer wants that request",
    "answers": [
     {
      "language": "rust",
      "path": "src/mcp/session.rs",
      "qualifiedName": "implementation@1.cancel",
      "kind": "method",
+     "startLine": 71,
      "declarationId": "sid:v1:74b658e39f674512606f32b7ee5ddae9"
     },
     {
@@ -522,6 +545,7 @@
      "path": "src/daemon/client.rs",
      "qualifiedName": "cancellation_id",
      "kind": "function",
+     "startLine": 1449,
      "declarationId": "sid:v1:3402855d7665e88b4bfe9e5af3f3e0b8"
     }
    ]
@@ -536,6 +560,7 @@
      "path": "src/metrics.rs",
      "qualifiedName": "score",
      "kind": "function",
+     "startLine": 489,
      "declarationId": "sid:v1:c7c7e4b49166246031e5c33fc6975d70"
     }
    ]
@@ -543,13 +568,14 @@
   {
    "id": "q30",
    "category": "concept",
-   "query": "write a phase marker line to stderr only when the diagnostics env var is set",
+   "query": "write a phase line to stderr only when the troubleshooting env var is set",
    "answers": [
     {
      "language": "rust",
      "path": "src/index_coordinator.rs",
      "qualifiedName": "diagnostic_marker",
      "kind": "function",
+     "startLine": 68,
      "declarationId": "sid:v1:1adf9973c1510d7817df9f7ab9cb416e"
     }
    ]
@@ -557,13 +583,22 @@
   {
    "id": "q31",
    "category": "concept",
-   "query": "wait for an index request in the durable queue to reach a terminal state",
+   "query": "block the command line until its queued job has finished, then re-read the outcome",
    "answers": [
+    {
+     "language": "rust",
+     "path": "src/daemon/registry.rs",
+     "qualifiedName": "implementation@10.cli_index",
+     "kind": "method",
+     "startLine": 1782,
+     "declarationId": "sid:v1:87abf5b9a4c5c9f0e9ef0f6f3e0c42ef"
+    },
     {
      "language": "rust",
      "path": "src/store.rs",
      "qualifiedName": "implementation@59.wait_terminal_change",
      "kind": "method",
+     "startLine": 5714,
      "declarationId": "sid:v1:f90dad084366fe720e988277e0a228a3"
     },
     {
@@ -571,6 +606,7 @@
      "path": "src/store.rs",
      "qualifiedName": "implementation@59.notify_terminal_waiters",
      "kind": "method",
+     "startLine": 5699,
      "declarationId": "sid:v1:fb2f479bdbbfd71967854cef04c56695"
     }
    ]
@@ -585,6 +621,7 @@
      "path": "src/dependency_rust.rs",
      "qualifiedName": "build",
      "kind": "function",
+     "startLine": 169,
      "declarationId": "sid:v1:a85d38824d748a072c42cff54109fc96"
     }
    ]
@@ -599,6 +636,7 @@
      "path": "src/mcp/catalog.rs",
      "qualifiedName": "list",
      "kind": "function",
+     "startLine": 30,
      "declarationId": "sid:v1:933ea916c17a98e6c15080f0f429068f"
     }
    ]
@@ -613,6 +651,7 @@
      "path": "src/store/mcp_read.rs",
      "qualifiedName": "implementation@6.mcp_find",
      "kind": "method",
+     "startLine": 476,
      "declarationId": "sid:v1:6a8a6d3745da157937afca3f5195b153"
     },
     {
@@ -620,6 +659,7 @@
      "path": "src/store/mcp_read.rs",
      "qualifiedName": "implementation@7.mcp_find_with_lines",
      "kind": "method",
+     "startLine": 683,
      "declarationId": "sid:v1:ab4c3dcf839169e3397451b7d87efea2"
     },
     {
@@ -627,6 +667,7 @@
      "path": "src/mcp/projection.rs",
      "qualifiedName": "find",
      "kind": "function",
+     "startLine": 178,
      "declarationId": "sid:v1:3868defcddedd31254f962ffcd0ffeb5"
     }
    ]
@@ -641,6 +682,7 @@
      "path": "src/mcp/projection.rs",
      "qualifiedName": "outgoing",
      "kind": "function",
+     "startLine": 739,
      "declarationId": "sid:v1:b1925d802c7d2090f25263215d35a622"
     },
     {
@@ -648,6 +690,7 @@
      "path": "src/store/mcp_read.rs",
      "qualifiedName": "implementation@12.mcp_outgoing",
      "kind": "method",
+     "startLine": 991,
      "declarationId": "sid:v1:47f721a1d53d3c1febc5341ed015b0e0"
     }
    ]
@@ -662,6 +705,7 @@
      "path": "src/store/requests.rs",
      "qualifiedName": "implementation@5.enqueue_request",
      "kind": "method",
+     "startLine": 954,
      "declarationId": "sid:v1:cc62c1d0e7a5680c86c0eae38433eaa3"
     }
    ]
@@ -676,6 +720,7 @@
      "path": "src/store/requests.rs",
      "qualifiedName": "implementation@5.settle_foreign_root_requests",
      "kind": "method",
+     "startLine": 1266,
      "declarationId": "sid:v1:4677ffd23572e1055630b3df411bf1e8"
     }
    ]
@@ -690,6 +735,7 @@
      "path": "src/native_ids.rs",
      "qualifiedName": "extraction_context",
      "kind": "function",
+     "startLine": 298,
      "declarationId": "sid:v1:7554f05f34bb86df4f8e48b603a58c69"
     }
    ]
@@ -704,6 +750,7 @@
      "path": "src/store.rs",
      "qualifiedName": "implementation@59.verify_metadata_root",
      "kind": "method",
+     "startLine": 6980,
      "declarationId": "sid:v1:f61cf958954d1aae196865cb5b8989f2"
     },
     {
@@ -711,6 +758,7 @@
      "path": "src/store.rs",
      "qualifiedName": "implementation@59.decode_control_status_raw",
      "kind": "method",
+     "startLine": 7224,
      "declarationId": "sid:v1:4eee34130679a97bc300af13c73e319c"
     }
    ]
@@ -725,6 +773,7 @@
      "path": "src/store/requests.rs",
      "qualifiedName": "implementation@5.try_open_maintenance_queue_probe",
      "kind": "method",
+     "startLine": 510,
      "declarationId": "sid:v1:53761e61d97e06aba6a151635802ac03"
     },
     {
@@ -732,6 +781,7 @@
      "path": "src/store/requests.rs",
      "qualifiedName": "implementation@5.request_connection_for_root_loss",
      "kind": "method",
+     "startLine": 793,
      "declarationId": "sid:v1:b09031c369a191c9de3cc360fffb7283"
     }
    ]
@@ -746,6 +796,7 @@
      "path": "src/store/topology.rs",
      "qualifiedName": "marker_at",
      "kind": "function",
+     "startLine": 856,
      "declarationId": "sid:v1:d361205e8469aa223f157cb59d324bae"
     },
     {
@@ -753,6 +804,7 @@
      "path": "src/store/topology.rs",
      "qualifiedName": "parse_git_pointer",
      "kind": "function",
+     "startLine": 693,
      "declarationId": "sid:v1:8e7b9e53db2b1e9ebe00b019eae676cb"
     },
     {
@@ -760,6 +812,7 @@
      "path": "src/store/topology.rs",
      "qualifiedName": "implementation@4.attach_existing_marker_readonly",
      "kind": "method",
+     "startLine": 455,
      "declarationId": "sid:v1:c7fec207718808f3ddcf56a6fc14d917"
     }
    ]
@@ -774,6 +827,7 @@
      "path": "src/store.rs",
      "qualifiedName": "replace_index_and_release_obsolete",
      "kind": "function",
+     "startLine": 1498,
      "declarationId": "sid:v1:9d1060cc31b9dfd59deb53b09941292d"
     }
    ]
@@ -788,6 +842,7 @@
      "path": "web/app.js",
      "qualifiedName": "api",
      "kind": "function",
+     "startLine": 142,
      "declarationId": "sid:v1:b31fa375d3245dd0b4575fee7b7976d4"
     }
    ]
@@ -795,14 +850,15 @@
   {
    "id": "e6",
    "category": "error",
-   "query": "storage_busy: cached completion disappeared",
+   "query": "storage_busy: index journal sidecar present",
    "answers": [
     {
      "language": "rust",
-     "path": "src/index_coordinator.rs",
-     "qualifiedName": "retry_cli_recorded_completion",
-     "kind": "function",
-     "declarationId": "sid:v1:2ac88f999134e73347baf937920e16c9"
+     "path": "src/store.rs",
+     "qualifiedName": "implementation@59.status_existing_readonly",
+     "kind": "method",
+     "startLine": 6171,
+     "declarationId": "sid:v1:9377d206ccae2cf551a7c5922ea97952"
     }
    ]
   },
@@ -816,6 +872,7 @@
      "path": "src/store.rs",
      "qualifiedName": "implementation@59.read_revision_for",
      "kind": "method",
+     "startLine": 10000,
      "declarationId": "sid:v1:fb5d0a1f6f279e2a4b7fe376db65d3a2"
     }
    ]
@@ -830,6 +887,7 @@
      "path": "src/mcp/session.rs",
      "qualifiedName": "implementation@1.validate",
      "kind": "method",
+     "startLine": 121,
      "declarationId": "sid:v1:6629d2b3fe5471b3894bcba64b1118f4"
     },
     {
@@ -837,6 +895,7 @@
      "path": "src/mcp/wire.rs",
      "qualifiedName": "implementation@0.new",
      "kind": "method",
+     "startLine": 218,
      "declarationId": "sid:v1:53125343c9330060e5b25e0e426e7883"
     }
    ]
@@ -851,6 +910,7 @@
      "path": "web/sequence.js",
      "qualifiedName": "renderSequence",
      "kind": "function",
+     "startLine": 3,
      "declarationId": "sid:v1:f8bd494078b293a26fc842df3e3c8bb5"
     },
     {
@@ -858,6 +918,7 @@
      "path": "web/sequence.js",
      "qualifiedName": "drawSequence",
      "kind": "function",
+     "startLine": 18,
      "declarationId": "sid:v1:49b1c5bef3f72712129bd3cc272e7e74"
     }
    ]
@@ -872,6 +933,7 @@
      "path": "web/classes.js",
      "qualifiedName": "render",
      "kind": "function",
+     "startLine": 403,
      "declarationId": "sid:v1:cbcd7e1a5d9ca72616c1354798735e4a"
     },
     {
@@ -879,6 +941,7 @@
      "path": "web/classes.js",
      "qualifiedName": "card",
      "kind": "function",
+     "startLine": 364,
      "declarationId": "sid:v1:82ffab2e621ee54c8741464033a3bdea"
     }
    ]
@@ -893,6 +956,7 @@
      "path": "web/app.js",
      "qualifiedName": "api",
      "kind": "function",
+     "startLine": 142,
      "declarationId": "sid:v1:b31fa375d3245dd0b4575fee7b7976d4"
     }
    ]
@@ -907,6 +971,7 @@
      "path": "web/app.js",
      "qualifiedName": "toggleDirectory",
      "kind": "function",
+     "startLine": 1350,
      "declarationId": "sid:v1:664148f2107e40acbba44344d6b7bb40"
     },
     {
@@ -914,6 +979,7 @@
      "path": "web/app.js",
      "qualifiedName": "renderDirectoryTree",
      "kind": "function",
+     "startLine": 1408,
      "declarationId": "sid:v1:f576da7c2e181c70efc0ef2d0052025e"
     }
    ]
@@ -921,13 +987,14 @@
   {
    "id": "q45",
    "category": "js",
-   "query": "save a view or note from the browser UI",
+   "query": "build the request payload for a saved view or note in the browser",
    "answers": [
     {
      "language": "javascript",
      "path": "web/app.js",
      "qualifiedName": "savedViewDto",
      "kind": "function",
+     "startLine": 546,
      "declarationId": "sid:v1:54ab92ff55e24feee8fd85eaf629798e"
     },
     {
@@ -935,6 +1002,7 @@
      "path": "web/app.js",
      "qualifiedName": "annotationDto",
      "kind": "function",
+     "startLine": 554,
      "declarationId": "sid:v1:d430c95590a0afc7d0a268a1c9e284dc"
     }
    ]
@@ -942,13 +1010,14 @@
   {
    "id": "q46",
    "category": "js",
-   "query": "go to the definition from a line in the browser source view",
+   "query": "open the navigation menu for a selected source line in the browser source view",
    "answers": [
     {
      "language": "javascript",
      "path": "web/navigation.js",
      "qualifiedName": "attachSource.navigate",
      "kind": "function",
+     "startLine": 199,
      "declarationId": "sid:v1:e28260b63d98fdabed58f6267777be1a"
     },
     {
@@ -956,6 +1025,7 @@
      "path": "web/navigation.js",
      "qualifiedName": "open",
      "kind": "function",
+     "startLine": 84,
      "declarationId": "sid:v1:a6e9b85005a96cf902e66a2b8297203f"
     }
    ]
