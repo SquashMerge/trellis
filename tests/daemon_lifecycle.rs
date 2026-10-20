@@ -17,6 +17,32 @@ fn identity(root: &Path) -> WorkspaceIdentity {
         .attach_marker()
         .unwrap()
 }
+/// Records every tracked row's state at each FIFO claim, then re-arms for the
+/// next claim. The worker runs the after-claim hook after the claim COMMITs and
+/// before it starts the row's work, so each entry is an event-ordered snapshot
+/// of the claim boundary. Unlike millisecond timestamps, it cannot pass a
+/// reversed or overlapping claim order.
+#[cfg(feature = "test-support")]
+type ClaimLog = std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>;
+#[cfg(feature = "test-support")]
+fn record_claims(
+    runtime: std::sync::Arc<trellis::daemon::registry::CheckoutRuntime>,
+    store: trellis::store::Store,
+    tracked: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    log: ClaimLog,
+) {
+    let next = runtime.clone();
+    runtime.set_after_claim_hook_for_tests(move || {
+        let ids = tracked.lock().unwrap().clone();
+        let states = ids
+            .iter()
+            .map(|id| store.request_by_id(id).unwrap().unwrap().state)
+            .collect();
+        log.lock().unwrap().push(states);
+        record_claims(next, store, tracked, log);
+    });
+}
+
 fn fixture() -> (
     tempfile::TempDir,
     WorkspaceIdentity,
@@ -595,6 +621,15 @@ async fn active_writer_and_protected_reader_overlap_orphan_idle_scan() {
         h_resume_rx.lock().unwrap().recv().unwrap();
     }));
     let runtime = registry.activate(&id.root_key).unwrap();
+    // Claims start only after startup reconciliation, which is paused here.
+    let tracked = std::sync::Arc::new(std::sync::Mutex::new(vec![first.id.clone()]));
+    let claims = ClaimLog::default();
+    record_claims(
+        runtime.clone(),
+        store.clone(),
+        tracked.clone(),
+        claims.clone(),
+    );
     tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         while h_entered_rx.try_recv().is_err() {
             tokio::task::yield_now().await;
@@ -660,6 +695,7 @@ async fn active_writer_and_protected_reader_overlap_orphan_idle_scan() {
         .await
         .unwrap();
     assert!(first.seq < second.seq);
+    tracked.lock().unwrap().push(second.id.clone());
     assert_eq!(
         store.request_by_id(&first.id).unwrap().unwrap().state,
         "queued"
@@ -695,8 +731,17 @@ async fn active_writer_and_protected_reader_overlap_orphan_idle_scan() {
         first_done.revision.unwrap().index_generation,
         second_done.revision.unwrap().index_generation
     );
-    assert!(
-        first_done.revision.unwrap().index_revision < second_done.revision.unwrap().index_revision
+    // Both no-op rows complete at the unchanged head (Decision 0006 §3).
+    assert_eq!(first_done.revision, second_done.revision);
+    // FIFO: the first claim finds the second row queued; the second claim
+    // finds the first row already terminal.
+    assert_eq!(
+        *claims.lock().unwrap(),
+        vec![
+            vec!["running".to_owned(), "queued".to_owned()],
+            vec!["done".to_owned(), "running".to_owned()],
+        ],
+        "claim-boundary snapshots"
     );
     await_release_after_drain(&mut registry, now + DAEMON_IDLE_DELAY, &id.root_key).await;
     assert!(!runtime.has_active_resources());
@@ -718,13 +763,32 @@ async fn committed_fifo_queue_keeps_both_expired_clocks_until_normal_daemon_drai
     let (claim_tx, claim_rx) = std::sync::mpsc::sync_channel(1);
     let (continue_tx, continue_rx) = std::sync::mpsc::sync_channel(1);
     let continue_rx = std::sync::Mutex::new(continue_rx);
+    // After the held first claim, record the queue at every later claim.
+    let tracked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let claims = ClaimLog::default();
+    let (recorder_runtime, recorder_store, recorder_tracked, recorder_claims) = (
+        runtime.clone(),
+        store.clone(),
+        tracked.clone(),
+        claims.clone(),
+    );
     runtime.set_after_claim_hook_for_tests(move || {
         claim_tx.send(()).unwrap();
         continue_rx.lock().unwrap().recv().unwrap();
+        record_claims(
+            recorder_runtime,
+            recorder_store,
+            recorder_tracked,
+            recorder_claims,
+        );
     });
     let first = store.enqueue_request(&options, None).unwrap();
     let second = store.enqueue_request(&options, None).unwrap();
     assert!(first.seq < second.seq);
+    tracked
+        .lock()
+        .unwrap()
+        .extend([first.id.clone(), second.id.clone()]);
     tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         while claim_rx.try_recv().is_err() {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -770,7 +834,14 @@ async fn committed_fifo_queue_keeps_both_expired_clocks_until_normal_daemon_drai
         first_revision.index_generation,
         second_revision.index_generation
     );
-    assert!(first_revision.index_revision < second_revision.index_revision);
+    // Both no-op rows complete at the unchanged head (Decision 0006 §3).
+    assert_eq!(first_revision, second_revision);
+    // FIFO: the second row is claimed only once the first is terminal.
+    assert_eq!(
+        *claims.lock().unwrap(),
+        vec![vec!["done".to_owned(), "running".to_owned()]],
+        "claim-boundary snapshots"
+    );
     await_release_after_drain(&mut registry, deadline, &id.root_key).await;
     assert!(!runtime.has_active_resources());
 }

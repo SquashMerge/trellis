@@ -3239,6 +3239,15 @@ async fn virgin_queue_use_lock_contention_retries_startup_before_claiming_fifo()
     // SQLite integrity; a bare existence check would miss a half-built queue.
     assert!(queue_path.exists());
     assert!(store.earliest_unfinished_request().unwrap().is_none());
+    // Witness the head at the FIFO claim: startup reconciliation must have
+    // committed it already. An unchanged FIFO request then completes there.
+    let at_claim = Arc::new(std::sync::Mutex::new(None));
+    {
+        let (slot, store) = (at_claim.clone(), store.clone());
+        runtime.set_after_claim_hook_for_tests(move || {
+            *slot.lock().unwrap() = Some(store.index_baseline().map_err(|e| format!("{e:#}")));
+        });
+    }
     let queued = store
         .enqueue_request(&IndexOptions::new(root), None)
         .unwrap();
@@ -3278,16 +3287,23 @@ async fn virgin_queue_use_lock_contention_retries_startup_before_claiming_fifo()
         assert!(finished.finished_at.is_some());
         assert_eq!(finished.id, queued.id);
         assert_eq!(finished.seq, queued.seq);
-        assert!(
-            finished.revision.unwrap().index_revision >= 2,
-            "FIFO request must commit after H"
+        assert_eq!(
+            finished.revision.unwrap().index_revision,
+            1,
+            "startup reconciliation publishes r1; the unchanged FIFO request completes at it"
+        );
+        assert_eq!(
+            *at_claim.lock().unwrap(),
+            Some(Ok(finished.revision.unwrap())),
+            "FIFO request must be claimed after H commits"
         );
         loop {
             let (code, _, status) =
                 selected_json(app.clone(), "GET", &format!("{prefix}/status"), Value::Null).await;
             if code == axum::http::StatusCode::OK && status["catchingUp"] == false {
-                assert!(
-                    status["revision"]["indexRevision"].as_u64().unwrap() >= 2,
+                assert_eq!(
+                    status["revision"],
+                    serde_json::json!(finished.revision.unwrap()),
                     "mandatory startup reconciliation must publish before FIFO completion: {status}"
                 );
                 break;
@@ -3457,9 +3473,11 @@ async fn selected_reads_validated_predecessor_through_owner_handoff() {
             )
             .await;
             if code == axum::http::StatusCode::OK && status["catchingUp"] == false {
-                assert!(
-                    status["revision"]["indexRevision"].as_u64().unwrap()
-                        >= prior["indexRevision"].as_u64().unwrap() + 2,
+                // Startup reconciliation publishes the edit; the queued request
+                // then finds its capture unchanged and completes at that head.
+                assert_eq!(
+                    status["revision"]["indexRevision"].as_u64().unwrap(),
+                    prior["indexRevision"].as_u64().unwrap() + 1,
                     "mandatory startup reconciliation must publish before queued work"
                 );
                 break;
@@ -3473,6 +3491,10 @@ async fn selected_reads_validated_predecessor_through_owner_handoff() {
     assert_eq!(
         (finished.id.as_str(), finished.seq, finished.state.as_str()),
         (queued.id.as_str(), queued.seq, "done")
+    );
+    assert_eq!(
+        finished.revision,
+        Some(published.status().unwrap().revision)
     );
 }
 

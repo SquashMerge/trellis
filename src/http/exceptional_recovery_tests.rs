@@ -107,7 +107,10 @@ fn damaged_index_reconciles_startup_then_existing_q0_once() {
     let done = store.request_by_id(&q0.id).unwrap().unwrap();
     assert_eq!(done.state, "done");
     let pin = done.revision.unwrap();
-    assert_eq!(pin.index_revision, 2, "startup r1 must precede Q0 r2");
+    assert_eq!(
+        pin.index_revision, 1,
+        "startup r1 precedes Q0; an unchanged no-op completes at the startup head (Decision 0006 §3)"
+    );
     assert_ne!(std::fs::read(&index).unwrap(), damaged);
     state.worker_step().unwrap();
     assert_eq!(store.status().unwrap().revision, pin);
@@ -131,14 +134,21 @@ async fn damaged_index_drains_earlier_q0_before_browser_ack() {
         (first.state.as_str(), pending.state.as_str()),
         ("done", "queued")
     );
-    assert_eq!(first.revision.unwrap().index_revision, 2);
+    assert_eq!(
+        first.revision.unwrap().index_revision,
+        1,
+        "an unchanged no-op completes at the startup head (Decision 0006 §3)"
+    );
     state.worker_step().unwrap();
     let second = store.request_by_id(&q1.id).unwrap().unwrap();
     assert_eq!(
         (second.id.as_str(), second.seq, second.state.as_str()),
         (q1.id.as_str(), q1.seq, "done")
     );
-    assert_eq!(second.revision.unwrap().index_revision, 3);
+    assert_eq!(
+        second.revision, first.revision,
+        "an unchanged no-op completes at the startup head (Decision 0006 §3)"
+    );
     assert_eq!(
         first.revision.unwrap().index_generation,
         second.revision.unwrap().index_generation
@@ -260,9 +270,14 @@ async fn browser_q1_then_cli_q2_exceptional_fifo_survives_reader_contention() {
         ),
         ("done", "done", "done")
     );
-    assert_eq!(first.revision.unwrap().index_revision, 2);
-    assert_eq!(browser_done.revision.unwrap().index_revision, 3);
-    assert_eq!(cli_done.revision.unwrap().index_revision, 4);
+    // FIFO order is witnessed step by step above; unchanged rows keep r1.
+    assert_eq!(
+        first.revision.unwrap().index_revision,
+        1,
+        "an unchanged no-op completes at the startup head (Decision 0006 §3)"
+    );
+    assert_eq!(browser_done.revision, first.revision);
+    assert_eq!(cli_done.revision, first.revision);
     assert_eq!(
         first.revision.unwrap().index_generation,
         browser_done.revision.unwrap().index_generation
@@ -327,11 +342,14 @@ async fn cli_accepted_exceptional_request_without_local_pending_id_must_be_drive
     assert_eq!(row.revision.unwrap(), store.status().unwrap().revision);
     let prior = store.request_by_id(&q0.id).unwrap().unwrap();
     assert_eq!(prior.state, "done");
-    assert_eq!(prior.revision.unwrap().index_revision, 2);
     assert_eq!(
-        row.revision.unwrap().index_revision,
-        3,
-        "startup r1 and earlier accepted Q0 r2 precede CLI r3"
+        prior.revision.unwrap().index_revision,
+        1,
+        "an unchanged no-op completes at the startup head (Decision 0006 §3)"
+    );
+    assert_eq!(
+        row.revision, prior.revision,
+        "startup r1 and earlier accepted Q0 precede CLI; both unchanged no-ops keep r1"
     );
     assert!(state.retained_serving_session().unwrap().verify().is_ok());
     store
@@ -349,8 +367,12 @@ fn assert_reclaimed_fifo(f: &PausedRecoveryFixture, old_incarnation: uuid::Uuid,
     let q2 = f.store.request_by_id(&f.q2.id).unwrap().unwrap();
     let q1 = f.store.request_by_id(&f.q1.id).unwrap().unwrap();
     assert_eq!((q2.state.as_str(), q1.state.as_str()), ("done", "done"));
-    assert_eq!(q2.revision.unwrap().index_revision, 2);
-    assert_eq!(q1.revision.unwrap().index_revision, 3);
+    assert_eq!(
+        q2.revision.unwrap().index_revision,
+        1,
+        "an unchanged no-op completes at the startup head (Decision 0006 §3)"
+    );
+    assert_eq!(q1.revision, q2.revision);
     assert_eq!(
         q2.revision.unwrap().index_generation,
         q1.revision.unwrap().index_generation
@@ -530,7 +552,11 @@ async fn idle_tick_cannot_drain_request_admitted_after_empty_pending_snapshot() 
         .unwrap();
     let done = store.request_by_id(&request.id).unwrap().unwrap();
     assert_eq!(done.state, "done");
-    assert_eq!(done.revision.unwrap().index_revision, 2);
+    assert_eq!(
+        done.revision.unwrap().index_revision,
+        1,
+        "an unchanged no-op completes at the startup head (Decision 0006 §3)"
+    );
     assert_ne!(
         done.revision.unwrap().index_generation,
         prior.index_generation
@@ -1002,8 +1028,8 @@ async fn concurrent_posts_queue_two_requests_across_exceptional_recovery() {
     );
     let q0_pin = q0_done.revision.unwrap();
     assert_eq!(
-        q0_pin.index_revision, 2,
-        "startup r1 must precede preexisting Q0 r2"
+        q0_pin.index_revision, 1,
+        "startup r1 precedes preexisting Q0; an unchanged no-op completes at the startup head (Decision 0006 §3)"
     );
     assert_eq!(
         store.status().unwrap().revision,
@@ -1049,7 +1075,10 @@ async fn concurrent_posts_queue_two_requests_across_exceptional_recovery() {
     );
     let first_pin = first.revision.unwrap();
     assert_eq!(first_pin.index_generation, q0_pin.index_generation);
-    assert_eq!(first_pin.index_revision, q0_pin.index_revision + 1);
+    assert_eq!(
+        first_pin, q0_pin,
+        "an unchanged no-op completes at the startup head (Decision 0006 §3)"
+    );
     assert_eq!(
         store.status().unwrap().revision,
         first_pin,
@@ -1088,7 +1117,10 @@ async fn concurrent_posts_queue_two_requests_across_exceptional_recovery() {
     );
     let second_pin = second.revision.unwrap();
     assert_eq!(second_pin.index_generation, first_pin.index_generation);
-    assert_eq!(second_pin.index_revision, first_pin.index_revision + 1);
+    assert_eq!(
+        second_pin, first_pin,
+        "an unchanged no-op completes at the startup head (Decision 0006 §3)"
+    );
     assert_eq!(store.status().unwrap().revision, second_pin);
     assert!(store.earliest_unfinished_request().unwrap().is_none());
     let newest = store.current_request().unwrap().unwrap();
@@ -1196,7 +1228,7 @@ fn queued_row_certifies_existing_full_batch_without_watcher_republication() {
     let terminal = store.request_by_id(&first.id).unwrap().unwrap();
     let pin = terminal.revision.unwrap();
     assert_eq!(terminal.state, "done");
-    assert_eq!(pin.index_revision, baseline.index_revision + 1);
+    assert_eq!(pin, baseline, "an unchanged no-op completes at the head");
     assert_eq!(store.status().unwrap().revision, pin);
     assert_eq!(
         store.request_by_id(&second.id).unwrap().unwrap().state,
@@ -1312,7 +1344,12 @@ fn ingress_after_early_gate_sample_reconciles_before_claim() {
     state.worker_step().unwrap();
     let next_done = store.request_by_id(&next.id).unwrap().unwrap();
     assert_eq!(next_done.state, "done");
-    assert!(next_done.revision.unwrap().index_revision > first_pin.index_revision + 1);
+    // The row covers the watcher's publication; its own capture is unchanged.
+    assert!(next_done.revision.unwrap().index_revision > first_pin.index_revision);
+    assert_eq!(
+        next_done.revision.unwrap(),
+        store.status().unwrap().revision
+    );
 }
 
 #[cfg(feature = "test-support")]
@@ -1819,7 +1856,11 @@ fn post_row_nonurgent_create_gate_precedes_next_fifo_claim() {
     state.worker_step().unwrap();
     let last = store.request_by_id(&second.id).unwrap().unwrap();
     assert_eq!(last.state, "done");
-    assert!(last.revision.unwrap().index_revision > gate_pin.index_revision);
+    assert_eq!(
+        last.revision.unwrap(),
+        gate_pin,
+        "the row covers the gate's publication; its own capture is unchanged"
+    );
 }
 
 #[test]
@@ -2389,7 +2430,11 @@ async fn browser_and_cli_routes_share_certified_watcher_gate() {
     }
     let next_done = state.store.request_by_id(&next.id).unwrap().unwrap();
     assert_eq!(next_done.state, "done");
-    assert!(next_done.revision.unwrap().index_revision > cli_pin.index_revision);
+    assert_eq!(
+        next_done.revision.unwrap(),
+        cli_pin,
+        "the successor covers the CLI publication; its own capture is unchanged"
+    );
     assert_eq!(
         state
             .watcher_work

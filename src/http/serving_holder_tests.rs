@@ -139,11 +139,10 @@ async fn daemon_local_writer_validates_selected_head_before_draining_queue() {
     store.verify_writer_session(&session).unwrap();
     let completed = store.request_by_id(&accepted.id).unwrap().unwrap();
     assert_eq!(completed.state, "done");
-    // The selected startup reconciliation must publish before the accepted FIFO request.
-    assert_eq!(
-        completed.revision.unwrap().index_revision,
-        old_pin.index_revision + 2
-    );
+    // Unchanged startup reconciliation and the unchanged accepted request both
+    // keep the validated head (Decision 0006 §3, amended 2026-10-20).
+    assert_eq!(completed.revision.unwrap(), old_pin);
+    assert_eq!(store.index_baseline().unwrap(), old_pin);
 }
 
 #[tokio::test]
@@ -406,6 +405,9 @@ async fn transient_publish_commit_busy_cannot_fail_accepted_takeover_head() {
     .unwrap();
     let ack = follower_store.enqueue_request(&options, None).unwrap();
     state.pending_requests.lock().unwrap().push(ack.id.clone());
+    // A real edit makes startup reconciliation publish, so the BUSY fixture
+    // reaches its pre-COMMIT point; an unchanged capture publishes nothing.
+    fs::write(root.join("a.js"), "function b() {}\n").unwrap();
     let encoded = serde_json::to_string(&crate::indexer::ReconcileOptions::from(&options)).unwrap();
     // This legacy fixture emits the plain-string pre-COMMIT BUSY. It is
     // not the direct typed mandatory startup reconciliation retry hook.
@@ -450,8 +452,8 @@ async fn transient_publish_commit_busy_cannot_fail_accepted_takeover_head() {
         index_generation: old_pin.index_generation,
         index_revision: old_pin.index_revision + 1,
     };
-    assert_eq!(done_pin.index_generation, startup_pin.index_generation);
-    assert_eq!(done_pin.index_revision, startup_pin.index_revision + 1);
+    // Q1's capture is unchanged against startup reconciliation's head.
+    assert_eq!(done_pin, startup_pin);
     assert_eq!(follower_store.status().unwrap().revision, done_pin);
     assert!(state.retained_serving_session().unwrap().verify().is_ok());
     // Post-ready historical read authenticates the distinct startup reconciliation publication
@@ -461,7 +463,7 @@ async fn transient_publish_commit_busy_cannot_fail_accepted_takeover_head() {
     read.validate_pin(startup_pin).unwrap();
     read.validate_pin(done_pin).unwrap();
     assert_eq!(
-        read.source_at("a.js", Some(startup_pin))
+        read.source_at("a.js", Some(old_pin))
             .unwrap()
             .unwrap()
             .1
@@ -469,12 +471,12 @@ async fn transient_publish_commit_busy_cannot_fail_accepted_takeover_head() {
         "function a() {}\n"
     );
     assert_eq!(
-        read.source_at("a.js", Some(done_pin))
+        read.source_at("a.js", Some(startup_pin))
             .unwrap()
             .unwrap()
             .1
             .text,
-        "function a() {}\n"
+        "function b() {}\n"
     );
     read.finish(()).unwrap();
     drop(read);
@@ -976,8 +978,9 @@ async fn failed_startup_reconciliation_backs_off_without_failing_fifo_head() {
         index_generation: old_pin.index_generation,
         index_revision: old_pin.index_revision + 1,
     };
-    assert_eq!(q1_pin.index_generation, startup_pin.index_generation);
-    assert_eq!(q1_pin.index_revision, startup_pin.index_revision + 1);
+    // The repaired source's new ctime makes startup reconciliation publish;
+    // Q1's capture is then unchanged and completes at that head.
+    assert_eq!(q1_pin, startup_pin);
     let read = follower_store.evidence_response().unwrap();
     read.validate_pin(startup_pin).unwrap();
     read.validate_pin(q1_pin).unwrap();

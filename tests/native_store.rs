@@ -2117,7 +2117,7 @@ fn invalid_retained_header_json_refuses_old_pin_without_mutating_sqlite_or_sidec
 
 #[test]
 #[cfg(feature = "test-support")]
-fn predecessor_stamps_cover_full_and_unchanged_publications() {
+fn predecessor_stamps_cover_full_publications_and_unchanged_stamps_nothing() {
     use std::sync::Mutex;
     use trellis::index_coordinator::IndexJobCoordinator;
     let (state, root, store, cancel) = fixture();
@@ -2153,17 +2153,18 @@ fn predecessor_stamps_cover_full_and_unchanged_publications() {
         .join("index.db");
     let db = Connection::open(&path).unwrap();
     assert_eq!(
+        r2, r1,
+        "an unchanged capture keeps the head (Decision 0006 §3)"
+    );
+    assert_eq!(
         db.query_row(
-            "SELECT count(*) FROM native_revision_supersessions WHERE revision_id=?1",
-            [format!(
-                "pin:v1:{}:{}",
-                r1.index_generation, r1.index_revision
-            )],
+            "SELECT count(*) FROM native_revision_supersessions",
+            [],
             |row| row.get::<_, i64>(0)
         )
         .unwrap(),
-        1,
-        "unchanged publication must stamp predecessor in same commit"
+        0,
+        "an unchanged capture supersedes nothing"
     );
     drop(db);
     fs::write(
@@ -2186,8 +2187,8 @@ fn predecessor_stamps_cover_full_and_unchanged_publications() {
     let rows: Vec<(String, i64)> = db.prepare("SELECT revision_id,superseded_at FROM native_revision_supersessions ORDER BY revision_id")
         .unwrap().query_map([], |row| Ok((row.get(0)?, row.get(1)?))).unwrap()
         .collect::<rusqlite::Result<_>>().unwrap();
-    assert_eq!(rows.len(), 2);
-    for (pin, (key, second)) in [r1, r2].iter().zip(&rows) {
+    assert_eq!(rows.len(), 1);
+    for (pin, (key, second)) in [r1].iter().zip(&rows) {
         assert_eq!(
             key,
             &format!("pin:v1:{}:{}", pin.index_generation, pin.index_revision)

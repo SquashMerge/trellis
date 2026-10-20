@@ -375,10 +375,9 @@ async fn index_admission_and_publication_pair() {
         completed["revision"],
         json!(store.status().unwrap().revision)
     );
-    assert_eq!(
-        store.status().unwrap().revision.index_revision,
-        pin.index_revision + 1
-    );
+    // The workspace is unchanged since the pinned head, so the CAS on it
+    // succeeds and the request completes at that same pin.
+    assert_eq!(store.status().unwrap().revision, pin);
 }
 
 #[test]

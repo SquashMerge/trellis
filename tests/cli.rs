@@ -393,7 +393,8 @@ fn unchanged_serve_reuses_selected_versions_and_detects_selected_source_corrupti
     let dbpath = real_index_db(&home);
     let db = rusqlite::Connection::open(&dbpath).unwrap();
     let (r1, old_ids) = pin_and_ids(&db);
-    assert_eq!(r1, 2);
+    // Startup reconciliation publishes r1; the unchanged Q completes at it.
+    assert_eq!(r1, 1);
     let immutable = [
         "document_versions",
         "graph_projections",
@@ -430,12 +431,8 @@ fn unchanged_serve_reuses_selected_versions_and_detects_selected_source_corrupti
     );
     let db = rusqlite::Connection::open(&dbpath).unwrap();
     let (r2, ids) = pin_and_ids(&db);
-    assert_eq!(r2, 2, "unchanged serve publishes no new pin");
-    assert_eq!(ids.len(), 2);
-    assert_eq!(
-        (&ids[0].1, &ids[0].2, &ids[0].3),
-        (&ids[1].1, &ids[1].2, &ids[1].3)
-    );
+    assert_eq!(r2, 1, "unchanged serve publishes no new pin");
+    assert_eq!(ids, old_ids, "unchanged serve adds no manifest");
     for (table, count) in immutable.iter().zip(old_counts.iter()) {
         let after: i64 = db
             .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
@@ -459,7 +456,7 @@ fn unchanged_serve_reuses_selected_versions_and_detects_selected_source_corrupti
     );
     assert_eq!(
         serde_json::from_slice::<Value>(&status.stdout).unwrap()["revision"]["indexRevision"],
-        2
+        1
     );
     drop(db);
     drop(leader);
@@ -509,7 +506,7 @@ fn unchanged_serve_reuses_selected_versions_and_detects_selected_source_corrupti
         .as_i64()
         .unwrap();
     assert!(
-        matches!(published_rev, 3 | 4),
+        matches!(published_rev, 2 | 3),
         "one Q publication, with at most one watcher publication of the edit: {result}"
     );
     let attached = command(&root, &home, "status").output().unwrap();
@@ -719,10 +716,10 @@ fn cli_helper_uses_isolated_home_instead_of_inherited_xdg_roots() {
     );
     let status: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(status["stats"]["files"], 0);
-    assert!(
-        status["revision"]["indexRevision"].as_u64().unwrap()
-            > first["revision"]["indexRevision"].as_u64().unwrap()
-    );
+    // The unchanged request completes at the isolated home's current pair.
+    let indexed: Value = serde_json::from_slice(&indexed.stdout).unwrap();
+    assert_eq!(indexed["publishedRevision"], status["revision"]);
+    assert_eq!(status["revision"], first["revision"]);
     let cache = home.join(if cfg!(target_os = "macos") {
         "Library/Caches/dev.squashmerge.trellis"
     } else {
@@ -814,7 +811,17 @@ fn standalone_takeover_replays_original_relative_presentation_from_another_cwd()
         String::from_utf8_lossy(&indexed.stderr)
     );
     let initial: Value = serde_json::from_slice(&indexed.stdout).unwrap();
-    assert_eq!(initial["publishedRevision"]["indexRevision"], 2);
+    // Startup reconciliation publishes r1. If its capture already used the
+    // accepted request's SCIP options, the request is unchanged and completes
+    // at r1 (Decision 0006 §3); otherwise it publishes r2 for the new inputs.
+    assert!(
+        (1..=2).contains(
+            &initial["publishedRevision"]["indexRevision"]
+                .as_u64()
+                .unwrap()
+        ),
+        "{initial}"
+    );
     let indexes = if cfg!(target_os = "macos") {
         home.join("Library/Caches/dev.squashmerge.trellis/indexes")
     } else {
@@ -856,11 +863,7 @@ fn standalone_takeover_replays_original_relative_presentation_from_another_cwd()
         String::from_utf8_lossy(&status.stderr)
     );
     let status: Value = serde_json::from_slice(&status.stdout).unwrap();
-    assert_eq!(status["revision"]["indexRevision"], 2);
-    assert_eq!(
-        status["revision"]["indexGeneration"],
-        initial["publishedRevision"]["indexGeneration"]
-    );
+    assert_eq!(status["revision"], initial["publishedRevision"]);
     let export = command(&root, &home, "export")
         .current_dir(&second_cwd)
         .output()
@@ -1225,7 +1228,8 @@ fn explicit_cli_index_recreates_corruption_but_bounded_reads_refuse_unknown_opti
     );
     let output: Value = serde_json::from_slice(&recovered.stdout).unwrap();
     assert_eq!(output["publishedRevision"], output["status"]["revision"]);
-    assert_eq!(output["publishedRevision"]["indexRevision"], 2);
+    // Recreation publishes r1; the claimed request is unchanged and completes at it.
+    assert_eq!(output["publishedRevision"]["indexRevision"], 1);
     assert_ne!(
         output["publishedRevision"]["indexGeneration"],
         first["publishedRevision"]["indexGeneration"]
@@ -1308,7 +1312,8 @@ fn corrupt_read_activation_waits_for_accepted_cli_options_in_same_daemon() {
     assert_eq!(fs::read_to_string(&marker).unwrap(), daemon_pid);
     let result: Value = serde_json::from_slice(&recovered.stdout).unwrap();
     assert_eq!(result["publishedRevision"], result["status"]["revision"]);
-    assert_eq!(result["publishedRevision"]["indexRevision"], 2);
+    // Startup reconciliation publishes r1; the unchanged claimed request completes at it.
+    assert_eq!(result["publishedRevision"]["indexRevision"], 1);
     let db = rusqlite::Connection::open(&index).unwrap();
     let recorded: String = db
         .query_row(
@@ -1805,10 +1810,8 @@ fn fixed_locations_and_removed_flag() {
     );
     let first: Value = serde_json::from_slice(&status.stdout).unwrap();
     let first = &first["status"];
-    assert!(
-        first["revision"]["indexRevision"].as_u64().unwrap()
-            > observed["revision"]["indexRevision"].as_u64().unwrap()
-    );
+    // The unchanged index completes at the head the status read observed.
+    assert_eq!(first["revision"], observed["revision"]);
     let generation = first["revision"]["indexGeneration"].as_str().unwrap();
     assert_eq!(
         uuid::Uuid::parse_str(generation).unwrap().get_version_num(),
@@ -1869,7 +1872,8 @@ fn cli_index_diagnostics_are_opt_in_without_changing_publication() {
     }
     assert_eq!(
         serde_json::from_slice::<Value>(&quiet.stdout).unwrap()["publishedRevision"]["indexRevision"],
-        2
+        1,
+        "startup reconciliation publishes r1; the unchanged request completes at it"
     );
     let diagnostic = command(&root, &home, "index")
         .env("TRELLIS_INDEX_DIAGNOSTICS", "1")
@@ -1887,7 +1891,8 @@ fn cli_index_diagnostics_are_opt_in_without_changing_publication() {
         serde_json::from_slice::<Value>(&diagnostic.stdout).unwrap()["publishedRevision"]["indexRevision"]
             .as_u64().unwrap(),
         serde_json::from_slice::<Value>(&quiet.stdout).unwrap()["publishedRevision"]["indexRevision"]
-            .as_u64().unwrap() + 1
+            .as_u64().unwrap(),
+        "diagnostics do not change publication: an unchanged request adds no revision"
     );
 }
 
@@ -1905,6 +1910,8 @@ fn index_forwards_pair_and_reports_pair() {
         String::from_utf8_lossy(&absent.stderr)
     );
     let prior: Value = serde_json::from_slice(&absent.stdout).unwrap();
+    // A real edit, so the forwarded request publishes past the prior pair.
+    fs::write(root.join("a.js"), "function seed() { edited(); }").unwrap();
     let result = command(&root, &home, "index")
         .env("TRELLIS_INDEX_DIAGNOSTICS", "1")
         .output()
@@ -3303,19 +3310,14 @@ def sink():
                         let catching_up = status["catchingUp"]
                             .as_bool()
                             .expect("selected catch-up state");
-                        if current == previous {
-                            assert!(
-                                catching_up,
-                                "{name}: prior head without pending mandatory startup reconciliation: {status}"
-                            );
-                        } else {
-                            assert!(
-                                current > previous,
-                                "{name}: selected pin moved backwards: {status}"
-                            );
-                            if !catching_up {
-                                break status;
-                            }
+                        assert!(
+                            current >= previous,
+                            "{name}: selected pin moved backwards: {status}"
+                        );
+                        // catchingUp clears only once startup reconciliation
+                        // committed or confirmed the head (Decision 0009 §2).
+                        if !catching_up {
+                            break status;
                         }
                     } else {
                         assert_eq!(
@@ -3334,10 +3336,9 @@ def sink():
             post_start_pin["indexGeneration"], old_pin["indexGeneration"],
             "{name}"
         );
-        assert!(
-            post_start_pin["indexRevision"].as_u64().unwrap()
-                > old_pin["indexRevision"].as_u64().unwrap(),
-            "{name}: mandatory startup reconciliation committed"
+        assert_eq!(
+            post_start_pin, old_pin,
+            "{name}: unchanged startup reconciliation keeps the head (Decision 0006 §3)"
         );
         let follower_status: Value =
             serde_json::from_slice(&command(&root, &home, "status").output().unwrap().stdout)
@@ -3418,8 +3419,8 @@ def sink():
             current["revision"], current_before["revision"],
             "{name}: rejected request changed job pin"
         );
-        // Cache a selected question and source at the committed prior head.
-        // The next publication must expire the packet but retain its source.
+        // Cache a selected question and source at the committed head. The
+        // unchanged request publishes nothing, so the source stays readable.
         let prior_selection = if file.is_empty() {
             None
         } else {
@@ -3520,9 +3521,8 @@ def sink():
             "{name}"
         );
         assert_eq!(
-            pin["indexRevision"].as_u64().unwrap(),
-            follower_pin["indexRevision"].as_u64().unwrap() + 1,
-            "{name}"
+            pin, follower_pin,
+            "{name}: the unchanged request completes done at the current pin"
         );
         let status: Value = client
             .get(format!("{url}/status"))
@@ -3556,7 +3556,9 @@ def sink():
             );
             assert_eq!(source_at["revision"], post_start_pin, "{name}");
             assert_eq!(source_at["file"]["text"], source, "{name}");
-            let (code, stale_packet) = real_selected_api(
+            // Every drained request resets the packet cache, even one that
+            // keeps the head, so the packet is evicted rather than stale.
+            let (code, evicted_packet) = real_selected_api(
                 &client,
                 &url,
                 &origin,
@@ -3567,11 +3569,9 @@ def sink():
             )
             .await;
             assert!(
-                (code == reqwest::StatusCode::NOT_FOUND
-                    && stale_packet["error"]["code"] == "not_found")
-                    || (code == reqwest::StatusCode::CONFLICT
-                        && stale_packet["error"]["code"] == "revision_conflict"),
-                "{name}: stale packet must be safely refused: {code} {stale_packet}"
+                code == reqwest::StatusCode::NOT_FOUND
+                    && evicted_packet["error"]["code"] == "not_found",
+                "{name}: evicted packet must be safely refused: {code} {evicted_packet}"
             );
         }
         use sha2::{Digest, Sha256};
@@ -3645,7 +3645,19 @@ def sink():
             );
             captured.insert("/questions/preview".into(), preview);
         }
-        let stale = request().bearer_auth(token).send().await.unwrap();
+        // No revision was superseded, so CAS on a pin that is not the head.
+        let not_head = serde_json::json!({
+            "indexGeneration": pin["indexGeneration"],
+            "indexRevision": pin["indexRevision"].as_u64().unwrap() + 1,
+        });
+        let stale = client
+            .post(format!("{url}/index"))
+            .header("Origin", &origin)
+            .json(&serde_json::json!({"expectedRevision":not_head}))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
         assert_eq!(
             stale.status(),
             202,
@@ -3694,13 +3706,9 @@ def sink():
         let native_after = stopped_snapshot(&home);
         let before_header = &native_before["allRows"]["native_revisions"][0];
         let after_header = &native_after["allRows"]["native_revisions"][0];
-        assert_ne!(
-            before_header[0], after_header[0],
-            "{name}: publication pin rotates"
-        );
-        assert_ne!(
-            before_header[13], after_header[13],
-            "{name}: revision advances"
+        assert_eq!(
+            before_header, after_header,
+            "{name}: unchanged startup and request publish no revision"
         );
         assert_eq!(after_header[13], pin["indexRevision"], "{name}");
         assert_eq!(
@@ -4276,7 +4284,8 @@ fn virgin_cli_activation_contention_expires_before_enqueue_and_new_index_succeed
     );
     let result: Value = serde_json::from_slice(&fresh.stdout).unwrap();
     assert_eq!(result["publishedRevision"], result["status"]["revision"]);
-    assert_eq!(result["publishedRevision"]["indexRevision"], 2);
+    // Startup reconciliation publishes r1; the unchanged claimed request completes at it.
+    assert_eq!(result["publishedRevision"]["indexRevision"], 1);
 
     // Raw SQLite reads may close descriptors on the live inode and drop its
     // process locks. Attest daemon shutdown and released use lock first.
@@ -4297,7 +4306,7 @@ fn virgin_cli_activation_contention_expires_before_enqueue_and_new_index_succeed
         .unwrap();
     assert_eq!(
         (count, distinct_ids, state.as_str(), revision),
-        (1, 1, "done", 2)
+        (1, 1, "done", 1)
     );
 }
 
@@ -4968,7 +4977,17 @@ fn optional_captured_scip_changes_presentation_without_native_identity_or_full_r
         String::from_utf8_lossy(&first.stderr)
     );
     let first_pin: Value = serde_json::from_slice(&first.stdout).unwrap();
-    assert_eq!(first_pin["publishedRevision"]["indexRevision"], 2);
+    // Startup reconciliation publishes r1. If its capture already used the
+    // accepted request's SCIP options, the request is unchanged and completes
+    // at r1 (Decision 0006 §3); otherwise it publishes r2 for the new inputs.
+    assert!(
+        (1..=2).contains(
+            &first_pin["publishedRevision"]["indexRevision"]
+                .as_u64()
+                .unwrap()
+        ),
+        "{first_pin}"
+    );
     let original = command(&root, &home, "export")
         .current_dir(&other)
         .output()
@@ -5094,13 +5113,14 @@ fn optional_captured_scip_changes_presentation_without_native_identity_or_full_r
 }
 
 #[test]
-fn explicit_cli_unchanged_claim_publishes_then_acks() {
+fn explicit_cli_unchanged_claim_acks_done_without_new_revision() {
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("source");
     let home = temp.path().join("home");
     fs::create_dir(&root).unwrap();
     fs::write(root.join("a.js"), "function unchanged() {}\n").unwrap();
-    for expected in [2_i64, 3] {
+    // Startup reconciliation publishes r1; each unchanged claim completes at it.
+    for expected in [1_i64, 1] {
         let output = command(&root, &home, "index").output().unwrap();
         assert!(
             output.status.success(),
@@ -5115,7 +5135,7 @@ fn explicit_cli_unchanged_claim_publishes_then_acks() {
             .unwrap();
         assert_eq!(
             actual, expected,
-            "one daemon publishes one revision for each claimed request"
+            "an unchanged claimed request publishes no revision"
         );
         let immutable: i64 = db
             .query_row("SELECT count(*) FROM document_versions", [], |r| r.get(0))
@@ -5127,7 +5147,7 @@ fn explicit_cli_unchanged_claim_publishes_then_acks() {
         let count: i64 = db
             .query_row("SELECT count(*) FROM revision_documents", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(count, expected, "each revision needs its own manifest");
+        assert_eq!(count, 1, "an unchanged claim adds no manifest");
         let queue =
             rusqlite::Connection::open(real_index_db(&home).with_file_name("requests.db")).unwrap();
         let (state, revision): (String, i64) = queue

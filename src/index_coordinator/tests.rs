@@ -618,7 +618,20 @@ fn recovery_pin_must_not_complete_a_request_admitted_after_its_capture() {
         store.request_by_id(&later.id).unwrap().unwrap().state,
         "queued"
     );
-    assert_eq!(drain_requests(&store, &session).unwrap(), 1);
+    // An edit after the earlier capture: only the request's own capture sees
+    // it, and an unchanged capture would publish nothing (Decision 0006 §3).
+    fs::write(workspace.path().join("a.js"), "function b() {}\n").unwrap();
+    let modes = std::sync::Mutex::new(Vec::new());
+    assert_eq!(
+        drain_requests_observed(&store, &session, |id, p| {
+            if p.phase.starts_with("mode:") {
+                modes.lock().unwrap().push(id.to_owned());
+            }
+        })
+        .unwrap(),
+        1
+    );
+    assert_eq!(modes.into_inner().unwrap(), vec![later.id.clone()]);
     let completed = store.request_by_id(&later.id).unwrap().unwrap();
     assert_eq!(completed.state, "done");
     assert!(completed.revision.unwrap().index_revision > old_pin.index_revision);

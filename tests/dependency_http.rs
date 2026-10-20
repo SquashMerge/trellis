@@ -477,6 +477,13 @@ async fn successful_workspace_index_automatically_rebuilds_catalog() {
     fixture
         .state
         .retain_serving_session(fixture.session.clone());
+    // The catalog is keyed by the workspace revision. An unchanged index keeps
+    // the revision (Decision 0006 §3), so edit a source to publish a new one.
+    std::fs::write(
+        fixture.temp.path().join("workspace/src/lib.rs"),
+        "pub fn workspace_only() {}\npub fn edited() {}\n",
+    )
+    .unwrap();
     assert_eq!(
         request(&fixture.app, "POST", "/api/index", "{}").await.0,
         202
