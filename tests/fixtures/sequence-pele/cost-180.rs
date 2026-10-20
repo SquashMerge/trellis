@@ -2,10 +2,8 @@ fn measured() {
     if true { work_0(); } else { work_1(); }
     while false { work_2(); }
     let _ = work_3()?;
-    work_4();
-    work_5();
-    work_6();
-    work_7();
+    work_4().work_5().work_6();
+    unresolved_external_7();
     work_8();
     work_9();
     work_10();
@@ -183,10 +181,6 @@ fn work_0() {}
 fn work_1() {}
 fn work_2() {}
 fn work_3() {}
-fn work_4() {}
-fn work_5() {}
-fn work_6() {}
-fn work_7() {}
 fn work_8() {}
 fn work_9() {}
 fn work_10() {}
@@ -359,3 +353,10 @@ fn work_176() {}
 fn work_177() {}
 fn work_178() {}
 fn work_179() {}
+
+struct Chain;
+fn work_4() -> Chain { Chain }
+impl Chain {
+    fn work_5(self) -> Self { self }
+    fn work_6(self) -> Self { self }
+}

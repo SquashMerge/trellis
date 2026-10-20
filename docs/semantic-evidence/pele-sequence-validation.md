@@ -1,65 +1,67 @@
-# Pele sequence browser validation — blocked evidence (run 232)
+# Pele sequence browser validation (run 232)
 
-This is **not** a passed performance acceptance. The final 80/180-call indexed
-normal/near-cap cohort must render through Pele without fallback; it currently
-falls back. Do not use the exploratory timings below as acceptance measurements.
+## Deployed asset and measured cohort
 
-## Reproducibility and asset
+- Exact locally served `pele` 1.6.0 browser JS: 682,005 raw bytes;
+  254,221 bytes with Node `zlib.gzipSync` at its default level; SHA-256
+  `b82d1bcd435302779a945e1e0f4a54ea56fb26e010ce3f2122f4216fcfc095d7`.
+  Its MIT license is in `web/vendor/pele-1.6.0.LICENSE`; pinned npm tarball,
+  integrity, acquisition and attribution are in `web/vendor/README.md`.
+- Host: Darwin 27.0.0 arm64, Apple M5 Pro; managed Playwright 1.55.1
+  HeadlessChrome 140.0.7339.186, loopback daemon with exact embedded assets.
+  Both cohorts use temporary indexed Rust checkouts and actual published
+  `Store::sequence_at` JSON through the production API. No reconstructed DTO
+  is used in either the production/browser E case or these costs.
+- Each Rust `cost-{80,180}.rs` function has exactly 80/180 measured call
+  steps (recursively counted before timing). Each includes a branch with
+  alternate, loop with guard, `?` early-return distinction, measured flat
+  three-call group, and an explicitly unresolved call. The browser asserts
+  those structures and **Pele rendered** without fallback.
 
-- Exact local `pele` 1.6.0 browser asset: `web/vendor/pele-1.6.0.js`,
-  682,005 raw bytes, 254,221 bytes with Node `zlib.gzipSync` (default level),
-  SHA-256 `b82d1bcd435302779a945e1e0f4a54ea56fb26e010ce3f2122f4216fcfc095d7`.
-  MIT license: `web/vendor/pele-1.6.0.LICENSE`; acquisition, npm tarball
-  integrity and attribution: `web/vendor/README.md`.
-- Cohort: macOS Darwin 27.0.0 arm64, Apple M5 Pro; pinned Playwright
-  HeadlessChrome 140.0.7339.186 / Playwright 1.55.1. Loopback production
-  browser, isolated temporary checkout indexed and read through Store/API.
-- The fixture files `tests/fixtures/sequence-pele/cost-{80,180}.rs` produce
-  exactly 80 and 180 recursive measured call steps, respectively. They include
-  branch, loop, `?` early return, and unresolved call targets. The test asserts
-  the producer count and no Pele fallback *before* measuring warm renders.
-- Four producer-validated DTO browser parity cases and the real published
-  smaller checkout E case pass. All recorded browser cases observe zero CSP
-  violations. Exact first-slice adapter + vendor assets, not a CDN, are used.
+## Browser results
 
-## Current blocker and measurements
+Warm comparison: 20 alternating old/Pele renders, each from the **same
+published pinned DTO**, on one Chromium page per cohort. JS `performance.now()`
+measures renderer calls including validated SVG and DOM installation. Medians
+and p95 are milliseconds; SVG bytes use the installed element's UTF-8
+`outerHTML`, including app-added control and witness attributes.
 
-`./tools/verify` exits 1. Its Rust browser lane fails only at the required
-80/180-call no-fallback assertion: `Pele fell back: Changed Pele control frames`.
-The checks lane also fails because `tests/factory-config.test.cjs` freezes the
-old `tools/verify` browser command list; that test needs a separately approved
-path update. The other 1,418 Rust tests pass (six skipped). Full log:
-`/tmp/trellis-232-verify-blocked.log`.
+| Indexed cohort | Cold app/connect¹ | First sequence selection² | Old warm median / p95 | Pele warm median / p95 | Pele SVG bytes / nodes | CSP violations |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 80 measured calls | 453 ms | 674 ms | 1.4 / 2.3 ms | 3.3 / 5.2 ms | 45,527 / 308 | 0 |
+| 180 measured calls | 433 ms | 530 ms | 2.3 / 4.5 ms | 6.5 / 8.0 ms | 92,948 / 608 | 0 |
 
-For each actual published 80/180 DTO, `TrellisPeleSequence.project` yields
-frame source/preorder `[alt, loop, opt, opt, alt, opt]`; Pele's SVG frame DOM
-order is `[alt, opt, loop, alt, opt, opt]` for nested control. The first-slice
-adapter compares these orders literally and rejects the whole view. It must
-validate nested frame identity without guessing geometry or dropping evidence.
-Reproduction: `/tmp/trellis-232-shape-count.json` (projected Mermaid, frame
-headers, SVG class/rect counts, producer call counts) and
-`/tmp/trellis-232-cost-adjusted.log`. The required fix is outside this slice:
-`web/sequence-pele.js`.
+¹ From navigation to the cold browser app through token connection, checkout
+selection and visible workspace; excludes daemon launch/indexing and browser
+process launch. ² From first click on the measured method in the already
+opened file to visible Pele-rendered sequence; includes the Store/API read.
+These are observed samples, not latency budgets or claims about other machines.
+Raw records: `/tmp/trellis-232-cost-{80,180}.json`; passing browser output:
+`/tmp/trellis-232-verify-final.log` (`./tools/verify` exit 0). The
+verification lanes run concurrently; earlier focused measurements had lower
+latencies. Cache and host effects can change these
+measurements; the test checks functionality and records, not a speed threshold.
 
-**Not yet measured on the accepted cohort:** cold app load/first sequence
-selection, 20 warm old/Pele timings, generated SVG bytes/node counts and
-final CSP results for the branch/loop/try 80/180 fixture. The cost test contains
-these assertions and writes `/tmp/trellis-232-cost-{80,180}.json` on success;
-its current run stops at the no-fallback assertion. Do not substitute a
-reconstructed Store DTO or an empty-control fixture to fill this table.
+Four producer-validated JavaScript/Rust/Java/Python DTO cases render through
+real Chromium, preserving original ordered note identity and measured
+inspector actions. A published indexed checkout E case proves actual
+note→inspector→explicit exact pinned source (click, Enter, Space, stale
+rejection). The nested loop/guard P case checks Pele 1.6.0's frame close
+order and rejection of changed frame shape. No CSP violations were observed
+in the tested cases. The current CSP did not gain `unsafe-inline`.
 
-For context only, an **earlier exploratory, superseded** 80/180-call indexed
-fixture *without these control cases* rendered in both engines: 20 warm
-old/Pele medians 1.3/2.9 ms (80) and 2.0/6.5 ms (180), p95 3.2/4.7 ms
-and 5.7/19.3 ms, SVG bytes/nodes 38,708/254 and 86,105/554, zero CSP
-violations. These are not accepted normal-cohort numbers and contain no cold
-app timing. Original logs: `/tmp/trellis-232-cost-{80,180}.json`.
+## Negative control and former blocker
 
-## Negative control
+`/tmp/trellis-232-P-pre-mutation.log` passes; hiding the production generated
+SVG via a temporary in-lane CSS mutation makes the class-wide Chromium test
+fail `display 'none' !== 'block'` (`/tmp/trellis-232-mutation.log`); restoring
+CSS passes (`/tmp/trellis-232-P-restored.log`). The mutation is reverted.
 
-Passing `/tmp/trellis-232-P-pre-mutation.log` → temporarily hide the generated
-SVG with an in-lane CSS production mutation → four-language browser test
-fails `display 'none' !== 'block'` in `/tmp/trellis-232-mutation.log` → restore
-CSS → passing `/tmp/trellis-232-P-restored.log`. The production mutation was
-reverted. This confirms the class-wide P visibility assertion detects a real
-integration regression.
+An earlier run failed with `Changed Pele control frames`: source/preorder
+`[alt, loop, opt, opt, alt, opt]` differs from Pele's nested SVG DOM close
+order `[alt, opt, loop, alt, opt, opt]`. Bounded actual Store reproduction:
+`/tmp/trellis-232-shape-count.json`. The adapter now validates exact
+kind/header in close order while retaining source note ordinals and separate
+original DTO witnesses; an intentionally changed frame fails closed. An
+initial simple 80/180-call fixture without controls was exploratory only,
+not the accepted cohort; its timings are deliberately excluded here.

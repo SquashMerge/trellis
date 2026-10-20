@@ -6,7 +6,14 @@ function stats(values){const sorted=[...values].sort((a,b)=>a-b);return {median:
 for(const count of [80,180])test(`indexed ${count}-call cohort uses Pele and measures 20 same-DTO renders`,{timeout:360000},async()=>{
  const source=readFileSync(resolve(ROOT,`tests/fixtures/sequence-pele/cost-${count}.rs`),"utf8");
  await published(source,async({page,dto,errors,coldAppMs,firstSelectionMs})=>{
- const calls=dto.steps.filter(step=>step.kind==="call");assert.equal(calls.length,count,`actual indexed producer must emit ${count} calls; got ${calls.length}`);
+ const steps=(function walk(items){return items.flatMap(step=>[step,...walk(step.children||[]),...walk(step.alternate||[])]);})(dto.steps);
+ const calls=steps.filter(step=>step.kind==="call");assert.equal(calls.length,count,`actual indexed producer must emit ${count} calls; got ${calls.length}`);
+ assert.ok(steps.some(step=>step.kind==="branch"&&step.alternate.length),"measured branch and alternate required");
+ assert.ok(steps.some(step=>step.kind==="loop"),"measured loop required");
+ assert.ok(steps.some(step=>step.label.includes("?")&&step.alternate.length),"measured ? early-return distinction required");
+ assert.ok(steps.some(step=>step.kind==="group"&&step.children.length>=3),"measured flat call group required");
+ assert.ok(calls.some(step=>step.label.includes("unresolved_external_7")),"explicit unknown target call required");
+ assert.ok(dto.participants.some(participant=>participant.kind==="unresolvedCallee"),"unknown target must remain unresolved");
  const result=await page.evaluate(async dto=>{
  const wrap=document.createElement("div");document.body.append(wrap);
  const old=[],pele=[];let result;

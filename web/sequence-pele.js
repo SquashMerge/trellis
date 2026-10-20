@@ -20,7 +20,7 @@
   }
   function project(view, expanded = new Set(), options = {}) {
     if (!view || !view.seed || !Array.isArray(view.steps) || !Array.isArray(view.participants) || !view.revision) unsupported("Invalid sequence view");
-    const seen = new Set(), rows = [], frames = [], frameHeaders = [], noteOrder = [null], lines = ["sequenceDiagram", `participant S as ${encode(view.seed.name || view.seed.id)}`, "Note over S: Static possible paths - target and timing unknown"];
+    const seen = new Set(), rows = [], frames = [], frameHeaders = [], closeFrames = [], closeHeaders = [], noteOrder = [null], lines = ["sequenceDiagram", `participant S as ${encode(view.seed.name || view.seed.id)}`, "Note over S: Static possible paths - target and timing unknown"];
     let separators = 1;
     const add = (step, preview) => {
       const ordinal = rows.length + 1;
@@ -70,10 +70,11 @@
         if (step.kind === "branch") frame = alternate.length ? "alt" : "opt";
         else if (step.kind === "loop") frame = "loop";
         else if (step.kind === "try" || (step.kind !== "group" && (children.length || alternate.length))) frame = "rect";
+        const header = frame && frame !== "rect" ? {kind:frame, header:`[${encode(step.label)}]`, alternate:frame === "alt" ? "[alternate path]" : null} : null;
         if (frame) {
           lines.push(frame === "rect" ? "rect" : `${frame} ${encode(step.label)}`);
           frames.push(frame);
-          if (frame !== "rect") frameHeaders.push({kind:frame, header:`[${encode(step.label)}]`, alternate:frame === "alt" ? "[alternate path]" : null});
+          if (header) frameHeaders.push(header);
         }
         add(step, preview);
         if (!collapsed) {
@@ -84,7 +85,12 @@
             visit(alternate, depth + 1);
           }
         }
-        if (frame) lines.push("end");
+        if (frame) {
+          lines.push("end");
+          // Pele appends completed frames to SVG after their nested frames.
+          // Identity remains in the numbered header note, never frame geometry.
+          if (header) { closeFrames.push(frame); closeHeaders.push(header); }
+        }
         if (separators > 200) unsupported("Too many separators");
       }
     };
@@ -94,7 +100,7 @@
     // Pele numbers every Mermaid statement, including operators and end, but
     // not the declaration or participant. These gaps are part of the pinned API.
     const noteIds = lines.slice(2).flatMap((line, i) => line.startsWith("Note ") ? [`i${i}`] : []);
-    return {source, rows, frames, frameHeaders, noteIds, separators, noteOrder};
+    return {source, rows, frames, frameHeaders, closeFrames, closeHeaders, noteIds, separators, noteOrder};
   }
   function validatedSvg(raw, projection) {
     if (typeof raw !== "string" || new TextEncoder().encode(raw).length > 8 * 1024 * 1024) unsupported("SVG output too large");
@@ -128,9 +134,9 @@
       if (!note.textContent.replace(/\s+/g, "").includes(expected.replace(/\s+/g, ""))) unsupported("Changed Pele note text");
     }
     const observed = [...root.querySelectorAll(".pele-frame")].map(n => n.classList.contains("pele-frame-alt") ? "alt" : n.classList.contains("pele-frame-opt") ? "opt" : n.classList.contains("pele-frame-loop") ? "loop" : "unknown");
-    if (observed.join("|") !== projection.frames.filter(x => x !== "rect").join("|") || root.querySelectorAll(".pele-rect").length !== projection.frames.filter(x => x === "rect").length) unsupported("Changed Pele control frames");
+    if (observed.join("|") !== projection.closeFrames.join("|") || root.querySelectorAll(".pele-rect").length !== projection.frames.filter(x => x === "rect").length) unsupported("Changed Pele control frames");
     for (const [i, frame] of [...root.querySelectorAll(".pele-frame")].entries()) {
-      const expected = projection.frameHeaders[i];
+      const expected = projection.closeHeaders[i];
       if (frame.hasAttribute("data-id") || frame.querySelector("[data-id]")) unsupported("Unexpected Pele frame identity");
       if (frame.querySelector(".pele-frame-kind")?.textContent !== expected.kind) unsupported("Changed Pele frame kind");
       const labels = [...frame.querySelectorAll(".pele-frame-label")].map(n => n.textContent.replace(/\s+/g, ""));

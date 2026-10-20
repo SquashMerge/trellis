@@ -78,3 +78,22 @@ test("untrusted labels stay text; invalid source and stale redraw cannot install
  },view),"stale");
  assert.deepEqual(violations.filter(error=>/Content Security Policy|CSP/.test(error)),[]);
 });
+
+test("nested loop/guard frames validate close order; changed frame fails closed",async()=>{
+ const view=fixture("rust"),loop=structuredClone(view.steps[1]);loop.kind="loop";loop.id="nested-loop";loop.label="possible iterations";loop.alternate=[];
+ const guard=structuredClone(view.steps[1]);guard.id="nested-guard";guard.label="only if measured condition";guard.alternate=[];
+ guard.children=[structuredClone(view.steps[0])];guard.children[0].id="nested-call";
+ loop.children=[guard];view.steps=[loop];
+ const result=await render(view);assert.equal(result.status,"rendered",result.reason);
+ assert.match(result.source,/loop possible iterations/);
+ assert.match(result.source,/opt only if measured condition/);
+ assert.deepEqual(await page.locator(".pele-frame").evaluateAll(frames=>frames.map(n=>n.querySelector(".pele-frame-kind")?.textContent)),["opt","loop"]);
+ const failed=await page.evaluate(async view=>{
+   const original=window.pele;
+   window.pele={render:(...args)=>{const output=original.render(...args);return {...output,svg:output.svg.replace('class="pele-frame pele-frame-opt"','class="pele-frame pele-frame-alt"')};}};
+   try{return (await TrellisPeleSequence.render(document.querySelector("#sequence-diagram"),view,null,new Set(),{})).status;}
+   finally{window.pele=original;}
+ },view);
+ assert.equal(failed,"unsupported");
+ assert.deepEqual(violations.filter(error=>/Content Security Policy|CSP/.test(error)),[]);
+});
