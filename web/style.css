@@ -342,3 +342,31 @@ footer details > p { position: absolute; bottom: 30px; right: 12px; width: min(5
 @media (min-width: 1600px) {
   .classes-view .workspace-frame { grid-template-columns: 268px minmax(0, 1fr); }
 }
+
+/* Pele is a locally generated, evidence-checked SVG. Its pinned inline root
+   declarations are removed before parsing and recreated here under our CSP. */
+.sequence-scroll svg.pele.trellis-pele {
+  max-width: 100%; height: auto;
+  --pele-bg: var(--bg); --pele-fg: var(--ink); --pele-muted: var(--muted);
+  --pele-line: var(--line-strong); --pele-surface: var(--node);
+  --pele-surface-alt: var(--card); --pele-border: var(--line);
+  --pele-accent: var(--primary); --pele-font: var(--sans);
+  --pele-font-mono: var(--mono);
+  --_bg: var(--pele-bg); --_fg: var(--pele-fg); --_m: var(--pele-muted);
+  --_l: var(--pele-line); --_s: var(--pele-surface);
+  --_a: var(--pele-surface-alt); --_b: var(--pele-border);
+  --_c: var(--pele-accent); color: var(--_fg);
+  --_r: var(--pele-radius, 4px); --_hw: var(--pele-heading-weight, bold);
+  --_fm: var(--pele-font-mono); font: 16px var(--sans);
+  letter-spacing: normal; word-spacing: normal; text-transform: none; direction: ltr;
+  font-family: var(--pele-font);
+}
+.sequence-scroll .trellis-pele .pele-note[role="button"] { cursor: pointer; }
+.sequence-scroll .trellis-pele .pele-note[role="button"]:hover rect,
+.sequence-scroll .trellis-pele .pele-note[role="button"][aria-pressed="true"] rect,
+.sequence-scroll .trellis-pele .pele-note[role="button"]:focus-visible rect { stroke: var(--primary); stroke-width: 2; }
+.sequence-scroll .trellis-pele .pele-note[role="button"]:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+.sequence-scroll .trellis-pele .sequence-group-control { font: 12px var(--sans); color: var(--ink); background: var(--card); border: 1px solid var(--line-strong); padding: 2px 4px; cursor: pointer; }
+.sequence-scroll .trellis-pele .sequence-group-control:hover,
+.sequence-scroll .trellis-pele .sequence-group-control:focus-visible { color: var(--primary); border-color: var(--primary); outline: 2px solid var(--primary); }
+@media (max-width: 600px) { .sequence-scroll svg.pele.trellis-pele { max-width: none; } }

@@ -1215,9 +1215,18 @@ async function loadSequence() {
     if (window.TrellisShell) options.onSelect = step => {
       if (current()) window.TrellisShell?.selectStep(step, data, () => readSource(step));
     };
-    window.TrellisSequence.render($("sequence-diagram"), data, readSource, new Set(), options);
+    const diagram = $("sequence-diagram");
+    const expanded = new Set();
+    const outcome = window.TrellisPeleSequence
+      ? await window.TrellisPeleSequence.render(diagram, data, readSource, expanded, options)
+      : {status:"unsupported", reason:"Pele asset unavailable"};
+    if (!current() || !IndexPin.equal(status?.revision, revision)) return;
+    if (outcome.status === "stale") return;
+    if (outcome.status !== "rendered") {
+      window.TrellisSequence.render(diagram, data, readSource, expanded, options);
+    }
     if ($("sequence-warning-count")) $("sequence-warning-count").textContent = String((data.warnings || []).length);
-    $("sequence-state").textContent = `${symbol.name} · ${symbol.path} · revision ${IndexPin.label(revision)} · ${data.hiddenSteps} incidental steps hidden${data.truncated ? " · truncated" : ""}${!data.steps.length ? " · No visible behavior steps. Read method source for context." : ""}`;
+    $("sequence-state").textContent = `${symbol.name} · ${symbol.path} · revision ${IndexPin.label(revision)} · ${data.hiddenSteps} incidental steps hidden${data.truncated ? " · truncated" : ""}${!data.steps.length ? " · No visible behavior steps. Read method source for context." : ""}${outcome.status !== "rendered" ? ` · Pele fell back: ${outcome.reason}` : " · Pele rendered"}`;
     for (const warning of data.warnings || []) $("sequence-warnings").append(element("li", warning, "warning"));
   }, current, "sequence-state");
 }
