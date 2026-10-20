@@ -864,7 +864,7 @@ fn captured_writer_is_reverified_after_root_replacement_before_publish() {
 }
 
 #[test]
-fn full_publication_rebuilds_and_compares_the_artifact_once() {
+fn full_publication_never_rebuilds_its_own_fresh_artifact() {
     let state = tempfile::tempdir().unwrap();
     let work = tempfile::tempdir().unwrap();
     fs::write(
@@ -879,11 +879,12 @@ fn full_publication_rebuilds_and_compares_the_artifact_once() {
     let _session = job.session();
     let before = crate::native_evidence::full_validations_for_tests();
     let pin = job.run_observed(&options, &cancel, |_| {}, |_| {}).unwrap();
-    // Measurement validates the artifact against its capture; publication
-    // keeps the bundle checks without repeating that rebuild.
+    // The artifact is this process's own build of the capture (#199 I-4b):
+    // measurement and publication keep the structural and bundle checks, and
+    // neither rebuilds it to compare.
     assert_eq!(
         crate::native_evidence::full_validations_for_tests() - before,
-        1
+        0
     );
     assert_eq!(store.status().unwrap().revision, pin);
 }

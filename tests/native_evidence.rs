@@ -1637,8 +1637,8 @@ fn assert_javascript_declaration_lookup(source: &str, name: &str, key: &str) {
             .unwrap();
     let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
     let capture = Capture::admit(&IndexOptions::new(root.path().into()), &cancel, &|_| {}).unwrap();
-    // from_capture also validates the independently rebuilt artifact. Store
-    // publication and incoming reads are exercised separately.
+    // from_capture structurally validates its own build. Store publication
+    // (with the full rebuild) and incoming reads are exercised separately.
     let artifact = from_capture(&capture, root.path(), &identity.record_id, &cancel).unwrap();
     let declaration = artifact
         .declarations
@@ -1677,4 +1677,48 @@ fn javascript_brace_escape_accepts_leading_zeros_and_bounds_code_point() {
     );
     assert!(lookup("javascript", r"\u{110000}arget").is_err());
     assert!(lookup("javascript", r"\u{0000000000110000}arget").is_err());
+}
+
+/// #199 I-4b: a fresh build is no longer rebuilt and compared inside
+/// validation, so `build_native` determinism is checked here instead. The
+/// same capture built twice must give byte-identical artifacts.
+#[test]
+fn native_build_is_deterministic() {
+    use std::sync::{Arc, atomic::AtomicBool};
+    use trellis::{
+        capture::Capture, indexer::IndexOptions, model::CancelFlag, native_evidence::from_capture,
+    };
+    let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/metrics");
+    let root = tempfile::tempdir().unwrap();
+    let mut copied = 0;
+    for language in ["java", "javascript", "python", "rust"] {
+        std::fs::create_dir(root.path().join(language)).unwrap();
+        for entry in std::fs::read_dir(fixtures.join(language)).unwrap() {
+            let entry = entry.unwrap();
+            std::fs::copy(
+                entry.path(),
+                root.path().join(language).join(entry.file_name()),
+            )
+            .unwrap();
+            copied += 1;
+        }
+    }
+    let identity =
+        trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+            .unwrap();
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let capture = Capture::admit(&IndexOptions::new(root.path().into()), &cancel, &|_| {}).unwrap();
+    assert_eq!(capture.files.len(), copied, "every fixture is captured");
+    let build = || {
+        let artifact = from_capture(&capture, root.path(), &identity.record_id, &cancel).unwrap();
+        serde_json::to_vec(&artifact).unwrap()
+    };
+    let first = build();
+    let second = build();
+    assert!(
+        first.len() > 10_000,
+        "fixture exercises real extraction: {} bytes",
+        first.len()
+    );
+    assert!(first == second, "the same capture built twice differs");
 }
