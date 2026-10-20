@@ -8664,10 +8664,9 @@ async fn mcp_outgoing_mid_attestation_expiry_keeps_required_calls_and_prior_hint
         ],
         "Owner",
         None,
-        // Each candidate attestation hashes its source twice (source row, then
-        // native witness): local.js twice at no cost, then target.js expires.
+        // Each candidate attestation reads and hashes its source once, and its
+        // native witness reuses those bytes: local.js at no cost, then target.js expires.
         Some(vec![
-            ("outgoing_hint_source_hash_chunk", 0),
             ("outgoing_hint_source_hash_chunk", 0),
             ("outgoing_hint_source_hash_chunk", 1001),
         ]),

@@ -496,8 +496,9 @@ async fn selected_request_cancelled_during_read_and_serialization() {
         let progress = AtomicUsize::new(0);
         let once = std::sync::atomic::AtomicBool::new(true);
         browser.set_selected_response_hook_for_tests(Arc::new(move |stage| {
+            // Inside the first document's attestation, before any memo entry.
             let at_read =
-                stage == "metrics_read_progress" && progress.fetch_add(1, Ordering::Relaxed) == 100;
+                stage == "metrics_read_progress" && progress.fetch_add(1, Ordering::Relaxed) == 50;
             let at_serialize = stage == "metrics_serialize";
             if ((phase == "read" && at_read) || (phase == "serialize" && at_serialize))
                 && once.swap(false, Ordering::AcqRel)
