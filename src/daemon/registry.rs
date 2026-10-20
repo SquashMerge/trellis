@@ -1591,7 +1591,8 @@ pub struct MetricsResponseHooks<'a> {
     pub before_finish: &'a mut dyn FnMut(),
     pub after_finish: &'a mut dyn FnMut(),
     pub on_write: &'a mut dyn FnMut(usize),
-    pub on_progress: &'a mut dyn FnMut(),
+    /// Called with every progress check, from the request thread or a metrics worker.
+    pub on_progress: &'a mut (dyn FnMut() + Send),
 }
 
 pub struct CheckoutEvidence {
@@ -2136,7 +2137,7 @@ impl CheckoutRuntime {
     pub fn metrics_response(
         &self,
         options: &crate::store::MetricsOptions,
-        check: &mut impl FnMut() -> anyhow::Result<()>,
+        check: &mut (impl FnMut() -> anyhow::Result<()> + Send),
         hooks: MetricsResponseHooks<'_>,
         max_bytes: usize,
     ) -> anyhow::Result<(Vec<u8>, bool)> {

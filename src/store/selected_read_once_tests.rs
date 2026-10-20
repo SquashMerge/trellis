@@ -2,7 +2,7 @@ use super::*;
 use crate::indexer::{IndexOptions, index_workspace_bundle};
 use std::{fs, sync::atomic::AtomicBool};
 
-fn published_store(files: usize) -> (tempfile::TempDir, tempfile::TempDir, Store) {
+pub(super) fn published_store(files: usize) -> (tempfile::TempDir, tempfile::TempDir, Store) {
     let state = tempfile::tempdir().unwrap();
     let root = tempfile::tempdir().unwrap();
     for n in 0..files {

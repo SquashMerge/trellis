@@ -76,16 +76,36 @@ pub fn compute_memoized(
     regions: &[ControlRegion],
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<Vec<DeclarationMetrics>> {
-    let key = (
-        VERSION.to_owned(),
-        source.language.to_owned(),
-        source.content_hash.to_owned(),
-    );
-    let cached = memo
-        .entries
-        .iter()
-        .find(|(k, _, _)| *k == key)
-        .map(|(_, scores, _)| scores.clone());
+    let cached = memo.lookup(&source);
+    compute_with_cached(cached, source, declarations, calls, regions, check)?.commit(memo)
+}
+
+/// One document's metrics rows, and its source-only scores when they were
+/// computed rather than taken from the memo.
+pub(crate) struct Computed {
+    rows: Vec<DeclarationMetrics>,
+    uncached: Option<(MemoKey, Vec<Score>)>,
+}
+
+impl Computed {
+    /// Accept this document: record its new scores in `memo`, return its rows.
+    pub(crate) fn commit(self, memo: &mut MetricsMemo) -> Result<Vec<DeclarationMetrics>> {
+        memo.commit(self.uncached)?;
+        Ok(self.rows)
+    }
+}
+
+/// Compute one document's rows from `cached` source scores (a memo hit) or
+/// from its source. The memo itself is untouched: `MetricsMemo::commit`
+/// records new scores once the caller accepts this document.
+pub(crate) fn compute_with_cached(
+    cached: Option<Vec<Score>>,
+    source: SourceInput<'_>,
+    declarations: &[Declaration],
+    calls: &[Call],
+    regions: &[ControlRegion],
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<Computed> {
     let was_cached = cached.is_some();
     let scores = match cached {
         Some(scores) => scores,
@@ -100,10 +120,19 @@ pub fn compute_memoized(
         check,
     )?;
     check()?;
-    if !was_cached {
-        memo.insert(key, scores)?;
-    }
-    Ok(rows)
+    Ok(Computed {
+        rows,
+        uncached: (!was_cached).then(|| (memo_key(&source), scores)),
+    })
+}
+
+type MemoKey = (String, String, String);
+fn memo_key(source: &SourceInput<'_>) -> MemoKey {
+    (
+        VERSION.to_owned(),
+        source.language.to_owned(),
+        source.content_hash.to_owned(),
+    )
 }
 /// The selected pinned source; only its language, hash and bytes enter the memo key.
 pub struct SourceInput<'a> {
@@ -853,6 +882,24 @@ impl MetricsMemo {
             self.bytes += size;
         }
         Ok(())
+    }
+    /// Source-only scores already recorded for this source, if any.
+    pub(crate) fn lookup(&self, source: &SourceInput<'_>) -> Option<Vec<Score>> {
+        let key = memo_key(source);
+        self.entries
+            .iter()
+            .find(|(k, _, _)| *k == key)
+            .map(|(_, scores, _)| scores.clone())
+    }
+    /// Record a document's newly computed scores, unless an equal source was
+    /// recorded since they were computed.
+    pub(crate) fn commit(&mut self, computed: Option<(MemoKey, Vec<Score>)>) -> Result<()> {
+        match computed {
+            Some((key, scores)) if !self.entries.iter().any(|(k, _, _)| *k == key) => {
+                self.insert(key, scores)
+            }
+            _ => Ok(()),
+        }
     }
     pub fn len(&self) -> usize {
         self.entries.len()
