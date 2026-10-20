@@ -40,7 +40,7 @@ Each item below ends with its open questions. The decisions they add up to are:
 | D10 | Size budget | int8 vectors at ≤1024 dimensions; a size cap on `vectors.db`; FTS5 measured against #199. Whether search waits for #199's size items is an owner decision |
 | D11 | Remote embedding (voyage-code-4) | Out of scope until the owner opts in; it would need its own contract change |
 | D12 | FTS5 and #199 item 5 (Q-8) | Two tables: a trigram prefilter for W2 (every hit still verified by W2's literal rule) and a split-identifier table for search |
-| D13 | Hybrid ordering | A fixed, deterministic fusion and tie-break rule (§1), part of the contract; changing it is a contract change. BM25 is scored over a head-only FTS5 table. The query transformation is total. No cross-call output promise by default; an optional `vectorSet` can promise only the same ordered hits, under stated conditions (owner choice). Cache-key reuse doesn't imply byte-identical vectors |
+| D13 | Hybrid ordering | A fixed, deterministic fusion and tie-break rule (§1), part of the contract; changing it is a contract change. BM25 is scored over a head-only FTS5 table. The query transformation is total. No cross-call output promise by default; an optional `vectorSet`, with exact integer ranking arithmetic, can promise only the same pre-clipping ranked order; emitted lists then agree on their common prefix (owner choice). Cache-key reuse doesn't imply byte-identical vectors |
 
 ## 1. New MCP tool and catalog version
 
@@ -150,12 +150,30 @@ tool, not a `view` of another tool, and not an `inspect` union.
       - `modelId`;
       - the inference runtime build identity and its numerical backend (for example CPU or Metal,
         and its precision);
+      - the SQLite library version (for `bm25()`);
       - `queryVectorDigest`;
       - the sorted `(cardHash, valueDigest)` pairs used in this call.
-    - **Promise: ordered hits only, under stated conditions.** If `evidenceBasis`, the request and
-      `vectorSet` are all equal, the similarity computation over those exact bytes uses the
-      contract's fixed arithmetic. The emitted **ordered hit list** (each hit's `symbolId`, `rank`
-      and `matchedBy`) is then equal.
+    - **Exact ranking arithmetic.** For the promise to hold, near-ties must reproduce. So the
+      option fixes the arithmetic rather than relying on floating-point behaviour:
+      - **Vector arm:** stored vectors and the query vector are unit-normalized, then quantized to
+        int8 before storage or use. Similarity is the **integer** dot product of the two int8
+        vectors, accumulated in at least 32-bit integers. It is exact, so precision and reduction
+        order can't change it. Ties go to `symbolId` bytes.
+      - **Fusion:** with integer weights `wL`, `wV` and `k`, each fused score is the rational
+        `wL/(k+l) + wV/(k+v)`. Scores are compared exactly, by integer cross-multiplication, never
+        as floating-point values.
+      - **Lexical arm:** FTS5's `bm25()` returns a double. Its value, and so the lexical order, is
+        reproducible only for the same SQLite build over the same head rows. `vectorSet` therefore
+        also covers the SQLite library version.
+    - **Promise: the pre-clipping ranked order, under those conditions.** If `evidenceBasis`, the
+      request and `vectorSet` are all equal, the **full ranked candidate order before clipping**
+      is equal, with each candidate's `symbolId`, `rank` and `matchedBy`.
+    - **Emitted lists agree only on their common prefix.** The response emits the longest prefix
+      of that order that fits the 65,536-byte cap. The size of the varying fields (the JSON-RPC
+      request ID, `catchingUp`, `searchIndex.state` and other values sampled at admission) can
+      move the cut by a hit even when the ranking is unchanged. Two such calls' emitted hit lists
+      therefore agree on their common prefix. They are equal in length only when the
+      serialization budget left after those varying fields is also equal.
     - **Not the whole envelope.** `searchIndex.state` (a background job can start or stop),
       `catchingUp`, the request ID and anything else sampled at admission can still differ.
     - **No promise that the same query embeds to the same bytes.** Re-embedding a query on another
@@ -252,7 +270,9 @@ its fixture are closed. The catalog adds about 13 KB to a 73 KB compact catalog.
 6. **Ranking stability across cache changes.** Should results make no equality promise across
    calls (proposed), or carry `searchIndex.vectorSet`? That hashes the cached and query vector
    *values* used, plus model, runtime and backend identity, so that equal basis, request and
-   `vectorSet` promise the same ordered hits (not the same whole envelope).
+   `vectorSet` promise the same pre-clipping ranked order, with emitted lists agreeing on their
+   common prefix (not the same whole envelope)? This requires the exact integer similarity and
+   rational fusion arithmetic in §1.
 
 ## 2. Card content and native extraction
 
