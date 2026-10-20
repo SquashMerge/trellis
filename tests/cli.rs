@@ -4975,7 +4975,11 @@ fn optional_captured_scip_changes_presentation_without_native_identity_or_full_r
     // accepted request's SCIP options, the request is unchanged and completes
     // at r1 (Decision 0006 §3); otherwise it publishes r2 for the new inputs.
     assert!(
-        (1..=2).contains(&first_pin["publishedRevision"]["indexRevision"].as_u64().unwrap()),
+        (1..=2).contains(
+            &first_pin["publishedRevision"]["indexRevision"]
+                .as_u64()
+                .unwrap()
+        ),
         "{first_pin}"
     );
     let original = command(&root, &home, "export")
