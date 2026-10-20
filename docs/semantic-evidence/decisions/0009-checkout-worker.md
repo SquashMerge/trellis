@@ -62,7 +62,7 @@ No handler, registry operation or test path publishes, claims or reconciles outs
 | Transition | Owner | Trigger |
 | --- | --- | --- |
 | `Activating → Reconciling` | registry | The queue is opened and prepared at activation |
-| `Reconciling → Ready` | worker | Startup reconciliation commits a validated head |
+| `Reconciling → Ready` | worker | Startup reconciliation commits a validated head, or confirms that the validated head is unchanged without publishing (amended 2026-10-20) |
 | `Reconciling → Reconciling{attempt+1}` | worker | Failure; retried after backoff (250 ms doubling, at most 30 s) |
 | `Ready → Reconciling` | worker | Writer session lost, recreate pending, or a non-retryable drain failure |
 | `Ready → RetireRequested{cutoff}` | registry, then worker | Release due (§5), and not declined |
@@ -89,7 +89,7 @@ The snapshot replaces lock probing as information. It never replaces the checks 
 ### 4. Priority at each worker boundary
 
 The worker runs one unit at a time. Before each unit, it picks the highest class that has work:
-1. **Startup reconciliation**, while `Reconciling`. Old-root settlement while `RootLost`. FIFO is held until a validated head commits.
+1. **Startup reconciliation**, while `Reconciling`. Old-root settlement while `RootLost`. FIFO is held until a validated head commits or is confirmed unchanged.
 2. **Accepted FIFO and watcher work**, interleaved exactly as today: one FIFO row, then the watcher gate. Watcher work runs when the FIFO is empty or a row just completed.
    - **In `RetireRequested`**, watcher intent **through the cutoff** gets one attempt before retirement (§5). Changes after the cutoff don't outrank retirement and can't delay it.
 3. **Retirement**, while `RetireRequested`.
@@ -250,6 +250,9 @@ Implementation may show that a rule needs to change. The change is then made to 
 - **§§2, 5:** `Retired` requires the watcher to be released, not its native teardown finished. A released watcher has no authority (its callbacks are inert once the release returns); teardown runs on tracked reapers. The degraded mode's service level is ruled separately (below).
 - **§5 (same day, after review):** the bound is a budget of native-watcher slots held from creation until teardown returns, at most 68 per daemon (64 active checkouts plus 4), replacing "at most 4 stranded", which counting only released watchers could not enforce: up to 68 can now be stranded if every teardown hangs. A release waits for a callback already in flight.
 - **§5 degraded mode (2026-10-15):** a checkout without a native watcher (registration failure or a full budget) is a scoped exception: degraded health, the 60 s periodic full inventory, convergence and rebuild parity reported separately, no latency claim. Stage 3 counts only healthy native watching; a series during which watching degrades is invalid and restarted, never trimmed.
+
+**Amendment approved by the owner (2026-10-20, #199 R-3/S-4):**
+- **§§2, 4:** when startup reconciliation's capture is unchanged against the selected head, as defined in [Decision 0006's 2026-10-20 amendment](0006-revision-retention-and-index-gc.md#amendment-2026-10-20-no-revision-for-an-unchanged-capture), it publishes no new revision. It attests the existing head for the new writer incarnation, and `Reconciling → Ready` follows as after a commit. Startup reconciliation itself, the recovery order, FIFO order and the Q2→watcher→Q1 gate are otherwise unchanged; a no-op FIFO row completes `done` at the current head.
 
 ## Consequences
 

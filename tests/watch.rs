@@ -554,7 +554,7 @@ fn daemon_watcher_keeps_cli_file_cap_and_selected_export_after_edit() {
 }
 
 #[test]
-fn empty_checkout_explicit_request_publishes_fresh_manifest_and_terminal_pin() {
+fn empty_checkout_explicit_request_completes_done_at_unchanged_head() {
     let state = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
     let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
@@ -569,11 +569,9 @@ fn empty_checkout_explicit_request_publishes_fresh_manifest_and_terminal_pin() {
         1
     );
     let published = store.status().unwrap().revision;
-    assert_eq!(published.index_generation, pin.index_generation);
     assert_eq!(
-        published.index_revision,
-        pin.index_revision + 1,
-        "unchanged explicit FIFO request publishes a fresh manifest"
+        published, pin,
+        "unchanged explicit FIFO request keeps the head (Decision 0006 §3)"
     );
     assert_eq!(store.status().unwrap().stats.files, 0);
     let row = store.request_by_id(&accepted.id).unwrap().unwrap();
@@ -953,10 +951,14 @@ fn accepted_watcher_intent_before_debounce_preempts_writer_unit() {
     let session =
         index_coordinator::establish_serving_session(&store, Some(&options), &cancel).unwrap();
     let old = store.status().unwrap().revision;
+    // A real change supersedes `old`, leaving retention work for maintenance;
+    // an unchanged run would keep `old` as head (Decision 0006 §3).
+    fs::write(&source, "function superseding() {}\n").unwrap();
     IndexJobCoordinator::prepare_with_session(&store, None, session.clone())
         .unwrap()
         .run_serving(&options, &cancel, |_| {})
         .unwrap();
+    assert!(store.status().unwrap().revision.index_revision > old.index_revision);
     let mut work = WatcherWork::new(&store, &session, &options).unwrap();
     work.disable_native_watcher_for_tests();
     work.reconcile_due(&store, &session, &options, &cancel, true)

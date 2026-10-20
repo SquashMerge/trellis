@@ -24,12 +24,38 @@ fn fixture() -> (
     (tmp, store, options, baseline, session)
 }
 
+/// An unchanged capture publishes nothing (Decision 0006 §3, amended
+/// 2026-10-20), so a real edit makes the next claimed request publish.
+fn edit_source(options: &IndexOptions, body: &str) {
+    fs::write(
+        options.workspace_root.join("a.js"),
+        format!("function a() {{ {body} }}\n"),
+    )
+    .unwrap();
+}
+
+/// Each claimed request that runs its own capture reports exactly one
+/// `mode:` event; a retried cached completion runs none.
+fn drain_modes(
+    store: &Store,
+    session: &Arc<WriterSession>,
+) -> (Result<usize>, Vec<(String, String)>) {
+    let modes = std::sync::Mutex::new(Vec::new());
+    let result = drain_requests_observed(store, session, |id, p| {
+        if p.phase.starts_with("mode:") {
+            modes.lock().unwrap().push((id.to_owned(), p.phase));
+        }
+    });
+    (result, modes.into_inner().unwrap())
+}
+
 #[test]
 fn failed_terminal_write_retries_exact_published_head_before_next_fifo_claim() {
     let (_tmp, store, options, baseline, session) = fixture();
     let first = store.enqueue_request(&options, None).unwrap();
     let second = store.enqueue_request(&options, None).unwrap();
     assert!(first.seq < second.seq);
+    edit_source(&options, "return 1;");
     store.inject_queue_finish_failure(false);
     let error = drain_requests(&store, &session).unwrap_err();
     assert!(error.to_string().contains("storage_busy"));
@@ -43,16 +69,16 @@ fn failed_terminal_write_retries_exact_published_head_before_next_fifo_claim() {
         store.request_by_id(&second.id).unwrap().unwrap().state,
         "queued"
     );
-    assert_eq!(drain_requests(&store, &session).unwrap(), 2);
+    let (drained, modes) = drain_modes(&store, &session);
+    assert_eq!(drained.unwrap(), 2);
+    // Q1's cached result is retried without a capture; Q2 runs its own.
+    assert_eq!(modes, vec![(second.id.clone(), "mode:unchanged".into())]);
     let q1 = store.request_by_id(&first.id).unwrap().unwrap();
     let q2 = store.request_by_id(&second.id).unwrap().unwrap();
     assert_eq!((q1.state.as_str(), q2.state.as_str()), ("done", "done"));
     assert_eq!(q1.revision.unwrap(), published);
-    assert_eq!(
-        q2.revision.unwrap().index_revision,
-        published.index_revision + 1
-    );
-    assert_eq!(store.status().unwrap().revision, q2.revision.unwrap());
+    assert_eq!(q2.revision.unwrap(), published);
+    assert_eq!(store.status().unwrap().revision, published);
 }
 
 #[test]
@@ -65,6 +91,7 @@ fn cached_completion_consumes_one_daemon_tick_before_next_fifo_claim() {
     assert!(first.seq < second.seq);
     assert_ne!(first.options_json, second.options_json);
 
+    edit_source(&options, "return 1;");
     store.inject_queue_finish_failure(false);
     let error = drain_one_request_observed(&store, &session, |_, _| {}).unwrap_err();
     assert!(error.to_string().contains("storage_busy"), "{error:#}");
@@ -137,8 +164,17 @@ fn ambiguous_committed_terminal_is_verified_without_republishing_head() {
     let (_tmp, store, options, baseline, session) = fixture();
     let first = store.enqueue_request(&options, None).unwrap();
     let second = store.enqueue_request(&options, None).unwrap();
+    edit_source(&options, "return 1;");
     store.inject_queue_finish_failure(true);
-    assert_eq!(drain_requests(&store, &session).unwrap(), 2);
+    let (drained, modes) = drain_modes(&store, &session);
+    assert_eq!(drained.unwrap(), 2);
+    // One capture per request: the ambiguous terminal is verified, not rerun.
+    assert_eq!(
+        modes.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>(),
+        vec![first.id.clone(), second.id.clone()]
+    );
+    assert_ne!(modes[0].1, "mode:unchanged");
+    assert_eq!(modes[1].1, "mode:unchanged");
     let q1 = store.request_by_id(&first.id).unwrap().unwrap();
     let q2 = store.request_by_id(&second.id).unwrap().unwrap();
     assert_eq!((q1.state.as_str(), q2.state.as_str()), ("done", "done"));
@@ -146,16 +182,15 @@ fn ambiguous_committed_terminal_is_verified_without_republishing_head() {
         q1.revision.unwrap().index_revision,
         baseline.index_revision + 1
     );
-    assert_eq!(
-        q2.revision.unwrap().index_revision,
-        baseline.index_revision + 2
-    );
+    assert_eq!(q2.revision, q1.revision);
+    assert_eq!(store.status().unwrap().revision, q1.revision.unwrap());
 }
 #[test]
 fn cli_cached_claim_mismatch_fails_closed_instead_of_retrying_forever() {
     let (_tmp, store, options, baseline, session) = fixture();
     let q1 = store.enqueue_request(&options, None).unwrap();
     let q2 = store.enqueue_request(&options, None).unwrap();
+    edit_source(&options, "return 1;");
     store.inject_queue_finish_failure(false);
     let initial = drain_requests(&store, &session).unwrap_err();
     assert!(

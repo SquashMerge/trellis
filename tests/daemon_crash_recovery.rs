@@ -215,15 +215,23 @@ async fn killed_daemon_with_accepted_queue_restarts_to_one_fifo_terminal_result_
     assert_eq!(drained[0].claim_incarnation, at_death[0].claim_incarnation);
     // The dead daemon's running claim was reclaimed by the new incarnation.
     assert_ne!(drained[1].claim_incarnation.as_deref(), Some(&*dead_claim));
-    // Terminal results follow FIFO (seq) order: each ID's single row names
-    // its own later committed revision.
+    // Terminal results follow FIFO (seq) order: each row finishes before the
+    // next is claimed. These unchanged rows complete at the same head
+    // (Decision 0006 §3), so revisions never move backwards.
     let revisions: Vec<u64> = drained
         .iter()
         .map(|r| r.revision.unwrap().index_revision)
         .collect();
     assert!(
-        revisions.windows(2).all(|pair| pair[0] < pair[1]),
-        "terminal results out of FIFO order: {revisions:?}"
+        revisions.windows(2).all(|pair| pair[0] <= pair[1]),
+        "terminal revisions move backwards: {revisions:?}"
+    );
+    let millis = |value: &Option<String>| value.as_deref().unwrap().parse::<u128>().unwrap();
+    assert!(
+        drained
+            .windows(2)
+            .all(|pair| millis(&pair[0].finished_at) <= millis(&pair[1].started_at)),
+        "terminal results out of FIFO order: {drained:?}"
     );
     assert!(store.earliest_unfinished_request().unwrap().is_none());
 }

@@ -305,7 +305,7 @@ impl IndexJobCoordinator {
             cutoff()?;
         }
         if unchanged_fast
-            && let Some(pin) = self.store.publish_unchanged_native_recovery(
+            && let Some(pin) = self.store.reuse_unchanged_native_head(
                 &capture,
                 self.session.writer_guard()?,
                 &self.expected,

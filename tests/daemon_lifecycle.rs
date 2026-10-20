@@ -695,8 +695,11 @@ async fn active_writer_and_protected_reader_overlap_orphan_idle_scan() {
         first_done.revision.unwrap().index_generation,
         second_done.revision.unwrap().index_generation
     );
+    // Both no-op rows complete at the unchanged head (Decision 0006 §3), in FIFO order.
+    assert_eq!(first_done.revision, second_done.revision);
     assert!(
-        first_done.revision.unwrap().index_revision < second_done.revision.unwrap().index_revision
+        first_done.finished_at.unwrap().parse::<u128>().unwrap()
+            <= second_done.started_at.unwrap().parse::<u128>().unwrap()
     );
     await_release_after_drain(&mut registry, now + DAEMON_IDLE_DELAY, &id.root_key).await;
     assert!(!runtime.has_active_resources());
@@ -770,7 +773,12 @@ async fn committed_fifo_queue_keeps_both_expired_clocks_until_normal_daemon_drai
         first_revision.index_generation,
         second_revision.index_generation
     );
-    assert!(first_revision.index_revision < second_revision.index_revision);
+    // Both no-op rows complete at the unchanged head (Decision 0006 §3), in FIFO order.
+    assert_eq!(first_revision, second_revision);
+    assert!(
+        first_done.finished_at.unwrap().parse::<u128>().unwrap()
+            <= second_done.started_at.unwrap().parse::<u128>().unwrap()
+    );
     await_release_after_drain(&mut registry, deadline, &id.root_key).await;
     assert!(!runtime.has_active_resources());
 }

@@ -1,6 +1,6 @@
 # Decision 0006: revision retention, automatic index deletion and unchanged requests
 
-- **Status:** owner-approved 2026-10-05: the 15-minute supersession grace with no reader-renewed lease, guarded whole-index deletion invalidating that generation's pins, and the unchanged path for explicit requests. Ratified when this record merges. It adds revision retention to `../../local-topology.md`, confirms that document's existing automatic GC rule, and governs #16.
+- **Status:** owner-approved 2026-10-05: the 15-minute supersession grace with no reader-renewed lease, guarded whole-index deletion invalidating that generation's pins, and the unchanged path for explicit requests. Ratified when this record merges. §3 amended 2026-10-20 (#199 R-3/S-4, [below](#amendment-2026-10-20-no-revision-for-an-unchanged-capture)). It adds revision retention to `../../local-topology.md`, confirms that document's existing automatic GC rule, and governs #16.
 - **Scope:** which published revisions stay readable, when a whole derived index may be deleted automatically, and how an explicit indexing request with no source change publishes. Pin identity (`{indexGeneration, indexRevision}`), #67's storage model and Decision 0005 are unchanged.
 - **Compatibility:** none needed (pre-release).
 
@@ -37,10 +37,10 @@ Durable per-reader pin leases were considered and rejected for now. Renewing a l
 
 ### 3. Explicit requests with no source change
 
-- After its normal FIFO claim, an explicit CLI or browser indexing request whose capture shows no change uses the **guarded unchanged-publication path**, as unchanged leader `serve` does since #67.
+- After its normal FIFO claim, an explicit CLI or browser indexing request whose capture shows no change uses the **guarded unchanged path**, as startup reconciliation does since #67.
   - It freshly hashes every admitted source.
   - It checks the same generation, the stored source bytes, the producer binding and executable, the extraction context, options, capture inputs and the projection links, with the CAS and `data_version` fences.
-  - It publishes a new revision header and manifest, then acknowledges the request as done.
+  - It publishes **nothing**: the request is acknowledged `done` with the current head's pin (amended 2026-10-20; it used to publish a new revision header and manifest copied from the head).
 - A source change, or a changed option or input, takes #67's local or full path instead. Executable drift requires **full fresh measurement** (Decision 0005), never the local path.
 
 ## Consequences
@@ -55,5 +55,27 @@ Durable per-reader pin leases were considered and rejected for now. Renewing a l
 - Record supersession time (for example from the next revision's publication time), and release revisions past the grace. Schedule `release_revision` and `collect_unreferenced` outside publication: after publications and periodically.
 - Add a typed expired-pin conflict, and test that it never moves to a newer revision.
 - Implement guarded automatic deletion per §2, using the existing 30-day `GC_AGE_SECONDS` (`src/store/topology.rs`).
-- Route unchanged explicit requests through the unchanged-publication path after their FIFO claim.
+- Route unchanged explicit requests through the guarded unchanged path after their FIFO claim.
 - Release retained SQLite check handles for deleted or recreated files (see #16's scope).
+
+## Amendment (2026-10-20): no revision for an unchanged capture
+
+Approved by the owner on #199 (items R-3 and S-4). Decision 0009 §2 is amended with it.
+
+**Why.** The unchanged path copied the head's header, manifest, capture inputs and producer binding into a new revision. The copy carried no new information, but at 10k documents each one added 17–34 MB, and every unchanged daemon restart or no-op request added one.
+
+**What counts as unchanged.** A capture is unchanged when all of these hold, decided only from values Trellis already computes for every capture and records with every revision:
+1. **Same head.** The selected head is the request's CAS baseline: the same `{indexGeneration, indexRevision}` (revision > 0), a compatible validated baseline with the same witness, and no recovery pending.
+2. **Same producer.** The head has a producer binding, and its bound producer hash equals the hash of the executing binary taken at this capture's admission (Decision 0005).
+3. **Same options.** The head's recorded reconcile options equal the capture's.
+4. **Same capture.** The capture's freshly read and hashed sources (path, content hash and capture stat) and its persisted capture inputs (root, directories, config, selector and presentation observations) equal the head's manifest and recorded capture inputs exactly: nothing added, deleted, stat-changed or hash-changed, and at least one entry examined.
+
+A copy made under these conditions would equal the head in everything but its revision number and `indexed_at`. Anything else takes the local or full path and publishes, as before. The decision does not re-validate stored rows. The path's existing fail-closed guards (stored source bytes, projection links and extraction context, class catalog budget) still run unchanged, and a guard failure still fails the request without acknowledging it.
+
+**What happens instead of publishing.**
+- No write transaction runs. The path's fences still hold: the index's `data_version` is unchanged since admission, the writer guard and workspace identity verify, and a re-read of the head pin and baseline witness still matches.
+- An explicit request completes as terminal `done` with the current head's pin, and its waiters wake through the terminal-commit counter as for any completion.
+- Startup reconciliation attests the unchanged head for the new writer incarnation and enters `Ready` (Decision 0009 §2), so `catchingUp` clears and FIFO claims proceed in their unchanged order.
+- **Pins and retention.** The head stays head and is not superseded, so it gets no supersession stamp and starts no grace period. A pin on it stays valid and is still the current head, so a CAS on it succeeds. Older retained revisions keep their original supersession times. `indexed_at` keeps the time the head was published.
+- The watcher's final-inventory check (`selected_capture_unchanged`) already published nothing for an unchanged capture; its gate ordering is unchanged.
+

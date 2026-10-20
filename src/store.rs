@@ -9024,7 +9024,7 @@ impl Store {
         Ok(true)
     }
 
-    pub(crate) fn publish_unchanged_native_recovery(
+    pub(crate) fn reuse_unchanged_native_head(
         &self,
         capture: &crate::capture::Capture,
         leader: &topology::WriterGuard,
@@ -9048,7 +9048,7 @@ impl Store {
                     .all(|ops| ops.opens == 1 && ops.complete_reads == 1 && ops.hashes == 1),
             "native_evidence_required: every unchanged source must be read and hashed"
         );
-        let mut db = self.cache_write()?;
+        let db = self.cache_write()?;
         let admitted_version: i64 =
             storage_result(db.pragma_query_value(None, "data_version", |row| row.get(0)))?;
         let selected = ReadRevision::current(&db)?;
@@ -9166,83 +9166,22 @@ impl Store {
         capture.verify(cancel)?;
         leader.verify()?;
         self.identity.verify()?;
-        let tx = storage_result(db.transaction_with_behavior(TransactionBehavior::Immediate))?;
-        let current = self.recovery_baseline_preflight(&tx)?;
-        let locked_version: i64 =
-            storage_result(tx.pragma_query_value(None, "data_version", |row| row.get(0)))?;
+        // Decision 0006 §3 (amended 2026-10-20): an unchanged capture publishes
+        // nothing. A copied revision would equal the head except for its
+        // number, so the request or startup reconciliation keeps the head.
+        self.ensure_not_recreate_pending()?;
+        let after: i64 =
+            storage_result(db.pragma_query_value(None, "data_version", |row| row.get(0)))?;
+        let current = self.recovery_baseline_preflight(&db)?;
         ensure!(
-            locked_version == admitted_version
+            after == admitted_version
+                && current.compatible
                 && current.pin == expected.pin()
                 && current.witness == expected.witness
-                && current.compatible,
-            "revision conflict: unchanged Serve baseline changed"
+                && ReadRevision::current(&db)?.pin == selected.pin,
+            "revision conflict: unchanged baseline changed"
         );
-        self.ensure_not_recreate_pending()?;
-        let revision = IndexPin {
-            index_generation: selected.pin.index_generation,
-            index_revision: selected
-                .pin
-                .index_revision
-                .checked_add(1)
-                .context("revision overflow")?,
-        };
-        let revision_key = format!(
-            "pin:v1:{}:{}",
-            revision.index_generation, revision.index_revision
-        );
-        let copied = tx.execute(
-            "INSERT INTO native_revisions SELECT ?1,source_set_id,toolchain_hash,config_hash,             dependency_hash,native_revision_id,source_inventory,dependency_observations,             reconcile_options,class_warnings,class_truncated,graph_stats,graph_diagnostics,?2             FROM native_revisions WHERE id=?3",
-            params![revision_key, revision.index_revision as i64, selected.key],
-        )?;
-        ensure!(
-            copied == 1,
-            "incompatible_index: selected native header missing"
-        );
-        tx.execute(
-            "INSERT INTO revision_capture_inputs SELECT ?1,input_key,payload             FROM revision_capture_inputs WHERE revision_id=?2",
-            params![revision_key, selected.key],
-        )?;
-        let copied = tx.execute(
-            "INSERT INTO revision_documents SELECT ?1,source_set_id,language,path,document_version_id,             graph_projection_id,class_projection_id,capture_stat,coverage_requested,             coverage_selected,coverage_state,coverage_diagnostic,ordinal             FROM revision_documents WHERE revision_id=?2",
-            params![revision_key, selected.key],
-        )?;
-        ensure!(
-            copied == capture.files.len(),
-            "incompatible_index: incomplete unchanged revision manifest"
-        );
-        let (bound_hash, binding_sha) = revision_producer_binding(&tx, &revision_key)?;
-        ensure!(
-            bound_hash == executing_hash,
-            "incompatible_index: executing producer binding changed"
-        );
-        tx.execute(
-            "INSERT INTO revision_producer_bindings VALUES(?1,?2,?3)",
-            params![revision_key, bound_hash, binding_sha],
-        )?;
-        let publication_time = self.retention_time()?;
-        ensure!(
-            publication_time.as_secs() <= 9_007_199_254_740_991,
-            "invalid_supersession_time"
-        );
-        let timestamp = publication_time.as_millis().to_string();
-        stamp_predecessor(&tx, &selected.key, publication_time.as_secs() as i64)?;
-        ensure!(
-            tx.execute(
-                "UPDATE index_metadata SET index_revision=?1,indexed_at=?2 WHERE singleton=1",
-                params![revision.index_revision as i64, timestamp],
-            )? == 1,
-            "incompatible_index: missing metadata head"
-        );
-        validate_paired_metadata(&tx, &self.identity.record_id, PairedManifestScope::Changing)?;
-        check_cancel(cancel)?;
-        capture.verify(cancel)?;
-        leader.verify()?;
-        self.identity.verify()?;
-        storage_result(tx.commit())?;
-        self.recovery_disposition
-            .store(RecoveryDisposition::Ready as u8, Ordering::Release);
-        self.recovery_required.store(false, Ordering::Release);
-        Ok(Some(revision))
+        Ok(Some(selected.pin))
     }
 
     pub(crate) fn prepare_local_revision(

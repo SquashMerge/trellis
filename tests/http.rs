@@ -323,17 +323,18 @@ async fn jobs_publish_and_cancel() {
     .await
     .unwrap();
     assert_eq!(completed["state"], "done");
+    let head = store.status().unwrap().revision;
     assert_eq!(
-        store.status().unwrap().revision.index_revision,
-        2,
-        "mandatory startup reconciliation r1 precedes accepted Q r2 DONE"
+        (head.index_revision, completed["revision"].clone()),
+        (1, json!(head)),
+        "mandatory startup reconciliation publishes r1; the unchanged accepted Q completes DONE at r1"
     );
     let (_, cancelled) = call(&app, "POST", &format!("/api/jobs/{id}/cancel"), Value::Null).await;
     assert_eq!(cancelled["state"], "done");
     assert_eq!(
-        store.status().unwrap().revision.index_revision,
-        2,
-        "mandatory startup reconciliation r1 precedes accepted Q r2 DONE"
+        store.status().unwrap().revision,
+        head,
+        "cancelling a finished job publishes nothing"
     );
     state.cancel_active();
 }
@@ -457,6 +458,11 @@ async fn active_job_cancellation_does_not_publish() {
     .await
     .expect("watcher did not settle");
     let settled = store.index_baseline().unwrap().index_revision;
+    // A real edit after the settled head: exactly one publication covers it,
+    // by the accepted Q or by the watcher with Q then unchanged.
+    let mut edited = std::fs::read_to_string(d.path().join("workspace/large.js")).unwrap();
+    edited.push_str("function edited() { console.log(-1); }\n");
+    std::fs::write(d.path().join("workspace/large.js"), edited).unwrap();
     let (code, j) = call(&app, "POST", "/api/index", json!({})).await;
     assert_eq!(code, 202);
     let id = j["id"].as_str().unwrap();
@@ -476,10 +482,12 @@ async fn active_job_cancellation_does_not_publish() {
     .await
     .unwrap();
     assert_eq!(terminal["state"], "done");
+    let head = store.index_baseline().unwrap();
+    assert_eq!(terminal["revision"], json!(head));
     assert_eq!(
-        store.index_baseline().unwrap().index_revision,
+        head.index_revision,
         settled + 1,
-        "accepted Q publishes its own revision; cancellation does not add one"
+        "the edit publishes exactly once; cancellation does not add one"
     );
 }
 
@@ -725,7 +733,9 @@ async fn explicit_recovery_without_startup_owner_rejects_pin_then_installs_same_
     assert_eq!(status, StatusCode::ACCEPTED, "{admitted}");
     let done = finished_index_job(&app, admitted["id"].as_str().unwrap()).await;
     assert_eq!(done["state"], "done", "{done}");
-    assert_eq!(done["revision"]["indexRevision"], 2);
+    // Recreation publishes r1; the claimed request's capture is unchanged
+    // against it, so it completes at r1 without another revision.
+    assert_eq!(done["revision"]["indexRevision"], 1);
     assert_ne!(
         done["revision"]["indexGeneration"],
         json!(old)["indexGeneration"]
@@ -805,8 +815,8 @@ async fn explicit_recovery_releases_only_daemon_old_owner_and_retries_after_fore
     let done = finished_index_job(&app, id).await;
     assert_eq!(done["state"], "done", "{done}");
     assert_eq!(
-        done["revision"]["indexRevision"], 2,
-        "recreation and claimed request publish exactly once each"
+        done["revision"]["indexRevision"], 1,
+        "recreation publishes once; the unchanged claimed request adds no revision"
     );
     assert_ne!(
         done["revision"]["indexGeneration"],
@@ -1097,7 +1107,7 @@ async fn expired_pin_saved_items_require_explicit_head_reattachment() {
 }
 
 #[tokio::test]
-async fn browser_claimed_unchanged_publishes_new_manifest_before_done() {
+async fn browser_claimed_unchanged_completes_done_at_head_without_new_manifest() {
     // Manually publish the first startup reconciliation before POST starts the periodic queue tick.
     let (dir, store, state, app) = setup_without_tick();
     std::fs::write(
@@ -1127,10 +1137,8 @@ async fn browser_claimed_unchanged_publishes_new_manifest_before_done() {
     .await
     .unwrap();
     assert_eq!(completed["state"], "done", "{completed}");
-    assert_eq!(
-        completed["revision"]["indexRevision"],
-        first.index_revision + 1
-    );
+    assert_eq!(completed["revision"]["indexRevision"], first.index_revision);
+    assert_eq!(store.status().unwrap().revision, first);
     let db =
         rusqlite::Connection::open(store.request_db_path().with_file_name("index.db")).unwrap();
     let manifests: i64 = db
@@ -1141,8 +1149,8 @@ async fn browser_claimed_unchanged_publishes_new_manifest_before_done() {
         .unwrap();
     assert_eq!(
         (manifests, immutable),
-        (2, 1),
-        "browser claim must publish its own revision without extracting again"
+        (1, 1),
+        "an unchanged browser claim publishes no revision and extracts nothing"
     );
 }
 

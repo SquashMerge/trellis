@@ -1149,17 +1149,24 @@ fn concurrent_cold_cli_indexes_share_one_daemon_and_keep_fifo_results() {
     let db =
         rusqlite::Connection::open_with_flags(queue, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .unwrap();
-    let rows: Vec<(i64, String, i64)> = db
-        .prepare("SELECT seq,state,result_revision FROM requests ORDER BY seq")
+    let rows: Vec<(i64, String, i64, i64, i64)> = db
+        .prepare(
+            "SELECT seq,state,result_revision,CAST(started_at AS INTEGER),CAST(finished_at AS INTEGER) FROM requests ORDER BY seq",
+        )
         .unwrap()
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+        })
         .unwrap()
         .map(|row| row.unwrap())
         .collect();
     assert_eq!(rows.len(), 2);
     assert!(rows[0].0 < rows[1].0);
-    assert!(rows.iter().all(|(_, state, _)| state == "done"));
-    assert!(rows[0].2 < rows[1].2);
+    assert!(rows.iter().all(|(_, state, ..)| state == "done"));
+    // Unchanged requests complete at the same head, so FIFO order is
+    // witnessed by claim and finish times, not by distinct revisions.
+    assert!(rows[0].2 <= rows[1].2);
+    assert!(rows[0].4 <= rows[1].3, "{rows:?}");
 }
 
 #[tokio::test]

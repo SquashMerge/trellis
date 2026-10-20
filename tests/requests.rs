@@ -284,10 +284,12 @@ fn real_process_death_after_request_publish_reclaims_without_false_done() {
     );
     let done = parent.request_by_id(&accepted.id).unwrap().unwrap();
     assert_eq!(done.state, "done");
-    assert!(
-        done.revision.unwrap().index_revision > recovered_h.index_revision,
+    assert_eq!(
+        done.revision.unwrap(),
+        recovered_h,
         "repeat-after-commit across process death is allowed, false earlier completion is not"
     );
+    assert_ne!(done.revision.unwrap(), after_commit);
 }
 
 #[test]
@@ -324,17 +326,29 @@ fn daemon_restart_reclaims_running_head_before_later_queued_row() {
         |_| {},
     )
     .unwrap();
+    let order = std::sync::Mutex::new(Vec::new());
     assert_eq!(
-        trellis::index_coordinator::drain_requests(&replacement, &new_owner).unwrap(),
+        trellis::index_coordinator::drain_requests_observed(&replacement, &new_owner, |id, p| {
+            if p.phase.starts_with("mode:") {
+                order.lock().unwrap().push(id.to_owned());
+            }
+        })
+        .unwrap(),
         2
     );
     let a = replacement.request_by_id(&first.id).unwrap().unwrap();
     let b = replacement.request_by_id(&next.id).unwrap().unwrap();
     assert_eq!((a.state.as_str(), b.state.as_str()), ("done", "done"));
     assert_ne!(a.claim_incarnation.unwrap(), old_claim);
+    assert_eq!(
+        order.into_inner().unwrap(),
+        vec![first.id.clone(), next.id.clone()],
+        "reclaimed running head must run before later queue admission"
+    );
     assert!(
-        a.revision.unwrap().index_revision < b.revision.unwrap().index_revision,
-        "reclaimed running head must publish before later queue admission"
+        a.finished_at.unwrap().parse::<u128>().unwrap()
+            <= b.started_at.unwrap().parse::<u128>().unwrap(),
+        "reclaimed running head must finish before the later row is claimed"
     );
 }
 
@@ -384,7 +398,7 @@ fn first_daemon_activation_reconciles_then_claims_fifo_head() {
     );
     let head = store.request_by_id(&accepted.id).unwrap().unwrap();
     let pin = head.revision.unwrap();
-    assert_eq!(pin.index_revision, h.index_revision + 1);
+    assert_eq!(pin, h, "an unchanged claim completes at the startup head");
     assert_eq!(head.state, "done");
     assert_eq!(store.status().unwrap().revision, pin);
 }
@@ -583,7 +597,11 @@ fn replacement_activation_settles_old_root_before_startup_and_new_fifo() {
     );
     let done = replacement.request_by_id(&new_request.id).unwrap().unwrap();
     assert_eq!(done.state, "done");
-    assert!(done.revision.unwrap().index_revision > h.index_revision);
+    assert_eq!(
+        done.revision,
+        Some(h),
+        "an unchanged claim completes at the startup head"
+    );
 }
 
 #[test]
@@ -936,8 +954,76 @@ fn replacement_writer_never_recreates_deleted_accepted_queue_on_enqueue() {
     assert_eq!(fs::read(&index).unwrap(), index_before);
 }
 
+/// Rows a published revision adds: its header, manifest, capture inputs and
+/// producer binding, plus the immutable versions and projections.
+fn revision_row_counts(store: &Store) -> Vec<(&'static str, i64)> {
+    let db =
+        rusqlite::Connection::open(store.request_db_path().with_file_name("index.db")).unwrap();
+    [
+        "native_revisions",
+        "revision_documents",
+        "revision_capture_inputs",
+        "revision_producer_bindings",
+        "native_revision_supersessions",
+        "document_versions",
+        "graph_projections",
+        "class_projections",
+    ]
+    .into_iter()
+    .map(|table| {
+        let count = db
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap();
+        (table, count)
+    })
+    .collect()
+}
+
 #[test]
-fn claimed_unchanged_fifo_publishes_fresh_manifest_without_reextracting() {
+fn unchanged_startup_keeps_head_and_adds_no_rows() {
+    use std::sync::{Arc, atomic::AtomicBool};
+    use trellis::index_coordinator::{drain_requests, establish_serving_session};
+    let state = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
+    let options = IndexOptions::new(workspace.path().to_owned());
+    let cancel = Arc::new(AtomicBool::new(false));
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    drop(establish_serving_session(&store, Some(&options), &cancel).unwrap());
+    let head = store.index_baseline().unwrap();
+    let rows = revision_row_counts(&store);
+    drop(store);
+    for restart in 0..3 {
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let session = establish_serving_session(&store, Some(&options), &cancel).unwrap();
+        assert_eq!(
+            store.index_baseline().unwrap(),
+            head,
+            "unchanged startup {restart} must keep {{indexGeneration, indexRevision}}"
+        );
+        assert_eq!(store.status().unwrap().revision, head);
+        assert_eq!(
+            revision_row_counts(&store),
+            rows,
+            "unchanged startup {restart} must add no rows"
+        );
+        // Startup reconciliation still admits FIFO claims on the kept head.
+        let request = store.enqueue_request(&options, Some(head)).unwrap();
+        assert_eq!(drain_requests(&store, &session).unwrap(), 1);
+        let row = store.request_by_id(&request.id).unwrap().unwrap();
+        assert_eq!((row.state.as_str(), row.revision), ("done", Some(head)));
+    }
+    // A real change still publishes a new revision at startup.
+    fs::write(workspace.path().join("a.js"), "function b() {}\n").unwrap();
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    drop(establish_serving_session(&store, Some(&options), &cancel).unwrap());
+    let changed = store.index_baseline().unwrap();
+    assert_eq!(changed.index_generation, head.index_generation);
+    assert_eq!(changed.index_revision, head.index_revision + 1);
+}
+
+#[test]
+fn claimed_unchanged_fifo_completes_done_without_new_revision() {
     use std::sync::{Arc, Mutex, atomic::AtomicBool};
     use trellis::index_coordinator::{drain_requests_observed, reconcile_workspace};
     let state = tempfile::tempdir().unwrap();
@@ -947,6 +1033,7 @@ fn claimed_unchanged_fifo_publishes_fresh_manifest_without_reextracting() {
     let options = IndexOptions::new(workspace.path().to_owned());
     let (baseline, owner) =
         reconcile_workspace(&store, &options, &Arc::new(AtomicBool::new(false)), |_| {}).unwrap();
+    let rows = revision_row_counts(&store);
     let first = store.enqueue_request(&options, None).unwrap();
     let second = store.enqueue_request(&options, None).unwrap();
     let modes = Mutex::new(Vec::new());
@@ -970,27 +1057,51 @@ fn claimed_unchanged_fifo_publishes_fresh_manifest_without_reextracting() {
     let a = store.request_by_id(&first.id).unwrap().unwrap();
     let b = store.request_by_id(&second.id).unwrap().unwrap();
     assert_eq!((a.state.as_str(), b.state.as_str()), ("done", "done"));
+    assert_eq!((a.revision, b.revision), (Some(baseline), Some(baseline)));
+    assert_eq!(store.index_baseline().unwrap(), baseline);
     assert_eq!(
-        a.revision.unwrap().index_revision,
-        baseline.index_revision + 1
+        revision_row_counts(&store),
+        rows,
+        "a no-op request must add no revision rows"
     );
+}
+
+#[test]
+fn pin_taken_before_noop_request_still_reads_and_cas_holds() {
+    use std::sync::{Arc, atomic::AtomicBool};
+    use trellis::index_coordinator::{drain_requests, reconcile_workspace};
+    let state = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    let options = IndexOptions::new(workspace.path().to_owned());
+    let (pin, owner) =
+        reconcile_workspace(&store, &options, &Arc::new(AtomicBool::new(false)), |_| {}).unwrap();
+    let before = store.graph_at(Some(pin)).unwrap();
+    let noop = store.enqueue_request(&options, Some(pin)).unwrap();
+    assert_eq!(drain_requests(&store, &owner).unwrap(), 1);
+    let row = store.request_by_id(&noop.id).unwrap().unwrap();
+    assert_eq!((row.state.as_str(), row.revision), ("done", Some(pin)));
+    // The pin is still the current head, so a pinned read and a CAS on it hold.
+    assert_eq!(store.status().unwrap().revision, pin);
+    assert_eq!(store.graph_at(Some(pin)).unwrap(), before);
+    fs::write(workspace.path().join("a.js"), "function b() {}\n").unwrap();
+    let changed = store.enqueue_request(&options, Some(pin)).unwrap();
+    assert_eq!(drain_requests(&store, &owner).unwrap(), 1);
+    let row = store.request_by_id(&changed.id).unwrap().unwrap();
+    assert_eq!(row.state, "done");
+    let next = row.revision.unwrap();
     assert_eq!(
-        b.revision.unwrap().index_revision,
-        baseline.index_revision + 2
+        (next.index_generation, next.index_revision),
+        (pin.index_generation, pin.index_revision + 1),
+        "a real change after the no-op still publishes a new revision"
     );
-    let db =
-        rusqlite::Connection::open(store.request_db_path().with_file_name("index.db")).unwrap();
-    let manifest_count: i64 = db
-        .query_row("SELECT count(*) FROM revision_documents", [], |r| r.get(0))
-        .unwrap();
-    let document_count: i64 = db
-        .query_row("SELECT count(*) FROM document_versions", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(manifest_count, 3);
-    assert_eq!(
-        document_count, 1,
-        "unchanged claimed work must reuse immutable measured facts"
-    );
+    // A CAS on the now superseded pin conflicts instead of completing.
+    let stale = store.enqueue_request(&options, Some(pin)).unwrap();
+    assert_eq!(drain_requests(&store, &owner).unwrap(), 1);
+    let row = store.request_by_id(&stale.id).unwrap().unwrap();
+    assert_eq!(row.state, "failed", "stale CAS must not complete");
+    assert_eq!(store.index_baseline().unwrap(), next);
 }
 
 #[test]
@@ -1197,7 +1308,12 @@ fn executable_drift_claim_child() {
     let fresh = done.revision.unwrap();
     assert_eq!(store.status().unwrap().revision, fresh);
     assert_eq!(fresh.index_generation, old.index_generation);
-    assert_eq!(fresh.index_revision, old.index_revision + 1);
+    // An unchanged claim keeps the head (Decision 0006 §3); a local edit publishes.
+    let unchanged = modes.lock().unwrap().as_slice() == ["mode:unchanged"];
+    assert_eq!(
+        fresh.index_revision,
+        old.index_revision + u64::from(!unchanged)
+    );
     for path in ["a.js", "b.js"] {
         assert!(
             store.source_at(path, Some(old)).unwrap().is_some(),
@@ -1349,14 +1465,16 @@ fn asserted_claim_under_real_executable_drift(body_edit: bool, drift: bool) {
         "old-process facts must bind to the old running image, never the replacement pathname"
     );
     assert_eq!(result["bindingSha"].as_str().unwrap().len(), 64);
-    assert_eq!(result["revision"], 2);
+    // The unchanged claim completes at the baseline r1; a body edit publishes r2.
+    let claimed_revision = if body_edit { 2 } else { 1 };
+    assert_eq!(result["revision"], claimed_revision);
     let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
     let row = store
         .request_by_id(result["requestId"].as_str().unwrap())
         .unwrap()
         .unwrap();
     assert_eq!(row.state, "done");
-    assert_eq!(row.revision.unwrap().index_revision, 2);
+    assert_eq!(row.revision.unwrap().index_revision, claimed_revision);
     assert_eq!(
         row.revision.unwrap().index_generation.to_string(),
         result["generation"]
@@ -1385,7 +1503,7 @@ fn asserted_claim_under_real_executable_drift(body_edit: bool, drift: bool) {
         assert_eq!(remeasured["modes"], serde_json::json!(["mode:full"]));
         assert_eq!(remeasured["producerSha"], executing_hash);
         assert_eq!(remeasured["generation"], result["generation"]);
-        assert_eq!(remeasured["revision"], 3);
+        assert_eq!(remeasured["revision"], claimed_revision + 1);
         assert_eq!(remeasured["selectedDocuments"], 2);
         assert_eq!(remeasured["bindingSha"].as_str().unwrap().len(), 64);
     }
