@@ -1,0 +1,48 @@
+# Drafted 2026-10-19 from docs/issue text only, BEFORE searching code for answers.
+# id | category | query
+q01|concept|retry a database operation when SQLite reports the database is busy or locked
+q02|concept|check that a caller's expected index generation and revision still match before answering
+q03|concept|hash the canonical absolute checkout path to choose where its cache directory lives
+q04|concept|parse a .git file that points at a separate git directory
+q05|concept|create the per-checkout UUID marker file and make it durable with fsync
+q06|concept|compute the stable 128-bit identifier of a declaration from its ancestors and path
+q07|concept|limit the size of a JSON-RPC string request id after re-serializing it
+q08|concept|cut a list result down to the longest prefix that still fits in the response byte cap
+q09|concept|turn a byte range into 1-based inclusive line numbers by counting newlines
+q10|concept|verify a cached source file's hash and length before returning a slice of it
+q11|concept|rank name matches exact first, then prefix, then substring
+q12|concept|release old published revisions after the supersession grace period
+q13|concept|decide whether a derived index directory is old or orphaned enough to garbage collect
+q14|concept|refuse to delete a saved record when sqlite journal or wal sidecar files exist
+q15|concept|coalesce bursts of file system change events before reindexing
+q16|concept|treat a file whose mtime is too close to the scan time as possibly modified and re-hash it
+q17|concept|make sure only one daemon process runs per user
+q18|concept|reject a fifth concurrent tool call on one connection
+q19|concept|stop work and report when a tool call runs past its five second deadline
+q20|concept|decide if a declaration is test code or production code
+q21|concept|reserve money from the spending ledger before calling the remote model
+q22|concept|escape control characters when writing canonical JSON bytes
+q23|concept|order and deduplicate warnings in an evidence response
+q24|concept|find call sites whose callee name matches the selected function, nearest files first
+q25|concept|pick which files the source walker admits and which directories it skips
+q26|concept|detect that the checkout root directory was moved or replaced while serving a read
+q27|concept|negotiate the MCP protocol version and reject unsupported versions
+q28|concept|suppress a response after the client sends a cancellation notification
+q29|concept|compute Halstead volume or maintainability index for a function
+q30|concept|write a phase marker line to stderr only when the diagnostics env var is set
+q31|concept|wait for an index request in the durable queue to reach a terminal state
+q32|concept|map a Rust crate dependency to its source files on disk
+q33|named|build the MCP tools/list catalog response
+q34|named|the find symbols MCP tool handler
+q35|named|serialize the outgoing calls view with native candidate hints
+q36|error|root_key_collision
+q37|error|invalid_workspace_id
+q38|error|workspace_id_not_durable
+q39|error|checkout_capacity
+q40|error|"range_too_large" when the requested source slice is over the cap
+q41|js|render the sequence diagram participants and messages in the browser
+q42|js|draw the class diagram boxes and relationship arrows in the browser
+q43|js|browser code that sends the auth token with API requests
+q44|js|expand and collapse folders in the file tree sidebar
+q45|js|save a view or note from the browser UI
+q46|js|navigate to a declaration when a call is clicked in the browser
