@@ -930,6 +930,19 @@ impl MetricsReadCheck<'_> {
             }
         }
     }
+    /// `expired` on every `every`-th call through `calls`, else only whether
+    /// a check already failed. Concurrent workers poll the caller's check this
+    /// way so they don't serialize on it; the poll interval is a few rows or
+    /// parser steps.
+    fn expired_every(&self, calls: &std::cell::Cell<u32>, every: u32) -> bool {
+        let n = calls.get().wrapping_add(1);
+        calls.set(n);
+        if n.is_multiple_of(every) {
+            self.expired()
+        } else {
+            self.stopped.load(Ordering::Acquire)
+        }
+    }
     fn check(&self) -> Result<()> {
         if self.expired() {
             return self.result(Err(anyhow::anyhow!("cancelled")));
@@ -960,6 +973,9 @@ enum MetricsDocumentFailure {
     Stopped,
 }
 
+/// How often a metrics worker polls the caller's check, in progress steps.
+/// A single-document request runs inline and checks at every step.
+const METRICS_WORKER_CHECK_EVERY: u32 = 64;
 /// Fetch up to this many documents (or bytes) ahead of the metrics workers.
 const METRICS_FETCH_DOCUMENTS: usize = 64;
 const METRICS_FETCH_BYTES: usize = 64 * 1024 * 1024;
@@ -1044,6 +1060,11 @@ impl EvidenceResponse {
             1
         };
         let expired = || progress.expired();
+        let check_every = if workers == 1 {
+            1
+        } else {
+            METRICS_WORKER_CHECK_EVERY
+        };
         let store = &self.store;
         let compute =
             |fetched: FetchedDocument,
@@ -1051,7 +1072,8 @@ impl EvidenceResponse {
              -> std::result::Result<crate::metrics::Computed, MetricsDocumentFailure> {
                 #[cfg(test)]
                 store.run_metrics_document_hook(&key.path);
-                let expired = || progress.expired();
+                let calls = std::cell::Cell::new(0);
+                let expired = || progress.expired_every(&calls, check_every);
                 // Metrics use the source and native rows exactly as attestation read them.
                 let attested = Store::attest_fetched(fetched, Some(&expired))
                     .map_err(MetricsDocumentFailure::Attest)?;
@@ -1060,7 +1082,7 @@ impl EvidenceResponse {
                         "incompatible_index: metrics language mismatch"
                     )));
                 }
-                if progress.expired() {
+                if expired() {
                     return Err(MetricsDocumentFailure::Stopped);
                 }
                 let source = crate::metrics::SourceInput {
@@ -1080,7 +1102,7 @@ impl EvidenceResponse {
                     &attested.calls,
                     &attested.regions,
                     &mut || {
-                        if progress.expired() {
+                        if expired() {
                             anyhow::bail!("cancelled")
                         }
                         Ok(())
