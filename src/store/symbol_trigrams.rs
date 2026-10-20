@@ -189,6 +189,95 @@ mod tests {
         assert_eq!(graph_hits(&reader, "alpha", 50).unwrap().len(), 1);
     }
 
+    /// The triggers keep each table equal to its source rows through inserts,
+    /// deletes (as retention and rebaseline delete), updates and reused rowids:
+    /// for every query the table's candidates are exactly the literal matches.
+    #[test]
+    fn triggers_keep_the_tables_exact_through_deletes_updates_and_reused_rowids() {
+        let db = Connection::open_in_memory().unwrap();
+        // Lone rows without their parents; this test is about the triggers.
+        db.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        db.execute_batch(super::super::CACHE_SCHEMA_V8).unwrap();
+        let insert = |n: i64, name: Option<&str>| {
+            let id = format!("sid:v1:{n:032x}");
+            let end = name.map(|_| 1);
+            db.execute(
+                "INSERT INTO native_version_declarations(rowid,version_id,syntax_id,kind,role,name,
+                    lookup_key,key_signature_present,key_ordinal,start_byte,end_byte,name_start,name_end)
+                    VALUES(?1,'v',?2,'function','production',?3,?3,0,0,0,1,?4,?5)",
+                rusqlite::params![n, id, name, end.map(|_| 0), end],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO graph_nodes(rowid,projection_id,id,name,path,payload) VALUES(?1,'p',?2,?3,'a.js','{}')",
+                rusqlite::params![n, id, name.unwrap_or("a.js")],
+            )
+            .unwrap();
+        };
+        let names = ["AlphaBeta", "alphaGamma", "ÜNÏcode", "beta_alpha", "Gamma"];
+        for (n, name) in names.iter().enumerate() {
+            insert(n as i64 + 1, Some(name));
+        }
+        insert(6, None);
+        // Retire the highest rowids so new rows reuse them, rename one row,
+        // then delete everything the way a rebaseline does for one version.
+        db.execute_batch(
+            "DELETE FROM native_version_declarations WHERE rowid>=5;
+            DELETE FROM graph_nodes WHERE rowid>=5;
+            UPDATE native_version_declarations SET name='Renamed',lookup_key='Renamed' WHERE rowid=2;
+            UPDATE graph_nodes SET name='Renamed' WHERE rowid=2;",
+        )
+        .unwrap();
+        insert(5, Some("deltaALPHA"));
+        insert(6, Some("Omega"));
+        for query in [
+            "alp", "ALPHA", "gam", "Gamma", "ren", "ünï", "ÜNÏ", "a.js", "sid:v1:", "0005", "meg",
+        ] {
+            let expression = match_expression(query).unwrap();
+            for (table, source, id) in [
+                (
+                    "native_declaration_trigrams",
+                    "native_version_declarations",
+                    "syntax_id",
+                ),
+                ("graph_node_trigrams", "graph_nodes", "id"),
+            ] {
+                let ids = |sql: &str, values: &[&dyn rusqlite::ToSql]| -> Vec<i64> {
+                    db.prepare(sql)
+                        .unwrap()
+                        .query_map(values, |r| r.get(0))
+                        .unwrap()
+                        .collect::<rusqlite::Result<_>>()
+                        .unwrap()
+                };
+                let candidates = ids(
+                    &format!("SELECT rowid FROM {table} WHERE {table} MATCH ?1 ORDER BY rowid"),
+                    &[&expression],
+                );
+                let literal = ids(
+                    &format!(
+                        "SELECT rowid FROM {source} WHERE instr(lower(name),lower(?1))>0
+                            OR instr(lower({id}),lower(?1))>0 ORDER BY rowid"
+                    ),
+                    &[&query],
+                );
+                assert_eq!(candidates, literal, "{table} {query:?}");
+            }
+        }
+        db.execute_batch("DELETE FROM native_version_declarations; DELETE FROM graph_nodes;")
+            .unwrap();
+        for table in ["native_declaration_trigrams", "graph_node_trigrams"] {
+            let left: i64 = db
+                .query_row(
+                    &format!("SELECT count(*) FROM {table} WHERE {table} MATCH '\"sid\"'"),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(left, 0, "{table}");
+        }
+    }
+
     /// Against a real trigram table, operator-shaped queries match literally
     /// and never fail to parse.
     #[test]

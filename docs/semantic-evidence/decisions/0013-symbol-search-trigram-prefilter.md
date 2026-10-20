@@ -17,5 +17,5 @@
 ## Implementation notes
 
 - `native_declaration_trigrams` serves W2 over `native_version_declarations`. The browser `/api/symbols` and CLI `symbols` search runs the same literal rule over `graph_nodes`, so it gets its own table, `graph_node_trigrams`, under the same rules. Neither table is a search index for #211.
-- Both are contentless (`content=''`, `contentless_delete=1`) and keyed by the source row's `rowid`. Triggers on the source table keep them in step on insert, delete and update, so every existing publication, retention and rebaseline path maintains them.
+- Both are contentless (`content=''`, `columnsize=0`) and keyed by the source row's `rowid`. Triggers on the source table keep them in step on insert, delete and update, so every existing publication, retention and rebaseline path maintains them. A delete uses FTS5's `'delete'` command with the same `lower`ed values the insert wrote; `contentless_delete=1` was measured about 7× slower to insert at 10k.
 - FTS5 phrase matching needs `detail=full`; `detail=none` and `detail=column` reject a multi-trigram string.
