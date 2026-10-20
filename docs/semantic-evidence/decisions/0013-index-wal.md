@@ -6,7 +6,7 @@
   - [Decision 0006](0006-revision-retention-and-index-gc.md) §2 (the "hot journal" GC condition);
   - [Decision 0008](0008-daemon-sole-writer.md) §5, its journal-mode statement, **for `index.db` only**.
 - **Does not amend:** Decision 0008 §3 "Open the queue". It describes `requests.db`, which keeps its rollback journal.
-- **Compatibility:** indexes are disposable derived state. The transition of existing indexes is §2 below. Nothing is migrated.
+- **Compatibility:** none. Indexes are disposable derived state; existing rollback-mode indexes are recreated as an obsolete format (§2). Nothing is migrated or converted.
 
 ## Background
 
@@ -44,19 +44,16 @@ Design reasoning, not a measured impossibility: one atomic publication can be ar
   - `data_version` fences.
 - **Goal:** prior-head reads keep being served while a publication is in progress. Startup reconciliation and the rules for reading during it (T03) don't change.
 
-### 2. Transition of existing indexes
+### 2. Existing indexes are recreated, not converted (owner ruling, 2026-10-19)
 
-An existing rollback-mode `index.db` is converted **in place**, keeping its generation, pins and `requests.db`. The worker does this at checkout activation, before startup reconciliation:
-- **Preconditions:** under the daemon single-instance lock and a verified **exclusive, non-blocking** checkout index use lock, with no other protected handle open (T03).
-- **Leftover journal:** any `-journal` left by an earlier crash is first rolled back by SQLite's normal writable open, as today. Only then is `PRAGMA journal_mode=WAL` run and checked.
-- **Busy:** if exclusive use isn't available, the conversion defers with typed `storage_busy` and retries. It **never** deletes or recreates.
-- **During the transition:**
-  - `open_index` admits `delete` only on a connection about to convert;
-  - every other open requires `wal`, so a mixed state is never served;
-  - new indexes and recreation stages are created in WAL.
-- **Failures:** an ordinary busy, I/O or full-disk failure during conversion leaves the index in rollback mode, unconverted and not served as converted, and retries later. It never authorizes recreation (T06).
-
-*Alternative for the owner:* recreate every existing index instead, a full rebuild under the T06 exceptional-recreation rules. It's simpler code, but costs one full index per checkout and drops retained pins. The draft recommends in-place conversion.
+Trellis is pre-release with no backward compatibility, and indexes are disposable. A rollback-mode `index.db` is therefore an **obsolete index format**, handled like any other disposable format change:
+- **Detection:** the implementation bumps the index schema version, so the existing obsolete-format marker check recognizes a rollback-mode file.
+- **Rebuild:** the existing exceptional-recreation path (T06) rebuilds it as a WAL index under verified exclusive, non-blocking index use. If exclusive use isn't available, recreation defers with typed `storage_busy`.
+- **What survives and what doesn't:**
+  - `requests.db`, durable records, UUID markers and facts survive;
+  - the new index gets a new generation, so old pins conflict, as with any recreation.
+- **Failures:** ordinary busy, I/O and full-disk failures never authorize the deletion itself (T06). Only the obsolete-format classification does.
+- **No conversion code:** there is no in-place conversion. `open_index` admits only `wal` for `index.db`, and new indexes and recreation stages are created in WAL.
 
 ### 3. A WAL file's presence is not evidence of a crash
 
@@ -67,7 +64,7 @@ An existing rollback-mode `index.db` is converted **in place**, keeping its gene
   - `SQLITE_BUSY_RECOVERY` and `SQLITE_BUSY_SNAPSHOT` are `storage_busy`, with bounded retry;
   - `SQLITE_READONLY_RECOVERY`, `SQLITE_READONLY_CANTINIT` and `SQLITE_READONLY_DBMOVED` are typed failures, never generic errors;
   - corruption takes the existing corruption path. Only that path may lead to exceptional recreation.
-- **`reject_sidecars`** keeps refusing a `-journal` on a converted index: it can only be a leftover from before the conversion, and §2 handles it. It accepts `-wal`/`-shm`.
+- **`reject_sidecars`** accepts `-wal`/`-shm` for `index.db`. A `-journal` beside a WAL index is unexpected and stays `recovery_required`; one beside an obsolete rollback-mode index is handled by §2's recreation.
 - **No separate file handles:** the rule against closing a separate descriptor on a live SQLite inode applies to the WAL and shm files too. Size checks use path metadata, never an opened descriptor.
 
 ### 4. Existing-only and report opens
@@ -119,7 +116,7 @@ Some paths must not write the index, among them `trellis gc --report` and the or
 4. **Old reader held through commits:** hold an old-snapshot reader through several commits and a partial checkpoint. Release it, and the `TRUNCATE` completes.
 5. **Budget backpressure:** with the WAL over budget and a held reader, the next publication defers with typed `storage_busy` and completes after release.
 6. **Injected faults:** busy, full-disk, I/O and permission faults injected into recovery and checkpoints all stay typed. A checkpoint fault never fails a committed request.
-7. **Transition (§2):** a rollback-mode index converts in place, keeping generation and pins. A busy conversion defers without deleting. A leftover `-journal` rolls back before conversion.
+7. **Obsolete format (§2):** a rollback-mode index is classified obsolete and recreated as WAL, keeping `requests.db`. A busy recreation defers without deleting.
 8. **Stage replacement:** rename and fsync failures, and a stale WAL, never attach to the new file.
 9. **GC:** skips a live or uncheckpointable WAL, and deletes all three files together.
 10. **Report path (§4):** never creates sidecars, and reports `busy` when it can't prove there's no live opener.
@@ -129,8 +126,7 @@ Existing tests specific to the rollback journal, such as the `daemon_crash_recov
 ## Open owner decisions
 
 1. Adopt WAL for `index.db` as scoped here.
-2. Transition: in-place conversion (recommended) or recreation (§2).
-3. The WAL budget value and the deferral policy (§5).
+2. The WAL budget value and the deferral policy (§5).
 
 ## Consequences
 
