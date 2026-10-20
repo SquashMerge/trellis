@@ -19,6 +19,8 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(test)]
+type TestMetricsDocumentHook = Arc<dyn Fn(&str) + Send + Sync>;
 #[derive(Default)]
 pub(crate) struct TestOneShotHook(Mutex<Option<Box<dyn FnOnce() + Send>>>);
 impl std::fmt::Debug for TestOneShotHook {
@@ -243,6 +245,9 @@ pub struct Store {
     writer_before_metadata_hook: Arc<TestOneShotHook>,
     #[cfg(test)]
     test_queue_before_shared_hook: Arc<TestOneShotHook>,
+    /// Called with each metrics document's path as its attestation and metrics work starts.
+    #[cfg(test)]
+    test_metrics_document_hook: Arc<Mutex<Option<TestMetricsDocumentHook>>>,
     #[cfg(feature = "test-support")]
     test_queue_after_root_verify_hook: Arc<TestOneShotHook>,
     #[cfg(test)]
@@ -951,6 +956,8 @@ impl EvidenceResponse {
             BTreeMap::new();
         for key in included {
             progress.check()?;
+            #[cfg(test)]
+            self.store.run_metrics_document_hook(&key.path);
             // Read and attest only the selected version; no checkout filesystem access.
             // Metrics use the source and native rows exactly as attestation read them.
             let expired = || progress.expired();
@@ -6132,6 +6139,8 @@ impl Store {
             writer_before_metadata_hook: Arc::new(TestOneShotHook::default()),
             #[cfg(test)]
             test_queue_before_shared_hook: Arc::new(TestOneShotHook::default()),
+            #[cfg(test)]
+            test_metrics_document_hook: Arc::new(Mutex::new(None)),
             #[cfg(feature = "test-support")]
             test_queue_after_root_verify_hook: Arc::new(TestOneShotHook::default()),
             #[cfg(test)]
@@ -7778,6 +7787,18 @@ impl Store {
 
     pub fn evidence_response(&self) -> Result<EvidenceResponse> {
         self.evidence_response_daemon_local()
+    }
+
+    #[cfg(test)]
+    fn set_metrics_document_hook(&self, hook: impl Fn(&str) + Send + Sync + 'static) {
+        *self.test_metrics_document_hook.lock().unwrap() = Some(Arc::new(hook));
+    }
+    #[cfg(test)]
+    fn run_metrics_document_hook(&self, path: &str) {
+        let hook = self.test_metrics_document_hook.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook(path);
+        }
     }
 
     #[cfg(feature = "test-support")]
@@ -13169,6 +13190,8 @@ mod rebaseline_fault_tests;
 #[cfg(test)]
 mod sqlite_schema_race_tests;
 
+#[cfg(test)]
+mod metrics_parallel_tests;
 #[cfg(test)]
 mod selected_read_once_tests;
 #[cfg(test)]
