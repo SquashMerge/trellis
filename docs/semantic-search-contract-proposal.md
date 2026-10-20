@@ -40,7 +40,7 @@ Each item below ends with its open questions. The decisions they add up to are:
 | D10 | Size budget | int8 vectors at ≤1024 dimensions; a size cap on `vectors.db`; FTS5 measured against #199. Whether search waits for #199's size items is an owner decision |
 | D11 | Remote embedding (voyage-code-4) | Out of scope until the owner opts in; it would need its own contract change |
 | D12 | FTS5 and #199 item 5 (Q-8) | Two tables: a trigram prefilter for W2 (every hit still verified by W2's literal rule) and a split-identifier table for search |
-| D13 | Hybrid ordering | A fixed, deterministic fusion and tie-break rule (§1), part of the contract; changing it is a contract change. BM25 is scored over a head-only FTS5 table. The query transformation is total. No cross-call output promise by default; an optional `vectorSet`, with exact integer ranking arithmetic, can promise only the same pre-clipping ranked order; emitted lists then agree on their common prefix (owner choice). Cache-key reuse doesn't imply byte-identical vectors |
+| D13 | Hybrid ordering | A fixed, deterministic fusion and tie-break rule (§1), part of the contract; changing it is a contract change. BM25 is scored over a head-only FTS5 table. The query transformation is total. No cross-call output promise by default; whether to add a cross-call determinism guarantee later is open question 6, to be specified and reviewed if the owner asks for it. Cache-key reuse doesn't imply byte-identical vectors |
 
 ## 1. New MCP tool and catalog version
 
@@ -127,64 +127,17 @@ tool, not a `view` of another tool, and not an `inspect` union.
     `vectors.db`, which is external, filled asynchronously and evictable. Two calls at the same
     basis can therefore return different vector candidates, `rank`, `matchedBy` and `embedded`
     counts while the background job fills the cache or eviction removes entries.
-  - **Proposed:** ordering is deterministic only when all of these are equal:
-    - the index snapshot and the request;
-    - `modelId`;
-    - the inference runtime build and its numerical backend;
-    - the **vector values** used in the call: the same card hashes *and* the same cached vector
-      bytes for each, and the same query-vector bytes.
-
-    A vector re-embedded for the same card hash (after eviction, repair, or under another runtime
-    build) can have different bytes, and so a different similarity and rank, without any change
-    in membership. Ranking is explicitly not stable across cache changes at one pin, and the
-    result makes no equality promise across calls. `searchIndex.embedded` and `state` let a caller
-    see that the cache was incomplete.
-  - **Alternative, for the owner (open question 6):** bind each result to the vector **values**
-    it used, adding `searchIndex.vectorSet: Hash`.
-    - **Value digest.** Each cache row stores a `valueDigest`, the SHA-256 of its vector blob,
-      computed when the row is written. The query vector, embedded on demand in this call, gets
-      its own `queryVectorDigest`, the SHA-256 of its bytes. These are identities for equality,
-      not integrity checks; T00 asks for none.
-    - **`vectorSet`.** SHA-256 over the domain `trellis.search-vector-set.v1\0` and the canonical
-      JSON of:
-      - `modelId`;
-      - the inference runtime build identity and its numerical backend (for example CPU or Metal,
-        and its precision);
-      - the SQLite library version (for `bm25()`);
-      - `queryVectorDigest`;
-      - the sorted `(cardHash, valueDigest)` pairs used in this call.
-    - **Exact ranking arithmetic.** For the promise to hold, near-ties must reproduce. So the
-      option fixes the arithmetic rather than relying on floating-point behaviour:
-      - **Vector arm:** stored vectors and the query vector are unit-normalized, then quantized to
-        int8 before storage or use. Similarity is the **integer** dot product of the two int8
-        vectors, accumulated in at least 32-bit integers. It is exact, so precision and reduction
-        order can't change it. Ties go to `symbolId` bytes.
-      - **Fusion:** with integer weights `wL`, `wV` and `k`, each fused score is the rational
-        `wL/(k+l) + wV/(k+v)`. Scores are compared exactly, by integer cross-multiplication, never
-        as floating-point values.
-      - **Lexical arm:** FTS5's `bm25()` returns a double. Its value, and so the lexical order, is
-        reproducible only for the same SQLite build over the same head rows. `vectorSet` therefore
-        also covers the SQLite library version.
-    - **Promise: the pre-clipping ranked order, under those conditions.** If `evidenceBasis`, the
-      request and `vectorSet` are all equal, the **full ranked candidate order before clipping**
-      is equal, with each candidate's `symbolId`, `rank` and `matchedBy`.
-    - **Emitted lists agree only on their common prefix.** The response emits the longest prefix
-      of that order that fits the 65,536-byte cap. The size of the varying fields (the JSON-RPC
-      request ID, `catchingUp`, `searchIndex.state` and other values sampled at admission) can
-      move the cut by a hit even when the ranking is unchanged. Two such calls' emitted hit lists
-      therefore agree on their common prefix. They are equal in length only when the
-      serialization budget left after those varying fields is also equal.
-    - **Not the whole envelope.** `searchIndex.state` (a background job can start or stop),
-      `catchingUp`, the request ID and anything else sampled at admission can still differ.
-    - **No promise that the same query embeds to the same bytes.** Re-embedding a query on another
-      backend can change `queryVectorDigest`, and then nothing is promised. `vectorSet` makes the
-      difference visible; it doesn't prevent it.
-    - **Cost and limits.** Combining stored digests costs one hash pass per call, not a re-hash
-      of the vectors. It detects drift; it doesn't make vectors immutable. That would mean storing
-      them in `index.db` (open question 13).
-    - **Weaker variant.** Hash membership only, without `valueDigest`. That would signal drift in
-      *which* cards had vectors, but it could promise nothing about equal output, so it isn't
-      proposed.
+  - **Proposed default: no cross-call equality promise.** Two calls, even at the same basis and
+    with the same request, may rank differently. The cache can fill or evict entries, and a vector
+    re-embedded for the same card hash can have different bytes. Within one call, the ordering
+    rules above apply to the vectors that call read. `searchIndex.embedded` and `state` let a
+    caller see that the cache was incomplete.
+  - **A cross-call guarantee is an open question (6).** The owner may later ask for a cross-call
+    determinism guarantee: that repeating a call reproduces its ranking. If so, its exact
+    definition would be specified and reviewed then: the ranking comparator, the numerical rules,
+    the build and runtime identities it depends on, and whether it covers the pre-clipping order
+    or the emitted hits. This proposal specifies none of that. Nothing in the default path depends
+    on it.
 - **Query transformation (deterministic and total).** Any valid 1–1024-byte query maps to a
   lexical arm as follows. Raw caller text never reaches FTS5's query parser.
   - **Tokenizer, fixed by the contract.** The search table uses `tokenize = "porter unicode61
@@ -267,12 +220,10 @@ its fixture are closed. The catalog adds about 13 KB to a 73 KB compact catalog.
    precision on the benchmark (#211). Should the contract fix a tuned rule instead, for example a
    lexical arm limited to exact phrase, literal and identifier matches? The ordering rule above
    stays deterministic whichever constants are chosen.
-6. **Ranking stability across cache changes.** Should results make no equality promise across
-   calls (proposed), or carry `searchIndex.vectorSet`? That hashes the cached and query vector
-   *values* used, plus model, runtime and backend identity, so that equal basis, request and
-   `vectorSet` promise the same pre-clipping ranked order, with emitted lists agreeing on their
-   common prefix (not the same whole envelope)? This requires the exact integer similarity and
-   rational fusion arithmetic in §1.
+6. **Cross-call determinism.** The default makes no cross-call equality promise. Does the owner
+   want a cross-call determinism guarantee later? If so, its exact definition would be specified
+   and reviewed then: the ranking comparator, numerical rules, build and runtime identities, and
+   pre-clipping versus emitted scope.
 
 ## 2. Card content and native extraction
 
