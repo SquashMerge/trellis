@@ -52,7 +52,7 @@ The candidate set is every **named** declaration in the head revision of a Trell
 too. All answers are production declarations (`role: production`); this is checked mechanically
 when the set is resolved.
 
-**Size and correlation.** 50 queries, 84 answer slots, 24 source files. Several declarations
+**Size and correlation.** 50 queries, 82 answer slots (73 distinct declarations), 24 source files. Several declarations
 answer more than one query (for example `q27`/`e8`, `e5`/`q43` and `q11`/`q34`), so the queries are
 correlated, not 50 independent trials. The `named` and `error` strata are intentionally easy:
 `named` mirrors identifiers, and `error` uses verbatim message text, so they measure literal
@@ -87,7 +87,10 @@ overall number is not evidence of semantic retrieval; the `concept` stratum is.
      - `q13`: the orphan check `inspect_index_with_open_hook` added beside the age check.
      - `q19`: the duration getter `relay_call_deadline` replaced by the code that enforces the
        deadline, `Relay::decide` and the daemon's `coordinate`.
-     - `q31`: the CLI wait loop `cli_index` added beside the terminal-change signal.
+     - `q31`: the CLI wait loop `cli_index` is the answer. In the second review round (`c4dcdb3`),
+       the generic terminal-change signal helpers `wait_terminal_change` and
+       `notify_terminal_waiters` were removed: they don't identify the request or read its
+       outcome.
    - **Mislabelled tasks reworded.**
      - `q45` now asks for building the saved view or note *payload*, which is what its answers do
        (the saving code is an anonymous callback).

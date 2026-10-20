@@ -592,22 +592,6 @@
      "kind": "method",
      "startLine": 1782,
      "declarationId": "sid:v1:87abf5b9a4c5c9f0e9ef0f6f3e0c42ef"
-    },
-    {
-     "language": "rust",
-     "path": "src/store.rs",
-     "qualifiedName": "implementation@59.wait_terminal_change",
-     "kind": "method",
-     "startLine": 5714,
-     "declarationId": "sid:v1:f90dad084366fe720e988277e0a228a3"
-    },
-    {
-     "language": "rust",
-     "path": "src/store.rs",
-     "qualifiedName": "implementation@59.notify_terminal_waiters",
-     "kind": "method",
-     "startLine": 5699,
-     "declarationId": "sid:v1:fb2f479bdbbfd71967854cef04c56695"
     }
    ]
   },

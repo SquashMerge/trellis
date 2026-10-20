@@ -32,7 +32,7 @@ Each item below ends with its open questions. The decisions they add up to are:
 | D2 | Query embedding on the MCP read path | Allowed, for a local pinned model only; never a hosted provider |
 | D3 | Result closure and search-index status | W2's emitted-only `coverage`/`provenance` closure and searched-scope `partial`/`coverageIncomplete` rule, unchanged; vector completeness only in a separate `searchIndex` object |
 | D4 | Revision pinning | W8 as it stands: the validated head only; an old complete pin conflicts, and a later `trellis_declaration` at the returned basis may conflict after a new head. Reading a retained older revision would be a separate #24 change, not proposed |
-| D5 | Vector store and its corruption | Per-user cache `<cache>/vectors.db`; `index.db` holds only the FTS5 table and card hashes. A row that fails decoding is a specified miss; a database integrity failure fails the call with `store_unavailable` (alternative stated in §5) |
+| D5 | Vector store and its corruption | Per-user cache `<cache>/vectors.db`; `index.db` holds only the FTS5 table and card hashes. A database integrity failure fails the call with `store_unavailable`. A row that fails decoding is an owner decision: typed failure per T00, or a narrow T00/T02 amendment making it a miss (§5) |
 | D6 | Card facts that extraction doesn't capture today | Captured during native extraction into search-only tables, behind a native producer version change. Cards and ranking use measured fields, never `displayKey` |
 | D7 | Model provenance | `modelId` pins name, revision, weight and tokenizer hashes, dimensions, quantization, prompts and card format |
 | D8 | Model distribution | A user-configured model path, verified against the pinned hash; no bundled weights and no download |
@@ -40,7 +40,7 @@ Each item below ends with its open questions. The decisions they add up to are:
 | D10 | Size budget | int8 vectors at ≤1024 dimensions; a size cap on `vectors.db`; FTS5 measured against #199. Whether search waits for #199's size items is an owner decision |
 | D11 | Remote embedding (voyage-code-4) | Out of scope until the owner opts in; it would need its own contract change |
 | D12 | FTS5 and #199 item 5 (Q-8) | Two tables: a trigram prefilter for W2 (every hit still verified by W2's literal rule) and a split-identifier table for search |
-| D13 | Hybrid ordering | A fixed, deterministic fusion and tie-break rule (§1), part of the contract; changing it is a contract change |
+| D13 | Hybrid ordering | A fixed, deterministic fusion and tie-break rule (§1), part of the contract; changing it is a contract change. BM25 is scored over a head-only FTS5 table. The query transformation is total. Ranking is stable only for the same embedded vector set (or bound to it with `vectorSet`: owner choice) |
 
 ## 1. New MCP tool and catalog version
 
@@ -106,7 +106,9 @@ tool, not a `view` of another tool, and not an `inspect` union.
   - **Candidates** are eligible named declarations of the candidate kinds, one per
     `(document version, symbolId)`; a declaration appears at most once.
   - **Lexical arm:** FTS5 BM25 over the split-identifier table, ordered by BM25 score ascending,
-    then `symbolId` bytes; cut at depth `D`. Lexical rank `l` is 1-based.
+    then `symbolId` bytes; cut at depth `D`. Lexical rank `l` is 1-based. The MATCH expression is
+    built from the query by the transformation below, and BM25 is scored over the **head-only**
+    corpus (§5), so its statistics are a function of the answering head alone.
   - **Vector arm:** cosine similarity of the query vector to each candidate that has a current
     vector, ordered by similarity descending, then `symbolId` bytes; cut at depth `D`. Vector rank
     `v` is 1-based.
@@ -117,9 +119,46 @@ tool, not a `view` of another tool, and not an `inspect` union.
     1:1 needs tuning (see open question 5), so these are placeholders for the owner.
   - `rank` is the 1-based position in the emitted list, contiguous. `matchedBy` is nonempty, unique,
     in the fixed order `lexical` then `vector`, and lists the arms that returned the candidate.
-  - **Determinism:** equal snapshot, request, `modelId` and inference runtime give the same order.
-    Vector similarities can differ in the last bits across runtimes or hardware, so the contract
-    promises byte-identical output only for a fixed `modelId` and runtime build.
+  - **One cache snapshot per call.** The vector arm and `searchIndex` counts read `vectors.db` in
+    one read transaction, so within a call the candidates, `matchedBy`, `embedded` and the order
+    are coherent with each other.
+  - **What the basis promises, and what it doesn't.** `evidenceBasis` pins the **index**
+    snapshot: candidates, card hashes, lexical scores, closure and coverage. It does **not** pin
+    `vectors.db`, which is external, filled asynchronously and evictable. Two calls at the same
+    basis can therefore return different vector candidates, `rank`, `matchedBy` and `embedded`
+    counts while the background job fills the cache or eviction removes entries.
+  - **Proposed:** ordering is deterministic for equal index snapshot, request, `modelId`,
+    inference runtime build **and the same set of embedded card hashes**. Ranking is explicitly
+    not stable across cache changes at one pin. `searchIndex.embedded` and `state` let a caller see
+    that the cache was incomplete. Vector similarities can also differ in the last bits across
+    runtimes or hardware.
+  - **Alternative, for the owner (open question 6):** bind each result to its cache state, adding
+    `searchIndex.vectorSet: Hash`. This is SHA-256 over the domain `trellis.search-vector-set.v1\0`
+    and the sorted card hashes that had a vector in this call, with `modelId`. Equal `evidenceBasis`
+    plus equal `vectorSet` would then promise equal output. It costs one hash over up to the
+    candidate count per call, and lets a client detect cache drift. It still doesn't make vectors
+    immutable; making them part of publication would mean storing them in `index.db` (open
+    question 13).
+- **Query transformation (deterministic and total).** Any valid 1–1024-byte query maps to a
+  lexical arm as follows. Raw caller text never reaches FTS5's query parser.
+  1. Take maximal runs of Unicode letters, digits and `_` (the `unicode61` token-character
+     classes). Every other character, including quotes, `*`, `^`, `:`, `(`, `)`, `+`, `-` and
+     whitespace, is only a separator.
+  2. Split each run at `_` and camelCase boundaries. Keep the whole run and its parts, then apply
+     ASCII lowercasing. Drop parts shorter than 2 characters and a fixed, versioned stopword list.
+     Deduplicate in first-occurrence order, and keep at most 32 tokens.
+  3. Emit each token as an FTS5 string literal: `"` + token + `"`. Tokens contain no `"` after
+     step 1, and any `"` would be doubled anyway. Join them with ` OR `, and bind the expression as
+     a SQL parameter to `MATCH`. A quoted string literal is never an FTS5 operator or column
+     filter, so the words `AND`, `OR`, `NOT` and `NEAR` inside the query are plain tokens.
+  4. If no token remains (punctuation-only or stopword-only input), **the lexical arm is empty**,
+     and no FTS5 query runs. The result comes from the vector arm alone, or has zero hits.
+  5. FTS5 should never report a syntax error for an expression built this way. If it reports any
+     error anyway, the call fails `store_unavailable`; it never retries with raw text.
+
+  The W2 trigram prefilter (§11) has its own total rule: the whole query becomes one FTS5 string
+  literal with `"` doubled, only when it has at least three Unicode characters. Otherwise, or on
+  any FTS5 error, it uses W2's literal scan.
 - **Summary text:** `trellis_search_symbols: <n> hits; full result in structuredContent.`, with the
   item word `hits`.
 - **Bounds:** W2's 65,536-byte response cap, its longest-fitting-prefix rule, and the five-second
@@ -150,6 +189,9 @@ its fixture are closed. The catalog adds about 13 KB to a 73 KB compact catalog.
    precision on the benchmark (#211). Should the contract fix a tuned rule instead, for example a
    lexical arm limited to exact phrase, literal and identifier matches? The ordering rule above
    stays deterministic whichever constants are chosen.
+6. **Ranking stability across cache changes.** Should ranking be stable only for the same
+   embedded set (proposed), or should results carry `searchIndex.vectorSet` so equal basis plus
+   equal vector set promises equal output?
 
 ## 2. Card content and native extraction
 
@@ -206,10 +248,10 @@ reproducible from a publication, and so search never rereads files.
 
 **Open questions.**
 
-6. Should the search-only facts live in `index.db` beside the declaration rows, or should they
+7. Should the search-only facts live in `index.db` beside the declaration rows, or should they
    be computed only when a card is built, and never stored? Storing them costs index size (#199);
    not storing them means a rebuild of the vector cache needs the tree again.
-7. Should the card format be versioned separately from the native producer version
+8. Should the card format be versioned separately from the native producer version
    (`cardFormat` in `modelId`, §6)? This proposal says yes, so a card-format change re-embeds
    without re-extracting.
 
@@ -269,10 +311,10 @@ other tools.
 
 **Open questions.**
 
-8. Should vector incompleteness also set the envelope's `partial:true`? This proposal says no,
+9. Should vector incompleteness also set the envelope's `partial:true`? This proposal says no,
    because `partial` is about evidence. An agent that wants complete vector coverage reads
    `searchIndex.state`.
-9. With no model configured, should the tool answer lexical-only (proposed), or fail? Answering
+10. With no model configured, should the tool answer lexical-only (proposed), or fail? Answering
    keeps search useful on machines without a model.
 
 ## 4. Revision pinning
@@ -319,9 +361,9 @@ typed, and needs no new rule; the plan's citation should be fixed.
 
 **Open questions.**
 
-10. Should search *require* `expectedBasis`? This proposal says no: it is optional, as in W2,
+11. Should search *require* `expectedBasis`? This proposal says no: it is optional, as in W2,
     because the first search usually starts a session.
-11. Should MCP reads (search, and then declaration) be able to select a *retained* older
+12. Should MCP reads (search, and then declaration) be able to select a *retained* older
     revision, so a search-then-verify sequence survives a publication? That would be a separate
     #24 pin-eligibility amendment for all evidence tools, not part of this proposal.
 
@@ -344,12 +386,23 @@ typed, and needs no new rule; the plan's citation should be fixed.
 - **New T02 row.** "Optional vectors | `<cache>/vectors.db` | Path-neutral card vectors keyed by
   `(modelId, cardHash)`. Misses and eviction change ranking only, never evidence, and are reported
   in `searchIndex`."
-- **`index.db`** holds, per document version (so #67's version sharing applies):
-  - the FTS5 identifier table;
-  - each declaration's `cardHash`.
+- **`index.db`** holds:
+  - each declaration's `cardHash` and the search-only card facts, per document version, so #67's
+    version sharing applies;
+  - a **head-only** split-identifier FTS5 table. It holds one row per candidate declaration of
+    the current head, and nothing for retained or released revisions. The publication that
+    advances the head updates it in the same transaction: delete the rows of document versions
+    leaving the head, insert those entering it. FTS5's BM25 corpus statistics (row count,
+    average length, document frequencies) are therefore a function of the head's rows alone.
+    They don't drift when older revisions are retained, released or collected, and a retained
+    revision's rows can't affect scoring. This fits W8, which admits only the head (§4). The
+    table is derived; a rebuild repopulates it from the head.
 
   `cardHash` is SHA-256 over a new domain, `trellis.search-card.v1\0`, and the exact card bytes.
   Vectors are never stored in `index.db`.
+
+  The alternative, per-version FTS rows filtered to the head with custom corpus statistics, would
+  need a ranking function written outside FTS5's `bm25()`. It is not proposed.
 - **The embedding job.**
   - **Ownership.** The daemon is the only writer of `vectors.db`, as of every other topology
     store. It runs one embedding owner per daemon, shared by all checkouts, with one resident
@@ -367,11 +420,27 @@ typed, and needs no new rule; the plan's citation should be fixed.
   cache, and a new worktree of the same commit reuses every vector (cards contain only
   root-relative paths).
 - **Corruption (T00).** Two cases, kept apart:
-  - **A row that fails typed decoding** (the blob length isn't `dimensions × bytes per component`,
-    or its `modelId` doesn't match the key) is a **specified cache miss**, as T02 already specifies
-    for an optional fact-cache entry ("a missing, corrupt, conflicting or unavailable entry falls
-    back to extraction"). That candidate is lexical-only, counts against `embedded`, and is
-    re-embedded in the background. This needs the new T02 row to say so explicitly.
+  - **A row that fails typed decoding.** For example, the blob length isn't `dimensions × bytes
+    per component`, or its `modelId` doesn't match the key. This is an **owner decision (open
+    question 14), not settled by an existing rule.** The two rules in play:
+    - T00, "Accidental corruption of state files": "rows that fail typed decoding or closed
+      validation return the contract's typed corrupt failure, never a partial or best-effort
+      result";
+    - T02, for the optional fact cache: "a missing, corrupt, conflicting or unavailable entry falls
+      back to extraction".
+
+    The options:
+    - **Option A, T00 as written:** the search call fails `store_unavailable`. No amendment is
+      needed. A single bad row makes search unavailable until the daemon repairs or recreates
+      the cache.
+    - **Option B, a narrow amendment** extending T02's fact-cache rule to the vector cache: a
+      vector-cache row that fails typed decoding is a **specified miss**. That candidate is
+      lexical-only, counts against `embedded`, and is re-embedded in the background. This would be
+      an explicit T00 exception, limited to disposable optional vector-cache entries whose miss
+      changes ranking but never evidence. The new T02 row and T00 would both say so.
+
+    This proposal leans to option B, by analogy with facts, but makes no claim that it is already
+    allowed.
   - **A database-level failure** (SQLite integrity failure, a malformed schema, or an unreadable or
     unsafe file) fails the search call with the typed `store_unavailable` and no hits. T00 requires
     "the contract's typed corrupt failure, never a partial or best-effort result", and #24 W8 says an
@@ -391,12 +460,14 @@ adding to the size problem #199 is working on.
 
 **Open questions.**
 
-12. Per-user cache (proposed), or `index.db`? `index.db` would make vectors part of the atomic
+13. Per-user cache (proposed), or `index.db`? `index.db` would make vectors part of the atomic
     publication, but it would multiply storage by worktrees, and a rebuild would drop them.
-13. Which corruption rule for `vectors.db`: typed failure (proposed) or lexical-only fallback
-    with T00 and W8 exceptions?
-14. What should the default cache cap be, and should it be configurable? See §8 for sizes.
-15. Should `trellis gc --report` list `vectors.db` size and entry count? It lists derived indexes
+14. **Corrupt vectors.** For a vector-cache *row* that fails typed decoding: option A (T00 as
+    written, `store_unavailable`) or option B (a narrow T00/T02 amendment making it a specified
+    miss)? For a *database-level* failure: typed `store_unavailable` (proposed), or a lexical-only
+    fallback with explicit T00 and W8 exceptions?
+15. What should the default cache cap be, and should it be configurable? See §8 for sizes.
+16. Should `trellis gc --report` list `vectors.db` size and entry count? It lists derived indexes
     today, and facts are not listed.
 
 ## 6. Model provenance pinning
@@ -432,13 +503,13 @@ weight or prompt change would mix incompatible vectors in one ranking.
 
 **Open questions.**
 
-16. Should Trellis bundle a default model, or require the user to configure one? Bundling makes
+17. Should Trellis bundle a default model, or require the user to configure one? Bundling makes
     search work out of the box but adds hundreds of megabytes to the distribution. Configuring
     keeps the binary small.
-17. Which inference runtime: ONNX Runtime or candle? Both run in-process. ONNX Runtime adds a
+18. Which inference runtime: ONNX Runtime or candle? Both run in-process. ONNX Runtime adds a
     native library, and candle adds build time. The benchmark used PyTorch and ONNX Runtime only
     to measure quality. A Rust runtime's speed still needs its own measurement.
-18. Some candidate models (voyage-4-nano, jina-embeddings-v2-base-code) publish custom Python
+19. Some candidate models (voyage-4-nano, jina-embeddings-v2-base-code) publish custom Python
     modelling code. A Rust runtime would reimplement the architecture rather than run that code.
     Is a model whose reference implementation is custom code acceptable?
 
@@ -474,7 +545,7 @@ inferred. Similarity is inference.
 
 **Open question.**
 
-19. Should hits expose scores for debugging behind a non-default flag? This proposal says no.
+20. Should hits expose scores for debugging behind a non-default flag? This proposal says no.
 
 ## 8. Size budget
 
@@ -505,9 +576,9 @@ cap bounds them independently of the number of checkouts.
 
 **Open questions.**
 
-20. Should search wait for #199's size items before shipping? #211 sequences it after them, but no
+21. Should search wait for #199's size items before shipping? #211 sequences it after them, but no
     ratified record makes that a release gate; it is an owner decision.
-21. Should a full-dimension mode (2048 for voyage-4-nano) be allowed? The benchmark shows what
+22. Should a full-dimension mode (2048 for voyage-4-nano) be allowed? The benchmark shows what
     truncation costs.
 
 ## 9. Threat model (T00) fit
@@ -522,8 +593,9 @@ cap bounds them independently of the number of checkouts.
   to `maxTokens` before embedding.
 - **Ordinary faults.** The embedding job may crash or be killed at any point. The cache is
   re-derivable, so a partial write or eviction is a miss.
-- **Accidental corruption.** A row failing typed decoding is a specified miss; a database-level
-  failure is the typed `store_unavailable`, never a best-effort answer (§5).
+- **Accidental corruption.** A database-level failure is the typed `store_unavailable`, never a
+  best-effort answer. Whether a single row failing typed decoding is a typed failure (T00 as
+  written) or a specified miss (a narrow amendment) is an owner decision (§5, open question 14).
 
 Out of scope, per T00: signing or authenticating cached vectors against a same-user process.
 
@@ -549,7 +621,7 @@ The #211 benchmark did not run it.
 
 **Open question.**
 
-22. Does the owner want the remote arm measured at all, and on which repository?
+23. Does the owner want the remote arm measured at all, and on which repository?
 
 ## 11. Coordination with #199 item 5 (Q-8, symbol search speed)
 
@@ -559,7 +631,9 @@ The #211 benchmark did not run it.
   `lower` and literal `instr`."
 - #199 item 5: "Symbol search: a narrow table or trigram index (Q-8)."
 
-**Proposed change.** None to W2. Two FTS5 tables, both per document version:
+**Proposed change.** None to W2. Two FTS5 tables. The W2 prefilter may be per document version,
+because it only filters candidates and never scores. The search table is head-only, because it
+scores (§5).
 
 - **For W2:** a `trigram` table used only as a **candidate prefilter**. FTS5 trigrams are built
   from Unicode **characters**, not UTF-8 bytes, so the prefilter is eligible only when the query has
@@ -570,11 +644,11 @@ The #211 benchmark did not run it.
   exactly (fewer than three characters, or any other unsupported case) falls back to the literal
   scan. W2's output stays byte-identical for **all** valid 1–256-byte queries. W2's 256-byte query
   limit is unchanged; it is a byte limit, independent of trigram eligibility.
-- **For search:** a split-identifier table (camelCase and snake_case split, porter stemming) over
-  the card's measured fields.
+- **For search:** a head-only split-identifier table (camelCase and snake_case split, porter
+  stemming) over the card's measured fields, queried only through the transformation in §1.
 
 One table can't serve both semantics exactly, so this proposal doesn't share one.
 
 **Open question.**
 
-23. Is one shared table worth W2's exactness risk? This proposal says no: two tables.
+24. Is one shared table worth W2's exactness risk? This proposal says no: two tables.
