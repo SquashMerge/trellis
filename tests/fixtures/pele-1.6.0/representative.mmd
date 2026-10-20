@@ -1,0 +1,19 @@
+sequenceDiagram
+participant S as bounded (source)
+Note over S: Static possible path - targets and timing unknown
+opt optional guard
+Note right of S: [01] guarded call
+end
+alt conditional
+Note right of S: [02] first path
+else alternate
+Note right of S: [03] other path
+end
+loop possible iterations
+Note right of S: [04] loop call
+end
+rect
+Note right of S: [05] try boundary
+Note over S: handlers / cleanup (see guards)
+Note right of S: [06] handler
+end
