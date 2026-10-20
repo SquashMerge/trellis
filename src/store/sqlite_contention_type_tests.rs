@@ -402,3 +402,45 @@ fn ioerr_rdlock_does_not_convert_to_contention() {
     assert!(reported.downcast_ref::<SqliteContention>().is_none());
     assert!(!transient_storage_contention(&reported));
 }
+
+/// #220: a writable open admits a cold journal (zeroed header, as a writer
+/// killed before its commit phase leaves it) and refuses one SQLite may treat
+/// as hot, naming the cause. WAL and shared-memory sidecars stay refused, and
+/// a read-only open never checks the journal.
+#[test]
+fn writable_open_admits_only_a_cold_journal_and_names_each_refusal() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("index.db");
+    std::fs::write(&path, b"").unwrap();
+    let journal = dir.path().join("index.db-journal");
+    for cold in [&[][..], &[0u8; 512][..]] {
+        std::fs::write(&journal, cold).unwrap();
+        reject_sidecars(&path, true).unwrap();
+    }
+    for hot in [&[0xd9u8; 512][..], &[0x01][..]] {
+        std::fs::write(&journal, hot).unwrap();
+        let error = reject_sidecars(&path, true).unwrap_err().to_string();
+        assert_eq!(
+            error,
+            format!("{HOT_INDEX_JOURNAL}: {}", journal.display()),
+            "{hot:?}"
+        );
+        reject_sidecars(&path, false).unwrap();
+    }
+    std::fs::remove_file(&journal).unwrap();
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = dir.path().join(format!("index.db{suffix}"));
+        std::fs::write(&sidecar, [0u8; 32]).unwrap();
+        for writable in [true, false] {
+            assert_eq!(
+                reject_sidecars(&path, writable).unwrap_err().to_string(),
+                format!(
+                    "recovery_required: unsupported index sidecar: {}",
+                    sidecar.display()
+                )
+            );
+        }
+        std::fs::remove_file(&sidecar).unwrap();
+    }
+    reject_sidecars(&path, true).unwrap();
+}

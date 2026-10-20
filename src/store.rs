@@ -1376,6 +1376,12 @@ impl EvidenceFence {
     }
 }
 
+/// Refuse sidecars this open must not let SQLite act on. WAL and shared-memory
+/// files are never supported. A writable open refuses a rollback journal only
+/// if it may be hot: a cold one (zeroed header, left by a writer killed before
+/// its commit phase, #220) never changed index.db, and SQLite ignores it and
+/// reuses it at the next write. A hot journal is rolled back only by
+/// activation's recovery under exclusive use (#122).
 fn reject_sidecars(path: &Path, writable: bool) -> Result<()> {
     for suffix in ["-wal", "-shm", "-journal"] {
         if suffix == "-journal" && !writable {
@@ -1388,7 +1394,14 @@ fn reject_sidecars(path: &Path, writable: bool) -> Result<()> {
                 .to_string_lossy()
         ));
         match std::fs::symlink_metadata(&sidecar) {
-            Ok(_) => anyhow::bail!("recovery_required: {}", sidecar.display()),
+            Ok(_) if suffix != "-journal" => anyhow::bail!(
+                "recovery_required: unsupported index sidecar: {}",
+                sidecar.display()
+            ),
+            Ok(_) if journal_may_be_hot(&sidecar) => {
+                anyhow::bail!("{HOT_INDEX_JOURNAL}: {}", sidecar.display())
+            }
+            Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
         }
@@ -2842,13 +2855,19 @@ fn hot_index_journal_present(index: &Path) -> Result<bool> {
 /// SQLite's hot test on `index.db-journal` without its lock check: present
 /// with a non-zero first byte. An unreadable journal counts as hot.
 fn sqlite_journal_may_be_hot(index: &Path) -> Result<bool> {
+    Ok(journal_may_be_hot(
+        &index.with_file_name("index.db-journal"),
+    ))
+}
+
+/// SQLite's hot test on one rollback journal, without its lock check.
+fn journal_may_be_hot(journal: &Path) -> bool {
     use std::io::Read;
-    let journal = index.with_file_name("index.db-journal");
     let mut first = [0u8; 1];
-    match std::fs::File::open(&journal).and_then(|mut file| file.read(&mut first)) {
-        Ok(read) => Ok(read == 1 && first[0] != 0),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(_) => Ok(true),
+    match std::fs::File::open(journal).and_then(|mut file| file.read(&mut first)) {
+        Ok(read) => read == 1 && first[0] != 0,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
     }
 }
 
