@@ -444,3 +444,44 @@ fn writable_open_admits_only_a_cold_journal_and_names_each_refusal() {
     }
     reject_sidecars(&path, true).unwrap();
 }
+
+/// #221 review: a non-regular journal is refused by type before any byte is
+/// read. A FIFO would block a read open indefinitely; a symlink to a cold file
+/// must not take the cold allowance. Bounded so a regression fails, not hangs.
+#[test]
+fn writable_open_refuses_a_non_regular_journal_without_reading_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("index.db");
+    std::fs::write(&path, b"").unwrap();
+    let journal = dir.path().join("index.db-journal");
+    let cold = dir.path().join("cold");
+    std::fs::write(&cold, [0u8; 512]).unwrap();
+    let fifo = std::ffi::CString::new(journal.as_os_str().as_encoded_bytes()).unwrap();
+    let make_fifo: Box<dyn Fn()> = Box::new(move || {
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    });
+    let link = journal.clone();
+    let make_symlink: Box<dyn Fn()> = Box::new(move || {
+        std::os::unix::fs::symlink(&cold, &link).unwrap();
+    });
+    for (kind, create) in [("fifo", make_fifo), ("symlink", make_symlink)] {
+        create();
+        let (sent, received) = std::sync::mpsc::channel();
+        let checked = path.clone();
+        std::thread::spawn(move || {
+            let _ = sent.send(reject_sidecars(&checked, true).map_err(|e| e.to_string()));
+        });
+        let refused = received
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap_or_else(|_| panic!("{kind} journal blocked the writable preflight"));
+        assert_eq!(
+            refused.unwrap_err(),
+            format!(
+                "recovery_required: unsupported index sidecar: {}",
+                journal.display()
+            ),
+            "{kind}"
+        );
+        std::fs::remove_file(&journal).unwrap();
+    }
+}

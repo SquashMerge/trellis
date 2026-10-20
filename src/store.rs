@@ -1377,11 +1377,13 @@ impl EvidenceFence {
 }
 
 /// Refuse sidecars this open must not let SQLite act on. WAL and shared-memory
-/// files are never supported. A writable open refuses a rollback journal only
-/// if it may be hot: a cold one (zeroed header, left by a writer killed before
-/// its commit phase, #220) never changed index.db, and SQLite ignores it and
-/// reuses it at the next write. A hot journal is rolled back only by
-/// activation's recovery under exclusive use (#122).
+/// files are never supported, nor is a journal that is not a regular file
+/// (symlink, FIFO or other type, refused before any byte is read). A writable
+/// open refuses a regular rollback journal only if it may be hot: a cold one
+/// (empty or zeroed header, left by a writer killed before its commit phase,
+/// #220) never changed index.db, and SQLite ignores it and reuses it at the
+/// next write. A hot journal is rolled back only by activation's recovery
+/// under exclusive use (#122).
 fn reject_sidecars(path: &Path, writable: bool) -> Result<()> {
     for suffix in ["-wal", "-shm", "-journal"] {
         if suffix == "-journal" && !writable {
@@ -1394,7 +1396,7 @@ fn reject_sidecars(path: &Path, writable: bool) -> Result<()> {
                 .to_string_lossy()
         ));
         match std::fs::symlink_metadata(&sidecar) {
-            Ok(_) if suffix != "-journal" => anyhow::bail!(
+            Ok(meta) if suffix != "-journal" || !meta.file_type().is_file() => anyhow::bail!(
                 "recovery_required: unsupported index sidecar: {}",
                 sidecar.display()
             ),
