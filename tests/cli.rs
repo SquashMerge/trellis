@@ -4971,7 +4971,13 @@ fn optional_captured_scip_changes_presentation_without_native_identity_or_full_r
         String::from_utf8_lossy(&first.stderr)
     );
     let first_pin: Value = serde_json::from_slice(&first.stdout).unwrap();
-    assert_eq!(first_pin["publishedRevision"]["indexRevision"], 2);
+    // Startup reconciliation publishes r1. If its capture already used the
+    // accepted request's SCIP options, the request is unchanged and completes
+    // at r1 (Decision 0006 §3); otherwise it publishes r2 for the new inputs.
+    assert!(
+        (1..=2).contains(&first_pin["publishedRevision"]["indexRevision"].as_u64().unwrap()),
+        "{first_pin}"
+    );
     let original = command(&root, &home, "export")
         .current_dir(&other)
         .output()
