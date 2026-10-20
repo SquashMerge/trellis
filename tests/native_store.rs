@@ -247,7 +247,7 @@ fn four_languages_normalized_rows_and_pinned_bytes_are_coherent() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        10
+        11
     );
     let count: i64 = db
         .query_row(
@@ -793,7 +793,7 @@ fn physical_v8_native_v4_index_recreates_before_role_column_read() {
         rebuilt
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        10
+        11
     );
     let stamp: String = rebuilt
         .query_row("SELECT extractor_version FROM index_metadata", [], |row| {
@@ -3549,7 +3549,7 @@ fn newer_disposable_schema_is_refused_without_rebuild_or_deletion() {
         .join("index.db");
     Connection::open(&path)
         .unwrap()
-        .execute_batch("PRAGMA user_version=11")
+        .execute_batch("PRAGMA user_version=12")
         .unwrap();
     let inode = fs::metadata(&path).unwrap().ino();
     let error = Store::open_for_tests(state.path(), root.path()).unwrap_err();
@@ -3569,7 +3569,7 @@ fn newer_disposable_schema_is_refused_without_rebuild_or_deletion() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(version, 11);
+    assert_eq!(version, 12);
     assert_eq!(generation, old.index_generation.to_string());
 }
 

@@ -3009,7 +3009,8 @@ mod cached_executable_digest_tests {
         use rusqlite::{Connection, types::Value};
         let db = Connection::open(db_path).unwrap();
         let tables = db
-            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+            // Decision 0013's trigram prefilter tables are derived search state, not evidence.
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '%trigrams%' ORDER BY name")
             .unwrap()
             .query_map([], |row| row.get::<_, String>(0))
             .unwrap()
