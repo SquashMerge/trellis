@@ -1,0 +1,157 @@
+{
+  "hiddenSteps": 0,
+  "participants": [
+    {
+      "id": "fixture-seed",
+      "identification": "Selected source symbol.",
+      "kind": "method",
+      "label": "run"
+    },
+    {
+      "id": "rust:source:unresolvedCallee:20f65c28671b40937c5bf23acc7c6f37e5a5ec0622e347b57685725df5ba9e50",
+      "identification": "Source expression only; type and dispatch unresolved. Repeated names are visual groups, not runtime object identity.",
+      "kind": "unresolvedCallee",
+      "label": "check"
+    },
+    {
+      "id": "rust:source:unresolvedCallee:8a798890fe93817163b10b5f7bd2ca4d25d84c52739a645a889c173eee7d9d3d",
+      "identification": "Source expression only; type and dispatch unresolved. Repeated names are visual groups, not runtime object identity.",
+      "kind": "unresolvedCallee",
+      "label": "yes"
+    },
+    {
+      "id": "rust:source:unresolvedCallee:9390298f3fb0c5b160498935d79cb139aef28e1c47358b4bbba61862b9c26e59",
+      "identification": "Source expression only; type and dispatch unresolved. Repeated names are visual groups, not runtime object identity.",
+      "kind": "unresolvedCallee",
+      "label": "no"
+    },
+    {
+      "id": "rust:source:unresolvedCallee:f39592393ef0859cb196a52693d2cea00fb2df784b3c04ae54aa7cadb8e562f8",
+      "identification": "Source expression only; type and dispatch unresolved. Repeated names are visual groups, not runtime object identity.",
+      "kind": "unresolvedCallee",
+      "label": "after"
+    }
+  ],
+  "revision": {
+    "indexGeneration": "00000000-0000-4000-8000-000000000001",
+    "indexRevision": 7
+  },
+  "seed": {
+    "accessor": false,
+    "id": "fixture-seed",
+    "kind": "function",
+    "name": "run",
+    "parent": null,
+    "path": "fixture.rs",
+    "provenance": {
+      "semantic": "unavailable",
+      "source": "native-measuredSyntax"
+    },
+    "range": {
+      "endByte": 58,
+      "endColumn": 59,
+      "endLine": 1,
+      "startByte": 0,
+      "startColumn": 1,
+      "startLine": 1
+    }
+  },
+  "steps": [
+    {
+      "alternate": [],
+      "callId": "fixture-call-1",
+      "children": [],
+      "hidden": false,
+      "id": "step:14:1",
+      "kind": "call",
+      "label": "check",
+      "path": "fixture.rs",
+      "range": {
+        "endByte": 21,
+        "endColumn": 22,
+        "endLine": 1,
+        "startByte": 14,
+        "startColumn": 15,
+        "startLine": 1
+      }
+    },
+    {
+      "alternate": [
+        {
+          "alternate": [],
+          "callId": "fixture-call-3",
+          "children": [],
+          "hidden": false,
+          "id": "step:40:4",
+          "kind": "call",
+          "label": "no",
+          "path": "fixture.rs",
+          "range": {
+            "endByte": 44,
+            "endColumn": 45,
+            "endLine": 1,
+            "startByte": 40,
+            "startColumn": 41,
+            "startLine": 1
+          }
+        }
+      ],
+      "callId": null,
+      "children": [
+        {
+          "alternate": [],
+          "callId": "fixture-call-2",
+          "children": [],
+          "hidden": false,
+          "id": "step:24:3",
+          "kind": "call",
+          "label": "yes",
+          "path": "fixture.rs",
+          "range": {
+            "endByte": 29,
+            "endColumn": 30,
+            "endLine": 1,
+            "startByte": 24,
+            "startColumn": 25,
+            "startLine": 1
+          }
+        }
+      ],
+      "hidden": false,
+      "id": "step:11:2",
+      "kind": "branch",
+      "label": "if check()",
+      "path": "fixture.rs",
+      "range": {
+        "endByte": 47,
+        "endColumn": 48,
+        "endLine": 1,
+        "startByte": 11,
+        "startColumn": 12,
+        "startLine": 1
+      }
+    },
+    {
+      "alternate": [],
+      "callId": "fixture-call-4",
+      "children": [],
+      "hidden": false,
+      "id": "step:48:5",
+      "kind": "call",
+      "label": "after",
+      "path": "fixture.rs",
+      "range": {
+        "endByte": 55,
+        "endColumn": 56,
+        "endLine": 1,
+        "startByte": 48,
+        "startColumn": 49,
+        "startLine": 1
+      }
+    }
+  ],
+  "truncated": false,
+  "warnings": [
+    "Static possible paths, not a runtime trace. Rust types, traits, dispatch, cfg/attributes, implicit drops, coercions and iterator protocols are not resolved. Async bodies describe possible execution when polled, not future construction. Calls may panic or diverge; those implicit paths are not expanded."
+  ]
+}

@@ -659,6 +659,26 @@ async fn provisioned_page_serves_all_referenced_assets() {
             }
         );
     }
+    for asset in ["sequence-pele.js", "vendor/pele-1.6.0.js"] {
+        let reply = response(
+            browser.router().unwrap(),
+            address,
+            &format!("/{asset}"),
+            None,
+        )
+        .await;
+        assert_eq!(reply.status(), StatusCode::OK, "{asset}");
+        assert_eq!(
+            reply.headers()["content-type"],
+            "text/javascript; charset=utf-8"
+        );
+        assert!(
+            !reply.headers()["content-security-policy"]
+                .to_str()
+                .unwrap()
+                .contains("unsafe-inline")
+        );
+    }
 }
 
 #[tokio::test]

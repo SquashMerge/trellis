@@ -1240,3 +1240,51 @@ fn gc_queued_before_candidate_yields_and_daily_stamp_defers_rescan() {
         "unscanned candidate is retried only next eligible day"
     );
 }
+
+#[tokio::test]
+async fn pele_assets_are_local_and_keep_csp() {
+    use sha2::{Digest, Sha256};
+    let (_d, _store, _state, app) = setup_without_tick();
+    for (route, expected) in [
+        (
+            "/sequence-pele.js",
+            include_bytes!("../web/sequence-pele.js").as_slice(),
+        ),
+        (
+            "/vendor/pele-1.6.0.js",
+            include_bytes!("../web/vendor/pele-1.6.0.js").as_slice(),
+        ),
+    ] {
+        let req = Request::builder()
+            .uri(route)
+            .header("host", "127.0.0.1:7331")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{route}");
+        assert_eq!(
+            response.headers()["content-type"],
+            "text/javascript; charset=utf-8"
+        );
+        assert!(
+            !response.headers()["content-security-policy"]
+                .to_str()
+                .unwrap()
+                .contains("unsafe-inline")
+        );
+        assert_eq!(
+            to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap()
+                .as_ref(),
+            expected
+        );
+    }
+    assert_eq!(
+        format!(
+            "{:x}",
+            Sha256::digest(include_bytes!("../web/vendor/pele-1.6.0.js"))
+        ),
+        "b82d1bcd435302779a945e1e0f4a54ea56fb26e010ce3f2122f4216fcfc095d7"
+    );
+}

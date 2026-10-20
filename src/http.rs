@@ -2103,6 +2103,24 @@ pub fn router(state: Arc<DaemonState>) -> Router {
                 )
             }),
         )
+        .route(
+            "/sequence-pele.js",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                    include_str!("../web/sequence-pele.js"),
+                )
+            }),
+        )
+        .route(
+            "/vendor/pele-1.6.0.js",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                    include_bytes!("../web/vendor/pele-1.6.0.js"),
+                )
+            }),
+        )
         .route("/api/symbols", get(symbols))
         .route("/api/symbol", get(symbol))
         .route("/api/source", get(source))
@@ -3703,6 +3721,24 @@ impl ProvisionedBrowser {
                     (
                         [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
                         include_str!("../web/sequence.js"),
+                    )
+                }),
+            )
+            .route(
+                "/sequence-pele.js",
+                get(|| async {
+                    (
+                        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                        include_str!("../web/sequence-pele.js"),
+                    )
+                }),
+            )
+            .route(
+                "/vendor/pele-1.6.0.js",
+                get(|| async {
+                    (
+                        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                        include_bytes!("../web/vendor/pele-1.6.0.js"),
                     )
                 }),
             )
