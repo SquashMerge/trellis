@@ -2,16 +2,18 @@
 //!
 //! Symbol search keeps its literal rule: SQLite's ASCII-only `lower`, then
 //! `instr` on the name or ID. The FTS5 tables `native_declaration_trigrams`
-//! (W2) and `graph_node_trigrams` (the browser and CLI search) hold
-//! `lower`ed copies of those two columns, written by triggers on the source
-//! rows, under `tokenize='trigram case_sensitive 1'`. Their only job is to
-//! narrow the rows the literal rule runs on. They never score or order, and
-//! every candidate is still checked with the literal rule, so the answer is
-//! the literal scan's answer.
+//! (W2) and `graph_node_trigrams` (the browser and CLI search) hold a
+//! `lower`ed copy of the **name** only, written by triggers on the source
+//! rows, under `tokenize='trigram case_sensitive 1'`. IDs are not indexed: a
+//! query that could occur in an ID adds the rows a covering scan of the ID
+//! finds. The tables never score or order, and every candidate is still
+//! checked with the literal rule, so the answer is the literal scan's answer.
 //!
 //! Every literal match is a candidate: if `lower(q)` occurs in `lower(name)`,
 //! each of its character trigrams occurs there consecutively, and the copy
-//! is indexed under the same `lower` with no further folding.
+//! is indexed under the same `lower` with no further folding. If `lower(q)`
+//! occurs only in the ID, the query has the shape [`can_match_an_id`]
+//! accepts, and the ID scan finds the row.
 use super::storage_result;
 use anyhow::Result;
 use rusqlite::Connection;
@@ -37,6 +39,103 @@ pub(super) fn match_expression(query: &str) -> Option<String> {
     ))
 }
 
+/// Whether `lower(query)` can occur in some ID, decided from the query alone.
+/// Every stored ID, native and graph, is a minted SyntaxId: `sid:v1:`
+/// followed by 32 lowercase hex digits. A string occurs in one exactly when
+/// it is a substring of `sid:v1:`, or a suffix of `sid:v1:` (possibly
+/// empty) followed by 1–32 hex digits.
+pub(super) fn can_match_an_id(query: &str) -> bool {
+    const PREFIX: &str = "sid:v1:";
+    let lowered = query.to_ascii_lowercase();
+    PREFIX.contains(lowered.as_str())
+        || (0..=PREFIX.len()).any(|start| {
+            lowered.strip_prefix(&PREFIX[start..]).is_some_and(|hex| {
+                (1..=32).contains(&hex.len())
+                    && hex
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            })
+        })
+}
+
+/// One search's candidate rows and how to find them.
+struct Search<'a> {
+    /// The selected `a, b, rank` columns; rank orders exact name (0), name
+    /// prefix (1), then any other name or ID substring (2).
+    columns: &'a str,
+    /// The source table and its alias, as `table alias`.
+    source: &'a str,
+    /// The FTS5 table over its names.
+    names: &'a str,
+    /// The covering ID scan of the answering revision, selecting `rowid`.
+    ids: &'a str,
+    /// Everything after the FROM clause's candidate source: the revision
+    /// join, `WHERE {candidates}` with the literal rule, ORDER BY and LIMIT.
+    rest: &'a str,
+    /// The positional parameter the MATCH expression binds to.
+    match_parameter: usize,
+}
+
+impl Search<'_> {
+    /// The ranked `(a, b)` hits. Literal scan for an unrepresentable query.
+    /// Otherwise the name candidates, plus the ID scan's rows when the query
+    /// can match an ID, unless the shortcut below proves they can't matter.
+    fn hits(
+        &self,
+        db: &Connection,
+        query: &str,
+        limit: i64,
+        values: &[&dyn rusqlite::ToSql],
+    ) -> Result<Vec<(String, String)>> {
+        let Some(expression) = match_expression(query) else {
+            return ranked(db, &self.sql(self.source), values).map(unranked);
+        };
+        let mut values = values.to_vec();
+        values.push(&expression);
+        let alias = self.source.rsplit(' ').next().unwrap_or_default();
+        let table = self.source.split(' ').next().unwrap_or_default();
+        let names = format!(
+            "(SELECT rowid AS r FROM {names} WHERE {names} MATCH ?{p}) c
+                CROSS JOIN {table} {alias} ON {alias}.rowid=c.r",
+            names = self.names,
+            p = self.match_parameter,
+        );
+        let hits = ranked(db, &self.sql(&names), &values)?;
+        if !can_match_an_id(query) || names_decide(&hits, limit) {
+            return Ok(unranked(hits));
+        }
+        #[cfg(test)]
+        ID_SCANS.set(ID_SCANS.get() + 1);
+        let both = format!(
+            "(SELECT rowid AS r FROM {names} WHERE {names} MATCH ?{p} UNION {ids}) c
+                CROSS JOIN {table} {alias} ON {alias}.rowid=c.r",
+            names = self.names,
+            ids = self.ids,
+            p = self.match_parameter,
+        );
+        ranked(db, &self.sql(&both), &values).map(unranked)
+    }
+
+    fn sql(&self, from: &str) -> String {
+        format!("SELECT {} FROM {from} {}", self.columns, self.rest)
+    }
+}
+
+/// The ID-scan shortcut. Not a fallback: it runs after the names query has
+/// succeeded and only decides whether a second, larger query could change
+/// the answer. A row the ID scan adds matches through its ID only, so its
+/// name neither equals nor starts with the query: it ranks 2. Hits come
+/// ordered by rank. If the names query already filled all `limit` rows with
+/// rank-0 or rank-1 hits, every added row would sort after them and fall
+/// beyond the LIMIT, so the answer is the same without the scan.
+fn names_decide(hits: &[(String, String, i64)], limit: i64) -> bool {
+    i64::try_from(hits.len()).is_ok_and(|n| n >= limit) && hits.last().is_some_and(|h| h.2 <= 1)
+}
+
+fn unranked(hits: Vec<(String, String, i64)>) -> Vec<(String, String)> {
+    hits.into_iter().map(|(a, b, _)| (a, b)).collect()
+}
+
 /// W2's ranked `(version_id, syntax_id)` hits in `revision`, at most
 /// `lookahead` of them. SQLite `lower` folds ASCII only, and `instr` treats
 /// the query as literal bytes, not a pattern.
@@ -46,27 +145,20 @@ pub(super) fn w2_hits(
     query: &str,
     lookahead: i64,
 ) -> Result<Vec<(String, String)>> {
-    let prefilter = match_expression(query);
-    let (from, candidates) = if prefilter.is_some() {
-        (
-            "native_declaration_trigrams CROSS JOIN native_version_declarations d
-                ON d.rowid=native_declaration_trigrams.rowid",
-            "native_declaration_trigrams MATCH ?4 AND",
-        )
-    } else {
-        ("native_version_declarations d", "")
-    };
-    let sql = format!(
-        "SELECT d.version_id,d.syntax_id FROM {from}
-        JOIN revision_documents m ON m.document_version_id=d.version_id AND m.revision_id=?1
-        WHERE {candidates} (instr(lower(d.name),lower(?2))>0 OR instr(lower(d.syntax_id),lower(?2))>0)
-        ORDER BY CASE WHEN lower(d.name)=lower(?2) THEN 0
-            WHEN instr(lower(d.name),lower(?2))=1 THEN 1 ELSE 2 END,
-            d.name COLLATE BINARY ASC, d.syntax_id COLLATE BINARY ASC LIMIT ?3"
-    );
-    let mut values: Vec<&dyn rusqlite::ToSql> = vec![&revision, &query, &lookahead];
-    values.extend(prefilter.as_ref().map(|e| e as &dyn rusqlite::ToSql));
-    pairs(db, &sql, &values)
+    Search {
+        columns: "d.version_id,d.syntax_id,CASE WHEN lower(d.name)=lower(?2) THEN 0
+            WHEN instr(lower(d.name),lower(?2))=1 THEN 1 ELSE 2 END",
+        source: "native_version_declarations d",
+        names: "native_declaration_trigrams",
+        ids: "SELECT d.rowid FROM revision_documents m
+            JOIN native_version_declarations d ON d.version_id=m.document_version_id
+            WHERE m.revision_id=?1 AND instr(lower(d.syntax_id),lower(?2))>0",
+        rest: "JOIN revision_documents m ON m.document_version_id=d.version_id AND m.revision_id=?1
+            WHERE instr(lower(d.name),lower(?2))>0 OR instr(lower(d.syntax_id),lower(?2))>0
+            ORDER BY 3, d.name COLLATE BINARY ASC, d.syntax_id COLLATE BINARY ASC LIMIT ?3",
+        match_parameter: 4,
+    }
+    .hits(db, query, lookahead, &[&revision, &query, &lookahead])
 }
 
 /// The browser and CLI search's ranked `(path, payload)` graph-node hits in
@@ -76,34 +168,31 @@ pub(super) fn graph_hits(
     query: &str,
     limit: i64,
 ) -> Result<Vec<(String, String)>> {
-    let prefilter = match_expression(query);
-    let (from, candidates) = if prefilter.is_some() {
-        (
-            "graph_node_trigrams CROSS JOIN graph_nodes n ON n.rowid=graph_node_trigrams.rowid",
-            "graph_node_trigrams MATCH ?3 AND",
-        )
-    } else {
-        ("graph_nodes n", "")
-    };
-    let sql = format!(
-        "SELECT n.path,n.payload FROM {from} JOIN revision_documents m ON m.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND m.graph_projection_id=n.projection_id WHERE {candidates} (instr(lower(n.name),lower(?1)) > 0 OR instr(lower(n.id),lower(?1)) > 0) ORDER BY CASE WHEN lower(n.name)=lower(?1) THEN 0 WHEN instr(lower(n.name),lower(?1))=1 THEN 1 ELSE 2 END,n.name,n.id LIMIT ?2"
-    );
-    let mut values: Vec<&dyn rusqlite::ToSql> = vec![&query, &limit];
-    values.extend(prefilter.as_ref().map(|e| e as &dyn rusqlite::ToSql));
-    pairs(db, &sql, &values)
+    Search {
+        columns: "n.path,n.payload,CASE WHEN lower(n.name)=lower(?1) THEN 0 WHEN instr(lower(n.name),lower(?1))=1 THEN 1 ELSE 2 END",
+        source: "graph_nodes n",
+        names: "graph_node_trigrams",
+        ids: "SELECT n.rowid FROM revision_documents m
+            JOIN graph_nodes n ON n.projection_id=m.graph_projection_id
+            WHERE m.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1)
+            AND instr(lower(n.id),lower(?1))>0",
+        rest: "JOIN revision_documents m ON m.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND m.graph_projection_id=n.projection_id WHERE instr(lower(n.name),lower(?1)) > 0 OR instr(lower(n.id),lower(?1)) > 0 ORDER BY 3,n.name,n.id LIMIT ?2",
+        match_parameter: 3,
+    }
+    .hits(db, query, limit, &[&query, &limit])
 }
 
-/// Run one search. SQLite contention is the typed, retried `storage_busy`;
-/// every other error, from FTS5 or not, fails the read. Nothing here retries
-/// the literal scan after FTS5 has run.
-fn pairs(
+/// Run one search, selecting `(a, b, rank)`. SQLite contention is the typed,
+/// retried `storage_busy`; every other error, from FTS5 or not, fails the
+/// read. Nothing here retries the literal scan after FTS5 has run.
+fn ranked(
     db: &Connection,
     sql: &str,
     values: &[&dyn rusqlite::ToSql],
-) -> Result<Vec<(String, String)>> {
+) -> Result<Vec<(String, String, i64)>> {
     storage_result((|| {
         db.prepare(sql)?
-            .query_map(values, |r| Ok((r.get(0)?, r.get(1)?)))?
+            .query_map(values, |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
             .collect()
     })())
 }
@@ -111,6 +200,13 @@ fn pairs(
 #[cfg(test)]
 thread_local! {
     static FORCE_LITERAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static ID_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many ID scans this thread has run, so a test can see the shortcut.
+#[cfg(test)]
+pub(crate) fn id_scans() -> usize {
+    ID_SCANS.get()
 }
 
 /// Run `read` with the prefilter off on this thread, so a test can compare
@@ -163,6 +259,44 @@ mod tests {
     }
 
     #[test]
+    fn id_shaped_queries_are_exactly_the_substrings_an_id_can_contain() {
+        let id = format!("sid:v1:{}", "0123456789abcdef".repeat(2));
+        // Every substring of a canonical ID, in any ASCII case, is ID-shaped.
+        for start in 0..id.len() {
+            for end in start + 1..=id.len() {
+                let part = &id[start..end];
+                assert!(can_match_an_id(part), "{part:?}");
+                assert!(can_match_an_id(&part.to_ascii_uppercase()), "{part:?}");
+            }
+        }
+        for query in [
+            "f0001", "add", "DEAD", "sid", "v1:", ":v1:ab", "d:v1:0", "1:a", "sid:v1:",
+        ] {
+            assert!(can_match_an_id(query), "{query:?}");
+        }
+        let too_long = format!("sid:v1:{}", "a".repeat(33));
+        let many_hex = "a".repeat(33);
+        for query in [
+            "parseConfig",
+            "peerValue",
+            "zzzznotfound",
+            "f0001x",
+            "g00",
+            "sid:v2:",
+            "sid:v1:ag",
+            "ab:",
+            "1:g",
+            "sid:v1:sid",
+            "éab",
+            "a b",
+            too_long.as_str(),
+            many_hex.as_str(),
+        ] {
+            assert!(!can_match_an_id(query), "{query:?}");
+        }
+    }
+
+    #[test]
     fn the_query_is_ascii_lowered_and_quoted_as_one_literal() {
         assert_eq!(match_expression("FooÉ").as_deref(), Some("\"fooÉ\""));
         assert_eq!(
@@ -209,7 +343,8 @@ mod tests {
 
     /// The triggers keep each table equal to its source rows through inserts,
     /// deletes (as retention and rebaseline delete), updates and reused rowids:
-    /// for every query the table's candidates are exactly the literal matches.
+    /// for every query the table's candidates are exactly the literal name
+    /// matches.
     #[test]
     fn triggers_keep_the_tables_exact_through_deletes_updates_and_reused_rowids() {
         let db = Connection::open_in_memory().unwrap();
@@ -252,13 +387,9 @@ mod tests {
             "alp", "ALPHA", "gam", "Gamma", "ren", "ünï", "ÜNÏ", "a.js", "sid:v1:", "0005", "meg",
         ] {
             let expression = match_expression(query).unwrap();
-            for (table, source, id) in [
-                (
-                    "native_declaration_trigrams",
-                    "native_version_declarations",
-                    "syntax_id",
-                ),
-                ("graph_node_trigrams", "graph_nodes", "id"),
+            for (table, source) in [
+                ("native_declaration_trigrams", "native_version_declarations"),
+                ("graph_node_trigrams", "graph_nodes"),
             ] {
                 let ids = |sql: &str, values: &[&dyn rusqlite::ToSql]| -> Vec<i64> {
                     db.prepare(sql)
@@ -274,8 +405,7 @@ mod tests {
                 );
                 let literal = ids(
                     &format!(
-                        "SELECT rowid FROM {source} WHERE instr(lower(name),lower(?1))>0
-                            OR instr(lower({id}),lower(?1))>0 ORDER BY rowid"
+                        "SELECT rowid FROM {source} WHERE instr(lower(name),lower(?1))>0 ORDER BY rowid"
                     ),
                     &[&query],
                 );
