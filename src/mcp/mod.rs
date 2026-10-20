@@ -1,5 +1,7 @@
 //! Bounded read-only MCP protocol and single-connection stdio transport.
 pub mod catalog;
+#[cfg(test)]
+mod find_trigram_tests;
 mod projection;
 pub mod session;
 pub mod tools;

@@ -39,7 +39,7 @@ Each item below ends with its open questions. The decisions they add up to are:
 | D9 | Retrieval, not evidence | Hits have no relevance provenance or score; agents verify with `trellis_declaration` |
 | D10 | Size budget | int8 vectors at ≤1024 dimensions; a size cap on `vectors.db`; FTS5 measured against #199. Whether search waits for #199's size items is an owner decision |
 | D11 | Remote embedding (voyage-code-4) | Out of scope until the owner opts in; it would need its own contract change |
-| D12 | FTS5 and #199 item 5 (Q-8) | Two tables: a trigram prefilter for W2 (every hit still verified by W2's literal rule) and a split-identifier table for search |
+| D12 | FTS5 and #199 item 5 (Q-8) | Two tables: a trigram prefilter for W2 (every hit still verified by W2's literal rule) and a split-identifier table for search. **The W2 prefilter is ratified by [Decision 0013](semantic-evidence/decisions/0013-symbol-search-trigram-prefilter.md);** the search table stays proposed |
 | D13 | Hybrid ordering | A fixed, deterministic fusion and tie-break rule (§1), part of the contract; changing it is a contract change. BM25 is scored over a head-only FTS5 table. The query transformation is total. No cross-call output promise by default; whether to add a cross-call determinism guarantee later is open question 6, to be specified and reviewed if the owner asks for it. Cache-key reuse doesn't imply byte-identical vectors |
 
 ## 1. New MCP tool and catalog version
@@ -665,6 +665,8 @@ The #211 benchmark did not run it.
 23. Does the owner want the remote arm measured at all, and on which repository?
 
 ## 11. Coordination with #199 item 5 (Q-8, symbol search speed)
+
+**Status:** the W2 part below is ratified by [Decision 0013](semantic-evidence/decisions/0013-symbol-search-trigram-prefilter.md) (2026-10-20). The search-table part stays proposed with #211.
 
 **Touches.**
 

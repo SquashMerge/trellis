@@ -583,21 +583,12 @@ impl EvidenceResponse {
                 counts[4] += 1;
             }
         }
-        // SQLite lower folds ASCII only. instr treats the query as literal bytes, not a pattern.
-        let mut statement = self.db.prepare(
-            "SELECT d.version_id,d.syntax_id FROM native_version_declarations d
-            JOIN revision_documents m ON m.document_version_id=d.version_id AND m.revision_id=?1
-            WHERE instr(lower(d.name),lower(?2))>0 OR instr(lower(d.syntax_id),lower(?2))>0
-            ORDER BY CASE WHEN lower(d.name)=lower(?2) THEN 0
-                WHEN instr(lower(d.name),lower(?2))=1 THEN 1 ELSE 2 END,
-                d.name COLLATE BINARY ASC, d.syntax_id COLLATE BINARY ASC LIMIT ?3",
+        let hits = super::symbol_trigrams::w2_hits(
+            &self.db,
+            &selected.key,
+            query,
+            i64::try_from(limit + 1)?,
         )?;
-        let hits = statement
-            .query_map(
-                params![selected.key, query, i64::try_from(limit + 1)?],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
-            )?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
         let has_more = hits.len() > limit;
         let mut symbols = Vec::new();
         let mut provenance = Vec::new();
