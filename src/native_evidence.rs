@@ -1272,6 +1272,7 @@ fn spool_full_capture_with(
     // A capture can feed exactly one graph projection. The following pass
     // projects one document at a time; its per-document helper does not claim.
     capture.claim_graph_projection()?;
+    let prepared_labels = crate::indexer::prepare_spooled_display_labels(options, capture);
     for index in 0..spool.len() {
         ensure!(
             !cancel.load(std::sync::atomic::Ordering::Acquire),
@@ -1290,13 +1291,14 @@ fn spool_full_capture_with(
         let mut facts: Artifact = serde_json::from_slice(&data)?;
         validate_spooled_document(&mut facts, document, file)?;
         observe(&document.key, FullNativeStage::Validated);
-        let graph = crate::indexer::project_native_document(
+        let graph = crate::indexer::project_native_spooled_document(
             options,
             capture,
             &facts,
             &document.key.path,
             cancel,
             &|_| {},
+            &prepared_labels,
         )?;
         crate::indexer::validate_native_graph_records(&graph, &facts, cancel)?;
         spool.stats.files += graph.stats.files;
@@ -4031,6 +4033,98 @@ mod full_document_spool_tests {
                     .collect::<Vec<_>>()
             );
         }
+    }
+
+    #[test]
+    fn prepared_multifile_scip_labels_match_full_projection_and_first_duplicate_wins() {
+        use protobuf::Message;
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let sources = [
+            ("A.java", "class A {}\n", vec![0, 6, 7], "A"),
+            ("b.py", "def g():\n    return 1\n", vec![0, 4, 5], "g"),
+            ("c.js", "function f() {}\n", vec![0, 9, 10], "f"),
+        ];
+        let mut manifest = BTreeMap::new();
+        let mut index = scip::types::Index::new();
+        for (path, source, range, name) in &sources {
+            fs::write(workspace.path().join(path), source).unwrap();
+            manifest.insert(*path, hash(source.as_bytes()));
+            let mut doc = scip::types::Document::new();
+            doc.relative_path = (*path).into();
+            let mut occurrence = scip::types::Occurrence::new();
+            occurrence.range = range.clone();
+            occurrence.symbol_roles = if *path == "c.js" { 0 } else { 1 };
+            occurrence.symbol = format!("scip display {name}()");
+            doc.occurrences.push(occurrence);
+            index.documents.push(doc);
+        }
+        let mut duplicate = scip::types::Document::new();
+        duplicate.relative_path = "c.js".into();
+        let mut occurrence = scip::types::Occurrence::new();
+        occurrence.range = vec![0, 9, 10];
+        occurrence.symbol_roles = 1;
+        occurrence.symbol = "scip later f()".into();
+        duplicate.occurrences.push(occurrence);
+        index.documents.push(duplicate);
+        fs::write(
+            workspace.path().join("index.scip"),
+            index.write_to_bytes().unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            workspace.path().join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let mut options = IndexOptions::new(workspace.path().to_owned());
+        options.scip_path = Some(workspace.path().join("index.scip"));
+        options.manifest_path = Some(workspace.path().join("manifest.json"));
+        let root = fs::canonicalize(workspace.path()).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let baseline_capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
+        let baseline_native =
+            from_capture(&baseline_capture, &root, store.root_id(), &cancel).unwrap();
+        let baseline = crate::indexer::project_native(
+            &options,
+            &baseline_capture,
+            &baseline_native,
+            &cancel,
+            &|_| {},
+        )
+        .unwrap();
+        let capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
+        let spool = spool_full_capture(
+            &options,
+            &capture,
+            &root,
+            store.root_id(),
+            &cancel,
+            &|_| {},
+            |_, _| {},
+            state.path(),
+        )
+        .unwrap();
+        let mut nodes = Vec::new();
+        for index in 0..spool.len() {
+            let (_, graph) = spool.read(index).unwrap();
+            nodes.extend(graph.nodes);
+        }
+        nodes.sort_by(|a, b| a.id.cmp(&b.id));
+        assert_eq!(nodes, baseline.nodes);
+        for name in ["A", "g"] {
+            assert!(
+                nodes
+                    .iter()
+                    .any(|node| node.name == name && node.display_label.is_some())
+            );
+        }
+        assert!(
+            nodes
+                .iter()
+                .any(|node| node.name == "f" && node.display_label.is_none())
+        );
     }
 
     #[test]
