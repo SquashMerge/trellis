@@ -9,6 +9,15 @@ use crate::{
 use anyhow::{Result, ensure};
 use std::sync::{Arc, atomic::Ordering};
 
+#[cfg(test)]
+thread_local! {
+    static FULL_STREAM_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+#[cfg(test)]
+fn full_stream_runs_for_tests() -> usize {
+    FULL_STREAM_RUNS.with(std::cell::Cell::get)
+}
+
 // Optional diagnostics never write on the publication or maintenance thread.
 // A full bounded channel increments a loss counter rather than blocking work.
 struct DiagnosticMarkers {

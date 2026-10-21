@@ -901,3 +901,19 @@ fn full_publication_never_rebuilds_its_own_fresh_artifact() {
     );
     assert_eq!(store.status().unwrap().revision, pin);
 }
+
+#[test]
+fn cold_full_publication_uses_bounded_document_stream() {
+    let state = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    fs::write(workspace.path().join("a.js"), "function a() { return b(); }\n").unwrap();
+    fs::write(workspace.path().join("b.py"), "def b():\n    return 1\n").unwrap();
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    let options = IndexOptions::new(workspace.path().to_owned());
+    let cancel = Arc::new(AtomicBool::new(false));
+    let before = full_stream_runs_for_tests();
+    let (pin, _owner) = reconcile_workspace(&store, &options, &cancel, |_| {}).unwrap();
+    assert_eq!(full_stream_runs_for_tests() - before, 1,
+        "cold full publication must use the bounded per-document stream");
+    assert_eq!(store.status().unwrap().revision, pin);
+}
