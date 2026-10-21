@@ -4428,11 +4428,18 @@ fn write_native(
             )?;
         }
     }
-    let selected_documents = a
-        .revision
-        .documents
-        .get(ordinal_start..ordinal_start.saturating_add(graph.files.len()))
-        .context("native document ordinal outside revision header")?;
+    let selected_documents = if write_header {
+        a.revision
+            .documents
+            .get(ordinal_start..ordinal_start.saturating_add(graph.files.len()))
+            .context("native document ordinal outside revision header")?
+    } else {
+        ensure!(
+            graph.files.len() == 1 && a.revision.documents.len() == 1,
+            "native_evidence_required: streamed document inventory differs"
+        );
+        &a.revision.documents
+    };
     let documents: BTreeMap<_, _> = selected_documents
         .iter()
         .map(|doc| (doc.key.path.as_str(), doc))
@@ -10347,7 +10354,7 @@ impl Store {
                     .is_some_and(|(version, _, _)| *version == ids.version_id);
                 let measured = if drift || reused_version {
                     Some(publication_native_witness(
-                        native.revision.documents.get(index)
+                        native.revision.documents.first()
                             .context("new native document absent")?,
                         &native.producer,
                         native.coverage.first().context("new native coverage absent")?,
@@ -10823,31 +10830,38 @@ impl Store {
         };
         let projections = if let Some(spool) = stream {
             let mut projections = BTreeMap::new();
-            if spool.len() == 0 {
-                // Even an empty revision has a producer/source-set/header,
-                // captured inputs and a binding. It has no document rows.
-                projections = write_native(
-                    &tx,
-                    (native, capture, graph, &classes, &extractions),
-                    revision,
-                    &stats,
-                    cancel,
-                    &mut immutable,
-                    &reuse,
-                    &rows,
-                    true,
-                    0,
-                    &graph.diagnostics,
-                )
-                .map_err(classify_immutable)?;
-            }
+            // Persist the full captured revision header exactly once, including
+            // the empty-workspace case. Per-document Artifacts keep only their
+            // own document rather than cloning the full revision header.
+            let empty_graph = Graph::default();
+            let header_rows = BTreeMap::new();
+            write_native(
+                &tx,
+                (native, capture, &empty_graph, &classes, &extractions),
+                revision,
+                &stats,
+                cancel,
+                &mut immutable,
+                &reuse,
+                &header_rows,
+                true,
+                0,
+                &graph.diagnostics,
+            )
+            .map_err(classify_immutable)?;
             for index in 0..spool.len() {
                 check_cancel(cancel)?;
                 let (artifact, document_graph) = spool.read(index)?;
                 ensure!(
                     artifact.producer == native.producer
                         && artifact.source_set == native.source_set
-                        && artifact.revision == native.revision,
+                        && artifact.revision.id == native.revision.id
+                        && artifact.revision.source_set_id == native.revision.source_set_id
+                        && artifact.revision.toolchain_hash == native.revision.toolchain_hash
+                        && artifact.revision.config_hash == native.revision.config_hash
+                        && artifact.revision.dependency_hash == native.revision.dependency_hash
+                        && artifact.revision.documents.as_slice()
+                            == std::slice::from_ref(&native.revision.documents[index]),
                     "native_evidence_required: streamed revision header differs"
                 );
                 let file = document_graph
@@ -10875,7 +10889,7 @@ impl Store {
                     &mut immutable,
                     &reuse,
                     &rows,
-                    index == 0,
+                    false,
                     index,
                     &graph.diagnostics,
                 )
