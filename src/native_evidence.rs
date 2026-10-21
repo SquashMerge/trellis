@@ -1048,7 +1048,7 @@ impl FullDocumentSpool {
     pub(crate) fn diagnostics(&self) -> &[Diagnostic] {
         &self.diagnostics
     }
-    /// Read a single document, retaining the full captured revision header.
+    /// Read one document with full revision identity but only its own document row.
     /// This is repeatable; no decoded document is cached between reads.
     pub(crate) fn read(&self, index: usize) -> Result<(Artifact, crate::model::Graph)> {
         let document = self
@@ -1072,10 +1072,7 @@ impl FullDocumentSpool {
                 && artifact.coverage[0].document_path == document.key.path,
             "native spool document/header mismatch"
         );
-        artifact
-            .revision
-            .documents
-            .clone_from(&self.header.revision.documents);
+        artifact.revision.documents.push(document.clone());
         let graph: crate::model::Graph = serde_json::from_slice(&graph)?;
         ensure!(
             graph.files.len() == 1 && graph.files[0].path == document.key.path,
@@ -1140,8 +1137,8 @@ impl FullDocumentSpool {
 }
 
 /// Validate the exact one-document view while retaining the full revision ID
-/// and captured config/toolchain/dependency binding. Callers restore the full
-/// revision document list before constructing the public projection.
+/// and captured config/toolchain/dependency binding. The full document list
+/// stays only in the spool header, not in each projected document.
 fn validate_spooled_document(
     facts: &mut Artifact,
     document: &Document,
@@ -1152,9 +1149,7 @@ fn validate_spooled_document(
         "native spool facts/document mismatch"
     );
     facts.revision.documents.push(document.clone());
-    let result = facts.validate_structure(std::slice::from_ref(file));
-    facts.revision.documents.clear();
-    result
+    facts.validate_structure(std::slice::from_ref(file))
 }
 
 /// Admit an entire immutable capture without retaining its full artifact or
@@ -1295,10 +1290,6 @@ fn spool_full_capture_with(
         let mut facts: Artifact = serde_json::from_slice(&data)?;
         validate_spooled_document(&mut facts, document, file)?;
         observe(&document.key, FullNativeStage::Validated);
-        facts
-            .revision
-            .documents
-            .clone_from(&spool.header.revision.documents);
         let graph = crate::indexer::project_native_document(
             options,
             capture,
@@ -3951,7 +3942,13 @@ mod full_document_spool_tests {
             let path = &spool.header().revision.documents[index].key.path;
             let (native, graph) = spool.read(index).unwrap();
             assert_eq!(spool.read(index).unwrap(), (native.clone(), graph.clone()));
-            assert_eq!(native.revision, baseline.revision);
+            assert_eq!(
+                native.revision,
+                Revision {
+                    documents: vec![baseline.revision.documents[index].clone()],
+                    ..baseline.revision.clone()
+                }
+            );
             assert_eq!(
                 native.coverage,
                 baseline
