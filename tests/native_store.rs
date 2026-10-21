@@ -4763,7 +4763,7 @@ fn cold_stream_matches_plain_artifact_publication_rows() {
     }
     // Compare the selected manifest without its intentionally different revision key.
     let selected = "SELECT source_set_id,language,path,document_version_id,graph_projection_id,class_projection_id,capture_stat,coverage_requested,coverage_selected,coverage_state,coverage_diagnostic,ordinal FROM revision_documents ORDER BY ordinal";
-    assert_eq!(values(&plain_db, &selected), values(&stream_db, &selected));
+    assert_eq!(values(&plain_db, selected), values(&stream_db, selected));
     assert_eq!(
         values(&plain_db, "SELECT stats,diagnostics FROM index_metadata"),
         values(&stream_db, "SELECT stats,diagnostics FROM index_metadata"),
