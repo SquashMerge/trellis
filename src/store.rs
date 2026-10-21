@@ -10823,6 +10823,24 @@ impl Store {
         };
         let projections = if let Some(spool) = stream {
             let mut projections = BTreeMap::new();
+            if spool.len() == 0 {
+                // Even an empty revision has a producer/source-set/header,
+                // captured inputs and a binding. It has no document rows.
+                projections = write_native(
+                    &tx,
+                    (native, capture, graph, &classes, &extractions),
+                    revision,
+                    &stats,
+                    cancel,
+                    &mut immutable,
+                    &reuse,
+                    &rows,
+                    true,
+                    0,
+                    &graph.diagnostics,
+                )
+                .map_err(classify_immutable)?;
+            }
             for index in 0..spool.len() {
                 check_cancel(cancel)?;
                 let (artifact, document_graph) = spool.read(index)?;
