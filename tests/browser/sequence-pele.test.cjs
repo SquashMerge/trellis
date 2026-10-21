@@ -137,3 +137,92 @@ test("failed async group expansion visibly installs complete legacy DTO",async()
  assert.match(await page.locator("#sequence-diagram").innerText(),/original complete group/);
  assert.ok(await page.locator('[data-source-step-id="unsupported-child"]').count(),"expanded legacy view retains original child");
 });
+
+// AC4 regression: a pin change during pending work cannot install a late result.
+test("late Pele success, failure, and timeout leave the newer pinned diagram untouched", async () => {
+ const view=fixture("rust");
+ const observations=await page.evaluate(async view=>{
+   const container=document.querySelector("#sequence-diagram"), state=document.querySelector("#state");
+   const original=window.pele, results=[];
+   try {
+     for(const scenario of ["success","failure","timeout"]) {
+       window.current=true;container.replaceChildren();state.textContent="current revision";
+       const initial=await TrellisPeleSequence.render(container,view,null,new Set(),{isCurrent:()=>window.current});
+       if(initial.status!=="rendered") throw Error(initial.reason);
+       const prior=container.firstElementChild;
+       let resolveWork,rejectWork;
+       window.pele={render:()=>({get svg(){return new Promise((resolve,reject)=>{resolveWork=resolve;rejectWork=reject;});}})};
+       const oldRequest=TrellisPeleSequence.render(container,view,null,new Set(),{
+         isCurrent:()=>window.current,
+         onSelect:()=>{state.textContent="old selected";},
+         onUnsupported:()=>{state.textContent="old fallback";}
+       });
+       await Promise.resolve();
+       window.current=false; // The application's pin check changed while Pele was pending.
+       if(scenario==="success") resolveWork(original.render(TrellisPeleSequence.project(view).source,{}));
+       if(scenario==="failure") rejectWork(new Error("old renderer failed"));
+       const outcome=await oldRequest; // timeout runs the real production 5-second timer.
+       results.push({scenario,status:outcome.status,same:container.firstElementChild===prior,
+         state:state.textContent,svg:!!container.querySelector("svg.pele.trellis-pele")});
+       window.pele=original;
+     }
+   }finally{window.pele=original;window.current=true;}
+   return results;
+ },view);
+ for(const observation of observations) {
+   assert.equal(observation.status,"stale",observation.scenario);
+   assert.equal(observation.same,true,observation.scenario);
+   assert.equal(observation.svg,true,observation.scenario);
+   assert.equal(observation.state,"current revision",observation.scenario);
+ }
+});
+
+test("24 levels project; level 25 and Mermaid source above 512 KiB reject atomically", async()=>{
+ const view=fixture("rust"),leaf=structuredClone(view.steps[0]);
+ const depth=(levels)=>{let node={...leaf,id:`depth-${levels-1}`,children:[]};
+   for(let n=levels-2;n>=0;n--) node={...leaf,id:`depth-${n}`,kind:"note",children:[node]};
+   return node;};
+ view.steps=[depth(24)];
+ const allowable=await render(view);
+ assert.equal(allowable.status,"rendered",allowable.reason);
+ view.steps=[depth(25)];
+ const tooDeep=await render(view);
+ assert.equal(tooDeep.status,"unsupported");assert.match(tooDeep.reason,/depth/);
+ const sourceView=fixture("rust");sourceView.steps=[{...leaf,label:"L".repeat(512*1024),id:"large-source"}];
+ const oversized=await render(sourceView,{showDetails:true});
+ assert.equal(oversized.status,"unsupported");assert.match(oversized.reason,/Mermaid source too large/);
+ // The last successful view stays whole, not a partial diagram of the rejected input.
+ assert.equal(await page.locator('.pele-note[data-trellis-step-id="depth-0"]').count(),1);
+ assert.equal(await page.locator('.pele-note[data-trellis-step-id="large-source"]').count(),0);
+});
+
+test("12,000 SVG nodes allowed and 12,001 reject with no partial SVG or selection",async()=>{
+ const view=fixture("rust"),result=await page.evaluate(async view=>{
+   const container=document.querySelector("#sequence-diagram"),original=window.pele;
+   const first=await TrellisPeleSequence.render(container,view,null,new Set(),{});
+   if(first.status!=="rendered") throw Error(first.reason);
+   const prior=container.firstElementChild;
+   const projection=TrellisPeleSequence.project(view);
+   const raw=original.render(projection.source,{}).svg;
+   const parser=new DOMParser().parseFromString(raw,"image/svg+xml");
+   const baseNodes=parser.querySelectorAll("*").length;
+   const filler='<g class="pele-test-padding"></g>';
+   const make=(count)=>raw.replace("</svg>",filler.repeat(count-baseNodes)+"</svg>");
+   let selections=0;
+   try {
+     window.pele={render:()=>({svg:make(12000)})};
+     const boundary=await TrellisPeleSequence.render(container,view,null,new Set(),{onSelect:()=>selections++});
+     const installed=container.firstElementChild;
+     const noteIds=[...container.querySelectorAll('.pele-note[data-trellis-step-id]')].map(n=>n.dataset.trellisStepId);
+     window.pele={render:()=>({svg:make(12001)})};
+     const overflow=await TrellisPeleSequence.render(container,view,null,new Set(),{onSelect:()=>selections++});
+     return {boundary:boundary.status,overflow:overflow.status,reason:overflow.reason,
+       kept:installed===container.firstElementChild,notOld:installed!==prior,nodes:installed.querySelectorAll('*').length+1,
+       noteIds,selections};
+   }finally{window.pele=original;}
+ },view);
+ assert.equal(result.boundary,"rendered");assert.equal(result.nodes,12000);
+ assert.equal(result.overflow,"unsupported");assert.match(result.reason,/SVG element/);
+ assert.equal(result.kept,true);assert.equal(result.notOld,true);
+ assert.deepEqual(result.noteIds,steps(view.steps).map(step=>step.id));assert.equal(result.selections,0);
+});
