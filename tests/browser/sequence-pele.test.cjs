@@ -147,29 +147,32 @@ test("late Pele success, failure, and timeout leave the newer pinned diagram unt
    const container=document.querySelector("#sequence-diagram"), state=document.querySelector("#state");
    const original=window.pele, results=[];
    try {
-     for(const scenario of ["success","failure","timeout"]) {
+     for(const scenario of ["success","failure","timeout","source-success","source-failure","source-timeout"]) {
+       const sourceOnly=scenario.startsWith("source-");
+       const completion=scenario.replace(/^source-/,"");
        let activePin="old",selections=0,sources=0,oldSelections=0,oldSources=0;
        container.replaceChildren();state.textContent="old pinned revision";
        const oldCurrent=()=>activePin==="old",newCurrent=()=>activePin==="new";
        const initial=await TrellisPeleSequence.render(container,oldView,()=>oldSources++,new Set(),
-         {isCurrent:oldCurrent,onSelect:()=>oldSelections++});
+         {isCurrent:oldCurrent,...(sourceOnly?{}:{onSelect:()=>oldSelections++})});
        if(initial.status!=="rendered") throw Error(initial.reason);
        const staleNote=container.querySelector('.pele-note[data-trellis-step-id]');
        let resolveWork,rejectWork;
        window.pele={render:()=>({get svg(){return new Promise((resolve,reject)=>{resolveWork=resolve;rejectWork=reject;});}})};
        const oldRequest=TrellisPeleSequence.render(container,oldView,()=>oldSources++,new Set(),{
-         isCurrent:oldCurrent,onSelect:()=>oldSelections++,onUnsupported:()=>{state.textContent="old fallback";}
+         isCurrent:oldCurrent,...(sourceOnly?{}:{onSelect:()=>oldSelections++}),
+         onUnsupported:()=>{state.textContent="old fallback";}
        });
        await Promise.resolve();
        if(!resolveWork || !rejectWork) throw Error("old Pele work did not start");
        activePin="new";window.pele=original;
        const newer=await TrellisPeleSequence.render(container,newView,()=>sources++,new Set(),
-         {isCurrent:newCurrent,onSelect:()=>selections++});
+         {isCurrent:newCurrent,...(sourceOnly?{}:{onSelect:()=>selections++})});
        if(newer.status!=="rendered") throw Error(newer.reason);
        state.textContent="new pinned revision";
        const currentDiagram=container.firstElementChild;
-       if(scenario==="success") resolveWork(original.render(TrellisPeleSequence.project(oldView).source,{}).svg);
-       if(scenario==="failure") rejectWork(new Error("old renderer failed"));
+       if(completion==="success") resolveWork(original.render(TrellisPeleSequence.project(oldView).source,{}).svg);
+       if(completion==="failure") rejectWork(new Error("old renderer failed"));
        const outcome=await oldRequest; // timeout uses the real production 5-second timer.
        staleNote.dispatchEvent(new MouseEvent("click",{bubbles:true}));
        staleNote.dispatchEvent(new KeyboardEvent("keydown",{key:"Enter",bubbles:true}));

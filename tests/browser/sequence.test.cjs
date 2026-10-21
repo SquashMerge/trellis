@@ -145,3 +145,82 @@ test("published truncated producer shows bound while retaining original call wit
  assert.deepEqual(await page.locator("#source .source-line.highlight .line-number").allTextContents(),[String(first.range.startLine)]);
  assert.match(await page.locator("#source").innerText(),/observed_0\(\)/);
 },"flow.js"));
+
+// Exercise the app's own unsupported branch, not a test-side legacy render.
+// The response is based on a real published SequenceView and keeps its pin/seed.
+test("published app visibly falls back for current depth, Mermaid, SVG and real timeout limits",{timeout:240000},async()=>published(source,async({page,dto,pin})=>{
+ const original=structuredClone(dto),leaf=original.steps.find(s=>s.kind==="call");
+ assert.ok(leaf,"published call witness required");
+ const cases=["depth","mermaid","svg","timeout"];
+ for(const scenario of cases) {
+   const changed=structuredClone(original);
+   const ids=[];
+   if(scenario==="depth") {
+     let child={...structuredClone(leaf),id:"fallback-depth-24",label:"deep original evidence",children:[],alternate:[],hidden:false};
+     ids.push(child.id);
+     for(let n=23;n>=0;n--) {
+       child={...structuredClone(leaf),id:`fallback-depth-${n}`,kind:"note",label:`depth evidence ${n}`,
+         children:[child],alternate:[],hidden:false};
+       ids.push(child.id);
+     }
+     changed.steps=[child];
+   } else if(scenario==="mermaid") {
+     changed.steps=[{...structuredClone(leaf),id:"fallback-large-source",label:"M".repeat(512*1024),
+       children:[],alternate:[],hidden:false}];ids.push(changed.steps[0].id);
+   } else {
+     changed.steps=[{...structuredClone(leaf),id:`fallback-${scenario}`,label:`${scenario} measured evidence`,
+       children:[],alternate:[],hidden:false}];ids.push(changed.steps[0].id);
+   }
+   assert.deepEqual(changed.revision,pin);
+   assert.equal(changed.seed.id,original.seed.id);
+   const responseRequests=[];const sourceRequests=[];
+   const capture=request=>{if(new URL(request.url()).pathname.endsWith("/source"))sourceRequests.push(request.url());};
+   page.on("request",capture);
+   const routePattern="**/api/checkouts/*/sequence";
+   const respond=async route=>{
+     const body=route.request().postDataJSON();responseRequests.push(body);
+     assert.equal(body.seed,changed.seed.id);assert.deepEqual(body.expectedRevision,pin);
+     await route.fulfill({status:200,contentType:"application/json",body:JSON.stringify(changed)});
+   };
+   await page.route(routePattern,respond);
+   try {
+     await page.evaluate(scenario=>{
+       const originalPele=window.pele,originalRender=originalPele.render;
+       window.testOriginalPele=originalPele;
+       if(scenario==="svg") window.pele={render:(...args)=>{
+         const result=originalRender(...args),svg=result.svg;
+         // Counting known SVG opening tags avoids DOM-parsing Pele's raw
+         // inline styles, which would itself violate the production CSP.
+         const count=(svg.match(/<(?:svg|g|path|rect|text|tspan)(?=[\s>])/g)||[]).length;
+         const modified=svg.replace("</svg>",'<g class="pele-test-padding"></g>'.repeat(12001-count)+"</svg>");
+         return {...result,svg:modified};
+       }};
+       if(scenario==="timeout") window.pele={render:()=>({get svg(){return new Promise(()=>{});}})};
+     },scenario);
+     // This actual app control invokes loadSequence and consumes the routed,
+     // published-pinned response. Show all is required to retain large labels.
+     const checked=await page.locator("#all-steps").isChecked();
+     if(checked) await page.locator("#all-steps").uncheck();
+     else await page.locator("#all-steps").check();
+     if(scenario==="mermaid" && !await page.locator("#all-steps").isChecked())
+       await page.locator("#all-steps").check();
+     await page.waitForFunction(()=>document.querySelector("#sequence-state")?.textContent?.includes("Pele fell back:"),null,{timeout:15000})
+       .catch(async error=>{throw new Error(`${scenario}: ${error.message}; state=${await page.locator("#sequence-state").textContent()}; responses=${JSON.stringify(responseRequests)}; pageErrors=${JSON.stringify(await page.evaluate(()=>({text:document.querySelector("#sequence-diagram")?.textContent?.slice(0,500),nodes:window.__testPeleNodes})))}`);});
+     const state=await page.locator("#sequence-state").textContent();
+     assert.match(state,/Pele fell back:/,scenario);
+     const reason={depth:/depth/,mermaid:/Mermaid source too large/,svg:/SVG element/,timeout:/timed out/}[scenario];
+     assert.match(state,reason,scenario);
+     assert.ok(responseRequests.length>=1,`${scenario}: app did not fetch sequence`);
+     assert.equal(await page.locator("#sequence-diagram svg.pele").count(),0,scenario);
+     assert.equal(await page.locator("#sequence-diagram svg:not(.pele)").count(),1,scenario);
+     const visible=await page.locator("#sequence-diagram [data-source-step-id]").evaluateAll(rows=>rows.map(n=>n.dataset.sourceStepId));
+     for(const id of ids) assert.ok(visible.includes(id),`${scenario}: lost original ${id}`);
+     assert.equal(sourceRequests.length,0,`${scenario}: source fetched without action`);
+     assert.equal(await page.locator("#source .source-line").count(),0,scenario);
+   } finally {
+     await page.evaluate(()=>{if(window.testOriginalPele)window.pele=window.testOriginalPele;
+       delete window.testOriginalPele;});
+     await page.unroute(routePattern,respond);page.off("request",capture);
+   }
+ }
+}));
