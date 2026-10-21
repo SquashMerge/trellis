@@ -137,3 +137,172 @@ test("failed async group expansion visibly installs complete legacy DTO",async()
  assert.match(await page.locator("#sequence-diagram").innerText(),/original complete group/);
  assert.ok(await page.locator('[data-source-step-id="unsupported-child"]').count(),"expanded legacy view retains original child");
 });
+
+// AC4: old callbacks and detached notes cannot affect a distinct newer pin.
+test("late Pele success, failure, and timeout leave the newer pinned diagram untouched", async () => {
+ const oldView=fixture("rust"),newView=fixture("rust");
+ newView.revision.indexRevision+=1;
+ newView.steps=[{...newView.steps[0],id:"new-pin-evidence",label:"new pinned evidence"}];
+ const observations=await page.evaluate(async ({oldView,newView})=>{
+   const container=document.querySelector("#sequence-diagram"), state=document.querySelector("#state");
+   const original=window.pele, results=[];
+   try {
+     for(const scenario of ["success","failure","timeout","source-success","source-failure","source-timeout"]) {
+       const sourceOnly=scenario.startsWith("source-");
+       const completion=scenario.replace(/^source-/,"");
+       let activePin="old",selections=0,sources=0,oldSelections=0,oldSources=0;
+       container.replaceChildren();state.textContent="old pinned revision";
+       const oldCurrent=()=>activePin==="old",newCurrent=()=>activePin==="new";
+       const initial=await TrellisPeleSequence.render(container,oldView,()=>oldSources++,new Set(),
+         {isCurrent:oldCurrent,...(sourceOnly?{}:{onSelect:()=>oldSelections++})});
+       if(initial.status!=="rendered") throw Error(initial.reason);
+       const staleNote=container.querySelector('.pele-note[data-trellis-step-id]');
+       let resolveWork,rejectWork;
+       window.pele={render:()=>({get svg(){return new Promise((resolve,reject)=>{resolveWork=resolve;rejectWork=reject;});}})};
+       const oldRequest=TrellisPeleSequence.render(container,oldView,()=>oldSources++,new Set(),{
+         isCurrent:oldCurrent,...(sourceOnly?{}:{onSelect:()=>oldSelections++}),
+         onUnsupported:()=>{state.textContent="old fallback";}
+       });
+       await Promise.resolve();
+       if(!resolveWork || !rejectWork) throw Error("old Pele work did not start");
+       activePin="new";window.pele=original;
+       const newer=await TrellisPeleSequence.render(container,newView,()=>sources++,new Set(),
+         {isCurrent:newCurrent,...(sourceOnly?{}:{onSelect:()=>selections++})});
+       if(newer.status!=="rendered") throw Error(newer.reason);
+       state.textContent="new pinned revision";
+       const currentDiagram=container.firstElementChild;
+       if(completion==="success") resolveWork(original.render(TrellisPeleSequence.project(oldView).source,{}).svg);
+       if(completion==="failure") rejectWork(new Error("old renderer failed"));
+       const outcome=await oldRequest; // timeout uses the real production 5-second timer.
+       staleNote.dispatchEvent(new MouseEvent("click",{bubbles:true}));
+       staleNote.dispatchEvent(new KeyboardEvent("keydown",{key:"Enter",bubbles:true}));
+       staleNote.dispatchEvent(new KeyboardEvent("keydown",{key:" ",bubbles:true}));
+       results.push({scenario,status:outcome.status,same:container.firstElementChild===currentDiagram,
+         state:state.textContent,newNote:!!container.querySelector('.pele-note[data-trellis-step-id="new-pin-evidence"]'),
+         oldNote:!!container.querySelector('.pele-note[data-trellis-step-id="'+oldView.steps[0].id+'"]'),
+         selections,sources,oldSelections,oldSources});
+     }
+   }finally{window.pele=original;}
+   return results;
+ },{oldView,newView});
+ for(const observation of observations) {
+   assert.equal(observation.status,"stale",observation.scenario);
+   assert.equal(observation.same,true,observation.scenario);
+   assert.equal(observation.newNote,true,observation.scenario);
+   assert.equal(observation.oldNote,false,observation.scenario);
+   assert.equal(observation.state,"new pinned revision",observation.scenario);
+   for(const field of ["selections","sources","oldSelections","oldSources"])
+     assert.equal(observation[field],0,`${observation.scenario}: ${field}`);
+ }
+});
+
+// The app's unsupported branch receives the same complete pinned DTO. Use its
+// actual legacy renderer and visible status rather than treating retained Pele
+// markup from a prior pin as a fallback.
+async function renderWithVisibleFallback(view, options={}) {
+ return page.evaluate(async ({view,options})=>{
+   const container=document.querySelector("#sequence-diagram"),state=document.querySelector("#state");
+   container.replaceChildren();state.textContent="Pele pending";
+   let selections=0,sources=0;
+   const expanded=new Set(),callbacks={...options,isCurrent:()=>true,onSelect:()=>selections++};
+   const outcome=await TrellisPeleSequence.render(container,view,()=>sources++,expanded,callbacks);
+   if(outcome.status==="unsupported") {
+     TrellisSequence.render(container,view,()=>sources++,expanded,callbacks);
+     state.textContent=`Pele fell back: ${outcome.reason}`;
+   }
+   return {status:outcome.status,reason:outcome.reason,state:state.textContent,
+     pele:container.querySelectorAll("svg.pele").length,legacy:container.querySelectorAll("svg:not(.pele)").length,
+     rows:[...container.querySelectorAll("[data-source-step-id]")].map(row=>row.dataset.sourceStepId),
+     text:container.textContent,selections,sources};
+ },{view,options});
+}
+function assertVisibleFallback(result,ids,marker) {
+ assert.equal(result.status,"unsupported");assert.match(result.state,/Pele fell back:/);
+ assert.equal(result.pele,0);assert.equal(result.legacy,1);
+ for(const id of ids) assert.ok(result.rows.includes(id),`missing original step ${id}`);
+ assert.ok(result.text.includes(marker),`missing evidence ${marker}`);
+ assert.equal(result.selections,0);assert.equal(result.sources,0);
+}
+
+test("24 levels render; rejected 25th level and over-512 KiB source visibly fall back whole", async()=>{
+ const view=fixture("rust"),leaf=structuredClone(view.steps[0]);
+ const depth=levels=>{let node={...leaf,id:`depth-${levels-1}`,children:[]};
+   for(let n=levels-2;n>=0;n--) node={...leaf,id:`depth-${n}`,kind:"note",children:[node]};
+   return node;};
+ view.steps=[depth(24)];
+ const allowable=await render(view);
+ assert.equal(allowable.status,"rendered",allowable.reason);
+ view.steps=[depth(25)];
+ const tooDeep=await renderWithVisibleFallback(view);
+ assert.match(tooDeep.reason,/depth/);
+ assertVisibleFallback(tooDeep,Array.from({length:25},(_,i)=>`depth-${i}`),leaf.label);
+ const sourceView=fixture("rust");sourceView.steps=[{...leaf,label:"L".repeat(512*1024),id:"large-source"}];
+ const oversized=await renderWithVisibleFallback(sourceView,{showDetails:true});
+ assert.match(oversized.reason,/Mermaid source too large/);
+ assertVisibleFallback(oversized,["large-source"],"LLLLLLLL");
+});
+
+test("12,000 SVG nodes allowed and 12,001 reject with no partial SVG or selection",async()=>{
+ const view=fixture("rust"),result=await page.evaluate(async view=>{
+   const container=document.querySelector("#sequence-diagram"),original=window.pele;
+   const first=await TrellisPeleSequence.render(container,view,null,new Set(),{});
+   if(first.status!=="rendered") throw Error(first.reason);
+   const prior=container.firstElementChild;
+   const projection=TrellisPeleSequence.project(view);
+   const raw=original.render(projection.source,{}).svg;
+   const parser=new DOMParser().parseFromString(raw,"image/svg+xml");
+   const baseNodes=parser.querySelectorAll("*").length;
+   const filler='<g class="pele-test-padding"></g>';
+   const make=(count)=>raw.replace("</svg>",filler.repeat(count-baseNodes)+"</svg>");
+   let selections=0,sources=0;
+   try {
+     window.pele={render:()=>({svg:make(12000)})};
+     const boundary=await TrellisPeleSequence.render(container,view,null,new Set(),{onSelect:()=>selections++});
+     const installed=container.firstElementChild;
+     const noteIds=[...container.querySelectorAll('.pele-note[data-trellis-step-id]')].map(n=>n.dataset.trellisStepId);
+     window.pele={render:()=>({svg:make(12001)})};
+     const overflow=await TrellisPeleSequence.render(container,view,null,new Set(),{onSelect:()=>selections++});
+     const kept=installed===container.firstElementChild;
+     TrellisSequence.render(container,view,()=>sources++,new Set(),{onSelect:()=>selections++});
+     document.querySelector("#state").textContent=`Pele fell back: ${overflow.reason}`;
+     return {boundary:boundary.status,overflow:overflow.status,reason:overflow.reason,
+       kept,notOld:installed!==prior,nodes:installed.querySelectorAll('*').length+1,
+       noteIds,selections,sources,legacy:container.querySelectorAll("svg:not(.pele)").length,
+       pele:container.querySelectorAll("svg.pele").length,
+       rows:[...container.querySelectorAll("[data-source-step-id]")].map(n=>n.dataset.sourceStepId),
+       text:container.textContent,state:document.querySelector("#state").textContent};
+   }finally{window.pele=original;}
+ },view);
+ assert.equal(result.boundary,"rendered");assert.equal(result.nodes,12000);
+ assert.equal(result.overflow,"unsupported");assert.match(result.reason,/SVG element/);
+ assert.equal(result.kept,true);assert.equal(result.notOld,true);
+ assert.deepEqual(result.noteIds,steps(view.steps).map(step=>step.id));
+ assert.equal(result.legacy,1);assert.equal(result.pele,0);
+ assert.match(result.state,/Pele fell back:/);
+ for(const step of steps(view.steps)) assert.ok(result.rows.includes(step.id),step.id);
+ assert.ok(result.text.includes(view.steps[0].label));
+ assert.equal(result.selections,0);assert.equal(result.sources,0);
+});
+
+test("currently pinned 5-second Pele timeout visibly falls back to complete legacy evidence",async()=>{
+ const view=fixture("rust"),result=await page.evaluate(async view=>{
+   const container=document.querySelector("#sequence-diagram"),state=document.querySelector("#state"),original=window.pele;
+   container.replaceChildren();state.textContent="Pele pending";
+   let selections=0,sources=0,started=false;
+   window.pele={render:()=>({get svg(){started=true;return new Promise(()=>{});}})};
+   try {
+     const outcome=await TrellisPeleSequence.render(container,view,()=>sources++,new Set(),
+       {isCurrent:()=>true,onSelect:()=>selections++});
+     if(outcome.status==="unsupported") {
+       TrellisSequence.render(container,view,()=>sources++,new Set(),{onSelect:()=>selections++});
+       state.textContent=`Pele fell back: ${outcome.reason}`;
+     }
+     return {started,status:outcome.status,reason:outcome.reason,state:state.textContent,
+       pele:container.querySelectorAll("svg.pele").length,legacy:container.querySelectorAll("svg:not(.pele)").length,
+       rows:[...container.querySelectorAll("[data-source-step-id]")].map(n=>n.dataset.sourceStepId),
+       text:container.textContent,selections,sources};
+   }finally{window.pele=original;}
+ },view);
+ assert.equal(result.started,true);assert.match(result.reason,/timed out/);
+ assertVisibleFallback(result,steps(view.steps).map(step=>step.id),view.steps[0].label);
+});

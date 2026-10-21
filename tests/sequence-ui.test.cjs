@@ -746,3 +746,20 @@ test("real Chromium validates pinned SVG and source note identity under unchange
     assert.deepEqual(errors, []);
   } finally { await browser.close(); }
 });
+
+test("Pele projector enforces 24 visible levels and the exact 512 KiB UTF-8 Mermaid boundary", () => {
+ const adapter=peleProjector(), view=peleFixture("rust"), leaf=view.steps[0];
+ const chain=levels=>{let node={...leaf,id:`level-${levels-1}`,children:[],alternate:[]};
+   for(let i=levels-2;i>=0;i--) node={...leaf,id:`level-${i}`,kind:"note",children:[node],alternate:[]};
+   return node;};
+ view.steps=[chain(24)];
+ assert.equal(adapter.project(view).rows.length,24);
+ view.steps=[chain(25)];assert.throws(()=>adapter.project(view),/Unsupported sequence depth/);
+ view.steps=[{...leaf,id:"mermaid-bytes",label:""}];
+ const sourceSize=label=>new TextEncoder().encode(adapter.project({...view,steps:[{...view.steps[0],label}]},new Set(),{showDetails:true}).source).length;
+ const fixed=sourceSize("call");
+ assert.ok(fixed<512*1024);
+ const limit="x".repeat(512*1024-fixed+4);
+ assert.equal(sourceSize(limit),512*1024);
+ assert.throws(()=>adapter.project({...view,steps:[{...view.steps[0],label:limit+"x"}]},new Set(),{showDetails:true}),/Mermaid source too large/);
+});
