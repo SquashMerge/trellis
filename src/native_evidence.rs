@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
 };
 use tree_sitter::Node;
@@ -1167,6 +1168,7 @@ pub(crate) fn spool_full_capture(
     cancel: &CancelFlag,
     progress: &(impl Fn(IndexProgress) + Sync),
     observe: impl Fn(&DocumentKey, FullNativeStage),
+    spool_dir: &Path,
 ) -> Result<FullDocumentSpool> {
     spool_full_capture_with(
         options,
@@ -1178,6 +1180,7 @@ pub(crate) fn spool_full_capture(
         observe,
         ExtractionPlan::default(),
         &|_| Ok(()),
+        spool_dir,
     )
 }
 
@@ -1191,16 +1194,24 @@ fn spool_full_capture_with(
     observe: impl Fn(&DocumentKey, FullNativeStage),
     plan: ExtractionPlan,
     before_file: &(dyn Fn(&SourceFile) -> Result<()> + Sync),
+    spool_dir: &Path,
 ) -> Result<FullDocumentSpool> {
     capture.verify(cancel)?;
     let (header, files) = build_native_header(capture, root, root_id)?;
-    let identity = crate::store::topology::WorkspaceIdentity::discover(Some(root), root)?;
-    let roots = crate::store::topology::TopologyRoots::production()?;
-    roots.prepare_index(&identity)?;
+    // The store supplies its already-prepared managed index directory, including
+    // isolated test topology. Never select a production home independently.
+    let metadata = std::fs::symlink_metadata(spool_dir)?;
+    ensure!(
+        metadata.is_dir()
+            && !metadata.file_type().is_symlink()
+            && metadata.uid() == unsafe { libc::geteuid() }
+            && metadata.mode() & 0o077 == 0,
+        "native spool directory is not private"
+    );
     let file = tempfile::Builder::new()
         .prefix("native-spool-")
         .suffix(".db")
-        .tempfile_in(roots.index_dir(&identity))?;
+        .tempfile_in(spool_dir)?;
     let conn = rusqlite::Connection::open(file.path())?;
     conn.execute_batch(
         "PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA cache_size=-2048;
@@ -3910,6 +3921,7 @@ mod full_document_spool_tests {
             &cancel,
             &|_| {},
             |key, stage| stages.borrow_mut().push((key.path.clone(), stage)),
+            state.path(),
         )
         .unwrap();
         let stages = stages.into_inner();
@@ -4042,6 +4054,7 @@ mod full_document_spool_tests {
             &cancel,
             &|_| {},
             |_, _| {},
+            state.path(),
         )
         .unwrap();
         let handle = "sid:v1:forced-collision";
@@ -4098,6 +4111,7 @@ mod full_document_spool_tests {
                     Ok(())
                 }
             },
+            state.path(),
         )
         .err()
         .expect("failure must be reported");
@@ -4130,6 +4144,7 @@ mod full_document_spool_tests {
             &cancel,
             &|_| {},
             |_, _| {},
+            state.path(),
         )
         .unwrap();
         let (mut native, _) = spool.read(0).unwrap();
