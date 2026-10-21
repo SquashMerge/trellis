@@ -4714,12 +4714,14 @@ fn cold_stream_matches_plain_artifact_publication_rows() {
     let (stream_pin, _owner) =
         trellis::index_coordinator::reconcile_workspace(&stream, &options, &cancel, |_| {})
             .unwrap();
-    let identity = trellis::store::topology::WorkspaceIdentity::discover(
-        Some(root.path()), root.path(),
-    )
-    .unwrap();
+    let identity =
+        trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+            .unwrap();
     let index_path = |state: &std::path::Path| {
-        state.join("cache/indexes").join(&identity.root_key).join("index.db")
+        state
+            .join("cache/indexes")
+            .join(&identity.root_key)
+            .join("index.db")
     };
     let plain_db = Connection::open(index_path(_plain_state.path())).unwrap();
     let stream_db = Connection::open(index_path(stream_state.path())).unwrap();
@@ -4736,13 +4738,25 @@ fn cold_stream_matches_plain_artifact_publication_rows() {
         .collect()
     };
     for table in [
-        "document_versions", "graph_projections", "class_projections", "graph_nodes",
-        "graph_calls", "graph_regions", "classes", "class_relations",
-        "native_version_coverage_roles", "native_version_declarations",
-        "native_version_declaration_ancestors", "native_version_ancestor_signature_types",
-        "native_version_headers", "native_version_header_items", "native_version_parameters",
-        "native_version_own_signature_types", "native_version_control_regions",
-        "native_version_calls", "native_version_call_regions",
+        "document_versions",
+        "graph_projections",
+        "class_projections",
+        "graph_nodes",
+        "graph_calls",
+        "graph_regions",
+        "classes",
+        "class_relations",
+        "native_version_coverage_roles",
+        "native_version_declarations",
+        "native_version_declaration_ancestors",
+        "native_version_ancestor_signature_types",
+        "native_version_headers",
+        "native_version_header_items",
+        "native_version_parameters",
+        "native_version_own_signature_types",
+        "native_version_control_regions",
+        "native_version_calls",
+        "native_version_call_regions",
     ] {
         let sql = format!("SELECT * FROM {table} ORDER BY 1,2");
         assert_eq!(values(&plain_db, &sql), values(&stream_db, &sql), "{table}");
@@ -4788,12 +4802,14 @@ fn empty_cold_stream_preserves_plain_native_header() {
         |_| {},
     )
     .unwrap();
-    let identity = trellis::store::topology::WorkspaceIdentity::discover(
-        Some(root.path()), root.path(),
-    )
-    .unwrap();
+    let identity =
+        trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+            .unwrap();
     let index_path = |state: &std::path::Path| {
-        state.join("cache/indexes").join(&identity.root_key).join("index.db")
+        state
+            .join("cache/indexes")
+            .join(&identity.root_key)
+            .join("index.db")
     };
     let header = |state: &std::path::Path| -> (String, String, String, String) {
         Connection::open(index_path(state))
@@ -4807,4 +4823,58 @@ fn empty_cold_stream_preserves_plain_native_header() {
     };
     assert_eq!(header(state_plain.path()), header(state_stream.path()));
     assert_eq!(stream.status().unwrap().revision, stream_pin);
+}
+
+#[test]
+#[cfg(feature = "test-support")]
+fn streamed_precommit_cancel_rolls_back_every_document() {
+    let (_state, root, store, cancel) = fixture();
+    let leader = store.publication_for_tests().unwrap();
+    let prior = publish(
+        &store,
+        root.path(),
+        &cancel,
+        store.index_baseline().unwrap(),
+        &leader,
+    )
+    .unwrap();
+    drop(leader);
+    fs::write(
+        root.path().join("flow.js"),
+        "function after() { return 1; }\n",
+    )
+    .unwrap();
+    fs::write(root.path().join("flow.py"), "def after():\n    return 2\n").unwrap();
+    let cancel_at_commit = cancel.clone();
+    store.set_publication_before_commit_hook_for_tests(move || {
+        cancel_at_commit.store(true, std::sync::atomic::Ordering::Release);
+    });
+    let options = IndexOptions::new(root.path().to_owned());
+    let attempt =
+        trellis::index_coordinator::reconcile_workspace(&store, &options, &cancel, |_| {});
+    assert!(attempt.is_err(), "cancelled revision must not commit");
+    assert!(cancel.load(std::sync::atomic::Ordering::Acquire));
+    cancel.store(false, std::sync::atomic::Ordering::Release);
+    assert_eq!(store.status().unwrap().revision, prior);
+    let identity =
+        trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+            .unwrap();
+    let db = Connection::open(
+        _state
+            .path()
+            .join("cache/indexes")
+            .join(&identity.root_key)
+            .join("index.db"),
+    )
+    .unwrap();
+    let count: i64 = db
+        .query_row("SELECT count(*) FROM native_revisions", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(count, 1, "rollback must not leave an unpublished revision");
+    drop(db);
+    let (next, _owner) =
+        trellis::index_coordinator::reconcile_workspace(&store, &options, &cancel, |_| {}).unwrap();
+    assert_eq!(next.index_revision, prior.index_revision + 1);
 }
