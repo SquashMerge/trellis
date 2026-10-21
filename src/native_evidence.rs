@@ -1091,10 +1091,12 @@ impl FullDocumentSpool {
         Ok(graph)
     }
     fn admit_identity(&self, handle: &str, canonical: &[u8], full: &str) -> Result<()> {
-        let inserted = self.conn.execute(
-            "INSERT OR IGNORE INTO identities (handle, canonical, full) VALUES (?1, ?2, ?3)",
-            rusqlite::params![handle, canonical, full],
-        )?;
+        let inserted = self
+            .conn
+            .prepare_cached(
+                "INSERT OR IGNORE INTO identities (handle, canonical, full) VALUES (?1, ?2, ?3)",
+            )?
+            .execute(rusqlite::params![handle, canonical, full])?;
         if inserted == 0 {
             let (prior, prior_full): (Vec<u8>, String) = self.conn.query_row(
                 "SELECT canonical, full FROM identities WHERE handle = ?1",
