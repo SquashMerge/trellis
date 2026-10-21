@@ -337,6 +337,23 @@ impl IdentityRegistry {
         }
         Ok(handle)
     }
+    /// Move each distinct logged identity out in first-insertion order. The
+    /// full canonical bytes and full digest must be kept together by a disk
+    /// registry; a truncated handle alone is not collision proof.
+    pub(crate) fn into_ordered(mut self) -> Vec<(String, Vec<u8>, String)> {
+        self.order
+            .take()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|handle| {
+                let (bytes, full) = self
+                    .handles
+                    .remove(&handle)
+                    .expect("logged identity is registered");
+                (handle, bytes, full)
+            })
+            .collect()
+    }
     /// Admit every identity of a logged registry in its first-insertion
     /// order, as if each had been registered here directly in that order.
     pub(crate) fn absorb(&mut self, mut other: IdentityRegistry) -> Result<()> {
