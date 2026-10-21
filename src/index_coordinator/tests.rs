@@ -917,3 +917,48 @@ fn cold_full_publication_uses_bounded_document_stream() {
         "cold full publication must use the bounded per-document stream");
     assert_eq!(store.status().unwrap().revision, pin);
 }
+
+#[test]
+fn cancelled_full_document_stream_never_changes_selected_pin() {
+    let state = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    fs::write(workspace.path().join("a.js"), "function before() {}\n").unwrap();
+    fs::write(workspace.path().join("b.py"), "def before():\n    return 1\n").unwrap();
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    let options = IndexOptions::new(workspace.path().to_owned());
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (prior, owner) = reconcile_workspace(&store, &options, &cancel, |_| {}).unwrap();
+    drop(owner);
+    fs::write(workspace.path().join("a.js"), "function after() {}\n").unwrap();
+    fs::write(workspace.path().join("b.py"), "def after():\n    return 2\n").unwrap();
+    let mut coordinator = IndexJobCoordinator::prepare(&store, Some(prior)).unwrap();
+    let observed = AtomicBool::new(false);
+    let attempt = coordinator.run_with_capture(
+        &options,
+        &cancel,
+        |_| {},
+        |_| {},
+        |_, stage| {
+            if stage == crate::native_evidence::FullNativeStage::Validated {
+                observed.store(true, Ordering::Release);
+                cancel.store(true, Ordering::Release);
+            }
+        },
+        PublicationAdmission {
+            capture: None,
+            unchanged_fast: false,
+            cutoff: || Ok(()),
+        },
+        || {},
+    );
+    assert!(observed.load(Ordering::Acquire), "first document must validate");
+    assert!(attempt.is_err(), "cancelled stream cannot publish");
+    assert_eq!(store.status().unwrap().revision, prior);
+    cancel.store(false, Ordering::Release);
+    drop(coordinator);
+    let next = IndexJobCoordinator::prepare(&store, Some(prior))
+        .unwrap()
+        .run(&options, &cancel, |_| {})
+        .unwrap();
+    assert_eq!(store.status().unwrap().revision, next);
+}
