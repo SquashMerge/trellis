@@ -703,7 +703,7 @@ pub(crate) fn measure_persisted_change(
                 key.starts_with("config:")
                     || key.starts_with("toolchain:")
                     || key.starts_with("ignore:")
-                    || key.starts_with("executable:")
+                    || *key == crate::capture::EXTRACTOR_INPUT_KEY
             })
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect::<BTreeMap<_, _>>()

@@ -5283,6 +5283,10 @@ pub(crate) fn compare_capture_observations(
                     crate::capture::CaptureInputObservation::Absent,
                     crate::capture::CaptureInputObservation::Absent,
                 ) => {}
+                (
+                    crate::capture::CaptureInputObservation::Extractor { hash: old },
+                    crate::capture::CaptureInputObservation::Extractor { hash: new },
+                ) => comparison.hash_changed += usize::from(old != new),
                 _ => comparison.stat_changed += 1,
             },
             (None, None) => unreachable!(),
@@ -5298,6 +5302,24 @@ const SELECTED_CAPTURE_SNAPSHOT_SQL: &str = "SELECT d.path,v.content_hash,d.capt
 fn compare_capture_snapshot(
     db: &Connection,
     capture: &crate::capture::Capture,
+) -> Result<ScanComparison> {
+    compare_capture_snapshot_with(db, capture, true)
+}
+
+/// The selected-reuse comparison: the executable observation is left out, so
+/// an executable rebuild alone is no change. Native reuse is decided by the
+/// recorded extractor producer hash, which is compared (Decision 0005).
+fn compare_capture_snapshot_for_reuse(
+    db: &Connection,
+    capture: &crate::capture::Capture,
+) -> Result<ScanComparison> {
+    compare_capture_snapshot_with(db, capture, false)
+}
+
+fn compare_capture_snapshot_with(
+    db: &Connection,
+    capture: &crate::capture::Capture,
+    include_executable: bool,
 ) -> Result<ScanComparison> {
     let mut previous_sources = BTreeMap::new();
     let mut statement = db.prepare(SELECTED_CAPTURE_SNAPSHOT_SQL)?;
@@ -5338,7 +5360,11 @@ fn compare_capture_snapshot(
             "incompatible_index: duplicate captured input observation"
         );
     }
-    let current_inputs = capture.persisted_inputs()?;
+    let mut current_inputs = capture.persisted_inputs()?;
+    if !include_executable {
+        previous_inputs.retain(|key: &String, _| !key.starts_with("executable:"));
+        current_inputs.retain(|key, _| !key.starts_with("executable:"));
+    }
     Ok(compare_capture_observations(
         &previous_sources,
         &current_sources,
@@ -5484,6 +5510,17 @@ fn validate_reconcile_inventory(db: &Connection) -> Result<()> {
                     );
                 }
             }
+            (key, crate::capture::CaptureInputObservation::Extractor { hash })
+                if key == crate::capture::EXTRACTOR_INPUT_KEY =>
+            {
+                control_ensure!(
+                    hash.len() == 64
+                        && hash
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+                    "incompatible_index: invalid extractor producer hash"
+                );
+            }
             (key, crate::capture::CaptureInputObservation::Absent)
                 if key.starts_with("config:")
                     || key.starts_with("toolchain:")
@@ -5567,6 +5604,11 @@ fn validate_reconcile_inventory(db: &Connection) -> Result<()> {
                 .any(|key| key.starts_with("presentation-manifest:")),
             "incompatible_index: unconfigured manifest input"
         ),
+    }
+    // Revisions published before the extractor producer hash lack it; they
+    // stay readable and simply never qualify for rebuilt-executable reuse.
+    if actual.contains(crate::capture::EXTRACTOR_INPUT_KEY) {
+        expected.insert(crate::capture::EXTRACTOR_INPUT_KEY.to_owned());
     }
     control_ensure!(
         actual == expected,
@@ -9092,11 +9134,12 @@ impl Store {
         let executing_hash = capture
             .executable_digest(capture.executable_path())
             .context("native_evidence_required: executable was not hashed at admission")?;
-        if selected_producer_hash(&db, &selected)? != executing_hash {
-            // Decision 0005: even identical source bytes cannot reuse native
-            // facts when the executing producer changed. FULL measurement wins.
-            return Ok(None);
-        }
+        // Decision 0005 (2026-10 amendment): a rebuilt executable keeps the
+        // selected facts only while its build-time extractor producer hash
+        // equals the one the selected head recorded. The reuse comparison
+        // below includes that hash and leaves out the executable observation;
+        // a changed or unrecorded hash is a change, so FULL measurement wins.
+        let drift = selected_producer_hash(&db, &selected)? != executing_hash;
         let prior_options: String = db.query_row(
             "SELECT reconcile_options FROM index_metadata WHERE singleton=1",
             [],
@@ -9105,12 +9148,44 @@ impl Store {
         if prior_options != json(capture.reconcile_options())? {
             return Ok(None);
         }
-        let comparison = compare_capture_snapshot(&db, capture)?;
+        let comparison = compare_capture_snapshot_for_reuse(&db, capture)?;
         if comparison.changed() || comparison.examined == 0 {
             // This compares the freshly hashed source content AND the captured
-            // root, directory, config, selector and presentation observations.
+            // root, directory, config, selector, presentation and extractor
+            // observations.
             return Ok(None);
         }
+        // A rebuilt executable changes only the toolchain part of the revision
+        // header (its SHA is revision provenance). Build the fresh header from
+        // this capture; every other header field must equal the selected one.
+        let fresh_header = if drift {
+            let (source_set, header) = crate::native_evidence::captured_revision_header(
+                capture,
+                Path::new(&self.workspace_root),
+                self.root_id(),
+            )?;
+            let (source_set_id, config_hash, dependency_hash, dependencies): (
+                String,
+                String,
+                String,
+                String,
+            ) = db.query_row(
+                "SELECT source_set_id,config_hash,dependency_hash,dependency_observations
+                 FROM native_revisions WHERE id=?1",
+                [&selected.key],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
+            if source_set_id != header.source_set_id
+                || config_hash != header.config_hash
+                || dependency_hash != header.dependency_hash
+                || dependencies != json(&source_set.dependencies)?
+            {
+                return Ok(None);
+            }
+            Some(header)
+        } else {
+            None
+        };
         for source in &capture.files {
             check_cancel(cancel)?;
             let stored = self
@@ -9190,7 +9265,106 @@ impl Store {
                 && ReadRevision::current(&db)?.pin == selected.pin,
             "revision conflict: unchanged baseline changed"
         );
-        Ok(Some(selected.pin))
+        let Some(header) = fresh_header else {
+            return Ok(Some(selected.pin));
+        };
+        // Decision 0005 (2026-10 amendment): a rebuilt executable with an
+        // unchanged extractor producer hash keeps every selected fact, but
+        // the head must carry this executable's provenance and binding. Publish
+        // one metadata-only revision: the selected manifest under a fresh
+        // header (toolchain hash and native revision ID) and fresh inputs.
+        let mut db = db;
+        let tx = storage_result(db.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        let locked = self.recovery_baseline_preflight(&tx)?;
+        let locked_version: i64 =
+            storage_result(tx.pragma_query_value(None, "data_version", |row| row.get(0)))?;
+        ensure!(
+            locked_version == admitted_version
+                && locked.pin == expected.pin()
+                && locked.witness == expected.witness
+                && locked.compatible,
+            "revision conflict: rebuilt-executable baseline changed"
+        );
+        let revision = IndexPin {
+            index_generation: selected.pin.index_generation,
+            index_revision: selected
+                .pin
+                .index_revision
+                .checked_add(1)
+                .context("revision overflow")?,
+        };
+        let revision_key = format!(
+            "pin:v1:{}:{}",
+            revision.index_generation, revision.index_revision
+        );
+        let copied = tx.execute(
+                "INSERT INTO native_revisions SELECT ?1,source_set_id,?4,config_hash,             dependency_hash,?5,?6,dependency_observations,             reconcile_options,class_warnings,class_truncated,graph_stats,graph_diagnostics,?2             FROM native_revisions WHERE id=?3",
+                params![
+                    revision_key,
+                    revision.index_revision as i64,
+                    selected.key,
+                    header.toolchain_hash,
+                    header.id,
+                    json(&header.documents)?
+                ],
+            )?;
+        ensure!(
+            copied == 1,
+            "incompatible_index: selected native header missing"
+        );
+        // This capture's own observations: equal to the selected ones except
+        // for the executable, whose fresh SHA the new binding records.
+        for (key, observation) in capture.persisted_inputs()? {
+            ensure!(
+                key != "__released:v1" && key != "__pending_release:v1",
+                "native_evidence_required: reserved release marker"
+            );
+            tx.execute(
+                "INSERT INTO revision_capture_inputs VALUES(?1,?2,?3)",
+                params![revision_key, key, json(&observation)?],
+            )?;
+        }
+        let copied = tx.execute(
+            "INSERT INTO revision_documents SELECT ?1,source_set_id,language,path,document_version_id,             graph_projection_id,class_projection_id,capture_stat,coverage_requested,             coverage_selected,coverage_state,coverage_diagnostic,ordinal             FROM revision_documents WHERE revision_id=?2",
+            params![revision_key, selected.key],
+        )?;
+        ensure!(
+            copied == capture.files.len(),
+            "incompatible_index: incomplete unchanged revision manifest"
+        );
+        let (bound_hash, binding_sha) = revision_producer_binding(&tx, &revision_key)?;
+        ensure!(
+            bound_hash == executing_hash,
+            "incompatible_index: executing producer binding changed"
+        );
+        tx.execute(
+            "INSERT INTO revision_producer_bindings VALUES(?1,?2,?3)",
+            params![revision_key, bound_hash, binding_sha],
+        )?;
+        let publication_time = self.retention_time()?;
+        ensure!(
+            publication_time.as_secs() <= 9_007_199_254_740_991,
+            "invalid_supersession_time"
+        );
+        let timestamp = publication_time.as_millis().to_string();
+        stamp_predecessor(&tx, &selected.key, publication_time.as_secs() as i64)?;
+        ensure!(
+            tx.execute(
+                "UPDATE index_metadata SET index_revision=?1,indexed_at=?2 WHERE singleton=1",
+                params![revision.index_revision as i64, timestamp],
+            )? == 1,
+            "incompatible_index: missing metadata head"
+        );
+        validate_paired_metadata(&tx, &self.identity.record_id, PairedManifestScope::Changing)?;
+        check_cancel(cancel)?;
+        capture.verify(cancel)?;
+        leader.verify()?;
+        self.identity.verify()?;
+        storage_result(tx.commit())?;
+        self.recovery_disposition
+            .store(RecoveryDisposition::Ready as u8, Ordering::Release);
+        self.recovery_required.store(false, Ordering::Release);
+        Ok(Some(revision))
     }
 
     pub(crate) fn prepare_local_revision(
@@ -9211,15 +9385,10 @@ impl Store {
             let selected = ReadRevision::current(db)?;
             ensure!(expected.pin() == Some(selected.pin),
                 "revision conflict: local source snapshot changed");
-            // Decision 0005: even a proved single-body edit cannot reuse
-            // unchanged documents when the executing native producer drifts.
-            // Compare the attested selected binding before any local measurement
-            // or selected-manifest reuse; the caller then takes the full path.
-            let executing_hash = capture.executable_digest(capture.executable_path())
-                .context("native_evidence_required: executable was not hashed at admission")?;
-            if selected_producer_hash(db, &selected)? != executing_hash {
-                return Ok(None);
-            }
+            // Decision 0005 (2026-10 amendment): a proved single-body edit may
+            // reuse unchanged documents under a rebuilt executable only while
+            // the extractor producer hash is unchanged. measure_persisted_change
+            // compares that recorded hash; a changed one takes the full path.
             // The selected head is a prior validated publication. Do not decode
             // its unchanged fact/projection rows; selected reads still attest
             // them, and the current captured source bytes are checked below.
@@ -9498,6 +9667,13 @@ impl Store {
             let selected=ReadRevision::current(db)?;
             ensure!(expected.pin()==Some(selected.pin),
                 "revision conflict: prior local snapshot changed");
+            // Selected native documents carry their own executable SHA, so this
+            // seam assembles only under the same executable.
+            let executing_hash = capture.executable_digest(capture.executable_path())
+                .context("native_evidence_required: executable was not hashed at admission")?;
+            if selected_producer_hash(db, &selected)? != executing_hash {
+                return Ok(None);
+            }
             // Actual selected reuse is authenticated by selected_reusable_native below;
             // unrelated retained versions must not be decoded.
             let previous_options:crate::indexer::ReconcileOptions = db.query_row(
@@ -9556,6 +9732,10 @@ impl Store {
         })
     }
 
+    /// R-1: a reused projection's stored row must carry the fresh projection
+    /// hash. Its child rows were bound to that hash when Trellis wrote and
+    /// validated them, so they are not decoded again here; selected reads
+    /// still attest what they serve. A mismatch is typed index corruption.
     fn verify_reusable_projection(
         &self,
         db: &Connection,
@@ -9563,14 +9743,6 @@ impl Store {
         reuse: ReusedFamilies,
         extraction: Option<&crate::classes::FileExtraction>,
     ) -> Result<()> {
-        fn payloads<T: DeserializeOwned>(db: &Connection, sql: &str, id: &str) -> Result<Vec<T>> {
-            let mut statement = db.prepare(sql)?;
-            let mut result = vec![];
-            for row in statement.query_map([id], |r| r.get::<_, String>(0))? {
-                result.push(serde_json::from_str(&row?)?);
-            }
-            Ok(result)
-        }
         if reuse.graph {
             let (version, hash, state, class_state, stored_f):
                 (String,String,String,String,Option<String>) = db.query_row(
@@ -9580,7 +9752,7 @@ impl Store {
                 |r| Ok((r.get(0)?, r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)),
             )?;
             let expected_f = extraction.map(json).transpose()?;
-            ensure!(
+            control_ensure!(
                 state == "ready"
                     && stored_f == expected_f
                     && (if extraction.is_some() {
@@ -9590,32 +9762,8 @@ impl Store {
                     }),
                 "incompatible_index: reusable class extraction witness mismatch"
             );
-            let nodes: Vec<Symbol> = payloads(
-                db,
-                "SELECT payload FROM graph_nodes WHERE projection_id=?1 ORDER BY id",
-                &ids.graph_id,
-            )?;
-            let calls: Vec<CallSite> = payloads(
-                db,
-                "SELECT payload FROM graph_calls WHERE projection_id=?1 ORDER BY id",
-                &ids.graph_id,
-            )?;
-            let regions: Vec<ControlRegion> = payloads(
-                db,
-                "SELECT payload FROM graph_regions WHERE projection_id=?1 ORDER BY id",
-                &ids.graph_id,
-            )?;
-            let projected = v8_id(
-                "",
-                b"trellis.graph-projection.v1\0",
-                serde_json::json!({
-                    "documentVersionId":version,"nodes":nodes,"calls":calls,"regions":regions
-                }),
-            );
-            ensure!(
-                version == ids.version_id
-                    && hash == ids.graph_hash
-                    && projected.trim_start_matches(':') == hash,
+            control_ensure!(
+                version == ids.version_id && hash == ids.graph_hash,
                 "incompatible_index: reusable graph witness mismatch"
             );
         }
@@ -9625,27 +9773,8 @@ impl Store {
                 [&ids.class_id],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )?;
-            let classes: Vec<crate::classes::ClassDefinition> = payloads(
-                db,
-                "SELECT payload FROM classes WHERE projection_id=?1 ORDER BY id",
-                &ids.class_id,
-            )?;
-            let relations: Vec<crate::classes::ClassRelation> = payloads(
-                db,
-                "SELECT payload FROM class_relations WHERE projection_id=?1 ORDER BY id",
-                &ids.class_id,
-            )?;
-            let projected = v8_id(
-                "",
-                b"trellis.class-projection.v1\0",
-                serde_json::json!({
-                    "graphProjectionId":graph_id,"classes":classes,"relations":relations
-                }),
-            );
-            ensure!(
-                graph_id == ids.graph_id
-                    && hash == ids.class_hash
-                    && projected.trim_start_matches(':') == hash,
+            control_ensure!(
+                graph_id == ids.graph_id && hash == ids.class_hash,
                 "incompatible_index: reusable class witness mismatch"
             );
         }
@@ -9829,31 +9958,61 @@ impl Store {
                     "incompatible_index: duplicate prior manifest document"
                 );
             }
+            // R-1: compare each fresh projection ID and native witness with
+            // the stored hashes Trellis wrote and validated at publication,
+            // instead of re-reading and re-canonicalizing every stored row.
+            // Both are pure per-document values, computed on workers.
+            let never = AtomicBool::new(false);
+            let computed = crate::parallel::map_ordered(
+                &graph.files,
+                crate::parallel::default_workers(),
+                &never,
+                |_, file| -> Result<(V8DocumentProjection, Option<String>)> {
+                    let grouped =
+                        rows.get(file.path.as_str()).context("publication rows missing")?;
+                    let ids = v8_document_projection(file, native, grouped)?;
+                    let reused_version =
+                        old.get(&file.path).is_some_and(|(version, _, _)| *version == ids.version_id);
+                    let witness = if drift || reused_version {
+                        Some(publication_native_witness(
+                            documents.get(file.path.as_str())
+                                .context("new native document absent")?,
+                            &native.producer,
+                            coverages.get(file.path.as_str())
+                                .context("new native coverage absent")?,
+                            grouped,
+                        )?)
+                    } else {
+                        None
+                    };
+                    Ok((ids, witness))
+                },
+            );
             let mut families = BTreeMap::new();
-            for file in &graph.files {
-                let grouped = rows.get(file.path.as_str()).context("publication rows missing")?;
-                let ids = v8_document_projection(file, native, grouped)?;
-                if drift {
-                        // The new executable FULLY measured this document.
-                        // Equal document/version inputs cannot silently acquire
-                        // different measured facts under Decision 0003.
-                        let prior_witness: Option<String> = db.query_row(
-                            "SELECT native_witness FROM document_versions WHERE id=?1",
-                            [&ids.version_id], |r| r.get(0),
-                        ).optional()?;
-                        if let Some(prior_witness) = prior_witness {
-                            let measured = publication_native_witness(
-                                documents.get(file.path.as_str())
-                                    .context("new native document absent")?,
-                                &native.producer,
-                                coverages.get(file.path.as_str())
-                                    .context("new native coverage absent")?,
-                                grouped,
-                            )?;
-                            ensure!(measured == prior_witness,
-                                "native_producer_version_required: measured facts changed under the same nativeProducerVersion; bump producer version before indexing");
-                        }
-                    }
+            for (file, computed) in graph.files.iter().zip(computed) {
+                let (ids, measured) = computed.context("preflight projection absent")??;
+                // An equal version ID means equal content, extraction context and
+                // producer version; its stored witness binds the measured facts.
+                let prior_witness: Option<String> = match &measured {
+                    Some(_) => db.query_row(
+                        "SELECT native_witness FROM document_versions WHERE id=?1",
+                        [&ids.version_id], |r| r.get(0),
+                    ).optional()?,
+                    None => None,
+                };
+                if let (Some(measured), Some(prior_witness)) = (&measured, &prior_witness)
+                    && measured != prior_witness
+                {
+                    // The new executable FULLY measured this document. Equal
+                    // document/version inputs cannot silently acquire different
+                    // measured facts under Decision 0003.
+                    ensure!(!drift,
+                        "native_producer_version_required: measured facts changed under the same nativeProducerVersion; bump producer version before indexing");
+                    return Err(ControlIntegrity(
+                        "incompatible_index: reusable normalized native witness mismatch".into(),
+                    )
+                    .into());
+                }
                 if let Some((old_version, old_graph, old_class)) = old.get(&file.path) {
                     let reused = ReusedFamilies {
                         native: *old_version == ids.version_id,
@@ -9869,11 +10028,10 @@ impl Store {
                         "incompatible_index: class reused with different graph projection"
                     );
                     if reused.native || reused.graph || reused.class {
-                        if reused.native {
-                            self.selected_reusable_native(db, &selected, file)
-                                .context("incompatible_index: prior native witness invalid")?;
-                        }
-                        // Projection hashes bind all decoded graph/class child rows.
+                        control_ensure!(
+                            !reused.native || prior_witness.is_some(),
+                            "incompatible_index: reusable native version absent"
+                        );
                         self.verify_reusable_projection(
                             db,
                             &ids,
@@ -10067,7 +10225,10 @@ impl Store {
             );
             self.preflight_local_reuse(graph, prepared)?
         } else if matches!(target, PublicationTarget::Live) {
-            self.preflight_reuse(graph, native, &extractions, &expected, &rows)?
+            // A stored hash that differs from the fresh one is typed index
+            // corruption: the next publication rebaselines from fresh facts.
+            self.preflight_reuse(graph, native, &extractions, &expected, &rows)
+                .map_err(|error| self.report_live_read_failure(error))?
         } else {
             PreflightReuse::default()
         };
@@ -13704,3 +13865,6 @@ mod live_sqlite_witness_tests;
 
 #[cfg(test)]
 mod sqlite_deleted_witness_tests;
+
+#[cfg(test)]
+mod preflight_hash_reuse_tests;
