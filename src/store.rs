@@ -3760,17 +3760,24 @@ fn stream_document_classes(
     catalog: &crate::classes::Catalog,
     path: &str,
 ) -> crate::classes::Catalog {
+    // Catalog::compose sorts both vectors by document path before their
+    // within-document key. Find that path's range without rescanning the
+    // bounded workspace catalog for each streamed document.
+    let first_class = catalog
+        .classes
+        .partition_point(|c| c.symbol.path.as_str() < path);
+    let first_relation = catalog
+        .relations
+        .partition_point(|r| r.path.as_str() < path);
     crate::classes::Catalog {
-        classes: catalog
-            .classes
+        classes: catalog.classes[first_class..]
             .iter()
-            .filter(|c| c.symbol.path == path)
+            .take_while(|c| c.symbol.path == path)
             .cloned()
             .collect(),
-        relations: catalog
-            .relations
+        relations: catalog.relations[first_relation..]
             .iter()
-            .filter(|r| r.path == path)
+            .take_while(|r| r.path == path)
             .cloned()
             .collect(),
         warnings: Vec::new(),
