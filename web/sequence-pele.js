@@ -131,7 +131,7 @@
       if (id !== projection.noteIds[i] || ids.has(id)) unsupported("Changed Pele note order");
       ids.add(id);
       const expected = i === 0 ? "Static possible paths - target and timing unknown" : projection.noteOrder[i]?.display || "handlers / cleanup (see guards)";
-      if (!note.textContent.replace(/\s+/g, "").includes(expected.replace(/\s+/g, ""))) unsupported("Changed Pele note text");
+      if (note.textContent !== expected) unsupported("Changed Pele note text");
     }
     const observed = [...root.querySelectorAll(".pele-frame")].map(n => n.classList.contains("pele-frame-alt") ? "alt" : n.classList.contains("pele-frame-opt") ? "opt" : n.classList.contains("pele-frame-loop") ? "loop" : "unknown");
     if (observed.join("|") !== projection.closeFrames.join("|") || root.querySelectorAll(".pele-rect").length !== projection.frames.filter(x => x === "rect").length) unsupported("Changed Pele control frames");
@@ -208,7 +208,12 @@
             const top = container.scrollTop, left = container.scrollLeft;
             if (expandedGroups.has(row.id)) expandedGroups.delete(row.id); else expandedGroups.add(row.id);
             const outcome = await render(container, view, readSource, expandedGroups, {...options, selectedId:selected.id});
-            if (!current() || outcome.status !== "rendered") return;
+            if (!current()) return;
+            if (outcome.status === "unsupported") {
+              options.onUnsupported?.(outcome.reason);
+              return;
+            }
+            if (outcome.status !== "rendered") return;
             outcome.controls.get(row.id)?.focus({preventScroll:true}); container.scrollTop = top; container.scrollLeft = left;
           });
           foreign.append(toggle); note.append(foreign);

@@ -97,3 +97,42 @@ test("nested loop/guard frames validate close order; changed frame fails closed"
  assert.equal(failed,"unsupported");
  assert.deepEqual(violations.filter(error=>/Content Security Policy|CSP/.test(error)),[]);
 });
+
+test("changed visible positional note text with intact IDs refuses source action",async()=>{
+ const view=fixture("rust");
+ const result=await page.evaluate(async view=>{
+   const container=document.querySelector("#sequence-diagram");container.replaceChildren();window.picks=[];
+   const original=window.pele;
+   window.pele={render:(...args)=>{
+     const output=original.render(...args);
+     return {...output,svg:output.svg.replace("Static possible paths - target and timing unknown","Static possible paths - target and timing  unknown")};
+   }};
+   try{return await TrellisPeleSequence.render(container,view,null,new Set(),{onSelect:step=>window.picks.push(step)});}
+   finally{window.pele=original;}
+ },view);
+ assert.equal(result.status,"unsupported");assert.match(result.reason,/Changed Pele note text/);
+ assert.equal(await page.locator("#sequence-diagram .pele-note").count(),0);
+ assert.equal(await page.evaluate(()=>window.picks.length),0);
+});
+test("failed async group expansion visibly installs complete legacy DTO",async()=>{
+ const view=fixture("rust"),group=structuredClone(view.steps[0]),entry=structuredClone(view.steps[0]);
+ group.id="unsupported-group";group.kind="group";group.callId=null;group.label="original complete group";
+ entry.id="unsupported-child";delete entry.hidden;group.children=[entry];view.steps=[group];
+ const initial=await page.evaluate(async view=>{
+   const container=document.querySelector("#sequence-diagram");container.replaceChildren();
+   const expanded=new Set();document.querySelector("#state").textContent="Pele rendered";
+   const options={isCurrent:()=>true,onUnsupported:reason=>{
+     TrellisSequence.render(container,view,null,expanded,options);
+     document.querySelector("#state").textContent=`Pele fell back: ${reason}`;
+   }};
+   return (await TrellisPeleSequence.render(container,view,null,expanded,options)).status;
+ },view);
+ assert.equal(initial,"rendered");
+ await page.locator('.trellis-pele button.sequence-group-control').click();
+ await page.waitForFunction(()=>document.querySelector("#state")?.textContent?.includes("Pele fell back"));
+ assert.match(await page.locator("#state").textContent(),/Unsupported sequence step/);
+ assert.equal(await page.locator("#sequence-diagram svg.pele").count(),0);
+ assert.equal(await page.locator("#sequence-diagram svg").count(),1);
+ assert.match(await page.locator("#sequence-diagram").innerText(),/original complete group/);
+ assert.ok(await page.locator('[data-source-step-id="unsupported-child"]').count(),"expanded legacy view retains original child");
+});

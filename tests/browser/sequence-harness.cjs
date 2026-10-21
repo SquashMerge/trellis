@@ -79,12 +79,12 @@ function isolatedEnv(paths) {
   delete env.RUST_SRC_PATH; delete env.JEV_KEY;
   return env;
 }
-function fixture(source = SOURCE_P) {
+function fixture(source = SOURCE_P, filename = "flow.rs") {
   const temp = mkdtempSync(join(tmpdir(), "trellis-saved-browser-"));
   const paths = {temp, workspace:join(temp,"workspace"), home:join(temp,"home"), xdgCache:join(temp,"xdg-cache"),
     xdgData:join(temp,"xdg-data"), xdgConfig:join(temp,"xdg-config"), cargoHome:join(temp,"cargo-home"), secrets:join(temp,"secrets")};
   for (const path of Object.values(paths).slice(1)) mkdirSync(path, {recursive:true, mode:0o700});
-  paths.source = join(paths.workspace, "flow.rs"); paths.tokenFile = join(paths.secrets, "daemon.token"); paths.token = randomBytes(32).toString("hex");
+  paths.source = join(paths.workspace, filename); paths.tokenFile = join(paths.secrets, "daemon.token"); paths.token = randomBytes(32).toString("hex");
   writeFileSync(paths.source, source); writeFileSync(paths.tokenFile, paths.token, {mode:0o600}); chmodSync(paths.tokenFile,0o600);
   paths.env = isolatedEnv(paths);
   return paths;
