@@ -144,3 +144,54 @@ fn equal_stored_hashes_reuse_without_decoding_stored_rows() {
     assert_eq!(next.index_generation, pin.index_generation);
     assert_eq!(next.index_revision, pin.index_revision + 1);
 }
+
+#[test]
+fn scratch_preflight_faults_do_not_reclassify_the_live_head() {
+    for fault in ["graph_json", "extraction_json", "sqlite_corrupt"] {
+        let (_state, _work, store, options, pin) = fixture();
+        *store.test_stream_before_preflight_hook.lock().unwrap() = Some(Box::new(move |spool| {
+            let index = spool
+                .header()
+                .revision
+                .documents
+                .iter()
+                .position(|document| document.key.path == "A.java")
+                .unwrap();
+            match fault {
+                "graph_json" => spool.corrupt_graph_json_for_tests(index),
+                "extraction_json" => spool.corrupt_extraction_json_for_tests(index),
+                "sqlite_corrupt" => spool.inject_sqlite_corrupt_read_for_tests(),
+                _ => unreachable!(),
+            }
+        }));
+        let error = publish_full(&store, &options).unwrap_err();
+        assert!(
+            error.downcast_ref::<NativeSpoolReadFailure>().is_some(),
+            "{fault}: {error:#}"
+        );
+        assert_eq!(store.disposition(), RecoveryDisposition::Ready, "{fault}");
+        let db = store.cache_write().unwrap();
+        let selected: (String, i64) = db
+            .query_row(
+                "SELECT index_generation,index_revision FROM index_metadata WHERE singleton=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            selected,
+            (pin.index_generation.to_string(), pin.index_revision as i64),
+            "{fault}: a scratch failure cannot partially publish"
+        );
+        let revisions: i64 = db
+            .query_row("SELECT count(*) FROM native_revisions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(revisions, 1, "{fault}");
+        drop(db);
+        let next = publish_full(&store, &options).unwrap();
+        assert_eq!(next.index_generation, pin.index_generation, "{fault}");
+        assert_eq!(next.index_revision, pin.index_revision + 1, "{fault}");
+    }
+}

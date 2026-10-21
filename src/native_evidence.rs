@@ -985,6 +985,8 @@ pub(crate) struct FullDocumentSpool {
     _file: tempfile::NamedTempFile,
     stats: IndexStats,
     diagnostics: Vec<Diagnostic>,
+    #[cfg(test)]
+    test_read_error: std::cell::RefCell<Option<rusqlite::Error>>,
 }
 
 impl FullDocumentSpool {
@@ -1009,6 +1011,10 @@ impl FullDocumentSpool {
             .documents
             .get(index)
             .context("native spool document index out of range")?;
+        #[cfg(test)]
+        if let Some(error) = self.test_read_error.borrow_mut().take() {
+            return Err(error.into());
+        }
         let (facts, graph): (Vec<u8>, Vec<u8>) = self.conn.query_row(
             "SELECT facts, graph FROM documents WHERE ordinal = ?1",
             rusqlite::params![i64::try_from(index)?],
@@ -1031,6 +1037,37 @@ impl FullDocumentSpool {
             "native spool graph/document mismatch"
         );
         Ok((artifact, graph))
+    }
+    #[cfg(test)]
+    pub(crate) fn corrupt_graph_json_for_tests(&self, index: usize) {
+        assert_eq!(
+            self.conn
+                .execute(
+                    "UPDATE documents SET graph=X'00' WHERE ordinal=?1",
+                    [i64::try_from(index).unwrap()],
+                )
+                .unwrap(),
+            1
+        );
+    }
+    #[cfg(test)]
+    pub(crate) fn corrupt_extraction_json_for_tests(&self, index: usize) {
+        assert_eq!(
+            self.conn
+                .execute(
+                    "UPDATE extractions SET payload=X'00' WHERE ordinal=?1",
+                    [i64::try_from(index).unwrap()],
+                )
+                .unwrap(),
+            1
+        );
+    }
+    #[cfg(test)]
+    pub(crate) fn inject_sqlite_corrupt_read_for_tests(&self) {
+        *self.test_read_error.borrow_mut() = Some(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT),
+            None,
+        ));
     }
     fn admit_identity(&self, handle: &str, canonical: &[u8], full: &str) -> Result<()> {
         let inserted = self.conn.execute(
@@ -1166,12 +1203,19 @@ fn spool_full_capture_with(
          CREATE TABLE identities (handle TEXT PRIMARY KEY, canonical BLOB NOT NULL, full TEXT NOT NULL) WITHOUT ROWID;
          CREATE TABLE extractions (ordinal INTEGER PRIMARY KEY, payload BLOB NOT NULL);",
     )?;
+    // SQLite retains its open file descriptor. Unlink the disposable spool now,
+    // so a crash cannot strand gigabytes of private scratch in the cache. No
+    // journal sidecar exists in OFF mode; keep the separate NamedTempFile handle
+    // alive until after SQLite's connection drops (POSIX close-lock rule).
+    std::fs::remove_file(file.path()).context("remove private native spool pathname")?;
     let mut spool = FullDocumentSpool {
         header,
         conn,
         _file: file,
         stats: IndexStats::default(),
         diagnostics: Vec::new(),
+        #[cfg(test)]
+        test_read_error: std::cell::RefCell::new(None),
     };
     // The full revision document vector remains in the header. Worker shells
     // carry only revision ID and inputs, never the complete document vector.
@@ -3869,6 +3913,14 @@ mod full_document_spool_tests {
             &store.native_spool_dir().unwrap(),
         )
         .unwrap();
+        let unlinked_path = spool._file.path().to_owned();
+        assert!(
+            !unlinked_path.exists(),
+            "active SQLite spool must be anonymous"
+        );
+        // Extraction and graph writes happened after unlink. Read through the
+        // still-open SQLite connection, then drop it without leaving a stage.
+        assert!(!spool.read(0).unwrap().1.files.is_empty());
         let stages = stages.into_inner();
         assert_eq!(capture.graph_projection_count(), 1);
         assert!(
@@ -3985,6 +4037,19 @@ mod full_document_spool_tests {
                     .collect::<Vec<_>>()
             );
         }
+        assert_eq!(spool._file.as_file().metadata().unwrap().nlink(), 0);
+        drop(spool);
+        assert!(!unlinked_path.exists());
+        assert!(
+            fs::read_dir(store.native_spool_dir().unwrap())
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("native-spool-")),
+            "dropped spool must leave no pathname"
+        );
     }
 
     #[test]

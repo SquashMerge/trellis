@@ -22,6 +22,8 @@ use std::{
 
 #[cfg(test)]
 type TestMetricsDocumentHook = Arc<dyn Fn(&str, MetricsDocumentStage) + Send + Sync>;
+#[cfg(test)]
+type TestStreamPreflightHook = Box<dyn FnOnce(&crate::native_evidence::FullDocumentSpool) + Send>;
 /// When a metrics document's test hook runs.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -250,6 +252,8 @@ pub struct Store {
     maintenance_before_writer_hook: Arc<TestOneShotHook>,
     maintenance_after_first_delete_hook: Arc<TestOneShotHook>,
     publication_before_commit_hook: Arc<TestOneShotHook>,
+    #[cfg(test)]
+    test_stream_before_preflight_hook: Arc<Mutex<Option<TestStreamPreflightHook>>>,
     /// The publication page cache in KiB; only tests lower it.
     publication_cache_kib: Arc<std::sync::atomic::AtomicI64>,
     writer_before_metadata_hook: Arc<TestOneShotHook>,
@@ -2984,6 +2988,21 @@ fn open_index(path: &Path, writable: bool) -> Result<ProtectedSqliteConnection> 
     storage_result(db.prepare("SELECT projection_id,id,payload FROM class_relations"))?;
     validate_cache_shape(&db)?;
     Ok(db)
+}
+
+/// A fault in the unpublished scratch spool is not evidence that index.db is
+/// corrupt. Do not retain a SQLite/JSON source in this wrapper: the live-index
+/// recovery classifier examines the full error chain.
+#[derive(Debug)]
+struct NativeSpoolReadFailure(String);
+impl std::fmt::Display for NativeSpoolReadFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "native_spool_failure: {}", self.0)
+    }
+}
+impl std::error::Error for NativeSpoolReadFailure {}
+fn native_spool_read_failure(error: anyhow::Error) -> anyhow::Error {
+    NativeSpoolReadFailure(format!("{error:#}")).into()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -6722,6 +6741,8 @@ impl Store {
             maintenance_before_writer_hook: Arc::new(TestOneShotHook::default()),
             maintenance_after_first_delete_hook: Arc::new(TestOneShotHook::default()),
             publication_before_commit_hook: Arc::new(TestOneShotHook::default()),
+            #[cfg(test)]
+            test_stream_before_preflight_hook: Arc::new(Mutex::new(None)),
             publication_cache_kib: Arc::new(std::sync::atomic::AtomicI64::new(
                 PUBLICATION_CACHE_KIB,
             )),
@@ -10353,7 +10374,7 @@ impl Store {
             // authenticating per-document reuse against this read snapshot.
             let mut families = BTreeMap::new();
             for &index in order {
-                let (native, graph) = spool.read(index)?;
+                let (native, graph) = spool.read(index).map_err(native_spool_read_failure)?;
                 let file = graph.files.first().context("stream graph document absent")?;
                 let selected_classes = stream_document_classes(classes, &file.path);
                 let rows = publication_rows(&graph, &native, &selected_classes)?;
@@ -10414,7 +10435,7 @@ impl Store {
                             "incompatible_index: reusable native version absent"
                         );
                         let extraction = if matches!(file.language.as_str(), "java" | "python") {
-                            Some(spool.read_extraction(index)?)
+                            Some(spool.read_extraction(index).map_err(native_spool_read_failure)?)
                         } else {
                             None
                         };
@@ -10660,6 +10681,17 @@ impl Store {
         // values from different connections cannot fence a concurrent SQL rewrite.
         let admitted_version: i64 =
             storage_result(db.pragma_query_value(None, "data_version", |r| r.get(0)))?;
+        #[cfg(test)]
+        if let Some(spool) = stream {
+            let hook = self
+                .test_stream_before_preflight_hook
+                .lock()
+                .unwrap()
+                .take();
+            if let Some(hook) = hook {
+                hook(spool);
+            }
+        }
         let reuse = if let Some(prepared) = local {
             ensure!(
                 matches!(target, PublicationTarget::Live),
