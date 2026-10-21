@@ -3613,6 +3613,7 @@ fn v8_id(prefix: &str, domain: &[u8], value: serde_json::Value) -> String {
         crate::native_ids::digest(domain, &crate::native_ids::canonical(&value))
     )
 }
+#[derive(Clone)]
 struct V8DocumentProjection {
     version_id: String,
     graph_id: String,
@@ -3751,6 +3752,30 @@ fn publication_rows_with_progress<'a>(
             .push(region);
     }
     Ok(rows)
+}
+
+// Catalog composition has global limits and warnings, while each SQL family
+// and projection hash uses only rows owned by the current document.
+fn stream_document_classes(
+    catalog: &crate::classes::Catalog,
+    path: &str,
+) -> crate::classes::Catalog {
+    crate::classes::Catalog {
+        classes: catalog
+            .classes
+            .iter()
+            .filter(|c| c.symbol.path == path)
+            .cloned()
+            .collect(),
+        relations: catalog
+            .relations
+            .iter()
+            .filter(|r| r.path == path)
+            .cloned()
+            .collect(),
+        warnings: Vec::new(),
+        truncated: catalog.truncated,
+    }
 }
 
 fn v8_document_projection(
@@ -4201,6 +4226,88 @@ impl ImmutableAppend {
     }
 }
 
+// Emit exactly one document's graph and class rows under the caller's transaction.
+fn write_graph_document(
+    db: &Connection,
+    grouped: &PublicationRows<'_>,
+    ids: &V8DocumentProjection,
+    reused: ReusedFamilies,
+    immutable: &mut ImmutableAppend,
+) -> Result<()> {
+    for n in &grouped.nodes {
+        if reused.graph {
+            continue;
+        }
+        immutable.insert(
+            db,
+            "INSERT INTO graph_nodes VALUES(?1,?2,?3,?4,?5)",
+            params![ids.graph_id, n.id, n.name, n.path, json(n)?],
+        )?;
+    }
+    for c in &grouped.calls {
+        if reused.graph {
+            continue;
+        }
+        immutable.insert(
+            db,
+            "INSERT INTO graph_calls VALUES(?1,?2,?3,?4,?5,?6)",
+            params![
+                ids.graph_id,
+                c.id,
+                c.caller,
+                Option::<String>::None,
+                c.path,
+                json(c)?
+            ],
+        )?;
+    }
+    for r in &grouped.regions {
+        if reused.graph {
+            continue;
+        }
+        immutable.insert(
+            db,
+            "INSERT INTO graph_regions VALUES(?1,?2,?3,?4,?5)",
+            params![ids.graph_id, r.id, r.owner, r.path, json(r)?],
+        )?;
+    }
+    for class in &grouped.classes {
+        if reused.class {
+            continue;
+        }
+        immutable.insert(
+            db,
+            "INSERT INTO classes VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                ids.class_id,
+                ids.graph_id,
+                class.symbol.id,
+                class.symbol.name,
+                class.qualified_name,
+                class.symbol.path,
+                json(class)?,
+            ],
+        )?;
+    }
+    for relation in &grouped.relations {
+        if reused.class {
+            continue;
+        }
+        immutable.insert(
+            db,
+            "INSERT INTO class_relations VALUES(?1,?2,?3,?4,?5)",
+            params![
+                ids.class_id,
+                relation.id,
+                relation.owner,
+                relation.target,
+                json(relation)?,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)] // The transaction seam keeps the immutable bundle and reuse witness separate.
 fn write_native(
     db: &Connection,
@@ -4217,6 +4324,9 @@ fn write_native(
     immutable: &mut ImmutableAppend,
     reuse: &PreflightReuse,
     rows: &BTreeMap<&str, PublicationRows<'_>>,
+    write_header: bool,
+    ordinal_start: usize,
+    full_diagnostics: &[Diagnostic],
 ) -> Result<BTreeMap<String, V8DocumentProjection>> {
     let (artifact, capture, graph, classes, extractions) = bundle;
     let a = artifact;
@@ -4224,101 +4334,106 @@ fn write_native(
         "pin:v1:{}:{}",
         revision.index_generation, revision.index_revision
     );
-    let origin: Option<(String,String,String,String,String)> = db.query_row(
+    if write_header {
+        let origin: Option<(String,String,String,String,String)> = db.query_row(
         "SELECT id,version,executable_hash,kind,position_encoding FROM native_producers LIMIT 1",
         [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)),
     ).optional()?;
-    if let Some((id, version, _, kind, encoding)) = &origin {
-        ensure!(
-            id == &a.producer.id
-                && version == &a.producer.version
-                && kind == &a.producer.kind
-                && encoding == &a.producer.position_encoding,
-            "incompatible_index: native producer schema/extractor descriptor differs"
-        );
-    } else {
-        immutable.insert(
-            db,
-            "INSERT INTO native_producers VALUES(?1,?2,?3,?4,?5)",
-            params![
-                a.producer.id,
-                a.producer.version,
-                a.producer.executable_hash,
-                a.producer.kind,
-                a.producer.position_encoding
-            ],
-        )?;
-    }
-    // The immutable row is the generation origin. Each NEW revision records the
-    // validated executing hash in revision_capture_inputs + its SHA binding.
+        if let Some((id, version, _, kind, encoding)) = &origin {
+            ensure!(
+                id == &a.producer.id
+                    && version == &a.producer.version
+                    && kind == &a.producer.kind
+                    && encoding == &a.producer.position_encoding,
+                "incompatible_index: native producer schema/extractor descriptor differs"
+            );
+        } else {
+            immutable.insert(
+                db,
+                "INSERT INTO native_producers VALUES(?1,?2,?3,?4,?5)",
+                params![
+                    a.producer.id,
+                    a.producer.version,
+                    a.producer.executable_hash,
+                    a.producer.kind,
+                    a.producer.position_encoding
+                ],
+            )?;
+        }
+        // The immutable row is the generation origin. Each NEW revision records the
+        // validated executing hash in revision_capture_inputs + its SHA binding.
 
-    for (ordinal, language) in a.producer.languages.iter().enumerate() {
+        for (ordinal, language) in a.producer.languages.iter().enumerate() {
+            immutable.insert(
+                db,
+                "INSERT INTO native_producer_languages VALUES(?1,?2,?3,?4,?5)",
+                params![
+                    a.producer.id,
+                    a.producer.version,
+                    language,
+                    1,
+                    ordinal as i64
+                ],
+            )?;
+        }
         immutable.insert(
             db,
-            "INSERT INTO native_producer_languages VALUES(?1,?2,?3,?4,?5)",
-            params![
-                a.producer.id,
-                a.producer.version,
-                language,
-                1,
-                ordinal as i64
-            ],
+            "INSERT INTO native_source_sets VALUES(?1,?2)",
+            params![a.source_set.id, a.source_set.root_id],
         )?;
-    }
-    immutable.insert(
-        db,
-        "INSERT INTO native_source_sets VALUES(?1,?2)",
-        params![a.source_set.id, a.source_set.root_id],
-    )?;
-    for (ordinal, language) in a.source_set.languages.iter().enumerate() {
-        immutable.insert(
-            db,
-            "INSERT INTO native_source_set_languages VALUES(?1,?2,?3)",
-            params![a.source_set.id, language, ordinal as i64],
-        )?;
-    }
-    for (ordinal, dependency) in a.source_set.dependencies.iter().enumerate() {
-        immutable.insert(
-            db,
-            "INSERT INTO native_source_set_dependencies VALUES(?1,?2,?3)",
-            params![a.source_set.id, dependency, ordinal as i64],
-        )?;
-    }
-    immutable.insert_manifest(
-        db,
-        "INSERT INTO native_revisions VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
-        params![
-            revision_key,
-            a.revision.source_set_id,
-            a.revision.toolchain_hash,
-            a.revision.config_hash,
-            a.revision.dependency_hash,
-            a.revision.id,
-            json(&a.revision.documents)?,
-            json(&a.source_set.dependencies)?,
-            json(capture.reconcile_options())?,
-            json(&classes.warnings)?,
-            classes.truncated,
-            json(stats)?,
-            json(&graph.diagnostics)?,
-            revision.index_revision as i64,
-        ],
-    )?;
-    for (key, observation) in capture.persisted_inputs()? {
-        check_cancel(cancel)?;
-        ensure!(
-            key != "__released:v1" && key != "__pending_release:v1",
-            "native_evidence_required: reserved release marker"
-        );
+        for (ordinal, language) in a.source_set.languages.iter().enumerate() {
+            immutable.insert(
+                db,
+                "INSERT INTO native_source_set_languages VALUES(?1,?2,?3)",
+                params![a.source_set.id, language, ordinal as i64],
+            )?;
+        }
+        for (ordinal, dependency) in a.source_set.dependencies.iter().enumerate() {
+            immutable.insert(
+                db,
+                "INSERT INTO native_source_set_dependencies VALUES(?1,?2,?3)",
+                params![a.source_set.id, dependency, ordinal as i64],
+            )?;
+        }
         immutable.insert_manifest(
             db,
-            "INSERT INTO revision_capture_inputs VALUES(?1,?2,?3)",
-            params![revision_key, key, json(&observation)?],
+            "INSERT INTO native_revisions VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+            params![
+                revision_key,
+                a.revision.source_set_id,
+                a.revision.toolchain_hash,
+                a.revision.config_hash,
+                a.revision.dependency_hash,
+                a.revision.id,
+                json(&a.revision.documents)?,
+                json(&a.source_set.dependencies)?,
+                json(capture.reconcile_options())?,
+                json(&classes.warnings)?,
+                classes.truncated,
+                json(stats)?,
+                json(full_diagnostics)?,
+                revision.index_revision as i64,
+            ],
         )?;
+        for (key, observation) in capture.persisted_inputs()? {
+            check_cancel(cancel)?;
+            ensure!(
+                key != "__released:v1" && key != "__pending_release:v1",
+                "native_evidence_required: reserved release marker"
+            );
+            immutable.insert_manifest(
+                db,
+                "INSERT INTO revision_capture_inputs VALUES(?1,?2,?3)",
+                params![revision_key, key, json(&observation)?],
+            )?;
+        }
     }
-    let documents: BTreeMap<_, _> = a
+    let selected_documents = a
         .revision
         .documents
+        .get(ordinal_start..ordinal_start.saturating_add(graph.files.len()))
+        .context("native document ordinal outside revision header")?;
+    let documents: BTreeMap<_, _> = selected_documents
         .iter()
         .map(|doc| (doc.key.path.as_str(), doc))
         .collect();
@@ -4368,7 +4483,8 @@ fn write_native(
     )
     .into_iter();
     let mut projections = BTreeMap::new();
-    for (ordinal, file) in graph.files.iter().enumerate() {
+    for (offset, file) in graph.files.iter().enumerate() {
+        let ordinal = ordinal_start + offset;
         check_cancel(cancel)?;
         let (mut projection, mut witness) = precomputed.next().flatten().unwrap_or_default();
         let doc = documents
@@ -4635,9 +4751,7 @@ fn write_native(
             ],
         )?;
     }
-    let documents_by_key: BTreeMap<_, _> = a
-        .revision
-        .documents
+    let documents_by_key: BTreeMap<_, _> = selected_documents
         .iter()
         .map(|document| (&document.key, document))
         .collect();
@@ -8379,6 +8493,81 @@ impl Store {
             cancel,
         )
     }
+    /// Publish a validated full revision from document-local evidence. The spool is
+    /// private, repeatable and never part of the visible index; SQL remains one
+    /// all-or-nothing revision transaction.
+    pub(crate) fn publish_validated_stream_recovery(
+        &self,
+        spool: &crate::native_evidence::FullDocumentSpool,
+        capture: &crate::capture::Capture,
+        leader: &topology::WriterGuard,
+        expected: RecoveryBaseline,
+        cancel: &CancelFlag,
+    ) -> Result<IndexPin> {
+        capture.verify(cancel)?;
+        ensure!(
+            capture.graph_projection_count() == 1,
+            "native_evidence_required: capture must have one graph projection"
+        );
+        ensure!(
+            capture.source_operations.len() == capture.files.len()
+                && capture
+                    .source_operations
+                    .values()
+                    .all(|counts| counts.opens == 1
+                        && counts.complete_reads == 1
+                        && counts.hashes == 1),
+            "native_evidence_required: each source must open, read, and hash once"
+        );
+        capture
+            .reconcile_options()
+            .require_absolute_optional_inputs()?;
+        ensure!(
+            spool.len() == spool.header().revision.documents.len()
+                && spool.len() == capture.files.len(),
+            "native_evidence_required: streamed document count mismatch"
+        );
+        let source_by_path: BTreeMap<_, _> = capture
+            .files
+            .iter()
+            .map(|file| (file.path.as_str(), file))
+            .collect();
+        ensure!(
+            source_by_path.len() == capture.files.len(),
+            "native_evidence_required: duplicate captured source path"
+        );
+        let mut graph = Graph {
+            stats: spool.stats().clone(),
+            diagnostics: spool.diagnostics().to_vec(),
+            ..Graph::default()
+        };
+        for doc in &spool.header().revision.documents {
+            let source = source_by_path
+                .get(doc.key.path.as_str())
+                .context("native document missing captured source")?;
+            ensure!(
+                doc.key.language == source.language
+                    && doc.content_hash == source.hash
+                    && doc.byte_length == source.text.len(),
+                "native document bytes differ from captured graph"
+            );
+            graph.files.push((*source).clone());
+        }
+        let pin = self.publish_inner_checked_target_with_local(
+            (&graph, capture, spool.header()),
+            leader,
+            PublicationPlan {
+                expected: ExpectedPublication::Recovery(Box::new(expected)),
+                target: PublicationTarget::Live,
+            },
+            cancel,
+            (256 * 1024 * 1024 + 16 * 1024, None, Some(spool)),
+            |_, _| Ok(()),
+        )?;
+        self.attest_post_acquisition_reconciliation_guard(leader, pin)?;
+        Ok(pin)
+    }
+
     #[allow(dead_code)] // Test seam for the original full-artifact selective rollback matrix.
     pub(crate) fn publish_native_recovery_selective(
         &self,
@@ -8443,7 +8632,7 @@ impl Store {
                 target: PublicationTarget::Live,
             },
             cancel,
-            (256 * 1024 * 1024 + 16 * 1024, Some(&prepared)),
+            (256 * 1024 * 1024 + 16 * 1024, Some(&prepared), None),
             |_, _| Ok(()),
         )
     }
@@ -10049,6 +10238,178 @@ impl Store {
             })
         })
     }
+
+    fn prepare_stream_class_catalog(
+        spool: &crate::native_evidence::FullDocumentSpool,
+        cancel: &CancelFlag,
+    ) -> Result<crate::classes::Catalog> {
+        let limits = crate::classes::Limits::default();
+        let compose = spool.len() <= limits.files && spool.stats().symbols <= limits.symbols;
+        let mut extractions = Vec::new();
+        for index in 0..spool.len() {
+            check_cancel(cancel)?;
+            let (_, graph) = spool.read(index)?;
+            let file = graph
+                .files
+                .first()
+                .context("stream graph document absent")?;
+            if matches!(file.language.as_str(), "java" | "python") {
+                let symbols: Vec<_> = graph
+                    .nodes
+                    .iter()
+                    .filter(|n| {
+                        matches!(
+                            n.kind,
+                            SymbolKind::Class | SymbolKind::Method | SymbolKind::Function
+                        )
+                    })
+                    .cloned()
+                    .collect();
+                let extraction =
+                    crate::classes::FileExtraction::extract_file(file, &symbols, cancel, limits)?;
+                spool.write_extraction(index, &extraction)?;
+                if compose {
+                    extractions.push(extraction);
+                }
+            }
+        }
+        crate::classes::Catalog::compose(&extractions, spool.len(), spool.stats().symbols, limits)
+    }
+
+    fn preflight_stream_reuse(
+        &self,
+        spool: &crate::native_evidence::FullDocumentSpool,
+        classes: &crate::classes::Catalog,
+        expected: &ExpectedPublication,
+    ) -> Result<PreflightReuse> {
+        if self.disposition() != RecoveryDisposition::Ready
+            || !match expected {
+                ExpectedPublication::Pin(pin) => pin.index_revision > 0,
+                ExpectedPublication::Recovery(baseline) => {
+                    baseline.compatible && baseline.pin().is_some_and(|p| p.index_revision > 0)
+                }
+            }
+        {
+            return Ok(PreflightReuse::default());
+        }
+        self.with_prior_publication_snapshot(|db| {
+            let selected = ReadRevision::current(db)?;
+            if !match expected {
+                ExpectedPublication::Pin(pin) => *pin == selected.pin,
+                ExpectedPublication::Recovery(baseline) => {
+                    baseline.pin() == Some(selected.pin) && baseline.compatible
+                }
+            } || selected.pin.index_revision == 0
+            {
+                return Ok(PreflightReuse::default());
+            }
+            // T00 attests only versions actually reused below. Unselected
+            // historical versions must not affect this fresh publication.
+            let drift = selected_producer_hash(db, &selected)? != spool.header().producer.executable_hash;
+            let mut old = BTreeMap::new();
+            let mut stmt = db.prepare(
+                "SELECT path,document_version_id,graph_projection_id,class_projection_id
+                FROM revision_documents WHERE revision_id=?1 ORDER BY path",
+            )?;
+            for row in stmt.query_map([&selected.key], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })? {
+                let (path, version, projection, class) = row?;
+                ensure!(
+                    old.insert(path, (version, projection, class)).is_none(),
+                    "incompatible_index: duplicate prior manifest document"
+                );
+            }
+            // Keep only one document's native and graph rows in memory while
+            // authenticating per-document reuse against this read snapshot.
+            let mut families = BTreeMap::new();
+            for index in 0..spool.len() {
+                let (native, graph) = spool.read(index)?;
+                let file = graph.files.first().context("stream graph document absent")?;
+                let selected_classes = stream_document_classes(classes, &file.path);
+                let rows = publication_rows(&graph, &native, &selected_classes)?;
+                let grouped = rows.get(file.path.as_str()).context("publication rows missing")?;
+                let ids = v8_document_projection(file, &native, grouped)?;
+                let reused_version = old.get(&file.path)
+                    .is_some_and(|(version, _, _)| *version == ids.version_id);
+                let measured = if drift || reused_version {
+                    Some(publication_native_witness(
+                        native.revision.documents.get(index)
+                            .context("new native document absent")?,
+                        &native.producer,
+                        native.coverage.first().context("new native coverage absent")?,
+                        grouped,
+                    )?)
+                } else {
+                    None
+                };
+                // An equal version ID means equal content, extraction context and
+                // producer version; its stored witness binds the measured facts.
+                let prior_witness: Option<String> = match &measured {
+                    Some(_) => db.query_row(
+                        "SELECT native_witness FROM document_versions WHERE id=?1",
+                        [&ids.version_id], |r| r.get(0),
+                    ).optional()?,
+                    None => None,
+                };
+                if let (Some(measured), Some(prior_witness)) = (&measured, &prior_witness)
+                    && measured != prior_witness
+                {
+                    // The new executable FULLY measured this document. Equal
+                    // document/version inputs cannot silently acquire different
+                    // measured facts under Decision 0003.
+                    ensure!(!drift,
+                        "native_producer_version_required: measured facts changed under the same nativeProducerVersion; bump producer version before indexing");
+                    return Err(ControlIntegrity(
+                        "incompatible_index: reusable normalized native witness mismatch".into(),
+                    )
+                    .into());
+                }
+                if let Some((old_version, old_graph, old_class)) = old.get(&file.path) {
+                    let reused = ReusedFamilies {
+                        native: *old_version == ids.version_id,
+                        graph: *old_graph == ids.graph_id,
+                        class: old_class.as_deref() == Some(ids.class_id.as_str()),
+                    };
+                    ensure!(
+                        !reused.graph || reused.native,
+                        "incompatible_index: graph reused with different native version"
+                    );
+                    ensure!(
+                        !reused.class || reused.graph,
+                        "incompatible_index: class reused with different graph projection"
+                    );
+                    if reused.native || reused.graph || reused.class {
+                        control_ensure!(
+                            !reused.native || prior_witness.is_some(),
+                            "incompatible_index: reusable native version absent"
+                        );
+                        self.verify_reusable_projection(
+                            db,
+                            &ids,
+                            reused,
+                            if matches!(file.language.as_str(), "java" | "python") {
+                                Some(&spool.read_extraction(index)?)
+                            } else {
+                                None
+                            },
+                        )?;
+                        families.insert(file.path.clone(), reused);
+                    }
+                }
+            }
+            Ok(PreflightReuse {
+                pin: Some(selected.pin),
+                families,
+                existing_ids: BTreeMap::new(),
+            })
+        })
+    }
     fn publish_inner_checked_target(
         &self,
         bundle: (
@@ -10067,7 +10428,7 @@ impl Store {
             leader,
             plan,
             cancel,
-            (max_graph_json_bytes, None),
+            (max_graph_json_bytes, None, None),
             during_tx,
         )
     }
@@ -10082,7 +10443,11 @@ impl Store {
         leader: &topology::WriterGuard,
         plan: PublicationPlan<'_>,
         cancel: &CancelFlag,
-        (max_graph_json_bytes, local): (usize, Option<&LocalPrepared>),
+        (max_graph_json_bytes, local, stream): (
+            usize,
+            Option<&LocalPrepared>,
+            Option<&crate::native_evidence::FullDocumentSpool>,
+        ),
         mut during_tx: impl FnMut(PublishStage, &Connection) -> Result<()>,
     ) -> Result<IndexPin> {
         let PublicationPlan { expected, target } = plan;
@@ -10096,75 +10461,63 @@ impl Store {
             "unsupported graph schema"
         );
         check_cancel(cancel)?;
-        let stats = if let Some(prepared) = local {
+        let (stats, classes, extractions) = if let Some(spool) = stream {
             ensure!(
-                prepared.prior_pin == expected.pin().context("local expected pin missing")?,
-                "revision conflict: local prepared pin changed"
+                local.is_none(),
+                "local and streamed publication cannot be combined"
             );
-            graph.stats.clone()
+            (
+                spool.stats().clone(),
+                Self::prepare_stream_class_catalog(spool, cancel)?,
+                BTreeMap::new(),
+            )
         } else {
-            validate_graph(graph, cancel)?
-        };
-        // Parse cached source before taking the writer lock. Projection and graph
-        // still publish in one transaction with the same CAS/cancellation guard.
-        let limits = crate::classes::Limits::default();
-        let class_paths: BTreeSet<_> = graph
-            .files
-            .iter()
-            .filter(|f| matches!(f.language.as_str(), "java" | "python"))
-            .map(|f| f.path.as_str())
-            .collect();
-        // Class extraction only consumes class/method/function symbols. Supply
-        // each file's symbols once instead of rescanning the full graph per file.
-        let mut class_symbols: BTreeMap<&str, Vec<Symbol>> = BTreeMap::new();
-        for node in &graph.nodes {
-            if class_paths.contains(node.path.as_str())
-                && matches!(
-                    node.kind,
-                    SymbolKind::Class | SymbolKind::Method | SymbolKind::Function
-                )
-            {
-                class_symbols
-                    .entry(node.path.as_str())
-                    .or_default()
-                    .push(node.clone());
-            }
-        }
-        let extractions: BTreeMap<String, crate::classes::FileExtraction> = if let Some(prepared) =
-            local
-        {
-            ensure!(
-                prepared.prior_extractions.len() == class_paths.len(),
-                "incompatible_index: local class extraction inventory incomplete"
-            );
-            let mut extractions = prepared.prior_extractions.clone();
-            if let Some(file) = graph.files.iter().find(|f| {
-                f.path == prepared.changed_path && matches!(f.language.as_str(), "java" | "python")
-            }) {
-                let extracted = crate::classes::FileExtraction::extract_file(
-                    file,
-                    class_symbols
-                        .get(file.path.as_str())
-                        .map(Vec::as_slice)
-                        .unwrap_or(&[]),
-                    cancel,
-                    limits,
-                )?;
+            let stats = if let Some(prepared) = local {
                 ensure!(
-                    extractions.insert(file.path.clone(), extracted).is_some(),
-                    "incompatible_index: prior class extraction absent"
+                    prepared.prior_pin == expected.pin().context("local expected pin missing")?,
+                    "revision conflict: local prepared pin changed"
                 );
-            }
-            extractions
-        } else {
-            graph
+                graph.stats.clone()
+            } else {
+                validate_graph(graph, cancel)?
+            };
+            // Parse cached source before taking the writer lock. Projection and graph
+            // still publish in one transaction with the same CAS/cancellation guard.
+            let limits = crate::classes::Limits::default();
+            let class_paths: BTreeSet<_> = graph
                 .files
                 .iter()
                 .filter(|f| matches!(f.language.as_str(), "java" | "python"))
-                .map(|file| {
-                    Ok((
-                        file.path.clone(),
-                        crate::classes::FileExtraction::extract_file(
+                .map(|f| f.path.as_str())
+                .collect();
+            // Class extraction only consumes class/method/function symbols. Supply
+            // each file's symbols once instead of rescanning the full graph per file.
+            let mut class_symbols: BTreeMap<&str, Vec<Symbol>> = BTreeMap::new();
+            for node in &graph.nodes {
+                if class_paths.contains(node.path.as_str())
+                    && matches!(
+                        node.kind,
+                        SymbolKind::Class | SymbolKind::Method | SymbolKind::Function
+                    )
+                {
+                    class_symbols
+                        .entry(node.path.as_str())
+                        .or_default()
+                        .push(node.clone());
+                }
+            }
+            let extractions: BTreeMap<String, crate::classes::FileExtraction> =
+                if let Some(prepared) = local {
+                    ensure!(
+                        prepared.prior_extractions.len() == class_paths.len(),
+                        "incompatible_index: local class extraction inventory incomplete"
+                    );
+                    let mut extractions = prepared.prior_extractions.clone();
+                    if let Some(file) = graph.files.iter().find(|f| {
+                        f.path == prepared.changed_path
+                            && matches!(f.language.as_str(), "java" | "python")
+                    }) {
+                        let extracted = crate::classes::FileExtraction::extract_file(
                             file,
                             class_symbols
                                 .get(file.path.as_str())
@@ -10172,32 +10525,71 @@ impl Store {
                                 .unwrap_or(&[]),
                             cancel,
                             limits,
-                        )?,
-                    ))
-                })
-                .collect::<Result<_>>()?
-        };
-        let classes = Self::compose_selected_class_catalog(graph, &extractions, limits)?;
-        if let Some(prepared) = local {
+                        )?;
+                        ensure!(
+                            extractions.insert(file.path.clone(), extracted).is_some(),
+                            "incompatible_index: prior class extraction absent"
+                        );
+                    }
+                    extractions
+                } else {
+                    graph
+                        .files
+                        .iter()
+                        .filter(|f| matches!(f.language.as_str(), "java" | "python"))
+                        .map(|file| {
+                            Ok((
+                                file.path.clone(),
+                                crate::classes::FileExtraction::extract_file(
+                                    file,
+                                    class_symbols
+                                        .get(file.path.as_str())
+                                        .map(Vec::as_slice)
+                                        .unwrap_or(&[]),
+                                    cancel,
+                                    limits,
+                                )?,
+                            ))
+                        })
+                        .collect::<Result<_>>()?
+                };
+            let classes = Self::compose_selected_class_catalog(graph, &extractions, limits)?;
+            if let Some(prepared) = local {
+                ensure!(
+                    classes.warnings == prepared.old_class_warnings
+                        && classes.truncated == prepared.old_class_truncated,
+                    "incompatible_index: local class catalog differs from trusted head"
+                );
+            }
             ensure!(
-                classes.warnings == prepared.old_class_warnings
-                    && classes.truncated == prepared.old_class_truncated,
-                "incompatible_index: local class catalog differs from trusted head"
+                classes.relations.iter().all(|r| r.target.is_none()
+                    && r.candidate_ids.is_empty()
+                    && r.match_kind == "unmatched"),
+                "unsafe_index: lexical class relationship"
             );
-        }
+            // The public read_status guard has this exact singleton JSON ceiling.
+            // Refuse over-limit catalog warnings before paired CAS.
+            ensure!(
+                json(&classes.warnings)?.len() <= 256 * 1024,
+                "incompatible_index: class catalog byte budget exceeded before publication"
+            );
+            (stats, classes, extractions)
+        };
         ensure!(
             classes.relations.iter().all(|r| r.target.is_none()
                 && r.candidate_ids.is_empty()
                 && r.match_kind == "unmatched"),
             "unsafe_index: lexical class relationship"
         );
-        // The public read_status guard has this exact singleton JSON ceiling.
-        // Refuse over-limit catalog warnings before paired CAS.
         ensure!(
             json(&classes.warnings)?.len() <= 256 * 1024,
             "incompatible_index: class catalog byte budget exceeded before publication"
         );
-        let rows = publication_rows(graph, native, &classes)?;
+        let rows = if stream.is_some() {
+            BTreeMap::new()
+        } else {
+            publication_rows(graph, native, &classes)?
+        };
         check_cancel(cancel)?;
         leader.belongs_to(&self.identity)?;
         self.identity.verify()?;
@@ -10224,6 +10616,9 @@ impl Store {
                 "local evidence cannot use a private stage"
             );
             self.preflight_local_reuse(graph, prepared)?
+        } else if let Some(spool) = stream {
+            self.preflight_stream_reuse(spool, &classes, &expected)
+                .map_err(|error| self.report_live_read_failure(error))?
         } else if matches!(target, PublicationTarget::Live) {
             // A stored hash that differs from the fresh one is typed index
             // corruption: the next publication rebaselines from fresh facts.
@@ -10418,17 +10813,84 @@ impl Store {
             PublicationTarget::Live => self.report_live_read_failure(error),
             PublicationTarget::Stage(_) => error,
         };
-        let projections = write_native(
-            &tx,
-            (native, capture, graph, &classes, &extractions),
-            revision,
-            &stats,
-            cancel,
-            &mut immutable,
-            &reuse,
-            &rows,
-        )
-        .map_err(classify_immutable)?;
+        let projections = if let Some(spool) = stream {
+            let mut projections = BTreeMap::new();
+            for index in 0..spool.len() {
+                check_cancel(cancel)?;
+                let (artifact, document_graph) = spool.read(index)?;
+                ensure!(
+                    artifact.producer == native.producer
+                        && artifact.source_set == native.source_set
+                        && artifact.revision == native.revision,
+                    "native_evidence_required: streamed revision header differs"
+                );
+                let file = document_graph
+                    .files
+                    .first()
+                    .context("stream graph document absent")?;
+                ensure!(
+                    document_graph.files.len() == 1 && graph.files.get(index) == Some(file),
+                    "native_evidence_required: streamed graph document differs from capture"
+                );
+                Self::enforce_selected_source_admission(&document_graph, max_graph_json_bytes)?;
+                let selected_classes = stream_document_classes(&classes, &file.path);
+                let rows = publication_rows(&document_graph, &artifact, &selected_classes)?;
+                let extractions = if matches!(file.language.as_str(), "java" | "python") {
+                    BTreeMap::from([(file.path.clone(), spool.read_extraction(index)?)])
+                } else {
+                    BTreeMap::new()
+                };
+                let written = write_native(
+                    &tx,
+                    (&artifact, capture, &document_graph, &classes, &extractions),
+                    revision,
+                    &stats,
+                    cancel,
+                    &mut immutable,
+                    &reuse,
+                    &rows,
+                    index == 0,
+                    index,
+                    &graph.diagnostics,
+                )
+                .map_err(classify_immutable)?;
+                let ids = written
+                    .get(&file.path)
+                    .context("missing streamed document projection")?;
+                during_tx(PublishStage::AfterFile, &tx)?;
+                let grouped = rows
+                    .get(file.path.as_str())
+                    .context("streamed publication rows missing")?;
+                write_graph_document(
+                    &tx,
+                    grouped,
+                    ids,
+                    reuse.for_path(&file.path),
+                    &mut immutable,
+                )
+                .map_err(classify_immutable)?;
+                ensure!(
+                    projections.insert(file.path.clone(), ids.clone()).is_none(),
+                    "duplicate streamed document path"
+                );
+            }
+            projections
+        } else {
+            let projections = write_native(
+                &tx,
+                (native, capture, graph, &classes, &extractions),
+                revision,
+                &stats,
+                cancel,
+                &mut immutable,
+                &reuse,
+                &rows,
+                true,
+                0,
+                &graph.diagnostics,
+            )
+            .map_err(classify_immutable)?;
+        };
         let revision_key = format!(
             "pin:v1:{}:{}",
             revision.index_generation, revision.index_revision
@@ -10442,94 +10904,17 @@ impl Store {
             "INSERT INTO revision_producer_bindings VALUES(?1,?2,?3)",
             params![revision_key, executing_hash, binding_sha],
         )?;
-        for f in &graph.files {
-            check_cancel(cancel)?;
-            during_tx(PublishStage::AfterFile, &tx)?;
-            let ids = projections
-                .get(&f.path)
-                .context("missing graph projection")?;
-            let grouped = rows
-                .get(f.path.as_str())
-                .context("publication rows missing")?;
-            for n in &grouped.nodes {
-                if reuse.for_path(&f.path).graph {
-                    continue;
-                }
-                immutable
-                    .insert(
-                        &tx,
-                        "INSERT INTO graph_nodes VALUES(?1,?2,?3,?4,?5)",
-                        params![ids.graph_id, n.id, n.name, n.path, json(n)?],
-                    )
-                    .map_err(classify_immutable)?;
-            }
-            for c in &grouped.calls {
-                if reuse.for_path(&f.path).graph {
-                    continue;
-                }
-                immutable
-                    .insert(
-                        &tx,
-                        "INSERT INTO graph_calls VALUES(?1,?2,?3,?4,?5,?6)",
-                        params![
-                            ids.graph_id,
-                            c.id,
-                            c.caller,
-                            Option::<String>::None,
-                            c.path,
-                            json(c)?
-                        ],
-                    )
-                    .map_err(classify_immutable)?;
-            }
-            for r in &grouped.regions {
-                if reuse.for_path(&f.path).graph {
-                    continue;
-                }
-                immutable
-                    .insert(
-                        &tx,
-                        "INSERT INTO graph_regions VALUES(?1,?2,?3,?4,?5)",
-                        params![ids.graph_id, r.id, r.owner, r.path, json(r)?],
-                    )
-                    .map_err(classify_immutable)?;
-            }
-            for class in &grouped.classes {
-                if reuse.for_path(&f.path).class {
-                    continue;
-                }
-                immutable
-                    .insert(
-                        &tx,
-                        "INSERT INTO classes VALUES(?1,?2,?3,?4,?5,?6,?7)",
-                        params![
-                            ids.class_id,
-                            ids.graph_id,
-                            class.symbol.id,
-                            class.symbol.name,
-                            class.qualified_name,
-                            class.symbol.path,
-                            json(class)?,
-                        ],
-                    )
-                    .map_err(classify_immutable)?;
-            }
-            for relation in &grouped.relations {
-                if reuse.for_path(&f.path).class {
-                    continue;
-                }
-                immutable
-                    .insert(
-                        &tx,
-                        "INSERT INTO class_relations VALUES(?1,?2,?3,?4,?5)",
-                        params![
-                            ids.class_id,
-                            relation.id,
-                            relation.owner,
-                            relation.target,
-                            json(relation)?,
-                        ],
-                    )
+        if stream.is_none() {
+            for f in &graph.files {
+                check_cancel(cancel)?;
+                during_tx(PublishStage::AfterFile, &tx)?;
+                let ids = projections
+                    .get(&f.path)
+                    .context("missing graph projection")?;
+                let grouped = rows
+                    .get(f.path.as_str())
+                    .context("publication rows missing")?;
+                write_graph_document(&tx, grouped, ids, reuse.for_path(&f.path), &mut immutable)
                     .map_err(classify_immutable)?;
             }
         }
