@@ -8316,7 +8316,7 @@ impl Store {
     }
     /// Managed private scratch directory for an unpublished full-document spool.
     /// The coordinator must use this Store's roots, including isolated test roots.
-    pub(crate) fn private_spool_dir(&self) -> Result<std::path::PathBuf> {
+    pub(crate) fn native_spool_dir(&self) -> Result<std::path::PathBuf> {
         self.identity.verify()?;
         self.roots.prepare_index(&self.identity)?;
         Ok(self.roots.index_dir(&self.identity))
