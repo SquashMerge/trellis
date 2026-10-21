@@ -49,6 +49,12 @@ Clean up operation-scoped requests on every exit, including dropped futures, wit
 
 - Build the simplest design that meets the acceptance criteria, and no mechanism beyond them.
 - Trust what Trellis itself wrote and validated. Never validate data that's about to be discarded or rebuilt.
+- **When a change would break existing behavior,** decide what kind of rule that behavior is:
+  - **Correctness rules** are always kept. Examples: nothing unvalidated reaches the index; publication is atomic; failures are typed and never partial.
+  - **Stability rules** are kept when they're cheap. Examples: the same input gives the same output and the same error; byte-identical results.
+  - **Any other invariant** is kept only if it actually helps something and is worth what it costs. Examples: exact error precedence between phases, ordering left over from older sequential code. Being pinned by code or tests alone doesn't qualify it. Rewrite the tests that pin a dropped invariant.
+
+  Ratified contract and decision text still binds until the owner amends it.
 - Test each distinct required behavior, at normal size. One acceptance criterion may need several tests, for example one per failure path. Use production-size data only when a criterion requires it.
 - **Concurrency tests:**
   - model at most 2–3 processes;
