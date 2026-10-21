@@ -101,18 +101,19 @@ test("nested loop/guard frames validate close order; changed frame fails closed"
 test("changed visible positional note text with intact IDs refuses source action",async()=>{
  const view=fixture("rust");
  const result=await page.evaluate(async view=>{
-   const container=document.querySelector("#sequence-diagram");container.replaceChildren();window.picks=[];
+   const container=document.querySelector("#sequence-diagram");container.replaceChildren();window.picks=[];window.sourceActions=[];
    const original=window.pele;
    window.pele={render:(...args)=>{
      const output=original.render(...args);
-     return {...output,svg:output.svg.replace("Static possible paths - target and timing unknown","Static possible paths - target and timing  unknown")};
+     return {...output,svg:output.svg.replace("Static possible paths - target and timing unknown","Static possible paths - target and timing altered")};
    }};
-   try{return await TrellisPeleSequence.render(container,view,null,new Set(),{onSelect:step=>window.picks.push(step)});}
+   try{return await TrellisPeleSequence.render(container,view,step=>window.sourceActions.push(step),new Set(),{onSelect:step=>window.picks.push(step)});}
    finally{window.pele=original;}
  },view);
  assert.equal(result.status,"unsupported");assert.match(result.reason,/Changed Pele note text/);
  assert.equal(await page.locator("#sequence-diagram .pele-note").count(),0);
  assert.equal(await page.evaluate(()=>window.picks.length),0);
+ assert.equal(await page.evaluate(()=>window.sourceActions.length),0);
 });
 test("failed async group expansion visibly installs complete legacy DTO",async()=>{
  const view=fixture("rust"),group=structuredClone(view.steps[0]),entry=structuredClone(view.steps[0]);

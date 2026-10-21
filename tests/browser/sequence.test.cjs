@@ -95,3 +95,53 @@ test("published JavaScript nested try/handler/exit retains order and original so
  assert.equal(await page.evaluate(()=>document.activeElement?.matches(".pele-note[data-trellis-step-id]")),true);
  assert.equal(await page.evaluate(()=>getComputedStyle(document.activeElement).outlineStyle),"solid");
 },"flow.js"));
+
+// A source import is only a syntax-level candidate for a module binding, not
+// a proven callee. The published app must retain its original call witness.
+const candidateSource = "import {parse as candidateParse} from 'candidate-parser';\nfunction measured(input) {\n  return candidateParse(input);\n}\n";
+test("published import candidate keeps partial provenance and original source",{timeout:240000},async()=>published(candidateSource,async({page,dto,pin})=>{
+ const candidate=dto.participants.find(p=>p.kind==="import"&&p.label==="candidate-parser");
+ assert.ok(candidate,JSON.stringify(dto.participants));
+ assert.match(candidate.identification,/Static import module/);
+ assert.match(candidate.identification,/not objects or resolved implementations/);
+ const step=dto.steps.find(s=>s.kind==="call"&&s.label==="candidateParse");
+ assert.ok(step?.callId,"candidate selection must be backed by an indexed call");
+ assert.equal(step.target,undefined,"a candidate module must not become a verified call target");
+ assert.equal(step.path,"flow.js");
+ assert.ok(!step.resolution||step.resolution.kind!=="verified","candidate is not verified dispatch");
+ assert.equal(await page.locator("#sequence-diagram .pele-message").count(),0,"candidate cannot become an inferred arrow");
+ const note=page.locator(`#sequence-diagram .pele-note[data-trellis-step-id="${step.id}"]`);
+ assert.equal(await note.getAttribute("data-trellis-call-id"),step.callId);
+ await note.focus();await page.keyboard.press("Enter");
+ assert.equal(await note.getAttribute("aria-pressed"),"true");
+ assert.equal(await page.locator("#inspector-title").getAttribute("title"),step.label);
+ assert.match(await page.locator("#inspector-target").innerText(),/no verified target/);
+ assert.match(await page.locator("#inspector-detail").innerText(),/candidateParse/);
+ const requests=[];page.on("request",r=>{if(new URL(r.url()).pathname.endsWith("/source"))requests.push(r.url());});
+ await page.locator("#inspector-open-source").click();
+ await page.waitForFunction(()=>document.querySelector("#source-path")?.textContent?.includes("cached snapshot"));
+ assert.ok(requests.some(raw=>{const q=new URL(raw).searchParams;return q.get("path")===step.path&&q.get("indexGeneration")===pin.indexGeneration&&q.get("indexRevision")===String(pin.indexRevision);}));
+ assert.deepEqual(await page.locator("#source .source-line.highlight .line-number").allTextContents(),[String(step.range.startLine)]);
+ assert.match(await page.locator("#source").innerText(),/candidateParse\(input\)/);
+},"flow.js"));
+
+const truncatedSource=`function measured() {\n${Array.from({length:202},(_,i)=>`  observed_${i}();\n`).join("")}}\n`;
+test("published truncated producer shows bound while retaining original call witness",{timeout:240000},async()=>published(truncatedSource,async({page,dto,pin})=>{
+ assert.equal(dto.truncated,true,"the actual producer must reach its 200-step cap");
+ assert.ok(dto.warnings.some(w=>w.includes("200 steps")));
+ assert.match(await page.locator("#sequence-state").innerText(),/truncated/);
+ assert.match(await page.locator("#sequence-state").innerText(),/Pele rendered/);
+ const first=dto.steps.find(step=>step.kind==="call"&&step.label==="observed_0");
+ assert.ok(first?.callId);
+ const note=page.locator(`#sequence-diagram .pele-note[data-trellis-step-id="${first.id}"]`);
+ assert.equal(await note.getAttribute("data-trellis-call-id"),first.callId);
+ await note.click();
+ assert.equal(await page.locator("#inspector-title").getAttribute("title"),first.label);
+ assert.match(await page.locator("#inspector-detail").innerText(),/observed_0/);
+ const requests=[];page.on("request",r=>{if(new URL(r.url()).pathname.endsWith("/source"))requests.push(r.url());});
+ await page.locator("#inspector-open-source").click();
+ await page.waitForFunction(()=>document.querySelector("#source-path")?.textContent?.includes("cached snapshot"));
+ assert.ok(requests.some(raw=>{const q=new URL(raw).searchParams;return q.get("path")===first.path&&q.get("indexGeneration")===pin.indexGeneration&&q.get("indexRevision")===String(pin.indexRevision);}));
+ assert.deepEqual(await page.locator("#source .source-line.highlight .line-number").allTextContents(),[String(first.range.startLine)]);
+ assert.match(await page.locator("#source").innerText(),/observed_0\(\)/);
+},"flow.js"));
