@@ -1578,4 +1578,103 @@ mod budget_tests {
             assert!(relation.target.is_none());
         }
     }
+
+    #[test]
+    fn ordered_bounded_composer_matches_catalog_limits_and_warning_order() {
+        fn extraction(path: &str) -> FileExtraction {
+            let symbol = Symbol {
+                id: format!("class:{path}"),
+                name: "C".into(),
+                display_label: None,
+                kind: SymbolKind::Class,
+                path: path.into(),
+                range: SourceRange::default(),
+                parent: None,
+                accessor: false,
+                provenance: crate::model::Provenance {
+                    source: "syntax".into(),
+                    semantic: crate::model::SemanticState::Unavailable,
+                },
+            };
+            FileExtraction {
+                path: path.into(),
+                source_bytes: 1,
+                registry_bytes: 1,
+                warnings: vec![format!("warning {path}")],
+                truncated: false,
+                registry_incomplete: false,
+                classes: vec![ClassDefinition {
+                    symbol,
+                    qualified_name: format!("{path}.C"),
+                    language: "python".into(),
+                    declaration_kind: "class".into(),
+                    fields: vec![],
+                    methods: vec![],
+                    truncated: false,
+                }],
+                items: vec![DetailItem {
+                    class_index: 0,
+                    records: 1,
+                    text: 1,
+                    value: DetailValue::ScopeText,
+                }],
+            }
+        }
+        let files = [extraction("c.py"), extraction("a.py"), extraction("b.py")];
+        for source_cap in [2, 3] {
+            let limits = Limits {
+                classes: 2,
+                records: 1,
+                total_bytes: source_cap,
+                ..Limits::default()
+            };
+            let expected = Catalog::compose(&files, 3, 3, limits).unwrap();
+            let mut streaming = CatalogComposer::new(3, 3, limits);
+            for file in [&files[1], &files[2], &files[0]] {
+                if !streaming.push(file) {
+                    break;
+                }
+            }
+            let actual = streaming.finish();
+            assert_eq!(actual, expected);
+            assert_eq!(actual.classes.len(), 2);
+            assert!(actual.classes[1].truncated);
+            assert!(actual.truncated);
+            assert_eq!(actual.warnings[0], "warning a.py");
+            assert_eq!(actual.warnings[1], "warning b.py");
+            assert!(
+                actual
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("Class detail limit reached"))
+            );
+            assert!(
+                actual
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("Incomplete class declaration registry"))
+            );
+            assert!(
+                actual
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains(if source_cap == 2 {
+                        "Class catalog source limit exceeded"
+                    } else {
+                        "Class catalog declaration limit reached"
+                    }))
+            );
+        }
+        let limits = Limits {
+            symbols: 2,
+            ..Limits::default()
+        };
+        let mut capped = CatalogComposer::new(3, 3, limits);
+        assert!(!capped.is_open());
+        assert!(!capped.push(&files[1]));
+        assert_eq!(
+            capped.finish(),
+            Catalog::compose(&files, 3, 3, limits).unwrap()
+        );
+    }
 }
