@@ -387,18 +387,19 @@ impl IndexJobCoordinator {
             completed: 0,
             total: 1,
         });
-        let native = crate::native_evidence::from_capture_observed(
+        let spool = crate::native_evidence::spool_full_capture(
+            options,
             &capture,
             &root,
             self.store.root_id(),
             cancel,
+            &progress,
             native_observe,
+            &self.store.native_spool_dir()?,
         )?;
+        #[cfg(test)]
+        FULL_STREAM_RUNS.with(|count| count.set(count.get() + 1));
         report("measure", phase_start.elapsed());
-        phase_start = std::time::Instant::now();
-        let graph =
-            indexer::project_native(options, &capture, native.artifact(), cancel, &progress)?;
-        report("compose", phase_start.elapsed());
         phase_start = std::time::Instant::now();
         capture.verify(cancel)?;
         observe(&capture);
@@ -407,9 +408,9 @@ impl IndexJobCoordinator {
         report("attest", phase_start.elapsed());
         phase_start = std::time::Instant::now();
         cutoff()?;
-        let published = self.store.publish_validated_native_recovery(
-            &graph,
-            &native,
+        let published = self.store.publish_validated_stream_recovery(
+            &spool,
+            &capture,
             self.session.writer_guard()?,
             self.expected.clone(),
             cancel,

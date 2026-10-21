@@ -4829,16 +4829,10 @@ fn empty_cold_stream_preserves_plain_native_header() {
 #[cfg(feature = "test-support")]
 fn streamed_precommit_cancel_rolls_back_every_document() {
     let (_state, root, store, cancel) = fixture();
-    let leader = store.publication_for_tests().unwrap();
-    let prior = publish(
-        &store,
-        root.path(),
-        &cancel,
-        store.index_baseline().unwrap(),
-        &leader,
-    )
-    .unwrap();
-    drop(leader);
+    let options = IndexOptions::new(root.path().to_owned());
+    let (prior, initial_owner) =
+        trellis::index_coordinator::reconcile_workspace(&store, &options, &cancel, |_| {}).unwrap();
+    drop(initial_owner);
     fs::write(
         root.path().join("flow.js"),
         "function after() { return 1; }\n",
@@ -4849,13 +4843,15 @@ fn streamed_precommit_cancel_rolls_back_every_document() {
     store.set_publication_before_commit_hook_for_tests(move || {
         cancel_at_commit.store(true, std::sync::atomic::Ordering::Release);
     });
-    let options = IndexOptions::new(root.path().to_owned());
     let attempt =
         trellis::index_coordinator::reconcile_workspace(&store, &options, &cancel, |_| {});
     assert!(attempt.is_err(), "cancelled revision must not commit");
-    assert!(cancel.load(std::sync::atomic::Ordering::Acquire));
+    assert!(
+        cancel.load(std::sync::atomic::Ordering::Acquire),
+        "precommit hook not reached: {attempt:?}"
+    );
     cancel.store(false, std::sync::atomic::Ordering::Release);
-    assert_eq!(store.status().unwrap().revision, prior);
+    assert!(attempt.unwrap_err().to_string().contains("cancelled"));
     let identity =
         trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
             .unwrap();
@@ -4873,6 +4869,20 @@ fn streamed_precommit_cancel_rolls_back_every_document() {
         })
         .unwrap();
     assert_eq!(count, 1, "rollback must not leave an unpublished revision");
+    let selected: (String, i64) = db
+        .query_row(
+            "SELECT index_generation,index_revision FROM index_metadata WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        selected,
+        (
+            prior.index_generation.to_string(),
+            prior.index_revision as i64
+        )
+    );
     drop(db);
     let (next, _owner) =
         trellis::index_coordinator::reconcile_workspace(&store, &options, &cancel, |_| {}).unwrap();

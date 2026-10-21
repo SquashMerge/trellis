@@ -906,15 +906,22 @@ fn full_publication_never_rebuilds_its_own_fresh_artifact() {
 fn cold_full_publication_uses_bounded_document_stream() {
     let state = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
-    fs::write(workspace.path().join("a.js"), "function a() { return b(); }\n").unwrap();
+    fs::write(
+        workspace.path().join("a.js"),
+        "function a() { return b(); }\n",
+    )
+    .unwrap();
     fs::write(workspace.path().join("b.py"), "def b():\n    return 1\n").unwrap();
     let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
     let options = IndexOptions::new(workspace.path().to_owned());
     let cancel = Arc::new(AtomicBool::new(false));
     let before = full_stream_runs_for_tests();
     let (pin, _owner) = reconcile_workspace(&store, &options, &cancel, |_| {}).unwrap();
-    assert_eq!(full_stream_runs_for_tests() - before, 1,
-        "cold full publication must use the bounded per-document stream");
+    assert_eq!(
+        full_stream_runs_for_tests() - before,
+        1,
+        "cold full publication must use the bounded per-document stream"
+    );
     assert_eq!(store.status().unwrap().revision, pin);
 }
 
@@ -923,14 +930,22 @@ fn cancelled_full_document_stream_never_changes_selected_pin() {
     let state = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
     fs::write(workspace.path().join("a.js"), "function before() {}\n").unwrap();
-    fs::write(workspace.path().join("b.py"), "def before():\n    return 1\n").unwrap();
+    fs::write(
+        workspace.path().join("b.py"),
+        "def before():\n    return 1\n",
+    )
+    .unwrap();
     let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
     let options = IndexOptions::new(workspace.path().to_owned());
     let cancel = Arc::new(AtomicBool::new(false));
     let (prior, owner) = reconcile_workspace(&store, &options, &cancel, |_| {}).unwrap();
     drop(owner);
     fs::write(workspace.path().join("a.js"), "function after() {}\n").unwrap();
-    fs::write(workspace.path().join("b.py"), "def after():\n    return 2\n").unwrap();
+    fs::write(
+        workspace.path().join("b.py"),
+        "def after():\n    return 2\n",
+    )
+    .unwrap();
     let mut coordinator = IndexJobCoordinator::prepare(&store, Some(prior)).unwrap();
     let observed = AtomicBool::new(false);
     let attempt = coordinator.run_with_capture(
@@ -951,9 +966,42 @@ fn cancelled_full_document_stream_never_changes_selected_pin() {
         },
         || {},
     );
-    assert!(observed.load(Ordering::Acquire), "first document must validate");
+    assert!(
+        observed.load(Ordering::Acquire),
+        "first document must validate"
+    );
     assert!(attempt.is_err(), "cancelled stream cannot publish");
-    assert_eq!(store.status().unwrap().revision, prior);
+    // A cancelled writer requires a new reconciliation before status serves
+    // again. Inspect the durable selected pair without treating that temporary
+    // gate as a lost or partially published revision.
+    let identity = crate::store::topology::WorkspaceIdentity::discover(
+        Some(workspace.path()),
+        workspace.path(),
+    )
+    .unwrap();
+    let db = rusqlite::Connection::open(
+        state
+            .path()
+            .join("cache/indexes")
+            .join(&identity.root_key)
+            .join("index.db"),
+    )
+    .unwrap();
+    let selected: (String, i64) = db
+        .query_row(
+            "SELECT index_generation,index_revision FROM index_metadata WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        selected,
+        (
+            prior.index_generation.to_string(),
+            prior.index_revision as i64
+        )
+    );
+    drop(db);
     cancel.store(false, Ordering::Release);
     drop(coordinator);
     let next = IndexJobCoordinator::prepare(&store, Some(prior))

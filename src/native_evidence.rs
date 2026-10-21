@@ -9,10 +9,12 @@ use icu_normalizer::ComposingNormalizerBorrowed;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+#[cfg(test)]
+use std::path::PathBuf;
 use std::{
     collections::{BTreeMap, BTreeSet},
     os::unix::fs::MetadataExt,
-    path::{Path, PathBuf},
+    path::Path,
 };
 use tree_sitter::Node;
 
@@ -660,37 +662,9 @@ pub fn from_capture(
     root_id: &str,
     cancel: &CancelFlag,
 ) -> Result<Artifact> {
-    Ok(from_capture_observed(capture, root, root_id, cancel, |_, _| {})?.into_artifact())
-}
-
-/// An artifact this process just built, by `build_native`, from exactly this
-/// capture, root and root id, and that passed the structural validation
-/// against it. Only `from_capture_observed` constructs one, from its own
-/// build, and it offers no mutable access to the artifact. Because the
-/// artifact is the build itself, it is not rebuilt and compared again
-/// (#199 I-4b): `build_native` determinism is a verify test instead. Any
-/// other artifact (a plain `Artifact` handed to the store) still runs the
-/// full `Artifact::validate`, rebuild and comparison included.
-pub(crate) struct ValidatedArtifact<'c> {
-    artifact: Artifact,
-    capture: &'c Capture,
-    root: PathBuf,
-    root_id: String,
-}
-
-impl<'c> ValidatedArtifact<'c> {
-    pub(crate) fn artifact(&self) -> &Artifact {
-        &self.artifact
-    }
-    pub(crate) fn capture(&self) -> &'c Capture {
-        self.capture
-    }
-    pub(crate) fn validated_for(&self, root: &Path, root_id: &str) -> bool {
-        self.root == root && self.root_id == root_id
-    }
-    pub(crate) fn into_artifact(self) -> Artifact {
-        self.artifact
-    }
+    let artifact = build_native(capture, root, root_id, cancel)?;
+    artifact.validate_own_build(capture, cancel)?;
+    Ok(artifact)
 }
 
 #[cfg(test)]
@@ -709,28 +683,6 @@ pub(crate) fn full_validations_for_tests() -> usize {
 pub enum FullNativeStage {
     Measured,
     Validated,
-}
-
-pub(crate) fn from_capture_observed<'c>(
-    capture: &'c Capture,
-    root: &Path,
-    root_id: &str,
-    cancel: &CancelFlag,
-    observe: impl Fn(&DocumentKey, FullNativeStage),
-) -> Result<ValidatedArtifact<'c>> {
-    let artifact = build_native_observed(capture, root, root_id, cancel, &|key| {
-        observe(key, FullNativeStage::Measured);
-    })?;
-    artifact.validate_own_build(capture, cancel)?;
-    for document in &artifact.revision.documents {
-        observe(&document.key, FullNativeStage::Validated);
-    }
-    Ok(ValidatedArtifact {
-        artifact,
-        capture,
-        root: root.to_owned(),
-        root_id: root_id.to_owned(),
-    })
 }
 
 /// The captured revision header alone, measuring no document. Used when an
@@ -2606,7 +2558,7 @@ impl Artifact {
     /// this capture, so rebuilding it would only re-check determinism, which
     /// the `native_build_is_deterministic` verify test covers. Every
     /// structural check and the capture freshness check still run. Only
-    /// `from_capture_observed` calls this.
+    /// `from_capture` calls this.
     fn validate_own_build(&self, capture: &Capture, cancel: &CancelFlag) -> Result<()> {
         capture.verify(cancel)?;
         self.validate_structure(&capture.files)
@@ -3914,7 +3866,7 @@ mod full_document_spool_tests {
             &cancel,
             &|_| {},
             |key, stage| stages.borrow_mut().push((key.path.clone(), stage)),
-            state.path(),
+            &store.native_spool_dir().unwrap(),
         )
         .unwrap();
         let stages = stages.into_inner();
@@ -4103,7 +4055,7 @@ mod full_document_spool_tests {
             &cancel,
             &|_| {},
             |_, _| {},
-            state.path(),
+            &store.native_spool_dir().unwrap(),
         )
         .unwrap();
         let mut nodes = Vec::new();
@@ -4145,7 +4097,7 @@ mod full_document_spool_tests {
             &cancel,
             &|_| {},
             |_, _| {},
-            state.path(),
+            &store.native_spool_dir().unwrap(),
         )
         .unwrap();
         let handle = "sid:v1:forced-collision";
@@ -4202,7 +4154,7 @@ mod full_document_spool_tests {
                     Ok(())
                 }
             },
-            state.path(),
+            &store.native_spool_dir().unwrap(),
         )
         .err()
         .expect("failure must be reported");
@@ -4235,7 +4187,7 @@ mod full_document_spool_tests {
             &cancel,
             &|_| {},
             |_, _| {},
-            state.path(),
+            &store.native_spool_dir().unwrap(),
         )
         .unwrap();
         let (mut native, _) = spool.read(0).unwrap();

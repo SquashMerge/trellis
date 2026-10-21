@@ -8506,24 +8506,6 @@ impl Store {
         self.attest_post_acquisition_reconciliation_guard(leader, pin)?;
         Ok(pin)
     }
-    pub(crate) fn publish_validated_native_recovery(
-        &self,
-        graph: &Graph,
-        native: &crate::native_evidence::ValidatedArtifact<'_>,
-        leader: &topology::WriterGuard,
-        expected: RecoveryBaseline,
-        cancel: &CancelFlag,
-    ) -> Result<IndexPin> {
-        self.validate_validated_native_bundle(graph, native, cancel)?;
-        self.publish_inner_expected(
-            graph,
-            native.capture(),
-            native.artifact(),
-            leader,
-            ExpectedPublication::Recovery(Box::new(expected)),
-            cancel,
-        )
-    }
     /// Publish a validated full revision from document-local evidence. The spool is
     /// private, repeatable and never part of the visible index; SQL remains one
     /// all-or-nothing revision transaction.
@@ -8722,24 +8704,6 @@ impl Store {
             )?;
         }
         self.validate_bundle_projection(graph, capture, native, cancel)
-    }
-    /// The artifact is this process's own build from this capture
-    /// (`ValidatedArtifact`), so it is never rebuilt and compared (#199 I-4b).
-    /// The capture freshness check and every bundle check still run here. A
-    /// plain `Artifact` from any other caller goes through
-    /// `validate_native_bundle_with_mode`, which runs the full rebuild.
-    fn validate_validated_native_bundle(
-        &self,
-        graph: &Graph,
-        native: &crate::native_evidence::ValidatedArtifact<'_>,
-        cancel: &CancelFlag,
-    ) -> Result<()> {
-        ensure!(
-            native.validated_for(Path::new(&self.workspace_root), &self.identity.record_id),
-            "native_evidence_required: artifact was validated for another root"
-        );
-        native.capture().verify(cancel)?;
-        self.validate_bundle_projection(graph, native.capture(), native.artifact(), cancel)
     }
     fn validate_bundle_projection(
         &self,
@@ -10449,15 +10413,16 @@ impl Store {
                             !reused.native || prior_witness.is_some(),
                             "incompatible_index: reusable native version absent"
                         );
+                        let extraction = if matches!(file.language.as_str(), "java" | "python") {
+                            Some(spool.read_extraction(index)?)
+                        } else {
+                            None
+                        };
                         self.verify_reusable_projection(
                             db,
                             &ids,
                             reused,
-                            if matches!(file.language.as_str(), "java" | "python") {
-                                Some(&spool.read_extraction(index)?)
-                            } else {
-                                None
-                            },
+                            extraction.as_ref(),
                         )?;
                         families.insert(file.path.clone(), reused);
                     }
@@ -11003,6 +10968,7 @@ impl Store {
                 None,
             )
             .map_err(classify_immutable)?;
+            projections
         };
         let revision_key = format!(
             "pin:v1:{}:{}",
