@@ -1,4 +1,4 @@
-# Saved-item browser acceptance
+# Browser acceptance: saved items and sequence
 
 This test drives the real Trellis web shell in Playwright Chromium. It starts the compiled daemon with an isolated workspace, token, home, and XDG directories. It does not mock or intercept application requests.
 
@@ -39,3 +39,22 @@ PLAYWRIGHT_BROWSERS_PATH="$TRELLIS_RUN_CACHE/playwright-browsers" \
 ```
 
 The harness fails if the environment variable, locked package, managed Chromium executable, Cargo build, daemon, or any browser assertion is unavailable. It has no synthetic-DOM fallback and never skips acceptance.
+
+## Pele sequence acceptance
+
+`sequence-pele.test.cjs` serves the exact local browser assets and four producer-validated
+DTO snapshots to real Chromium with the same no-inline-style/script CSP. It tests original
+note identity, group controls, unsafe text/output, keyboard and stale actions.
+`sequence.test.cjs` uses a temporary indexed checkout, the production daemon and
+published Store/API response, then selects a real method in the unmodified browser shell.
+It checks Pele without fallback, inspector, mouse/keyboard selection, pinned source and
+stale actions. `sequence-cost.test.cjs` indexes the 80/180-call Rust cohorts and measures
+20 warm old/Pele renders of each *identical published DTO*. No reconstructed DTO is
+used for this full-app cohort. All browser files run sequentially after the built binary.
+
+For focused runs, first provision Chromium using the commands above, build with
+`cargo build --locked --bin trellis`, then invoke `node --test
+--test-concurrency=1 tests/browser/sequence-pele.test.cjs tests/browser/sequence.test.cjs
+tests/browser/sequence-cost.test.cjs` with `TRELLIS_SUITE_BINARY` set to the
+absolute built binary. Do not run multiple browser suites in parallel against the
+same checkout.

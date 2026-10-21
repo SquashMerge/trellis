@@ -1212,12 +1212,28 @@ async function loadSequence() {
     if (data.seed.id !== symbol.id) throw new Error("Sequence provenance mismatch. Nothing displayed.");
     const readSource = step => { if (current()) return perform(() => showSource(step, revision)); };
     const options = {showDetails: !!$("all-steps").checked, isCurrent: () => current() && IndexPin.equal(status?.revision, revision)};
+    // A later group redraw can fail after the initial load succeeded. Preserve
+    // the whole pinned DTO rather than leaving an inert, silently folded group.
+    options.onUnsupported = reason => {
+      if (!options.isCurrent()) return;
+      window.TrellisSequence.render($("sequence-diagram"), data, readSource, expanded, options);
+      $("sequence-state").textContent = $("sequence-state").textContent.replace(/ · Pele rendered$/, ` · Pele fell back: ${reason}`);
+    };
     if (window.TrellisShell) options.onSelect = step => {
       if (current()) window.TrellisShell?.selectStep(step, data, () => readSource(step));
     };
-    window.TrellisSequence.render($("sequence-diagram"), data, readSource, new Set(), options);
+    const diagram = $("sequence-diagram");
+    const expanded = new Set();
+    const outcome = window.TrellisPeleSequence
+      ? await window.TrellisPeleSequence.render(diagram, data, readSource, expanded, options)
+      : {status:"unsupported", reason:"Pele asset unavailable"};
+    if (!current() || !IndexPin.equal(status?.revision, revision)) return;
+    if (outcome.status === "stale") return;
+    if (outcome.status !== "rendered") {
+      window.TrellisSequence.render(diagram, data, readSource, expanded, options);
+    }
     if ($("sequence-warning-count")) $("sequence-warning-count").textContent = String((data.warnings || []).length);
-    $("sequence-state").textContent = `${symbol.name} · ${symbol.path} · revision ${IndexPin.label(revision)} · ${data.hiddenSteps} incidental steps hidden${data.truncated ? " · truncated" : ""}${!data.steps.length ? " · No visible behavior steps. Read method source for context." : ""}`;
+    $("sequence-state").textContent = `${symbol.name} · ${symbol.path} · revision ${IndexPin.label(revision)} · ${data.hiddenSteps} incidental steps hidden${data.truncated ? " · truncated" : ""}${!data.steps.length ? " · No visible behavior steps. Read method source for context." : ""}${outcome.status !== "rendered" ? ` · Pele fell back: ${outcome.reason}` : " · Pele rendered"}`;
     for (const warning of data.warnings || []) $("sequence-warnings").append(element("li", warning, "warning"));
   }, current, "sequence-state");
 }
