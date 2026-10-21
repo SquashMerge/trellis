@@ -8622,7 +8622,8 @@ impl Store {
                 "native document bytes differ from captured graph"
             );
         }
-        let pin = self.publish_inner_checked_target_with_local(
+        // The coordinator attests this committed pin once before it returns.
+        self.publish_inner_checked_target_with_local(
             (&graph, capture, spool.header()),
             leader,
             PublicationPlan {
@@ -8632,9 +8633,7 @@ impl Store {
             cancel,
             (256 * 1024 * 1024 + 16 * 1024, None, Some(spool)),
             |_, _| Ok(()),
-        )?;
-        self.attest_post_acquisition_reconciliation_guard(leader, pin)?;
-        Ok(pin)
+        )
     }
 
     #[allow(dead_code)] // Test seam for the original full-artifact selective rollback matrix.
@@ -11015,7 +11014,7 @@ impl Store {
             }
             projections
         } else {
-            let projections = write_native(
+            write_native(
                 &tx,
                 (native, capture, graph, &classes, &extractions),
                 revision,
@@ -11029,8 +11028,7 @@ impl Store {
                 &graph.diagnostics,
                 None,
             )
-            .map_err(classify_immutable)?;
-            projections
+            .map_err(classify_immutable)?
         };
         let revision_key = format!(
             "pin:v1:{}:{}",

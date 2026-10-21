@@ -1167,6 +1167,7 @@ fn validate_spooled_document(
 /// Admit an entire immutable capture without retaining its full artifact or
 /// graph. Rows and exact global ID inputs live in one bounded-cache SQLite
 /// scratch file, never in index.db. A failure drops it without publication.
+#[allow(clippy::too_many_arguments)] // Keep capture, observer and scratch-owner bindings explicit.
 pub(crate) fn spool_full_capture(
     options: &crate::indexer::IndexOptions,
     capture: &Capture,
@@ -1191,6 +1192,7 @@ pub(crate) fn spool_full_capture(
     )
 }
 
+#[allow(clippy::too_many_arguments)] // The test injection seam preserves the production argument order.
 fn spool_full_capture_with(
     options: &crate::indexer::IndexOptions,
     capture: &Capture,
