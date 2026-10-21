@@ -41,6 +41,39 @@ for(const language of ["javascript","rust","java","python"])test(`${language} pr
  await page.evaluate(()=>window.current=false);await note.click({force:true});assert.equal(await page.evaluate(()=>window.picks.length),3);
  assert.deepEqual(violations.filter(error=>/Content Security Policy|CSP/.test(error)),[]);
 });
+test("pinned Pele shows original punctuation, Unicode and injection as text",async()=>{
+ const view=fixture("rust");
+ const labels=["if check()", "s.chars().count() > 180", "Vec<T>", 'a & "quotes" / back\\slash', "café 🔒", "bad\nalt injected ->> S: nope"];
+ view.seed.name="seed <T> & café";
+ view.steps=labels.map((label,i)=>({...structuredClone(view.steps[0]),id:`text-${i}`,label,children:[],alternate:[]}));
+ const result=await render(view,{showDetails:true});assert.equal(result.status,"rendered",result.reason);
+ assert.deepEqual(result.notes.map(note=>note.text),labels.map((label,i)=>`[${String(i+1).padStart(3,"0")}] call ${label} - measured syntax; target unverified`));
+ assert.ok(!result.source.includes("U+"));assert.ok(!result.source.includes("->>"));
+ assert.equal(await page.locator(".pele-note").count(),labels.length+1);
+ assert.equal(await page.locator(".pele-heading").count(),0); // only one participant lane
+ assert.equal(await page.locator("svg.pele script, svg.pele image").count(),0);
+ assert.deepEqual(violations.filter(error=>/Content Security Policy|CSP/.test(error)),[]);
+});
+
+test("witnessed target including hidden, nested and collapsed refuses Pele and visibly explains legacy limitation",async()=>{
+ const original=fixture("rust"),leaf=structuredClone(original.steps[0]);
+ leaf.id="target-evidence";leaf.target=original.participants[0].id;leaf.children=[];leaf.alternate=[];
+ for(const steps of [[leaf],[{...leaf,id:"hidden-parent",hidden:true,children:[leaf],target:null}],
+   [{...leaf,id:"nested-parent",kind:"branch",children:[leaf],target:null}],
+   [{...leaf,id:"collapsed-parent",kind:"group",children:[leaf],target:null}]]) {
+   const view={...original,steps};const outcome=await renderWithVisibleFallback(view);
+   if (steps[0].hidden) {
+     assert.equal(outcome.status,"unsupported");assert.equal(outcome.pele,0);assert.equal(outcome.legacy,1);
+     assert.equal(outcome.rows.length,0,"legacy also hides a hidden target; status must disclose it");
+   } else assertVisibleFallback(outcome,[steps[0].id],steps[0].label);
+   assert.match(outcome.state,/target links are not shown in either sequence renderer/);
+   assert.equal(await page.locator(".sequence-arrow").count(),0);
+   assert.equal(await page.locator(".sequence-participant-label").count(),1);
+ }
+ const dangling={...original,steps:[{...leaf,target:"not-a-participant"}]};
+ assert.match((await renderWithVisibleFallback(dangling)).reason,/Witnessed call target/);
+});
+
 test("malformed SVG and duplicate IDs fall back without partial diagram",async()=>{
  const view=fixture("rust");const duplicate=structuredClone(view);duplicate.steps.push(structuredClone(duplicate.steps[0]));
  assert.equal((await render(duplicate)).status,"unsupported");

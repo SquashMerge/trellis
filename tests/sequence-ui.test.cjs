@@ -495,6 +495,29 @@ test("Pele projection rejects duplicates and encodes malicious repository text",
   assert.throws(() => adapter.project(view), /Duplicate sequence identity/);
 });
 
+test("Pele projection keeps human labels separate from encoded Mermaid and refuses all witnessed targets", () => {
+  const adapter = peleProjector(), view = peleFixture("rust");
+  view.steps[0].label = 'if check() Vec<T> & "quoted" / café 🔒';
+  const result = adapter.project(view,new Set(),{showDetails:true});
+  assert.ok(result.rows[0].display.includes(view.steps[0].label));
+  assert.match(result.source, /#40;#41;/);
+  assert.match(result.source, /#60;T#62;/);
+  assert.match(result.source, /#233;/);
+  assert.doesNotMatch(result.source, /U\+[0-9A-F]+|Vec<T>/);
+  const cases = [
+    step => step.target = view.participants[0].id,
+    step => step.target = "dangling-id",
+    step => {step.hidden=true;step.target="dangling-id";},
+    step => {step.children=[{...step,id:"nested-target",target:"dangling-id",children:[],alternate:[]}];},
+    step => {step.kind="group";step.children=[{...step,id:"collapsed-target",kind:"call",target:"dangling-id",children:[],alternate:[]}];}
+  ];
+  for (const change of cases) {
+    const candidate=peleFixture("rust");candidate.steps=[structuredClone(candidate.steps[0])];
+    change(candidate.steps[0]);
+    assert.throws(()=>adapter.project(candidate),/Witnessed call target/);
+  }
+});
+
 test("frozen real Pele 1.6.0 sequence and grammar output remain byte-identical", () => {
   const sandbox = {};
   vm.runInNewContext(fs.readFileSync("web/vendor/pele-1.6.0.js", "utf8"), sandbox);
@@ -680,9 +703,10 @@ test("real Chromium validates pinned SVG and source note identity under unchange
         await new Promise(resolve => setTimeout(resolve, 10));
       const successor = container.querySelector('[data-trellis-step-id="group-alpha"] button');
       return {status:result.status, collapsed:2,
-        longEvidence:projection.source.includes("first measured entry: ENTRY") &&
-          projection.source.includes(view.steps[0].children[0].callId) &&
-          projection.source.includes("+1 calls collapsed (entry preview)"),
+        longEvidence:projection.rows[0].display.includes("first measured entry: ENTRY") &&
+          projection.rows[0].display.includes(view.steps[0].children[0].callId) &&
+          projection.rows[0].display.includes("+1 calls collapsed (entry preview)") &&
+          projection.source.includes("#43;1 calls collapsed #40;entry preview#41;"),
         visibleEvidence:text.includes("ENTRY") && text.includes("+1callscollapsed(entrypreview)") &&
           text.includes(view.steps[0].children[0].callId),
         unchanged:originalLabel === view.steps[0].label && originalChildLabel === view.steps[0].children[0].label,

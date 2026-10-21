@@ -148,14 +148,18 @@ test("published truncated producer shows bound while retaining original call wit
 
 // Exercise the app's own unsupported branch, not a test-side legacy render.
 // The response is based on a real published SequenceView and keeps its pin/seed.
-test("published app visibly falls back for current depth, Mermaid, SVG and real timeout limits",{timeout:240000},async()=>published(source,async({page,dto,pin})=>{
+test("published app visibly falls back for witnessed targets and current depth, Mermaid, SVG and timeout limits",{timeout:240000},async()=>published(source,async({page,dto,pin})=>{
  const original=structuredClone(dto),leaf=original.steps.find(s=>s.kind==="call");
  assert.ok(leaf,"published call witness required");
- const cases=["depth","mermaid","svg","timeout"];
+ const cases=["target","depth","mermaid","svg","timeout"];
  for(const scenario of cases) {
    const changed=structuredClone(original);
    const ids=[];
-   if(scenario==="depth") {
+   if(scenario==="target") {
+     changed.steps=[{...structuredClone(leaf),id:"fallback-target",label:"measured target evidence",
+       target:original.participants[0].id,children:[],alternate:[],hidden:false}];
+     ids.push(changed.steps[0].id);
+   } else if(scenario==="depth") {
      let child={...structuredClone(leaf),id:"fallback-depth-24",label:"deep original evidence",children:[],alternate:[],hidden:false};
      ids.push(child.id);
      for(let n=23;n>=0;n--) {
@@ -208,13 +212,17 @@ test("published app visibly falls back for current depth, Mermaid, SVG and real 
        .catch(async error=>{throw new Error(`${scenario}: ${error.message}; state=${await page.locator("#sequence-state").textContent()}; responses=${JSON.stringify(responseRequests)}; pageErrors=${JSON.stringify(await page.evaluate(()=>({text:document.querySelector("#sequence-diagram")?.textContent?.slice(0,500),nodes:window.__testPeleNodes})))}`);});
      const state=await page.locator("#sequence-state").textContent();
      assert.match(state,/Pele fell back:/,scenario);
-     const reason={depth:/depth/,mermaid:/Mermaid source too large/,svg:/SVG element/,timeout:/timed out/}[scenario];
+     const reason={target:/Witnessed call target: target links are not shown in either sequence renderer/,depth:/depth/,mermaid:/Mermaid source too large/,svg:/SVG element/,timeout:/timed out/}[scenario];
      assert.match(state,reason,scenario);
      assert.ok(responseRequests.length>=1,`${scenario}: app did not fetch sequence`);
      assert.equal(await page.locator("#sequence-diagram svg.pele").count(),0,scenario);
      assert.equal(await page.locator("#sequence-diagram svg:not(.pele)").count(),1,scenario);
      const visible=await page.locator("#sequence-diagram [data-source-step-id]").evaluateAll(rows=>rows.map(n=>n.dataset.sourceStepId));
      for(const id of ids) assert.ok(visible.includes(id),`${scenario}: lost original ${id}`);
+     if(scenario==="target") {
+       assert.equal(await page.locator("#sequence-diagram .sequence-arrow").count(),0);
+       assert.equal(await page.locator("#sequence-diagram .sequence-participant-label").count(),1);
+     }
      assert.equal(sourceRequests.length,0,`${scenario}: source fetched without action`);
      assert.equal(await page.locator("#source .source-line").count(),0,scenario);
    } finally {

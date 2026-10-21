@@ -7,7 +7,9 @@
   const tags = new Set(["svg", "g", "path", "rect", "text", "tspan"]);
   const attrs = new Set(["xmlns", "class", "viewBox", "width", "height", "fill", "fill-opacity", "role", "aria-roledescription", "transform", "stroke", "font-size", "data-id", "d", "x", "y", "rx", "text-anchor", "font-weight", "stroke-dasharray", "xml:space"]);
   function unsupported(reason) { const error = new Error(reason); error.code = "unsupported"; throw error; }
-  const encode = value => Array.from(String(value)).map(c => /[A-Za-z0-9 ._-]/.test(c) ? c : `U+${c.codePointAt(0).toString(16).toUpperCase()}`).join("");
+  // Pele decodes numeric entities into SVG text. Escape everything outside
+  // a small literal alphabet so repository text cannot become Mermaid grammar.
+  const encode = value => Array.from(String(value)).map(c => /[A-Za-z0-9 ._-]/.test(c) ? c : `#${c.codePointAt(0)};`).join("");
   function witness(step) {
     const r = step?.range;
     return typeof step?.path === "string" && !!step.path.trim() && r &&
@@ -39,14 +41,14 @@
         const room = Math.max(24, 160 - fixed.length);
         const groupLimit = Math.max(12, Math.floor(room / 2));
         const entryLimit = Math.max(12, room - groupLimit);
-        displayLabel = `${encode(shorten(label, groupLimit))} - first measured entry: ${encode(shorten(preview.label, entryLimit))} - call ${entryId} -${suffix}`;
+        displayLabel = `${shorten(label, groupLimit)} - first measured entry: ${shorten(preview.label, entryLimit)} - call ${entryId} -${suffix}`;
       } else {
         if (!options.showDetails) label = shorten(label, 160);
-        displayLabel = encode(label);
+        displayLabel = label;
       }
       const marker = `[${String(ordinal).padStart(3, "0")}]`;
-      const display = `${marker} ${encode(step.kind)} ${displayLabel}`;
-      lines.push(`Note right of S: ${display}`);
+      const display = `${marker} ${step.kind} ${displayLabel}`;
+      lines.push(`Note right of S: ${encode(display)}`);
       const row = {ordinal, marker, display, step, id:step.id, callId:step.callId, path:step.path, range:step.range, revision:view.revision, previewEntryCallId:preview?.callId, preview};
       rows.push(row); noteOrder.push(row);
     };
@@ -70,7 +72,7 @@
         if (step.kind === "branch") frame = alternate.length ? "alt" : "opt";
         else if (step.kind === "loop") frame = "loop";
         else if (step.kind === "try" || (step.kind !== "group" && (children.length || alternate.length))) frame = "rect";
-        const header = frame && frame !== "rect" ? {kind:frame, header:`[${encode(step.label)}]`, alternate:frame === "alt" ? "[alternate path]" : null} : null;
+        const header = frame && frame !== "rect" ? {kind:frame, header:`[${step.label}]`, alternate:frame === "alt" ? "[alternate path]" : null} : null;
         if (frame) {
           lines.push(frame === "rect" ? "rect" : `${frame} ${encode(step.label)}`);
           frames.push(frame);
@@ -94,6 +96,18 @@
         if (separators > 200) unsupported("Too many separators");
       }
     };
+    // A hidden or collapsed step can carry future measured target evidence.
+    // Refuse the whole view before projecting any subset; legacy fallback
+    // retains the complete DTO but currently draws only the seed lane.
+    const pending = [...view.steps];
+    let inspected = 0;
+    while (pending.length) {
+      if (++inspected > 12000) unsupported("Too many sequence members");
+      const step = pending.pop();
+      if (step?.target != null) unsupported("Witnessed call target: target links are not shown in either sequence renderer");
+      if (Array.isArray(step?.children)) pending.push(...step.children);
+      if (Array.isArray(step?.alternate)) pending.push(...step.alternate);
+    }
     visit(view.steps, 0);
     const source = lines.join("\n") + "\n";
     if (new TextEncoder().encode(source).length > 512 * 1024) unsupported("Mermaid source too large");
