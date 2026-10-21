@@ -4694,3 +4694,71 @@ fn escaped_javascript_declarations_publish_without_losing_later_facts() {
         }
     }
 }
+
+#[test]
+#[cfg(feature = "test-support")]
+fn cold_stream_matches_plain_artifact_publication_rows() {
+    let (_plain_state, root, plain, cancel) = fixture();
+    let stream_state = tempfile::tempdir().unwrap();
+    let stream = Store::open_for_tests(stream_state.path(), root.path()).unwrap();
+    let leader = plain.publication_for_tests().unwrap();
+    let plain_pin = publish(
+        &plain,
+        root.path(),
+        &cancel,
+        plain.index_baseline().unwrap(),
+        &leader,
+    )
+    .unwrap();
+    let options = IndexOptions::new(root.path().to_owned());
+    let (stream_pin, _owner) =
+        trellis::index_coordinator::reconcile_workspace(&stream, &options, &cancel, |_| {})
+            .unwrap();
+    let identity = trellis::store::topology::WorkspaceIdentity::discover(
+        Some(root.path()), root.path(),
+    )
+    .unwrap();
+    let index_path = |state: &std::path::Path| {
+        state.join("cache/indexes").join(&identity.root_key).join("index.db")
+    };
+    let plain_db = Connection::open(index_path(_plain_state.path())).unwrap();
+    let stream_db = Connection::open(index_path(stream_state.path())).unwrap();
+    let values = |db: &Connection, sql: &str| -> Vec<Vec<rusqlite::types::Value>> {
+        let mut stmt = db.prepare(sql).unwrap();
+        let columns = stmt.column_count();
+        stmt.query_map([], |row| {
+            (0..columns)
+                .map(|index| row.get::<_, rusqlite::types::Value>(index))
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+    };
+    for table in [
+        "document_versions", "graph_projections", "class_projections", "graph_nodes",
+        "graph_calls", "graph_regions", "classes", "class_relations",
+        "native_version_coverage_roles", "native_version_declarations",
+        "native_version_declaration_ancestors", "native_version_ancestor_signature_types",
+        "native_version_headers", "native_version_header_items", "native_version_parameters",
+        "native_version_own_signature_types", "native_version_control_regions",
+        "native_version_calls", "native_version_call_regions",
+    ] {
+        let sql = format!("SELECT * FROM {table} ORDER BY 1,2");
+        assert_eq!(values(&plain_db, &sql), values(&stream_db, &sql), "{table}");
+    }
+    // Compare the selected manifest without its intentionally different revision key.
+    let selected = "SELECT source_set_id,language,path,document_version_id,graph_projection_id,class_projection_id,capture_stat,coverage_requested,coverage_selected,coverage_state,coverage_diagnostic,ordinal FROM revision_documents ORDER BY ordinal";
+    assert_eq!(values(&plain_db, &selected), values(&stream_db, &selected));
+    assert_eq!(
+        values(&plain_db, "SELECT stats,diagnostics FROM index_metadata"),
+        values(&stream_db, "SELECT stats,diagnostics FROM index_metadata"),
+    );
+    for name in ["flow.js", "flow.java", "flow.rs", "flow.py"] {
+        assert_eq!(
+            plain.source_at(name, Some(plain_pin)).unwrap().unwrap().1,
+            stream.source_at(name, Some(stream_pin)).unwrap().unwrap().1,
+            "{name}",
+        );
+    }
+}
