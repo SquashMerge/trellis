@@ -4762,3 +4762,49 @@ fn cold_stream_matches_plain_artifact_publication_rows() {
         );
     }
 }
+
+#[test]
+#[cfg(feature = "test-support")]
+fn empty_cold_stream_preserves_plain_native_header() {
+    let state_plain = tempfile::tempdir().unwrap();
+    let state_stream = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let plain = Store::open_for_tests(state_plain.path(), root.path()).unwrap();
+    let stream = Store::open_for_tests(state_stream.path(), root.path()).unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let leader = plain.publication_for_tests().unwrap();
+    let _plain_pin = publish(
+        &plain,
+        root.path(),
+        &cancel,
+        plain.index_baseline().unwrap(),
+        &leader,
+    )
+    .unwrap();
+    let (stream_pin, _owner) = trellis::index_coordinator::reconcile_workspace(
+        &stream,
+        &IndexOptions::new(root.path().to_owned()),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    let identity = trellis::store::topology::WorkspaceIdentity::discover(
+        Some(root.path()), root.path(),
+    )
+    .unwrap();
+    let index_path = |state: &std::path::Path| {
+        state.join("cache/indexes").join(&identity.root_key).join("index.db")
+    };
+    let header = |state: &std::path::Path| -> (String, String, String, String) {
+        Connection::open(index_path(state))
+            .unwrap()
+            .query_row(
+                "SELECT source_set_id,toolchain_hash,config_hash,source_inventory FROM native_revisions",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap()
+    };
+    assert_eq!(header(state_plain.path()), header(state_stream.path()));
+    assert_eq!(stream.status().unwrap().revision, stream_pin);
+}
