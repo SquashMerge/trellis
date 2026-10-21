@@ -8558,23 +8558,31 @@ impl Store {
                 && spool.len() == capture.files.len(),
             "native_evidence_required: streamed document count mismatch"
         );
-        let source_by_path: BTreeMap<_, _> = capture
-            .files
+        let documents: BTreeMap<_, _> = spool
+            .header()
+            .revision
+            .documents
             .iter()
-            .map(|file| (file.path.as_str(), file))
+            .map(|doc| (doc.key.path.as_str(), doc))
             .collect();
         ensure!(
-            source_by_path.len() == capture.files.len(),
-            "native_evidence_required: duplicate captured source path"
+            documents.len() == spool.len(),
+            "native_evidence_required: duplicate revision document path"
         );
-        let mut graph = Graph {
+        let graph = Graph {
+            files: capture.files.clone(),
             stats: spool.stats().clone(),
             diagnostics: spool.diagnostics().to_vec(),
             ..Graph::default()
         };
-        for doc in &spool.header().revision.documents {
-            let source = source_by_path
-                .get(doc.key.path.as_str())
+        let mut unique_paths = BTreeSet::new();
+        for source in &graph.files {
+            ensure!(
+                unique_paths.insert(source.path.as_str()),
+                "native_evidence_required: duplicate captured source path"
+            );
+            let doc = documents
+                .get(source.path.as_str())
                 .context("native document missing captured source")?;
             ensure!(
                 doc.key.language == source.language
@@ -8582,7 +8590,6 @@ impl Store {
                     && doc.byte_length == source.text.len(),
                 "native document bytes differ from captured graph"
             );
-            graph.files.push((*source).clone());
         }
         let pin = self.publish_inner_checked_target_with_local(
             (&graph, capture, spool.header()),
@@ -10272,12 +10279,13 @@ impl Store {
 
     fn prepare_stream_class_catalog(
         spool: &crate::native_evidence::FullDocumentSpool,
+        order: &[usize],
         cancel: &CancelFlag,
     ) -> Result<crate::classes::Catalog> {
         let limits = crate::classes::Limits::default();
         let compose = spool.len() <= limits.files && spool.stats().symbols <= limits.symbols;
         let mut extractions = Vec::new();
-        for index in 0..spool.len() {
+        for &index in order {
             check_cancel(cancel)?;
             let (_, graph) = spool.read(index)?;
             let file = graph
@@ -10310,6 +10318,7 @@ impl Store {
     fn preflight_stream_reuse(
         &self,
         spool: &crate::native_evidence::FullDocumentSpool,
+        order: &[usize],
         classes: &crate::classes::Catalog,
         expected: &ExpectedPublication,
     ) -> Result<PreflightReuse> {
@@ -10359,7 +10368,7 @@ impl Store {
             // Keep only one document's native and graph rows in memory while
             // authenticating per-document reuse against this read snapshot.
             let mut families = BTreeMap::new();
-            for index in 0..spool.len() {
+            for &index in order {
                 let (native, graph) = spool.read(index)?;
                 let file = graph.files.first().context("stream graph document absent")?;
                 let selected_classes = stream_document_classes(classes, &file.path);
@@ -10486,6 +10495,31 @@ impl Store {
             self.ensure_not_recreate_pending()?;
         }
         let (graph, capture, native) = bundle;
+        let stream_order = if stream.is_some() {
+            let by_path: BTreeMap<_, _> = native
+                .revision
+                .documents
+                .iter()
+                .enumerate()
+                .map(|(index, doc)| (doc.key.path.as_str(), index))
+                .collect();
+            ensure!(
+                by_path.len() == native.revision.documents.len(),
+                "native_evidence_required: duplicate revision document path"
+            );
+            graph
+                .files
+                .iter()
+                .map(|file| {
+                    by_path
+                        .get(file.path.as_str())
+                        .copied()
+                        .context("native document missing captured graph path")
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
         Self::enforce_selected_source_admission(graph, max_graph_json_bytes)?;
         ensure!(
             graph.schema_version == SCHEMA_VERSION,
@@ -10499,7 +10533,7 @@ impl Store {
             );
             (
                 spool.stats().clone(),
-                Self::prepare_stream_class_catalog(spool, cancel)?,
+                Self::prepare_stream_class_catalog(spool, &stream_order, cancel)?,
                 BTreeMap::new(),
             )
         } else {
@@ -10648,7 +10682,7 @@ impl Store {
             );
             self.preflight_local_reuse(graph, prepared)?
         } else if let Some(spool) = stream {
-            self.preflight_stream_reuse(spool, &classes, &expected)
+            self.preflight_stream_reuse(spool, &stream_order, &classes, &expected)
                 .map_err(|error| self.report_live_read_failure(error))?
         } else if matches!(target, PublicationTarget::Live) {
             // A stored hash that differs from the fresh one is typed index
@@ -10866,7 +10900,7 @@ impl Store {
                 None,
             )
             .map_err(classify_immutable)?;
-            for index in 0..spool.len() {
+            for (ordinal, &index) in stream_order.iter().enumerate() {
                 check_cancel(cancel)?;
                 let (artifact, document_graph) = spool.read(index)?;
                 ensure!(
@@ -10886,7 +10920,7 @@ impl Store {
                     .first()
                     .context("stream graph document absent")?;
                 ensure!(
-                    document_graph.files.len() == 1 && graph.files.get(index) == Some(file),
+                    document_graph.files.len() == 1 && graph.files.get(ordinal) == Some(file),
                     "native_evidence_required: streamed graph document differs from capture"
                 );
                 Self::enforce_selected_source_admission(&document_graph, max_graph_json_bytes)?;
@@ -10907,9 +10941,9 @@ impl Store {
                     &reuse,
                     &rows,
                     false,
-                    index,
+                    ordinal,
                     &graph.diagnostics,
-                    graph.files.get(index),
+                    graph.files.get(ordinal),
                 )
                 .map_err(classify_immutable)?;
                 let ids = written
