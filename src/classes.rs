@@ -219,6 +219,162 @@ fn dotted(s: &str) -> bool {
                 })
         })
 }
+/// Ordered, bounded class composition. Callers may replay per-file extraction
+/// payloads from private storage instead of retaining every payload in memory.
+pub(crate) struct CatalogComposer {
+    result: Catalog,
+    source: usize,
+    registry: usize,
+    records: usize,
+    detail: usize,
+    registry_complete: bool,
+    detail_open: bool,
+    open: bool,
+    limits: Limits,
+}
+impl CatalogComposer {
+    pub(crate) fn new(file_count: usize, symbol_count: usize, limits: Limits) -> Self {
+        let mut result = Catalog::default();
+        let open = file_count <= limits.files && symbol_count <= limits.symbols;
+        if !open {
+            result.truncated = true;
+            result.warnings.push(format!(
+                "Class catalog input limit exceeded ({} files / {} symbols)",
+                limits.files, limits.symbols
+            ));
+        }
+        Self {
+            result,
+            source: 0,
+            registry: 0,
+            records: 0,
+            detail: 0,
+            registry_complete: true,
+            detail_open: true,
+            open,
+            limits,
+        }
+    }
+    pub(crate) fn is_open(&self) -> bool {
+        self.open
+    }
+    /// False means composition reached the exact global stop point. Extraction
+    /// of other files must already be complete before callers stop replaying.
+    pub(crate) fn push(&mut self, f: &FileExtraction) -> bool {
+        if !self.open {
+            return false;
+        }
+        if self.source.saturating_add(f.source_bytes) > self.limits.total_bytes {
+            self.result.limit_warning(
+                &format!(
+                    "Class catalog source limit exceeded ({} MiB)",
+                    self.limits.total_bytes / (1024 * 1024)
+                ),
+                self.limits.text,
+            );
+            self.registry_complete = false;
+            self.open = false;
+            return false;
+        }
+        if self.registry.saturating_add(f.registry_bytes) > self.limits.registry_text {
+            self.result.limit_warning(
+                &format!(
+                    "Class declaration registry text limit reached ({} MiB)",
+                    self.limits.registry_text / (1024 * 1024)
+                ),
+                self.limits.text,
+            );
+            self.registry_complete = false;
+            self.open = false;
+            return false;
+        }
+        self.source += f.source_bytes;
+        self.registry += f.registry_bytes;
+        for warning in &f.warnings {
+            self.result.add_warning(warning, self.limits.text);
+        }
+        self.result.truncated |= f.truncated;
+        self.registry_complete &= !f.registry_incomplete;
+        for (index, c) in f.classes.iter().enumerate() {
+            if self.result.classes.len() == self.limits.classes {
+                self.result.limit_warning(
+                    &format!(
+                        "Class catalog declaration limit reached ({})",
+                        self.limits.classes
+                    ),
+                    self.limits.text,
+                );
+                self.registry_complete = false;
+                self.open = false;
+                return false;
+            }
+            let mut c = c.clone();
+            c.fields.clear();
+            c.methods.clear();
+            for item in f.items.iter().filter(|i| i.class_index == index) {
+                if !self.detail_open {
+                    c.truncated = true;
+                    continue;
+                }
+                if self.records.saturating_add(item.records) > self.limits.records
+                    || self.detail.saturating_add(item.text) > self.limits.output_text
+                {
+                    let message = if self.records.saturating_add(item.records) > self.limits.records
+                    {
+                        format!(
+                            "Class detail limit reached ({} records / {} MiB text / {} visits per file); declaration discovery continues",
+                            self.limits.records,
+                            self.limits.output_text / (1024 * 1024),
+                            self.limits.visits
+                        )
+                    } else {
+                        format!(
+                            "Class detail text limit reached ({} MiB); declaration discovery continues",
+                            self.limits.output_text / (1024 * 1024)
+                        )
+                    };
+                    self.result.limit_warning(&message, self.limits.text);
+                    self.detail_open = false;
+                    c.truncated = true;
+                    continue;
+                }
+                self.records += item.records;
+                self.detail += item.text;
+                match &item.value {
+                    DetailValue::Field(value) => c.fields.push(value.clone()),
+                    DetailValue::Method(value) => c.methods.push(value.clone()),
+                    DetailValue::Relation(value) => self.result.relations.push(value.clone()),
+                    DetailValue::ScopeText => (),
+                }
+            }
+            self.result.classes.push(c);
+        }
+        true
+    }
+    pub(crate) fn finish(mut self) -> Catalog {
+        self.result.classes.sort_by(|a, b| {
+            (&a.symbol.path, a.symbol.range.start_byte, &a.symbol.id).cmp(&(
+                &b.symbol.path,
+                b.symbol.range.start_byte,
+                &b.symbol.id,
+            ))
+        });
+        self.result.relations.sort_by(|a, b| {
+            (&a.path, a.range.start_byte, &a.id).cmp(&(&b.path, b.range.start_byte, &b.id))
+        });
+        self.result.relations.dedup_by(|a, b| a.id == b.id);
+        if !self.result.classes.is_empty() {
+            self.result.warnings.push("Declared types are terminal source text, not class relationships. Direct Java/Python declarations only; no function-body, conditional/anonymous class, generated member, wildcard-import, type-alias or dependency discovery.".into());
+        }
+        if !self.registry_complete {
+            self.result.warnings.push(
+                "Incomplete class declaration registry: some declarations may be absent.".into(),
+            );
+        }
+        self.result
+    }
+}
+
 impl Catalog {
     pub fn build(files: &[SourceFile], nodes: &[Symbol], cancel: &CancelFlag) -> Result<Self> {
         Self::build_with_limits(files, nodes, cancel, Limits::default())
@@ -256,123 +412,17 @@ impl Catalog {
         symbol_count: usize,
         limits: Limits,
     ) -> Result<Self> {
-        let mut result = Self::default();
-        if file_count > limits.files || symbol_count > limits.symbols {
-            result.truncated = true;
-            result.warnings.push(format!(
-                "Class catalog input limit exceeded ({} files / {} symbols)",
-                limits.files, limits.symbols
-            ));
-            return Ok(result);
-        }
+        let mut composer = CatalogComposer::new(file_count, symbol_count, limits);
         let mut ordered: Vec<_> = extracts.iter().collect();
         ordered.sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
-        let (mut source, mut registry, mut records, mut detail) = (0usize, 0usize, 0usize, 0usize);
-        let (mut registry_complete, mut detail_open) = (true, true);
-        'file_loop: for f in ordered {
-            if source.saturating_add(f.source_bytes) > limits.total_bytes {
-                result.limit_warning(
-                    &format!(
-                        "Class catalog source limit exceeded ({} MiB)",
-                        limits.total_bytes / (1024 * 1024)
-                    ),
-                    limits.text,
-                );
-                registry_complete = false;
+        for extraction in ordered {
+            if !composer.push(extraction) {
                 break;
             }
-            if registry.saturating_add(f.registry_bytes) > limits.registry_text {
-                result.limit_warning(
-                    &format!(
-                        "Class declaration registry text limit reached ({} MiB)",
-                        limits.registry_text / (1024 * 1024)
-                    ),
-                    limits.text,
-                );
-                registry_complete = false;
-                break;
-            }
-            source += f.source_bytes;
-            registry += f.registry_bytes;
-            for warning in &f.warnings {
-                result.add_warning(warning, limits.text);
-            }
-            result.truncated |= f.truncated;
-            registry_complete &= !f.registry_incomplete;
-            for (index, c) in f.classes.iter().enumerate() {
-                if result.classes.len() == limits.classes {
-                    result.limit_warning(
-                        &format!(
-                            "Class catalog declaration limit reached ({})",
-                            limits.classes
-                        ),
-                        limits.text,
-                    );
-                    registry_complete = false;
-                    break 'file_loop;
-                }
-                let mut c = c.clone();
-                c.fields.clear();
-                c.methods.clear();
-                for item in f.items.iter().filter(|i| i.class_index == index) {
-                    if !detail_open {
-                        c.truncated = true;
-                        continue;
-                    }
-                    if records.saturating_add(item.records) > limits.records
-                        || detail.saturating_add(item.text) > limits.output_text
-                    {
-                        let message = if records.saturating_add(item.records) > limits.records {
-                            format!(
-                                "Class detail limit reached ({} records / {} MiB text / {} visits per file); declaration discovery continues",
-                                limits.records,
-                                limits.output_text / (1024 * 1024),
-                                limits.visits
-                            )
-                        } else {
-                            format!(
-                                "Class detail text limit reached ({} MiB); declaration discovery continues",
-                                limits.output_text / (1024 * 1024)
-                            )
-                        };
-                        result.limit_warning(&message, limits.text);
-                        detail_open = false;
-                        c.truncated = true;
-                        continue;
-                    }
-                    records += item.records;
-                    detail += item.text;
-                    match &item.value {
-                        DetailValue::Field(value) => c.fields.push(value.clone()),
-                        DetailValue::Method(value) => c.methods.push(value.clone()),
-                        DetailValue::Relation(value) => result.relations.push(value.clone()),
-                        DetailValue::ScopeText => (),
-                    }
-                }
-                result.classes.push(c);
-            }
         }
-        result.classes.sort_by(|a, b| {
-            (&a.symbol.path, a.symbol.range.start_byte, &a.symbol.id).cmp(&(
-                &b.symbol.path,
-                b.symbol.range.start_byte,
-                &b.symbol.id,
-            ))
-        });
-        result.relations.sort_by(|a, b| {
-            (&a.path, a.range.start_byte, &a.id).cmp(&(&b.path, b.range.start_byte, &b.id))
-        });
-        result.relations.dedup_by(|a, b| a.id == b.id);
-        if !result.classes.is_empty() {
-            result.warnings.push("Declared types are terminal source text, not class relationships. Direct Java/Python declarations only; no function-body, conditional/anonymous class, generated member, wildcard-import, type-alias or dependency discovery.".into());
-        }
-        if !registry_complete {
-            result.warnings.push(
-                "Incomplete class declaration registry: some declarations may be absent.".into(),
-            );
-        }
-        Ok(result)
+        Ok(composer.finish())
     }
+
     fn add_warning(&mut self, message: &str, text: usize) {
         if self.warnings.len() < 100 && !self.warnings.iter().any(|s| s == message) {
             self.warnings.push(message.chars().take(text).collect());

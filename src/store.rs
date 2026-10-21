@@ -10283,8 +10283,8 @@ impl Store {
         cancel: &CancelFlag,
     ) -> Result<crate::classes::Catalog> {
         let limits = crate::classes::Limits::default();
-        let compose = spool.len() <= limits.files && spool.stats().symbols <= limits.symbols;
-        let mut extractions = Vec::new();
+        // Finish *all* file extraction before composing. A later extraction
+        // error outranks an earlier catalog limit, as in the full publisher.
         for &index in order {
             check_cancel(cancel)?;
             let (_, graph) = spool.read(index)?;
@@ -10307,12 +10307,32 @@ impl Store {
                 let extraction =
                     crate::classes::FileExtraction::extract_file(file, &symbols, cancel, limits)?;
                 spool.write_extraction(index, &extraction)?;
-                if compose {
-                    extractions.push(extraction);
+            }
+        }
+        let mut composer =
+            crate::classes::CatalogComposer::new(spool.len(), spool.stats().symbols, limits);
+        let mut replay = order.to_vec();
+        replay.sort_by(|a, b| {
+            spool.header().revision.documents[*a]
+                .key
+                .path
+                .as_bytes()
+                .cmp(spool.header().revision.documents[*b].key.path.as_bytes())
+        });
+        for index in replay {
+            if !composer.is_open() {
+                break;
+            }
+            let document = &spool.header().revision.documents[index];
+            if matches!(document.key.language.as_str(), "java" | "python") {
+                check_cancel(cancel)?;
+                let extraction = spool.read_extraction(index)?;
+                if !composer.push(&extraction) {
+                    break;
                 }
             }
         }
-        crate::classes::Catalog::compose(&extractions, spool.len(), spool.stats().symbols, limits)
+        Ok(composer.finish())
     }
 
     fn preflight_stream_reuse(
