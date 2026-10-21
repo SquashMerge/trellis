@@ -4327,6 +4327,7 @@ fn write_native(
     write_header: bool,
     ordinal_start: usize,
     full_diagnostics: &[Diagnostic],
+    captured_file: Option<&SourceFile>,
 ) -> Result<BTreeMap<String, V8DocumentProjection>> {
     let (artifact, capture, graph, classes, extractions) = bundle;
     let a = artifact;
@@ -4449,11 +4450,16 @@ fn write_native(
         .iter()
         .map(|coverage| (coverage.document_path.as_str(), coverage))
         .collect();
-    let captured_by_key: HashMap<(&str, &str), &crate::model::SourceFile> = capture
-        .files
-        .iter()
-        .map(|source| ((source.language.as_str(), source.path.as_str()), source))
-        .collect();
+    let captured_by_key: HashMap<(&str, &str), &SourceFile> =
+        if captured_file.is_none() && !graph.files.is_empty() {
+            capture
+                .files
+                .iter()
+                .map(|source| ((source.language.as_str(), source.path.as_str()), source))
+                .collect()
+        } else {
+            HashMap::new()
+        };
     // Projection IDs and native witnesses are pure per-document values. They
     // are computed on workers before the insert loop, under the same reuse
     // conditions, and each is consumed below exactly where it was computed
@@ -4503,9 +4509,12 @@ fn write_native(
                 && doc.byte_length == file.text.len(),
             "native document bytes differ from captured graph"
         );
-        let source = captured_by_key
-            .get(&(file.language.as_str(), file.path.as_str()))
-            .copied()
+        let source = captured_file
+            .or_else(|| {
+                captured_by_key
+                    .get(&(file.language.as_str(), file.path.as_str()))
+                    .copied()
+            })
             .filter(|source| *source == file)
             .context("native source missing immutable capture")?;
         ensure!(
@@ -10847,6 +10856,7 @@ impl Store {
                 true,
                 0,
                 &graph.diagnostics,
+                None,
             )
             .map_err(classify_immutable)?;
             for index in 0..spool.len() {
@@ -10892,6 +10902,7 @@ impl Store {
                     false,
                     index,
                     &graph.diagnostics,
+                    graph.files.get(index),
                 )
                 .map_err(classify_immutable)?;
                 let ids = written
@@ -10928,6 +10939,7 @@ impl Store {
                 true,
                 0,
                 &graph.diagnostics,
+                None,
             )
             .map_err(classify_immutable)?;
         };
