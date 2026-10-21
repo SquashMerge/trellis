@@ -1,0 +1,157 @@
+{
+  "hiddenSteps": 0,
+  "participants": [
+    {
+      "id": "fixture-seed",
+      "identification": "Selected source symbol.",
+      "kind": "method",
+      "label": "run"
+    },
+    {
+      "id": "python:source:unresolvedCallee:20f65c28671b40937c5bf23acc7c6f37e5a5ec0622e347b57685725df5ba9e50",
+      "identification": "Source expression only; type, descriptors and dispatch unresolved. Visual group, not object identity or a constructor claim.",
+      "kind": "unresolvedCallee",
+      "label": "check"
+    },
+    {
+      "id": "python:source:unresolvedCallee:8a798890fe93817163b10b5f7bd2ca4d25d84c52739a645a889c173eee7d9d3d",
+      "identification": "Source expression only; type, descriptors and dispatch unresolved. Visual group, not object identity or a constructor claim.",
+      "kind": "unresolvedCallee",
+      "label": "yes"
+    },
+    {
+      "id": "python:source:unresolvedCallee:9390298f3fb0c5b160498935d79cb139aef28e1c47358b4bbba61862b9c26e59",
+      "identification": "Source expression only; type, descriptors and dispatch unresolved. Visual group, not object identity or a constructor claim.",
+      "kind": "unresolvedCallee",
+      "label": "no"
+    },
+    {
+      "id": "python:source:unresolvedCallee:f39592393ef0859cb196a52693d2cea00fb2df784b3c04ae54aa7cadb8e562f8",
+      "identification": "Source expression only; type, descriptors and dispatch unresolved. Visual group, not object identity or a constructor claim.",
+      "kind": "unresolvedCallee",
+      "label": "after"
+    }
+  ],
+  "revision": {
+    "indexGeneration": "00000000-0000-4000-8000-000000000001",
+    "indexRevision": 7
+  },
+  "seed": {
+    "accessor": false,
+    "id": "fixture-seed",
+    "kind": "function",
+    "name": "run",
+    "parent": null,
+    "path": "fixture.py",
+    "provenance": {
+      "semantic": "unavailable",
+      "source": "native-measuredSyntax"
+    },
+    "range": {
+      "endByte": 75,
+      "endColumn": 12,
+      "endLine": 6,
+      "startByte": 0,
+      "startColumn": 1,
+      "startLine": 1
+    }
+  },
+  "steps": [
+    {
+      "alternate": [],
+      "callId": "fixture-call-1",
+      "children": [],
+      "hidden": false,
+      "id": "step:18:1",
+      "kind": "call",
+      "label": "check",
+      "path": "fixture.py",
+      "range": {
+        "endByte": 25,
+        "endColumn": 15,
+        "endLine": 2,
+        "startByte": 18,
+        "startColumn": 8,
+        "startLine": 2
+      }
+    },
+    {
+      "alternate": [
+        {
+          "alternate": [],
+          "callId": "fixture-call-3",
+          "children": [],
+          "hidden": false,
+          "id": "step:59:4",
+          "kind": "call",
+          "label": "no",
+          "path": "fixture.py",
+          "range": {
+            "endByte": 63,
+            "endColumn": 13,
+            "endLine": 5,
+            "startByte": 59,
+            "startColumn": 9,
+            "startLine": 5
+          }
+        }
+      ],
+      "callId": null,
+      "children": [
+        {
+          "alternate": [],
+          "callId": "fixture-call-2",
+          "children": [],
+          "hidden": false,
+          "id": "step:35:3",
+          "kind": "call",
+          "label": "yes",
+          "path": "fixture.py",
+          "range": {
+            "endByte": 40,
+            "endColumn": 14,
+            "endLine": 3,
+            "startByte": 35,
+            "startColumn": 9,
+            "startLine": 3
+          }
+        }
+      ],
+      "hidden": false,
+      "id": "step:15:2",
+      "kind": "branch",
+      "label": "if check()",
+      "path": "fixture.py",
+      "range": {
+        "endByte": 63,
+        "endColumn": 13,
+        "endLine": 5,
+        "startByte": 15,
+        "startColumn": 5,
+        "startLine": 2
+      }
+    },
+    {
+      "alternate": [],
+      "callId": "fixture-call-4",
+      "children": [],
+      "hidden": false,
+      "id": "step:68:5",
+      "kind": "call",
+      "label": "after",
+      "path": "fixture.py",
+      "range": {
+        "endByte": 75,
+        "endColumn": 12,
+        "endLine": 6,
+        "startByte": 68,
+        "startColumn": 5,
+        "startLine": 6
+      }
+    }
+  ],
+  "truncated": false,
+  "warnings": [
+    "Static possible paths, not a runtime trace. Python types, imports, dispatch, descriptors, operator/truthiness protocols and implicit exceptions are not resolved. Async/generator bodies show possible execution on await/iteration, not call-time execution. Unsupported definition-time effects remain opaque; function bodies are deferred."
+  ]
+}

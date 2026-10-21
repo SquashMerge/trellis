@@ -1,0 +1,139 @@
+{
+  "hiddenSteps": 0,
+  "participants": [
+    {
+      "id": "fixture-seed",
+      "identification": "Selected source symbol.",
+      "kind": "method",
+      "label": "run"
+    },
+    {
+      "id": "boundary:unknown",
+      "identification": "Target unknown; visual group only.",
+      "kind": "boundary",
+      "label": "Unknown/external operations (visual group, not object identity)"
+    }
+  ],
+  "revision": {
+    "indexGeneration": "00000000-0000-4000-8000-000000000001",
+    "indexRevision": 7
+  },
+  "seed": {
+    "accessor": false,
+    "id": "fixture-seed",
+    "kind": "function",
+    "name": "run",
+    "parent": null,
+    "path": "fixture.js",
+    "provenance": {
+      "semantic": "unavailable",
+      "source": "native-measuredSyntax"
+    },
+    "range": {
+      "endByte": 66,
+      "endColumn": 67,
+      "endLine": 1,
+      "startByte": 0,
+      "startColumn": 1,
+      "startLine": 1
+    }
+  },
+  "steps": [
+    {
+      "alternate": [],
+      "callId": "fixture-call-1",
+      "children": [],
+      "hidden": false,
+      "id": "step:21:1",
+      "kind": "call",
+      "label": "check",
+      "path": "fixture.js",
+      "range": {
+        "endByte": 28,
+        "endColumn": 29,
+        "endLine": 1,
+        "startByte": 21,
+        "startColumn": 22,
+        "startLine": 1
+      }
+    },
+    {
+      "alternate": [
+        {
+          "alternate": [],
+          "callId": "fixture-call-3",
+          "children": [],
+          "hidden": false,
+          "id": "step:48:4",
+          "kind": "call",
+          "label": "no",
+          "path": "fixture.js",
+          "range": {
+            "endByte": 52,
+            "endColumn": 53,
+            "endLine": 1,
+            "startByte": 48,
+            "startColumn": 49,
+            "startLine": 1
+          }
+        }
+      ],
+      "callId": null,
+      "children": [
+        {
+          "alternate": [],
+          "callId": "fixture-call-2",
+          "children": [],
+          "hidden": false,
+          "id": "step:32:3",
+          "kind": "call",
+          "label": "yes",
+          "path": "fixture.js",
+          "range": {
+            "endByte": 37,
+            "endColumn": 38,
+            "endLine": 1,
+            "startByte": 32,
+            "startColumn": 33,
+            "startLine": 1
+          }
+        }
+      ],
+      "hidden": false,
+      "id": "step:17:2",
+      "kind": "branch",
+      "label": "if (check())",
+      "path": "fixture.js",
+      "range": {
+        "endByte": 55,
+        "endColumn": 56,
+        "endLine": 1,
+        "startByte": 17,
+        "startColumn": 18,
+        "startLine": 1
+      }
+    },
+    {
+      "alternate": [],
+      "callId": "fixture-call-4",
+      "children": [],
+      "hidden": false,
+      "id": "step:56:5",
+      "kind": "call",
+      "label": "after",
+      "path": "fixture.js",
+      "range": {
+        "endByte": 63,
+        "endColumn": 64,
+        "endLine": 1,
+        "startByte": 56,
+        "startColumn": 57,
+        "startLine": 1
+      }
+    }
+  ],
+  "truncated": false,
+  "warnings": [
+    "Static possible paths, not observed runtime order. Selectivity is an uncalibrated conservative heuristic. Implicit getters, coercions, iteration protocols, and other runtime effects are not expanded."
+  ]
+}

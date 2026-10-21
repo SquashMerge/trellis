@@ -1,0 +1,13 @@
+sequenceDiagram
+participant S as bounded (source)
+Note over S: Static possible path - targets and timing unknown
+Note over S: [Q1] group chars → take(180) → collect (3 calls)
+Note over S: [Q2] call chars - target unknown
+Note over S: [Q3] call take - target unknown
+Note over S: [Q4] call collect - target unknown
+Note over S: [Q5] call chars - target unknown
+Note over S: [Q6] call count - target unknown
+alt [Q7] if s.chars().count() greater than 180
+Note over S: [Q8] call push - target unknown
+end
+Note over S: warnings 1 - inspect original DTO

@@ -1,0 +1,157 @@
+{
+  "hiddenSteps": 0,
+  "participants": [
+    {
+      "id": "fixture-seed",
+      "identification": "Selected source symbol.",
+      "kind": "method",
+      "label": "run"
+    },
+    {
+      "id": "java:source:unresolvedCallee:20f65c28671b40937c5bf23acc7c6f37e5a5ec0622e347b57685725df5ba9e50",
+      "identification": "Source spelling only; types, overloads and virtual dispatch unresolved. Visual group, not runtime object identity or a claimed return type.",
+      "kind": "unresolvedCallee",
+      "label": "check"
+    },
+    {
+      "id": "java:source:unresolvedCallee:8a798890fe93817163b10b5f7bd2ca4d25d84c52739a645a889c173eee7d9d3d",
+      "identification": "Source spelling only; types, overloads and virtual dispatch unresolved. Visual group, not runtime object identity or a claimed return type.",
+      "kind": "unresolvedCallee",
+      "label": "yes"
+    },
+    {
+      "id": "java:source:unresolvedCallee:9390298f3fb0c5b160498935d79cb139aef28e1c47358b4bbba61862b9c26e59",
+      "identification": "Source spelling only; types, overloads and virtual dispatch unresolved. Visual group, not runtime object identity or a claimed return type.",
+      "kind": "unresolvedCallee",
+      "label": "no"
+    },
+    {
+      "id": "java:source:unresolvedCallee:f39592393ef0859cb196a52693d2cea00fb2df784b3c04ae54aa7cadb8e562f8",
+      "identification": "Source spelling only; types, overloads and virtual dispatch unresolved. Visual group, not runtime object identity or a claimed return type.",
+      "kind": "unresolvedCallee",
+      "label": "after"
+    }
+  ],
+  "revision": {
+    "indexGeneration": "00000000-0000-4000-8000-000000000001",
+    "indexRevision": 7
+  },
+  "seed": {
+    "accessor": false,
+    "id": "fixture-seed",
+    "kind": "method",
+    "name": "run",
+    "parent": "fixture-parent",
+    "path": "Fixture.java",
+    "provenance": {
+      "semantic": "unavailable",
+      "source": "native-measuredSyntax"
+    },
+    "range": {
+      "endByte": 78,
+      "endColumn": 79,
+      "endLine": 1,
+      "startByte": 16,
+      "startColumn": 17,
+      "startLine": 1
+    }
+  },
+  "steps": [
+    {
+      "alternate": [],
+      "callId": "fixture-call-1",
+      "children": [],
+      "hidden": false,
+      "id": "step:33:1",
+      "kind": "call",
+      "label": "check",
+      "path": "Fixture.java",
+      "range": {
+        "endByte": 40,
+        "endColumn": 41,
+        "endLine": 1,
+        "startByte": 33,
+        "startColumn": 34,
+        "startLine": 1
+      }
+    },
+    {
+      "alternate": [
+        {
+          "alternate": [],
+          "callId": "fixture-call-3",
+          "children": [],
+          "hidden": false,
+          "id": "step:60:4",
+          "kind": "call",
+          "label": "no",
+          "path": "Fixture.java",
+          "range": {
+            "endByte": 64,
+            "endColumn": 65,
+            "endLine": 1,
+            "startByte": 60,
+            "startColumn": 61,
+            "startLine": 1
+          }
+        }
+      ],
+      "callId": null,
+      "children": [
+        {
+          "alternate": [],
+          "callId": "fixture-call-2",
+          "children": [],
+          "hidden": false,
+          "id": "step:44:3",
+          "kind": "call",
+          "label": "yes",
+          "path": "Fixture.java",
+          "range": {
+            "endByte": 49,
+            "endColumn": 50,
+            "endLine": 1,
+            "startByte": 44,
+            "startColumn": 45,
+            "startLine": 1
+          }
+        }
+      ],
+      "hidden": false,
+      "id": "step:29:2",
+      "kind": "branch",
+      "label": "if (check())",
+      "path": "Fixture.java",
+      "range": {
+        "endByte": 67,
+        "endColumn": 68,
+        "endLine": 1,
+        "startByte": 29,
+        "startColumn": 30,
+        "startLine": 1
+      }
+    },
+    {
+      "alternate": [],
+      "callId": "fixture-call-4",
+      "children": [],
+      "hidden": false,
+      "id": "step:68:5",
+      "kind": "call",
+      "label": "after",
+      "path": "Fixture.java",
+      "range": {
+        "endByte": 75,
+        "endColumn": 76,
+        "endLine": 1,
+        "startByte": 68,
+        "startColumn": 69,
+        "startLine": 1
+      }
+    }
+  ],
+  "truncated": false,
+  "warnings": [
+    "Static possible paths, not a runtime trace. Java types, overloads, virtual dispatch, annotations/Lombok, reflection, generated methods and implicit initialization are not resolved. Calls/operations may throw; implicit exception paths are not expanded."
+  ]
+}

@@ -455,3 +455,335 @@ test("sequence actions recheck matched snapshot at click time",()=>{
  const row=d.row("call");assert.equal(row.attrs.role,"button");current=false;
  row.listeners.click();assert.equal(selected,0);
 });
+
+// Pele projection tests use the real adapter, not a reconstructed prototype DTO.
+function peleProjector() {
+  const window = {};
+  vm.runInNewContext(fs.readFileSync("web/sequence-pele.js", "utf8"), {window, TextEncoder});
+  return window.TrellisPeleSequence;
+}
+function peleFixture(language) {
+  return JSON.parse(fs.readFileSync(`tests/fixtures/sequence-pele/${language}.json`, "utf8"));
+}
+test("four measured language DTOs project to one lane, ordered source notes and no invented messages", () => {
+  const adapter = peleProjector();
+  for (const language of ["javascript", "rust", "java", "python"]) {
+    const view = peleFixture(language);
+    const result = adapter.project(view);
+    assert.match(result.source, /^sequenceDiagram\nparticipant S as /);
+    assert.equal((result.source.match(/^participant /gm) || []).length, 1);
+    assert.equal((result.source.match(/^Note right of S:/gm) || []).length, result.rows.length);
+    assert.doesNotMatch(result.source, /S\s*[-=]+>/);
+    assert.equal(new Set(result.rows.map(row => row.id)).size, result.rows.length);
+    for (const row of result.rows) {
+      assert.equal(row.step.id, row.id);
+      assert.equal(row.step.path, row.path);
+      assert.strictEqual(row.step.range, row.range);
+      assert.strictEqual(row.revision, view.revision);
+      assert.ok(row.range.startLine > 0);
+    }
+    assert.ok(result.rows.some(row => row.callId), language);
+  }
+});
+test("Pele projection rejects duplicates and encodes malicious repository text", () => {
+  const adapter = peleProjector(), view = peleFixture("rust");
+  view.seed.name = '<script onload="evil()">';
+  view.steps[0].label = 'unsafe\nalt <img src=x>';
+  const result = adapter.project(view);
+  assert.doesNotMatch(result.source, /<script|<img|\nalt </);
+  view.steps.push(view.steps[0]);
+  assert.throws(() => adapter.project(view), /Duplicate sequence identity/);
+});
+
+test("Pele projection keeps human labels separate from encoded Mermaid and refuses all witnessed targets", () => {
+  const adapter = peleProjector(), view = peleFixture("rust");
+  view.steps[0].label = 'if check() Vec<T> & "quoted" / café 🔒';
+  const result = adapter.project(view,new Set(),{showDetails:true});
+  assert.ok(result.rows[0].display.includes(view.steps[0].label));
+  assert.match(result.source, /#40;#41;/);
+  assert.match(result.source, /#60;T#62;/);
+  assert.match(result.source, /#233;/);
+  assert.doesNotMatch(result.source, /U\+[0-9A-F]+|Vec<T>/);
+  const cases = [
+    step => step.target = view.participants[0].id,
+    step => step.target = "dangling-id",
+    step => {step.hidden=true;step.target="dangling-id";},
+    step => {step.children=[{...step,id:"nested-target",target:"dangling-id",children:[],alternate:[]}];},
+    step => {step.kind="group";step.children=[{...step,id:"collapsed-target",kind:"call",target:"dangling-id",children:[],alternate:[]}];}
+  ];
+  for (const change of cases) {
+    const candidate=peleFixture("rust");candidate.steps=[structuredClone(candidate.steps[0])];
+    change(candidate.steps[0]);
+    assert.throws(()=>adapter.project(candidate),/Witnessed call target/);
+  }
+});
+
+test("frozen real Pele 1.6.0 sequence and grammar output remain byte-identical", () => {
+  const sandbox = {};
+  vm.runInNewContext(fs.readFileSync("web/vendor/pele-1.6.0.js", "utf8"), sandbox);
+  assert.equal(typeof sandbox.pele.render, "function");
+  for (const name of ["sequence", "representative"]) {
+    const source = fs.readFileSync(`tests/fixtures/pele-1.6.0/${name}.mmd`, "utf8");
+    const output = sandbox.pele.render(source).svg;
+    assert.equal(output, fs.readFileSync(`tests/fixtures/pele-1.6.0/${name}.svg`, "utf8"));
+  }
+  const actual = fs.readFileSync("tests/fixtures/pele-1.6.0/sequence.svg", "utf8");
+  assert.deepEqual([...actual.matchAll(/class="pele-note" data-id="(i\d+)"/g)].map(match => match[1]),
+    ["i0", "i1", "i2", "i3", "i4", "i5", "i6", "i8", "i10"]);
+  assert.match(actual, /class="pele-frame pele-frame-alt"/);
+  assert.doesNotMatch(actual, /class="pele-frame pele-frame-alt" data-id=/);
+});
+
+test("negative control: original step identity check detects altered projector", () => {
+  const source = fs.readFileSync("web/sequence-pele.js", "utf8");
+  const fixture = peleFixture("rust");
+  const evaluate = text => {
+    const window = {};
+    vm.runInNewContext(text, {window, TextEncoder});
+    const row = window.TrellisPeleSequence.project(fixture).rows[0];
+    assert.equal(row.id, row.step.id, "Pele map must retain original measured identity");
+  };
+  evaluate(source); // positive production behavior
+  const mutated = source.replace("id:step.id, callId:step.callId", 'id:"mutated", callId:step.callId');
+  assert.notEqual(mutated, source);
+  assert.throws(() => evaluate(mutated), /Pele map must retain original measured identity/);
+  evaluate(source); // restored production behavior
+});
+
+test("pinned Pele renders all four producer Mermaid sources and bounded near-cap input", () => {
+  const sandbox = {};
+  vm.runInNewContext(fs.readFileSync("web/vendor/pele-1.6.0.js", "utf8"), sandbox);
+  const adapter = peleProjector();
+  for (const language of ["javascript", "rust", "java", "python"]) {
+    const projection = adapter.project(peleFixture(language));
+    const result = sandbox.pele.render(projection.source).svg;
+    assert.match(result, /^<svg xmlns="http:\/\/www\.w3\.org\/2000\/svg" class="pele pele-sequence"/);
+    assert.equal((result.match(/class="pele-note" data-id="i\d+"/g) || []).length,
+      projection.rows.length + projection.separators, language);
+    assert.equal((result.match(/class="pele-frame pele-frame-/g) || []).length,
+      projection.frames.filter(frame => frame !== "rect").length, language);
+    assert.equal((result.match(/class="pele-rect"/g) || []).length,
+      projection.frames.filter(frame => frame === "rect").length, language);
+  }
+  const near = peleFixture("rust");
+  near.steps = Array.from({length: 180}, (_, i) => ({...near.steps[0], id:`near-${i}`}));
+  const projection = adapter.project(near);
+  assert.equal(projection.rows.length, 180);
+  assert.equal((sandbox.pele.render(projection.source).svg.match(/class="pele-note" data-id=/g) || []).length, 181);
+  near.steps = Array.from({length: 201}, (_, i) => ({...near.steps[0], id:`overflow-${i}`}));
+  assert.throws(() => adapter.project(near), /Too many source notes/);
+});
+
+test("Pele rejects changed inline style and oversized SVG before DOMParser", async () => {
+  const source = fs.readFileSync("web/sequence-pele.js", "utf8");
+  const frozen = fs.readFileSync("tests/fixtures/pele-1.6.0/sequence.svg", "utf8");
+  const view = peleFixture("rust");
+  let parses = 0;
+  const sandbox = {window:{pele:{render:() => ({svg:frozen.replace("max-width:100%", "max-width:200%")})}},
+    TextEncoder, setTimeout, clearTimeout, DOMParser:class { parseFromString() { parses++; throw Error("should not parse"); } }};
+  vm.runInNewContext(source, sandbox);
+  const container = {replaceChildren() { throw Error("partial DOM installed"); }};
+  const changed = await sandbox.window.TrellisPeleSequence.render(container, view);
+  assert.equal(changed.status, "unsupported");
+  assert.match(changed.reason, /theme/);
+  assert.equal(parses, 0);
+  sandbox.window.pele.render = () => ({svg:"x".repeat(8 * 1024 * 1024 + 1)});
+  const oversized = await sandbox.window.TrellisPeleSequence.render(container, view);
+  assert.equal(oversized.status, "unsupported");
+  assert.match(oversized.reason, /too large/);
+  assert.equal(parses, 0);
+  sandbox.window.pele.render = () => ({svg:frozen});
+  const stale = await sandbox.window.TrellisPeleSequence.render(container, view, null, new Set(), {isCurrent:() => false});
+  assert.equal(stale.status, "stale");
+});
+
+test("real Chromium validates pinned SVG and source note identity under unchanged CSP", async t => {
+  if (!process.env.PLAYWRIGHT_BROWSERS_PATH) { t.skip("Playwright browser is provisioned by ./tools/verify"); return; }
+  const {chromium} = require("./browser/node_modules/playwright");
+  const browser = await chromium.launch();
+  try {
+    const page = await browser.newPage();
+    const errors = [];
+    page.on("pageerror", error => errors.push(error.message));
+    await page.route("http://127.0.0.1:43987/**", route => {
+      const path = new URL(route.request().url()).pathname;
+      const assets = {"/vendor/pele-1.6.0.js":"web/vendor/pele-1.6.0.js", "/sequence-pele.js":"web/sequence-pele.js"};
+      if (assets[path]) return route.fulfill({status:200, contentType:"text/javascript; charset=utf-8", body:fs.readFileSync(assets[path])});
+      if (path === "/test.css") return route.fulfill({status:200, contentType:"text/css", body:"#diagram { width:240px; height:110px; overflow:auto }"});
+      return route.fulfill({status:200, contentType:"text/html; charset=utf-8", body:
+        `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'"><script src="/vendor/pele-1.6.0.js"></script><script src="/sequence-pele.js"></script><link rel="stylesheet" href="/test.css"><div id="diagram"></div>`});
+    });
+    await page.goto("http://127.0.0.1:43987/");
+    await page.evaluate(() => document.addEventListener("securitypolicyviolation", event =>
+      (window.cspViolations ||= []).push(event.violatedDirective)));
+    for (const language of ["javascript", "rust", "java", "python"]) {
+      const fixture = peleFixture(language);
+      const actual = await page.evaluate(async view => {
+        let selected;
+        const result = await window.TrellisPeleSequence.render(document.querySelector("#diagram"), view,
+          null, new Set(), {onSelect:step => selected=step});
+        const note = document.querySelector('.pele-note[data-trellis-step-id]');
+        note?.dispatchEvent(new MouseEvent("click", {bubbles:true}));
+        const sameOriginalObject = selected === view.steps[0];
+        selected = undefined;
+        note?.dispatchEvent(new KeyboardEvent("keydown", {key:"Enter", bubbles:true}));
+        const keyboardOriginalObject = selected === view.steps[0];
+        selected = undefined;
+        return {status:result.status, reason:result.reason, notes:document.querySelectorAll('.pele-note[data-trellis-step-id]').length,
+          original:sameOriginalObject, keyboard:keyboardOriginalObject, id:note?.getAttribute("data-trellis-step-id"), csp:window.cspViolations || []};
+      }, fixture);
+      assert.equal(actual.status, "rendered", `${language}: ${actual.reason}`);
+      assert.equal(actual.notes, 5, language);
+      assert.equal(actual.original, true, language);
+      assert.equal(actual.keyboard, true, language);
+      assert.deepEqual(actual.csp, [], language);
+    }
+    // Mutate actual Pele output, then run the production validator rather than
+    // merely inspecting static fixture markup. No partial DOM may be installed.
+    const mutated = await page.evaluate(async view => {
+      const container = document.querySelector("#diagram");
+      const originalRender = window.pele.render;
+      const source = window.TrellisPeleSequence.project(view).source;
+      const actual = originalRender(source, {}).svg;
+      const cases = {
+        guard:actual.replace(/(<text class="pele-frame-label"[^>]*>)([^<]+)(<\/text>)/g,
+          (whole, open, label, close) => label === "[alternate path]" ? whole : `${open}[changed guard]${close}`),
+        alternate:actual.replace(/(<text class="pele-frame-label"[^>]*>)[^<]+/, "$1[changed alternate]"),
+        altIdentity:actual.replace('class="pele-frame pele-frame-alt"', 'class="pele-frame pele-frame-alt" data-id="i7"'),
+        positionalNotes:actual.replace(/class="pele-note" data-id="i(\d+)"/g, (_, n) => `class="pele-note" data-id="i${Number(n) + 10}"`)
+      };
+      const results = {};
+      for (const [name, svg] of Object.entries(cases)) {
+        let selected = false;
+        const previous = container.firstElementChild;
+        window.pele = {render:() => ({svg})};
+        const outcome = await window.TrellisPeleSequence.render(container, view, null, new Set(), {onSelect:() => selected=true});
+        results[name] = {status:outcome.status, reason:outcome.reason, unchanged:container.firstElementChild === previous, selected};
+      }
+      window.pele = {render:originalRender};
+      return results;
+    }, peleFixture("rust"));
+    for (const [name, expected] of Object.entries({guard:/frame header/, alternate:/frame header/, altIdentity:/frame identity/, positionalNotes:/note order/})) {
+      assert.equal(mutated[name].status, "unsupported", name);
+      assert.match(mutated[name].reason, expected, name);
+      assert.equal(mutated[name].unchanged, true, name);
+      assert.equal(mutated[name].selected, false, name);
+    }
+    const groupView = peleFixture("rust");
+    const first = groupView.steps[0], last = groupView.steps[2];
+    const nested = groupView.steps[1];
+    const groupLabel = "GROUP".repeat(36), childLabel = "ENTRY".repeat(36);
+    groupView.steps = [
+      {...first, id:"group-alpha", kind:"group", label:groupLabel, callId:null,
+        children:[{...first, label:childLabel}, last], alternate:[]},
+      {...nested.children[0], id:"group-beta", kind:"group", label:"second measured chain", callId:null,
+        children:[nested.children[0], nested.alternate[0]], alternate:[]}
+    ];
+    const group = await page.evaluate(async view => {
+      window.groupView = view;
+      window.groupSelected = null;
+      const container = document.querySelector("#diagram");
+      const projection = window.TrellisPeleSequence.project(view);
+      const originalLabel = view.steps[0].label, originalChildLabel = view.steps[0].children[0].label;
+      const result = await window.TrellisPeleSequence.render(container, view, null, new Set(),
+        {onSelect:step => window.groupSelected=step});
+      const note = container.querySelector('.pele-note[data-trellis-step-id="group-alpha"]');
+      const second = container.querySelector('.pele-note[data-trellis-step-id="group-beta"]');
+      const toggle = note?.querySelector("button.sequence-group-control");
+      const secondToggle = second?.querySelector("button.sequence-group-control");
+      if (result.status !== "rendered" || !toggle || !secondToggle) return {status:result.status, reason:result.reason};
+      const text = note.textContent.replace(/\s+/g, "");
+      note.dispatchEvent(new MouseEvent("click", {bubbles:true}));
+      const originalSelection = window.groupSelected === view.steps[0];
+      window.groupSelected = null;
+      container.scrollTop = 24; container.scrollLeft = 35;
+      const before = [container.scrollTop, container.scrollLeft];
+      toggle.click();
+      for (let i=0; i<50 && container.querySelector('[data-trellis-step-id="group-alpha"] button')?.getAttribute("aria-expanded") !== "true"; i++)
+        await new Promise(resolve => setTimeout(resolve, 10));
+      const successor = container.querySelector('[data-trellis-step-id="group-alpha"] button');
+      return {status:result.status, collapsed:2,
+        longEvidence:projection.rows[0].display.includes("first measured entry: ENTRY") &&
+          projection.rows[0].display.includes(view.steps[0].children[0].callId) &&
+          projection.rows[0].display.includes("+1 calls collapsed (entry preview)") &&
+          projection.source.includes("#43;1 calls collapsed #40;entry preview#41;"),
+        visibleEvidence:text.includes("ENTRY") && text.includes("+1callscollapsed(entrypreview)") &&
+          text.includes(view.steps[0].children[0].callId),
+        unchanged:originalLabel === view.steps[0].label && originalChildLabel === view.steps[0].children[0].label,
+        identityBound:toggle.parentElement.localName === "foreignObject" && toggle.parentElement.parentElement === note &&
+          secondToggle.parentElement.parentElement === second && toggle.getAttribute("aria-controls") === note.id &&
+          secondToggle.getAttribute("aria-controls") === second.id && note.getAttribute("aria-describedby") === toggle.id,
+        originalSelection, noToggleSelection:window.groupSelected === null,
+        previewCallId:note.getAttribute("data-trellis-preview-call-id"),
+        expanded:container.querySelectorAll('.pele-note[data-trellis-step-id]').length,
+        focused:document.activeElement === successor,
+        scroll:[container.scrollTop, container.scrollLeft], before, csp:window.cspViolations || []};
+    }, groupView);
+    assert.equal(group.status, "rendered", group.reason);
+    for (const key of ["longEvidence", "visibleEvidence", "unchanged", "identityBound", "originalSelection", "noToggleSelection", "focused"])
+      assert.equal(group[key], true, key);
+    assert.equal(group.previewCallId, first.callId);
+    assert.equal(group.expanded, 4);
+    assert.deepEqual(group.scroll, group.before);
+    assert.deepEqual(group.csp, []);
+    const secondToggle = page.locator('button.sequence-group-control[data-trellis-step-id="group-beta"]');
+    await secondToggle.focus();
+    const beforeEnter = await page.evaluate(() => {
+      const c = document.querySelector("#diagram"); c.scrollTop = 31; c.scrollLeft = 28;
+      return [c.scrollTop, c.scrollLeft];
+    });
+    await secondToggle.press("Enter");
+    assert.deepEqual(await page.evaluate(() => {
+      const c = document.querySelector("#diagram");
+      return {expanded:c.querySelectorAll('.pele-note[data-trellis-step-id]').length,
+        focus:document.activeElement?.dataset.trellisStepId, scroll:[c.scrollTop,c.scrollLeft],
+        selected:window.groupSelected === null};
+    }), {expanded:6, focus:"group-beta", scroll:beforeEnter, selected:true});
+    const firstToggle = page.locator('button.sequence-group-control[data-trellis-step-id="group-alpha"]');
+    await firstToggle.focus();
+    await firstToggle.press("Space");
+    assert.equal(await page.locator('.pele-note[data-trellis-step-id]').count(), 4);
+    assert.equal(await page.evaluate(() => document.activeElement?.dataset.trellisStepId), "group-alpha");
+    await secondToggle.focus();
+    await secondToggle.press("Space");
+    assert.equal(await page.locator('.pele-note[data-trellis-step-id]').count(), 2);
+    assert.equal(await page.evaluate(() => document.activeElement?.dataset.trellisStepId), "group-beta");
+    const controlView = peleFixture("rust");
+    const measured = controlView.steps[0], measuredNext = controlView.steps[2];
+    controlView.steps = [
+      {...measured, id:"loop-1", kind:"loop", label:"possible iterations", callId:null,
+        children:[{...measured, id:"loop-call"}], alternate:[]},
+      {...measured, id:"try-1", kind:"try", label:"try: paths and cleanup unknown", callId:null,
+        children:[{...measuredNext, id:"try-call"}], alternate:[{...measured, id:"handler-call"}]}
+    ];
+    const controls = await page.evaluate(async view => {
+      const container = document.querySelector("#diagram");
+      const result = await window.TrellisPeleSequence.render(container, view, null, new Set(), {});
+      return {status:result.status, loops:container.querySelectorAll(".pele-frame-loop").length,
+        rects:container.querySelectorAll(".pele-rect").length, notes:container.querySelectorAll('.pele-note[data-trellis-step-id]').length};
+    }, controlView);
+    assert.deepEqual(controls, {status:"rendered", loops:1, rects:1, notes:5});
+    const emptyView = peleFixture("rust"); emptyView.steps = [];
+    const empty = await page.evaluate(view => window.TrellisPeleSequence.render(
+      document.querySelector("#diagram"), view, null, new Set(), {}), emptyView);
+    assert.equal(empty.status, "rendered", empty.reason);
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});
+
+test("Pele projector enforces 24 visible levels and the exact 512 KiB UTF-8 Mermaid boundary", () => {
+ const adapter=peleProjector(), view=peleFixture("rust"), leaf=view.steps[0];
+ const chain=levels=>{let node={...leaf,id:`level-${levels-1}`,children:[],alternate:[]};
+   for(let i=levels-2;i>=0;i--) node={...leaf,id:`level-${i}`,kind:"note",children:[node],alternate:[]};
+   return node;};
+ view.steps=[chain(24)];
+ assert.equal(adapter.project(view).rows.length,24);
+ view.steps=[chain(25)];assert.throws(()=>adapter.project(view),/Unsupported sequence depth/);
+ view.steps=[{...leaf,id:"mermaid-bytes",label:""}];
+ const sourceSize=label=>new TextEncoder().encode(adapter.project({...view,steps:[{...view.steps[0],label}]},new Set(),{showDetails:true}).source).length;
+ const fixed=sourceSize("call");
+ assert.ok(fixed<512*1024);
+ const limit="x".repeat(512*1024-fixed+4);
+ assert.equal(sourceSize(limit),512*1024);
+ assert.throws(()=>adapter.project({...view,steps:[{...view.steps[0],label:limit+"x"}]},new Set(),{showDetails:true}),/Mermaid source too large/);
+});
