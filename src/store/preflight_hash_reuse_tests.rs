@@ -29,6 +29,47 @@ fn fixture() -> (
     (state, work, store, options, pin)
 }
 
+fn call_lookups(store: &Store) -> Vec<(String, String, Option<String>)> {
+    let db = store.cache_write().unwrap();
+    let mut statement = db
+        .prepare("SELECT version_id,id,callee_lookup_key FROM native_version_calls ORDER BY version_id,id")
+        .unwrap();
+    statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+#[test]
+fn streamed_callee_lookups_equal_plain_without_source_blob_reads() {
+    let before = writer_source_sql_reads_for_tests();
+    let (_state, work, streamed, options, _pin) = fixture();
+    let stream_lookups = call_lookups(&streamed);
+    assert!(
+        !stream_lookups.is_empty(),
+        "fixture must contain a native call"
+    );
+    assert_eq!(writer_source_sql_reads_for_tests() - before, 0);
+
+    let state = tempfile::tempdir().unwrap();
+    let plain = Store::open_for_tests(state.path(), work.path()).unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (graph, native, capture) =
+        crate::indexer::index_workspace_bundle(&options, plain.root_id(), &cancel, |_| {}).unwrap();
+    let baseline = plain.index_baseline().unwrap();
+    let leader = plain.writer().unwrap();
+    plain
+        .publish_native(&graph, &capture, &native, &leader, baseline, &cancel)
+        .unwrap();
+    assert_eq!(call_lookups(&plain), stream_lookups);
+    assert_eq!(
+        writer_source_sql_reads_for_tests() - before,
+        native.calls.len(),
+        "plain artifact still checks stored source bytes for each call"
+    );
+}
+
 /// Overwrite one stored hash of A.java's selected rows with zeros.
 fn corrupt(store: &Store, pin: IndexPin, sql: &str) {
     let mut db = store.cache_write().unwrap();

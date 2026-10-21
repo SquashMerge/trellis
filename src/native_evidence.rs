@@ -1069,6 +1069,27 @@ impl FullDocumentSpool {
             None,
         ));
     }
+    /// Class extraction uses only the graph; do not decode the native facts
+    /// again while replaying its Java/Python files.
+    pub(crate) fn read_graph(&self, index: usize) -> Result<crate::model::Graph> {
+        let document = self
+            .header
+            .revision
+            .documents
+            .get(index)
+            .context("native spool document index out of range")?;
+        let bytes: Vec<u8> = self.conn.query_row(
+            "SELECT graph FROM documents WHERE ordinal = ?1",
+            [i64::try_from(index)?],
+            |row| row.get(0),
+        )?;
+        let graph: crate::model::Graph = serde_json::from_slice(&bytes)?;
+        ensure!(
+            graph.files.len() == 1 && graph.files[0].path == document.key.path,
+            "native spool graph/document mismatch"
+        );
+        Ok(graph)
+    }
     fn admit_identity(&self, handle: &str, canonical: &[u8], full: &str) -> Result<()> {
         let inserted = self.conn.execute(
             "INSERT OR IGNORE INTO identities (handle, canonical, full) VALUES (?1, ?2, ?3)",
@@ -3947,6 +3968,7 @@ mod full_document_spool_tests {
         for index in 0..spool.len() {
             let path = &spool.header().revision.documents[index].key.path;
             let (native, graph) = spool.read(index).unwrap();
+            assert_eq!(spool.read_graph(index).unwrap(), graph);
             assert_eq!(spool.read(index).unwrap(), (native.clone(), graph.clone()));
             assert_eq!(
                 native.revision,
@@ -4037,6 +4059,18 @@ mod full_document_spool_tests {
                     .collect::<Vec<_>>()
             );
         }
+        let js = spool
+            .header()
+            .revision
+            .documents
+            .iter()
+            .position(|document| document.key.path == "c.js")
+            .unwrap();
+        spool.corrupt_graph_json_for_tests(js);
+        assert!(
+            spool.read_graph(js).is_err(),
+            "malformed scratch graph is typed"
+        );
         assert_eq!(spool._file.as_file().metadata().unwrap().nlink(), 0);
         drop(spool);
         assert!(!unlinked_path.exists());

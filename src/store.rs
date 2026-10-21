@@ -4334,6 +4334,15 @@ fn write_graph_document(
     Ok(())
 }
 
+#[cfg(test)]
+thread_local! {
+    static WRITER_SOURCE_SQL_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+#[cfg(test)]
+fn writer_source_sql_reads_for_tests() -> usize {
+    WRITER_SOURCE_SQL_READS.with(std::cell::Cell::get)
+}
+
 #[allow(clippy::too_many_arguments)] // The transaction seam keeps the immutable bundle and reuse witness separate.
 fn write_native(
     db: &Connection,
@@ -4810,12 +4819,31 @@ fn write_native(
             .get(&c.document)
             .copied()
             .context("native call missing validated document")?;
-        let source: Vec<u8> = db.query_row(
-            "SELECT source_bytes FROM document_versions WHERE id=?1 AND source_set_id=?2 AND language=?3 AND path=?4",
-            params![version, document.key.source_set_id, document.key.language, document.key.path],
-            |row| row.get(0),
-        )?;
-        let source = std::str::from_utf8(&source).context("native stored source is not UTF-8")?;
+        // A new streamed version was inserted above from this exact admitted
+        // file. Avoid one SQLite source BLOB read per native call. The public
+        // plain-artifact path still checks stored source bytes as before;
+        // reused native versions skip this loop entirely.
+        let stored_source: Option<Vec<u8>> = if captured_file.is_none() {
+            #[cfg(test)]
+            WRITER_SOURCE_SQL_READS.with(|reads| reads.set(reads.get() + 1));
+            Some(db.query_row(
+                "SELECT source_bytes FROM document_versions WHERE id=?1 AND source_set_id=?2 AND language=?3 AND path=?4",
+                params![version, document.key.source_set_id, document.key.language, document.key.path],
+                |row| row.get(0),
+            )?)
+        } else {
+            None
+        };
+        let source = if let Some(file) = captured_file {
+            file.text.as_str()
+        } else {
+            std::str::from_utf8(
+                stored_source
+                    .as_deref()
+                    .context("native stored source missing")?,
+            )
+            .context("native stored source is not UTF-8")?
+        };
         let callee_lookup_key =
             crate::native_evidence::verified_callee_lookup(&document.key.language, c, source);
         immutable.insert(
@@ -10272,27 +10300,29 @@ impl Store {
         // error outranks an earlier catalog limit, as in the full publisher.
         for &index in order {
             check_cancel(cancel)?;
-            let (_, graph) = spool.read(index)?;
+            let document = &spool.header().revision.documents[index];
+            if !matches!(document.key.language.as_str(), "java" | "python") {
+                continue;
+            }
+            let graph = spool.read_graph(index)?;
             let file = graph
                 .files
                 .first()
                 .context("stream graph document absent")?;
-            if matches!(file.language.as_str(), "java" | "python") {
-                let symbols: Vec<_> = graph
-                    .nodes
-                    .iter()
-                    .filter(|n| {
-                        matches!(
-                            n.kind,
-                            SymbolKind::Class | SymbolKind::Method | SymbolKind::Function
-                        )
-                    })
-                    .cloned()
-                    .collect();
-                let extraction =
-                    crate::classes::FileExtraction::extract_file(file, &symbols, cancel, limits)?;
-                spool.write_extraction(index, &extraction)?;
-            }
+            let symbols: Vec<_> = graph
+                .nodes
+                .iter()
+                .filter(|n| {
+                    matches!(
+                        n.kind,
+                        SymbolKind::Class | SymbolKind::Method | SymbolKind::Function
+                    )
+                })
+                .cloned()
+                .collect();
+            let extraction =
+                crate::classes::FileExtraction::extract_file(file, &symbols, cancel, limits)?;
+            spool.write_extraction(index, &extraction)?;
         }
         let mut composer =
             crate::classes::CatalogComposer::new(spool.len(), spool.stats().symbols, limits);
