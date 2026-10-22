@@ -1904,8 +1904,8 @@ pub enum GcStage {
 }
 
 // Final admission runs under this candidate's nonblocking EX use lock.
-// Historical v8 layouts without the complete maintenance extension remain
-// report-only, even if their extractor marker matches the current binary.
+// Earlier disposable schemas remain report-only to GC, even if their
+// extractor marker matches the current binary.
 fn validate_gc_candidate_shape(db: &rusqlite::Connection) -> Result<()> {
     let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
     ensure!(version == 12, "historical GC schema is report-only");
