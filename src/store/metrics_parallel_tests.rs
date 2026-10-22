@@ -106,17 +106,30 @@ fn a_document_over_the_read_ahead_budget_is_held_alone() {
 }
 
 #[test]
-fn read_ahead_never_holds_more_than_its_budget() {
+fn read_ahead_counts_one_carried_document_at_a_chunk_boundary() {
     let (_state, _root, store) = published_store(12);
     let (_, unbounded) = metrics_with(&store, 3, u64::MAX, &mut || Ok(()));
     let largest = *unbounded.charges.iter().max().unwrap();
-    // Room for about three documents across both read-ahead chunks.
-    let budget = largest * 3;
+    // Each chunk fits one fixture document; fetching the next one crosses
+    // its boundary while both pending and current chunks are still held.
+    let budget = largest * 2;
     let (payload, trace) = metrics_with(&store, 3, budget, &mut || Ok(()));
     assert_eq!(payload.unwrap().files.len(), 12);
-    assert!(trace.max_resident_bytes <= budget, "{trace:?}");
+    let boundary = trace
+        .boundaries
+        .iter()
+        .find(|&&(pending, current, carried)| pending > 0 && current > 0 && carried > 0)
+        .expect("lookahead crosses a chunk boundary before pending acceptance");
+    assert!(boundary.0 + boundary.1 <= budget, "{trace:?}");
+    assert!(boundary.2 <= largest, "{trace:?}");
     assert!(
-        trace.max_resident_documents >= 2,
-        "documents still overlap: {trace:?}"
+        boundary.0 + boundary.1 + boundary.2 > budget,
+        "the carried document crosses the two-chunk budget: {trace:?}"
     );
+    assert!(
+        trace.max_resident_bytes >= boundary.0 + boundary.1 + boundary.2,
+        "peak includes pending + current + carried: {trace:?}"
+    );
+    assert!(trace.max_resident_bytes <= budget + largest, "{trace:?}");
+    assert!(trace.max_resident_documents >= 3, "{trace:?}");
 }

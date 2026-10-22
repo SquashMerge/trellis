@@ -1109,11 +1109,14 @@ enum MetricsDocumentFailure {
 const METRICS_WORKER_CHECK_EVERY: u32 = 64;
 /// At most this many documents are read into one chunk for the workers.
 const METRICS_FETCH_DOCUMENTS: usize = 64;
-/// Read-ahead budget across the chunk being read and the chunk the workers
-/// hold, charged as each document's stored bytes (source, native and class
-/// ancillary rows, graph rows and F) as its existing SQL budgets measured them.
-/// Each of the two chunks is charged at most half of it; a document charged
-/// more than half is read and computed alone.
+/// The two overlapping metrics chunks together have at most this much
+/// read-ahead charge. Each chunk has at most half the budget, except that a
+/// document over half is computed alone. Deriving graph DTOs before charging
+/// can also leave one fully fetched lookahead document carried across a chunk
+/// boundary. Thus the held charge is pending + current + carried: at most
+/// 64 MiB for the two ordinary chunks, plus one document within the existing
+/// per-document source, ancillary, graph and F typed envelopes. This charge
+/// counts derived graph bytes once; it is not a bound on decoded Rust RSS.
 const METRICS_FETCH_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Test overrides for one metrics request on this thread.
@@ -1132,8 +1135,10 @@ struct MetricsFetchTrace {
     charges: Vec<u64>,
     /// The most documents read and not yet accepted at once.
     max_resident_documents: usize,
-    /// The most read-ahead charge held at once.
+    /// The most read-ahead charge held at once, including a fetched lookahead.
     max_resident_bytes: u64,
+    /// (pending, current, carried) charges when a document crosses a boundary.
+    boundaries: Vec<(u64, u64, u64)>,
 }
 #[cfg(test)]
 thread_local! {
@@ -1408,10 +1413,10 @@ impl EvidenceResponse {
             let chunk_bytes = fetch_bytes / 2;
             loop {
                 // Read the next chunk while the workers compute the previous one.
-                // Each chunk is charged at most half the budget, so the two held
-                // at once stay within it. Deriving the graph is necessary to
-                // know its charge, so one fetched document may be carried into
-                // the next chunk. A document over half the budget is computed alone.
+                // The two ordinary chunks together stay within the budget.
+                // Graph DTOs must be derived before their charge is known, so
+                // one fully fetched document may be carried past that budget.
+                // A document over half the budget is computed alone.
                 let mut keys: Vec<&DocumentKey> = Vec::new();
                 let mut fetched: Vec<std::sync::Mutex<Option<Fetched>>> = Vec::new();
                 let mut bytes = 0u64;
@@ -1448,13 +1453,29 @@ impl EvidenceResponse {
                         }
                     };
                     let charge = item.stored_bytes;
+                    // The newly fetched item is resident before deciding whether
+                    // it fits: count pending + current + this lookahead even if
+                    // pending is about to be joined and accepted.
+                    #[cfg(test)]
+                    trace_metrics_resident(
+                        fetched.len() + pending.as_ref().map_or(0, |(keys, _)| keys.len()) + 1,
+                        pending_bytes.saturating_add(bytes).saturating_add(charge),
+                    );
                     let oversized = charge > chunk_bytes;
                     if !keys.is_empty() && (oversized || bytes.saturating_add(charge) > chunk_bytes)
                     {
+                        #[cfg(test)]
+                        METRICS_FETCH_TRACE.with_borrow_mut(|trace| {
+                            trace.boundaries.push((pending_bytes, bytes, charge));
+                        });
                         carried = Some((key, item));
                         break;
                     }
                     if oversized && pending.is_some() {
+                        #[cfg(test)]
+                        METRICS_FETCH_TRACE.with_borrow_mut(|trace| {
+                            trace.boundaries.push((pending_bytes, bytes, charge));
+                        });
                         carried = Some((key, item));
                         break;
                     }
@@ -1464,10 +1485,6 @@ impl EvidenceResponse {
                     #[cfg(test)]
                     {
                         METRICS_FETCH_TRACE.with_borrow_mut(|trace| trace.charges.push(charge));
-                        trace_metrics_resident(
-                            fetched.len() + pending.as_ref().map_or(0, |(keys, _)| keys.len()),
-                            bytes.saturating_add(pending_bytes),
-                        );
                     }
                     if oversized {
                         alone = true;
