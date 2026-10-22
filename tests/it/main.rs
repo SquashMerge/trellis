@@ -133,3 +133,19 @@ mod topology;
 mod topology_http;
 #[path = "../watch.rs"]
 mod watch;
+
+/// Cargo no longer discovers test files (`autotests = false`), so a new file
+/// under tests/ must be listed above or it would silently never build.
+#[test]
+fn every_test_file_is_a_module_of_this_binary() {
+    let tests = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let listed = std::fs::read_to_string(tests.join("it/main.rs")).unwrap();
+    let mut missing = Vec::new();
+    for entry in std::fs::read_dir(&tests).unwrap() {
+        let name = entry.unwrap().file_name().into_string().unwrap();
+        if name.ends_with(".rs") && !listed.contains(&format!("#[path = \"../{name}\"]")) {
+            missing.push(name);
+        }
+    }
+    assert!(missing.is_empty(), "add to tests/it/main.rs: {missing:?}");
+}
