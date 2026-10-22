@@ -4343,6 +4343,38 @@ fn writer_source_sql_reads_for_tests() -> usize {
     WRITER_SOURCE_SQL_READS.with(std::cell::Cell::get)
 }
 
+/// A document's projection IDs and native witness, computed off the SQL
+/// thread. `None` means the reuse path supplies it, or it is recomputed inline.
+type PrecomputedDocument = (Option<Result<V8DocumentProjection>>, Option<Result<String>>);
+
+/// One document's projection and witness, under write_native's reuse conditions.
+fn precompute_document(
+    file: &SourceFile,
+    native: &crate::native_evidence::Artifact,
+    grouped: Option<&PublicationRows<'_>>,
+    document: Option<&crate::native_evidence::Document>,
+    coverage: Option<&crate::native_evidence::Coverage>,
+    reuse: &PreflightReuse,
+) -> PrecomputedDocument {
+    let projection = if reuse.existing_ids.contains_key(&file.path) {
+        None
+    } else {
+        grouped.map(|grouped| v8_document_projection(file, native, grouped))
+    };
+    let witness =
+        if reuse.for_path(&file.path).native {
+            None
+        } else {
+            match (document, coverage, grouped) {
+                (Some(document), Some(coverage), Some(grouped)) => Some(
+                    publication_native_witness(document, &native.producer, coverage, grouped),
+                ),
+                _ => None,
+            }
+        };
+    (projection, witness)
+}
+
 #[allow(clippy::too_many_arguments)] // The transaction seam keeps the immutable bundle and reuse witness separate.
 fn write_native(
     db: &Connection,
@@ -4363,6 +4395,7 @@ fn write_native(
     ordinal_start: usize,
     full_diagnostics: &[Diagnostic],
     captured_file: Option<&SourceFile>,
+    precomputed: Option<PrecomputedDocument>,
 ) -> Result<BTreeMap<String, V8DocumentProjection>> {
     let (artifact, capture, graph, classes, extractions) = bundle;
     let a = artifact;
@@ -4499,36 +4532,25 @@ fn write_native(
     // are computed on workers before the insert loop, under the same reuse
     // conditions, and each is consumed below exactly where it was computed
     // before, so every earlier check still runs first. SQL stays here.
-    let projection_of = |file: &SourceFile| -> Option<Result<V8DocumentProjection>> {
-        let grouped = rows.get(file.path.as_str())?;
-        Some(v8_document_projection(file, a, grouped))
-    };
-    let witness_of = |file: &SourceFile| -> Option<Result<String>> {
-        Some(publication_native_witness(
-            documents.get(file.path.as_str())?,
-            &a.producer,
-            coverages.get(file.path.as_str())?,
-            rows.get(file.path.as_str())?,
-        ))
-    };
-    let mut precomputed = crate::parallel::map_ordered(
-        &graph.files,
-        crate::parallel::default_workers(),
-        cancel,
-        |_, file| {
-            let projection = if reuse.existing_ids.contains_key(&file.path) {
-                None
-            } else {
-                projection_of(file)
-            };
-            let witness = if reuse.for_path(&file.path).native {
-                None
-            } else {
-                witness_of(file)
-            };
-            (projection, witness)
-        },
-    )
+    let mut precomputed = match precomputed {
+        // A streamed caller already computed this one document on a worker.
+        Some(one) => vec![Some(one)],
+        None => crate::parallel::map_ordered(
+            &graph.files,
+            crate::parallel::default_workers(),
+            cancel,
+            |_, file| {
+                precompute_document(
+                    file,
+                    a,
+                    rows.get(file.path.as_str()),
+                    documents.get(file.path.as_str()).copied(),
+                    coverages.get(file.path.as_str()).copied(),
+                    reuse,
+                )
+            },
+        ),
+    }
     .into_iter();
     let mut projections = BTreeMap::new();
     for (offset, file) in graph.files.iter().enumerate() {
@@ -10921,79 +10943,123 @@ impl Store {
                 0,
                 &graph.diagnostics,
                 None,
+                None,
             )
             .map_err(classify_immutable)?;
-            for (ordinal, &index) in stream_order.iter().enumerate() {
-                check_cancel(cancel)?;
-                let (artifact, document_graph) =
-                    spool.read(index).map_err(native_spool_read_failure)?;
-                ensure!(
-                    artifact.producer == native.producer
-                        && artifact.source_set == native.source_set
-                        && artifact.revision.id == native.revision.id
-                        && artifact.revision.source_set_id == native.revision.source_set_id
-                        && artifact.revision.toolchain_hash == native.revision.toolchain_hash
-                        && artifact.revision.config_hash == native.revision.config_hash
-                        && artifact.revision.dependency_hash == native.revision.dependency_hash
-                        && artifact.revision.documents.as_slice()
-                            == std::slice::from_ref(&native.revision.documents[index]),
-                    "native_evidence_required: streamed revision header differs"
-                );
-                let file = document_graph
-                    .files
-                    .first()
-                    .context("stream graph document absent")?;
-                ensure!(
-                    document_graph.files.len() == 1 && graph.files.get(ordinal) == Some(file),
-                    "native_evidence_required: streamed graph document differs from capture"
-                );
-                Self::enforce_selected_source_admission(&document_graph, max_graph_json_bytes)?;
-                let selected_classes = stream_document_classes(&classes, &file.path);
-                let rows = publication_rows(&document_graph, &artifact, &selected_classes)?;
-                let extractions = if matches!(file.language.as_str(), "java" | "python") {
-                    BTreeMap::from([(
-                        file.path.clone(),
-                        spool
-                            .read_extraction(index)
-                            .map_err(native_spool_read_failure)?,
-                    )])
-                } else {
-                    BTreeMap::new()
-                };
-                let written = write_native(
-                    &tx,
-                    (&artifact, capture, &document_graph, &classes, &extractions),
-                    revision,
-                    &stats,
+            // Decode a bounded batch, hash its projections and witnesses on
+            // workers, then write it in order on this connection.
+            let batch_len = crate::parallel::default_workers() * 16;
+            for (batch_index, batch) in stream_order.chunks(batch_len).enumerate() {
+                let mut decoded = Vec::with_capacity(batch.len());
+                for (offset, &index) in batch.iter().enumerate() {
+                    check_cancel(cancel)?;
+                    let ordinal = batch_index * batch_len + offset;
+                    let (artifact, document_graph) =
+                        spool.read(index).map_err(native_spool_read_failure)?;
+                    ensure!(
+                        artifact.producer == native.producer
+                            && artifact.source_set == native.source_set
+                            && artifact.revision.id == native.revision.id
+                            && artifact.revision.source_set_id == native.revision.source_set_id
+                            && artifact.revision.toolchain_hash == native.revision.toolchain_hash
+                            && artifact.revision.config_hash == native.revision.config_hash
+                            && artifact.revision.dependency_hash == native.revision.dependency_hash
+                            && artifact.revision.documents.as_slice()
+                                == std::slice::from_ref(&native.revision.documents[index]),
+                        "native_evidence_required: streamed revision header differs"
+                    );
+                    let file = document_graph
+                        .files
+                        .first()
+                        .context("stream graph document absent")?;
+                    ensure!(
+                        document_graph.files.len() == 1 && graph.files.get(ordinal) == Some(file),
+                        "native_evidence_required: streamed graph document differs from capture"
+                    );
+                    Self::enforce_selected_source_admission(&document_graph, max_graph_json_bytes)?;
+                    let selected_classes = stream_document_classes(&classes, &file.path);
+                    let extractions = if matches!(file.language.as_str(), "java" | "python") {
+                        BTreeMap::from([(
+                            file.path.clone(),
+                            spool
+                                .read_extraction(index)
+                                .map_err(native_spool_read_failure)?,
+                        )])
+                    } else {
+                        BTreeMap::new()
+                    };
+                    decoded.push((
+                        ordinal,
+                        artifact,
+                        document_graph,
+                        selected_classes,
+                        extractions,
+                    ));
+                }
+                let rows = decoded
+                    .iter()
+                    .map(|(_, artifact, document_graph, selected_classes, _)| {
+                        publication_rows(document_graph, artifact, selected_classes)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let mut precomputed = crate::parallel::map_ordered(
+                    &decoded,
+                    crate::parallel::default_workers(),
                     cancel,
-                    &mut immutable,
-                    &reuse,
-                    &rows,
-                    false,
-                    ordinal,
-                    &graph.diagnostics,
-                    graph.files.get(ordinal),
+                    |offset, (_, artifact, document_graph, _, _)| {
+                        let file = &document_graph.files[0];
+                        precompute_document(
+                            file,
+                            artifact,
+                            rows[offset].get(file.path.as_str()),
+                            artifact.revision.documents.first(),
+                            artifact.coverage.first(),
+                            &reuse,
+                        )
+                    },
                 )
-                .map_err(classify_immutable)?;
-                let ids = written
-                    .get(&file.path)
-                    .context("missing streamed document projection")?;
-                during_tx(PublishStage::AfterFile, &tx)?;
-                let grouped = rows
-                    .get(file.path.as_str())
-                    .context("streamed publication rows missing")?;
-                write_graph_document(
-                    &tx,
-                    grouped,
-                    ids,
-                    reuse.for_path(&file.path),
-                    &mut immutable,
-                )
-                .map_err(classify_immutable)?;
-                ensure!(
-                    projections.insert(file.path.clone(), ids.clone()).is_none(),
-                    "duplicate streamed document path"
-                );
+                .into_iter();
+                for ((ordinal, artifact, document_graph, _, extractions), rows) in
+                    decoded.iter().zip(&rows)
+                {
+                    check_cancel(cancel)?;
+                    let file = &document_graph.files[0];
+                    let written = write_native(
+                        &tx,
+                        (artifact, capture, document_graph, &classes, extractions),
+                        revision,
+                        &stats,
+                        cancel,
+                        &mut immutable,
+                        &reuse,
+                        rows,
+                        false,
+                        *ordinal,
+                        &graph.diagnostics,
+                        graph.files.get(*ordinal),
+                        Some(precomputed.next().flatten().context("indexing cancelled")?),
+                    )
+                    .map_err(classify_immutable)?;
+                    let ids = written
+                        .get(&file.path)
+                        .context("missing streamed document projection")?;
+                    during_tx(PublishStage::AfterFile, &tx)?;
+                    let grouped = rows
+                        .get(file.path.as_str())
+                        .context("streamed publication rows missing")?;
+                    write_graph_document(
+                        &tx,
+                        grouped,
+                        ids,
+                        reuse.for_path(&file.path),
+                        &mut immutable,
+                    )
+                    .map_err(classify_immutable)?;
+                    ensure!(
+                        projections.insert(file.path.clone(), ids.clone()).is_none(),
+                        "duplicate streamed document path"
+                    );
+                }
             }
             projections
         } else {
@@ -11009,6 +11075,7 @@ impl Store {
                 true,
                 0,
                 &graph.diagnostics,
+                None,
                 None,
             )
             .map_err(classify_immutable)?

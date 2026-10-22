@@ -1122,6 +1122,77 @@ fn validate_spooled_document(
     facts.validate_structure(std::slice::from_ref(file))
 }
 
+/// One document's spool rows, prepared on a worker.
+struct PreparedSpoolDocument {
+    facts: Vec<u8>,
+    graph: Vec<u8>,
+    extraction: Option<crate::classes::FileExtraction>,
+    stats: IndexStats,
+    diagnostics: Vec<Diagnostic>,
+}
+
+/// Validate, project and encode one extracted document. Pure per-document
+/// work: it touches no shared registry and no SQLite handle.
+#[allow(clippy::too_many_arguments)] // The worker's whole per-document context.
+fn prepare_spooled_document(
+    options: &crate::indexer::IndexOptions,
+    capture: &Capture,
+    mut facts: Artifact,
+    document: &Document,
+    file: &SourceFile,
+    cancel: &CancelFlag,
+    labels: &crate::indexer::PreparedDisplayLabels<'_>,
+    before_validate: &(dyn Fn(&Document, &mut Artifact) -> Result<()> + Sync),
+    after_class: &(dyn Fn(&Document, &crate::classes::FileExtraction) -> Result<()> + Sync),
+) -> Result<PreparedSpoolDocument> {
+    // The spool keeps facts without their document row; read() restores it.
+    let encoded_facts = serde_json::to_vec(&facts)?;
+    before_validate(document, &mut facts)?;
+    validate_spooled_document(&mut facts, document, file)?;
+    let graph = crate::indexer::project_native_spooled_document(
+        options,
+        capture,
+        &facts,
+        &document.key.path,
+        cancel,
+        &|_| {},
+        labels,
+    )?;
+    crate::indexer::validate_native_graph_records(&graph, &facts, cancel)?;
+    let extraction = if matches!(file.language.as_str(), "java" | "python") {
+        let symbols: Vec<_> = graph
+            .nodes
+            .iter()
+            .filter(|node| {
+                matches!(
+                    node.kind,
+                    crate::model::SymbolKind::Class
+                        | crate::model::SymbolKind::Method
+                        | crate::model::SymbolKind::Function
+                )
+            })
+            .cloned()
+            .collect();
+        let extraction = crate::classes::FileExtraction::extract_file(
+            file,
+            &symbols,
+            cancel,
+            crate::classes::Limits::default(),
+        )?;
+        after_class(document, &extraction)?;
+        Some(extraction)
+    } else {
+        None
+    };
+    Ok(PreparedSpoolDocument {
+        facts: encoded_facts,
+        graph: serde_json::to_vec(&graph)?,
+        extraction,
+        stats: graph.stats.clone(),
+        diagnostics: graph.diagnostics.clone(),
+    })
+}
+
 /// Admit an immutable capture without retaining its full artifact or graph.
 /// The global digest registry is resident; only facts and graphs live in the
 /// disposable SQLite spool. A failure drops it without publication.
@@ -1164,9 +1235,9 @@ fn spool_full_capture_with(
     observe: impl Fn(&DocumentKey, FullNativeStage),
     plan: ExtractionPlan,
     after_extract: &(dyn Fn(&SourceFile, &IdentityRegistry) -> Result<()> + Sync),
-    before_validate: &dyn Fn(&Document, &mut Artifact) -> Result<()>,
+    before_validate: &(dyn Fn(&Document, &mut Artifact) -> Result<()> + Sync),
     before_admit: &dyn Fn(&Document, &mut IdentityRegistry, &IdentityRegistry) -> Result<()>,
-    after_class: &dyn Fn(&Document, &crate::classes::FileExtraction) -> Result<()>,
+    after_class: &(dyn Fn(&Document, &crate::classes::FileExtraction) -> Result<()> + Sync),
     spool_dir: &Path,
 ) -> Result<FullDocumentSpool> {
     capture.verify(cancel)?;
@@ -1223,82 +1294,56 @@ fn spool_full_capture_with(
             !cancel.load(std::sync::atomic::Ordering::Acquire),
             "indexing cancelled"
         );
-        let measured =
+        // Each worker does all of one document's own work: extraction,
+        // structure and graph validation, class extraction and encoding. The
+        // ordered owner below only admits identities and writes the spool, in
+        // sorted order, so the earliest sorted file's failure is still the one
+        // reported whatever order the workers finish in.
+        let prepared =
             crate::parallel::map_ordered(chunk, plan.workers, cancel, |_, (file, document)| {
-                let mut facts = FileFacts {
-                    shell: shell.clone(),
-                    ids: IdentityRegistry::logged(),
-                    result: Ok(()),
-                };
-                facts.result = extract_known(&mut facts.shell, file, document, &mut facts.ids)
-                    .and_then(|()| after_extract(file, &facts.ids));
-                facts
+                let mut ids = IdentityRegistry::logged();
+                let mut facts = shell.clone();
+                let result = extract_known(&mut facts, file, document, &mut ids)
+                    .and_then(|()| after_extract(file, &ids))
+                    .and_then(|()| {
+                        prepare_spooled_document(
+                            options,
+                            capture,
+                            facts,
+                            document,
+                            file,
+                            cancel,
+                            &prepared_labels,
+                            before_validate,
+                            after_class,
+                        )
+                    });
+                (ids, result)
             });
-        for (offset, (facts, (file, document))) in measured.into_iter().zip(chunk).enumerate() {
-            let facts = facts.context("indexing cancelled")?;
-            // Extraction failure in this file wins over its unadmitted IDs.
-            facts.result?;
+        for (offset, (prepared, (_, document))) in prepared.into_iter().zip(chunk).enumerate() {
+            let (local_ids, prepared) = prepared.context("indexing cancelled")?;
+            let prepared = prepared?;
             let index = chunk_index * plan.chunk.max(1) + offset;
             spool.conn.execute(
-                "INSERT INTO documents (ordinal, facts) VALUES (?1, ?2)",
-                rusqlite::params![i64::try_from(index)?, serde_json::to_vec(&facts.shell)?],
+                "INSERT INTO documents (ordinal, facts, graph) VALUES (?1, ?2, ?3)",
+                rusqlite::params![i64::try_from(index)?, prepared.facts, prepared.graph],
             )?;
             observe(&document.key, FullNativeStage::Measured);
             // Scratch facts are disposable; collision checking must precede
-            // validation and any index.db publication, not this scratch write.
-            before_admit(document, &mut ids, &facts.ids)?;
-            ids.absorb(facts.ids)?;
-            let mut document_facts = facts.shell;
-            before_validate(document, &mut document_facts)?;
-            validate_spooled_document(&mut document_facts, document, file)?;
+            // any index.db publication, not this scratch write.
+            before_admit(document, &mut ids, &local_ids)?;
+            ids.absorb(local_ids)?;
             observe(&document.key, FullNativeStage::Validated);
-            let graph = crate::indexer::project_native_spooled_document(
-                options,
-                capture,
-                &document_facts,
-                &document.key.path,
-                cancel,
-                &|_| {},
-                &prepared_labels,
-            )?;
-            crate::indexer::validate_native_graph_records(&graph, &document_facts, cancel)?;
-            // Class extraction can itself fail. Finish it here, before a later
-            // file's native error can outrank this sorted file's failure. Only
-            // the bounded, private spool retains the extraction for replay.
-            if matches!(file.language.as_str(), "java" | "python") {
-                let symbols: Vec<_> = graph
-                    .nodes
-                    .iter()
-                    .filter(|node| {
-                        matches!(
-                            node.kind,
-                            crate::model::SymbolKind::Class
-                                | crate::model::SymbolKind::Method
-                                | crate::model::SymbolKind::Function
-                        )
-                    })
-                    .cloned()
-                    .collect();
-                let extraction = crate::classes::FileExtraction::extract_file(
-                    file,
-                    &symbols,
-                    cancel,
-                    crate::classes::Limits::default(),
-                )?;
-                after_class(document, &extraction)?;
-                spool.write_extraction(index, &extraction)?;
+            if let Some(extraction) = &prepared.extraction {
+                spool.write_extraction(index, extraction)?;
             }
-            spool.stats.files += graph.stats.files;
-            spool.stats.symbols += graph.stats.symbols;
-            spool.stats.calls += graph.stats.calls;
-            spool.stats.regions += graph.stats.regions;
-            spool.stats.unresolved += graph.stats.unresolved;
-            spool.stats.parse_error_files += graph.stats.parse_error_files;
-            spool.diagnostics.extend(graph.diagnostics.iter().cloned());
-            spool.conn.execute(
-                "UPDATE documents SET graph = ?2 WHERE ordinal = ?1",
-                rusqlite::params![i64::try_from(index)?, serde_json::to_vec(&graph)?],
-            )?;
+            spool.stats.files += prepared.stats.files;
+            spool.stats.symbols += prepared.stats.symbols;
+            spool.stats.calls += prepared.stats.calls;
+            spool.stats.regions += prepared.stats.regions;
+            spool.stats.unresolved += prepared.stats.unresolved;
+            spool.stats.parse_error_files += prepared.stats.parse_error_files;
+            spool.diagnostics.extend(prepared.diagnostics);
             progress(IndexProgress {
                 phase: "parse".into(),
                 completed: index + 1,
@@ -4194,10 +4239,8 @@ mod full_document_spool_tests {
                 .contains("injected second extraction failure"),
             "{err:#}"
         );
-        assert_eq!(
-            stages.into_inner(),
-            vec![("a.py".into(), FullNativeStage::Measured)]
-        );
+        // Validation runs on the worker, before the ordered owner writes it.
+        assert_eq!(stages.into_inner(), vec![]);
         assert_eq!(capture.graph_projection_count(), 1);
     }
 
@@ -4213,6 +4256,7 @@ mod full_document_spool_tests {
         let cancel = Arc::new(AtomicBool::new(false));
         let capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
         let (completed, observed) = std::sync::mpsc::sync_channel(1);
+        let observed = std::sync::Mutex::new(observed);
         let stages = std::cell::RefCell::new(Vec::new());
         let err = spool_full_capture_with(
             &options,
@@ -4237,8 +4281,11 @@ mod full_document_spool_tests {
             &|_, _, _| Ok(()),
             &|document, _extraction| {
                 if document.key.path == "a.py" {
+                    // Hold this earlier file until the later worker has failed.
                     observed
-                        .try_recv()
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(std::time::Duration::from_secs(60))
                         .expect("later worker completed before ordered class check");
                     anyhow::bail!("injected earlier class extraction failure")
                 }
@@ -4253,13 +4300,7 @@ mod full_document_spool_tests {
                 .contains("injected earlier class extraction failure"),
             "{err:#}"
         );
-        assert_eq!(
-            stages.into_inner(),
-            vec![
-                ("a.py".into(), FullNativeStage::Measured),
-                ("a.py".into(), FullNativeStage::Validated),
-            ]
-        );
+        assert_eq!(stages.into_inner(), vec![]);
     }
 
     #[test]
