@@ -14,7 +14,24 @@ PLAYWRIGHT_BROWSERS_PATH=$(node tools/verify-env.mjs)
 export PLAYWRIGHT_BROWSERS_PATH
 
 logs=$(mktemp -d "${TMPDIR:-/tmp}/trellis-verify.XXXXXX")
-trap 'rm -rf "$logs"' EXIT
+deps_pid=""
+# Signal a process and then its descendants (sudo relays TERM to apt).
+stop_tree() {
+  for child in $(pgrep -P "$1" 2>/dev/null); do
+    stop_tree "$child"
+  done
+  kill -TERM "$1" 2>/dev/null || true
+}
+# An early lane failure can leave the background install running; stop and
+# reap it on every exit before its logs go away.
+cleanup() {
+  if [ -n "$deps_pid" ] && kill -0 "$deps_pid" 2>/dev/null; then
+    stop_tree "$deps_pid"
+    wait "$deps_pid" 2>/dev/null || true
+  fi
+  rm -rf "$logs"
+}
+trap cleanup EXIT
 
 # Linux CI sets TRELLIS_BROWSER_SYSTEM_DEPS to install Chromium's system
 # packages (apt) while the lanes build. Only the browser suite at the end of
@@ -29,6 +46,7 @@ if [ -n "${TRELLIS_BROWSER_SYSTEM_DEPS:-}" ]; then
     echo "$code $(($(date +%s) - start))" >"$logs/browser-deps.tmp"
     mv "$logs/browser-deps.tmp" "$logs/browser-deps.status"
   ) &
+  deps_pid=$!
 fi
 browser_system_deps() {
   [ -n "${TRELLIS_BROWSER_SYSTEM_DEPS:-}" ] || return 0

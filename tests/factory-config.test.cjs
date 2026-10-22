@@ -179,8 +179,13 @@ for arg in "$@"; do
   if [ "$arg" = tests/browser/saved-items.test.cjs ] && [ -z "\${TRELLIS_SUITE_BINARY:-}" ]; then exit 37; fi
 done
 if [ "\${FAKE_VERIFY_FAIL_DEPS:-0}" = 1 ] && [ "$2" = install-deps ]; then echo "fake apt failure"; exit 41; fi
+if [ -n "\${FAKE_VERIFY_HANG_DEPS:-}" ] && [ "$2" = install-deps ]; then echo $$ > "$FAKE_VERIFY_HANG_DEPS"; exec sleep 600; fi
 if [ "\${FAKE_VERIFY_NO_NEXTEST:-0}" = 1 ] && [ "$1" = nextest ]; then exit 101; fi
-if [ "\${FAKE_VERIFY_FAIL_CLIPPY:-0}" = 1 ] && [ "$1" = clippy ]; then exit 23; fi
+if [ "\${FAKE_VERIFY_FAIL_CLIPPY:-0}" = 1 ] && [ "$1" = clippy ]; then
+  # Fail only once a hanging install is running, so the test is deterministic.
+  if [ -n "\${FAKE_VERIFY_HANG_DEPS:-}" ]; then while [ ! -s "$FAKE_VERIFY_HANG_DEPS" ]; do sleep 0.1; done; fi
+  exit 23
+fi
 if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contract/test/run.mjs ]; then exit 29; fi
 `;
   try {
@@ -189,9 +194,10 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
       writeFileSync(command, fakeTool);
       chmodSync(command, 0o755);
     }
-    function runVerify(extraEnv = {}) {
+    function runVerify(extraEnv = {}, timeout = undefined) {
       const result = spawnSync(config.verify, [], {
         cwd: ROOT,
+        timeout,
         encoding: "utf8",
         env: {
           ...process.env,
@@ -262,6 +268,19 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
     assert.match(depsFailure.result.stdout, /fake apt failure/);
     assert.match(depsFailure.result.stdout, /Chromium system package install failed \(exit 41\)/);
     assert.match(depsFailure.result.stderr, /failed lane\(s\): rust$/m);
+    rmSync(log);
+    // A lane that fails before the browser suite must not leave the install
+    // running: verify stops and reaps it on exit (#244).
+    const hangPid = join(fakeDir, "deps.pid");
+    // A leaked install would hold verify's output open for its full 600 s.
+    const earlyFailure = runVerify(
+      { TRELLIS_BROWSER_SYSTEM_DEPS: "1", FAKE_VERIFY_HANG_DEPS: hangPid, FAKE_VERIFY_FAIL_CLIPPY: "1" },
+      120_000,
+    );
+    assert.equal(earlyFailure.result.error, undefined, "verify did not exit after its lane failed");
+    assert.equal(earlyFailure.result.status, 23);
+    const installer = Number(readFileSync(hangPid, "utf8"));
+    assert.throws(() => process.kill(installer, 0), { code: "ESRCH" }, "the background install outlived verify");
     rmSync(log);
     const failure = runVerify({ FAKE_VERIFY_FAIL_CLIPPY: "1" });
     assert.equal(failure.result.status, 23);
