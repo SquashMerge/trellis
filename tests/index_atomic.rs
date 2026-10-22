@@ -623,7 +623,7 @@ fn full_reconcile_replaces_persisted_source_and_input_inventory() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        11
+        12
     );
     let files = db
         .prepare("SELECT path FROM revision_documents WHERE revision_id=?1 ORDER BY path")
@@ -1117,7 +1117,7 @@ fn new_producer_binding_refuses_unilateral_executable_header_and_binding_tamper(
 
 #[cfg(feature = "test-support")]
 #[test]
-fn additive_producer_binding_keeps_same_generation_legacy_pin_and_queue() {
+fn current_producer_binding_preserves_old_pin_and_queue() {
     use std::sync::{Arc, atomic::AtomicBool};
     use trellis::{
         index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
@@ -1136,7 +1136,7 @@ fn additive_producer_binding_keeps_same_generation_legacy_pin_and_queue() {
         .unwrap()
         .run(&options, &cancel, |_| {})
         .unwrap();
-    let legacy_source = store.source_at("A.java", Some(first)).unwrap().unwrap().1;
+    let first_source = store.source_at("A.java", Some(first)).unwrap().unwrap().1;
     // Publish the virgin queue without this fixture's writer SH, then resume
     // the same-generation publication test with a fresh writer session.
     drop(session);
@@ -1144,15 +1144,22 @@ fn additive_producer_binding_keeps_same_generation_legacy_pin_and_queue() {
     let db_path = index_dir(state.path()).join("index.db");
     let queue_path = index_dir(state.path()).join("requests.db");
     let queue_before = fs::read(&queue_path).unwrap();
-    // Fixture models an index persisted by the shipped v8 code before this
-    // additive extension. No evidence, generation, source or queue is rebuilt.
+    // The first publication binds the producer in the base schema. Reusing
+    // this generation must retain that binding, both pins and the queue.
     let db = rusqlite::Connection::open(&db_path).unwrap();
-    db.execute_batch("DROP TABLE revision_producer_bindings; DROP TABLE native_binding_epoch;")
+    let (initial_bound, initial_epoch): (i64, i64) = db
+        .query_row(
+            "SELECT (SELECT count(*) FROM revision_producer_bindings),
+                    (SELECT first_revision FROM native_binding_epoch)",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
         .unwrap();
+    assert_eq!((initial_bound, initial_epoch), (1, first.index_revision as i64));
     drop(db);
     assert_eq!(
         store.source_at("A.java", Some(first)).unwrap().unwrap().1,
-        legacy_source
+        first_source
     );
     let generation = first.index_generation;
     fs::write(
@@ -1169,7 +1176,7 @@ fn additive_producer_binding_keeps_same_generation_legacy_pin_and_queue() {
     assert_eq!(second.index_revision, first.index_revision + 1);
     assert_eq!(
         store.source_at("A.java", Some(first)).unwrap().unwrap().1,
-        legacy_source
+        first_source
     );
     assert!(
         store
@@ -1189,14 +1196,14 @@ fn additive_producer_binding_keeps_same_generation_legacy_pin_and_queue() {
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .unwrap();
-    assert_eq!((bound, epoch), (1, second.index_revision as i64));
+    assert_eq!((bound, epoch), (2, first.index_revision as i64));
     assert_eq!(
         fs::read(queue_path).unwrap(),
         queue_before,
-        "producer binding upgrade must not touch durable requests.db"
+        "same-generation publication must not touch durable requests.db"
     );
-    // Legacy selected pins still reject a one-sided captured executable SHA
-    // forgery by comparing it with their immutable generation-origin marker.
+    // A retained selected pin still rejects a one-sided captured executable
+    // SHA forgery against its immutable producer binding.
     let old_key = format!("pin:v1:{}:{}", first.index_generation, first.index_revision);
     assert_eq!(db.execute(
         "UPDATE revision_capture_inputs SET payload=json_set(payload,'$.hash',printf('%064d',0))
@@ -1205,7 +1212,7 @@ fn additive_producer_binding_keeps_same_generation_legacy_pin_and_queue() {
     let err = store.source_at("A.java", Some(first)).unwrap_err();
     assert!(
         format!("{err:#}").contains("incompatible_index"),
-        "legacy pin: {err:#}"
+        "retained pin: {err:#}"
     );
 }
 
