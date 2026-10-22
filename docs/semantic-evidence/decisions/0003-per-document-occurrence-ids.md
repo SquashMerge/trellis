@@ -33,7 +33,7 @@ The v1 rule "occurrence-keyed evidence never crosses revisions" protects **seman
    - `contentHash` is the containing document's exact content digest.
    - `nativeProducerId`/`nativeProducerVersion` are the native producer descriptor's `id` and `version`.
    - `ownerSyntaxId` is the emitted 128-bit owner ID, which binds the source set, path and language.
-   - Ordering, ordinal namespaces, duplicate rejection and collision handling are unchanged.
+   - Ordering, ordinal namespaces and duplicate rejection are unchanged. Collision handling for the two native ID namespaces is subsequently narrowed by [Decision 0015](0015-native-hash-based-identity.md): only a matching typed 16-byte handle with a different full digest is detected and rejected.
 3. **Native producer versioning.** Any extractor change that can alter **any** native measured field or projection of any occurrence or declaration **must** change `nativeProducerVersion`. That covers owner, kind, ordinal, range, callee range, spelling, lookup key, region membership, parent and arm, and coverage. #71 relies on the same rule. The executable hash stays in `Producer.executableHash`, provenance and `Revision.id`, but is not occurrence identity.
 4. **When IDs are equal.** Two revisions share an occurrence ID exactly when the document has identical bytes (`contentHash`) at the same `DocumentKey` (through the owner ID), under the same native producer ID and version and the same authenticated `extractionContext`, with the same owner, kind and ordinal. Under items 1 and 3, those inputs determine identical native measured output. What a change re-identifies:
    - a byte change to one document re-identifies all of **that** document's occurrences and no other document's;
