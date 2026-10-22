@@ -13021,18 +13021,15 @@ impl Store {
         let selected_path: Option<String> = match request {
             crate::navigation::NavigationRequest::Source(s) => Some(s.path.clone()),
             crate::navigation::NavigationRequest::Member(s) => {
-                let selected: Option<(String, String)> = tx
-                    .query_row(
-                        "SELECT m.path,n.kind FROM graph_nodes n JOIN revision_documents m ON m.revision_id=?2 AND m.graph_projection_id=n.projection_id WHERE n.id=?1 LIMIT 1",
-                        params![s.class_id, selected.key],
-                        |row| Ok((row.get(0)?, row.get(1)?)),
-                    )
-                    .optional()
-                    .map_err(|error| self.report_selected_failure(error.into()))?;
-                match selected {
-                    Some((path, kind)) if kind == "class" => Some(path),
-                    _ => None,
-                }
+                // Locate the selected document by identity, not the untrusted
+                // materialized kind. Attest the document before using that kind.
+                tx.query_row(
+                    "SELECT m.path FROM graph_nodes n JOIN revision_documents m ON m.revision_id=?2 AND m.graph_projection_id=n.projection_id WHERE n.id=?1 LIMIT 1",
+                    params![s.class_id, selected.key],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| self.report_selected_failure(error.into()))?
             }
         };
         let mut selected_document = None;

@@ -1262,12 +1262,32 @@ async fn navigation_selected_graph_nodes_are_attested_without_scanning_other_doc
     let class_id = id(&selected_graph, "A");
     let selector = member(&selected_dir, class_id, "first", 0);
     let selected_db = rusqlite::Connection::open(index_db(&selected_dir)).unwrap();
-    selected_db
-        .execute(
-            "UPDATE graph_nodes SET kind='forged-kind' WHERE projection_id=?1 AND id=?2",
-            rusqlite::params![admitted_document(&selected_db, "A.java").1, class_id],
-        )
+    // Corruption in a different document does not make the selected A read
+    // scan B. The selected class kind must then be checked before use.
+    let unrelated_class = selected_graph
+        .nodes
+        .iter()
+        .find(|node| node.path == "B.java" && node.name == "B" && node.kind == SymbolKind::Class)
         .unwrap();
+    assert_eq!(
+        selected_db
+            .execute(
+                "UPDATE graph_nodes SET kind='forged-unrelated-kind' WHERE projection_id=?1 AND id=?2",
+                rusqlite::params![admitted_document(&selected_db, "B.java").1, unrelated_class.id],
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(call(&selected_app, selector.clone()).await.0, StatusCode::OK);
+    assert_eq!(
+        selected_db
+            .execute(
+                "UPDATE graph_nodes SET kind='forged-kind' WHERE projection_id=?1 AND id=?2",
+                rusqlite::params![admitted_document(&selected_db, "A.java").1, class_id],
+            )
+            .unwrap(),
+        1
+    );
     let (status, invalid) = call(&selected_app, selector).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{invalid}");
     assert_eq!(invalid["error"]["code"], "incompatible_index");
