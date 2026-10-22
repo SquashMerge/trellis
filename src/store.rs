@@ -8,7 +8,7 @@ use crate::model::*;
 use anyhow::{Context, Result, ensure};
 pub use requests::{MaintenanceQueueProbe, MaintenanceQueueState, QueueProbeAdmission};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
-use serde::{Serialize, de::DeserializeOwned};
+use serde::Serialize;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     ops::{Deref, DerefMut},
@@ -3271,25 +3271,6 @@ mod sqlite_contention_type_tests;
 
 fn json<T: Serialize + ?Sized>(value: &T) -> Result<String> {
     Ok(serde_json::to_string(value)?)
-}
-fn rows_at<T: DeserializeOwned>(db: &Connection, sql: &str, revision_id: &str) -> Result<Vec<T>> {
-    let mut stmt = storage_result(db.prepare(sql))?;
-    let values = storage_result(stmt.query_map([revision_id], |r| r.get::<_, String>(0)))?;
-    values
-        .map(|v| Ok(serde_json::from_str(&storage_result(v)?)?))
-        .collect()
-}
-fn one_at<T: DeserializeOwned>(
-    db: &Connection,
-    sql: &str,
-    id: &str,
-    revision_id: &str,
-) -> Result<Option<T>> {
-    let value: Option<String> = storage_result(
-        db.query_row(sql, params![id, revision_id], |r| r.get(0))
-            .optional(),
-    )?;
-    value.map(|v| Ok(serde_json::from_str(&v)?)).transpose()
 }
 fn check_cancel(cancel: &CancelFlag) -> Result<()> {
     ensure!(
