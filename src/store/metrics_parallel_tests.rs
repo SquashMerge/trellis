@@ -8,7 +8,7 @@ fn corrupt(store: &Store, table: &str, column: &str, path: &str) {
     db.pragma_update(None, "foreign_keys", "OFF").unwrap();
     let changed = db
         .execute(
-            &format!("UPDATE {table} SET {column}={column}||'x' WHERE path=?1"),
+            &format!("UPDATE {table} SET {column}={column}||'x' WHERE projection_id=(SELECT graph_projection_id FROM revision_documents WHERE path=?1)"),
             [path],
         )
         .unwrap();
@@ -63,12 +63,12 @@ fn metrics_documents_are_attested_and_computed_concurrently() {
 }
 
 #[test]
-fn the_first_failure_in_manifest_order_is_reported_when_a_later_one_fails_first() {
+fn the_first_failure_in_manifest_order_is_reported() {
     let (_state, _root, store) = published_store(3);
     corrupt(&store, "graph_nodes", "name", "f0.js");
-    corrupt(&store, "graph_calls", "caller", "f2.js");
-    // f0 resumes only after f2's work has returned its failure.
-    hold_until(&store, "f0.js", "f2.js", MetricsDocumentStage::Done);
+    corrupt(&store, "graph_nodes", "name", "f2.js");
+    // Derivation charges graph bytes before dispatch, so the first corrupt
+    // document fails during ordered fetch, before later workers can start.
     let (result, _) = metrics_with(&store, 3, u64::MAX, &mut || Ok(()));
     let error = result.unwrap_err();
     assert!(

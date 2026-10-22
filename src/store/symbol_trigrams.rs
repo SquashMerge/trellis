@@ -164,7 +164,7 @@ pub(super) fn w2_hits(
     .hits(db, query, lookahead, &[&revision, &query, &lookahead])
 }
 
-/// The browser and CLI search's ranked `(path, payload)` graph-node hits in
+/// The browser and CLI search's ranked `(path, id)` graph-node hits in
 /// the admitted head, at most `limit` of them, under the same literal rule.
 pub(super) fn graph_hits(
     db: &Connection,
@@ -172,7 +172,7 @@ pub(super) fn graph_hits(
     limit: i64,
 ) -> Result<Vec<(String, String)>> {
     Search {
-        columns: "n.path,n.payload,CASE WHEN lower(n.name)=lower(?1) THEN 0 WHEN instr(lower(n.name),lower(?1))=1 THEN 1 ELSE 2 END",
+        columns: "m.path,n.id,CASE WHEN lower(n.name)=lower(?1) THEN 0 WHEN instr(lower(n.name),lower(?1))=1 THEN 1 ELSE 2 END",
         source: "graph_nodes n",
         names: "graph_node_trigrams",
         ids: "SELECT n.rowid FROM revision_documents m
@@ -353,7 +353,7 @@ mod tests {
         let db = Connection::open_in_memory().unwrap();
         // Lone rows without their parents; this test is about the triggers.
         db.pragma_update(None, "foreign_keys", "OFF").unwrap();
-        db.execute_batch(super::super::CACHE_SCHEMA_V12).unwrap();
+        db.execute_batch(super::super::CACHE_SCHEMA_V13).unwrap();
         let insert = |n: i64, name: Option<&str>| {
             let id = format!("sid:v1:{n:032x}");
             let end = name.map(|_| 1);
@@ -365,7 +365,7 @@ mod tests {
             )
             .unwrap();
             db.execute(
-                "INSERT INTO graph_nodes(rowid,projection_id,id,name,path,payload) VALUES(?1,'p',?2,?3,'a.js','{}')",
+                "INSERT INTO graph_nodes(rowid,projection_id,id,name,kind) VALUES(?1,'p',?2,?3,'module')",
                 rusqlite::params![n, id, name.unwrap_or("a.js")],
             )
             .unwrap();

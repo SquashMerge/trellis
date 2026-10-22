@@ -607,8 +607,8 @@ fn second_connection_adds_legacy_trigger_after_admission_before_publish_lock() {
                     // The Store connection has passed open_index's exact object check,
                     // but has NOT acquired the SQLite writer lock yet.
                     let attacker = Connection::open(&path)?;
-                    attacker.execute_batch("CREATE TRIGGER forged_after_admission AFTER INSERT ON graph_calls BEGIN
-                        UPDATE graph_calls SET payload=json_set(payload,'$.calleeText','FORGED-NOT-MEASURED') WHERE projection_id=NEW.projection_id AND id=NEW.id; END;")?;
+                    attacker.execute_batch("CREATE TRIGGER forged_after_admission AFTER INSERT ON graph_nodes BEGIN
+                        UPDATE graph_nodes SET name='FORGED-NOT-MEASURED' WHERE projection_id=NEW.projection_id AND id=NEW.id; END;")?;
                     drop(attacker);
                     *after_external.borrow_mut() = Some(fs::read(&path)?);
                 }
@@ -632,7 +632,7 @@ fn second_connection_adds_legacy_trigger_after_admission_before_publish_lock() {
     assert_eq!(
         (schema, marker.as_str(), generation, revision),
         (
-            12,
+            i64::from(DATABASE_SCHEMA_VERSION),
             "native-v6-delta-v1",
             old.index_generation.to_string(),
             old.index_revision as i64
@@ -641,11 +641,11 @@ fn second_connection_adds_legacy_trigger_after_admission_before_publish_lock() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        12
+        i64::from(DATABASE_SCHEMA_VERSION)
     );
     let forged: i64 = db
         .query_row(
-            "SELECT count(*) FROM graph_calls WHERE payload LIKE '%FORGED-NOT-MEASURED%'",
+            "SELECT count(*) FROM graph_nodes WHERE name='FORGED-NOT-MEASURED'",
             [],
             |r| r.get(0),
         )

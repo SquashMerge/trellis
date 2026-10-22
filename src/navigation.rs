@@ -108,6 +108,7 @@ struct Reader<'a> {
     rows: usize,
     output_bytes: usize,
     seen: BTreeSet<(String, &'static str, String)>,
+    symbols: Option<&'a [Symbol]>,
 }
 impl Reader<'_> {
     fn warn(&mut self, message: &str) {
@@ -152,10 +153,34 @@ impl Reader<'_> {
         }
         Ok(result)
     }
+    // Identical to `records` for derived symbols: one row probe at a time,
+    // then per-record and aggregate byte checks in the same SQL order.
+    fn symbol_records(&mut self, symbols: impl IntoIterator<Item = Symbol>) -> Result<Vec<Symbol>> {
+        let mut result = Vec::new();
+        for (index, symbol) in symbols.into_iter().enumerate() {
+            self.rows += 1;
+            if index >= QUERY_ROWS || self.rows > TOTAL_ROWS {
+                self.clipped();
+                break;
+            }
+            let payload_len = serde_json::to_vec(&symbol)?.len();
+            if payload_len > RECORD_BYTES as usize {
+                self.clipped();
+                continue;
+            }
+            if self.input_bytes + payload_len > INPUT_BYTES {
+                self.clipped();
+                break;
+            }
+            self.input_bytes += payload_len;
+            result.push(symbol);
+        }
+        Ok(result)
+    }
     fn symbol(&mut self, id: &str) -> Result<Option<Symbol>> {
-        let revision_key = self.revision_key;
-        Ok(self.records("SELECT CASE WHEN length(CAST(payload AS BLOB))<=?2 THEN payload END FROM graph_nodes n JOIN revision_documents d ON d.revision_id=?3 AND d.graph_projection_id=n.projection_id WHERE n.id=?1",
-            params![id, RECORD_BYTES, revision_key])?.pop())
+        let symbols = self.symbols.unwrap_or(&[]);
+        let symbol = symbols.iter().find(|symbol| symbol.id == id).cloned();
+        Ok(self.symbol_records(symbol)?.pop())
     }
     fn add(&mut self, symbol: Symbol, reason: &'static str, certainty: &str) -> Result<()> {
         let action = match symbol.kind {
@@ -215,27 +240,29 @@ impl Reader<'_> {
             lines.is_some_and(|lines| s.line as i64 <= lines),
             InvalidRequest("The path or line is not present in the cached revision.")
         );
-        let revision_key = self.revision_key;
-        let declarations: Vec<Symbol> = self.records(
-            "SELECT CASE WHEN length(CAST(payload AS BLOB))<=?3 THEN payload END FROM graph_nodes n JOIN revision_documents d ON d.revision_id=?4 AND d.graph_projection_id=n.projection_id
-             WHERE n.path=?1 AND json_extract(payload,'$.kind') IN ('class','method','function')
-             AND json_extract(payload,'$.range.startLine')=?2 ORDER BY id LIMIT 129",
-            params![s.path, s.line as i64, RECORD_BYTES, revision_key],
-        )?;
+        let mut candidates: Vec<Symbol> = self.symbols.unwrap_or(&[]).iter()
+            .filter(|node| node.path == s.path && node.range.start_line == s.line
+                && matches!(node.kind, SymbolKind::Class | SymbolKind::Method | SymbolKind::Function))
+            .cloned().collect();
+        candidates.sort_by(|a, b| a.id.cmp(&b.id));
+        let declarations = self.symbol_records(candidates.into_iter().take(129))?;
         for symbol in declarations {
             self.add(symbol, "declaration", "measured")?;
         }
-        for kinds in ["class", "callable"] {
-            let symbols: Vec<Symbol> = self.records(
-                "SELECT CASE WHEN length(CAST(payload AS BLOB))<=?4 THEN payload END FROM graph_nodes n JOIN revision_documents d ON d.revision_id=?5 AND d.graph_projection_id=n.projection_id
-                 WHERE n.path=?1 AND ((?3='class' AND json_extract(payload,'$.kind')='class')
-                    OR (?3='callable' AND json_extract(payload,'$.kind') IN ('function','method')))
-                 AND json_extract(payload,'$.range.startLine')<=?2
-                 AND (json_extract(payload,'$.range.endLine')>?2 OR
-                    (json_extract(payload,'$.range.endLine')=?2 AND json_extract(payload,'$.range.endColumn')>1))
-                 ORDER BY json_extract(payload,'$.range.endByte')-json_extract(payload,'$.range.startByte'),id LIMIT 1",
-                params![s.path, s.line as i64, kinds, RECORD_BYTES, revision_key])?;
-            for symbol in symbols {
+        for class in [true, false] {
+            let mut enclosing: Vec<Symbol> = self.symbols.unwrap_or(&[]).iter()
+                .filter(|node| node.path == s.path
+                    && (if class { node.kind == SymbolKind::Class }
+                        else { matches!(node.kind, SymbolKind::Method | SymbolKind::Function) })
+                    && node.range.start_line <= s.line
+                    && (node.range.end_line > s.line
+                        || (node.range.end_line == s.line && node.range.end_column > 1)))
+                .cloned().collect();
+            enclosing.sort_by(|a, b| {
+                (a.range.end_byte - a.range.start_byte, &a.id)
+                    .cmp(&(b.range.end_byte - b.range.start_byte, &b.id))
+            });
+            for symbol in self.symbol_records(enclosing.into_iter().take(1))? {
                 self.add(symbol, "enclosing", "measured")?;
             }
         }
@@ -290,6 +317,7 @@ pub(crate) fn navigate(
     request: &NavigationRequest,
     revision: IndexPin,
     revision_key: &str,
+    symbols: Option<&[Symbol]>,
 ) -> Result<NavigationResult> {
     let metadata: Option<bool> = db
         .query_row(
@@ -312,6 +340,7 @@ pub(crate) fn navigate(
         rows: 0,
         output_bytes: 0,
         seen: BTreeSet::new(),
+        symbols,
     };
     if metadata.is_none() {
         reader.warn(crate::class_diagram::INDEX_NOTICE);
@@ -327,4 +356,81 @@ pub(crate) fn navigate(
         reader.warn("No indexed navigation target on this source line.");
     }
     Ok(reader.result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Provenance, SemanticState, SourceRange};
+
+    fn symbol(id: usize) -> Symbol {
+        Symbol {
+            id: format!("sid:v1:{id:032x}"),
+            name: "f".into(),
+            display_label: None,
+            kind: SymbolKind::Function,
+            path: "a.js".into(),
+            range: SourceRange {
+                start_byte: 0, end_byte: 1, start_line: 1, end_line: 1,
+                start_column: 1, end_column: 2,
+            },
+            parent: None, accessor: false,
+            provenance: Provenance { source: "tree-sitter".into(), semantic: SemanticState::Unavailable },
+        }
+    }
+
+    fn reader<'a>(db: &'a Connection) -> Reader<'a> {
+        Reader {
+            db, revision_key: "pin", symbols: None,
+            result: NavigationResult {
+                revision: IndexPin {
+                    index_generation: uuid::Uuid::parse_str("11000000-0000-4000-8000-000000000000").unwrap(),
+                    index_revision: 1,
+                },
+                targets: vec![], warnings: vec![], truncated: false, require_index: false,
+            },
+            input_bytes: 0, rows: 0, output_bytes: 0, seen: BTreeSet::new(),
+        }
+    }
+
+    #[test]
+    fn derived_symbol_record_and_aggregate_byte_boundaries() {
+        let db = Connection::open_in_memory().unwrap();
+        let mut one = symbol(1);
+        let base = serde_json::to_vec(&one).unwrap().len();
+        one.name = "x".repeat(RECORD_BYTES as usize - base + one.name.len());
+        assert_eq!(serde_json::to_vec(&one).unwrap().len(), RECORD_BYTES as usize);
+        let mut read = reader(&db);
+        read.input_bytes = INPUT_BYTES - RECORD_BYTES as usize;
+        assert_eq!(read.symbol_records([one.clone()]).unwrap().len(), 1);
+        assert_eq!(read.input_bytes, INPUT_BYTES);
+        one.name.push('x');
+        assert!(read.symbol_records([one]).unwrap().is_empty());
+        assert!(read.result.truncated);
+        let one = symbol(2);
+        let size = serde_json::to_vec(&one).unwrap().len();
+        let mut read = reader(&db);
+        read.input_bytes = INPUT_BYTES - size + 1;
+        assert!(read.symbol_records([one]).unwrap().is_empty());
+        assert!(read.result.truncated);
+    }
+
+    #[test]
+    fn derived_symbol_query_and_total_row_boundaries() {
+        let db = Connection::open_in_memory().unwrap();
+        let mut read = reader(&db);
+        assert_eq!(read.symbol_records((0..QUERY_ROWS).map(symbol)).unwrap().len(), QUERY_ROWS);
+        assert!(!read.result.truncated);
+        assert_eq!(read.symbol_records((QUERY_ROWS..QUERY_ROWS + 1).map(symbol)).unwrap().len(), 1);
+        assert!(!read.result.truncated);
+        let mut read = reader(&db);
+        read.rows = TOTAL_ROWS - 1;
+        assert_eq!(read.symbol_records([symbol(1)]).unwrap().len(), 1);
+        assert!(!read.result.truncated);
+        assert!(read.symbol_records([symbol(2)]).unwrap().is_empty());
+        assert!(read.result.truncated);
+        let mut read = reader(&db);
+        assert_eq!(read.symbol_records((0..QUERY_ROWS + 1).map(symbol)).unwrap().len(), QUERY_ROWS);
+        assert!(read.result.truncated);
+    }
 }

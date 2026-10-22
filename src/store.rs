@@ -784,12 +784,47 @@ struct FetchedDocument {
     declarations: Vec<crate::native_evidence::Declaration>,
     calls: Vec<crate::native_evidence::Call>,
     regions: Vec<crate::native_evidence::ControlRegion>,
-    node_rows: Vec<(String, String, String, String)>,
-    call_rows: Vec<(String, String, Option<String>, String, String)>,
-    region_rows: Vec<(String, String, String, String)>,
+    node_rows: Vec<(String, String, String)>,
+    label_rows: Vec<(String, String)>,
+    graph_nodes: Vec<Symbol>,
+    graph_calls: Vec<CallSite>,
+    graph_regions: Vec<ControlRegion>,
     class_rows: Vec<(String, String, String, String, String)>,
     relation_rows: Vec<(String, String, Option<String>, String)>,
     stored_f: Option<String>,
+    stored_bytes: u64,
+}
+
+/// Match the former graph-row SQL charge: key TEXT byte lengths plus the
+/// compact JSON payload, with identical row and aggregate thresholds.
+fn derived_graph_bytes(nodes: &[Symbol], calls: &[CallSite], regions: &[ControlRegion], source_bytes: i64) -> Result<u64> {
+    let mut max_row = 0u64;
+    let mut total = 0u64;
+    for node in nodes {
+        let row = node.id.len() + node.name.len() + node.path.len() + json(node)?.len();
+        let row = row as u64;
+        max_row = max_row.max(row);
+        total = total.saturating_add(row);
+    }
+    for call in calls {
+        let row = call.id.len() + call.caller.len() + call.path.len() + json(call)?.len();
+        let row = row as u64;
+        max_row = max_row.max(row);
+        total = total.saturating_add(row);
+    }
+    for region in regions {
+        let row = region.id.len() + region.owner.len() + region.path.len() + json(region)?.len();
+        let row = row as u64;
+        max_row = max_row.max(row);
+        total = total.saturating_add(row);
+    }
+    let bytes = source_bytes.max(0) as u64;
+    ensure!(
+        max_row <= bytes.saturating_mul(6).saturating_add(16 * 1024).min(256 * 1024 * 1024 + 16 * 1024)
+        && total <= bytes.saturating_mul(64).saturating_add(256 * 1024).min(512 * 1024 * 1024),
+        "incompatible_index: selected graph row byte budget exceeded"
+    );
+    Ok(total)
 }
 
 /// One selected document's source and native rows, as authenticated by its
@@ -799,6 +834,9 @@ struct AttestedDocument {
     declarations: Vec<crate::native_evidence::Declaration>,
     calls: Vec<crate::native_evidence::Call>,
     regions: Vec<crate::native_evidence::ControlRegion>,
+    nodes: Vec<Symbol>,
+    graph_calls: Vec<CallSite>,
+    graph_regions: Vec<ControlRegion>,
 }
 
 /// Immutable revision chosen inside an admitted read transaction. This is not
@@ -1359,7 +1397,7 @@ impl EvidenceResponse {
             let mut remaining = included.iter();
             let mut exhausted = false;
             // A document whose rows did not fit beside what is already held.
-            let mut carried: Option<(&DocumentKey, SelectedHeader)> = None;
+            let mut carried: Option<(&DocumentKey, FetchedDocument)> = None;
             let mut pending: Option<(
                 Vec<&DocumentKey>,
                 std::thread::ScopedJoinHandle<'_, Vec<Option<_>>>,
@@ -1371,15 +1409,15 @@ impl EvidenceResponse {
             loop {
                 // Read the next chunk while the workers compute the previous one.
                 // Each chunk is charged at most half the budget, so the two held
-                // at once stay within it. Each document's budgets are read first
-                // and its rows only if its charge fits in this chunk. A document
-                // over half the budget is read and computed alone.
+                // at once stay within it. Deriving the graph is necessary to
+                // know its charge, so one fetched document may be carried into
+                // the next chunk. A document over half the budget is computed alone.
                 let mut keys: Vec<&DocumentKey> = Vec::new();
                 let mut fetched: Vec<std::sync::Mutex<Option<Fetched>>> = Vec::new();
                 let mut bytes = 0u64;
                 let mut alone = false;
                 while keys.len() < METRICS_FETCH_DOCUMENTS {
-                    let (key, header) = match carried.take() {
+                    let (key, item) = match carried.take() {
                         Some(carry) => carry,
                         None => {
                             if exhausted {
@@ -1389,22 +1427,18 @@ impl EvidenceResponse {
                                 exhausted = true;
                                 break;
                             };
-                            let header = if progress.expired() {
+                            let item = if progress.expired() {
                                 Err(MetricsDocumentFailure::Stopped)
                             } else {
-                                self.store
-                                    .fetch_selected_header(
-                                        &self.db,
-                                        &key.path,
-                                        &selected,
-                                        Some(&expired),
-                                    )
-                                    .map_err(MetricsDocumentFailure::Attest)
+                                self.store.fetch_selected_header(
+                                    &self.db, &key.path, &selected, Some(&expired)
+                                ).and_then(|header| self.store.fetch_selected_rows(
+                                    &self.db, header, &selected, Some(&expired)
+                                )).map_err(MetricsDocumentFailure::Attest)
                             };
-                            match header {
-                                Ok(header) => (key, header),
+                            match item {
+                                Ok(item) => (key, item),
                                 Err(failure) => {
-                                    // Nothing after a failed document is read.
                                     keys.push(key);
                                     fetched.push(std::sync::Mutex::new(Some(Err(failure))));
                                     exhausted = true;
@@ -1413,26 +1447,19 @@ impl EvidenceResponse {
                             }
                         }
                     };
-                    let charge = header.stored_bytes;
+                    let charge = item.stored_bytes;
                     let oversized = charge > chunk_bytes;
                     if !keys.is_empty() && (oversized || bytes.saturating_add(charge) > chunk_bytes)
                     {
-                        // Start the next chunk with it.
-                        carried = Some((key, header));
+                        carried = Some((key, item));
                         break;
                     }
                     if oversized && pending.is_some() {
-                        // Accept the chunk the workers hold before reading it.
-                        carried = Some((key, header));
+                        carried = Some((key, item));
                         break;
                     }
                     keys.push(key);
-                    let item = self
-                        .store
-                        .fetch_selected_rows(&self.db, header, &selected, Some(&expired))
-                        .map_err(MetricsDocumentFailure::Attest);
-                    let failed = item.is_err();
-                    fetched.push(std::sync::Mutex::new(Some(item)));
+                    fetched.push(std::sync::Mutex::new(Some(Ok(item))));
                     bytes = bytes.saturating_add(charge);
                     #[cfg(test)]
                     {
@@ -1441,10 +1468,6 @@ impl EvidenceResponse {
                             fetched.len() + pending.as_ref().map_or(0, |(keys, _)| keys.len()),
                             bytes.saturating_add(pending_bytes),
                         );
-                    }
-                    if failed {
-                        exhausted = true;
-                        break;
                     }
                     if oversized {
                         alone = true;
@@ -3534,11 +3557,13 @@ fn resolve_class_id(
         )? {
             return Ok(current);
         }
-        let symbol = one_at::<Symbol>(db, "SELECT n.payload FROM graph_nodes n JOIN revision_documents m ON m.revision_id=?2 AND m.graph_projection_id=n.projection_id WHERE n.id=?1", &current, &selected.key)
-            .map_err(|error| store.report_selected_failure(error))?
-            .ok_or(InvalidRequest(
-                "Choose an indexed Java or Python class or method.",
-            ))?;
+        let path: Option<String> = db.query_row(
+            "SELECT m.path FROM graph_nodes n JOIN revision_documents m ON m.revision_id=?2 AND m.graph_projection_id=n.projection_id WHERE n.id=?1",
+            params![current, selected.key], |r| r.get(0),
+        ).optional().map_err(|error| store.report_selected_failure(error.into()))?;
+        let symbol = path.map(|path| store.selected_graph_document_for(db, &path, selected))
+            .transpose()?.and_then(|doc| doc.nodes.into_iter().find(|node| node.id == current))
+            .ok_or(InvalidRequest("Choose an indexed Java or Python class or method."))?;
         ensure!(
             depth > 0 || matches!(symbol.kind, SymbolKind::Method | SymbolKind::Function),
             InvalidRequest("Choose an indexed Java or Python class or method.")
@@ -12033,6 +12058,14 @@ impl Store {
             .map_err(selected_integrity)
             .map_err(|error| self.report_selected_failure(error))
     }
+    /// Derive a selected graph exactly once from the attested native rows.
+    fn selected_graph_document_for(
+        &self, db: &Connection, path: &str, selected: &ReadRevision,
+    ) -> Result<AttestedDocument> {
+        self.attest_selected_document_loaded(db, path, selected, None)
+            .map_err(selected_integrity)
+            .map_err(|error| self.report_selected_failure(error))
+    }
     fn attest_selected_document_optional_for(
         &self,
         db: &Connection,
@@ -12203,8 +12236,9 @@ impl Store {
         );
         let row_limit = bytes.saturating_mul(16).clamp(1024, 1_000_000);
         let counts_sql = "SELECT (SELECT count(*) FROM graph_nodes WHERE projection_id=?1),
-            (SELECT count(*) FROM graph_calls WHERE projection_id=?1),
-            (SELECT count(*) FROM graph_regions WHERE projection_id=?1),
+            (SELECT count(*) FROM graph_display_labels WHERE projection_id=?1),
+            (SELECT count(*) FROM native_version_calls WHERE version_id=?3),
+            (SELECT count(*) FROM native_version_control_regions WHERE version_id=?3),
             (SELECT count(*) FROM classes WHERE projection_id=?2),
             (SELECT count(*) FROM class_relations WHERE projection_id=?2),
             (SELECT count(*) FROM native_version_coverage_roles WHERE version_id=?3),
@@ -12220,7 +12254,7 @@ impl Store {
             (SELECT count(*) FROM native_version_call_regions WHERE version_id=?3)";
         let counts: Vec<i64> =
             db.query_row(counts_sql, params![graph_id, class_id, version_id], |r| {
-                (0..16)
+                (0..17)
                     .map(|i| r.get(i))
                     .collect::<rusqlite::Result<Vec<_>>>()
             })?;
@@ -12246,30 +12280,10 @@ impl Store {
                         .min(512 * 1024 * 1024),
             "incompatible_index: selected evidence byte budget exceeded"
         );
-        let graph_byte_sql="SELECT COALESCE(max(row_bytes),0),COALESCE(sum(row_bytes),0) FROM (
-            SELECT length(CAST(id AS BLOB))+length(CAST(name AS BLOB))+length(CAST(path AS BLOB))+length(CAST(payload AS BLOB)) AS row_bytes FROM graph_nodes WHERE projection_id=?1
-            UNION ALL SELECT length(CAST(id AS BLOB))+length(CAST(caller AS BLOB))+COALESCE(length(CAST(target AS BLOB)),0)+length(CAST(path AS BLOB))+length(CAST(payload AS BLOB)) FROM graph_calls WHERE projection_id=?1
-            UNION ALL SELECT length(CAST(id AS BLOB))+length(CAST(owner AS BLOB))+length(CAST(path AS BLOB))+length(CAST(payload AS BLOB)) FROM graph_regions WHERE projection_id=?1)";
-        optional_hint_check(progress)?;
-        let (graph_row, graph_total): (i64, i64) =
-            db.query_row(graph_byte_sql, [&graph_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
-        ensure!(
-            graph_row >= 0
-                && graph_total >= 0
-                && graph_row
-                    <= bytes
-                        .saturating_mul(6)
-                        .saturating_add(16 * 1024)
-                        .min(256 * 1024 * 1024 + 16 * 1024)
-                && graph_total
-                    <= bytes
-                        .saturating_mul(64)
-                        .saturating_add(256 * 1024)
-                        .min(512 * 1024 * 1024),
-            "incompatible_index: selected graph row byte budget exceeded"
-        );
-        // Everything the rows below will hold, as the budgets above measured it.
-        let stored_bytes = [bytes, total_bytes, graph_total, f_length.unwrap_or(0)]
+        // The graph byte budget is checked on serialized derived rows after
+        // the native facts and labels have been fetched. The row counts above
+        // still bound their allocation before any native decoding.
+        let stored_bytes = [bytes, total_bytes, f_length.unwrap_or(0)]
             .iter()
             .map(|&n| u64::try_from(n).unwrap_or(0))
             .sum();
@@ -12305,7 +12319,7 @@ impl Store {
             hash,
             bytes,
             scope,
-            stored_bytes: _,
+            stored_bytes: ancillary_bytes,
         } = header;
         let path = path.as_str();
         let file = Self::selected_source_row_bounded_for_inner(
@@ -12328,34 +12342,32 @@ impl Store {
         optional_hint_check(progress)?;
         let regions = read_native_control_regions_v8_inner(db, &scope, None, progress)?;
         let mut node_rows = Vec::new();
-        for row in db
-            .prepare_cached(
-                "SELECT id,name,path,payload FROM graph_nodes WHERE projection_id=?1 ORDER BY id",
-            )?
-            .query_map([&graph_id], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
-                ))
-            })?
-        {
+        for row in db.prepare_cached(
+            "SELECT id,name,kind FROM graph_nodes WHERE projection_id=?1 ORDER BY id",
+        )?.query_map([&graph_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))? {
             optional_hint_check(progress)?;
             node_rows.push(row?);
         }
-        let mut call_rows = Vec::new();
-        for row in db.prepare_cached("SELECT id,caller,target,path,payload FROM graph_calls WHERE projection_id=?1 ORDER BY id")?
-            .query_map([&graph_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?)))? {
+        let mut label_rows = Vec::new();
+        for row in db.prepare_cached(
+            "SELECT id,label FROM graph_display_labels WHERE projection_id=?1 ORDER BY id",
+        )?.query_map([&graph_id], |r| Ok((r.get(0)?, r.get(1)?)))? {
             optional_hint_check(progress)?;
-            call_rows.push(row?);
+            label_rows.push(row?);
         }
-        let mut region_rows = Vec::new();
-        for row in db.prepare_cached("SELECT id,owner,path,payload FROM graph_regions WHERE projection_id=?1 ORDER BY id")?
-            .query_map([&graph_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?)))? {
-            optional_hint_check(progress)?;
-            region_rows.push(row?);
-        }
+        let labels: BTreeMap<String, String> = label_rows.iter().cloned().collect();
+        let (graph_nodes, graph_calls, graph_regions) = crate::indexer::project_document(
+            &file.path,
+            file.text.as_bytes(),
+            crate::indexer::NativeDocument {
+                declarations: declarations.iter().collect(),
+                calls: calls.iter().collect(),
+                control_regions: regions.iter().collect(),
+            },
+            &labels,
+        ).context("incompatible_index: selected graph derivation failed")?;
+        let graph_bytes = derived_graph_bytes(&graph_nodes, &graph_calls, &graph_regions, bytes)?;
+        let stored_bytes = ancillary_bytes.saturating_add(graph_bytes);
         let mut class_rows = Vec::new();
         for row in db.prepare_cached("SELECT id,name,qualified_name,path,payload FROM classes WHERE projection_id=?1 ORDER BY id")?
             .query_map([&class_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?)))? {
@@ -12386,11 +12398,14 @@ impl Store {
             calls,
             regions,
             node_rows,
-            call_rows,
-            region_rows,
+            label_rows,
+            graph_nodes,
+            graph_calls,
+            graph_regions,
             class_rows,
             relation_rows,
             stored_f,
+            stored_bytes,
         })
     }
 
@@ -12416,11 +12431,14 @@ impl Store {
             calls: native_calls,
             regions: native_regions,
             node_rows,
-            call_rows,
-            region_rows,
+            label_rows,
+            graph_nodes: nodes,
+            graph_calls: calls,
+            graph_regions: regions,
             class_rows: stored_class_rows,
             relation_rows,
             stored_f,
+            stored_bytes: _,
         } = fetched;
         let witness = crate::native_evidence::selected_source_witness_with_progress(
             &file,
@@ -12468,43 +12486,19 @@ impl Store {
             native_regions == expected_regions,
             "incompatible_index: selected native regions differ from source"
         );
-        let mut nodes = Vec::new();
-        for (id, name, path, payload) in node_rows {
-            optional_hint_check(progress)?;
-            let node: Symbol = serde_json::from_str(&payload)?;
-            ensure!(
-                node.id == id && node.name == name && node.path == path && path == file.path,
-                "incompatible_index: selected graph node materialization differs"
-            );
-            nodes.push(node);
-        }
-        let mut calls = Vec::new();
-        for (id, caller, target, path, payload) in call_rows {
-            optional_hint_check(progress)?;
-            let call: CallSite = serde_json::from_str(&payload)?;
-            ensure!(
-                call.id == id
-                    && call.caller == caller
-                    && call.path == path
-                    && path == file.path
-                    && target.is_none(),
-                "incompatible_index: selected graph call materialization differs"
-            );
-            calls.push(call);
-        }
-        let mut regions = Vec::new();
-        for (id, owner, path, payload) in region_rows {
-            optional_hint_check(progress)?;
-            let region: ControlRegion = serde_json::from_str(&payload)?;
-            ensure!(
-                region.id == id
-                    && region.owner == owner
-                    && region.path == path
-                    && path == file.path,
-                "incompatible_index: selected graph region materialization differs"
-            );
-            regions.push(region);
-        }
+        // Both narrow search rows and display labels must match the shared
+        // native-fact projector in both directions, not just its graph hash.
+        let expected_nodes: Vec<_> = nodes.iter().map(|node| {
+            let kind = serde_json::to_value(&node.kind)?;
+            Ok((node.id.clone(), node.name.clone(),
+                kind.as_str().context("incompatible_index: selected graph kind invalid")?.to_owned()))
+        }).collect::<Result<Vec<_>>>()?;
+        ensure!(node_rows == expected_nodes,
+            "incompatible_index: selected graph node materialization differs");
+        let expected_labels: Vec<_> = nodes.iter().filter_map(|node|
+            node.display_label.as_ref().map(|label| (node.id.clone(), label.clone()))).collect();
+        ensure!(label_rows == expected_labels,
+            "incompatible_index: selected graph display labels differ");
         let mut class_rows = Vec::new();
         for (id, name, qualified, path, payload) in stored_class_rows {
             optional_hint_check(progress)?;
@@ -12625,6 +12619,9 @@ impl Store {
             declarations: native_declarations,
             calls: native_calls,
             regions: native_regions,
+            nodes: graph.nodes,
+            graph_calls: graph.calls,
+            graph_regions: graph.regions,
         })
     }
 
@@ -12970,28 +12967,21 @@ impl Store {
         let selected_path: Option<String> = match request {
             crate::navigation::NavigationRequest::Source(s) => Some(s.path.clone()),
             crate::navigation::NavigationRequest::Member(s) => {
-                let selected: Option<(String, bool, Option<String>)> = tx
+                let selected: Option<(String, String)> = tx
                     .query_row(
-                        "SELECT n.path,json_valid(n.payload),CASE WHEN json_valid(n.payload) THEN json_extract(n.payload,'$.kind') ELSE NULL END FROM graph_nodes n JOIN revision_documents m ON m.revision_id=?2 AND m.graph_projection_id=n.projection_id WHERE n.id=?1 LIMIT 1",
+                        "SELECT m.path,n.kind FROM graph_nodes n JOIN revision_documents m ON m.revision_id=?2 AND m.graph_projection_id=n.projection_id WHERE n.id=?1 LIMIT 1",
                         params![s.class_id, selected.key],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                        |row| Ok((row.get(0)?, row.get(1)?)),
                     )
                     .optional()
                     .map_err(|error| self.report_selected_failure(error.into()))?;
                 match selected {
-                    Some((_path, false, _)) => {
-                        return Err(self.report_selected_failure(
-                            SelectedIntegrity(
-                                "incompatible_index: selected navigation node JSON invalid".into(),
-                            )
-                            .into(),
-                        ));
-                    }
-                    Some((path, true, Some(kind))) if kind == "class" => Some(path),
+                    Some((path, kind)) if kind == "class" => Some(path),
                     _ => None,
                 }
             }
         };
+        let mut selected_document = None;
         if let Some(path) = selected_path {
             // Gate allocation of the selected JSON/BLOB before decoding either.
             // This reads only SQLite byte lengths, not every workspace document.
@@ -13013,7 +13003,7 @@ impl Store {
                         .into(),
                     ));
                 }
-                self.attest_selected_document_for(tx, &path, &selected)?;
+                selected_document = Some(self.selected_graph_document_for(tx, &path, &selected)?);
             } else {
                 let graph_file: bool = tx.query_row(
                     "SELECT EXISTS(SELECT 1 FROM revision_documents WHERE revision_id=?2 AND path=?1)",
@@ -13030,7 +13020,8 @@ impl Store {
                 }
             }
         }
-        crate::navigation::navigate(tx, request, revision, &selected.key)
+        crate::navigation::navigate(tx, request, revision, &selected.key,
+            selected_document.as_ref().map(|document| document.nodes.as_slice()))
     }
 
     pub fn classes_at(
@@ -13232,18 +13223,16 @@ impl Store {
         let selected = self.read_revision_for(tx, None, pre_startup)?;
         let revision = selected.pin;
         let rows = symbol_trigrams::graph_hits(tx, query, limit.min(150) as i64)?;
-        let selected_paths: BTreeSet<&str> = rows.iter().map(|(path, _)| path.as_str()).collect();
-        for path in &selected_paths {
-            self.attest_selected_document_for(tx, path, &selected)?;
+        let mut documents = BTreeMap::new();
+        for (path, _) in &rows {
+            if !documents.contains_key(path) {
+                documents.insert(path.clone(), self.selected_graph_document_for(tx, path, &selected)?);
+            }
         }
-        let values = rows
-            .iter()
-            .map(|(_, payload)| Ok(serde_json::from_str(payload)?))
-            .collect::<Result<Vec<Symbol>>>()?;
-        let paths: BTreeSet<_> = values.iter().map(|node| node.path.as_str()).collect();
-        for path in paths.difference(&selected_paths) {
-            self.attest_selected_document_for(tx, path, &selected)?;
-        }
+        let values = rows.iter().map(|(path, id)| {
+            documents[path].nodes.iter().find(|node| node.id == *id).cloned()
+                .context("incompatible_index: selected search symbol missing")
+        }).collect::<Result<Vec<_>>>()?;
         Ok((revision, values))
     }
 
@@ -13270,17 +13259,14 @@ impl Store {
         let selected = self.read_revision_for(tx, expected_revision, pre_startup)?;
         let revision = selected.pin;
         let selected_path: Option<String> = tx
-                .query_row("SELECT n.path FROM graph_nodes n JOIN revision_documents m ON m.revision_id=?2 AND m.graph_projection_id=n.projection_id WHERE n.id=?1", params![id, selected.key], |r| r.get(0))
+                .query_row("SELECT m.path FROM graph_nodes n JOIN revision_documents m ON m.revision_id=?2 AND m.graph_projection_id=n.projection_id WHERE n.id=?1", params![id, selected.key], |r| r.get(0))
                 .optional()?;
-        if let Some(path) = selected_path {
-            self.attest_selected_document_for(tx, &path, &selected)?;
-        }
-        let node: Option<Symbol> = one_at(
-            tx,
-            "SELECT n.payload FROM graph_nodes n JOIN revision_documents m ON m.revision_id=?2 AND m.graph_projection_id=n.projection_id WHERE n.id=?1",
-            id,
-            &selected.key,
-        )?;
+        let node = if let Some(path) = selected_path {
+            self.selected_graph_document_for(tx, &path, &selected)?.nodes
+                .into_iter().find(|node| node.id == id)
+        } else {
+            None
+        };
         Ok(node.map(|node| (revision, node)))
     }
 
@@ -13535,10 +13521,10 @@ impl Store {
             let revision = self.read_status(tx)?.revision;
             let workspace = Path::new(&self.workspace_root);
             let mut valid_stmt = tx.prepare(
-                "SELECT NOT EXISTS(SELECT 1 FROM graph_nodes n WHERE n.projection_id=m.graph_projection_id AND json_valid(n.payload)=0) FROM revision_documents m JOIN index_metadata active_manifest ON active_manifest.singleton=1 AND m.revision_id='pin:v1:'||active_manifest.index_generation||':'||active_manifest.index_revision WHERE m.path=?1",
+                "SELECT 1 FROM revision_documents m JOIN index_metadata active_manifest ON active_manifest.singleton=1 AND m.revision_id='pin:v1:'||active_manifest.index_generation||':'||active_manifest.index_revision WHERE m.path=?1",
             )?;
             let mut count_stmt = tx.prepare(
-                "SELECT (SELECT count(*) FROM graph_nodes n WHERE n.projection_id=m.graph_projection_id AND CASE WHEN json_valid(n.payload) THEN json_extract(n.payload,'$.kind') IN ('function','method') ELSE 0 END) FROM revision_documents m JOIN index_metadata active_manifest ON active_manifest.singleton=1 AND m.revision_id='pin:v1:'||active_manifest.index_generation||':'||active_manifest.index_revision WHERE m.path=?1",
+                "SELECT (SELECT count(*) FROM graph_nodes n WHERE n.projection_id=m.graph_projection_id AND n.kind IN ('function','method')) FROM revision_documents m JOIN index_metadata active_manifest ON active_manifest.singleton=1 AND m.revision_id='pin:v1:'||active_manifest.index_generation||':'||active_manifest.index_revision WHERE m.path=?1",
             )?;
             let mut overlays = Vec::new();
             for (index, item) in items.iter().enumerate().filter(|(_, entry)| entry.kind == "file") {
@@ -13578,10 +13564,10 @@ impl Store {
         let revision = self.read_status_for(tx, pre_startup)?.revision;
         let workspace = Path::new(&self.workspace_root);
         let mut valid_stmt = tx.prepare(
-                "SELECT NOT EXISTS(SELECT 1 FROM graph_nodes n WHERE n.projection_id=m.graph_projection_id AND json_valid(n.payload)=0) FROM revision_documents m JOIN index_metadata active_manifest ON active_manifest.singleton=1 AND m.revision_id='pin:v1:'||active_manifest.index_generation||':'||active_manifest.index_revision WHERE m.path=?1",
+                "SELECT 1 FROM revision_documents m JOIN index_metadata active_manifest ON active_manifest.singleton=1 AND m.revision_id='pin:v1:'||active_manifest.index_generation||':'||active_manifest.index_revision WHERE m.path=?1",
             )?;
         let mut count_stmt = tx.prepare(
-                "SELECT (SELECT count(*) FROM graph_nodes n WHERE n.projection_id=m.graph_projection_id AND CASE WHEN json_valid(n.payload) THEN json_extract(n.payload,'$.kind') IN ('function','method') ELSE 0 END) FROM revision_documents m JOIN index_metadata active_manifest ON active_manifest.singleton=1 AND m.revision_id='pin:v1:'||active_manifest.index_generation||':'||active_manifest.index_revision WHERE m.path=?1",
+                "SELECT (SELECT count(*) FROM graph_nodes n WHERE n.projection_id=m.graph_projection_id AND n.kind IN ('function','method')) FROM revision_documents m JOIN index_metadata active_manifest ON active_manifest.singleton=1 AND m.revision_id='pin:v1:'||active_manifest.index_generation||':'||active_manifest.index_revision WHERE m.path=?1",
             )?;
         let mut overlays = Vec::new();
         for (index, item) in items
@@ -13663,7 +13649,7 @@ impl Store {
             self.attest_selected_document_for(tx, &path, &selected)?;
             let methods: i64 = tx.query_row(
                 "SELECT count(*) FROM graph_nodes WHERE projection_id=?1
-                    AND json_extract(payload,'$.kind') IN ('function','method')",
+                    AND kind IN ('function','method')",
                 [&projection_id],
                 |r| r.get(0),
             )?;
@@ -13696,18 +13682,14 @@ impl Store {
                 |r| r.get(0),
             )
             .optional()?;
-        let Some(projection_id) = projection_id else {
+        let Some(_projection_id) = projection_id else {
             return Ok(None);
         };
-        self.attest_selected_document_for(tx, path, &selected)?;
-        let mut stmt = tx.prepare(
-            "SELECT payload FROM graph_nodes WHERE projection_id=?1
-                AND json_extract(payload,'$.kind') IN ('function','method')
-                ORDER BY json_extract(payload,'$.range.startByte'),id LIMIT 1001",
-        )?;
+        let mut symbols = self.selected_graph_document_for(tx, path, &selected)?.nodes;
+        symbols.retain(|node| matches!(node.kind, SymbolKind::Method | SymbolKind::Function));
+        symbols.sort_by(|a, b| (a.range.start_byte, &a.id).cmp(&(b.range.start_byte, &b.id)));
         let mut items = Vec::new();
-        for payload in stmt.query_map([&projection_id], |r| r.get::<_, String>(0))? {
-            let symbol: Symbol = serde_json::from_str(&payload?)?;
+        for symbol in symbols.into_iter().take(1001) {
             items.push(serde_json::json!({"symbol":symbol,"consequential":true,
                     "reason":"Conservative heuristic: retained; triviality is not proven"}));
         }
@@ -13737,40 +13719,20 @@ impl Store {
     ) -> Result<Option<crate::behavior::SequenceView>> {
         let selected_revision = self.read_revision_for(tx, Some(expected), pre_startup)?;
         let revision = selected_revision.pin;
-        let selected: Option<(String, String)> = tx
-            .query_row(
-                "SELECT n.path,n.projection_id FROM graph_nodes n JOIN revision_documents m
-                 ON m.revision_id=?2 AND m.graph_projection_id=n.projection_id
-                 WHERE n.id=?1",
-                params![seed, selected_revision.key],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        let Some((path, graph_id)) = selected else {
-            return Ok(None);
-        };
-        self.attest_selected_document_for(tx, &path, &selected_revision)?;
-        let payload: String = tx.query_row(
-            "SELECT payload FROM graph_nodes WHERE projection_id=?1 AND id=?2",
-            params![graph_id, seed],
-            |r| r.get(0),
-        )?;
-        let symbol: Symbol = serde_json::from_str(&payload)?;
-        ensure!(
-            matches!(symbol.kind, SymbolKind::Function | SymbolKind::Method),
-            "invalid sequence symbol kind"
-        );
-        let file = self
-            .selected_source_row_for(tx, &path, &selected_revision)?
-            .context("sequence source missing")?;
-        let mut stmt = tx.prepare(
-            "SELECT payload FROM graph_calls WHERE projection_id=?1
-                ORDER BY json_extract(payload,'$.range.startByte'),id",
-        )?;
-        let calls: Vec<CallSite> = stmt
-            .query_map([&graph_id], |r| r.get::<_, String>(0))?
-            .map(|payload| Ok(serde_json::from_str(&payload?)?))
-            .collect::<Result<_>>()?;
+        let path: Option<String> = tx.query_row(
+            "SELECT m.path FROM graph_nodes n JOIN revision_documents m
+             ON m.revision_id=?2 AND m.graph_projection_id=n.projection_id WHERE n.id=?1",
+            params![seed, selected_revision.key], |r| r.get(0),
+        ).optional()?;
+        let Some(path) = path else { return Ok(None) };
+        let document = self.selected_graph_document_for(tx, &path, &selected_revision)?;
+        let symbol = document.nodes.iter().find(|node| node.id == seed)
+            .context("incompatible_index: selected sequence seed missing")?;
+        ensure!(matches!(symbol.kind, SymbolKind::Function | SymbolKind::Method),
+            "invalid sequence symbol kind");
+        let mut calls = document.graph_calls;
+        calls.sort_by(|a,b| (a.range.start_byte, &a.id).cmp(&(b.range.start_byte, &b.id)));
+        let file = document.file;
         crate::behavior::build_sequence(revision, &symbol, &file, &calls, show_all).map(Some)
     }
 
@@ -13809,29 +13771,22 @@ impl Store {
             )?
             .query_map([&selected.key], |row| row.get(0))?
             .collect::<rusqlite::Result<_>>()?;
+        let mut files = Vec::new();
+        let mut nodes = Vec::new();
+        let mut calls = Vec::new();
+        let mut regions = Vec::new();
         for path in &paths {
-            self.attest_selected_document_for(db, path, selected)?;
+            let document = self.selected_graph_document_for(db, path, selected)?;
+            files.push(document.file);
+            nodes.extend(document.nodes);
+            calls.extend(document.graph_calls);
+            regions.extend(document.graph_regions);
         }
-        let files = paths
-            .iter()
-            .map(|path| {
-                self.selected_source_row_for(db, path, selected)?
-                    .context("missing manifest graph source")
-            })
-            .collect::<Result<Vec<_>>>()?;
-        Ok(Graph {
-            schema_version: SCHEMA_VERSION,
-            files,
-            nodes: rows_at(db, "SELECT n.payload FROM graph_nodes n JOIN revision_documents d
-                ON d.revision_id=?1 AND d.graph_projection_id=n.projection_id ORDER BY n.id", &selected.key)?,
-            calls: rows_at(db, "SELECT c.payload FROM graph_calls c JOIN revision_documents d
-                ON d.revision_id=?1 AND d.graph_projection_id=c.projection_id
-                ORDER BY c.path,json_extract(c.payload,'$.range.startByte'),json_extract(c.payload,'$.range.endByte') DESC,c.id", &selected.key)?,
-            regions: rows_at(db, "SELECT g.payload FROM graph_regions g JOIN revision_documents d
-                ON d.revision_id=?1 AND d.graph_projection_id=g.projection_id ORDER BY g.id", &selected.key)?,
-            stats,
-            diagnostics,
-        })
+        nodes.sort_by(|a,b| a.id.cmp(&b.id));
+        calls.sort_by(|a,b| (&a.path,a.range.start_byte,std::cmp::Reverse(a.range.end_byte),&a.id)
+            .cmp(&(&b.path,b.range.start_byte,std::cmp::Reverse(b.range.end_byte),&b.id)));
+        regions.sort_by(|a,b| a.id.cmp(&b.id));
+        Ok(Graph { schema_version: SCHEMA_VERSION, files, nodes, calls, regions, stats, diagnostics })
     }
     pub fn graph(&self) -> Result<Graph> {
         self.graph_at(None)
@@ -13906,44 +13861,24 @@ impl Store {
             .chain(view.regions.iter().map(|r| r.path.as_str()))
             .chain(sources.iter().map(|f| f.path.as_str()))
             .collect();
+        let mut documents = BTreeMap::new();
         for path in paths {
-            self.attest_selected_document_for(tx, path, &selected)?;
+            documents.insert(path, self.selected_graph_document_for(tx, path, &selected)?);
         }
         for node in &view.nodes {
-            let actual: Option<Symbol> = one_at(
-                tx,
-                "SELECT n.payload FROM graph_nodes n JOIN revision_documents m ON m.revision_id=?2 AND m.graph_projection_id=n.projection_id WHERE n.id=?1",
-                &node.id,
-                &selected.key,
-            )?;
-            ensure!(
-                actual.as_ref() == Some(node),
-                "incompatible_index: cached packet selected graph declaration changed"
-            );
+            ensure!(documents.get(node.path.as_str())
+                .and_then(|document| document.nodes.iter().find(|actual| actual.id == node.id)) == Some(node),
+                "incompatible_index: cached packet selected graph declaration changed");
         }
         for call in &view.calls {
-            let actual: Option<CallSite> = one_at(
-                tx,
-                "SELECT c.payload FROM graph_calls c JOIN revision_documents m ON m.revision_id=?2 AND m.graph_projection_id=c.projection_id WHERE c.id=?1",
-                &call.id,
-                &selected.key,
-            )?;
-            ensure!(
-                actual.as_ref() == Some(call),
-                "incompatible_index: cached packet selected graph call changed"
-            );
+            ensure!(documents.get(call.path.as_str())
+                .and_then(|document| document.graph_calls.iter().find(|actual| actual.id == call.id)) == Some(call),
+                "incompatible_index: cached packet selected graph call changed");
         }
         for region in &view.regions {
-            let actual: Option<ControlRegion> = one_at(
-                tx,
-                "SELECT g.payload FROM graph_regions g JOIN revision_documents m ON m.revision_id=?2 AND m.graph_projection_id=g.projection_id WHERE g.id=?1",
-                &region.id,
-                &selected.key,
-            )?;
-            ensure!(
-                actual.as_ref() == Some(region),
-                "incompatible_index: cached packet selected graph region changed"
-            );
+            ensure!(documents.get(region.path.as_str())
+                .and_then(|document| document.graph_regions.iter().find(|actual| actual.id == region.id)) == Some(region),
+                "incompatible_index: cached packet selected graph region changed");
         }
         for source in sources {
             ensure!(
@@ -13986,31 +13921,41 @@ impl Store {
         let selected = self.read_revision_for(tx, expected_pin.copied(), pre_startup)?;
         let revision = selected.pin;
         let selected_path: Option<String> = tx
-            .query_row("SELECT n.path FROM graph_nodes n JOIN revision_documents m ON m.revision_id=?2 AND m.graph_projection_id=n.projection_id WHERE n.id=?1", params![query.seed, selected.key], |r| {
+            .query_row("SELECT m.path FROM graph_nodes n JOIN revision_documents m ON m.revision_id=?2 AND m.graph_projection_id=n.projection_id WHERE n.id=?1", params![query.seed, selected.key], |r| {
                 r.get(0)
             })
             .optional()?;
-        if let Some(path) = selected_path {
-            self.attest_selected_document_for(tx, &path, &selected)?;
-        }
-        let seed: Option<Symbol> = one_at(
-            tx,
-            "SELECT n.payload FROM graph_nodes n JOIN revision_documents m ON m.revision_id=?2 AND m.graph_projection_id=n.projection_id WHERE n.id=?1",
-            &query.seed,
-            &selected.key,
-        )?;
-        let Some(seed) = seed else { return Ok(None) };
+        let Some(path) = selected_path else { return Ok(None) };
+        let mut documents = BTreeMap::new();
+        let seed_document = self.selected_graph_document_for(tx, &path, &selected)?;
+        let seed = seed_document.nodes.iter().find(|symbol| symbol.id == query.seed).cloned()
+            .context("incompatible_index: selected view seed missing")?;
+        documents.insert(path, seed_document);
         let mut calls = Vec::new();
         let mut region_ids = BTreeSet::new();
         let mut truncated = false;
         if !query.exclude_paths.iter().any(|p| seed.path.starts_with(p)) {
-            let mut stmt = tx.prepare("SELECT c.payload FROM graph_calls c JOIN revision_documents m ON m.revision_id=?3 AND m.graph_projection_id=c.projection_id WHERE c.caller=?1 ORDER BY c.path,json_extract(c.payload,'$.range.startByte'),json_extract(c.payload,'$.range.endByte') DESC,c.id LIMIT ?2")?;
-            let rows = stmt.query_map(
-                params![seed.id, (query.max_calls + 1) as i64, selected.key],
-                |r| r.get::<_, String>(0),
-            )?;
-            for payload in rows {
-                let call: CallSite = serde_json::from_str(&payload?)?;
+            // The native owner index selects candidate documents without scanning
+            // every revision document. Derive each document once, sort globally,
+            // and take the SQL LIMIT before filtering excluded paths.
+            let call_paths: Vec<String> = tx.prepare(
+                "SELECT DISTINCT m.path FROM native_version_calls c JOIN revision_documents m
+                 ON m.revision_id=?2 AND m.document_version_id=c.version_id
+                 WHERE c.owner_syntax_id=?1 ORDER BY m.path"
+            )?.query_map(params![seed.id, selected.key], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            for path in call_paths {
+                if !documents.contains_key(&path) {
+                    documents.insert(path.clone(), self.selected_graph_document_for(tx, &path, &selected)?);
+                }
+            }
+            let mut ordered: Vec<CallSite> = documents.values()
+                .flat_map(|doc| doc.graph_calls.iter())
+                .filter(|call| call.caller == seed.id).cloned().collect();
+            ordered.sort_by(|a, b| (&a.path, a.range.start_byte).cmp(&(&b.path, b.range.start_byte))
+                .then_with(|| b.range.end_byte.cmp(&a.range.end_byte))
+                .then_with(|| a.id.cmp(&b.id)));
+            for call in ordered.into_iter().take(query.max_calls + 1) {
                 if query.exclude_paths.iter().any(|p| call.path.starts_with(p)) {
                     continue;
                 }
@@ -14024,25 +13969,14 @@ impl Store {
         }
         let mut regions = BTreeMap::new();
         while let Some(id) = region_ids.pop_first() {
-            let region: Option<ControlRegion> = one_at(
-                tx,
-                "SELECT g.payload FROM graph_regions g JOIN revision_documents m ON m.revision_id=?2 AND m.graph_projection_id=g.projection_id WHERE g.id=?1",
-                &id,
-                &selected.key,
-            )?;
+            let region = documents.values().flat_map(|doc| doc.graph_regions.iter())
+                .find(|region| region.id == id).cloned();
             if let Some(region) = region {
                 if let Some(parent) = &region.parent {
                     region_ids.insert(parent.clone());
                 }
                 regions.insert(id, region);
             }
-        }
-        let paths: BTreeSet<_> = std::iter::once(seed.path.as_str())
-            .chain(calls.iter().map(|c| c.path.as_str()))
-            .chain(regions.values().map(|r| r.path.as_str()))
-            .collect();
-        for path in paths {
-            self.attest_selected_document_for(tx, path, &selected)?;
         }
         Ok(Some(ViewResult {
             revision,
