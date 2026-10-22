@@ -13781,8 +13781,7 @@ impl Store {
             regions.extend(document.graph_regions);
         }
         nodes.sort_by(|a,b| a.id.cmp(&b.id));
-        calls.sort_by(|a,b| (&a.path,a.range.start_byte,std::cmp::Reverse(a.range.end_byte),&a.id)
-            .cmp(&(&b.path,b.range.start_byte,std::cmp::Reverse(b.range.end_byte),&b.id)));
+        calls.sort_by(crate::indexer::compare_reader_calls);
         regions.sort_by(|a,b| a.id.cmp(&b.id));
         Ok(Graph { schema_version: SCHEMA_VERSION, files, nodes, calls, regions, stats, diagnostics })
     }
@@ -13950,9 +13949,7 @@ impl Store {
             let mut ordered: Vec<CallSite> = documents.values()
                 .flat_map(|doc| doc.graph_calls.iter())
                 .filter(|call| call.caller == seed.id).cloned().collect();
-            ordered.sort_by(|a, b| (&a.path, a.range.start_byte).cmp(&(&b.path, b.range.start_byte))
-                .then_with(|| b.range.end_byte.cmp(&a.range.end_byte))
-                .then_with(|| a.id.cmp(&b.id)));
+            ordered.sort_by(crate::indexer::compare_reader_calls);
             for call in ordered.into_iter().take(query.max_calls + 1) {
                 if query.exclude_paths.iter().any(|p| call.path.starts_with(p)) {
                     continue;
