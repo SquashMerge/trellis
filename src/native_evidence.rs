@@ -2796,8 +2796,14 @@ impl Artifact {
         // The pure part of every ID (input checks, canonical bytes, digest) is
         // minted on workers, a chunk at a time. Each row's checks still run
         // here in order, and the minted ID is admitted at the point where it
-        // was computed before, so errors and their order are unchanged.
-        let workers = crate::parallel::default_workers();
+        // was computed before, so errors and their order are unchanged. A
+        // one-document view is already running on a document worker, so it
+        // mints inline instead of starting threads of its own.
+        let workers = if files.len() == 1 {
+            1
+        } else {
+            crate::parallel::default_workers()
+        };
         let never = std::sync::atomic::AtomicBool::new(false);
         let stable_input = |d: &Declaration| {
             crate::native_ids::mint_stable(
