@@ -3539,7 +3539,7 @@ fn captured_scip_document_cutoff_refuses_optional_java_python_and_javascript_lab
         assert_eq!(name, expected.name);
         assert_eq!(
             kind.as_str(),
-            serde_json::to_value(&expected.kind)
+            serde_json::to_value(expected.kind)
                 .unwrap()
                 .as_str()
                 .unwrap()
