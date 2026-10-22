@@ -13,6 +13,61 @@ rustc --version
 PLAYWRIGHT_BROWSERS_PATH=$(node tools/verify-env.mjs)
 export PLAYWRIGHT_BROWSERS_PATH
 
+logs=$(mktemp -d "${TMPDIR:-/tmp}/trellis-verify.XXXXXX")
+deps_pid=""
+# Signal a process and then its descendants (sudo relays TERM to apt).
+stop_tree() {
+  for child in $(pgrep -P "$1" 2>/dev/null); do
+    stop_tree "$child"
+  done
+  kill -TERM "$1" 2>/dev/null || true
+}
+# An early lane failure can leave the background install running; stop and
+# reap it on every exit before its logs go away.
+cleanup() {
+  if [ -n "$deps_pid" ] && kill -0 "$deps_pid" 2>/dev/null; then
+    stop_tree "$deps_pid"
+    wait "$deps_pid" 2>/dev/null || true
+  fi
+  rm -rf "$logs"
+}
+trap cleanup EXIT
+
+# Linux CI sets TRELLIS_BROWSER_SYSTEM_DEPS to install Chromium's system
+# packages (apt) while the lanes build. Only the browser suite at the end of
+# the rust lane needs them, and a slow apt mirror would otherwise hold up the
+# whole run (#244). The lane polls for the status file because it is a
+# subshell and cannot `wait` on its sibling.
+if [ -n "${TRELLIS_BROWSER_SYSTEM_DEPS:-}" ]; then
+  (
+    start=$(date +%s)
+    code=0
+    node tests/browser/node_modules/playwright/cli.js install-deps chromium >"$logs/browser-deps.log" 2>&1 || code=$?
+    echo "$code $(($(date +%s) - start))" >"$logs/browser-deps.tmp"
+    mv "$logs/browser-deps.tmp" "$logs/browser-deps.status"
+  ) &
+  deps_pid=$!
+fi
+browser_system_deps() {
+  [ -n "${TRELLIS_BROWSER_SYSTEM_DEPS:-}" ] || return 0
+  waited=0
+  while [ ! -e "$logs/browser-deps.status" ]; do
+    if [ "$waited" -ge 1800 ]; then
+      echo "verify: Chromium system package install did not finish within 1800 s" >&2
+      return 1
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  read -r code took <"$logs/browser-deps.status"
+  echo "verify: Chromium system package install finished in $took s (exit $code); the browser suite waited $waited s"
+  if [ "$code" -ne 0 ]; then
+    cat "$logs/browser-deps.log" >&2
+    echo "verify: Chromium system package install failed (exit $code)" >&2
+    return 1
+  fi
+}
+
 # Each Cargo target directory belongs to one lane, so no lane waits on
 # another's build lock. The rust lane owns `target`: it lints the production
 # build, lints again with the test-support hooks (off the tests lane's
@@ -29,6 +84,7 @@ rust() {
   cargo clippy --locked --all-targets -- -D warnings
   cargo clippy --locked --all-targets --features test-support -- -D warnings
   cargo build --locked --bin trellis
+  browser_system_deps
   TRELLIS_SUITE_BINARY="$target_dir/debug/trellis" node --test --test-concurrency=1 tests/browser/saved-items.test.cjs tests/browser/sequence-pele.test.cjs tests/browser/sequence.test.cjs tests/browser/sequence-cost.test.cjs
 }
 tests() {
@@ -55,8 +111,6 @@ checks() {
 }
 
 lanes="rust tests semantic cohorts checks"
-logs=$(mktemp -d "${TMPDIR:-/tmp}/trellis-verify.XXXXXX")
-trap 'rm -rf "$logs"' EXIT
 started=$(date +%s)
 for lane in $lanes; do
   # The inner subshell keeps errexit (it is not the left side of || or &&);

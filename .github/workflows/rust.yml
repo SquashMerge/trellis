@@ -52,20 +52,11 @@ jobs:
             . -> target-test-support
           cache-directories: ${{ env.COMPOSITION_TARGET }}
           save-if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/feature-')) }}
-      - run: npm ci --prefix tests/browser --ignore-scripts
-        env:
-          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/pw-browsers
-      - name: Install Playwright Chromium with system dependencies
-        if: runner.os == 'Linux'
-        run: node tests/browser/node_modules/playwright/cli.js install --with-deps chromium
-        env:
-          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/pw-browsers
-      - name: Install Playwright Chromium
-        if: runner.os == 'macOS'
-        run: node tests/browser/node_modules/playwright/cli.js install chromium
-        env:
-          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/pw-browsers
       # verify lints the default build and runs the tests once, with test-support hooks.
+      # verify provisions the browser packages and the pinned Chromium itself.
+      # On Linux it also installs Chromium's system packages in the background,
+      # since only the browser suite at the end of the rust lane needs them (#244).
       - run: ./tools/verify
         env:
           PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/pw-browsers
+          TRELLIS_BROWSER_SYSTEM_DEPS: ${{ runner.os == 'Linux' && '1' || '' }}
