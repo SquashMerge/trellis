@@ -64,4 +64,5 @@ opt-level = 3
 # Light optimization of the crate itself makes its heavy indexing and publish
 # tests several times faster for a modest rebuild cost.
 [profile.dev.package.trellis]
-opt-level = 0
+opt-level = 1
+debug = false
