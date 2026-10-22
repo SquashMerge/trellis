@@ -1724,6 +1724,19 @@ impl From<anyhow::Error> for ApiError {
         })) {
             return Self(StatusCode::CONFLICT, "storage_busy", "Storage is busy");
         }
+        // A spilled large publication holds every reader out until COMMIT;
+        // say so at once instead of a generic busy (#210).
+        if e.chain().any(|cause| {
+            cause
+                .downcast_ref::<crate::store::RebuildInProgress>()
+                .is_some()
+        }) {
+            return Self(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "rebuild_in_progress",
+                "The index is being rebuilt; retry after it finishes",
+            );
+        }
         if let Some(directory) = e.downcast_ref::<BrowseDirectoryError>() {
             return browse_directory_error(&directory.0);
         }
@@ -3160,6 +3173,7 @@ fn question_error(e: anyhow::Error) -> ApiError {
             "workspace_id_changed",
             "index_not_ready",
             "storage_busy",
+            "rebuild_in_progress",
             "incompatible_index",
             "incompatible_record",
             "incomplete_record",

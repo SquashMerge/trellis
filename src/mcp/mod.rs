@@ -227,6 +227,13 @@ fn validated_expected_basis(
 }
 
 fn mcp_read_error(error: &anyhow::Error) -> &'static str {
+    if error.chain().any(|cause| {
+        cause
+            .downcast_ref::<crate::store::RebuildInProgress>()
+            .is_some()
+    }) {
+        return "rebuild_in_progress";
+    }
     if error
         .downcast_ref::<crate::store::topology::StorageBusy>()
         .is_some()
@@ -1897,6 +1904,25 @@ mod w1_error_tests {
         assert!(!codes.iter().any(|item| item == "storage_busy"));
         let resolved = super::tools::failure(&serde_json::json!(1), code);
         assert_eq!(resolved["error"]["retryable"], true);
+    }
+
+    #[test]
+    fn rebuild_in_progress_is_an_advertised_retryable_code() {
+        let rebuild = crate::store::RebuildInProgress {
+            since: std::time::SystemTime::now(),
+            documents: 10_000,
+        };
+        let error = anyhow::Error::new(rebuild).context("selected read");
+        let code = super::mcp_read_error(&error);
+        assert_eq!(code, "rebuild_in_progress");
+        let catalog = super::catalog::list(true);
+        let codes = catalog["tools"][0]["outputSchema"]["$defs"]["ResolvedFailureCode"]["enum"]
+            .as_array()
+            .unwrap();
+        assert!(codes.iter().any(|item| item == code));
+        let resolved = super::tools::failure(&serde_json::json!(1), code);
+        assert_eq!(resolved["error"]["retryable"], true);
+        assert!(!crate::store::cli_read_retryable_contention(&error));
     }
 }
 
