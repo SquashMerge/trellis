@@ -1278,7 +1278,10 @@ async fn navigation_selected_graph_nodes_are_attested_without_scanning_other_doc
             .unwrap(),
         1
     );
-    assert_eq!(call(&selected_app, selector.clone()).await.0, StatusCode::OK);
+    assert_eq!(
+        call(&selected_app, selector.clone()).await.0,
+        StatusCode::OK
+    );
     assert_eq!(
         selected_db
             .execute(
