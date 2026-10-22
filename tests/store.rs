@@ -579,7 +579,9 @@ fn traversal_cycles_bounds_callbacks_and_boundaries() {
 fn main_nested_query_view_keeps_call_order_limit_and_exclusion() {
     // Frozen main (0532a70) SQL payloads and CLI query results. The fixture is
     // added separately on the integration branch; do not derive expectations
-    // from this branch's writer or the candidate query result.
+    // from this branch's writer or the candidate query result. Symbol and call
+    // IDs include the source-set root ID, so their raw bytes (and CLI/payload
+    // hashes containing them) cannot match between independent checkout roots.
     let oracle: serde_json::Value = serde_json::from_str(include_str!(
         "fixtures/graph-payload-main-0532a70-ties/oracle.json"
     ))
@@ -591,8 +593,36 @@ fn main_nested_query_view_keeps_call_order_limit_and_exclusion() {
     let leader = store.publication_for_tests().unwrap();
     publish_bundle(&store, &captured, store.index_baseline().unwrap(), &leader);
 
+    let main_seed_row = oracle["rows"]["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == oracle["seed"])
+        .unwrap();
+    let main_seed: serde_json::Value =
+        serde_json::from_str(main_seed_row["payload"].as_str().unwrap()).unwrap();
+    // Locate this root's seed from the independently frozen main name, path,
+    // and range. Never obtain an expected order from the candidate graph.
+    let seeds: Vec<_> = captured
+        .0
+        .nodes
+        .iter()
+        .filter(|node| {
+            node.name == main_seed["name"].as_str().unwrap()
+                && node.path == main_seed["path"].as_str().unwrap()
+                && serde_json::to_value(&node.range).unwrap() == main_seed["range"]
+        })
+        .collect();
+    assert_eq!(seeds.len(), 1, "main seed identity is not unique");
+    let mut candidate_seed = serde_json::to_value(seeds[0]).unwrap();
+    candidate_seed["id"] = main_seed["id"].clone();
+    assert_eq!(
+        candidate_seed, main_seed,
+        "seed differs from main apart from root-scoped ID"
+    );
+
     let mut query = query();
-    query.seed = oracle["seed"].as_str().unwrap().to_owned();
+    query.seed = seeds[0].id.clone();
     let main_queries = &oracle["queries"];
     for case in ["max1", "max2", "excluded"] {
         let expected = &main_queries[case];
@@ -606,14 +636,35 @@ fn main_nested_query_view_keeps_call_order_limit_and_exclusion() {
         let actual = store.query_view(&query).unwrap().unwrap();
         assert_eq!(actual.nodes.len(), 1, "{case}: seed missing");
         assert_eq!(actual.nodes[0].id, query.seed, "{case}: wrong seed");
-        let main_ids: Vec<&str> = expected["calls"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|call| call.as_str().unwrap())
-            .collect();
-        let observed_ids: Vec<&str> = actual.calls.iter().map(|call| call.id.as_str()).collect();
-        assert_eq!(observed_ids, main_ids, "{case}: main call order");
+        let mut actual_seed = serde_json::to_value(&actual.nodes[0]).unwrap();
+        actual_seed["id"] = main_seed["id"].clone();
+        assert_eq!(actual_seed, main_seed, "{case}: seed differs from main");
+        let main_ids = expected["calls"].as_array().unwrap();
+        assert_eq!(
+            actual.calls.len(),
+            main_ids.len(),
+            "{case}: main call count"
+        );
+        let mut observed_ids = BTreeSet::new();
+        for (call, main_id) in actual.calls.iter().zip(main_ids) {
+            assert!(observed_ids.insert(&call.id), "{case}: duplicate call ID");
+            assert_eq!(call.caller, query.seed, "{case}: wrong caller");
+            let main_row = oracle["rows"]["calls"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["id"] == *main_id)
+                .unwrap();
+            let main_call: serde_json::Value =
+                serde_json::from_str(main_row["payload"].as_str().unwrap()).unwrap();
+            let mut observed = serde_json::to_value(call).unwrap();
+            observed["id"] = main_call["id"].clone();
+            observed["caller"] = main_call["caller"].clone();
+            // Compare each call in MAIN's frozen order, including start/end
+            // bytes, ordinal, callee range, and provenance. Only root-scoped
+            // references are normalized; no candidate row defines an oracle.
+            assert_eq!(observed, main_call, "{case}: call/order differs from main");
+        }
         assert_eq!(
             actual.truncated,
             expected["truncated"].as_bool().unwrap(),
@@ -627,19 +678,6 @@ fn main_nested_query_view_keeps_call_order_limit_and_exclusion() {
             .collect();
         assert_eq!(actual.warnings, main_warnings, "{case}");
         assert!(actual.regions.is_empty(), "{case}: unexpected region");
-        for call in &actual.calls {
-            let main_row = oracle["rows"]["calls"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|row| row["id"].as_str() == Some(call.id.as_str()))
-                .unwrap();
-            assert_eq!(
-                serde_json::to_string(call).unwrap().as_bytes(),
-                main_row["payload"].as_str().unwrap().as_bytes(),
-                "{case}: call payload differs from main"
-            );
-        }
     }
     // Main's first call is the longer of two calls starting at byte 75.
     // This is main-produced evidence for endByte DESC, not a synthetic full tie.
@@ -1259,8 +1297,19 @@ fn cache_loss_never_reuses_revision_tokens_and_sql_enforces_foreign_keys() {
         db.execute("DELETE FROM document_versions WHERE id=(SELECT document_version_id FROM revision_documents WHERE path='a.js')", [])
             .is_err()
     );
-    let a = symbol_id(&captured.0, "a");
-    assert!(db.execute("DELETE FROM graph_nodes WHERE projection_id=(SELECT graph_projection_id FROM revision_documents WHERE path='a.js') AND id=?1", [&a]).is_err());
+    // Graph nodes no longer have call-edge FKs in schema 13. Check the
+    // retained graph_display_labels -> graph_nodes FK with a dangling label.
+    let label_error = db
+        .execute(
+            "INSERT INTO graph_display_labels(projection_id,id,label) VALUES ((SELECT graph_projection_id FROM revision_documents WHERE path='a.js'), ?1, 'orphan')",
+            ["missing-node"],
+        )
+        .unwrap_err();
+    assert!(matches!(
+        label_error,
+        rusqlite::Error::SqliteFailure(ref error, _)
+            if error.code == rusqlite::ErrorCode::ConstraintViolation
+    ));
     drop(leader);
     drop(store);
     drop(db);
