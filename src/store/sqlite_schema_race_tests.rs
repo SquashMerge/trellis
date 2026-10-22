@@ -641,7 +641,7 @@ fn second_connection_adds_legacy_trigger_after_admission_before_publish_lock() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        11
+        12
     );
     let forged: i64 = db
         .query_row(

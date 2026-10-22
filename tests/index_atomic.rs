@@ -1155,7 +1155,10 @@ fn current_producer_binding_preserves_old_pin_and_queue() {
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .unwrap();
-    assert_eq!((initial_bound, initial_epoch), (1, first.index_revision as i64));
+    assert_eq!(
+        (initial_bound, initial_epoch),
+        (1, first.index_revision as i64)
+    );
     drop(db);
     assert_eq!(
         store.source_at("A.java", Some(first)).unwrap().unwrap().1,

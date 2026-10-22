@@ -3506,8 +3506,7 @@ fn newer_disposable_schema_is_refused_without_rebuild_or_deletion() {
         .join(identity.root_key)
         .join("index.db");
     let db = Connection::open(&path).unwrap();
-    db.execute_batch("PRAGMA user_version=13")
-        .unwrap();
+    db.execute_batch("PRAGMA user_version=13").unwrap();
     drop(db);
     let inode = fs::metadata(&path).unwrap().ino();
     let error = Store::open_for_tests(state.path(), root.path()).unwrap_err();
@@ -3529,7 +3528,9 @@ fn newer_disposable_schema_is_refused_without_rebuild_or_deletion() {
         .unwrap();
     assert_eq!(version, 13);
     let metadata_version: i64 = db
-        .query_row("SELECT schema_version FROM index_metadata", [], |r| r.get(0))
+        .query_row("SELECT schema_version FROM index_metadata", [], |r| {
+            r.get(0)
+        })
         .unwrap();
     assert_eq!(metadata_version, 12);
     assert_eq!(generation, old.index_generation.to_string());
