@@ -224,7 +224,7 @@ fn four_languages_normalized_rows_and_pinned_bytes_are_coherent() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        12
+        13
     );
     let count: i64 = db
         .query_row(
@@ -417,8 +417,7 @@ fn empty_workspace_has_native_pair_without_document_rows() {
         "revision_documents",
         "graph_projections",
         "graph_nodes",
-        "graph_calls",
-        "graph_regions",
+        "graph_display_labels",
         "class_projections",
         "native_version_calls",
         "native_version_declarations",
@@ -770,7 +769,7 @@ fn physical_v8_native_v4_index_recreates_before_role_column_read() {
         rebuilt
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        12
+        13
     );
     let stamp: String = rebuilt
         .query_row("SELECT extractor_version FROM index_metadata", [], |row| {
@@ -1015,11 +1014,10 @@ fn selected_sources_bind_paired_hash_bytes_and_graph_path_without_pin_change() {
     .unwrap();
     // The admitted manifest still names the same immutable document version.
     db.execute_batch("COMMIT").unwrap();
-    // v8 has no duplicated files.payload. Forge the selected graph row's
-    // serialized path without changing its projection, document version or pin.
+    // Forge a selected narrow graph node without changing its projection or pin.
     let projection = live_graph_projection(&db, "flow.js");
     assert_eq!(db.execute(
-        "UPDATE graph_nodes SET payload=json_set(payload,'$.path','forged.js') WHERE projection_id=?1 AND path='flow.js' AND id=(SELECT id FROM graph_nodes WHERE projection_id=?1 AND path='flow.js' ORDER BY id LIMIT 1)",
+        "UPDATE graph_nodes SET name='forgedName' WHERE projection_id=?1 AND id=(SELECT id FROM graph_nodes WHERE projection_id=?1 ORDER BY id LIMIT 1)",
         [&projection],
     ).unwrap(), 1);
     let payload_store = Store::open_for_tests(state.path(), root.path()).unwrap();
@@ -1158,7 +1156,7 @@ fn direct_native_ranges_regions_and_coverage_reject_selected_sql_edits() {
 
 #[test]
 #[cfg(feature = "test-support")]
-fn pinned_graph_call_payload_must_match_native_before_query_and_sequence() {
+fn pinned_native_call_must_match_source_before_query_and_sequence() {
     let (state, root, store, cancel) = fixture();
     let leader = store.publication_for_tests().unwrap();
     let pin = publish(
@@ -1181,44 +1179,22 @@ fn pinned_graph_call_payload_must_match_native_before_query_and_sequence() {
         serde_json::from_value(serde_json::json!({"seed":owner})).unwrap();
     assert!(!store.query_view(&query).unwrap().unwrap().calls.is_empty());
     assert!(store.sequence_at(&owner, pin, true).unwrap().is_some());
-    let call_id: String = db
-        .query_row(
-            "SELECT id FROM graph_calls WHERE projection_id=?1 ORDER BY id LIMIT 1",
-            [live_graph_projection(&db, "flow.js")],
-            |r| r.get(0),
-        )
-        .unwrap();
-    let original: String = db
-        .query_row(
-            "SELECT payload FROM graph_calls WHERE projection_id=?1 AND id=?2",
-            rusqlite::params![live_graph_projection(&db, "flow.js"), call_id],
-            |r| r.get(0),
-        )
-        .unwrap();
-    let original_value: serde_json::Value = serde_json::from_str(&original).unwrap();
-    assert!(
-        original_value["calleeText"].is_string(),
-        "fixture must contain measured calleeText"
+    let version = live_document_version(&db, "flow.js");
+    assert_eq!(
+        db.execute(
+            "UPDATE native_version_calls SET spelling='fabricatedCallee' WHERE version_id=?1 AND id=(SELECT id FROM native_version_calls WHERE version_id=?1 AND spelling IS NOT NULL ORDER BY id LIMIT 1)",
+            [&version],
+        ).unwrap(),
+        1,
     );
-    let mut forged = original_value.clone();
-    forged["calleeText"] = serde_json::json!("fabricatedCallee");
-    db.execute(
-        "UPDATE graph_calls SET payload=?1 WHERE projection_id=?2 AND id=?3",
-        rusqlite::params![
-            forged.to_string(),
-            live_graph_projection(&db, "flow.js"),
-            call_id
-        ],
-    )
-    .unwrap();
     assert_eq!(store.status().unwrap().revision, pin);
     let query_clone = store.clone();
     let query_error = store.query_view(&query).unwrap_err();
     assert!(
-        query_error.to_string().contains("native_evidence_required")
+        query_error.to_string().contains("incompatible_index")
             && query_error
                 .to_string()
-                .contains("graph call differs from measured native row"),
+                .contains("selected native calls differ from source"),
         "{query_error:#}"
     );
     assert_current_corruption(query_clone.status().unwrap_err());
@@ -1230,10 +1206,10 @@ fn pinned_graph_call_payload_must_match_native_before_query_and_sequence() {
     assert!(
         sequence_error
             .to_string()
-            .contains("native_evidence_required")
+            .contains("incompatible_index")
             && sequence_error
                 .to_string()
-                .contains("graph call differs from measured native row"),
+                .contains("selected native calls differ from source"),
         "{sequence_error:#}"
     );
     let java: String = db
@@ -1517,58 +1493,7 @@ fn selected_native_text_total_budget_is_not_count_times_single_row_limit() {
 
 #[test]
 #[cfg(feature = "test-support")]
-fn graph_node_call_and_region_payloads_each_have_predecode_byte_envelope() {
-    let (state, root, store, cancel) = fixture();
-    let leader = store.publication_for_tests().unwrap();
-    let pin = publish(
-        &store,
-        root.path(),
-        &cancel,
-        store.index_baseline().unwrap(),
-        &leader,
-    )
-    .unwrap();
-    let db = Connection::open(published_db(state.path(), root.path())).unwrap();
-    for table in ["graph_nodes", "graph_calls", "graph_regions"] {
-        // These three fixed SQL identifiers are the selected graph row families.
-        let projection = live_graph_projection(&db, "flow.js");
-        let query =
-            format!("SELECT id,payload FROM {table} WHERE projection_id=?1 ORDER BY id LIMIT 1");
-        let (id, original): (String, String) = db
-            .query_row(&query, [&projection], |r| Ok((r.get(0)?, r.get(1)?)))
-            .unwrap();
-        db.execute(
-            &format!("UPDATE {table} SET payload=?1 WHERE projection_id=?2 AND id=?3"),
-            rusqlite::params!["invalid-json".repeat(8000), projection, id],
-        )
-        .unwrap();
-        let selected_store = Store::open_for_tests(state.path(), root.path()).unwrap();
-        assert_eq!(selected_store.status().unwrap().revision, pin);
-        let selected_clone = selected_store.clone();
-        let error = selected_store
-            .native_declarations_at(pin, "javascript", "hello")
-            .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("selected graph row byte budget exceeded"),
-            "{table}: {error:#}"
-        );
-        let closed = selected_clone
-            .native_declarations_at(pin, "java", "go")
-            .unwrap_err();
-        assert_current_corruption(closed);
-        db.execute(
-            &format!("UPDATE {table} SET payload=?1 WHERE projection_id=?2 AND id=?3"),
-            rusqlite::params![original, projection, id],
-        )
-        .unwrap();
-    }
-}
-
-#[test]
-#[cfg(feature = "test-support")]
-fn selected_graph_rows_share_a_source_scoped_aggregate_byte_envelope() {
+fn selected_graph_display_label_must_match_derived_graph() {
     let (state, root, store, cancel) = fixture();
     let leader = store.publication_for_tests().unwrap();
     let pin = publish(
@@ -1581,20 +1506,56 @@ fn selected_graph_rows_share_a_source_scoped_aggregate_byte_envelope() {
     .unwrap();
     let db = Connection::open(published_db(state.path(), root.path())).unwrap();
     db.pragma_update(None, "foreign_keys", "ON").unwrap();
+    // No SCIP labels were captured. A foreign-key-valid extra label must not
+    // become a graph symbol or escape selected-document attestation.
+    assert_eq!(
+        db.execute(
+            "INSERT INTO graph_display_labels(projection_id,id,label)
+             SELECT projection_id,id,'forgedLabel' FROM graph_nodes
+             WHERE projection_id=?1 ORDER BY id LIMIT 1",
+            [live_graph_projection(&db, "flow.js")],
+        )
+        .unwrap(),
+        1,
+    );
+    let selected_clone = store.clone();
+    let error = store
+        .native_declarations_at(pin, "javascript", "hello")
+        .unwrap_err();
+    assert!(error.to_string().contains("incompatible_index"), "{error:#}");
+    assert!(!error.to_string().contains("forgedLabel"), "{error:#}");
+    let closed = selected_clone
+        .native_declarations_at(pin, "java", "go")
+        .unwrap_err();
+    assert_current_corruption(closed);
+}
+
+#[test]
+#[cfg(feature = "test-support")]
+fn selected_graph_nodes_row_count_is_bounded_before_derivation() {
+    let (state, root, store, cancel) = fixture();
+    let leader = store.publication_for_tests().unwrap();
+    let pin = publish(
+        &store,
+        root.path(),
+        &cancel,
+        store.index_baseline().unwrap(),
+        &leader,
+    )
+    .unwrap();
+    let db = Connection::open(published_db(state.path(), root.path())).unwrap();
+    db.pragma_update(None, "foreign_keys", "ON").unwrap();
+    // This small source has a 1024-row minimum budget. The narrow rows are
+    // counted before reconstructing any derived graph payloads.
     db.execute(
-        "WITH RECURSIVE n(v) AS (SELECT 1 UNION ALL SELECT v+1 FROM n WHERE v<40)
-        INSERT INTO graph_nodes(projection_id,id,name,path,payload)
-        SELECT ?1,printf('forged-graph-%d',v),'forged','flow.js',?2 FROM n",
-        rusqlite::params![
-            live_graph_projection(&db, "flow.js"),
-            "invalid-json".repeat(800)
-        ],
+        "WITH RECURSIVE n(v) AS (SELECT 1 UNION ALL SELECT v+1 FROM n WHERE v<1025)
+         INSERT INTO graph_nodes(projection_id,id,name,kind)
+         SELECT ?1,printf('forged-graph-%d',v),'forged','function' FROM n",
+        [live_graph_projection(&db, "flow.js")],
     )
     .unwrap();
     let fk_count: i64 = db
-        .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
-            r.get(0)
-        })
+        .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| r.get(0))
         .unwrap();
     assert_eq!(fk_count, 0);
     let selected_clone = store.clone();
@@ -1602,9 +1563,7 @@ fn selected_graph_rows_share_a_source_scoped_aggregate_byte_envelope() {
         .native_declarations_at(pin, "javascript", "hello")
         .unwrap_err();
     assert!(
-        error
-            .to_string()
-            .contains("selected graph row byte budget exceeded"),
+        error.to_string().contains("selected evidence row budget exceeded"),
         "{error:#}"
     );
     let closed = selected_clone
@@ -3506,7 +3465,7 @@ fn newer_disposable_schema_is_refused_without_rebuild_or_deletion() {
         .join(identity.root_key)
         .join("index.db");
     let db = Connection::open(&path).unwrap();
-    db.execute_batch("PRAGMA user_version=13").unwrap();
+    db.execute_batch("PRAGMA user_version=14").unwrap();
     drop(db);
     let inode = fs::metadata(&path).unwrap().ino();
     let error = Store::open_for_tests(state.path(), root.path()).unwrap_err();
@@ -3526,13 +3485,13 @@ fn newer_disposable_schema_is_refused_without_rebuild_or_deletion() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(version, 13);
+    assert_eq!(version, 14);
     let metadata_version: i64 = db
         .query_row("SELECT schema_version FROM index_metadata", [], |r| {
             r.get(0)
         })
         .unwrap();
-    assert_eq!(metadata_version, 12);
+    assert_eq!(metadata_version, 13);
     assert_eq!(generation, old.index_generation.to_string());
 }
 
@@ -4712,8 +4671,7 @@ fn cold_stream_matches_plain_artifact_publication_rows() {
         "graph_projections",
         "class_projections",
         "graph_nodes",
-        "graph_calls",
-        "graph_regions",
+        "graph_display_labels",
         "classes",
         "class_relations",
         "native_version_coverage_roles",

@@ -621,7 +621,7 @@ async fn cached_packet_checks_only_its_selected_source_and_graph_witnesses() {
 }
 
 #[tokio::test]
-async fn cached_packet_refuses_changed_selected_graph_call_under_same_pin() {
+async fn cached_packet_refuses_changed_selected_native_call_under_same_pin() {
     let (dir, store, _graph, _state, app, request, _session) = setup(0);
     let (status, preview) = call(&app, "POST", "/api/questions/preview", request).await;
     assert_eq!(status, StatusCode::OK, "{preview}");
@@ -638,7 +638,7 @@ async fn cached_packet_refuses_changed_selected_graph_call_under_same_pin() {
     let db = rusqlite::Connection::open(db_path).unwrap();
     assert_eq!(
         db.execute(
-            "UPDATE graph_calls SET payload=json_set(payload,'$.calleeText','forged') WHERE id=?1 AND projection_id IN (SELECT m.graph_projection_id FROM revision_documents m JOIN native_revisions r ON r.id=m.revision_id JOIN index_metadata current ON current.index_revision=r.published_index_revision)",
+            "UPDATE native_version_calls SET spelling='forged' WHERE id=?1 AND version_id IN (SELECT m.document_version_id FROM revision_documents m JOIN native_revisions r ON r.id=m.revision_id JOIN index_metadata current ON current.index_revision=r.published_index_revision)",
             [id],
         )
         .unwrap(),
