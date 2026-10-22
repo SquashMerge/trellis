@@ -347,14 +347,10 @@ impl IdentityRegistry {
             ensure!(prior == &full, "native identity handle collision: {handle}");
         } else {
             #[cfg(test)]
-            let additional = if std::mem::take(&mut self.fail_reservation) {
-                usize::MAX
-            } else {
-                1
-            };
-            #[cfg(not(test))]
-            let additional = 1;
-            self.handles.try_reserve(additional)?;
+            if std::mem::take(&mut self.fail_reservation) {
+                self.handles.try_reserve(usize::MAX)?;
+            }
+            self.handles.try_reserve(1)?;
             if let Some(order) = &mut self.order {
                 order.try_reserve(1)?;
                 order.push(key);

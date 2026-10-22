@@ -222,17 +222,18 @@ fn graph_provenance() -> Provenance {
         semantic: SemanticState::Unavailable,
     }
 }
-/// A SCIP symbol is strictly untrusted UI copy, keyed only to a captured native SyntaxId.
-/// A malformed/missing/stale optional display artifact contributes no labels.
-/// Parse optional display-only SCIP input once for a full spooled run. Keep
-/// only first-in-SCIP-order documents with admitted matching source hashes;
-/// malformed inputs and the >1,000-document cutoff still contribute no labels.
+/// Validated optional SCIP display documents indexed by admitted source path.
 pub(crate) struct PreparedDisplayLabels<'a> {
     documents: Vec<(scip::types::Document, &'a SourceFile)>,
     by_path: BTreeMap<String, usize>,
 }
 
-pub(crate) fn prepare_spooled_display_labels<'a>(
+/// A SCIP symbol is strictly untrusted UI copy, keyed only to a captured native SyntaxId.
+/// A malformed/missing/stale optional display artifact contributes no labels.
+/// Parse optional display-only SCIP input once for a full or spooled run. Keep
+/// only first-in-SCIP-order documents with admitted matching source hashes;
+/// malformed inputs and the >1,000-document cutoff still contribute no labels.
+pub(crate) fn prepare_display_labels<'a>(
     options: &IndexOptions,
     capture: &'a Capture,
 ) -> PreparedDisplayLabels<'a> {
@@ -289,7 +290,7 @@ fn measured_display_labels(
     capture: &Capture,
     native: &native_evidence::Artifact,
 ) -> BTreeMap<String, String> {
-    let prepared = prepare_spooled_display_labels(options, capture);
+    let prepared = prepare_display_labels(options, capture);
     measured_display_labels_prepared(native, &prepared, None)
 }
 

@@ -4737,6 +4737,13 @@ fn cold_stream_matches_plain_artifact_publication_rows() {
         .map(Result::unwrap)
         .collect()
     };
+    // Compare all native revision header fields except the selected revision
+    // key and publication sequence, which differ by design between stores.
+    let revision_header = "SELECT source_set_id,toolchain_hash,config_hash,dependency_hash,native_revision_id,source_inventory,dependency_observations,reconcile_options,class_warnings,class_truncated,graph_stats,graph_diagnostics FROM native_revisions";
+    assert_eq!(
+        values(&plain_db, revision_header),
+        values(&stream_db, revision_header)
+    );
     for table in [
         "document_versions",
         "graph_projections",
@@ -4811,18 +4818,85 @@ fn empty_cold_stream_preserves_plain_native_header() {
             .join(&identity.root_key)
             .join("index.db")
     };
-    let header = |state: &std::path::Path| -> (String, String, String, String) {
-        Connection::open(index_path(state))
-            .unwrap()
-            .query_row(
-                "SELECT source_set_id,toolchain_hash,config_hash,source_inventory FROM native_revisions",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
+    let header = |state: &std::path::Path| -> Vec<rusqlite::types::Value> {
+        let db = Connection::open(index_path(state)).unwrap();
+        let mut stmt = db.prepare("SELECT source_set_id,toolchain_hash,config_hash,dependency_hash,native_revision_id,source_inventory,dependency_observations,reconcile_options,class_warnings,class_truncated,graph_stats,graph_diagnostics FROM native_revisions").unwrap();
+        let count = stmt.column_count();
+        stmt.query_row([], |row| (0..count).map(|i| row.get(i)).collect())
             .unwrap()
     };
     assert_eq!(header(state_plain.path()), header(state_stream.path()));
     assert_eq!(stream.status().unwrap().revision, stream_pin);
+}
+
+#[test]
+#[cfg(feature = "test-support")]
+fn capped_cold_stream_preserves_plain_revision_header_and_catalog_warning() {
+    // Cross the production 20,000-class catalog cap with normal-size source
+    // files, not with a test-only limit or a huge individual document.
+    let root = tempfile::tempdir().unwrap();
+    for file in 0..101 {
+        let source: String = (0..200)
+            .map(|class| format!("class C{file}_{class} {{}}\n"))
+            .collect();
+        fs::write(root.path().join(format!("classes_{file:03}.java")), source).unwrap();
+    }
+    let plain_state = tempfile::tempdir().unwrap();
+    let stream_state = tempfile::tempdir().unwrap();
+    let plain = Store::open_for_tests(plain_state.path(), root.path()).unwrap();
+    let stream = Store::open_for_tests(stream_state.path(), root.path()).unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let leader = plain.publication_for_tests().unwrap();
+    publish(
+        &plain,
+        root.path(),
+        &cancel,
+        plain.index_baseline().unwrap(),
+        &leader,
+    )
+    .unwrap();
+    trellis::index_coordinator::reconcile_workspace(
+        &stream,
+        &IndexOptions::new(root.path().to_owned()),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    let identity =
+        trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+            .unwrap();
+    let read_header = |state: &std::path::Path| {
+        let db = Connection::open(
+            state
+                .join("cache/indexes")
+                .join(&identity.root_key)
+                .join("index.db"),
+        )
+        .unwrap();
+        let mut stmt = db.prepare("SELECT source_set_id,toolchain_hash,config_hash,dependency_hash,native_revision_id,source_inventory,dependency_observations,reconcile_options,class_warnings,class_truncated,graph_stats,graph_diagnostics FROM native_revisions").unwrap();
+        let columns = stmt.column_count();
+        stmt.query_row([], |row| {
+            (0..columns)
+                .map(|i| row.get::<_, rusqlite::types::Value>(i))
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .unwrap()
+    };
+    let header = read_header(plain_state.path());
+    assert_eq!(header, read_header(stream_state.path()));
+    assert_eq!(header[9], rusqlite::types::Value::Integer(1));
+    let warnings = match &header[8] {
+        rusqlite::types::Value::Text(text) => serde_json::from_str::<Vec<String>>(text).unwrap(),
+        other => panic!("expected class warning JSON, got {other:?}"),
+    };
+    assert_eq!(
+        warnings,
+        vec![
+            "Class catalog declaration limit reached (20000)",
+            "Declared types are terminal source text, not class relationships. Direct Java/Python declarations only; no function-body, conditional/anonymous class, generated member, wildcard-import, type-alias or dependency discovery.",
+            "Incomplete class declaration registry: some declarations may be absent.",
+        ]
+    );
 }
 
 #[test]

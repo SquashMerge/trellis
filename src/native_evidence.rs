@@ -10,10 +10,11 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 #[cfg(test)]
+use std::os::unix::fs::MetadataExt;
+#[cfg(test)]
 use std::path::PathBuf;
 use std::{
     collections::{BTreeMap, BTreeSet},
-    os::unix::fs::MetadataExt,
     path::Path,
 };
 use tree_sitter::Node;
@@ -677,8 +678,10 @@ pub(crate) fn full_validations_for_tests() -> usize {
 }
 
 /// Call-scoped evidence from the full native pipeline. `Measured` fires only
-/// after extraction of that captured document; `Validated` fires only after
-/// the structural validation of the whole built artifact has succeeded.
+/// after the ordered owner writes that document's validated facts to disposable
+/// scratch; `Validated` fires after its document-level structural and graph
+/// checks, class extraction and identity admission succeed. Neither event means
+/// the entire artifact has been validated or published.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FullNativeStage {
     Measured,
@@ -980,6 +983,8 @@ fn build_native_with(
 /// before advancing, so the earliest sorted-file failure is reported.
 pub(crate) struct FullDocumentSpool {
     header: Artifact,
+    // Drop the connection before the separate file handle: closing another
+    // descriptor on a live SQLite file would discard this process's POSIX locks.
     conn: rusqlite::Connection,
     _file: tempfile::NamedTempFile,
     stats: IndexStats,
@@ -1068,7 +1073,7 @@ impl FullDocumentSpool {
             None,
         ));
     }
-    pub(crate) fn write_extraction(
+    fn write_extraction(
         &self,
         index: usize,
         extraction: &crate::classes::FileExtraction,
@@ -1082,7 +1087,7 @@ impl FullDocumentSpool {
             "native spool extraction path mismatch"
         );
         self.conn.execute(
-            "INSERT OR REPLACE INTO extractions (ordinal, payload) VALUES (?1, ?2)",
+            "INSERT INTO extractions (ordinal, payload) VALUES (?1, ?2)",
             rusqlite::params![i64::try_from(index)?, serde_json::to_vec(extraction)?],
         )?;
         Ok(())
@@ -1244,29 +1249,19 @@ fn spool_full_capture_with(
     let (header, files) = build_native_header(capture, root, root_id)?;
     // The store supplies its already-prepared managed index directory, including
     // isolated test topology. Never select a production home independently.
-    let metadata = std::fs::symlink_metadata(spool_dir)?;
-    ensure!(
-        metadata.is_dir()
-            && !metadata.file_type().is_symlink()
-            && metadata.uid() == unsafe { libc::geteuid() }
-            && metadata.mode() & 0o077 == 0,
-        "native spool directory is not private"
-    );
     let file = tempfile::Builder::new()
         .prefix("native-spool-")
         .suffix(".db")
         .tempfile_in(spool_dir)?;
     let conn = rusqlite::Connection::open(file.path())?;
+    // SQLite keeps its own descriptor. Unlink before any schema writes so a
+    // crash cannot strand the disposable spool. OFF mode creates no journal.
+    std::fs::remove_file(file.path()).context("remove private native spool pathname")?;
     conn.execute_batch(
         "PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA cache_size=-2048;
          CREATE TABLE documents (ordinal INTEGER PRIMARY KEY, facts BLOB NOT NULL, graph BLOB);
          CREATE TABLE extractions (ordinal INTEGER PRIMARY KEY, payload BLOB NOT NULL);",
     )?;
-    // SQLite retains its open file descriptor. Unlink the disposable spool now,
-    // so a crash cannot strand gigabytes of private scratch in the cache. No
-    // journal sidecar exists in OFF mode; keep the separate NamedTempFile handle
-    // alive until after SQLite's connection drops (POSIX close-lock rule).
-    std::fs::remove_file(file.path()).context("remove private native spool pathname")?;
     let mut spool = FullDocumentSpool {
         header,
         conn,
@@ -1278,15 +1273,29 @@ fn spool_full_capture_with(
     };
     // The full revision document vector remains in the header. Worker shells
     // carry only revision ID and inputs, never the complete document vector.
-    let mut shell = spool.header.clone();
-    shell.revision.documents.clear();
+    let shell = Artifact {
+        producer: spool.header.producer.clone(),
+        source_set: spool.header.source_set.clone(),
+        revision: Revision {
+            documents: Vec::new(),
+            id: spool.header.revision.id.clone(),
+            source_set_id: spool.header.revision.source_set_id.clone(),
+            toolchain_hash: spool.header.revision.toolchain_hash.clone(),
+            config_hash: spool.header.revision.config_hash.clone(),
+            dependency_hash: spool.header.revision.dependency_hash.clone(),
+        },
+        coverage: Vec::new(),
+        provenance: Vec::new(),
+        declarations: Vec::new(),
+        calls: Vec::new(),
+        control_regions: Vec::new(),
+    };
     let documents = &spool.header.revision.documents;
     let pairs: Vec<(&SourceFile, &Document)> = files.into_iter().zip(documents).collect();
     // Only one graph projection is allowed for this capture. Per-document
     // projection does not claim again. Keep source/producer checks before work.
-    capture.verify(cancel)?;
     capture.claim_graph_projection()?;
-    let prepared_labels = crate::indexer::prepare_spooled_display_labels(options, capture);
+    let prepared_labels = crate::indexer::prepare_display_labels(options, capture);
     let mut ids = IdentityRegistry::default();
     spool.conn.execute_batch("BEGIN IMMEDIATE")?;
     for (chunk_index, chunk) in pairs.chunks(plan.chunk.max(1)).enumerate() {
@@ -4199,6 +4208,65 @@ mod full_document_spool_tests {
     }
 
     #[test]
+    fn cancellation_after_first_spooled_document_skips_next_chunk() {
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("a.py"), "def first(): return 1\n").unwrap();
+        fs::write(workspace.path().join("b.py"), "def second(): return 2\n").unwrap();
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let options = IndexOptions::new(workspace.path().to_owned());
+        let root = fs::canonicalize(workspace.path()).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
+        let stages = std::cell::RefCell::new(Vec::new());
+        let error = spool_full_capture_with(
+            &options,
+            &capture,
+            &root,
+            store.root_id(),
+            &cancel,
+            &|progress| {
+                if progress.phase == "parse" && progress.completed == 1 {
+                    cancel.store(true, std::sync::atomic::Ordering::Release);
+                }
+            },
+            |key, stage| stages.borrow_mut().push((key.path.clone(), stage)),
+            ExtractionPlan {
+                workers: 2,
+                chunk: 1,
+            },
+            &|_, _| Ok(()),
+            &|_, _| Ok(()),
+            &|_, _, _| Ok(()),
+            &|_, _| Ok(()),
+            &store.native_spool_dir().unwrap(),
+        )
+        .err()
+        .expect("cancellation must stop the next chunk");
+        assert!(
+            error.to_string().contains("indexing cancelled"),
+            "{error:#}"
+        );
+        assert_eq!(
+            stages.into_inner(),
+            vec![
+                ("a.py".into(), FullNativeStage::Measured),
+                ("a.py".into(), FullNativeStage::Validated),
+            ]
+        );
+        assert!(
+            fs::read_dir(store.native_spool_dir().unwrap())
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("native-spool-")),
+            "failed spool must not leave a scratch pathname"
+        );
+    }
+
+    #[test]
     fn earliest_validation_error_precedes_later_extraction_error() {
         let state = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
@@ -4210,6 +4278,8 @@ mod full_document_spool_tests {
         let cancel = Arc::new(AtomicBool::new(false));
         let capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
         let stages = std::cell::RefCell::new(Vec::new());
+        let (completed, observed) = std::sync::mpsc::sync_channel(1);
+        let observed = std::sync::Mutex::new(observed);
         let err = spool_full_capture_with(
             &options,
             &capture,
@@ -4224,12 +4294,18 @@ mod full_document_spool_tests {
             },
             &|file, _ids| {
                 if file.path == "b.py" {
+                    completed.send(()).unwrap();
                     anyhow::bail!("injected second extraction failure")
                 }
                 Ok(())
             },
             &|document, facts| {
                 if document.key.path == "a.py" {
+                    observed
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(std::time::Duration::from_secs(60))
+                        .expect("later worker failed before earlier validation");
                     facts.declarations[0].syntax_id = "sid:v1:invalid".into();
                 }
                 Ok(())
@@ -4241,8 +4317,11 @@ mod full_document_spool_tests {
         .err()
         .expect("ordered failure");
         assert!(
-            !err.to_string()
-                .contains("injected second extraction failure"),
+            format!("{err:#}").contains("native stable ID collision/duplicate"),
+            "unexpected earlier validation error: {err:#}"
+        );
+        assert!(
+            !format!("{err:#}").contains("injected second extraction failure"),
             "{err:#}"
         );
         // Validation runs on the worker, before the ordered owner writes it.
