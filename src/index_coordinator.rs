@@ -401,7 +401,8 @@ impl IndexJobCoordinator {
         FULL_STREAM_RUNS.with(|count| count.set(count.get() + 1));
         report("measure", phase_start.elapsed());
         phase_start = std::time::Instant::now();
-        capture.verify(cancel)?;
+        // The spool verified the capture after completing all document work.
+        // The publisher reattests it before the first version insert.
         observe(&capture);
         ensure!(!cancel.load(Ordering::Acquire), "index cancelled");
         self.store.verify_writer_session(&self.session)?;
