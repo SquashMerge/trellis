@@ -632,7 +632,7 @@ fn second_connection_adds_legacy_trigger_after_admission_before_publish_lock() {
     assert_eq!(
         (schema, marker.as_str(), generation, revision),
         (
-            11,
+            12,
             "native-v6-delta-v1",
             old.index_generation.to_string(),
             old.index_revision as i64

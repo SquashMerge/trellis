@@ -125,8 +125,11 @@ fn first_publication_creates_epoch_and_attests_selected_producer() {
 
     let state = tempfile::tempdir().unwrap();
     let work = tempfile::tempdir().unwrap();
-    fs::write(work.path().join("A.java"), "class A { int run() { return 1; } }\n")
-        .unwrap();
+    fs::write(
+        work.path().join("A.java"),
+        "class A { int run() { return 1; } }\n",
+    )
+    .unwrap();
     let store = Store::open_for_tests(state.path(), work.path()).unwrap();
     let pin = IndexJobCoordinator::prepare(&store, None)
         .unwrap()
