@@ -176,7 +176,7 @@ fn injected_sql_failure_after_insert_preserves_previous_revision() {
     let next = index_workspace(&options, &cancel, |_| {}).unwrap();
     let id = next.calls[1].id.replace('\'', "''");
     let db = rusqlite::Connection::open(index_db(&state)).unwrap();
-    db.execute_batch(&format!("CREATE TRIGGER abort_second_call BEFORE INSERT ON graph_calls WHEN NEW.projection_id IS NOT NULL AND NEW.id='{id}' BEGIN SELECT RAISE(ABORT,'injected post-write failure'); END;")).unwrap();
+    db.execute_batch(&format!("CREATE TRIGGER abort_second_call BEFORE INSERT ON native_version_calls WHEN NEW.version_id IS NOT NULL AND NEW.id='{id}' BEGIN SELECT RAISE(ABORT,'injected post-write failure'); END;")).unwrap();
     drop(db);
     let unchanged = fs::read(index_db(&state)).unwrap();
     let failure = publish_bundle(

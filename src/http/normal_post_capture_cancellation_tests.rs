@@ -38,18 +38,17 @@ fn pair_snapshot(index: &std::path::Path) -> PairSnapshot {
             .unwrap();
     assert_eq!(
         tables.len(),
-        35,
-        "compare exact v9 derived evidence inventory"
+        34,
+        "compare exact schema-13 derived evidence inventory"
     );
     let expected = vec![
         "class_projections",
         "class_relations",
         "classes",
         "document_versions",
-        "graph_calls",
+        "graph_display_labels",
         "graph_nodes",
         "graph_projections",
-        "graph_regions",
         "native_binding_epoch",
         "native_producer_inputs",
         "native_producer_languages",
@@ -81,7 +80,7 @@ fn pair_snapshot(index: &std::path::Path) -> PairSnapshot {
     assert_eq!(
         tables.iter().map(String::as_str).collect::<Vec<_>>(),
         expected,
-        "exact v9 table names: complete paired producer bindings and durable release debt"
+        "exact schema-13 table names: complete paired producer bindings and durable release debt"
     );
     for required in [
         "document_versions",

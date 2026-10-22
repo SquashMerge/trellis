@@ -400,8 +400,7 @@ fn unchanged_serve_reuses_selected_versions_and_detects_selected_source_corrupti
         "graph_projections",
         "class_projections",
         "graph_nodes",
-        "graph_calls",
-        "graph_regions",
+        "graph_display_labels",
         "classes",
         "class_relations",
         "native_version_declarations",
@@ -2480,7 +2479,7 @@ fn real_native_snapshot(home: &std::path::Path) -> Value {
     // Generation-specific binding control is checked separately; compare the
     // actual native/graph/class evidence across independent CLI/daemon roots.
     // Decision 0013's trigram prefilter tables are derived search state.
-    let mut names = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE '%trigrams%' AND name!='native_binding_epoch' AND name!='native_revision_supersessions' AND (name LIKE 'native_%' OR name IN ('document_versions','revision_documents','revision_capture_inputs','graph_projections','graph_nodes','graph_calls','graph_regions','class_projections','classes','class_relations')) ORDER BY name").unwrap();
+    let mut names = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE '%trigrams%' AND name!='native_binding_epoch' AND name!='native_revision_supersessions' AND (name LIKE 'native_%' OR name IN ('document_versions','revision_documents','revision_capture_inputs','graph_projections','graph_nodes','graph_display_labels','class_projections','classes','class_relations')) ORDER BY name").unwrap();
     for name in names.query_map([], |r| r.get::<_, String>(0)).unwrap() {
         let name = name.unwrap();
         let (predicate, alias) = match name.as_str() {
@@ -2514,7 +2513,7 @@ fn real_native_snapshot(home: &std::path::Path) -> Value {
                 "id IN (SELECT graph_projection_id FROM revision_documents WHERE revision_id=?1)",
                 "",
             ),
-            "graph_nodes" | "graph_calls" | "graph_regions" => (
+            "graph_nodes" | "graph_display_labels" => (
                 "projection_id IN (SELECT graph_projection_id FROM revision_documents WHERE revision_id=?1)",
                 "",
             ),
@@ -4055,9 +4054,9 @@ def sink():
             )
             .unwrap();
             assert_eq!(
-                sequence["steps"],
-                serde_json::json!(expected_sequence.steps),
-                "{name}: no extra invented or null-call steps beyond captured source projection"
+                sequence,
+                serde_json::to_value(&expected_sequence).unwrap(),
+                "{name}: complete sequence wire matches the captured source projection"
             );
 
             let (code, preview) = captured

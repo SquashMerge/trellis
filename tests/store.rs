@@ -54,7 +54,7 @@ fn private_stage_build_is_unpublished_and_cleans_only_its_own_inode() {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!((version, metadata_version), (12, 12));
+        assert_eq!((version, metadata_version), (13, 13));
         for name in [
             "document_versions",
             "revision_documents",
@@ -546,13 +546,28 @@ fn traversal_cycles_bounds_callbacks_and_boundaries() {
     let bounded = store.query_view(&q).unwrap().unwrap();
     assert_eq!(bounded.calls.len(), 1);
     assert!(bounded.truncated);
+    assert_eq!(
+        bounded.warnings,
+        vec!["Measured calls truncated at the request limit.".to_string()]
+    );
+    // This captured source has exactly two calls from a. At max_calls + 1,
+    // the overflow probe sees the second; at the boundary neither is lost.
+    q.max_calls = 2;
+    let at_boundary = store.query_view(&q).unwrap().unwrap();
+    assert_eq!(at_boundary.calls.len(), 2);
+    assert!(!at_boundary.truncated);
+    assert!(at_boundary.warnings.is_empty());
+    assert_eq!(bounded.calls, at_boundary.calls[..1]);
     q.max_calls = 0;
     assert!(store.query_view(&q).is_err());
     q.max_calls = 1;
     q.exclude_paths.push("a.js".into());
     let excluded = store.query_view(&q).unwrap().unwrap();
     assert_eq!(excluded.nodes.len(), 1);
+    assert_eq!(excluded.nodes[0], seed.nodes[0]);
     assert!(excluded.calls.is_empty());
+    assert!(!excluded.truncated);
+    assert!(excluded.warnings.is_empty());
     q.seed = "missing".into();
     assert!(store.query_view(&q).unwrap().is_none());
     q.depth = 6;
