@@ -81,6 +81,16 @@ fn api_error_walks_context_but_never_masks_sqlite_ioerr_rdlock() {
         (mapped.0, mapped.1),
         (StatusCode::INTERNAL_SERVER_ERROR, "internal_error")
     );
+    let rebuild = anyhow::Error::new(crate::store::RebuildInProgress {
+        since: std::time::SystemTime::now(),
+        documents: 10_000,
+    })
+    .context("selected evidence");
+    let mapped = ApiError::from(rebuild);
+    assert_eq!(
+        (mapped.0, mapped.1),
+        (StatusCode::SERVICE_UNAVAILABLE, "rebuild_in_progress")
+    );
 }
 
 #[test]

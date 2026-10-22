@@ -97,6 +97,10 @@ struct PublicationGate {
     /// for it to change; requests.db stays the only record of outcomes.
     terminal_commits: Mutex<u64>,
     terminal_changed: Condvar,
+    /// Set while a live publication's transaction has spilled pages to
+    /// `index.db`. In rollback-journal mode that spill takes EXCLUSIVE until
+    /// COMMIT, so every reader of the prior head is locked out (#210).
+    readers_blocked: Mutex<Option<RebuildInProgress>>,
     #[cfg(feature = "test-support")]
     test_ambiguous_settlement_once: AtomicBool,
     #[cfg(feature = "test-support")]
@@ -143,6 +147,91 @@ impl PublicationGate {
 }
 /// The closing bit of a queue's enqueue word; the rest counts enqueues.
 const CLOSING: usize = 1 << (usize::BITS - 1);
+
+/// A read found the index locked by a publication that has spilled to the
+/// file, which holds readers out until it commits (#210). Readers fail with
+/// this at once instead of waiting out their busy budget.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RebuildInProgress {
+    pub since: SystemTime,
+    pub documents: usize,
+}
+impl std::fmt::Display for RebuildInProgress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let held = SystemTime::now()
+            .duration_since(self.since)
+            .unwrap_or_default()
+            .as_secs();
+        write!(
+            f,
+            "rebuild_in_progress: a publication of {} documents has locked the index for {held} s; retry after it commits",
+            self.documents
+        )
+    }
+}
+impl std::error::Error for RebuildInProgress {}
+
+thread_local! {
+    /// The publication gate of the index this thread last opened for reading.
+    /// SQLite's busy handler is a plain function, so it finds the gate here.
+    static READ_GATE: std::cell::RefCell<Weak<PublicationGate>> = const { std::cell::RefCell::new(Weak::new()) };
+}
+
+/// Whether the index this thread reads is locked by a spilled publication.
+fn read_gate_blocked() -> Option<RebuildInProgress> {
+    READ_GATE
+        .with(|gate| gate.borrow().upgrade())
+        .and_then(|gate| gate.readers_blocked.lock().unwrap().clone())
+}
+
+/// Marks a live publication's transaction as blocking readers once SQLite
+/// has spilled its dirty pages to the file, and clears the mark when the
+/// transaction ends by commit, rollback, error or unwind.
+struct ReadersBlockedWatch<'a> {
+    gate: &'a PublicationGate,
+    documents: usize,
+    marked: bool,
+}
+impl<'a> ReadersBlockedWatch<'a> {
+    fn new(gate: &'a PublicationGate, documents: usize) -> Self {
+        Self {
+            gate,
+            documents,
+            marked: false,
+        }
+    }
+    fn check(&mut self, db: &Connection) {
+        if self.marked {
+            return;
+        }
+        let (mut current, mut highwater) = (0, 0);
+        // SAFETY: the handle belongs to a live connection used on this thread,
+        // and the out-pointers are valid locals.
+        let status = unsafe {
+            rusqlite::ffi::sqlite3_db_status(
+                db.handle(),
+                rusqlite::ffi::SQLITE_DBSTATUS_CACHE_SPILL,
+                &mut current,
+                &mut highwater,
+                0,
+            )
+        };
+        if status == rusqlite::ffi::SQLITE_OK && current > 0 {
+            *self.gate.readers_blocked.lock().unwrap() = Some(RebuildInProgress {
+                since: SystemTime::now(),
+                documents: self.documents,
+            });
+            self.marked = true;
+        }
+    }
+}
+impl Drop for ReadersBlockedWatch<'_> {
+    fn drop(&mut self) {
+        if self.marked {
+            *self.gate.readers_blocked.lock().unwrap() = None;
+        }
+    }
+}
 
 /// An enqueue counted as in flight on its queue's gate.
 pub(crate) struct EnqueueInFlight(Arc<PublicationGate>);
@@ -2692,6 +2781,9 @@ pub fn with_read_deadline<T>(deadline: Instant, read: impl FnOnce() -> T) -> T {
 /// scope's deadline allows, then give up (BUSY). A connection used after its
 /// scope ended falls back to a bounded wait (as `busy_timeout` would).
 fn read_deadline_busy(attempt: i32) -> bool {
+    if read_gate_blocked().is_some() {
+        return false;
+    }
     let pause = Duration::from_millis((1_u64 << attempt.clamp(0, 4) as u32).min(20));
     let remaining = match read_deadline() {
         Some(deadline) => deadline.saturating_duration_since(Instant::now()),
@@ -2723,7 +2815,12 @@ fn open_index_marker_probe(
     let db = protected_sqlite_open(path, flags)?;
     // Inside a read scope a read-only connection's waits share the scope's one
     // deadline (#142); otherwise each SQLite call waits up to `busy_wait`.
-    if !writable && read_deadline().is_some() && !busy_wait.is_zero() {
+    // A standard read outside a scope uses the same handler with its own 5 s
+    // budget, so it too stops waiting at once on a spilled publication (#210).
+    if !writable
+        && !busy_wait.is_zero()
+        && (read_deadline().is_some() || busy_wait == Duration::from_secs(5))
+    {
         storage_result(db.busy_handler(Some(read_deadline_busy)))?;
     } else {
         storage_result(db.busy_timeout(busy_wait))?;
@@ -2949,6 +3046,7 @@ pub(crate) fn transient_storage_contention(error: &anyhow::Error) -> bool {
     if error.chain().any(|cause| {
         cause.downcast_ref::<topology::StorageBusy>().is_some()
             || cause.downcast_ref::<SqliteContention>().is_some()
+            || cause.downcast_ref::<RebuildInProgress>().is_some()
             || matches!(cause.downcast_ref::<rusqlite::Error>(),
                 Some(rusqlite::Error::SqliteFailure(info, _))
                     if matches!(info.code,
@@ -3135,11 +3233,16 @@ fn storage_result<T>(result: rusqlite::Result<T>) -> Result<T> {
                 rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
             ) =>
         {
-            Err(SqliteContention(()).into())
+            match read_gate_blocked() {
+                Some(rebuild) => Err(rebuild.into()),
+                None => Err(SqliteContention(()).into()),
+            }
         }
         other => Ok(other?),
     }
 }
+#[cfg(test)]
+mod rebuild_in_progress_tests;
 #[cfg(test)]
 mod sqlite_contention_type_tests;
 
@@ -7462,6 +7565,9 @@ impl Store {
         self.identity.verify()?;
         let use_guard = self.roots.index_use_existing(&self.identity)?;
         let path = self.roots.index_db(&self.identity);
+        if !writable {
+            READ_GATE.with(|gate| *gate.borrow_mut() = Arc::downgrade(&self.publication_gate));
+        }
         let opened = if writable {
             open_index(&path, writable)
         } else {
@@ -10632,6 +10738,9 @@ impl Store {
         storage_result(db.pragma_update(None, "cache_size", -cache_kib))?;
         during_tx(PublishStage::BeforeTransaction, &db)?;
         let tx = storage_result(db.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        // Only the live index has readers; a private stage has none.
+        let mut readers_blocked = matches!(target, PublicationTarget::Live)
+            .then(|| ReadersBlockedWatch::new(&self.publication_gate, source_files.len()));
         let current = match target {
             PublicationTarget::Live => self
                 .recovery_baseline_preflight(&tx)
@@ -10922,6 +11031,9 @@ impl Store {
                         .get(&file.path)
                         .context("missing streamed document projection")?;
                     during_tx(PublishStage::AfterFile, &tx)?;
+                    if let Some(watch) = readers_blocked.as_mut() {
+                        watch.check(&tx);
+                    }
                     let grouped = rows
                         .get(file.path.as_str())
                         .context("streamed publication rows missing")?;
@@ -10972,6 +11084,9 @@ impl Store {
             for f in source_files {
                 check_cancel(cancel)?;
                 during_tx(PublishStage::AfterFile, &tx)?;
+                if let Some(watch) = readers_blocked.as_mut() {
+                    watch.check(&tx);
+                }
                 let ids = projections
                     .get(&f.path)
                     .context("missing graph projection")?;
@@ -11030,6 +11145,9 @@ impl Store {
         if let PublicationTarget::Stage(stage) = target {
             stage.verify_path()?;
             leader.verify_exclusive_use(&self.roots.index_use_lock(&self.identity))?;
+        }
+        if let Some(watch) = readers_blocked.as_mut() {
+            watch.check(&tx);
         }
         self.publication_before_commit_hook.run();
         during_tx(PublishStage::BeforeCommit, &tx)?;

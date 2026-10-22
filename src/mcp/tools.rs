@@ -189,6 +189,7 @@ fn details(code: &str) -> (&'static str, bool) {
         "not_found" => ("Not found", false),
         "too_many_requests" => ("Too many requests", true),
         "deadline_exceeded" => ("Deadline exceeded", true),
+        "rebuild_in_progress" => ("Index is being rebuilt; retry after it finishes", true),
         "root_changed" => ("Workspace root changed", false),
         "store_unavailable" => ("Store is unavailable", false),
         "checkout_capacity" => ("Checkout capacity reached", true),
@@ -678,6 +679,7 @@ mod tests {
                         "not_found",
                         "too_many_requests",
                         "deadline_exceeded",
+                        "rebuild_in_progress",
                         "root_changed",
                         "store_unavailable",
                     ] {
