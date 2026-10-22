@@ -4,14 +4,33 @@ use crate::{
     capture::Capture,
     classes::{Catalog, FileExtraction, Limits},
     indexer::{IndexOptions, NativeDocument, project_document},
-    native_evidence,
+    native_evidence::{Call, ControlRegion, Declaration},
     native_ids,
-    store::topology::WorkspaceIdentity,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, fs, path::Path, sync::{Arc, atomic::AtomicBool}};
+
+// These native DTOs were decoded from main's published index.db, not extracted
+// in this worktree. Source bytes and SCIP labels remain separate test inputs.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MainNativeDocument {
+    document_version_id: String,
+    declarations: Vec<Declaration>,
+    calls: Vec<Call>,
+    control_regions: Vec<ControlRegion>,
+}
+
+fn main_native(root: &Path, expected_sha: &str) -> BTreeMap<String, MainNativeDocument> {
+    let bytes = fs::read(root.join("native-main.json")).unwrap();
+    assert_eq!(sha(&bytes), expected_sha, "frozen main native input drift");
+    let value: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(value["writerCommit"], "0532a7090003904317136aeac98a23716aea1fc2");
+    assert_eq!(value["writerBinarySha256"], "536cdd7231b66c7a8e807d528084b6f00377a96d425ca6c5183a7a7728ff7d9f");
+    serde_json::from_value(value["documents"].clone()).unwrap()
+}
 
 fn sha(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
@@ -38,7 +57,7 @@ fn main_writer_graph_payloads_match_one_shared_projection_byte_for_byte() {
     assert_eq!(frozen["writerCommit"], "0532a7090003904317136aeac98a23716aea1fc2");
     assert_eq!(frozen["writerBinarySha256"], "536cdd7231b66c7a8e807d528084b6f00377a96d425ca6c5183a7a7728ff7d9f");
     let cancel = Arc::new(AtomicBool::new(false));
-    let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+    let native = main_native(&root, "8c47ae03958e0955b1e42d5d3310d6cb38be1b72d34658509a4392cd148d762d");
     for mode in ["plain", "scip"] {
         let mut options = IndexOptions::new(root.clone());
         if mode == "scip" {
@@ -47,9 +66,9 @@ fn main_writer_graph_payloads_match_one_shared_projection_byte_for_byte() {
             assert_eq!(sha(&fs::read(root.join("labels.scip")).unwrap()), frozen["modes"][mode]["scipSha256"]);
         }
         let capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
-        let native = native_evidence::from_capture(&capture, &root, &identity.record_id, &cancel).unwrap();
         let documents = frozen["modes"][mode]["documents"].as_object().unwrap();
         assert_eq!(documents.len(), 5);
+        assert_eq!(native.len(), documents.len());
         let mut extractions = Vec::new();
         let mut projected = BTreeMap::new();
         let mut symbol_count = 0;
@@ -64,14 +83,14 @@ fn main_writer_graph_payloads_match_one_shared_projection_byte_for_byte() {
                     labels.insert(node["id"].as_str().unwrap().to_owned(), label.to_owned());
                 }
             }
-            let mut declarations: Vec<_> = native.declarations.iter()
-                .filter(|d| d.document.path == *path).collect();
+            let facts = &native[path];
+            assert_eq!(facts.document_version_id, old["documentVersionId"]);
+            let mut declarations: Vec<_> = facts.declarations.iter().collect();
             // Simulates SQL attestation's syntax-id order, even when child precedes parent.
             declarations.sort_by(|a, b| a.syntax_id.cmp(&b.syntax_id));
-            let mut calls: Vec<_> = native.calls.iter().filter(|c| c.document.path == *path).collect();
+            let mut calls: Vec<_> = facts.calls.iter().collect();
             calls.sort_by(|a, b| a.id.cmp(&b.id));
-            let mut control_regions: Vec<_> = native.control_regions.iter()
-                .filter(|r| r.document.path == *path).collect();
+            let mut control_regions: Vec<_> = facts.control_regions.iter().collect();
             control_regions.sort_by(|a, b| a.id.cmp(&b.id));
             let (mut nodes, mut calls, mut regions) = project_document(
                 path, &source, NativeDocument { declarations, calls, control_regions }, &labels,
@@ -139,14 +158,16 @@ fn main_writer_nested_call_and_query_view_oracle() {
     let source = fs::read(root.join(path)).unwrap();
     assert_eq!(sha(&source), frozen["sourceSha256"]);
     let cancel = Arc::new(AtomicBool::new(false));
-    let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
     let capture = Capture::admit(&IndexOptions::new(root.clone()), &cancel, &|_| {}).unwrap();
-    let native = native_evidence::from_capture(&capture, &root, &identity.record_id, &cancel).unwrap();
-    let mut declarations: Vec<_> = native.declarations.iter().filter(|d| d.document.path == path).collect();
+    let native = main_native(&root, "b668a53cd112cee9158db05f2f8db5278924cde3a7ac1b3330d8c118684f2027");
+    assert_eq!(native.len(), 1);
+    let facts = &native[path];
+    assert_eq!(facts.document_version_id, frozen["documentVersionId"]);
+    let mut declarations: Vec<_> = facts.declarations.iter().collect();
     declarations.sort_by(|a, b| a.syntax_id.cmp(&b.syntax_id));
-    let mut calls: Vec<_> = native.calls.iter().filter(|c| c.document.path == path).collect();
+    let mut calls: Vec<_> = facts.calls.iter().collect();
     calls.sort_by(|a, b| a.id.cmp(&b.id));
-    let mut control_regions: Vec<_> = native.control_regions.iter().filter(|r| r.document.path == path).collect();
+    let mut control_regions: Vec<_> = facts.control_regions.iter().collect();
     control_regions.sort_by(|a, b| a.id.cmp(&b.id));
     let (mut nodes, mut calls, mut regions) = project_document(
         path, &source, NativeDocument { declarations, calls, control_regions }, &BTreeMap::new(),

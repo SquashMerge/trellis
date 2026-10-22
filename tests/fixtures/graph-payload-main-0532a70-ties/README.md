@@ -43,3 +43,15 @@ here yields two calls tied on start and end byte; answer 8 requires a separate
 direct comparator test on synthetic `CallSite` DTOs, not a forged artifact.
 The original 112 main SQL payload rows in sibling `graph-payload-main-0532a70/`
 remain untouched.
+
+`native-main.json` freezes the main-produced typed native rows used as the
+projector input. It decodes the `document_versions` and `native_version_*`
+rows of that same isolated home's
+`Library/Caches/dev.squashmerge.trellis/indexes/e70f413d606c08fd26e563b59790e1797d0a918b2930bcada9a77f13c133642f/index.db`
+(SHA-256 `f89fddbffb645e05cdfa2e3b76b5fa28ca1559c85bcc9bde56e9d83dd5579afc`).
+Snapshot SHA-256: `b668a53cd112cee9158db05f2f8db5278924cde3a7ac1b3330d8c118684f2027`.
+The snapshot has original native IDs, ancestor keys, ranges and ordered call
+regions. The document/revision/proof fields are reconstructed from the main
+SQL metadata using the native proof domain. This is independent of the frozen
+`oracle.json` payloads and the candidate graph. The conversion script was
+not preserved; source DB and SHA record provenance, not a repeatable command.
