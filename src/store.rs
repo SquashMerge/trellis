@@ -3779,8 +3779,10 @@ fn stream_document_classes(
     catalog: &crate::classes::Catalog,
     path: &str,
 ) -> crate::classes::Catalog {
-    // Catalog::compose sorts both vectors by document path before their
-    // within-document key. Find that path's range without rescanning the
+    // CatalogComposer::finish sorts both vectors by document path before their
+    // within-document key (the same order as Catalog::compose). Keep that
+    // invariant if either composer changes: partition_point requires it.
+    // Find that path's range without rescanning the
     // bounded workspace catalog for each streamed document.
     let first_class = catalog
         .classes
@@ -4375,6 +4377,20 @@ fn precompute_document(
     (projection, witness)
 }
 
+// The full-artifact caller writes its header and all documents together.
+// The streamed caller writes its header once, then one checked document at a
+// time; these distinct modes cannot be mixed by positional flags.
+enum NativeWrite<'a> {
+    Header {
+        ordinal_start: usize,
+    },
+    Document {
+        ordinal: usize,
+        captured_file: &'a SourceFile,
+        precomputed: PrecomputedDocument,
+    },
+}
+
 #[allow(clippy::too_many_arguments)] // The transaction seam keeps the immutable bundle and reuse witness separate.
 fn write_native(
     db: &Connection,
@@ -4391,12 +4407,17 @@ fn write_native(
     immutable: &mut ImmutableAppend,
     reuse: &PreflightReuse,
     rows: &BTreeMap<&str, PublicationRows<'_>>,
-    write_header: bool,
-    ordinal_start: usize,
     full_diagnostics: &[Diagnostic],
-    captured_file: Option<&SourceFile>,
-    precomputed: Option<PrecomputedDocument>,
+    mode: NativeWrite<'_>,
 ) -> Result<BTreeMap<String, V8DocumentProjection>> {
+    let (write_header, ordinal_start, captured_file, precomputed) = match mode {
+        NativeWrite::Header { ordinal_start } => (true, ordinal_start, None, None),
+        NativeWrite::Document {
+            ordinal,
+            captured_file,
+            precomputed,
+        } => (false, ordinal, Some(captured_file), Some(precomputed)),
+    };
     let (artifact, capture, graph, classes, extractions) = bundle;
     let a = artifact;
     let revision_key = format!(
@@ -7332,15 +7353,22 @@ impl Store {
         }
         let mut stage = self.create_staged_index(leader, true)?;
         let result = (|| -> Result<IndexPin> {
-            let (graph, native, capture) =
-                crate::indexer::index_workspace_bundle(options, self.root_id(), cancel, |_| {})?;
-            let pin = self.publish_native_to_stage(
-                (&graph, &capture, &native),
-                &stage,
-                leader,
+            // Rebuild from the same bounded, sorted document spool as a normal
+            // full publication. No facts or projections from the old index are
+            // usable here; the private stage remains the sole SQL target.
+            let capture = crate::capture::Capture::admit(options, cancel, &|_| {})?;
+            let spool = crate::native_evidence::spool_full_capture(
+                options,
+                &capture,
+                &self.identity.root,
+                self.root_id(),
                 cancel,
-                |_, _| Ok(()),
+                &|_| {},
+                |_, _| {},
+                &self.native_spool_dir()?,
             )?;
+            let pin =
+                self.publish_validated_stream_to_stage(&spool, &capture, &stage, leader, cancel)?;
             ensure!(
                 pin.index_revision == 1,
                 "recovery_required: replacement must start at revision one"
@@ -8588,6 +8616,75 @@ impl Store {
         expected: RecoveryBaseline,
         cancel: &CancelFlag,
     ) -> Result<IndexPin> {
+        self.publish_validated_stream_target(
+            spool,
+            capture,
+            leader,
+            expected,
+            PublicationTarget::Live,
+            cancel,
+        )
+    }
+
+    /// A replacement starts from an empty bootstrap under exclusive use. In
+    /// particular, it never consults corrupt live rows for reuse or baseline.
+    fn publish_validated_stream_to_stage(
+        &self,
+        spool: &crate::native_evidence::FullDocumentSpool,
+        capture: &crate::capture::Capture,
+        stage: &StagedIndex,
+        leader: &topology::WriterGuard,
+        cancel: &CancelFlag,
+    ) -> Result<IndexPin> {
+        leader.belongs_to(&self.identity)?;
+        leader.verify_exclusive_use(&self.roots.index_use_lock(&self.identity))?;
+        stage.verify_path()?;
+        self.identity.verify()?;
+        let index_dir = self.roots.index_dir(&self.identity);
+        let stage_id = stage
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix("index.db.tmp-"));
+        ensure!(
+            stage.path.parent() == Some(index_dir.as_path())
+                && stage_id.is_some_and(|value| uuid::Uuid::parse_str(value).is_ok()),
+            "unsafe_index: stage is outside the managed index directory"
+        );
+        let bootstrap = open_index(&stage.path, false)?;
+        let version: u32 = bootstrap.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        ensure!(
+            version == DATABASE_SCHEMA_VERSION,
+            "incompatible_index: stage is not an unpublished bootstrap"
+        );
+        validate_v8_bootstrap(&bootstrap)?;
+        let expected = self.recovery_baseline(&bootstrap)?;
+        ensure!(
+            expected.pin().is_some_and(|pin| pin.index_revision == 0) && expected.compatible,
+            "incompatible_index: invalid private stage baseline"
+        );
+        drop(bootstrap);
+        stage.verify_path()?;
+        leader.verify_exclusive_use(&self.roots.index_use_lock(&self.identity))?;
+        self.publish_validated_stream_target(
+            spool,
+            capture,
+            leader,
+            expected,
+            PublicationTarget::Stage(stage),
+            cancel,
+        )
+    }
+
+    fn publish_validated_stream_target(
+        &self,
+        spool: &crate::native_evidence::FullDocumentSpool,
+        capture: &crate::capture::Capture,
+        leader: &topology::WriterGuard,
+        expected: RecoveryBaseline,
+        target: PublicationTarget<'_>,
+        cancel: &CancelFlag,
+    ) -> Result<IndexPin> {
         capture.verify(cancel)?;
         ensure!(
             capture.graph_projection_count() == 1,
@@ -8622,14 +8719,15 @@ impl Store {
             documents.len() == spool.len(),
             "native_evidence_required: duplicate revision document path"
         );
+        // The full source set remains borrowed from the attested capture. Only
+        // each one-document graph decoded from the spool owns a source copy.
         let graph = Graph {
-            files: capture.files.clone(),
             stats: spool.stats().clone(),
             diagnostics: spool.diagnostics().to_vec(),
             ..Graph::default()
         };
         let mut unique_paths = BTreeSet::new();
-        for source in &graph.files {
+        for source in &capture.files {
             ensure!(
                 unique_paths.insert(source.path.as_str()),
                 "native_evidence_required: duplicate captured source path"
@@ -8650,7 +8748,7 @@ impl Store {
             leader,
             PublicationPlan {
                 expected: ExpectedPublication::Recovery(Box::new(expected)),
-                target: PublicationTarget::Live,
+                target,
             },
             cancel,
             (256 * 1024 * 1024 + 16 * 1024, None, Some(spool)),
@@ -8886,7 +8984,11 @@ impl Store {
     // Admission/read parity: only publish SourceFile JSON that pinned reads can
     // select under the same encoded-byte ceiling. This inspects the immutable
     // captured graph; it neither opens source files nor reprojects the graph.
-    fn enforce_selected_source_admission(graph: &Graph, max_graph_json_bytes: usize) -> Result<()> {
+    fn enforce_selected_source_admission(
+        graph: &Graph,
+        files: &[SourceFile],
+        max_graph_json_bytes: usize,
+    ) -> Result<()> {
         fn encoded_len<T: Serialize>(value: &T, max: usize) -> Result<usize> {
             let mut sink = EncodedSourceBudget {
                 bytes: 0,
@@ -8896,7 +8998,7 @@ impl Store {
             Ok(sink.bytes)
         }
         let mut selected: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
-        for file in &graph.files {
+        for file in files {
             let raw = file.text.len();
             ensure!(
                 raw <= 256 * 1024 * 1024,
@@ -10354,6 +10456,7 @@ impl Store {
         order: &[usize],
         classes: &crate::classes::Catalog,
         expected: &ExpectedPublication,
+        cancel: &CancelFlag,
     ) -> Result<PreflightReuse> {
         if self.disposition() != RecoveryDisposition::Ready
             || !match expected {
@@ -10402,6 +10505,7 @@ impl Store {
             // authenticating per-document reuse against this read snapshot.
             let mut families = BTreeMap::new();
             for &index in order {
+                check_cancel(cancel)?;
                 let (native, graph) = spool.read(index).map_err(native_spool_read_failure)?;
                 let file = graph.files.first().context("stream graph document absent")?;
                 let selected_classes = stream_document_classes(classes, &file.path);
@@ -10529,6 +10633,11 @@ impl Store {
             self.ensure_not_recreate_pending()?;
         }
         let (graph, capture, native) = bundle;
+        let source_files = if stream.is_some() {
+            capture.files.as_slice()
+        } else {
+            graph.files.as_slice()
+        };
         let stream_order = if stream.is_some() {
             let by_path: BTreeMap<_, _> = native
                 .revision
@@ -10541,8 +10650,7 @@ impl Store {
                 by_path.len() == native.revision.documents.len(),
                 "native_evidence_required: duplicate revision document path"
             );
-            graph
-                .files
+            source_files
                 .iter()
                 .map(|file| {
                     by_path
@@ -10554,7 +10662,7 @@ impl Store {
         } else {
             Vec::new()
         };
-        Self::enforce_selected_source_admission(graph, max_graph_json_bytes)?;
+        Self::enforce_selected_source_admission(graph, source_files, max_graph_json_bytes)?;
         ensure!(
             graph.schema_version == SCHEMA_VERSION,
             "unsupported graph schema"
@@ -10660,20 +10768,10 @@ impl Store {
                     "incompatible_index: local class catalog differs from trusted head"
                 );
             }
-            ensure!(
-                classes.relations.iter().all(|r| r.target.is_none()
-                    && r.candidate_ids.is_empty()
-                    && r.match_kind == "unmatched"),
-                "unsafe_index: lexical class relationship"
-            );
-            // The public read_status guard has this exact singleton JSON ceiling.
-            // Refuse over-limit catalog warnings before paired CAS.
-            ensure!(
-                json(&classes.warnings)?.len() <= 256 * 1024,
-                "incompatible_index: class catalog byte budget exceeded before publication"
-            );
             (stats, classes, extractions)
         };
+        // The public read_status guard has this exact singleton JSON ceiling.
+        // Refuse over-limit catalog warnings before paired CAS.
         ensure!(
             classes.relations.iter().all(|r| r.target.is_none()
                 && r.candidate_ids.is_empty()
@@ -10727,7 +10825,7 @@ impl Store {
             );
             self.preflight_local_reuse(graph, prepared)?
         } else if let Some(spool) = stream {
-            self.preflight_stream_reuse(spool, &stream_order, &classes, &expected)
+            self.preflight_stream_reuse(spool, &stream_order, &classes, &expected, cancel)
                 .map_err(|error| self.report_live_read_failure(error))?
         } else if matches!(target, PublicationTarget::Live) {
             // A stored hash that differs from the fresh one is typed index
@@ -10806,7 +10904,7 @@ impl Store {
             let _changed = comparison.changed();
         }
         ensure!(
-            graph.files.len() == native.revision.documents.len(),
+            source_files.len() == native.revision.documents.len(),
             "graph/native document cardinality mismatch"
         );
         let mut documents_by_key: HashMap<(&str, &str), Vec<_>> = HashMap::new();
@@ -10823,7 +10921,7 @@ impl Store {
                 .or_default()
                 .push(source);
         }
-        for file in &graph.files {
+        for file in source_files {
             let key = (file.language.as_str(), file.path.as_str());
             ensure!(
                 documents_by_key
@@ -10924,7 +11022,7 @@ impl Store {
             PublicationTarget::Stage(_) => error,
         };
         let projections = if let Some(spool) = stream {
-            let mut projections = BTreeMap::new();
+            let mut seen_paths = BTreeSet::new();
             // Persist the full captured revision header exactly once, including
             // the empty-workspace case. Per-document Artifacts keep only their
             // own document rather than cloning the full revision header.
@@ -10939,11 +11037,8 @@ impl Store {
                 &mut immutable,
                 &reuse,
                 &header_rows,
-                true,
-                0,
                 &graph.diagnostics,
-                None,
-                None,
+                NativeWrite::Header { ordinal_start: 0 },
             )
             .map_err(classify_immutable)?;
             // Decode a bounded batch, hash its projections and witnesses on
@@ -10973,10 +11068,14 @@ impl Store {
                         .first()
                         .context("stream graph document absent")?;
                     ensure!(
-                        document_graph.files.len() == 1 && graph.files.get(ordinal) == Some(file),
+                        document_graph.files.len() == 1 && source_files.get(ordinal) == Some(file),
                         "native_evidence_required: streamed graph document differs from capture"
                     );
-                    Self::enforce_selected_source_admission(&document_graph, max_graph_json_bytes)?;
+                    Self::enforce_selected_source_admission(
+                        &document_graph,
+                        &document_graph.files,
+                        max_graph_json_bytes,
+                    )?;
                     let selected_classes = stream_document_classes(&classes, &file.path);
                     let extractions = if matches!(file.language.as_str(), "java" | "python") {
                         BTreeMap::from([(
@@ -11033,11 +11132,17 @@ impl Store {
                         &mut immutable,
                         &reuse,
                         rows,
-                        false,
-                        *ordinal,
                         &graph.diagnostics,
-                        graph.files.get(*ordinal),
-                        Some(precomputed.next().flatten().context("indexing cancelled")?),
+                        NativeWrite::Document {
+                            ordinal: *ordinal,
+                            captured_file: source_files
+                                .get(*ordinal)
+                                .context("streamed captured document ordinal missing")?,
+                            precomputed: precomputed
+                                .next()
+                                .flatten()
+                                .context("indexing cancelled")?,
+                        },
                     )
                     .map_err(classify_immutable)?;
                     let ids = written
@@ -11056,12 +11161,12 @@ impl Store {
                     )
                     .map_err(classify_immutable)?;
                     ensure!(
-                        projections.insert(file.path.clone(), ids.clone()).is_none(),
+                        seen_paths.insert(file.path.clone()),
                         "duplicate streamed document path"
                     );
                 }
             }
-            projections
+            BTreeMap::new()
         } else {
             write_native(
                 &tx,
@@ -11072,11 +11177,8 @@ impl Store {
                 &mut immutable,
                 &reuse,
                 &rows,
-                true,
-                0,
                 &graph.diagnostics,
-                None,
-                None,
+                NativeWrite::Header { ordinal_start: 0 },
             )
             .map_err(classify_immutable)?
         };
@@ -11094,7 +11196,7 @@ impl Store {
             params![revision_key, executing_hash, binding_sha],
         )?;
         if stream.is_none() {
-            for f in &graph.files {
+            for f in source_files {
                 check_cancel(cancel)?;
                 during_tx(PublishStage::AfterFile, &tx)?;
                 let ids = projections
@@ -11145,7 +11247,7 @@ impl Store {
             |r| r.get(0),
         )?;
         ensure!(
-            count == graph.files.len() as i64,
+            count == source_files.len() as i64,
             "incompatible_index: incomplete new revision manifest"
         );
         check_cancel(cancel)?;
@@ -14420,6 +14522,8 @@ mod selected_manifest_query_plan_tests;
 
 #[cfg(test)]
 mod rebaseline_fault_tests;
+#[cfg(test)]
+mod recreate_spool_tests;
 
 #[cfg(test)]
 mod sqlite_schema_race_tests;
