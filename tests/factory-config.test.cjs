@@ -178,6 +178,7 @@ fi
 for arg in "$@"; do
   if [ "$arg" = tests/browser/saved-items.test.cjs ] && [ -z "\${TRELLIS_SUITE_BINARY:-}" ]; then exit 37; fi
 done
+if [ "\${FAKE_VERIFY_FAIL_DEPS:-0}" = 1 ] && [ "$2" = install-deps ]; then echo "fake apt failure"; exit 41; fi
 if [ "\${FAKE_VERIFY_NO_NEXTEST:-0}" = 1 ] && [ "$1" = nextest ]; then exit 101; fi
 if [ "\${FAKE_VERIFY_FAIL_CLIPPY:-0}" = 1 ] && [ "$1" = clippy ]; then exit 23; fi
 if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contract/test/run.mjs ]; then exit 29; fi
@@ -197,6 +198,8 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
           PATH: `${fakeDir}${delimiter}${process.env.PATH ?? ""}`,
           FAKE_VERIFY_LOG: log,
           FAKE_BROWSER_ROOT: join(fakeDir, "browser-cache"),
+          // Linux CI sets this for the real verify; the fake runs opt in per case.
+          TRELLIS_BROWSER_SYSTEM_DEPS: "",
           ...extraEnv,
         },
       });
@@ -244,6 +247,21 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
     const success = runVerify();
     assert.equal(success.result.status, 0, success.result.stderr);
     assertRan(success.commands, lanes);
+    rmSync(log);
+    // With TRELLIS_BROWSER_SYSTEM_DEPS set, the system packages install in the
+    // background and the browser suite runs only after it succeeds (#244).
+    const deps = ["node", "tests/browser/node_modules/playwright/cli.js", "install-deps", "chromium"];
+    const withDeps = runVerify({ TRELLIS_BROWSER_SYSTEM_DEPS: "1" });
+    assert.equal(withDeps.result.status, 0, withDeps.result.stderr);
+    assertRan(withDeps.commands, { ...lanes, deps: [deps] });
+    assert.match(withDeps.result.stdout, /^verify: Chromium system package install finished in \d+ s \(exit 0\)/m);
+    rmSync(log);
+    const depsFailure = runVerify({ TRELLIS_BROWSER_SYSTEM_DEPS: "1", FAKE_VERIFY_FAIL_DEPS: "1" });
+    assert.equal(depsFailure.result.status, 1);
+    assertRan(depsFailure.commands, { ...lanes, deps: [deps], rust: lanes.rust.slice(0, 4) });
+    assert.match(depsFailure.result.stdout, /fake apt failure/);
+    assert.match(depsFailure.result.stdout, /Chromium system package install failed \(exit 41\)/);
+    assert.match(depsFailure.result.stderr, /failed lane\(s\): rust$/m);
     rmSync(log);
     const failure = runVerify({ FAKE_VERIFY_FAIL_CLIPPY: "1" });
     assert.equal(failure.result.status, 23);
