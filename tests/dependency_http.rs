@@ -1,5 +1,4 @@
 #![cfg(feature = "test-support")]
-mod common;
 use axum::{
     Router,
     body::{Body, to_bytes},

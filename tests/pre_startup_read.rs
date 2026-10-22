@@ -1,6 +1,5 @@
 //! Daemon-local selected reads use a validated committed head during mandatory startup reconciliation.
 //! The retired cross-process predecessor permit and leader lock are not read gates.
-mod common;
 use std::sync::{Arc, atomic::AtomicBool};
 use trellis::{
     index_coordinator::{self, IndexJobCoordinator},

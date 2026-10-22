@@ -1,5 +1,4 @@
 #![cfg(feature = "test-support")]
-mod common;
 use axum::{
     Router,
     body::{Body, to_bytes},
@@ -427,7 +426,7 @@ async fn active_and_hot_journal_keep_pinned_http_safe() {
     let use_path = roots.index_use_lock(&identity);
     let leader = state.retained_serving_session().unwrap();
     let mut child = Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "sqlite_journal_child", "--nocapture"])
+        .args(["--exact", "pins_http::sqlite_journal_child", "--nocapture"])
         .env("TRELLIS_SQLITE_JOURNAL_CHILD", &db_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

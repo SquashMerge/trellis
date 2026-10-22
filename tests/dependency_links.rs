@@ -1,4 +1,3 @@
-mod common;
 fn test_pin(n: u64) -> trellis::model::IndexPin {
     trellis::model::IndexPin {
         index_generation: uuid::Uuid::from_u128(0x00000000000040008000000000000001),

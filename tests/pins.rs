@@ -1,4 +1,3 @@
-mod common;
 use serde_json::json;
 use std::sync::{Arc, atomic::AtomicBool};
 use trellis::{

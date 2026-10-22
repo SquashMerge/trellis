@@ -1,12 +1,11 @@
-#[cfg(feature = "test-support")]
-use trellis::model::*;
-mod common;
 use std::{
     fs,
     sync::{Arc, atomic::AtomicBool},
 };
 use tempfile::TempDir;
 use trellis::indexer::{IndexOptions, index_workspace};
+#[cfg(feature = "test-support")]
+use trellis::model::*;
 #[cfg(feature = "test-support")]
 #[test]
 fn real_syntax_rename_orphans_notes_and_cached_graph_preserves_call_order() {

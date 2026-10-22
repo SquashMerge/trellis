@@ -1,6 +1,5 @@
 #![cfg(feature = "test-support")]
 //! Offline catalog and cached-source sequence API checks.
-mod common;
 use axum::{
     Router,
     body::{Body, to_bytes},

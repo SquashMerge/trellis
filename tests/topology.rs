@@ -1,4 +1,4 @@
-mod common;
+use crate::common;
 use std::{
     fs,
     io::{Read, Write},
@@ -45,7 +45,7 @@ fn implicit_home_is_refused_in_isolated_child() {
     let home = fs::canonicalize(root(temp.path())).unwrap();
     let output = Command::new(std::env::current_exe().unwrap())
         .arg("--exact")
-        .arg("implicit_home_child")
+        .arg("topology::implicit_home_child")
         .arg("--nocapture")
         .env("HOME", &home)
         .env("TOPOLOGY_IMPLICIT_HOME_CHILD", &home)
@@ -191,7 +191,7 @@ fn marker_race_and_durability() {
         .map(|_| {
             Command::new(std::env::current_exe().unwrap())
                 .arg("--exact")
-                .arg("marker_child")
+                .arg("topology::marker_child")
                 .arg("--nocapture")
                 .env("TOPOLOGY_MARKER_CHILD", &work)
                 .stdout(Stdio::piped())
@@ -545,7 +545,7 @@ fn stale_use_inode_waiters_reopen_before_success() {
     let original = UseGuard::acquire(&path, true, true).unwrap();
     let mut child = Command::new(std::env::current_exe().unwrap())
         .arg("--exact")
-        .arg("stale_use_child")
+        .arg("topology::stale_use_child")
         .arg("--nocapture")
         .env("TOPOLOGY_STALE_USE", &path)
         .stdin(Stdio::piped())
@@ -599,7 +599,7 @@ fn exclusive_deletion_waits_for_shared_process() {
     let path = roots.index_use_lock(&id);
     let mut child = Command::new(std::env::current_exe().unwrap())
         .arg("--exact")
-        .arg("shared_holder_child")
+        .arg("topology::shared_holder_child")
         .arg("--nocapture")
         .env("TOPOLOGY_SHARED_HOLDER", &path)
         .stdin(Stdio::piped())
@@ -885,7 +885,7 @@ fn durable_existing_lock_replacement_checks_new_inode_and_holder() {
         drop(roots.record_use(&id, true)?);
         let mut process = Command::new(std::env::current_exe().unwrap())
             .arg("--exact")
-            .arg("shared_holder_child")
+            .arg("topology::shared_holder_child")
             .arg("--nocapture")
             .env("TOPOLOGY_SHARED_HOLDER", &lock)
             .stdin(Stdio::piped())
@@ -1016,7 +1016,7 @@ fn durable_first_creator_process_contention_and_retry() {
     let lock = roots.record_use(&id, true).unwrap();
     let mut child = Command::new(std::env::current_exe().unwrap())
         .arg("--exact")
-        .arg("durable_creator_child")
+        .arg("topology::durable_creator_child")
         .arg("--nocapture")
         .env("TOPOLOGY_DURABLE_CHILD", temp.path())
         .stdin(Stdio::piped())

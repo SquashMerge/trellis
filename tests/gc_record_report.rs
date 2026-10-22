@@ -1,4 +1,4 @@
-mod common;
+use crate::common;
 use std::os::unix::fs::MetadataExt;
 use std::{
     fs,
@@ -84,7 +84,7 @@ fn report_continues_past_busy_and_hot_journal_records_without_writes() {
     let db_path = roots.record_db(hot);
     let result = Command::new(std::env::current_exe().unwrap())
         .arg("--exact")
-        .arg("leave_hot_journal_child")
+        .arg("gc_record_report::leave_hot_journal_child")
         .env("GC_HOT_RECORD_DB", &db_path)
         .output()
         .unwrap();

@@ -1,6 +1,6 @@
 #![cfg(feature = "test-support")]
 //! Synthetic class projection tests. No workspace programs or providers run.
-mod common;
+use crate::common;
 use axum::{
     Router,
     body::{Body, to_bytes},

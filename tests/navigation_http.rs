@@ -1,6 +1,5 @@
 #![cfg(feature = "test-support")]
 //! Synthetic cached-only navigation. No providers or repository programs are executed.
-mod common;
 use axum::{
     Router,
     body::{Body, to_bytes},

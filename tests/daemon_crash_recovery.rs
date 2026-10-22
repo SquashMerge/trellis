@@ -64,7 +64,12 @@ fn announce_and_wait_for_kill(line: &str) -> ! {
 /// announcement, then SIGKILL it and reap it. Returns the announcement.
 fn run_child_until_hook_then_kill(child_test: &str, state: &Path, root: &Path) -> String {
     let mut child: Child = Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", child_test, "--nocapture", "--test-threads=1"])
+        .args([
+            "--exact",
+            &format!("daemon_crash_recovery::{child_test}"),
+            "--nocapture",
+            "--test-threads=1",
+        ])
         .env(STATE_ENV, state)
         .env(ROOT_ENV, root)
         .stdin(Stdio::null())

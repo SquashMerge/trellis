@@ -1,23 +1,21 @@
 #![cfg(feature = "test-support")]
 //! HTTP protocol fixtures are offline; synthetic responses are not model quality evidence.
-mod common;
+use crate::jev_wire;
 use axum::{
     Router,
     body::{Body, to_bytes},
     http::{Request, StatusCode},
 };
+use jev_wire::decode_packet;
 use serde_json::{Value, json};
+use std::sync::{Arc, atomic::AtomicBool};
+use tower::ServiceExt;
 use trellis::{
     http,
     indexer::{IndexOptions, index_workspace},
     model::*,
     store::{Store, topology::WriterSession},
 };
-#[path = "common/jev_wire.rs"]
-mod jev_wire;
-use jev_wire::decode_packet;
-use std::sync::{Arc, atomic::AtomicBool};
-use tower::ServiceExt;
 const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 fn setup(
     padding: usize,

@@ -1,6 +1,5 @@
 #![cfg(feature = "test-support")]
 //! No credentials or outbound calls. Enabled fixtures use an already exhausted local ledger.
-mod common;
 mod offline {
 
     use axum::{

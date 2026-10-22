@@ -1,6 +1,6 @@
 #![cfg(feature = "test-support")]
 //! Rust file -> methods -> sequence on cached source, without executing the workspace.
-mod common;
+use crate::common;
 use axum::{
     Router,
     body::{Body, to_bytes},

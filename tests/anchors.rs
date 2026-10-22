@@ -1,5 +1,3 @@
-mod common;
-
 use trellis::{
     model::{AnchorReason, AnchorStatus},
     native_evidence::{Declaration, DeclarationRole, DocumentKey, Header, Key, Range},

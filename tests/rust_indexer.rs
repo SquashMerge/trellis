@@ -1,4 +1,3 @@
-mod common;
 use protobuf::Message;
 use sha2::{Digest, Sha256};
 use std::{

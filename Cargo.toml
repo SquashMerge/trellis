@@ -5,6 +5,12 @@ edition = "2024"
 description = "Local diagram-first code index and daemon"
 license = "BUSL-1.1"
 publish = false
+# Integration tests build as one binary; see tests/it/main.rs (#243).
+autotests = false
+
+[[test]]
+name = "it"
+path = "tests/it/main.rs"
 
 [features]
 default = []

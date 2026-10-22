@@ -1,7 +1,6 @@
 #![cfg(feature = "test-support")]
 //! Synthetic Java/Python file -> method -> static sequence integration.
 //! Workspace code, build scripts, and Python imports must never execute.
-mod common;
 use axum::{
     Router,
     body::{Body, to_bytes},

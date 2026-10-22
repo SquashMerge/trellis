@@ -1429,7 +1429,11 @@ async fn serve_registers_in_place_while_an_accepted_index_runs() {
         claimed_tx.send(()).unwrap();
         let _ = resume_rx.recv();
     });
-    let store = Store::open(roots(base.path()), crate::identity(&checkout)).unwrap();
+    let store = Store::open(
+        roots(base.path()),
+        crate::daemon_checkout::identity(&checkout),
+    )
+    .unwrap();
     let accepted = store
         .enqueue_request(&trellis::indexer::IndexOptions::new(checkout.clone()), None)
         .unwrap();
@@ -2625,7 +2629,11 @@ async fn explicit_serve_options_apply_once() {
     };
     ready(&runtime).await;
     let scheduler = runtime.browser_scheduler().unwrap();
-    let store = Store::open(roots(base.path()), crate::identity(&checkout)).unwrap();
+    let store = Store::open(
+        roots(base.path()),
+        crate::daemon_checkout::identity(&checkout),
+    )
+    .unwrap();
     let recorded = |bytes: u64| {
         let store = store.clone();
         async move {

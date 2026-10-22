@@ -1,15 +1,13 @@
 //! Synthetic protocol fixtures only: not recorded model runs or quality evidence.
-mod common;
+use crate::jev_wire;
+use jev_wire::decode_packet;
 use serde_json::{Value, json};
+use std::sync::{Arc, atomic::AtomicBool};
 use trellis::{
     indexer::{IndexOptions, index_workspace_bundle},
     jev::{parse_response, request_for, response_warnings},
     planning::{QuestionPacket, QuestionRequest, prepare},
 };
-#[path = "common/jev_wire.rs"]
-mod jev_wire;
-use jev_wire::decode_packet;
-use std::sync::{Arc, atomic::AtomicBool};
 const CODE: &str =
     "// UNIQUE_COMPLETE_SOURCE\nfunction seed(flag) { if (flag) check(); run(callback); }\n";
 

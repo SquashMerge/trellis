@@ -242,7 +242,7 @@ fn real_process_death_after_request_publish_reclaims_without_false_done() {
     let proof = state.path().join("post-publication-proof");
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .arg("--exact")
-        .arg("published_pin_before_completion_crash_child")
+        .arg("requests::published_pin_before_completion_crash_child")
         .env("TRELLIS_TEST_CRASH_GAP_STATE", state.path())
         .env("TRELLIS_TEST_CRASH_GAP_WORKSPACE", workspace.path())
         .env("TRELLIS_TEST_CRASH_GAP_PROOF", &proof)
@@ -494,7 +494,7 @@ fn hot_journal_rolls_back_before_queue_identity_and_ack() {
     let db_path = store.request_db_path();
     let child = std::process::Command::new(std::env::current_exe().unwrap())
         .arg("--exact")
-        .arg("queue_hot_journal_child")
+        .arg("requests::queue_hot_journal_child")
         .env("TRELLIS_QUEUE_HOT_JOURNAL_CHILD", &db_path)
         .output()
         .unwrap();
@@ -1417,7 +1417,7 @@ fn asserted_claim_under_real_executable_drift(body_edit: bool, drift: bool) {
     let proof = state.path().join("drift-proof.json");
     let mut child = Command::new(&binary)
         .arg("--exact")
-        .arg("executable_drift_claim_child")
+        .arg("requests::executable_drift_claim_child")
         .arg("--nocapture")
         .env("TRELLIS_DRIFT_CLAIM_STATE", state.path())
         .env("TRELLIS_DRIFT_CLAIM_WORKSPACE", workspace.path())
@@ -1513,7 +1513,7 @@ fn asserted_claim_under_real_executable_drift(body_edit: bool, drift: bool) {
                 let mut command = Command::new(&binary);
                 command
                     .arg("--exact")
-                    .arg("executable_drift_claim_child")
+                    .arg("requests::executable_drift_claim_child")
                     .arg("--nocapture")
                     .env("TRELLIS_DRIFT_CLAIM_STATE", state.path())
                     .env("TRELLIS_DRIFT_CLAIM_WORKSPACE", workspace.path())
@@ -1636,7 +1636,7 @@ fn maintenance_probe_child(
 ) -> std::process::Child {
     std::process::Command::new(std::env::current_exe().unwrap())
         .arg("--exact")
-        .arg("maintenance_probe_external_child")
+        .arg("requests::maintenance_probe_external_child")
         .arg("--nocapture")
         .env("TRELLIS_TEST_MAINTENANCE_PROBE_CHILD", mode)
         .env("TRELLIS_PROBE_STATE", state)

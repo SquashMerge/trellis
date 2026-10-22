@@ -1,7 +1,6 @@
 #![cfg(feature = "test-support")]
 //! Synthetic executable fixtures only. No model, Jev, or network calls.
 #![cfg(unix)]
-mod common;
 use axum::{
     Router,
     body::{Body, to_bytes},
