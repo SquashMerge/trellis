@@ -12527,7 +12527,7 @@ impl Store {
         let expected_nodes: Vec<_> = nodes
             .iter()
             .map(|node| {
-                let kind = serde_json::to_value(&node.kind)?;
+                let kind = serde_json::to_value(node.kind)?;
                 Ok((
                     node.id.clone(),
                     node.name.clone(),
@@ -13814,7 +13814,7 @@ impl Store {
         let mut calls = document.graph_calls;
         calls.sort_by(|a, b| (a.range.start_byte, &a.id).cmp(&(b.range.start_byte, &b.id)));
         let file = document.file;
-        crate::behavior::build_sequence(revision, &symbol, &file, &calls, show_all).map(Some)
+        crate::behavior::build_sequence(revision, symbol, &file, &calls, show_all).map(Some)
     }
 
     fn read_graph_for(&self, db: &Connection, selected: &ReadRevision) -> Result<Graph> {

@@ -2571,8 +2571,8 @@ fn real_native_snapshot(home: &std::path::Path) -> Value {
     }
     assert_eq!(
         all_rows.len(),
-        32,
-        "retain every v9 evidence table in raw snapshot"
+        31,
+        "retain every schema-13 evidence table in raw snapshot"
     );
     serde_json::json!({"sourceSet":{"id":source_set.0,"rootId":source_set.1},
         "revision":{"id":revision.0,"sourceSetId":revision.1,"toolchainHash":revision.2,
@@ -3723,7 +3723,7 @@ def sink():
         assert_eq!(
             same_bytes_evidence(&native_after),
             same_bytes_evidence(&post_start_native),
-            "{name}: all 32 v9 evidence tables and documents must match after only publication identity normalization"
+            "{name}: all 31 schema-13 evidence tables and documents must match after only publication identity normalization"
         );
         assert_eq!(
             graph_after, graph_before,
@@ -4554,8 +4554,8 @@ async fn saved_items_real_index_matrix() {
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
     assert_eq!(
-        index_version, 12,
-        "derived v12 index inspection is separate"
+        index_version, 13,
+        "derived v13 index inspection is separate"
     );
 
     let edited_view_body = serde_json::json!({

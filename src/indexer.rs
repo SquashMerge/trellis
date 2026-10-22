@@ -1164,7 +1164,7 @@ pub(crate) fn project_document(
             callee_text: c.spelling.clone(),
             path: c.document.path.clone(),
             range: range(&c.range)?,
-            callee_range: c.callee_range.as_ref().map(&range).transpose()?,
+            callee_range: c.callee_range.as_ref().map(range).transpose()?,
             ordinal: c.ordinal,
             regions: c.region_ids.clone(),
             provenance: graph_provenance(),
@@ -1914,7 +1914,7 @@ mod projection_document_tests {
         let last = make_call("occ:v2:ffffffffffffffffffffffffffffffff", 2);
         let first = make_call("occ:v2:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 2);
         let longest = make_call("occ:v2:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", 3);
-        let mut writer = vec![last.clone(), longest.clone(), first.clone()];
+        let mut writer = [last.clone(), longest.clone(), first.clone()];
         writer.sort_by(compare_writer_calls);
         assert_eq!(
             writer
@@ -1923,7 +1923,7 @@ mod projection_document_tests {
                 .collect::<Vec<_>>(),
             vec![first.id.as_str(), last.id.as_str(), longest.id.as_str()]
         );
-        let mut reader = vec![last.clone(), longest.clone(), first.clone()];
+        let mut reader = [last.clone(), longest.clone(), first.clone()];
         reader.sort_by(compare_reader_calls);
         assert_eq!(
             reader

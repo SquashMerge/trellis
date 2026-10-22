@@ -631,7 +631,7 @@ fn failed_publication_keeps_projection_atomic_with_graph() {
     assert_eq!(
         (version, marker.as_str(), generation, revision),
         (
-            12,
+            13,
             "native-v6-delta-v1",
             prior.index_generation.to_string(),
             prior.index_revision as i64
