@@ -576,6 +576,119 @@ fn traversal_cycles_bounds_callbacks_and_boundaries() {
 
 #[test]
 #[cfg(feature = "test-support")]
+fn main_nested_query_view_keeps_call_order_limit_and_exclusion() {
+    // Frozen main (0532a70) SQL payloads and CLI query results. The fixture is
+    // added separately on the integration branch; do not derive expectations
+    // from this branch's writer or the candidate query result.
+    let oracle: serde_json::Value = serde_json::from_str(include_str!(
+        "fixtures/graph-payload-main-0532a70-ties/oracle.json"
+    ))
+    .unwrap();
+    let source = include_str!("fixtures/graph-payload-main-0532a70-ties/nested.js");
+    let (_state, work, store) = fixture();
+    std::fs::write(work.path().join("nested.js"), source).unwrap();
+    let captured = bundle(&store, &work);
+    let leader = store.publication_for_tests().unwrap();
+    publish_bundle(&store, &captured, store.index_baseline().unwrap(), &leader);
+
+    let mut query = query();
+    query.seed = oracle["seed"].as_str().unwrap().to_owned();
+    let main_queries = &oracle["queries"];
+    for case in ["max1", "max2", "excluded"] {
+        let expected = &main_queries[case];
+        query.max_calls = expected["maxCalls"].as_u64().unwrap() as usize;
+        query.exclude_paths = expected["excludePaths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|path| path.as_str().unwrap().to_owned())
+            .collect();
+        let actual = store.query_view(&query).unwrap().unwrap();
+        assert_eq!(actual.nodes.len(), 1, "{case}: seed missing");
+        assert_eq!(actual.nodes[0].id, query.seed, "{case}: wrong seed");
+        let main_ids: Vec<&str> = expected["calls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|call| call.as_str().unwrap())
+            .collect();
+        let observed_ids: Vec<&str> = actual.calls.iter().map(|call| call.id.as_str()).collect();
+        assert_eq!(observed_ids, main_ids, "{case}: main call order");
+        assert_eq!(
+            actual.truncated,
+            expected["truncated"].as_bool().unwrap(),
+            "{case}"
+        );
+        let main_warnings: Vec<&str> = expected["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|warning| warning.as_str().unwrap())
+            .collect();
+        assert_eq!(actual.warnings, main_warnings, "{case}");
+        assert!(actual.regions.is_empty(), "{case}: unexpected region");
+        for call in &actual.calls {
+            let main_row = oracle["rows"]["calls"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["id"].as_str() == Some(call.id.as_str()))
+                .unwrap();
+            assert_eq!(
+                serde_json::to_string(call).unwrap().as_bytes(),
+                main_row["payload"].as_str().unwrap().as_bytes(),
+                "{case}: call payload differs from main"
+            );
+        }
+    }
+    // Main's first call is the longer of two calls starting at byte 75.
+    // This is main-produced evidence for endByte DESC, not a synthetic full tie.
+    let main_calls = main_queries["max2"]["calls"].as_array().unwrap();
+    let main_rows = oracle["rows"]["calls"].as_array().unwrap();
+    let first = main_rows
+        .iter()
+        .find(|row| row["id"] == main_calls[0])
+        .unwrap();
+    let second = main_rows
+        .iter()
+        .find(|row| row["id"] == main_calls[1])
+        .unwrap();
+    let first_payload: serde_json::Value =
+        serde_json::from_str(first["payload"].as_str().unwrap()).unwrap();
+    let second_payload: serde_json::Value =
+        serde_json::from_str(second["payload"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        first_payload["range"]["startByte"],
+        second_payload["range"]["startByte"]
+    );
+    assert!(
+        first_payload["range"]["endByte"].as_u64().unwrap()
+            > second_payload["range"]["endByte"].as_u64().unwrap()
+    );
+}
+
+#[test]
+fn query_view_structurally_sorts_then_limits_then_excludes() {
+    // An excluded call at LIMIT is impossible for this seed-scoped query:
+    // all its calls have the seed's path. Guard the otherwise unobservable
+    // ordering of the three stages in the implementation as approved in S-3.
+    let source = include_str!("../src/store.rs");
+    let method = source.split_once("fn query_view_in_for(").unwrap().1;
+    let method = method.split_once("pub fn put_view(").unwrap().0;
+    let sort = method
+        .find("ordered.sort_by(crate::indexer::compare_reader_calls)")
+        .unwrap();
+    let limit = method
+        .find("ordered.into_iter().take(query.max_calls + 1)")
+        .unwrap();
+    let exclude = method
+        .find("query.exclude_paths.iter().any(|p| call.path.starts_with(p))")
+        .unwrap();
+    assert!(sort < limit && limit < exclude);
+}
+
+#[test]
+#[cfg(feature = "test-support")]
 fn durable_user_data_survives_cache_loss_and_resolves_orphans() {
     let (state, work, store) = fixture();
     write_source(&work);
