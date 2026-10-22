@@ -225,6 +225,18 @@ impl<'a> ReadersBlockedWatch<'a> {
         }
     }
 }
+/// Test-only: runs its hook when a publication fails before COMMIT, while the
+/// transaction (and its lock) is still open.
+#[cfg(test)]
+struct BeforeRollback<'a>(Option<&'a TestOneShotHook>);
+#[cfg(test)]
+impl Drop for BeforeRollback<'_> {
+    fn drop(&mut self) {
+        if let Some(hook) = self.0 {
+            hook.run();
+        }
+    }
+}
 impl Drop for ReadersBlockedWatch<'_> {
     fn drop(&mut self) {
         if self.marked {
@@ -341,6 +353,8 @@ pub struct Store {
     maintenance_before_writer_hook: Arc<TestOneShotHook>,
     maintenance_after_first_delete_hook: Arc<TestOneShotHook>,
     publication_before_commit_hook: Arc<TestOneShotHook>,
+    #[cfg(test)]
+    publication_before_rollback_hook: Arc<TestOneShotHook>,
     #[cfg(test)]
     test_stream_before_preflight_hook: Arc<Mutex<Option<TestStreamPreflightHook>>>,
     /// The publication page cache in KiB; only tests lower it.
@@ -6713,6 +6727,8 @@ impl Store {
             maintenance_after_first_delete_hook: Arc::new(TestOneShotHook::default()),
             publication_before_commit_hook: Arc::new(TestOneShotHook::default()),
             #[cfg(test)]
+            publication_before_rollback_hook: Arc::new(TestOneShotHook::default()),
+            #[cfg(test)]
             test_stream_before_preflight_hook: Arc::new(Mutex::new(None)),
             publication_cache_kib: Arc::new(std::sync::atomic::AtomicI64::new(
                 PUBLICATION_CACHE_KIB,
@@ -10737,10 +10753,16 @@ impl Store {
         let cache_kib = self.publication_cache_kib.load(Ordering::Acquire);
         storage_result(db.pragma_update(None, "cache_size", -cache_kib))?;
         during_tx(PublishStage::BeforeTransaction, &db)?;
-        let tx = storage_result(db.transaction_with_behavior(TransactionBehavior::Immediate))?;
-        // Only the live index has readers; a private stage has none.
+        // Only the live index has readers; a private stage has none. Declared
+        // before the transaction so it drops after it: on an error or unwind
+        // the mark stays set until the rollback has released the lock.
         let mut readers_blocked = matches!(target, PublicationTarget::Live)
             .then(|| ReadersBlockedWatch::new(&self.publication_gate, source_files.len()));
+        let tx = storage_result(db.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        // Dropped before the transaction, so a failed publication pauses here
+        // with its lock still held and its rollback not yet run.
+        #[cfg(test)]
+        let mut before_rollback = BeforeRollback(Some(&self.publication_before_rollback_hook));
         let current = match target {
             PublicationTarget::Live => self
                 .recovery_baseline_preflight(&tx)
@@ -11178,7 +11200,13 @@ impl Store {
             // Same rollback point, but a direct typed SQLite contention.
             return Err(SqliteContention(()).into());
         }
+        #[cfg(test)]
+        {
+            before_rollback.0 = None;
+        }
         storage_result(tx.commit())?;
+        // COMMIT released the lock; later failures are not a held rebuild.
+        drop(readers_blocked);
         #[cfg(test)]
         if matches!(target, PublicationTarget::Live)
             && self
@@ -11425,6 +11453,12 @@ impl Store {
     #[doc(hidden)]
     pub fn set_publication_cache_kib_for_tests(&self, kib: i64) {
         self.publication_cache_kib.store(kib, Ordering::Release);
+    }
+
+    /// Pause a failed publication before its rollback, with its lock held.
+    #[cfg(test)]
+    fn set_publication_before_rollback_hook_for_tests(&self, hook: impl FnOnce() + Send + 'static) {
+        self.publication_before_rollback_hook.set(hook);
     }
 
     /// Deterministic rollback after a complete index rebuild but before COMMIT.

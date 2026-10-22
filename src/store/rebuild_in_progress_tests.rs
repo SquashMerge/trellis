@@ -103,3 +103,63 @@ fn reads_fail_fast_while_a_spilled_publication_holds_the_index() {
     );
     assert_eq!(store.status().unwrap().revision, next);
 }
+
+/// #210 review: a spilled publication that fails still holds EXCLUSIVE until
+/// its rollback finishes. Reads in that window must keep failing fast with
+/// `rebuild_in_progress`, so the mark must outlive the transaction.
+#[test]
+fn reads_fail_fast_while_a_spilled_publication_is_rolling_back() {
+    let state = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let options = IndexOptions::new(work.path().to_owned());
+    let cancel = Arc::new(AtomicBool::new(false));
+    let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+    write_tree(work.path(), 1);
+    let first_job = IndexJobCoordinator::prepare(&store, None).unwrap();
+    let session = first_job.session();
+    let first = first_job.run(&options, &cancel, |_| {}).unwrap();
+
+    store.set_publication_cache_kib_for_tests(64);
+    write_tree(work.path(), 2);
+    // Cancel at the commit barrier, then pause before the rollback runs.
+    let abort = cancel.clone();
+    store.set_publication_before_commit_hook_for_tests(move || {
+        abort.store(true, Ordering::Release);
+    });
+    let (arrived_tx, arrived_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    store.set_publication_before_rollback_hook_for_tests(move || {
+        arrived_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+    });
+    let job = IndexJobCoordinator::prepare_with_session(&store, Some(first), session).unwrap();
+    let publish_options = options.clone();
+    let publish_cancel = cancel.clone();
+    let publisher = std::thread::spawn(move || job.run(&publish_options, &publish_cancel, |_| {}));
+    arrived_rx
+        .recv_timeout(crate::testing::HANG_BACKSTOP)
+        .expect("failed publication did not reach its rollback");
+    let started = Instant::now();
+    let during = store.status();
+    let waited = started.elapsed();
+    release_tx.send(()).unwrap();
+    assert!(publisher.join().unwrap().is_err());
+
+    let error = during.expect_err("an unfinished rollback still locks readers out");
+    assert!(
+        error
+            .chain()
+            .any(|cause| cause.downcast_ref::<RebuildInProgress>().is_some()),
+        "expected rebuild_in_progress, got {error:#}"
+    );
+    assert!(waited < Duration::from_secs(4), "read waited {waited:?}");
+    assert!(
+        store
+            .publication_gate
+            .readers_blocked
+            .lock()
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(store.status().unwrap().revision, first);
+}
