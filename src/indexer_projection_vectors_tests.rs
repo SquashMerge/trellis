@@ -1,0 +1,189 @@
+//! Frozen SQL payload bytes written by unmodified main 0532a70. Never update
+//! these vectors from `project_document` or the candidate writer.
+use crate::{
+    capture::Capture,
+    classes::{Catalog, FileExtraction, Limits},
+    indexer::{IndexOptions, NativeDocument, project_document},
+    native_evidence,
+    native_ids,
+    store::topology::WorkspaceIdentity,
+};
+use serde::Serialize;
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use std::{collections::BTreeMap, fs, path::Path, sync::{Arc, atomic::AtomicBool}};
+
+fn sha(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+fn compare_rows<T: Serialize>(expected: &Value, rows: &[T], family: &str) {
+    let frozen = expected[family].as_array().expect("main writer family");
+    assert_eq!(rows.len(), frozen.len(), "{family} count, including empty families");
+    for (row, old) in rows.iter().zip(frozen) {
+        let actual = serde_json::to_vec(row).unwrap();
+        let bytes = old["payload"].as_str().unwrap().as_bytes();
+        assert_eq!(sha(bytes), old["sha256"].as_str().unwrap());
+        assert_eq!(actual.as_slice(), bytes, "{family} payload {}", old["id"]);
+        let value: Value = serde_json::from_slice(&actual).unwrap();
+        assert_eq!(value["id"], old["id"], "{family} row id");
+    }
+}
+
+#[test]
+fn main_writer_graph_payloads_match_one_shared_projection_byte_for_byte() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/graph-payload-main-0532a70");
+    let frozen: Value = serde_json::from_slice(&fs::read(root.join("vectors.json")).unwrap()).unwrap();
+    assert_eq!(frozen["writerCommit"], "0532a7090003904317136aeac98a23716aea1fc2");
+    assert_eq!(frozen["writerBinarySha256"], "536cdd7231b66c7a8e807d528084b6f00377a96d425ca6c5183a7a7728ff7d9f");
+    let cancel = Arc::new(AtomicBool::new(false));
+    let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+    for mode in ["plain", "scip"] {
+        let mut options = IndexOptions::new(root.clone());
+        if mode == "scip" {
+            options.scip_path = Some(root.join("labels.scip"));
+            options.manifest_path = Some(root.join("labels-manifest.json"));
+            assert_eq!(sha(&fs::read(root.join("labels.scip")).unwrap()), frozen["modes"][mode]["scipSha256"]);
+        }
+        let capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
+        let native = native_evidence::from_capture(&capture, &root, &identity.record_id, &cancel).unwrap();
+        let documents = frozen["modes"][mode]["documents"].as_object().unwrap();
+        assert_eq!(documents.len(), 5);
+        let mut extractions = Vec::new();
+        let mut projected = BTreeMap::new();
+        let mut symbol_count = 0;
+        let mut payload_count = 0;
+        for (path, old) in documents {
+            let source = fs::read(root.join(path)).unwrap();
+            assert_eq!(sha(&source), old["sourceSha256"], "{mode} {path} input drift");
+            let mut labels = BTreeMap::new();
+            for node in old["rows"]["nodes"].as_array().unwrap() {
+                let payload: Value = serde_json::from_str(node["payload"].as_str().unwrap()).unwrap();
+                if let Some(label) = payload["displayLabel"].as_str() {
+                    labels.insert(node["id"].as_str().unwrap().to_owned(), label.to_owned());
+                }
+            }
+            let mut declarations: Vec<_> = native.declarations.iter()
+                .filter(|d| d.document.path == *path).collect();
+            // Simulates SQL attestation's syntax-id order, even when child precedes parent.
+            declarations.sort_by(|a, b| a.syntax_id.cmp(&b.syntax_id));
+            let mut calls: Vec<_> = native.calls.iter().filter(|c| c.document.path == *path).collect();
+            calls.sort_by(|a, b| a.id.cmp(&b.id));
+            let mut control_regions: Vec<_> = native.control_regions.iter()
+                .filter(|r| r.document.path == *path).collect();
+            control_regions.sort_by(|a, b| a.id.cmp(&b.id));
+            let (mut nodes, mut calls, mut regions) = project_document(
+                path, &source, NativeDocument { declarations, calls, control_regions }, &labels,
+            ).unwrap();
+            nodes.sort_by(|a, b| a.id.cmp(&b.id));
+            calls.sort_by(|a, b| a.id.cmp(&b.id));
+            regions.sort_by(|a, b| a.id.cmp(&b.id));
+            compare_rows(&old["rows"], &nodes, "nodes");
+            compare_rows(&old["rows"], &calls, "calls");
+            compare_rows(&old["rows"], &regions, "regions");
+            symbol_count += nodes.len();
+            payload_count += nodes.len() + calls.len() + regions.len();
+            if matches!(path.as_str(), "java.java" | "python.py") {
+                let file = capture.files.iter().find(|f| f.path == *path).unwrap();
+                let extracted = FileExtraction::extract_file(
+                    file, &nodes, &cancel, Limits::default(),
+                ).unwrap();
+                assert_eq!(serde_json::to_string(&extracted).unwrap(), old["classExtraction"],
+                    "{mode} {path} main class extraction F");
+                extractions.push(extracted);
+            }
+            projected.insert(path.as_str(), old);
+            let graph_input = json!({
+                "documentVersionId": old["documentVersionId"],
+                "nodes": nodes, "calls": calls, "regions": regions,
+            });
+            let hash = native_ids::digest(
+                b"trellis.graph-projection.v1\0", &native_ids::canonical(&graph_input),
+            );
+            assert_eq!(hash, old["graphHash"], "{mode} {path} main graph hash");
+            assert_eq!(format!("graph:v1:{hash}"), old["graphProjectionId"], "{mode} {path} graph id");
+            if !matches!(path.as_str(), "java.java" | "python.py") {
+                assert_eq!(old["classExtraction"], "");
+            }
+        }
+        assert_eq!(payload_count, 56, "{mode} complete main payload corpus");
+        let catalog = Catalog::compose(&extractions, capture.files.len(), symbol_count, Limits::default()).unwrap();
+        for (path, old) in projected {
+            let mut classes: Vec<_> = catalog.classes.iter()
+                .filter(|class| class.symbol.path == path).collect();
+            classes.sort_by(|a, b| a.symbol.id.cmp(&b.symbol.id));
+            let mut relations: Vec<_> = catalog.relations.iter()
+                .filter(|relation| relation.path == path).collect();
+            relations.sort_by(|a, b| a.id.cmp(&b.id));
+            let input = json!({"graphProjectionId": old["graphProjectionId"],
+                "classes": classes, "relations": relations});
+            let class_hash = native_ids::digest(
+                b"trellis.class-projection.v1\0", &native_ids::canonical(&input),
+            );
+            assert_eq!(class_hash, old["classHash"], "{mode} {path} main class hash");
+            assert_eq!(format!("class-projection:v1:{class_hash}"), old["classProjectionId"],
+                "{mode} {path} main class projection id");
+        }
+    }
+}
+
+#[test]
+fn main_writer_nested_call_and_query_view_oracle() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/graph-payload-main-0532a70-ties");
+    let frozen: Value = serde_json::from_slice(&fs::read(root.join("oracle.json")).unwrap()).unwrap();
+    assert_eq!(frozen["writerCommit"], "0532a7090003904317136aeac98a23716aea1fc2");
+    assert_eq!(frozen["writerBinarySha256"], "536cdd7231b66c7a8e807d528084b6f00377a96d425ca6c5183a7a7728ff7d9f");
+    let path = "nested.js";
+    let source = fs::read(root.join(path)).unwrap();
+    assert_eq!(sha(&source), frozen["sourceSha256"]);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+    let capture = Capture::admit(&IndexOptions::new(root.clone()), &cancel, &|_| {}).unwrap();
+    let native = native_evidence::from_capture(&capture, &root, &identity.record_id, &cancel).unwrap();
+    let mut declarations: Vec<_> = native.declarations.iter().filter(|d| d.document.path == path).collect();
+    declarations.sort_by(|a, b| a.syntax_id.cmp(&b.syntax_id));
+    let mut calls: Vec<_> = native.calls.iter().filter(|c| c.document.path == path).collect();
+    calls.sort_by(|a, b| a.id.cmp(&b.id));
+    let mut control_regions: Vec<_> = native.control_regions.iter().filter(|r| r.document.path == path).collect();
+    control_regions.sort_by(|a, b| a.id.cmp(&b.id));
+    let (mut nodes, mut calls, mut regions) = project_document(
+        path, &source, NativeDocument { declarations, calls, control_regions }, &BTreeMap::new(),
+    ).unwrap();
+    nodes.sort_by(|a, b| a.id.cmp(&b.id));
+    calls.sort_by(|a, b| a.id.cmp(&b.id));
+    regions.sort_by(|a, b| a.id.cmp(&b.id));
+    compare_rows(&frozen["rows"], &nodes, "nodes");
+    compare_rows(&frozen["rows"], &calls, "calls");
+    compare_rows(&frozen["rows"], &regions, "regions");
+    let graph_input = json!({"documentVersionId": frozen["documentVersionId"],
+        "nodes": nodes, "calls": calls, "regions": regions});
+    let graph_hash = native_ids::digest(b"trellis.graph-projection.v1\0", &native_ids::canonical(&graph_input));
+    assert_eq!(graph_hash, frozen["graphHash"], "main graph hash must not change");
+    assert_eq!(format!("graph:v1:{graph_hash}"), frozen["graphProjectionId"]);
+    assert_eq!(frozen["classExtraction"], "");
+    let catalog = Catalog::compose(&[], capture.files.len(), nodes.len(), Limits::default()).unwrap();
+    let class_input = json!({"graphProjectionId": frozen["graphProjectionId"],
+        "classes": catalog.classes, "relations": catalog.relations});
+    let class_hash = native_ids::digest(b"trellis.class-projection.v1\0", &native_ids::canonical(&class_input));
+    assert_eq!(class_hash, frozen["classHash"], "main class hash must not change");
+    assert_eq!(format!("class-projection:v1:{class_hash}"), frozen["classProjectionId"]);
+
+    // Main 0532's SQL orders endByte DESC before id. These two real source calls
+    // have the same startByte but different endByte. The second row is the
+    // max_calls+1 overflow probe. Excluding the seed path removes both calls.
+    let ids: Vec<&str> = frozen["rows"]["calls"].as_array().unwrap().iter()
+        .map(|row| row["id"].as_str().unwrap()).collect();
+    let longer = calls.iter().max_by_key(|call| call.range.end_byte).unwrap().id.as_str();
+    let shorter = calls.iter().min_by_key(|call| call.range.end_byte).unwrap().id.as_str();
+    assert_ne!(longer, shorter);
+    assert_eq!(frozen["queries"]["max1"]["calls"], json!([longer]));
+    assert_eq!(frozen["queries"]["max1"]["truncated"], true);
+    assert_eq!(frozen["queries"]["max2"]["calls"], json!([longer, shorter]));
+    assert_eq!(frozen["queries"]["max2"]["truncated"], false);
+    assert_eq!(frozen["queries"]["excluded"]["calls"], json!([]));
+    assert_eq!(frozen["queries"]["excluded"]["truncated"], false);
+    assert_eq!(frozen["queries"]["excluded"]["excludePaths"], json!([path]));
+    assert_eq!(ids.len(), 2);
+}
