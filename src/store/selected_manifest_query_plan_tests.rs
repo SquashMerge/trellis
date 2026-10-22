@@ -3,7 +3,7 @@ use super::*;
 #[test]
 fn selected_capture_and_reconcile_use_the_revision_index() {
     let db = Connection::open_in_memory().unwrap();
-    db.execute_batch(CACHE_SCHEMA_V8).unwrap();
+    db.execute_batch(CACHE_SCHEMA_V12).unwrap();
     for (label, sql) in [
         ("capture", SELECTED_CAPTURE_SNAPSHOT_SQL),
         ("reconcile", SELECTED_RECONCILE_FILES_SQL),
@@ -33,18 +33,28 @@ fn selected_capture_and_reconcile_use_the_revision_index() {
 }
 
 #[test]
-fn per_file_manifest_lookup_uses_the_path_index() {
+fn incomplete_current_schema_is_rejected() {
     let db = Connection::open_in_memory().unwrap();
-    db.execute_batch(CACHE_SCHEMA_V8).unwrap();
-    db.execute_batch(SUPERSESSION_SCHEMA_V8).unwrap();
-    db.execute_batch(RETENTION_SCHEMA_V8).unwrap();
-    db.execute_batch(RETENTION_FK_INDEX_SCHEMA_V8).unwrap();
-    db.execute_batch(REVISION_HEADER_INDEX_SCHEMA_V8).unwrap();
+    db.execute_batch(CACHE_SCHEMA_V12).unwrap();
     db.pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)
         .unwrap();
-    // The shape without the path index stays accepted until the leader adds it.
     validate_cache_shape(&db).unwrap();
-    db.execute_batch(REVISION_DOCUMENT_PATH_INDEX_SCHEMA_V8)
+    db.execute_batch("DROP INDEX native_revisions_header_cover")
+        .unwrap();
+    let failure = validate_cache_shape(&db).unwrap_err();
+    assert!(
+        failure
+            .to_string()
+            .contains("incompatible_index: unknown cache object type, name or shape"),
+        "{failure:#}"
+    );
+}
+
+#[test]
+fn per_file_manifest_lookup_uses_the_path_index() {
+    let db = Connection::open_in_memory().unwrap();
+    db.execute_batch(CACHE_SCHEMA_V12).unwrap();
+    db.pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)
         .unwrap();
     validate_cache_shape(&db).unwrap();
     for sql in [
@@ -71,15 +81,9 @@ fn per_file_manifest_lookup_uses_the_path_index() {
 #[test]
 fn header_and_changing_manifest_plan_avoid_wide_revision_scans() {
     let db = Connection::open_in_memory().unwrap();
-    db.execute_batch(CACHE_SCHEMA_V8).unwrap();
-    db.execute_batch(SUPERSESSION_SCHEMA_V8).unwrap();
-    db.execute_batch(RETENTION_SCHEMA_V8).unwrap();
-    db.execute_batch(RETENTION_FK_INDEX_SCHEMA_V8).unwrap();
+    db.execute_batch(CACHE_SCHEMA_V12).unwrap();
     db.pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)
         .unwrap();
-    // Existing v8 shapes remain accepted before the leader's additive upgrade.
-    validate_cache_shape(&db).unwrap();
-    db.execute_batch(REVISION_HEADER_INDEX_SCHEMA_V8).unwrap();
     validate_cache_shape(&db).unwrap();
     let header: Vec<String> = db
         .prepare(&format!("EXPLAIN QUERY PLAN {HEADER_SQL}"))
@@ -111,6 +115,50 @@ fn header_and_changing_manifest_plan_avoid_wide_revision_scans() {
         !plan.iter().any(|step| step.starts_with("SCAN r")),
         "changing manifest scanned all revision headers: {plan:?}"
     );
+}
+
+#[test]
+fn first_publication_creates_epoch_and_attests_selected_producer() {
+    use crate::index_coordinator::IndexJobCoordinator;
+    use crate::indexer::IndexOptions;
+    use std::{fs, sync::atomic::AtomicBool};
+
+    let state = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    fs::write(
+        work.path().join("A.java"),
+        "class A { int run() { return 1; } }\n",
+    )
+    .unwrap();
+    let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+    let pin = IndexJobCoordinator::prepare(&store, None)
+        .unwrap()
+        .run(
+            &IndexOptions::new(work.path().to_owned()),
+            &Arc::new(AtomicBool::new(false)),
+            |_| {},
+        )
+        .unwrap();
+    let db = store.cache_write().unwrap();
+    let epoch: (String, i64) = db
+        .query_row(
+            "SELECT index_generation,first_revision FROM native_binding_epoch WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(epoch, (pin.index_generation.to_string(), 1));
+    let selected = ReadRevision::current(&db).unwrap();
+    assert_eq!(selected.pin, pin);
+    let derived = selected_producer_hash(&db, &selected).unwrap();
+    let persisted: String = db
+        .query_row(
+            "SELECT producer_sha FROM revision_producer_bindings WHERE revision_id=?1",
+            [&selected.key],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(derived, persisted);
 }
 
 #[test]

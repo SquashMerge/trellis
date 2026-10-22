@@ -520,51 +520,31 @@ SELECT COALESCE(length(CAST(x.projection_id AS BLOB)),0)+COALESCE(length(CAST(x.
 UNION ALL
 SELECT COALESCE(length(CAST(x.projection_id AS BLOB)),0)+COALESCE(length(CAST(x.id AS BLOB)),0)+COALESCE(length(CAST(x.owner AS BLOB)),0)+COALESCE(length(CAST(x.target AS BLOB)),0)+COALESCE(length(CAST(x.payload AS BLOB)),0) AS row_bytes FROM class_relations x WHERE x.projection_id=?2
 )"#;
-const DATABASE_SCHEMA_VERSION: u32 = 11;
+const DATABASE_SCHEMA_VERSION: u32 = 12;
 const EXTRACTOR_VERSION: &str = "native-v6-delta-v1";
 const EVIDENCE_FORMAT: &str = "terminal-native-graph-v1";
-// The original v8 supersession extension stays byte-for-byte compatible.
-const SUPERSESSION_SCHEMA_V8: &str = "CREATE TABLE native_revision_supersessions(revision_id TEXT PRIMARY KEY REFERENCES native_revisions(id),superseded_at INTEGER NOT NULL CHECK(superseded_at BETWEEN 0 AND 9007199254740991));";
-// Additive v8 maintenance extension: installed under a verified leader's
-// write transaction without replacing existing pins, queues, or index inode.
-const RETENTION_SCHEMA_V8: &str = r#"
-ALTER TABLE native_revision_supersessions ADD COLUMN state TEXT NOT NULL DEFAULT 'retained' CHECK(state IN ('retained','pending','released'));
-CREATE INDEX native_supersessions_clock ON native_revision_supersessions(superseded_at,revision_id);
-CREATE INDEX native_supersessions_due ON native_revision_supersessions(superseded_at,revision_id) WHERE state='retained';
-CREATE TABLE native_revision_release_debt(revision_id TEXT PRIMARY KEY REFERENCES native_revisions(id) DEFERRABLE INITIALLY DEFERRED,phase TEXT NOT NULL CHECK(phase='pending'));
-CREATE TABLE native_release_candidate_versions(revision_id TEXT NOT NULL REFERENCES native_revisions(id) DEFERRABLE INITIALLY DEFERRED,id TEXT NOT NULL,PRIMARY KEY(revision_id,id));
-CREATE TABLE native_release_candidate_graphs(revision_id TEXT NOT NULL REFERENCES native_revisions(id) DEFERRABLE INITIALLY DEFERRED,id TEXT NOT NULL,PRIMARY KEY(revision_id,id));
-CREATE TABLE native_release_candidate_classes(revision_id TEXT NOT NULL REFERENCES native_revisions(id) DEFERRABLE INITIALLY DEFERRED,id TEXT NOT NULL,PRIMARY KEY(revision_id,id));
-"#;
-// These indexes avoid quadratic self-FK checks when a large document is retired.
-// Keep them separate so indexes written by the previous v8 extension remain valid.
-const RETENTION_FK_INDEX_SCHEMA_V8: &str = r#"
-CREATE INDEX native_version_declarations_owner ON native_version_declarations(version_id,owner_syntax_id);
-CREATE INDEX native_version_regions_parent ON native_version_control_regions(version_id,parent_id,owner_syntax_id);
-"#;
-// Additive v8 index: validation can read headers without loading source_inventory.
-const REVISION_HEADER_INDEX_SCHEMA_V8: &str = "CREATE INDEX native_revisions_header_cover ON native_revisions(source_set_id,published_index_revision,id);";
-// Additive v8 index: per-file (revision_id,path) lookups are point reads, not revision scans.
-const REVISION_DOCUMENT_PATH_INDEX_SCHEMA_V8: &str =
-    "CREATE INDEX revision_documents_path ON revision_documents(revision_id,path);";
-
-const CACHE_SCHEMA_V8: &str = r#"
-CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=11), extractor_version TEXT NOT NULL CHECK(extractor_version='native-v6-delta-v1'), root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL, reconcile_options TEXT);
+const CACHE_SCHEMA_V12: &str = r#"
+CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=12), extractor_version TEXT NOT NULL CHECK(extractor_version='native-v6-delta-v1'), root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL, reconcile_options TEXT);
 CREATE TABLE native_producers(id TEXT NOT NULL,version TEXT NOT NULL,executable_hash TEXT NOT NULL CHECK(length(executable_hash)=64),kind TEXT NOT NULL CHECK(kind='native'),position_encoding TEXT NOT NULL CHECK(position_encoding='utf8'),PRIMARY KEY(id,version));
 CREATE TABLE native_producer_languages(producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,language TEXT NOT NULL,inventory_authenticated INTEGER NOT NULL CHECK(inventory_authenticated IN (0,1)),ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(producer_id,producer_version,language),UNIQUE(producer_id,producer_version,ordinal),FOREIGN KEY(producer_id,producer_version) REFERENCES native_producers(id,version) DEFERRABLE INITIALLY DEFERRED);
 CREATE TABLE native_producer_inputs(producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,language TEXT NOT NULL,component_name TEXT NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(producer_id,producer_version,language,component_name),UNIQUE(producer_id,producer_version,language,ordinal),FOREIGN KEY(producer_id,producer_version,language) REFERENCES native_producer_languages(producer_id,producer_version,language) DEFERRABLE INITIALLY DEFERRED);
 CREATE TABLE native_source_sets(id TEXT PRIMARY KEY,root_id TEXT NOT NULL);
 CREATE TABLE native_source_set_languages(source_set_id TEXT NOT NULL REFERENCES native_source_sets(id) DEFERRABLE INITIALLY DEFERRED,language TEXT NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(source_set_id,language),UNIQUE(source_set_id,ordinal));
 CREATE TABLE native_source_set_dependencies(source_set_id TEXT NOT NULL REFERENCES native_source_sets(id) DEFERRABLE INITIALLY DEFERRED,dependency_id TEXT NOT NULL REFERENCES native_source_sets(id) DEFERRABLE INITIALLY DEFERRED,ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(source_set_id,dependency_id),UNIQUE(source_set_id,ordinal));
+CREATE TABLE native_revision_supersessions(revision_id TEXT PRIMARY KEY REFERENCES native_revisions(id),superseded_at INTEGER NOT NULL CHECK(superseded_at BETWEEN 0 AND 9007199254740991),state TEXT NOT NULL DEFAULT 'retained' CHECK(state IN ('retained','pending','released')));
+CREATE INDEX native_supersessions_clock ON native_revision_supersessions(superseded_at,revision_id);
+CREATE INDEX native_supersessions_due ON native_revision_supersessions(superseded_at,revision_id) WHERE state='retained';
+CREATE TABLE native_revision_release_debt(revision_id TEXT PRIMARY KEY REFERENCES native_revisions(id) DEFERRABLE INITIALLY DEFERRED,phase TEXT NOT NULL CHECK(phase='pending'));
+CREATE TABLE native_release_candidate_versions(revision_id TEXT NOT NULL REFERENCES native_revisions(id) DEFERRABLE INITIALLY DEFERRED,id TEXT NOT NULL,PRIMARY KEY(revision_id,id));
+CREATE TABLE native_release_candidate_graphs(revision_id TEXT NOT NULL REFERENCES native_revisions(id) DEFERRABLE INITIALLY DEFERRED,id TEXT NOT NULL,PRIMARY KEY(revision_id,id));
+CREATE TABLE native_release_candidate_classes(revision_id TEXT NOT NULL REFERENCES native_revisions(id) DEFERRABLE INITIALLY DEFERRED,id TEXT NOT NULL,PRIMARY KEY(revision_id,id));
 CREATE TABLE native_revisions(id TEXT PRIMARY KEY,source_set_id TEXT NOT NULL REFERENCES native_source_sets(id) DEFERRABLE INITIALLY DEFERRED,toolchain_hash TEXT NOT NULL CHECK(length(toolchain_hash)=64),config_hash TEXT NOT NULL CHECK(length(config_hash)=64),dependency_hash TEXT NOT NULL CHECK(length(dependency_hash)=64),native_revision_id TEXT NOT NULL,source_inventory TEXT NOT NULL,dependency_observations TEXT NOT NULL,reconcile_options TEXT,class_warnings TEXT NOT NULL,class_truncated INTEGER NOT NULL CHECK(class_truncated IN (0,1)),graph_stats TEXT NOT NULL CHECK(json_valid(graph_stats) AND json_type(graph_stats)='object'),graph_diagnostics TEXT NOT NULL CHECK(json_valid(graph_diagnostics) AND json_type(graph_diagnostics)='array'),published_index_revision INTEGER NOT NULL CHECK(published_index_revision BETWEEN 0 AND 9007199254740991));
 CREATE UNIQUE INDEX native_revisions_pin ON native_revisions(published_index_revision);
+CREATE INDEX native_revisions_header_cover ON native_revisions(source_set_id,published_index_revision,id);
 CREATE TABLE revision_capture_inputs(revision_id TEXT NOT NULL REFERENCES native_revisions(id) DEFERRABLE INITIALLY DEFERRED,input_key TEXT NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(revision_id,input_key));
 CREATE TABLE document_versions(id TEXT PRIMARY KEY,source_set_id TEXT NOT NULL REFERENCES native_source_sets(id) DEFERRABLE INITIALLY DEFERRED,language TEXT NOT NULL,path TEXT NOT NULL,content_hash TEXT NOT NULL CHECK(length(content_hash)=64),extraction_context TEXT NOT NULL CHECK(length(extraction_context)=64),producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,byte_length INTEGER NOT NULL CHECK(byte_length>=0 AND byte_length=length(source_bytes)),source_bytes BLOB NOT NULL,native_witness TEXT NOT NULL CHECK(length(native_witness)=64),UNIQUE(source_set_id,language,path,content_hash,extraction_context,producer_id,producer_version),UNIQUE(id,source_set_id,language,path),UNIQUE(id,language),FOREIGN KEY(producer_id,producer_version,language) REFERENCES native_producer_languages(producer_id,producer_version,language) DEFERRABLE INITIALLY DEFERRED);
-CREATE INDEX document_versions_path ON document_versions(source_set_id,language,path,id);
 CREATE TABLE graph_projections(id TEXT PRIMARY KEY,document_version_id TEXT NOT NULL,language TEXT NOT NULL,graph_hash TEXT NOT NULL CHECK(length(graph_hash)=64),state TEXT NOT NULL CHECK(state IN ('staged','ready','unavailable')),class_extraction_state TEXT NOT NULL CHECK(class_extraction_state IN ('notApplicable','ready')),class_extraction_payload TEXT,CHECK((class_extraction_state='ready')=(class_extraction_payload IS NOT NULL)),CHECK((language IN ('java','python'))=(class_extraction_state IN ('ready'))),UNIQUE(document_version_id,graph_hash),UNIQUE(id,document_version_id),FOREIGN KEY(document_version_id,language) REFERENCES document_versions(id,language) DEFERRABLE INITIALLY DEFERRED);
-CREATE INDEX graph_projections_version ON graph_projections(document_version_id,id);
 CREATE TABLE graph_nodes(projection_id TEXT NOT NULL REFERENCES graph_projections(id) DEFERRABLE INITIALLY DEFERRED,id TEXT NOT NULL,name TEXT NOT NULL,path TEXT NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(projection_id,id));
-CREATE INDEX graph_nodes_name ON graph_nodes(projection_id,name,id);
 CREATE VIRTUAL TABLE graph_node_trigrams USING fts5(name,content='',columnsize=0,tokenize='trigram case_sensitive 1');
 CREATE TRIGGER graph_node_trigrams_insert AFTER INSERT ON graph_nodes BEGIN INSERT INTO graph_node_trigrams(rowid,name) VALUES(new.rowid,lower(new.name)); END;
 CREATE TRIGGER graph_node_trigrams_delete AFTER DELETE ON graph_nodes BEGIN INSERT INTO graph_node_trigrams(graph_node_trigrams,rowid,name) VALUES('delete',old.rowid,lower(old.name)); END;
@@ -575,7 +555,6 @@ CREATE TABLE graph_regions(projection_id TEXT NOT NULL,id TEXT NOT NULL,owner TE
 CREATE INDEX graph_regions_owner ON graph_regions(projection_id,owner,id);
 CREATE TABLE class_projections(id TEXT PRIMARY KEY,graph_projection_id TEXT NOT NULL REFERENCES graph_projections(id) DEFERRABLE INITIALLY DEFERRED,content_hash TEXT NOT NULL CHECK(length(content_hash)=64),state TEXT NOT NULL CHECK(state IN ('ready','unavailable')),UNIQUE(graph_projection_id,content_hash),UNIQUE(id,graph_projection_id));
 CREATE TABLE classes(projection_id TEXT NOT NULL,graph_projection_id TEXT NOT NULL,id TEXT NOT NULL,name TEXT NOT NULL,qualified_name TEXT NOT NULL,path TEXT NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(projection_id,id),FOREIGN KEY(projection_id,graph_projection_id) REFERENCES class_projections(id,graph_projection_id) DEFERRABLE INITIALLY DEFERRED,FOREIGN KEY(graph_projection_id,id) REFERENCES graph_nodes(projection_id,id) DEFERRABLE INITIALLY DEFERRED);
-CREATE INDEX classes_path ON classes(projection_id,path,id);
 CREATE TABLE class_relations(projection_id TEXT NOT NULL,id TEXT NOT NULL,owner TEXT NOT NULL,target TEXT,payload TEXT NOT NULL,PRIMARY KEY(projection_id,id),FOREIGN KEY(projection_id,owner) REFERENCES classes(projection_id,id) DEFERRABLE INITIALLY DEFERRED,FOREIGN KEY(projection_id,target) REFERENCES classes(projection_id,id) DEFERRABLE INITIALLY DEFERRED);
 CREATE INDEX class_relations_owner ON class_relations(projection_id,owner,id);
 CREATE INDEX class_relations_target ON class_relations(projection_id,target,id);
@@ -583,9 +562,11 @@ CREATE TABLE revision_documents(revision_id TEXT NOT NULL REFERENCES native_revi
 CREATE INDEX revision_documents_version ON revision_documents(document_version_id,revision_id);
 CREATE INDEX revision_documents_graph ON revision_documents(graph_projection_id,revision_id);
 CREATE INDEX revision_documents_class ON revision_documents(class_projection_id,revision_id);
+CREATE INDEX revision_documents_path ON revision_documents(revision_id,path);
 CREATE TABLE native_version_coverage_roles(version_id TEXT NOT NULL REFERENCES document_versions(id) DEFERRABLE INITIALLY DEFERRED,role_kind TEXT NOT NULL CHECK(role_kind IN ('supported','observed')),role TEXT NOT NULL CHECK(role IN ('definition','call')),ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(version_id,role_kind,ordinal),UNIQUE(version_id,role_kind,role));
 CREATE TABLE native_version_declarations(version_id TEXT NOT NULL REFERENCES document_versions(id) DEFERRABLE INITIALLY DEFERRED,syntax_id TEXT NOT NULL,owner_syntax_id TEXT,kind TEXT NOT NULL,role TEXT NOT NULL CHECK(role IN ('test','production')),name TEXT,lookup_key TEXT,key_signature_present INTEGER NOT NULL CHECK(key_signature_present IN (0,1)),key_type_parameter_count INTEGER,key_variadic INTEGER,key_ordinal INTEGER NOT NULL CHECK(key_ordinal>=0),start_byte INTEGER NOT NULL,end_byte INTEGER NOT NULL,name_start INTEGER,name_end INTEGER,CHECK(start_byte>=0 AND end_byte>=start_byte),CHECK((name IS NULL)=(lookup_key IS NULL) AND (name IS NULL)=(name_start IS NULL) AND (name_start IS NULL)=(name_end IS NULL)),CHECK(name_start IS NULL OR (name_start>=start_byte AND name_end<=end_byte AND name_end>name_start)),CHECK((key_signature_present=0 AND key_type_parameter_count IS NULL AND key_variadic IS NULL) OR (key_signature_present=1 AND key_type_parameter_count>=0 AND key_variadic IN (0,1))),PRIMARY KEY(version_id,syntax_id),FOREIGN KEY(version_id,owner_syntax_id) REFERENCES native_version_declarations(version_id,syntax_id) DEFERRABLE INITIALLY DEFERRED);
 CREATE INDEX native_version_declarations_lookup ON native_version_declarations(lookup_key,version_id,syntax_id);
+CREATE INDEX native_version_declarations_owner ON native_version_declarations(version_id,owner_syntax_id);
 CREATE VIRTUAL TABLE native_declaration_trigrams USING fts5(name,content='',columnsize=0,tokenize='trigram case_sensitive 1');
 CREATE TRIGGER native_declaration_trigrams_insert AFTER INSERT ON native_version_declarations BEGIN INSERT INTO native_declaration_trigrams(rowid,name) VALUES(new.rowid,lower(new.name)); END;
 CREATE TRIGGER native_declaration_trigrams_delete AFTER DELETE ON native_version_declarations BEGIN INSERT INTO native_declaration_trigrams(native_declaration_trigrams,rowid,name) VALUES('delete',old.rowid,lower(old.name)); END;
@@ -597,15 +578,10 @@ CREATE TABLE native_version_headers(version_id TEXT NOT NULL,syntax_id TEXT NOT 
 CREATE TABLE native_version_header_items(version_id TEXT NOT NULL,syntax_id TEXT NOT NULL,item_kind TEXT NOT NULL CHECK(item_kind IN ('modifier','typeParameter','base')),ordinal INTEGER NOT NULL CHECK(ordinal>=0),value TEXT NOT NULL,PRIMARY KEY(version_id,syntax_id,item_kind,ordinal),FOREIGN KEY(version_id,syntax_id) REFERENCES native_version_headers(version_id,syntax_id) DEFERRABLE INITIALLY DEFERRED);
 CREATE TABLE native_version_parameters(version_id TEXT NOT NULL,syntax_id TEXT NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),name TEXT,type_name TEXT,variadic INTEGER NOT NULL CHECK(variadic IN (0,1)),PRIMARY KEY(version_id,syntax_id,ordinal),FOREIGN KEY(version_id,syntax_id) REFERENCES native_version_headers(version_id,syntax_id) DEFERRABLE INITIALLY DEFERRED);
 CREATE TABLE native_version_calls(version_id TEXT NOT NULL,id TEXT NOT NULL,owner_syntax_id TEXT NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),start_byte INTEGER NOT NULL,end_byte INTEGER NOT NULL,callee_start INTEGER,callee_end INTEGER,spelling TEXT,source_set_id TEXT NOT NULL,language TEXT NOT NULL,callee_lookup_key TEXT,CHECK(start_byte>=0 AND end_byte>start_byte),CHECK((callee_start IS NULL)=(callee_end IS NULL)),CHECK(callee_start IS NULL OR (callee_start>=start_byte AND callee_end<=end_byte AND callee_end>callee_start)),PRIMARY KEY(version_id,id),UNIQUE(version_id,owner_syntax_id,ordinal),FOREIGN KEY(version_id,owner_syntax_id) REFERENCES native_version_declarations(version_id,syntax_id) DEFERRABLE INITIALLY DEFERRED);
-CREATE INDEX native_version_calls_owner ON native_version_calls(version_id,owner_syntax_id,ordinal);
 CREATE INDEX native_version_calls_incoming ON native_version_calls(source_set_id,language,callee_lookup_key);
 CREATE TABLE native_version_control_regions(version_id TEXT NOT NULL,id TEXT NOT NULL,owner_syntax_id TEXT NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),kind TEXT NOT NULL,start_byte INTEGER NOT NULL,end_byte INTEGER NOT NULL,parent_id TEXT,arm TEXT,CHECK(start_byte>=0 AND end_byte>start_byte),PRIMARY KEY(version_id,id),UNIQUE(version_id,owner_syntax_id,ordinal),UNIQUE(version_id,id,owner_syntax_id),FOREIGN KEY(version_id,owner_syntax_id) REFERENCES native_version_declarations(version_id,syntax_id) DEFERRABLE INITIALLY DEFERRED,FOREIGN KEY(version_id,parent_id,owner_syntax_id) REFERENCES native_version_control_regions(version_id,id,owner_syntax_id) DEFERRABLE INITIALLY DEFERRED);
-CREATE INDEX native_version_regions_owner ON native_version_control_regions(version_id,owner_syntax_id,ordinal);
+CREATE INDEX native_version_regions_parent ON native_version_control_regions(version_id,parent_id,owner_syntax_id);
 CREATE TABLE native_version_call_regions(version_id TEXT NOT NULL,call_id TEXT NOT NULL,region_id TEXT NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(version_id,call_id,ordinal),UNIQUE(version_id,call_id,region_id),FOREIGN KEY(version_id,call_id) REFERENCES native_version_calls(version_id,id) DEFERRABLE INITIALLY DEFERRED,FOREIGN KEY(version_id,region_id) REFERENCES native_version_control_regions(version_id,id) DEFERRABLE INITIALLY DEFERRED);
-"#;
-// Additive schema8 extension. An existing v8 cache keeps every row, generation,
-// pin, and queue; the first new publication installs these two tables atomically.
-const PRODUCER_BINDING_SCHEMA_V8: &str = r#"
 CREATE TABLE native_binding_epoch(singleton INTEGER PRIMARY KEY CHECK(singleton=1),index_generation TEXT NOT NULL,first_revision INTEGER NOT NULL CHECK(first_revision BETWEEN 1 AND 9007199254740991));
 CREATE TABLE revision_producer_bindings(revision_id TEXT PRIMARY KEY REFERENCES native_revisions(id) DEFERRABLE INITIALLY DEFERRED,producer_sha TEXT NOT NULL CHECK(length(producer_sha)=64),binding_sha TEXT NOT NULL CHECK(length(binding_sha)=64));
 "#;
@@ -2426,95 +2402,13 @@ fn validate_cache_shape(db: &Connection) -> Result<()> {
         version == DATABASE_SCHEMA_VERSION,
         "incompatible_index: unknown schema version"
     );
-    expected.execute_batch(CACHE_SCHEMA_V8)?;
-    let actual = objects(db)?;
-    if actual == objects(&expected)? {
-        return Ok(());
-    }
-    expected.execute_batch(PRODUCER_BINDING_SCHEMA_V8)?;
-    if actual == objects(&expected)? {
-        return Ok(());
-    }
-    expected.execute_batch(SUPERSESSION_SCHEMA_V8)?;
-    if actual == objects(&expected)? {
-        return Ok(());
-    }
-    expected.execute_batch(RETENTION_SCHEMA_V8)?;
-    if actual == objects(&expected)? {
-        return Ok(());
-    }
-    expected.execute_batch(RETENTION_FK_INDEX_SCHEMA_V8)?;
-    if actual == objects(&expected)? {
-        return Ok(());
-    }
-    expected.execute_batch(REVISION_HEADER_INDEX_SCHEMA_V8)?;
-    if actual == objects(&expected)? {
-        return Ok(());
-    }
-    expected.execute_batch(REVISION_DOCUMENT_PATH_INDEX_SCHEMA_V8)?;
-    if actual == objects(&expected)? {
-        return Ok(());
-    }
-    let without_binding = Connection::open_in_memory()?;
-    without_binding.execute_batch(CACHE_SCHEMA_V8)?;
-    without_binding.execute_batch(SUPERSESSION_SCHEMA_V8)?;
-    if actual == objects(&without_binding)? {
-        return Ok(());
-    }
-    without_binding.execute_batch(RETENTION_SCHEMA_V8)?;
-    if actual == objects(&without_binding)? {
-        return Ok(());
-    }
-    without_binding.execute_batch(RETENTION_FK_INDEX_SCHEMA_V8)?;
-    if actual == objects(&without_binding)? {
-        return Ok(());
-    }
-    without_binding.execute_batch(REVISION_HEADER_INDEX_SCHEMA_V8)?;
-    if actual == objects(&without_binding)? {
-        return Ok(());
-    }
-    without_binding.execute_batch(REVISION_DOCUMENT_PATH_INDEX_SCHEMA_V8)?;
+    expected.execute_batch(CACHE_SCHEMA_V12)?;
     control_ensure!(
-        actual == objects(&without_binding)?,
+        objects(db)? == objects(&expected)?,
         "incompatible_index: unknown cache object type, name or shape"
     );
     Ok(())
 }
-fn has_revision_supersessions(db: &Connection) -> Result<bool> {
-    Ok(db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='native_revision_supersessions')",
-        [], |r| r.get(0),
-    )?)
-}
-
-fn has_revision_release_debt(db: &Connection) -> Result<bool> {
-    Ok(db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='native_revision_release_debt')",
-        [], |r| r.get(0),
-    )?)
-}
-
-fn has_retention_fk_indexes(db: &Connection) -> Result<bool> {
-    Ok(db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='native_version_declarations_owner')",
-        [], |r| r.get(0),
-    )?)
-}
-
-fn has_revision_header_cover(db: &Connection) -> Result<bool> {
-    Ok(db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='native_revisions_header_cover')",
-        [], |r| r.get(0),
-    )?)
-}
-
-fn has_revision_document_path_index(db: &Connection) -> Result<bool> {
-    Ok(db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='revision_documents_path')",
-        [], |r| r.get(0),
-    )?)
-}
-
 fn publication_second() -> Result<i64> {
     let seconds = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     ensure!(
@@ -2730,61 +2624,7 @@ fn retention_clock_plausible(start: i64, wall: i64, elapsed: u64) -> bool {
 #[cfg(test)]
 mod retention_clock_tests;
 
-// Called only with the leader's immediate write transaction. Existing pins stay put.
-fn install_supersessions(db: &Connection, now: i64) -> Result<()> {
-    let missing_supersessions = !has_revision_supersessions(db)?;
-    let missing_retention = !has_revision_release_debt(db)?;
-    if missing_supersessions {
-        db.execute_batch(SUPERSESSION_SCHEMA_V8)?;
-    }
-    if missing_retention {
-        db.execute_batch(RETENTION_SCHEMA_V8)?;
-    }
-    if !has_retention_fk_indexes(db)? {
-        db.execute_batch(RETENTION_FK_INDEX_SCHEMA_V8)?;
-    }
-    if !has_revision_header_cover(db)? {
-        db.execute_batch(REVISION_HEADER_INDEX_SCHEMA_V8)?;
-    }
-    if !has_revision_document_path_index(db)? {
-        db.execute_batch(REVISION_DOCUMENT_PATH_INDEX_SCHEMA_V8)?;
-    }
-    if missing_supersessions {
-        db.execute(
-            "INSERT INTO native_revision_supersessions(revision_id,superseded_at,state)
-             SELECT r.id,?1,CASE WHEN EXISTS (SELECT 1 FROM revision_capture_inputs c
-               WHERE c.revision_id=r.id AND c.input_key='__released:v1')
-               THEN 'released' ELSE 'retained' END
-             FROM native_revisions r CROSS JOIN index_metadata m
-             WHERE m.singleton=1 AND r.id != 'pin:v1:'||m.index_generation||':'||m.index_revision",
-            [now],
-        )?;
-    } else if missing_retention {
-        // Earlier v8 could have released a pin before the state column existed.
-        // Preserve its tombstone instead of treating it as retained corruption.
-        db.execute_batch(
-            "UPDATE native_revision_supersessions SET state='released'
-             WHERE EXISTS (SELECT 1 FROM revision_capture_inputs c
-               WHERE c.revision_id=native_revision_supersessions.revision_id
-                 AND c.input_key='__released:v1');",
-        )?;
-        db.execute(
-            "INSERT INTO native_revision_supersessions(revision_id,superseded_at,state)
-             SELECT r.id,?1,'released' FROM native_revisions r CROSS JOIN index_metadata m
-             WHERE m.singleton=1 AND r.id != 'pin:v1:'||m.index_generation||':'||m.index_revision
-               AND EXISTS (SELECT 1 FROM revision_capture_inputs c
-                 WHERE c.revision_id=r.id AND c.input_key='__released:v1')
-               AND NOT EXISTS (SELECT 1 FROM native_revision_supersessions s WHERE s.revision_id=r.id)",
-            [now],
-        )?;
-    }
-    validate_supersessions(db)
-}
-
 fn validate_supersessions(db: &Connection) -> Result<()> {
-    if !has_revision_supersessions(db)? {
-        return Ok(());
-    }
     let bad: i64 = db.query_row(
         "SELECT EXISTS(
            SELECT 1 FROM native_revision_supersessions s
@@ -2821,12 +2661,6 @@ fn stamp_predecessor(db: &Connection, old: &str, now: i64) -> Result<()> {
     Ok(())
 }
 
-fn has_revision_producer_bindings(db: &Connection) -> Result<bool> {
-    Ok(db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='native_binding_epoch')",
-        [], |r| r.get(0),
-    )?)
-}
 thread_local! {
     static READ_DEADLINE: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
 }
@@ -4935,7 +4769,7 @@ fn validate_v8_bootstrap(db: &Connection) -> Result<()> {
         indexed_at.is_empty() && options.is_none(),
         "incompatible_index: invalid v8 bootstrap metadata"
     );
-    // Fixed identifiers from CACHE_SCHEMA_V8 only. Do not read table names from
+    // Fixed identifiers from CACHE_SCHEMA_V12 only. Do not read table names from
     // sqlite_master or treat a partial publication as a valid empty bootstrap.
     for name in [
         "class_projections",
@@ -5129,13 +4963,6 @@ fn selected_producer_hash(db: &Connection, selected: &ReadRevision) -> Result<St
         [],
         |r| r.get(0),
     )?;
-    if !has_revision_producer_bindings(db)? {
-        ensure!(
-            executable == origin,
-            "incompatible_index: legacy selected producer differs from origin"
-        );
-        return Ok(executable);
-    }
     let epoch: Vec<(String, i64)> = db
         .prepare("SELECT index_generation,first_revision FROM native_binding_epoch LIMIT 2")?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
@@ -5188,8 +5015,7 @@ enum PairedManifestScope {
     Preflight,
 }
 
-// One header query works before and after the additive v8 index is installed.
-// Once present, SQLite reads the narrow covering index instead of wide JSON rows.
+// The schema-12 covering index lets this header query avoid wide JSON rows.
 const HEADER_SQL: &str = "SELECT count(r.id),min(r.published_index_revision),max(r.published_index_revision),
             coalesce(sum(CASE WHEN r.id IS NULL THEN 0 WHEN r.id='pin:v1:'||m.index_generation||':'||r.published_index_revision
               AND r.source_set_id=?1 AND r.published_index_revision BETWEEN 1 AND m.index_revision
@@ -5300,7 +5126,7 @@ fn validate_paired_metadata(
             ),
         "incompatible_index: missing native pair metadata"
     );
-    // The planner uses the narrow covering index once leader startup installs it.
+    // The planner uses the narrow covering index from the base schema.
     let (count, first, last, mismatched, current): (i64, Option<i64>, Option<i64>, i64, i64) =
         db.query_row(HEADER_SQL, [&expected_source], |row| {
             Ok((
@@ -5317,62 +5143,33 @@ fn validate_paired_metadata(
         count == current && first == Some(1) && last == Some(current) && mismatched == 0,
         "incompatible_index: native header pin mismatch"
     );
-    if !has_revision_release_debt(db)? {
-        // A prior v8 index has no maintenance extension yet. Validate its
-        // complete retained manifests before the first atomic installation.
-        // A release leaves its header as a durable tombstone. Missing manifests
-        // without that exact marker (including an empty legitimate revision) are
-        // never accepted as released. The marker owns no native capture input.
-        let malformed: bool = db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM native_revisions r WHERE
-                (EXISTS(SELECT 1 FROM revision_capture_inputs i
-                    WHERE i.revision_id=r.id AND i.input_key='__released:v1') AND
-                  ((SELECT count(*) FROM revision_capture_inputs i WHERE i.revision_id=r.id)!=1 OR
-                   NOT EXISTS(SELECT 1 FROM revision_capture_inputs i
-                     WHERE i.revision_id=r.id AND i.input_key='__released:v1' AND i.payload='released:v1') OR
-                   EXISTS(SELECT 1 FROM revision_documents d WHERE d.revision_id=r.id)))
-                OR (NOT EXISTS(SELECT 1 FROM revision_capture_inputs i
-                    WHERE i.revision_id=r.id AND i.input_key='__released:v1') AND
-                   (SELECT count(*) FROM revision_documents d WHERE d.revision_id=r.id)
-                       != json_array_length(r.source_inventory)))",
-            [], |row| row.get(0),
-        )?;
-        control_ensure!(
-            !malformed,
-            "incompatible_index: retained manifest/release mismatch"
-        );
-    } else {
-        // Pending retains original inputs while its manifest may be partly drained.
-        // A changed predecessor has just gained its supersession row; any pending
-        // debt is also mutable. Only Store admission/replacement sweeps all history.
-        let malformed_sql = paired_manifest_query(scope);
-        let malformed: bool = db.query_row(&malformed_sql, [], |row| row.get(0))?;
-        control_ensure!(
-            !malformed,
-            "incompatible_index: retained manifest/release mismatch"
-        );
-        let stray_candidates: bool = db.query_row(
-            "SELECT EXISTS(
-               SELECT 1 FROM native_release_candidate_versions c
-                 LEFT JOIN native_revision_supersessions s ON s.revision_id=c.revision_id
-                 WHERE s.state IS NOT 'pending'
-               UNION ALL
-               SELECT 1 FROM native_release_candidate_graphs c
-                 LEFT JOIN native_revision_supersessions s ON s.revision_id=c.revision_id
-                 WHERE s.state IS NOT 'pending'
-               UNION ALL
-               SELECT 1 FROM native_release_candidate_classes c
-                 LEFT JOIN native_revision_supersessions s ON s.revision_id=c.revision_id
-                 WHERE s.state IS NOT 'pending'
-             )",
-            [],
-            |row| row.get(0),
-        )?;
-        control_ensure!(
-            !stray_candidates,
-            "incompatible_index: release candidates without pending debt"
-        );
-    }
+    let malformed_sql = paired_manifest_query(scope);
+    let malformed: bool = db.query_row(&malformed_sql, [], |row| row.get(0))?;
+    control_ensure!(
+        !malformed,
+        "incompatible_index: retained manifest/release mismatch"
+    );
+    let stray_candidates: bool = db.query_row(
+        "SELECT EXISTS(
+           SELECT 1 FROM native_release_candidate_versions c
+             LEFT JOIN native_revision_supersessions s ON s.revision_id=c.revision_id
+             WHERE s.state IS NOT 'pending'
+           UNION ALL
+           SELECT 1 FROM native_release_candidate_graphs c
+             LEFT JOIN native_revision_supersessions s ON s.revision_id=c.revision_id
+             WHERE s.state IS NOT 'pending'
+           UNION ALL
+           SELECT 1 FROM native_release_candidate_classes c
+             LEFT JOIN native_revision_supersessions s ON s.revision_id=c.revision_id
+             WHERE s.state IS NOT 'pending'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    control_ensure!(
+        !stray_candidates,
+        "incompatible_index: release candidates without pending debt"
+    );
     bounded_graph_pair(
         db,
         "SELECT typeof(r.graph_stats),length(CAST(r.graph_stats AS BLOB)),
@@ -7157,16 +6954,11 @@ impl Store {
             db.pragma_update(None, "synchronous", "FULL")?;
             db.execute_batch("BEGIN IMMEDIATE")?;
             let result = (|| -> Result<()> {
-                db.execute_batch(CACHE_SCHEMA_V8)?;
-                db.execute_batch(SUPERSESSION_SCHEMA_V8)?;
-                db.execute_batch(RETENTION_SCHEMA_V8)?;
-                db.execute_batch(RETENTION_FK_INDEX_SCHEMA_V8)?;
-                db.execute_batch(REVISION_HEADER_INDEX_SCHEMA_V8)?;
-                db.execute_batch(REVISION_DOCUMENT_PATH_INDEX_SCHEMA_V8)?;
+                db.execute_batch(CACHE_SCHEMA_V12)?;
                 let age = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
                 ensure!(age <= 9_007_199_254_740_991, "invalid_open_age");
                 db.execute(
-                    "INSERT INTO index_metadata VALUES(1,11,?1,?2,?3,?4,?5,0,?6,'',?7,?8,NULL)",
+                    "INSERT INTO index_metadata VALUES(1,12,?1,?2,?3,?4,?5,0,?6,'',?7,?8,NULL)",
                     params![
                         EXTRACTOR_VERSION,
                         self.workspace_root,
@@ -9368,9 +9160,6 @@ impl Store {
             "revision conflict: final inventory baseline changed"
         );
         validate_reconcile_inventory(&db)?;
-        if !has_revision_producer_bindings(&db)? {
-            return Ok(false);
-        }
         let executing_hash = capture
             .executable_digest(capture.executable_path())
             .context("native_evidence_required: final inventory executable not hashed")?;
@@ -9489,11 +9278,6 @@ impl Store {
             class_warning_bytes.is_some_and(|bytes| (0..=256 * 1024).contains(&bytes)),
             "incompatible_index: selected class catalog budget exceeded or missing"
         );
-        if !has_revision_producer_bindings(&db)? {
-            // Legacy 28-table indexes use the ordinary FULL publication path,
-            // which atomically introduces the paired producer-binding extension.
-            return Ok(None);
-        }
         let executing_hash = capture
             .executable_digest(capture.executable_path())
             .context("native_evidence_required: executable was not hashed at admission")?;
@@ -10954,27 +10738,10 @@ impl Store {
                     .context("revision overflow")?
             },
         };
-        if rebaseline {
-            if !has_revision_supersessions(&tx)? {
-                tx.execute_batch(SUPERSESSION_SCHEMA_V8)?;
-            }
-            if !has_revision_release_debt(&tx)? {
-                tx.execute_batch(RETENTION_SCHEMA_V8)?;
-            }
-            if !has_retention_fk_indexes(&tx)? {
-                tx.execute_batch(RETENTION_FK_INDEX_SCHEMA_V8)?;
-            }
-            if !has_revision_header_cover(&tx)? {
-                tx.execute_batch(REVISION_HEADER_INDEX_SCHEMA_V8)?;
-            }
-            if !has_revision_document_path_index(&tx)? {
-                tx.execute_batch(REVISION_DOCUMENT_PATH_INDEX_SCHEMA_V8)?;
-            }
-        } else {
-            install_supersessions(&tx, self.retention_time()?.as_secs() as i64)?;
+        if !rebaseline {
+            validate_supersessions(&tx)?;
         }
-        let binding_extension = has_revision_producer_bindings(&tx)?;
-        if rebaseline && binding_extension {
+        if rebaseline {
             tx.execute_batch(
                 "DELETE FROM revision_producer_bindings; DELETE FROM native_binding_epoch;",
             )?;
@@ -10998,12 +10765,18 @@ impl Store {
                 DELETE FROM native_producer_inputs; DELETE FROM native_producer_languages;
                 DELETE FROM native_producers;")?;
         }
-        if !binding_extension {
-            // DDL and epoch are committed with the FIRST newly bound revision.
-            // Readers before commit see the original exact v8 shape and old pins.
-            tx.execute_batch(PRODUCER_BINDING_SCHEMA_V8)?;
-        }
-        if !binding_extension || rebaseline {
+        // A fresh schema has the binding tables but no epoch until its first
+        // publication. Rebaseline removes the prior epoch and creates a new one.
+        let epoch_exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM native_binding_epoch WHERE singleton=1)",
+            [],
+            |row| row.get(0),
+        )?;
+        if !epoch_exists {
+            control_ensure!(
+                rebaseline || old_pin.is_some_and(|pin| pin.index_revision == 0),
+                "incompatible_index: selected producer binding epoch invalid"
+            );
             tx.execute(
                 "INSERT INTO native_binding_epoch VALUES(1,?1,?2)",
                 params![
@@ -11220,7 +10993,7 @@ impl Store {
             let old_key = format!("pin:v1:{}:{}", prior.index_generation, prior.index_revision);
             stamp_predecessor(&tx, &old_key, publication_time.as_secs() as i64)?;
         }
-        tx.execute("UPDATE index_metadata SET schema_version=11,extractor_version=?1,index_generation=?2,index_revision=?3,indexed_at=?4,stats=?5,diagnostics=?6,reconcile_options=?7 WHERE singleton=1",
+        tx.execute("UPDATE index_metadata SET schema_version=12,extractor_version=?1,index_generation=?2,index_revision=?3,indexed_at=?4,stats=?5,diagnostics=?6,reconcile_options=?7 WHERE singleton=1",
             params![EXTRACTOR_VERSION, revision.index_generation.to_string(), revision.index_revision as i64,timestamp,json(&stats)?,json(&graph.diagnostics)?,json(capture.reconcile_options())?])?;
         immutable.counters.record(
             "manifest",
@@ -11463,10 +11236,6 @@ impl Store {
             )?;
             storage_result(db.execute_batch("BEGIN DEFERRED"))?;
             begin_read_snapshot(&db, &self.roots.index_db(&self.identity), Duration::ZERO)?;
-            if !has_revision_release_debt(&db)? {
-                guard.verify()?;
-                return Ok(None);
-            }
             let latest: Option<i64> = db.query_row(
                 "SELECT max(superseded_at) FROM native_revision_supersessions",
                 [],
@@ -11623,10 +11392,6 @@ impl Store {
                 return Ok(MaintenanceOutcome::Deferred);
             }
             return Err(error);
-        }
-        if !has_revision_release_debt(&db)? {
-            guard.verify()?;
-            return Ok(MaintenanceOutcome::Idle);
         }
         let selected_read = (|| -> Result<(IndexPin, i64, Option<String>)> {
             let head = ReadRevision::current(&db)?.pin;

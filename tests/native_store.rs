@@ -45,29 +45,6 @@ fn live_class_projection(db: &Connection, path: &str) -> String {
         |row| row.get(0),
     ).unwrap()
 }
-// Simulate a prior current-v8 cache whose additive maintenance extension has
-// not yet been installed. The first new publication must preserve this inode,
-// generation, selected pin, and durable request queue.
-#[cfg(feature = "test-support")]
-fn remove_maintenance_extension_for_v8_test(path: &std::path::Path) {
-    let db = Connection::open(path).unwrap();
-    db.execute_batch(
-        "PRAGMA foreign_keys=OFF; BEGIN IMMEDIATE;
-         DROP TABLE native_release_candidate_classes;
-         DROP TABLE native_release_candidate_graphs;
-         DROP TABLE native_release_candidate_versions;
-         DROP TABLE native_revision_release_debt;
-         DROP INDEX native_supersessions_due;
-         DROP INDEX native_supersessions_clock;
-         DROP INDEX native_version_declarations_owner;
-         DROP INDEX native_version_regions_parent;
-         DROP INDEX native_revisions_header_cover;
-         DROP INDEX revision_documents_path;
-         DROP TABLE native_revision_supersessions;
-         CREATE TABLE native_revision_supersessions(revision_id TEXT PRIMARY KEY REFERENCES native_revisions(id),superseded_at INTEGER NOT NULL CHECK(superseded_at BETWEEN 0 AND 9007199254740991));
-         COMMIT; PRAGMA foreign_keys=ON;",
-    ).unwrap();
-}
 fn fixture() -> (tempfile::TempDir, tempfile::TempDir, Store, CancelFlag) {
     let state = tempfile::tempdir().unwrap();
     let root = tempfile::tempdir().unwrap();
@@ -148,7 +125,7 @@ fn four_languages_normalized_rows_and_pinned_bytes_are_coherent() {
     let baseline = store.index_baseline().unwrap();
     let leader = store.publication_for_tests().unwrap();
     let pin = publish(&store, root.path(), &cancel, baseline, &leader).unwrap();
-    // A current v10 empty bootstrap is the same generation; only a rebuild rotates it.
+    // A current empty bootstrap is the same generation; only a rebuild rotates it.
     assert_eq!(baseline.index_generation, pin.index_generation);
     assert_eq!(
         store.status().unwrap().evidence_format.as_deref(),
@@ -247,7 +224,7 @@ fn four_languages_normalized_rows_and_pinned_bytes_are_coherent() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        11
+        12
     );
     let count: i64 = db
         .query_row(
@@ -793,7 +770,7 @@ fn physical_v8_native_v4_index_recreates_before_role_column_read() {
         rebuilt
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        11
+        12
     );
     let stamp: String = rebuilt
         .query_row("SELECT extractor_version FROM index_metadata", [], |row| {
@@ -2215,7 +2192,7 @@ fn predecessor_stamps_cover_full_publications_and_unchanged_stamps_nothing() {
 
 #[test]
 #[cfg(feature = "test-support")]
-fn prior_v8_additive_maintenance_keeps_inode_generation_and_unfinished_fifo() {
+fn current_maintenance_keeps_inode_generation_and_unfinished_fifo() {
     use std::os::unix::fs::MetadataExt;
     let (state, root, store, cancel) = fixture();
     let leader = store.publication_for_tests().unwrap();
@@ -2242,7 +2219,6 @@ fn prior_v8_additive_maintenance_keeps_inode_generation_and_unfinished_fifo() {
         .join("cache/indexes")
         .join(identity.root_key)
         .join("index.db");
-    remove_maintenance_extension_for_v8_test(&path);
     let inode = fs::metadata(&path).unwrap().ino();
     let reopened = Store::open_for_tests(state.path(), root.path()).unwrap();
     let leader = reopened.publication_for_tests().unwrap();
@@ -2261,7 +2237,7 @@ fn prior_v8_additive_maintenance_keeps_inode_generation_and_unfinished_fifo() {
     assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
     let db = Connection::open(&path).unwrap();
     let installed: i64 = db.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='native_revision_release_debt'", [], |r|r.get(0)).unwrap();
-    assert_eq!(installed, 1);
+    assert_eq!(installed, 1, "maintenance table belongs to the base schema");
     assert!(reopened.graph_at(Some(old)).is_ok());
     let preserved = reopened.request_by_id(&pending.id).unwrap().unwrap();
     assert_eq!(preserved.id, pending.id);
@@ -2271,7 +2247,7 @@ fn prior_v8_additive_maintenance_keeps_inode_generation_and_unfinished_fifo() {
 
 #[test]
 #[cfg(feature = "test-support")]
-fn prior_v8_retention_layout_adds_self_fk_indexes_without_replacing_pin() {
+fn current_retention_indexes_survive_publication_without_replacing_pin() {
     use std::os::unix::fs::MetadataExt;
     let (state, root, store, cancel) = fixture();
     let leader = store.publication_for_tests().unwrap();
@@ -2293,12 +2269,6 @@ fn prior_v8_retention_layout_adds_self_fk_indexes_without_replacing_pin() {
         .join("cache/indexes")
         .join(identity.root_key)
         .join("index.db");
-    let db = Connection::open(&path).unwrap();
-    db.execute_batch(
-        "DROP INDEX native_version_declarations_owner; DROP INDEX native_version_regions_parent; DROP INDEX native_revisions_header_cover; DROP INDEX revision_documents_path;",
-    )
-    .unwrap();
-    drop(db);
     let inode = fs::metadata(&path).unwrap().ino();
     let reopened = Store::open_for_tests(state.path(), root.path()).unwrap();
     let leader = reopened.publication_for_tests().unwrap();
@@ -2320,14 +2290,14 @@ fn prior_v8_retention_layout_adds_self_fk_indexes_without_replacing_pin() {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(present, 1, "{name} missing after additive upgrade");
+        assert_eq!(present, 1, "{name} missing from current schema");
     }
     assert!(reopened.graph_at(Some(old)).is_ok());
 }
 
 #[test]
 #[cfg(feature = "test-support")]
-fn prior_v8_released_tombstone_upgrades_without_losing_generation_or_pin() {
+fn current_released_tombstone_survives_reopen_and_publication() {
     use std::os::unix::fs::MetadataExt;
     let (state, root, store, cancel) = fixture();
     store.set_retention_clock_for_tests(1_000, 0);
@@ -2360,17 +2330,6 @@ fn prior_v8_released_tombstone_upgrades_without_losing_generation_or_pin() {
         .join("cache/indexes")
         .join(identity.root_key)
         .join("index.db");
-    remove_maintenance_extension_for_v8_test(&path);
-    let db = Connection::open(&path).unwrap();
-    db.execute(
-        "INSERT INTO native_revision_supersessions(revision_id,superseded_at) VALUES(?1,1000)",
-        [format!(
-            "pin:v1:{}:{}",
-            old.index_generation, old.index_revision
-        )],
-    )
-    .unwrap();
-    drop(db);
     let inode = fs::metadata(&path).unwrap().ino();
     let reopened = Store::open_for_tests(state.path(), root.path()).unwrap();
     let leader = reopened.publication_for_tests().unwrap();
@@ -2667,7 +2626,7 @@ fn backward_step_keeps_young_pin_and_restart_uses_persisted_utc() {
 
 #[test]
 #[cfg(feature = "test-support")]
-fn failed_publication_after_additive_v8_upgrade_preserves_old_pin() {
+fn failed_current_publication_preserves_old_pin_and_queue() {
     use std::{os::unix::fs::MetadataExt, sync::atomic::Ordering};
     let (state, root, store, cancel) = fixture();
     let leader = store.publication_for_tests().unwrap();
@@ -2697,7 +2656,6 @@ fn failed_publication_after_additive_v8_upgrade_preserves_old_pin() {
         .join("cache/indexes")
         .join(identity.root_key)
         .join("index.db");
-    remove_maintenance_extension_for_v8_test(&path);
     let inode = fs::metadata(&path).unwrap().ino();
     let reopened = Store::open_for_tests(state.path(), root.path()).unwrap();
     let leader = reopened.publication_for_tests().unwrap();
@@ -2729,8 +2687,8 @@ fn failed_publication_after_additive_v8_upgrade_preserves_old_pin() {
     };
     assert_eq!(
         extension(),
-        0,
-        "cancelled transaction rolls back extension DDL"
+        1,
+        "cancelled transaction keeps the current base schema"
     );
     assert_eq!(
         head(),
@@ -2753,7 +2711,7 @@ fn failed_publication_after_additive_v8_upgrade_preserves_old_pin() {
     assert_eq!(
         extension(),
         1,
-        "successful retry installs maintenance extension"
+        "successful retry keeps the current base schema"
     );
     assert_eq!(
         head(),
@@ -3547,10 +3505,9 @@ fn newer_disposable_schema_is_refused_without_rebuild_or_deletion() {
         .join("cache/indexes")
         .join(identity.root_key)
         .join("index.db");
-    Connection::open(&path)
-        .unwrap()
-        .execute_batch("PRAGMA user_version=12")
-        .unwrap();
+    let db = Connection::open(&path).unwrap();
+    db.execute_batch("PRAGMA user_version=13").unwrap();
+    drop(db);
     let inode = fs::metadata(&path).unwrap().ino();
     let error = Store::open_for_tests(state.path(), root.path()).unwrap_err();
     assert!(
@@ -3569,7 +3526,13 @@ fn newer_disposable_schema_is_refused_without_rebuild_or_deletion() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(version, 12);
+    assert_eq!(version, 13);
+    let metadata_version: i64 = db
+        .query_row("SELECT schema_version FROM index_metadata", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(metadata_version, 12);
     assert_eq!(generation, old.index_generation.to_string());
 }
 
