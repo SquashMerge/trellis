@@ -10295,34 +10295,9 @@ impl Store {
         cancel: &CancelFlag,
     ) -> Result<crate::classes::Catalog> {
         let limits = crate::classes::Limits::default();
-        // Finish *all* file extraction before composing. A later extraction
-        // error outranks an earlier catalog limit, as in the full publisher.
-        for &index in order {
-            check_cancel(cancel)?;
-            let document = &spool.header().revision.documents[index];
-            if !matches!(document.key.language.as_str(), "java" | "python") {
-                continue;
-            }
-            let graph = spool.read_graph(index)?;
-            let file = graph
-                .files
-                .first()
-                .context("stream graph document absent")?;
-            let symbols: Vec<_> = graph
-                .nodes
-                .iter()
-                .filter(|n| {
-                    matches!(
-                        n.kind,
-                        SymbolKind::Class | SymbolKind::Method | SymbolKind::Function
-                    )
-                })
-                .cloned()
-                .collect();
-            let extraction =
-                crate::classes::FileExtraction::extract_file(file, &symbols, cancel, limits)?;
-            spool.write_extraction(index, &extraction)?;
-        }
+        // All Java/Python files were extracted and stored by the sorted native
+        // owner before this publisher was entered. Replay in the same path
+        // order to preserve catalog warning and class ordering.
         let mut composer =
             crate::classes::CatalogComposer::new(spool.len(), spool.stats().symbols, limits);
         let mut replay = order.to_vec();
@@ -10340,7 +10315,9 @@ impl Store {
             let document = &spool.header().revision.documents[index];
             if matches!(document.key.language.as_str(), "java" | "python") {
                 check_cancel(cancel)?;
-                let extraction = spool.read_extraction(index)?;
+                let extraction = spool
+                    .read_extraction(index)
+                    .map_err(native_spool_read_failure)?;
                 if !composer.push(&extraction) {
                     break;
                 }
@@ -10948,7 +10925,8 @@ impl Store {
             .map_err(classify_immutable)?;
             for (ordinal, &index) in stream_order.iter().enumerate() {
                 check_cancel(cancel)?;
-                let (artifact, document_graph) = spool.read(index)?;
+                let (artifact, document_graph) =
+                    spool.read(index).map_err(native_spool_read_failure)?;
                 ensure!(
                     artifact.producer == native.producer
                         && artifact.source_set == native.source_set
@@ -10973,7 +10951,12 @@ impl Store {
                 let selected_classes = stream_document_classes(&classes, &file.path);
                 let rows = publication_rows(&document_graph, &artifact, &selected_classes)?;
                 let extractions = if matches!(file.language.as_str(), "java" | "python") {
-                    BTreeMap::from([(file.path.clone(), spool.read_extraction(index)?)])
+                    BTreeMap::from([(
+                        file.path.clone(),
+                        spool
+                            .read_extraction(index)
+                            .map_err(native_spool_read_failure)?,
+                    )])
                 } else {
                     BTreeMap::new()
                 };

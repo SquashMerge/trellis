@@ -236,3 +236,60 @@ fn scratch_preflight_faults_do_not_reclassify_the_live_head() {
         assert_eq!(next.index_revision, pin.index_revision + 1, "{fault}");
     }
 }
+
+#[test]
+fn first_publication_scratch_reads_fail_typed_without_partial_head() {
+    for fault in ["graph_json", "extraction_json"] {
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        fs::write(work.path().join("A.java"), "class A { void f(){} }\n").unwrap();
+        fs::write(work.path().join("b.js"), "function b(){ return 1; }\n").unwrap();
+        let options = IndexOptions::new(work.path().to_owned());
+        let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+        let baseline = store.index_baseline().unwrap();
+        *store.test_stream_before_preflight_hook.lock().unwrap() = Some(Box::new(move |spool| {
+            let index = spool
+                .header()
+                .revision
+                .documents
+                .iter()
+                .position(|document| document.key.path == "A.java")
+                .unwrap();
+            match fault {
+                "graph_json" => spool.corrupt_graph_json_for_tests(index),
+                "extraction_json" => spool.corrupt_extraction_json_for_tests(index),
+                _ => unreachable!(),
+            }
+        }));
+        let error = IndexJobCoordinator::prepare(&store, None)
+            .unwrap()
+            .run(&options, &Arc::new(AtomicBool::new(false)), |_| {})
+            .unwrap_err();
+        assert!(
+            error.downcast_ref::<NativeSpoolReadFailure>().is_some(),
+            "{fault}: {error:#}"
+        );
+        assert_eq!(store.index_baseline().unwrap(), baseline, "{fault}");
+        let revisions: i64 = store
+            .cache_write()
+            .unwrap()
+            .query_row("SELECT count(*) FROM native_revisions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            revisions, 0,
+            "{fault}: failed first publication left no revision"
+        );
+        let retry = IndexJobCoordinator::prepare(&store, None)
+            .unwrap()
+            .run(&options, &Arc::new(AtomicBool::new(false)), |_| {})
+            .unwrap();
+        assert_eq!(retry.index_revision, 1, "{fault}");
+        assert_eq!(
+            store.graph_at(Some(retry)).unwrap().files.len(),
+            2,
+            "{fault}"
+        );
+    }
+}
