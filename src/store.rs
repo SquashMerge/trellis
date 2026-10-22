@@ -797,7 +797,12 @@ struct FetchedDocument {
 
 /// Match the former graph-row SQL charge: key TEXT byte lengths plus the
 /// compact JSON payload, with identical row and aggregate thresholds.
-fn derived_graph_bytes(nodes: &[Symbol], calls: &[CallSite], regions: &[ControlRegion], source_bytes: i64) -> Result<u64> {
+fn derived_graph_bytes(
+    nodes: &[Symbol],
+    calls: &[CallSite],
+    regions: &[ControlRegion],
+    source_bytes: i64,
+) -> Result<u64> {
     let mut max_row = 0u64;
     let mut total = 0u64;
     for node in nodes {
@@ -820,8 +825,16 @@ fn derived_graph_bytes(nodes: &[Symbol], calls: &[CallSite], regions: &[ControlR
     }
     let bytes = source_bytes.max(0) as u64;
     ensure!(
-        max_row <= bytes.saturating_mul(6).saturating_add(16 * 1024).min(256 * 1024 * 1024 + 16 * 1024)
-        && total <= bytes.saturating_mul(64).saturating_add(256 * 1024).min(512 * 1024 * 1024),
+        max_row
+            <= bytes
+                .saturating_mul(6)
+                .saturating_add(16 * 1024)
+                .min(256 * 1024 * 1024 + 16 * 1024)
+            && total
+                <= bytes
+                    .saturating_mul(64)
+                    .saturating_add(256 * 1024)
+                    .min(512 * 1024 * 1024),
         "incompatible_index: selected graph row byte budget exceeded"
     );
     Ok(total)
@@ -1435,11 +1448,22 @@ impl EvidenceResponse {
                             let item = if progress.expired() {
                                 Err(MetricsDocumentFailure::Stopped)
                             } else {
-                                self.store.fetch_selected_header(
-                                    &self.db, &key.path, &selected, Some(&expired)
-                                ).and_then(|header| self.store.fetch_selected_rows(
-                                    &self.db, header, &selected, Some(&expired)
-                                )).map_err(MetricsDocumentFailure::Attest)
+                                self.store
+                                    .fetch_selected_header(
+                                        &self.db,
+                                        &key.path,
+                                        &selected,
+                                        Some(&expired),
+                                    )
+                                    .and_then(|header| {
+                                        self.store.fetch_selected_rows(
+                                            &self.db,
+                                            header,
+                                            &selected,
+                                            Some(&expired),
+                                        )
+                                    })
+                                    .map_err(MetricsDocumentFailure::Attest)
                             };
                             match item {
                                 Ok(item) => (key, item),
@@ -3559,9 +3583,13 @@ fn resolve_class_id(
             "SELECT m.path FROM graph_nodes n JOIN revision_documents m ON m.revision_id=?2 AND m.graph_projection_id=n.projection_id WHERE n.id=?1",
             params![current, selected.key], |r| r.get(0),
         ).optional().map_err(|error| store.report_selected_failure(error.into()))?;
-        let symbol = path.map(|path| store.selected_graph_document_for(db, &path, selected))
-            .transpose()?.and_then(|doc| doc.nodes.into_iter().find(|node| node.id == current))
-            .ok_or(InvalidRequest("Choose an indexed Java or Python class or method."))?;
+        let symbol = path
+            .map(|path| store.selected_graph_document_for(db, &path, selected))
+            .transpose()?
+            .and_then(|doc| doc.nodes.into_iter().find(|node| node.id == current))
+            .ok_or(InvalidRequest(
+                "Choose an indexed Java or Python class or method.",
+            ))?;
         ensure!(
             depth > 0 || matches!(symbol.kind, SymbolKind::Method | SymbolKind::Function),
             InvalidRequest("Choose an indexed Java or Python class or method.")
@@ -12058,7 +12086,10 @@ impl Store {
     }
     /// Derive a selected graph exactly once from the attested native rows.
     fn selected_graph_document_for(
-        &self, db: &Connection, path: &str, selected: &ReadRevision,
+        &self,
+        db: &Connection,
+        path: &str,
+        selected: &ReadRevision,
     ) -> Result<AttestedDocument> {
         self.attest_selected_document_loaded(db, path, selected, None)
             .map_err(selected_integrity)
@@ -12340,16 +12371,22 @@ impl Store {
         optional_hint_check(progress)?;
         let regions = read_native_control_regions_v8_inner(db, &scope, None, progress)?;
         let mut node_rows = Vec::new();
-        for row in db.prepare_cached(
-            "SELECT id,name,kind FROM graph_nodes WHERE projection_id=?1 ORDER BY id",
-        )?.query_map([&graph_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))? {
+        for row in db
+            .prepare_cached(
+                "SELECT id,name,kind FROM graph_nodes WHERE projection_id=?1 ORDER BY id",
+            )?
+            .query_map([&graph_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        {
             optional_hint_check(progress)?;
             node_rows.push(row?);
         }
         let mut label_rows = Vec::new();
-        for row in db.prepare_cached(
-            "SELECT id,label FROM graph_display_labels WHERE projection_id=?1 ORDER BY id",
-        )?.query_map([&graph_id], |r| Ok((r.get(0)?, r.get(1)?)))? {
+        for row in db
+            .prepare_cached(
+                "SELECT id,label FROM graph_display_labels WHERE projection_id=?1 ORDER BY id",
+            )?
+            .query_map([&graph_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+        {
             optional_hint_check(progress)?;
             label_rows.push(row?);
         }
@@ -12363,7 +12400,8 @@ impl Store {
                 control_regions: regions.iter().collect(),
             },
             &labels,
-        ).context("incompatible_index: selected graph derivation failed")?;
+        )
+        .context("incompatible_index: selected graph derivation failed")?;
         let graph_bytes = derived_graph_bytes(&graph_nodes, &graph_calls, &graph_regions, bytes)?;
         let stored_bytes = ancillary_bytes.saturating_add(graph_bytes);
         let mut class_rows = Vec::new();
@@ -12486,17 +12524,35 @@ impl Store {
         );
         // Both narrow search rows and display labels must match the shared
         // native-fact projector in both directions, not just its graph hash.
-        let expected_nodes: Vec<_> = nodes.iter().map(|node| {
-            let kind = serde_json::to_value(&node.kind)?;
-            Ok((node.id.clone(), node.name.clone(),
-                kind.as_str().context("incompatible_index: selected graph kind invalid")?.to_owned()))
-        }).collect::<Result<Vec<_>>>()?;
-        ensure!(node_rows == expected_nodes,
-            "incompatible_index: selected graph node materialization differs");
-        let expected_labels: Vec<_> = nodes.iter().filter_map(|node|
-            node.display_label.as_ref().map(|label| (node.id.clone(), label.clone()))).collect();
-        ensure!(label_rows == expected_labels,
-            "incompatible_index: selected graph display labels differ");
+        let expected_nodes: Vec<_> = nodes
+            .iter()
+            .map(|node| {
+                let kind = serde_json::to_value(&node.kind)?;
+                Ok((
+                    node.id.clone(),
+                    node.name.clone(),
+                    kind.as_str()
+                        .context("incompatible_index: selected graph kind invalid")?
+                        .to_owned(),
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        ensure!(
+            node_rows == expected_nodes,
+            "incompatible_index: selected graph node materialization differs"
+        );
+        let expected_labels: Vec<_> = nodes
+            .iter()
+            .filter_map(|node| {
+                node.display_label
+                    .as_ref()
+                    .map(|label| (node.id.clone(), label.clone()))
+            })
+            .collect();
+        ensure!(
+            label_rows == expected_labels,
+            "incompatible_index: selected graph display labels differ"
+        );
         let mut class_rows = Vec::new();
         for (id, name, qualified, path, payload) in stored_class_rows {
             optional_hint_check(progress)?;
@@ -13018,8 +13074,15 @@ impl Store {
                 }
             }
         }
-        crate::navigation::navigate(tx, request, revision, &selected.key,
-            selected_document.as_ref().map(|document| document.nodes.as_slice()))
+        crate::navigation::navigate(
+            tx,
+            request,
+            revision,
+            &selected.key,
+            selected_document
+                .as_ref()
+                .map(|document| document.nodes.as_slice()),
+        )
     }
 
     pub fn classes_at(
@@ -13224,13 +13287,23 @@ impl Store {
         let mut documents = BTreeMap::new();
         for (path, _) in &rows {
             if !documents.contains_key(path) {
-                documents.insert(path.clone(), self.selected_graph_document_for(tx, path, &selected)?);
+                documents.insert(
+                    path.clone(),
+                    self.selected_graph_document_for(tx, path, &selected)?,
+                );
             }
         }
-        let values = rows.iter().map(|(path, id)| {
-            documents[path].nodes.iter().find(|node| node.id == *id).cloned()
-                .context("incompatible_index: selected search symbol missing")
-        }).collect::<Result<Vec<_>>>()?;
+        let values = rows
+            .iter()
+            .map(|(path, id)| {
+                documents[path]
+                    .nodes
+                    .iter()
+                    .find(|node| node.id == *id)
+                    .cloned()
+                    .context("incompatible_index: selected search symbol missing")
+            })
+            .collect::<Result<Vec<_>>>()?;
         Ok((revision, values))
     }
 
@@ -13260,8 +13333,10 @@ impl Store {
                 .query_row("SELECT m.path FROM graph_nodes n JOIN revision_documents m ON m.revision_id=?2 AND m.graph_projection_id=n.projection_id WHERE n.id=?1", params![id, selected.key], |r| r.get(0))
                 .optional()?;
         let node = if let Some(path) = selected_path {
-            self.selected_graph_document_for(tx, &path, &selected)?.nodes
-                .into_iter().find(|node| node.id == id)
+            self.selected_graph_document_for(tx, &path, &selected)?
+                .nodes
+                .into_iter()
+                .find(|node| node.id == id)
         } else {
             None
         };
@@ -13717,19 +13792,27 @@ impl Store {
     ) -> Result<Option<crate::behavior::SequenceView>> {
         let selected_revision = self.read_revision_for(tx, Some(expected), pre_startup)?;
         let revision = selected_revision.pin;
-        let path: Option<String> = tx.query_row(
-            "SELECT m.path FROM graph_nodes n JOIN revision_documents m
+        let path: Option<String> = tx
+            .query_row(
+                "SELECT m.path FROM graph_nodes n JOIN revision_documents m
              ON m.revision_id=?2 AND m.graph_projection_id=n.projection_id WHERE n.id=?1",
-            params![seed, selected_revision.key], |r| r.get(0),
-        ).optional()?;
+                params![seed, selected_revision.key],
+                |r| r.get(0),
+            )
+            .optional()?;
         let Some(path) = path else { return Ok(None) };
         let document = self.selected_graph_document_for(tx, &path, &selected_revision)?;
-        let symbol = document.nodes.iter().find(|node| node.id == seed)
+        let symbol = document
+            .nodes
+            .iter()
+            .find(|node| node.id == seed)
             .context("incompatible_index: selected sequence seed missing")?;
-        ensure!(matches!(symbol.kind, SymbolKind::Function | SymbolKind::Method),
-            "invalid sequence symbol kind");
+        ensure!(
+            matches!(symbol.kind, SymbolKind::Function | SymbolKind::Method),
+            "invalid sequence symbol kind"
+        );
         let mut calls = document.graph_calls;
-        calls.sort_by(|a,b| (a.range.start_byte, &a.id).cmp(&(b.range.start_byte, &b.id)));
+        calls.sort_by(|a, b| (a.range.start_byte, &a.id).cmp(&(b.range.start_byte, &b.id)));
         let file = document.file;
         crate::behavior::build_sequence(revision, &symbol, &file, &calls, show_all).map(Some)
     }
@@ -13780,10 +13863,18 @@ impl Store {
             calls.extend(document.graph_calls);
             regions.extend(document.graph_regions);
         }
-        nodes.sort_by(|a,b| a.id.cmp(&b.id));
+        nodes.sort_by(|a, b| a.id.cmp(&b.id));
         calls.sort_by(crate::indexer::compare_reader_calls);
-        regions.sort_by(|a,b| a.id.cmp(&b.id));
-        Ok(Graph { schema_version: SCHEMA_VERSION, files, nodes, calls, regions, stats, diagnostics })
+        regions.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(Graph {
+            schema_version: SCHEMA_VERSION,
+            files,
+            nodes,
+            calls,
+            regions,
+            stats,
+            diagnostics,
+        })
     }
     pub fn graph(&self) -> Result<Graph> {
         self.graph_at(None)
@@ -13863,19 +13954,37 @@ impl Store {
             documents.insert(path, self.selected_graph_document_for(tx, path, &selected)?);
         }
         for node in &view.nodes {
-            ensure!(documents.get(node.path.as_str())
-                .and_then(|document| document.nodes.iter().find(|actual| actual.id == node.id)) == Some(node),
-                "incompatible_index: cached packet selected graph declaration changed");
+            ensure!(
+                documents
+                    .get(node.path.as_str())
+                    .and_then(|document| document.nodes.iter().find(|actual| actual.id == node.id))
+                    == Some(node),
+                "incompatible_index: cached packet selected graph declaration changed"
+            );
         }
         for call in &view.calls {
-            ensure!(documents.get(call.path.as_str())
-                .and_then(|document| document.graph_calls.iter().find(|actual| actual.id == call.id)) == Some(call),
-                "incompatible_index: cached packet selected graph call changed");
+            ensure!(
+                documents
+                    .get(call.path.as_str())
+                    .and_then(|document| document
+                        .graph_calls
+                        .iter()
+                        .find(|actual| actual.id == call.id))
+                    == Some(call),
+                "incompatible_index: cached packet selected graph call changed"
+            );
         }
         for region in &view.regions {
-            ensure!(documents.get(region.path.as_str())
-                .and_then(|document| document.graph_regions.iter().find(|actual| actual.id == region.id)) == Some(region),
-                "incompatible_index: cached packet selected graph region changed");
+            ensure!(
+                documents
+                    .get(region.path.as_str())
+                    .and_then(|document| document
+                        .graph_regions
+                        .iter()
+                        .find(|actual| actual.id == region.id))
+                    == Some(region),
+                "incompatible_index: cached packet selected graph region changed"
+            );
         }
         for source in sources {
             ensure!(
@@ -13922,10 +14031,16 @@ impl Store {
                 r.get(0)
             })
             .optional()?;
-        let Some(path) = selected_path else { return Ok(None) };
+        let Some(path) = selected_path else {
+            return Ok(None);
+        };
         let mut documents = BTreeMap::new();
         let seed_document = self.selected_graph_document_for(tx, &path, &selected)?;
-        let seed = seed_document.nodes.iter().find(|symbol| symbol.id == query.seed).cloned()
+        let seed = seed_document
+            .nodes
+            .iter()
+            .find(|symbol| symbol.id == query.seed)
+            .cloned()
             .context("incompatible_index: selected view seed missing")?;
         documents.insert(path, seed_document);
         let mut calls = Vec::new();
@@ -13935,20 +14050,28 @@ impl Store {
             // The native owner index selects candidate documents without scanning
             // every revision document. Derive each document once, sort globally,
             // and take the SQL LIMIT before filtering excluded paths.
-            let call_paths: Vec<String> = tx.prepare(
-                "SELECT DISTINCT m.path FROM native_version_calls c JOIN revision_documents m
+            let call_paths: Vec<String> = tx
+                .prepare(
+                    "SELECT DISTINCT m.path FROM native_version_calls c JOIN revision_documents m
                  ON m.revision_id=?2 AND m.document_version_id=c.version_id
-                 WHERE c.owner_syntax_id=?1 ORDER BY m.path"
-            )?.query_map(params![seed.id, selected.key], |r| r.get(0))?
+                 WHERE c.owner_syntax_id=?1 ORDER BY m.path",
+                )?
+                .query_map(params![seed.id, selected.key], |r| r.get(0))?
                 .collect::<rusqlite::Result<_>>()?;
             for path in call_paths {
                 if !documents.contains_key(&path) {
-                    documents.insert(path.clone(), self.selected_graph_document_for(tx, &path, &selected)?);
+                    documents.insert(
+                        path.clone(),
+                        self.selected_graph_document_for(tx, &path, &selected)?,
+                    );
                 }
             }
-            let mut ordered: Vec<CallSite> = documents.values()
+            let mut ordered: Vec<CallSite> = documents
+                .values()
                 .flat_map(|doc| doc.graph_calls.iter())
-                .filter(|call| call.caller == seed.id).cloned().collect();
+                .filter(|call| call.caller == seed.id)
+                .cloned()
+                .collect();
             ordered.sort_by(crate::indexer::compare_reader_calls);
             for call in ordered.into_iter().take(query.max_calls + 1) {
                 if query.exclude_paths.iter().any(|p| call.path.starts_with(p)) {
@@ -13964,8 +14087,11 @@ impl Store {
         }
         let mut regions = BTreeMap::new();
         while let Some(id) = region_ids.pop_first() {
-            let region = documents.values().flat_map(|doc| doc.graph_regions.iter())
-                .find(|region| region.id == id).cloned();
+            let region = documents
+                .values()
+                .flat_map(|doc| doc.graph_regions.iter())
+                .find(|region| region.id == id)
+                .cloned();
             if let Some(region) = region {
                 if let Some(parent) = &region.parent {
                     region_ids.insert(parent.clone());

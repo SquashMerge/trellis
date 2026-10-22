@@ -1746,7 +1746,11 @@ async fn normal_size_captured_java_python_cold_oracle_attests_full_published_cat
             .filter(|node| node.path == file.path)
             .collect();
         derived_nodes.sort_by(|a, b| a.id.cmp(&b.id));
-        assert_eq!(derived_nodes, measured_nodes, "derived graph: {}", file.path);
+        assert_eq!(
+            derived_nodes, measured_nodes,
+            "derived graph: {}",
+            file.path
+        );
         assert_eq!(
             stored_nodes.len(),
             measured_nodes.len(),
@@ -1758,7 +1762,10 @@ async fn normal_size_captured_java_python_cold_oracle_attests_full_published_cat
             assert_eq!(name, &measured.name, "measured node name: {}", file.path);
             assert_eq!(
                 kind.as_str(),
-                serde_json::to_value(&measured.kind).unwrap().as_str().unwrap(),
+                serde_json::to_value(&measured.kind)
+                    .unwrap()
+                    .as_str()
+                    .unwrap(),
                 "measured node kind: {}",
                 file.path
             );

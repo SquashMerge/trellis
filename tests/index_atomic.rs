@@ -767,7 +767,11 @@ fn sqlite_snapshot(
         "native_binding_epoch",
         "revision_producer_bindings",
     ];
-    assert_eq!(required.len(), 31, "v13 mandatory table list must be unique");
+    assert_eq!(
+        required.len(),
+        31,
+        "v13 mandatory table list must be unique"
+    );
     assert!(
         required.is_subset(&actual),
         "missing v13 evidence tables: {:?}",
@@ -3533,7 +3537,13 @@ fn captured_scip_document_cutoff_refuses_optional_java_python_and_javascript_lab
             "SELECT n.name,n.kind FROM graph_nodes n JOIN revision_documents m ON n.projection_id=m.graph_projection_id WHERE m.revision_id=?1 AND m.path=?2 AND n.id=?3",
             rusqlite::params![current,path,expected.id],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
         assert_eq!(name, expected.name);
-        assert_eq!(kind.as_str(), serde_json::to_value(&expected.kind).unwrap().as_str().unwrap());
+        assert_eq!(
+            kind.as_str(),
+            serde_json::to_value(&expected.kind)
+                .unwrap()
+                .as_str()
+                .unwrap()
+        );
         assert!(expected.display_label.is_none());
     }
     for f in &cutoff_f {

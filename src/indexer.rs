@@ -1234,7 +1234,9 @@ fn project_native_selected(
             .push(r);
     }
     for file in &selected_files {
-        let facts = by_path.remove(file.path.as_str()).context("missing graph source")?;
+        let facts = by_path
+            .remove(file.path.as_str())
+            .context("missing graph source")?;
         let (nodes, calls, regions) =
             project_document(&file.path, file.text.as_bytes(), facts, &display_labels)?;
         graph.nodes.extend(nodes);
@@ -1813,7 +1815,11 @@ mod projection_document_tests {
             kind: if child { "function" } else { "module" }.into(),
             name: child.then(|| "nested".into()),
             lookup_key: None,
-            ancestors: if child { vec![parent_key.clone()] } else { vec![] },
+            ancestors: if child {
+                vec![parent_key.clone()]
+            } else {
+                vec![]
+            },
             key: if child {
                 Key {
                     kind: "function".into(),
@@ -1848,8 +1854,18 @@ mod projection_document_tests {
             ("A.java", "java"),
         ] {
             // The SQL read's syntax_id order is child first, unlike extraction order.
-            let parent = declaration(path, language, "sid:v1:ffffffffffffffffffffffffffffffff", false);
-            let child = declaration(path, language, "sid:v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", true);
+            let parent = declaration(
+                path,
+                language,
+                "sid:v1:ffffffffffffffffffffffffffffffff",
+                false,
+            );
+            let child = declaration(
+                path,
+                language,
+                "sid:v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                true,
+            );
             let labels = BTreeMap::new();
             let project = |declarations: Vec<&Declaration>| {
                 project_document(
@@ -1866,7 +1882,10 @@ mod projection_document_tests {
             };
             let writer = project(vec![&parent, &child]);
             let sql = project(vec![&child, &parent]);
-            assert_eq!(serde_json::to_vec(&writer).unwrap(), serde_json::to_vec(&sql).unwrap());
+            assert_eq!(
+                serde_json::to_vec(&writer).unwrap(),
+                serde_json::to_vec(&sql).unwrap()
+            );
             assert_eq!(sql.0[0].parent.as_deref(), Some(parent.syntax_id.as_str()));
             assert_eq!(sql.0[0].id, child.syntax_id);
             assert_eq!(sql.0[1].name, path);
@@ -1898,23 +1917,39 @@ mod projection_document_tests {
         let mut writer = vec![last.clone(), longest.clone(), first.clone()];
         writer.sort_by(compare_writer_calls);
         assert_eq!(
-            writer.iter().map(|call| call.id.as_str()).collect::<Vec<_>>(),
+            writer
+                .iter()
+                .map(|call| call.id.as_str())
+                .collect::<Vec<_>>(),
             vec![first.id.as_str(), last.id.as_str(), longest.id.as_str()]
         );
         let mut reader = vec![last.clone(), longest.clone(), first.clone()];
         reader.sort_by(compare_reader_calls);
         assert_eq!(
-            reader.iter().map(|call| call.id.as_str()).collect::<Vec<_>>(),
+            reader
+                .iter()
+                .map(|call| call.id.as_str())
+                .collect::<Vec<_>>(),
             vec![longest.id.as_str(), first.id.as_str(), last.id.as_str()]
         );
     }
 
     #[test]
     fn duplicate_owner_key_and_missing_parent_are_explicit_failures() {
-        let parent = declaration("a.rs", "rust", "sid:v1:ffffffffffffffffffffffffffffffff", false);
+        let parent = declaration(
+            "a.rs",
+            "rust",
+            "sid:v1:ffffffffffffffffffffffffffffffff",
+            false,
+        );
         let mut duplicate = parent.clone();
         duplicate.syntax_id = "sid:v1:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".into();
-        let child = declaration("a.rs", "rust", "sid:v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", true);
+        let child = declaration(
+            "a.rs",
+            "rust",
+            "sid:v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            true,
+        );
         let project = |declarations: Vec<&Declaration>| {
             project_document(
                 "a.rs",
@@ -1929,7 +1964,10 @@ mod projection_document_tests {
             .unwrap_err()
             .to_string()
         };
-        assert_eq!(project(vec![&parent, &duplicate]), "native declaration key collision");
+        assert_eq!(
+            project(vec![&parent, &duplicate]),
+            "native declaration key collision"
+        );
         assert_eq!(project(vec![&child]), "native declaration parent missing");
     }
 }

@@ -1204,9 +1204,7 @@ fn pinned_native_call_must_match_source_before_query_and_sequence() {
     let sequence_clone = sequence_store.clone();
     let sequence_error = sequence_store.sequence_at(&owner, pin, true).unwrap_err();
     assert!(
-        sequence_error
-            .to_string()
-            .contains("incompatible_index")
+        sequence_error.to_string().contains("incompatible_index")
             && sequence_error
                 .to_string()
                 .contains("selected native calls differ from source"),
@@ -1522,7 +1520,10 @@ fn selected_graph_display_label_must_match_derived_graph() {
     let error = store
         .native_declarations_at(pin, "javascript", "hello")
         .unwrap_err();
-    assert!(error.to_string().contains("incompatible_index"), "{error:#}");
+    assert!(
+        error.to_string().contains("incompatible_index"),
+        "{error:#}"
+    );
     assert!(!error.to_string().contains("forgedLabel"), "{error:#}");
     let closed = selected_clone
         .native_declarations_at(pin, "java", "go")
@@ -1555,7 +1556,9 @@ fn selected_graph_nodes_row_count_is_bounded_before_derivation() {
     )
     .unwrap();
     let fk_count: i64 = db
-        .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| r.get(0))
+        .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
+            r.get(0)
+        })
         .unwrap();
     assert_eq!(fk_count, 0);
     let selected_clone = store.clone();
@@ -1563,7 +1566,9 @@ fn selected_graph_nodes_row_count_is_bounded_before_derivation() {
         .native_declarations_at(pin, "javascript", "hello")
         .unwrap_err();
     assert!(
-        error.to_string().contains("selected evidence row budget exceeded"),
+        error
+            .to_string()
+            .contains("selected evidence row budget exceeded"),
         "{error:#}"
     );
     let closed = selected_clone

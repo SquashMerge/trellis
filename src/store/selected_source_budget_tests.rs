@@ -30,18 +30,43 @@ fn selected_length_guard_precedes_json_and_blob_decode() {
         .query_row(
             "SELECT n.id,n.name FROM graph_nodes n JOIN revision_documents m
              ON m.graph_projection_id=n.projection_id WHERE m.path='one.js' LIMIT 1",
-            [], |r| Ok((r.get(0)?, r.get(1)?)),
-        ).unwrap();
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
     let selected = store.read_revision_for(&db, None, true).unwrap();
-    let document = store.selected_graph_document_for(&db, "one.js", &selected).unwrap();
-    let normal_charge = derived_graph_bytes(&document.nodes, &document.graph_calls,
-        &document.graph_regions, document.file.text.len() as i64).unwrap();
-    let manual_charge: usize = document.nodes.iter().map(|node|
-        node.id.len() + node.name.len() + node.path.len() + json(node).unwrap().len()).sum::<usize>()
-        + document.graph_calls.iter().map(|call|
-            call.id.len() + call.caller.len() + call.path.len() + json(call).unwrap().len()).sum::<usize>()
-        + document.graph_regions.iter().map(|region|
-            region.id.len() + region.owner.len() + region.path.len() + json(region).unwrap().len()).sum::<usize>();
+    let document = store
+        .selected_graph_document_for(&db, "one.js", &selected)
+        .unwrap();
+    let normal_charge = derived_graph_bytes(
+        &document.nodes,
+        &document.graph_calls,
+        &document.graph_regions,
+        document.file.text.len() as i64,
+    )
+    .unwrap();
+    let manual_charge: usize = document
+        .nodes
+        .iter()
+        .map(|node| node.id.len() + node.name.len() + node.path.len() + json(node).unwrap().len())
+        .sum::<usize>()
+        + document
+            .graph_calls
+            .iter()
+            .map(|call| {
+                call.id.len() + call.caller.len() + call.path.len() + json(call).unwrap().len()
+            })
+            .sum::<usize>()
+        + document
+            .graph_regions
+            .iter()
+            .map(|region| {
+                region.id.len()
+                    + region.owner.len()
+                    + region.path.len()
+                    + json(region).unwrap().len()
+            })
+            .sum::<usize>();
     assert_eq!(normal_charge, manual_charge as u64);
     // Use ordinary-size, individually valid labels. The aggregate graph budget
     // must accept its boundary and reject the next byte; no oversized label is
@@ -50,16 +75,20 @@ fn selected_length_guard_precedes_json_and_blob_decode() {
     let cap = (source_bytes as usize) * 64 + 256 * 1024;
     let mut template = document.nodes[0].clone();
     template.display_label = Some(String::new());
-    let base = template.id.len() + template.name.len() + template.path.len()
+    let base = template.id.len()
+        + template.name.len()
+        + template.path.len()
         + json(&template).unwrap().len();
     let count = cap / base;
     assert!(count <= (source_bytes * 16).clamp(1024, 1_000_000) as usize);
     assert!((cap - count * base) <= count * 256);
-    let mut boundary: Vec<_> = (0..count).map(|i| {
-        let mut node = template.clone();
-        node.id = format!("sid:v1:{i:032x}");
-        node
-    }).collect();
+    let mut boundary: Vec<_> = (0..count)
+        .map(|i| {
+            let mut node = template.clone();
+            node.id = format!("sid:v1:{i:032x}");
+            node
+        })
+        .collect();
     let mut remaining = cap - count * base;
     for node in &mut boundary {
         let size = remaining.min(256);
@@ -67,18 +96,32 @@ fn selected_length_guard_precedes_json_and_blob_decode() {
         remaining -= size;
     }
     assert_eq!(remaining, 0);
-    assert_eq!(derived_graph_bytes(&boundary, &[], &[], source_bytes).unwrap(), cap as u64);
-    let last = boundary.iter_mut().find(|node| node.display_label.as_ref().unwrap().len() < 256)
+    assert_eq!(
+        derived_graph_bytes(&boundary, &[], &[], source_bytes).unwrap(),
+        cap as u64
+    );
+    let last = boundary
+        .iter_mut()
+        .find(|node| node.display_label.as_ref().unwrap().len() < 256)
         .unwrap();
     last.display_label.as_mut().unwrap().push('x');
-    assert!(derived_graph_bytes(&boundary, &[], &[], source_bytes)
-        .unwrap_err().to_string().contains("graph row byte budget exceeded"));
+    assert!(
+        derived_graph_bytes(&boundary, &[], &[], source_bytes)
+            .unwrap_err()
+            .to_string()
+            .contains("graph row byte budget exceeded")
+    );
     db.execute(
         "UPDATE graph_nodes SET name=?1 WHERE id=?2 AND projection_id=(SELECT graph_projection_id FROM revision_documents WHERE path='one.js')",
         params!["wrong", node_id],
     ).unwrap();
-    assert!(store.attest_selected_document_for(&db, "one.js", &selected)
-        .unwrap_err().to_string().contains("graph node materialization differs"));
+    assert!(
+        store
+            .attest_selected_document_for(&db, "one.js", &selected)
+            .unwrap_err()
+            .to_string()
+            .contains("graph node materialization differs")
+    );
     db.execute(
         "UPDATE graph_nodes SET name=?1 WHERE id=?2 AND projection_id=(SELECT graph_projection_id FROM revision_documents WHERE path='one.js')",
         params![original, node_id],

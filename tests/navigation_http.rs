@@ -505,7 +505,9 @@ async fn source_candidate_count_and_huge_cached_text_have_fixed_output_limits() 
     let mut line_one: Vec<_> = graph
         .nodes
         .iter()
-        .filter(|node| node.path == "Many.java" && node.range.start_line == 1 && node.kind == SymbolKind::Class)
+        .filter(|node| {
+            node.path == "Many.java" && node.range.start_line == 1 && node.kind == SymbolKind::Class
+        })
         .collect();
     line_one.sort_by(|a, b| a.id.cmp(&b.id));
     assert_eq!(line_one.len(), 200);
@@ -513,7 +515,10 @@ async fn source_candidate_count_and_huge_cached_text_have_fixed_output_limits() 
         assert_eq!(target["symbol"], serde_json::to_value(expected).unwrap());
         assert_eq!(target["reason"], "declaration");
     }
-    assert_eq!(view["warnings"], json!(["Navigation limits reached; some cached evidence or targets were omitted."]));
+    assert_eq!(
+        view["warnings"],
+        json!(["Navigation limits reached; some cached evidence or targets were omitted."])
+    );
     assert!(serde_json::to_vec(&view).unwrap().len() <= 512 * 1024);
     let (status, other_line) = call(&app, source("Many.java", 2, &dir)).await;
     assert_eq!(status, 200);
@@ -1203,11 +1208,13 @@ async fn navigation_selected_graph_nodes_are_attested_without_scanning_other_doc
             [&graph],
         )
         .unwrap();
-    missing_db.execute(
-        "INSERT INTO graph_display_labels(projection_id,id,label)
+    missing_db
+        .execute(
+            "INSERT INTO graph_display_labels(projection_id,id,label)
          SELECT 'orphan-graph',id,label FROM graph_display_labels WHERE projection_id=?1",
-        [&graph],
-    ).unwrap();
+            [&graph],
+        )
+        .unwrap();
     assert_eq!(missing_db.execute(
         "INSERT INTO class_projections(id,graph_projection_id,content_hash,state)
          SELECT 'orphan-class','orphan-graph',content_hash,state FROM class_projections WHERE id=?1",

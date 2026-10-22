@@ -21,9 +21,9 @@ pub mod file_tree;
 pub mod http;
 pub mod index_coordinator;
 pub mod indexer;
+mod indexer_java;
 #[cfg(test)]
 mod indexer_projection_vectors_tests;
-mod indexer_java;
 mod indexer_python;
 mod indexer_rust;
 pub mod mcp;

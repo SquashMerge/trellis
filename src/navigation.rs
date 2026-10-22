@@ -240,24 +240,43 @@ impl Reader<'_> {
             lines.is_some_and(|lines| s.line as i64 <= lines),
             InvalidRequest("The path or line is not present in the cached revision.")
         );
-        let mut candidates: Vec<Symbol> = self.symbols.unwrap_or(&[]).iter()
-            .filter(|node| node.path == s.path && node.range.start_line == s.line
-                && matches!(node.kind, SymbolKind::Class | SymbolKind::Method | SymbolKind::Function))
-            .cloned().collect();
+        let mut candidates: Vec<Symbol> = self
+            .symbols
+            .unwrap_or(&[])
+            .iter()
+            .filter(|node| {
+                node.path == s.path
+                    && node.range.start_line == s.line
+                    && matches!(
+                        node.kind,
+                        SymbolKind::Class | SymbolKind::Method | SymbolKind::Function
+                    )
+            })
+            .cloned()
+            .collect();
         candidates.sort_by(|a, b| a.id.cmp(&b.id));
         let declarations = self.symbol_records(candidates.into_iter().take(129))?;
         for symbol in declarations {
             self.add(symbol, "declaration", "measured")?;
         }
         for class in [true, false] {
-            let mut enclosing: Vec<Symbol> = self.symbols.unwrap_or(&[]).iter()
-                .filter(|node| node.path == s.path
-                    && (if class { node.kind == SymbolKind::Class }
-                        else { matches!(node.kind, SymbolKind::Method | SymbolKind::Function) })
-                    && node.range.start_line <= s.line
-                    && (node.range.end_line > s.line
-                        || (node.range.end_line == s.line && node.range.end_column > 1)))
-                .cloned().collect();
+            let mut enclosing: Vec<Symbol> = self
+                .symbols
+                .unwrap_or(&[])
+                .iter()
+                .filter(|node| {
+                    node.path == s.path
+                        && (if class {
+                            node.kind == SymbolKind::Class
+                        } else {
+                            matches!(node.kind, SymbolKind::Method | SymbolKind::Function)
+                        })
+                        && node.range.start_line <= s.line
+                        && (node.range.end_line > s.line
+                            || (node.range.end_line == s.line && node.range.end_column > 1))
+                })
+                .cloned()
+                .collect();
             enclosing.sort_by(|a, b| {
                 (a.range.end_byte - a.range.start_byte, &a.id)
                     .cmp(&(b.range.end_byte - b.range.start_byte, &b.id))
@@ -371,25 +390,42 @@ mod tests {
             kind: SymbolKind::Function,
             path: "a.js".into(),
             range: SourceRange {
-                start_byte: 0, end_byte: 1, start_line: 1, end_line: 1,
-                start_column: 1, end_column: 2,
+                start_byte: 0,
+                end_byte: 1,
+                start_line: 1,
+                end_line: 1,
+                start_column: 1,
+                end_column: 2,
             },
-            parent: None, accessor: false,
-            provenance: Provenance { source: "tree-sitter".into(), semantic: SemanticState::Unavailable },
+            parent: None,
+            accessor: false,
+            provenance: Provenance {
+                source: "tree-sitter".into(),
+                semantic: SemanticState::Unavailable,
+            },
         }
     }
 
     fn reader<'a>(db: &'a Connection) -> Reader<'a> {
         Reader {
-            db, revision_key: "pin", symbols: None,
+            db,
+            revision_key: "pin",
+            symbols: None,
             result: NavigationResult {
                 revision: IndexPin {
-                    index_generation: uuid::Uuid::parse_str("11000000-0000-4000-8000-000000000000").unwrap(),
+                    index_generation: uuid::Uuid::parse_str("11000000-0000-4000-8000-000000000000")
+                        .unwrap(),
                     index_revision: 1,
                 },
-                targets: vec![], warnings: vec![], truncated: false, require_index: false,
+                targets: vec![],
+                warnings: vec![],
+                truncated: false,
+                require_index: false,
             },
-            input_bytes: 0, rows: 0, output_bytes: 0, seen: BTreeSet::new(),
+            input_bytes: 0,
+            rows: 0,
+            output_bytes: 0,
+            seen: BTreeSet::new(),
         }
     }
 
@@ -399,7 +435,10 @@ mod tests {
         let mut one = symbol(1);
         let base = serde_json::to_vec(&one).unwrap().len();
         one.name = "x".repeat(RECORD_BYTES as usize - base + one.name.len());
-        assert_eq!(serde_json::to_vec(&one).unwrap().len(), RECORD_BYTES as usize);
+        assert_eq!(
+            serde_json::to_vec(&one).unwrap().len(),
+            RECORD_BYTES as usize
+        );
         let mut read = reader(&db);
         read.input_bytes = INPUT_BYTES - RECORD_BYTES as usize;
         assert_eq!(read.symbol_records([one.clone()]).unwrap().len(), 1);
@@ -419,9 +458,19 @@ mod tests {
     fn derived_symbol_query_and_total_row_boundaries() {
         let db = Connection::open_in_memory().unwrap();
         let mut read = reader(&db);
-        assert_eq!(read.symbol_records((0..QUERY_ROWS).map(symbol)).unwrap().len(), QUERY_ROWS);
+        assert_eq!(
+            read.symbol_records((0..QUERY_ROWS).map(symbol))
+                .unwrap()
+                .len(),
+            QUERY_ROWS
+        );
         assert!(!read.result.truncated);
-        assert_eq!(read.symbol_records((QUERY_ROWS..QUERY_ROWS + 1).map(symbol)).unwrap().len(), 1);
+        assert_eq!(
+            read.symbol_records((QUERY_ROWS..QUERY_ROWS + 1).map(symbol))
+                .unwrap()
+                .len(),
+            1
+        );
         assert!(!read.result.truncated);
         let mut read = reader(&db);
         read.rows = TOTAL_ROWS - 1;
@@ -430,7 +479,12 @@ mod tests {
         assert!(read.symbol_records([symbol(2)]).unwrap().is_empty());
         assert!(read.result.truncated);
         let mut read = reader(&db);
-        assert_eq!(read.symbol_records((0..QUERY_ROWS + 1).map(symbol)).unwrap().len(), QUERY_ROWS);
+        assert_eq!(
+            read.symbol_records((0..QUERY_ROWS + 1).map(symbol))
+                .unwrap()
+                .len(),
+            QUERY_ROWS
+        );
         assert!(read.result.truncated);
     }
 }

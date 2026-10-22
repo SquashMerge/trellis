@@ -1751,9 +1751,12 @@ fn captured_long_call_exceeds_injected_small_graph_cap_and_remains_selectable() 
             &cancel,
         )
         .unwrap();
-    let call_bytes = graph.calls.iter()
+    let call_bytes = graph
+        .calls
+        .iter()
         .map(|call| json(call).unwrap().len())
-        .max().unwrap();
+        .max()
+        .unwrap();
     assert!(
         call_bytes > 32 * 1024,
         "genuine call JSON exceeds an injected 32KiB row cap"
