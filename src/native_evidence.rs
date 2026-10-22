@@ -3928,7 +3928,7 @@ mod full_document_spool_tests {
         assert_eq!(spool.stats(), &plain.stats);
         assert_eq!(spool.diagnostics(), plain.diagnostics.as_slice());
         assert_eq!(stages.len(), 2 * spool.len());
-        for (index, pair) in stages.chunks_exact(2).enumerate() {
+        for (index, pair) in stages.as_chunks::<2>().0.iter().enumerate() {
             let path = &spool.header().revision.documents[index].key.path;
             assert_eq!(
                 pair,
