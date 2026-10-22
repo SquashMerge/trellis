@@ -1185,9 +1185,9 @@ async fn same_pin_selected_graph_declaration_rejected_by_class_and_symbol_routes
         200
     );
     let db = rusqlite::Connection::open(index_db(&dir.path().join("state"))).unwrap();
-    // No ID, path, index pin, or FK changes: only selected graph JSON is forged.
+    // No ID, path, index pin, or FK changes: only the selected narrow graph name is forged.
     db.execute(
-        "UPDATE graph_nodes SET payload=json_set(payload,'$.name','Fabricated') WHERE projection_id=(SELECT graph_projection_id FROM revision_documents WHERE path='Types.java') AND id=?1",
+        "UPDATE graph_nodes SET name='Fabricated' WHERE projection_id=(SELECT graph_projection_id FROM revision_documents WHERE path='Types.java') AND id=?1",
         [&seed],
     )
     .unwrap();
@@ -1232,24 +1232,22 @@ class B {}
     let symbol_url = format!("/api/symbol?id={class_id}&{}", pin_query(pin));
     assert_eq!(call(&app, "GET", &class_url, Value::Null).await.0, 200);
     let db = rusqlite::Connection::open(index_db(&dir.path().join("state"))).unwrap();
-    let id: String = db
+    // Graph calls derive from native call facts. Forge one FK-valid native spelling.
+    let call_id: String = db
         .query_row(
-            "SELECT id FROM graph_calls WHERE projection_id=(SELECT graph_projection_id FROM revision_documents WHERE path='Types.java') LIMIT 1",
+            "SELECT c.id FROM native_version_calls c JOIN revision_documents m ON m.document_version_id=c.version_id WHERE m.path='Types.java' LIMIT 1",
             [],
             |r| r.get(0),
         )
         .unwrap();
-    let payload: String = db
-        .query_row("SELECT payload FROM graph_calls WHERE projection_id=(SELECT graph_projection_id FROM revision_documents WHERE path='Types.java') AND id=?1", [&id], |r| r.get(0))
-        .unwrap();
-    let mut forged: Value = serde_json::from_str(&payload).unwrap();
-    assert!(forged["calleeText"].is_string());
-    forged["calleeText"] = json!("fabricatedCall");
-    db.execute(
-        "UPDATE graph_calls SET payload=?1 WHERE projection_id=(SELECT graph_projection_id FROM revision_documents WHERE path='Types.java') AND id=?2",
-        rusqlite::params![forged.to_string(), id],
-    )
-    .unwrap();
+    assert_eq!(
+        db.execute(
+            "UPDATE native_version_calls SET spelling='fabricatedCall' WHERE version_id=(SELECT document_version_id FROM revision_documents WHERE path='Types.java') AND id=?1",
+            [&call_id],
+        )
+        .unwrap(),
+        1
+    );
     assert_eq!(store.status().unwrap().revision, pin);
     for (method, path, body) in [
         ("GET", class_url.as_str(), Value::Null),
@@ -1335,14 +1333,14 @@ async fn selected_class_json_decode_and_clipping_fail_closed_without_retyping_in
             .contains("incompatible_index")
     );
 
-    // A selected method seed reaches only the resolver's persisted Symbol decode.
+    // A selected method seed attests its narrow graph node against derived native facts.
     let (dir, store, graph, app, _session) = setup();
     let clone = store.clone();
     let pin = store.status().unwrap().revision;
     let method_id = id(&graph, "run");
     let db = rusqlite::Connection::open(index_db(&dir.path().join("state"))).unwrap();
     db.execute(
-        "UPDATE graph_nodes SET payload='not-json' WHERE projection_id=(SELECT graph_projection_id FROM revision_documents WHERE path='Types.java') AND id=?1",
+        "UPDATE graph_nodes SET kind='class' WHERE projection_id=(SELECT graph_projection_id FROM revision_documents WHERE path='Types.java') AND id=?1",
         [&method_id],
     )
     .unwrap();
@@ -1713,6 +1711,7 @@ async fn normal_size_captured_java_python_cold_oracle_attests_full_published_cat
     assert!(!cold_catalog.classes.is_empty());
     assert!(!cold_catalog.truncated);
     let db = rusqlite::Connection::open(index_db(&dir.path().join("state"))).unwrap();
+    let derived_graph = store.graph_at(Some(pin)).unwrap();
     let revision_id = format!("pin:v1:{}:{}", pin.index_generation, pin.index_revision);
     for (file, extraction) in cold_capture.files.iter().zip(&cold_f) {
         let (state, payload): (String, String) = db.query_row(
@@ -1732,8 +1731,8 @@ async fn normal_size_captured_java_python_cold_oracle_attests_full_published_cat
             serde_json::to_vec(file).unwrap()
         );
         let stored_nodes = db.prepare(
-            "SELECT n.payload FROM graph_nodes n JOIN revision_documents m ON m.graph_projection_id=n.projection_id WHERE m.revision_id=?1 AND m.path=?2 ORDER BY n.id"
-        ).unwrap().query_map(rusqlite::params![revision_id, file.path], |r| r.get::<_, String>(0))
+            "SELECT n.id,n.name,n.kind FROM graph_nodes n JOIN revision_documents m ON m.graph_projection_id=n.projection_id WHERE m.revision_id=?1 AND m.path=?2 ORDER BY n.id"
+        ).unwrap().query_map(rusqlite::params![revision_id, file.path], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))
             .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
         let mut measured_nodes: Vec<_> = cold_graph
             .nodes
@@ -1741,17 +1740,26 @@ async fn normal_size_captured_java_python_cold_oracle_attests_full_published_cat
             .filter(|node| node.path == file.path)
             .collect();
         measured_nodes.sort_by(|a, b| a.id.cmp(&b.id));
+        let mut derived_nodes: Vec<_> = derived_graph
+            .nodes
+            .iter()
+            .filter(|node| node.path == file.path)
+            .collect();
+        derived_nodes.sort_by(|a, b| a.id.cmp(&b.id));
+        assert_eq!(derived_nodes, measured_nodes, "derived graph: {}", file.path);
         assert_eq!(
             stored_nodes.len(),
             measured_nodes.len(),
             "measured graph: {}",
             file.path
         );
-        for (stored, measured) in stored_nodes.iter().zip(measured_nodes) {
+        for ((id, name, kind), measured) in stored_nodes.iter().zip(measured_nodes) {
+            assert_eq!(id, &measured.id, "measured node ID: {}", file.path);
+            assert_eq!(name, &measured.name, "measured node name: {}", file.path);
             assert_eq!(
-                stored.as_bytes(),
-                serde_json::to_vec(measured).unwrap(),
-                "measured node: {}",
+                kind.as_str(),
+                serde_json::to_value(&measured.kind).unwrap().as_str().unwrap(),
+                "measured node kind: {}",
                 file.path
             );
         }

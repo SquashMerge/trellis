@@ -722,11 +722,12 @@ fn sqlite_snapshot(
         .unwrap()
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
-    // The selected v9 evidence is the 28 base tables plus four release-control
-    // tables. Supersession state and the paired producer bindings are additive.
+    // Schema 13 replaces stored graph call/region rows with derived native facts,
+    // retains narrow graph nodes, and stores optional SCIP display labels.
+    // Supersession state and the paired producer bindings are additive.
     // Check exact names, not just a count: an unknown table must not escape the
     // independent cold-source comparison.
-    const REQUIRED_V9_TABLES: [&str; 32] = [
+    const REQUIRED_V13_TABLES: [&str; 31] = [
         "native_producers",
         "native_producer_languages",
         "native_producer_inputs",
@@ -738,8 +739,7 @@ fn sqlite_snapshot(
         "document_versions",
         "graph_projections",
         "graph_nodes",
-        "graph_calls",
-        "graph_regions",
+        "graph_display_labels",
         "class_projections",
         "classes",
         "class_relations",
@@ -760,33 +760,33 @@ fn sqlite_snapshot(
         "native_release_candidate_graphs",
         "native_release_candidate_classes",
     ];
-    let required: std::collections::BTreeSet<_> = REQUIRED_V9_TABLES.into_iter().collect();
+    let required: std::collections::BTreeSet<_> = REQUIRED_V13_TABLES.into_iter().collect();
     let actual: std::collections::BTreeSet<_> = tables.iter().map(String::as_str).collect();
     let optional = [
         "native_revision_supersessions",
         "native_binding_epoch",
         "revision_producer_bindings",
     ];
-    assert_eq!(required.len(), 32, "v9 mandatory table list must be unique");
+    assert_eq!(required.len(), 31, "v13 mandatory table list must be unique");
     assert!(
         required.is_subset(&actual),
-        "missing v9 evidence tables: {:?}",
+        "missing v13 evidence tables: {:?}",
         required.difference(&actual).collect::<Vec<_>>()
     );
     assert!(
         actual
             .difference(&required)
             .all(|table| optional.contains(table)),
-        "unexpected v9 evidence table: {:?}",
+        "unexpected v13 evidence table: {:?}",
         actual.difference(&required).collect::<Vec<_>>()
     );
     assert_eq!(
         actual.len(),
-        32 + optional
+        31 + optional
             .iter()
             .filter(|name| actual.contains(*name))
             .count(),
-        "exact v9 base and optional table count"
+        "exact v13 base and optional table count"
     );
     assert_eq!(
         actual.contains("native_binding_epoch"),
@@ -830,14 +830,14 @@ fn sqlite_snapshot(
                     ("EXISTS(SELECT 1 FROM document_versions v JOIN revision_documents d ON d.document_version_id=v.id WHERE d.revision_id=?1 AND v.producer_id=selected.producer_id AND v.producer_version=selected.producer_version)", "producer"),
                 "document_versions" => ("id IN (SELECT document_version_id FROM revision_documents WHERE revision_id=?1)", ""),
                 "graph_projections" => ("id IN (SELECT graph_projection_id FROM revision_documents WHERE revision_id=?1)", ""),
-                "graph_nodes" | "graph_calls" | "graph_regions" =>
+                "graph_nodes" | "graph_display_labels" =>
                     ("projection_id IN (SELECT graph_projection_id FROM revision_documents WHERE revision_id=?1)", ""),
                 "class_projections" => ("id IN (SELECT class_projection_id FROM revision_documents WHERE revision_id=?1)", ""),
                 "classes" | "class_relations" =>
                     ("projection_id IN (SELECT class_projection_id FROM revision_documents WHERE revision_id=?1)", ""),
                 name if name.starts_with("native_version_") =>
                     ("version_id IN (SELECT document_version_id FROM revision_documents WHERE revision_id=?1)", ""),
-                _ => panic!("unhandled v9 evidence table: {table}"),
+                _ => panic!("unhandled v13 evidence table: {table}"),
             };
             // Producer descriptor columns differ: only the parent table uses id/version.
             let where_clause = if table == "native_producers" {
@@ -1018,7 +1018,7 @@ fn parse_error_retained_pin_matches_independent_cold_and_advisory_uses_exact_tok
             cold_pin,
             true
         ),
-        "all selected v9 evidence tables: source/hash, revision, coverage, provenance, IDs, ordered native children, graph, class/warnings/truncated, and empty current-head release control"
+        "all selected v13 evidence tables: source/hash, revision, coverage, provenance, IDs, ordered native children, graph, class/warnings/truncated, and empty current-head release control"
     );
     assert_eq!(sqlite_snapshot(&path, before, false), old_rows);
     assert_eq!(parsed_graph, cold.graph_at(Some(cold_pin)).unwrap());
@@ -1488,7 +1488,7 @@ fn local_reuse_trusts_validated_head_but_selected_reads_refuse_sql_forgery() {
         ),
         (
             "graph",
-            "UPDATE graph_nodes SET payload=json_set(payload,'$.name','forged') WHERE projection_id=(SELECT graph_projection_id FROM revision_documents WHERE path='A.java' LIMIT 1) AND id=(SELECT id FROM graph_nodes WHERE projection_id=(SELECT graph_projection_id FROM revision_documents WHERE path='A.java' LIMIT 1) LIMIT 1)",
+            "UPDATE graph_nodes SET name='forged' WHERE projection_id=(SELECT graph_projection_id FROM revision_documents WHERE path='A.java' LIMIT 1) AND id=(SELECT id FROM graph_nodes WHERE projection_id=(SELECT graph_projection_id FROM revision_documents WHERE path='A.java' LIMIT 1) LIMIT 1)",
         ),
         (
             "class",
@@ -1737,7 +1737,7 @@ fn reconcile_matches_fresh_full_snapshot_after_add_edit_delete_rename_and_ignore
     assert_eq!(
         r2,
         sqlite_snapshot(&fresh_path, cold_pin, true),
-        "current r2 must equal a full independent cold build, including every selected v9 evidence table"
+        "current r2 must equal a full independent cold build, including every selected v13 evidence table"
     );
     let metadata = |path: &Path| {
         let db = rusqlite::Connection::open(path).unwrap();
@@ -2230,7 +2230,7 @@ fn current_v8_inventory_validation_rejects_missing_unknown_and_unsupported_state
 }
 
 #[test]
-fn selected_projection_json_failures_latch_only_selected_reads() {
+fn selected_projection_corruption_latches_only_selected_reads() {
     // Selected file JSON is bounded to the requested page.
     let (state, _workspace, store, pin, _session) = projection_fixture();
     let clone = store.clone();
@@ -2253,15 +2253,18 @@ fn selected_projection_json_failures_latch_only_selected_reads() {
             .contains("incompatible_index")
     );
 
-    // A matching invalid node is selected by the page even when file JSON is valid.
+    // A matching narrow graph node is attested by the selected file page.
     let (state, _workspace, store, pin, _session) = projection_fixture();
     let clone = store.clone();
     let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
-    db.execute(
-        "UPDATE graph_nodes SET payload='not-json' WHERE path='flow.js'",
-        [],
-    )
-    .unwrap();
+    assert_eq!(
+        db.execute(
+            "UPDATE graph_nodes SET name='forged' WHERE projection_id=(SELECT graph_projection_id FROM revision_documents WHERE path='flow.js') AND name='go'",
+            [],
+        )
+        .unwrap(),
+        1
+    );
     let error = store.files_at(Some(pin), 0, 10).unwrap_err();
     assert!(
         error.to_string().contains("incompatible_index"),
@@ -2275,29 +2278,30 @@ fn selected_projection_json_failures_latch_only_selected_reads() {
             .contains("incompatible_index")
     );
 
-    // The methods route types both invalid JSON and valid JSON with bad Symbol shape.
-    for payload in ["not-json", r#"{"kind":"function"}"#] {
-        let (state, _workspace, store, pin, _session) = projection_fixture();
-        let clone = store.clone();
-        let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
+    // The methods route also attests the narrow node kind, not a JSON payload.
+    let (state, _workspace, store, pin, _session) = projection_fixture();
+    let clone = store.clone();
+    let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
+    assert_eq!(
         db.execute(
-            "UPDATE graph_nodes SET payload=?1 WHERE path='flow.js'",
-            [payload],
+            "UPDATE graph_nodes SET kind='class' WHERE projection_id=(SELECT graph_projection_id FROM revision_documents WHERE path='flow.js') AND kind='function'",
+            [],
         )
-        .unwrap();
-        let error = store.methods_at("flow.js", Some(pin)).unwrap_err();
-        assert!(
-            error.to_string().contains("incompatible_index"),
-            "{error:#}"
-        );
-        assert!(
-            clone
-                .status()
-                .unwrap_err()
-                .to_string()
-                .contains("incompatible_index")
-        );
-    }
+        .unwrap(),
+        1
+    );
+    let error = store.methods_at("flow.js", Some(pin)).unwrap_err();
+    assert!(
+        error.to_string().contains("incompatible_index"),
+        "{error:#}"
+    );
+    assert!(
+        clone
+            .status()
+            .unwrap_err()
+            .to_string()
+            .contains("incompatible_index")
+    );
 
     // The selected source's bytes remain the same, but storing them as TEXT
     // instead of BLOB must produce a typed conversion refusal. No FK or CHECK
@@ -2332,15 +2336,17 @@ fn selected_projection_json_failures_latch_only_selected_reads() {
             .contains("incompatible_index")
     );
 
-    // Tree enrichment evaluates only its visible file and latches its invalid node.
-    let (state, workspace, store, _pin, _session) = projection_fixture();
-    let clone = store.clone();
+    // Tree enrichment counts narrow node kinds for its visible file.
+    let (state, workspace, store, pin, _session) = projection_fixture();
     let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
-    db.execute(
-        "UPDATE graph_nodes SET payload='not-json' WHERE path='flow.js'",
-        [],
-    )
-    .unwrap();
+    let expected: i64 = db
+        .query_row(
+            "SELECT count(*) FROM graph_nodes WHERE projection_id=(SELECT graph_projection_id FROM revision_documents WHERE path='flow.js') AND kind IN ('function','method')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(expected > 0);
     let mut items = vec![trellis::file_tree::Entry {
         name: "flow.js".into(),
         path: "flow.js".into(),
@@ -2350,18 +2356,9 @@ fn selected_projection_json_failures_latch_only_selected_reads() {
         unindexed_reason: None,
     }];
     let tree_root = workspace.path().canonicalize().unwrap();
-    let error = store.tree_metadata(&tree_root, &mut items).unwrap_err();
-    assert!(
-        error.to_string().contains("incompatible_index"),
-        "{error:#}"
-    );
-    assert!(
-        clone
-            .status()
-            .unwrap_err()
-            .to_string()
-            .contains("incompatible_index")
-    );
+    assert_eq!(store.tree_metadata(&tree_root, &mut items).unwrap().0, pin);
+    assert_eq!(items[0].method_count, Some(expected as usize));
+    assert_eq!(items[0].indexed_path.as_deref(), Some("flow.js"));
 
     // Benign absence and a bad pin remain non-latching request outcomes.
     let (_state, _workspace, store, pin, _session) = projection_fixture();
@@ -3532,13 +3529,11 @@ fn captured_scip_document_cutoff_refuses_optional_java_python_and_javascript_lab
     );
     for (path, name) in [("A.java", "A"), ("a.py", "P"), ("a.js", "J")] {
         let expected = node(&cutoff, path, name);
-        let graph_payload:String=db.query_row(
-            "SELECT n.payload FROM graph_nodes n JOIN revision_documents m ON n.projection_id=m.graph_projection_id WHERE m.revision_id=?1 AND m.path=?2 AND n.id=?3",
-            rusqlite::params![current,path,expected.id],|r|r.get(0)).unwrap();
-        assert_eq!(
-            serde_json::from_str::<trellis::model::Symbol>(&graph_payload).unwrap(),
-            *expected
-        );
+        let (name, kind): (String, String) = db.query_row(
+            "SELECT n.name,n.kind FROM graph_nodes n JOIN revision_documents m ON n.projection_id=m.graph_projection_id WHERE m.revision_id=?1 AND m.path=?2 AND n.id=?3",
+            rusqlite::params![current,path,expected.id],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert_eq!(name, expected.name);
+        assert_eq!(kind.as_str(), serde_json::to_value(&expected.kind).unwrap().as_str().unwrap());
         assert!(expected.display_label.is_none());
     }
     for f in &cutoff_f {
