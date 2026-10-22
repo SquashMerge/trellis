@@ -1748,7 +1748,7 @@ fn readonly_db(path: &Path) -> Result<rusqlite::Connection> {
 /// Exact historical sqlite_master inventories made by released v4–v7 and
 /// pre-delta v8 writers. The digest includes table/index DDL and SQLite's
 /// autoindexes; a copied metadata row inside an invented schema is NOT proof.
-/// Historical shapes are report-only; current-v11 validation gates deletion.
+/// Historical shapes are report-only; current-v12 validation gates deletion.
 fn historical_index_extractor(
     db: &rusqlite::Connection,
     version: i64,
@@ -2527,7 +2527,7 @@ mod gc_schema_race_tests {
         assert_eq!(
             (schema, marker.as_str(), generation, revision),
             (
-                11,
+                12,
                 "native-v6-delta-v1",
                 pin.index_generation.to_string(),
                 pin.index_revision as i64
@@ -2795,7 +2795,7 @@ mod gc_schema_race_tests {
     }
 
     #[test]
-    fn exact_v11_gc_candidate_survives_unknown_busy_then_deletes_after_fences_clear() {
+    fn exact_v12_gc_candidate_survives_unknown_busy_then_deletes_after_fences_clear() {
         let state = tempfile::tempdir().unwrap();
         let candidate_root = tempfile::tempdir().unwrap();
         let current_root = tempfile::tempdir().unwrap();
@@ -2909,7 +2909,7 @@ mod gc_schema_race_tests {
         assert_eq!(
             inspect_index(&dir, &identity.root_key, now).unwrap(),
             ("unknown", "recent_open"),
-            "genuine current-v11 cache must pass GC admission"
+            "genuine current-v12 cache must pass GC admission"
         );
 
         let attacker = rusqlite::Connection::open(&path).unwrap();
@@ -2927,7 +2927,7 @@ mod gc_schema_race_tests {
         assert_eq!(
             (schema, marker.as_str(), generation, revision),
             (
-                11,
+                12,
                 "native-v4",
                 pin.index_generation.to_string(),
                 pin.index_revision as i64
@@ -3081,7 +3081,7 @@ mod gc_final_witness_tests {
         assert_eq!(
             db.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            11
+            12
         );
         drop(live);
         assert!(roots.index_use_lock(&candidate).exists());

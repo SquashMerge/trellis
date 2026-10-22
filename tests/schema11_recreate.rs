@@ -21,14 +21,15 @@ fn schema11_marker_recreates_exclusively_with_spooled_revision() {
     fs::create_dir(&root).unwrap();
     fs::write(root.join("hello.js"), "function hello() { return 1; }\n").unwrap();
     let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
-    // Establish the real private candidate directory and use-lock without
-    // opening a current Store, which would retain a different SQLite inode.
-    drop(
-        roots
-            .writer(Arc::new(identity.verified_clone_for_tests().unwrap()))
-            .unwrap(),
-    );
+    // Start with a real durable request queue. Recreate must preserve its
+    // accepted rows; a missing queue is not a virgin startup after this point.
+    let initial = Store::open_for_tests(state.path(), &root).unwrap();
+    let queued = initial
+        .enqueue_request(&IndexOptions::new(root.clone()), None)
+        .unwrap();
+    drop(initial);
     let path = roots.index_db(&identity);
+    fs::remove_file(&path).unwrap();
     let db = rusqlite::Connection::open(&path).unwrap();
     db.execute_batch(include_str!("fixtures/schema11-new-index.sql"))
         .unwrap();
@@ -89,6 +90,9 @@ fn schema11_marker_recreates_exclusively_with_spooled_revision() {
     )
     .unwrap();
     assert_eq!(pin.index_revision, 1);
+    let preserved = store.request_by_id(&queued.id).unwrap().unwrap();
+    assert_eq!(preserved.seq, queued.seq);
+    assert_eq!(preserved.state, "queued");
     assert_ne!(fs::metadata(&path).unwrap().ino(), old_inode);
     let rebuilt = rusqlite::Connection::open(&path).unwrap();
     assert_eq!(
