@@ -1180,7 +1180,7 @@ fn index_delete_journal_no_wal() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        11
+        12
     );
     drop(db);
     let bytes = fs::read(&index).unwrap();
@@ -1859,7 +1859,7 @@ fn forget_rechecks_sqlite_schema_after_confirmation() {
 }
 
 #[test]
-fn gc_classifies_current_schema9_but_refuses_spoofed_shapes() {
+fn gc_classifies_current_schema12_but_refuses_spoofed_shapes() {
     let (temp, roots) = common::fixture();
     let work = root(temp.path());
     let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
@@ -1882,7 +1882,7 @@ fn gc_classifies_current_schema9_but_refuses_spoofed_shapes() {
         (entry.status, entry.reason)
     };
     assert_eq!(inspect(), ("unknown", "recent_open"));
-    // v10's CHECK forbids spoofing an old extractor on the current layout.
+    // The current CHECK forbids spoofing an old extractor on the current layout.
     assert!(
         db.execute(
             "UPDATE index_metadata SET extractor_version='native-v1'",
@@ -1911,10 +1911,35 @@ fn gc_classifies_current_schema9_but_refuses_spoofed_shapes() {
     db.pragma_update(None, "user_version", 10).unwrap();
     assert_eq!(inspect(), ("unknown", "unknown_index_schema"));
     db.pragma_update(None, "user_version", 11).unwrap();
+    assert_eq!(inspect(), ("unknown", "unknown_index_schema"));
+    db.pragma_update(None, "user_version", 12).unwrap();
     assert_eq!(inspect(), ("unknown", "recent_open"));
     db.execute("UPDATE index_metadata SET root_inode='1'", [])
         .unwrap();
     assert_eq!(inspect(), ("eligible", "root_replaced"));
+}
+
+#[test]
+fn complete_schema12_index_remains_gc_eligible() {
+    let (temp, roots) = common::fixture();
+    let work = root(temp.path());
+    let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
+    drop(common::open_store(temp.path(), &work).unwrap());
+    let db = rusqlite::Connection::open(roots.index_db(&identity)).unwrap();
+    assert_eq!(
+        db.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        12
+    );
+    let now = 1_800_000_000_i64;
+    db.execute(
+        "UPDATE index_metadata SET last_opened_at=?1",
+        [now - 30 * 86_400],
+    )
+    .unwrap();
+    drop(db);
+    let entry = roots.gc_report_at(now).unwrap().derived.remove(0);
+    assert_eq!((entry.status, entry.reason), ("eligible", "age_30_days"));
 }
 
 #[test]
@@ -2587,7 +2612,7 @@ fn server_updates_recapture_after_confirmed_delete_and_reject_stale_raw_input() 
 
 #[cfg(feature = "test-support")]
 #[test]
-fn gc_report_accepts_current_v8_retention_extension_but_rejects_bad_inventory() {
+fn gc_report_accepts_current_schema12_but_rejects_bad_inventory() {
     let (temp, roots) = common::fixture();
     let work = root(temp.path());
     let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
