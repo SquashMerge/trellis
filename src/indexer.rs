@@ -1050,6 +1050,27 @@ pub(crate) struct NativeDocument<'a> {
     pub control_regions: Vec<&'a native_evidence::ControlRegion>,
 }
 
+/// Writer order for derived calls: path, start byte, end byte, then ID.
+/// The ID breaks ties independently of native extraction order.
+pub(crate) fn compare_writer_calls(a: &CallSite, b: &CallSite) -> std::cmp::Ordering {
+    (&a.path, a.range.start_byte, a.range.end_byte, &a.id).cmp(&(
+        &b.path,
+        b.range.start_byte,
+        b.range.end_byte,
+        &b.id,
+    ))
+}
+
+/// Reader order from the graph SQL queries: path, start byte, descending
+/// end byte, then ID. String comparison uses SQLite's BINARY byte order.
+pub(crate) fn compare_reader_calls(a: &CallSite, b: &CallSite) -> std::cmp::Ordering {
+    a.path
+        .cmp(&b.path)
+        .then_with(|| a.range.start_byte.cmp(&b.range.start_byte))
+        .then_with(|| b.range.end_byte.cmp(&a.range.end_byte))
+        .then_with(|| a.id.cmp(&b.id))
+}
+
 /// The sole graph-row derivation for both publication and selected reads.
 /// No optional SCIP input or other document affects these measured rows.
 pub(crate) fn project_document(
@@ -1151,14 +1172,7 @@ pub(crate) fn project_document(
     }
     nodes.sort_by(|a, b| a.id.cmp(&b.id));
     regions.sort_by(|a, b| a.id.cmp(&b.id));
-    calls.sort_by(|a, b| {
-        (&a.path, a.range.start_byte, a.range.end_byte, &a.id).cmp(&(
-            &b.path,
-            b.range.start_byte,
-            b.range.end_byte,
-            &b.id,
-        ))
-    });
+    calls.sort_by(compare_writer_calls);
     Ok((nodes, calls, regions))
 }
 
@@ -1252,14 +1266,7 @@ fn project_native_selected(
         }
     }
     graph.nodes.sort_by(|a, b| a.id.cmp(&b.id));
-    graph.calls.sort_by(|a, b| {
-        (&a.path, a.range.start_byte, a.range.end_byte, &a.id).cmp(&(
-            &b.path,
-            b.range.start_byte,
-            b.range.end_byte,
-            &b.id,
-        ))
-    });
+    graph.calls.sort_by(compare_writer_calls);
     graph.regions.sort_by(|a, b| a.id.cmp(&b.id));
     graph.stats.files = graph.files.len();
     graph.stats.symbols = graph.nodes.len();
@@ -1782,10 +1789,9 @@ mod local_classification_tests {
 
 #[cfg(test)]
 mod projection_document_tests {
-    use super::{NativeDocument, project_document};
-    use crate::native_evidence::{
-        Call, Declaration, DeclarationRole, DocumentKey, Header, Key, Range,
-    };
+    use super::{NativeDocument, compare_reader_calls, compare_writer_calls, project_document};
+    use crate::model::{CallSite, SourceRange};
+    use crate::native_evidence::{Declaration, DeclarationRole, DocumentKey, Header, Key, Range};
     use std::collections::BTreeMap;
 
     fn declaration(path: &str, language: &str, id: &str, child: bool) -> Declaration {
@@ -1868,41 +1874,38 @@ mod projection_document_tests {
     }
 
     #[test]
-    fn calls_with_identical_ranges_sort_by_id_not_native_input_order() {
-        let path = "a.rs";
-        let make_call = |id: &str, end: usize| Call {
+    fn synthetic_call_site_sort_tie_breaks_by_bytewise_id_without_native_validation() {
+        // This tests DTO comparators directly. These synthetic rows do not claim
+        // to be native-validated artifacts or main-produced payload goldens.
+        let make_call = |id: &str, end_byte: usize| CallSite {
             id: id.into(),
-            owner_syntax_id: "sid:v1:ffffffffffffffffffffffffffffffff".into(),
-            ordinal: 0,
-            document: DocumentKey {
-                source_set_id: "source-set".into(),
-                language: "rust".into(),
-                path: path.into(),
+            caller: "sid:v1:ffffffffffffffffffffffffffffffff".into(),
+            callee_text: None,
+            path: "a.rs".into(),
+            range: SourceRange {
+                start_byte: 0,
+                end_byte,
+                ..SourceRange::default()
             },
-            revision_id: "revision".into(),
-            range: Range { start: 0, end },
             callee_range: None,
-            spelling: None,
-            region_ids: vec![],
-            provenance_id: "native".into(),
+            ordinal: 0,
+            regions: vec![],
+            provenance: super::graph_provenance(),
         };
         let last = make_call("occ:v2:ffffffffffffffffffffffffffffffff", 2);
         let first = make_call("occ:v2:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 2);
         let longest = make_call("occ:v2:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", 3);
-        let (_, calls, _) = project_document(
-            path,
-            b"abc",
-            NativeDocument {
-                declarations: vec![],
-                calls: vec![&last, &longest, &first],
-                control_regions: vec![],
-            },
-            &BTreeMap::new(),
-        )
-        .unwrap();
+        let mut writer = vec![last.clone(), longest.clone(), first.clone()];
+        writer.sort_by(compare_writer_calls);
         assert_eq!(
-            calls.iter().map(|call| call.id.as_str()).collect::<Vec<_>>(),
+            writer.iter().map(|call| call.id.as_str()).collect::<Vec<_>>(),
             vec![first.id.as_str(), last.id.as_str(), longest.id.as_str()]
+        );
+        let mut reader = vec![last.clone(), longest.clone(), first.clone()];
+        reader.sort_by(compare_reader_calls);
+        assert_eq!(
+            reader.iter().map(|call| call.id.as_str()).collect::<Vec<_>>(),
+            vec![longest.id.as_str(), first.id.as_str(), last.id.as_str()]
         );
     }
 
