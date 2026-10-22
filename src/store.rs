@@ -613,11 +613,11 @@ SELECT COALESCE(length(CAST(x.projection_id AS BLOB)),0)+COALESCE(length(CAST(x.
 UNION ALL
 SELECT COALESCE(length(CAST(x.projection_id AS BLOB)),0)+COALESCE(length(CAST(x.id AS BLOB)),0)+COALESCE(length(CAST(x.owner AS BLOB)),0)+COALESCE(length(CAST(x.target AS BLOB)),0)+COALESCE(length(CAST(x.payload AS BLOB)),0) AS row_bytes FROM class_relations x WHERE x.projection_id=?2
 )"#;
-const DATABASE_SCHEMA_VERSION: u32 = 12;
+const DATABASE_SCHEMA_VERSION: u32 = 13;
 const EXTRACTOR_VERSION: &str = "native-v6-delta-v1";
 const EVIDENCE_FORMAT: &str = "terminal-native-graph-v1";
-const CACHE_SCHEMA_V12: &str = r#"
-CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=12), extractor_version TEXT NOT NULL CHECK(extractor_version='native-v6-delta-v1'), root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL, reconcile_options TEXT);
+const CACHE_SCHEMA_V13: &str = r#"
+CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=13), extractor_version TEXT NOT NULL CHECK(extractor_version='native-v6-delta-v1'), root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL, reconcile_options TEXT);
 CREATE TABLE native_producers(id TEXT NOT NULL,version TEXT NOT NULL,executable_hash TEXT NOT NULL CHECK(length(executable_hash)=64),kind TEXT NOT NULL CHECK(kind='native'),position_encoding TEXT NOT NULL CHECK(position_encoding='utf8'),PRIMARY KEY(id,version));
 CREATE TABLE native_producer_languages(producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,language TEXT NOT NULL,inventory_authenticated INTEGER NOT NULL CHECK(inventory_authenticated IN (0,1)),ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(producer_id,producer_version,language),UNIQUE(producer_id,producer_version,ordinal),FOREIGN KEY(producer_id,producer_version) REFERENCES native_producers(id,version) DEFERRABLE INITIALLY DEFERRED);
 CREATE TABLE native_producer_inputs(producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,language TEXT NOT NULL,component_name TEXT NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(producer_id,producer_version,language,component_name),UNIQUE(producer_id,producer_version,language,ordinal),FOREIGN KEY(producer_id,producer_version,language) REFERENCES native_producer_languages(producer_id,producer_version,language) DEFERRABLE INITIALLY DEFERRED);
@@ -637,15 +637,12 @@ CREATE INDEX native_revisions_header_cover ON native_revisions(source_set_id,pub
 CREATE TABLE revision_capture_inputs(revision_id TEXT NOT NULL REFERENCES native_revisions(id) DEFERRABLE INITIALLY DEFERRED,input_key TEXT NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(revision_id,input_key));
 CREATE TABLE document_versions(id TEXT PRIMARY KEY,source_set_id TEXT NOT NULL REFERENCES native_source_sets(id) DEFERRABLE INITIALLY DEFERRED,language TEXT NOT NULL,path TEXT NOT NULL,content_hash TEXT NOT NULL CHECK(length(content_hash)=64),extraction_context TEXT NOT NULL CHECK(length(extraction_context)=64),producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,byte_length INTEGER NOT NULL CHECK(byte_length>=0 AND byte_length=length(source_bytes)),source_bytes BLOB NOT NULL,native_witness TEXT NOT NULL CHECK(length(native_witness)=64),UNIQUE(source_set_id,language,path,content_hash,extraction_context,producer_id,producer_version),UNIQUE(id,source_set_id,language,path),UNIQUE(id,language),FOREIGN KEY(producer_id,producer_version,language) REFERENCES native_producer_languages(producer_id,producer_version,language) DEFERRABLE INITIALLY DEFERRED);
 CREATE TABLE graph_projections(id TEXT PRIMARY KEY,document_version_id TEXT NOT NULL,language TEXT NOT NULL,graph_hash TEXT NOT NULL CHECK(length(graph_hash)=64),state TEXT NOT NULL CHECK(state IN ('staged','ready','unavailable')),class_extraction_state TEXT NOT NULL CHECK(class_extraction_state IN ('notApplicable','ready')),class_extraction_payload TEXT,CHECK((class_extraction_state='ready')=(class_extraction_payload IS NOT NULL)),CHECK((language IN ('java','python'))=(class_extraction_state IN ('ready'))),UNIQUE(document_version_id,graph_hash),UNIQUE(id,document_version_id),FOREIGN KEY(document_version_id,language) REFERENCES document_versions(id,language) DEFERRABLE INITIALLY DEFERRED);
-CREATE TABLE graph_nodes(projection_id TEXT NOT NULL REFERENCES graph_projections(id) DEFERRABLE INITIALLY DEFERRED,id TEXT NOT NULL,name TEXT NOT NULL,path TEXT NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(projection_id,id));
+CREATE TABLE graph_nodes(projection_id TEXT NOT NULL REFERENCES graph_projections(id) DEFERRABLE INITIALLY DEFERRED,id TEXT NOT NULL,name TEXT NOT NULL,kind TEXT NOT NULL,PRIMARY KEY(projection_id,id));
+CREATE TABLE graph_display_labels(projection_id TEXT NOT NULL,id TEXT NOT NULL,label TEXT NOT NULL,PRIMARY KEY(projection_id,id),FOREIGN KEY(projection_id,id) REFERENCES graph_nodes(projection_id,id) DEFERRABLE INITIALLY DEFERRED);
 CREATE VIRTUAL TABLE graph_node_trigrams USING fts5(name,content='',columnsize=0,tokenize='trigram case_sensitive 1');
 CREATE TRIGGER graph_node_trigrams_insert AFTER INSERT ON graph_nodes BEGIN INSERT INTO graph_node_trigrams(rowid,name) VALUES(new.rowid,lower(new.name)); END;
 CREATE TRIGGER graph_node_trigrams_delete AFTER DELETE ON graph_nodes BEGIN INSERT INTO graph_node_trigrams(graph_node_trigrams,rowid,name) VALUES('delete',old.rowid,lower(old.name)); END;
 CREATE TRIGGER graph_node_trigrams_update AFTER UPDATE OF name ON graph_nodes BEGIN INSERT INTO graph_node_trigrams(graph_node_trigrams,rowid,name) VALUES('delete',old.rowid,lower(old.name)); INSERT INTO graph_node_trigrams(rowid,name) VALUES(new.rowid,lower(new.name)); END;
-CREATE TABLE graph_calls(projection_id TEXT NOT NULL,id TEXT NOT NULL,caller TEXT NOT NULL,target TEXT,path TEXT NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(projection_id,id),FOREIGN KEY(projection_id,caller) REFERENCES graph_nodes(projection_id,id) DEFERRABLE INITIALLY DEFERRED);
-CREATE INDEX graph_calls_caller ON graph_calls(projection_id,caller,id);
-CREATE TABLE graph_regions(projection_id TEXT NOT NULL,id TEXT NOT NULL,owner TEXT NOT NULL,path TEXT NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(projection_id,id),FOREIGN KEY(projection_id,owner) REFERENCES graph_nodes(projection_id,id) DEFERRABLE INITIALLY DEFERRED);
-CREATE INDEX graph_regions_owner ON graph_regions(projection_id,owner,id);
 CREATE TABLE class_projections(id TEXT PRIMARY KEY,graph_projection_id TEXT NOT NULL REFERENCES graph_projections(id) DEFERRABLE INITIALLY DEFERRED,content_hash TEXT NOT NULL CHECK(length(content_hash)=64),state TEXT NOT NULL CHECK(state IN ('ready','unavailable')),UNIQUE(graph_projection_id,content_hash),UNIQUE(id,graph_projection_id));
 CREATE TABLE classes(projection_id TEXT NOT NULL,graph_projection_id TEXT NOT NULL,id TEXT NOT NULL,name TEXT NOT NULL,qualified_name TEXT NOT NULL,path TEXT NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(projection_id,id),FOREIGN KEY(projection_id,graph_projection_id) REFERENCES class_projections(id,graph_projection_id) DEFERRABLE INITIALLY DEFERRED,FOREIGN KEY(graph_projection_id,id) REFERENCES graph_nodes(projection_id,id) DEFERRABLE INITIALLY DEFERRED);
 CREATE TABLE class_relations(projection_id TEXT NOT NULL,id TEXT NOT NULL,owner TEXT NOT NULL,target TEXT,payload TEXT NOT NULL,PRIMARY KEY(projection_id,id),FOREIGN KEY(projection_id,owner) REFERENCES classes(projection_id,id) DEFERRABLE INITIALLY DEFERRED,FOREIGN KEY(projection_id,target) REFERENCES classes(projection_id,id) DEFERRABLE INITIALLY DEFERRED);
@@ -2495,7 +2492,7 @@ fn validate_cache_shape(db: &Connection) -> Result<()> {
         version == DATABASE_SCHEMA_VERSION,
         "incompatible_index: unknown schema version"
     );
-    expected.execute_batch(CACHE_SCHEMA_V12)?;
+    expected.execute_batch(CACHE_SCHEMA_V13)?;
     control_ensure!(
         objects(db)? == objects(&expected)?,
         "incompatible_index: unknown cache object type, name or shape"
@@ -2597,7 +2594,7 @@ fn cleanup_release_candidate(tx: &Connection, revision: &str, kind: &str) -> Res
             "native_release_candidate_graphs",
             "graph_projections",
             "graph_projection_id",
-            &["graph_calls", "graph_regions", "graph_nodes"][..],
+            &["graph_display_labels", "graph_nodes"][..],
             "projection_id",
         ),
         "version" => (
@@ -2915,9 +2912,8 @@ fn open_index(path: &Path, writable: bool) -> Result<ProtectedSqliteConnection> 
     storage_result(db.prepare(
         "SELECT id,document_version_id,language,class_extraction_state FROM graph_projections",
     ))?;
-    storage_result(db.prepare("SELECT projection_id,id,payload FROM graph_nodes"))?;
-    storage_result(db.prepare("SELECT projection_id,id,payload FROM graph_calls"))?;
-    storage_result(db.prepare("SELECT projection_id,id,payload FROM graph_regions"))?;
+    storage_result(db.prepare("SELECT projection_id,id,name,kind FROM graph_nodes"))?;
+    storage_result(db.prepare("SELECT projection_id,id,label FROM graph_display_labels"))?;
     storage_result(db.prepare("SELECT id,graph_projection_id FROM class_projections"))?;
     storage_result(db.prepare("SELECT projection_id,id,payload FROM classes"))?;
     storage_result(db.prepare("SELECT projection_id,id,payload FROM class_relations"))?;
@@ -3941,8 +3937,7 @@ impl ImmutableAppend {
                     | "graph_projections"
                     | "class_projections"
                     | "graph_nodes"
-                    | "graph_calls"
-                    | "graph_regions"
+                    | "graph_display_labels"
                     | "classes"
                     | "class_relations"
                     | "native_version_coverage_roles"
@@ -3980,8 +3975,7 @@ impl ImmutableAppend {
             "native_source_set_languages"
             | "native_source_set_dependencies"
             | "graph_nodes"
-            | "graph_calls"
-            | "graph_regions"
+            | "graph_display_labels"
             | "classes"
             | "class_relations"
             | "native_version_coverage_roles"
@@ -4145,8 +4139,7 @@ impl ImmutableAppend {
                 "graph_projections",
                 &[
                     ("graph_nodes", "projection_id"),
-                    ("graph_calls", "projection_id"),
-                    ("graph_regions", "projection_id"),
+                    ("graph_display_labels", "projection_id"),
                 ],
             ),
             (
@@ -4207,38 +4200,29 @@ fn write_graph_document(
         if reused.graph {
             continue;
         }
+        let kind = match n.kind {
+            SymbolKind::Module => "module",
+            SymbolKind::Function => "function",
+            SymbolKind::Method => "method",
+            SymbolKind::Class => "class",
+            SymbolKind::Field => "field",
+            SymbolKind::Variable => "variable",
+            SymbolKind::Parameter => "parameter",
+            SymbolKind::TypeParameter => "typeParameter",
+            SymbolKind::Alias => "alias",
+        };
         immutable.insert(
             db,
-            "INSERT INTO graph_nodes VALUES(?1,?2,?3,?4,?5)",
-            params![ids.graph_id, n.id, n.name, n.path, json(n)?],
+            "INSERT INTO graph_nodes VALUES(?1,?2,?3,?4)",
+            params![ids.graph_id, n.id, n.name, kind],
         )?;
-    }
-    for c in &grouped.calls {
-        if reused.graph {
-            continue;
+        if let Some(label) = &n.display_label {
+            immutable.insert(
+                db,
+                "INSERT INTO graph_display_labels VALUES(?1,?2,?3)",
+                params![ids.graph_id, n.id, label],
+            )?;
         }
-        immutable.insert(
-            db,
-            "INSERT INTO graph_calls VALUES(?1,?2,?3,?4,?5,?6)",
-            params![
-                ids.graph_id,
-                c.id,
-                c.caller,
-                Option::<String>::None,
-                c.path,
-                json(c)?
-            ],
-        )?;
-    }
-    for r in &grouped.regions {
-        if reused.graph {
-            continue;
-        }
-        immutable.insert(
-            db,
-            "INSERT INTO graph_regions VALUES(?1,?2,?3,?4,?5)",
-            params![ids.graph_id, r.id, r.owner, r.path, json(r)?],
-        )?;
     }
     for class in &grouped.classes {
         if reused.class {
@@ -4876,17 +4860,16 @@ fn validate_v8_bootstrap(db: &Connection) -> Result<()> {
         indexed_at.is_empty() && options.is_none(),
         "incompatible_index: invalid v8 bootstrap metadata"
     );
-    // Fixed identifiers from CACHE_SCHEMA_V12 only. Do not read table names from
+    // Fixed identifiers from CACHE_SCHEMA_V13 only. Do not read table names from
     // sqlite_master or treat a partial publication as a valid empty bootstrap.
     for name in [
         "class_projections",
         "class_relations",
         "classes",
         "document_versions",
-        "graph_calls",
+        "graph_display_labels",
         "graph_nodes",
         "graph_projections",
-        "graph_regions",
         "native_producer_inputs",
         "native_producer_languages",
         "native_producers",
@@ -7061,11 +7044,11 @@ impl Store {
             db.pragma_update(None, "synchronous", "FULL")?;
             db.execute_batch("BEGIN IMMEDIATE")?;
             let result = (|| -> Result<()> {
-                db.execute_batch(CACHE_SCHEMA_V12)?;
+                db.execute_batch(CACHE_SCHEMA_V13)?;
                 let age = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
                 ensure!(age <= 9_007_199_254_740_991, "invalid_open_age");
                 db.execute(
-                    "INSERT INTO index_metadata VALUES(1,12,?1,?2,?3,?4,?5,0,?6,'',?7,?8,NULL)",
+                    "INSERT INTO index_metadata VALUES(1,13,?1,?2,?3,?4,?5,0,?6,'',?7,?8,NULL)",
                     params![
                         EXTRACTOR_VERSION,
                         self.workspace_root,
@@ -9791,12 +9774,18 @@ impl Store {
             if measured.coverage.state != "complete" { return Ok(None); }
             let native=native_evidence::validated_changed_artifact(capture,measured,cancel)?;
             // The prior graph counts are used only for this changed path's
-            // header delta, not to authorize any old semantic fact.
-            let count = |table: &str| -> Result<usize> {
-                Ok(db.query_row(&format!("SELECT count(*) FROM {table} WHERE projection_id=?1"),
-                    [&stored.graph_id],|r|r.get::<_,i64>(0))? as usize)
-            };
-            let old_changed_counts=(count("graph_nodes")?,count("graph_calls")?,count("graph_regions")?);
+            // header delta, not to authorize any old semantic fact. Native calls
+            // and regions determine the two derived graph row counts.
+            let old_nodes: i64 = db.query_row(
+                "SELECT count(*) FROM graph_nodes WHERE projection_id=?1",
+                [&stored.graph_id], |r| r.get(0))?;
+            let old_calls: i64 = db.query_row(
+                "SELECT count(*) FROM native_version_calls WHERE version_id=?1",
+                [&stored.version_id], |r| r.get(0))?;
+            let old_regions: i64 = db.query_row(
+                "SELECT count(*) FROM native_version_control_regions WHERE version_id=?1",
+                [&stored.version_id], |r| r.get(0))?;
+            let old_changed_counts=(old_nodes as usize, old_calls as usize, old_regions as usize);
             let (stats,diagnostics,warnings,truncated):(String,String,String,bool)=db.query_row(
                 "SELECT m.stats,m.diagnostics,r.class_warnings,r.class_truncated
                  FROM index_metadata m JOIN native_revisions r ON r.id=?1 WHERE m.singleton=1",
@@ -10871,7 +10860,7 @@ impl Store {
                 DELETE FROM native_version_header_items; DELETE FROM native_version_headers;
                 DELETE FROM native_version_declaration_ancestors; DELETE FROM native_version_declarations;
                 DELETE FROM native_version_coverage_roles; DELETE FROM class_relations; DELETE FROM classes;
-                DELETE FROM class_projections; DELETE FROM graph_calls; DELETE FROM graph_regions;
+                DELETE FROM class_projections; DELETE FROM graph_display_labels;
                 DELETE FROM graph_nodes; DELETE FROM graph_projections; DELETE FROM document_versions;
                 DELETE FROM native_release_candidate_classes; DELETE FROM native_release_candidate_graphs;
                 DELETE FROM native_release_candidate_versions; DELETE FROM native_revision_release_debt;
@@ -11114,7 +11103,7 @@ impl Store {
             let old_key = format!("pin:v1:{}:{}", prior.index_generation, prior.index_revision);
             stamp_predecessor(&tx, &old_key, publication_time.as_secs() as i64)?;
         }
-        tx.execute("UPDATE index_metadata SET schema_version=12,extractor_version=?1,index_generation=?2,index_revision=?3,indexed_at=?4,stats=?5,diagnostics=?6,reconcile_options=?7 WHERE singleton=1",
+        tx.execute("UPDATE index_metadata SET schema_version=13,extractor_version=?1,index_generation=?2,index_revision=?3,indexed_at=?4,stats=?5,diagnostics=?6,reconcile_options=?7 WHERE singleton=1",
             params![EXTRACTOR_VERSION, revision.index_generation.to_string(), revision.index_revision as i64,timestamp,json(&stats)?,json(&graph.diagnostics)?,json(capture.reconcile_options())?])?;
         immutable.counters.record(
             "manifest",
@@ -11862,7 +11851,7 @@ impl Store {
         )?;
         let unreferenced_graph = "SELECT p.id FROM graph_projections p WHERE NOT EXISTS
             (SELECT 1 FROM revision_documents m WHERE m.graph_projection_id=p.id)";
-        for table in ["graph_calls", "graph_regions", "graph_nodes"] {
+        for table in ["graph_display_labels", "graph_nodes"] {
             tx.execute(
                 &format!("DELETE FROM {table} WHERE projection_id IN ({unreferenced_graph})"),
                 [],
