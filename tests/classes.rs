@@ -13,8 +13,11 @@ use trellis::{
 };
 thread_local! { static GOLDEN_ORDINAL: Cell<usize> = const { Cell::new(0) }; }
 fn golden(catalog: &Catalog) {
+    // The harness names the thread after the test's full path; the golden
+    // files are named after the test function alone.
     let name = std::thread::current()
         .name()
+        .and_then(|name| name.rsplit("::").next())
         .unwrap_or("unnamed")
         .to_owned();
     let ordinal = GOLDEN_ORDINAL.with(|counter| {
