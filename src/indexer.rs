@@ -1061,28 +1061,36 @@ pub(crate) fn project_document(
     let text = std::str::from_utf8(source).context("invalid graph source UTF-8")?;
     let lines = LineIndex::new(text);
     let range = |r: &native_evidence::Range| measured_range_text(text, &lines, r);
-    // Build the complete owner map before resolving any parents. SQL attestation
-    // returns syntax-ID order, which need not be parent-before-child order.
+    // Build the complete owner map and prepare parent lookup keys once. SQL
+    // attestation returns syntax-ID order, which need not be parent-before-child.
     let mut owners: BTreeMap<(String, String), String> = BTreeMap::new();
-    for d in &native.declarations {
+    let mut prepared = Vec::with_capacity(native.declarations.len());
+    for d in native.declarations {
         ensure!(d.document.path == path, "missing graph source");
-        let ancestors = serde_json::to_string(&d.ancestors)?;
-        let key = serde_json::to_string(&d.key)?;
+        let owner_key = (
+            serde_json::to_string(&d.ancestors)?,
+            serde_json::to_string(&d.key)?,
+        );
         ensure!(
-            owners
-                .insert((ancestors, key), d.syntax_id.clone())
-                .is_none(),
+            owners.insert(owner_key, d.syntax_id.clone()).is_none(),
             "native declaration key collision"
         );
+        let parent_key = if let Some(last) = d.ancestors.last() {
+            Some((
+                serde_json::to_string(&d.ancestors[..d.ancestors.len() - 1])?,
+                serde_json::to_string(last)?,
+            ))
+        } else {
+            None
+        };
+        prepared.push((d, parent_key));
     }
-    let mut nodes = Vec::with_capacity(native.declarations.len());
-    for d in native.declarations {
-        let parent = if let Some(last) = d.ancestors.last() {
-            let ancestors = serde_json::to_string(&d.ancestors[..d.ancestors.len() - 1])?;
-            let key = serde_json::to_string(last)?;
+    let mut nodes = Vec::with_capacity(prepared.len());
+    for (d, parent_key) in prepared {
+        let parent = if let Some(key) = parent_key {
             Some(
                 owners
-                    .get(&(ancestors, key))
+                    .get(&key)
                     .context("native declaration parent missing")?
                     .clone(),
             )
