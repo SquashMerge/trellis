@@ -1,7 +1,7 @@
 //! Closed native-only in-memory evidence, derived from the admitted immutable capture.
 use crate::{
     capture::Capture,
-    model::{CancelFlag, SourceFile},
+    model::{CancelFlag, Diagnostic, IndexProgress, IndexStats, SourceFile},
     native_ids::{IdentityRegistry, canonical, digest, extraction_context},
 };
 use anyhow::{Context, Result, ensure};
@@ -9,9 +9,13 @@ use icu_normalizer::ComposingNormalizerBorrowed;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+#[cfg(test)]
+use std::os::unix::fs::MetadataExt;
+#[cfg(test)]
+use std::path::PathBuf;
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::{Path, PathBuf},
+    path::Path,
 };
 use tree_sitter::Node;
 
@@ -659,37 +663,9 @@ pub fn from_capture(
     root_id: &str,
     cancel: &CancelFlag,
 ) -> Result<Artifact> {
-    Ok(from_capture_observed(capture, root, root_id, cancel, |_, _| {})?.into_artifact())
-}
-
-/// An artifact this process just built, by `build_native`, from exactly this
-/// capture, root and root id, and that passed the structural validation
-/// against it. Only `from_capture_observed` constructs one, from its own
-/// build, and it offers no mutable access to the artifact. Because the
-/// artifact is the build itself, it is not rebuilt and compared again
-/// (#199 I-4b): `build_native` determinism is a verify test instead. Any
-/// other artifact (a plain `Artifact` handed to the store) still runs the
-/// full `Artifact::validate`, rebuild and comparison included.
-pub(crate) struct ValidatedArtifact<'c> {
-    artifact: Artifact,
-    capture: &'c Capture,
-    root: PathBuf,
-    root_id: String,
-}
-
-impl<'c> ValidatedArtifact<'c> {
-    pub(crate) fn artifact(&self) -> &Artifact {
-        &self.artifact
-    }
-    pub(crate) fn capture(&self) -> &'c Capture {
-        self.capture
-    }
-    pub(crate) fn validated_for(&self, root: &Path, root_id: &str) -> bool {
-        self.root == root && self.root_id == root_id
-    }
-    pub(crate) fn into_artifact(self) -> Artifact {
-        self.artifact
-    }
+    let artifact = build_native(capture, root, root_id, cancel)?;
+    artifact.validate_own_build(capture, cancel)?;
+    Ok(artifact)
 }
 
 #[cfg(test)]
@@ -702,34 +678,14 @@ pub(crate) fn full_validations_for_tests() -> usize {
 }
 
 /// Call-scoped evidence from the full native pipeline. `Measured` fires only
-/// after extraction of that captured document; `Validated` fires only after
-/// the structural validation of the whole built artifact has succeeded.
+/// after the ordered owner writes that document's validated facts to disposable
+/// scratch; `Validated` fires after its document-level structural and graph
+/// checks, class extraction and identity admission succeed. Neither event means
+/// the entire artifact has been validated or published.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FullNativeStage {
     Measured,
     Validated,
-}
-
-pub(crate) fn from_capture_observed<'c>(
-    capture: &'c Capture,
-    root: &Path,
-    root_id: &str,
-    cancel: &CancelFlag,
-    observe: impl Fn(&DocumentKey, FullNativeStage),
-) -> Result<ValidatedArtifact<'c>> {
-    let artifact = build_native_observed(capture, root, root_id, cancel, &|key| {
-        observe(key, FullNativeStage::Measured);
-    })?;
-    artifact.validate_own_build(capture, cancel)?;
-    for document in &artifact.revision.documents {
-        observe(&document.key, FullNativeStage::Validated);
-    }
-    Ok(ValidatedArtifact {
-        artifact,
-        capture,
-        root: root.to_owned(),
-        root_id: root_id.to_owned(),
-    })
 }
 
 /// The captured revision header alone, measuring no document. Used when an
@@ -1002,11 +958,10 @@ fn build_native_with(
             });
         for (facts, (_, document)) in measured.into_iter().zip(chunk) {
             let facts = facts.context("indexing cancelled")?;
-            // IDs minted before a failure are admitted first: a collision with
-            // an earlier file precedes this file's own failure, as it did when
-            // one registry measured every file in turn.
-            ids.absorb(facts.ids)?;
+            // A failed file reports its own extraction error. Successful files
+            // enter the global registry in sorted-file, first-insertion order.
             facts.result?;
+            ids.absorb(facts.ids)?;
             let shell = facts.shell;
             artifact.coverage.extend(shell.coverage);
             artifact.provenance.extend(shell.provenance);
@@ -1019,6 +974,401 @@ fn build_native_with(
     drop(pairs);
     artifact.revision.documents = documents;
     Ok(artifact)
+}
+
+/// Disposable, disk-backed full extraction. Only the captured header and aggregate
+/// counters remain in memory; each measured document is serialized before the next
+/// batch is measured. The file is private to this process and removed on drop.
+/// The ordered owner admits successful files and validates/projects each file
+/// before advancing, so the earliest sorted-file failure is reported.
+pub(crate) struct FullDocumentSpool {
+    header: Artifact,
+    // Drop the connection before the separate file handle: closing another
+    // descriptor on a live SQLite file would discard this process's POSIX locks.
+    conn: rusqlite::Connection,
+    _file: tempfile::NamedTempFile,
+    stats: IndexStats,
+    diagnostics: Vec<Diagnostic>,
+    #[cfg(test)]
+    test_read_error: std::cell::RefCell<Option<rusqlite::Error>>,
+}
+
+impl FullDocumentSpool {
+    pub(crate) fn header(&self) -> &Artifact {
+        &self.header
+    }
+    pub(crate) fn len(&self) -> usize {
+        self.header.revision.documents.len()
+    }
+    pub(crate) fn stats(&self) -> &IndexStats {
+        &self.stats
+    }
+    pub(crate) fn diagnostics(&self) -> &[Diagnostic] {
+        &self.diagnostics
+    }
+    /// Read one document with full revision identity but only its own document row.
+    /// This is repeatable; no decoded document is cached between reads.
+    pub(crate) fn read(&self, index: usize) -> Result<(Artifact, crate::model::Graph)> {
+        let document = self
+            .header
+            .revision
+            .documents
+            .get(index)
+            .context("native spool document index out of range")?;
+        #[cfg(test)]
+        if let Some(error) = self.test_read_error.borrow_mut().take() {
+            return Err(error.into());
+        }
+        let (facts, graph): (Vec<u8>, Vec<u8>) = self.conn.query_row(
+            "SELECT facts, graph FROM documents WHERE ordinal = ?1",
+            rusqlite::params![i64::try_from(index)?],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let mut artifact: Artifact = serde_json::from_slice(&facts)?;
+        ensure!(
+            artifact.revision.documents.is_empty()
+                && artifact.producer == self.header.producer
+                && artifact.source_set == self.header.source_set
+                && artifact.revision.id == self.header.revision.id
+                && artifact.coverage.len() == 1
+                && artifact.coverage[0].document_path == document.key.path,
+            "native spool document/header mismatch"
+        );
+        artifact.revision.documents.push(document.clone());
+        let graph: crate::model::Graph = serde_json::from_slice(&graph)?;
+        ensure!(
+            graph.files.len() == 1 && graph.files[0].path == document.key.path,
+            "native spool graph/document mismatch"
+        );
+        Ok((artifact, graph))
+    }
+    #[cfg(test)]
+    pub(crate) fn corrupt_graph_json_for_tests(&self, index: usize) {
+        assert_eq!(
+            self.conn
+                .execute(
+                    "UPDATE documents SET graph=X'00' WHERE ordinal=?1",
+                    [i64::try_from(index).unwrap()],
+                )
+                .unwrap(),
+            1
+        );
+    }
+    #[cfg(test)]
+    pub(crate) fn corrupt_extraction_json_for_tests(&self, index: usize) {
+        assert_eq!(
+            self.conn
+                .execute(
+                    "UPDATE extractions SET payload=X'00' WHERE ordinal=?1",
+                    [i64::try_from(index).unwrap()],
+                )
+                .unwrap(),
+            1
+        );
+    }
+    #[cfg(test)]
+    pub(crate) fn inject_sqlite_corrupt_read_for_tests(&self) {
+        *self.test_read_error.borrow_mut() = Some(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT),
+            None,
+        ));
+    }
+    fn write_extraction(
+        &self,
+        index: usize,
+        extraction: &crate::classes::FileExtraction,
+    ) -> Result<()> {
+        ensure!(
+            index < self.len(),
+            "native spool extraction index out of range"
+        );
+        ensure!(
+            extraction.path == self.header.revision.documents[index].key.path,
+            "native spool extraction path mismatch"
+        );
+        self.conn.execute(
+            "INSERT INTO extractions (ordinal, payload) VALUES (?1, ?2)",
+            rusqlite::params![i64::try_from(index)?, serde_json::to_vec(extraction)?],
+        )?;
+        Ok(())
+    }
+    pub(crate) fn read_extraction(&self, index: usize) -> Result<crate::classes::FileExtraction> {
+        ensure!(
+            index < self.len(),
+            "native spool extraction index out of range"
+        );
+        let payload: Vec<u8> = self.conn.query_row(
+            "SELECT payload FROM extractions WHERE ordinal = ?1",
+            rusqlite::params![i64::try_from(index)?],
+            |row| row.get(0),
+        )?;
+        let extraction: crate::classes::FileExtraction = serde_json::from_slice(&payload)?;
+        ensure!(
+            extraction.path == self.header.revision.documents[index].key.path,
+            "native spool extraction path mismatch"
+        );
+        Ok(extraction)
+    }
+}
+
+/// Validate the exact one-document view while retaining the full revision ID
+/// and captured config/toolchain/dependency binding. The full document list
+/// stays only in the spool header, not in each projected document.
+fn validate_spooled_document(
+    facts: &mut Artifact,
+    document: &Document,
+    file: &SourceFile,
+) -> Result<()> {
+    ensure!(
+        facts.revision.documents.is_empty() && document.key.path == file.path,
+        "native spool facts/document mismatch"
+    );
+    facts.revision.documents.push(document.clone());
+    facts.validate_structure(std::slice::from_ref(file))
+}
+
+/// One document's spool rows, prepared on a worker.
+struct PreparedSpoolDocument {
+    facts: Vec<u8>,
+    graph: Vec<u8>,
+    extraction: Option<crate::classes::FileExtraction>,
+    stats: IndexStats,
+    diagnostics: Vec<Diagnostic>,
+}
+
+/// Validate, project and encode one extracted document. Pure per-document
+/// work: it touches no shared registry and no SQLite handle.
+#[allow(clippy::too_many_arguments)] // The worker's whole per-document context.
+fn prepare_spooled_document(
+    options: &crate::indexer::IndexOptions,
+    capture: &Capture,
+    mut facts: Artifact,
+    document: &Document,
+    file: &SourceFile,
+    cancel: &CancelFlag,
+    labels: &crate::indexer::PreparedDisplayLabels<'_>,
+    before_validate: &(dyn Fn(&Document, &mut Artifact) -> Result<()> + Sync),
+    after_class: &(dyn Fn(&Document, &crate::classes::FileExtraction) -> Result<()> + Sync),
+) -> Result<PreparedSpoolDocument> {
+    // The spool keeps facts without their document row; read() restores it.
+    let encoded_facts = serde_json::to_vec(&facts)?;
+    before_validate(document, &mut facts)?;
+    validate_spooled_document(&mut facts, document, file)?;
+    let graph = crate::indexer::project_native_spooled_document(
+        options,
+        capture,
+        &facts,
+        &document.key.path,
+        cancel,
+        &|_| {},
+        labels,
+    )?;
+    crate::indexer::validate_native_graph_records(&graph, &facts, cancel)?;
+    let extraction = if matches!(file.language.as_str(), "java" | "python") {
+        let symbols: Vec<_> = graph
+            .nodes
+            .iter()
+            .filter(|node| {
+                matches!(
+                    node.kind,
+                    crate::model::SymbolKind::Class
+                        | crate::model::SymbolKind::Method
+                        | crate::model::SymbolKind::Function
+                )
+            })
+            .cloned()
+            .collect();
+        let extraction = crate::classes::FileExtraction::extract_file(
+            file,
+            &symbols,
+            cancel,
+            crate::classes::Limits::default(),
+        )?;
+        after_class(document, &extraction)?;
+        Some(extraction)
+    } else {
+        None
+    };
+    Ok(PreparedSpoolDocument {
+        facts: encoded_facts,
+        graph: serde_json::to_vec(&graph)?,
+        extraction,
+        stats: graph.stats.clone(),
+        diagnostics: graph.diagnostics.clone(),
+    })
+}
+
+/// Admit an immutable capture without retaining its full artifact or graph.
+/// The global digest registry is resident; only facts and graphs live in the
+/// disposable SQLite spool. A failure drops it without publication.
+#[allow(clippy::too_many_arguments)] // Keep capture, observer and scratch-owner bindings explicit.
+pub(crate) fn spool_full_capture(
+    options: &crate::indexer::IndexOptions,
+    capture: &Capture,
+    root: &Path,
+    root_id: &str,
+    cancel: &CancelFlag,
+    progress: &(impl Fn(IndexProgress) + Sync),
+    observe: impl Fn(&DocumentKey, FullNativeStage),
+    spool_dir: &Path,
+) -> Result<FullDocumentSpool> {
+    spool_full_capture_with(
+        options,
+        capture,
+        root,
+        root_id,
+        cancel,
+        progress,
+        observe,
+        ExtractionPlan::default(),
+        &|_, _| Ok(()),
+        &|_, _| Ok(()),
+        &|_, _, _| Ok(()),
+        &|_, _| Ok(()),
+        spool_dir,
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // The test injection seam preserves the production argument order.
+fn spool_full_capture_with(
+    options: &crate::indexer::IndexOptions,
+    capture: &Capture,
+    root: &Path,
+    root_id: &str,
+    cancel: &CancelFlag,
+    progress: &(impl Fn(IndexProgress) + Sync),
+    observe: impl Fn(&DocumentKey, FullNativeStage),
+    plan: ExtractionPlan,
+    after_extract: &(dyn Fn(&SourceFile, &IdentityRegistry) -> Result<()> + Sync),
+    before_validate: &(dyn Fn(&Document, &mut Artifact) -> Result<()> + Sync),
+    before_admit: &dyn Fn(&Document, &mut IdentityRegistry, &IdentityRegistry) -> Result<()>,
+    after_class: &(dyn Fn(&Document, &crate::classes::FileExtraction) -> Result<()> + Sync),
+    spool_dir: &Path,
+) -> Result<FullDocumentSpool> {
+    capture.verify(cancel)?;
+    let (header, files) = build_native_header(capture, root, root_id)?;
+    // The store supplies its already-prepared managed index directory, including
+    // isolated test topology. Never select a production home independently.
+    let file = tempfile::Builder::new()
+        .prefix("native-spool-")
+        .suffix(".db")
+        .tempfile_in(spool_dir)?;
+    let conn = rusqlite::Connection::open(file.path())?;
+    // SQLite keeps its own descriptor. Unlink before any schema writes so a
+    // crash cannot strand the disposable spool. OFF mode creates no journal.
+    std::fs::remove_file(file.path()).context("remove private native spool pathname")?;
+    conn.execute_batch(
+        "PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA cache_size=-2048;
+         CREATE TABLE documents (ordinal INTEGER PRIMARY KEY, facts BLOB NOT NULL, graph BLOB);
+         CREATE TABLE extractions (ordinal INTEGER PRIMARY KEY, payload BLOB NOT NULL);",
+    )?;
+    let mut spool = FullDocumentSpool {
+        header,
+        conn,
+        _file: file,
+        stats: IndexStats::default(),
+        diagnostics: Vec::new(),
+        #[cfg(test)]
+        test_read_error: std::cell::RefCell::new(None),
+    };
+    // The full revision document vector remains in the header. Worker shells
+    // carry only revision ID and inputs, never the complete document vector.
+    let shell = Artifact {
+        producer: spool.header.producer.clone(),
+        source_set: spool.header.source_set.clone(),
+        revision: Revision {
+            documents: Vec::new(),
+            id: spool.header.revision.id.clone(),
+            source_set_id: spool.header.revision.source_set_id.clone(),
+            toolchain_hash: spool.header.revision.toolchain_hash.clone(),
+            config_hash: spool.header.revision.config_hash.clone(),
+            dependency_hash: spool.header.revision.dependency_hash.clone(),
+        },
+        coverage: Vec::new(),
+        provenance: Vec::new(),
+        declarations: Vec::new(),
+        calls: Vec::new(),
+        control_regions: Vec::new(),
+    };
+    let documents = &spool.header.revision.documents;
+    let pairs: Vec<(&SourceFile, &Document)> = files.into_iter().zip(documents).collect();
+    // Only one graph projection is allowed for this capture. Per-document
+    // projection does not claim again. Keep source/producer checks before work.
+    capture.claim_graph_projection()?;
+    let prepared_labels = crate::indexer::prepare_display_labels(options, capture);
+    let mut ids = IdentityRegistry::default();
+    spool.conn.execute_batch("BEGIN IMMEDIATE")?;
+    for (chunk_index, chunk) in pairs.chunks(plan.chunk.max(1)).enumerate() {
+        ensure!(
+            !cancel.load(std::sync::atomic::Ordering::Acquire),
+            "indexing cancelled"
+        );
+        // Each worker does all of one document's own work: extraction,
+        // structure and graph validation, class extraction and encoding. The
+        // ordered owner below only admits identities and writes the spool, in
+        // sorted order, so the earliest sorted file's failure is still the one
+        // reported whatever order the workers finish in.
+        let prepared =
+            crate::parallel::map_ordered(chunk, plan.workers, cancel, |_, (file, document)| {
+                let mut ids = IdentityRegistry::logged();
+                let mut facts = shell.clone();
+                let result = extract_known(&mut facts, file, document, &mut ids)
+                    .and_then(|()| after_extract(file, &ids))
+                    .and_then(|()| {
+                        prepare_spooled_document(
+                            options,
+                            capture,
+                            facts,
+                            document,
+                            file,
+                            cancel,
+                            &prepared_labels,
+                            before_validate,
+                            after_class,
+                        )
+                    });
+                (ids, result)
+            });
+        for (offset, (prepared, (_, document))) in prepared.into_iter().zip(chunk).enumerate() {
+            let (local_ids, prepared) = prepared.context("indexing cancelled")?;
+            let prepared = prepared?;
+            let index = chunk_index * plan.chunk.max(1) + offset;
+            spool.conn.execute(
+                "INSERT INTO documents (ordinal, facts, graph) VALUES (?1, ?2, ?3)",
+                rusqlite::params![i64::try_from(index)?, prepared.facts, prepared.graph],
+            )?;
+            observe(&document.key, FullNativeStage::Measured);
+            // Scratch facts are disposable; collision checking must precede
+            // any index.db publication, not this scratch write.
+            before_admit(document, &mut ids, &local_ids)?;
+            ids.absorb(local_ids)?;
+            observe(&document.key, FullNativeStage::Validated);
+            if let Some(extraction) = &prepared.extraction {
+                spool.write_extraction(index, extraction)?;
+            }
+            spool.stats.files += prepared.stats.files;
+            spool.stats.symbols += prepared.stats.symbols;
+            spool.stats.calls += prepared.stats.calls;
+            spool.stats.regions += prepared.stats.regions;
+            spool.stats.unresolved += prepared.stats.unresolved;
+            spool.stats.parse_error_files += prepared.stats.parse_error_files;
+            spool.diagnostics.extend(prepared.diagnostics);
+            progress(IndexProgress {
+                phase: "parse".into(),
+                completed: index + 1,
+                total: spool.len(),
+            });
+        }
+    }
+    spool.conn.execute_batch("COMMIT")?;
+    drop(shell);
+    capture.verify(cancel)?;
+    progress(IndexProgress {
+        phase: "complete".into(),
+        completed: spool.len(),
+        total: spool.len(),
+    });
+    Ok(spool)
 }
 
 /// Native facts for exactly one document of the full admitted revision. This is not
@@ -2300,7 +2650,7 @@ impl Artifact {
     /// this capture, so rebuilding it would only re-check determinism, which
     /// the `native_build_is_deterministic` verify test covers. Every
     /// structural check and the capture freshness check still run. Only
-    /// `from_capture_observed` calls this.
+    /// `from_capture` calls this.
     fn validate_own_build(&self, capture: &Capture, cancel: &CancelFlag) -> Result<()> {
         capture.verify(cancel)?;
         self.validate_structure(&capture.files)
@@ -2455,8 +2805,14 @@ impl Artifact {
         // The pure part of every ID (input checks, canonical bytes, digest) is
         // minted on workers, a chunk at a time. Each row's checks still run
         // here in order, and the minted ID is admitted at the point where it
-        // was computed before, so errors and their order are unchanged.
-        let workers = crate::parallel::default_workers();
+        // was computed before, so errors and their order are unchanged. A
+        // one-document view is already running on a document worker, so it
+        // mints inline instead of starting threads of its own.
+        let workers = if files.len() == 1 {
+            1
+        } else {
+            crate::parallel::default_workers()
+        };
         let never = std::sync::atomic::AtomicBool::new(false);
         let stable_input = |d: &Declaration| {
             crate::native_ids::mint_stable(
@@ -3559,5 +3915,712 @@ mod parallel_extraction_tests {
         );
         assert!(started.load(Ordering::SeqCst) <= 2, "a later chunk started");
         assert!(measured.load(Ordering::SeqCst) <= 2);
+    }
+}
+
+#[cfg(test)]
+mod full_document_spool_tests {
+    use super::*;
+    use crate::{indexer::IndexOptions, store::Store};
+    use std::{fs, sync::Arc, sync::atomic::AtomicBool};
+
+    #[test]
+    fn spooled_full_documents_match_plain_native_and_graph_with_one_claim() {
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("A.java"),
+            "class A { int go(int n) { if (n > 0) return helper(n); return 0; } int helper(int n) { return n; } }\n").unwrap();
+        fs::write(
+            workspace.path().join("b.py"),
+            "def f(x):\n    if x:\n        return f(x - 1)\n    return 0\n",
+        )
+        .unwrap();
+        fs::write(
+            workspace.path().join("c.js"),
+            "function café() { return café(); }\n",
+        )
+        .unwrap();
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let options = IndexOptions::new(workspace.path().to_owned());
+        let root = fs::canonicalize(workspace.path()).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let baseline_capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
+        let baseline = from_capture(&baseline_capture, &root, store.root_id(), &cancel).unwrap();
+        let plain = crate::indexer::project_native(
+            &options,
+            &baseline_capture,
+            &baseline,
+            &cancel,
+            &|_| {},
+        )
+        .unwrap();
+        let capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
+        let stages = std::cell::RefCell::new(Vec::new());
+        let spool = spool_full_capture(
+            &options,
+            &capture,
+            &root,
+            store.root_id(),
+            &cancel,
+            &|_| {},
+            |key, stage| stages.borrow_mut().push((key.path.clone(), stage)),
+            &store.native_spool_dir().unwrap(),
+        )
+        .unwrap();
+        let unlinked_path = spool._file.path().to_owned();
+        assert!(
+            !unlinked_path.exists(),
+            "active SQLite spool must be anonymous"
+        );
+        // Extraction and graph writes happened after unlink. Read through the
+        // still-open SQLite connection, then drop it without leaving a stage.
+        assert!(!spool.read(0).unwrap().1.files.is_empty());
+        let stages = stages.into_inner();
+        assert_eq!(capture.graph_projection_count(), 1);
+        assert!(
+            capture
+                .source_operations
+                .values()
+                .all(|ops| ops.opens == 1 && ops.complete_reads == 1 && ops.hashes == 1)
+        );
+        assert_eq!(spool.header().revision, baseline.revision);
+        assert_eq!(spool.header().producer, baseline.producer);
+        assert_eq!(spool.stats(), &plain.stats);
+        assert_eq!(spool.diagnostics(), plain.diagnostics.as_slice());
+        assert_eq!(stages.len(), 2 * spool.len());
+        for (index, pair) in stages.as_chunks::<2>().0.iter().enumerate() {
+            let path = &spool.header().revision.documents[index].key.path;
+            assert_eq!(
+                pair,
+                &[
+                    (path.clone(), FullNativeStage::Measured),
+                    (path.clone(), FullNativeStage::Validated),
+                ]
+            );
+        }
+        for index in 0..spool.len() {
+            let path = &spool.header().revision.documents[index].key.path;
+            let (native, graph) = spool.read(index).unwrap();
+            assert_eq!(spool.read(index).unwrap(), (native.clone(), graph.clone()));
+            assert_eq!(
+                native.revision,
+                Revision {
+                    documents: vec![baseline.revision.documents[index].clone()],
+                    ..baseline.revision.clone()
+                }
+            );
+            assert_eq!(
+                native.coverage,
+                baseline
+                    .coverage
+                    .iter()
+                    .filter(|r| &r.document_path == path)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                native.provenance,
+                baseline
+                    .provenance
+                    .iter()
+                    .filter(|r| &r.document.path == path)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                native.declarations,
+                baseline
+                    .declarations
+                    .iter()
+                    .filter(|r| &r.document.path == path)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                native.calls,
+                baseline
+                    .calls
+                    .iter()
+                    .filter(|r| &r.document.path == path)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                native.control_regions,
+                baseline
+                    .control_regions
+                    .iter()
+                    .filter(|r| &r.document.path == path)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                graph.files,
+                plain
+                    .files
+                    .iter()
+                    .filter(|r| &r.path == path)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                graph.nodes,
+                plain
+                    .nodes
+                    .iter()
+                    .filter(|r| &r.path == path)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                graph.calls,
+                plain
+                    .calls
+                    .iter()
+                    .filter(|r| &r.path == path)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                graph.regions,
+                plain
+                    .regions
+                    .iter()
+                    .filter(|r| &r.path == path)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            );
+        }
+        let js = spool
+            .header()
+            .revision
+            .documents
+            .iter()
+            .position(|document| document.key.path == "c.js")
+            .unwrap();
+        spool.corrupt_graph_json_for_tests(js);
+        assert!(spool.read(js).is_err(), "malformed scratch graph is typed");
+        assert_eq!(spool._file.as_file().metadata().unwrap().nlink(), 0);
+        drop(spool);
+        assert!(!unlinked_path.exists());
+        assert!(
+            fs::read_dir(store.native_spool_dir().unwrap())
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("native-spool-")),
+            "dropped spool must leave no pathname"
+        );
+    }
+
+    #[test]
+    fn prepared_multifile_scip_labels_match_full_projection_and_first_duplicate_wins() {
+        use protobuf::Message;
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let sources = [
+            ("A.java", "class A {}\n", vec![0, 6, 7], "A"),
+            ("b.py", "def g():\n    return 1\n", vec![0, 4, 5], "g"),
+            ("c.js", "function f() {}\n", vec![0, 9, 10], "f"),
+        ];
+        let mut manifest = BTreeMap::new();
+        let mut index = scip::types::Index::new();
+        for (path, source, range, name) in &sources {
+            fs::write(workspace.path().join(path), source).unwrap();
+            manifest.insert(*path, hash(source.as_bytes()));
+            let mut doc = scip::types::Document::new();
+            doc.relative_path = (*path).into();
+            let mut occurrence = scip::types::Occurrence::new();
+            occurrence.range = range.clone();
+            occurrence.symbol_roles = if *path == "c.js" { 0 } else { 1 };
+            occurrence.symbol = format!("scip display {name}()");
+            doc.occurrences.push(occurrence);
+            index.documents.push(doc);
+        }
+        let mut duplicate = scip::types::Document::new();
+        duplicate.relative_path = "c.js".into();
+        let mut occurrence = scip::types::Occurrence::new();
+        occurrence.range = vec![0, 9, 10];
+        occurrence.symbol_roles = 1;
+        occurrence.symbol = "scip later f()".into();
+        duplicate.occurrences.push(occurrence);
+        index.documents.push(duplicate);
+        fs::write(
+            workspace.path().join("index.scip"),
+            index.write_to_bytes().unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            workspace.path().join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let mut options = IndexOptions::new(workspace.path().to_owned());
+        options.scip_path = Some(workspace.path().join("index.scip"));
+        options.manifest_path = Some(workspace.path().join("manifest.json"));
+        let root = fs::canonicalize(workspace.path()).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let baseline_capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
+        let baseline_native =
+            from_capture(&baseline_capture, &root, store.root_id(), &cancel).unwrap();
+        let baseline = crate::indexer::project_native(
+            &options,
+            &baseline_capture,
+            &baseline_native,
+            &cancel,
+            &|_| {},
+        )
+        .unwrap();
+        let capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
+        let spool = spool_full_capture(
+            &options,
+            &capture,
+            &root,
+            store.root_id(),
+            &cancel,
+            &|_| {},
+            |_, _| {},
+            &store.native_spool_dir().unwrap(),
+        )
+        .unwrap();
+        let mut nodes = Vec::new();
+        for index in 0..spool.len() {
+            let (_, graph) = spool.read(index).unwrap();
+            nodes.extend(graph.nodes);
+        }
+        nodes.sort_by(|a, b| a.id.cmp(&b.id));
+        assert_eq!(nodes, baseline.nodes);
+        for name in ["A", "g"] {
+            assert!(
+                nodes
+                    .iter()
+                    .any(|node| node.name == name && node.display_label.is_some())
+            );
+        }
+        assert!(
+            nodes
+                .iter()
+                .any(|node| node.name == "f" && node.display_label.is_none())
+        );
+    }
+
+    #[test]
+    fn cancellation_after_first_spooled_document_skips_next_chunk() {
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("a.py"), "def first(): return 1\n").unwrap();
+        fs::write(workspace.path().join("b.py"), "def second(): return 2\n").unwrap();
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let options = IndexOptions::new(workspace.path().to_owned());
+        let root = fs::canonicalize(workspace.path()).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
+        let stages = std::cell::RefCell::new(Vec::new());
+        let error = spool_full_capture_with(
+            &options,
+            &capture,
+            &root,
+            store.root_id(),
+            &cancel,
+            &|progress| {
+                if progress.phase == "parse" && progress.completed == 1 {
+                    cancel.store(true, std::sync::atomic::Ordering::Release);
+                }
+            },
+            |key, stage| stages.borrow_mut().push((key.path.clone(), stage)),
+            ExtractionPlan {
+                workers: 2,
+                chunk: 1,
+            },
+            &|_, _| Ok(()),
+            &|_, _| Ok(()),
+            &|_, _, _| Ok(()),
+            &|_, _| Ok(()),
+            &store.native_spool_dir().unwrap(),
+        )
+        .err()
+        .expect("cancellation must stop the next chunk");
+        assert!(
+            error.to_string().contains("indexing cancelled"),
+            "{error:#}"
+        );
+        assert_eq!(
+            stages.into_inner(),
+            vec![
+                ("a.py".into(), FullNativeStage::Measured),
+                ("a.py".into(), FullNativeStage::Validated),
+            ]
+        );
+        assert!(
+            fs::read_dir(store.native_spool_dir().unwrap())
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("native-spool-")),
+            "failed spool must not leave a scratch pathname"
+        );
+    }
+
+    #[test]
+    fn earliest_validation_error_precedes_later_extraction_error() {
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("a.py"), "def first(): return 1\n").unwrap();
+        fs::write(workspace.path().join("b.py"), "def second(): return 2\n").unwrap();
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let options = IndexOptions::new(workspace.path().to_owned());
+        let root = fs::canonicalize(workspace.path()).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
+        let stages = std::cell::RefCell::new(Vec::new());
+        let (completed, observed) = std::sync::mpsc::sync_channel(1);
+        let observed = std::sync::Mutex::new(observed);
+        let err = spool_full_capture_with(
+            &options,
+            &capture,
+            &root,
+            store.root_id(),
+            &cancel,
+            &|_| {},
+            |key, stage| stages.borrow_mut().push((key.path.clone(), stage)),
+            ExtractionPlan {
+                workers: 2,
+                chunk: 2,
+            },
+            &|file, _ids| {
+                if file.path == "b.py" {
+                    completed.send(()).unwrap();
+                    anyhow::bail!("injected second extraction failure")
+                }
+                Ok(())
+            },
+            &|document, facts| {
+                if document.key.path == "a.py" {
+                    observed
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(std::time::Duration::from_secs(60))
+                        .expect("later worker failed before earlier validation");
+                    facts.declarations[0].syntax_id = "sid:v1:invalid".into();
+                }
+                Ok(())
+            },
+            &|_, _, _| Ok(()),
+            &|_, _| Ok(()),
+            &store.native_spool_dir().unwrap(),
+        )
+        .err()
+        .expect("ordered failure");
+        assert!(
+            format!("{err:#}").contains("native stable ID collision/duplicate"),
+            "unexpected earlier validation error: {err:#}"
+        );
+        assert!(
+            !format!("{err:#}").contains("injected second extraction failure"),
+            "{err:#}"
+        );
+        // Validation runs on the worker, before the ordered owner writes it.
+        assert_eq!(stages.into_inner(), vec![]);
+        assert_eq!(capture.graph_projection_count(), 1);
+    }
+
+    #[test]
+    fn earlier_class_failure_beats_completed_later_native_extraction_failure() {
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("a.py"), "class First:\n    pass\n").unwrap();
+        fs::write(workspace.path().join("b.py"), "def second(): return 2\n").unwrap();
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let options = IndexOptions::new(workspace.path().to_owned());
+        let root = fs::canonicalize(workspace.path()).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
+        let (completed, observed) = std::sync::mpsc::sync_channel(1);
+        let observed = std::sync::Mutex::new(observed);
+        let stages = std::cell::RefCell::new(Vec::new());
+        let err = spool_full_capture_with(
+            &options,
+            &capture,
+            &root,
+            store.root_id(),
+            &cancel,
+            &|_| {},
+            |key, stage| stages.borrow_mut().push((key.path.clone(), stage)),
+            ExtractionPlan {
+                workers: 2,
+                chunk: 2,
+            },
+            &|file, _ids| {
+                if file.path == "b.py" {
+                    completed.send(()).unwrap();
+                    anyhow::bail!("injected later native extraction failure")
+                }
+                Ok(())
+            },
+            &|_, _| Ok(()),
+            &|_, _, _| Ok(()),
+            &|document, _extraction| {
+                if document.key.path == "a.py" {
+                    // Hold this earlier file until the later worker has failed.
+                    observed
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(std::time::Duration::from_secs(60))
+                        .expect("later worker completed before ordered class check");
+                    anyhow::bail!("injected earlier class extraction failure")
+                }
+                Ok(())
+            },
+            &store.native_spool_dir().unwrap(),
+        )
+        .err()
+        .expect("earliest sorted file failure must be reported");
+        assert!(
+            err.to_string()
+                .contains("injected earlier class extraction failure"),
+            "{err:#}"
+        );
+        assert_eq!(stages.into_inner(), vec![]);
+    }
+
+    #[test]
+    fn earliest_extraction_error_precedes_later_validation_error() {
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("a.py"), "def first(): return 1\n").unwrap();
+        fs::write(workspace.path().join("b.py"), "def second(): return 2\n").unwrap();
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let options = IndexOptions::new(workspace.path().to_owned());
+        let root = fs::canonicalize(workspace.path()).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
+        let err = spool_full_capture_with(
+            &options,
+            &capture,
+            &root,
+            store.root_id(),
+            &cancel,
+            &|_| {},
+            |_, _| {},
+            ExtractionPlan {
+                workers: 2,
+                chunk: 2,
+            },
+            &|file, _ids| {
+                if file.path == "a.py" {
+                    anyhow::bail!("injected first extraction failure")
+                }
+                Ok(())
+            },
+            &|_, _| anyhow::bail!("injected later validation failure"),
+            &|_, _, _| Ok(()),
+            &|_, _| Ok(()),
+            &store.native_spool_dir().unwrap(),
+        )
+        .err()
+        .expect("ordered failure");
+        assert!(
+            err.to_string()
+                .contains("injected first extraction failure"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn failed_file_reports_extraction_error_before_its_minted_ids_collide() {
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("a.py"), "def first(): return 1\n").unwrap();
+        fs::write(workspace.path().join("b.py"), "def second(): return 2\n").unwrap();
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let options = IndexOptions::new(workspace.path().to_owned());
+        let root = fs::canonicalize(workspace.path()).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
+        // Pre-extract the same captured later file only to select its real
+        // first minted identity. This fixture creates no index.db rows.
+        let (mut shell, files) = build_native_header(&capture, &root, store.root_id()).unwrap();
+        let later = shell
+            .revision
+            .documents
+            .iter()
+            .find(|d| d.key.path == "b.py")
+            .unwrap()
+            .clone();
+        shell.revision.documents.clear();
+        let mut later_ids = IdentityRegistry::logged();
+        extract_known(
+            &mut shell,
+            files.iter().find(|f| f.path == "b.py").unwrap(),
+            &later,
+            &mut later_ids,
+        )
+        .unwrap();
+        let minted_in_failed_file = Arc::new(AtomicBool::new(false));
+        let seen = minted_in_failed_file.clone();
+        let err = spool_full_capture_with(
+            &options,
+            &capture,
+            &root,
+            store.root_id(),
+            &cancel,
+            &|_| {},
+            |_, _| {},
+            ExtractionPlan {
+                workers: 2,
+                chunk: 2,
+            },
+            &|file, ids| {
+                if file.path == "b.py" {
+                    assert!(ids.same_first_identity_for_tests(&later_ids));
+                    seen.store(true, std::sync::atomic::Ordering::SeqCst);
+                    anyhow::bail!("injected in-file extraction failure")
+                }
+                Ok(())
+            },
+            &|_, _| Ok(()),
+            &|document, global, _local| {
+                if document.key.path == "a.py" {
+                    global.inject_collision_for_tests(&later_ids);
+                    let mut probe = global.clone();
+                    assert!(
+                        probe
+                            .absorb(later_ids.clone())
+                            .unwrap_err()
+                            .to_string()
+                            .contains("identity handle collision")
+                    );
+                }
+                Ok(())
+            },
+            &|_, _| Ok(()),
+            &store.native_spool_dir().unwrap(),
+        )
+        .err()
+        .expect("failed file must be rejected");
+        assert!(minted_in_failed_file.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            err.to_string()
+                .contains("injected in-file extraction failure"),
+            "{err:#}"
+        );
+    }
+
+    fn private_spool_failure_preserves_prior_head(allocation: bool) {
+        use crate::index_coordinator::IndexJobCoordinator;
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("a.py"), "def first(): return 1\n").unwrap();
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let options = IndexOptions::new(workspace.path().to_owned());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let prior = IndexJobCoordinator::prepare(&store, None)
+            .unwrap()
+            .run(&options, &cancel, |_| {})
+            .unwrap();
+        fs::write(workspace.path().join("b.py"), "def second(): return 2\n").unwrap();
+        let capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
+        let root = fs::canonicalize(workspace.path()).unwrap();
+        let stages = std::cell::RefCell::new(Vec::new());
+        let err = spool_full_capture_with(
+            &options,
+            &capture,
+            &root,
+            store.root_id(),
+            &cancel,
+            &|_| {},
+            |key, stage| stages.borrow_mut().push((key.path.clone(), stage)),
+            ExtractionPlan {
+                workers: 2,
+                chunk: 2,
+            },
+            &|_, _| Ok(()),
+            &|_, _| Ok(()),
+            &|document, global, local| {
+                if document.key.path == "b.py" {
+                    if allocation {
+                        global.fail_next_reservation_for_tests();
+                    } else {
+                        global.inject_collision_for_tests(local);
+                    }
+                }
+                Ok(())
+            },
+            &|_, _| Ok(()),
+            &store.native_spool_dir().unwrap(),
+        )
+        .err()
+        .expect("the digest collision or allocation failure must reject scratch");
+        if allocation {
+            assert!(err.to_string().contains("memory allocation"), "{err:#}");
+        } else {
+            assert!(
+                err.to_string().contains("identity handle collision"),
+                "{err:#}"
+            );
+        }
+        assert!(
+            stages
+                .borrow()
+                .contains(&("b.py".into(), FullNativeStage::Measured)),
+            "a disposable spool write can precede its collision verdict"
+        );
+        assert_eq!(store.index_baseline().unwrap(), prior);
+        let previous = store.graph_at(Some(prior)).unwrap();
+        assert_eq!(previous.files.len(), 1);
+        assert_eq!(previous.files[0].path, "a.py");
+    }
+
+    #[test]
+    fn collision_after_private_spool_write_cannot_change_compatible_prior_head() {
+        private_spool_failure_preserves_prior_head(false);
+    }
+
+    #[test]
+    fn fallible_allocation_after_private_spool_write_preserves_prior_head() {
+        private_spool_failure_preserves_prior_head(true);
+    }
+
+    #[test]
+    fn spooled_document_validator_rejects_corrupt_range_and_owner() {
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("a.py"), "def f():\n    return f()\n").unwrap();
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let options = IndexOptions::new(workspace.path().to_owned());
+        let root = fs::canonicalize(workspace.path()).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
+        let spool = spool_full_capture(
+            &options,
+            &capture,
+            &root,
+            store.root_id(),
+            &cancel,
+            &|_| {},
+            |_, _| {},
+            &store.native_spool_dir().unwrap(),
+        )
+        .unwrap();
+        let (mut native, _) = spool.read(0).unwrap();
+        let document = native.revision.documents[0].clone();
+        let file = &capture.files[0];
+        native.revision.documents.clear();
+        native.calls[0].owner_syntax_id = "sid:v1:missing".into();
+        assert!(validate_spooled_document(&mut native, &document, file).is_err());
+        let (mut native, _) = spool.read(0).unwrap();
+        native.revision.documents.clear();
+        native.calls[0].range.end = file.text.len() + 1;
+        assert!(validate_spooled_document(&mut native, &document, file).is_err());
+        let (mut native, _) = spool.read(0).unwrap();
+        native.revision.documents.clear();
+        let mut changed = file.clone();
+        changed.text = "def f():\n    return z()\n".into();
+        assert!(validate_spooled_document(&mut native, &document, &changed).is_err());
     }
 }

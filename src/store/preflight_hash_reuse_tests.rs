@@ -29,6 +29,47 @@ fn fixture() -> (
     (state, work, store, options, pin)
 }
 
+fn call_lookups(store: &Store) -> Vec<(String, String, Option<String>)> {
+    let db = store.cache_write().unwrap();
+    let mut statement = db
+        .prepare("SELECT version_id,id,callee_lookup_key FROM native_version_calls ORDER BY version_id,id")
+        .unwrap();
+    statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+#[test]
+fn streamed_callee_lookups_equal_plain_without_source_blob_reads() {
+    let before = writer_source_sql_reads_for_tests();
+    let (_state, work, streamed, options, _pin) = fixture();
+    let stream_lookups = call_lookups(&streamed);
+    assert!(
+        !stream_lookups.is_empty(),
+        "fixture must contain a native call"
+    );
+    assert_eq!(writer_source_sql_reads_for_tests() - before, 0);
+
+    let state = tempfile::tempdir().unwrap();
+    let plain = Store::open_for_tests(state.path(), work.path()).unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (graph, native, capture) =
+        crate::indexer::index_workspace_bundle(&options, plain.root_id(), &cancel, |_| {}).unwrap();
+    let baseline = plain.index_baseline().unwrap();
+    let leader = plain.writer().unwrap();
+    plain
+        .publish_native(&graph, &capture, &native, &leader, baseline, &cancel)
+        .unwrap();
+    assert_eq!(call_lookups(&plain), stream_lookups);
+    assert_eq!(
+        writer_source_sql_reads_for_tests() - before,
+        native.calls.len(),
+        "plain artifact still checks stored source bytes for each call"
+    );
+}
+
 /// Overwrite one stored hash of A.java's selected rows with zeros.
 fn corrupt(store: &Store, pin: IndexPin, sql: &str) {
     let mut db = store.cache_write().unwrap();
@@ -143,4 +184,112 @@ fn equal_stored_hashes_reuse_without_decoding_stored_rows() {
     let next = publish_full(&store, &options).unwrap();
     assert_eq!(next.index_generation, pin.index_generation);
     assert_eq!(next.index_revision, pin.index_revision + 1);
+}
+
+#[test]
+fn scratch_preflight_faults_do_not_reclassify_the_live_head() {
+    for fault in ["graph_json", "extraction_json", "sqlite_corrupt"] {
+        let (_state, _work, store, options, pin) = fixture();
+        *store.test_stream_before_preflight_hook.lock().unwrap() = Some(Box::new(move |spool| {
+            let index = spool
+                .header()
+                .revision
+                .documents
+                .iter()
+                .position(|document| document.key.path == "A.java")
+                .unwrap();
+            match fault {
+                "graph_json" => spool.corrupt_graph_json_for_tests(index),
+                "extraction_json" => spool.corrupt_extraction_json_for_tests(index),
+                "sqlite_corrupt" => spool.inject_sqlite_corrupt_read_for_tests(),
+                _ => unreachable!(),
+            }
+        }));
+        let error = publish_full(&store, &options).unwrap_err();
+        assert!(
+            error.downcast_ref::<NativeSpoolReadFailure>().is_some(),
+            "{fault}: {error:#}"
+        );
+        assert_eq!(store.disposition(), RecoveryDisposition::Ready, "{fault}");
+        let db = store.cache_write().unwrap();
+        let selected: (String, i64) = db
+            .query_row(
+                "SELECT index_generation,index_revision FROM index_metadata WHERE singleton=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            selected,
+            (pin.index_generation.to_string(), pin.index_revision as i64),
+            "{fault}: a scratch failure cannot partially publish"
+        );
+        let revisions: i64 = db
+            .query_row("SELECT count(*) FROM native_revisions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(revisions, 1, "{fault}");
+        drop(db);
+        let next = publish_full(&store, &options).unwrap();
+        assert_eq!(next.index_generation, pin.index_generation, "{fault}");
+        assert_eq!(next.index_revision, pin.index_revision + 1, "{fault}");
+    }
+}
+
+#[test]
+fn first_publication_scratch_reads_fail_typed_without_partial_head() {
+    for fault in ["graph_json", "extraction_json"] {
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        fs::write(work.path().join("A.java"), "class A { void f(){} }\n").unwrap();
+        fs::write(work.path().join("b.js"), "function b(){ return 1; }\n").unwrap();
+        let options = IndexOptions::new(work.path().to_owned());
+        let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+        let baseline = store.index_baseline().unwrap();
+        *store.test_stream_before_preflight_hook.lock().unwrap() = Some(Box::new(move |spool| {
+            let index = spool
+                .header()
+                .revision
+                .documents
+                .iter()
+                .position(|document| document.key.path == "A.java")
+                .unwrap();
+            match fault {
+                "graph_json" => spool.corrupt_graph_json_for_tests(index),
+                "extraction_json" => spool.corrupt_extraction_json_for_tests(index),
+                _ => unreachable!(),
+            }
+        }));
+        let error = IndexJobCoordinator::prepare(&store, None)
+            .unwrap()
+            .run(&options, &Arc::new(AtomicBool::new(false)), |_| {})
+            .unwrap_err();
+        assert!(
+            error.downcast_ref::<NativeSpoolReadFailure>().is_some(),
+            "{fault}: {error:#}"
+        );
+        assert_eq!(store.index_baseline().unwrap(), baseline, "{fault}");
+        let revisions: i64 = store
+            .cache_write()
+            .unwrap()
+            .query_row("SELECT count(*) FROM native_revisions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            revisions, 0,
+            "{fault}: failed first publication left no revision"
+        );
+        let retry = IndexJobCoordinator::prepare(&store, None)
+            .unwrap()
+            .run(&options, &Arc::new(AtomicBool::new(false)), |_| {})
+            .unwrap();
+        assert_eq!(retry.index_revision, 1, "{fault}");
+        assert_eq!(
+            store.graph_at(Some(retry)).unwrap().files.len(),
+            2,
+            "{fault}"
+        );
+    }
 }

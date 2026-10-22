@@ -29,6 +29,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["arbitrary_precision", "raw_value"] }
 sha2 = "0.10"
 subtle = "2"
+tempfile = "3"
 tokio = { version = "1", features = ["full"] }
 toml = "0.9"
 tracing = "0.1"
@@ -45,7 +46,6 @@ uuid = { version = "1", features = ["v4"] }
 sha2 = "0.10"
 
 [dev-dependencies]
-tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 

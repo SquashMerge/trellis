@@ -4694,3 +4694,271 @@ fn escaped_javascript_declarations_publish_without_losing_later_facts() {
         }
     }
 }
+
+#[test]
+#[cfg(feature = "test-support")]
+fn cold_stream_matches_plain_artifact_publication_rows() {
+    let (_plain_state, root, plain, cancel) = fixture();
+    let stream_state = tempfile::tempdir().unwrap();
+    let stream = Store::open_for_tests(stream_state.path(), root.path()).unwrap();
+    let leader = plain.publication_for_tests().unwrap();
+    let plain_pin = publish(
+        &plain,
+        root.path(),
+        &cancel,
+        plain.index_baseline().unwrap(),
+        &leader,
+    )
+    .unwrap();
+    let options = IndexOptions::new(root.path().to_owned());
+    let (stream_pin, _owner) =
+        trellis::index_coordinator::reconcile_workspace(&stream, &options, &cancel, |_| {})
+            .unwrap();
+    let identity =
+        trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+            .unwrap();
+    let index_path = |state: &std::path::Path| {
+        state
+            .join("cache/indexes")
+            .join(&identity.root_key)
+            .join("index.db")
+    };
+    let plain_db = Connection::open(index_path(_plain_state.path())).unwrap();
+    let stream_db = Connection::open(index_path(stream_state.path())).unwrap();
+    let values = |db: &Connection, sql: &str| -> Vec<Vec<rusqlite::types::Value>> {
+        let mut stmt = db.prepare(sql).unwrap();
+        let columns = stmt.column_count();
+        stmt.query_map([], |row| {
+            (0..columns)
+                .map(|index| row.get::<_, rusqlite::types::Value>(index))
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+    };
+    // Compare all native revision header fields except the selected revision
+    // key and publication sequence, which differ by design between stores.
+    let revision_header = "SELECT source_set_id,toolchain_hash,config_hash,dependency_hash,native_revision_id,source_inventory,dependency_observations,reconcile_options,class_warnings,class_truncated,graph_stats,graph_diagnostics FROM native_revisions";
+    assert_eq!(
+        values(&plain_db, revision_header),
+        values(&stream_db, revision_header)
+    );
+    for table in [
+        "document_versions",
+        "graph_projections",
+        "class_projections",
+        "graph_nodes",
+        "graph_calls",
+        "graph_regions",
+        "classes",
+        "class_relations",
+        "native_version_coverage_roles",
+        "native_version_declarations",
+        "native_version_declaration_ancestors",
+        "native_version_ancestor_signature_types",
+        "native_version_headers",
+        "native_version_header_items",
+        "native_version_parameters",
+        "native_version_own_signature_types",
+        "native_version_control_regions",
+        "native_version_calls",
+        "native_version_call_regions",
+    ] {
+        let sql = format!("SELECT * FROM {table} ORDER BY 1,2");
+        assert_eq!(values(&plain_db, &sql), values(&stream_db, &sql), "{table}");
+    }
+    // Compare the selected manifest without its intentionally different revision key.
+    let selected = "SELECT source_set_id,language,path,document_version_id,graph_projection_id,class_projection_id,capture_stat,coverage_requested,coverage_selected,coverage_state,coverage_diagnostic,ordinal FROM revision_documents ORDER BY ordinal";
+    assert_eq!(values(&plain_db, selected), values(&stream_db, selected));
+    assert_eq!(
+        values(&plain_db, "SELECT stats,diagnostics FROM index_metadata"),
+        values(&stream_db, "SELECT stats,diagnostics FROM index_metadata"),
+    );
+    for name in ["flow.js", "flow.java", "flow.rs", "flow.py"] {
+        assert_eq!(
+            plain.source_at(name, Some(plain_pin)).unwrap().unwrap().1,
+            stream.source_at(name, Some(stream_pin)).unwrap().unwrap().1,
+            "{name}",
+        );
+    }
+}
+
+#[test]
+#[cfg(feature = "test-support")]
+fn empty_cold_stream_preserves_plain_native_header() {
+    let state_plain = tempfile::tempdir().unwrap();
+    let state_stream = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let plain = Store::open_for_tests(state_plain.path(), root.path()).unwrap();
+    let stream = Store::open_for_tests(state_stream.path(), root.path()).unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let leader = plain.publication_for_tests().unwrap();
+    let _plain_pin = publish(
+        &plain,
+        root.path(),
+        &cancel,
+        plain.index_baseline().unwrap(),
+        &leader,
+    )
+    .unwrap();
+    let (stream_pin, _owner) = trellis::index_coordinator::reconcile_workspace(
+        &stream,
+        &IndexOptions::new(root.path().to_owned()),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    let identity =
+        trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+            .unwrap();
+    let index_path = |state: &std::path::Path| {
+        state
+            .join("cache/indexes")
+            .join(&identity.root_key)
+            .join("index.db")
+    };
+    let header = |state: &std::path::Path| -> Vec<rusqlite::types::Value> {
+        let db = Connection::open(index_path(state)).unwrap();
+        let mut stmt = db.prepare("SELECT source_set_id,toolchain_hash,config_hash,dependency_hash,native_revision_id,source_inventory,dependency_observations,reconcile_options,class_warnings,class_truncated,graph_stats,graph_diagnostics FROM native_revisions").unwrap();
+        let count = stmt.column_count();
+        stmt.query_row([], |row| (0..count).map(|i| row.get(i)).collect())
+            .unwrap()
+    };
+    assert_eq!(header(state_plain.path()), header(state_stream.path()));
+    assert_eq!(stream.status().unwrap().revision, stream_pin);
+}
+
+#[test]
+#[cfg(feature = "test-support")]
+fn capped_cold_stream_preserves_plain_revision_header_and_catalog_warning() {
+    // Cross the production 20,000-class catalog cap with normal-size source
+    // files, not with a test-only limit or a huge individual document.
+    let root = tempfile::tempdir().unwrap();
+    for file in 0..101 {
+        let source: String = (0..200)
+            .map(|class| format!("class C{file}_{class} {{}}\n"))
+            .collect();
+        fs::write(root.path().join(format!("classes_{file:03}.java")), source).unwrap();
+    }
+    let plain_state = tempfile::tempdir().unwrap();
+    let stream_state = tempfile::tempdir().unwrap();
+    let plain = Store::open_for_tests(plain_state.path(), root.path()).unwrap();
+    let stream = Store::open_for_tests(stream_state.path(), root.path()).unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let leader = plain.publication_for_tests().unwrap();
+    publish(
+        &plain,
+        root.path(),
+        &cancel,
+        plain.index_baseline().unwrap(),
+        &leader,
+    )
+    .unwrap();
+    trellis::index_coordinator::reconcile_workspace(
+        &stream,
+        &IndexOptions::new(root.path().to_owned()),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    let identity =
+        trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+            .unwrap();
+    let read_header = |state: &std::path::Path| {
+        let db = Connection::open(
+            state
+                .join("cache/indexes")
+                .join(&identity.root_key)
+                .join("index.db"),
+        )
+        .unwrap();
+        let mut stmt = db.prepare("SELECT source_set_id,toolchain_hash,config_hash,dependency_hash,native_revision_id,source_inventory,dependency_observations,reconcile_options,class_warnings,class_truncated,graph_stats,graph_diagnostics FROM native_revisions").unwrap();
+        let columns = stmt.column_count();
+        stmt.query_row([], |row| {
+            (0..columns)
+                .map(|i| row.get::<_, rusqlite::types::Value>(i))
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .unwrap()
+    };
+    let header = read_header(plain_state.path());
+    assert_eq!(header, read_header(stream_state.path()));
+    assert_eq!(header[9], rusqlite::types::Value::Integer(1));
+    let warnings = match &header[8] {
+        rusqlite::types::Value::Text(text) => serde_json::from_str::<Vec<String>>(text).unwrap(),
+        other => panic!("expected class warning JSON, got {other:?}"),
+    };
+    assert_eq!(
+        warnings,
+        vec![
+            "Class catalog declaration limit reached (20000)",
+            "Declared types are terminal source text, not class relationships. Direct Java/Python declarations only; no function-body, conditional/anonymous class, generated member, wildcard-import, type-alias or dependency discovery.",
+            "Incomplete class declaration registry: some declarations may be absent.",
+        ]
+    );
+}
+
+#[test]
+#[cfg(feature = "test-support")]
+fn streamed_precommit_cancel_rolls_back_every_document() {
+    let (_state, root, store, cancel) = fixture();
+    let options = IndexOptions::new(root.path().to_owned());
+    let (prior, initial_owner) =
+        trellis::index_coordinator::reconcile_workspace(&store, &options, &cancel, |_| {}).unwrap();
+    drop(initial_owner);
+    fs::write(
+        root.path().join("flow.js"),
+        "function after() { return 1; }\n",
+    )
+    .unwrap();
+    fs::write(root.path().join("flow.py"), "def after():\n    return 2\n").unwrap();
+    let cancel_at_commit = cancel.clone();
+    store.set_publication_before_commit_hook_for_tests(move || {
+        cancel_at_commit.store(true, std::sync::atomic::Ordering::Release);
+    });
+    let attempt =
+        trellis::index_coordinator::reconcile_workspace(&store, &options, &cancel, |_| {});
+    assert!(attempt.is_err(), "cancelled revision must not commit");
+    assert!(
+        cancel.load(std::sync::atomic::Ordering::Acquire),
+        "precommit hook not reached: {attempt:?}"
+    );
+    cancel.store(false, std::sync::atomic::Ordering::Release);
+    assert!(attempt.unwrap_err().to_string().contains("cancelled"));
+    let identity =
+        trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+            .unwrap();
+    let db = Connection::open(
+        _state
+            .path()
+            .join("cache/indexes")
+            .join(&identity.root_key)
+            .join("index.db"),
+    )
+    .unwrap();
+    let count: i64 = db
+        .query_row("SELECT count(*) FROM native_revisions", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(count, 1, "rollback must not leave an unpublished revision");
+    let selected: (String, i64) = db
+        .query_row(
+            "SELECT index_generation,index_revision FROM index_metadata WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        selected,
+        (
+            prior.index_generation.to_string(),
+            prior.index_revision as i64
+        )
+    );
+    drop(db);
+    let (next, _owner) =
+        trellis::index_coordinator::reconcile_workspace(&store, &options, &cancel, |_| {}).unwrap();
+    assert_eq!(next.index_revision, prior.index_revision + 1);
+}

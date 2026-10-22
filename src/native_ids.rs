@@ -4,7 +4,7 @@ use anyhow::{Result, ensure};
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 
 pub fn canonical(value: &Value) -> Vec<u8> {
     let mut out = Vec::new();
@@ -263,32 +263,55 @@ fn validate_occurrence(value: &Value) -> Result<()> {
     Ok(())
 }
 
-#[derive(Default)]
-pub struct IdentityRegistry {
-    handles: BTreeMap<String, (Vec<u8>, String)>,
-    /// First-insertion order, kept only by a per-document registry that is
-    /// later absorbed into a full one (`IdentityRegistry::logged`).
-    order: Option<Vec<String>>,
+/// Namespace is part of the key even if two truncated digests have the same bytes.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum Namespace {
+    Syntax,
+    Occurrence,
 }
 
-/// The pure part of one identity: its validated canonical bytes, full
-/// digest and handle. `IdentityRegistry::admit` applies the collision rule.
+impl Namespace {
+    fn prefix(self) -> &'static str {
+        match self {
+            Self::Syntax => "sid:v1:",
+            Self::Occurrence => "occ:v2:",
+        }
+    }
+}
+
+type Key = (Namespace, [u8; 16]);
+
+#[derive(Default)]
+#[cfg_attr(test, derive(Clone))]
+pub struct IdentityRegistry {
+    handles: HashMap<Key, [u8; 32]>,
+    /// First-insertion order only in per-document registries, later absorbed
+    /// into the revision-wide registry in sorted file order.
+    order: Option<Vec<Key>>,
+    #[cfg(test)]
+    fail_reservation: bool,
+}
+
+/// Hash-based identity over validated canonical input and the original domain.
+/// A full digest match is the same identity; the owner accepts the residual
+/// full-SHA-256 collision risk. No canonical bytes are retained.
 pub(crate) struct Minted {
-    handle: String,
-    bytes: Vec<u8>,
-    full: String,
+    key: Key,
+    full: [u8; 32],
 }
 
 const STABLE_DOMAIN: &[u8] = b"trellis.syntax.v1\0";
 const OCCURRENCE_DOMAIN: &[u8] = b"trellis.occurrence.v2\0";
 
-fn mint(domain: &[u8], value: &Value, prefix: &str) -> Minted {
-    let bytes = canonical(value);
-    let full = digest(domain, &bytes);
-    let handle = format!("{}{}", prefix, &full[..32]);
+fn mint(domain: &[u8], value: &Value, namespace: Namespace) -> Minted {
+    let mut hash = Sha256::new();
+    hash.update(domain);
+    canonical_into(value, &mut |bytes| hash.update(bytes));
+    let full: [u8; 32] = hash.finalize().into();
+    let mut handle = [0; 16];
+    handle.copy_from_slice(&full[..16]);
     Minted {
-        handle,
-        bytes,
+        key: (namespace, handle),
         full,
     }
 }
@@ -296,62 +319,75 @@ fn mint(domain: &[u8], value: &Value, prefix: &str) -> Minted {
 /// Validate and mint a SyntaxId without registering it.
 pub(crate) fn mint_stable(input: &Value) -> Result<Minted> {
     validate_stable(input)?;
-    Ok(mint(STABLE_DOMAIN, input, "sid:v1:"))
+    Ok(mint(STABLE_DOMAIN, input, Namespace::Syntax))
 }
 
 /// Validate and mint an occurrence ID without registering it.
 pub(crate) fn mint_occurrence(input: &Value) -> Result<Minted> {
     validate_occurrence(input)?;
-    Ok(mint(OCCURRENCE_DOMAIN, input, "occ:v2:"))
+    Ok(mint(OCCURRENCE_DOMAIN, input, Namespace::Occurrence))
 }
 
 impl IdentityRegistry {
     /// A registry that records first-insertion order, for `absorb`.
     pub(crate) fn logged() -> Self {
         Self {
-            handles: BTreeMap::new(),
+            handles: HashMap::new(),
             order: Some(Vec::new()),
+            #[cfg(test)]
+            fail_reservation: false,
         }
     }
-    pub fn register(&mut self, domain: &[u8], value: &Value, prefix: &str) -> Result<String> {
-        self.admit(mint(domain, value, prefix))
-    }
-    /// Register a minted identity; a handle seen before must carry the
-    /// same canonical bytes and digest.
+    /// Admit a minted identity. A typed 128-bit handle with a different
+    /// full digest is a detected collision, even across different files.
     pub(crate) fn admit(&mut self, minted: Minted) -> Result<String> {
-        let Minted {
-            handle,
-            bytes,
-            full,
-        } = minted;
-        if let Some((prior, prior_full)) = self.handles.get(&handle) {
-            ensure!(
-                prior == &bytes && prior_full == &full,
-                "native identity handle collision: {handle}"
-            );
+        let Minted { key, full } = minted;
+        let handle = format!("{}{}", key.0.prefix(), hex::encode(key.1));
+        if let Some(prior) = self.handles.get(&key) {
+            ensure!(prior == &full, "native identity handle collision: {handle}");
         } else {
-            if let Some(order) = &mut self.order {
-                order.push(handle.clone());
+            #[cfg(test)]
+            if std::mem::take(&mut self.fail_reservation) {
+                self.handles.try_reserve(usize::MAX)?;
             }
-            self.handles.insert(handle.clone(), (bytes, full));
+            self.handles.try_reserve(1)?;
+            if let Some(order) = &mut self.order {
+                order.try_reserve(1)?;
+                order.push(key);
+            }
+            self.handles.insert(key, full);
         }
         Ok(handle)
     }
-    /// Admit every identity of a logged registry in its first-insertion
-    /// order, as if each had been registered here directly in that order.
+    /// Admit the successful document's distinct identities in their original
+    /// first-insertion order. Failed documents are never admitted.
     pub(crate) fn absorb(&mut self, mut other: IdentityRegistry) -> Result<()> {
-        for handle in other.order.take().unwrap_or_default() {
-            let (bytes, full) = other
+        for key in other.order.take().unwrap_or_default() {
+            let full = other
                 .handles
-                .remove(&handle)
+                .remove(&key)
                 .expect("logged identity is registered");
-            self.admit(Minted {
-                handle,
-                bytes,
-                full,
-            })?;
+            self.admit(Minted { key, full })?;
         }
         Ok(())
+    }
+    #[cfg(test)]
+    pub(crate) fn fail_next_reservation_for_tests(&mut self) {
+        self.fail_reservation = true;
+    }
+    #[cfg(test)]
+    pub(crate) fn same_first_identity_for_tests(&self, other: &IdentityRegistry) -> bool {
+        let first = self.order.as_ref().and_then(|order| order.first());
+        first.is_some()
+            && first == other.order.as_ref().and_then(|order| order.first())
+            && self.handles.get(first.unwrap()) == other.handles.get(first.unwrap())
+    }
+    #[cfg(test)]
+    pub(crate) fn inject_collision_for_tests(&mut self, other: &IdentityRegistry) {
+        let key = *other.order.as_ref().unwrap().first().unwrap();
+        let mut full = *other.handles.get(&key).unwrap();
+        full[16] ^= 1;
+        self.handles.insert(key, full);
     }
     pub fn stable(&mut self, input: &Value) -> Result<String> {
         self.admit(mint_stable(input)?)
@@ -387,4 +423,96 @@ pub fn extraction_context(language: &str, components: &[(String, String)]) -> Re
         b"trellis.extraction-context.v1\0",
         &canonical(&serde_json::json!({"language":language,"components":components})),
     ))
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+
+    fn minted(namespace: Namespace, handle: [u8; 16], suffix: u8) -> Minted {
+        let mut full = [suffix; 32];
+        full[..16].copy_from_slice(&handle);
+        Minted {
+            key: (namespace, handle),
+            full,
+        }
+    }
+
+    #[test]
+    fn both_namespaces_detect_handle_collision_and_accept_exact_duplicates() {
+        let handle = [0x35; 16];
+        for namespace in [Namespace::Syntax, Namespace::Occurrence] {
+            let mut log = IdentityRegistry::logged();
+            let id = log.admit(minted(namespace, handle, 1)).unwrap();
+            assert_eq!(id, format!("{}{}", namespace.prefix(), "35".repeat(16)));
+            assert_eq!(log.admit(minted(namespace, handle, 1)).unwrap(), id);
+            assert_eq!(log.order.as_ref().unwrap().len(), 1);
+            assert!(
+                log.admit(minted(namespace, handle, 2))
+                    .unwrap_err()
+                    .to_string()
+                    .contains("identity handle collision")
+            );
+            let mut global = IdentityRegistry::default();
+            global.absorb(log).unwrap();
+            assert_eq!(global.admit(minted(namespace, handle, 1)).unwrap(), id);
+            assert!(
+                global
+                    .admit(minted(namespace, handle, 2))
+                    .unwrap_err()
+                    .to_string()
+                    .contains("identity handle collision")
+            );
+            assert_eq!(global.handles.len(), 1);
+        }
+    }
+
+    #[test]
+    fn ordered_absorb_reports_first_inserted_collision_not_handle_sort_order() {
+        let first = [0xf0; 16];
+        let second = [0x10; 16];
+        let mut logged = IdentityRegistry::logged();
+        logged.admit(minted(Namespace::Syntax, first, 1)).unwrap();
+        logged.admit(minted(Namespace::Syntax, second, 2)).unwrap();
+        logged.admit(minted(Namespace::Syntax, first, 1)).unwrap();
+        assert_eq!(logged.order.as_ref().unwrap().len(), 2);
+
+        let mut first_only = IdentityRegistry::logged();
+        first_only
+            .admit(minted(Namespace::Syntax, first, 1))
+            .unwrap();
+        let mut second_only = IdentityRegistry::logged();
+        second_only
+            .admit(minted(Namespace::Syntax, second, 2))
+            .unwrap();
+        let mut global = IdentityRegistry::default();
+        global.inject_collision_for_tests(&first_only);
+        global.inject_collision_for_tests(&second_only);
+        let error = global.absorb(logged).unwrap_err().to_string();
+        assert!(error.contains(&"f0".repeat(16)), "{error}");
+        assert!(!error.contains(&"10".repeat(16)), "{error}");
+    }
+
+    #[test]
+    fn matching_truncated_bytes_are_separate_across_namespaces_and_logs_keep_order() {
+        let mut log = IdentityRegistry::logged();
+        let first = [1; 16];
+        let second = [2; 16];
+        log.admit(minted(Namespace::Occurrence, first, 3)).unwrap();
+        log.admit(minted(Namespace::Syntax, second, 4)).unwrap();
+        log.admit(minted(Namespace::Syntax, first, 5)).unwrap();
+        log.admit(minted(Namespace::Occurrence, first, 3)).unwrap();
+        assert_eq!(
+            log.order.as_ref().unwrap(),
+            &vec![
+                (Namespace::Occurrence, first),
+                (Namespace::Syntax, second),
+                (Namespace::Syntax, first),
+            ]
+        );
+        let mut global = IdentityRegistry::default();
+        global.absorb(log).unwrap();
+        assert_eq!(global.handles.len(), 3);
+        assert!(global.admit(minted(Namespace::Syntax, first, 5)).is_ok());
+    }
 }

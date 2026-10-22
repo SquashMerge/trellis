@@ -9,6 +9,15 @@ use crate::{
 use anyhow::{Result, ensure};
 use std::sync::{Arc, atomic::Ordering};
 
+#[cfg(test)]
+thread_local! {
+    static FULL_STREAM_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+#[cfg(test)]
+fn full_stream_runs_for_tests() -> usize {
+    FULL_STREAM_RUNS.with(std::cell::Cell::get)
+}
+
 // Optional diagnostics never write on the publication or maintenance thread.
 // A full bounded channel increments a loss counter rather than blocking work.
 struct DiagnosticMarkers {
@@ -378,29 +387,31 @@ impl IndexJobCoordinator {
             completed: 0,
             total: 1,
         });
-        let native = crate::native_evidence::from_capture_observed(
+        let spool = crate::native_evidence::spool_full_capture(
+            options,
             &capture,
             &root,
             self.store.root_id(),
             cancel,
+            &progress,
             native_observe,
+            &self.store.native_spool_dir()?,
         )?;
+        #[cfg(test)]
+        FULL_STREAM_RUNS.with(|count| count.set(count.get() + 1));
         report("measure", phase_start.elapsed());
         phase_start = std::time::Instant::now();
-        let graph =
-            indexer::project_native(options, &capture, native.artifact(), cancel, &progress)?;
-        report("compose", phase_start.elapsed());
-        phase_start = std::time::Instant::now();
-        capture.verify(cancel)?;
+        // The spool verified the capture after completing all document work.
+        // The publisher reattests it before the first version insert.
         observe(&capture);
         ensure!(!cancel.load(Ordering::Acquire), "index cancelled");
         self.store.verify_writer_session(&self.session)?;
         report("attest", phase_start.elapsed());
         phase_start = std::time::Instant::now();
         cutoff()?;
-        let published = self.store.publish_validated_native_recovery(
-            &graph,
-            &native,
+        let published = self.store.publish_validated_stream_recovery(
+            &spool,
+            &capture,
             self.session.writer_guard()?,
             self.expected.clone(),
             cancel,
