@@ -53,44 +53,6 @@ fn election_preserves_private_socket_and_only_holder_recovers_stale_socket() {
 }
 
 #[test]
-fn election_identity_detects_lock_removal_and_replacement() {
-    let temp = tempfile::tempdir().unwrap();
-    let paths = paths(&temp);
-    let owner = SocketOwner::acquire(&paths).unwrap().unwrap();
-    assert!(owner.still_elected().unwrap());
-    // Keep the old inode alive at a different name: replacement must not look
-    // like continued ownership just because the new file has the same mode.
-    std::fs::rename(&paths.lock, paths.run.join("former.lock")).unwrap();
-    assert!(!owner.still_elected().unwrap());
-    let successor = SocketOwner::acquire(&paths).unwrap().unwrap();
-    assert!(!owner.still_elected().unwrap());
-    assert!(successor.still_elected().unwrap());
-    let identity = std::fs::metadata(&paths.socket).unwrap();
-    drop(owner);
-    let named = std::fs::metadata(&paths.socket).unwrap();
-    assert_eq!((named.dev(), named.ino()), (identity.dev(), identity.ino()));
-    UnixStream::connect(&paths.socket).expect("old owner removed successor socket");
-    drop(successor);
-    assert!(!paths.socket.exists());
-}
-
-#[test]
-fn election_identity_reports_inspection_errors() {
-    let temp = tempfile::tempdir().unwrap();
-    let paths = paths(&temp);
-    let owner = SocketOwner::acquire(&paths).unwrap().unwrap();
-    // A regular-file ancestor produces ENOTDIR on every platform, even when
-    // this test is run with privileges that could bypass mode restrictions.
-    let moved = paths.run.with_extension("moved");
-    std::fs::rename(&paths.run, &moved).unwrap();
-    std::fs::write(&paths.run, b"not a directory").unwrap();
-    assert!(owner.still_elected().is_err());
-    std::fs::remove_file(&paths.run).unwrap();
-    std::fs::rename(moved, &paths.run).unwrap();
-    assert!(owner.still_elected().unwrap());
-}
-
-#[test]
 fn simultaneous_starters_elect_one_socket_owner() {
     let temp = tempfile::tempdir().unwrap();
     let paths = paths(&temp);

@@ -48,7 +48,6 @@ PR #117 shows the cost: cross-process ownership transitions contributed substant
   - follower mode;
   - takeover and successor handoff.
 - Checkout ownership becomes **in-process state** in the daemon's registry.
-- **Election-path loss (#130, 2026-10-23):** a daemon exits when its retained election lock no longer matches the named lock (device/inode), including a removed data directory. A 250 ms observation interval bounds this liveness check; it is not a writer fence and does not claim to prevent overlap before loss is observed. Shutdown removes only the predecessor's socket, never a successor's.
 - **Per-checkout use locks** may be removed only after both of these:
   1. every **Trellis-controlled** out-of-process `Store` or SQLite opener is removed or blocked (external tools are unsupported; see Consequences);
   2. a **daemon-local admission gate** replaces the lock. The gate must cover every active snapshot, every retained SQLite handle and every new opener, and stay held from GC's eligibility check through the unlink.
