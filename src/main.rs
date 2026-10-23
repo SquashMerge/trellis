@@ -43,8 +43,6 @@ enum Command {
     Metrics(MetricsArgs),
     /// Query a bounded static call view. This is not a runtime sequence.
     Query(QueryArgs),
-    /// Export the normalized snapshot graph as JSON, including indexed source.
-    Export(ExportArgs),
     /// Inspect existing derived indexes and saved records without changing them.
     Gc(GcArgs),
     /// Permanently remove one saved workspace record by its exact ID.
@@ -174,14 +172,6 @@ struct MetricsArgs {
     #[arg(long)]
     metrics: Option<String>,
 }
-#[derive(Args)]
-struct ExportArgs {
-    #[command(flatten)]
-    workspace: WorkspaceArgs,
-    /// Without this option, write JSON to stdout. Never overwrites an existing file.
-    #[arg(long)]
-    output: Option<PathBuf>,
-}
 impl WorkspaceArgs {
     fn resolve_unattached(&self) -> Result<(TopologyRoots, WorkspaceIdentity)> {
         let roots = TopologyRoots::production()?;
@@ -274,8 +264,7 @@ async fn main() -> Result<()> {
         | Command::Status(_)
         | Command::Symbols(_)
         | Command::Query(_)
-        | Command::Metrics(_)
-        | Command::Export(_)) => dispatch_cli(&command)?,
+        | Command::Metrics(_)) => dispatch_cli(&command)?,
     }
     Ok(())
 }
@@ -723,7 +712,6 @@ fn dispatch_cli(command: &Command) -> Result<()> {
                 true,
             )
         }
-        Command::Export(args) => ("export", &args.workspace, serde_json::json!({}), true),
         Command::Index(args) => (
             "index",
             &args.workspace,
@@ -735,7 +723,7 @@ fn dispatch_cli(command: &Command) -> Result<()> {
         ),
         _ => unreachable!(),
     };
-    let (roots, identity) = workspace.resolve_unattached()?;
+    let (_roots, identity) = workspace.resolve_unattached()?;
     if let Command::Metrics(args) = command
         && args.metrics.is_none()
     {
@@ -762,11 +750,6 @@ fn dispatch_cli(command: &Command) -> Result<()> {
                 .remove("maxFileBytes");
         }
     }
-    if let Command::Export(args) = command
-        && let Some(path) = &args.output
-    {
-        roots.validate_external(&identity, std::slice::from_ref(path))?;
-    }
     let request = daemon_request(
         operation,
         serde_json::json!({
@@ -774,24 +757,7 @@ fn dispatch_cli(command: &Command) -> Result<()> {
         }),
     );
     let value = send_daemon(&request, read_only)?;
-    if let Command::Export(args) = command
-        && let Some(path) = &args.output
-    {
-        use std::io::Write;
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options
-            .open(path)
-            .context("create export (existing files are never overwritten)")?;
-        serde_json::to_writer_pretty(&mut file, &value)?;
-        file.write_all(b"\n")?;
-        file.flush()?;
-    } else if let Command::Metrics(args) = command {
+    if let Command::Metrics(args) = command {
         if args.json {
             print_json(&value)?;
         } else {
@@ -1284,7 +1250,7 @@ fn dispatch_connection(
     let request_deadline = Instant::now() + if metrics { metrics_work } else { CLI_READ_WAIT };
     let read_scope = matches!(
         request.operation.as_str(),
-        "status" | "symbols" | "query" | "export" | "metrics"
+        "status" | "symbols" | "query" | "metrics"
     );
     let run = || -> Result<serde_json::Value> {
         let root: PathBuf = serde_json::from_value(
@@ -1335,7 +1301,7 @@ fn dispatch_connection(
         ensure!(
             matches!(
                 request.operation.as_str(),
-                "status" | "symbols" | "query" | "export" | "index" | "metrics"
+                "status" | "symbols" | "query" | "index" | "metrics"
             ),
             "unknown daemon operation"
         );
@@ -1399,7 +1365,6 @@ fn dispatch_connection(
                         .context("missing includeCallbacks")?,
                     exclude_paths: serde_json::from_value(args["excludePaths"].clone())?,
                 }),
-                "export" => checkout.cli_export(),
                 "metrics" => {
                     let options = metrics_options.as_ref().expect("metrics options validated");
                     let mut before_work = || {

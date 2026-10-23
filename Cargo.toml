@@ -65,3 +65,61 @@ opt-level = 3
 # tests several times faster for a modest rebuild cost.
 [profile.dev.package.trellis]
 opt-level = 1
+
+# Whole-graph Store read methods are test-oracle-only. Integration test crates
+# do not set cfg(test) for the library, so these targets need test-support.
+[[test]]
+name = "class_diagram_http"
+required-features = ["test-support"]
+
+[[test]]
+name = "dependency_links"
+required-features = ["test-support"]
+
+[[test]]
+name = "http"
+required-features = ["test-support"]
+
+[[test]]
+name = "identity"
+required-features = ["test-support"]
+
+[[test]]
+name = "index_atomic"
+required-features = ["test-support"]
+
+[[test]]
+name = "indexer"
+required-features = ["test-support"]
+
+[[test]]
+name = "jev"
+required-features = ["test-support"]
+
+[[test]]
+name = "native_store"
+required-features = ["test-support"]
+
+[[test]]
+name = "navigation_http"
+required-features = ["test-support"]
+
+[[test]]
+name = "planning"
+required-features = ["test-support"]
+
+[[test]]
+name = "requests"
+required-features = ["test-support"]
+
+[[test]]
+name = "rust_indexer"
+required-features = ["test-support"]
+
+[[test]]
+name = "store"
+required-features = ["test-support"]
+
+[[test]]
+name = "watch"
+required-features = ["test-support"]

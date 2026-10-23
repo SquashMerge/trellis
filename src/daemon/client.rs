@@ -9,12 +9,14 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CallError {
     DaemonUnavailable,
+    DeadlineExceeded,
     OutcomeUnknown,
 }
 impl CallError {
     pub fn code(self) -> &'static str {
         match self {
             Self::DaemonUnavailable => "daemon_unavailable",
+            Self::DeadlineExceeded => "deadline_exceeded",
             Self::OutcomeUnknown => "outcome_unknown",
         }
     }
@@ -105,10 +107,27 @@ pub fn call(
         };
         // A partially written request can still have reached the server. Never replay
         // a mutation after attempting its write, including when the reply is lost.
-        let reply = protocol::write_frame(&mut stream, request)
-            .and_then(|()| read_reply(&mut stream, request.id));
-        match reply {
+        if protocol::write_frame(&mut stream, request).is_err() {
+            if read_only && attempt + 1 < attempts {
+                continue;
+            }
+            return Err(if read_only {
+                CallError::DaemonUnavailable
+            } else {
+                CallError::OutcomeUnknown
+            });
+        }
+        match read_reply(&mut stream, request.id) {
             Ok(reply) => return Ok(reply),
+            Err(error)
+                if read_only
+                    && matches!(
+                        error.kind(),
+                        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                    ) =>
+            {
+                return Err(CallError::DeadlineExceeded);
+            }
             Err(_) if read_only && attempt + 1 < attempts => continue,
             Err(_) if read_only => return Err(CallError::DaemonUnavailable),
             Err(_) => return Err(CallError::OutcomeUnknown),
@@ -158,7 +177,7 @@ pub fn call_metrics(
     Err(CallError::DaemonUnavailable)
 }
 
-/// One large CLI export is a sequence of individually bounded frames. The
+/// One large daemon reply is a sequence of individually bounded frames. The
 /// final JSON is parsed only after every frame with the same request ID arrives.
 fn read_reply(stream: &mut UnixStream, id: u64) -> io::Result<Reply> {
     read_reply_until(stream, id, None)

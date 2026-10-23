@@ -199,7 +199,7 @@ async fn reattach_reports_catching_up_and_keeps_complete_head_until_startup() {
 
 #[cfg(feature = "test-support")]
 #[tokio::test]
-async fn cli_symbols_and_export_use_the_admitted_prior_head_during_startup() {
+async fn symbols_and_graph_reads_use_the_admitted_prior_head_during_startup() {
     let base = tempfile::tempdir().unwrap();
     let checkout = base.path().join("work");
     fs::create_dir(&checkout).unwrap();
@@ -231,25 +231,23 @@ async fn cli_symbols_and_export_use_the_admitted_prior_head_during_startup() {
     let symbols = resumed.cli_symbols("oldHead", 10).unwrap();
     assert_eq!(symbols["catchingUp"], true);
     assert_eq!(symbols["data"]["items"].as_array().unwrap().len(), 1);
-    let export = resumed.cli_export().unwrap();
-    assert_eq!(export["catchingUp"], true);
-    assert!(
-        export["data"]["files"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("oldHead")
-    );
+    let (response, catching_up) = resumed.evidence_response().unwrap();
+    assert!(catching_up);
+    let graph = response.graph().unwrap();
+    assert!(graph.files[0].text.contains("oldHead"));
+    response.finish(graph).unwrap();
+    drop(response);
     resume_tx.send(()).unwrap();
     ready(&resumed).await;
     let symbols = resumed.cli_symbols("newHead", 10).unwrap();
     assert_eq!(symbols["catchingUp"], false);
     assert_eq!(symbols["data"]["items"].as_array().unwrap().len(), 1);
-    assert!(
-        resumed.cli_export().unwrap()["data"]["files"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("newHead")
-    );
+    let (response, catching_up) = resumed.evidence_response().unwrap();
+    assert!(!catching_up);
+    let graph = response.graph().unwrap();
+    assert!(graph.files[0].text.contains("newHead"));
+    response.finish(graph).unwrap();
+    drop(response);
 }
 
 #[tokio::test]

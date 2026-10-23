@@ -1774,12 +1774,6 @@ impl CheckoutRuntime {
             "data": response.finish(view)?}))
     }
 
-    pub fn cli_export(&self) -> anyhow::Result<serde_json::Value> {
-        let (response, catching_up) = self.evidence_response()?;
-        let graph = response.graph()?;
-        Ok(serde_json::json!({"catchingUp": catching_up, "data": response.finish(graph)?}))
-    }
-
     pub fn cli_index(&self, options: &IndexOptions) -> anyhow::Result<serde_json::Value> {
         // Serialize acceptance with idle retirement. A caller may have cloned
         // this runtime before serve entered the registry gate: it must not

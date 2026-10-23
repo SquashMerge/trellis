@@ -801,7 +801,6 @@ async fn executable_daemon_is_socket_only_until_explicit_serve_and_registers_two
             .unwrap()
             .is_empty()
     );
-    assert!(run(&home, "export", &first).is_object());
     // Index activated this checkout. A conflicting registration cannot replace
     // its options until the active checkout is released.
     let mut conflict = serve(&home, &first, requested_bind, &token_file)
@@ -882,8 +881,6 @@ fn cold_cli_commands_start_and_reuse_daemon() {
     );
     let symbols: Value = serde_json::from_slice(&symbols.stdout).unwrap();
     assert!(!symbols["data"]["items"].as_array().unwrap().is_empty());
-    let exported = run(&home, "export", &root);
-    assert!(exported.is_object());
 }
 
 #[tokio::test]
@@ -1200,72 +1197,6 @@ fn concurrent_cold_cli_indexes_share_one_daemon_and_keep_fifo_results() {
         std::thread::sleep(Duration::from_millis(20));
     };
     assert_eq!(markers, expected, "daemon claim/terminal order");
-}
-
-#[tokio::test]
-async fn daemon_served_export_survives_multi_frame_cli_reply() {
-    use std::os::unix::net::UnixStream;
-
-    let temp = short_temp();
-    let home = temp.path().join("home");
-    fs::create_dir(&home).unwrap();
-    let root = checkout(temp.path(), "large-export");
-    let mut source = String::new();
-    for i in 0..6000 {
-        source.push_str(&format!(
-            "function symbol_{i:05}_{}() {{ return {i}; }}\n",
-            "x".repeat(140)
-        ));
-    }
-    fs::write(root.join("large.js"), source).unwrap();
-    let mut command = cli(&home);
-    command.arg("daemon");
-    let mut daemon = detached(command);
-    let socket = fixture_socket_paths(&home).socket;
-    let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
-    while UnixStream::connect(&socket).is_err() {
-        assert!(
-            daemon.0.try_wait().unwrap().is_none(),
-            "daemon exited before socket readiness: {}",
-            fixture_daemon_diagnostic(&home, &socket)
-        );
-        assert!(
-            Instant::now() < deadline,
-            "daemon socket not ready: {}",
-            fixture_daemon_diagnostic(&home, &socket)
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    let indexed = cli(&home)
-        .arg("index")
-        .arg("--workspace")
-        .arg(&root)
-        .output()
-        .unwrap();
-    assert!(
-        indexed.status.success(),
-        "{}",
-        String::from_utf8_lossy(&indexed.stderr)
-    );
-    let exported = cli(&home)
-        .arg("export")
-        .arg("--workspace")
-        .arg(&root)
-        .output()
-        .unwrap();
-    assert!(
-        exported.status.success(),
-        "{}",
-        String::from_utf8_lossy(&exported.stderr)
-    );
-    assert!(
-        exported.stdout.len() > 1_048_576,
-        "fixture did not cross one reply frame: {} bytes",
-        exported.stdout.len()
-    );
-    let graph: Value = serde_json::from_slice(&exported.stdout).unwrap();
-    assert!(graph.is_object(), "daemon export lost its JSON payload");
-    assert!(daemon.0.try_wait().unwrap().is_none());
 }
 
 #[cfg(unix)]
@@ -1589,24 +1520,29 @@ async fn cold_serve_startup_preserves_implicit_scip_and_honors_explicit_default_
             assert_eq!(after["scipPath"], scip_path.to_str().unwrap());
             assert_eq!(after["manifestPath"], manifest_path.to_str().unwrap());
         }
-        // The unchanged `f` source and matching manifest must let startup reconciliation apply the
-        // recorded SCIP presentation, not merely keep a path string in storage.
-        let mut export = cli(&home);
-        export.arg("export").arg("--workspace").arg(&root);
-        let (exit, stdout, stderr) = bounded_cli_capture(export, &home, Duration::from_secs(5))
+        // The unchanged `f` source and matching manifest must let startup reconciliation apply
+        // the recorded SCIP presentation, not merely keep a path string in storage.
+        let mut symbols = cli(&home);
+        symbols
+            .arg("symbols")
+            .arg("--workspace")
+            .arg(&root)
+            .arg("--search")
+            .arg("f");
+        let (exit, stdout, stderr) = bounded_cli_capture(symbols, &home, Duration::from_secs(5))
             .await
-            .expect("export subprocess timed out after H");
+            .expect("symbols subprocess timed out after H");
         assert!(
             exit.success(),
-            "export failed: {}",
+            "symbols failed: {}",
             String::from_utf8_lossy(&stderr)
         );
-        let graph: Value = serde_json::from_slice(&stdout).unwrap();
-        let symbol = graph["data"]["nodes"]
+        let reply: Value = serde_json::from_slice(&stdout).unwrap();
+        let symbol = reply["data"]["items"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|node| node["name"] == "f")
+            .find(|item| item["name"] == "f")
             .expect("unchanged declaration was not indexed");
         if explicit_default {
             assert!(
@@ -1656,32 +1592,6 @@ fn cold_cli_reads_start_daemon_and_keep_data_envelopes() {
     let query: Value = serde_json::from_slice(&query.stdout).unwrap();
     assert!(query["catchingUp"].is_boolean());
     assert!(query["data"]["nodes"].is_array());
-    let destination = temp.path().join("graph.json");
-    let output = cli(&home)
-        .arg("export")
-        .arg("--workspace")
-        .arg(&root)
-        .arg("--output")
-        .arg(&destination)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let exported: Value = serde_json::from_slice(&fs::read(&destination).unwrap()).unwrap();
-    assert!(exported["catchingUp"].is_boolean());
-    assert!(exported["data"]["files"].is_array());
-    let repeat = cli(&home)
-        .arg("export")
-        .arg("--workspace")
-        .arg(&root)
-        .arg("--output")
-        .arg(&destination)
-        .output()
-        .unwrap();
-    assert!(!repeat.status.success());
     let gc = cli(&home).arg("gc").arg("--report").output().unwrap();
     assert!(
         gc.status.success(),
@@ -2414,12 +2324,81 @@ fn metrics_client_discards_partial_chunks_after_absolute_result_deadline() {
     server.join().unwrap();
 }
 
-/// Plays the daemon for one `trellis index` (#179): binds the fixture socket,
-/// starts the CLI and returns once its whole request has arrived, so a
-/// caller's clock starts at the CLI's reply wait, not at its launch.
-fn fake_daemon_index(
+/// A timed-out socket read must not replay a read-only call. On Unix the
+/// receive timeout may surface as WouldBlock rather than TimedOut.
+#[test]
+fn client_read_timeout_does_not_retry_but_connect_failure_does() {
+    use std::io;
+    use std::os::unix::net::UnixStream;
+    use trellis::daemon::{client, protocol};
+    let request = protocol::Request {
+        id: 44,
+        operation: "status".into(),
+        payload: serde_json::json!({}),
+    };
+    let (left, mut right) = UnixStream::pair().unwrap();
+    left.set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    let server = std::thread::spawn(move || {
+        let request: protocol::Request = protocol::read_frame(&mut right).unwrap();
+        // The peer remains open until the client finishes waiting, ensuring
+        // the failure is a read timeout rather than a closed connection.
+        let mut byte = [0];
+        let eof = std::io::Read::read(&mut right, &mut byte).unwrap();
+        (request, eof)
+    });
+    let mut first = Some(left);
+    let mut connects = 0;
+    let result = client::call(&request, true, || {
+        connects += 1;
+        first
+            .take()
+            .ok_or_else(|| io::Error::from(io::ErrorKind::ConnectionRefused))
+    });
+    assert_eq!(result.unwrap_err(), client::CallError::DeadlineExceeded);
+    assert_eq!(connects, 1, "timed-out read was replayed");
+    let (received, eof) = server.join().unwrap();
+    assert_eq!(received, request);
+    assert_eq!(eof, 0);
+
+    let (left, mut right) = UnixStream::pair().unwrap();
+    let server = std::thread::spawn(move || {
+        let received: protocol::Request = protocol::read_frame(&mut right).unwrap();
+        protocol::write_frame(
+            &mut right,
+            &protocol::Reply {
+                id: received.id,
+                payload: serde_json::json!({"result": true}),
+            },
+        )
+        .unwrap();
+        received
+    });
+    let mut second = Some(left);
+    let mut connects = 0;
+    let reply = client::call(&request, true, || {
+        connects += 1;
+        if connects == 1 {
+            Err(io::Error::from(io::ErrorKind::ConnectionRefused))
+        } else {
+            second
+                .take()
+                .ok_or_else(|| io::Error::from(io::ErrorKind::ConnectionRefused))
+        }
+    })
+    .unwrap();
+    assert_eq!(connects, 2, "connection failure should retry");
+    assert_eq!(server.join().unwrap(), request);
+    assert_eq!(reply.payload, serde_json::json!({"result": true}));
+}
+
+/// Plays the daemon for one CLI call: binds the fixture socket, starts
+/// the CLI and returns once its whole request has arrived, so a caller's
+/// clock starts at the CLI's reply wait, not at its launch.
+fn fake_daemon_cli(
     home: &Path,
     root: &Path,
+    operation: &str,
     configure: impl FnOnce(&mut Command),
 ) -> (
     Owned,
@@ -2435,7 +2414,7 @@ fn fake_daemon_index(
     listener.set_nonblocking(true).unwrap();
     let mut command = cli(home);
     command
-        .arg("index")
+        .arg(operation)
         .arg("--workspace")
         .arg(root)
         .stdout(Stdio::piped())
@@ -2458,7 +2437,7 @@ fn fake_daemon_index(
         .unwrap();
     let request: trellis::daemon::protocol::Request =
         trellis::daemon::protocol::read_frame(&mut stream).unwrap();
-    assert_eq!(request.operation, "index");
+    assert_eq!(request.operation, operation);
     (index, stream, request)
 }
 
@@ -2502,7 +2481,7 @@ fn cli_index_waits_past_the_cli_reply_bound_for_its_reply() {
     let _daemon = AutoDaemonGuard::for_home(&home);
     let root = checkout(temp.path(), "stalled");
     let mut past_bound = Duration::ZERO;
-    let (mut index, mut stream, request) = fake_daemon_index(&home, &root, |command| {
+    let (mut index, mut stream, request) = fake_daemon_cli(&home, &root, "index", |command| {
         past_bound = lower_cli_reply_bound(command);
     });
     // The old bound would have expired half a second before this check.
@@ -2525,6 +2504,26 @@ fn cli_index_waits_past_the_cli_reply_bound_for_its_reply() {
     assert_eq!(serde_json::from_str::<Value>(&out).unwrap(), result);
 }
 
+/// A silent daemon after accepting a read-only CLI request has exceeded the
+/// socket reply bound, not become unavailable. Receiving the request first
+/// synchronizes the test with the beginning of the reply wait.
+#[test]
+fn cli_read_reply_timeout_is_deadline_exceeded() {
+    let temp = short_temp();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let _daemon = AutoDaemonGuard::for_home(&home);
+    let root = checkout(temp.path(), "silent-read");
+    let (mut status, _stream, _request) = fake_daemon_cli(&home, &root, "status", |command| {
+        command.env("TRELLIS_TEST_CLI_REPLY_BOUND_MS", "100");
+    });
+    let (exit, out, err) = finished(&mut status);
+    assert!(!exit.success());
+    assert!(out.is_empty(), "read returned partial output: {out}");
+    assert!(err.contains("deadline_exceeded"), "{err}");
+    assert!(!err.contains("daemon_unavailable"), "{err}");
+}
+
 /// #179: the index wait is still bounded. Its backstop (10 minutes, shrunk
 /// here) ends a wait with no reply as `outcome_unknown`.
 #[test]
@@ -2534,7 +2533,7 @@ fn cli_index_reply_wait_ends_at_its_backstop() {
     fs::create_dir(&home).unwrap();
     let _daemon = AutoDaemonGuard::for_home(&home);
     let root = checkout(temp.path(), "silent");
-    let (mut index, _stream, _request) = fake_daemon_index(&home, &root, |command| {
+    let (mut index, _stream, _request) = fake_daemon_cli(&home, &root, "index", |command| {
         command.env("TRELLIS_TEST_INDEX_REPLY_BOUND_MS", "500");
     });
     let (status, _, err) = finished(&mut index);
