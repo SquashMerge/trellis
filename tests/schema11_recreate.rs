@@ -61,12 +61,12 @@ fn schema11_marker_recreates_exclusively_with_spooled_revision() {
     let report = roots.gc_report_at(1_800_000_000).unwrap();
     assert_eq!(
         (report.derived[0].status, report.derived[0].reason),
-        ("unknown", "unknown_index_schema")
+        ("eligible", "old_schema")
     );
     assert_eq!(
         fs::read(&path).unwrap(),
         old_bytes,
-        "GC must not mutate an obsolete index"
+        "a GC report must not mutate an obsolete index"
     );
 
     let store = Store::open_for_tests(state.path(), &root).unwrap();
