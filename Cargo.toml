@@ -21,20 +21,20 @@ icu_normalizer = { version = "2.3.0", default-features = false, features = ["com
 libc = "0.2"
 notify = "8"
 protobuf = "3"
-rand = "0.9"
+rand = "0.10"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 rusqlite = { version = "0.40", features = ["bundled", "blob"] }
 scip = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["arbitrary_precision", "raw_value"] }
-sha2 = "0.10"
+sha2 = "0.11"
 subtle = "2"
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }
-toml = "0.9"
+toml = "1.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tree-sitter = "0.25"
+tree-sitter = "0.27"
 tree-sitter-java = "0.23"
 tree-sitter-javascript = "0.25"
 tree-sitter-python = "0.25"
@@ -43,7 +43,7 @@ uuid = { version = "1", features = ["v4"] }
 
 [build-dependencies]
 # build.rs hashes the native extraction inputs (build/extractor_inputs.rs).
-sha2 = "0.10"
+sha2 = "0.11"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
