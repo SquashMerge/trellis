@@ -183,7 +183,7 @@ impl DaemonState {
     /// options win; otherwise recorded inputs, then the FIFO head's, then the
     /// daemon defaults. Recreation uses the FIFO head, retained watcher
     /// options, then daemon defaults when no explicit options are registered.
-    fn startup_options(&self) -> anyhow::Result<Option<IndexOptions>> {
+    fn startup_options(&self) -> anyhow::Result<IndexOptions> {
         let config = self.config();
         let explicit = config.explicit_options;
         // The FIFO head is read first, even when unused: a typed failure to
@@ -194,7 +194,7 @@ impl DaemonState {
             .transpose()?;
         if self.store.is_recreate_pending() {
             if explicit {
-                return Ok(Some(config.options.clone()));
+                return Ok(config.options.clone());
             }
             let watched = self
                 .watcher_work
@@ -202,14 +202,12 @@ impl DaemonState {
                 .unwrap()
                 .as_ref()
                 .map(|(_, watcher)| watcher.options());
-            return Ok(Some(
-                head.or(watched).unwrap_or_else(|| config.options.clone()),
-            ));
+            return Ok(head.or(watched).unwrap_or_else(|| config.options.clone()));
         }
         if explicit {
-            return Ok(Some(config.options.clone()));
+            return Ok(config.options.clone());
         }
-        Ok(Some(match self.store.recorded_index_options() {
+        Ok(match self.store.recorded_index_options() {
             Ok(Some(recorded)) => recorded,
             Ok(None) => head.unwrap_or_else(|| config.options.clone()),
             Err(error) if crate::store::Store::is_rebuild_failure(&error) => {
@@ -222,7 +220,7 @@ impl DaemonState {
                 watched.or(head).unwrap_or_else(|| config.options.clone())
             }
             Err(error) => return Err(error),
-        }))
+        })
     }
 
     /// The FIFO head as startup reconciliation sees it.
@@ -254,9 +252,7 @@ impl DaemonState {
         if let Some((session, options)) = retained {
             let options = match options {
                 Some(options) => options,
-                None => self.startup_options()?.ok_or_else(|| {
-                    anyhow::anyhow!("recovery_required: index options unavailable")
-                })?,
+                None => self.startup_options()?,
             };
             let coordinator = crate::index_coordinator::IndexJobCoordinator::prepare_with_session(
                 &self.store,
@@ -269,7 +265,7 @@ impl DaemonState {
         let options = self.startup_options()?;
         crate::index_coordinator::establish_serving_session(
             &self.store,
-            options.as_ref(),
+            Some(&options),
             &Arc::new(AtomicBool::new(false)),
         )
     }

@@ -148,3 +148,49 @@ fn sqlite_witness_resource_limit_does_not_schedule_recovery() {
     assert_eq!(store.status().unwrap().revision, pin);
     assert!(store.source("f0.js").unwrap().is_some());
 }
+
+#[test]
+fn exceptional_recheck_without_file_damage_rebuilds_in_place() {
+    use std::os::unix::fs::MetadataExt;
+
+    let (_state, root, store) = published_store();
+    let before = store.status().unwrap().revision;
+    let index = store.roots.index_db(&store.identity);
+    let inode = std::fs::metadata(&index).unwrap().ino();
+    let (page_size, root_page): (u32, u32) = {
+        let db = store.cache().unwrap();
+        (
+            db.pragma_query_value(None, "page_size", |row| row.get(0))
+                .unwrap(),
+            db.query_row(
+                "SELECT rootpage FROM sqlite_schema WHERE name='graph_nodes' AND type='table'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap(),
+        )
+    };
+    let offset = u64::from(root_page - 1) * u64::from(page_size);
+    let original = std::fs::read(&index).unwrap()[offset as usize];
+    {
+        let mut file = OpenOptions::new().write(true).open(&index).unwrap();
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        file.write_all(&[0]).unwrap();
+        file.sync_all().unwrap();
+    }
+    assert_file_corruption(&store.symbols("f0", 10).unwrap_err(), &store);
+    // Repair the triggering page only after EX admission, so the recheck passes
+    // without erasing the earlier corruption observation or its recovery fence.
+    let restored = index.clone();
+    store.test_exclusive_recovery_hook.set(move || {
+        let mut file = OpenOptions::new().write(true).open(restored).unwrap();
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        file.write_all(&[original]).unwrap();
+        file.sync_all().unwrap();
+    });
+    reconcile_and_read(&store, root.path());
+    let after = store.status().unwrap().revision;
+    assert_ne!(before.index_generation, after.index_generation);
+    assert_eq!(after.index_revision, 1);
+    assert_eq!(std::fs::metadata(index).unwrap().ino(), inode);
+}

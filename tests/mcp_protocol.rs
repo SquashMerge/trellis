@@ -8202,6 +8202,8 @@ async fn mcp_corrupt_find_declaration_outgoing_omit_current_basis_but_stale_pin_
     })
     .await
     .expect("runtime did not complete startup");
+    let scheduler = runtime.browser_scheduler().unwrap();
+    let _worker = scheduler.hold_worker_for_tests();
     let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
     for corrupt in [false, true] {
         if corrupt {

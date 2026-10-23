@@ -7409,13 +7409,27 @@ impl Store {
                     );
                     obsolete = Some(found.0.clone());
                 }
-                recovery_class(&error)
+                let class = recovery_class(&error);
+                if class == RecoveryClass::Hard
+                    && self.disposition() != RecoveryDisposition::RootReplaced
+                {
+                    return Err(error);
+                }
+                class
             }
             Ok(db) => {
                 let result = self.recovery_baseline_full(&db);
                 drop(db);
                 match result {
-                    Err(error) => recovery_class(&error),
+                    Err(error) => {
+                        let class = recovery_class(&error);
+                        if class == RecoveryClass::Hard
+                            && self.disposition() != RecoveryDisposition::RootReplaced
+                        {
+                            return Err(error);
+                        }
+                        class
+                    }
                     Ok(_) if self.disposition() == RecoveryDisposition::RecreatePending => {
                         // Control reads cannot detect corruption inside FTS segments.
                         // Reconfirm it under EX without changing the live index.
@@ -7455,6 +7469,37 @@ impl Store {
                 journal.is_none(),
                 "recovery_required: root replacement has hot journal"
             );
+        } else if cause == RecoveryClass::Rebuild {
+            // The exclusive probe did not confirm file-level damage. Keep the
+            // recovery fence, but rebuild in place instead of replacing the inode.
+            check_cancel(cancel)?;
+            old.verify()?;
+            self.identity.verify()?;
+            leader.verify_exclusive_use(&self.roots.index_use_lock(&self.identity))?;
+            leader.downgrade_use_to_shared()?;
+            self.recovery_disposition
+                .compare_exchange(
+                    RecoveryDisposition::RecreatePending as u8,
+                    RecoveryDisposition::Rebuild as u8,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .map_err(|_| anyhow::anyhow!("recovery_required: disposition changed under EX"))?;
+            let _publication = self.enter_publication(cancel, Duration::from_millis(250))?;
+            let expected = self.publication_index_baseline()?;
+            let capture = crate::capture::Capture::admit(options, cancel, &|_| {})?;
+            let spool = crate::native_evidence::spool_full_capture(
+                options,
+                &capture,
+                &self.identity.root,
+                self.root_id(),
+                cancel,
+                &|_| {},
+                |_, _| {},
+                &self.native_spool_dir()?,
+            )?;
+            return self
+                .publish_validated_stream_recovery(&spool, &capture, leader, expected, cancel);
         } else {
             ensure!(
                 cause == RecoveryClass::RecreatePending,
@@ -9807,7 +9852,7 @@ impl Store {
         // writers, while the metadata CAS excludes stale in-process requests.
         let after_preflight: i64 =
             storage_result(db.pragma_query_value(None, "data_version", |row| row.get(0)))?;
-        selected_ensure!(
+        ensure!(
             after_preflight == admitted_version,
             "incompatible_index: index changed during unchanged preflight"
         );
