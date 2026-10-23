@@ -130,15 +130,28 @@ async fn optional_endpoint_matrix() {
 }
 #[tokio::test]
 async fn recreated_index_rejects_old_generation_at_reused_numeric_revision() {
-    let (temp, store, graph, app, id) = fixture();
+    let (temp, store, graph, state, app, id) = fixture_with_state();
     let old = store.status().unwrap().revision;
     let old_source = format!("/api/source?path=Types.java&{}", query(old));
     assert_eq!(call(&app, "GET", &old_source, Value::Null).await.0, 200);
 
     // Simulate deleting a disposable index while the non-Git workspace remains unchanged.
     // This is not an in-place rebuild or a #39 full rebuild publication path.
+    // The checkout worker may still own the old state, and its SQLite connection,
+    // mid-step (#256). Retire it and wait for actual owner release before unlinking.
+    state.release_checkout_runtime_for_fixture();
+    let retired = Arc::downgrade(&state);
     drop(app);
+    drop(state);
     drop(store);
+    let deadline = std::time::Instant::now() + trellis::testing::HANG_BACKSTOP;
+    while retired.upgrade().is_some() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "old daemon owner leaked"
+        );
+        tokio::task::yield_now().await;
+    }
     let indexes = temp.path().join("state/cache/indexes");
     let index_dir = std::fs::read_dir(&indexes)
         .unwrap()
