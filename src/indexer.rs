@@ -1307,32 +1307,21 @@ pub fn validate_native_graph(
     validate_native_graph_records(graph, native, cancel)
 }
 
-/// Cross-witness only the supplied graph rows against native facts. A read may
-/// supply one selected document; this never projects a second whole graph.
+/// Cross-witness only the supplied graph rows against native facts at write
+/// time; this never projects a second whole graph. Selected reads project
+/// their graph from attested native rows instead (#254).
 pub(crate) fn validate_native_graph_records(
     graph: &Graph,
     native: &native_evidence::Artifact,
     cancel: &CancelFlag,
 ) -> Result<()> {
-    validate_native_graph_records_with_progress(graph, native, cancel, None)
-}
-pub(crate) fn validate_native_graph_records_with_progress(
-    graph: &Graph,
-    native: &native_evidence::Artifact,
-    cancel: &CancelFlag,
-    progress: Option<&dyn Fn() -> bool>,
-) -> Result<()> {
-    crate::store::optional_hint_check(progress)?;
     let mut files = BTreeMap::new();
     for file in &graph.files {
-        crate::store::optional_hint_check(progress)?;
         files.insert(file.path.as_str(), file);
     }
     let lines = line_indexes(&files);
-    crate::store::optional_hint_check(progress)?;
     let mut declaration_keys = BTreeMap::new();
     for d in &native.declarations {
-        crate::store::optional_hint_check(progress)?;
         let key = (
             d.document.path.as_str(),
             serde_json::to_string(&d.ancestors)?,
@@ -1345,7 +1334,6 @@ pub(crate) fn validate_native_graph_records_with_progress(
     }
     let mut symbols = BTreeMap::new();
     for node in &graph.nodes {
-        crate::store::optional_hint_check(progress)?;
         symbols.insert(node.id.as_str(), node);
     }
     ensure!(
@@ -1353,7 +1341,6 @@ pub(crate) fn validate_native_graph_records_with_progress(
         "native_evidence_required: graph declaration cardinality"
     );
     for d in &native.declarations {
-        crate::store::optional_hint_check(progress)?;
         ensure!(!cancel.load(Ordering::Relaxed), "indexing cancelled");
         let f = files
             .get(d.document.path.as_str())
@@ -1396,7 +1383,6 @@ pub(crate) fn validate_native_graph_records_with_progress(
     }
     let mut regions = BTreeMap::new();
     for region in &graph.regions {
-        crate::store::optional_hint_check(progress)?;
         regions.insert(region.id.as_str(), region);
     }
     ensure!(
@@ -1404,7 +1390,6 @@ pub(crate) fn validate_native_graph_records_with_progress(
         "native_evidence_required: graph region cardinality"
     );
     for r in &native.control_regions {
-        crate::store::optional_hint_check(progress)?;
         ensure!(!cancel.load(Ordering::Relaxed), "indexing cancelled");
         let f = files
             .get(r.document.path.as_str())
@@ -1428,7 +1413,6 @@ pub(crate) fn validate_native_graph_records_with_progress(
     }
     let mut calls = BTreeMap::new();
     for call in &graph.calls {
-        crate::store::optional_hint_check(progress)?;
         calls.insert(call.id.as_str(), call);
     }
     ensure!(
@@ -1436,7 +1420,6 @@ pub(crate) fn validate_native_graph_records_with_progress(
         "native_evidence_required: graph call cardinality"
     );
     for c in &native.calls {
-        crate::store::optional_hint_check(progress)?;
         ensure!(!cancel.load(Ordering::Relaxed), "indexing cancelled");
         let f = files
             .get(c.document.path.as_str())
@@ -1470,7 +1453,6 @@ pub(crate) fn validate_native_graph_records_with_progress(
     };
     let mut diagnostics = Vec::new();
     for c in &native.coverage {
-        crate::store::optional_hint_check(progress)?;
         if c.state != "complete" {
             let recovered = c
                 .diagnostic
@@ -1494,7 +1476,6 @@ pub(crate) fn validate_native_graph_records_with_progress(
             });
         }
     }
-    crate::store::optional_hint_check(progress)?;
     ensure!(
         graph.stats == stats && graph.diagnostics == diagnostics,
         "native_evidence_required: graph diagnostics or statistics differ from native coverage"

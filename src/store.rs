@@ -12811,13 +12811,8 @@ impl Store {
                 });
             }
         }
-        optional_hint_check(progress)?;
-        crate::indexer::validate_native_graph_records_with_progress(
-            &graph,
-            &witness,
-            &Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            progress,
-        )?;
+        // The graph was projected from the stored native rows, which equal the
+        // source witness above; re-deriving it against the witness repeats that.
         if matches!(language.as_str(), "java" | "python") {
             optional_hint_check(progress)?;
             let expected_f = crate::classes::FileExtraction::extract_file_with_progress(
