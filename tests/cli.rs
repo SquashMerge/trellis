@@ -400,8 +400,7 @@ fn unchanged_serve_reuses_selected_versions_and_detects_selected_source_corrupti
         "graph_projections",
         "class_projections",
         "graph_nodes",
-        "graph_calls",
-        "graph_regions",
+        "graph_display_labels",
         "classes",
         "class_relations",
         "native_version_declarations",
@@ -2480,7 +2479,7 @@ fn real_native_snapshot(home: &std::path::Path) -> Value {
     // Generation-specific binding control is checked separately; compare the
     // actual native/graph/class evidence across independent CLI/daemon roots.
     // Decision 0013's trigram prefilter tables are derived search state.
-    let mut names = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE '%trigrams%' AND name!='native_binding_epoch' AND name!='native_revision_supersessions' AND (name LIKE 'native_%' OR name IN ('document_versions','revision_documents','revision_capture_inputs','graph_projections','graph_nodes','graph_calls','graph_regions','class_projections','classes','class_relations')) ORDER BY name").unwrap();
+    let mut names = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE '%trigrams%' AND name!='native_binding_epoch' AND name!='native_revision_supersessions' AND (name LIKE 'native_%' OR name IN ('document_versions','revision_documents','revision_capture_inputs','graph_projections','graph_nodes','graph_display_labels','class_projections','classes','class_relations')) ORDER BY name").unwrap();
     for name in names.query_map([], |r| r.get::<_, String>(0)).unwrap() {
         let name = name.unwrap();
         let (predicate, alias) = match name.as_str() {
@@ -2514,7 +2513,7 @@ fn real_native_snapshot(home: &std::path::Path) -> Value {
                 "id IN (SELECT graph_projection_id FROM revision_documents WHERE revision_id=?1)",
                 "",
             ),
-            "graph_nodes" | "graph_calls" | "graph_regions" => (
+            "graph_nodes" | "graph_display_labels" => (
                 "projection_id IN (SELECT graph_projection_id FROM revision_documents WHERE revision_id=?1)",
                 "",
             ),
@@ -2572,8 +2571,8 @@ fn real_native_snapshot(home: &std::path::Path) -> Value {
     }
     assert_eq!(
         all_rows.len(),
-        32,
-        "retain every v9 evidence table in raw snapshot"
+        31,
+        "retain every schema-13 evidence table in raw snapshot"
     );
     serde_json::json!({"sourceSet":{"id":source_set.0,"rootId":source_set.1},
         "revision":{"id":revision.0,"sourceSetId":revision.1,"toolchainHash":revision.2,
@@ -3724,7 +3723,7 @@ def sink():
         assert_eq!(
             same_bytes_evidence(&native_after),
             same_bytes_evidence(&post_start_native),
-            "{name}: all 32 v9 evidence tables and documents must match after only publication identity normalization"
+            "{name}: all 31 schema-13 evidence tables and documents must match after only publication identity normalization"
         );
         assert_eq!(
             graph_after, graph_before,
@@ -4055,9 +4054,9 @@ def sink():
             )
             .unwrap();
             assert_eq!(
-                sequence["steps"],
-                serde_json::json!(expected_sequence.steps),
-                "{name}: no extra invented or null-call steps beyond captured source projection"
+                sequence,
+                serde_json::to_value(&expected_sequence).unwrap(),
+                "{name}: complete sequence wire matches the captured source projection"
             );
 
             let (code, preview) = captured
@@ -4555,8 +4554,8 @@ async fn saved_items_real_index_matrix() {
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
     assert_eq!(
-        index_version, 12,
-        "derived v12 index inspection is separate"
+        index_version, 13,
+        "derived v13 index inspection is separate"
     );
 
     let edited_view_body = serde_json::json!({

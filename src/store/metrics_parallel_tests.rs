@@ -8,7 +8,7 @@ fn corrupt(store: &Store, table: &str, column: &str, path: &str) {
     db.pragma_update(None, "foreign_keys", "OFF").unwrap();
     let changed = db
         .execute(
-            &format!("UPDATE {table} SET {column}={column}||'x' WHERE path=?1"),
+            &format!("UPDATE {table} SET {column}={column}||'x' WHERE projection_id=(SELECT graph_projection_id FROM revision_documents WHERE path=?1)"),
             [path],
         )
         .unwrap();
@@ -66,8 +66,20 @@ fn metrics_documents_are_attested_and_computed_concurrently() {
 fn the_first_failure_in_manifest_order_is_reported_when_a_later_one_fails_first() {
     let (_state, _root, store) = published_store(3);
     corrupt(&store, "graph_nodes", "name", "f0.js");
-    corrupt(&store, "graph_calls", "caller", "f2.js");
-    // f0 resumes only after f2's work has returned its failure.
+    // A valid role change leaves graph derivation intact but fails the worker's
+    // native-vs-source attestation with a different error from f0's node check.
+    let db = Connection::open(store.roots.index_db(&store.identity)).unwrap();
+    let changed = db
+        .execute(
+            "UPDATE native_version_declarations
+             SET role=CASE role WHEN 'production' THEN 'test' ELSE 'production' END
+             WHERE version_id=(SELECT document_version_id FROM revision_documents WHERE path='f2.js')",
+            [],
+        )
+        .unwrap();
+    assert!(changed > 0, "f2.js has native declarations");
+    drop(db);
+    // f0 resumes only after f2's worker has returned its distinct failure.
     hold_until(&store, "f0.js", "f2.js", MetricsDocumentStage::Done);
     let (result, _) = metrics_with(&store, 3, u64::MAX, &mut || Ok(()));
     let error = result.unwrap_err();
@@ -106,17 +118,30 @@ fn a_document_over_the_read_ahead_budget_is_held_alone() {
 }
 
 #[test]
-fn read_ahead_never_holds_more_than_its_budget() {
+fn read_ahead_counts_one_carried_document_at_a_chunk_boundary() {
     let (_state, _root, store) = published_store(12);
     let (_, unbounded) = metrics_with(&store, 3, u64::MAX, &mut || Ok(()));
     let largest = *unbounded.charges.iter().max().unwrap();
-    // Room for about three documents across both read-ahead chunks.
-    let budget = largest * 3;
+    // Each chunk fits one fixture document; fetching the next one crosses
+    // its boundary while both pending and current chunks are still held.
+    let budget = largest * 2;
     let (payload, trace) = metrics_with(&store, 3, budget, &mut || Ok(()));
     assert_eq!(payload.unwrap().files.len(), 12);
-    assert!(trace.max_resident_bytes <= budget, "{trace:?}");
+    let boundary = trace
+        .boundaries
+        .iter()
+        .find(|&&(pending, current, carried)| pending > 0 && current > 0 && carried > 0)
+        .expect("lookahead crosses a chunk boundary before pending acceptance");
+    assert!(boundary.0 + boundary.1 <= budget, "{trace:?}");
+    assert!(boundary.2 <= largest, "{trace:?}");
     assert!(
-        trace.max_resident_documents >= 2,
-        "documents still overlap: {trace:?}"
+        boundary.0 + boundary.1 + boundary.2 > budget,
+        "the carried document crosses the two-chunk budget: {trace:?}"
     );
+    assert!(
+        trace.max_resident_bytes >= boundary.0 + boundary.1 + boundary.2,
+        "peak includes pending + current + carried: {trace:?}"
+    );
+    assert!(trace.max_resident_bytes <= budget + largest, "{trace:?}");
+    assert!(trace.max_resident_documents >= 3, "{trace:?}");
 }

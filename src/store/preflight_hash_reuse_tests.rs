@@ -177,7 +177,7 @@ fn equal_stored_hashes_reuse_without_decoding_stored_rows() {
     corrupt(
         &store,
         pin,
-        "UPDATE graph_nodes SET payload='{}'
+        "UPDATE graph_nodes SET name=name||'not-a-matching-name'
          WHERE projection_id=(SELECT graph_projection_id FROM revision_documents
                               WHERE revision_id=?1 AND path=?2)",
     );

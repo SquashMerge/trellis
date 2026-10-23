@@ -252,7 +252,7 @@ fn prompt_keeps_pair() {
 }
 
 #[tokio::test]
-async fn first_question_preview_rejects_same_pin_forged_graph_callee_before_packet_creation() {
+async fn first_question_preview_rejects_same_pin_forged_native_callee_before_packet_creation() {
     use axum::{
         body::{Body, to_bytes},
         http::Request,
@@ -337,26 +337,26 @@ function helper() {}
         .unwrap()
         .join("index.db");
     let db = rusqlite::Connection::open(db_path).unwrap();
-    let (projection_id,id):(String,String) = db
-        .query_row("SELECT c.projection_id,c.id FROM graph_calls c JOIN revision_documents m ON m.graph_projection_id=c.projection_id JOIN native_revisions r ON r.id=m.revision_id JOIN index_metadata current ON current.index_revision=r.published_index_revision WHERE m.path='a.js' LIMIT 1", [], |r| {
-            Ok((r.get(0)?,r.get(1)?))
-        })
-        .unwrap();
-    let payload: String = db
+    let version_id: String = db
         .query_row(
-            "SELECT payload FROM graph_calls WHERE projection_id=?1 AND id=?2",
-            rusqlite::params![projection_id, id],
+            "SELECT m.document_version_id FROM revision_documents m
+             JOIN native_revisions r ON r.id=m.revision_id
+             JOIN index_metadata current ON current.index_revision=r.published_index_revision
+             WHERE m.path='a.js' LIMIT 1",
+            [],
             |r| r.get(0),
         )
         .unwrap();
-    let mut forged: Value = serde_json::from_str(&payload).unwrap();
-    assert!(forged["calleeText"].is_string());
-    forged["calleeText"] = json!("sqlInventedCallee");
-    db.execute(
-        "UPDATE graph_calls SET payload=?1 WHERE projection_id=?2 AND id=?3",
-        rusqlite::params![forged.to_string(), projection_id, id],
-    )
-    .unwrap();
+    assert_eq!(
+        db.execute(
+            "UPDATE native_version_calls SET spelling='sqlInventedCallee'
+             WHERE version_id=?1 AND id=(SELECT id FROM native_version_calls
+             WHERE version_id=?1 AND spelling IS NOT NULL ORDER BY id LIMIT 1)",
+            [&version_id],
+        )
+        .unwrap(),
+        1,
+    );
     assert_eq!(store.status().unwrap().revision, pin);
     let response = app.clone().oneshot(preview(&seed)).await.unwrap();
     assert_eq!(response.status(), 503);

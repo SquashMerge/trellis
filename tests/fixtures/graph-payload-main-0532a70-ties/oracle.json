@@ -1,0 +1,84 @@
+{
+  "writerCommit": "0532a7090003904317136aeac98a23716aea1fc2",
+  "writerBinarySha256": "536cdd7231b66c7a8e807d528084b6f00377a96d425ca6c5183a7a7728ff7d9f",
+  "sourceSha256": "c384e71ccd4a2a5268bb0bda6099e3a1db3d7ad19f0eed3c7b0907b816f6e715",
+  "documentVersionId": "document:v1:be47d3f97485f1b888845d313adc257a79b5014f16fea495ad69038c0fe0b816",
+  "graphProjectionId": "graph:v1:fd0bbb45cb3ffc1d687e23cb51ab86d4729deed2bddb426aa56f54eda3ab5861",
+  "graphHash": "fd0bbb45cb3ffc1d687e23cb51ab86d4729deed2bddb426aa56f54eda3ab5861",
+  "classExtraction": "",
+  "classProjectionId": "class-projection:v1:bf8479b4917603c5c822c602f12ff390d21ef2c4569ea86ee9669fa8477aff3c",
+  "classHash": "bf8479b4917603c5c822c602f12ff390d21ef2c4569ea86ee9669fa8477aff3c",
+  "seed": "sid:v1:e493b84cc86c98985e2d910ae9a89b04",
+  "rows": {
+    "nodes": [
+      {
+        "id": "sid:v1:58206b3bdbfe1730bff8b9cc81769a6a",
+        "payload": "{\"id\":\"sid:v1:58206b3bdbfe1730bff8b9cc81769a6a\",\"name\":\"done\",\"kind\":\"function\",\"path\":\"nested.js\",\"range\":{\"startByte\":25,\"endByte\":43,\"startLine\":1,\"startColumn\":26,\"endLine\":1,\"endColumn\":44},\"parent\":\"sid:v1:656c64e1f053541d6a07ac04b98263b5\",\"accessor\":false,\"provenance\":{\"source\":\"native-measuredSyntax\",\"semantic\":\"unavailable\"}}",
+        "sha256": "c9430082a5823605505a1fe68dc217058f68f4dfdc8c17f98733691b0b9581f9"
+      },
+      {
+        "id": "sid:v1:656c64e1f053541d6a07ac04b98263b5",
+        "payload": "{\"id\":\"sid:v1:656c64e1f053541d6a07ac04b98263b5\",\"name\":\"make\",\"kind\":\"function\",\"path\":\"nested.js\",\"range\":{\"startByte\":0,\"endByte\":46,\"startLine\":1,\"startColumn\":1,\"endLine\":1,\"endColumn\":47},\"parent\":null,\"accessor\":false,\"provenance\":{\"source\":\"native-measuredSyntax\",\"semantic\":\"unavailable\"}}",
+        "sha256": "66759aead1e7c3ae646e3299c7e4923c91c51f81fe31506a605db2c90e7b63ae"
+      },
+      {
+        "id": "sid:v1:cec260e1c0f49ccd34084c5b08d156a1",
+        "payload": "{\"id\":\"sid:v1:cec260e1c0f49ccd34084c5b08d156a1\",\"name\":\"nested.js\",\"kind\":\"module\",\"path\":\"nested.js\",\"range\":{\"startByte\":0,\"endByte\":87,\"startLine\":1,\"startColumn\":1,\"endLine\":5,\"endColumn\":1},\"parent\":null,\"accessor\":false,\"provenance\":{\"source\":\"native-measuredSyntax\",\"semantic\":\"unavailable\"}}",
+        "sha256": "3cc76e2676f9bdb8d11e65241f828b47f2916edd3d6ae403273b805943618fec"
+      },
+      {
+        "id": "sid:v1:e493b84cc86c98985e2d910ae9a89b04",
+        "payload": "{\"id\":\"sid:v1:e493b84cc86c98985e2d910ae9a89b04\",\"name\":\"call_chain\",\"kind\":\"function\",\"path\":\"nested.js\",\"range\":{\"startByte\":47,\"endByte\":86,\"startLine\":2,\"startColumn\":1,\"endLine\":4,\"endColumn\":2},\"parent\":null,\"accessor\":false,\"provenance\":{\"source\":\"native-measuredSyntax\",\"semantic\":\"unavailable\"}}",
+        "sha256": "a21664ce0d6fab11e258f8fbc4268adc01ce3cb0f086fa7fda2776de1199fd8a"
+      }
+    ],
+    "calls": [
+      {
+        "id": "occ:v2:21fd8896f667781152cfb61a0f0e89f0",
+        "payload": "{\"id\":\"occ:v2:21fd8896f667781152cfb61a0f0e89f0\",\"caller\":\"sid:v1:e493b84cc86c98985e2d910ae9a89b04\",\"calleeText\":\"make\",\"path\":\"nested.js\",\"range\":{\"startByte\":75,\"endByte\":81,\"startLine\":3,\"startColumn\":5,\"endLine\":3,\"endColumn\":11},\"calleeRange\":{\"startByte\":75,\"endByte\":79,\"startLine\":3,\"startColumn\":5,\"endLine\":3,\"endColumn\":9},\"ordinal\":0,\"regions\":[],\"provenance\":{\"source\":\"native-measuredSyntax\",\"semantic\":\"unavailable\"}}",
+        "sha256": "60fdd6de9ebf3f28ab4f0d13992d351d8227fd24147c2f9ad072d7afeceefefe"
+      },
+      {
+        "id": "occ:v2:c6479e7a399102f8d6e92ac5d2333323",
+        "payload": "{\"id\":\"occ:v2:c6479e7a399102f8d6e92ac5d2333323\",\"caller\":\"sid:v1:e493b84cc86c98985e2d910ae9a89b04\",\"calleeText\":\"make()\",\"path\":\"nested.js\",\"range\":{\"startByte\":75,\"endByte\":83,\"startLine\":3,\"startColumn\":5,\"endLine\":3,\"endColumn\":13},\"calleeRange\":null,\"ordinal\":1,\"regions\":[],\"provenance\":{\"source\":\"native-measuredSyntax\",\"semantic\":\"unavailable\"}}",
+        "sha256": "e2a90c7365d822970dfbad92763fbc0c934114fad38e3389a8c00e68111815b8"
+      }
+    ],
+    "regions": []
+  },
+  "queries": {
+    "max1": {
+      "cliSha256": "cae04609b4991e21990d914db0beee693883609d4dcf8f6197e8de3c3a73cc7a",
+      "calls": [
+        "occ:v2:c6479e7a399102f8d6e92ac5d2333323"
+      ],
+      "truncated": true,
+      "warnings": [
+        "Measured calls truncated at the request limit."
+      ],
+      "maxCalls": 1,
+      "excludePaths": []
+    },
+    "max2": {
+      "cliSha256": "3d0b93befeaa17d717d88957f796a48ba7594b41602db80507f1a1792067e158",
+      "calls": [
+        "occ:v2:c6479e7a399102f8d6e92ac5d2333323",
+        "occ:v2:21fd8896f667781152cfb61a0f0e89f0"
+      ],
+      "truncated": false,
+      "warnings": [],
+      "maxCalls": 2,
+      "excludePaths": []
+    },
+    "excluded": {
+      "cliSha256": "613e711ed575b5dd89ed4ef71aee05928a361373bfe5cadb3baec6f2f6fc3e0e",
+      "calls": [],
+      "truncated": false,
+      "warnings": [],
+      "maxCalls": 1,
+      "excludePaths": [
+        "nested.js"
+      ]
+    }
+  }
+}

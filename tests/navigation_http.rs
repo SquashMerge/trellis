@@ -495,13 +495,119 @@ async fn source_candidate_count_and_huge_cached_text_have_fixed_output_limits() 
     }
     text.push('\n');
     text.push_str(&" ".repeat(700_000));
-    let (dir, _store, _graph, app, _session) = setup(&[("Many.java", &text)]);
+    let (dir, _store, graph, app, _session) = setup(&[("Many.java", &text)]);
     let (_, view) = call(&app, source("Many.java", 1, &dir)).await;
     assert_eq!(view["truncated"], true);
-    assert!(view["targets"].as_array().unwrap().len() <= 64);
+    let targets = view["targets"].as_array().unwrap();
+    assert_eq!(targets.len(), 64);
+    // The source line is filtered before the id sort and 129-row overflow probe.
+    // All 200 measured classes start on line one; only the first 64 fit the wire.
+    let mut line_one: Vec<_> = graph
+        .nodes
+        .iter()
+        .filter(|node| {
+            node.path == "Many.java" && node.range.start_line == 1 && node.kind == SymbolKind::Class
+        })
+        .collect();
+    line_one.sort_by(|a, b| a.id.cmp(&b.id));
+    assert_eq!(line_one.len(), 200);
+    for (target, expected) in targets.iter().zip(line_one.iter()) {
+        assert_eq!(target["symbol"], serde_json::to_value(expected).unwrap());
+        assert_eq!(target["reason"], "declaration");
+    }
+    assert_eq!(
+        view["warnings"],
+        json!(["Navigation limits reached; some cached evidence or targets were omitted."])
+    );
     assert!(serde_json::to_vec(&view).unwrap().len() <= 512 * 1024);
-    assert_eq!(call(&app, source("Many.java", 2, &dir)).await.0, 200);
+    let (status, other_line) = call(&app, source("Many.java", 2, &dir)).await;
+    assert_eq!(status, 200);
+    assert_eq!(other_line["targets"], json!([]));
     assert_eq!(call(&app, source("Many.java", 3, &dir)).await.0, 400);
+}
+
+#[tokio::test]
+async fn main_31c_source_filter_order_and_limit_are_stable() {
+    // Frozen from main 31c63fa's HTTP response on a fresh home. The full raw
+    // response and export are retained under odin/trellis-evidence/s123/s3/review/navigation-main31c.
+    let text = include_str!("fixtures/navigation-main-31c-mixed/Mixed.java");
+    let expected: Value = serde_json::from_str(include_str!(
+        "fixtures/navigation-main-31c-mixed/expected-main-31c.json"
+    ))
+    .unwrap();
+    let main_symbols: Value = serde_json::from_str(include_str!(
+        "fixtures/navigation-main-31c-mixed/main-line3-symbols.json"
+    ))
+    .unwrap();
+    let (dir, _store, graph, app, _session) = setup(&[("Mixed.java", text)]);
+    let line_three: Vec<_> = graph
+        .nodes
+        .iter()
+        .filter(|node| node.path == "Mixed.java" && node.range.start_line == 3)
+        .collect();
+    assert_eq!(
+        line_three
+            .iter()
+            .filter(|node| node.kind == SymbolKind::Class)
+            .count(),
+        180
+    );
+    assert_eq!(
+        line_three
+            .iter()
+            .filter(|node| node.kind == SymbolKind::Field)
+            .count(),
+        360
+    );
+    assert_eq!(
+        graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == SymbolKind::Class && node.range.start_line == 2)
+            .count(),
+        190
+    );
+    // SyntaxIds include the absolute checkout root. Use main's frozen DTOs
+    // for root-independent content, and this root's IDs only for the order.
+    let mut eligible: Vec<_> = line_three
+        .iter()
+        .copied()
+        .filter(|node| node.kind == SymbolKind::Class)
+        .collect();
+    eligible.sort_by(|a, b| a.id.cmp(&b.id));
+    assert_eq!(main_symbols.as_object().unwrap().len(), eligible.len());
+    for node in &eligible {
+        let mut stable = serde_json::to_value(node).unwrap();
+        stable.as_object_mut().unwrap().remove("id");
+        stable.as_object_mut().unwrap().remove("parent");
+        assert_eq!(
+            stable,
+            main_symbols[node.name.as_str()],
+            "main 31c {}",
+            node.name
+        );
+    }
+
+    let (status, view) = call(&app, source("Mixed.java", 3, &dir)).await;
+    assert_eq!(status, 200, "{view}");
+    let returned = view["targets"].as_array().unwrap();
+    assert_eq!(
+        returned.len(),
+        expected["targets"].as_array().unwrap().len()
+    );
+    for (target, node) in returned.iter().zip(eligible.iter()) {
+        assert_eq!(target["symbol"]["id"], json!(node.id));
+        let mut stable = target["symbol"].clone();
+        stable.as_object_mut().unwrap().remove("id");
+        stable.as_object_mut().unwrap().remove("parent");
+        assert_eq!(stable, main_symbols[node.name.as_str()]);
+        for key in ["action", "reason", "matchKind"] {
+            assert_eq!(target[key], expected["targets"][0][key], "main 31c {key}");
+        }
+    }
+    for key in ["warnings", "truncated", "requireIndex"] {
+        assert_eq!(view[key], expected[key], "main 31c {key}");
+    }
 }
 
 #[tokio::test]
@@ -1132,7 +1238,7 @@ fn publish_bundle(
 }
 
 #[tokio::test]
-async fn navigation_selected_graph_path_is_authenticated_without_scanning_other_documents() {
+async fn navigation_selected_graph_nodes_are_attested_without_scanning_other_documents() {
     let (dir, store, _graph, app, _session) = fixture();
     assert_eq!(
         call(&app, source("A.java", 3, &dir)).await.0,
@@ -1141,7 +1247,7 @@ async fn navigation_selected_graph_path_is_authenticated_without_scanning_other_
     let db = rusqlite::Connection::open(index_db(&dir)).unwrap();
     let pin_before = store.status().unwrap().revision;
     db.execute(
-        "UPDATE graph_nodes SET payload=json_set(payload,'$.path','forged.java') WHERE projection_id=?1 AND id=(SELECT id FROM graph_nodes WHERE projection_id=?1 ORDER BY id LIMIT 1)",
+        "UPDATE graph_nodes SET name='forgedName' WHERE projection_id=?1 AND id=(SELECT id FROM graph_nodes WHERE projection_id=?1 ORDER BY id LIMIT 1)",
         [admitted_document(&db, "A.java").1],
     )
     .unwrap();
@@ -1149,11 +1255,11 @@ async fn navigation_selected_graph_path_is_authenticated_without_scanning_other_
     let (status, result) = call(&app, source("A.java", 3, &dir)).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{result}");
     assert_eq!(result["error"]["code"], "incompatible_index");
-    assert!(!result.to_string().contains("forged.java"));
+    assert!(!result.to_string().contains("forgedName"));
     let (status, closed) = call(&app, source("B.java", 1, &dir)).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{closed}");
     assert_eq!(closed["error"]["code"], "incompatible_index");
-    assert!(!closed.to_string().contains("forged.java"));
+    assert!(!closed.to_string().contains("forgedName"));
 
     // v8 cannot admit graph-only files: every manifest row must reference a
     // source version and graph/class projections. Clone a coherent FK-valid
@@ -1180,23 +1286,16 @@ async fn navigation_selected_graph_path_is_authenticated_without_scanning_other_
     ).unwrap(), 1);
     missing_db
         .execute(
-            "INSERT INTO graph_nodes(projection_id,id,name,path,payload)
-         SELECT 'orphan-graph',id,name,'orphan.java',json_set(payload,'$.path','orphan.java')
+            "INSERT INTO graph_nodes(projection_id,id,name,kind)
+         SELECT 'orphan-graph',id,name,kind
          FROM graph_nodes WHERE projection_id=?1",
             [&graph],
         )
         .unwrap();
-    missing_db.execute(
-        "INSERT INTO graph_calls(projection_id,id,caller,target,path,payload)
-         SELECT 'orphan-graph',id,caller,target,'orphan.java',json_set(payload,'$.path','orphan.java')
-         FROM graph_calls WHERE projection_id=?1",
-        [&graph],
-    ).unwrap();
     missing_db
         .execute(
-            "INSERT INTO graph_regions(projection_id,id,owner,path,payload)
-         SELECT 'orphan-graph',id,owner,'orphan.java',json_set(payload,'$.path','orphan.java')
-         FROM graph_regions WHERE projection_id=?1",
+            "INSERT INTO graph_display_labels(projection_id,id,label)
+         SELECT 'orphan-graph',id,label FROM graph_display_labels WHERE projection_id=?1",
             [&graph],
         )
         .unwrap();
@@ -1235,29 +1334,52 @@ async fn navigation_selected_graph_path_is_authenticated_without_scanning_other_
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{missing}");
     assert_eq!(missing["error"]["code"], "incompatible_index");
     assert!(missing.get("targets").is_none());
-    assert!(!missing.to_string().contains("forged.java"));
+    assert!(!missing.to_string().contains("forgedName"));
     let (status, closed) = call(&missing_app, source("B.java", 1, &missing_dir)).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{closed}");
     assert_eq!(closed["error"]["code"], "incompatible_index");
-    assert!(!closed.to_string().contains("forged.java"));
+    assert!(!closed.to_string().contains("forgedName"));
 
-    // Member selection authenticates the exact node JSON before using its kind.
+    // Member selection authenticates the exact narrow node before using its kind.
     let (selected_dir, selected_store, selected_graph, selected_app, _selected_session) = fixture();
     let selected_clone = selected_store.clone();
     let class_id = id(&selected_graph, "A");
     let selector = member(&selected_dir, class_id, "first", 0);
     let selected_db = rusqlite::Connection::open(index_db(&selected_dir)).unwrap();
-    selected_db
-        .execute(
-            "UPDATE graph_nodes SET payload='not-json' WHERE projection_id=?1 AND id=?2",
-            rusqlite::params![admitted_document(&selected_db, "A.java").1, class_id],
-        )
+    // Corruption in a different document does not make the selected A read
+    // scan B. The selected class kind must then be checked before use.
+    let unrelated_class = selected_graph
+        .nodes
+        .iter()
+        .find(|node| node.path == "B.java" && node.name == "B" && node.kind == SymbolKind::Class)
         .unwrap();
+    assert_eq!(
+        selected_db
+            .execute(
+                "UPDATE graph_nodes SET kind='forged-unrelated-kind' WHERE projection_id=?1 AND id=?2",
+                rusqlite::params![admitted_document(&selected_db, "B.java").1, unrelated_class.id],
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        call(&selected_app, selector.clone()).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        selected_db
+            .execute(
+                "UPDATE graph_nodes SET kind='forged-kind' WHERE projection_id=?1 AND id=?2",
+                rusqlite::params![admitted_document(&selected_db, "A.java").1, class_id],
+            )
+            .unwrap(),
+        1
+    );
     let (status, invalid) = call(&selected_app, selector).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{invalid}");
     assert_eq!(invalid["error"]["code"], "incompatible_index");
     assert!(invalid.get("targets").is_none());
-    assert!(!invalid.to_string().contains("not-json"));
+    assert!(!invalid.to_string().contains("forged-kind"));
     let (status, closed) = call(&selected_app, source("B.java", 1, &selected_dir)).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{closed}");
     assert_eq!(closed["error"]["code"], "incompatible_index");

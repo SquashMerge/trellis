@@ -3,7 +3,7 @@
 - **Status:** owner-ratified 2026-10-20 on [#199](https://github.com/SquashMerge/trellis/issues/199) (item 5, Q-8). Three rulings, all recorded on #199 and all recorded here:
   - The first approves the W2 part of D12 in [`../../semantic-search-contract-proposal.md`](../../semantic-search-contract-proposal.md) §11 as proposed.
   - The [names-only ruling](https://github.com/SquashMerge/trellis/issues/199#issuecomment-6297417762) narrows the table to symbol names, with exact results kept for queries that can match IDs.
-  - The [second-table ruling](https://github.com/SquashMerge/trellis/issues/199#issuecomment-6297450336) keeps `graph_node_trigrams` for the browser and CLI search.
+  - The [second-table ruling](https://github.com/SquashMerge/trellis/issues/199#issuecomment-6297450336) keeps `graph_node_trigrams` for the browser and CLI search. Decision [0016](0016-graph-rows-derived-from-native-facts.md) narrows the underlying `graph_nodes` to names, IDs and kinds without changing this ruling.
 
   The number 0013 was last used by the closed, unmerged WAL draft (#215), which never became a record.
 - **Amends:** nothing in W2's output. [`../../mcp-readonly-pilot-contract.md`](../../mcp-readonly-pilot-contract.md) § W2 keeps its literal ASCII-`lower`/`instr` rule, ranking, limits and truncation. This record adds only how candidates are found.
@@ -16,7 +16,7 @@
    - The copy is written with SQLite's own `lower`, the same function the literal rule uses, so trigram folding can't diverge from it.
    - A table is only a candidate prefilter: it never scores or orders.
    - It may hold every retained document version. The usual manifest join selects the answering revision.
-   - There are two tables: `native_declaration_trigrams` for W2, and `graph_node_trigrams` for the browser `/api/symbols` and CLI `symbols` search. That search runs the same literal rule over `graph_nodes`. Keeping the second table is an owner ruling (see Status).
+   - There are two tables: `native_declaration_trigrams` for W2, and `graph_node_trigrams` for the browser `/api/symbols` and CLI `symbols` search. That search runs the same literal rule over the narrow `graph_nodes` name/ID table. Keeping the second table is an owner ruling (see Status).
 2. **The query.** A query is ASCII-`lower`ed the same way, then quoted as one FTS5 string literal with `"` doubled. FTS5 operators, column filters and parentheses in the query are therefore plain text.
 3. **Queries that can match an ID**, decided from the query alone, before FTS5 runs.
    - **The ID format.** Every stored ID, native and graph, is a minted SyntaxId: `sid:v1:` followed by 32 lowercase hex digits.

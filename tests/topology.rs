@@ -1180,7 +1180,7 @@ fn index_delete_journal_no_wal() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        12
+        13
     );
     drop(db);
     let bytes = fs::read(&index).unwrap();
@@ -1859,7 +1859,7 @@ fn forget_rechecks_sqlite_schema_after_confirmation() {
 }
 
 #[test]
-fn gc_classifies_current_schema12_but_refuses_spoofed_shapes() {
+fn gc_classifies_current_schema13_but_refuses_spoofed_shapes() {
     let (temp, roots) = common::fixture();
     let work = root(temp.path());
     let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
@@ -1899,7 +1899,7 @@ fn gc_classifies_current_schema12_but_refuses_spoofed_shapes() {
         .unwrap();
     assert_eq!(inspect(), ("unknown", "unknown_index_shape"));
     db.execute_batch("DROP VIEW unapproved_view").unwrap();
-    db.execute_batch("CREATE TRIGGER unapproved_trigger AFTER INSERT ON graph_calls BEGIN SELECT RAISE(FAIL, 'FORGED'); END;")
+    db.execute_batch("CREATE TRIGGER unapproved_trigger AFTER INSERT ON graph_nodes BEGIN SELECT RAISE(FAIL, 'FORGED'); END;")
         .unwrap();
     assert_eq!(inspect(), ("unknown", "unknown_index_shape"));
     db.execute_batch("DROP TRIGGER unapproved_trigger").unwrap();
@@ -1913,6 +1913,8 @@ fn gc_classifies_current_schema12_but_refuses_spoofed_shapes() {
     db.pragma_update(None, "user_version", 11).unwrap();
     assert_eq!(inspect(), ("unknown", "unknown_index_schema"));
     db.pragma_update(None, "user_version", 12).unwrap();
+    assert_eq!(inspect(), ("unknown", "unknown_index_schema"));
+    db.pragma_update(None, "user_version", 13).unwrap();
     assert_eq!(inspect(), ("unknown", "recent_open"));
     db.execute("UPDATE index_metadata SET root_inode='1'", [])
         .unwrap();
@@ -1920,7 +1922,7 @@ fn gc_classifies_current_schema12_but_refuses_spoofed_shapes() {
 }
 
 #[test]
-fn complete_schema12_index_remains_gc_eligible() {
+fn complete_schema13_index_remains_gc_eligible() {
     let (temp, roots) = common::fixture();
     let work = root(temp.path());
     let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
@@ -1929,7 +1931,7 @@ fn complete_schema12_index_remains_gc_eligible() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        12
+        13
     );
     let now = 1_800_000_000_i64;
     db.execute(
@@ -2612,7 +2614,7 @@ fn server_updates_recapture_after_confirmed_delete_and_reject_stale_raw_input() 
 
 #[cfg(feature = "test-support")]
 #[test]
-fn gc_report_accepts_current_schema12_but_rejects_bad_inventory() {
+fn gc_report_accepts_current_schema13_but_rejects_bad_inventory() {
     let (temp, roots) = common::fixture();
     let work = root(temp.path());
     let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
@@ -2884,7 +2886,7 @@ fn automatic_gc_rejects_unknown_shapes_busy_and_hot_files() {
                 let ddl = match *case {
                     "table" => "CREATE TABLE unsafe_table(id INTEGER)",
                     "trigger" => {
-                        "CREATE TRIGGER unsafe_trigger AFTER INSERT ON graph_calls BEGIN SELECT 1; END"
+                        "CREATE TRIGGER unsafe_trigger AFTER INSERT ON graph_nodes BEGIN SELECT 1; END"
                     }
                     _ => "CREATE INDEX unsafe_index ON index_metadata(root_inode)",
                 };

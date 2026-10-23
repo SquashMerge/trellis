@@ -684,30 +684,25 @@ async fn root_loss_fails_accepted_work_then_releases_old_runtime_handles() {
         "accepted FIFO row prevents replacement listing"
     );
     drop(held);
+    // A published pending-work flag can be briefly false before this worker
+    // processes the enqueue. Retired is the owner's post-COMMIT root-loss
+    // transition, not a sampled queue-empty hint.
+    retired(&scheduler).await;
+    assert!(scheduler.checkout_root_loss_retired());
     drop(scheduler);
-    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
-        while registry.refresh_pending_work(&key).unwrap() {
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    })
-    .await
-    .unwrap_or_else(|error| {
-        let db = rusqlite::Connection::open(&db_path).unwrap();
-        let state: String = db.query_row("SELECT state FROM requests WHERE id=?1", [&row.id], |r| r.get(0)).unwrap();
-        panic!(
-            "old-root queue did not reach a terminal result: {error}; state={state}; startup reconciliation error: {:?}; owner={:?}",
-            old.reconciliation_error(), old.browser_scheduler().unwrap().root_loss_retirement_for_tests()
-        )
-    });
+    assert!(!registry.refresh_pending_work(&key).unwrap());
     let db = rusqlite::Connection::open(db_path).unwrap();
-    let (state, error): (String, String) = db
+    let (state, error): (String, Option<String>) = db
         .query_row(
             "SELECT state,error_code FROM requests WHERE id=?1",
             [&row.id],
             |record| Ok((record.get(0)?, record.get(1)?)),
         )
         .unwrap();
-    assert_eq!((state.as_str(), error.as_str()), ("failed", "root_changed"));
+    assert_eq!(
+        (state.as_str(), error.as_deref()),
+        ("failed", Some("root_changed"))
+    );
     drop(db);
     release_when_idle(&mut registry, &key).await;
     assert_eq!(

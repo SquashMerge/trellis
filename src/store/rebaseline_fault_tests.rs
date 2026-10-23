@@ -1641,15 +1641,13 @@ fn large_real_native_pair_cancels_at_before_commit_without_partial_rows() {
                         "new revision not staged in publisher transaction");
                     let staged_pin = format!("pin:v1:{}:{}", pin.index_generation, pin.index_revision + 1);
                     let graph_functions:i64=tx.query_row(
-                        "SELECT count(*) FROM graph_nodes n JOIN revision_documents m ON m.graph_projection_id=n.projection_id WHERE m.revision_id=?1 AND m.path='a.js' AND n.path='a.js' AND json_extract(n.payload,'$.kind')='function'",[&staged_pin],|r|r.get(0))?;
+                        "SELECT count(*) FROM graph_nodes n JOIN revision_documents m ON m.graph_projection_id=n.projection_id WHERE m.revision_id=?1 AND m.path='a.js' AND n.kind='function'",[&staged_pin],|r|r.get(0))?;
                     let native_functions:i64=tx.query_row(
                         "SELECT count(*) FROM native_version_declarations d JOIN document_versions v ON v.id=d.version_id JOIN revision_documents m ON m.document_version_id=v.id WHERE m.revision_id=?1 AND m.path='a.js' AND v.path='a.js' AND d.kind='function'",[&staged_pin],|r|r.get(0))?;
-                    let graph_calls:i64=tx.query_row(
-                        "SELECT count(*) FROM graph_calls c JOIN revision_documents m ON m.graph_projection_id=c.projection_id WHERE m.revision_id=?1 AND m.path='a.js' AND c.path='a.js'",[&staged_pin],|r|r.get(0))?;
                     let native_calls:i64=tx.query_row(
                         "SELECT count(*) FROM native_version_calls c JOIN document_versions v ON v.id=c.version_id JOIN revision_documents m ON m.document_version_id=v.id WHERE m.revision_id=?1 AND m.path='a.js' AND v.path='a.js'",[&staged_pin],|r|r.get(0))?;
-                    ensure!((graph_functions,native_functions,graph_calls,native_calls)==(5_000,5_000,5_000,5_000),
-                        "5,000 measured graph/native function and call rows not staged for active pin: graph={graph_functions}/{graph_calls} native={native_functions}/{native_calls}");
+                    ensure!((graph_functions,native_functions,native_calls)==(5_000,5_000,5_000),
+                        "5,000 measured graph/native function and call rows not staged for active pin: graph={graph_functions} native={native_functions}/{native_calls}");
                     let source_bytes:Vec<u8>=tx.query_row(
                         "SELECT v.source_bytes FROM document_versions v JOIN revision_documents m ON m.document_version_id=v.id WHERE m.revision_id=?1 AND m.path='a.js' AND v.path='a.js'",[&staged_pin],|r|r.get(0))?;
                     ensure!(source_bytes==large_source.as_bytes(),
@@ -1753,13 +1751,11 @@ fn captured_long_call_exceeds_injected_small_graph_cap_and_remains_selectable() 
             &cancel,
         )
         .unwrap();
-    let db = Connection::open(store.roots.index_db(&store.identity)).unwrap();
-    let call_bytes: i64 = db
-        .query_row(
-            "SELECT max(length(CAST(payload AS BLOB))) FROM graph_calls WHERE path='flow.js'",
-            [],
-            |r| r.get(0),
-        )
+    let call_bytes = graph
+        .calls
+        .iter()
+        .map(|call| json(call).unwrap().len())
+        .max()
         .unwrap();
     assert!(
         call_bytes > 32 * 1024,

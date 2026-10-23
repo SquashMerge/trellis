@@ -188,8 +188,16 @@ fn measured_range(
     let lines = lines
         .get(file.path.as_str())
         .context("missing measured source lines")?;
-    let (start_line, start_column) = lines.location(&file.text, range.start)?;
-    let (end_line, end_column) = lines.location(&file.text, range.end)?;
+    measured_range_text(&file.text, lines, range)
+}
+
+fn measured_range_text(
+    text: &str,
+    lines: &LineIndex,
+    range: &native_evidence::Range,
+) -> Result<SourceRange> {
+    let (start_line, start_column) = lines.location(text, range.start)?;
+    let (end_line, end_column) = lines.location(text, range.end)?;
     ensure!(range.start <= range.end, "inverted measured graph range");
     Ok(SourceRange {
         start_byte: range.start,
@@ -1033,6 +1041,141 @@ fn project_native_document_with_labels(
     )
 }
 
+/// Borrowed facts for exactly one document. Group the writer's full artifact by
+/// path once; selected SQL readers can borrow their attested per-document rows.
+#[derive(Default)]
+pub(crate) struct NativeDocument<'a> {
+    pub declarations: Vec<&'a native_evidence::Declaration>,
+    pub calls: Vec<&'a native_evidence::Call>,
+    pub control_regions: Vec<&'a native_evidence::ControlRegion>,
+}
+
+/// Writer order for derived calls: path, start byte, end byte, then ID.
+/// The ID breaks ties independently of native extraction order.
+pub(crate) fn compare_writer_calls(a: &CallSite, b: &CallSite) -> std::cmp::Ordering {
+    (&a.path, a.range.start_byte, a.range.end_byte, &a.id).cmp(&(
+        &b.path,
+        b.range.start_byte,
+        b.range.end_byte,
+        &b.id,
+    ))
+}
+
+/// Reader order from the graph SQL queries: path, start byte, descending
+/// end byte, then ID. String comparison uses SQLite's BINARY byte order.
+pub(crate) fn compare_reader_calls(a: &CallSite, b: &CallSite) -> std::cmp::Ordering {
+    a.path
+        .cmp(&b.path)
+        .then_with(|| a.range.start_byte.cmp(&b.range.start_byte))
+        .then_with(|| b.range.end_byte.cmp(&a.range.end_byte))
+        .then_with(|| a.id.cmp(&b.id))
+}
+
+/// The sole graph-row derivation for both publication and selected reads.
+/// No optional SCIP input or other document affects these measured rows.
+pub(crate) fn project_document(
+    path: &str,
+    source: &[u8],
+    native: NativeDocument<'_>,
+    labels: &BTreeMap<String, String>,
+) -> Result<(Vec<Symbol>, Vec<CallSite>, Vec<ControlRegion>)> {
+    let text = std::str::from_utf8(source).context("invalid graph source UTF-8")?;
+    let lines = LineIndex::new(text);
+    let range = |r: &native_evidence::Range| measured_range_text(text, &lines, r);
+    // Build the complete owner map and prepare parent lookup keys once. SQL
+    // attestation returns syntax-ID order, which need not be parent-before-child.
+    let mut owners: BTreeMap<(String, String), String> = BTreeMap::new();
+    let mut prepared = Vec::with_capacity(native.declarations.len());
+    for d in native.declarations {
+        ensure!(d.document.path == path, "missing graph source");
+        let owner_key = (
+            serde_json::to_string(&d.ancestors)?,
+            serde_json::to_string(&d.key)?,
+        );
+        ensure!(
+            owners.insert(owner_key, d.syntax_id.clone()).is_none(),
+            "native declaration key collision"
+        );
+        let parent_key = if let Some(last) = d.ancestors.last() {
+            Some((
+                serde_json::to_string(&d.ancestors[..d.ancestors.len() - 1])?,
+                serde_json::to_string(last)?,
+            ))
+        } else {
+            None
+        };
+        prepared.push((d, parent_key));
+    }
+    let mut nodes = Vec::with_capacity(prepared.len());
+    for (d, parent_key) in prepared {
+        let parent = if let Some(key) = parent_key {
+            Some(
+                owners
+                    .get(&key)
+                    .context("native declaration parent missing")?
+                    .clone(),
+            )
+        } else {
+            None
+        };
+        nodes.push(Symbol {
+            id: d.syntax_id.clone(),
+            name: d.name.clone().unwrap_or_else(|| {
+                if d.kind == "module" {
+                    path.to_owned()
+                } else {
+                    format!("<{}@{}>", d.kind, d.range.start)
+                }
+            }),
+            display_label: labels.get(&d.syntax_id).cloned(),
+            kind: graph_kind(&d.kind)?,
+            path: d.document.path.clone(),
+            range: range(&d.range)?,
+            parent,
+            accessor: d.header.modifiers.iter().any(|m| m == "get" || m == "set"),
+            provenance: graph_provenance(),
+        });
+    }
+    let mut regions = Vec::with_capacity(native.control_regions.len());
+    for r in native.control_regions {
+        ensure!(r.document.path == path, "missing region source");
+        let label = text
+            .get(r.range.start..r.range.end)
+            .context("invalid region text")?
+            .chars()
+            .take(140)
+            .collect();
+        regions.push(ControlRegion {
+            id: r.id.clone(),
+            kind: r.kind.clone(),
+            label,
+            parent: r.parent_id.clone(),
+            owner: r.owner_syntax_id.clone(),
+            path: r.document.path.clone(),
+            range: range(&r.range)?,
+        });
+    }
+    let mut calls = Vec::with_capacity(native.calls.len());
+    for c in native.calls {
+        ensure!(c.document.path == path, "missing call source");
+        calls.push(CallSite {
+            id: c.id.clone(),
+            caller: c.owner_syntax_id.clone(),
+            callee_text: c.spelling.clone(),
+            path: c.document.path.clone(),
+            range: range(&c.range)?,
+            callee_range: c.callee_range.as_ref().map(range).transpose()?,
+            ordinal: c.ordinal,
+            regions: c.region_ids.clone(),
+            provenance: graph_provenance(),
+        });
+    }
+    nodes.sort_by(|a, b| a.id.cmp(&b.id));
+    regions.sort_by(|a, b| a.id.cmp(&b.id));
+    calls.sort_by(compare_writer_calls);
+    Ok((nodes, calls, regions))
+}
+
 fn project_native_selected(
     options: &IndexOptions,
     capture: &Capture,
@@ -1056,11 +1199,6 @@ fn project_native_selected(
         selected.is_none() || selected_files.len() == 1,
         "selected graph source is missing or ambiguous"
     );
-    let files: BTreeMap<_, _> = selected_files
-        .iter()
-        .map(|f| (f.path.as_str(), f))
-        .collect();
-    let lines = line_indexes(&files);
     let mut graph = Graph {
         files: selected_files.clone(),
         ..Graph::default()
@@ -1070,86 +1208,40 @@ fn project_native_selected(
     } else {
         measured_display_labels(options, capture, native)
     };
-    let mut owners: BTreeMap<(String, String), String> = BTreeMap::new();
-    // Parent is the measured #22 ancestor chain, never a name-based match.
+    let mut by_path: BTreeMap<&str, NativeDocument<'_>> = selected_files
+        .iter()
+        .map(|file| (file.path.as_str(), NativeDocument::default()))
+        .collect();
     for d in &native.declarations {
-        let file = files
-            .get(d.document.path.as_str())
-            .context("missing graph source")?;
-        let key = serde_json::to_string(&d.ancestors)?;
-        let parent = if d.ancestors.is_empty() {
-            None
-        } else {
-            let prefix = serde_json::to_string(&d.ancestors[..d.ancestors.len() - 1])?;
-            let last = serde_json::to_string(&d.ancestors[d.ancestors.len() - 1])?;
-            owners
-                .get(&(d.document.path.clone(), format!("{prefix}/{last}")))
-                .cloned()
-        };
-        ensure!(
-            d.ancestors.is_empty() || parent.is_some(),
-            "native declaration parent missing"
-        );
-        let current = serde_json::to_string(&d.key)?;
-        owners.insert(
-            (d.document.path.clone(), format!("{key}/{current}")),
-            d.syntax_id.clone(),
-        );
-        graph.nodes.push(Symbol {
-            id: d.syntax_id.clone(),
-            name: d.name.clone().unwrap_or_else(|| {
-                if d.kind == "module" {
-                    file.path.clone()
-                } else {
-                    format!("<{}@{}>", d.kind, d.range.start)
-                }
-            }),
-            display_label: display_labels.get(&d.syntax_id).cloned(),
-            kind: graph_kind(&d.kind)?,
-            path: d.document.path.clone(),
-            range: measured_range(file, &lines, &d.range)?,
-            parent,
-            accessor: d.header.modifiers.iter().any(|m| m == "get" || m == "set"),
-            provenance: graph_provenance(),
-        });
-    }
-    for r in &native.control_regions {
-        let file = files
-            .get(r.document.path.as_str())
-            .context("missing region source")?;
-        let text = file
-            .text
-            .get(r.range.start..r.range.end)
-            .context("invalid region text")?;
-        graph.regions.push(ControlRegion {
-            id: r.id.clone(),
-            kind: r.kind.clone(),
-            label: text.chars().take(140).collect(),
-            parent: r.parent_id.clone(),
-            owner: r.owner_syntax_id.clone(),
-            path: r.document.path.clone(),
-            range: measured_range(file, &lines, &r.range)?,
-        });
+        by_path
+            .get_mut(d.document.path.as_str())
+            .context("missing graph source")?
+            .declarations
+            .push(d);
     }
     for c in &native.calls {
-        let file = files
-            .get(c.document.path.as_str())
-            .context("missing call source")?;
-        graph.calls.push(CallSite {
-            id: c.id.clone(),
-            caller: c.owner_syntax_id.clone(),
-            callee_text: c.spelling.clone(),
-            path: c.document.path.clone(),
-            range: measured_range(file, &lines, &c.range)?,
-            callee_range: c
-                .callee_range
-                .as_ref()
-                .map(|r| measured_range(file, &lines, r))
-                .transpose()?,
-            ordinal: c.ordinal,
-            regions: c.region_ids.clone(),
-            provenance: graph_provenance(),
-        });
+        by_path
+            .get_mut(c.document.path.as_str())
+            .context("missing call source")?
+            .calls
+            .push(c);
+    }
+    for r in &native.control_regions {
+        by_path
+            .get_mut(r.document.path.as_str())
+            .context("missing region source")?
+            .control_regions
+            .push(r);
+    }
+    for file in &selected_files {
+        let facts = by_path
+            .remove(file.path.as_str())
+            .context("missing graph source")?;
+        let (nodes, calls, regions) =
+            project_document(&file.path, file.text.as_bytes(), facts, &display_labels)?;
+        graph.nodes.extend(nodes);
+        graph.calls.extend(calls);
+        graph.regions.extend(regions);
     }
     for coverage in &native.coverage {
         if coverage.state != "complete" {
@@ -1176,13 +1268,7 @@ fn project_native_selected(
         }
     }
     graph.nodes.sort_by(|a, b| a.id.cmp(&b.id));
-    graph.calls.sort_by(|a, b| {
-        (&a.path, a.range.start_byte, a.range.end_byte).cmp(&(
-            &b.path,
-            b.range.start_byte,
-            b.range.end_byte,
-        ))
-    });
+    graph.calls.sort_by(compare_writer_calls);
     graph.regions.sort_by(|a, b| a.id.cmp(&b.id));
     graph.stats.files = graph.files.len();
     graph.stats.symbols = graph.nodes.len();
@@ -1700,6 +1786,189 @@ mod local_classification_tests {
             }
         }
         assert_eq!(paths, 40);
+    }
+}
+
+#[cfg(test)]
+mod projection_document_tests {
+    use super::{NativeDocument, compare_reader_calls, compare_writer_calls, project_document};
+    use crate::model::{CallSite, SourceRange};
+    use crate::native_evidence::{Declaration, DeclarationRole, DocumentKey, Header, Key, Range};
+    use std::collections::BTreeMap;
+
+    fn declaration(path: &str, language: &str, id: &str, child: bool) -> Declaration {
+        let parent_key = Key {
+            kind: "module".into(),
+            name: Some(path.into()),
+            signature: None,
+            ordinal: 0,
+        };
+        Declaration {
+            role: DeclarationRole::Production,
+            syntax_id: id.into(),
+            document: DocumentKey {
+                source_set_id: "source-set".into(),
+                language: language.into(),
+                path: path.into(),
+            },
+            revision_id: "revision".into(),
+            kind: if child { "function" } else { "module" }.into(),
+            name: child.then(|| "nested".into()),
+            lookup_key: None,
+            ancestors: if child {
+                vec![parent_key.clone()]
+            } else {
+                vec![]
+            },
+            key: if child {
+                Key {
+                    kind: "function".into(),
+                    name: Some("nested".into()),
+                    signature: None,
+                    ordinal: 0,
+                }
+            } else {
+                parent_key
+            },
+            range: Range { start: 0, end: 3 },
+            name_range: None,
+            header: Header {
+                kind: if child { "function" } else { "module" }.into(),
+                name: None,
+                modifiers: vec![],
+                type_parameters: vec![],
+                parameters: vec![],
+                result_type: None,
+                bases: vec![],
+            },
+            provenance_id: "native".into(),
+        }
+    }
+
+    #[test]
+    fn child_before_parent_syntax_id_and_input_order_preserve_graph_rows() {
+        for (path, language) in [
+            ("a.rs", "rust"),
+            ("a.js", "javascript"),
+            ("a.py", "python"),
+            ("A.java", "java"),
+        ] {
+            // The SQL read's syntax_id order is child first, unlike extraction order.
+            let parent = declaration(
+                path,
+                language,
+                "sid:v1:ffffffffffffffffffffffffffffffff",
+                false,
+            );
+            let child = declaration(
+                path,
+                language,
+                "sid:v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                true,
+            );
+            let labels = BTreeMap::new();
+            let project = |declarations: Vec<&Declaration>| {
+                project_document(
+                    path,
+                    b"abc",
+                    NativeDocument {
+                        declarations,
+                        calls: vec![],
+                        control_regions: vec![],
+                    },
+                    &labels,
+                )
+                .unwrap()
+            };
+            let writer = project(vec![&parent, &child]);
+            let sql = project(vec![&child, &parent]);
+            assert_eq!(
+                serde_json::to_vec(&writer).unwrap(),
+                serde_json::to_vec(&sql).unwrap()
+            );
+            assert_eq!(sql.0[0].parent.as_deref(), Some(parent.syntax_id.as_str()));
+            assert_eq!(sql.0[0].id, child.syntax_id);
+            assert_eq!(sql.0[1].name, path);
+        }
+    }
+
+    #[test]
+    fn synthetic_call_site_sort_tie_breaks_by_bytewise_id_without_native_validation() {
+        // This tests DTO comparators directly. These synthetic rows do not claim
+        // to be native-validated artifacts or main-produced payload goldens.
+        let make_call = |id: &str, end_byte: usize| CallSite {
+            id: id.into(),
+            caller: "sid:v1:ffffffffffffffffffffffffffffffff".into(),
+            callee_text: None,
+            path: "a.rs".into(),
+            range: SourceRange {
+                start_byte: 0,
+                end_byte,
+                ..SourceRange::default()
+            },
+            callee_range: None,
+            ordinal: 0,
+            regions: vec![],
+            provenance: super::graph_provenance(),
+        };
+        let last = make_call("occ:v2:ffffffffffffffffffffffffffffffff", 2);
+        let first = make_call("occ:v2:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 2);
+        let longest = make_call("occ:v2:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", 3);
+        let mut writer = [last.clone(), longest.clone(), first.clone()];
+        writer.sort_by(compare_writer_calls);
+        assert_eq!(
+            writer
+                .iter()
+                .map(|call| call.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![first.id.as_str(), last.id.as_str(), longest.id.as_str()]
+        );
+        let mut reader = [last.clone(), longest.clone(), first.clone()];
+        reader.sort_by(compare_reader_calls);
+        assert_eq!(
+            reader
+                .iter()
+                .map(|call| call.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![longest.id.as_str(), first.id.as_str(), last.id.as_str()]
+        );
+    }
+
+    #[test]
+    fn duplicate_owner_key_and_missing_parent_are_explicit_failures() {
+        let parent = declaration(
+            "a.rs",
+            "rust",
+            "sid:v1:ffffffffffffffffffffffffffffffff",
+            false,
+        );
+        let mut duplicate = parent.clone();
+        duplicate.syntax_id = "sid:v1:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".into();
+        let child = declaration(
+            "a.rs",
+            "rust",
+            "sid:v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            true,
+        );
+        let project = |declarations: Vec<&Declaration>| {
+            project_document(
+                "a.rs",
+                b"abc",
+                NativeDocument {
+                    declarations,
+                    calls: vec![],
+                    control_regions: vec![],
+                },
+                &BTreeMap::new(),
+            )
+            .unwrap_err()
+            .to_string()
+        };
+        assert_eq!(
+            project(vec![&parent, &duplicate]),
+            "native declaration key collision"
+        );
+        assert_eq!(project(vec![&child]), "native declaration parent missing");
     }
 }
 
