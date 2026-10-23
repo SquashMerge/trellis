@@ -13167,21 +13167,30 @@ impl Store {
         let selected = self.read_revision_for(tx, expected, pre_startup)?;
         let revision = selected.pin;
         let mut stmt = tx.prepare(
-            "SELECT m.path,d.language,m.gid FROM revision_documents m
-                 JOIN document_versions d ON d.vid=m.vid
+            "SELECT m.path,d.language,g.gid FROM revision_documents m
+                 LEFT JOIN document_versions d ON d.vid=m.vid
+                   AND d.language=m.language AND d.path=m.path
+                 LEFT JOIN graph_projections g ON g.gid=m.gid AND g.vid=m.vid
                  WHERE m.revision_id=?3 ORDER BY m.path LIMIT ?1 OFFSET ?2",
         )?;
-        let source_rows: Vec<(String, String, i64)> = stmt
+        let source_rows: Vec<(String, Option<String>, Option<i64>)> = stmt
             .query_map(
                 params![(limit + 1) as i64, offset as i64, selected.key],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )?
             .collect::<rusqlite::Result<_>>()?;
         // The extra row only decides whether a next page exists; it isn't
-        // returned, so only the returned rows are counted.
+        // returned, so only the returned rows are checked and counted.
         let next = (source_rows.len() > limit).then_some(offset + limit);
         let mut items = Vec::new();
         for (path, language, projection_id) in source_rows.into_iter().take(limit) {
+            // A manifest row whose version or graph projection is absent is
+            // corruption, not an empty file.
+            let (Some(language), Some(projection_id)) = (language, projection_id) else {
+                return Err(self.report_selected_read(anyhow::anyhow!(
+                    "incompatible_index: selected document projection absent"
+                )));
+            };
             let methods: i64 = tx
                 .query_row(
                     "SELECT count(*) FROM graph_nodes WHERE gid=?1

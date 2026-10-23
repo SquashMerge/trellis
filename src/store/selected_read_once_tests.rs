@@ -159,3 +159,28 @@ fn mcp_reads_check_the_producer_binding_once_per_request() {
         ]
     );
 }
+
+#[test]
+fn files_page_reports_a_dangling_graph_projection() {
+    let (_state, _root, store) = published_store(2);
+    {
+        let db = store.cache_write().unwrap();
+        db.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        assert_eq!(
+            db.execute(
+                "UPDATE revision_documents SET gid=-1 WHERE path='f1.js'",
+                []
+            )
+            .unwrap(),
+            1
+        );
+        db.pragma_update(None, "foreign_keys", "ON").unwrap();
+    }
+    // Not a zero method count: the missing projection is corruption.
+    let error = store.files_at(None, 0, 10).unwrap_err();
+    assert_eq!(
+        format!("{error:#}"),
+        "incompatible_index: selected evidence decode failed: incompatible_index: selected document projection absent"
+    );
+    assert_eq!(store.disposition(), RecoveryDisposition::Rebuild);
+}
