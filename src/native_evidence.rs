@@ -657,6 +657,60 @@ fn entry(root: &Path, path: &Path, bytes: Option<&[u8]>) -> Result<Value> {
     })
 }
 
+/// Fixture-only entry to the production document extractor. The caller admits the listed
+/// immutable snapshot bytes and fixture labels; no checkout discovery or alternate parser runs.
+#[cfg(feature = "test-support")]
+pub(crate) fn measure_fixture(
+    files: &[SourceFile],
+    source_set: SourceSet,
+    revision: Revision,
+) -> Result<Artifact> {
+    let mut artifact = Artifact {
+        producer: fixture_producer(),
+        source_set,
+        revision,
+        coverage: vec![],
+        provenance: vec![],
+        declarations: vec![],
+        calls: vec![],
+        control_regions: vec![],
+    };
+    let mut ids = IdentityRegistry::default();
+    for file in files {
+        extract(&mut artifact, file, &mut ids)?;
+    }
+    // The full publisher validator requires checkout-derived source-set/revision IDs.
+    // Fixtures deliberately retain their authored labels; extract authenticates each
+    // document hash and extraction context before minting its measured rows.
+    Ok(artifact)
+}
+
+#[cfg(feature = "test-support")]
+pub(crate) fn fixture_producer() -> Producer {
+    Producer {
+        id: PRODUCER.into(),
+        version: NATIVE_VERSION.into(),
+        // This is the actual compiled extraction build, never a fixture label or override.
+        executable_hash: env!("TRELLIS_EXTRACTOR_HASH").into(),
+        kind: "native".into(),
+        languages: LANGUAGES.map(str::to_owned).into(),
+        position_encoding: "utf8".into(),
+    }
+}
+
+#[cfg(feature = "test-support")]
+pub(crate) fn fixture_descriptor() -> Value {
+    let inputs: serde_json::Map<String, Value> = LANGUAGES
+        .into_iter()
+        .map(|language| {
+            let inventory = declared_extraction_inputs(PRODUCER, NATIVE_VERSION, language)
+                .expect("native producer must declare every supported language");
+            (language.into(), json!(inventory))
+        })
+        .collect();
+    json!({"producer":fixture_producer(), "hashKind":"nativeExtractor", "extractionInputs": inputs})
+}
+
 pub fn from_capture(
     capture: &Capture,
     root: &Path,
@@ -3062,6 +3116,65 @@ mod occurrence_identity_tests {
             hash: hash(text.as_bytes()),
             language: "javascript".into(),
             text: text.into(),
+        }
+    }
+
+    fn check_inventory_registry(rust_inventory: &Value, semantic_inventory: &Value) -> Result<()> {
+        ensure!(
+            rust_inventory == semantic_inventory,
+            "Rust and semantic-contract native extraction inventories differ"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn native_extraction_inventory_matches_semantic_contract_registry() {
+        let rust_inventory = json!(EXTRACTION_INPUTS);
+        let output = std::process::Command::new("node")
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .args([
+                "--input-type=module",
+                "-e",
+                r#"
+import { trustedInventory } from './tools/semantic-contract/native-inventory.mjs';
+const declarations = JSON.parse(process.argv[1]);
+console.log(JSON.stringify(declarations.map(([id, version, languages]) => [
+    id, version, languages.map(([language]) => [
+        language, trustedInventory(id, version, language) ?? null,
+    ]),
+])));
+"#,
+                &rust_inventory.to_string(),
+            ])
+            .output()
+            .expect("Node is required by the repository verification suite");
+        assert!(
+            output.status.success(),
+            "semantic inventory lookup failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let semantic_inventory: Value = serde_json::from_slice(&output.stdout).unwrap();
+        check_inventory_registry(&rust_inventory, &semantic_inventory).unwrap();
+        // The same comparison must reject drift on either side, not just a missing entry.
+        for change_rust in [false, true] {
+            for change_version in [false, true] {
+                let mut rust = rust_inventory.clone();
+                let mut semantic = semantic_inventory.clone();
+                let changed = if change_rust {
+                    &mut rust
+                } else {
+                    &mut semantic
+                };
+                if change_version {
+                    changed[0][1] = json!("native-unregistered-future");
+                } else {
+                    changed[0][2][0][1] = json!(["config"]);
+                }
+                assert!(
+                    check_inventory_registry(&rust, &semantic).is_err(),
+                    "accepted drift: Rust={change_rust}, version={change_version}"
+                );
+            }
         }
     }
 

@@ -1,6 +1,6 @@
 # Semantic-contract corpus tooling (v1)
 
-Offline Node 24 ESM tooling. No install, network, production importer, server API, or language parser is required. The normative contract is `docs/semantic-evidence/contract-v1.md`; its #22 record shapes and enum orders are preserved. `schema.mjs` owns **all** closed record, authored input, answer, count and manifest shapes. `formats.mjs` checks their fields recursively; downstream modules must use these definitions rather than copy or relax them. Shape checks are distinct from cross-field/source/provenance/graph invariants.
+Offline Node 24 ESM checking tooling. Normal checking requires no install, network, server API, or language parser. The optional production-native capture path below uses a pinned Trellis test-support build; it does not import or publish an index. The normative contract is `docs/semantic-evidence/contract-v1.md`; its #22 record shapes and enum orders are preserved. `schema.mjs` owns **all** closed record, authored input, answer, count and manifest shapes. `formats.mjs` checks their fields recursively; downstream modules must use these definitions rather than copy or relax them. Shape checks are distinct from cross-field/source/provenance/graph invariants.
 
 ## Commands
 
@@ -76,3 +76,60 @@ These rules are enforced by the tooling but are not stated in the #22 contract. 
 ## Mutation controls and review
 
 Tests define local finite control rows `{id,baseline,mutate,expectedAssertion,expectedCode,expectedField}` and pass them to `test/mutations.mjs`. The harness first validates baseline, then applies one mutation and requires the exact assertion/code/field; new slices add their own rows without changing a central inventory. `schemaFieldControls` derives required-field omission rows from the registry. Assertions use stable prefixes such as `FORMAT.*`, `RELATIONSHIP_FORMAT.*`, `CANONICAL.*`, `ID.*`, `COVERAGE.*`, `FRESHNESS.*`, `JOIN.*`, `GRAPH.*`, `WARNING.*`, `COUNT.*`, and `PUBLICATION.*`; these are tooling assertions, **not** extra #22 semantic/error/warning codes. A mutation reaching an unrelated shape/hash error does not pass its control. Keep independently authored expected files separate from checker logic: a green test must never compare the checker to an answer it generated itself.
+
+## Capture with the production native extractor (#95)
+
+The registry admits the current `trellis.native.syntax@native-v8` with the
+production `EXTRACTION_INPUTS` inventory (`[]` for Java, Rust, Python and
+JavaScript). Historical v3/v4 descriptors are not admitted. The Rust inventory
+guard queries this JS registry through Node and compares the actual Rust table;
+version/language/component drift fails verification. A new producer version adds
+a new entry instead of changing an existing version's claim.
+
+Build once on `rust-toolchain.toml` in the owning checkout and an isolated target:
+
+```sh
+cargo build --locked --features test-support --bin trellis
+"$CARGO_TARGET_DIR/debug/trellis" native-capture --describe
+"$CARGO_TARGET_DIR/debug/trellis" native-capture \
+  --fixture /absolute/path/to/fixture/fixture.json \
+  --output /absolute/path/to/fresh-native.json
+```
+
+`native-capture` is a supported **test-support-only** authoring command, not an
+index/daemon operation. It reads the fixture's source-set/revision/document lists
+and captured source bytes, invokes the same native measurement code as the
+production indexer, and writes the toolkit's raw `NativeArtifact` shape. It does
+not read semantic artifacts or expected answers, run repository code, resolve
+dependencies, access the network or publish a store. An optional `--source-set`
+and `--revision` restrict the selected snapshot; without them all listed revisions
+are captured. Output must be a fresh file. Repeating a capture of the same bytes
+and descriptor yields identical output. The existing example fixture remains
+unchanged; the integration test captures its representative sources in a temporary
+native-only draft and normalizes/checks those measured rows.
+
+`--describe` reports the actual compiled producer descriptor, UTF-8 encoding,
+per-language extraction inventory and `hashKind:"nativeExtractor"`. The descriptor
+uses the compiled `TRELLIS_EXTRACTOR_HASH`, including the `test-support` build flag,
+not an environment override or the whole executable's SHA. Record that descriptor
+and the pinned Rust toolchain/source provenance with the capture. Do not copy a
+production-build hash onto a test-support build. The proposed native-specific
+[Decision 0017 Amendment 2](../../docs/semantic-evidence/decisions/0017-conformance-corpus-storage-and-producers.md#proposed-amendment-2-95-production-native-extractor-identity)
+keeps the existing profile pin lookup while changing this native digest's meaning;
+it awaits owner ratification. No real hardware pin or corpus is changed here.
+
+The adapter preserves production declarations, calls and controls; it does not
+reparse source to invent additional measurements or map dynamic evidence to
+execution. Production currently emits no reference-candidate family, so the raw
+capture's `references` array is empty. The toolkit accepts unnamed Rust
+`implementation` declarations and treats the synthetic module as outermost when
+its range equals a real declaration's range; nested declarations still require
+the real immediate source parent. Witnesses attest the actual header/spelling
+leaves against the captured UTF-8 source, and native IDs are diagnostic labels,
+never generated stable IDs. A field that cannot be witnessed, or a production signature inconsistent with
+its measured header (currently possible for Java varargs), fails capture rather
+than being silently rewritten. Fixing those production measurements requires its
+own producer-version decision; the adapter must not invent missing types. Keep annotations/coverage honest about the families
+present; this capture path does not implement per-construct family-unavailability
+or qualify the unsupported floor. That owner question is proposed separately in
+#95's PR body.

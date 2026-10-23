@@ -7,6 +7,12 @@
 // input must ship under a new version with a new entry; it can never re-declare its inventory
 // under an existing version.
 const INVENTORIES = new Map([
+  // Current production extractor. Its compiled grammars and normalization tables are
+  // versioned by native-v8; no external capture affects per-document measurement.
+  [
+    "trellis.native.syntax\u0000native-v8",
+    { java: [], rust: [], python: [], javascript: [] },
+  ],
   // Conformance producer used by the example fixture and the toolkit tests. Like the Rust
   // native producer (`EXTRACTION_INPUTS` in src/native_evidence.rs), it measures a document
   // from only its own bytes, path and language, so every language declares `[]`.

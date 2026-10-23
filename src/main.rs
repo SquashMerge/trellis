@@ -27,6 +27,9 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Export fixture snapshots through the real native extractor (test-support build only).
+    #[cfg(feature = "test-support")]
+    NativeCapture(NativeCaptureArgs),
     /// Build and atomically publish a complete index. Does not execute repository code.
     Index(IndexArgs),
     /// Run the elected user-level socket service.
@@ -47,6 +50,23 @@ enum Command {
     Gc(GcArgs),
     /// Permanently remove one saved workspace record by its exact ID.
     Forget(ForgetArgs),
+}
+#[cfg(feature = "test-support")]
+#[derive(Args)]
+struct NativeCaptureArgs {
+    /// Print the compiled producer descriptor and extraction-input inventory.
+    #[arg(long, conflicts_with_all = ["fixture", "output", "source_set", "revision"])]
+    describe: bool,
+    /// Fixture directory or fixture.json; only its listed snapshot sources are measured.
+    #[arg(long, required_unless_present = "describe")]
+    fixture: Option<PathBuf>,
+    /// New output path. Existing files are never replaced.
+    #[arg(long, required_unless_present = "describe")]
+    output: Option<PathBuf>,
+    #[arg(long)]
+    source_set: Option<String>,
+    #[arg(long)]
+    revision: Option<String>,
 }
 #[derive(Args)]
 struct ForgetArgs {
@@ -212,6 +232,19 @@ async fn main() -> Result<()> {
         return serve_via_daemon(args).await;
     }
     match command {
+        #[cfg(feature = "test-support")]
+        Command::NativeCapture(args) => {
+            if args.describe {
+                print_json(&trellis::native_capture::describe())?;
+            } else {
+                trellis::native_capture::capture(
+                    args.fixture.as_deref().context("missing fixture")?,
+                    args.output.as_deref().context("missing output")?,
+                    args.source_set.as_deref(),
+                    args.revision.as_deref(),
+                )?;
+            }
+        }
         Command::Daemon | Command::Serve(_) => unreachable!(),
         Command::Mcp(args) => {
             let (_, identity) = args.resolve_unattached()?;
