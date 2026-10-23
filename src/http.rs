@@ -1275,6 +1275,11 @@ impl DaemonState {
         }
         #[cfg(test)]
         self.test_queue_after_stream.run();
+        // Queue openers may provision a missing index directory. Observe its
+        // loss first, while this worker owns the serial boundary.
+        if self.close_if_index_missing()? {
+            return Ok(());
+        }
         // A lost captured root has no claim or publication authority. Resolve
         // its accepted queue rows before releasing local scheduler resources;
         // until that COMMIT is confirmed the runtime keeps them and makes no

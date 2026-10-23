@@ -60,3 +60,23 @@ For focused runs, first provision Chromium using the commands above, build with
 tests/browser/sequence-cost.test.cjs` with `TRELLIS_SUITE_BINARY` set to the
 absolute built binary. Do not run multiple browser suites in parallel against the
 same checkout.
+
+### Sequence fixture cleanup self-test
+
+`sequence-harness.test.cjs` checks normal teardown, a thrown test failure, SIGTERM,
+and SIGINT without launching a browser:
+
+```sh
+TRELLIS_SUITE_BINARY=/absolute/path/to/debug/trellis \
+  node --test tests/browser/sequence-harness.test.cjs
+```
+
+The missed cleanup path was an interrupted suite: Node does not run `test.after`
+on SIGTERM/SIGINT, so its detached, test-elected daemon could outlive the suite.
+The harness now handles those signals through the same cleanup owner as normal
+teardown. It first stops its CLI/serve children, then stops only detached daemons
+whose exact command uses its run-unique suite binary. The self-test waits for an
+IPC readiness hook after real daemon election and serve attachment, interrupts
+that child suite, and checks both owned PIDs are gone. A daemon using another
+suite binary must survive. SIGKILL cannot run JavaScript cleanup. Production
+15-minute checkout/browser and 30-minute daemon idle policy is unchanged.

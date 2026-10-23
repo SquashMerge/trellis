@@ -157,6 +157,51 @@ async fn idle_exit_waits_for_release_when_read_finishes_between_idle_probes() {
     assert!(registry.advance(due + Duration::from_secs(1)).unwrap().exit);
 }
 
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn lost_active_index_releases_after_read_and_preserves_idle_clocks() {
+    let (base, id, mut registry, now) = fixture();
+    registry.attach_launch(1, &id).unwrap();
+    let runtime = registry.activate(&id.root_key).unwrap();
+    ready(&runtime).await;
+    let (response, _) = runtime.evidence_response().unwrap();
+    let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let holder = runtime.clone();
+    let held = tokio::task::spawn_blocking(move || {
+        holder.hold_worker_step_for_tests(|| {
+            let _ = held_tx.send(());
+            let _ = resume_rx.recv();
+        });
+    });
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, held_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    let index_dir = base.path().join("cache/indexes").join(&id.root_key);
+    fs::remove_dir_all(&index_dir).unwrap();
+    registry.disconnect_at(1, now);
+    let due = now + DAEMON_IDLE_DELAY;
+    let tick = registry.advance(due).unwrap();
+    assert!(tick.released.is_empty());
+    assert!(!tick.exit);
+    assert!(runtime.has_active_resources());
+    // The owner cannot release while this already-admitted read is alive.
+    drop(response);
+    resume_tx.send(()).unwrap();
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, held)
+        .await
+        .unwrap()
+        .unwrap();
+    await_release_after_drain(&mut registry, due, &id.root_key).await;
+    assert!(!runtime.has_active_resources());
+    assert!(
+        !index_dir.exists(),
+        "release recreated the lost durable queue"
+    );
+    assert_eq!(registry.idle_exit_deadline(), Some(due));
+}
+
 #[tokio::test]
 async fn lifecycle_driver_exits_when_startup_deadline_is_due() {
     let registry = std::sync::Arc::new(tokio::sync::Mutex::new(CheckoutRegistry::starting_at(
@@ -356,7 +401,7 @@ async fn queued_or_inflight_work_defers_expired_deadlines_until_drain() {
 }
 
 #[test]
-fn startup_orphan_queue_blocks_idle_exit_without_any_client() {
+fn leftover_index_state_never_keeps_an_idle_daemon_alive() {
     let base = tempfile::tempdir().unwrap();
     let checkout = base.path().join("work");
     fs::create_dir(&checkout).unwrap();
@@ -364,81 +409,40 @@ fn startup_orphan_queue_blocks_idle_exit_without_any_client() {
     let id = identity(&checkout);
     let roots =
         TopologyRoots::isolated_for_tests(base.path().join("cache"), base.path().join("data"));
-    let store = trellis::store::Store::open(roots.clone(), id).unwrap();
-    store
+    let store = trellis::store::Store::open(roots.clone(), identity(&checkout)).unwrap();
+    let accepted = store
         .enqueue_request(&trellis::indexer::IndexOptions::new(checkout), None)
         .unwrap();
-    drop(store);
+    let dir = roots.index_db(&id).parent().unwrap().to_owned();
+    let queue = roots.requests_db(&id);
+    let queue_bytes = fs::read(&queue).unwrap();
+    let journal = dir.join("index.db-journal");
+    fs::write(&journal, b"unfinished journal").unwrap();
+    fs::create_dir(roots.cache.join("indexes/unknown-entry")).unwrap();
     let now = Instant::now();
-    let mut restarted = CheckoutRegistry::with_roots_at(roots, now);
-    assert!(!restarted.advance(now + DAEMON_IDLE_DELAY).unwrap().exit);
-}
-
-#[test]
-fn empty_interrupted_index_exits_but_unknown_queue_does_not() {
-    let (base, id, _, now) = fixture();
-    let roots =
-        TopologyRoots::isolated_for_tests(base.path().join("cache"), base.path().join("data"));
-    let store = trellis::store::Store::open(roots.clone(), identity(&id.root)).unwrap();
-    let dir = base.path().join("cache/indexes").join(&id.root_key);
-    drop(store);
-    fs::remove_file(dir.join("index.db")).unwrap();
-    let queue = dir.join("requests.db");
-    if queue.exists() {
-        fs::remove_file(&queue).unwrap();
-    }
     let mut registry = CheckoutRegistry::with_roots_at(roots.clone(), now);
-    assert!(registry.advance(now + DAEMON_IDLE_DELAY).unwrap().exit);
-    fs::write(&queue, b"not a queue").unwrap();
-    let mut registry = CheckoutRegistry::with_roots_at(roots, now);
-    assert!(!registry.advance(now + DAEMON_IDLE_DELAY).unwrap().exit);
-    assert_eq!(fs::read(&queue).unwrap(), b"not a queue");
-    fs::remove_file(&queue).unwrap();
-    let sidecar = dir.join("requests.db-wal");
-    fs::write(&sidecar, b"unfinished queue").unwrap();
-    let mut registry = CheckoutRegistry::with_roots_at(
-        TopologyRoots::isolated_for_tests(base.path().join("cache"), base.path().join("data")),
-        now,
-    );
-    assert!(!registry.advance(now + DAEMON_IDLE_DELAY).unwrap().exit);
-    assert_eq!(fs::read(&sidecar).unwrap(), b"unfinished queue");
-}
-
-#[test]
-fn orphan_scan_refuses_hot_index_sidecars_and_wal_header_without_creation() {
-    use std::os::unix::fs::FileExt;
-    let (base, id, _, now) = fixture();
-    let roots =
-        TopologyRoots::isolated_for_tests(base.path().join("cache"), base.path().join("data"));
-    let store = trellis::store::Store::open(roots.clone(), identity(&id.root)).unwrap();
-    drop(store);
-    let dir = base.path().join("cache/indexes").join(&id.root_key);
-    let index = dir.join("index.db");
-    let names = || {
-        let mut names: Vec<_> = fs::read_dir(&dir)
+    assert!(
+        !registry
+            .advance(now + DAEMON_IDLE_DELAY - Duration::from_nanos(1))
             .unwrap()
-            .map(|entry| entry.unwrap().file_name())
-            .collect();
-        names.sort();
-        names
-    };
-    for suffix in ["-journal", "-wal"] {
-        let sidecar = dir.join(format!("index.db{suffix}"));
-        fs::write(&sidecar, b"unfinished journal").unwrap();
-        let before = names();
-        let mut registry = CheckoutRegistry::with_roots_at(roots.clone(), now);
-        assert!(!registry.advance(now + DAEMON_IDLE_DELAY).unwrap().exit);
-        assert_eq!(names(), before);
-        assert_eq!(fs::read(&sidecar).unwrap(), b"unfinished journal");
-        fs::remove_file(sidecar).unwrap();
-    }
-    let file = fs::OpenOptions::new().write(true).open(&index).unwrap();
-    file.write_at(&[2, 2], 18).unwrap();
-    drop(file);
-    let before = names();
+            .exit
+    );
+    assert!(registry.advance(now + DAEMON_IDLE_DELAY).unwrap().exit);
+    assert_eq!(fs::read(&queue).unwrap(), queue_bytes);
+    assert_eq!(fs::read(&journal).unwrap(), b"unfinished journal");
+    assert_eq!(
+        store.request_by_id(&accepted.id).unwrap().unwrap().state,
+        "queued"
+    );
+    // Unreadable queue bytes in a never-activated checkout are not an exit veto.
+    drop(store);
+    let before = b"not a queue";
+    // Keep the real accepted queue untouched; use a separate leftover directory.
+    let stray = roots.cache.join("indexes/unknown-entry/requests.db");
+    fs::write(&stray, before).unwrap();
     let mut registry = CheckoutRegistry::with_roots_at(roots, now);
-    assert!(!registry.advance(now + DAEMON_IDLE_DELAY).unwrap().exit);
-    assert_eq!(names(), before);
+    assert!(registry.advance(now + DAEMON_IDLE_DELAY).unwrap().exit);
+    assert_eq!(fs::read(stray).unwrap(), before);
 }
 
 #[cfg(unix)]
@@ -590,7 +594,7 @@ async fn invalid_prior_head_does_not_pin_idle_resources_or_skip_reattach_startup
 
 #[cfg(feature = "test-support")]
 #[tokio::test]
-async fn active_writer_and_protected_reader_overlap_orphan_idle_scan() {
+async fn active_writer_and_protected_reader_keep_activated_checkout_pending() {
     use trellis::store::MaintenanceQueueState;
 
     let (base, id, mut registry, now) = fixture();
@@ -661,30 +665,10 @@ async fn active_writer_and_protected_reader_overlap_orphan_idle_scan() {
     // The retained reader observes the rollback journal of the live writer,
     // rather than a writer thread that is merely waiting after its commit.
     assert_eq!(reader.check(), MaintenanceQueueState::Unknown);
-    let active = std::iter::once(id.root_key.clone()).collect();
     registry.disconnect_at(1, now);
-    // SQLite busy retries must run off the Tokio scheduler while the writer
-    // waits on its channel. The scanner sees both the active and orphan views
-    // of the SAME root before the transaction is allowed to commit.
-    let (active_pending, orphan_pending, tick, returned_registry) =
-        tokio::task::spawn_blocking(move || {
-            let active_pending = trellis::store::Store::orphan_queues_pending(&roots, &active);
-            let orphan_pending =
-                trellis::store::Store::orphan_queues_pending(&roots, &Default::default());
-            let tick = registry.advance(now + DAEMON_IDLE_DELAY).unwrap();
-            (active_pending, orphan_pending, tick, registry)
-        })
-        .await
-        .unwrap();
-    registry = returned_registry;
-    assert!(
-        !active_pending,
-        "an active root must not enter the orphan scanner"
-    );
-    assert!(
-        orphan_pending,
-        "the live writer and accepted row are not clear orphan work"
-    );
+    // The held startup attempt and accepted FIFO rows are active work. The
+    // lifecycle observes their owner's publication, not a filesystem scan.
+    let tick = registry.advance(now + DAEMON_IDLE_DELAY).unwrap();
     assert!(tick.released.is_empty());
     assert!(!tick.exit);
     assert!(runtime.has_active_resources());
@@ -938,104 +922,5 @@ fn replaced_path_refuses_live_browser_or_pending_work() {
     assert_eq!(
         registry.browser_identity(&next.root_key).unwrap().record_id,
         next.record_id
-    );
-}
-
-#[test]
-fn pending_orphan_scans_are_not_repeated_every_tick() {
-    let base = tempfile::tempdir().unwrap();
-    let checkout = base.path().join("work");
-    fs::create_dir(&checkout).unwrap();
-    let id = identity(&checkout);
-    let roots =
-        TopologyRoots::isolated_for_tests(base.path().join("cache"), base.path().join("data"));
-    let store = trellis::store::Store::open(roots.clone(), id).unwrap();
-    store
-        .enqueue_request(&trellis::indexer::IndexOptions::new(checkout), None)
-        .unwrap();
-    drop(store);
-    let now = Instant::now();
-    let mut registry = CheckoutRegistry::with_roots_at(roots, now);
-    assert_eq!(registry.orphan_scan_count_for_tests(), 0);
-    registry
-        .advance(now + DAEMON_IDLE_DELAY - Duration::from_nanos(1))
-        .unwrap();
-    assert_eq!(registry.orphan_scan_count_for_tests(), 0);
-    assert!(!registry.advance(now + DAEMON_IDLE_DELAY).unwrap().exit);
-    assert_eq!(registry.orphan_scan_count_for_tests(), 1);
-    assert!(
-        !registry
-            .advance(now + DAEMON_IDLE_DELAY + Duration::from_millis(250))
-            .unwrap()
-            .exit
-    );
-    assert_eq!(registry.orphan_scan_count_for_tests(), 1);
-    assert!(
-        !registry
-            .advance(now + DAEMON_IDLE_DELAY + Duration::from_secs(5))
-            .unwrap()
-            .exit
-    );
-    assert_eq!(registry.orphan_scan_count_for_tests(), 2);
-}
-
-#[test]
-fn orphan_published_non_git_root_that_became_git_does_not_pin_exit() {
-    let base = tempfile::tempdir().unwrap();
-    let checkout = base.path().join("work");
-    fs::create_dir(&checkout).unwrap();
-    fs::write(
-        checkout.join("a.js"),
-        "function beforeGit() {}
-",
-    )
-    .unwrap();
-    let old = identity(&checkout);
-    let roots =
-        TopologyRoots::isolated_for_tests(base.path().join("cache"), base.path().join("data"));
-    let store = trellis::store::Store::open(roots.clone(), old).unwrap();
-    let owner = trellis::index_coordinator::establish_serving_session(
-        &store,
-        Some(&trellis::indexer::IndexOptions::new(checkout.clone())),
-        &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-    )
-    .unwrap();
-    drop(owner);
-    drop(store);
-    assert!(
-        std::process::Command::new("git")
-            .arg("init")
-            .arg("-q")
-            .arg(&checkout)
-            .status()
-            .unwrap()
-            .success()
-    );
-    identity(&checkout);
-    let now = Instant::now();
-    let mut registry = CheckoutRegistry::with_roots_at(roots, now);
-    assert!(registry.advance(now + DAEMON_IDLE_DELAY).unwrap().exit);
-}
-
-#[test]
-fn orphan_ambiguous_same_inode_git_metadata_stays_busy() {
-    let base = tempfile::tempdir().unwrap();
-    let checkout = base.path().join("work");
-    fs::create_dir(&checkout).unwrap();
-    let old = identity(&checkout);
-    let roots =
-        TopologyRoots::isolated_for_tests(base.path().join("cache"), base.path().join("data"));
-    drop(trellis::store::Store::open(roots.clone(), old).unwrap());
-    fs::write(
-        checkout.join(".git"),
-        "invalid pointer
-",
-    )
-    .unwrap();
-    let now = Instant::now();
-    let mut registry = CheckoutRegistry::with_roots_at(roots, now);
-    assert!(
-        !registry.advance(now + DAEMON_IDLE_DELAY).unwrap().exit,
-        "unreadable same-inode Git identity is not proof the queue is abandoned"
     );
 }

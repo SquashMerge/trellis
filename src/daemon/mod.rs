@@ -123,10 +123,11 @@ impl SocketPaths {
 }
 
 pub struct SocketOwner {
-    _lock: File,
+    lock: File,
+    lock_path: PathBuf,
     listener: UnixListener,
     socket: PathBuf,
-    inode: u64,
+    socket_identity: (u64, u64),
 }
 
 impl SocketOwner {
@@ -175,25 +176,54 @@ impl SocketOwner {
         }
         let listener = UnixListener::bind(&paths.socket)?;
         fs::set_permissions(&paths.socket, fs::Permissions::from_mode(0o600))?;
-        let inode = fs::symlink_metadata(&paths.socket)?.ino();
+        let socket_metadata = fs::symlink_metadata(&paths.socket)?;
         Ok(Some(Self {
-            _lock: lock,
+            lock,
+            lock_path: paths.lock.clone(),
             listener,
             socket: paths.socket.clone(),
-            inode,
+            socket_identity: (socket_metadata.dev(), socket_metadata.ino()),
         }))
     }
 
     pub fn listener(&self) -> &UnixListener {
         &self.listener
     }
+
+    /// Detect removal or replacement of the pathname for the retained election
+    /// lock. This is a shutdown signal, not a fence against a successor writer.
+    pub fn still_elected(&self) -> io::Result<bool> {
+        let named = match fs::symlink_metadata(&self.lock_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        let held = self.lock.metadata()?;
+        Ok(named.is_file() && (named.dev(), named.ino()) == (held.dev(), held.ino()))
+    }
 }
 
 impl Drop for SocketOwner {
     fn drop(&mut self) {
-        if fs::symlink_metadata(&self.socket)
-            .is_ok_and(|metadata| metadata.file_type().is_socket() && metadata.ino() == self.inode)
-        {
+        // A replacement lock may already have a successor socket. Do not
+        // unlink it, even if the filesystem recycled the old socket's inode.
+        match fs::symlink_metadata(&self.lock_path) {
+            Ok(named) => {
+                if !self
+                    .lock
+                    .metadata()
+                    .is_ok_and(|held| (named.dev(), named.ino()) == (held.dev(), held.ino()))
+                {
+                    return;
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => return,
+        }
+        if fs::symlink_metadata(&self.socket).is_ok_and(|metadata| {
+            metadata.file_type().is_socket()
+                && (metadata.dev(), metadata.ino()) == self.socket_identity
+        }) {
             let _ = fs::remove_file(&self.socket);
         }
     }

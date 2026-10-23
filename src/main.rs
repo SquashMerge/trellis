@@ -206,7 +206,13 @@ async fn main() -> Result<()> {
         )
         .init();
     if matches!(&command, Command::Daemon) {
-        return run_daemon().await;
+        if matches!(run_daemon().await?, DaemonExit::ElectionLost) {
+            // Cleanup has released the socket owner. Do not wait for blocking
+            // control sessions or checkout workers on the old election: Tokio
+            // runtime drop otherwise waits for blocking tasks indefinitely.
+            std::process::exit(0);
+        }
+        return Ok(());
     }
     if let Command::Serve(args) = &command {
         return serve_via_daemon(args).await;
@@ -952,10 +958,15 @@ async fn serve_via_daemon(args: &ServeArgs) -> Result<()> {
     Ok(())
 }
 
-async fn run_daemon() -> Result<()> {
+enum DaemonExit {
+    Normal,
+    ElectionLost,
+}
+
+async fn run_daemon() -> Result<DaemonExit> {
     let paths = daemon::SocketPaths::new(&TopologyRoots::production()?.data);
     let Some(owner) = daemon::SocketOwner::acquire(&paths)? else {
-        return Ok(());
+        return Ok(DaemonExit::Normal);
     };
     // Test-only ownership marker: only the elected daemon records its PID.
     #[cfg(feature = "test-support")]
@@ -970,6 +981,28 @@ async fn run_daemon() -> Result<()> {
     let (browser_shutdown, _) = tokio::sync::watch::channel(false);
     let idle = daemon::run_idle_lifecycle(registry.clone());
     tokio::pin!(idle);
+    let election_lost = async {
+        // Let a real-process test replace the lock and elect its successor
+        // before this owner observes the change. The handshake proves ordering;
+        // no test relies on winning a race against the polling interval.
+        #[cfg(feature = "test-support")]
+        if let Some(path) = std::env::var_os("TRELLIS_TEST_ELECTION_CHECK_GATE") {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut gate = tokio::net::UnixStream::connect(path).await?;
+            gate.write_all(b"ready").await?;
+            let mut release = [0u8; 1];
+            gate.read_exact(&mut release).await?;
+        }
+        loop {
+            if !owner.still_elected()? {
+                return Ok::<(), std::io::Error>(());
+            }
+            // Filesystem path loss has no in-process owner that can signal us.
+            // This is bounded liveness detection, not a writer fence.
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    };
+    tokio::pin!(election_lost);
     // A test-elected daemon ends with the test process that owns it (#130),
     // even when the test never stops it or is killed before its guards run.
     let owner_gone = async {
@@ -997,10 +1030,11 @@ async fn run_daemon() -> Result<()> {
             Ok("econnaborted") => Some(libc::ECONNABORTED),
             _ => None,
         };
-    loop {
+    let outcome = loop {
         tokio::select! {
-            result = &mut idle => { result.map_err(|e| anyhow::anyhow!("{}", e.reason()))?; break; }
-            () = &mut owner_gone => break,
+            result = &mut idle => break result.map(|()| DaemonExit::Normal).map_err(|e| anyhow::anyhow!("{}", e.reason())),
+            result = &mut election_lost => break result.map(|()| DaemonExit::ElectionLost).map_err(anyhow::Error::from),
+            () = &mut owner_gone => break Ok(DaemonExit::Normal),
             accepted = async {
                 #[cfg(feature = "test-support")]
                 if let Some(errno) = injected_accept_errno {
@@ -1037,11 +1071,12 @@ async fn run_daemon() -> Result<()> {
                 });
             }
         }
-    }
+    };
     let _ = browser_shutdown.send(true);
     drop(listener);
-    drop(owner);
-    Ok(())
+    // `election_lost` borrows the owner until its future is dropped. Scope exit
+    // drops both; SocketOwner only removes a socket with its captured identity.
+    outcome
 }
 
 fn checked_serve_options(raw: serde_json::Value) -> Result<registry::CheckoutOptions> {

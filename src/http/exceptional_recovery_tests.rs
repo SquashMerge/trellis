@@ -1,7 +1,7 @@
 use super::*;
 use crate::store::topology::{TopologyRoots, WorkspaceIdentity};
 
-fn fixture() -> (
+pub(super) fn fixture() -> (
     tempfile::TempDir,
     Store,
     Arc<DaemonState>,
