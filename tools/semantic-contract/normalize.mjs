@@ -325,8 +325,9 @@ export function assignKeys(loaded, registry = identityRegistry()) {
       fail("NORMALIZE.RANGE", "range", "empty non-module declaration");
     if (
       (row.name === null) !== (nameRange === null) ||
-      (row.kind === "module" || row.kind === "anonymousFunction") !==
-        (row.name === null)
+      (["module", "anonymousFunction"].includes(row.kind)
+        ? row.name !== null
+        : row.name === null && row.kind !== "implementation")
     )
       fail("NORMALIZE.NAME", "nameRange", "name/kind nullability differs");
     if (nameRange && !contains(range, nameRange))

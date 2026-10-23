@@ -9,9 +9,9 @@ fn main() {
         println!("cargo:rerun-if-changed={path}");
         std::fs::read(path).unwrap_or_else(|error| panic!("read {path}: {error}"))
     };
-    let modules: Vec<(&str, Vec<u8>)> = EXTRACTION_MODULES
-        .iter()
-        .map(|path| (*path, read(path)))
+    let test_support = std::env::var_os("CARGO_FEATURE_TEST_SUPPORT").is_some();
+    let modules: Vec<(&str, Vec<u8>)> = extraction_modules(test_support)
+        .map(|path| (path, read(path)))
         .collect();
     let modules: Vec<(&str, &[u8])> = modules
         .iter()
@@ -20,7 +20,6 @@ fn main() {
     let lock = String::from_utf8(read("Cargo.lock")).expect("Cargo.lock is UTF-8");
     println!("cargo:rerun-if-changed=build/extractor_inputs.rs");
     println!("cargo:rerun-if-changed=build.rs");
-    let test_support = std::env::var_os("CARGO_FEATURE_TEST_SUPPORT").is_some();
     println!(
         "cargo:rustc-env=TRELLIS_EXTRACTOR_HASH={}",
         extractor_hash(&modules, &lock, test_support)
