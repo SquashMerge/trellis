@@ -10,18 +10,35 @@ fn fixture() -> (s::SemanticPublication, n::Artifact, s::CapturedComponents) {
         language: "rust".into(),
         path: "src/main.rs".into(),
     };
+    let native_toolchain = json!({"nativeExecutable":h(b"native")});
+    let native_config = vec![json!({"config":"test"})];
+    let native_dependencies = vec![json!({"dependencies":"test"})];
+    let toolchain = native_ids::canonical(&native_toolchain);
+    let config = native_ids::canonical(&json!(native_config));
+    let dependency = native_ids::canonical(&json!(native_dependencies));
+    let native_id = format!(
+        "revision:v2:{}",
+        native_ids::digest(
+            b"trellis.native-revision.v2\0",
+            &native_ids::canonical(&json!({
+                "sourceSetId":document.source_set_id,
+                "documents":[{"byteLength":bytes.len(),"contentHash":h(&bytes),"language":document.language,"path":document.path}],
+                "toolchain":native_toolchain,"config":native_config,"dependencies":native_dependencies
+            }))
+        )
+    );
     let revision = n::Revision {
-        id: "revision-1".into(),
+        id: native_id.clone(),
         source_set_id: document.source_set_id.clone(),
         documents: vec![n::Document {
             key: document.clone(),
-            revision_id: "revision-1".into(),
+            revision_id: native_id.clone(),
             content_hash: h(&bytes),
             byte_length: bytes.len(),
         }],
-        toolchain_hash: h(b"tool"),
-        config_hash: h(b"config"),
-        dependency_hash: h(b"dependency"),
+        toolchain_hash: h(&toolchain),
+        config_hash: h(&config),
+        dependency_hash: h(&dependency),
     };
     let producer = n::Producer {
         id: "trellis.native.syntax".into(),
@@ -238,9 +255,13 @@ fn fixture() -> (s::SemanticPublication, n::Artifact, s::CapturedComponents) {
         artifacts: BTreeMap::from([("semantic".into(), b"semantic-artifact".to_vec())]),
         sources: BTreeMap::from([(document, bytes)]),
         captured_revision: revision,
-        toolchain: b"tool".to_vec(),
-        config: b"config".to_vec(),
-        dependency: b"dependency".to_vec(),
+        native_toolchain,
+        native_config,
+        native_dependencies,
+        requested_producers: semantic.producers.clone(),
+        toolchain,
+        config,
+        dependency,
         native_extraction_components: BTreeMap::new(),
     };
     (semantic, native, captured)
@@ -403,6 +424,7 @@ fn captured_basis_is_authenticated_before_requested_freshness() {
     semantic.references.clear();
     semantic.call_bindings.clear();
     semantic.type_relationships.clear();
+    semantic.coverage[0].observed_roles.clear();
     native.revision.id = "revision-2".into();
     for d in &mut native.revision.documents {
         d.revision_id = native.revision.id.clone();
@@ -427,4 +449,458 @@ fn captured_basis_is_authenticated_before_requested_freshness() {
             .to_string()
             .contains("component mismatch")
     );
+}
+
+#[test]
+fn native_capture_identity_and_requested_context_are_independent() {
+    let (mut semantic, native, mut captured) = fixture();
+    captured.captured_revision.id = "revision:v2:".to_owned() + &"0".repeat(64);
+    captured.captured_revision.documents[0].revision_id = captured.captured_revision.id.clone();
+    assert!(
+        s::validate_evidence(&semantic, &native, &captured)
+            .unwrap_err()
+            .to_string()
+            .contains("native revision ID")
+    );
+    let (_, _, mut captured) = fixture();
+    captured.native_toolchain = json!({"nativeExecutable":"forged"});
+    assert!(s::validate_evidence(&semantic, &native, &captured).is_err());
+    let (_, _, mut captured) = fixture();
+    captured.requested_producers[0].version = "v2".into();
+    for proof in &mut semantic.provenance {
+        proof.freshness = s::Freshness::PossiblyStale;
+    }
+    s::validate_evidence(&semantic, &native, &captured).unwrap();
+    captured.requested_producers.clear();
+    s::validate_evidence(&semantic, &native, &captured).unwrap();
+    captured.requested_producers = semantic.producers.clone();
+    captured.requested_producers[0].executable_hash = "0".repeat(64);
+    s::validate_evidence(&semantic, &native, &captured).unwrap();
+    captured.requested_producers = semantic.producers.clone();
+    captured.requested_producers[0].languages = vec![s::Language::Python];
+    s::validate_evidence(&semantic, &native, &captured).unwrap();
+    captured.requested_producers = semantic.producers.clone();
+    semantic.provenance[0].freshness = s::Freshness::Fresh;
+    assert!(s::validate_evidence(&semantic, &native, &captured).is_err());
+}
+#[test]
+fn captured_manifest_contract_order_and_current_coverage() {
+    let (mut semantic, mut native, mut captured) = fixture();
+    let second = n::DocumentKey {
+        source_set_id: native.revision.source_set_id.clone(),
+        language: "javascript".into(),
+        path: "extra.js".into(),
+    };
+    native.source_set.languages.push("javascript".into());
+    native.revision.id = "revision:v2:".to_owned() + &"1".repeat(64);
+    native.revision.documents[0].revision_id = native.revision.id.clone();
+    for p in &mut semantic.provenance {
+        p.freshness = s::Freshness::PossiblyStale;
+    }
+    semantic.coverage[0].revision_id = native.revision.id.clone();
+    // Cross-revision occurrence facts are not admitted; retain only historical coverage/proofs.
+    semantic.symbols.clear();
+    semantic.declaration_bindings.clear();
+    semantic.references.clear();
+    semantic.call_bindings.clear();
+    semantic.type_relationships.clear();
+    semantic.coverage[0].observed_roles.clear();
+    native.revision.documents.push(n::Document {
+        key: second.clone(),
+        revision_id: native.revision.id.clone(),
+        content_hash: native_ids::digest(b"", b"let x=0;"),
+        byte_length: 8,
+    });
+    // Captured document is still only rust, but current coverage must include JavaScript for a producer supporting it.
+    semantic.producers[0]
+        .languages
+        .push(s::Language::Javascript);
+    captured.requested_producers = semantic.producers.clone();
+    semantic.coverage.push(s::Coverage {
+        producer_id: "semantic".into(),
+        language: s::Language::Javascript,
+        source_set_id: second.source_set_id.clone(),
+        document_path: second.path.clone(),
+        revision_id: native.revision.id.clone(),
+        requested: false,
+        selected: false,
+        state: s::CoverageState::NotRequested,
+        supported_roles: vec![],
+        observed_roles: vec![],
+        diagnostic: None,
+    });
+    // Producer language order must itself follow contract order (rust before javascript).
+    s::validate_evidence(&semantic, &native, &captured).unwrap();
+    semantic.coverage.pop();
+    assert!(
+        s::validate_evidence(&semantic, &native, &captured)
+            .unwrap_err()
+            .to_string()
+            .contains("missing producer coverage")
+    );
+    semantic.coverage.push(s::Coverage {
+        producer_id: "semantic".into(),
+        language: s::Language::Javascript,
+        source_set_id: second.source_set_id.clone(),
+        document_path: second.path.clone(),
+        revision_id: native.revision.id.clone(),
+        requested: false,
+        selected: false,
+        state: s::CoverageState::NotRequested,
+        supported_roles: vec![],
+        observed_roles: vec![],
+        diagnostic: None,
+    });
+    semantic.coverage[1].document_path = "captured-only.js".into();
+    assert!(
+        s::validate_evidence(&semantic, &native, &captured)
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported coverage document")
+    );
+}
+#[test]
+fn independent_producers_and_duplicate_fact_partitions() {
+    let (mut semantic, native, mut captured) = fixture();
+    let mut second = semantic.producers[0].clone();
+    second.id = "semantic-2".into();
+    captured
+        .producer_executables
+        .insert(second.id.clone(), b"semantic-exe".to_vec());
+    captured
+        .artifacts
+        .insert(second.id.clone(), b"semantic-artifact".to_vec());
+    captured.requested_producers.push(second.clone());
+    semantic.producers.push(second);
+    let mut coverage = semantic.coverage[0].clone();
+    coverage.producer_id = "semantic-2".into();
+    semantic.coverage.push(coverage);
+    let originals = semantic.provenance.clone();
+    for mut p in originals {
+        p.id = format!("2-{}", p.id);
+        p.producer_id = "semantic-2".into();
+        p.basis.as_mut().unwrap().producer_id = "semantic-2".into();
+        semantic.provenance.push(p);
+    }
+    let mut symbol = semantic.symbols[0].clone();
+    symbol.provenance_id = "2-bind".into();
+    semantic.symbols.push(symbol);
+    let mut call = semantic.call_bindings[0].clone();
+    call.provenance_id = "2-ref".into();
+    semantic.call_bindings.push(call);
+    let mut reference = semantic.references[0].clone();
+    reference.provenance_id = "2-ref".into();
+    semantic.references.push(reference);
+    s::validate_evidence(&semantic, &native, &captured).unwrap();
+    semantic.symbols.push(semantic.symbols[0].clone());
+    assert!(
+        s::validate_evidence(&semantic, &native, &captured)
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate semantic symbol")
+    );
+    semantic.symbols.pop();
+    semantic.references.push(semantic.references[0].clone());
+    assert!(
+        s::validate_evidence(&semantic, &native, &captured)
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate reference")
+    );
+}
+#[test]
+fn invalid_roles_and_cross_fact_targets_are_rejected() {
+    let (base, native, bytes) = fixture();
+    let mut s = base.clone();
+    s.references[0].roles = vec![s::Role::Alias];
+    assert!(s::validate_evidence(&s, &native, &bytes).is_err());
+    let mut s = base.clone();
+    s.references[0].roles = vec![s::Role::Call];
+    s.references[0].range = n::Range { start: 3, end: 8 };
+    assert!(s::validate_evidence(&s, &native, &bytes).is_err());
+    let mut s = base.clone();
+    s.coverage[0].observed_roles.push(s::Role::Type);
+    assert!(s::validate_evidence(&s, &native, &bytes).is_err());
+    let mut s = base.clone();
+    s.call_bindings.push(s.call_bindings[0].clone());
+    s.call_bindings[1].provenance_id = "bind".into(); // incompatible proof kind
+    assert!(s::validate_evidence(&s, &native, &bytes).is_err());
+    s.call_bindings[1].provenance_id = "ref".into();
+    assert!(
+        s::validate_evidence(&s, &native, &bytes)
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate call binding")
+    );
+    let mut s = base.clone();
+    s.type_relationships[0].source = base.type_relationships[0].target.clone();
+    assert!(s::validate_evidence(&s, &native, &bytes).is_err());
+}
+
+#[test]
+fn unavailable_native_measurement_is_not_an_unmatched_join() {
+    let (mut semantic, mut native, bytes) = fixture();
+    let key = native.revision.documents[0].key.clone();
+    native.coverage.push(n::Coverage {
+        producer_id: native.producer.id.clone(),
+        language: key.language.clone(),
+        source_set_id: key.source_set_id.clone(),
+        document_path: key.path.clone(),
+        revision_id: native.revision.id.clone(),
+        requested: true,
+        selected: true,
+        state: "failed".into(),
+        supported_roles: vec![],
+        observed_roles: vec![],
+        diagnostic: Some("native measurement unavailable".into()),
+    });
+    semantic.declaration_bindings[0].join.anchor.range = n::Range { start: 0, end: 2 };
+    semantic.declaration_bindings[0].join.candidate_ids.clear();
+    semantic.declaration_bindings[0].syntax_id = None;
+    semantic.declaration_bindings[0].join.status = s::JoinStatus::Unsupported;
+    semantic.declaration_bindings[0].join.diagnostic = Some("measurement unavailable".into());
+    s::validate_evidence(&semantic, &native, &bytes).unwrap();
+    semantic.declaration_bindings[0].join.status = s::JoinStatus::Unmatched;
+    assert!(s::validate_evidence(&semantic, &native, &bytes).is_err());
+    semantic.declaration_bindings[0].join.status = s::JoinStatus::Unsupported;
+    semantic.coverage[0]
+        .observed_roles
+        .retain(|role| *role != s::Role::Call);
+    semantic.call_bindings[0].join.anchor.range = n::Range { start: 0, end: 2 };
+    semantic.call_bindings[0].join.candidate_ids.clear();
+    semantic.call_bindings[0].call_id = None;
+    semantic.call_bindings[0].join.status = s::JoinStatus::Unsupported;
+    semantic.call_bindings[0].join.diagnostic = Some("measurement unavailable".into());
+    s::validate_evidence(&semantic, &native, &bytes).unwrap();
+    semantic.call_bindings[0].join.anchor.range = n::Range {
+        start: 200,
+        end: 210,
+    };
+    assert!(
+        s::validate_evidence(&semantic, &native, &bytes)
+            .unwrap_err()
+            .to_string()
+            .contains("converted semantic span")
+    );
+}
+#[test]
+fn exact_invocation_and_distinct_provenances_are_preserved() {
+    let (mut semantic, native, bytes) = fixture();
+    let another = semantic
+        .provenance
+        .iter()
+        .find(|p| p.id == "ref")
+        .unwrap()
+        .clone();
+    let mut another = s::Provenance {
+        id: "ref-2".into(),
+        ..another
+    };
+    another.freshness = s::Freshness::Fresh;
+    semantic.provenance.push(another);
+    let mut binding = semantic.call_bindings[0].clone();
+    binding.provenance_id = "ref-2".into();
+    binding.join.anchor.kind = s::JoinKind::Invocation;
+    binding.join.anchor.range = n::Range { start: 13, end: 20 };
+    semantic.call_bindings.push(binding);
+    s::validate_evidence(&semantic, &native, &bytes).unwrap();
+    semantic.call_bindings[1].declared_target = Some(semantic.type_relationships[0].target.clone());
+    semantic.call_bindings[1].resolution = s::Resolution::External;
+    semantic.call_bindings[1].stale_target = None;
+    assert!(
+        s::validate_evidence(&semantic, &native, &bytes)
+            .unwrap_err()
+            .to_string()
+            .contains("contradictory resolved call targets")
+    );
+}
+
+#[test]
+fn captured_components_are_verified_before_each_requested_comparison() {
+    let (mut semantic, mut native, captured) = fixture();
+    for field in ["toolchain", "config", "dependency"] {
+        let mut changed = native.clone();
+        match field {
+            "toolchain" => changed.revision.toolchain_hash = "0".repeat(64),
+            "config" => changed.revision.config_hash = "0".repeat(64),
+            _ => changed.revision.dependency_hash = "0".repeat(64),
+        }
+        changed.revision.id = "revision:v2:".to_owned() + &"1".repeat(64);
+        changed.revision.documents[0].revision_id = changed.revision.id.clone();
+        let mut historical = semantic.clone();
+        historical.coverage[0].revision_id = changed.revision.id.clone();
+        historical.coverage[0].observed_roles.clear();
+        historical.symbols.clear();
+        historical.declaration_bindings.clear();
+        historical.references.clear();
+        historical.call_bindings.clear();
+        historical.type_relationships.clear();
+        for proof in &mut historical.provenance {
+            proof.freshness = s::Freshness::PossiblyStale;
+        }
+        s::validate_evidence(&historical, &changed, &captured).unwrap();
+        historical.provenance[0].freshness = s::Freshness::Fresh;
+        assert!(
+            s::validate_evidence(&historical, &changed, &captured).is_err(),
+            "{field}"
+        );
+    }
+    native.revision.documents[0].content_hash = "0".repeat(64);
+    native.revision.documents[0].byte_length = 23;
+    native.revision.id = "revision:v2:".to_owned() + &"1".repeat(64);
+    native.revision.documents[0].revision_id = native.revision.id.clone();
+    semantic.coverage[0].revision_id = native.revision.id.clone();
+    semantic.coverage[0].observed_roles.clear();
+    semantic.symbols.clear();
+    semantic.declaration_bindings.clear();
+    semantic.references.clear();
+    semantic.call_bindings.clear();
+    semantic.type_relationships.clear();
+    for proof in &mut semantic.provenance {
+        proof.freshness = s::Freshness::Stale;
+    }
+    s::validate_evidence(&semantic, &native, &captured).unwrap();
+    semantic.provenance[0].freshness = s::Freshness::PossiblyStale;
+    assert!(s::validate_evidence(&semantic, &native, &captured).is_err());
+    let (mut semantic, native, captured) = fixture();
+    semantic.type_relationships[0].source = s::Target::Internal {
+        syntax_id: native.declarations[0].syntax_id.clone(),
+        document: n::DocumentKey {
+            path: "foreign.rs".into(),
+            ..native.declarations[0].document.clone()
+        },
+        revision_id: native.revision.id.clone(),
+    };
+    assert!(s::validate_evidence(&semantic, &native, &captured).is_err());
+}
+#[test]
+fn malformed_nested_contract_fields_do_not_default() {
+    let (semantic, _, _) = fixture();
+    let value = serde_json::to_value(semantic).unwrap();
+    for (family, index, field) in [
+        ("provenance", 0, "derivedFrom"),
+        ("provenance", 0, "basis"),
+        ("symbols", 0, "displayName"),
+        ("declarationBindings", 0, "syntaxId"),
+        ("references", 0, "declaredTarget"),
+        ("callBindings", 0, "callId"),
+        ("callBindings", 0, "staleTarget"),
+    ] {
+        let mut variant = value.clone();
+        variant[family][index]
+            .as_object_mut()
+            .unwrap()
+            .remove(field);
+        assert!(
+            serde_json::from_value::<s::SemanticPublication>(variant).is_err(),
+            "{family}.{field}"
+        );
+    }
+    let mut variant = value.clone();
+    variant["provenance"][0]["basis"]["surplus"] = json!(1);
+    assert!(serde_json::from_value::<s::SemanticPublication>(variant).is_err());
+    let mut variant = value.clone();
+    variant["coverage"][0]["state"] = json!("mystery");
+    assert!(serde_json::from_value::<s::SemanticPublication>(variant).is_err());
+}
+
+#[test]
+fn captured_manifest_uses_language_enum_order_not_alphabetical_order() {
+    let (mut semantic, mut native, mut captured) = fixture();
+    let extra = n::DocumentKey {
+        source_set_id: native.revision.source_set_id.clone(),
+        language: "javascript".into(),
+        path: "z.js".into(),
+    };
+    captured.sources.insert(extra.clone(), b"x".to_vec());
+    captured.captured_revision.documents.push(n::Document {
+        key: extra.clone(),
+        revision_id: String::new(),
+        content_hash: native_ids::digest(b"", b"x"),
+        byte_length: 1,
+    });
+    let native_input = json!({"sourceSetId":captured.captured_revision.source_set_id,
+        "documents":captured.captured_revision.documents.iter().map(|d|json!({"byteLength":d.byte_length,"contentHash":d.content_hash,"language":d.key.language,"path":d.key.path})).collect::<Vec<_>>(),
+        "toolchain":captured.native_toolchain,"config":captured.native_config,"dependencies":captured.native_dependencies});
+    let old = captured.captured_revision.id.clone();
+    let captured_id = format!(
+        "revision:v2:{}",
+        native_ids::digest(
+            b"trellis.native-revision.v2\0",
+            &native_ids::canonical(&native_input)
+        )
+    );
+    captured.captured_revision.id = captured_id.clone();
+    for d in &mut captured.captured_revision.documents {
+        d.revision_id = captured_id.clone();
+    }
+    native.revision.id = "revision:v2:".to_owned() + &"a".repeat(64);
+    native.revision.documents[0].revision_id = native.revision.id.clone();
+    semantic.coverage[0].revision_id = native.revision.id.clone();
+    semantic.coverage[0].observed_roles.clear();
+    semantic.symbols.clear();
+    semantic.declaration_bindings.clear();
+    semantic.references.clear();
+    semantic.call_bindings.clear();
+    semantic.type_relationships.clear();
+    let manifest = serde_json::Value::Array(
+        captured
+            .captured_revision
+            .documents
+            .iter()
+            .map(|d| json!({"document":d.key,"contentHash":d.content_hash}))
+            .collect(),
+    );
+    for proof in &mut semantic.provenance {
+        proof.revision_id = captured_id.clone();
+        proof.basis.as_mut().unwrap().revision_id = captured_id.clone();
+        proof.basis.as_mut().unwrap().source_manifest_hash =
+            native_ids::digest(b"", &native_ids::canonical(&manifest));
+        proof.freshness = s::Freshness::PossiblyStale;
+    }
+    assert_ne!(old, captured_id);
+    s::validate_evidence(&semantic, &native, &captured).unwrap();
+    captured.captured_revision.documents.reverse();
+    assert!(
+        s::validate_evidence(&semantic, &native, &captured)
+            .unwrap_err()
+            .to_string()
+            .contains("unsorted native document manifest")
+    );
+}
+
+#[test]
+fn contradictory_targets_can_be_reported_as_ambiguous_without_changing_exact_join() {
+    let (mut semantic, native, bytes) = fixture();
+    let proof = semantic
+        .provenance
+        .iter()
+        .find(|p| p.id == "ref")
+        .unwrap()
+        .clone();
+    semantic.provenance.push(s::Provenance {
+        id: "ref-2".into(),
+        ..proof
+    });
+    let mut binding = semantic.call_bindings[0].clone();
+    binding.provenance_id = "ref-2".into();
+    let mut candidates = vec![
+        semantic.call_bindings[0].declared_target.clone().unwrap(),
+        semantic.type_relationships[0].target.clone(),
+    ];
+    candidates.sort_by_key(|t| native_ids::canonical(&serde_json::to_value(t).unwrap()));
+    for b in &mut semantic.call_bindings {
+        b.resolution = s::Resolution::Ambiguous;
+        b.declared_target = None;
+        b.candidates = candidates.clone();
+        b.stale_target = None;
+    }
+    binding.resolution = s::Resolution::Ambiguous;
+    binding.declared_target = None;
+    binding.candidates = candidates;
+    binding.stale_target = None;
+    semantic.call_bindings.push(binding);
+    s::validate_evidence(&semantic, &native, &bytes).unwrap();
+    semantic.call_bindings[1].candidates.reverse();
+    assert!(s::validate_evidence(&semantic, &native, &bytes).is_err());
 }

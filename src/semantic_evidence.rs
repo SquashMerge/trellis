@@ -99,6 +99,12 @@ pub struct CapturedComponents {
     pub artifacts: BTreeMap<String, Vec<u8>>,
     pub sources: BTreeMap<native::DocumentKey, Vec<u8>>,
     pub captured_revision: native::Revision,
+    /// Canonical native revision input components, captured with the native header.
+    pub native_toolchain: serde_json::Value,
+    pub native_config: Vec<serde_json::Value>,
+    pub native_dependencies: Vec<serde_json::Value>,
+    /// Requested descriptors are independent of captured producer descriptors.
+    pub requested_producers: Vec<Producer>,
     pub toolchain: Vec<u8>,
     pub config: Vec<u8>,
     pub dependency: Vec<u8>,
@@ -265,7 +271,15 @@ fn validate_join(
         "foreign join anchor"
     );
     let mut candidates = BTreeSet::new();
-    let mut available = true;
+    let available = native
+        .coverage
+        .iter()
+        .find(|c| {
+            c.document_path == a.document.path
+                && c.language == a.document.language
+                && c.source_set_id == a.document.source_set_id
+        })
+        .is_none_or(|c| matches!(c.state.as_str(), "complete" | "partial"));
     match family {
         JoinKind::DeclarationName => {
             for d in &native.declarations {
@@ -294,14 +308,6 @@ fn validate_join(
         }
         _ => anyhow::bail!("unsupported join family"),
     }
-    // Current native measurement has available UTF-8 ranges for every measured row.
-    if native.coverage.iter().any(|c| {
-        c.document_path == a.document.path
-            && c.language == a.document.language
-            && c.state == "unsupported"
-    }) {
-        available = false;
-    }
     let expected: Vec<_> = candidates.into_iter().collect();
     let status = if expected.len() == 1 {
         JoinStatus::Exact
@@ -328,6 +334,33 @@ fn validate_join(
         }
     }
     Ok(())
+}
+
+fn language_rank(language: &str) -> usize {
+    match language {
+        "java" => 0,
+        "rust" => 1,
+        "python" => 2,
+        "javascript" => 3,
+        _ => unreachable!("validated language"),
+    }
+}
+
+fn native_revision_id(captured: &CapturedComponents) -> String {
+    let documents: Vec<_> = captured.captured_revision.documents.iter().map(|d| json!({"byteLength":d.byte_length,"contentHash":d.content_hash,"language":d.key.language,"path":d.key.path})).collect();
+    format!(
+        "revision:v2:{}",
+        native_ids::digest(
+            b"trellis.native-revision.v2\0",
+            &native_ids::canonical(&json!({
+                "sourceSetId":captured.captured_revision.source_set_id,
+                "documents":documents,
+                "toolchain":captured.native_toolchain,
+                "config":captured.native_config,
+                "dependencies":captured.native_dependencies,
+            }))
+        )
+    )
 }
 
 fn requested_manifest_hash(revision: &native::Revision) -> String {
@@ -389,13 +422,23 @@ pub fn validate_evidence(
         .captured_revision
         .documents
         .iter()
-        .map(|d| (&d.key.language, &d.key.path))
+        .map(|d| (language_rank(&d.key.language), d.key.path.as_bytes()))
         .collect::<Vec<_>>();
     let original = ordered_docs.clone();
     ordered_docs.sort();
     ensure!(
         original == ordered_docs && original.windows(2).all(|w| w[0] != w[1]),
         "unsorted native document manifest"
+    );
+    ensure!(
+        captured.captured_revision.id == native_revision_id(captured),
+        "unauthenticated captured native revision ID"
+    );
+    ensure!(
+        captured.toolchain == native_ids::canonical(&captured.native_toolchain)
+            && captured.config == native_ids::canonical(&json!(captured.native_config))
+            && captured.dependency == native_ids::canonical(&json!(captured.native_dependencies)),
+        "captured native component input mismatch"
     );
     if captured.captured_revision.id == revision.id {
         ensure!(
@@ -452,6 +495,17 @@ pub fn validate_evidence(
             && captured.artifacts.len() == producers.len(),
         "unclaimed semantic bytes"
     );
+    let mut requested_producers = BTreeMap::new();
+    for p in &captured.requested_producers {
+        text(&p.id)?;
+        text(&p.version)?;
+        hash(&p.executable_hash)?;
+        ordered(&p.languages)?;
+        ensure!(
+            !p.languages.is_empty() && requested_producers.insert(p.id.as_str(), p).is_none(),
+            "invalid requested semantic producer"
+        );
+    }
     let mut coverage = BTreeMap::new();
     for row in &semantic.coverage {
         text(&row.producer_id)?;
@@ -470,9 +524,12 @@ pub fn validate_evidence(
         ensure!(
             producer.languages.contains(&row.language)
                 && native.source_set.languages.contains(&lang)
-                && sources
-                    .keys()
-                    .any(|d| d.language == lang && d.path == row.document_path),
+                && revision
+                    .documents
+                    .iter()
+                    .any(|d| d.key.source_set_id == row.source_set_id
+                        && d.key.language == lang
+                        && d.key.path == row.document_path),
             "unsupported coverage document"
         );
         ordered(&row.supported_roles)?;
@@ -634,6 +691,7 @@ pub fn validate_evidence(
             "captured proof document hash mismatch"
         );
         let requested = revision.documents.iter().find(|d| d.key == p.document);
+        let requested_producer = requested_producers.get(p.producer_id.as_str());
         let freshness = if requested.is_none_or(|d| d.content_hash != p.content_hash) {
             Freshness::Stale
         } else if basis.revision_id != revision.id
@@ -641,6 +699,12 @@ pub fn validate_evidence(
             || basis.toolchain_hash != revision.toolchain_hash
             || basis.config_hash != revision.config_hash
             || basis.dependency_hash != revision.dependency_hash
+            || basis.source_set_id != revision.source_set_id
+            || requested_producer.is_none_or(|current| {
+                current.version != basis.producer_version
+                    || current.executable_hash != basis.producer_hash
+                    || !current.languages.contains(&basis.language)
+            })
         {
             Freshness::PossiblyStale
         } else {
@@ -665,8 +729,13 @@ pub fn validate_evidence(
             ensure!(
                 p.evidence_kind == kind
                     && doc.is_none_or(|d| d == &p.document)
-                    && p.revision_id == revision.id,
-                "semantic fact/provenance mismatch"
+                    && p.revision_id == revision.id
+                    && coverage.contains_key(&(
+                        p.producer_id.as_str(),
+                        p.document.language.clone(),
+                        p.document.path.as_str()
+                    )),
+                "semantic fact/provenance tuple mismatch"
             );
             Ok(p)
         };
@@ -682,16 +751,29 @@ pub fn validate_evidence(
         }
         targets(&s.declarations, native, &decls, false)?;
         ensure!(
-            symbols.insert(native_ids::canonical(&serde_json::to_value(&s.key)?)),
+            symbols.insert((
+                p.producer_id.clone(),
+                native_ids::canonical(&serde_json::to_value(&s.key)?)
+            )),
             "duplicate semantic symbol key"
         );
     }
+    let mut binding_facts = BTreeSet::new();
     for b in &semantic.declaration_bindings {
         let p = fact(
             &b.provenance_id,
             Some(&b.join.anchor.document),
             EvidenceKind::DeclarationBinding,
         )?;
+        ensure!(
+            binding_facts.insert((
+                p.producer_id.clone(),
+                p.document.clone(),
+                b.provenance_id.clone(),
+                native_ids::canonical(&serde_json::to_value(&b.join.anchor)?)
+            )),
+            "duplicate declaration binding fact"
+        );
         validate_join(&b.join, JoinKind::DeclarationName, native, &sources)?;
         ensure!(
             p.document == b.join.anchor.document,
@@ -716,9 +798,10 @@ pub fn validate_evidence(
         }
     }
     let mut references = BTreeSet::new();
-    let mut grouped: BTreeMap<(&native::DocumentKey, &str), Vec<&Reference>> = BTreeMap::new();
+    let mut grouped: BTreeMap<(&str, &native::DocumentKey, &str), Vec<&Reference>> =
+        BTreeMap::new();
     for r in &semantic.references {
-        fact(
+        let p = fact(
             &r.provenance_id,
             Some(&r.document),
             EvidenceKind::SemanticReference,
@@ -751,22 +834,47 @@ pub fn validate_evidence(
             "invalid reference roles"
         );
         ensure!(
+            !r.roles.contains(&Role::Alias) || r.roles.contains(&Role::Definition),
+            "alias without definition"
+        );
+        if r.roles.contains(&Role::Call) {
+            ensure!(
+                native.calls.iter().any(|call| call.document == r.document
+                    && call.owner_syntax_id == r.owner_syntax_id
+                    && call.callee_range.as_ref() == Some(&r.range)
+                    && call.spelling.as_deref() == Some(&r.spelling)),
+                "call role without measured invocation"
+            );
+        }
+        ensure!(
             (r.site == ReferenceSite::Declaration) == r.roles.contains(&Role::Definition),
             "reference site/role mismatch"
         );
+        if r.site == ReferenceSite::Declaration {
+            ensure!(
+                decls
+                    .get(&r.owner_syntax_id)
+                    .is_some_and(|d| d.name_range.as_ref() == Some(&r.range)
+                        && d.name.as_deref() == Some(&r.spelling)),
+                "declaration reference site not measured"
+            );
+        }
         resolution(r.resolution, &r.declared_target, &r.candidates)?;
         if let Some(t) = &r.declared_target {
             target(t, native, &decls)?;
         }
         targets(&r.candidates, native, &decls, true)?;
-        ensure!(references.insert(r.id.as_str()), "duplicate reference ID");
+        ensure!(
+            references.insert((p.producer_id.as_str(), r.id.as_str())),
+            "duplicate reference ID"
+        );
         grouped
-            .entry((&r.document, &r.owner_syntax_id))
+            .entry((&p.producer_id, &r.document, &r.owner_syntax_id))
             .or_default()
             .push(r);
     }
     let mut registry = IdentityRegistry::default();
-    for ((document, owner), mut group) in grouped {
+    for ((_producer, document, owner), mut group) in grouped {
         group.sort_by_key(|r| (r.range.start, r.range.end));
         let content_hash = &revision
             .documents
@@ -785,12 +893,24 @@ pub fn validate_evidence(
             ensure!(id == r.id, "noncanonical reference ID");
         }
     }
+    let mut call_facts = BTreeSet::new();
+    type TargetClaim = (Resolution, Option<Vec<u8>>, Vec<Vec<u8>>);
+    let mut call_resolutions: BTreeMap<(String, String), Vec<TargetClaim>> = BTreeMap::new();
     for b in &semantic.call_bindings {
-        fact(
+        let proof = fact(
             &b.provenance_id,
             Some(&b.join.anchor.document),
             EvidenceKind::SemanticReference,
         )?;
+        ensure!(
+            call_facts.insert((
+                proof.producer_id.clone(),
+                proof.document.clone(),
+                b.provenance_id.clone(),
+                native_ids::canonical(&serde_json::to_value(&b.join.anchor)?)
+            )),
+            "duplicate call binding fact"
+        );
         validate_join(&b.join, JoinKind::Callee, native, &sources)?;
         ensure!(
             b.call_id.as_ref()
@@ -798,6 +918,23 @@ pub fn validate_evidence(
             "call binding ID mismatch"
         );
         resolution(b.resolution, &b.declared_target, &b.candidates)?;
+        if let Some(call_id) = &b.call_id {
+            let key = (proof.producer_id.clone(), call_id.clone());
+            let target = b.declared_target.as_ref().map(|t| {
+                native_ids::canonical(&serde_json::to_value(t).expect("target serializes"))
+            });
+            let candidates = b
+                .candidates
+                .iter()
+                .map(|t| {
+                    native_ids::canonical(&serde_json::to_value(t).expect("target serializes"))
+                })
+                .collect();
+            call_resolutions
+                .entry(key)
+                .or_default()
+                .push((b.resolution, target, candidates));
+        }
         if let Some(t) = &b.declared_target {
             target(t, native, &decls)?;
         }
@@ -817,14 +954,80 @@ pub fn validate_evidence(
             "stale target mismatch"
         );
     }
+    for proofs in call_resolutions.values() {
+        let mut asserted = BTreeSet::new();
+        for (_, target, candidates) in proofs {
+            if let Some(target) = target {
+                asserted.insert(target.clone());
+            }
+            asserted.extend(candidates.iter().cloned());
+        }
+        if asserted.len() > 1 {
+            let all: Vec<_> = asserted.into_iter().collect();
+            ensure!(
+                proofs
+                    .iter()
+                    .all(
+                        |(resolution, declared, candidates)| *resolution == Resolution::Ambiguous
+                            && declared.is_none()
+                            && *candidates == all
+                    ),
+                "contradictory resolved call targets"
+            );
+        }
+    }
+    let mut relationships = BTreeSet::new();
     for r in &semantic.type_relationships {
         let proof = fact(&r.provenance_id, None, EvidenceKind::TypeRelationship)?;
         ensure!(
             matches!(&r.source, Target::Internal { document, .. } if document == &proof.document),
             "relationship source/evidence document mismatch"
         );
+        ensure!(
+            relationships.insert((
+                proof.producer_id.clone(),
+                proof.document.clone(),
+                r.provenance_id.clone(),
+                native_ids::canonical(&serde_json::to_value((&r.kind, &r.source, &r.target))?)
+            )),
+            "duplicate relationship fact"
+        );
         target(&r.source, native, &decls)?;
         target(&r.target, native, &decls)?;
+    }
+    for ((producer, lang, path), row) in &coverage {
+        let observed = |id: &str| {
+            proof.get(id).is_some_and(|p| {
+                p.producer_id == *producer
+                    && p.document.language == *lang
+                    && p.document.path == *path
+            })
+        };
+        for role in &row.observed_roles {
+            let from_reference = semantic
+                .references
+                .iter()
+                .any(|r| observed(&r.provenance_id) && r.roles.contains(role));
+            let from_binding = *role == Role::Definition
+                && semantic
+                    .declaration_bindings
+                    .iter()
+                    .any(|b| observed(&b.provenance_id) && b.syntax_id.is_some());
+            let from_call = *role == Role::Call
+                && semantic
+                    .call_bindings
+                    .iter()
+                    .any(|b| observed(&b.provenance_id) && b.call_id.is_some());
+            let from_type = *role == Role::Type
+                && semantic
+                    .type_relationships
+                    .iter()
+                    .any(|r| observed(&r.provenance_id));
+            ensure!(
+                from_reference || from_binding || from_call || from_type,
+                "coverage observed role without admitted evidence"
+            );
+        }
     }
     Ok(())
 }
