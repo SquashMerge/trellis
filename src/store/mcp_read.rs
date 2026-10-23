@@ -3,6 +3,11 @@ use super::*;
 
 impl EvidenceResponse {
     pub fn mcp_language_counts(&self) -> Result<[[u64; 5]; 4]> {
+        self.mcp_language_counts_inner()
+            .map_err(|error| self.store.report_index_failure(error))
+    }
+
+    fn mcp_language_counts_inner(&self) -> Result<[[u64; 5]; 4]> {
         #[cfg(feature = "test-support")]
         if self
             .store
@@ -33,14 +38,22 @@ impl EvidenceResponse {
                 "rust" => 1,
                 "python" => 2,
                 "javascript" => 3,
-                _ => anyhow::bail!("store_unavailable: invalid selected language"),
+                _ => {
+                    return Err(
+                        self.corrupt_evidence("store_unavailable: invalid selected language")
+                    );
+                }
             };
             let category = if chosen {
                 match state.as_str() {
                     "complete" => 1,
                     "partial" => 2,
                     "failed" => 3,
-                    _ => anyhow::bail!("store_unavailable: invalid selected coverage"),
+                    _ => {
+                        return Err(
+                            self.corrupt_evidence("store_unavailable: invalid selected coverage")
+                        );
+                    }
                 }
             } else {
                 4
@@ -228,10 +241,12 @@ impl McpSelectedLines {
     }
 
     fn range(&self, range: &crate::native_evidence::Range) -> Result<Option<McpLines>> {
-        ensure!(
-            range.start <= range.end && range.end <= self.bytes.len(),
-            "store_unavailable: selected byte range outside source"
-        );
+        if !(range.start <= range.end && range.end <= self.bytes.len()) {
+            return Err(SelectedIntegrity(
+                "store_unavailable: selected byte range outside source".into(),
+            )
+            .into());
+        }
         if self.bytes.is_empty() {
             return Ok(None);
         }
@@ -288,6 +303,11 @@ fn mcp_lf_range(bytes: &[u8], start: u64, end: u64) -> Result<(usize, usize)> {
 
 impl EvidenceResponse {
     pub fn mcp_source_hash(&self, path: &str) -> Result<Option<String>> {
+        self.mcp_source_hash_inner(path)
+            .map_err(|error| self.store.report_index_failure(error))
+    }
+
+    fn mcp_source_hash_inner(&self, path: &str) -> Result<Option<String>> {
         let selected = self.store.read_revision_for(&self.db, None, true)?;
         Ok(self
             .store
@@ -296,6 +316,18 @@ impl EvidenceResponse {
     }
 
     pub fn mcp_source(
+        &self,
+        path: &str,
+        start_line: u64,
+        end_line: u64,
+        expected: Option<IndexPin>,
+        expected_hash: Option<&str>,
+    ) -> Result<Option<McpSource>> {
+        self.mcp_source_inner(path, start_line, end_line, expected, expected_hash)
+            .map_err(|error| self.store.report_index_failure(error))
+    }
+
+    fn mcp_source_inner(
         &self,
         path: &str,
         start_line: u64,
@@ -384,16 +416,18 @@ impl EvidenceResponse {
             cache.insert(declaration.document.clone(), source);
         }
         let source = &cache[&declaration.document];
-        ensure!(
-            source.document.revision_id == declaration.revision_id
-                && source.document.provenance_id == declaration.provenance_id
-                && source.document.content_hash == hash
-                && provenance.document == source.document.document
-                && provenance.revision_id == source.document.revision_id
-                && provenance.id == source.document.provenance_id
-                && provenance.content_hash == source.document.content_hash,
-            "store_unavailable: selected document proof mismatch"
-        );
+        if !(source.document.revision_id == declaration.revision_id
+            && source.document.provenance_id == declaration.provenance_id
+            && source.document.content_hash == hash
+            && provenance.document == source.document.document
+            && provenance.revision_id == source.document.revision_id
+            && provenance.id == source.document.provenance_id
+            && provenance.content_hash == source.document.content_hash)
+        {
+            return Err(
+                self.corrupt_evidence("store_unavailable: selected document proof mismatch")
+            );
+        }
         Ok(source)
     }
 
@@ -405,17 +439,21 @@ impl EvidenceResponse {
         provenance: &crate::native_evidence::Provenance,
     ) -> Result<McpCheckedSource> {
         use sha2::{Digest, Sha256};
-        let scope = v8_native_scope_for(&self.db, &declaration.document, selected)?
-            .context("store_unavailable: selected document scope absent")?;
-        ensure!(
-            declaration.revision_id == scope.native_revision_id
-                && declaration.provenance_id == scope.proof_id()
-                && provenance.document == declaration.document
-                && provenance.revision_id == declaration.revision_id
-                && provenance.id == declaration.provenance_id
-                && provenance.content_hash == hash,
-            "store_unavailable: selected document proof mismatch"
-        );
+        let scope =
+            v8_native_scope_for(&self.db, &declaration.document, selected)?.ok_or_else(|| {
+                self.corrupt_evidence("store_unavailable: selected document scope absent")
+            })?;
+        if !(declaration.revision_id == scope.native_revision_id
+            && declaration.provenance_id == scope.proof_id()
+            && provenance.document == declaration.document
+            && provenance.revision_id == declaration.revision_id
+            && provenance.id == declaration.provenance_id
+            && provenance.content_hash == hash)
+        {
+            return Err(
+                self.corrupt_evidence("store_unavailable: selected document proof mismatch")
+            );
+        }
         let row: Option<(String, String, String, String, i64, Vec<u8>)> = self
             .db
             .query_row(
@@ -444,20 +482,24 @@ impl EvidenceResponse {
                 },
             )
             .optional()?;
-        let (source_set, language, path, stored_hash, length, bytes) =
-            row.context("store_unavailable: selected raw source version absent")?;
-        ensure!(
-            source_set == declaration.document.source_set_id
-                && language == declaration.document.language
-                && path == declaration.document.path
-                && stored_hash == hash,
-            "store_unavailable: selected raw source identity mismatch"
-        );
+        let (source_set, language, path, stored_hash, length, bytes) = row.ok_or_else(|| {
+            self.corrupt_evidence("store_unavailable: selected raw source version absent")
+        })?;
+        if !(source_set == declaration.document.source_set_id
+            && language == declaration.document.language
+            && path == declaration.document.path
+            && stored_hash == hash)
+        {
+            return Err(
+                self.corrupt_evidence("store_unavailable: selected raw source identity mismatch")
+            );
+        }
         if usize::try_from(length).ok() != Some(bytes.len())
             || stored_hash != hex::encode(Sha256::digest(&bytes))
         {
-            self.store.mark_recovery(RecoveryDisposition::Rebuild);
-            anyhow::bail!("store_unavailable: selected raw source length or digest mismatch");
+            return Err(self.corrupt_evidence(
+                "store_unavailable: selected raw source length or digest mismatch",
+            ));
         }
         Ok(McpCheckedSource {
             document: McpDocumentVersion {
@@ -493,6 +535,16 @@ pub struct McpFindSymbol {
 
 impl EvidenceResponse {
     pub fn mcp_find(
+        &self,
+        query: &str,
+        limit: usize,
+        expected: Option<IndexPin>,
+    ) -> Result<McpFind> {
+        self.mcp_find_inner(query, limit, expected)
+            .map_err(|error| self.store.report_index_failure(error))
+    }
+
+    fn mcp_find_inner(
         &self,
         query: &str,
         limit: usize,
@@ -536,18 +588,21 @@ impl EvidenceResponse {
         let mut coverage = BTreeMap::new();
         let mut scopes = BTreeMap::new();
         for key in keys {
-            let scope = v8_native_scope_for(&self.db, &key, &selected)?
-                .context("store_unavailable: missing native coverage scope")?;
+            let scope = v8_native_scope_for(&self.db, &key, &selected)?.ok_or_else(|| {
+                self.corrupt_evidence("store_unavailable: missing native coverage scope")
+            })?;
             let row = read_native_coverage_v8(&self.db, &scope)
                 .map_err(|error| self.store.report_selected_read(error))?;
-            ensure!(
-                row.revision_id == scope.native_revision_id
-                    && row.producer_id == scope.producer_id
-                    && row.language == key.language
-                    && row.source_set_id == key.source_set_id
-                    && row.document_path == key.path,
-                "store_unavailable: native coverage identity mismatch"
-            );
+            if !(row.revision_id == scope.native_revision_id
+                && row.producer_id == scope.producer_id
+                && row.language == key.language
+                && row.source_set_id == key.source_set_id
+                && row.document_path == key.path)
+            {
+                return Err(
+                    self.corrupt_evidence("store_unavailable: native coverage identity mismatch")
+                );
+            }
             let valid_state = match row.state.as_str() {
                 "notRequested" => !row.requested && !row.selected && row.diagnostic.is_none(),
                 "omitted" | "unsupported" => {
@@ -562,24 +617,26 @@ impl EvidenceResponse {
                     matches!((pair[0].as_str(), pair[1].as_str()), ("definition", "call"))
                 })
             };
-            ensure!(
-                valid_state
-                    && ordered_roles(&row.supported_roles)
-                    && ordered_roles(&row.observed_roles)
-                    && row
-                        .observed_roles
-                        .iter()
-                        .all(|role| row.supported_roles.contains(role))
-                    && row
-                        .supported_roles
-                        .iter()
-                        .all(|role| matches!(role.as_str(), "definition" | "call"))
-                    && row
-                        .observed_roles
-                        .iter()
-                        .all(|role| matches!(role.as_str(), "definition" | "call")),
-                "store_unavailable: inconsistent native coverage tuple"
-            );
+            if !(valid_state
+                && ordered_roles(&row.supported_roles)
+                && ordered_roles(&row.observed_roles)
+                && row
+                    .observed_roles
+                    .iter()
+                    .all(|role| row.supported_roles.contains(role))
+                && row
+                    .supported_roles
+                    .iter()
+                    .all(|role| matches!(role.as_str(), "definition" | "call"))
+                && row
+                    .observed_roles
+                    .iter()
+                    .all(|role| matches!(role.as_str(), "definition" | "call")))
+            {
+                return Err(
+                    self.corrupt_evidence("store_unavailable: inconsistent native coverage tuple")
+                );
+            }
             coverage.insert(scope.version_id.clone(), row);
             scopes.insert(scope.version_id.clone(), scope);
         }
@@ -590,7 +647,10 @@ impl EvidenceResponse {
                 "rust" => 1,
                 "python" => 2,
                 "javascript" => 3,
-                _ => anyhow::bail!("store_unavailable: invalid native coverage language"),
+                _ => {
+                    return Err(self
+                        .corrupt_evidence("store_unavailable: invalid native coverage language"));
+                }
             };
             let counts = &mut scope_counts[language];
             if row.selected {
@@ -623,7 +683,7 @@ impl EvidenceResponse {
         for (version, id) in hits.into_iter().take(limit) {
             let scope = scopes
                 .get(&version)
-                .context("store_unavailable: find scope absent")?;
+                .ok_or_else(|| self.corrupt_evidence("store_unavailable: find scope absent"))?;
             if !loaded.contains_key(&version) {
                 let declarations = read_native_declarations_v8(&self.db, scope, None, true)
                     .map_err(|error| self.store.report_selected_read(error))?
@@ -650,19 +710,23 @@ impl EvidenceResponse {
             let (declarations, hash) = &loaded[&version];
             let declaration = declarations
                 .get(&id)
-                .context("store_unavailable: selected declaration absent")?
+                .ok_or_else(|| {
+                    self.corrupt_evidence("store_unavailable: selected declaration absent")
+                })?
                 .clone();
-            ensure!(
-                declaration.provenance_id == scope.proof_id()
-                    && declaration.revision_id == scope.native_revision_id,
-                "store_unavailable: native proof mismatch"
-            );
+            if !(declaration.provenance_id == scope.proof_id()
+                && declaration.revision_id == scope.native_revision_id)
+            {
+                return Err(self.corrupt_evidence("store_unavailable: native proof mismatch"));
+            }
             symbols.push(McpFindSymbol {
                 declaration,
                 content_hash: hash.clone(),
                 coverage: coverage
                     .get(&version)
-                    .context("store_unavailable: find coverage absent")?
+                    .ok_or_else(|| {
+                        self.corrupt_evidence("store_unavailable: find coverage absent")
+                    })?
                     .clone(),
             });
         }
@@ -697,6 +761,16 @@ impl EvidenceResponse {
         limit: usize,
         expected: Option<IndexPin>,
     ) -> Result<McpFindWithLines> {
+        self.mcp_find_with_lines_inner(query, limit, expected)
+            .map_err(|error| self.store.report_index_failure(error))
+    }
+
+    fn mcp_find_with_lines_inner(
+        &self,
+        query: &str,
+        limit: usize,
+        expected: Option<IndexPin>,
+    ) -> Result<McpFindWithLines> {
         let found = self.mcp_find(query, limit, expected)?;
         let selected = self
             .store
@@ -722,7 +796,9 @@ impl EvidenceResponse {
                     .provenance
                     .iter()
                     .find(|proof| proof.id == symbol.declaration.provenance_id)
-                    .context("store_unavailable: find provenance absent")?;
+                    .ok_or_else(|| {
+                        self.corrupt_evidence("store_unavailable: find provenance absent")
+                    })?;
                 sources[index] = Some(
                     self.mcp_checked_source(
                         &mut source_cache,
@@ -765,6 +841,15 @@ pub struct McpDeclaration {
 
 impl EvidenceResponse {
     pub fn mcp_declaration(
+        &self,
+        symbol_id: &str,
+        expected: Option<IndexPin>,
+    ) -> Result<Option<McpDeclaration>> {
+        self.mcp_declaration_inner(symbol_id, expected)
+            .map_err(|error| self.store.report_index_failure(error))
+    }
+
+    fn mcp_declaration_inner(
         &self,
         symbol_id: &str,
         expected: Option<IndexPin>,
@@ -870,6 +955,15 @@ impl EvidenceResponse {
         symbol_id: &str,
         expected: Option<IndexPin>,
     ) -> Result<Option<McpDeclarationWithLines>> {
+        self.mcp_declaration_with_lines_inner(symbol_id, expected)
+            .map_err(|error| self.store.report_index_failure(error))
+    }
+
+    fn mcp_declaration_with_lines_inner(
+        &self,
+        symbol_id: &str,
+        expected: Option<IndexPin>,
+    ) -> Result<Option<McpDeclarationWithLines>> {
         let Some(declaration) = self.mcp_declaration(symbol_id, expected)? else {
             return Ok(None);
         };
@@ -880,7 +974,9 @@ impl EvidenceResponse {
             .provenance
             .iter()
             .find(|proof| proof.id == declaration.declaration.provenance_id)
-            .context("store_unavailable: declaration provenance absent")?;
+            .ok_or_else(|| {
+                self.corrupt_evidence("store_unavailable: declaration provenance absent")
+            })?;
         let source = self
             .mcp_document_version(
                 &selected,
@@ -942,9 +1038,9 @@ fn mcp_callee_text(
     let Some(range) = range else {
         return Ok((None, false));
     };
-    let text = source
-        .get(range.start..range.end)
-        .context("store_unavailable: invalid selected callee range")?;
+    let text = source.get(range.start..range.end).ok_or_else(|| {
+        SelectedIntegrity("store_unavailable: invalid selected callee range".into())
+    })?;
     let end = text
         .char_indices()
         .map(|(at, ch)| at + ch.len_utf8())
@@ -1019,6 +1115,18 @@ impl EvidenceResponse {
         hint_now: &dyn Fn() -> std::time::Instant,
         required_deadline: std::time::Instant,
     ) -> Result<Option<McpOutgoing>> {
+        self.mcp_outgoing_inner(symbol_id, limit, expected, hint_now, required_deadline)
+            .map_err(|error| self.store.report_index_failure(error))
+    }
+
+    fn mcp_outgoing_inner(
+        &self,
+        symbol_id: &str,
+        limit: usize,
+        expected: Option<IndexPin>,
+        hint_now: &dyn Fn() -> std::time::Instant,
+        required_deadline: std::time::Instant,
+    ) -> Result<Option<McpOutgoing>> {
         use crate::native_evidence::{DocumentKey, Provenance};
         let selected = self.store.read_revision_for(&self.db, None, true)?;
         ensure!(
@@ -1028,16 +1136,20 @@ impl EvidenceResponse {
         let Some(owner) = self.mcp_declaration(symbol_id, expected)? else {
             return Ok(None);
         };
-        let scope = v8_owner_scope_for(&self.db, symbol_id, &selected)?
-            .context("store_unavailable: selected outgoing owner absent")?;
+        let scope = v8_owner_scope_for(&self.db, symbol_id, &selected)?.ok_or_else(|| {
+            self.corrupt_evidence("store_unavailable: selected outgoing owner absent")
+        })?;
         let source = self
             .store
             .selected_source_row_for(&self.db, &scope.key.path, &selected)?
-            .context("store_unavailable: selected outgoing source absent")?;
-        ensure!(
-            source.hash == owner.content_hash,
-            "store_unavailable: selected outgoing source hash mismatch"
-        );
+            .ok_or_else(|| {
+                self.corrupt_evidence("store_unavailable: selected outgoing source absent")
+            })?;
+        if !(source.hash == owner.content_hash) {
+            return Err(
+                self.corrupt_evidence("store_unavailable: selected outgoing source hash mismatch")
+            );
+        }
         let mut measured = read_native_calls_v8(&self.db, &scope, Some(symbol_id))
             .map_err(|error| self.store.report_selected_read(error))?;
         for call in &measured {
@@ -1074,7 +1186,7 @@ impl EvidenceResponse {
             });
         }
         #[cfg(feature = "test-support")]
-        crate::mcp::phase_hook("outgoing_hint_start").map_err(|e| anyhow::anyhow!(e))?;
+        crate::mcp::phase_hook("outgoing_hint_start")?;
         // Leave time to finish the selected read and serialize/send its mandatory
         // answer. Optional hints never extend the accepted call's deadline.
         let required_hint_end = required_deadline
@@ -1085,7 +1197,7 @@ impl EvidenceResponse {
             end: (hint_now() + std::time::Duration::from_millis(1000)).min(required_hint_end),
         };
         #[cfg(feature = "test-support")]
-        crate::mcp::phase_hook("outgoing_hint").map_err(|e| anyhow::anyhow!(e))?;
+        crate::mcp::phase_hook("outgoing_hint")?;
         // SQLite checks inside long optional statements as well as between rows.
         // The read-only selected snapshot already holds its shared lock; no new
         // connection or lock transition is needed for these candidate SELECTs.
@@ -1105,7 +1217,7 @@ impl EvidenceResponse {
         for (item_index, item) in calls.iter_mut().enumerate() {
             #[cfg(feature = "test-support")]
             if item_index == 1 {
-                crate::mcp::phase_hook("outgoing_hint_item_1").map_err(|e| anyhow::anyhow!(e))?;
+                crate::mcp::phase_hook("outgoing_hint_item_1")?;
             }
             #[cfg(not(feature = "test-support"))]
             let _ = item_index;
@@ -1134,7 +1246,11 @@ impl EvidenceResponse {
                     item.omitted = None;
                     continue;
                 }
-                Err(error) => return Err(error.into()),
+                Err(error) => {
+                    self.report_optional_corruption(error.into());
+                    item.omitted = None;
+                    continue;
+                }
             };
             let mut rows = match statement.query(params![
                 selected.key,
@@ -1147,7 +1263,11 @@ impl EvidenceResponse {
                     item.omitted = None;
                     continue;
                 }
-                Err(error) => return Err(error.into()),
+                Err(error) => {
+                    self.report_optional_corruption(error.into());
+                    item.omitted = None;
+                    continue;
+                }
             };
             // Rank the cheap lexical rows first, then verify in rank order only
             // until eight hints pass (#170); later matches are left unexamined.
@@ -1164,31 +1284,42 @@ impl EvidenceResponse {
                         timed_out = true;
                         break;
                     }
-                    Err(error) => return Err(error.into()),
+                    Err(error) => {
+                        self.report_optional_corruption(error.into());
+                        timed_out = true;
+                        break;
+                    }
                 };
                 let Some(row) = row else { break };
                 #[cfg(feature = "test-support")]
-                crate::mcp::phase_hook("outgoing_hint_row").map_err(|e| anyhow::anyhow!(e))?;
+                crate::mcp::phase_hook("outgoing_hint_row")?;
                 if progress.expired() {
                     timed_out = true;
                     break;
                 }
-                let version: String = row.get(0)?;
-                let id = id_codec::decode_sid(&row.get::<_, Vec<u8>>(1)?)
-                    .map_err(|error| self.store.report_selected_failure(error))?;
-                let key = DocumentKey {
-                    source_set_id: row.get(2)?,
-                    language: row.get(3)?,
-                    path: row.get(4)?,
-                };
-                let (start, end): (i64, i64) = (row.get(5)?, row.get(6)?);
-                // Test code is not an eligible hint for non-test code; skip it
-                // before verification so it costs no hint budget.
-                if !owner_is_test
-                    && crate::native_evidence::DeclarationRole::from_stored(
+                let decoded = (|| -> Result<_> {
+                    let version: String = row.get(0)?;
+                    let id = id_codec::decode_sid(&row.get::<_, Vec<u8>>(1)?)?;
+                    let key = DocumentKey {
+                        source_set_id: row.get(2)?,
+                        language: row.get(3)?,
+                        path: row.get(4)?,
+                    };
+                    let (start, end): (i64, i64) = (row.get(5)?, row.get(6)?);
+                    let role = crate::native_evidence::DeclarationRole::from_stored(
                         &row.get::<_, String>(7)?,
-                    )? == crate::native_evidence::DeclarationRole::Test
-                {
+                    )?;
+                    Ok((version, id, key, start, end, role))
+                })();
+                let (version, id, key, start, end, role) = match decoded {
+                    Ok(row) => row,
+                    Err(error) => {
+                        self.report_optional_corruption(error);
+                        continue;
+                    }
+                };
+                // Test code is ineligible for non-test callers.
+                if !owner_is_test && role == crate::native_evidence::DeclarationRole::Test {
                     continue;
                 }
                 ranked.push((
@@ -1221,20 +1352,20 @@ impl EvidenceResponse {
                 }
                 let candidate = (|| -> Result<Option<McpOutgoingCandidate>> {
                     optional_hint_check(Some(&|| progress.expired()))?;
-                    let Some(candidate_scope) = v8_native_scope_for(&self.db, &key, &selected)?
-                    else {
-                        return Ok(None);
-                    };
-                    if candidate_scope.version_id != version {
-                        return Ok(None);
-                    }
+                    let candidate_scope = v8_native_scope_for(&self.db, &key, &selected)?
+                        .ok_or_else(|| {
+                            SelectedIntegrity("optional candidate scope absent".into())
+                        })?;
+                    ensure!(
+                        candidate_scope.version_id == version,
+                        "optional candidate version mismatch"
+                    );
                     if !verified_versions.contains_key(&version) {
                         if progress.expired() {
                             return Ok(None);
                         }
                         #[cfg(feature = "test-support")]
-                        crate::mcp::phase_hook("outgoing_hint_verify_version")
-                            .map_err(|error| anyhow::anyhow!(error))?;
+                        crate::mcp::phase_hook("outgoing_hint_verify_version")?;
                         if progress.expired() {
                             return Ok(None);
                         }
@@ -1246,29 +1377,41 @@ impl EvidenceResponse {
                             &|| progress.expired(),
                         )?;
                         let coverage = read_native_coverage_v8(&self.db, &candidate_scope)?;
-                        // An optional candidate that fails to read or is ineligible is
-                        // skipped without scheduling a rebuild: it must not poison the
-                        // required calls.
-                        let Some(declaration) = declarations.iter().find(|row| row.syntax_id == id)
-                        else {
+                        // Ineligible candidates are skipped. Corrupt candidates also
+                        // schedule recovery after the required answer passes its fence.
+                        let declaration = declarations
+                            .iter()
+                            .find(|row| row.syntax_id == id)
+                            .ok_or_else(|| {
+                                SelectedIntegrity("optional candidate declaration absent".into())
+                            })?;
+                        ensure!(
+                            coverage.revision_id == candidate_scope.native_revision_id
+                                && coverage.producer_id == candidate_scope.producer_id
+                                && coverage.language == key.language
+                                && coverage.source_set_id == key.source_set_id
+                                && coverage.document_path == key.path,
+                            "optional candidate coverage identity mismatch"
+                        );
+                        if !coverage.requested
+                            || !coverage.selected
+                            || !matches!(coverage.state.as_str(), "complete" | "partial")
+                        {
                             return Ok(None);
-                        };
+                        }
                         if declaration.name.is_none()
                             || declaration.lookup_key.as_deref() != Some(lookup.as_str())
                             || declaration.provenance_id != candidate_scope.proof_id()
                             || declaration.revision_id != candidate_scope.native_revision_id
                             || declaration.document != candidate_scope.key
                             || !mcp_canonical_syntax_id(&id)
-                            || !coverage.requested
-                            || !coverage.selected
-                            || !matches!(coverage.state.as_str(), "complete" | "partial")
                             || coverage.revision_id != candidate_scope.native_revision_id
                             || coverage.producer_id != candidate_scope.producer_id
                             || coverage.language != key.language
                             || coverage.source_set_id != key.source_set_id
                             || coverage.document_path != key.path
                         {
-                            return Ok(None);
+                            anyhow::bail!("optional candidate evidence mismatch");
                         }
                         let hash: String = self.db.query_row(
                             "SELECT content_hash FROM document_versions d JOIN native_source_sets s ON s.id=?2 WHERE d.id=?1 AND d.language=?3 AND d.path=?4",
@@ -1279,10 +1422,12 @@ impl EvidenceResponse {
                         verified_versions.insert(version.clone(), (declarations, coverage, hash));
                     }
                     let (declarations, coverage, hash) = &verified_versions[&version];
-                    let Some(declaration) = declarations.iter().find(|row| row.syntax_id == id)
-                    else {
-                        return Ok(None);
-                    };
+                    let declaration = declarations
+                        .iter()
+                        .find(|row| row.syntax_id == id)
+                        .ok_or_else(|| {
+                            SelectedIntegrity("optional candidate declaration absent".into())
+                        })?;
                     if declaration.name.is_none()
                         || declaration.lookup_key.as_deref() != Some(lookup.as_str())
                         || declaration.provenance_id != candidate_scope.proof_id()
@@ -1290,23 +1435,21 @@ impl EvidenceResponse {
                         || declaration.document != candidate_scope.key
                         || !mcp_canonical_syntax_id(&id)
                     {
-                        return Ok(None);
+                        anyhow::bail!("optional candidate declaration mismatch");
                     }
-                    if !coverage.requested
-                        || !coverage.selected
-                        || !matches!(coverage.state.as_str(), "complete" | "partial")
-                        || coverage.revision_id != candidate_scope.native_revision_id
+                    if coverage.revision_id != candidate_scope.native_revision_id
                         || coverage.producer_id != candidate_scope.producer_id
                         || coverage.language != key.language
                         || coverage.source_set_id != key.source_set_id
                         || coverage.document_path != key.path
                     {
-                        return Ok(None);
+                        anyhow::bail!("optional candidate coverage mismatch");
                     }
                     let proof_id = candidate_scope.proof_id();
-                    if declaration.provenance_id != proof_id {
-                        return Ok(None);
-                    }
+                    ensure!(
+                        declaration.provenance_id == proof_id,
+                        "optional candidate proof mismatch"
+                    );
                     let provenance = Provenance {
                         id: proof_id,
                         producer_id: candidate_scope.producer_id,
@@ -1318,9 +1461,10 @@ impl EvidenceResponse {
                         freshness: "fresh".into(),
                         derived_from: None,
                     };
-                    if !mcp_candidate_proof_matches(declaration, &provenance) {
-                        return Ok(None);
-                    }
+                    ensure!(
+                        mcp_candidate_proof_matches(declaration, &provenance),
+                        "optional candidate proof mismatch"
+                    );
                     Ok(Some(McpOutgoingCandidate {
                         declaration: declaration.clone(),
                         coverage: coverage.clone(),
@@ -1342,10 +1486,13 @@ impl EvidenceResponse {
                             timed_out = true;
                             break;
                         }
+                        self.report_optional_corruption(error);
                         continue;
                     }
                 };
-                insert_mcp_candidate(&mut candidates, id, candidate)?;
+                if let Err(error) = insert_mcp_candidate(&mut candidates, id, candidate) {
+                    self.report_optional_corruption(error);
+                }
             }
             if timed_out || progress.expired() {
                 item.omitted = None;
@@ -1385,6 +1532,18 @@ impl EvidenceResponse {
         hint_now: &dyn Fn() -> std::time::Instant,
         required_deadline: std::time::Instant,
     ) -> Result<Option<McpOutgoingWithLines>> {
+        self.mcp_outgoing_with_lines_inner(symbol_id, limit, expected, hint_now, required_deadline)
+            .map_err(|error| self.store.report_index_failure(error))
+    }
+
+    fn mcp_outgoing_with_lines_inner(
+        &self,
+        symbol_id: &str,
+        limit: usize,
+        expected: Option<IndexPin>,
+        hint_now: &dyn Fn() -> std::time::Instant,
+        required_deadline: std::time::Instant,
+    ) -> Result<Option<McpOutgoingWithLines>> {
         let Some(outgoing) =
             self.mcp_outgoing(symbol_id, limit, expected, hint_now, required_deadline)?
         else {
@@ -1398,7 +1557,9 @@ impl EvidenceResponse {
             .provenance
             .iter()
             .find(|proof| proof.id == outgoing.owner.declaration.provenance_id)
-            .context("store_unavailable: outgoing owner provenance absent")?;
+            .ok_or_else(|| {
+                self.corrupt_evidence("store_unavailable: outgoing owner provenance absent")
+            })?;
         let mut source_cache = BTreeMap::new();
         let owner_source = self
             .mcp_checked_source(
@@ -1413,12 +1574,14 @@ impl EvidenceResponse {
             .calls
             .into_iter()
             .map(|call| {
-                ensure!(
-                    call.call.document == outgoing.owner.declaration.document
-                        && call.call.revision_id == outgoing.owner.declaration.revision_id
-                        && call.call.provenance_id == outgoing.owner.declaration.provenance_id,
-                    "store_unavailable: outgoing call proof mismatch"
-                );
+                if !(call.call.document == outgoing.owner.declaration.document
+                    && call.call.revision_id == outgoing.owner.declaration.revision_id
+                    && call.call.provenance_id == outgoing.owner.declaration.provenance_id)
+                {
+                    return Err(
+                        self.corrupt_evidence("store_unavailable: outgoing call proof mismatch")
+                    );
+                }
                 let source = self
                     .mcp_checked_source(
                         &mut source_cache,
@@ -1486,6 +1649,16 @@ impl EvidenceResponse {
         limit: usize,
         expected: Option<IndexPin>,
     ) -> Result<Option<McpIncomingWithLines>> {
+        self.mcp_incoming_with_lines_inner(symbol_id, limit, expected)
+            .map_err(|error| self.store.report_index_failure(error))
+    }
+
+    fn mcp_incoming_with_lines_inner(
+        &self,
+        symbol_id: &str,
+        limit: usize,
+        expected: Option<IndexPin>,
+    ) -> Result<Option<McpIncomingWithLines>> {
         use crate::native_evidence::{DeclarationRole, DocumentKey, Provenance};
         let selected = self.store.read_revision_for(&self.db, None, true)?;
         ensure!(
@@ -1502,7 +1675,7 @@ impl EvidenceResponse {
             "rust" => 1,
             "python" => 2,
             "javascript" => 3,
-            _ => anyhow::bail!("store_unavailable: invalid selected language"),
+            _ => return Err(self.corrupt_evidence("store_unavailable: invalid selected language")),
         };
         let keys = self.db.prepare(
             "SELECT path FROM revision_documents m JOIN native_source_sets s ON s.id=?2 WHERE m.revision_id=?1 AND m.language=?3 ORDER BY path"
@@ -1572,7 +1745,9 @@ impl EvidenceResponse {
             .provenance
             .iter()
             .find(|p| p.id == owner.declaration.provenance_id)
-            .context("store_unavailable: incoming selected provenance absent")?;
+            .ok_or_else(|| {
+                self.corrupt_evidence("store_unavailable: incoming selected provenance absent")
+            })?;
         let selected_source =
             self.mcp_document_version(&selected, &owner.declaration, &owner.content_hash, proof)?;
         let owner_lines = selected_source.item(&owner.declaration.range)?;
@@ -1591,10 +1766,10 @@ impl EvidenceResponse {
                     params![version, lookup], |r| r.get(0)
                 )?;
                 same_name_declarations += u64::try_from(count)?;
-                ensure!(
-                    scope.key.source_set_id == selected_key.source_set_id,
-                    "store_unavailable: incoming selected scope mismatch"
-                );
+                if !(scope.key.source_set_id == selected_key.source_set_id) {
+                    return Err(self
+                        .corrupt_evidence("store_unavailable: incoming selected scope mismatch"));
+                }
             }
             // A selected indexed call with a denormalized key that disagrees
             // with its selected version is corrupt, not a negative name match.
@@ -1613,10 +1788,10 @@ impl EvidenceResponse {
                 ],
                 |r| r.get(0),
             )?;
-            ensure!(
-                !mismatched,
-                "store_unavailable: incoming indexed call scope mismatch"
-            );
+            if !(!mismatched) {
+                return Err(self
+                    .corrupt_evidence("store_unavailable: incoming indexed call scope mismatch"));
+            }
             // This uses the exact three-key native-call index. The manifest
             // selects one immutable version; no historical call is a fallback.
             let directory = selected_key
@@ -1684,7 +1859,8 @@ impl EvidenceResponse {
                         self.corrupt_evidence("store_unavailable: incoming call scope mismatch")
                     );
                 }
-                let role = DeclarationRole::from_stored(&stored_role)?;
+                let role = DeclarationRole::from_stored(&stored_role)
+                    .map_err(|error| self.store.report_selected_read(error))?;
                 if !loaded.contains_key(&version) {
                     let declarations = read_native_declarations_v8(&self.db, scope, None, true)
                         .map_err(|error| self.store.report_selected_read(error))?
@@ -1737,13 +1913,14 @@ impl EvidenceResponse {
                 let bytes = &checked.lines.bytes;
                 let text = std::str::from_utf8(bytes)
                     .map_err(|_| anyhow::anyhow!("store_unavailable: incoming source encoding"))?;
-                let range = call
-                    .callee_range
-                    .as_ref()
-                    .context("store_unavailable: incoming callee range absent")?;
+                let range = call.callee_range.as_ref().ok_or_else(|| {
+                    self.corrupt_evidence("store_unavailable: incoming callee range absent")
+                })?;
                 let callee_text = text
                     .get(range.start..range.end)
-                    .context("store_unavailable: incoming callee outside source")?
+                    .ok_or_else(|| {
+                        self.corrupt_evidence("store_unavailable: incoming callee outside source")
+                    })?
                     .to_owned();
                 if calls.len() < limit {
                     calls.push(McpIncomingCallWithLines {
@@ -1805,12 +1982,15 @@ fn insert_mcp_candidate(
             entry.insert(candidate);
         }
         std::collections::btree_map::Entry::Occupied(entry) => {
-            ensure!(
-                entry.get().declaration == candidate.declaration
-                    && entry.get().coverage == candidate.coverage
-                    && entry.get().provenance == candidate.provenance,
-                "store_unavailable: conflicting duplicate native hint"
-            );
+            if !(entry.get().declaration == candidate.declaration
+                && entry.get().coverage == candidate.coverage
+                && entry.get().provenance == candidate.provenance)
+            {
+                return Err(SelectedIntegrity(
+                    "store_unavailable: conflicting duplicate native hint".into(),
+                )
+                .into());
+            }
         }
     }
     Ok(())
@@ -2050,31 +2230,215 @@ mod enriched_read_tests {
                 db.pragma_update(None, "foreign_keys", "ON").unwrap();
             }
             let read = store.evidence_response().unwrap();
-            let error = match fault {
-                "outgoing_hint_sid" => read
-                    .mcp_outgoing(
+            if fault == "outgoing_hint_sid" {
+                let outgoing = read
+                    .mcp_outgoing_with_lines(
                         &owner,
                         20,
                         Some(pin),
                         &|| now,
                         now + std::time::Duration::from_secs(5),
                     )
-                    .err()
-                    .expect("corrupt outgoing hint must fail"),
-                "incoming_call_occ" => read
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(outgoing.calls.len(), 1);
+                assert!(outgoing.calls[0].selected.candidates.is_empty());
+                assert_eq!(store.disposition(), RecoveryDisposition::Ready);
+                read.finish(()).unwrap();
+            } else {
+                let error = read
                     .mcp_incoming_with_lines(&target, 20, Some(pin))
                     .err()
-                    .expect("corrupt incoming call must fail"),
+                    .expect("corrupt incoming call must fail");
+                assert!(
+                    error
+                        .to_string()
+                        .starts_with("incompatible_index: selected evidence decode failed"),
+                    "{fault}: {error:#}"
+                );
+            }
+            assert_eq!(store.disposition(), RecoveryDisposition::Rebuild, "{fault}");
+        }
+    }
+
+    #[test]
+    fn required_mcp_faults_rebuild_and_reread_cleanly() {
+        for (fault, sql) in [
+            (
+                "find_scope",
+                "UPDATE document_versions SET path='missing.js' WHERE path='owner.js'",
+            ),
+            (
+                "find_row_type",
+                "UPDATE native_version_declarations SET start_byte=x'00' WHERE name='Owner'",
+            ),
+            (
+                "language_counts",
+                "UPDATE revision_documents SET coverage_state='invalid' WHERE path='owner.js'",
+            ),
+            (
+                "outgoing_range",
+                "UPDATE native_version_calls SET callee_end=9999 WHERE callee_lookup_key='Target'",
+            ),
+            (
+                "incoming_callee",
+                "UPDATE native_version_calls SET callee_start=NULL,callee_end=NULL WHERE callee_lookup_key='Target'",
+            ),
+            (
+                "source_digest",
+                "UPDATE document_versions SET content_hash=printf('%064d',0) WHERE path='owner.js'",
+            ),
+        ] {
+            let state = tempfile::tempdir().unwrap();
+            let workspace = tempfile::tempdir().unwrap();
+            std::fs::write(
+                workspace.path().join("owner.js"),
+                "function Owner() { Target(); }\n",
+            )
+            .unwrap();
+            std::fs::write(workspace.path().join("target.js"), "function Target() {}\n").unwrap();
+            let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+            let options = IndexOptions::new(workspace.path().to_owned());
+            let (pin, _) = crate::index_coordinator::reconcile_workspace(
+                &store,
+                &options,
+                &Arc::new(AtomicBool::new(false)),
+                |_| {},
+            )
+            .unwrap();
+            let read = store.evidence_response().unwrap();
+            let ids = read
+                .mcp_find("", 20, Some(pin))
+                .unwrap()
+                .symbols
+                .into_iter()
+                .filter_map(|hit| {
+                    hit.declaration
+                        .name
+                        .map(|name| (name, hit.declaration.syntax_id))
+                })
+                .collect::<BTreeMap<_, _>>();
+            read.finish(()).unwrap();
+            drop(read);
+            {
+                let db = store.cache_write().unwrap();
+                db.pragma_update(None, "foreign_keys", "OFF").unwrap();
+                db.pragma_update(None, "ignore_check_constraints", "ON")
+                    .unwrap();
+                assert_eq!(db.execute(sql, []).unwrap(), 1, "{fault}");
+                db.pragma_update(None, "ignore_check_constraints", "OFF")
+                    .unwrap();
+                db.pragma_update(None, "foreign_keys", "ON").unwrap();
+            }
+            let read = store.evidence_response().unwrap();
+            let now = std::time::Instant::now();
+            let result = match fault {
+                "find_scope" | "find_row_type" => {
+                    read.mcp_find_with_lines("Owner", 20, Some(pin)).map(|_| ())
+                }
+                "language_counts" => read.mcp_language_counts().map(|_| ()),
+                "outgoing_range" => read
+                    .mcp_outgoing_with_lines(
+                        &ids["Owner"],
+                        20,
+                        Some(pin),
+                        &|| now,
+                        now + std::time::Duration::from_secs(5),
+                    )
+                    .map(|_| ()),
+                "incoming_callee" => read
+                    .mcp_incoming_with_lines(&ids["Target"], 20, Some(pin))
+                    .map(|_| ()),
+                "source_digest" => read
+                    .mcp_source("owner.js", 1, 1, Some(pin), None)
+                    .map(|_| ()),
                 _ => unreachable!(),
             };
+            let error = result.expect_err(fault);
             assert!(
-                error
-                    .to_string()
-                    .starts_with("incompatible_index: selected evidence decode failed"),
+                error.to_string().starts_with("incompatible_index:"),
                 "{fault}: {error:#}"
             );
             assert_eq!(store.disposition(), RecoveryDisposition::Rebuild, "{fault}");
+            drop(read);
+            let (rebuilt, _) = crate::index_coordinator::reconcile_workspace(
+                &store,
+                &options,
+                &Arc::new(AtomicBool::new(false)),
+                |_| {},
+            )
+            .unwrap_or_else(|error| panic!("{fault}: {error:#}"));
+            let read = store.evidence_response().unwrap();
+            assert_eq!(
+                read.mcp_find_with_lines("Owner", 20, Some(rebuilt))
+                    .unwrap()
+                    .symbols
+                    .len(),
+                1,
+                "{fault}"
+            );
+            let owner = &ids["Owner"];
+            assert!(
+                read.mcp_declaration_with_lines(owner, Some(rebuilt))
+                    .unwrap()
+                    .is_some(),
+                "{fault}"
+            );
+            read.finish(()).unwrap();
+            assert_eq!(store.disposition(), RecoveryDisposition::Ready, "{fault}");
         }
+    }
+
+    #[test]
+    fn request_range_and_selected_slice_encoding_do_not_mark_recovery() {
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("bad.js"), b"a\nb\n").unwrap();
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let (pin, _) = crate::index_coordinator::reconcile_workspace(
+            &store,
+            &IndexOptions::new(workspace.path().to_owned()),
+            &Arc::new(AtomicBool::new(false)),
+            |_| {},
+        )
+        .unwrap();
+        // Simulate a byte edit after validated publication, retaining a matching
+        // whole-BLOB digest so only the requested slice's encoding is invalid.
+        let bytes = b"a\n\xff\n";
+        {
+            use sha2::{Digest, Sha256};
+            let db = store.cache_write().unwrap();
+            assert_eq!(db.execute(
+                "UPDATE document_versions SET source_bytes=?1,byte_length=?2,content_hash=?3 WHERE path='bad.js'",
+                params![bytes.as_slice(), bytes.len() as i64, hex::encode(Sha256::digest(bytes))],
+            ).unwrap(), 1);
+        }
+        let read = store.evidence_response().unwrap();
+        assert_eq!(
+            read.mcp_source("bad.js", 1, 1, Some(pin), None)
+                .unwrap()
+                .unwrap()
+                .text,
+            "a\n"
+        );
+        let error = read
+            .mcp_source("bad.js", 2, 2, Some(pin), None)
+            .err()
+            .unwrap();
+        assert!(
+            error.to_string().starts_with("unsupported_encoding:"),
+            "{error:#}"
+        );
+        let error = read
+            .mcp_source("bad.js", 0, 1, Some(pin), None)
+            .err()
+            .unwrap();
+        assert!(
+            error.to_string().starts_with("invalid_request:"),
+            "{error:#}"
+        );
+        assert_eq!(store.disposition(), RecoveryDisposition::Ready);
+        read.finish(()).unwrap();
     }
 
     #[test]
@@ -2316,6 +2680,39 @@ mod enriched_read_tests {
         assert_eq!(after_fault.calls[0].selected.omitted, Some(0));
         assert!(after_fault.calls[0].selected.candidates.is_empty());
         assert!(after_fault.calls[0].candidate_documents.is_empty());
+        assert_eq!(store.disposition(), RecoveryDisposition::Ready);
+        read.finish(()).unwrap();
+        assert_eq!(store.disposition(), RecoveryDisposition::Rebuild);
+        drop(read);
+        drop(_owner);
+        let (rebuilt, _) = crate::index_coordinator::reconcile_workspace(
+            &store,
+            &IndexOptions::new(workspace.path().to_owned()),
+            &Arc::new(AtomicBool::new(false)),
+            |_| {},
+        )
+        .unwrap();
+        let read = store.evidence_response().unwrap();
+        let repaired_owner = read
+            .mcp_find("Owner", 20, Some(rebuilt))
+            .unwrap()
+            .symbols
+            .into_iter()
+            .find(|hit| hit.declaration.name.as_deref() == Some("Owner"))
+            .unwrap()
+            .declaration
+            .syntax_id;
+        let repaired = read
+            .mcp_outgoing_with_lines(
+                &repaired_owner,
+                20,
+                Some(rebuilt),
+                &|| base,
+                base + std::time::Duration::from_secs(5),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(repaired.calls[0].selected.candidates.len(), 1);
         read.finish(()).unwrap();
     }
 
@@ -2388,29 +2785,6 @@ mod enriched_read_tests {
             fetched.byte_start <= symbol.symbol.declaration.range.start
                 && fetched.byte_end >= symbol.symbol.declaration.range.end
         );
-        let mut conflicting_proof = find
-            .provenance
-            .iter()
-            .find(|proof| proof.id == symbol.source.document.provenance_id)
-            .unwrap()
-            .clone();
-        conflicting_proof.id.push_str(":conflict");
-        let selected = store.read_revision_for(&read.db, Some(pin), true).unwrap();
-        let error = read
-            .mcp_document_version(
-                &selected,
-                &symbol.symbol.declaration,
-                &symbol.symbol.content_hash,
-                &conflicting_proof,
-            )
-            .err()
-            .unwrap();
-        assert!(
-            error
-                .to_string()
-                .contains("selected document proof mismatch"),
-            "{error:#}"
-        );
         let declaration = read
             .mcp_declaration_with_lines(&id, Some(pin))
             .unwrap()
@@ -2466,6 +2840,28 @@ mod enriched_read_tests {
             );
         }
         read.finish(()).unwrap();
+        let mut conflicting_proof = find
+            .provenance
+            .iter()
+            .find(|proof| proof.id == symbol.source.document.provenance_id)
+            .unwrap()
+            .clone();
+        conflicting_proof.id.push_str(":conflict");
+        let selected = store.read_revision_for(&read.db, Some(pin), true).unwrap();
+        let error = read
+            .mcp_document_version(
+                &selected,
+                &symbol.symbol.declaration,
+                &symbol.symbol.content_hash,
+                &conflicting_proof,
+            )
+            .err()
+            .unwrap();
+        assert!(
+            format!("{error:#}").contains("selected document proof mismatch"),
+            "{error:#}"
+        );
+        assert_eq!(store.disposition(), RecoveryDisposition::Rebuild);
     }
 
     #[test]

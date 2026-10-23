@@ -579,12 +579,11 @@ fn failed_publication_keeps_projection_atomic_with_graph() {
         &cancel(),
     )
     .unwrap_err();
+    let reason = format!("{rejected:#}");
     assert!(
-        rejected.to_string().contains("incompatible_index")
-            && rejected
-                .to_string()
-                .contains("unknown cache object type, name or shape"),
-        "{rejected:#}"
+        reason.contains("incompatible_index")
+            && reason.contains("unknown cache object type, name or shape"),
+        "{reason}"
     );
     assert_eq!(std::fs::read(&path).unwrap(), unchanged);
     let (version, marker, generation, revision): (i64, String, String, i64) = db

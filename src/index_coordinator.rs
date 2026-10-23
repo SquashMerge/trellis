@@ -610,6 +610,10 @@ impl WatcherWork {
             || self.options.max_file_bytes != options.max_file_bytes
     }
 
+    pub(crate) fn options(&self) -> IndexOptions {
+        self.options.clone()
+    }
+
     /// When `reconcile_due` next has work: a failed run's retry delay, else the
     /// debounce deadline of accepted signals, else the periodic inventory.
     /// Signals still in the ingress channel wake the worker themselves.

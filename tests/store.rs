@@ -898,11 +898,11 @@ fn live_current_decode_failure_hard_latches_saved_views() {
         .unwrap();
     let first = stats_store.annotations().unwrap_err();
     assert!(
-        first
-            .to_string()
-            .contains("incompatible_index: live index decode failed"),
+        first.to_string().starts_with("incompatible_index:")
+            && format!("{first:#}").contains("live index decode failed"),
         "{first:#}"
     );
+    assert!(stats_store.recovery_pending_for_tests());
     for closed in [
         stats_store.view("legacy-view").unwrap_err(),
         stats_clone.view("legacy-view").unwrap_err(),

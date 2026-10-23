@@ -1303,6 +1303,21 @@ impl DaemonState {
         {
             return Ok(());
         }
+        if !self.store.is_ready_disposition() {
+            let retained = self.runtime.lock().unwrap().session().cloned();
+            if let Some(session) = retained {
+                let options = self
+                    .watcher_work
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|(_, watcher)| watcher.options());
+                self.run_rebuild_reconciliation(session, options)?;
+                if self.runtime.lock().unwrap().session().is_none() {
+                    return Ok(());
+                }
+            }
+        }
         let mut pending = self.pending_requests.lock().unwrap();
         pending.retain(|id| {
             #[cfg(test)]
@@ -3574,6 +3589,9 @@ mod serving_holder_tests;
 
 #[cfg(test)]
 mod exceptional_recovery_tests;
+
+#[cfg(test)]
+mod rebuild_recovery_tests;
 
 #[cfg(all(test, feature = "test-support"))]
 mod normal_post_capture_cancellation_tests;

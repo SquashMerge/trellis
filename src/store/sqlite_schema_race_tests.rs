@@ -684,11 +684,7 @@ fn second_connection_adds_view_after_admission_before_status_and_leader_snapshot
             Ok(())
         })
         .unwrap_err();
-    assert!(
-        status_error
-            .to_string()
-            .contains("incompatible_index: unknown cache object")
-    );
+    assert!(format!("{status_error:#}").contains("incompatible_index: unknown cache object"));
     assert_eq!(
         fs::read(&path).unwrap(),
         after_status_ddl.into_inner().unwrap()

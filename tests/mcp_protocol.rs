@@ -6503,59 +6503,61 @@ async fn mcp_deadline_before_read_admission_uses_the_pre_resolution_shape() {
 #[test]
 fn mcp_find_unrelated_corrupt_scope_row_fails_zero_hit_and_elsewhere_hits() {
     use trellis::store::Store;
-    let temp = tempfile::tempdir().unwrap();
-    let root = checkout(temp.path());
-    fs::write(root.join("a.js"), "function Alpha() {}\n").unwrap();
-    fs::write(root.join("b.js"), "function Beta() {}\n").unwrap();
-    let store = Store::open_for_tests(temp.path(), &root).unwrap();
-    store.mcp_prepare_virgin_queue_for_tests().unwrap();
-    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
-        &trellis::indexer::IndexOptions::new(root.clone()),
-        store.root_id(),
-        &cancel,
-        |_| {},
-    )
-    .unwrap();
-    let writer = store.publication_for_tests().unwrap();
-    store
-        .publish_native(
-            &graph,
-            &capture,
-            &native,
-            &writer,
-            store.index_baseline().unwrap(),
+    for query in ["no_such_name", "Alpha"] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = checkout(temp.path());
+        fs::write(root.join("a.js"), "function Alpha() {}\n").unwrap();
+        fs::write(root.join("b.js"), "function Beta() {}\n").unwrap();
+        let store = Store::open_for_tests(temp.path(), &root).unwrap();
+        store.mcp_prepare_virgin_queue_for_tests().unwrap();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
+            &trellis::indexer::IndexOptions::new(root.clone()),
+            store.root_id(),
             &cancel,
+            |_| {},
         )
         .unwrap();
-    drop(writer);
-    let response = store.evidence_response().unwrap();
-    assert!(
-        response
-            .mcp_find("no_such_name", 20, None)
-            .unwrap()
-            .symbols
-            .is_empty()
-    );
-    assert_eq!(
-        response.mcp_find("Alpha", 20, None).unwrap().symbols.len(),
-        1
-    );
-    response.finish(()).unwrap();
-    drop(response);
-    // Only b.js's tuple becomes inconsistent (unselected yet "failed").
-    let writer = store.publication_for_tests().unwrap();
-    store
-        .mcp_set_coverage_for_tests(&writer, "b.js", false, "failed")
-        .unwrap();
-    drop(writer);
-    let response = store.evidence_response().unwrap();
-    for query in ["no_such_name", "Alpha"] {
-        let error = response.mcp_find(query, 20, None).map(|_| ()).unwrap_err();
+        let writer = store.publication_for_tests().unwrap();
+        store
+            .publish_native(
+                &graph,
+                &capture,
+                &native,
+                &writer,
+                store.index_baseline().unwrap(),
+                &cancel,
+            )
+            .unwrap();
+        drop(writer);
+        let response = store.evidence_response().unwrap();
         assert!(
-            error.to_string().starts_with("store_unavailable"),
-            "{query}: {error:#}"
+            response
+                .mcp_find("no_such_name", 20, None)
+                .unwrap()
+                .symbols
+                .is_empty()
         );
+        assert_eq!(
+            response.mcp_find("Alpha", 20, None).unwrap().symbols.len(),
+            1
+        );
+        response.finish(()).unwrap();
+        drop(response);
+        // Only b.js's tuple becomes inconsistent (unselected yet "failed").
+        let writer = store.publication_for_tests().unwrap();
+        store
+            .mcp_set_coverage_for_tests(&writer, "b.js", false, "failed")
+            .unwrap();
+        drop(writer);
+        let response = store.evidence_response().unwrap();
+        let error = response.mcp_find(query, 20, None).map(|_| ()).unwrap_err();
+        let reason = format!("{error:#}");
+        assert!(
+            reason.contains("store_unavailable: inconsistent native coverage tuple"),
+            "{query}: {reason}"
+        );
+        assert!(store.recovery_pending_for_tests());
     }
 }
 
@@ -9618,23 +9620,22 @@ async fn mcp_source_required_selected_path_and_digest_refuse_corrupt_rows() {
         })
         .await
         .expect("runtime did not finish valid startup before corruption");
+        let scheduler = runtime.browser_scheduler().unwrap();
+        let _worker = scheduler.hold_worker_for_tests();
         let writer = store.publication_for_tests().unwrap();
         store.mcp_corrupt_find_for_tests(&writer, fault).unwrap();
         drop(writer);
         let selected = store.evidence_response().unwrap();
         let error = selected.mcp_source("a.js", 1, 1, None, None).err().unwrap();
-        assert!(
-            error.to_string().contains("store_unavailable"),
-            "{fault}: {error:#}"
-        );
+        let reason = format!("{error:#}");
+        let expected = if fault == "missing_scope" {
+            "store_unavailable: selected raw source identity mismatch"
+        } else {
+            "store_unavailable: selected raw source length or digest mismatch"
+        };
+        assert!(reason.contains(expected), "{fault}: {reason}");
         drop(selected);
-        // Only stored bytes disagreeing with their recorded length or hash
-        // schedule a rebuild; a missing manifest scope does not.
-        assert_eq!(
-            store.recovery_pending_for_tests(),
-            fault != "missing_scope",
-            "{fault}"
-        );
+        assert!(store.recovery_pending_for_tests(), "{fault}");
         let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
         for legacy in [false, true] {
             let (mut client, mut reader, session) = socket_session(&identity, &registry, 145, None);

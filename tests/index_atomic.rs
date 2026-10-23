@@ -66,13 +66,13 @@ fn v8_bootstrap_admits_only_empty_unpublished_evidence() {
             .contains("incompatible_index"),
         "partial v8 bootstrap must fail closed"
     );
-    assert!(
-        reopened
-            .recorded_index_options()
-            .expect_err("partial bootstrap cannot become an absent-option fallback")
-            .to_string()
-            .contains("partial v8 bootstrap")
-    );
+    let error = reopened
+        .recorded_index_options()
+        .expect_err("partial bootstrap cannot become an absent-option fallback");
+    let reason = format!("{error:#}");
+    assert!(reason.contains("partial v8 bootstrap"), "{reason}");
+    #[cfg(feature = "test-support")]
+    assert!(reopened.recovery_pending_for_tests());
 }
 
 #[test]
@@ -82,13 +82,13 @@ fn published_v8_missing_reconcile_options_never_looks_like_a_bootstrap() {
     let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
     db.execute("UPDATE index_metadata SET reconcile_options=NULL", [])
         .unwrap();
-    assert!(
-        store
-            .recorded_index_options()
-            .expect_err("published v8 cannot omit recorded options")
-            .to_string()
-            .contains("missing reconcile options")
-    );
+    let error = store
+        .recorded_index_options()
+        .expect_err("published v8 cannot omit recorded options");
+    let reason = format!("{error:#}");
+    assert!(reason.contains("missing reconcile options"), "{reason}");
+    #[cfg(feature = "test-support")]
+    assert!(store.recovery_pending_for_tests());
 }
 
 fn index_dir(state: &Path) -> std::path::PathBuf {
