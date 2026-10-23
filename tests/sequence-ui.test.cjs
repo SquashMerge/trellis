@@ -580,7 +580,7 @@ test("Pele rejects changed inline style and oversized SVG before DOMParser", asy
   const view = peleFixture("rust");
   let parses = 0;
   const sandbox = {window:{pele:{render:() => ({svg:frozen.replace("max-width:100%", "max-width:200%")})}},
-    TextEncoder, setTimeout, clearTimeout, DOMParser:class { parseFromString() { parses++; throw Error("should not parse"); } }};
+    TextEncoder, DOMParser:class { parseFromString() { parses++; throw Error("should not parse"); } }};
   vm.runInNewContext(source, sandbox);
   const container = {replaceChildren() { throw Error("partial DOM installed"); }};
   const changed = await sandbox.window.TrellisPeleSequence.render(container, view);
@@ -591,6 +591,11 @@ test("Pele rejects changed inline style and oversized SVG before DOMParser", asy
   const oversized = await sandbox.window.TrellisPeleSequence.render(container, view);
   assert.equal(oversized.status, "unsupported");
   assert.match(oversized.reason, /too large/);
+  assert.equal(parses, 0);
+  sandbox.window.pele.render = () => { throw Error("render failed"); };
+  const failed = await sandbox.window.TrellisPeleSequence.render(container, view);
+  assert.equal(failed.status, "unsupported");
+  assert.equal(failed.reason, "render failed");
   assert.equal(parses, 0);
   sandbox.window.pele.render = () => ({svg:frozen});
   const stale = await sandbox.window.TrellisPeleSequence.render(container, view, null, new Set(), {isCurrent:() => false});
@@ -699,6 +704,8 @@ test("real Chromium validates pinned SVG and source note identity under unchange
       container.scrollTop = 24; container.scrollLeft = 35;
       const before = [container.scrollTop, container.scrollLeft];
       toggle.click();
+      // The async toggle restores focus after its render promise resolves.
+      await Promise.resolve();
       for (let i=0; i<50 && container.querySelector('[data-trellis-step-id="group-alpha"] button')?.getAttribute("aria-expanded") !== "true"; i++)
         await new Promise(resolve => setTimeout(resolve, 10));
       const successor = container.querySelector('[data-trellis-step-id="group-alpha"] button');
