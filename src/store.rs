@@ -13613,6 +13613,15 @@ impl Store {
         let Some(revision) = revision else {
             return Ok(None);
         };
+        // A manifest row without its native version is corruption, not an
+        // orphaned anchor: report it so the index is rebuilt.
+        v8_native_scope_for(db, &anchor.document, selected)
+            .and_then(|scope| {
+                scope
+                    .map(drop)
+                    .context("incompatible_index: selected native version missing")
+            })
+            .map_err(|error| store.report_selected_read(error))?;
         let declarations = Self::read_native_declarations_for(
             db,
             &anchor.document.language,
