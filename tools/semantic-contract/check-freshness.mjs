@@ -51,7 +51,9 @@ function captureExists(loaded, kind, hash) {
     (x) =>
       x.kind === kind &&
       x.hash === hash &&
-      contentHash(loaded.captureBytes.get(x.ref)) === hash,
+      // A pinned capture was verified against its profile at load (Decision 0017).
+      (x.pinned !== undefined ||
+        contentHash(loaded.captureBytes.get(x.ref)) === hash),
   );
 }
 
