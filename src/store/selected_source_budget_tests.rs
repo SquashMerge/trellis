@@ -76,10 +76,10 @@ fn selected_source_length_guard_precedes_decode_and_graph_guard_follows() {
         )
         .unwrap();
     let db = Connection::open(store.roots.index_db(&store.identity)).unwrap();
-    let (node_id, original): (String, String) = db
+    let (node_id, original): (Vec<u8>, String) = db
         .query_row(
             "SELECT n.id,n.name FROM graph_nodes n JOIN revision_documents m
-             ON m.graph_projection_id=n.projection_id WHERE m.path='one.js' LIMIT 1",
+             ON m.gid=n.gid WHERE m.path='one.js' LIMIT 1",
             [],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
@@ -162,8 +162,8 @@ fn selected_source_length_guard_precedes_decode_and_graph_guard_follows() {
             .contains("graph row byte budget exceeded")
     );
     db.execute(
-        "UPDATE graph_nodes SET name=?1 WHERE id=?2 AND projection_id=(SELECT graph_projection_id FROM revision_documents WHERE path='one.js')",
-        params!["wrong", node_id],
+        "UPDATE graph_nodes SET name=?1 WHERE id=?2 AND gid=(SELECT gid FROM revision_documents WHERE path='one.js')",
+        params!["wrong", &node_id],
     ).unwrap();
     assert!(
         store
@@ -173,8 +173,8 @@ fn selected_source_length_guard_precedes_decode_and_graph_guard_follows() {
             .contains("graph node materialization differs")
     );
     db.execute(
-        "UPDATE graph_nodes SET name=?1 WHERE id=?2 AND projection_id=(SELECT graph_projection_id FROM revision_documents WHERE path='one.js')",
-        params![original, node_id],
+        "UPDATE graph_nodes SET name=?1 WHERE id=?2 AND gid=(SELECT gid FROM revision_documents WHERE path='one.js')",
+        params![original, &node_id],
     ).unwrap();
     // A tiny test limit exercises the same SQL size gate without a 256 MiB fixture.
     assert!(
@@ -184,7 +184,7 @@ fn selected_source_length_guard_precedes_decode_and_graph_guard_follows() {
             .contains("byte budget exceeded")
     );
     db.execute(
-            "UPDATE document_versions SET source_bytes=?1,byte_length=length(?1) WHERE id=(SELECT document_version_id FROM revision_documents WHERE path='one.js')",
+            "UPDATE document_versions SET source_bytes=?1,byte_length=length(?1) WHERE vid=(SELECT vid FROM revision_documents WHERE path='one.js')",
             ["not-valid-json".repeat(2000)],
         )
         .unwrap();
@@ -195,7 +195,7 @@ fn selected_source_length_guard_precedes_decode_and_graph_guard_follows() {
             .contains("byte budget exceeded")
     );
     db.execute(
-            "UPDATE document_versions SET source_bytes=x'ff',byte_length=1 WHERE id=(SELECT document_version_id FROM revision_documents WHERE path='one.js')",
+            "UPDATE document_versions SET source_bytes=x'ff',byte_length=1 WHERE vid=(SELECT vid FROM revision_documents WHERE path='one.js')",
             [],
         )
         .unwrap();

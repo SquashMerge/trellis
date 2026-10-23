@@ -63,13 +63,14 @@ fn assert_owned_calls(
 ) {
     let source =
         "function first() { return 1; }\nfunction second() { first(); first(); return 2; }\n";
-    let persisted: Vec<(String, String, i64, i64)> = db.prepare(
-        "SELECT d.name,d.syntax_id,d.start_byte,d.end_byte FROM native_version_declarations d          JOIN document_versions v ON v.id=d.version_id WHERE v.path=?1 AND d.name IN ('first','second') ORDER BY d.name"
-    ).unwrap().query_map([path], |r| Ok((r.get(0)?, r.get(1)?, r.get::<_,i64>(2)?, r.get::<_,i64>(3)?)))
+    let persisted: Vec<(String, Vec<u8>, i64, i64)> = db.prepare(
+        "SELECT d.name,d.syntax_id,d.start_byte,d.end_byte FROM native_version_declarations d          JOIN document_versions v ON v.vid=d.vid WHERE v.path=?1 AND d.name IN ('first','second') ORDER BY d.name"
+    ).unwrap().query_map([path], |r| Ok((r.get(0)?, r.get::<_, Vec<u8>>(1)?, r.get::<_,i64>(2)?, r.get::<_,i64>(3)?)))
         .unwrap().map(Result::unwrap).collect();
     assert_eq!(persisted.len(), 2);
     assert_eq!(rows.len(), 2);
-    for (name, sid, start, end) in persisted {
+    for (name, sid_blob, start, end) in persisted {
+        let sid = format!("sid:v1:{}", hex::encode(sid_blob));
         let expected_start = source.find(&format!("function {name}")).unwrap();
         let expected_end = source[expected_start..].find('}').unwrap() + expected_start + 1;
         assert_eq!(
@@ -419,7 +420,7 @@ fn selected_fact_corruption_is_typed_and_atomic() {
     let (state, _root, store, _pin) = fixture();
     let db = rusqlite::Connection::open(index_path(state.path())).unwrap();
     db.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
-    db.execute("UPDATE native_version_calls SET owner_syntax_id='sid:v1:missing' WHERE version_id IN (SELECT id FROM document_versions WHERE path='src/a.js')", []).unwrap();
+    db.execute("UPDATE native_version_calls SET owner_syntax_id=X'00000000000000000000000000000000' WHERE vid IN (SELECT vid FROM document_versions WHERE path='src/a.js')", []).unwrap();
     drop(db);
     let response = store.evidence_response().unwrap();
     let error = response

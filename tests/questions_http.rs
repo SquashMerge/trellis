@@ -564,7 +564,7 @@ async fn cached_packet_checks_only_its_selected_source_and_graph_witnesses() {
     let corrupt = |path: &str| {
         let mut bytes: Vec<u8> = db
             .query_row(
-                "SELECT v.source_bytes FROM document_versions v JOIN revision_documents m ON m.document_version_id=v.id WHERE m.path=?1",
+                "SELECT v.source_bytes FROM document_versions v JOIN revision_documents m ON m.vid=v.vid WHERE m.path=?1",
                 [path],
                 |row| row.get(0),
             )
@@ -572,7 +572,7 @@ async fn cached_packet_checks_only_its_selected_source_and_graph_witnesses() {
         bytes[0] ^= 1;
         assert_eq!(
             db.execute(
-                "UPDATE document_versions SET source_bytes=?1 WHERE id=(SELECT document_version_id FROM revision_documents WHERE path=?2)",
+                "UPDATE document_versions SET source_bytes=?1 WHERE vid=(SELECT vid FROM revision_documents WHERE path=?2)",
                 rusqlite::params![bytes, path],
             )
             .unwrap(),
@@ -638,8 +638,8 @@ async fn cached_packet_refuses_changed_selected_native_call_under_same_pin() {
     let db = rusqlite::Connection::open(db_path).unwrap();
     assert_eq!(
         db.execute(
-            "UPDATE native_version_calls SET spelling='forged' WHERE id=?1 AND version_id IN (SELECT m.document_version_id FROM revision_documents m JOIN native_revisions r ON r.id=m.revision_id JOIN index_metadata current ON current.index_revision=r.published_index_revision)",
-            [id],
+            "UPDATE native_version_calls SET spelling='forged' WHERE id=?1 AND vid IN (SELECT m.vid FROM revision_documents m JOIN native_revisions r ON r.id=m.revision_id JOIN index_metadata current ON current.index_revision=r.published_index_revision)",
+            [hex::decode(id.strip_prefix("occ:v2:").unwrap()).unwrap()],
         )
         .unwrap(),
         1

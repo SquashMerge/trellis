@@ -1,6 +1,6 @@
-//! R-1 (#199): publication reuse compares fresh hashes with the stored ones.
-//! A stored mismatch is typed index corruption, and the next publication
-//! rebaselines from fresh facts.
+//! R-1 (#199): reused projections compare fresh hashes with stored witnesses.
+//! Non-reused class hashes are replaced by fresh, validated projections; a
+//! retained selected read still attests its own class rows.
 use super::*;
 use crate::{index_coordinator::IndexJobCoordinator, indexer::IndexOptions};
 use std::{fs, sync::atomic::AtomicBool};
@@ -29,10 +29,10 @@ fn fixture() -> (
     (state, work, store, options, pin)
 }
 
-fn call_lookups(store: &Store) -> Vec<(String, String, Option<String>)> {
+fn call_lookups(store: &Store) -> Vec<(String, Vec<u8>, Option<String>)> {
     let db = store.cache_write().unwrap();
     let mut statement = db
-        .prepare("SELECT version_id,id,callee_lookup_key FROM native_version_calls ORDER BY version_id,id")
+        .prepare("SELECT v.id,c.id,c.callee_lookup_key FROM native_version_calls c JOIN document_versions v ON v.vid=c.vid ORDER BY v.id,c.id")
         .unwrap();
     statement
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
@@ -143,7 +143,7 @@ fn stored_mismatch_fails_typed_then_rebaselines(sql: &str, message: &str) {
 fn a_stored_native_witness_mismatch_fails_typed_then_rebaselines() {
     stored_mismatch_fails_typed_then_rebaselines(
         "UPDATE document_versions SET native_witness=printf('%064d',0)
-         WHERE id=(SELECT document_version_id FROM revision_documents
+         WHERE vid=(SELECT vid FROM revision_documents
                    WHERE revision_id=?1 AND path=?2)",
         "reusable normalized native witness mismatch",
     );
@@ -153,19 +153,80 @@ fn a_stored_native_witness_mismatch_fails_typed_then_rebaselines() {
 fn a_stored_graph_hash_mismatch_fails_typed_then_rebaselines() {
     stored_mismatch_fails_typed_then_rebaselines(
         "UPDATE graph_projections SET graph_hash=printf('%064d',0)
-         WHERE id=(SELECT graph_projection_id FROM revision_documents
+         WHERE gid=(SELECT gid FROM revision_documents
                    WHERE revision_id=?1 AND path=?2)",
-        "reusable graph witness mismatch",
+        "class reused with different graph projection",
     );
 }
 
 #[test]
-fn a_stored_class_hash_mismatch_fails_typed_then_rebaselines() {
-    stored_mismatch_fails_typed_then_rebaselines(
+fn corrupted_non_reused_class_hash_reprojects_r2_but_retained_r1_fails_typed() {
+    let (_state, _work, store, options, r1) = fixture();
+    let expected = store
+        .classes_at(Some("A.java"), "", Some(r1), 0, 100)
+        .unwrap();
+    assert!(!expected.items.is_empty(), "fixture must contain classes");
+    corrupt(
+        &store,
+        r1,
         "UPDATE class_projections SET content_hash=printf('%064d',0)
-         WHERE id=(SELECT class_projection_id FROM revision_documents
+         WHERE cid=(SELECT cid FROM revision_documents
                    WHERE revision_id=?1 AND path=?2)",
-        "reusable class witness mismatch",
+    );
+
+    let r2 = publish_full(&store, &options).unwrap();
+    assert_eq!(r2.index_generation, r1.index_generation);
+    assert_eq!(r2.index_revision, r1.index_revision + 1);
+    let db = store.cache_write().unwrap();
+    let selected_r1 = store.read_revision_for(&db, Some(r1), true).unwrap();
+    let selected_r2 = store.read_revision_for(&db, Some(r2), true).unwrap();
+    let cid = |revision| {
+        db.query_row(
+            "SELECT cid FROM revision_documents WHERE revision_id=?1 AND path='A.java'",
+            [revision],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap()
+    };
+    assert_ne!(
+        cid(selected_r1.key),
+        cid(selected_r2.key),
+        "r2 writes a fresh class projection"
+    );
+    drop(db);
+    let fresh = store
+        .classes_at(Some("A.java"), "", Some(r2), 0, 100)
+        .unwrap();
+    assert_eq!(fresh.revision, r2);
+    assert_eq!(
+        serde_json::to_value(&fresh.items).unwrap(),
+        serde_json::to_value(&expected.items).unwrap()
+    );
+
+    // The selected read returns only an error: no partial class page can escape.
+    let error = store
+        .classes_at(Some("A.java"), "", Some(r1), 0, 100)
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "incompatible_index: selected evidence decode failed: incompatible_index: selected projection fingerprint mismatch"
+    );
+
+    // A retained r1 read is valid after r2 publication when r1 was not corrupt.
+    let (_clean_state, _clean_work, clean_store, clean_options, clean_r1) = fixture();
+    let clean_expected = clean_store
+        .classes_at(Some("A.java"), "", Some(clean_r1), 0, 100)
+        .unwrap();
+    let clean_r2 = publish_full(&clean_store, &clean_options).unwrap();
+    assert_eq!(clean_r2.index_generation, clean_r1.index_generation);
+    assert_eq!(clean_r2.index_revision, clean_r1.index_revision + 1);
+    let retained = clean_store
+        .classes_at(Some("A.java"), "", Some(clean_r1), 0, 100)
+        .unwrap();
+    assert_eq!(retained.revision, clean_r1);
+    assert_eq!(
+        serde_json::to_value(&retained.items).unwrap(),
+        serde_json::to_value(&clean_expected.items).unwrap()
     );
 }
 
@@ -178,7 +239,7 @@ fn equal_stored_hashes_reuse_without_decoding_stored_rows() {
         &store,
         pin,
         "UPDATE graph_nodes SET name=name||'not-a-matching-name'
-         WHERE projection_id=(SELECT graph_projection_id FROM revision_documents
+         WHERE gid=(SELECT gid FROM revision_documents
                               WHERE revision_id=?1 AND path=?2)",
     );
     let next = publish_full(&store, &options).unwrap();

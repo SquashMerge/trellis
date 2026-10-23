@@ -90,18 +90,22 @@ fn active_revision(db: &rusqlite::Connection) -> String {
         |row| row.get(0),
     ).unwrap()
 }
-fn admitted_document(db: &rusqlite::Connection, path: &str) -> (String, String, String) {
+fn sid_blob(id: &str) -> Vec<u8> {
+    hex::decode(id.strip_prefix("sid:v1:").expect("syntax ID")).expect("hex syntax ID")
+}
+fn admitted_document(db: &rusqlite::Connection, path: &str) -> (i64, i64, i64) {
     db.query_row(
-        "SELECT document_version_id,graph_projection_id,class_projection_id FROM revision_documents WHERE revision_id=?1 AND path=?2",
+        "SELECT vid,gid,cid FROM revision_documents WHERE revision_id=?1 AND path=?2",
         rusqlite::params![active_revision(db), path],
-        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
-    ).unwrap()
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )
+    .unwrap()
 }
 fn replace_source_bytes(db: &rusqlite::Connection, path: &str, text: &str) {
     let (version, _, _) = admitted_document(db, path);
     assert_eq!(
         db.execute(
-            "UPDATE document_versions SET source_bytes=?1,byte_length=length(?1) WHERE id=?2",
+            "UPDATE document_versions SET source_bytes=?1,byte_length=length(?1) WHERE vid=?2",
             rusqlite::params![text.as_bytes(), version],
         )
         .unwrap(),
@@ -123,7 +127,7 @@ fn id<'a>(g: &'a Graph, name: &str) -> &'a str {
 fn member(dir: &tempfile::TempDir, class: &str, name: &str, ordinal: usize) -> Value {
     let db = rusqlite::Connection::open(index_db(dir)).unwrap();
     let payload: String = db
-        .query_row("SELECT c.payload FROM classes c JOIN revision_documents m ON m.class_projection_id=c.projection_id WHERE m.revision_id=?1 AND c.id=?2", rusqlite::params![active_revision(&db), class], |r| {
+        .query_row("SELECT c.payload FROM classes c JOIN revision_documents m ON m.cid=c.cid WHERE m.revision_id=?1 AND c.id=?2", rusqlite::params![active_revision(&db), sid_blob(class)], |r| {
             r.get(0)
         })
         .unwrap();
@@ -373,8 +377,8 @@ async fn schema8_class_corruption_refuses_without_old_projection_guidance() {
     let db = rusqlite::Connection::open(index_db(&dir)).unwrap();
     let huge=json!({"name":"padding","typeHint":"x".repeat(2*1024*1024),"symbolId":null,"path":"A.java","range":{"startByte":0,"endByte":1,"startLine":1,"endLine":1,"startColumn":1,"endColumn":2}}).to_string();
     db.execute(
-        "UPDATE classes SET payload=json_insert(payload,'$.methods[#]',json(?1)) WHERE projection_id=?2 AND id=?3",
-        rusqlite::params![huge, admitted_document(&db, "A.java").2, id(&graph, "A")],
+        "UPDATE classes SET payload=json_insert(payload,'$.methods[#]',json(?1)) WHERE cid=?2 AND id=?3",
+        rusqlite::params![huge, admitted_document(&db, "A.java").2, sid_blob(id(&graph, "A"))],
     )
     .unwrap();
     refusal(call(&app, selector).await, "incompatible_index");
@@ -451,8 +455,8 @@ async fn schema8_class_corruption_refuses_without_old_projection_guidance() {
     // Selected class relationships are scoped by their owner and file.
     let (dir, _store, graph, app, _session) = fixture();
     let db = rusqlite::Connection::open(index_db(&dir)).unwrap();
-    db.execute("UPDATE class_relations SET payload=json_set(payload,'$.candidateIds',json(?1)) WHERE projection_id=?2 AND owner=?3",
-        rusqlite::params![json!(["x".repeat(100000)]).to_string(),admitted_document(&db, "A.java").2,id(&graph,"A")]).unwrap();
+    db.execute("UPDATE class_relations SET payload=json_set(payload,'$.candidateIds',json(?1)) WHERE cid=?2 AND owner=?3",
+        rusqlite::params![json!(["x".repeat(100000)]).to_string(),admitted_document(&db, "A.java").2,sid_blob(id(&graph,"A"))]).unwrap();
     refusal(
         call(&app, member(&dir, id(&graph, "A"), "first", 0)).await,
         "incompatible_index",
@@ -468,8 +472,8 @@ async fn schema8_class_corruption_refuses_without_old_projection_guidance() {
     let (dir, store, _graph, app, _session) = fixture();
     let db = rusqlite::Connection::open(index_db(&dir)).unwrap();
     let revision = active_revision(&db);
-    db.execute("DELETE FROM class_relations WHERE projection_id IN (SELECT class_projection_id FROM revision_documents WHERE revision_id=?1)", [&revision]).unwrap();
-    db.execute("DELETE FROM classes WHERE projection_id IN (SELECT class_projection_id FROM revision_documents WHERE revision_id=?1)", [&revision]).unwrap();
+    db.execute("DELETE FROM class_relations WHERE cid IN (SELECT cid FROM revision_documents WHERE revision_id=?1)", [&revision]).unwrap();
+    db.execute("DELETE FROM classes WHERE cid IN (SELECT cid FROM revision_documents WHERE revision_id=?1)", [&revision]).unwrap();
     db.execute(
         "UPDATE native_revisions SET class_warnings='not-json' WHERE id=?1",
         [&revision],
@@ -709,7 +713,7 @@ async fn cached_java_source_budget_and_unproven_member_shape_do_not_guess() {
     let (_, _, class_projection) = admitted_document(&db, "Large.java");
     let class_payload: String = db
         .query_row(
-            "SELECT payload FROM classes WHERE projection_id=?1 AND name='A'",
+            "SELECT payload FROM classes WHERE cid=?1 AND name='A'",
             [&class_projection],
             |row| row.get(0),
         )
@@ -717,7 +721,7 @@ async fn cached_java_source_budget_and_unproven_member_shape_do_not_guess() {
     // v8 has one source BLOB, so a graph-only alteration belongs to the
     // selected class projection, not to a duplicate files.payload text field.
     assert_eq!(db.execute(
-        "UPDATE classes SET payload=json_set(payload,'$.fields[0].typeHint','C') WHERE projection_id=?1 AND name='A'",
+        "UPDATE classes SET payload=json_set(payload,'$.fields[0].typeHint','C') WHERE cid=?1 AND name='A'",
         [&class_projection],
     ).unwrap(), 1);
     let (unproven_store, unproven_app) = reopen();
@@ -735,7 +739,7 @@ async fn cached_java_source_budget_and_unproven_member_shape_do_not_guess() {
     // Direct-native and HTTP selection each close on the same version corruption.
     assert_eq!(
         db.execute(
-            "UPDATE classes SET payload=?1 WHERE projection_id=?2 AND name='A'",
+            "UPDATE classes SET payload=?1 WHERE cid=?2 AND name='A'",
             rusqlite::params![class_payload, class_projection],
         )
         .unwrap(),
@@ -743,14 +747,14 @@ async fn cached_java_source_budget_and_unproven_member_shape_do_not_guess() {
     );
     let mut bytes: Vec<u8> = db
         .query_row(
-            "SELECT source_bytes FROM document_versions WHERE id=?1",
+            "SELECT source_bytes FROM document_versions WHERE vid=?1",
             [admitted_document(&db, "Large.java").0],
             |row| row.get(0),
         )
         .unwrap();
     bytes[0] ^= 1;
     db.execute(
-        "UPDATE document_versions SET source_bytes=?1 WHERE id=?2",
+        "UPDATE document_versions SET source_bytes=?1 WHERE vid=?2",
         rusqlite::params![bytes, admitted_document(&db, "Large.java").0],
     )
     .unwrap();
@@ -1247,7 +1251,7 @@ async fn navigation_selected_graph_nodes_are_attested_without_scanning_other_doc
     let db = rusqlite::Connection::open(index_db(&dir)).unwrap();
     let pin_before = store.status().unwrap().revision;
     db.execute(
-        "UPDATE graph_nodes SET name='forgedName' WHERE projection_id=?1 AND id=(SELECT id FROM graph_nodes WHERE projection_id=?1 ORDER BY id LIMIT 1)",
+        "UPDATE graph_nodes SET name='forgedName' WHERE gid=?1 AND id=(SELECT id FROM graph_nodes WHERE gid=?1 ORDER BY id LIMIT 1)",
         [admitted_document(&db, "A.java").1],
     )
     .unwrap();
@@ -1272,57 +1276,57 @@ async fn navigation_selected_graph_nodes_are_attested_without_scanning_other_doc
         .unwrap();
     let (version, graph, class) = admitted_document(&missing_db, "B.java");
     let revision = active_revision(&missing_db);
-    assert_eq!(missing_db.execute(
-        "INSERT INTO document_versions(id,source_set_id,language,path,content_hash,extraction_context,producer_id,producer_version,byte_length,source_bytes,native_witness)
-         SELECT 'orphan-version',source_set_id,language,'orphan.java',content_hash,extraction_context,producer_id,producer_version,byte_length,source_bytes,native_witness
-         FROM document_versions WHERE id=?1",
-        [&version],
-    ).unwrap(), 1);
-    assert_eq!(missing_db.execute(
-        "INSERT INTO graph_projections(id,document_version_id,language,graph_hash,state,class_extraction_state,class_extraction_payload)
-         SELECT 'orphan-graph','orphan-version',language,graph_hash,state,class_extraction_state,class_extraction_payload
-         FROM graph_projections WHERE id=?1",
-        [&graph],
-    ).unwrap(), 1);
-    missing_db
-        .execute(
-            "INSERT INTO graph_nodes(projection_id,id,name,kind)
-         SELECT 'orphan-graph',id,name,kind
-         FROM graph_nodes WHERE projection_id=?1",
-            [&graph],
-        )
-        .unwrap();
-    missing_db
-        .execute(
-            "INSERT INTO graph_display_labels(projection_id,id,label)
-         SELECT 'orphan-graph',id,label FROM graph_display_labels WHERE projection_id=?1",
-            [&graph],
-        )
-        .unwrap();
-    assert_eq!(missing_db.execute(
-        "INSERT INTO class_projections(id,graph_projection_id,content_hash,state)
-         SELECT 'orphan-class','orphan-graph',content_hash,state FROM class_projections WHERE id=?1",
-        [&class],
-    ).unwrap(), 1);
-    missing_db.execute(
-        "INSERT INTO classes(projection_id,graph_projection_id,id,name,qualified_name,path,payload)
-         SELECT 'orphan-class','orphan-graph',id,name,qualified_name,'orphan.java',json_set(payload,'$.symbol.path','orphan.java')
-         FROM classes WHERE projection_id=?1",
-        [&class],
+    let orphan_vid: i64 = missing_db.query_row(
+        "INSERT INTO document_versions(id,language,path,content_hash,extraction_context,producer_id,producer_version,byte_length,source_bytes,native_witness)
+         SELECT 'orphan-version',language,'orphan.java',content_hash,extraction_context,producer_id,producer_version,byte_length,source_bytes,native_witness
+         FROM document_versions WHERE vid=?1 RETURNING vid",
+        [version], |row| row.get(0),
+    ).unwrap();
+    let orphan_gid: i64 = missing_db.query_row(
+        "INSERT INTO graph_projections(vid,language,graph_hash,state,class_extraction_state,class_extraction_payload)
+         SELECT ?1,language,(CASE substr(graph_hash,1,1) WHEN '0' THEN '1' ELSE '0' END)||substr(graph_hash,2),state,class_extraction_state,class_extraction_payload
+         FROM graph_projections WHERE gid=?2 RETURNING gid",
+        rusqlite::params![orphan_vid, graph], |row| row.get(0),
     ).unwrap();
     missing_db
         .execute(
-            "INSERT INTO class_relations(projection_id,id,owner,target,payload)
-         SELECT 'orphan-class',id,owner,target,payload FROM class_relations WHERE projection_id=?1",
-            [&class],
+            "INSERT INTO graph_nodes(gid,id,name,kind)
+         SELECT ?1,id,name,kind FROM graph_nodes WHERE gid=?2",
+            rusqlite::params![orphan_gid, graph],
+        )
+        .unwrap();
+    missing_db
+        .execute(
+            "INSERT INTO graph_display_labels(gid,id,label)
+         SELECT ?1,id,label FROM graph_display_labels WHERE gid=?2",
+            rusqlite::params![orphan_gid, graph],
+        )
+        .unwrap();
+    let orphan_cid: i64 = missing_db.query_row(
+        "INSERT INTO class_projections(gid,content_hash,state)
+         SELECT ?1,(CASE substr(content_hash,1,1) WHEN '0' THEN '1' ELSE '0' END)||substr(content_hash,2),state
+         FROM class_projections WHERE cid=?2 RETURNING cid",
+        rusqlite::params![orphan_gid, class], |row| row.get(0),
+    ).unwrap();
+    missing_db.execute(
+        "INSERT INTO classes(cid,gid,id,name,qualified_name,path,payload)
+         SELECT ?1,?2,id,name,qualified_name,'orphan.java',json_set(payload,'$.symbol.path','orphan.java')
+         FROM classes WHERE cid=?3",
+        rusqlite::params![orphan_cid, orphan_gid, class],
+    ).unwrap();
+    missing_db
+        .execute(
+            "INSERT INTO class_relations(cid,id,owner,target,payload)
+         SELECT ?1,id,owner,target,payload FROM class_relations WHERE cid=?2",
+            rusqlite::params![orphan_cid, class],
         )
         .unwrap();
     assert_eq!(missing_db.execute(
-        "INSERT INTO revision_documents(revision_id,source_set_id,language,path,document_version_id,graph_projection_id,class_projection_id,capture_stat,coverage_requested,coverage_selected,coverage_state,coverage_diagnostic,ordinal)
-         SELECT revision_id,source_set_id,language,'orphan.java','orphan-version','orphan-graph','orphan-class',capture_stat,coverage_requested,coverage_selected,coverage_state,coverage_diagnostic,
+        "INSERT INTO revision_documents(revision_id,language,path,vid,gid,cid,capture_stat,coverage_requested,coverage_selected,coverage_state,coverage_diagnostic,ordinal)
+         SELECT revision_id,language,'orphan.java',?2,?3,?4,capture_stat,coverage_requested,coverage_selected,coverage_state,coverage_diagnostic,
                 (SELECT max(ordinal)+1 FROM revision_documents WHERE revision_id=?1)
          FROM revision_documents WHERE revision_id=?1 AND path='B.java'",
-        [&revision],
+        rusqlite::params![revision, orphan_vid, orphan_gid, orphan_cid],
     ).unwrap(), 1);
     let fk_count: i64 = missing_db
         .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
@@ -1356,8 +1360,11 @@ async fn navigation_selected_graph_nodes_are_attested_without_scanning_other_doc
     assert_eq!(
         selected_db
             .execute(
-                "UPDATE graph_nodes SET kind='forged-unrelated-kind' WHERE projection_id=?1 AND id=?2",
-                rusqlite::params![admitted_document(&selected_db, "B.java").1, unrelated_class.id],
+                "UPDATE graph_nodes SET kind='forged-unrelated-kind' WHERE gid=?1 AND id=?2",
+                rusqlite::params![
+                    admitted_document(&selected_db, "B.java").1,
+                    sid_blob(&unrelated_class.id)
+                ],
             )
             .unwrap(),
         1
@@ -1369,8 +1376,11 @@ async fn navigation_selected_graph_nodes_are_attested_without_scanning_other_doc
     assert_eq!(
         selected_db
             .execute(
-                "UPDATE graph_nodes SET kind='forged-kind' WHERE projection_id=?1 AND id=?2",
-                rusqlite::params![admitted_document(&selected_db, "A.java").1, class_id],
+                "UPDATE graph_nodes SET kind='forged-kind' WHERE gid=?1 AND id=?2",
+                rusqlite::params![
+                    admitted_document(&selected_db, "A.java").1,
+                    sid_blob(class_id)
+                ],
             )
             .unwrap(),
         1

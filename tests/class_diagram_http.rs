@@ -19,6 +19,9 @@ use trellis::{
     model::*,
     store::Store,
 };
+fn sid_blob(id: &str) -> Vec<u8> {
+    hex::decode(id.strip_prefix("sid:v1:").expect("syntax ID")).expect("hex syntax ID")
+}
 const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const JAVA: &str = r#"package demo;
 class A extends B {
@@ -303,11 +306,11 @@ fn selected_class_pages_and_diagrams_refuse_fk_valid_f_and_class_forgeries() {
     for (family, mutation) in [
         (
             "F",
-            "UPDATE graph_projections SET class_extraction_payload=json_set(class_extraction_payload,'$.path','forged.java') WHERE id=(SELECT graph_projection_id FROM revision_documents WHERE path='Types.java' LIMIT 1)",
+            "UPDATE graph_projections SET class_extraction_payload=json_set(class_extraction_payload,'$.path','forged.java') WHERE gid=(SELECT gid FROM revision_documents WHERE path='Types.java' LIMIT 1)",
         ),
         (
             "class",
-            "UPDATE classes SET payload=json_set(payload,'$.qualifiedName','forged') WHERE projection_id=(SELECT class_projection_id FROM revision_documents WHERE path='Types.java' LIMIT 1) AND id=(SELECT id FROM classes WHERE projection_id=(SELECT class_projection_id FROM revision_documents WHERE path='Types.java' LIMIT 1) LIMIT 1)",
+            "UPDATE classes SET payload=json_set(payload,'$.qualifiedName','forged') WHERE cid=(SELECT cid FROM revision_documents WHERE path='Types.java' LIMIT 1) AND id=(SELECT id FROM classes WHERE cid=(SELECT cid FROM revision_documents WHERE path='Types.java' LIMIT 1) LIMIT 1)",
         ),
     ] {
         let (dir, store, graph, _app, _session) = setup();
@@ -631,7 +634,7 @@ fn failed_publication_keeps_projection_atomic_with_graph() {
     assert_eq!(
         (version, marker.as_str(), generation, revision),
         (
-            13,
+            14,
             "native-v6-delta-v1",
             prior.index_generation.to_string(),
             prior.index_revision as i64
@@ -640,7 +643,7 @@ fn failed_publication_keeps_projection_atomic_with_graph() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        13
+        14
     );
     assert!(
         store
@@ -883,7 +886,10 @@ fn presentation_byte_budget_clips_members_and_paginates_without_skipping_rows() 
         .collect();
     db.execute(
         "UPDATE classes SET payload=?1 WHERE id=?2",
-        rusqlite::params![serde_json::to_string(&forged).unwrap(), forged.symbol.id],
+        rusqlite::params![
+            serde_json::to_string(&forged).unwrap(),
+            sid_blob(&forged.symbol.id)
+        ],
     )
     .unwrap();
     let error = store
@@ -1187,8 +1193,8 @@ async fn same_pin_selected_graph_declaration_rejected_by_class_and_symbol_routes
     let db = rusqlite::Connection::open(index_db(&dir.path().join("state"))).unwrap();
     // No ID, path, index pin, or FK changes: only the selected narrow graph name is forged.
     db.execute(
-        "UPDATE graph_nodes SET name='Fabricated' WHERE projection_id=(SELECT graph_projection_id FROM revision_documents WHERE path='Types.java') AND id=?1",
-        [&seed],
+        "UPDATE graph_nodes SET name='Fabricated' WHERE gid=(SELECT gid FROM revision_documents WHERE path='Types.java') AND id=?1",
+        [sid_blob(&seed)],
     )
     .unwrap();
     assert_eq!(store.status().unwrap().revision, pin);
@@ -1233,16 +1239,16 @@ class B {}
     assert_eq!(call(&app, "GET", &class_url, Value::Null).await.0, 200);
     let db = rusqlite::Connection::open(index_db(&dir.path().join("state"))).unwrap();
     // Graph calls derive from native call facts. Forge one FK-valid native spelling.
-    let call_id: String = db
+    let call_id: Vec<u8> = db
         .query_row(
-            "SELECT c.id FROM native_version_calls c JOIN revision_documents m ON m.document_version_id=c.version_id WHERE m.path='Types.java' LIMIT 1",
+            "SELECT c.id FROM native_version_calls c JOIN revision_documents m ON m.vid=c.vid WHERE m.path='Types.java' LIMIT 1",
             [],
             |r| r.get(0),
         )
         .unwrap();
     assert_eq!(
         db.execute(
-            "UPDATE native_version_calls SET spelling='fabricatedCall' WHERE version_id=(SELECT document_version_id FROM revision_documents WHERE path='Types.java') AND id=?1",
+            "UPDATE native_version_calls SET spelling='fabricatedCall' WHERE vid=(SELECT vid FROM revision_documents WHERE path='Types.java') AND id=?1",
             [&call_id],
         )
         .unwrap(),
@@ -1283,7 +1289,7 @@ async fn selected_class_json_decode_and_clipping_fail_closed_without_retyping_in
     let db = rusqlite::Connection::open(index_db(&dir.path().join("state"))).unwrap();
     db.execute(
         "UPDATE classes SET payload='not-json' WHERE id=?1",
-        [&class_id],
+        [sid_blob(&class_id)],
     )
     .unwrap();
     let (status, body) = call(
@@ -1312,7 +1318,7 @@ async fn selected_class_json_decode_and_clipping_fail_closed_without_retyping_in
     let db = rusqlite::Connection::open(index_db(&dir.path().join("state"))).unwrap();
     db.execute(
         "UPDATE classes SET payload='not-json' WHERE id=?1",
-        [&class_id],
+        [sid_blob(&class_id)],
     )
     .unwrap();
     let (status, body) = call(
@@ -1340,8 +1346,8 @@ async fn selected_class_json_decode_and_clipping_fail_closed_without_retyping_in
     let method_id = id(&graph, "run");
     let db = rusqlite::Connection::open(index_db(&dir.path().join("state"))).unwrap();
     db.execute(
-        "UPDATE graph_nodes SET kind='class' WHERE projection_id=(SELECT graph_projection_id FROM revision_documents WHERE path='Types.java') AND id=?1",
-        [&method_id],
+        "UPDATE graph_nodes SET kind='class' WHERE gid=(SELECT gid FROM revision_documents WHERE path='Types.java') AND id=?1",
+        [sid_blob(&method_id)],
     )
     .unwrap();
     let (status, body) = call(
@@ -1369,7 +1375,7 @@ async fn selected_class_json_decode_and_clipping_fail_closed_without_retyping_in
     let db = rusqlite::Connection::open(index_db(&dir.path().join("state"))).unwrap();
     db.execute(
         "UPDATE classes SET payload=json_set(payload,'$.fields',json_array('wrong'),'$.padding',?1) WHERE id=?2",
-        rusqlite::params!["x".repeat(70 * 1024), class_id],
+        rusqlite::params!["x".repeat(70 * 1024), sid_blob(&class_id)],
     )
     .unwrap();
     let (status, body) = call(
@@ -1412,7 +1418,7 @@ async fn ready_file_extraction_is_persisted_and_selected_http_reads_attest_it() 
     let pin = store.status().unwrap().revision;
     let db = rusqlite::Connection::open(index_db(&dir.path().join("state"))).unwrap();
     let (state, stored): (String, String) = db.query_row(
-        "SELECT g.class_extraction_state,g.class_extraction_payload FROM graph_projections g JOIN revision_documents m ON m.graph_projection_id=g.id WHERE m.path='Types.java'",
+        "SELECT g.class_extraction_state,g.class_extraction_payload FROM graph_projections g JOIN revision_documents m ON m.gid=g.gid WHERE m.path='Types.java'",
         [], |r| Ok((r.get(0)?,r.get(1)?)),
     ).unwrap();
     assert_eq!(state, "ready");
@@ -1433,15 +1439,15 @@ async fn ready_file_extraction_is_persisted_and_selected_http_reads_attest_it() 
     assert_eq!(call(&app, "GET", &source, Value::Null).await.0, 200);
     assert_eq!(call(&app, "GET", &classes, Value::Null).await.0, 200);
     let (_,unrelated): (String,Option<String>)=db.query_row(
-        "SELECT class_extraction_state,class_extraction_payload FROM graph_projections g JOIN revision_documents m ON m.graph_projection_id=g.id WHERE m.path='unsupported.js'",
+        "SELECT class_extraction_state,class_extraction_payload FROM graph_projections g JOIN revision_documents m ON m.gid=g.gid WHERE m.path='unsupported.js'",
         [],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
     assert!(unrelated.is_none());
     db.execute(
-        "UPDATE graph_projections SET class_extraction_payload=json_set(class_extraction_payload,'$.source_bytes',0) WHERE id=(SELECT graph_projection_id FROM revision_documents WHERE path='Types.java')",
+        "UPDATE graph_projections SET class_extraction_payload=json_set(class_extraction_payload,'$.source_bytes',0) WHERE gid=(SELECT gid FROM revision_documents WHERE path='Types.java')",
         [],
     ).unwrap();
     let mutated: String = db.query_row(
-        "SELECT class_extraction_payload FROM graph_projections WHERE id=(SELECT graph_projection_id FROM revision_documents WHERE path='Types.java')",
+        "SELECT class_extraction_payload FROM graph_projections WHERE gid=(SELECT gid FROM revision_documents WHERE path='Types.java')",
         [], |r| r.get(0),
     ).unwrap();
     let changed: trellis::classes::FileExtraction = serde_json::from_str(&mutated).unwrap();
@@ -1466,8 +1472,8 @@ async fn selected_class_relation_rows_are_witnessed_by_source_and_graph() {
     assert_eq!(baseline["items"][0]["symbol"]["name"], "A");
     let db = rusqlite::Connection::open(index_db(&dir.path().join("state"))).unwrap();
     assert_eq!(db.execute(
-        "UPDATE class_relations SET payload=json_set(payload,'$.typeName','Forged') WHERE projection_id=(SELECT class_projection_id FROM revision_documents WHERE path='Types.java') AND id=(SELECT min(id) FROM class_relations WHERE owner=?1)",
-        [&seed],
+        "UPDATE class_relations SET payload=json_set(payload,'$.typeName','Forged') WHERE cid=(SELECT cid FROM revision_documents WHERE path='Types.java') AND id=(SELECT min(id) FROM class_relations WHERE owner=?1)",
+        [sid_blob(&seed)],
     ).unwrap(),1);
     let (status, value) = call(&app, "GET", &class_url, Value::Null).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{value}");
@@ -1568,8 +1574,8 @@ async fn changed_captured_class_scip_label_recomputes_f_and_new_revision_class_p
     assert_eq!((first.index_revision, second.index_revision), (1, 2));
     let db = rusqlite::Connection::open(index_db(&dir.path().join("state"))).unwrap();
     for path in ["A.java", "a.py", "a.js", "a.rs"] {
-        let ids = |revision| -> (String, String, String, Option<String>) {
-            db.query_row("SELECT m.document_version_id,m.graph_projection_id,m.class_projection_id,g.class_extraction_payload FROM revision_documents m JOIN native_revisions r ON r.id=m.revision_id JOIN graph_projections g ON g.id=m.graph_projection_id WHERE r.published_index_revision=?1 AND m.path=?2",
+        let ids = |revision| -> (i64, i64, Option<i64>, Option<String>) {
+            db.query_row("SELECT m.vid,m.gid,m.cid,g.class_extraction_payload FROM revision_documents m JOIN native_revisions r ON r.id=m.revision_id JOIN graph_projections g ON g.gid=m.gid WHERE r.published_index_revision=?1 AND m.path=?2",
                 rusqlite::params![revision,path],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap()
         };
         let old = ids(1);
@@ -1715,7 +1721,7 @@ async fn normal_size_captured_java_python_cold_oracle_attests_full_published_cat
     let revision_id = format!("pin:v1:{}:{}", pin.index_generation, pin.index_revision);
     for (file, extraction) in cold_capture.files.iter().zip(&cold_f) {
         let (state, payload): (String, String) = db.query_row(
-            "SELECT g.class_extraction_state,g.class_extraction_payload FROM revision_documents m JOIN graph_projections g ON g.id=m.graph_projection_id WHERE m.revision_id=?1 AND m.path=?2",
+            "SELECT g.class_extraction_state,g.class_extraction_payload FROM revision_documents m JOIN graph_projections g ON g.gid=m.gid WHERE m.revision_id=?1 AND m.path=?2",
             rusqlite::params![revision_id, file.path], |r| Ok((r.get(0)?,r.get(1)?)),
         ).unwrap();
         assert_eq!(state, "ready");
@@ -1731,8 +1737,8 @@ async fn normal_size_captured_java_python_cold_oracle_attests_full_published_cat
             serde_json::to_vec(file).unwrap()
         );
         let stored_nodes = db.prepare(
-            "SELECT n.id,n.name,n.kind FROM graph_nodes n JOIN revision_documents m ON m.graph_projection_id=n.projection_id WHERE m.revision_id=?1 AND m.path=?2 ORDER BY n.id"
-        ).unwrap().query_map(rusqlite::params![revision_id, file.path], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))
+            "SELECT n.id,n.name,n.kind FROM graph_nodes n JOIN revision_documents m ON m.gid=n.gid WHERE m.revision_id=?1 AND m.path=?2 ORDER BY n.id"
+        ).unwrap().query_map(rusqlite::params![revision_id, file.path], |r| Ok((format!("sid:v1:{}", hex::encode(r.get::<_, Vec<u8>>(0)?)), r.get::<_, String>(1)?, r.get::<_, String>(2)?)))
             .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
         let mut measured_nodes: Vec<_> = cold_graph
             .nodes
@@ -1772,7 +1778,7 @@ async fn normal_size_captured_java_python_cold_oracle_attests_full_published_cat
         }
     }
     let stored_classes = db.prepare(
-        "SELECT c.payload FROM classes c JOIN revision_documents m ON m.class_projection_id=c.projection_id WHERE m.revision_id=?1 ORDER BY c.path,json_extract(c.payload,'$.symbol.range.startByte'),c.id"
+        "SELECT c.payload FROM classes c JOIN revision_documents m ON m.cid=c.cid WHERE m.revision_id=?1 ORDER BY c.path,json_extract(c.payload,'$.symbol.range.startByte'),c.id"
     ).unwrap().query_map([&revision_id], |r| r.get::<_, String>(0))
         .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
     assert_eq!(stored_classes.len(), cold_catalog.classes.len());
@@ -1785,7 +1791,7 @@ async fn normal_size_captured_java_python_cold_oracle_attests_full_published_cat
         );
     }
     let stored_relations = db.prepare(
-        "SELECT r.payload FROM class_relations r JOIN revision_documents m ON m.class_projection_id=r.projection_id WHERE m.revision_id=?1 ORDER BY json_extract(r.payload,'$.path'),json_extract(r.payload,'$.range.startByte'),r.id"
+        "SELECT r.payload FROM class_relations r JOIN revision_documents m ON m.cid=r.cid WHERE m.revision_id=?1 ORDER BY json_extract(r.payload,'$.path'),json_extract(r.payload,'$.range.startByte'),r.id"
     ).unwrap().query_map([&revision_id], |r| r.get::<_, String>(0))
         .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
     assert_eq!(stored_relations.len(), cold_catalog.relations.len());

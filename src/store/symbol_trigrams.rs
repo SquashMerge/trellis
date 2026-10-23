@@ -149,16 +149,17 @@ pub(super) fn w2_hits(
     lookahead: i64,
 ) -> Result<Vec<(String, String)>> {
     Search {
-        columns: "d.version_id,d.syntax_id,CASE WHEN lower(d.name)=lower(?2) THEN 0
+        columns: "v.id,d.syntax_id,CASE WHEN lower(d.name)=lower(?2) THEN 0
             WHEN instr(lower(d.name),lower(?2))=1 THEN 1 ELSE 2 END",
         source: "native_version_declarations d",
         names: "native_declaration_trigrams",
         ids: "SELECT d.rowid FROM revision_documents m
-            JOIN native_version_declarations d ON d.version_id=m.document_version_id
-            WHERE m.revision_id=?1 AND instr(lower(d.syntax_id),lower(?2))>0",
-        rest: "JOIN revision_documents m ON m.document_version_id=d.version_id AND m.revision_id=?1
-            WHERE instr(lower(d.name),lower(?2))>0 OR instr(lower(d.syntax_id),lower(?2))>0
-            ORDER BY 3, d.name COLLATE BINARY ASC, d.syntax_id COLLATE BINARY ASC LIMIT ?3",
+            JOIN native_version_declarations d ON d.vid=m.vid
+            WHERE m.revision_id=?1 AND instr('sid:v1:'||lower(hex(d.syntax_id)),lower(?2))>0",
+        rest: "JOIN revision_documents m ON m.vid=d.vid AND m.revision_id=?1
+            JOIN document_versions v ON v.vid=d.vid
+            WHERE instr(lower(d.name),lower(?2))>0 OR instr('sid:v1:'||lower(hex(d.syntax_id)),lower(?2))>0
+            ORDER BY 3, d.name COLLATE BINARY ASC, d.syntax_id ASC LIMIT ?3",
         match_parameter: 4,
     }
     .hits(db, query, lookahead, &[&revision, &query, &lookahead])
@@ -176,10 +177,10 @@ pub(super) fn graph_hits(
         source: "graph_nodes n",
         names: "graph_node_trigrams",
         ids: "SELECT n.rowid FROM revision_documents m
-            JOIN graph_nodes n ON n.projection_id=m.graph_projection_id
+            JOIN graph_nodes n ON n.gid=m.gid
             WHERE m.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1)
-            AND instr(lower(n.id),lower(?1))>0",
-        rest: "JOIN revision_documents m ON m.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND m.graph_projection_id=n.projection_id WHERE instr(lower(n.name),lower(?1)) > 0 OR instr(lower(n.id),lower(?1)) > 0 ORDER BY 3,n.name,n.id LIMIT ?2",
+            AND instr('sid:v1:'||lower(hex(n.id)),lower(?1))>0",
+        rest: "JOIN revision_documents m ON m.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND m.gid=n.gid WHERE instr(lower(n.name),lower(?1)) > 0 OR instr('sid:v1:'||lower(hex(n.id)),lower(?1)) > 0 ORDER BY 3,n.name,n.id LIMIT ?2",
         match_parameter: 3,
     }
     .hits(db, query, limit, &[&query, &limit])
@@ -193,11 +194,14 @@ fn ranked(
     sql: &str,
     values: &[&dyn rusqlite::ToSql],
 ) -> Result<Vec<(String, String, i64)>> {
-    storage_result((|| {
+    let raw: Vec<(String, Vec<u8>, i64)> = storage_result((|| {
         db.prepare(sql)?
             .query_map(values, |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
             .collect()
-    })())
+    })())?;
+    raw.into_iter()
+        .map(|(first, id, rank)| Ok((first, super::id_codec::decode_sid(&id)?, rank)))
+        .collect()
 }
 
 #[cfg(test)]
@@ -344,6 +348,48 @@ mod tests {
         assert_eq!(graph_hits(&reader, "alpha", 50).unwrap().len(), 1);
     }
 
+    #[test]
+    fn corrupt_graph_node_id_fails_search_and_marks_rebuild() {
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("a.js"), "function Alpha() {}\n").unwrap();
+        let store = super::super::Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        crate::index_coordinator::reconcile_workspace(
+            &store,
+            &crate::indexer::IndexOptions::new(workspace.path().to_owned()),
+            &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(store.symbols("Alpha", 20).unwrap().len(), 1);
+        assert_eq!(
+            store.disposition(),
+            super::super::RecoveryDisposition::Ready
+        );
+
+        // The graph's labels reference this key. Simulate an on-disk corrupt
+        // BLOB using Store's connection rather than opening a second FD.
+        {
+            let db = store.cache_write().unwrap();
+            db.pragma_update(None, "foreign_keys", "OFF").unwrap();
+            let changed = db
+                .execute("UPDATE graph_nodes SET id=x'00' WHERE name='Alpha'", [])
+                .unwrap();
+            assert_eq!(changed, 1);
+        }
+        let error = store.symbols("Alpha", 20).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .starts_with("incompatible_index: selected evidence decode failed"),
+            "{error:#}"
+        );
+        assert_eq!(
+            store.disposition(),
+            super::super::RecoveryDisposition::Rebuild
+        );
+    }
+
     /// The triggers keep each table equal to its source rows through inserts,
     /// deletes (as retention and rebaseline delete), updates and reused rowids:
     /// for every query the table's candidates are exactly the literal name
@@ -353,20 +399,24 @@ mod tests {
         let db = Connection::open_in_memory().unwrap();
         // Lone rows without their parents; this test is about the triggers.
         db.pragma_update(None, "foreign_keys", "OFF").unwrap();
-        db.execute_batch(super::super::CACHE_SCHEMA_V13).unwrap();
+        db.execute_batch(super::super::CACHE_SCHEMA_V14).unwrap();
         let insert = |n: i64, name: Option<&str>| {
             let id = format!("sid:v1:{n:032x}");
             let end = name.map(|_| 1);
             db.execute(
-                "INSERT INTO native_version_declarations(rowid,version_id,syntax_id,kind,role,name,
+                "INSERT INTO native_version_declarations(rowid,vid,syntax_id,kind,role,name,
                     lookup_key,key_signature_present,key_ordinal,start_byte,end_byte,name_start,name_end)
-                    VALUES(?1,'v',?2,'function','production',?3,?3,0,0,0,1,?4,?5)",
-                rusqlite::params![n, id, name, end.map(|_| 0), end],
+                    VALUES(?1,1,?2,'function','production',?3,?3,0,0,0,1,?4,?5)",
+                rusqlite::params![n, super::super::id_codec::encode_sid(&id).unwrap(), name, end.map(|_| 0), end],
             )
             .unwrap();
             db.execute(
-                "INSERT INTO graph_nodes(rowid,projection_id,id,name,kind) VALUES(?1,'p',?2,?3,'module')",
-                rusqlite::params![n, id, name.unwrap_or("a.js")],
+                "INSERT INTO graph_nodes(rowid,gid,id,name,kind) VALUES(?1,1,?2,?3,'module')",
+                rusqlite::params![
+                    n,
+                    super::super::id_codec::encode_sid(&id).unwrap(),
+                    name.unwrap_or("a.js")
+                ],
             )
             .unwrap();
         };

@@ -117,7 +117,7 @@ impl Store {
         let result = (|| -> Result<()> {
             let tx = storage_result(db.transaction_with_behavior(TransactionBehavior::Immediate))?;
             let changed = storage_result(tx.execute(
-                "UPDATE native_version_declarations SET role='invalid' WHERE name=?1 AND version_id IN (SELECT document_version_id FROM revision_documents WHERE revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1))",
+                "UPDATE native_version_declarations SET role='invalid' WHERE name=?1 AND vid IN (SELECT vid FROM revision_documents WHERE revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1))",
                 [name],
             ))?;
             ensure!(changed == 1, "fixture caller absent");
@@ -129,11 +129,11 @@ impl Store {
     }
 
     /// Fixture-only foreign indexed call key, through Store's cached writer.
-    pub fn mcp_rekey_call_source_set_for_tests(
+    pub fn mcp_rekey_call_language_for_tests(
         &self,
         writer: &topology::WriterGuard,
         path: &str,
-        source_set: &str,
+        language: &str,
     ) -> Result<()> {
         writer.belongs_to(&self.identity)?;
         self.identity.verify()?;
@@ -141,8 +141,8 @@ impl Store {
         let mut db = self.cache_write()?;
         let tx = storage_result(db.transaction_with_behavior(TransactionBehavior::Immediate))?;
         let changed = storage_result(tx.execute(
-            "UPDATE native_version_calls SET source_set_id=?1 WHERE version_id=(SELECT document_version_id FROM revision_documents WHERE revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND path=?2) AND callee_lookup_key IS NOT NULL",
-            params![source_set, path],
+            "UPDATE native_version_calls SET language=?1 WHERE vid=(SELECT vid FROM revision_documents WHERE revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND path=?2) AND callee_lookup_key IS NOT NULL",
+            params![language, path],
         ))?;
         ensure!(changed == 1, "fixture call absent");
         storage_result(tx.commit())?;
@@ -416,15 +416,34 @@ impl EvidenceResponse {
                 && provenance.content_hash == hash,
             "store_unavailable: selected document proof mismatch"
         );
-        let row: Option<(String, String, String, String, i64, Vec<u8>)> = self.db.query_row(
-            "SELECT d.source_set_id,d.language,d.path,d.content_hash,d.byte_length,d.source_bytes
-             FROM revision_documents m JOIN document_versions d ON d.id=m.document_version_id
-             WHERE m.revision_id=?1 AND m.document_version_id=?2
-               AND m.source_set_id=?3 AND m.language=?4 AND m.path=?5
-               AND d.source_set_id=m.source_set_id AND d.language=m.language AND d.path=m.path",
-            params![selected.key, scope.version_id, scope.key.source_set_id, scope.key.language, scope.key.path],
-            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)),
-        ).optional()?;
+        let row: Option<(String, String, String, String, i64, Vec<u8>)> = self
+            .db
+            .query_row(
+                "SELECT s.id,d.language,d.path,d.content_hash,d.byte_length,d.source_bytes
+             FROM revision_documents m JOIN document_versions d ON d.vid=m.vid
+             JOIN native_source_sets s ON 1=1
+             WHERE m.revision_id=?1 AND d.id=?2
+               AND s.id=?3 AND m.language=?4 AND m.path=?5
+               AND d.language=m.language AND d.path=m.path",
+                params![
+                    selected.key,
+                    scope.version_id,
+                    scope.key.source_set_id,
+                    scope.key.language,
+                    scope.key.path
+                ],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .optional()?;
         let (source_set, language, path, stored_hash, length, bytes) =
             row.context("store_unavailable: selected raw source version absent")?;
         ensure!(
@@ -500,8 +519,9 @@ impl EvidenceResponse {
         let keys = self
             .db
             .prepare(
-                "SELECT source_set_id,language,path FROM revision_documents
-            WHERE revision_id=?1 ORDER BY source_set_id,language,path",
+                "SELECT s.id,m.language,m.path FROM revision_documents m
+            JOIN native_source_sets s ON 1=1
+            WHERE m.revision_id=?1 ORDER BY s.id,m.language,m.path",
             )?
             .query_map([&selected.key], |row| {
                 Ok(DocumentKey {
@@ -611,7 +631,7 @@ impl EvidenceResponse {
                     .map(|d| (d.syntax_id.clone(), d))
                     .collect();
                 let hash: String = self.db.query_row(
-                    "SELECT content_hash FROM document_versions WHERE id=?1 AND source_set_id=?2 AND language=?3 AND path=?4",
+                    "SELECT content_hash FROM document_versions d JOIN native_source_sets s ON s.id=?2 WHERE d.id=?1 AND d.language=?3 AND d.path=?4",
                     params![scope.version_id, scope.key.source_set_id, scope.key.language, scope.key.path],
                     |r| r.get(0))?;
                 loaded.insert(version.clone(), (declarations, hash.clone()));
@@ -802,7 +822,7 @@ impl EvidenceResponse {
             "store_unavailable: selected declaration coverage mismatch"
         );
         let hash: String = self.db.query_row(
-            "SELECT content_hash FROM document_versions WHERE id=?1 AND source_set_id=?2 AND language=?3 AND path=?4",
+            "SELECT content_hash FROM document_versions d JOIN native_source_sets s ON s.id=?2 WHERE d.id=?1 AND d.language=?3 AND d.path=?4",
             params![scope.version_id, scope.key.source_set_id, scope.key.language, scope.key.path],
             |r| r.get(0),
         )?;
@@ -1086,11 +1106,13 @@ impl EvidenceResponse {
                 continue;
             };
             let mut statement = match self.db.prepare(
-                "SELECT d.version_id,d.syntax_id,m.source_set_id,m.language,m.path,
+                "SELECT v.id,d.syntax_id,s.id,m.language,m.path,
                         d.start_byte,d.end_byte,d.role
                  FROM native_version_declarations d JOIN revision_documents m
-                   ON m.document_version_id=d.version_id AND m.revision_id=?1
-                 WHERE m.source_set_id=?2 AND m.language=?3 AND d.lookup_key=?4",
+                   ON m.vid=d.vid AND m.revision_id=?1
+                 JOIN document_versions v ON v.vid=d.vid
+                 JOIN native_source_sets s ON s.id=?2
+                 WHERE m.language=?3 AND d.lookup_key=?4",
             ) {
                 Ok(statement) => statement,
                 Err(error) if optional_hint_interrupt(&error, &progress) => {
@@ -1137,7 +1159,8 @@ impl EvidenceResponse {
                     break;
                 }
                 let version: String = row.get(0)?;
-                let id: String = row.get(1)?;
+                let id = id_codec::decode_sid(&row.get::<_, Vec<u8>>(1)?)
+                    .map_err(|error| self.store.report_selected_failure(error))?;
                 let key = DocumentKey {
                     source_set_id: row.get(2)?,
                     language: row.get(3)?,
@@ -1238,7 +1261,7 @@ impl EvidenceResponse {
                             &|| progress.expired(),
                         )?;
                         let hash: String = self.db.query_row(
-                            "SELECT content_hash FROM document_versions WHERE id=?1 AND source_set_id=?2 AND language=?3 AND path=?4",
+                            "SELECT content_hash FROM document_versions d JOIN native_source_sets s ON s.id=?2 WHERE d.id=?1 AND d.language=?3 AND d.path=?4",
                             params![version,key.source_set_id,key.language,key.path],|r|r.get(0))?;
                         if progress.expired() {
                             return Ok(None);
@@ -1472,7 +1495,7 @@ impl EvidenceResponse {
             _ => anyhow::bail!("store_unavailable: invalid selected language"),
         };
         let keys = self.db.prepare(
-            "SELECT path FROM revision_documents WHERE revision_id=?1 AND source_set_id=?2 AND language=?3 ORDER BY path"
+            "SELECT path FROM revision_documents m JOIN native_source_sets s ON s.id=?2 WHERE m.revision_id=?1 AND m.language=?3 ORDER BY path"
         )?.query_map(params![selected.key, selected_key.source_set_id, selected_key.language], |r| r.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let mut scopes = BTreeMap::new();
@@ -1510,7 +1533,7 @@ impl EvidenceResponse {
                 _ => false,
             };
             let manifest: (bool, String) = self.db.query_row(
-                "SELECT coverage_selected,coverage_state FROM revision_documents WHERE revision_id=?1 AND document_version_id=?2 AND source_set_id=?3 AND language=?4 AND path=?5",
+                "SELECT m.coverage_selected,m.coverage_state FROM revision_documents m JOIN document_versions d ON d.vid=m.vid JOIN native_source_sets s ON s.id=?3 WHERE m.revision_id=?1 AND d.id=?2 AND m.language=?4 AND m.path=?5",
                 params![selected.key, scope.version_id, key.source_set_id, key.language, key.path],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )?;
@@ -1551,7 +1574,7 @@ impl EvidenceResponse {
                     continue;
                 }
                 let count: i64 = self.db.query_row(
-                    "SELECT count(*) FROM native_version_declarations WHERE version_id=?1 AND lookup_key=?2 AND name IS NOT NULL",
+                    "SELECT count(*) FROM native_version_declarations n JOIN document_versions d ON d.vid=n.vid WHERE d.id=?1 AND n.lookup_key=?2 AND n.name IS NOT NULL",
                     params![version, lookup], |r| r.get(0)
                 )?;
                 same_name_declarations += u64::try_from(count)?;
@@ -1564,10 +1587,11 @@ impl EvidenceResponse {
             // with its selected version is corrupt, not a negative name match.
             let mismatched: bool = self.db.query_row(
                 "SELECT EXISTS(SELECT 1 FROM revision_documents m
-                 JOIN native_version_calls c ON c.version_id=m.document_version_id
-                 WHERE m.revision_id=?1 AND m.source_set_id=?2 AND m.language=?3
+                 JOIN native_version_calls c ON c.vid=m.vid
+                 JOIN native_source_sets s ON s.id=?2
+                 WHERE m.revision_id=?1 AND m.language=?3
                    AND c.callee_lookup_key=?4
-                   AND (c.source_set_id<>m.source_set_id OR c.language<>m.language))",
+                   AND c.language<>m.language)",
                 params![
                     selected.key,
                     selected_key.source_set_id,
@@ -1588,13 +1612,17 @@ impl EvidenceResponse {
                 .map_or("", |(dir, _)| dir);
             // SQLite orders the indexed matches before returning only the
             // required prefix. A directory match must not include descendants.
-            let ranked = self.db.prepare(
-                "SELECT c.version_id,c.id,c.owner_syntax_id,m.path,d.role
+            let ranked = self
+                .db
+                .prepare(
+                    "SELECT v.id,c.id,c.owner_syntax_id,m.path,d.role
                  FROM native_version_calls c
-                 JOIN revision_documents m ON m.document_version_id=c.version_id AND m.revision_id=?1
-                 JOIN native_version_declarations d ON d.version_id=c.version_id AND d.syntax_id=c.owner_syntax_id
-                 WHERE c.source_set_id=?2 AND c.language=?3 AND c.callee_lookup_key=?4
-                   AND m.source_set_id=c.source_set_id AND m.language=c.language
+                 JOIN revision_documents m ON m.vid=c.vid AND m.revision_id=?1
+                 JOIN document_versions v ON v.vid=c.vid
+                 JOIN native_source_sets s ON s.id=?2
+                 JOIN native_version_declarations d ON d.vid=c.vid AND d.syntax_id=c.owner_syntax_id
+                 WHERE c.language=?3 AND c.callee_lookup_key=?4
+                   AND m.language=c.language
                    AND m.coverage_selected=1 AND m.coverage_state IN ('complete','partial')
                  ORDER BY CASE d.role WHEN 'production' THEN 1 WHEN 'test' THEN 2 ELSE 0 END,
                    CASE WHEN m.path=?5 THEN 0
@@ -1603,15 +1631,36 @@ impl EvidenceResponse {
                            AND instr(substr(m.path,length(?6)+2),'/')=0)
                      THEN 1 ELSE 2 END,
                    m.path COLLATE BINARY, c.start_byte, c.end_byte, c.id COLLATE BINARY
-                 LIMIT ?7"
-            )?.query_map(params![selected.key, selected_key.source_set_id, selected_key.language,
-                lookup, selected_key.path, directory, i64::try_from(limit + 1)?], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?, r.get::<_, String>(4)?))
-            })?.collect::<rusqlite::Result<Vec<_>>>()?;
+                 LIMIT ?7",
+                )?
+                .query_map(
+                    params![
+                        selected.key,
+                        selected_key.source_set_id,
+                        selected_key.language,
+                        lookup,
+                        selected_key.path,
+                        directory,
+                        i64::try_from(limit + 1)?
+                    ],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, Vec<u8>>(1)?,
+                            r.get::<_, Vec<u8>>(2)?,
+                            r.get::<_, String>(3)?,
+                            r.get::<_, String>(4)?,
+                        ))
+                    },
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
             has_more = ranked.len() > limit;
             let mut loaded = BTreeMap::new();
-            for (version, id, caller_id, path, stored_role) in ranked {
+            for (version, id_blob, caller_blob, path, stored_role) in ranked {
+                let id = id_codec::decode_occ(&id_blob)
+                    .map_err(|error| self.store.report_selected_failure(error))?;
+                let caller_id = id_codec::decode_sid(&caller_blob)
+                    .map_err(|error| self.store.report_selected_failure(error))?;
                 let scope = scopes
                     .get(&version)
                     .context("store_unavailable: incoming call scope absent")?;
@@ -1636,7 +1685,7 @@ impl EvidenceResponse {
                         .map(|c| (c.id.clone(), c))
                         .collect::<BTreeMap<_, _>>();
                     let hash: String = self.db.query_row(
-                        "SELECT content_hash FROM document_versions WHERE id=?1 AND source_set_id=?2 AND language=?3 AND path=?4",
+                        "SELECT content_hash FROM document_versions d JOIN native_source_sets s ON s.id=?2 WHERE d.id=?1 AND d.language=?3 AND d.path=?4",
                         params![version, scope.key.source_set_id, scope.key.language, scope.key.path], |r| r.get(0)
                     )?;
                     loaded.insert(version.clone(), (declarations, measured, hash));
@@ -1754,11 +1803,7 @@ fn insert_mcp_candidate(
 }
 
 fn mcp_canonical_syntax_id(id: &str) -> bool {
-    id.len() == 39
-        && id.starts_with("sid:v1:")
-        && id[7..]
-            .bytes()
-            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    id_codec::encode_sid(id).is_some()
 }
 
 #[cfg(test)]
@@ -1907,6 +1952,116 @@ mod enriched_read_tests {
     use super::*;
     use crate::indexer::IndexOptions;
     use std::sync::{Arc, atomic::AtomicBool};
+
+    #[test]
+    fn corrupt_ranked_ids_mark_rebuild_in_outgoing_hints_and_incoming_calls() {
+        for fault in ["outgoing_hint_sid", "incoming_call_occ"] {
+            // Each arm starts with a fresh selected index; a prior corrupt read
+            // must not affect admission of the next fixture.
+            let state = tempfile::tempdir().unwrap();
+            let workspace = tempfile::tempdir().unwrap();
+            std::fs::write(
+                workspace.path().join("owner.js"),
+                "function Owner() { Target(); }\n",
+            )
+            .unwrap();
+            std::fs::write(workspace.path().join("target.js"), "function Target() {}\n").unwrap();
+            let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+            let (pin, _) = crate::index_coordinator::reconcile_workspace(
+                &store,
+                &IndexOptions::new(workspace.path().to_owned()),
+                &Arc::new(AtomicBool::new(false)),
+                |_| {},
+            )
+            .unwrap();
+            let read = store.evidence_response().unwrap();
+            let id = |name| {
+                read.mcp_find(name, 20, Some(pin))
+                    .unwrap()
+                    .symbols
+                    .into_iter()
+                    .find(|hit| hit.declaration.name.as_deref() == Some(name))
+                    .unwrap()
+                    .declaration
+                    .syntax_id
+            };
+            let owner = id("Owner");
+            let target = id("Target");
+            let now = std::time::Instant::now();
+            assert_eq!(
+                read.mcp_outgoing(
+                    &owner,
+                    20,
+                    Some(pin),
+                    &|| now,
+                    now + std::time::Duration::from_secs(5)
+                )
+                .unwrap()
+                .unwrap()
+                .calls[0]
+                    .candidates
+                    .len(),
+                1,
+                "{fault}: fixture needs an optional candidate"
+            );
+            assert_eq!(
+                read.mcp_incoming_with_lines(&target, 20, Some(pin))
+                    .unwrap()
+                    .unwrap()
+                    .calls
+                    .len(),
+                1,
+                "{fault}: fixture needs a ranked incoming call"
+            );
+            read.finish(()).unwrap();
+            drop(read);
+
+            // Simulate one corrupt stored ID using Store's connection. Turning
+            // off foreign keys allows a malformed key in otherwise valid rows.
+            {
+                let db = store.cache_write().unwrap();
+                db.pragma_update(None, "foreign_keys", "OFF").unwrap();
+                let (sql, expected) = match fault {
+                    "outgoing_hint_sid" => (
+                        "UPDATE native_version_declarations SET syntax_id=x'00' WHERE name='Target'",
+                        1,
+                    ),
+                    "incoming_call_occ" => (
+                        "UPDATE native_version_calls SET id=x'00' WHERE callee_lookup_key='Target'",
+                        1,
+                    ),
+                    _ => unreachable!(),
+                };
+                assert_eq!(db.execute(sql, []).unwrap(), expected, "{fault}");
+                db.pragma_update(None, "foreign_keys", "ON").unwrap();
+            }
+            let read = store.evidence_response().unwrap();
+            let error = match fault {
+                "outgoing_hint_sid" => read
+                    .mcp_outgoing(
+                        &owner,
+                        20,
+                        Some(pin),
+                        &|| now,
+                        now + std::time::Duration::from_secs(5),
+                    )
+                    .err()
+                    .expect("corrupt outgoing hint must fail"),
+                "incoming_call_occ" => read
+                    .mcp_incoming_with_lines(&target, 20, Some(pin))
+                    .err()
+                    .expect("corrupt incoming call must fail"),
+                _ => unreachable!(),
+            };
+            assert!(
+                error
+                    .to_string()
+                    .starts_with("incompatible_index: selected evidence decode failed"),
+                "{fault}: {error:#}"
+            );
+            assert_eq!(store.disposition(), RecoveryDisposition::Rebuild, "{fault}");
+        }
+    }
 
     #[test]
     fn stored_roles_hide_inline_rust_test_helpers_from_production_calls() {
@@ -2454,7 +2609,7 @@ mod enriched_read_tests {
             db.execute(
                 "DELETE FROM native_version_headers WHERE syntax_id IN
                 (SELECT d.syntax_id FROM native_version_declarations d
-                 JOIN document_versions v ON v.id=d.version_id
+                 JOIN document_versions v ON v.vid=d.vid
                  WHERE d.name='Target' AND v.path='src/near.js')",
                 [],
             )

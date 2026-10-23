@@ -1,5 +1,6 @@
 //! SQLite snapshots and durable user data. Connections are never shared between threads.
 pub mod anchors;
+pub(crate) mod id_codec;
 pub(crate) mod mcp_read;
 pub mod requests;
 pub(crate) mod symbol_trigrams;
@@ -587,37 +588,37 @@ impl std::io::Write for EncodedSourceBudget {
     }
 }
 const SELECTED_ANCILLARY_BYTE_SQL: &str = r#"SELECT COALESCE(max(row_bytes),0),COALESCE(sum(row_bytes),0) FROM (
-SELECT COALESCE(length(CAST(x.version_id AS BLOB)),0)+COALESCE(length(CAST(x.role_kind AS BLOB)),0)+COALESCE(length(CAST(x.role AS BLOB)),0)+COALESCE(length(CAST(x.ordinal AS BLOB)),0) AS row_bytes FROM native_version_coverage_roles x WHERE x.version_id=?1
+SELECT ?3+COALESCE(length(CAST(x.role_kind AS BLOB)),0)+COALESCE(length(CAST(x.role AS BLOB)),0)+COALESCE(length(CAST(x.ordinal AS BLOB)),0) AS row_bytes FROM native_version_coverage_roles x WHERE x.vid=?1
 UNION ALL
-SELECT COALESCE(length(CAST(x.version_id AS BLOB)),0)+COALESCE(length(CAST(x.syntax_id AS BLOB)),0)+COALESCE(length(CAST(x.owner_syntax_id AS BLOB)),0)+COALESCE(length(CAST(x.kind AS BLOB)),0)+COALESCE(length(CAST(x.name AS BLOB)),0)+COALESCE(length(CAST(x.lookup_key AS BLOB)),0)+COALESCE(length(CAST(x.key_signature_present AS BLOB)),0)+COALESCE(length(CAST(x.key_type_parameter_count AS BLOB)),0)+COALESCE(length(CAST(x.key_variadic AS BLOB)),0)+COALESCE(length(CAST(x.key_ordinal AS BLOB)),0)+COALESCE(length(CAST(x.start_byte AS BLOB)),0)+COALESCE(length(CAST(x.end_byte AS BLOB)),0)+COALESCE(length(CAST(x.name_start AS BLOB)),0)+COALESCE(length(CAST(x.name_end AS BLOB)),0) AS row_bytes FROM native_version_declarations x WHERE x.version_id=?1
+SELECT ?3+(CASE WHEN x.syntax_id IS NULL THEN 0 ELSE 39 END)+(CASE WHEN x.owner_syntax_id IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.kind AS BLOB)),0)+COALESCE(length(CAST(x.name AS BLOB)),0)+COALESCE(length(CAST(x.lookup_key AS BLOB)),0)+COALESCE(length(CAST(x.key_signature_present AS BLOB)),0)+COALESCE(length(CAST(x.key_type_parameter_count AS BLOB)),0)+COALESCE(length(CAST(x.key_variadic AS BLOB)),0)+COALESCE(length(CAST(x.key_ordinal AS BLOB)),0)+COALESCE(length(CAST(x.start_byte AS BLOB)),0)+COALESCE(length(CAST(x.end_byte AS BLOB)),0)+COALESCE(length(CAST(x.name_start AS BLOB)),0)+COALESCE(length(CAST(x.name_end AS BLOB)),0) AS row_bytes FROM native_version_declarations x WHERE x.vid=?1
 UNION ALL
-SELECT COALESCE(length(CAST(x.version_id AS BLOB)),0)+COALESCE(length(CAST(x.syntax_id AS BLOB)),0)+COALESCE(length(CAST(x.ordinal AS BLOB)),0)+COALESCE(length(CAST(x.kind AS BLOB)),0)+COALESCE(length(CAST(x.name AS BLOB)),0)+COALESCE(length(CAST(x.sibling_ordinal AS BLOB)),0)+COALESCE(length(CAST(x.signature_present AS BLOB)),0)+COALESCE(length(CAST(x.type_parameter_count AS BLOB)),0)+COALESCE(length(CAST(x.variadic AS BLOB)),0) AS row_bytes FROM native_version_declaration_ancestors x WHERE x.version_id=?1
+SELECT ?3+(CASE WHEN x.syntax_id IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.ordinal AS BLOB)),0)+COALESCE(length(CAST(x.kind AS BLOB)),0)+COALESCE(length(CAST(x.name AS BLOB)),0)+COALESCE(length(CAST(x.sibling_ordinal AS BLOB)),0)+COALESCE(length(CAST(x.signature_present AS BLOB)),0)+COALESCE(length(CAST(x.type_parameter_count AS BLOB)),0)+COALESCE(length(CAST(x.variadic AS BLOB)),0) AS row_bytes FROM native_version_declaration_ancestors x WHERE x.vid=?1
 UNION ALL
-SELECT COALESCE(length(CAST(x.version_id AS BLOB)),0)+COALESCE(length(CAST(x.syntax_id AS BLOB)),0)+COALESCE(length(CAST(x.ordinal AS BLOB)),0)+COALESCE(length(CAST(x.type_name AS BLOB)),0) AS row_bytes FROM native_version_own_signature_types x WHERE x.version_id=?1
+SELECT ?3+(CASE WHEN x.syntax_id IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.ordinal AS BLOB)),0)+COALESCE(length(CAST(x.type_name AS BLOB)),0) AS row_bytes FROM native_version_own_signature_types x WHERE x.vid=?1
 UNION ALL
-SELECT COALESCE(length(CAST(x.version_id AS BLOB)),0)+COALESCE(length(CAST(x.syntax_id AS BLOB)),0)+COALESCE(length(CAST(x.ancestor_ordinal AS BLOB)),0)+COALESCE(length(CAST(x.ordinal AS BLOB)),0)+COALESCE(length(CAST(x.type_name AS BLOB)),0) AS row_bytes FROM native_version_ancestor_signature_types x WHERE x.version_id=?1
+SELECT ?3+(CASE WHEN x.syntax_id IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.ancestor_ordinal AS BLOB)),0)+COALESCE(length(CAST(x.ordinal AS BLOB)),0)+COALESCE(length(CAST(x.type_name AS BLOB)),0) AS row_bytes FROM native_version_ancestor_signature_types x WHERE x.vid=?1
 UNION ALL
-SELECT COALESCE(length(CAST(x.version_id AS BLOB)),0)+COALESCE(length(CAST(x.syntax_id AS BLOB)),0)+COALESCE(length(CAST(x.kind AS BLOB)),0)+COALESCE(length(CAST(x.name AS BLOB)),0)+COALESCE(length(CAST(x.result_type AS BLOB)),0) AS row_bytes FROM native_version_headers x WHERE x.version_id=?1
+SELECT ?3+(CASE WHEN x.syntax_id IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.kind AS BLOB)),0)+COALESCE(length(CAST(x.name AS BLOB)),0)+COALESCE(length(CAST(x.result_type AS BLOB)),0) AS row_bytes FROM native_version_headers x WHERE x.vid=?1
 UNION ALL
-SELECT COALESCE(length(CAST(x.version_id AS BLOB)),0)+COALESCE(length(CAST(x.syntax_id AS BLOB)),0)+COALESCE(length(CAST(x.item_kind AS BLOB)),0)+COALESCE(length(CAST(x.ordinal AS BLOB)),0)+COALESCE(length(CAST(x.value AS BLOB)),0) AS row_bytes FROM native_version_header_items x WHERE x.version_id=?1
+SELECT ?3+(CASE WHEN x.syntax_id IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.item_kind AS BLOB)),0)+COALESCE(length(CAST(x.ordinal AS BLOB)),0)+COALESCE(length(CAST(x.value AS BLOB)),0) AS row_bytes FROM native_version_header_items x WHERE x.vid=?1
 UNION ALL
-SELECT COALESCE(length(CAST(x.version_id AS BLOB)),0)+COALESCE(length(CAST(x.syntax_id AS BLOB)),0)+COALESCE(length(CAST(x.ordinal AS BLOB)),0)+COALESCE(length(CAST(x.name AS BLOB)),0)+COALESCE(length(CAST(x.type_name AS BLOB)),0)+COALESCE(length(CAST(x.variadic AS BLOB)),0) AS row_bytes FROM native_version_parameters x WHERE x.version_id=?1
+SELECT ?3+(CASE WHEN x.syntax_id IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.ordinal AS BLOB)),0)+COALESCE(length(CAST(x.name AS BLOB)),0)+COALESCE(length(CAST(x.type_name AS BLOB)),0)+COALESCE(length(CAST(x.variadic AS BLOB)),0) AS row_bytes FROM native_version_parameters x WHERE x.vid=?1
 UNION ALL
-SELECT COALESCE(length(CAST(x.version_id AS BLOB)),0)+COALESCE(length(CAST(x.id AS BLOB)),0)+COALESCE(length(CAST(x.owner_syntax_id AS BLOB)),0)+COALESCE(length(CAST(x.ordinal AS BLOB)),0)+COALESCE(length(CAST(x.start_byte AS BLOB)),0)+COALESCE(length(CAST(x.end_byte AS BLOB)),0)+COALESCE(length(CAST(x.callee_start AS BLOB)),0)+COALESCE(length(CAST(x.callee_end AS BLOB)),0)+COALESCE(length(CAST(x.spelling AS BLOB)),0)+COALESCE(length(CAST(x.source_set_id AS BLOB)),0)+COALESCE(length(CAST(x.language AS BLOB)),0)+COALESCE(length(CAST(x.callee_lookup_key AS BLOB)),0) AS row_bytes FROM native_version_calls x WHERE x.version_id=?1
+SELECT ?3+(CASE WHEN x.id IS NULL THEN 0 ELSE 39 END)+(CASE WHEN x.owner_syntax_id IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.ordinal AS BLOB)),0)+COALESCE(length(CAST(x.start_byte AS BLOB)),0)+COALESCE(length(CAST(x.end_byte AS BLOB)),0)+COALESCE(length(CAST(x.callee_start AS BLOB)),0)+COALESCE(length(CAST(x.callee_end AS BLOB)),0)+COALESCE(length(CAST(x.spelling AS BLOB)),0)+?4+COALESCE(length(CAST(x.language AS BLOB)),0)+COALESCE(length(CAST(x.callee_lookup_key AS BLOB)),0) AS row_bytes FROM native_version_calls x WHERE x.vid=?1
 UNION ALL
-SELECT COALESCE(length(CAST(x.version_id AS BLOB)),0)+COALESCE(length(CAST(x.id AS BLOB)),0)+COALESCE(length(CAST(x.owner_syntax_id AS BLOB)),0)+COALESCE(length(CAST(x.ordinal AS BLOB)),0)+COALESCE(length(CAST(x.kind AS BLOB)),0)+COALESCE(length(CAST(x.start_byte AS BLOB)),0)+COALESCE(length(CAST(x.end_byte AS BLOB)),0)+COALESCE(length(CAST(x.parent_id AS BLOB)),0)+COALESCE(length(CAST(x.arm AS BLOB)),0) AS row_bytes FROM native_version_control_regions x WHERE x.version_id=?1
+SELECT ?3+(CASE WHEN x.id IS NULL THEN 0 ELSE 39 END)+(CASE WHEN x.owner_syntax_id IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.ordinal AS BLOB)),0)+COALESCE(length(CAST(x.kind AS BLOB)),0)+COALESCE(length(CAST(x.start_byte AS BLOB)),0)+COALESCE(length(CAST(x.end_byte AS BLOB)),0)+(CASE WHEN x.parent_id IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.arm AS BLOB)),0) AS row_bytes FROM native_version_control_regions x WHERE x.vid=?1
 UNION ALL
-SELECT COALESCE(length(CAST(x.version_id AS BLOB)),0)+COALESCE(length(CAST(x.call_id AS BLOB)),0)+COALESCE(length(CAST(x.region_id AS BLOB)),0)+COALESCE(length(CAST(x.ordinal AS BLOB)),0) AS row_bytes FROM native_version_call_regions x WHERE x.version_id=?1
+SELECT ?3+(CASE WHEN x.call_id IS NULL THEN 0 ELSE 39 END)+(CASE WHEN x.region_id IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.ordinal AS BLOB)),0) AS row_bytes FROM native_version_call_regions x WHERE x.vid=?1
 UNION ALL
-SELECT COALESCE(length(CAST(x.projection_id AS BLOB)),0)+COALESCE(length(CAST(x.graph_projection_id AS BLOB)),0)+COALESCE(length(CAST(x.id AS BLOB)),0)+COALESCE(length(CAST(x.name AS BLOB)),0)+COALESCE(length(CAST(x.qualified_name AS BLOB)),0)+COALESCE(length(CAST(x.path AS BLOB)),0)+COALESCE(length(CAST(x.payload AS BLOB)),0) AS row_bytes FROM classes x WHERE x.projection_id=?2
+SELECT (SELECT length(content_hash)+20 FROM class_projections WHERE cid=x.cid)+(SELECT length(graph_hash)+9 FROM graph_projections WHERE gid=x.gid)+39+COALESCE(length(CAST(x.name AS BLOB)),0)+COALESCE(length(CAST(x.qualified_name AS BLOB)),0)+COALESCE(length(CAST(x.path AS BLOB)),0)+COALESCE(length(CAST(x.payload AS BLOB)),0) AS row_bytes FROM classes x WHERE x.cid=?2
 UNION ALL
-SELECT COALESCE(length(CAST(x.projection_id AS BLOB)),0)+COALESCE(length(CAST(x.id AS BLOB)),0)+COALESCE(length(CAST(x.owner AS BLOB)),0)+COALESCE(length(CAST(x.target AS BLOB)),0)+COALESCE(length(CAST(x.payload AS BLOB)),0) AS row_bytes FROM class_relations x WHERE x.projection_id=?2
+SELECT (SELECT length(content_hash)+20 FROM class_projections WHERE cid=x.cid)+COALESCE(length(CAST(x.id AS BLOB)),0)+39+(CASE WHEN x.target IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.payload AS BLOB)),0) AS row_bytes FROM class_relations x WHERE x.cid=?2
 )"#;
-const DATABASE_SCHEMA_VERSION: u32 = 13;
+const DATABASE_SCHEMA_VERSION: u32 = 14;
 const EXTRACTOR_VERSION: &str = "native-v6-delta-v1";
 const EVIDENCE_FORMAT: &str = "terminal-native-graph-v1";
-const CACHE_SCHEMA_V13: &str = r#"
-CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=13), extractor_version TEXT NOT NULL CHECK(extractor_version='native-v6-delta-v1'), root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL, reconcile_options TEXT);
+const CACHE_SCHEMA_V14: &str = r#"
+CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=14), extractor_version TEXT NOT NULL CHECK(extractor_version='native-v6-delta-v1'), root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL, reconcile_options TEXT);
 CREATE TABLE native_producers(id TEXT NOT NULL,version TEXT NOT NULL,executable_hash TEXT NOT NULL CHECK(length(executable_hash)=64),kind TEXT NOT NULL CHECK(kind='native'),position_encoding TEXT NOT NULL CHECK(position_encoding='utf8'),PRIMARY KEY(id,version));
 CREATE TABLE native_producer_languages(producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,language TEXT NOT NULL,inventory_authenticated INTEGER NOT NULL CHECK(inventory_authenticated IN (0,1)),ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(producer_id,producer_version,language),UNIQUE(producer_id,producer_version,ordinal),FOREIGN KEY(producer_id,producer_version) REFERENCES native_producers(id,version) DEFERRABLE INITIALLY DEFERRED);
 CREATE TABLE native_producer_inputs(producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,language TEXT NOT NULL,component_name TEXT NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(producer_id,producer_version,language,component_name),UNIQUE(producer_id,producer_version,language,ordinal),FOREIGN KEY(producer_id,producer_version,language) REFERENCES native_producer_languages(producer_id,producer_version,language) DEFERRABLE INITIALLY DEFERRED);
@@ -628,50 +629,50 @@ CREATE TABLE native_revision_supersessions(revision_id TEXT PRIMARY KEY REFERENC
 CREATE INDEX native_supersessions_clock ON native_revision_supersessions(superseded_at,revision_id);
 CREATE INDEX native_supersessions_due ON native_revision_supersessions(superseded_at,revision_id) WHERE state='retained';
 CREATE TABLE native_revision_release_debt(revision_id TEXT PRIMARY KEY REFERENCES native_revisions(id) DEFERRABLE INITIALLY DEFERRED,phase TEXT NOT NULL CHECK(phase='pending'));
-CREATE TABLE native_release_candidate_versions(revision_id TEXT NOT NULL REFERENCES native_revisions(id) DEFERRABLE INITIALLY DEFERRED,id TEXT NOT NULL,PRIMARY KEY(revision_id,id));
-CREATE TABLE native_release_candidate_graphs(revision_id TEXT NOT NULL REFERENCES native_revisions(id) DEFERRABLE INITIALLY DEFERRED,id TEXT NOT NULL,PRIMARY KEY(revision_id,id));
-CREATE TABLE native_release_candidate_classes(revision_id TEXT NOT NULL REFERENCES native_revisions(id) DEFERRABLE INITIALLY DEFERRED,id TEXT NOT NULL,PRIMARY KEY(revision_id,id));
+CREATE TABLE native_release_candidate_versions(revision_id TEXT NOT NULL REFERENCES native_revisions(id) DEFERRABLE INITIALLY DEFERRED,vid INTEGER NOT NULL REFERENCES document_versions(vid) DEFERRABLE INITIALLY DEFERRED,PRIMARY KEY(revision_id,vid));
+CREATE TABLE native_release_candidate_graphs(revision_id TEXT NOT NULL REFERENCES native_revisions(id) DEFERRABLE INITIALLY DEFERRED,gid INTEGER NOT NULL REFERENCES graph_projections(gid) DEFERRABLE INITIALLY DEFERRED,PRIMARY KEY(revision_id,gid));
+CREATE TABLE native_release_candidate_classes(revision_id TEXT NOT NULL REFERENCES native_revisions(id) DEFERRABLE INITIALLY DEFERRED,cid INTEGER NOT NULL REFERENCES class_projections(cid) DEFERRABLE INITIALLY DEFERRED,PRIMARY KEY(revision_id,cid));
 CREATE TABLE native_revisions(id TEXT PRIMARY KEY,source_set_id TEXT NOT NULL REFERENCES native_source_sets(id) DEFERRABLE INITIALLY DEFERRED,toolchain_hash TEXT NOT NULL CHECK(length(toolchain_hash)=64),config_hash TEXT NOT NULL CHECK(length(config_hash)=64),dependency_hash TEXT NOT NULL CHECK(length(dependency_hash)=64),native_revision_id TEXT NOT NULL,source_inventory TEXT NOT NULL,dependency_observations TEXT NOT NULL,reconcile_options TEXT,class_warnings TEXT NOT NULL,class_truncated INTEGER NOT NULL CHECK(class_truncated IN (0,1)),graph_stats TEXT NOT NULL CHECK(json_valid(graph_stats) AND json_type(graph_stats)='object'),graph_diagnostics TEXT NOT NULL CHECK(json_valid(graph_diagnostics) AND json_type(graph_diagnostics)='array'),published_index_revision INTEGER NOT NULL CHECK(published_index_revision BETWEEN 0 AND 9007199254740991));
 CREATE UNIQUE INDEX native_revisions_pin ON native_revisions(published_index_revision);
 CREATE INDEX native_revisions_header_cover ON native_revisions(source_set_id,published_index_revision,id);
 CREATE TABLE revision_capture_inputs(revision_id TEXT NOT NULL REFERENCES native_revisions(id) DEFERRABLE INITIALLY DEFERRED,input_key TEXT NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(revision_id,input_key));
-CREATE TABLE document_versions(id TEXT PRIMARY KEY,source_set_id TEXT NOT NULL REFERENCES native_source_sets(id) DEFERRABLE INITIALLY DEFERRED,language TEXT NOT NULL,path TEXT NOT NULL,content_hash TEXT NOT NULL CHECK(length(content_hash)=64),extraction_context TEXT NOT NULL CHECK(length(extraction_context)=64),producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,byte_length INTEGER NOT NULL CHECK(byte_length>=0 AND byte_length=length(source_bytes)),source_bytes BLOB NOT NULL,native_witness TEXT NOT NULL CHECK(length(native_witness)=64),UNIQUE(source_set_id,language,path,content_hash,extraction_context,producer_id,producer_version),UNIQUE(id,source_set_id,language,path),UNIQUE(id,language),FOREIGN KEY(producer_id,producer_version,language) REFERENCES native_producer_languages(producer_id,producer_version,language) DEFERRABLE INITIALLY DEFERRED);
-CREATE TABLE graph_projections(id TEXT PRIMARY KEY,document_version_id TEXT NOT NULL,language TEXT NOT NULL,graph_hash TEXT NOT NULL CHECK(length(graph_hash)=64),state TEXT NOT NULL CHECK(state IN ('staged','ready','unavailable')),class_extraction_state TEXT NOT NULL CHECK(class_extraction_state IN ('notApplicable','ready')),class_extraction_payload TEXT,CHECK((class_extraction_state='ready')=(class_extraction_payload IS NOT NULL)),CHECK((language IN ('java','python'))=(class_extraction_state IN ('ready'))),UNIQUE(document_version_id,graph_hash),UNIQUE(id,document_version_id),FOREIGN KEY(document_version_id,language) REFERENCES document_versions(id,language) DEFERRABLE INITIALLY DEFERRED);
-CREATE TABLE graph_nodes(projection_id TEXT NOT NULL REFERENCES graph_projections(id) DEFERRABLE INITIALLY DEFERRED,id TEXT NOT NULL,name TEXT NOT NULL,kind TEXT NOT NULL,PRIMARY KEY(projection_id,id));
-CREATE TABLE graph_display_labels(projection_id TEXT NOT NULL,id TEXT NOT NULL,label TEXT NOT NULL,PRIMARY KEY(projection_id,id),FOREIGN KEY(projection_id,id) REFERENCES graph_nodes(projection_id,id) DEFERRABLE INITIALLY DEFERRED);
+CREATE TABLE document_versions(vid INTEGER PRIMARY KEY,id TEXT NOT NULL UNIQUE,language TEXT NOT NULL,path TEXT NOT NULL,content_hash TEXT NOT NULL CHECK(length(content_hash)=64),extraction_context TEXT NOT NULL CHECK(length(extraction_context)=64),producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,byte_length INTEGER NOT NULL CHECK(byte_length>=0 AND byte_length=length(source_bytes)),source_bytes BLOB NOT NULL,native_witness TEXT NOT NULL CHECK(length(native_witness)=64),UNIQUE(language,path,content_hash,extraction_context,producer_id,producer_version),UNIQUE(vid,language,path),UNIQUE(vid,language),FOREIGN KEY(producer_id,producer_version,language) REFERENCES native_producer_languages(producer_id,producer_version,language) DEFERRABLE INITIALLY DEFERRED);
+CREATE TABLE graph_projections(gid INTEGER PRIMARY KEY,vid INTEGER NOT NULL,language TEXT NOT NULL,graph_hash TEXT NOT NULL UNIQUE CHECK(length(graph_hash)=64),state TEXT NOT NULL CHECK(state IN ('staged','ready','unavailable')),class_extraction_state TEXT NOT NULL CHECK(class_extraction_state IN ('notApplicable','ready')),class_extraction_payload TEXT,CHECK((class_extraction_state='ready')=(class_extraction_payload IS NOT NULL)),CHECK((language IN ('java','python'))=(class_extraction_state IN ('ready'))),UNIQUE(vid,graph_hash),UNIQUE(gid,vid),FOREIGN KEY(vid,language) REFERENCES document_versions(vid,language) DEFERRABLE INITIALLY DEFERRED);
+CREATE TABLE graph_nodes(gid INTEGER NOT NULL REFERENCES graph_projections(gid) DEFERRABLE INITIALLY DEFERRED,id BLOB NOT NULL,name TEXT NOT NULL,kind TEXT NOT NULL,PRIMARY KEY(gid,id));
+CREATE TABLE graph_display_labels(gid INTEGER NOT NULL,id BLOB NOT NULL,label TEXT NOT NULL,PRIMARY KEY(gid,id),FOREIGN KEY(gid,id) REFERENCES graph_nodes(gid,id) DEFERRABLE INITIALLY DEFERRED);
 CREATE VIRTUAL TABLE graph_node_trigrams USING fts5(name,content='',columnsize=0,tokenize='trigram case_sensitive 1');
 CREATE TRIGGER graph_node_trigrams_insert AFTER INSERT ON graph_nodes BEGIN INSERT INTO graph_node_trigrams(rowid,name) VALUES(new.rowid,lower(new.name)); END;
 CREATE TRIGGER graph_node_trigrams_delete AFTER DELETE ON graph_nodes BEGIN INSERT INTO graph_node_trigrams(graph_node_trigrams,rowid,name) VALUES('delete',old.rowid,lower(old.name)); END;
 CREATE TRIGGER graph_node_trigrams_update AFTER UPDATE OF name ON graph_nodes BEGIN INSERT INTO graph_node_trigrams(graph_node_trigrams,rowid,name) VALUES('delete',old.rowid,lower(old.name)); INSERT INTO graph_node_trigrams(rowid,name) VALUES(new.rowid,lower(new.name)); END;
-CREATE TABLE class_projections(id TEXT PRIMARY KEY,graph_projection_id TEXT NOT NULL REFERENCES graph_projections(id) DEFERRABLE INITIALLY DEFERRED,content_hash TEXT NOT NULL CHECK(length(content_hash)=64),state TEXT NOT NULL CHECK(state IN ('ready','unavailable')),UNIQUE(graph_projection_id,content_hash),UNIQUE(id,graph_projection_id));
-CREATE TABLE classes(projection_id TEXT NOT NULL,graph_projection_id TEXT NOT NULL,id TEXT NOT NULL,name TEXT NOT NULL,qualified_name TEXT NOT NULL,path TEXT NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(projection_id,id),FOREIGN KEY(projection_id,graph_projection_id) REFERENCES class_projections(id,graph_projection_id) DEFERRABLE INITIALLY DEFERRED,FOREIGN KEY(graph_projection_id,id) REFERENCES graph_nodes(projection_id,id) DEFERRABLE INITIALLY DEFERRED);
-CREATE TABLE class_relations(projection_id TEXT NOT NULL,id TEXT NOT NULL,owner TEXT NOT NULL,target TEXT,payload TEXT NOT NULL,PRIMARY KEY(projection_id,id),FOREIGN KEY(projection_id,owner) REFERENCES classes(projection_id,id) DEFERRABLE INITIALLY DEFERRED,FOREIGN KEY(projection_id,target) REFERENCES classes(projection_id,id) DEFERRABLE INITIALLY DEFERRED);
-CREATE INDEX class_relations_owner ON class_relations(projection_id,owner,id);
-CREATE INDEX class_relations_target ON class_relations(projection_id,target,id);
-CREATE TABLE revision_documents(revision_id TEXT NOT NULL REFERENCES native_revisions(id) DEFERRABLE INITIALLY DEFERRED,source_set_id TEXT NOT NULL,language TEXT NOT NULL,path TEXT NOT NULL,document_version_id TEXT NOT NULL,graph_projection_id TEXT NOT NULL,class_projection_id TEXT,capture_stat TEXT,coverage_requested INTEGER NOT NULL CHECK(coverage_requested IN (0,1)),coverage_selected INTEGER NOT NULL CHECK(coverage_selected IN (0,1)),coverage_state TEXT NOT NULL CHECK(coverage_state IN ('notRequested','omitted','unsupported','failed','partial','complete')),coverage_diagnostic TEXT,ordinal INTEGER NOT NULL CHECK(ordinal>=0),CHECK((coverage_state='complete')=(coverage_diagnostic IS NULL)),PRIMARY KEY(revision_id,source_set_id,language,path),UNIQUE(revision_id,ordinal),FOREIGN KEY(document_version_id,source_set_id,language,path) REFERENCES document_versions(id,source_set_id,language,path) DEFERRABLE INITIALLY DEFERRED,FOREIGN KEY(graph_projection_id,document_version_id) REFERENCES graph_projections(id,document_version_id) DEFERRABLE INITIALLY DEFERRED,FOREIGN KEY(class_projection_id,graph_projection_id) REFERENCES class_projections(id,graph_projection_id) DEFERRABLE INITIALLY DEFERRED);
-CREATE INDEX revision_documents_version ON revision_documents(document_version_id,revision_id);
-CREATE INDEX revision_documents_graph ON revision_documents(graph_projection_id,revision_id);
-CREATE INDEX revision_documents_class ON revision_documents(class_projection_id,revision_id);
+CREATE TABLE class_projections(cid INTEGER PRIMARY KEY,gid INTEGER NOT NULL REFERENCES graph_projections(gid) DEFERRABLE INITIALLY DEFERRED,content_hash TEXT NOT NULL UNIQUE CHECK(length(content_hash)=64),state TEXT NOT NULL CHECK(state IN ('ready','unavailable')),UNIQUE(gid,content_hash),UNIQUE(cid,gid));
+CREATE TABLE classes(cid INTEGER NOT NULL,gid INTEGER NOT NULL,id BLOB NOT NULL,name TEXT NOT NULL,qualified_name TEXT NOT NULL,path TEXT NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(cid,id),FOREIGN KEY(cid,gid) REFERENCES class_projections(cid,gid) DEFERRABLE INITIALLY DEFERRED,FOREIGN KEY(gid,id) REFERENCES graph_nodes(gid,id) DEFERRABLE INITIALLY DEFERRED);
+CREATE TABLE class_relations(cid INTEGER NOT NULL,id TEXT NOT NULL,owner BLOB NOT NULL,target BLOB,payload TEXT NOT NULL,PRIMARY KEY(cid,id),FOREIGN KEY(cid,owner) REFERENCES classes(cid,id) DEFERRABLE INITIALLY DEFERRED,FOREIGN KEY(cid,target) REFERENCES classes(cid,id) DEFERRABLE INITIALLY DEFERRED);
+CREATE INDEX class_relations_owner ON class_relations(cid,owner,id);
+CREATE INDEX class_relations_target ON class_relations(cid,target,id);
+CREATE TABLE revision_documents(revision_id TEXT NOT NULL REFERENCES native_revisions(id) DEFERRABLE INITIALLY DEFERRED,language TEXT NOT NULL,path TEXT NOT NULL,vid INTEGER NOT NULL,gid INTEGER NOT NULL,cid INTEGER,capture_stat TEXT,coverage_requested INTEGER NOT NULL CHECK(coverage_requested IN (0,1)),coverage_selected INTEGER NOT NULL CHECK(coverage_selected IN (0,1)),coverage_state TEXT NOT NULL CHECK(coverage_state IN ('notRequested','omitted','unsupported','failed','partial','complete')),coverage_diagnostic TEXT,ordinal INTEGER NOT NULL CHECK(ordinal>=0),CHECK((coverage_state='complete')=(coverage_diagnostic IS NULL)),PRIMARY KEY(revision_id,language,path),UNIQUE(revision_id,ordinal),FOREIGN KEY(vid,language,path) REFERENCES document_versions(vid,language,path) DEFERRABLE INITIALLY DEFERRED,FOREIGN KEY(gid,vid) REFERENCES graph_projections(gid,vid) DEFERRABLE INITIALLY DEFERRED,FOREIGN KEY(cid,gid) REFERENCES class_projections(cid,gid) DEFERRABLE INITIALLY DEFERRED);
+CREATE INDEX revision_documents_version ON revision_documents(vid,revision_id);
+CREATE INDEX revision_documents_graph ON revision_documents(gid,revision_id);
+CREATE INDEX revision_documents_class ON revision_documents(cid,revision_id);
 CREATE INDEX revision_documents_path ON revision_documents(revision_id,path);
-CREATE TABLE native_version_coverage_roles(version_id TEXT NOT NULL REFERENCES document_versions(id) DEFERRABLE INITIALLY DEFERRED,role_kind TEXT NOT NULL CHECK(role_kind IN ('supported','observed')),role TEXT NOT NULL CHECK(role IN ('definition','call')),ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(version_id,role_kind,ordinal),UNIQUE(version_id,role_kind,role));
-CREATE TABLE native_version_declarations(version_id TEXT NOT NULL REFERENCES document_versions(id) DEFERRABLE INITIALLY DEFERRED,syntax_id TEXT NOT NULL,owner_syntax_id TEXT,kind TEXT NOT NULL,role TEXT NOT NULL CHECK(role IN ('test','production')),name TEXT,lookup_key TEXT,key_signature_present INTEGER NOT NULL CHECK(key_signature_present IN (0,1)),key_type_parameter_count INTEGER,key_variadic INTEGER,key_ordinal INTEGER NOT NULL CHECK(key_ordinal>=0),start_byte INTEGER NOT NULL,end_byte INTEGER NOT NULL,name_start INTEGER,name_end INTEGER,CHECK(start_byte>=0 AND end_byte>=start_byte),CHECK((name IS NULL)=(lookup_key IS NULL) AND (name IS NULL)=(name_start IS NULL) AND (name_start IS NULL)=(name_end IS NULL)),CHECK(name_start IS NULL OR (name_start>=start_byte AND name_end<=end_byte AND name_end>name_start)),CHECK((key_signature_present=0 AND key_type_parameter_count IS NULL AND key_variadic IS NULL) OR (key_signature_present=1 AND key_type_parameter_count>=0 AND key_variadic IN (0,1))),PRIMARY KEY(version_id,syntax_id),FOREIGN KEY(version_id,owner_syntax_id) REFERENCES native_version_declarations(version_id,syntax_id) DEFERRABLE INITIALLY DEFERRED);
-CREATE INDEX native_version_declarations_lookup ON native_version_declarations(lookup_key,version_id,syntax_id);
-CREATE INDEX native_version_declarations_owner ON native_version_declarations(version_id,owner_syntax_id);
+CREATE TABLE native_version_coverage_roles(vid INTEGER NOT NULL REFERENCES document_versions(vid) DEFERRABLE INITIALLY DEFERRED,role_kind TEXT NOT NULL CHECK(role_kind IN ('supported','observed')),role TEXT NOT NULL CHECK(role IN ('definition','call')),ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(vid,role_kind,ordinal),UNIQUE(vid,role_kind,role));
+CREATE TABLE native_version_declarations(vid INTEGER NOT NULL REFERENCES document_versions(vid) DEFERRABLE INITIALLY DEFERRED,syntax_id BLOB NOT NULL,owner_syntax_id BLOB,kind TEXT NOT NULL,role TEXT NOT NULL CHECK(role IN ('test','production')),name TEXT,lookup_key TEXT,key_signature_present INTEGER NOT NULL CHECK(key_signature_present IN (0,1)),key_type_parameter_count INTEGER,key_variadic INTEGER,key_ordinal INTEGER NOT NULL CHECK(key_ordinal>=0),start_byte INTEGER NOT NULL,end_byte INTEGER NOT NULL,name_start INTEGER,name_end INTEGER,CHECK(start_byte>=0 AND end_byte>=start_byte),CHECK((name IS NULL)=(lookup_key IS NULL) AND (name IS NULL)=(name_start IS NULL) AND (name_start IS NULL)=(name_end IS NULL)),CHECK(name_start IS NULL OR (name_start>=start_byte AND name_end<=end_byte AND name_end>name_start)),CHECK((key_signature_present=0 AND key_type_parameter_count IS NULL AND key_variadic IS NULL) OR (key_signature_present=1 AND key_type_parameter_count>=0 AND key_variadic IN (0,1))),PRIMARY KEY(vid,syntax_id),FOREIGN KEY(vid,owner_syntax_id) REFERENCES native_version_declarations(vid,syntax_id) DEFERRABLE INITIALLY DEFERRED);
+CREATE INDEX native_version_declarations_lookup ON native_version_declarations(lookup_key,vid,syntax_id);
+CREATE INDEX native_version_declarations_owner ON native_version_declarations(vid,owner_syntax_id);
 CREATE VIRTUAL TABLE native_declaration_trigrams USING fts5(name,content='',columnsize=0,tokenize='trigram case_sensitive 1');
 CREATE TRIGGER native_declaration_trigrams_insert AFTER INSERT ON native_version_declarations BEGIN INSERT INTO native_declaration_trigrams(rowid,name) VALUES(new.rowid,lower(new.name)); END;
 CREATE TRIGGER native_declaration_trigrams_delete AFTER DELETE ON native_version_declarations BEGIN INSERT INTO native_declaration_trigrams(native_declaration_trigrams,rowid,name) VALUES('delete',old.rowid,lower(old.name)); END;
 CREATE TRIGGER native_declaration_trigrams_update AFTER UPDATE OF name ON native_version_declarations BEGIN INSERT INTO native_declaration_trigrams(native_declaration_trigrams,rowid,name) VALUES('delete',old.rowid,lower(old.name)); INSERT INTO native_declaration_trigrams(rowid,name) VALUES(new.rowid,lower(new.name)); END;
-CREATE TABLE native_version_declaration_ancestors(version_id TEXT NOT NULL,syntax_id TEXT NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),kind TEXT NOT NULL,name TEXT,sibling_ordinal INTEGER NOT NULL CHECK(sibling_ordinal>=0),signature_present INTEGER NOT NULL CHECK(signature_present IN (0,1)),type_parameter_count INTEGER,variadic INTEGER,CHECK((signature_present=0 AND type_parameter_count IS NULL AND variadic IS NULL) OR (signature_present=1 AND type_parameter_count>=0 AND variadic IN (0,1))),PRIMARY KEY(version_id,syntax_id,ordinal),FOREIGN KEY(version_id,syntax_id) REFERENCES native_version_declarations(version_id,syntax_id) DEFERRABLE INITIALLY DEFERRED);
-CREATE TABLE native_version_own_signature_types(version_id TEXT NOT NULL,syntax_id TEXT NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),type_name TEXT NOT NULL,PRIMARY KEY(version_id,syntax_id,ordinal),FOREIGN KEY(version_id,syntax_id) REFERENCES native_version_declarations(version_id,syntax_id) DEFERRABLE INITIALLY DEFERRED);
-CREATE TABLE native_version_ancestor_signature_types(version_id TEXT NOT NULL,syntax_id TEXT NOT NULL,ancestor_ordinal INTEGER NOT NULL CHECK(ancestor_ordinal>=0),ordinal INTEGER NOT NULL CHECK(ordinal>=0),type_name TEXT NOT NULL,PRIMARY KEY(version_id,syntax_id,ancestor_ordinal,ordinal),FOREIGN KEY(version_id,syntax_id,ancestor_ordinal) REFERENCES native_version_declaration_ancestors(version_id,syntax_id,ordinal) DEFERRABLE INITIALLY DEFERRED);
-CREATE TABLE native_version_headers(version_id TEXT NOT NULL,syntax_id TEXT NOT NULL,kind TEXT NOT NULL,name TEXT,result_type TEXT,PRIMARY KEY(version_id,syntax_id),FOREIGN KEY(version_id,syntax_id) REFERENCES native_version_declarations(version_id,syntax_id) DEFERRABLE INITIALLY DEFERRED);
-CREATE TABLE native_version_header_items(version_id TEXT NOT NULL,syntax_id TEXT NOT NULL,item_kind TEXT NOT NULL CHECK(item_kind IN ('modifier','typeParameter','base')),ordinal INTEGER NOT NULL CHECK(ordinal>=0),value TEXT NOT NULL,PRIMARY KEY(version_id,syntax_id,item_kind,ordinal),FOREIGN KEY(version_id,syntax_id) REFERENCES native_version_headers(version_id,syntax_id) DEFERRABLE INITIALLY DEFERRED);
-CREATE TABLE native_version_parameters(version_id TEXT NOT NULL,syntax_id TEXT NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),name TEXT,type_name TEXT,variadic INTEGER NOT NULL CHECK(variadic IN (0,1)),PRIMARY KEY(version_id,syntax_id,ordinal),FOREIGN KEY(version_id,syntax_id) REFERENCES native_version_headers(version_id,syntax_id) DEFERRABLE INITIALLY DEFERRED);
-CREATE TABLE native_version_calls(version_id TEXT NOT NULL,id TEXT NOT NULL,owner_syntax_id TEXT NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),start_byte INTEGER NOT NULL,end_byte INTEGER NOT NULL,callee_start INTEGER,callee_end INTEGER,spelling TEXT,source_set_id TEXT NOT NULL,language TEXT NOT NULL,callee_lookup_key TEXT,CHECK(start_byte>=0 AND end_byte>start_byte),CHECK((callee_start IS NULL)=(callee_end IS NULL)),CHECK(callee_start IS NULL OR (callee_start>=start_byte AND callee_end<=end_byte AND callee_end>callee_start)),PRIMARY KEY(version_id,id),UNIQUE(version_id,owner_syntax_id,ordinal),FOREIGN KEY(version_id,owner_syntax_id) REFERENCES native_version_declarations(version_id,syntax_id) DEFERRABLE INITIALLY DEFERRED);
-CREATE INDEX native_version_calls_incoming ON native_version_calls(source_set_id,language,callee_lookup_key);
-CREATE TABLE native_version_control_regions(version_id TEXT NOT NULL,id TEXT NOT NULL,owner_syntax_id TEXT NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),kind TEXT NOT NULL,start_byte INTEGER NOT NULL,end_byte INTEGER NOT NULL,parent_id TEXT,arm TEXT,CHECK(start_byte>=0 AND end_byte>start_byte),PRIMARY KEY(version_id,id),UNIQUE(version_id,owner_syntax_id,ordinal),UNIQUE(version_id,id,owner_syntax_id),FOREIGN KEY(version_id,owner_syntax_id) REFERENCES native_version_declarations(version_id,syntax_id) DEFERRABLE INITIALLY DEFERRED,FOREIGN KEY(version_id,parent_id,owner_syntax_id) REFERENCES native_version_control_regions(version_id,id,owner_syntax_id) DEFERRABLE INITIALLY DEFERRED);
-CREATE INDEX native_version_regions_parent ON native_version_control_regions(version_id,parent_id,owner_syntax_id);
-CREATE TABLE native_version_call_regions(version_id TEXT NOT NULL,call_id TEXT NOT NULL,region_id TEXT NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(version_id,call_id,ordinal),UNIQUE(version_id,call_id,region_id),FOREIGN KEY(version_id,call_id) REFERENCES native_version_calls(version_id,id) DEFERRABLE INITIALLY DEFERRED,FOREIGN KEY(version_id,region_id) REFERENCES native_version_control_regions(version_id,id) DEFERRABLE INITIALLY DEFERRED);
+CREATE TABLE native_version_declaration_ancestors(vid INTEGER NOT NULL,syntax_id BLOB NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),kind TEXT NOT NULL,name TEXT,sibling_ordinal INTEGER NOT NULL CHECK(sibling_ordinal>=0),signature_present INTEGER NOT NULL CHECK(signature_present IN (0,1)),type_parameter_count INTEGER,variadic INTEGER,CHECK((signature_present=0 AND type_parameter_count IS NULL AND variadic IS NULL) OR (signature_present=1 AND type_parameter_count>=0 AND variadic IN (0,1))),PRIMARY KEY(vid,syntax_id,ordinal),FOREIGN KEY(vid,syntax_id) REFERENCES native_version_declarations(vid,syntax_id) DEFERRABLE INITIALLY DEFERRED);
+CREATE TABLE native_version_own_signature_types(vid INTEGER NOT NULL,syntax_id BLOB NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),type_name TEXT NOT NULL,PRIMARY KEY(vid,syntax_id,ordinal),FOREIGN KEY(vid,syntax_id) REFERENCES native_version_declarations(vid,syntax_id) DEFERRABLE INITIALLY DEFERRED);
+CREATE TABLE native_version_ancestor_signature_types(vid INTEGER NOT NULL,syntax_id BLOB NOT NULL,ancestor_ordinal INTEGER NOT NULL CHECK(ancestor_ordinal>=0),ordinal INTEGER NOT NULL CHECK(ordinal>=0),type_name TEXT NOT NULL,PRIMARY KEY(vid,syntax_id,ancestor_ordinal,ordinal),FOREIGN KEY(vid,syntax_id,ancestor_ordinal) REFERENCES native_version_declaration_ancestors(vid,syntax_id,ordinal) DEFERRABLE INITIALLY DEFERRED);
+CREATE TABLE native_version_headers(vid INTEGER NOT NULL,syntax_id BLOB NOT NULL,kind TEXT NOT NULL,name TEXT,result_type TEXT,PRIMARY KEY(vid,syntax_id),FOREIGN KEY(vid,syntax_id) REFERENCES native_version_declarations(vid,syntax_id) DEFERRABLE INITIALLY DEFERRED);
+CREATE TABLE native_version_header_items(vid INTEGER NOT NULL,syntax_id BLOB NOT NULL,item_kind TEXT NOT NULL CHECK(item_kind IN ('modifier','typeParameter','base')),ordinal INTEGER NOT NULL CHECK(ordinal>=0),value TEXT NOT NULL,PRIMARY KEY(vid,syntax_id,item_kind,ordinal),FOREIGN KEY(vid,syntax_id) REFERENCES native_version_headers(vid,syntax_id) DEFERRABLE INITIALLY DEFERRED);
+CREATE TABLE native_version_parameters(vid INTEGER NOT NULL,syntax_id BLOB NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),name TEXT,type_name TEXT,variadic INTEGER NOT NULL CHECK(variadic IN (0,1)),PRIMARY KEY(vid,syntax_id,ordinal),FOREIGN KEY(vid,syntax_id) REFERENCES native_version_headers(vid,syntax_id) DEFERRABLE INITIALLY DEFERRED);
+CREATE TABLE native_version_calls(vid INTEGER NOT NULL,id BLOB NOT NULL,owner_syntax_id BLOB NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),start_byte INTEGER NOT NULL,end_byte INTEGER NOT NULL,callee_start INTEGER,callee_end INTEGER,spelling TEXT,language TEXT NOT NULL,callee_lookup_key TEXT,CHECK(start_byte>=0 AND end_byte>start_byte),CHECK((callee_start IS NULL)=(callee_end IS NULL)),CHECK(callee_start IS NULL OR (callee_start>=start_byte AND callee_end<=end_byte AND callee_end>callee_start)),PRIMARY KEY(vid,id),UNIQUE(vid,owner_syntax_id,ordinal),FOREIGN KEY(vid,owner_syntax_id) REFERENCES native_version_declarations(vid,syntax_id) DEFERRABLE INITIALLY DEFERRED);
+CREATE INDEX native_version_calls_incoming ON native_version_calls(language,callee_lookup_key);
+CREATE TABLE native_version_control_regions(vid INTEGER NOT NULL,id BLOB NOT NULL,owner_syntax_id BLOB NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),kind TEXT NOT NULL,start_byte INTEGER NOT NULL,end_byte INTEGER NOT NULL,parent_id BLOB,arm TEXT,CHECK(start_byte>=0 AND end_byte>start_byte),PRIMARY KEY(vid,id),UNIQUE(vid,owner_syntax_id,ordinal),UNIQUE(vid,id,owner_syntax_id),FOREIGN KEY(vid,owner_syntax_id) REFERENCES native_version_declarations(vid,syntax_id) DEFERRABLE INITIALLY DEFERRED,FOREIGN KEY(vid,parent_id,owner_syntax_id) REFERENCES native_version_control_regions(vid,id,owner_syntax_id) DEFERRABLE INITIALLY DEFERRED);
+CREATE INDEX native_version_regions_parent ON native_version_control_regions(vid,parent_id,owner_syntax_id);
+CREATE TABLE native_version_call_regions(vid INTEGER NOT NULL,call_id BLOB NOT NULL,region_id BLOB NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(vid,call_id,ordinal),UNIQUE(vid,call_id,region_id),FOREIGN KEY(vid,call_id) REFERENCES native_version_calls(vid,id) DEFERRABLE INITIALLY DEFERRED,FOREIGN KEY(vid,region_id) REFERENCES native_version_control_regions(vid,id) DEFERRABLE INITIALLY DEFERRED);
 CREATE TABLE native_binding_epoch(singleton INTEGER PRIMARY KEY CHECK(singleton=1),index_generation TEXT NOT NULL,first_revision INTEGER NOT NULL CHECK(first_revision BETWEEN 1 AND 9007199254740991));
 CREATE TABLE revision_producer_bindings(revision_id TEXT PRIMARY KEY REFERENCES native_revisions(id) DEFERRABLE INITIALLY DEFERRED,producer_sha TEXT NOT NULL CHECK(length(producer_sha)=64),binding_sha TEXT NOT NULL CHECK(length(binding_sha)=64));
 "#;
@@ -759,6 +760,8 @@ struct SelectedHeader {
     version_id: String,
     graph_id: String,
     class_id: String,
+    gid: i64,
+    cid: i64,
     graph_hash: String,
     class_hash: Option<String>,
     hash: String,
@@ -1193,8 +1196,9 @@ impl EvidenceResponse {
         let names: Vec<&str> = selected_metrics.iter().map(String::as_str).collect();
         use crate::native_evidence::DocumentKey;
         let mut stmt = self.db.prepare(
-            "SELECT source_set_id,language,path FROM revision_documents
-            WHERE revision_id=?1 ORDER BY source_set_id,language,path",
+            "SELECT r.source_set_id,m.language,m.path FROM revision_documents m
+            JOIN native_revisions r ON r.id=m.revision_id
+            WHERE m.revision_id=?1 ORDER BY r.source_set_id,m.language,m.path",
         )?;
         let mut documents = Vec::new();
         let mut cursor = stmt.query([&selected.key])?;
@@ -2556,7 +2560,7 @@ fn validate_cache_shape(db: &Connection) -> Result<()> {
         version == DATABASE_SCHEMA_VERSION,
         "incompatible_index: unknown schema version"
     );
-    expected.execute_batch(CACHE_SCHEMA_V13)?;
+    expected.execute_batch(CACHE_SCHEMA_V14)?;
     control_ensure!(
         objects(db)? == objects(&expected)?,
         "incompatible_index: unknown cache object type, name or shape"
@@ -2646,25 +2650,27 @@ fn maintenance_contention(error: &anyhow::Error) -> bool {
 }
 
 fn cleanup_release_candidate(tx: &Connection, revision: &str, kind: &str) -> Result<()> {
-    let (candidate, parent, reference, children, child_key) = match kind {
+    let (candidate, parent, reference, children, child_key, key) = match kind {
         "class" => (
             "native_release_candidate_classes",
             "class_projections",
-            "class_projection_id",
+            "cid",
             &["class_relations", "classes"][..],
-            "projection_id",
+            "cid",
+            "cid",
         ),
         "graph" => (
             "native_release_candidate_graphs",
             "graph_projections",
-            "graph_projection_id",
+            "gid",
             &["graph_display_labels", "graph_nodes"][..],
-            "projection_id",
+            "gid",
+            "gid",
         ),
         "version" => (
             "native_release_candidate_versions",
             "document_versions",
-            "document_version_id",
+            "vid",
             &[
                 "native_version_call_regions",
                 "native_version_calls",
@@ -2678,7 +2684,8 @@ fn cleanup_release_candidate(tx: &Connection, revision: &str, kind: &str) -> Res
                 "native_version_declarations",
                 "native_version_coverage_roles",
             ][..],
-            "version_id",
+            "vid",
+            "vid",
         ),
         _ => unreachable!("fixed cleanup kind"),
     };
@@ -2686,9 +2693,11 @@ fn cleanup_release_candidate(tx: &Connection, revision: &str, kind: &str) -> Res
     // need just the indexed EXISTS probe and an un-journal; large child trees
     // retain the candidate while small committed DELETE batches resume later.
     for _ in 0..64 {
-        let candidate_id: Option<String> = tx
+        let candidate_id: Option<i64> = tx
             .query_row(
-                &format!("SELECT id FROM {candidate} WHERE revision_id=?1 ORDER BY id LIMIT 1"),
+                &format!(
+                    "SELECT {key} FROM {candidate} WHERE revision_id=?1 ORDER BY {key} LIMIT 1"
+                ),
                 [revision],
                 |r| r.get(0),
             )
@@ -2700,7 +2709,7 @@ fn cleanup_release_candidate(tx: &Connection, revision: &str, kind: &str) -> Res
             &format!(
                 "SELECT EXISTS(SELECT 1 FROM revision_documents WHERE {reference}=?1 LIMIT 1)"
             ),
-            [&id],
+            [id],
             |r| r.get(0),
         )?;
         if !still_referenced {
@@ -2709,27 +2718,34 @@ fn cleanup_release_candidate(tx: &Connection, revision: &str, kind: &str) -> Res
             let dependent = match kind {
                 "graph" => Some((
                     "class_projections",
-                    "graph_projection_id",
+                    "gid",
                     "native_release_candidate_classes",
                 )),
                 "version" => Some((
                     "graph_projections",
-                    "document_version_id",
+                    "vid",
                     "native_release_candidate_graphs",
                 )),
                 _ => None,
             };
             if let Some((table, field, queue)) = dependent {
-                let child: Option<String> = tx
+                let child: Option<i64> = tx
                     .query_row(
-                        &format!("SELECT id FROM {table} WHERE {field}=?1 ORDER BY id LIMIT 1"),
-                        [&id],
+                        &format!(
+                            "SELECT {} FROM {table} WHERE {field}=?1 ORDER BY {} LIMIT 1",
+                            if kind == "graph" { "cid" } else { "gid" },
+                            if kind == "graph" { "cid" } else { "gid" }
+                        ),
+                        [id],
                         |r| r.get(0),
                     )
                     .optional()?;
                 if let Some(child) = child {
                     tx.execute(
-                        &format!("INSERT OR IGNORE INTO {queue}(revision_id,id) VALUES(?1,?2)"),
+                        &format!(
+                            "INSERT OR IGNORE INTO {queue}(revision_id,{}) VALUES(?1,?2)",
+                            if kind == "graph" { "cid" } else { "gid" }
+                        ),
                         params![revision, child],
                     )?;
                     return Ok(());
@@ -2744,21 +2760,21 @@ fn cleanup_release_candidate(tx: &Connection, revision: &str, kind: &str) -> Res
                     "native_version_declarations" | "native_version_control_regions"
                 );
                 let changed = if self_referential {
-                    tx.execute(&format!("DELETE FROM {child} WHERE {child_key}=?1"), [&id])?
+                    tx.execute(&format!("DELETE FROM {child} WHERE {child_key}=?1"), [id])?
                 } else {
                     tx.execute(
                         &format!("DELETE FROM {child} WHERE rowid IN (SELECT rowid FROM {child} WHERE {child_key}=?1 LIMIT 256)"),
-                        [&id],
+                        [id],
                     )?
                 };
                 if !self_referential && changed == 256 {
                     return Ok(());
                 }
             }
-            tx.execute(&format!("DELETE FROM {parent} WHERE id=?1"), [&id])?;
+            tx.execute(&format!("DELETE FROM {parent} WHERE {key}=?1"), [id])?;
         }
         tx.execute(
-            &format!("DELETE FROM {candidate} WHERE revision_id=?1 AND id=?2"),
+            &format!("DELETE FROM {candidate} WHERE revision_id=?1 AND {key}=?2"),
             params![revision, id],
         )?;
     }
@@ -2969,18 +2985,20 @@ fn open_index(path: &Path, writable: bool) -> Result<ProtectedSqliteConnection> 
     storage_result(db.prepare(
         "SELECT index_generation,index_revision,indexed_at,stats,diagnostics FROM index_metadata",
     ))?;
-    storage_result(db.prepare("SELECT revision_id,source_set_id,language,path,document_version_id,graph_projection_id,class_projection_id FROM revision_documents"))?;
-    storage_result(db.prepare(
-        "SELECT id,source_set_id,language,path,content_hash,source_bytes FROM document_versions",
-    ))?;
-    storage_result(db.prepare(
-        "SELECT id,document_version_id,language,class_extraction_state FROM graph_projections",
-    ))?;
-    storage_result(db.prepare("SELECT projection_id,id,name,kind FROM graph_nodes"))?;
-    storage_result(db.prepare("SELECT projection_id,id,label FROM graph_display_labels"))?;
-    storage_result(db.prepare("SELECT id,graph_projection_id FROM class_projections"))?;
-    storage_result(db.prepare("SELECT projection_id,id,payload FROM classes"))?;
-    storage_result(db.prepare("SELECT projection_id,id,payload FROM class_relations"))?;
+    storage_result(
+        db.prepare("SELECT revision_id,language,path,vid,gid,cid FROM revision_documents"),
+    )?;
+    storage_result(
+        db.prepare("SELECT vid,id,language,path,content_hash,source_bytes FROM document_versions"),
+    )?;
+    storage_result(
+        db.prepare("SELECT gid,vid,language,class_extraction_state FROM graph_projections"),
+    )?;
+    storage_result(db.prepare("SELECT gid,id,name,kind FROM graph_nodes"))?;
+    storage_result(db.prepare("SELECT gid,id,label FROM graph_display_labels"))?;
+    storage_result(db.prepare("SELECT cid,gid FROM class_projections"))?;
+    storage_result(db.prepare("SELECT cid,id,payload FROM classes"))?;
+    storage_result(db.prepare("SELECT cid,id,payload FROM class_relations"))?;
     validate_cache_shape(&db)?;
     Ok(db)
 }
@@ -3492,8 +3510,8 @@ fn presentation_class(
     use crate::class_diagram::CLASS_BYTES;
     let size: Option<i64> = db
         .query_row(
-            "SELECT length(CAST(payload AS BLOB)) FROM classes JOIN revision_documents m ON m.revision_id=?2 AND m.class_projection_id=classes.projection_id WHERE classes.id=?1",
-            params![id, selected.key],
+            "SELECT length(CAST(payload AS BLOB)) FROM classes JOIN revision_documents m ON m.revision_id=?2 AND m.cid=classes.cid WHERE classes.id=?1",
+            params![id_codec::encode_sid(id), selected.key],
             |r| r.get(0),
         )
         .optional()
@@ -3503,8 +3521,8 @@ fn presentation_class(
     };
     let valid: bool = db
         .query_row(
-            "SELECT json_valid(payload) FROM classes JOIN revision_documents m ON m.revision_id=?2 AND m.class_projection_id=classes.projection_id WHERE classes.id=?1",
-            params![id, selected.key],
+            "SELECT json_valid(payload) FROM classes JOIN revision_documents m ON m.revision_id=?2 AND m.cid=classes.cid WHERE classes.id=?1",
+            params![id_codec::encode_sid(id), selected.key],
             |r| r.get(0),
         )
         .map_err(|error| store.report_selected_failure(error.into()))?;
@@ -3515,7 +3533,7 @@ fn presentation_class(
     }
     if size <= CLASS_BYTES as i64 {
         let payload: String = db
-            .query_row("SELECT payload FROM classes JOIN revision_documents m ON m.revision_id=?2 AND m.class_projection_id=classes.projection_id WHERE classes.id=?1", params![id, selected.key], |r| {
+            .query_row("SELECT payload FROM classes JOIN revision_documents m ON m.revision_id=?2 AND m.cid=classes.cid WHERE classes.id=?1", params![id_codec::encode_sid(id), selected.key], |r| {
                 r.get(0)
             })
             .map_err(|error| store.report_selected_failure(error.into()))?;
@@ -3529,8 +3547,8 @@ fn presentation_class(
                 AND json_type(payload,'$.methods')='array'
                 AND NOT EXISTS(SELECT 1 FROM json_each(payload,'$.fields') WHERE type!='object')
                 AND NOT EXISTS(SELECT 1 FROM json_each(payload,'$.methods') WHERE type!='object')
-             FROM classes JOIN revision_documents m ON m.revision_id=?2 AND m.class_projection_id=classes.projection_id WHERE classes.id=?1",
-            params![id, selected.key],
+             FROM classes JOIN revision_documents m ON m.revision_id=?2 AND m.cid=classes.cid WHERE classes.id=?1",
+            params![id_codec::encode_sid(id), selected.key],
             |r| r.get(0),
         )
         .map_err(|error| store.report_selected_failure(error.into()))?;
@@ -3545,9 +3563,9 @@ fn presentation_class(
             SELECT json_set(payload,
                 '$.fields',(SELECT json_group_array(json(value)) FROM json_each(classes.payload,'$.fields') WHERE key < ?2),
                 '$.methods',(SELECT json_group_array(json(value)) FROM json_each(classes.payload,'$.methods') WHERE key < ?2),
-                '$.truncated',json('true')) AS payload FROM classes JOIN revision_documents m ON m.revision_id=?4 AND m.class_projection_id=classes.projection_id WHERE classes.id=?1)
+                '$.truncated',json('true')) AS payload FROM classes JOIN revision_documents m ON m.revision_id=?4 AND m.cid=classes.cid WHERE classes.id=?1)
             SELECT CASE WHEN length(CAST(payload AS BLOB)) <= ?3 THEN payload ELSE NULL END FROM clipped",
-            params![id, count, CLASS_BYTES as i64, selected.key], |r| r.get(0))
+            params![id_codec::encode_sid(id), count, CLASS_BYTES as i64, selected.key], |r| r.get(0))
             .map_err(|error| store.report_selected_failure(error.into()))?;
         if let Some(payload) = payload {
             let class = serde_json::from_str(&payload)
@@ -3582,16 +3600,16 @@ fn resolve_class_id(
             );
         }
         if db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM classes c JOIN revision_documents m ON m.revision_id=?2 AND m.class_projection_id=c.projection_id WHERE c.id=?1)",
-            params![current, selected.key],
+            "SELECT EXISTS(SELECT 1 FROM classes c JOIN revision_documents m ON m.revision_id=?2 AND m.cid=c.cid WHERE c.id=?1)",
+            params![id_codec::encode_sid(&current), selected.key],
             |r| r.get::<_, bool>(0),
         )? {
             return Ok(current);
         }
         if document.is_none() {
             let path: Option<String> = db.query_row(
-                "SELECT m.path FROM graph_nodes n JOIN revision_documents m ON m.revision_id=?2 AND m.graph_projection_id=n.projection_id WHERE n.id=?1",
-                params![current, selected.key], |r| r.get(0),
+                "SELECT m.path FROM graph_nodes n JOIN revision_documents m ON m.revision_id=?2 AND m.gid=n.gid WHERE n.id=?1",
+                params![id_codec::encode_sid(&current), selected.key], |r| r.get(0),
             ).optional().map_err(|error| store.report_selected_failure(error.into()))?;
             document = path
                 .map(|path| store.selected_graph_document_for(db, &path, selected))
@@ -3988,7 +4006,10 @@ impl ImmutableAppend {
         let table = sql
             .split_whitespace()
             .nth(2)
-            .context("missing immutable table")?;
+            .context("missing immutable table")?
+            .split('(')
+            .next()
+            .context("missing immutable table name")?;
         ensure!(
             matches!(
                 table,
@@ -4071,12 +4092,28 @@ impl ImmutableAppend {
                     Ok((row.get::<_, String>(1)?, row.get::<_, i64>(5)?))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
-            let keys = columns
-                .iter()
-                .enumerate()
-                .filter(|(_, (_, order))| *order > 0)
-                .map(|(i, _)| i)
-                .collect::<Vec<_>>();
+            // Parent surrogates are SQLite rowids, not caller-supplied values.
+            // Equality and dedupe still use the canonical natural key.
+            if matches!(
+                table,
+                "document_versions" | "graph_projections" | "class_projections"
+            ) {
+                columns.remove(0);
+            }
+            let keys = if matches!(table, "graph_projections") {
+                vec![2] // graph_hash
+            } else if matches!(table, "class_projections") {
+                vec![1] // content_hash
+            } else if table == "document_versions" {
+                vec![0] // id
+            } else {
+                columns
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (_, order))| *order > 0)
+                    .map(|(i, _)| i)
+                    .collect::<Vec<_>>()
+            };
             ensure!(
                 !keys.is_empty(),
                 "incompatible_index: immutable table has no key"
@@ -4150,8 +4187,22 @@ impl ImmutableAppend {
                 Self::key(db, values, 0)?,
                 Self::key(db, values, 1)?
             )),
-            "native_source_sets" | "document_versions" | "graph_projections"
-            | "class_projections" => Some(Self::key(db, values, 0)?),
+            "native_source_sets" => Some(Self::key(db, values, 0)?),
+            "document_versions" | "graph_projections" | "class_projections" => {
+                let (key, column, index) = match table {
+                    "document_versions" => ("vid", "id", 0),
+                    "graph_projections" => ("gid", "graph_hash", 2),
+                    _ => ("cid", "content_hash", 1),
+                };
+                Some(
+                    db.query_row(
+                        &format!("SELECT {key} FROM {table} WHERE {column}=?1"),
+                        [values[index]],
+                        |row| row.get::<_, i64>(0),
+                    )?
+                    .to_string(),
+                )
+            }
             _ => None,
         };
         if exists != 0
@@ -4186,32 +4237,26 @@ impl ImmutableAppend {
             (
                 "document_versions",
                 &[
-                    ("native_version_coverage_roles", "version_id"),
-                    ("native_version_declarations", "version_id"),
-                    ("native_version_declaration_ancestors", "version_id"),
-                    ("native_version_own_signature_types", "version_id"),
-                    ("native_version_ancestor_signature_types", "version_id"),
-                    ("native_version_headers", "version_id"),
-                    ("native_version_header_items", "version_id"),
-                    ("native_version_parameters", "version_id"),
-                    ("native_version_calls", "version_id"),
-                    ("native_version_control_regions", "version_id"),
-                    ("native_version_call_regions", "version_id"),
+                    ("native_version_coverage_roles", "vid"),
+                    ("native_version_declarations", "vid"),
+                    ("native_version_declaration_ancestors", "vid"),
+                    ("native_version_own_signature_types", "vid"),
+                    ("native_version_ancestor_signature_types", "vid"),
+                    ("native_version_headers", "vid"),
+                    ("native_version_header_items", "vid"),
+                    ("native_version_parameters", "vid"),
+                    ("native_version_calls", "vid"),
+                    ("native_version_control_regions", "vid"),
+                    ("native_version_call_regions", "vid"),
                 ],
             ),
             (
                 "graph_projections",
-                &[
-                    ("graph_nodes", "projection_id"),
-                    ("graph_display_labels", "projection_id"),
-                ],
+                &[("graph_nodes", "gid"), ("graph_display_labels", "gid")],
             ),
             (
                 "class_projections",
-                &[
-                    ("classes", "projection_id"),
-                    ("class_relations", "projection_id"),
-                ],
+                &[("classes", "cid"), ("class_relations", "cid")],
             ),
         ];
         for (parent_table, children) in FAMILIES {
@@ -4252,6 +4297,22 @@ impl ImmutableAppend {
     }
 }
 
+fn graph_id_row(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<String> {
+    row.get::<_, String>(index)
+        .map(|hash| format!("graph:v1:{hash}"))
+}
+fn class_id_row(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Option<String>> {
+    row.get::<_, Option<String>>(index)
+        .map(|hash| hash.map(|hash| format!("class-projection:v1:{hash}")))
+}
+
+fn stored_sid(id: &str) -> Result<Vec<u8>> {
+    id_codec::encode_sid(id).context("native_evidence_required: invalid syntax ID")
+}
+fn stored_occ(id: &str) -> Result<Vec<u8>> {
+    id_codec::encode_occ(id).context("native_evidence_required: invalid occurrence ID")
+}
+
 // Emit exactly one document's graph and class rows under the caller's transaction.
 fn write_graph_document(
     db: &Connection,
@@ -4260,6 +4321,16 @@ fn write_graph_document(
     reused: ReusedFamilies,
     immutable: &mut ImmutableAppend,
 ) -> Result<()> {
+    let gid: i64 = db.query_row(
+        "SELECT gid FROM graph_projections WHERE graph_hash=?1",
+        [&ids.graph_hash],
+        |row| row.get(0),
+    )?;
+    let cid: i64 = db.query_row(
+        "SELECT cid FROM class_projections WHERE content_hash=?1",
+        [&ids.class_hash],
+        |row| row.get(0),
+    )?;
     for n in &grouped.nodes {
         if reused.graph {
             continue;
@@ -4271,13 +4342,13 @@ fn write_graph_document(
         immutable.insert(
             db,
             "INSERT INTO graph_nodes VALUES(?1,?2,?3,?4)",
-            params![ids.graph_id, n.id, n.name, kind],
+            params![gid, stored_sid(&n.id)?, n.name, kind],
         )?;
         if let Some(label) = &n.display_label {
             immutable.insert(
                 db,
                 "INSERT INTO graph_display_labels VALUES(?1,?2,?3)",
-                params![ids.graph_id, n.id, label],
+                params![gid, stored_sid(&n.id)?, label],
             )?;
         }
     }
@@ -4289,9 +4360,9 @@ fn write_graph_document(
             db,
             "INSERT INTO classes VALUES(?1,?2,?3,?4,?5,?6,?7)",
             params![
-                ids.class_id,
-                ids.graph_id,
-                class.symbol.id,
+                cid,
+                gid,
+                stored_sid(&class.symbol.id)?,
                 class.symbol.name,
                 class.qualified_name,
                 class.symbol.path,
@@ -4307,10 +4378,10 @@ fn write_graph_document(
             db,
             "INSERT INTO class_relations VALUES(?1,?2,?3,?4,?5)",
             params![
-                ids.class_id,
+                cid,
                 relation.id,
-                relation.owner,
-                relation.target,
+                stored_sid(&relation.owner)?,
+                relation.target.as_deref().map(stored_sid).transpose()?,
                 json(relation)?,
             ],
         )?;
@@ -4556,6 +4627,7 @@ fn write_native(
     }
     .into_iter();
     let mut projections = BTreeMap::new();
+    let mut storage_ids = BTreeMap::new();
     for (offset, file) in graph.files.iter().enumerate() {
         let ordinal = ordinal_start + offset;
         check_cancel(cancel)?;
@@ -4605,10 +4677,9 @@ fn write_native(
         if !reuse.for_path(&file.path).native {
             immutable.insert(
                 db,
-                "INSERT INTO document_versions VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                "INSERT INTO document_versions(id,language,path,content_hash,extraction_context,producer_id,producer_version,byte_length,source_bytes,native_witness) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
                 params![
                     ids.version_id,
-                    a.source_set.id,
                     file.language,
                     file.path,
                     file.hash,
@@ -4631,13 +4702,17 @@ fn write_native(
                 ],
             )?;
         }
+        let vid: i64 = db.query_row(
+            "SELECT vid FROM document_versions WHERE id=?1",
+            [&ids.version_id],
+            |row| row.get(0),
+        )?;
         if !reuse.for_path(&file.path).graph {
             immutable.insert(
                 db,
-                "INSERT INTO graph_projections VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                "INSERT INTO graph_projections(vid,language,graph_hash,state,class_extraction_state,class_extraction_payload) VALUES(?1,?2,?3,?4,?5,?6)",
                 params![
-                    ids.graph_id,
-                    ids.version_id,
+                    vid,
                     file.language,
                     ids.graph_hash,
                     "ready",
@@ -4650,13 +4725,24 @@ fn write_native(
                 ],
             )?;
         }
+        let gid: i64 = db.query_row(
+            "SELECT gid FROM graph_projections WHERE graph_hash=?1",
+            [&ids.graph_hash],
+            |row| row.get(0),
+        )?;
         if !reuse.for_path(&file.path).class {
             immutable.insert(
                 db,
-                "INSERT INTO class_projections VALUES(?1,?2,?3,?4)",
-                params![ids.class_id, ids.graph_id, ids.class_hash, "ready"],
+                "INSERT INTO class_projections(gid,content_hash,state) VALUES(?1,?2,?3)",
+                params![gid, ids.class_hash, "ready"],
             )?;
         }
+        let cid: i64 = db.query_row(
+            "SELECT cid FROM class_projections WHERE content_hash=?1",
+            [&ids.class_hash],
+            |row| row.get(0),
+        )?;
+        storage_ids.insert(file.path.clone(), (vid, gid, cid));
         let coverage = coverages
             .get(file.path.as_str())
             .context("missing native coverage")?;
@@ -4668,15 +4754,14 @@ fn write_native(
         );
         immutable.insert_manifest(
             db,
-            "INSERT INTO revision_documents VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+            "INSERT INTO revision_documents VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
             params![
                 revision_key,
-                a.source_set.id,
                 file.language,
                 file.path,
-                ids.version_id,
-                ids.graph_id,
-                ids.class_id,
+                vid,
+                gid,
+                cid,
                 json(&capture.source_stat(&file.path)?)?,
                 coverage.requested,
                 coverage.selected,
@@ -4696,7 +4781,7 @@ fn write_native(
                 immutable.insert(
                     db,
                     "INSERT INTO native_version_coverage_roles VALUES(?1,?2,?3,?4)",
-                    params![ids.version_id, kind, role, ordinal as i64],
+                    params![vid, kind, role, ordinal as i64],
                 )?;
             }
         }
@@ -4715,10 +4800,10 @@ fn write_native(
     }
     for d in &a.declarations {
         check_cancel(cancel)?;
-        let version = &projections
+        let vid = storage_ids
             .get(&d.document.path)
             .context("native declaration missing document")?
-            .version_id;
+            .0;
         if reuse.for_path(&d.document.path).native {
             continue;
         }
@@ -4736,7 +4821,7 @@ fn write_native(
             .transpose()?;
         let sig = d.key.signature.as_ref();
         immutable.insert(db,"INSERT INTO native_version_declarations VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",params![
-            version,d.syntax_id,owner,d.kind,d.role.as_str(),d.name,d.lookup_key,sig.is_some(),sig.map(|s|s.type_parameter_count as i64),
+            vid,stored_sid(&d.syntax_id)?,owner.as_deref().map(stored_sid).transpose()?,d.kind,d.role.as_str(),d.name,d.lookup_key,sig.is_some(),sig.map(|s|s.type_parameter_count as i64),
             sig.map(|s|s.variadic),d.key.ordinal as i64,d.range.start as i64,d.range.end as i64,
             d.name_range.as_ref().map(|r|r.start as i64),d.name_range.as_ref().map(|r|r.end as i64),
         ])?;
@@ -4745,20 +4830,20 @@ fn write_native(
                 immutable.insert(
                     db,
                     "INSERT INTO native_version_own_signature_types VALUES(?1,?2,?3,?4)",
-                    params![version, d.syntax_id, ordinal as i64, parameter],
+                    params![vid, stored_sid(&d.syntax_id)?, ordinal as i64, parameter],
                 )?;
             }
         }
         for (ordinal, key) in d.ancestors.iter().enumerate() {
             let sig = key.signature.as_ref();
             immutable.insert(db,"INSERT INTO native_version_declaration_ancestors VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",params![
-                version,d.syntax_id,ordinal as i64,key.kind,key.name,key.ordinal as i64,sig.is_some(),
+                vid,stored_sid(&d.syntax_id)?,ordinal as i64,key.kind,key.name,key.ordinal as i64,sig.is_some(),
                 sig.map(|s|s.type_parameter_count as i64),sig.map(|s|s.variadic),
             ])?;
             if let Some(sig) = sig {
                 for (parameter_ordinal, parameter) in sig.parameter_types.iter().enumerate() {
                     immutable.insert(db,"INSERT INTO native_version_ancestor_signature_types VALUES(?1,?2,?3,?4,?5)",params![
-                        version,d.syntax_id,ordinal as i64,parameter_ordinal as i64,parameter,
+                        vid,stored_sid(&d.syntax_id)?,ordinal as i64,parameter_ordinal as i64,parameter,
                     ])?;
                 }
             }
@@ -4767,8 +4852,8 @@ fn write_native(
             db,
             "INSERT INTO native_version_headers VALUES(?1,?2,?3,?4,?5)",
             params![
-                version,
-                d.syntax_id,
+                vid,
+                stored_sid(&d.syntax_id)?,
                 d.header.kind,
                 d.header.name,
                 d.header.result_type,
@@ -4783,7 +4868,7 @@ fn write_native(
                 immutable.insert(
                     db,
                     "INSERT INTO native_version_header_items VALUES(?1,?2,?3,?4,?5)",
-                    params![version, d.syntax_id, kind, ordinal as i64, item],
+                    params![vid, stored_sid(&d.syntax_id)?, kind, ordinal as i64, item],
                 )?;
             }
         }
@@ -4792,8 +4877,8 @@ fn write_native(
                 db,
                 "INSERT INTO native_version_parameters VALUES(?1,?2,?3,?4,?5,?6)",
                 params![
-                    version,
-                    d.syntax_id,
+                    vid,
+                    stored_sid(&d.syntax_id)?,
                     ordinal as i64,
                     parameter.name,
                     parameter.type_name,
@@ -4807,22 +4892,22 @@ fn write_native(
         if reuse.for_path(&r.document.path).native {
             continue;
         }
-        let version = &projections
+        let vid = storage_ids
             .get(&r.document.path)
             .context("native region missing document")?
-            .version_id;
+            .0;
         immutable.insert(
             db,
             "INSERT INTO native_version_control_regions VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             params![
-                version,
-                r.id,
-                r.owner_syntax_id,
+                vid,
+                stored_occ(&r.id)?,
+                stored_sid(&r.owner_syntax_id)?,
                 r.ordinal as i64,
                 r.kind,
                 r.range.start as i64,
                 r.range.end as i64,
-                r.parent_id,
+                r.parent_id.as_deref().map(stored_occ).transpose()?,
                 r.arm,
             ],
         )?;
@@ -4836,10 +4921,10 @@ fn write_native(
         if reuse.for_path(&c.document.path).native {
             continue;
         }
-        let version = &projections
+        let vid = storage_ids
             .get(&c.document.path)
             .context("native call missing document")?
-            .version_id;
+            .0;
         let document = documents_by_key
             .get(&c.document)
             .copied()
@@ -4852,8 +4937,8 @@ fn write_native(
             #[cfg(test)]
             WRITER_SOURCE_SQL_READS.with(|reads| reads.set(reads.get() + 1));
             Some(db.query_row(
-                "SELECT source_bytes FROM document_versions WHERE id=?1 AND source_set_id=?2 AND language=?3 AND path=?4",
-                params![version, document.key.source_set_id, document.key.language, document.key.path],
+                "SELECT source_bytes FROM document_versions WHERE vid=?1 AND language=?2 AND path=?3",
+                params![vid, document.key.language, document.key.path],
                 |row| row.get(0),
             )?)
         } else {
@@ -4873,18 +4958,17 @@ fn write_native(
             crate::native_evidence::verified_callee_lookup(&document.key.language, c, source);
         immutable.insert(
             db,
-            "INSERT INTO native_version_calls VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+            "INSERT INTO native_version_calls VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
             params![
-                version,
-                c.id,
-                c.owner_syntax_id,
+                vid,
+                stored_occ(&c.id)?,
+                stored_sid(&c.owner_syntax_id)?,
                 c.ordinal as i64,
                 c.range.start as i64,
                 c.range.end as i64,
                 c.callee_range.as_ref().map(|r| r.start as i64),
                 c.callee_range.as_ref().map(|r| r.end as i64),
                 c.spelling,
-                document.key.source_set_id,
                 document.key.language,
                 callee_lookup_key,
             ],
@@ -4893,7 +4977,7 @@ fn write_native(
             immutable.insert(
                 db,
                 "INSERT INTO native_version_call_regions VALUES(?1,?2,?3,?4)",
-                params![version, c.id, region, ordinal as i64],
+                params![vid, stored_occ(&c.id)?, stored_occ(region)?, ordinal as i64],
             )?;
         }
     }
@@ -4917,7 +5001,7 @@ fn validate_v8_bootstrap(db: &Connection) -> Result<()> {
         indexed_at.is_empty() && options.is_none(),
         "incompatible_index: invalid v8 bootstrap metadata"
     );
-    // Fixed identifiers from CACHE_SCHEMA_V13 only. Do not read table names from
+    // Fixed identifiers from CACHE_SCHEMA_V14 only. Do not read table names from
     // sqlite_master or treat a partial publication as a valid empty bootstrap.
     for name in [
         "class_projections",
@@ -5468,7 +5552,7 @@ pub(crate) fn compare_capture_observations(
 
 // Keep the selected manifest indexed even when many older revisions are retained.
 // The revision join still verifies that this is the exact metadata-selected head.
-const SELECTED_CAPTURE_SNAPSHOT_SQL: &str = "SELECT d.path,v.content_hash,d.capture_stat FROM revision_documents d JOIN document_versions v ON v.id=d.document_version_id JOIN native_revisions r ON r.id=d.revision_id JOIN index_metadata m ON m.index_revision=r.published_index_revision AND r.id='pin:v1:'||m.index_generation||':'||m.index_revision WHERE d.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) ORDER BY d.path";
+const SELECTED_CAPTURE_SNAPSHOT_SQL: &str = "SELECT d.path,v.content_hash,d.capture_stat FROM revision_documents d JOIN document_versions v ON v.vid=d.vid JOIN native_revisions r ON r.id=d.revision_id JOIN index_metadata m ON m.index_revision=r.published_index_revision AND r.id='pin:v1:'||m.index_generation||':'||m.index_revision WHERE d.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) ORDER BY d.path";
 
 fn compare_capture_snapshot(
     db: &Connection,
@@ -5838,7 +5922,7 @@ fn validate_paired_rows(db: &Connection) -> Result<()> {
     );
     let (manifest_rows, projection_rows, inventory_rows): (i64, i64, i64) = db.query_row(
         "SELECT (SELECT count(*) FROM revision_documents d WHERE d.revision_id=r.id),
-                (SELECT count(*) FROM revision_documents d WHERE d.revision_id=r.id AND d.class_projection_id IS NOT NULL),
+                (SELECT count(*) FROM revision_documents d WHERE d.revision_id=r.id AND d.cid IS NOT NULL),
                 json_array_length(r.source_inventory)
          FROM native_revisions r JOIN index_metadata m ON m.singleton=1
            AND r.published_index_revision=m.index_revision
@@ -5850,9 +5934,10 @@ fn validate_paired_rows(db: &Connection) -> Result<()> {
         manifest_rows == inventory_rows && projection_rows == manifest_rows,
         "incompatible_index: incomplete revision manifest"
     );
-    let mut stmt=db.prepare("SELECT d.source_bytes,d.content_hash,d.byte_length,r.path,r.language,r.source_set_id,g.language
-        FROM revision_documents r JOIN document_versions d ON d.id=r.document_version_id
-        JOIN graph_projections g ON g.id=r.graph_projection_id")?;
+    let mut stmt=db.prepare("SELECT d.source_bytes,d.content_hash,d.byte_length,r.path,r.language,n.source_set_id,g.language
+        FROM revision_documents r JOIN native_revisions n ON n.id=r.revision_id
+        JOIN document_versions d ON d.vid=r.vid
+        JOIN graph_projections g ON g.gid=r.gid")?;
     let mut matched = 0;
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
@@ -5890,6 +5975,7 @@ fn validate_paired_rows(db: &Connection) -> Result<()> {
 struct V8NativeScope {
     revision_key: String, // internal pin:v1 generation/revision key
     version_id: String,
+    vid: i64,
     key: crate::native_evidence::DocumentKey,
     native_revision_id: String,
     producer_id: String,
@@ -5908,17 +5994,52 @@ impl V8NativeScope {
         )
     }
 }
+// Decode compact ID columns at the SQLite row boundary. A malformed stored
+// BLOB is a corrupt index, not a malformed caller selector.
+fn stored_id_row(
+    row: &rusqlite::Row<'_>,
+    index: usize,
+    occurrence: bool,
+) -> rusqlite::Result<String> {
+    let blob: Vec<u8> = row.get(index)?;
+    let text = if occurrence {
+        id_codec::decode_occ(&blob)
+    } else {
+        id_codec::decode_sid(&blob)
+    };
+    text.map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Blob,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                error.to_string(),
+            )),
+        )
+    })
+}
+fn optional_stored_id_row(
+    row: &rusqlite::Row<'_>,
+    index: usize,
+    occurrence: bool,
+) -> rusqlite::Result<Option<String>> {
+    if row.get::<_, Option<Vec<u8>>>(index)?.is_none() {
+        return Ok(None);
+    }
+    stored_id_row(row, index, occurrence).map(Some)
+}
+
 fn v8_native_scope_for(
     db: &Connection,
     key: &crate::native_evidence::DocumentKey,
     selected: &ReadRevision,
 ) -> Result<Option<V8NativeScope>> {
     let mut stmt = db.prepare(
-        "SELECT rd.revision_id,rd.document_version_id,r.native_revision_id,d.producer_id
+        "SELECT rd.revision_id,d.id,d.vid,r.native_revision_id,d.producer_id
         FROM native_revisions r JOIN revision_documents rd ON rd.revision_id=r.id
-        JOIN document_versions d ON d.id=rd.document_version_id
-          AND d.source_set_id=rd.source_set_id AND d.language=rd.language AND d.path=rd.path
-        WHERE r.id=?4 AND rd.source_set_id=?1 AND rd.language=?2 AND rd.path=?3 LIMIT 2",
+        JOIN document_versions d ON d.vid=rd.vid
+          AND d.language=rd.language AND d.path=rd.path
+        WHERE r.id=?4 AND r.source_set_id=?1 AND rd.language=?2 AND rd.path=?3 LIMIT 2",
     )?;
     let rows = stmt
         .query_map(
@@ -5927,8 +6048,9 @@ fn v8_native_scope_for(
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(2)?,
                     r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
                 ))
             },
         )?
@@ -5938,9 +6060,10 @@ fn v8_native_scope_for(
         "incompatible_index: duplicate selected document manifest"
     );
     Ok(rows.into_iter().next().map(
-        |(revision_key, version_id, native_revision_id, producer_id)| V8NativeScope {
+        |(revision_key, version_id, vid, native_revision_id, producer_id)| V8NativeScope {
             revision_key,
             version_id,
+            vid,
             key: key.clone(),
             native_revision_id,
             producer_id,
@@ -5955,11 +6078,15 @@ fn v8_owner_scope_for(
 ) -> Result<Option<V8NativeScope>> {
     use crate::native_evidence::DocumentKey;
     let mut stmt = db.prepare(
-        "SELECT m.source_set_id,m.language,m.path
+        "SELECT r.source_set_id,m.language,m.path
         FROM native_version_declarations d JOIN revision_documents m
-          ON m.revision_id=?2 AND m.document_version_id=d.version_id
+          ON m.revision_id=?2 AND m.vid=d.vid
+        JOIN native_revisions r ON r.id=m.revision_id
         WHERE d.syntax_id=?1 LIMIT 2",
     )?;
+    let Some(owner) = id_codec::encode_sid(owner) else {
+        return Ok(None);
+    };
     let keys: Vec<DocumentKey> = stmt
         .query_map(params![owner, selected.key], |r| {
             Ok(DocumentKey {
@@ -6038,17 +6165,17 @@ fn read_native_declarations_v8_inner(
 ) -> Result<Vec<crate::native_evidence::Declaration>> {
     use crate::native_evidence::{Declaration, Header, Key, Parameter, Range};
     optional_hint_check(progress)?;
-    let v = &scope.version_id;
+    let v = &scope.vid;
     let mut own_types: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for row in db.prepare("SELECT syntax_id,ordinal,type_name FROM native_version_own_signature_types WHERE version_id=?1 ORDER BY syntax_id,ordinal")?
-        .query_map([v],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?)))? {
+    for row in db.prepare("SELECT syntax_id,ordinal,type_name FROM native_version_own_signature_types WHERE vid=?1 ORDER BY syntax_id,ordinal")?
+        .query_map([v],|r|Ok((stored_id_row(r,0,false)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?)))? {
         optional_hint_check(progress)?;
         let (id,ord,value)=row?;let entry=own_types.entry(id).or_default();
         contiguous(ord,entry.len(),"own signature")?;entry.push(value);
     }
     let mut ancestor_types: BTreeMap<(String, i64), Vec<String>> = BTreeMap::new();
-    for row in db.prepare("SELECT syntax_id,ancestor_ordinal,ordinal,type_name FROM native_version_ancestor_signature_types WHERE version_id=?1 ORDER BY syntax_id,ancestor_ordinal,ordinal")?
-        .query_map([v],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?,r.get::<_,String>(3)?)))? {
+    for row in db.prepare("SELECT syntax_id,ancestor_ordinal,ordinal,type_name FROM native_version_ancestor_signature_types WHERE vid=?1 ORDER BY syntax_id,ancestor_ordinal,ordinal")?
+        .query_map([v],|r|Ok((stored_id_row(r,0,false)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?,r.get::<_,String>(3)?)))? {
         optional_hint_check(progress)?;
         let (id,ancestor,ord,value)=row?;let entry=ancestor_types.entry((id,ancestor)).or_default();
         contiguous(ord,entry.len(),"ancestor signature")?;entry.push(value);
@@ -6063,24 +6190,24 @@ fn read_native_declarations_v8_inner(
         Option<bool>,
     );
     let mut ancestors: BTreeMap<String, Vec<Ancestor>> = BTreeMap::new();
-    for row in db.prepare("SELECT syntax_id,ordinal,kind,name,sibling_ordinal,signature_present,type_parameter_count,variadic FROM native_version_declaration_ancestors WHERE version_id=?1 ORDER BY syntax_id,ordinal")?
-        .query_map([v],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,i64>(4)?,r.get::<_,bool>(5)?,r.get::<_,Option<i64>>(6)?,r.get::<_,Option<bool>>(7)?)))? {
+    for row in db.prepare("SELECT syntax_id,ordinal,kind,name,sibling_ordinal,signature_present,type_parameter_count,variadic FROM native_version_declaration_ancestors WHERE vid=?1 ORDER BY syntax_id,ordinal")?
+        .query_map([v],|r|Ok((stored_id_row(r,0,false)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,i64>(4)?,r.get::<_,bool>(5)?,r.get::<_,Option<i64>>(6)?,r.get::<_,Option<bool>>(7)?)))? {
         optional_hint_check(progress)?;
         let (id,ord,kind,name,sibling,present,count,variadic)=row?;
         let entry=ancestors.entry(id).or_default();contiguous(ord,entry.len(),"ancestor")?;
         entry.push((ord,kind,name,sibling,present,count,variadic));
     }
     let mut headers: BTreeMap<String, Header> = BTreeMap::new();
-    for row in db.prepare("SELECT syntax_id,kind,name,result_type FROM native_version_headers WHERE version_id=?1 ORDER BY syntax_id")?
-        .query_map([v],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,Option<String>>(3)?)))? {
+    for row in db.prepare("SELECT syntax_id,kind,name,result_type FROM native_version_headers WHERE vid=?1 ORDER BY syntax_id")?
+        .query_map([v],|r|Ok((stored_id_row(r,0,false)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,Option<String>>(3)?)))? {
         optional_hint_check(progress)?;
         let (id,kind,name,result_type)=row?;
         ensure!(headers.insert(id,Header{kind,name,modifiers:vec![],type_parameters:vec![],parameters:vec![],result_type,bases:vec![]}).is_none(),"duplicate native header");
     }
     // Separate ordinal spaces for each (syntax_id,item_kind); don't collapse them.
     let mut item_ordinals: BTreeMap<(String, String), usize> = BTreeMap::new();
-    for row in db.prepare("SELECT syntax_id,item_kind,ordinal,value FROM native_version_header_items WHERE version_id=?1 ORDER BY syntax_id,item_kind,ordinal")?
-        .query_map([v],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?,r.get::<_,String>(3)?)))? {
+    for row in db.prepare("SELECT syntax_id,item_kind,ordinal,value FROM native_version_header_items WHERE vid=?1 ORDER BY syntax_id,item_kind,ordinal")?
+        .query_map([v],|r|Ok((stored_id_row(r,0,false)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?,r.get::<_,String>(3)?)))? {
         optional_hint_check(progress)?;
         let (id,kind,ordinal,value)=row?;
         let n=item_ordinals.entry((id.clone(),kind.clone())).or_default();contiguous(ordinal,*n,"header item")?;*n+=1;
@@ -6088,8 +6215,8 @@ fn read_native_declarations_v8_inner(
         match kind.as_str(){"modifier"=>h.modifiers.push(value),"typeParameter"=>h.type_parameters.push(value),"base"=>h.bases.push(value),_=>anyhow::bail!("unknown header item")}
     }
     let mut param_ordinals: BTreeMap<String, usize> = BTreeMap::new();
-    for row in db.prepare("SELECT syntax_id,ordinal,name,type_name,variadic FROM native_version_parameters WHERE version_id=?1 ORDER BY syntax_id,ordinal")?
-        .query_map([v],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,bool>(4)?)))? {
+    for row in db.prepare("SELECT syntax_id,ordinal,name,type_name,variadic FROM native_version_parameters WHERE vid=?1 ORDER BY syntax_id,ordinal")?
+        .query_map([v],|r|Ok((stored_id_row(r,0,false)?,r.get::<_,i64>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,bool>(4)?)))? {
         optional_hint_check(progress)?;
         let (id,ordinal,name,type_name,variadic)=row?;
         let n=param_ordinals.entry(id.clone()).or_default();contiguous(ordinal,*n,"header parameter")?;*n+=1;
@@ -6098,8 +6225,8 @@ fn read_native_declarations_v8_inner(
     let proof = scope.proof_id();
     let mut result = Vec::new();
     let mut recorded_owners: BTreeMap<String, Option<String>> = BTreeMap::new();
-    for row in db.prepare("SELECT syntax_id,owner_syntax_id,kind,role,name,lookup_key,key_signature_present,key_type_parameter_count,key_variadic,key_ordinal,start_byte,end_byte,name_start,name_end FROM native_version_declarations WHERE version_id=?1 ORDER BY syntax_id")?
-      .query_map([v],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,Option<String>>(4)?,r.get::<_,Option<String>>(5)?,r.get::<_,bool>(6)?,r.get::<_,Option<i64>>(7)?,r.get::<_,Option<bool>>(8)?,r.get::<_,i64>(9)?,r.get::<_,i64>(10)?,r.get::<_,i64>(11)?,r.get::<_,Option<i64>>(12)?,r.get::<_,Option<i64>>(13)?)))? {
+    for row in db.prepare("SELECT syntax_id,owner_syntax_id,kind,role,name,lookup_key,key_signature_present,key_type_parameter_count,key_variadic,key_ordinal,start_byte,end_byte,name_start,name_end FROM native_version_declarations WHERE vid=?1 ORDER BY syntax_id")?
+      .query_map([v],|r|Ok((stored_id_row(r,0,false)?,optional_stored_id_row(r,1,false)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,Option<String>>(4)?,r.get::<_,Option<String>>(5)?,r.get::<_,bool>(6)?,r.get::<_,Option<i64>>(7)?,r.get::<_,Option<bool>>(8)?,r.get::<_,i64>(9)?,r.get::<_,i64>(10)?,r.get::<_,i64>(11)?,r.get::<_,Option<i64>>(12)?,r.get::<_,Option<i64>>(13)?)))? {
         optional_hint_check(progress)?;
         let (id,owner,kind,role,name,lookup,present,count,variadic,ordinal,start,end,name_start,name_end)=row?;
         let role = crate::native_evidence::DeclarationRole::from_stored(&role)?;
@@ -6171,12 +6298,12 @@ fn read_native_coverage_v8(
 ) -> Result<crate::native_evidence::Coverage> {
     use crate::native_evidence::Coverage;
     let (requested,selected,state,diagnostic):(bool,bool,String,Option<String>)=
-        db.query_row("SELECT coverage_requested,coverage_selected,coverage_state,coverage_diagnostic FROM revision_documents WHERE revision_id=?1 AND source_set_id=?2 AND language=?3 AND path=?4 AND document_version_id=?5",
-            params![scope.revision_key,scope.key.source_set_id,scope.key.language,scope.key.path,scope.version_id],
+        db.query_row("SELECT coverage_requested,coverage_selected,coverage_state,coverage_diagnostic FROM revision_documents WHERE revision_id=?1 AND language=?2 AND path=?3 AND vid=?4",
+            params![scope.revision_key,scope.key.language,scope.key.path,scope.vid],
             |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
     let (mut supported_roles, mut observed_roles) = (vec![], vec![]);
-    for row in db.prepare("SELECT role_kind,role,ordinal FROM native_version_coverage_roles WHERE version_id=?1 ORDER BY role_kind,ordinal")?
-        .query_map([&scope.version_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?)))? {
+    for row in db.prepare("SELECT role_kind,role,ordinal FROM native_version_coverage_roles WHERE vid=?1 ORDER BY role_kind,ordinal")?
+        .query_map([&scope.vid],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?)))? {
         let (kind,role,ordinal)=row?;
         let out=match kind.as_str(){"supported"=>&mut supported_roles,"observed"=>&mut observed_roles,_=>anyhow::bail!("invalid native coverage role kind")};
         contiguous(ordinal,out.len(),"coverage role")?;out.push(role);
@@ -6211,22 +6338,20 @@ fn read_native_calls_v8_inner(
 ) -> Result<Vec<crate::native_evidence::Call>> {
     optional_hint_check(progress)?;
     use crate::native_evidence::{Call, Range};
-    let version = &scope.version_id;
+    let version = &scope.vid;
     let mut known = BTreeSet::new();
     for row in db
-        .prepare("SELECT syntax_id FROM native_version_declarations WHERE version_id=?1")?
-        .query_map([version], |r| r.get::<_, String>(0))?
+        .prepare("SELECT syntax_id FROM native_version_declarations WHERE vid=?1")?
+        .query_map([version], |r| stored_id_row(r, 0, false))?
     {
         optional_hint_check(progress)?;
         known.insert(row?);
     }
     let mut region_owner = BTreeMap::new();
     for row in db
-        .prepare(
-            "SELECT id,owner_syntax_id FROM native_version_control_regions WHERE version_id=?1",
-        )?
+        .prepare("SELECT id,owner_syntax_id FROM native_version_control_regions WHERE vid=?1")?
         .query_map([version], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            Ok((stored_id_row(r, 0, true)?, stored_id_row(r, 1, false)?))
         })?
     {
         optional_hint_check(progress)?;
@@ -6237,11 +6362,11 @@ fn read_native_calls_v8_inner(
     let mut calls: Vec<Call> = vec![];
     let mut indexes: BTreeMap<String, usize> = BTreeMap::new();
     let mut ordinals: BTreeMap<String, usize> = BTreeMap::new();
-    for row in db.prepare("SELECT id,owner_syntax_id,ordinal,start_byte,end_byte,callee_start,callee_end,spelling,source_set_id,language,callee_lookup_key FROM native_version_calls WHERE version_id=?1 ORDER BY owner_syntax_id,ordinal")?
-        .query_map([version],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?,r.get::<_,i64>(3)?,r.get::<_,i64>(4)?,r.get::<_,Option<i64>>(5)?,r.get::<_,Option<i64>>(6)?,r.get::<_,Option<String>>(7)?,r.get::<_,String>(8)?,r.get::<_,String>(9)?,r.get::<_,Option<String>>(10)?)))? {
+    for row in db.prepare("SELECT id,owner_syntax_id,ordinal,start_byte,end_byte,callee_start,callee_end,spelling,language,callee_lookup_key FROM native_version_calls WHERE vid=?1 ORDER BY owner_syntax_id,ordinal")?
+        .query_map([version],|r|Ok((stored_id_row(r,0,true)?,stored_id_row(r,1,false)?,r.get::<_,i64>(2)?,r.get::<_,i64>(3)?,r.get::<_,i64>(4)?,r.get::<_,Option<i64>>(5)?,r.get::<_,Option<i64>>(6)?,r.get::<_,Option<String>>(7)?,r.get::<_,String>(8)?,r.get::<_,Option<String>>(9)?)))? {
         optional_hint_check(progress)?;
-        let (id,call_owner,ordinal,start,end,callee_start,callee_end,spelling,source_set_id,language,callee_lookup_key)=row?;
-        ensure!(source_set_id == scope.key.source_set_id && language == scope.key.language, "native call document mismatch");
+        let (id,call_owner,ordinal,start,end,callee_start,callee_end,spelling,language,callee_lookup_key)=row?;
+        ensure!(language == scope.key.language, "native call document mismatch");
         ensure!(callee_lookup_key.is_none() || callee_start.is_some() && spelling.is_some(), "invalid native call lookup key");
         ensure!(known.contains(&call_owner),"orphan native call owner");
         let n=ordinals.entry(call_owner.clone()).or_default();contiguous(ordinal,*n,"call")?;*n+=1;
@@ -6254,8 +6379,8 @@ fn read_native_calls_v8_inner(
             revision_id:scope.native_revision_id.clone(),range:Range{start:usize::try_from(start)?,end:usize::try_from(end)?},
             callee_range,spelling,region_ids:vec![],provenance_id:proof.clone()});
     }
-    for row in db.prepare("SELECT call_id,region_id,ordinal FROM native_version_call_regions WHERE version_id=?1 ORDER BY call_id,ordinal")?
-        .query_map([version],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?)))? {
+    for row in db.prepare("SELECT call_id,region_id,ordinal FROM native_version_call_regions WHERE vid=?1 ORDER BY call_id,ordinal")?
+        .query_map([version],|r|Ok((stored_id_row(r,0,true)?,stored_id_row(r,1,true)?,r.get::<_,i64>(2)?)))? {
         optional_hint_check(progress)?;
         let (call_id,region_id,ordinal)=row?;
         let call=&mut calls[*indexes.get(&call_id).context("orphan native call region")?];
@@ -6293,8 +6418,8 @@ fn read_native_control_regions_v8_inner(
     use crate::native_evidence::{ControlRegion, Range};
     let mut known = BTreeSet::new();
     for row in db
-        .prepare("SELECT syntax_id FROM native_version_declarations WHERE version_id=?1")?
-        .query_map([&scope.version_id], |r| r.get::<_, String>(0))?
+        .prepare("SELECT syntax_id FROM native_version_declarations WHERE vid=?1")?
+        .query_map([&scope.vid], |r| stored_id_row(r, 0, false))?
     {
         optional_hint_check(progress)?;
         known.insert(row?);
@@ -6303,8 +6428,8 @@ fn read_native_control_regions_v8_inner(
     let mut regions = Vec::<ControlRegion>::new();
     let mut indexes = BTreeMap::<String, usize>::new();
     let mut ordinals = BTreeMap::<String, usize>::new();
-    for row in db.prepare("SELECT id,owner_syntax_id,ordinal,kind,start_byte,end_byte,parent_id,arm FROM native_version_control_regions WHERE version_id=?1 ORDER BY owner_syntax_id,ordinal")?
-        .query_map([&scope.version_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?,r.get::<_,String>(3)?,r.get::<_,i64>(4)?,r.get::<_,i64>(5)?,r.get::<_,Option<String>>(6)?,r.get::<_,Option<String>>(7)?)))? {
+    for row in db.prepare("SELECT id,owner_syntax_id,ordinal,kind,start_byte,end_byte,parent_id,arm FROM native_version_control_regions WHERE vid=?1 ORDER BY owner_syntax_id,ordinal")?
+        .query_map([&scope.vid],|r|Ok((stored_id_row(r,0,true)?,stored_id_row(r,1,false)?,r.get::<_,i64>(2)?,r.get::<_,String>(3)?,r.get::<_,i64>(4)?,r.get::<_,i64>(5)?,optional_stored_id_row(r,6,true)?,r.get::<_,Option<String>>(7)?)))? {
         optional_hint_check(progress)?;
         let (id,region_owner,ordinal,kind,start,end,parent_id,arm)=row?;
         ensure!(known.contains(&region_owner),"orphan native region owner");
@@ -7101,11 +7226,11 @@ impl Store {
             db.pragma_update(None, "synchronous", "FULL")?;
             db.execute_batch("BEGIN IMMEDIATE")?;
             let result = (|| -> Result<()> {
-                db.execute_batch(CACHE_SCHEMA_V13)?;
+                db.execute_batch(CACHE_SCHEMA_V14)?;
                 let age = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
                 ensure!(age <= 9_007_199_254_740_991, "invalid_open_age");
                 db.execute(
-                    "INSERT INTO index_metadata VALUES(1,13,?1,?2,?3,?4,?5,0,?6,'',?7,?8,NULL)",
+                    "INSERT INTO index_metadata VALUES(1,14,?1,?2,?3,?4,?5,0,?6,'',?7,?8,NULL)",
                     params![
                         EXTRACTOR_VERSION,
                         self.workspace_root,
@@ -9148,8 +9273,8 @@ impl Store {
         ) = db.query_row(
             "SELECT d.content_hash,d.byte_length,d.source_bytes,d.extraction_context,
                 d.producer_id,d.producer_version,d.native_witness FROM document_versions d
-                WHERE d.id=?1 AND d.source_set_id=?2 AND d.language=?3 AND d.path=?4",
-            params![scope.version_id, key.source_set_id, key.language, key.path],
+                WHERE d.vid=?1 AND d.language=?2 AND d.path=?3",
+            params![scope.vid, key.language, key.path],
             |r| {
                 Ok((
                     r.get(0)?,
@@ -9337,16 +9462,26 @@ impl Store {
                 stored == *source,
                 "incompatible_index: selected final inventory source differs"
             );
-            let linked: Option<(String, String, String, String, String)> = db.query_row(
-                "SELECT g.state,c.state,v.extraction_context,v.producer_id,v.producer_version
+            let linked: Option<(String, String, String, String, String)> = db
+                .query_row(
+                    "SELECT g.state,c.state,v.extraction_context,v.producer_id,v.producer_version
                  FROM revision_documents m
-                 JOIN document_versions v ON v.id=m.document_version_id AND v.language=m.language AND v.path=m.path
-                 JOIN graph_projections g ON g.id=m.graph_projection_id AND g.document_version_id=m.document_version_id AND g.language=m.language
-                 JOIN class_projections c ON c.id=m.class_projection_id AND c.graph_projection_id=m.graph_projection_id
+                 JOIN document_versions v ON v.vid=m.vid AND v.language=m.language AND v.path=m.path
+                 JOIN graph_projections g ON g.gid=m.gid AND g.vid=m.vid AND g.language=m.language
+                 JOIN class_projections c ON c.cid=m.cid AND c.gid=m.gid
                  WHERE m.revision_id=?1 AND m.path=?2",
-                 params![selected.key, source.path],
-                 |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
-            ).optional()?;
+                    params![selected.key, source.path],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .optional()?;
             let (graph, class, context, producer, version) = linked
                 .context("incompatible_index: selected final inventory projection missing")?;
             ensure!(
@@ -9500,12 +9635,12 @@ impl Store {
                 .query_row(
                     "SELECT g.state,c.state,v.extraction_context,v.producer_id,v.producer_version
                  FROM revision_documents m
-                 JOIN document_versions v ON v.id=m.document_version_id
+                 JOIN document_versions v ON v.vid=m.vid
                    AND v.language=m.language AND v.path=m.path
-                 JOIN graph_projections g ON g.id=m.graph_projection_id
-                   AND g.document_version_id=m.document_version_id AND g.language=m.language
-                 JOIN class_projections c ON c.id=m.class_projection_id
-                   AND c.graph_projection_id=m.graph_projection_id
+                 JOIN graph_projections g ON g.gid=m.gid
+                   AND g.vid=m.vid AND g.language=m.language
+                 JOIN class_projections c ON c.cid=m.cid
+                   AND c.gid=m.gid
                  WHERE m.revision_id=?1 AND m.path=?2",
                     params![selected.key, source.path],
                     |row| {
@@ -9622,7 +9757,7 @@ impl Store {
             )?;
         }
         let copied = tx.execute(
-            "INSERT INTO revision_documents SELECT ?1,source_set_id,language,path,document_version_id,             graph_projection_id,class_projection_id,capture_stat,coverage_requested,             coverage_selected,coverage_state,coverage_diagnostic,ordinal             FROM revision_documents WHERE revision_id=?2",
+            "INSERT INTO revision_documents SELECT ?1,language,path,vid,             gid,cid,capture_stat,coverage_requested,             coverage_selected,coverage_state,coverage_diagnostic,ordinal             FROM revision_documents WHERE revision_id=?2",
             params![revision_key, selected.key],
         )?;
         ensure!(
@@ -9722,21 +9857,22 @@ impl Store {
             // re-hashed or decoded here. Only the changed document's bytes are
             // loaded and witness-checked below. Selected reads still attest
             // what they serve.
-            let mut statement = db.prepare("SELECT m.source_set_id,m.path,m.language,v.content_hash,v.byte_length,NULL,
-                v.extraction_context,v.producer_id,v.producer_version,m.document_version_id,
-                m.graph_projection_id,m.class_projection_id,g.graph_hash,c.content_hash,
+            let mut statement = db.prepare("SELECT r.source_set_id,m.path,m.language,v.content_hash,v.byte_length,NULL,
+                v.extraction_context,v.producer_id,v.producer_version,v.id,
+                g.graph_hash,c.content_hash,g.graph_hash,c.content_hash,
                 g.class_extraction_payload,m.coverage_requested,m.coverage_selected,
                 m.coverage_state,m.coverage_diagnostic
-                FROM revision_documents m JOIN document_versions v ON v.id=m.document_version_id
-                JOIN graph_projections g ON g.id=m.graph_projection_id
-                LEFT JOIN class_projections c ON c.id=m.class_projection_id
+                FROM revision_documents m JOIN native_revisions r ON r.id=m.revision_id
+                JOIN document_versions v ON v.vid=m.vid
+                JOIN graph_projections g ON g.gid=m.gid
+                LEFT JOIN class_projections c ON c.cid=m.cid
                 WHERE m.revision_id=?1 ORDER BY m.ordinal")?;
             for row in statement.query_map([&selected.key], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?,
                     r.get::<_, String>(3)?, r.get::<_, i64>(4)?, (),
                     r.get::<_, String>(6)?, r.get::<_, String>(7)?, r.get::<_, String>(8)?,
-                    r.get::<_, String>(9)?, r.get::<_, String>(10)?,
-                    r.get::<_, Option<String>>(11)?, r.get::<_, String>(12)?,
+                    r.get::<_, String>(9)?, graph_id_row(r,10)?,
+                    class_id_row(r,11)?, r.get::<_, String>(12)?,
                     r.get::<_, Option<String>>(13)?, r.get::<_, Option<String>>(14)?,
                     r.get::<_, bool>(15)?, r.get::<_, bool>(16)?,
                     r.get::<_, String>(17)?, r.get::<_, Option<String>>(18)?))
@@ -9782,7 +9918,7 @@ impl Store {
                 let old = &mut previous[i];
                 let (length, bytes): (i64, Vec<u8>) = db.query_row(
                     "SELECT v.byte_length,v.source_bytes FROM revision_documents m
-                     JOIN document_versions v ON v.id=m.document_version_id
+                     JOIN document_versions v ON v.vid=m.vid
                      WHERE m.revision_id=?1 AND m.path=?2 AND m.language=?3",
                     params![selected.key, old.path, old.language], |r| Ok((r.get(0)?, r.get(1)?)))?;
                 ensure!(length >= 0 && length as usize == bytes.len()
@@ -9834,14 +9970,14 @@ impl Store {
             // header delta, not to authorize any old semantic fact. Native calls
             // and regions determine the two derived graph row counts.
             let old_nodes: i64 = db.query_row(
-                "SELECT count(*) FROM graph_nodes WHERE projection_id=?1",
-                [&stored.graph_id], |r| r.get(0))?;
+                "SELECT count(*) FROM graph_nodes WHERE gid=?1",
+                [db.query_row("SELECT gid FROM graph_projections WHERE graph_hash=?1", [&stored.graph_hash], |r| r.get::<_,i64>(0))?], |r| r.get(0))?;
             let old_calls: i64 = db.query_row(
-                "SELECT count(*) FROM native_version_calls WHERE version_id=?1",
-                [&stored.version_id], |r| r.get(0))?;
+                "SELECT count(*) FROM native_version_calls WHERE vid=?1",
+                [db.query_row("SELECT vid FROM document_versions WHERE id=?1", [&stored.version_id], |r| r.get::<_,i64>(0))?], |r| r.get(0))?;
             let old_regions: i64 = db.query_row(
-                "SELECT count(*) FROM native_version_control_regions WHERE version_id=?1",
-                [&stored.version_id], |r| r.get(0))?;
+                "SELECT count(*) FROM native_version_control_regions WHERE vid=?1",
+                [db.query_row("SELECT vid FROM document_versions WHERE id=?1", [&stored.version_id], |r| r.get::<_,i64>(0))?], |r| r.get(0))?;
             let old_changed_counts=(old_nodes as usize, old_calls as usize, old_regions as usize);
             let (stats,diagnostics,warnings,truncated):(String,String,String,bool)=db.query_row(
                 "SELECT m.stats,m.diagnostics,r.class_warnings,r.class_truncated
@@ -9992,7 +10128,7 @@ impl Store {
             }
             let mut previous=vec![];
             for row in db.prepare("SELECT d.path,d.language,d.content_hash,d.byte_length,d.source_bytes
-                FROM revision_documents m JOIN document_versions d ON d.id=m.document_version_id
+                FROM revision_documents m JOIN document_versions d ON d.vid=m.vid
                 WHERE m.revision_id=?1 ORDER BY m.ordinal")?
                 .query_map([&selected.key],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,
                     r.get::<_,String>(2)?,r.get::<_,i64>(3)?,r.get::<_,Vec<u8>>(4)?)))? {
@@ -10049,9 +10185,10 @@ impl Store {
         if reuse.graph {
             let (version, hash, state, class_state, stored_f):
                 (String,String,String,String,Option<String>) = db.query_row(
-                "SELECT document_version_id,graph_hash,state,class_extraction_state,class_extraction_payload
-                    FROM graph_projections WHERE id=?1",
-                [&ids.graph_id],
+                "SELECT v.id,g.graph_hash,g.state,g.class_extraction_state,g.class_extraction_payload
+                    FROM graph_projections g JOIN document_versions v ON v.vid=g.vid
+                    WHERE g.graph_hash=?1",
+                [&ids.graph_hash],
                 |r| Ok((r.get(0)?, r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)),
             )?;
             let expected_f = extraction.map(json).transpose()?;
@@ -10072,9 +10209,10 @@ impl Store {
         }
         if reuse.class {
             let (graph_id, hash): (String, String) = db.query_row(
-                "SELECT graph_projection_id,content_hash FROM class_projections WHERE id=?1",
-                [&ids.class_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                "SELECT g.graph_hash,c.content_hash FROM class_projections c
+                    JOIN graph_projections g ON g.gid=c.gid WHERE c.content_hash=?1",
+                [&ids.class_hash],
+                |r| Ok((graph_id_row(r, 0)?, r.get(1)?)),
             )?;
             control_ensure!(
                 graph_id == ids.graph_id && hash == ids.class_hash,
@@ -10110,10 +10248,12 @@ impl Store {
             let mut existing_ids = BTreeMap::new();
             let mut count = 0;
             let mut statement = db.prepare(
-                "SELECT m.path,m.language,m.document_version_id,
-                m.graph_projection_id,m.class_projection_id,v.content_hash,v.extraction_context,
+                "SELECT m.path,m.language,v.id,
+                g.graph_hash,c.content_hash,v.content_hash,v.extraction_context,
                 v.producer_id,v.producer_version
-                FROM revision_documents m JOIN document_versions v ON v.id=m.document_version_id
+                FROM revision_documents m JOIN document_versions v ON v.vid=m.vid
+                JOIN graph_projections g ON g.gid=m.gid
+                LEFT JOIN class_projections c ON c.cid=m.cid
                 WHERE m.revision_id=?1 ORDER BY m.ordinal",
             )?;
             for row in statement.query_map([&selected.key], |r| {
@@ -10121,8 +10261,8 @@ impl Store {
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
-                    r.get::<_, Option<String>>(4)?,
+                    graph_id_row(r, 3)?,
+                    class_id_row(r, 4)?,
                     r.get::<_, String>(5)?,
                     r.get::<_, String>(6)?,
                     r.get::<_, String>(7)?,
@@ -10244,15 +10384,19 @@ impl Store {
                 .map(|coverage| (coverage.document_path.as_str(), coverage)).collect();
             let mut old = BTreeMap::new();
             let mut stmt = db.prepare(
-                "SELECT path,document_version_id,graph_projection_id,class_projection_id
-                FROM revision_documents WHERE revision_id=?1 ORDER BY path",
+                "SELECT m.path,v.id,g.graph_hash,
+                c.content_hash
+                FROM revision_documents m JOIN document_versions v ON v.vid=m.vid
+                JOIN graph_projections g ON g.gid=m.gid
+                LEFT JOIN class_projections c ON c.cid=m.cid
+                WHERE m.revision_id=?1 ORDER BY m.path",
             )?;
             for row in stmt.query_map([&selected.key], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<String>>(3)?,
+                    graph_id_row(row,2)?,
+                    class_id_row(row,3)?,
                 ))
             })? {
                 let (path, version, projection, class) = row?;
@@ -10326,7 +10470,7 @@ impl Store {
                         !reused.graph || reused.native,
                         "incompatible_index: graph reused with different native version"
                     );
-                    ensure!(
+                    control_ensure!(
                         !reused.class || reused.graph,
                         "incompatible_index: class reused with different graph projection"
                     );
@@ -10424,15 +10568,19 @@ impl Store {
             let drift = selected_producer_hash(db, &selected)? != spool.header().producer.executable_hash;
             let mut old = BTreeMap::new();
             let mut stmt = db.prepare(
-                "SELECT path,document_version_id,graph_projection_id,class_projection_id
-                FROM revision_documents WHERE revision_id=?1 ORDER BY path",
+                "SELECT m.path,v.id,g.graph_hash,
+                c.content_hash
+                FROM revision_documents m JOIN document_versions v ON v.vid=m.vid
+                JOIN graph_projections g ON g.gid=m.gid
+                LEFT JOIN class_projections c ON c.cid=m.cid
+                WHERE m.revision_id=?1 ORDER BY m.path",
             )?;
             for row in stmt.query_map([&selected.key], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<String>>(3)?,
+                    graph_id_row(row,2)?,
+                    class_id_row(row,3)?,
                 ))
             })? {
                 let (path, version, projection, class) = row?;
@@ -10497,7 +10645,7 @@ impl Store {
                         !reused.graph || reused.native,
                         "incompatible_index: graph reused with different native version"
                     );
-                    ensure!(
+                    control_ensure!(
                         !reused.class || reused.graph,
                         "incompatible_index: class reused with different graph projection"
                     );
@@ -11160,7 +11308,7 @@ impl Store {
             let old_key = format!("pin:v1:{}:{}", prior.index_generation, prior.index_revision);
             stamp_predecessor(&tx, &old_key, publication_time.as_secs() as i64)?;
         }
-        tx.execute("UPDATE index_metadata SET schema_version=13,extractor_version=?1,index_generation=?2,index_revision=?3,indexed_at=?4,stats=?5,diagnostics=?6,reconcile_options=?7 WHERE singleton=1",
+        tx.execute("UPDATE index_metadata SET schema_version=14,extractor_version=?1,index_generation=?2,index_revision=?3,indexed_at=?4,stats=?5,diagnostics=?6,reconcile_options=?7 WHERE singleton=1",
             params![EXTRACTOR_VERSION, revision.index_generation.to_string(), revision.index_revision as i64,timestamp,json(&stats)?,json(&graph.diagnostics)?,json(capture.reconcile_options())?])?;
         immutable.counters.record(
             "manifest",
@@ -11683,9 +11831,9 @@ impl Store {
                     state == "pending",
                     "incompatible_index: invalid pending debt state"
                 );
-                let entries: Vec<(String, String, Option<String>, i64)> = tx
+                let entries: Vec<(i64, i64, Option<i64>, i64)> = tx
                     .prepare(
-                        "SELECT document_version_id,graph_projection_id,class_projection_id,ordinal
+                        "SELECT vid,gid,cid,ordinal
                      FROM revision_documents WHERE revision_id=?1 ORDER BY ordinal LIMIT 64",
                     )?
                     .query_map([&selected], |r| {
@@ -11894,32 +12042,37 @@ impl Store {
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         self.read_revision(&tx, None)?;
         leader.verify()?;
-        let unreferenced_class = "SELECT p.id FROM class_projections p WHERE NOT EXISTS
-            (SELECT 1 FROM revision_documents m WHERE m.class_projection_id=p.id)";
+        let unreferenced_class = "SELECT p.cid FROM class_projections p WHERE NOT EXISTS
+            (SELECT 1 FROM revision_documents m WHERE m.cid=p.cid)
+            AND NOT EXISTS (SELECT 1 FROM native_release_candidate_classes q WHERE q.cid=p.cid)";
         for table in ["class_relations", "classes"] {
             tx.execute(
-                &format!("DELETE FROM {table} WHERE projection_id IN ({unreferenced_class})"),
+                &format!("DELETE FROM {table} WHERE cid IN ({unreferenced_class})"),
                 [],
             )?;
         }
         tx.execute(
-            &format!("DELETE FROM class_projections WHERE id IN ({unreferenced_class})"),
+            &format!("DELETE FROM class_projections WHERE cid IN ({unreferenced_class})"),
             [],
         )?;
-        let unreferenced_graph = "SELECT p.id FROM graph_projections p WHERE NOT EXISTS
-            (SELECT 1 FROM revision_documents m WHERE m.graph_projection_id=p.id)";
+        let unreferenced_graph = "SELECT p.gid FROM graph_projections p WHERE NOT EXISTS
+            (SELECT 1 FROM revision_documents m WHERE m.gid=p.gid)
+            AND NOT EXISTS (SELECT 1 FROM native_release_candidate_graphs q WHERE q.gid=p.gid)
+            AND NOT EXISTS (SELECT 1 FROM class_projections c WHERE c.gid=p.gid)";
         for table in ["graph_display_labels", "graph_nodes"] {
             tx.execute(
-                &format!("DELETE FROM {table} WHERE projection_id IN ({unreferenced_graph})"),
+                &format!("DELETE FROM {table} WHERE gid IN ({unreferenced_graph})"),
                 [],
             )?;
         }
         tx.execute(
-            &format!("DELETE FROM graph_projections WHERE id IN ({unreferenced_graph})"),
+            &format!("DELETE FROM graph_projections WHERE gid IN ({unreferenced_graph})"),
             [],
         )?;
-        let unreferenced_version = "SELECT v.id FROM document_versions v WHERE NOT EXISTS
-            (SELECT 1 FROM revision_documents m WHERE m.document_version_id=v.id)";
+        let unreferenced_version = "SELECT v.vid FROM document_versions v WHERE NOT EXISTS
+            (SELECT 1 FROM revision_documents m WHERE m.vid=v.vid)
+            AND NOT EXISTS (SELECT 1 FROM native_release_candidate_versions q WHERE q.vid=v.vid)
+            AND NOT EXISTS (SELECT 1 FROM graph_projections g WHERE g.vid=v.vid)";
         for table in [
             "native_version_call_regions",
             "native_version_calls",
@@ -11934,12 +12087,12 @@ impl Store {
             "native_version_coverage_roles",
         ] {
             tx.execute(
-                &format!("DELETE FROM {table} WHERE version_id IN ({unreferenced_version})"),
+                &format!("DELETE FROM {table} WHERE vid IN ({unreferenced_version})"),
                 [],
             )?;
         }
         tx.execute(
-            &format!("DELETE FROM document_versions WHERE id IN ({unreferenced_version})"),
+            &format!("DELETE FROM document_versions WHERE vid IN ({unreferenced_version})"),
             [],
         )?;
         Self::check_retained_foreign_keys(&tx)?;
@@ -11964,7 +12117,7 @@ impl Store {
         use crate::native_evidence::{Document, DocumentKey};
         let (source_set_id, revision_id): (String, String) = db
             .query_row(
-                "SELECT m.source_set_id,r.native_revision_id FROM revision_documents m
+                "SELECT r.source_set_id,r.native_revision_id FROM revision_documents m
                  JOIN native_revisions r ON r.id=m.revision_id
                  WHERE m.path=?1 AND m.revision_id=?2",
                 params![path, selected.key],
@@ -12072,12 +12225,19 @@ impl Store {
     // after source and native rows are decoded.
     fn selected_ancillary_byte_usage(
         db: &Connection,
+        vid: i64,
+        cid: i64,
         version_id: &str,
-        class_id: &str,
+        source_set_id: &str,
     ) -> Result<(i64, i64)> {
         Ok(db.query_row(
             SELECTED_ANCILLARY_BYTE_SQL,
-            params![version_id, class_id],
+            params![
+                vid,
+                cid,
+                version_id.len() as i64,
+                source_set_id.len() as i64
+            ],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?)
     }
@@ -12163,16 +12323,16 @@ impl Store {
         count_selected_read(|counts| counts.attestations += 1);
         use crate::native_evidence::DocumentKey;
         optional_hint_check(progress)?;
-        let sql = "SELECT m.source_set_id,m.language,m.path,m.document_version_id,m.graph_projection_id,
-            m.class_projection_id,d.content_hash,d.byte_length,length(d.source_bytes),
+        let sql = "SELECT r.source_set_id,m.language,m.path,d.id,g.graph_hash,
+            c.content_hash,d.content_hash,d.byte_length,length(d.source_bytes),
             g.graph_hash,g.state,g.class_extraction_state,length(CAST(g.class_extraction_payload AS BLOB)),
-            c.content_hash,c.state,r.native_revision_id
+            c.content_hash,c.state,r.native_revision_id,d.vid,g.gid,c.cid
             FROM revision_documents m JOIN native_revisions r ON r.id=m.revision_id
-            JOIN document_versions d ON d.id=m.document_version_id
-              AND d.source_set_id=m.source_set_id AND d.language=m.language AND d.path=m.path
-            JOIN graph_projections g ON g.id=m.graph_projection_id
-              AND g.document_version_id=d.id AND g.language=d.language
-            LEFT JOIN class_projections c ON c.id=m.class_projection_id AND c.graph_projection_id=g.id
+            JOIN document_versions d ON d.vid=m.vid
+              AND d.language=m.language AND d.path=m.path
+            JOIN graph_projections g ON g.gid=m.gid
+              AND g.vid=d.vid AND g.language=d.language
+            LEFT JOIN class_projections c ON c.cid=m.cid AND c.gid=g.gid
             WHERE m.path=?1 AND m.revision_id=?2 LIMIT 2";
         let mut stmt = db.prepare(sql)?;
         optional_hint_check(progress)?;
@@ -12183,8 +12343,8 @@ impl Store {
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
                     r.get::<_, String>(3)?,
-                    r.get::<_, String>(4)?,
-                    r.get::<_, Option<String>>(5)?,
+                    graph_id_row(r, 4)?,
+                    class_id_row(r, 5)?,
                     r.get::<_, String>(6)?,
                     r.get::<_, i64>(7)?,
                     r.get::<_, i64>(8)?,
@@ -12195,6 +12355,9 @@ impl Store {
                     r.get::<_, Option<String>>(13)?,
                     r.get::<_, Option<String>>(14)?,
                     r.get::<_, String>(15)?,
+                    r.get::<_, i64>(16)?,
+                    r.get::<_, i64>(17)?,
+                    r.get::<_, Option<i64>>(18)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -12219,6 +12382,9 @@ impl Store {
             class_hash,
             class_projection_state,
             native_revision_id,
+            vid,
+            gid,
+            cid,
         ) = rows.into_iter().next().unwrap();
         ensure!(
             stored_path == path
@@ -12240,6 +12406,7 @@ impl Store {
             "incompatible_index: selected source byte budget exceeded"
         );
         let class_id = class_id.context("incompatible_index: selected class projection missing")?;
+        let cid = cid.context("incompatible_index: selected class surrogate missing")?;
         ensure!(
             graph_state == "ready"
                 && class_projection_state.as_deref() == Some("ready")
@@ -12260,7 +12427,7 @@ impl Store {
             "incompatible_index: class extraction state invalid"
         );
         let key = DocumentKey {
-            source_set_id: source_set,
+            source_set_id: source_set.clone(),
             language: language.clone(),
             path: path.into(),
         };
@@ -12271,34 +12438,33 @@ impl Store {
             "incompatible_index: selected native manifest mismatch"
         );
         let row_limit = bytes.saturating_mul(16).clamp(1024, 1_000_000);
-        let counts_sql = "SELECT (SELECT count(*) FROM graph_nodes WHERE projection_id=?1),
-            (SELECT count(*) FROM graph_display_labels WHERE projection_id=?1),
-            (SELECT count(*) FROM native_version_calls WHERE version_id=?3),
-            (SELECT count(*) FROM native_version_control_regions WHERE version_id=?3),
-            (SELECT count(*) FROM classes WHERE projection_id=?2),
-            (SELECT count(*) FROM class_relations WHERE projection_id=?2),
-            (SELECT count(*) FROM native_version_coverage_roles WHERE version_id=?3),
-            (SELECT count(*) FROM native_version_declarations WHERE version_id=?3),
-            (SELECT count(*) FROM native_version_declaration_ancestors WHERE version_id=?3),
-            (SELECT count(*) FROM native_version_own_signature_types WHERE version_id=?3),
-            (SELECT count(*) FROM native_version_ancestor_signature_types WHERE version_id=?3),
-            (SELECT count(*) FROM native_version_headers WHERE version_id=?3),
-            (SELECT count(*) FROM native_version_header_items WHERE version_id=?3),
-            (SELECT count(*) FROM native_version_parameters WHERE version_id=?3),
-            (SELECT count(*) FROM native_version_call_regions WHERE version_id=?3)";
-        let counts: Vec<i64> =
-            db.query_row(counts_sql, params![graph_id, class_id, version_id], |r| {
-                (0..15)
-                    .map(|i| r.get(i))
-                    .collect::<rusqlite::Result<Vec<_>>>()
-            })?;
+        let counts_sql = "SELECT (SELECT count(*) FROM graph_nodes WHERE gid=?1),
+            (SELECT count(*) FROM graph_display_labels WHERE gid=?1),
+            (SELECT count(*) FROM native_version_calls WHERE vid=?3),
+            (SELECT count(*) FROM native_version_control_regions WHERE vid=?3),
+            (SELECT count(*) FROM classes WHERE cid=?2),
+            (SELECT count(*) FROM class_relations WHERE cid=?2),
+            (SELECT count(*) FROM native_version_coverage_roles WHERE vid=?3),
+            (SELECT count(*) FROM native_version_declarations WHERE vid=?3),
+            (SELECT count(*) FROM native_version_declaration_ancestors WHERE vid=?3),
+            (SELECT count(*) FROM native_version_own_signature_types WHERE vid=?3),
+            (SELECT count(*) FROM native_version_ancestor_signature_types WHERE vid=?3),
+            (SELECT count(*) FROM native_version_headers WHERE vid=?3),
+            (SELECT count(*) FROM native_version_header_items WHERE vid=?3),
+            (SELECT count(*) FROM native_version_parameters WHERE vid=?3),
+            (SELECT count(*) FROM native_version_call_regions WHERE vid=?3)";
+        let counts: Vec<i64> = db.query_row(counts_sql, params![gid, cid, vid], |r| {
+            (0..15)
+                .map(|i| r.get(i))
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })?;
         ensure!(
             counts.iter().all(|&n| n >= 0 && n <= row_limit),
             "incompatible_index: selected evidence row budget exceeded"
         );
         optional_hint_check(progress)?;
         let (max_row, total_bytes) =
-            Self::selected_ancillary_byte_usage(db, &version_id, &class_id)?;
+            Self::selected_ancillary_byte_usage(db, vid, cid, &version_id, &source_set)?;
         ensure!(
             max_row >= 0
                 && total_bytes >= 0
@@ -12327,6 +12493,8 @@ impl Store {
             version_id,
             graph_id,
             class_id,
+            gid,
+            cid,
             graph_hash,
             class_hash,
             hash,
@@ -12348,6 +12516,8 @@ impl Store {
             version_id,
             graph_id,
             class_id,
+            gid,
+            cid,
             graph_hash,
             class_hash,
             hash,
@@ -12377,20 +12547,18 @@ impl Store {
         let regions = read_native_control_regions_v8_inner(db, &scope, None, progress)?;
         let mut node_rows = Vec::new();
         for row in db
-            .prepare_cached(
-                "SELECT id,name,kind FROM graph_nodes WHERE projection_id=?1 ORDER BY id",
-            )?
-            .query_map([&graph_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .prepare_cached("SELECT id,name,kind FROM graph_nodes WHERE gid=?1 ORDER BY id")?
+            .query_map([gid], |r| {
+                Ok((stored_id_row(r, 0, false)?, r.get(1)?, r.get(2)?))
+            })?
         {
             optional_hint_check(progress)?;
             node_rows.push(row?);
         }
         let mut label_rows = Vec::new();
         for row in db
-            .prepare_cached(
-                "SELECT id,label FROM graph_display_labels WHERE projection_id=?1 ORDER BY id",
-            )?
-            .query_map([&graph_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .prepare_cached("SELECT id,label FROM graph_display_labels WHERE gid=?1 ORDER BY id")?
+            .query_map([gid], |r| Ok((stored_id_row(r, 0, false)?, r.get(1)?)))?
         {
             optional_hint_check(progress)?;
             label_rows.push(row?);
@@ -12410,21 +12578,44 @@ impl Store {
         let graph_bytes = derived_graph_bytes(&graph_nodes, &graph_calls, &graph_regions, bytes)?;
         let stored_bytes = ancillary_bytes.saturating_add(graph_bytes);
         let mut class_rows = Vec::new();
-        for row in db.prepare_cached("SELECT id,name,qualified_name,path,payload FROM classes WHERE projection_id=?1 ORDER BY id")?
-            .query_map([&class_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?)))? {
+        for row in db
+            .prepare_cached(
+                "SELECT id,name,qualified_name,path,payload FROM classes WHERE cid=?1 ORDER BY id",
+            )?
+            .query_map([cid], |r| {
+                Ok((
+                    stored_id_row(r, 0, false)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                ))
+            })?
+        {
             optional_hint_check(progress)?;
             class_rows.push(row?);
         }
         let mut relation_rows = Vec::new();
-        for row in db.prepare_cached("SELECT id,owner,target,payload FROM class_relations WHERE projection_id=?1 ORDER BY id")?
-            .query_map([&class_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,String>(3)?)))? {
+        for row in db
+            .prepare_cached(
+                "SELECT id,owner,target,payload FROM class_relations WHERE cid=?1 ORDER BY id",
+            )?
+            .query_map([cid], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    stored_id_row(r, 1, false)?,
+                    optional_stored_id_row(r, 2, false)?,
+                    r.get::<_, String>(3)?,
+                ))
+            })?
+        {
             optional_hint_check(progress)?;
             relation_rows.push(row?);
         }
         optional_hint_check(progress)?;
         let stored_f: Option<String> = db
-            .prepare_cached("SELECT class_extraction_payload FROM graph_projections WHERE id=?1")?
-            .query_row([&graph_id], |r| r.get(0))?;
+            .prepare_cached("SELECT class_extraction_payload FROM graph_projections WHERE gid=?1")?
+            .query_row([gid], |r| r.get(0))?;
         Ok(FetchedDocument {
             language,
             version_id,
@@ -12740,8 +12931,8 @@ impl Store {
         let mut f_bytes = 0usize;
         let mut statement = db.prepare(
             "SELECT m.path,g.class_extraction_payload FROM revision_documents m
-             JOIN graph_projections g ON g.id=m.graph_projection_id
-               AND g.document_version_id=m.document_version_id
+             JOIN graph_projections g ON g.gid=m.gid
+               AND g.vid=m.vid
              WHERE m.revision_id=?1 AND m.language IN ('java','python') ORDER BY m.path",
         )?;
         for row in statement.query_map([&selected.key], |r| {
@@ -12773,8 +12964,8 @@ impl Store {
             "incompatible_index: selected class catalog metadata differs"
         );
         for path in paths {
-            let (language, class_id): (String, String) = db.query_row(
-                "SELECT language,class_projection_id FROM revision_documents
+            let (language, class_id): (String, i64) = db.query_row(
+                "SELECT language,cid FROM revision_documents
                  WHERE revision_id=?1 AND path=?2",
                 params![selected.key, path],
                 |r| Ok((r.get(0)?, r.get(1)?)),
@@ -12789,7 +12980,7 @@ impl Store {
                 .cloned()
                 .collect();
             let mut actual: Vec<crate::classes::ClassDefinition> = db
-                .prepare("SELECT payload FROM classes WHERE projection_id=?1 ORDER BY id")?
+                .prepare("SELECT payload FROM classes WHERE cid=?1 ORDER BY id")?
                 .query_map([&class_id], |r| r.get::<_, String>(0))?
                 .map(|payload| Ok(serde_json::from_str(&payload?)?))
                 .collect::<Result<_>>()?;
@@ -12806,7 +12997,7 @@ impl Store {
                 .cloned()
                 .collect();
             let mut actual_relations: Vec<crate::classes::ClassRelation> = db
-                .prepare("SELECT payload FROM class_relations WHERE projection_id=?1 ORDER BY id")?
+                .prepare("SELECT payload FROM class_relations WHERE cid=?1 ORDER BY id")?
                 .query_map([&class_id], |r| r.get::<_, String>(0))?
                 .map(|payload| Ok(serde_json::from_str(&payload?)?))
                 .collect::<Result<_>>()?;
@@ -12829,7 +13020,7 @@ impl Store {
         self.native_at(pin, |db, selected| {
             let mut paths=db.prepare(
                 "SELECT DISTINCT m.path FROM native_version_declarations d JOIN revision_documents m
-                 ON m.revision_id=?3 AND m.document_version_id=d.version_id
+                 ON m.revision_id=?3 AND m.vid=d.vid
                  WHERE m.language=?1 AND d.lookup_key=?2 ORDER BY m.path LIMIT 5001"
             )?.query_map(params![language,lookup_key,selected.key],|r|r.get::<_,String>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -12859,11 +13050,14 @@ impl Store {
         selected: &ReadRevision,
     ) -> Result<Vec<crate::native_evidence::Declaration>> {
         use crate::native_evidence::DocumentKey;
-        let mut stmt=db.prepare("SELECT DISTINCT m.source_set_id,m.language,m.path
-            FROM revision_documents m JOIN native_version_declarations d ON d.version_id=m.document_version_id
+        let mut stmt = db.prepare(
+            "SELECT DISTINCT r.source_set_id,m.language,m.path
+            FROM revision_documents m JOIN native_revisions r ON r.id=m.revision_id
+            JOIN native_version_declarations d ON d.vid=m.vid
             WHERE m.revision_id=?5 AND m.language=?1
               AND (?4 OR ((?2 IS NULL AND d.lookup_key IS NULL) OR d.lookup_key=?2))
-              AND (?3 IS NULL OR m.path=?3) ORDER BY m.path LIMIT 5001")?;
+              AND (?3 IS NULL OR m.path=?3) ORDER BY m.path LIMIT 5001",
+        )?;
         let keys: Vec<DocumentKey> = stmt
             .query_map(
                 params![
@@ -12973,8 +13167,8 @@ impl Store {
                 read_native_calls_v8(db, &scope, Some(owner))
             } else {
                 let dangling: bool = db.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM native_version_calls c JOIN revision_documents m ON m.document_version_id=c.version_id AND m.revision_id=?2 WHERE c.owner_syntax_id=?1)",
-                    params![owner, selected.key],
+                    "SELECT EXISTS(SELECT 1 FROM native_version_calls c JOIN revision_documents m ON m.vid=c.vid AND m.revision_id=?2 WHERE c.owner_syntax_id=?1)",
+                    params![id_codec::encode_sid(owner), selected.key],
                     |r| r.get(0),
                 )?;
                 ensure!(!dangling, "incompatible_index: native owner absent");
@@ -12993,8 +13187,8 @@ impl Store {
                 read_native_control_regions_v8(db,&scope,Some(owner))
             } else {
                 let dangling:bool=db.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM native_version_control_regions c JOIN revision_documents m ON m.document_version_id=c.version_id AND m.revision_id=?2 WHERE c.owner_syntax_id=?1)",
-                    params![owner, selected.key],|r|r.get(0),
+                    "SELECT EXISTS(SELECT 1 FROM native_version_control_regions c JOIN revision_documents m ON m.vid=c.vid AND m.revision_id=?2 WHERE c.owner_syntax_id=?1)",
+                    params![id_codec::encode_sid(owner), selected.key],|r|r.get(0),
                 )?;
                 ensure!(!dangling,"incompatible_index: native owner absent");
                 Ok(vec![])
@@ -13029,8 +13223,8 @@ impl Store {
                 // Locate the selected document by identity, not the untrusted
                 // materialized kind. Attest the document before using that kind.
                 tx.query_row(
-                    "SELECT m.path FROM graph_nodes n JOIN revision_documents m ON m.revision_id=?2 AND m.graph_projection_id=n.projection_id WHERE n.id=?1 LIMIT 1",
-                    params![s.class_id, selected.key],
+                    "SELECT m.path FROM graph_nodes n JOIN revision_documents m ON m.revision_id=?2 AND m.gid=n.gid WHERE n.id=?1 LIMIT 1",
+                    params![id_codec::encode_sid(&s.class_id), selected.key],
                     |row| row.get(0),
                 )
                 .optional()
@@ -13044,7 +13238,7 @@ impl Store {
             let sizes: Option<(i64, i64)> = tx
                 .query_row(
                     "SELECT length(d.source_bytes),length(d.source_bytes) FROM revision_documents m
-                 JOIN document_versions d ON d.id=m.document_version_id
+                 JOIN document_versions d ON d.vid=m.vid
                  WHERE m.revision_id=?2 AND m.path=?1",
                     params![path, selected.key],
                     |row| Ok((row.get(0)?, row.get(1)?)),
@@ -13139,8 +13333,8 @@ impl Store {
                 .replace('%', "\\%")
                 .replace('_', "\\_")
         );
-        let mut stmt = tx.prepare("SELECT c.id FROM classes c JOIN revision_documents m ON m.revision_id=?6 AND m.class_projection_id=c.projection_id WHERE (?1 IS NULL OR c.path=?1)
-            AND (c.name LIKE ?2 ESCAPE '\\' OR c.qualified_name LIKE ?2 ESCAPE '\\' OR c.id=?3)
+        let mut stmt = tx.prepare("SELECT c.id FROM classes c JOIN revision_documents m ON m.revision_id=?6 AND m.cid=c.cid WHERE (?1 IS NULL OR c.path=?1)
+            AND (c.name LIKE ?2 ESCAPE '\\' OR c.qualified_name LIKE ?2 ESCAPE '\\' OR ('sid:v1:'||lower(hex(c.id)))=?3)
             ORDER BY CASE WHEN lower(c.name)=lower(?3) THEN 0 ELSE 1 END,c.qualified_name,c.path,c.id LIMIT ?4 OFFSET ?5")?;
         let ids = stmt
             .query_map(
@@ -13152,7 +13346,7 @@ impl Store {
                     offset as i64,
                     selected_revision.key
                 ],
-                |r| r.get::<_, String>(0),
+                |r| stored_id_row(r, 0, false),
             )?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|error| self.report_selected_failure(error.into()))?;
@@ -13285,7 +13479,14 @@ impl Store {
     ) -> Result<(IndexPin, Vec<Symbol>)> {
         let selected = self.read_revision_for(tx, None, pre_startup)?;
         let revision = selected.pin;
-        let rows = symbol_trigrams::graph_hits(tx, query, limit.min(150) as i64)?;
+        let rows =
+            symbol_trigrams::graph_hits(tx, query, limit.min(150) as i64).map_err(|error| {
+                if error.downcast_ref::<SelectedIntegrity>().is_some() {
+                    self.report_selected_failure(error)
+                } else {
+                    error
+                }
+            })?;
         let mut documents = BTreeMap::new();
         for (path, _) in &rows {
             if !documents.contains_key(path) {
@@ -13332,7 +13533,7 @@ impl Store {
         let selected = self.read_revision_for(tx, expected_revision, pre_startup)?;
         let revision = selected.pin;
         let selected_path: Option<String> = tx
-                .query_row("SELECT m.path FROM graph_nodes n JOIN revision_documents m ON m.revision_id=?2 AND m.graph_projection_id=n.projection_id WHERE n.id=?1", params![id, selected.key], |r| r.get(0))
+                .query_row("SELECT m.path FROM graph_nodes n JOIN revision_documents m ON m.revision_id=?2 AND m.gid=n.gid WHERE n.id=?1", params![id_codec::encode_sid(id), selected.key], |r| r.get(0))
                 .optional()?;
         let node = if let Some(path) = selected_path {
             self.selected_graph_document_for(tx, &path, &selected)?
@@ -13368,7 +13569,7 @@ impl Store {
         let db = self.cache_write()?;
         let changed = storage_result(db.execute(
             "UPDATE document_versions SET source_bytes=?1,byte_length=?2,content_hash=?3
-             WHERE id=(SELECT document_version_id FROM revision_documents
+             WHERE vid=(SELECT vid FROM revision_documents
                  WHERE revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision
                      FROM index_metadata WHERE singleton=1) AND path=?4)",
             params![
@@ -13391,8 +13592,10 @@ impl Store {
         selected: &ReadRevision,
     ) -> Result<Option<(String, Vec<u8>)>> {
         let mut statement = db.prepare(
-            "SELECT document_version_id,source_set_id,language FROM revision_documents
-             WHERE revision_id=?1 AND path=?2 LIMIT 2",
+            "SELECT v.id,r.source_set_id,m.language FROM revision_documents m
+             JOIN native_revisions r ON r.id=m.revision_id
+             JOIN document_versions v ON v.vid=m.vid
+             WHERE m.revision_id=?1 AND m.path=?2 LIMIT 2",
         )?;
         let mut rows = statement.query(params![selected.key, path])?;
         let manifest = rows
@@ -13414,9 +13617,10 @@ impl Store {
         };
         let row: Option<(String, String, String, String, i64, Vec<u8>)> = db
             .query_row(
-                "SELECT source_set_id,language,path,content_hash,byte_length,source_bytes
-                 FROM document_versions WHERE id=?1",
-                [&version],
+                "SELECT r.source_set_id,v.language,v.path,v.content_hash,v.byte_length,v.source_bytes
+                 FROM document_versions v JOIN native_revisions r ON r.id=?2
+                 WHERE v.id=?1",
+                params![version, selected.key],
                 |row| {
                     Ok((
                         row.get(0)?,
@@ -13485,12 +13689,12 @@ impl Store {
         #[cfg(test)]
         count_selected_read(|counts| counts.source_reads += 1);
         optional_hint_check(progress)?;
-        let selected_sql = "FROM revision_documents m JOIN document_versions d
-            ON d.id=m.document_version_id AND d.source_set_id=m.source_set_id
+        let selected_sql = "FROM revision_documents m JOIN native_revisions r ON r.id=m.revision_id
+            JOIN document_versions d ON d.vid=m.vid
               AND d.language=m.language AND d.path=m.path
             WHERE m.revision_id=?2 AND m.path=?1";
         let sql = format!(
-            "SELECT length(d.source_bytes),length(CAST(d.source_set_id AS BLOB)),length(CAST(d.language AS BLOB)),length(CAST(d.path AS BLOB)),length(CAST(d.content_hash AS BLOB)) {selected_sql} LIMIT 2"
+            "SELECT length(d.source_bytes),length(CAST(r.source_set_id AS BLOB)),length(CAST(d.language AS BLOB)),length(CAST(d.path AS BLOB)),length(CAST(d.content_hash AS BLOB)) {selected_sql} LIMIT 2"
         );
         let mut stmt = db.prepare(&sql)?;
         let mut sizes = stmt.query(params![path, selected.key])?;
@@ -13514,7 +13718,7 @@ impl Store {
             return Ok(None);
         }
         let sql = format!(
-            "SELECT d.source_set_id,d.language,d.path,d.content_hash,d.byte_length,d.source_bytes {selected_sql}"
+            "SELECT r.source_set_id,d.language,d.path,d.content_hash,d.byte_length,d.source_bytes {selected_sql}"
         );
         let checked: Result<(String, String, String, String, Vec<u8>)> =
             db.query_row(&sql, params![path, selected.key], |r| {
@@ -13596,7 +13800,7 @@ impl Store {
             let revision = self.read_status(tx)?.revision;
             let workspace = Path::new(&self.workspace_root);
             let mut count_stmt = tx.prepare(
-                "SELECT (SELECT count(*) FROM graph_nodes n WHERE n.projection_id=m.graph_projection_id AND n.kind IN ('function','method')) FROM revision_documents m JOIN index_metadata active_manifest ON active_manifest.singleton=1 AND m.revision_id='pin:v1:'||active_manifest.index_generation||':'||active_manifest.index_revision WHERE m.path=?1",
+                "SELECT (SELECT count(*) FROM graph_nodes n WHERE n.gid=m.gid AND n.kind IN ('function','method')) FROM revision_documents m JOIN index_metadata active_manifest ON active_manifest.singleton=1 AND m.revision_id='pin:v1:'||active_manifest.index_generation||':'||active_manifest.index_revision WHERE m.path=?1",
             )?;
             let mut overlays = Vec::new();
             for (index, item) in items.iter().enumerate().filter(|(_, entry)| entry.kind == "file") {
@@ -13628,7 +13832,7 @@ impl Store {
         let revision = self.read_status_for(tx, pre_startup)?.revision;
         let workspace = Path::new(&self.workspace_root);
         let mut count_stmt = tx.prepare(
-                "SELECT (SELECT count(*) FROM graph_nodes n WHERE n.projection_id=m.graph_projection_id AND n.kind IN ('function','method')) FROM revision_documents m JOIN index_metadata active_manifest ON active_manifest.singleton=1 AND m.revision_id='pin:v1:'||active_manifest.index_generation||':'||active_manifest.index_revision WHERE m.path=?1",
+                "SELECT (SELECT count(*) FROM graph_nodes n WHERE n.gid=m.gid AND n.kind IN ('function','method')) FROM revision_documents m JOIN index_metadata active_manifest ON active_manifest.singleton=1 AND m.revision_id='pin:v1:'||active_manifest.index_generation||':'||active_manifest.index_revision WHERE m.path=?1",
             )?;
         let mut overlays = Vec::new();
         for (index, item) in items
@@ -13683,11 +13887,11 @@ impl Store {
         let selected = self.read_revision_for(tx, expected, pre_startup)?;
         let revision = selected.pin;
         let mut stmt = tx.prepare(
-            "SELECT m.path,d.language,m.graph_projection_id FROM revision_documents m
-                 JOIN document_versions d ON d.id=m.document_version_id
+            "SELECT m.path,d.language,m.gid FROM revision_documents m
+                 JOIN document_versions d ON d.vid=m.vid
                  WHERE m.revision_id=?3 ORDER BY m.path LIMIT ?1 OFFSET ?2",
         )?;
-        let source_rows: Vec<(String, String, String)> = stmt
+        let source_rows: Vec<(String, String, i64)> = stmt
             .query_map(
                 params![(limit + 1) as i64, offset as i64, selected.key],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
@@ -13700,7 +13904,7 @@ impl Store {
         for (path, language, projection_id) in source_rows.into_iter().take(limit) {
             self.attest_selected_document_for(tx, &path, &selected)?;
             let methods: i64 = tx.query_row(
-                "SELECT count(*) FROM graph_nodes WHERE projection_id=?1
+                "SELECT count(*) FROM graph_nodes WHERE gid=?1
                     AND kind IN ('function','method')",
                 [&projection_id],
                 |r| r.get(0),
@@ -13726,9 +13930,9 @@ impl Store {
     ) -> Result<Option<serde_json::Value>> {
         let selected = self.read_revision_for(tx, expected, pre_startup)?;
         let revision = selected.pin;
-        let projection_id: Option<String> = tx
+        let projection_id: Option<i64> = tx
             .query_row(
-                "SELECT m.graph_projection_id FROM revision_documents m
+                "SELECT m.gid FROM revision_documents m
                      WHERE m.revision_id=?2 AND m.path=?1",
                 params![path, selected.key],
                 |r| r.get(0),
@@ -13774,8 +13978,8 @@ impl Store {
         let path: Option<String> = tx
             .query_row(
                 "SELECT m.path FROM graph_nodes n JOIN revision_documents m
-             ON m.revision_id=?2 AND m.graph_projection_id=n.projection_id WHERE n.id=?1",
-                params![seed, selected_revision.key],
+             ON m.revision_id=?2 AND m.gid=n.gid WHERE n.id=?1",
+                params![id_codec::encode_sid(seed), selected_revision.key],
                 |r| r.get(0),
             )
             .optional()?;
@@ -13900,7 +14104,7 @@ impl Store {
         let tx = storage_result(db.transaction_with_behavior(TransactionBehavior::Immediate))?;
         let selected = self.read_revision_for(&tx, Some(pin), true)?;
         let changed = storage_result(tx.execute(
-            "UPDATE document_versions SET source_bytes=zeroblob(length(source_bytes))              WHERE id=(SELECT m.document_version_id FROM revision_documents m              WHERE m.revision_id=?1 AND m.path=?2) AND length(source_bytes)>0",
+            "UPDATE document_versions SET source_bytes=zeroblob(length(source_bytes))              WHERE vid=(SELECT m.vid FROM revision_documents m              WHERE m.revision_id=?1 AND m.path=?2) AND length(source_bytes)>0",
             params![selected.key, path],
         ))?;
         ensure!(changed == 1, "test fixture: selected source row missing");
@@ -14006,7 +14210,7 @@ impl Store {
         let selected = self.read_revision_for(tx, expected_pin.copied(), pre_startup)?;
         let revision = selected.pin;
         let selected_path: Option<String> = tx
-            .query_row("SELECT m.path FROM graph_nodes n JOIN revision_documents m ON m.revision_id=?2 AND m.graph_projection_id=n.projection_id WHERE n.id=?1", params![query.seed, selected.key], |r| {
+            .query_row("SELECT m.path FROM graph_nodes n JOIN revision_documents m ON m.revision_id=?2 AND m.gid=n.gid WHERE n.id=?1", params![id_codec::encode_sid(&query.seed), selected.key], |r| {
                 r.get(0)
             })
             .optional()?;
@@ -14091,9 +14295,9 @@ impl Store {
         let selected: Option<(String, String)> = db
             .query_row(
                 "SELECT m.language,m.path FROM native_version_declarations d
-                 JOIN revision_documents m ON m.revision_id=?2 AND m.document_version_id=d.version_id
+                 JOIN revision_documents m ON m.revision_id=?2 AND m.vid=d.vid
                  WHERE d.syntax_id=?1",
-                params![target, revision.key],
+                params![id_codec::encode_sid(target), revision.key],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
@@ -14115,7 +14319,7 @@ impl Store {
             .query_row(
                 "SELECT r.native_revision_id FROM revision_documents m
              JOIN native_revisions r ON r.id=m.revision_id
-             WHERE m.revision_id=?4 AND m.source_set_id=?1 AND m.language=?2 AND m.path=?3",
+             WHERE m.revision_id=?4 AND r.source_set_id=?1 AND m.language=?2 AND m.path=?3",
                 params![
                     anchor.document.source_set_id,
                     anchor.document.language,
@@ -14188,8 +14392,8 @@ impl Store {
         let mut orphaned_ids = vec![];
         for id in ids {
             let exists: bool = db.query_row(
-                "SELECT EXISTS(SELECT 1 FROM graph_nodes n JOIN revision_documents m ON m.revision_id=?2 AND m.graph_projection_id=n.projection_id WHERE n.id=?1)",
-                params![id, selected.key],
+                "SELECT EXISTS(SELECT 1 FROM graph_nodes n JOIN revision_documents m ON m.revision_id=?2 AND m.gid=n.gid WHERE n.id=?1)",
+                params![id_codec::encode_sid(id), selected.key],
                 |r| r.get(0),
             )?;
             if !exists {
@@ -14416,6 +14620,128 @@ impl Store {
     pub fn delete_annotation(&self, id: &str) -> Result<bool> {
         self.records().delete_annotation(id)
     }
+}
+
+// The SQL runs against encoded BLOB keys. Its budget must still match the old
+// TEXT-key representation, including virtual class and call key components.
+#[cfg(test)]
+#[test]
+fn selected_ancillary_budget_matches_main_text_key_bytes() {
+    let db = Connection::open_in_memory().unwrap();
+    db.execute_batch(CACHE_SCHEMA_V14).unwrap();
+    // The aggregate needs only synthetic child rows; FK behavior is covered by
+    // publication/retention tests, not this isolated budget-SQL fixture.
+    db.pragma_update(None, "foreign_keys", "OFF").unwrap();
+    let version = "version:é";
+    let source_set = "source-set:v1:root-é";
+    let graph_hash = "a".repeat(64);
+    let class_hash = "b".repeat(64);
+    let owner = [0x11; 16];
+    let target = [0x22; 16];
+    let call = [0x33; 16];
+    let region = [0x44; 16];
+    db.execute(
+        "INSERT INTO native_version_coverage_roles(vid,role_kind,role,ordinal)
+         VALUES(1,'supported','definition',0)",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO native_version_declarations(vid,syntax_id,kind,role,name,lookup_key,key_signature_present,
+         key_type_parameter_count,key_variadic,key_ordinal,start_byte,end_byte,
+         name_start,name_end)
+         VALUES(1,?1,'function','production','héllo','hello',1,0,0,0,0,9,0,5)",
+        [&owner[..]],
+    ).unwrap();
+    db.execute(
+        "INSERT INTO native_version_calls(vid,id,owner_syntax_id,ordinal,start_byte,end_byte,language,callee_lookup_key)
+         VALUES(1,?1,?2,0,0,7,'javascript','hello')",
+        params![&call[..], &owner[..]],
+    ).unwrap();
+    db.execute(
+        "INSERT INTO native_version_control_regions(vid,id,owner_syntax_id,ordinal,kind,start_byte,end_byte,arm)
+         VALUES(1,?1,?2,0,'if',0,7,'then')",
+        params![&region[..], &owner[..]],
+    ).unwrap();
+    db.execute(
+        "INSERT INTO native_version_call_regions(vid,call_id,region_id,ordinal) VALUES(1,?1,?2,0)",
+        params![&call[..], &region[..]],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO graph_projections(gid,vid,language,graph_hash,state,class_extraction_state,
+         class_extraction_payload)
+         VALUES(2,1,'java',?1,'ready','ready','{}')",
+        [&graph_hash],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO class_projections(cid,gid,content_hash,state) VALUES(3,2,?1,'ready')",
+        [&class_hash],
+    )
+    .unwrap();
+    for (id, name) in [(&owner[..], "Widget"), (&target[..], "Other")] {
+        db.execute(
+            "INSERT INTO classes(cid,gid,id,name,qualified_name,path,payload)
+             VALUES(3,2,?1,?2,'app.Widget','widget.py','{}')",
+            params![id, name],
+        )
+        .unwrap();
+    }
+    db.execute(
+        "INSERT INTO class_relations(cid,id,owner,target,payload) VALUES(3,'rel-1',?1,?2,'{}')",
+        params![&owner[..], &target[..]],
+    )
+    .unwrap();
+
+    // Compute the former text-key cost from decoded handles and fixture values,
+    // not from the budget SQL or SQLite BLOB lengths. Integer fields are charged
+    // as decimal text, as they were on main.
+    let sid = id_codec::decode_sid(&owner).unwrap();
+    let target_sid = id_codec::decode_sid(&target).unwrap();
+    let call_id = id_codec::decode_occ(&call).unwrap();
+    let region_id = id_codec::decode_occ(&region).unwrap();
+    let bytes = |fields: &[&str]| fields.iter().map(|field| field.len()).sum::<usize>();
+    let decimal = |fields: &[i64]| {
+        fields
+            .iter()
+            .map(|field| field.to_string().len())
+            .sum::<usize>()
+    };
+    let class_projection_id = class_hash.len() + 20;
+    let graph_projection_id = graph_hash.len() + 9;
+    let rows = [
+        version.len() + bytes(&["supported", "definition"]) + decimal(&[0]),
+        version.len()
+            + sid.len()
+            + bytes(&["function", "héllo", "hello"])
+            + decimal(&[1, 0, 0, 0, 0, 9, 0, 5]),
+        version.len()
+            + call_id.len()
+            + sid.len()
+            + decimal(&[0, 0, 7])
+            + source_set.len()
+            + bytes(&["javascript", "hello"]),
+        version.len() + region_id.len() + sid.len() + decimal(&[0, 0, 7]) + bytes(&["if", "then"]),
+        version.len() + call_id.len() + region_id.len() + decimal(&[0]),
+        class_projection_id
+            + graph_projection_id
+            + sid.len()
+            + bytes(&["Widget", "app.Widget", "widget.py", "{}"]),
+        class_projection_id
+            + graph_projection_id
+            + target_sid.len()
+            + bytes(&["Other", "app.Widget", "widget.py", "{}"]),
+        class_projection_id + bytes(&["rel-1", "{}"]) + sid.len() + target_sid.len(),
+    ];
+    let actual = Store::selected_ancillary_byte_usage(&db, 1, 3, version, source_set).unwrap();
+    assert_eq!(
+        actual,
+        (
+            *rows.iter().max().unwrap() as i64,
+            rows.iter().sum::<usize>() as i64,
+        )
+    );
 }
 
 #[cfg(test)]

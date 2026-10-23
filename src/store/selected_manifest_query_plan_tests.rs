@@ -3,7 +3,7 @@ use super::*;
 #[test]
 fn selected_capture_and_reconcile_use_the_revision_index() {
     let db = Connection::open_in_memory().unwrap();
-    db.execute_batch(CACHE_SCHEMA_V13).unwrap();
+    db.execute_batch(CACHE_SCHEMA_V14).unwrap();
     for (label, sql) in [
         ("capture", SELECTED_CAPTURE_SNAPSHOT_SQL),
         ("reconcile", SELECTED_RECONCILE_FILES_SQL),
@@ -35,7 +35,7 @@ fn selected_capture_and_reconcile_use_the_revision_index() {
 #[test]
 fn incomplete_current_schema_is_rejected() {
     let db = Connection::open_in_memory().unwrap();
-    db.execute_batch(CACHE_SCHEMA_V13).unwrap();
+    db.execute_batch(CACHE_SCHEMA_V14).unwrap();
     db.pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)
         .unwrap();
     validate_cache_shape(&db).unwrap();
@@ -53,14 +53,14 @@ fn incomplete_current_schema_is_rejected() {
 #[test]
 fn per_file_manifest_lookup_uses_the_path_index() {
     let db = Connection::open_in_memory().unwrap();
-    db.execute_batch(CACHE_SCHEMA_V13).unwrap();
+    db.execute_batch(CACHE_SCHEMA_V14).unwrap();
     db.pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)
         .unwrap();
     validate_cache_shape(&db).unwrap();
     for sql in [
         "SELECT EXISTS(SELECT 1 FROM revision_documents WHERE revision_id=?2 AND path=?1)",
         "SELECT d.source_bytes FROM revision_documents m JOIN document_versions d
-         ON d.id=m.document_version_id WHERE m.revision_id=?2 AND m.path=?1",
+         ON d.vid=m.vid WHERE m.revision_id=?2 AND m.path=?1",
     ] {
         let plan: Vec<String> = db
             .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
@@ -81,7 +81,7 @@ fn per_file_manifest_lookup_uses_the_path_index() {
 #[test]
 fn header_and_changing_manifest_plan_avoid_wide_revision_scans() {
     let db = Connection::open_in_memory().unwrap();
-    db.execute_batch(CACHE_SCHEMA_V13).unwrap();
+    db.execute_batch(CACHE_SCHEMA_V14).unwrap();
     db.pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)
         .unwrap();
     validate_cache_shape(&db).unwrap();

@@ -13,7 +13,7 @@ fn corrupt_stored_source(store: &Store, pin: IndexPin, path: &str) {
     let changed = tx
         .execute(
             "UPDATE document_versions SET source_bytes=zeroblob(length(source_bytes))
-                 WHERE id=(SELECT m.document_version_id FROM revision_documents m
+                 WHERE vid=(SELECT m.vid FROM revision_documents m
                  WHERE m.revision_id=?1 AND m.path=?2)",
             params![selected.key, path],
         )
@@ -533,9 +533,9 @@ fn canonical_cohort_produced_native_fact_floors() {
         let revision = format!("pin:v1:{}:{}", pin.index_generation, pin.index_revision);
         let mut counts = BTreeMap::new();
         for row in db.prepare("SELECT m.language,SUM(
-                (SELECT count(*) FROM native_version_declarations d WHERE d.version_id=m.document_version_id)+
-                (SELECT count(*) FROM native_version_calls c WHERE c.version_id=m.document_version_id)+
-                (SELECT count(*) FROM native_version_control_regions r WHERE r.version_id=m.document_version_id))
+                (SELECT count(*) FROM native_version_declarations d WHERE d.vid=m.vid)+
+                (SELECT count(*) FROM native_version_calls c WHERE c.vid=m.vid)+
+                (SELECT count(*) FROM native_version_control_regions r WHERE r.vid=m.vid))
                 FROM revision_documents m WHERE m.revision_id=?1 GROUP BY m.language ORDER BY m.language")
                 .unwrap().query_map([&revision],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?)))
                 .unwrap() {
@@ -1385,13 +1385,13 @@ fn cancellation_at_before_commit_rolls_back_entire_native_class_graph_pair() {
                     );
                     let staged_pin = format!("pin:v1:{}:{}", pin.index_generation, pin.index_revision + 1);
                     let added: i64 = tx.query_row(
-                        "SELECT count(*) FROM classes c JOIN revision_documents m ON m.class_projection_id=c.projection_id WHERE m.revision_id=?1 AND c.path='Types.java' AND c.name='Added'",
+                        "SELECT count(*) FROM classes c JOIN revision_documents m ON m.cid=c.cid WHERE m.revision_id=?1 AND c.path='Types.java' AND c.name='Added'",
                         [&staged_pin],
                         |row| row.get(0),
                     )?;
                     ensure!(added == 1, "new class projection not staged");
                     let raw: Vec<u8> = tx.query_row(
-                        "SELECT v.source_bytes FROM document_versions v JOIN revision_documents m ON m.document_version_id=v.id WHERE m.revision_id=?1 AND m.path='Types.java' AND v.path='Types.java'",
+                        "SELECT v.source_bytes FROM document_versions v JOIN revision_documents m ON m.vid=v.vid WHERE m.revision_id=?1 AND m.path='Types.java' AND v.path='Types.java'",
                         [&staged_pin],
                         |row| row.get(0),
                     )?;
@@ -1641,15 +1641,15 @@ fn large_real_native_pair_cancels_at_before_commit_without_partial_rows() {
                         "new revision not staged in publisher transaction");
                     let staged_pin = format!("pin:v1:{}:{}", pin.index_generation, pin.index_revision + 1);
                     let graph_functions:i64=tx.query_row(
-                        "SELECT count(*) FROM graph_nodes n JOIN revision_documents m ON m.graph_projection_id=n.projection_id WHERE m.revision_id=?1 AND m.path='a.js' AND n.kind='function'",[&staged_pin],|r|r.get(0))?;
+                        "SELECT count(*) FROM graph_nodes n JOIN revision_documents m ON m.gid=n.gid WHERE m.revision_id=?1 AND m.path='a.js' AND n.kind='function'",[&staged_pin],|r|r.get(0))?;
                     let native_functions:i64=tx.query_row(
-                        "SELECT count(*) FROM native_version_declarations d JOIN document_versions v ON v.id=d.version_id JOIN revision_documents m ON m.document_version_id=v.id WHERE m.revision_id=?1 AND m.path='a.js' AND v.path='a.js' AND d.kind='function'",[&staged_pin],|r|r.get(0))?;
+                        "SELECT count(*) FROM native_version_declarations d JOIN document_versions v ON v.vid=d.vid JOIN revision_documents m ON m.vid=v.vid WHERE m.revision_id=?1 AND m.path='a.js' AND v.path='a.js' AND d.kind='function'",[&staged_pin],|r|r.get(0))?;
                     let native_calls:i64=tx.query_row(
-                        "SELECT count(*) FROM native_version_calls c JOIN document_versions v ON v.id=c.version_id JOIN revision_documents m ON m.document_version_id=v.id WHERE m.revision_id=?1 AND m.path='a.js' AND v.path='a.js'",[&staged_pin],|r|r.get(0))?;
+                        "SELECT count(*) FROM native_version_calls c JOIN document_versions v ON v.vid=c.vid JOIN revision_documents m ON m.vid=v.vid WHERE m.revision_id=?1 AND m.path='a.js' AND v.path='a.js'",[&staged_pin],|r|r.get(0))?;
                     ensure!((graph_functions,native_functions,native_calls)==(5_000,5_000,5_000),
                         "5,000 measured graph/native function and call rows not staged for active pin: graph={graph_functions} native={native_functions}/{native_calls}");
                     let source_bytes:Vec<u8>=tx.query_row(
-                        "SELECT v.source_bytes FROM document_versions v JOIN revision_documents m ON m.document_version_id=v.id WHERE m.revision_id=?1 AND m.path='a.js' AND v.path='a.js'",[&staged_pin],|r|r.get(0))?;
+                        "SELECT v.source_bytes FROM document_versions v JOIN revision_documents m ON m.vid=v.vid WHERE m.revision_id=?1 AND m.path='a.js' AND v.path='a.js'",[&staged_pin],|r|r.get(0))?;
                     ensure!(source_bytes==large_source.as_bytes(),
                         "new captured native source bytes not staged");
                     validate_paired_metadata(tx,worker_store.root_id(),PairedManifestScope::Full)?;
@@ -1913,11 +1913,17 @@ fn real_source_above_injected_ancillary_cap_keeps_selected_source_available() {
         )
         .unwrap();
     let db = Connection::open(store.roots.index_db(&store.identity)).unwrap();
-    let (version_id,class_id):(String,String)=db.query_row(
-            "SELECT document_version_id,class_projection_id FROM revision_documents WHERE path='flow.js'",[],
-            |r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+    let (vid, cid, version_id, source_set_id): (i64, i64, String, String) = db
+        .query_row(
+            "SELECT m.vid,m.cid,v.id,s.id FROM revision_documents m
+             JOIN document_versions v ON v.vid=m.vid
+             CROSS JOIN native_source_sets s WHERE m.path='flow.js'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
     let (max_ancillary, total_ancillary) =
-        Store::selected_ancillary_byte_usage(&db, &version_id, &class_id).unwrap();
+        Store::selected_ancillary_byte_usage(&db, vid, cid, &version_id, &source_set_id).unwrap();
     let source_json_bytes: i64 = db
         .query_row(
             "SELECT length(source_bytes) FROM document_versions WHERE path='flow.js'",

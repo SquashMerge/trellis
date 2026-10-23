@@ -446,7 +446,7 @@ async fn mock_run(change_snapshot: bool, scenario: &'static str) {
         let db = rusqlite::Connection::open(db_path).unwrap();
         let mut bytes: Vec<u8> = db
                 .query_row(
-                    "SELECT v.source_bytes FROM document_versions v JOIN revision_documents m ON m.document_version_id=v.id JOIN native_revisions r ON r.id=m.revision_id JOIN index_metadata current ON current.index_revision=r.published_index_revision WHERE m.path='a.js'",
+                    "SELECT v.source_bytes FROM document_versions v JOIN revision_documents m ON m.vid=v.vid JOIN native_revisions r ON r.id=m.revision_id JOIN index_metadata current ON current.index_revision=r.published_index_revision WHERE m.path='a.js'",
                     [],
                     |row| row.get(0),
                 )
@@ -454,7 +454,7 @@ async fn mock_run(change_snapshot: bool, scenario: &'static str) {
         bytes[0] ^= 1;
         assert_eq!(
                 db.execute(
-                    "UPDATE document_versions SET source_bytes=?1 WHERE id=(SELECT m.document_version_id FROM revision_documents m JOIN native_revisions r ON r.id=m.revision_id JOIN index_metadata current ON current.index_revision=r.published_index_revision WHERE m.path='a.js')",
+                    "UPDATE document_versions SET source_bytes=?1 WHERE vid=(SELECT m.vid FROM revision_documents m JOIN native_revisions r ON r.id=m.revision_id JOIN index_metadata current ON current.index_revision=r.published_index_revision WHERE m.path='a.js')",
                     [bytes],
                 )
                 .unwrap(),

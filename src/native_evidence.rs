@@ -3064,7 +3064,9 @@ impl Artifact {
             }
         }
         for c in &self.calls {
+            let mut seen_regions = BTreeSet::new();
             for id in &c.region_ids {
+                ensure!(seen_regions.insert(id), "duplicate native call region");
                 let r = regions.get(id).context("native call dangling region")?;
                 ensure!(
                     r.owner_syntax_id == c.owner_syntax_id
@@ -3273,6 +3275,28 @@ mod occurrence_identity_tests {
     }
 
     #[test]
+    fn duplicate_call_region_is_rejected_during_native_validation() {
+        let source = file("function f() { if (x) { h(); } }");
+        let revision = format!("revision:v2:{}", hash(b"r1"));
+        let mut artifact = selected(&source, &revision, NATIVE_VERSION).unwrap();
+        assert_eq!(artifact.calls.len(), 1);
+        assert_eq!(artifact.calls[0].region_ids.len(), 1);
+        artifact
+            .validate_structure(std::slice::from_ref(&source))
+            .unwrap();
+
+        let region_id = artifact.calls[0].region_ids[0].clone();
+        artifact.calls[0].region_ids.push(region_id);
+        let error = artifact
+            .validate_structure(std::slice::from_ref(&source))
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("duplicate native call region"),
+            "unexpected validation error: {error:#}"
+        );
+    }
+
+    #[test]
     fn document_version_keeps_occurrence_ids_across_revisions() {
         let source = file("function f() { g(); if (x) { h(); } }");
         let r1 = selected(&source, "revision:v2:r1", NATIVE_VERSION).unwrap();
@@ -3467,8 +3491,8 @@ mod cached_executable_digest_tests {
         let old_occurrences: i64 = Connection::open(&db_path)
             .unwrap()
             .query_row(
-                "SELECT (SELECT count(*) FROM native_version_calls WHERE id LIKE 'occ:v2:%') +
-                    (SELECT count(*) FROM native_version_control_regions WHERE id LIKE 'occ:v2:%')",
+                "SELECT (SELECT count(*) FROM native_version_calls WHERE length(id)=16) +
+                    (SELECT count(*) FROM native_version_control_regions WHERE length(id)=16)",
                 [],
                 |row| row.get(0),
             )
@@ -3533,11 +3557,14 @@ mod cached_executable_digest_tests {
                 })
                 .unwrap();
             assert_eq!(published, 1, "new revision escaped component refusal");
-            let occurrence_count: i64 = db.query_row(
-                "SELECT (SELECT count(*) FROM native_version_calls WHERE id LIKE 'occ:v2:%') +
-                        (SELECT count(*) FROM native_version_control_regions WHERE id LIKE 'occ:v2:%')",
-                [], |row| row.get(0),
-            ).unwrap();
+            let occurrence_count: i64 = db
+                .query_row(
+                    "SELECT (SELECT count(*) FROM native_version_calls WHERE length(id)=16) +
+                        (SELECT count(*) FROM native_version_control_regions WHERE length(id)=16)",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
             assert_eq!(
                 occurrence_count, old_occurrences,
                 "new occ:v2 record escaped component refusal"
