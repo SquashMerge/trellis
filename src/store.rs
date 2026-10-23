@@ -1726,7 +1726,6 @@ impl EvidenceResponse {
     pub fn symbols_at(&self, query: &str, limit: usize) -> Result<(IndexPin, Vec<Symbol>)> {
         self.store.symbols_in(&self.db, query, limit, true)
     }
-    #[cfg(any(test, feature = "test-support"))]
     pub fn graph(&self) -> Result<Graph> {
         let selected = self.store.read_revision_for(&self.db, None, true)?;
         self.store.read_graph_for(&self.db, &selected)
@@ -13797,7 +13796,6 @@ impl Store {
         crate::behavior::build_sequence(revision, symbol, &file, &calls, show_all).map(Some)
     }
 
-    #[cfg(any(test, feature = "test-support"))]
     fn read_graph_for(&self, db: &Connection, selected: &ReadRevision) -> Result<Graph> {
         let (stats_type, stats_len, diagnostics_type, diagnostics_len): (String, i64, String, i64) =
             db.query_row(
@@ -13857,11 +13855,9 @@ impl Store {
             diagnostics,
         })
     }
-    #[cfg(any(test, feature = "test-support"))]
     pub fn graph(&self) -> Result<Graph> {
         self.graph_at(None)
     }
-    #[cfg(any(test, feature = "test-support"))]
     pub fn graph_at(&self, expected: Option<IndexPin>) -> Result<Graph> {
         self.with_evidence(|tx| {
             let selected = self.read_revision(tx, expected)?;
