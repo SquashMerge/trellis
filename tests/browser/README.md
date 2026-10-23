@@ -7,7 +7,7 @@ This test drives the real Trellis web shell in Playwright Chromium. It starts th
 From the repository root, run `./tools/verify`. Its sequential setup step installs the
 locked `runtime/acp` and `tests/browser` Node packages when missing or stale, then checks
 and repairs the pinned Playwright Chromium bundles. Setup completes before the parallel verification
-lanes start. The package lock pins `playwright` to exactly `1.55.1`; setup never uses `npx`,
+lanes start. The package lock pins `playwright` to exactly `1.64.1`; setup never uses `npx`,
 a system browser, or `--with-deps`. A first run needs npm registry and browser-download access.
 
 By default, setup uses an owner-private, stable **per-checkout** cache under the OS temp
@@ -18,9 +18,11 @@ it has the same safe ownership and permissions. Invalid, symlinked, or in-checko
 paths fail verification; neither missing packages nor a missing browser are skipped.
 Run only one verifier per checkout at a time because `npm ci` replaces ignored dependencies.
 
-Linux still needs Chromium's host libraries. CI installs them with `install --with-deps
-chromium` before `./tools/verify`; local setup does not request privileged OS changes.
-The macOS CI job installs Chromium without `--with-deps`.
+Linux still needs Chromium's host libraries. CI sets `TRELLIS_BROWSER_SYSTEM_DEPS=1`
+so `./tools/verify` runs `install-deps chromium` alongside the build and waits for it
+before browser tests. Local setup does not request privileged OS changes.
+Playwright 1.64.1 supports Ubuntu 26.04, so CI uses `ubuntu-latest` again.
+The macOS CI job only installs the managed Chromium bundles.
 
 ## Run the browser test alone
 

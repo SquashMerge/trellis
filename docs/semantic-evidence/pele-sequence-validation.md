@@ -18,6 +18,14 @@
   three-call group, and an explicitly unresolved call. The browser asserts
   those structures and **Pele rendered** without fallback.
 
+## Render bounds
+
+Pele renders synchronously on the browser thread; there is no interruptible
+wall-clock timeout. Projection admits at most 200 source notes, 512 KiB of
+Mermaid source and 12,000 inspected sequence members, with visible depth capped
+at 24. SVG validation rejects output above 8 MiB or 12,000 nodes before DOM
+installation. These are size bounds, not a render-time guarantee.
+
 ## Browser results
 
 Warm comparison: 20 alternating old/Pele renders, each from the **same
@@ -36,9 +44,9 @@ selection and visible workspace; excludes daemon launch/indexing and browser
 process launch. ² From first click on the measured method in the already
 opened file to visible Pele-rendered sequence; includes the Store/API read.
 These are observed samples, not latency budgets or claims about other machines.
-Raw records: `/tmp/trellis-232-cost-{80,180}.json`; passing browser output:
-`/tmp/trellis-232-verify-final.log` (`./tools/verify` exit 0). The
-verification lanes run concurrently; earlier focused measurements had lower
+The original temporary raw records and verification log are no longer
+retained; this table is a historical summary, not reproducible raw evidence.
+The verification lanes run concurrently; earlier focused measurements had lower
 latencies. Cache and host effects can change these
 measurements; the test checks functionality and records, not a speed threshold.
 
@@ -52,15 +60,15 @@ in the tested cases. The current CSP did not gain `unsafe-inline`.
 
 ## Negative control and former blocker
 
-`/tmp/trellis-232-P-pre-mutation.log` passes; hiding the production generated
-SVG via a temporary in-lane CSS mutation makes the class-wide Chromium test
-fail `display 'none' !== 'block'` (`/tmp/trellis-232-mutation.log`); restoring
-CSS passes (`/tmp/trellis-232-P-restored.log`). The mutation is reverted.
+The original run passed before mutation; hiding the production generated
+SVG via a temporary in-lane CSS mutation made the class-wide Chromium test
+fail `display 'none' !== 'block'`; restoring CSS passed. The mutation was
+reverted. Those temporary logs are no longer retained.
 
 An earlier run failed with `Changed Pele control frames`: source/preorder
 `[alt, loop, opt, opt, alt, opt]` differs from Pele's nested SVG DOM close
-order `[alt, opt, loop, alt, opt, opt]`. Bounded actual Store reproduction:
-`/tmp/trellis-232-shape-count.json`. The adapter now validates exact
+order `[alt, opt, loop, alt, opt, opt]`. The temporary Store reproduction
+record is no longer retained. The adapter now validates exact
 kind/header in close order while retaining source note ordinals and separate
 original DTO witnesses; an intentionally changed frame fails closed. An
 initial simple 80/180-call fixture without controls was exploratory only,
