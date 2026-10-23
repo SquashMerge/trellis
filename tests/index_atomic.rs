@@ -2021,9 +2021,14 @@ fn extractor_and_typed_mismatch_rebuild_in_place_and_failed_rebuild_stays_closed
         .native_declarations_at(recovered, "javascript", &lookup_key)
         .unwrap_err();
     assert!(
-        type_error.to_string().contains("incompatible_index"),
+        matches!(
+            type_error.downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::InvalidColumnType(..))
+        ),
         "{type_error:#}"
     );
+    #[cfg(feature = "test-support")]
+    assert!(store.recovery_pending_for_tests());
     assert!(store.status().is_err());
     failed_cancel.store(true, Ordering::Release);
     let failure =
@@ -2300,10 +2305,9 @@ fn selected_projection_corruption_latches_only_selected_reads() {
     ).unwrap();
     assert_eq!(storage_class, "text");
     let error = store.methods_at("flow.js", Some(pin)).unwrap_err();
-    assert!(
-        error.to_string().contains("incompatible_index"),
-        "{error:#}"
-    );
+    assert!(error.is::<rusqlite::types::FromSqlError>(), "{error:#}");
+    #[cfg(feature = "test-support")]
+    assert!(store.recovery_pending_for_tests());
     assert!(
         clone
             .status()
@@ -2750,9 +2754,14 @@ fn live_control_decode_corruption_latches_direct_reads_and_control_clones() {
     drop(db);
     let error = store.symbol_at(&symbol, Some(pin)).unwrap_err();
     assert!(
-        error.to_string().starts_with("incompatible_index:"),
+        matches!(
+            error.downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::InvalidColumnType(..))
+        ),
         "{error:#}"
     );
+    #[cfg(feature = "test-support")]
+    assert!(store.recovery_pending_for_tests());
     assert!(
         clone
             .views()
@@ -2773,10 +2782,9 @@ fn live_control_decode_corruption_latches_direct_reads_and_control_clones() {
     .unwrap();
     drop(db);
     let error = store.classes_at(None, "", Some(pin), 0, 10).unwrap_err();
-    assert!(
-        error.to_string().starts_with("incompatible_index:"),
-        "{error:#}"
-    );
+    assert!(error.is::<serde_json::Error>(), "{error:#}");
+    #[cfg(feature = "test-support")]
+    assert!(store.recovery_pending_for_tests());
     assert!(
         clone
             .annotations()
@@ -2978,10 +2986,24 @@ fn live_control_corruption_status_first_is_typed_and_clone_shared() {
         db.execute(sql, []).unwrap();
         drop(db);
         let error = store.status().unwrap_err();
-        assert!(
-            error.to_string().starts_with("incompatible_index:"),
-            "{sql}: {error:#}"
-        );
+        if sql.contains("index_revision") {
+            assert!(
+                matches!(
+                    error.downcast_ref::<rusqlite::Error>(),
+                    Some(rusqlite::Error::InvalidColumnType(..))
+                ),
+                "{sql}: {error:#}"
+            );
+        } else if sql.contains("payload") {
+            assert!(error.is::<serde_json::Error>(), "{sql}: {error:#}");
+        } else {
+            assert!(
+                format!("{error:#}").contains("native header/control graph metadata mismatch"),
+                "{sql}: {error:#}"
+            );
+        }
+        #[cfg(feature = "test-support")]
+        assert!(store.recovery_pending_for_tests(), "{sql}");
         assert!(
             clone
                 .source_at("flow.js", Some(pin))

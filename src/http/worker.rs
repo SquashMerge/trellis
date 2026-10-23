@@ -181,8 +181,8 @@ impl DaemonState {
 
     /// The options startup reconciliation captures with. Explicit registered
     /// options win; otherwise recorded inputs, then the FIFO head's, then the
-    /// daemon defaults. A recreate without trusted inputs needs the FIFO
-    /// head's options (or, for a replaced root, the defaults).
+    /// daemon defaults. Recreation uses the FIFO head, retained watcher
+    /// options, then daemon defaults when no explicit options are registered.
     fn startup_options(&self) -> anyhow::Result<Option<IndexOptions>> {
         let config = self.config();
         let explicit = config.explicit_options;
@@ -196,11 +196,15 @@ impl DaemonState {
             if explicit {
                 return Ok(Some(config.options.clone()));
             }
-            return Ok(head.or_else(|| {
-                self.store
-                    .is_root_replaced()
-                    .then(|| config.options.clone())
-            }));
+            let watched = self
+                .watcher_work
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|(_, watcher)| watcher.options());
+            return Ok(Some(
+                head.or(watched).unwrap_or_else(|| config.options.clone()),
+            ));
         }
         if explicit {
             return Ok(Some(config.options.clone()));

@@ -225,6 +225,7 @@ fn a_corrupt_trigram_table_is_store_unavailable_without_fallback() {
     let read = store.evidence_response().unwrap();
     let error = read
         .mcp_find_with_lines("alpha", 20, Some(pin))
+        .map_err(|error| read.report_index_failure(error))
         .err()
         .unwrap();
     assert!(

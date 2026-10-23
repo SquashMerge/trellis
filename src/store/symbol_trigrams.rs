@@ -392,11 +392,9 @@ mod tests {
             assert_eq!(changed, 1);
         }
         let error = store.symbols("Alpha", 20).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .starts_with("incompatible_index: selected evidence decode failed"),
-            "{error:#}"
+        assert_eq!(
+            super::super::recovery_class(&error),
+            super::super::RecoveryClass::Rebuild
         );
         assert_eq!(
             store.disposition(),

@@ -4598,6 +4598,153 @@ async fn describe_cold_initial_startup_reports_indexing_without_prior_coverage()
     session.join().unwrap().unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn obsolete_cold_index_recovers_over_mcp_without_explicit_options_or_fifo() {
+    use trellis::daemon::registry::CheckoutRegistry;
+    use trellis::store::{
+        Store,
+        topology::{TopologyRoots, WorkspaceIdentity},
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let root = checkout(temp.path());
+    fs::write(root.join("a.js"), "function UpgradeTarget() {}\n").unwrap();
+    let identity = WorkspaceIdentity::discover(Some(&root), &root)
+        .unwrap()
+        .attach_marker()
+        .unwrap();
+    let topology =
+        TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+    let store = Store::open_for_tests(temp.path(), &root).unwrap();
+    store.mcp_prepare_virgin_queue_for_tests().unwrap();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
+        &trellis::indexer::IndexOptions::new(root.clone()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    let writer = store.publication_for_tests().unwrap();
+    let original = store
+        .publish_native(
+            &graph,
+            &capture,
+            &native,
+            &writer,
+            store.index_baseline().unwrap(),
+            &cancel,
+        )
+        .unwrap();
+    assert!(store.earliest_unfinished_request().unwrap().is_none());
+    drop(writer);
+    drop(store);
+    // No live SQLite handle remains while changing the stored format marker.
+    let db = rusqlite::Connection::open(topology.index_db(&identity)).unwrap();
+    db.execute_batch(
+        "PRAGMA ignore_check_constraints=ON; UPDATE index_metadata SET schema_version=7;",
+    )
+    .unwrap();
+    drop(db);
+
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(1930, &identity).unwrap();
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (resume_tx, resume_rx) = mpsc::sync_channel(1);
+    let resume_rx = std::sync::Mutex::new(resume_rx);
+    registry.set_next_startup_hook_for_tests(std::sync::Arc::new(move || {
+        entered_tx.send(()).unwrap();
+        resume_rx
+            .lock()
+            .unwrap()
+            .recv_timeout(trellis::testing::HANG_BACKSTOP)
+            .unwrap();
+    }));
+    let runtime = registry.activate(&identity.root_key).unwrap();
+    tokio::task::spawn_blocking(move || {
+        entered_rx
+            .recv_timeout(trellis::testing::HANG_BACKSTOP)
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    let (mut client, mut reader, session) = socket_session(&identity, &registry, 1930, None);
+    writeln!(client, "{}", modern(json!(1931), "tools/call", json!({
+        "name":"trellis_find_symbols", "arguments":{"schemaVersion":1,"query":"UpgradeTarget"}
+    }))).unwrap();
+    let pending = next_reply(&mut reader);
+    tool(&pending, Some("index_not_ready"), true);
+    writeln!(
+        client,
+        "{}",
+        modern(
+            json!(1932),
+            "tools/call",
+            json!({
+                "name":"trellis_workspace_describe", "arguments":{"schemaVersion":1}
+            })
+        )
+    )
+    .unwrap();
+    let described = next_reply(&mut reader);
+    tool(&described, None, true);
+    let pending = &described["result"]["structuredContent"];
+    assert_eq!(pending["catchingUp"], true, "{described}");
+    assert_eq!(pending["data"]["indexState"], "reconciling", "{described}");
+    assert!(pending["evidenceBasis"].is_null());
+
+    let version = runtime.state_version();
+    resume_tx.send(()).unwrap();
+    let ready_runtime = runtime.clone();
+    tokio::task::spawn_blocking(move || {
+        ready_runtime.wait_state_change(version, trellis::testing::HANG_BACKSTOP);
+        assert_ne!(
+            ready_runtime.state_version(),
+            version,
+            "startup did not publish a state transition"
+        );
+        assert!(
+            ready_runtime.reconciliation_error().is_none(),
+            "{:?}",
+            ready_runtime.reconciliation_error()
+        );
+    })
+    .await
+    .unwrap();
+    writeln!(
+        client,
+        "{}",
+        modern(
+            json!(1933),
+            "tools/call",
+            json!({
+                "name":"trellis_workspace_describe", "arguments":{"schemaVersion":1}
+            })
+        )
+    )
+    .unwrap();
+    let ready = next_reply(&mut reader);
+    tool(&ready, None, true);
+    let ready = &ready["result"]["structuredContent"];
+    assert_eq!(ready["data"]["indexState"], "ready");
+    assert_ne!(
+        ready["evidenceBasis"]["indexGeneration"],
+        original.index_generation.to_string()
+    );
+    writeln!(client, "{}", modern(json!(1934), "tools/call", json!({
+        "name":"trellis_find_symbols", "arguments":{"schemaVersion":1,"query":"UpgradeTarget"}
+    }))).unwrap();
+    let found = next_reply(&mut reader);
+    tool(&found, None, true);
+    assert_eq!(
+        found["result"]["structuredContent"]["data"]["symbols"][0]["name"],
+        "UpgradeTarget"
+    );
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn describe_counts_persisted_selected_and_unselected_native_coverage() {
     use std::os::unix::net::UnixStream;
@@ -6500,9 +6647,13 @@ async fn mcp_deadline_before_read_admission_uses_the_pre_resolution_shape() {
 /// counts leave the store. A corrupt row in an unrelated document fails a
 /// zero-hit query, and a query whose hit lies elsewhere, as store_unavailable,
 /// never a successful answer with counts.
-#[test]
-fn mcp_find_unrelated_corrupt_scope_row_fails_zero_hit_and_elsewhere_hits() {
-    use trellis::store::Store;
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_find_unrelated_corrupt_scope_row_fails_zero_hit_and_elsewhere_hits() {
+    use trellis::daemon::registry::CheckoutRegistry;
+    use trellis::store::{
+        Store,
+        topology::{TopologyRoots, WorkspaceIdentity},
+    };
     for query in ["no_such_name", "Alpha"] {
         let temp = tempfile::tempdir().unwrap();
         let root = checkout(temp.path());
@@ -6544,6 +6695,30 @@ fn mcp_find_unrelated_corrupt_scope_row_fails_zero_hit_and_elsewhere_hits() {
         );
         response.finish(()).unwrap();
         drop(response);
+        let identity = WorkspaceIdentity::discover(Some(&root), &root)
+            .unwrap()
+            .attach_marker()
+            .unwrap();
+        let topology =
+            TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+        let mut registry = CheckoutRegistry::with_roots(topology);
+        registry.attach_launch(2621, &identity).unwrap();
+        let runtime = registry.activate(&identity.root_key).unwrap();
+        tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+            loop {
+                if let Ok((response, catching_up)) = runtime.evidence_response()
+                    && response.finish(()).is_ok()
+                    && !catching_up
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("runtime did not finish valid startup before corruption");
+        let scheduler = runtime.browser_scheduler().unwrap();
+        let _worker = scheduler.hold_worker_for_tests();
         // Only b.js's tuple becomes inconsistent (unselected yet "failed").
         let writer = store.publication_for_tests().unwrap();
         store
@@ -6557,7 +6732,36 @@ fn mcp_find_unrelated_corrupt_scope_row_fails_zero_hit_and_elsewhere_hits() {
             reason.contains("store_unavailable: inconsistent native coverage tuple"),
             "{query}: {reason}"
         );
-        assert!(store.recovery_pending_for_tests());
+        drop(response);
+        let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+        let (mut client, mut reader, session) = socket_session(&identity, &registry, 2621, None);
+        writeln!(
+            client,
+            "{}",
+            modern(
+                json!(1),
+                "tools/call",
+                json!({
+                    "name":"trellis_find_symbols", "arguments":{"schemaVersion":1,"query":query}
+                })
+            )
+        )
+        .unwrap();
+        let reply = next_reply(&mut reader);
+        tool(&reply, Some("store_unavailable"), true);
+        let envelope = &reply["result"]["structuredContent"];
+        assert!(envelope.get("data").is_none(), "{query}: {reply}");
+        assert!(
+            envelope["error"]["currentBasis"].is_null(),
+            "{query}: {reply}"
+        );
+        assert!(
+            runtime.evidence_response().is_err(),
+            "tool boundary did not latch recovery: {query}"
+        );
+        drop(reader);
+        drop(client);
+        session.join().unwrap().unwrap();
     }
 }
 
@@ -9635,7 +9839,6 @@ async fn mcp_source_required_selected_path_and_digest_refuse_corrupt_rows() {
         };
         assert!(reason.contains(expected), "{fault}: {reason}");
         drop(selected);
-        assert!(store.recovery_pending_for_tests(), "{fault}");
         let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
         for legacy in [false, true] {
             let (mut client, mut reader, session) = socket_session(&identity, &registry, 145, None);
@@ -9686,6 +9889,10 @@ async fn mcp_source_required_selected_path_and_digest_refuse_corrupt_rows() {
                 "{fault}: {reply}"
             );
             assert!(envelope.get("data").is_none(), "{fault}: {reply}");
+            assert!(
+                runtime.evidence_response().is_err(),
+                "tool boundary did not latch recovery: {fault}"
+            );
             drop(reader);
             drop(client);
             session.join().unwrap().unwrap();

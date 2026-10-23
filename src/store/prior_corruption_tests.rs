@@ -142,7 +142,11 @@ fn retention_inspection_row_decode_failure_schedules_rebuild_and_then_succeeds()
     );
     drop(db);
     let writer = store.writer().unwrap();
-    assert!(store.oldest_due_debt_age(&writer).is_err());
+    let error = store
+        .oldest_due_debt_age(&writer)
+        .map_err(|error| store.report_index_failure(error))
+        .unwrap_err();
+    assert_eq!(recovery_class(&error), RecoveryClass::Rebuild, "{error:#}");
     pending(&store);
     drop(writer);
     reindex(&store, &options);

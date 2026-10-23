@@ -82,6 +82,84 @@ fn repair_corrupt_metadata(column: &str) {
 }
 
 #[test]
+fn runtime_file_corruption_recreates_with_actual_watcher_options_after_a_deferred_attempt() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("workspace");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("a.js"), "function a() {}\n").unwrap();
+    let state_root = tmp.path().join("state");
+    let roots =
+        TopologyRoots::isolated_for_tests(state_root.join("cache"), state_root.join("data"));
+    let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+    let store = Store::open_for_tests(&state_root, &root).unwrap();
+    let mut actual = IndexOptions::new(root.clone());
+    actual.max_file_bytes = 8192;
+    let (before, session) = crate::index_coordinator::reconcile_workspace(
+        &store,
+        &actual,
+        &Arc::new(AtomicBool::new(false)),
+        |_| {},
+    )
+    .unwrap();
+    let state = new(
+        store.clone(),
+        IndexOptions::new(root),
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+        "127.0.0.1:7331".parse().unwrap(),
+    )
+    .unwrap();
+    state.retain_serving_session_without_tick_for_tests(session.clone());
+    let watcher = crate::index_coordinator::WatcherWork::publishing(
+        &store,
+        &session,
+        &actual,
+        state.watcher_health.clone(),
+    )
+    .unwrap();
+    *state.watcher_work.lock().unwrap() = Some((Arc::downgrade(&session), watcher));
+    drop(session);
+    assert!(!state.config().explicit_options);
+    assert_ne!(state.config().options.max_file_bytes, actual.max_file_bytes);
+    assert!(store.earliest_unfinished_request().unwrap().is_none());
+    // There are no open SQLite connections while the derived file is damaged.
+    std::fs::write(roots.index_db(&identity), b"bad sqlite index header").unwrap();
+    assert!(store.status().is_err());
+    assert!(store.is_recreate_pending());
+    let reader = roots.index_use_existing(&identity).unwrap();
+    state.worker_step().unwrap();
+    assert!(store.is_recreate_pending());
+    assert!(state.runtime.lock().unwrap().session().is_none());
+    assert_eq!(
+        state
+            .watcher_work
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .1
+            .options()
+            .max_file_bytes,
+        8192
+    );
+    drop(reader);
+    *state.recovery_retry_after.lock().unwrap() = None;
+    state.worker_step().unwrap();
+    let after = store.status().unwrap().revision;
+    assert_ne!(after.index_generation, before.index_generation);
+    assert!(store.is_ready_disposition());
+    assert_eq!(
+        store
+            .recorded_index_options()
+            .unwrap()
+            .unwrap()
+            .max_file_bytes,
+        8192
+    );
+    assert!(store.source_at("a.js", Some(after)).unwrap().is_some());
+    assert!(store.earliest_unfinished_request().unwrap().is_none());
+}
+
+#[test]
 fn cold_recovery_uses_fifo_options_or_existing_defaults_when_recorded_options_are_corrupt() {
     for (queued, explicit, missing_metadata) in [
         (false, false, false),

@@ -314,11 +314,8 @@ fn live_read_reporter_separates_root_storage_corruption_from_operational_errors(
     for code in [rusqlite::ffi::SQLITE_CORRUPT, rusqlite::ffi::SQLITE_NOTADB] {
         let (_state, _work, store, _graph, _capture, _native, _pin, _cancel, _session) = ready();
         let clone = store.clone();
-        let error = store.report_live_read_failure(sqlite(code));
-        assert!(
-            error.to_string().starts_with("recovery_required:"),
-            "{error:#}"
-        );
+        let error = store.report_index_failure(sqlite(code));
+        assert_eq!(recovery_class(&error), RecoveryClass::RecreatePending);
         assert_eq!(store.disposition(), RecoveryDisposition::RecreatePending);
         assert!(
             clone
@@ -335,17 +332,17 @@ fn live_read_reporter_separates_root_storage_corruption_from_operational_errors(
         rusqlite::ffi::SQLITE_ERROR,
     ] {
         let (_state, _work, store, _graph, _capture, _native, pin, _cancel, _session) = ready();
-        let error = store.report_live_read_failure(sqlite(code));
+        let error = store.report_index_failure(sqlite(code));
         assert!(error.downcast_ref::<rusqlite::Error>().is_some());
         assert_eq!(store.status().unwrap().revision, pin);
     }
     let (_state, _work, store, _graph, _capture, _native, _pin, _cancel, _session) = ready();
     let clone = store.clone();
-    let error = store.report_live_read_failure(
+    let error = store.report_index_failure(
         rusqlite::Error::InvalidColumnType(0, "root_spelling".into(), rusqlite::types::Type::Real)
             .into(),
     );
-    assert!(error.to_string().starts_with("incompatible_index:"));
+    assert_eq!(recovery_class(&error), RecoveryClass::Rebuild);
     assert!(
         clone
             .status()
@@ -356,10 +353,10 @@ fn live_read_reporter_separates_root_storage_corruption_from_operational_errors(
 
     let (_state, _work, store, _graph, _capture, _native, _pin, _cancel, _session) = ready();
     let clone = store.clone();
-    let error = store.report_live_read_failure(
+    let error = store.report_index_failure(
         ControlIntegrity("incompatible_index: existing structural check".into()).into(),
     );
-    assert!(error.to_string().starts_with("incompatible_index:"));
+    assert_eq!(recovery_class(&error), RecoveryClass::Rebuild);
     assert!(
         clone
             .status()
@@ -369,7 +366,7 @@ fn live_read_reporter_separates_root_storage_corruption_from_operational_errors(
     );
 
     let (_state, _work, store, _graph, _capture, _native, pin, _cancel, _session) = ready();
-    let error = store.report_live_read_failure(anyhow::anyhow!(
+    let error = store.report_index_failure(anyhow::anyhow!(
         "root_key_collision: index belongs to a different spelling"
     ));
     assert!(error.to_string().starts_with("root_key_collision:"));
@@ -392,7 +389,7 @@ fn selected_operational_errors_do_not_latch_but_integrity_failure_closes_clones(
         let clone = store.clone();
         let operational: anyhow::Error =
             rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None).into();
-        let returned = store.report_selected_failure(operational);
+        let returned = store.report_index_failure(operational);
         assert!(returned.downcast_ref::<rusqlite::Error>().is_some());
         assert_eq!(store.status().unwrap().revision, pin);
         assert_eq!(clone.status().unwrap().revision, pin);
@@ -402,14 +399,14 @@ fn selected_operational_errors_do_not_latch_but_integrity_failure_closes_clones(
     let clone = store.clone();
     let io: anyhow::Error =
         std::io::Error::new(std::io::ErrorKind::PermissionDenied, "injected").into();
-    let returned = store.report_selected_failure(io);
+    let returned = store.report_index_failure(io);
     assert!(returned.downcast_ref::<std::io::Error>().is_some());
     assert_eq!(store.status().unwrap().revision, pin);
     assert_eq!(clone.status().unwrap().revision, pin);
 
     let integrity: anyhow::Error = SelectedIntegrity("selected mismatch".into()).into();
-    let returned = store.report_selected_failure(integrity);
-    assert!(returned.to_string().contains("incompatible_index"));
+    let returned = store.report_index_failure(integrity);
+    assert!(returned.is::<SelectedIntegrity>());
     assert!(store.status().is_err());
     assert!(clone.status().is_err());
 }

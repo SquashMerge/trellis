@@ -39,7 +39,7 @@ fn fixture() -> (
 }
 
 #[test]
-fn damaged_index_without_accepted_head_never_guesses_startup_options() {
+fn damaged_index_without_accepted_head_uses_configured_startup_options() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("workspace");
     std::fs::create_dir(&root).unwrap();
@@ -73,23 +73,12 @@ fn damaged_index_without_accepted_head_never_guesses_startup_options() {
         "127.0.0.1:7331".parse().unwrap(),
     )
     .unwrap();
-    let started = Instant::now();
-    let error = state.worker_step().unwrap_err();
-    let finished = Instant::now();
-    assert!(
-        error.to_string().starts_with("recovery_required:"),
-        "{error:#}"
-    );
-    assert!(
-        state
-            .recovery_retry_after
-            .lock()
-            .unwrap()
-            .is_some_and(|at| { at >= started && at <= finished + Duration::from_millis(500) })
-    );
-    assert!(state.runtime.lock().unwrap().session().is_none());
+    state.worker_step().unwrap();
+    assert!(state.runtime.lock().unwrap().session().is_some());
     assert!(store.current_request().unwrap().is_none());
-    assert_eq!(std::fs::read(index).unwrap(), damaged);
+    assert!(!store.is_recreate_pending());
+    assert_ne!(std::fs::read(index).unwrap(), damaged);
+    assert!(store.source_at("a.js", None).unwrap().is_some());
 }
 
 #[test]
@@ -1888,6 +1877,10 @@ fn failed_nonurgent_full_gate_is_spent_then_next_row_covers_it() {
         state.worker_step().is_err(),
         "the full gate must reject unreadable source text"
     );
+    assert!(
+        !store.recovery_pending_for_tests(),
+        "invalid repository source is not derived index corruption"
+    );
     let first_pin = store
         .request_by_id(&first.id)
         .unwrap()
@@ -1956,6 +1949,10 @@ fn deferred_full_gate_clears_only_matching_explicit_registration() {
         .1
         .set_queue_gate();
     assert!(state.worker_step().is_err());
+    assert!(
+        !store.recovery_pending_for_tests(),
+        "invalid repository source is not derived index corruption"
+    );
     assert!(Arc::ptr_eq(
         state.explicit_pending.lock().unwrap().as_ref().unwrap(),
         &applied

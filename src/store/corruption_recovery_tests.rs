@@ -38,7 +38,9 @@ impl ReaderFamily {
             }
             Self::Metrics => {
                 let response = store.evidence_response()?;
-                let result = response.metrics_at(&MetricsOptions::default(), &mut || Ok(()))?;
+                let result = response
+                    .metrics_at(&MetricsOptions::default(), &mut || Ok(()))
+                    .map_err(|error| response.report_index_failure(error))?;
                 let result = response.finish(result)?;
                 assert_eq!(result.index_revision, pin.index_revision);
                 assert_eq!(result.files.len(), 1);
@@ -84,10 +86,7 @@ fn reindex(store: &Store, root: &Path) -> IndexPin {
 }
 
 fn assert_rebuild(store: &Store, error: &anyhow::Error) {
-    assert!(
-        error.to_string().starts_with("incompatible_index:"),
-        "{error:#}"
-    );
+    assert_eq!(recovery_class(error), RecoveryClass::Rebuild, "{error:#}");
     assert_eq!(store.disposition(), RecoveryDisposition::Rebuild);
     assert!(store.recovery_required.load(Ordering::Acquire));
 }
@@ -180,7 +179,10 @@ fn corrupt_retained_pin_binding_schedules_reindex() {
         );
     }
     let response = store.evidence_response().unwrap();
-    let error = response.validate_pin(retained).unwrap_err();
+    let error = response
+        .validate_pin(retained)
+        .map_err(|error| response.report_index_failure(error))
+        .unwrap_err();
     drop(response);
     assert_rebuild(&store, &error);
     let repaired = reindex(&store, root.path());
@@ -252,6 +254,7 @@ fn metrics_cancellation_does_not_schedule_recovery() {
             &MetricsOptions::default(),
             &mut || Err(CancelledRead.into()),
         )
+        .map_err(|error| response.report_index_failure(error))
         .unwrap_err();
     assert!(error.is::<CancelledRead>());
     drop(response);
@@ -344,7 +347,9 @@ fn selected_anchor_index_decode_failure_schedules_rebuild() {
         .unwrap();
     }
     let response = store.evidence_response().unwrap();
-    let error = Store::selected_anchor_in(&response.db, &store, &id, true).unwrap_err();
+    let error = Store::selected_anchor_in(&response.db, &store, &id, true)
+        .map_err(|error| response.report_index_failure(error))
+        .unwrap_err();
     drop(response);
     assert_rebuild(&store, &error);
     let repaired = reindex(&store, root.path());

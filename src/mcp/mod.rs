@@ -391,7 +391,9 @@ fn evidence_read(
             #[cfg(not(feature = "test-support"))]
             let status = response.status()?;
             let pin = status.revision;
-            let mut envelope = match read(&runtime, &response, sampled) {
+            let mut envelope = match read(&runtime, &response, sampled)
+                .map_err(|error| response.report_index_failure(error))
+            {
                 Ok(envelope) => envelope,
                 Err(error) if crate::store::cli_read_retryable_contention(&error) => {
                     return Err(error);
@@ -464,9 +466,13 @@ fn read_describe(
                     runtime.run_mcp_admitted_gate_for_tests();
                     let data = response
                         .map(|response| {
-                            let status = response.status()?;
-                            let counts = response.mcp_language_counts()?;
-                            response.finish((status, counts))
+                            let data = (|| {
+                                let status = response.status()?;
+                                let counts = response.mcp_language_counts()?;
+                                Ok((status, counts))
+                            })()
+                            .map_err(|error| response.report_index_failure(error))?;
+                            response.finish(data)
                         })
                         .transpose()?;
                     Ok(DescribedSnapshot {

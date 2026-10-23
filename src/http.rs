@@ -1290,10 +1290,14 @@ impl DaemonState {
         ) {
             return self.run_retirement();
         }
-        // A previously serving writer cannot claim against a damaged index.
-        // Retire its local work; startup reconciliation recreates it.
+        // Release the damaged file's writer before exclusive recreation, but keep
+        // the watcher's actual options until a replacement session is admitted.
         if self.store.is_recreate_pending() && self.runtime.lock().unwrap().session().is_some() {
-            self.replace_serving_session(None);
+            *self.runtime.lock().unwrap() = RuntimeState::Reconciling {
+                attempts: 0,
+                waiting: false,
+            };
+            self.note_state_change();
         }
         if self
             .recovery_retry_after

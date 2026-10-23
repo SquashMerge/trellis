@@ -314,12 +314,15 @@ impl IndexJobCoordinator {
             cutoff()?;
         }
         if unchanged_fast
-            && let Some(pin) = self.store.reuse_unchanged_native_head(
-                &capture,
-                self.session.writer_guard()?,
-                &self.expected,
-                cancel,
-            )?
+            && let Some(pin) = self
+                .store
+                .reuse_unchanged_native_head(
+                    &capture,
+                    self.session.writer_guard()?,
+                    &self.expected,
+                    cancel,
+                )
+                .map_err(|error| self.store.report_index_failure(error))?
         {
             progress(IndexProgress {
                 phase: "mode:unchanged".into(),
@@ -329,7 +332,8 @@ impl IndexJobCoordinator {
             report("publish", phase_start.elapsed());
             observe(&capture);
             self.store
-                .attest_post_acquisition_reconciliation(&self.session, pin)?;
+                .attest_post_acquisition_reconciliation(&self.session, pin)
+                .map_err(|error| self.store.report_index_failure(error))?;
             return Ok(pin);
         }
         let root = std::fs::canonicalize(&options.workspace_root)?;
@@ -375,7 +379,8 @@ impl IndexJobCoordinator {
                 )?;
                 report("publish", phase_start.elapsed());
                 self.store
-                    .attest_post_acquisition_reconciliation(&self.session, pin)?;
+                    .attest_post_acquisition_reconciliation(&self.session, pin)
+                    .map_err(|error| self.store.report_index_failure(error))?;
                 return Ok(pin);
             }
             // A moved D4 class cut is unproved: recalculate every native fact
@@ -418,7 +423,8 @@ impl IndexJobCoordinator {
         )?;
         report("publish", phase_start.elapsed());
         self.store
-            .attest_post_acquisition_reconciliation(&self.session, published)?;
+            .attest_post_acquisition_reconciliation(&self.session, published)
+            .map_err(|error| self.store.report_index_failure(error))?;
         Ok(published)
     }
 }
@@ -1059,12 +1065,9 @@ impl WatcherWork {
             };
             cutoff()?;
             let baseline = store.publication_index_baseline()?;
-            let unchanged = store.selected_capture_unchanged(
-                &captured,
-                session.writer_guard()?,
-                &baseline,
-                cancel,
-            )?;
+            let unchanged = store
+                .selected_capture_unchanged(&captured, session.writer_guard()?, &baseline, cancel)
+                .map_err(|error| store.report_index_failure(error))?;
             if unchanged {
                 cutoff()?;
             } else {
@@ -1508,7 +1511,9 @@ pub fn cooperative_maintenance_unit(
         Ok(writer) => writer,
         Err(_) => return Ok(MaintenanceOutcome::Deferred),
     };
-    store.maintenance_step(writer, &permit, &probe, priority)
+    store
+        .maintenance_step(writer, &permit, &probe, priority)
+        .map_err(|error| store.report_index_failure(error))
 }
 
 /// A checkout's daemon-local writer confirms old-root queue settlement, then
