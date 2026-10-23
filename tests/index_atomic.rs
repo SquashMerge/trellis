@@ -878,7 +878,7 @@ fn sqlite_snapshot(
                     ("cid IN (SELECT cid FROM revision_documents WHERE revision_id=?1)", ""),
                 name if name.starts_with("native_version_") =>
                     ("vid IN (SELECT vid FROM revision_documents WHERE revision_id=?1)", ""),
-                name if name.starts_with("semantic_") => ("0=1 AND ?1 IS NOT NULL", ""),
+                name if name.starts_with("semantic_") => ("?1 IS NOT NULL", ""),
                 _ => panic!("unhandled v15 evidence table: {table}"),
             };
             // Producer descriptor columns differ: only the parent table uses id/version.
@@ -921,6 +921,9 @@ fn sqlite_snapshot(
                 .unwrap()
                 .collect::<rusqlite::Result<Vec<_>>>()
                 .unwrap();
+            if table.starts_with("semantic_") {
+                assert!(rows.is_empty(), "native-only selected snapshot has semantic rows in {table}");
+            }
             // A retained old pin may carry its own pending debt. Compare those
             // rows raw; only the currently published head must be empty.
             if pin.index_revision as i64 == published_revision

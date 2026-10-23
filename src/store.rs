@@ -690,11 +690,11 @@ CREATE TABLE semantic_declaration_bindings(binding_id INTEGER PRIMARY KEY,tuple_
 CREATE INDEX semantic_declaration_bindings_syntax ON semantic_declaration_bindings(tuple_id,syntax_id);
 CREATE TABLE semantic_declaration_binding_symbols(binding_id INTEGER NOT NULL REFERENCES semantic_declaration_bindings(binding_id),ordinal INTEGER NOT NULL,scheme TEXT NOT NULL,symbol TEXT NOT NULL,scope TEXT NOT NULL,document_language TEXT,document_path TEXT,PRIMARY KEY(binding_id,ordinal));
 CREATE TABLE semantic_declaration_join_candidates(binding_id INTEGER NOT NULL REFERENCES semantic_declaration_bindings(binding_id),ordinal INTEGER NOT NULL,candidate_id BLOB NOT NULL CHECK(length(candidate_id)=16),PRIMARY KEY(binding_id,ordinal),UNIQUE(binding_id,candidate_id));
-CREATE TABLE semantic_references(tuple_id INTEGER NOT NULL,reference_id BLOB NOT NULL CHECK(length(reference_id)=16),ordinal INTEGER NOT NULL,owner_id BLOB NOT NULL CHECK(length(owner_id)=16),start_byte INTEGER NOT NULL,end_byte INTEGER NOT NULL,spelling TEXT NOT NULL,lookup_key TEXT NOT NULL,site TEXT NOT NULL CHECK(site IN ('declaration','use')),resolution TEXT NOT NULL CHECK(resolution IN ('resolved','external','ambiguous','unresolved')),declared_kind TEXT CHECK(declared_kind IS NULL OR declared_kind IN ('internal','external')),declared_internal_syntax_id BLOB,declared_internal_language TEXT,declared_internal_path TEXT,declared_internal_native_revision_id TEXT,declared_external_scheme TEXT,declared_external_symbol TEXT,declared_external_scope TEXT,declared_external_language TEXT,declared_external_path TEXT,provenance_id TEXT NOT NULL,CHECK(declared_kind IS NULL OR (declared_kind='internal' AND length(declared_internal_syntax_id)=16 AND declared_internal_language IS NOT NULL AND declared_internal_path IS NOT NULL AND declared_internal_native_revision_id IS NOT NULL AND declared_external_scheme IS NULL AND declared_external_symbol IS NULL AND declared_external_scope IS NULL AND declared_external_language IS NULL AND declared_external_path IS NULL) OR (declared_kind='external' AND declared_internal_syntax_id IS NULL AND declared_internal_language IS NULL AND declared_internal_path IS NULL AND declared_internal_native_revision_id IS NULL AND declared_external_scheme IS NOT NULL AND declared_external_symbol IS NOT NULL AND declared_external_scope IN ('global','document') AND ((declared_external_scope='global' AND declared_external_language IS NULL AND declared_external_path IS NULL) OR (declared_external_scope='document' AND declared_external_language IS NOT NULL AND declared_external_path IS NOT NULL)))),PRIMARY KEY(tuple_id,reference_id),FOREIGN KEY(tuple_id,provenance_id) REFERENCES semantic_provenance(tuple_id,provenance_id));
+CREATE TABLE semantic_references(tuple_id INTEGER NOT NULL,reference_id BLOB NOT NULL CHECK(length(reference_id)=16),ordinal INTEGER NOT NULL,owner_id BLOB NOT NULL CHECK(length(owner_id)=16),start_byte INTEGER NOT NULL,end_byte INTEGER NOT NULL,spelling TEXT NOT NULL,lookup_key TEXT NOT NULL,site TEXT NOT NULL CHECK(site IN ('declaration','use')),resolution TEXT NOT NULL CHECK(resolution IN ('resolved','external','ambiguous','unresolved')),declared_kind TEXT CHECK(declared_kind IS NULL OR declared_kind IN ('internal','external')),declared_internal_syntax_id BLOB,declared_internal_language TEXT,declared_internal_path TEXT,declared_internal_native_revision_id TEXT,declared_external_scheme TEXT,declared_external_symbol TEXT,declared_external_scope TEXT,declared_external_language TEXT,declared_external_path TEXT,provenance_id TEXT NOT NULL,CHECK((declared_kind IS NULL AND declared_internal_syntax_id IS NULL AND declared_internal_language IS NULL AND declared_internal_path IS NULL AND declared_internal_native_revision_id IS NULL AND declared_external_scheme IS NULL AND declared_external_symbol IS NULL AND declared_external_scope IS NULL AND declared_external_language IS NULL AND declared_external_path IS NULL) OR (declared_kind IS NOT NULL AND declared_kind='internal' AND length(declared_internal_syntax_id)=16 AND declared_internal_language IS NOT NULL AND declared_internal_path IS NOT NULL AND declared_internal_native_revision_id IS NOT NULL AND declared_external_scheme IS NULL AND declared_external_symbol IS NULL AND declared_external_scope IS NULL AND declared_external_language IS NULL AND declared_external_path IS NULL) OR (declared_kind IS NOT NULL AND declared_kind='external' AND declared_internal_syntax_id IS NULL AND declared_internal_language IS NULL AND declared_internal_path IS NULL AND declared_internal_native_revision_id IS NULL AND declared_external_scheme IS NOT NULL AND declared_external_symbol IS NOT NULL AND declared_external_scope IN ('global','document') AND ((declared_external_scope='global' AND declared_external_language IS NULL AND declared_external_path IS NULL) OR (declared_external_scope='document' AND declared_external_language IS NOT NULL AND declared_external_path IS NOT NULL)))),PRIMARY KEY(tuple_id,reference_id),FOREIGN KEY(tuple_id,provenance_id) REFERENCES semantic_provenance(tuple_id,provenance_id));
 CREATE INDEX semantic_references_owner ON semantic_references(tuple_id,owner_id);
 CREATE TABLE semantic_reference_roles(tuple_id INTEGER NOT NULL,reference_id BLOB NOT NULL,ordinal INTEGER NOT NULL,role TEXT NOT NULL,PRIMARY KEY(tuple_id,reference_id,ordinal),UNIQUE(tuple_id,reference_id,role),FOREIGN KEY(tuple_id,reference_id) REFERENCES semantic_references(tuple_id,reference_id));
 CREATE TABLE semantic_reference_candidates(tuple_id INTEGER NOT NULL,reference_id BLOB NOT NULL,ordinal INTEGER NOT NULL,kind TEXT NOT NULL CHECK(kind IN ('internal','external')),internal_syntax_id BLOB,internal_language TEXT,internal_path TEXT,internal_native_revision_id TEXT,external_scheme TEXT,external_symbol TEXT,external_scope TEXT,external_language TEXT,external_path TEXT,CHECK((kind='internal' AND length(internal_syntax_id)=16 AND internal_language IS NOT NULL AND internal_path IS NOT NULL AND internal_native_revision_id IS NOT NULL AND external_scheme IS NULL AND external_symbol IS NULL AND external_scope IS NULL AND external_language IS NULL AND external_path IS NULL) OR (kind='external' AND internal_syntax_id IS NULL AND internal_language IS NULL AND internal_path IS NULL AND internal_native_revision_id IS NULL AND external_scheme IS NOT NULL AND external_symbol IS NOT NULL AND external_scope IN ('global','document') AND ((external_scope='global' AND external_language IS NULL AND external_path IS NULL) OR (external_scope='document' AND external_language IS NOT NULL AND external_path IS NOT NULL)))),PRIMARY KEY(tuple_id,reference_id,ordinal),FOREIGN KEY(tuple_id,reference_id) REFERENCES semantic_references(tuple_id,reference_id));
-CREATE TABLE semantic_call_bindings(binding_id INTEGER PRIMARY KEY,tuple_id INTEGER NOT NULL,ordinal INTEGER NOT NULL,call_id BLOB CHECK(call_id IS NULL OR length(call_id)=16),join_document_language TEXT NOT NULL,join_document_path TEXT NOT NULL,join_native_revision_id TEXT NOT NULL,join_content_hash TEXT NOT NULL,join_start INTEGER NOT NULL,join_end INTEGER NOT NULL,join_kind TEXT NOT NULL CHECK(join_kind IN ('callee','invocation')),join_status TEXT NOT NULL,join_diagnostic TEXT,resolution TEXT NOT NULL,declared_kind TEXT CHECK(declared_kind IS NULL OR declared_kind IN ('internal','external')),declared_internal_syntax_id BLOB,declared_internal_language TEXT,declared_internal_path TEXT,declared_internal_native_revision_id TEXT,declared_external_scheme TEXT,declared_external_symbol TEXT,declared_external_scope TEXT,declared_external_language TEXT,declared_external_path TEXT,dispatch TEXT NOT NULL,possible_dispatch_complete INTEGER NOT NULL CHECK(possible_dispatch_complete=0),stale_target INTEGER CHECK(stale_target IS NULL OR stale_target=0),provenance_id TEXT NOT NULL,CHECK(declared_kind IS NULL OR (declared_kind='internal' AND length(declared_internal_syntax_id)=16 AND declared_internal_language IS NOT NULL AND declared_internal_path IS NOT NULL AND declared_internal_native_revision_id IS NOT NULL AND declared_external_scheme IS NULL AND declared_external_symbol IS NULL AND declared_external_scope IS NULL AND declared_external_language IS NULL AND declared_external_path IS NULL) OR (declared_kind='external' AND declared_internal_syntax_id IS NULL AND declared_internal_language IS NULL AND declared_internal_path IS NULL AND declared_internal_native_revision_id IS NULL AND declared_external_scheme IS NOT NULL AND declared_external_symbol IS NOT NULL AND declared_external_scope IN ('global','document') AND ((declared_external_scope='global' AND declared_external_language IS NULL AND declared_external_path IS NULL) OR (declared_external_scope='document' AND declared_external_language IS NOT NULL AND declared_external_path IS NOT NULL)))),UNIQUE(tuple_id,ordinal),FOREIGN KEY(tuple_id,provenance_id) REFERENCES semantic_provenance(tuple_id,provenance_id));
+CREATE TABLE semantic_call_bindings(binding_id INTEGER PRIMARY KEY,tuple_id INTEGER NOT NULL,ordinal INTEGER NOT NULL,call_id BLOB CHECK(call_id IS NULL OR length(call_id)=16),join_document_language TEXT NOT NULL,join_document_path TEXT NOT NULL,join_native_revision_id TEXT NOT NULL,join_content_hash TEXT NOT NULL,join_start INTEGER NOT NULL,join_end INTEGER NOT NULL,join_kind TEXT NOT NULL CHECK(join_kind IN ('callee','invocation')),join_status TEXT NOT NULL,join_diagnostic TEXT,resolution TEXT NOT NULL,declared_kind TEXT CHECK(declared_kind IS NULL OR declared_kind IN ('internal','external')),declared_internal_syntax_id BLOB,declared_internal_language TEXT,declared_internal_path TEXT,declared_internal_native_revision_id TEXT,declared_external_scheme TEXT,declared_external_symbol TEXT,declared_external_scope TEXT,declared_external_language TEXT,declared_external_path TEXT,dispatch TEXT NOT NULL,possible_dispatch_complete INTEGER NOT NULL CHECK(possible_dispatch_complete=0),stale_target INTEGER CHECK(stale_target IS NULL OR stale_target=0),provenance_id TEXT NOT NULL,CHECK((declared_kind IS NULL AND declared_internal_syntax_id IS NULL AND declared_internal_language IS NULL AND declared_internal_path IS NULL AND declared_internal_native_revision_id IS NULL AND declared_external_scheme IS NULL AND declared_external_symbol IS NULL AND declared_external_scope IS NULL AND declared_external_language IS NULL AND declared_external_path IS NULL) OR (declared_kind IS NOT NULL AND declared_kind='internal' AND length(declared_internal_syntax_id)=16 AND declared_internal_language IS NOT NULL AND declared_internal_path IS NOT NULL AND declared_internal_native_revision_id IS NOT NULL AND declared_external_scheme IS NULL AND declared_external_symbol IS NULL AND declared_external_scope IS NULL AND declared_external_language IS NULL AND declared_external_path IS NULL) OR (declared_kind IS NOT NULL AND declared_kind='external' AND declared_internal_syntax_id IS NULL AND declared_internal_language IS NULL AND declared_internal_path IS NULL AND declared_internal_native_revision_id IS NULL AND declared_external_scheme IS NOT NULL AND declared_external_symbol IS NOT NULL AND declared_external_scope IN ('global','document') AND ((declared_external_scope='global' AND declared_external_language IS NULL AND declared_external_path IS NULL) OR (declared_external_scope='document' AND declared_external_language IS NOT NULL AND declared_external_path IS NOT NULL)))),UNIQUE(tuple_id,ordinal),FOREIGN KEY(tuple_id,provenance_id) REFERENCES semantic_provenance(tuple_id,provenance_id));
 CREATE INDEX semantic_call_bindings_call ON semantic_call_bindings(tuple_id,call_id);
 CREATE TABLE semantic_call_candidates(binding_id INTEGER NOT NULL REFERENCES semantic_call_bindings(binding_id),ordinal INTEGER NOT NULL,kind TEXT NOT NULL CHECK(kind IN ('internal','external')),internal_syntax_id BLOB,internal_language TEXT,internal_path TEXT,internal_native_revision_id TEXT,external_scheme TEXT,external_symbol TEXT,external_scope TEXT,external_language TEXT,external_path TEXT,CHECK((kind='internal' AND length(internal_syntax_id)=16 AND internal_language IS NOT NULL AND internal_path IS NOT NULL AND internal_native_revision_id IS NOT NULL AND external_scheme IS NULL AND external_symbol IS NULL AND external_scope IS NULL AND external_language IS NULL AND external_path IS NULL) OR (kind='external' AND internal_syntax_id IS NULL AND internal_language IS NULL AND internal_path IS NULL AND internal_native_revision_id IS NULL AND external_scheme IS NOT NULL AND external_symbol IS NOT NULL AND external_scope IN ('global','document') AND ((external_scope='global' AND external_language IS NULL AND external_path IS NULL) OR (external_scope='document' AND external_language IS NOT NULL AND external_path IS NOT NULL)))),PRIMARY KEY(binding_id,ordinal));
 CREATE TABLE semantic_call_possible_dispatch(binding_id INTEGER NOT NULL REFERENCES semantic_call_bindings(binding_id),ordinal INTEGER NOT NULL,kind TEXT NOT NULL CHECK(kind IN ('internal','external')),internal_syntax_id BLOB,internal_language TEXT,internal_path TEXT,internal_native_revision_id TEXT,external_scheme TEXT,external_symbol TEXT,external_scope TEXT,external_language TEXT,external_path TEXT,CHECK((kind='internal' AND length(internal_syntax_id)=16 AND internal_language IS NOT NULL AND internal_path IS NOT NULL AND internal_native_revision_id IS NOT NULL AND external_scheme IS NULL AND external_symbol IS NULL AND external_scope IS NULL AND external_language IS NULL AND external_path IS NULL) OR (kind='external' AND internal_syntax_id IS NULL AND internal_language IS NULL AND internal_path IS NULL AND internal_native_revision_id IS NULL AND external_scheme IS NOT NULL AND external_symbol IS NOT NULL AND external_scope IN ('global','document') AND ((external_scope='global' AND external_language IS NULL AND external_path IS NULL) OR (external_scope='document' AND external_language IS NOT NULL AND external_path IS NOT NULL)))),PRIMARY KEY(binding_id,ordinal));
@@ -4731,7 +4731,16 @@ fn semantic_target_read(
     use crate::semantic_evidence as sem;
     let kind: Option<String> = row.get(start)?;
     Ok(match kind.as_deref() {
-        None => None,
+        None => {
+            for column in start + 1..=start + 9 {
+                ensure!(
+                    row.get::<_, Option<rusqlite::types::Value>>(column)?
+                        .is_none(),
+                    "incompatible_index: corrupt semantic target payload"
+                );
+            }
+            None
+        }
         Some("internal") => {
             let id: Vec<u8> = row.get(start + 1)?;
             Some(sem::Target::Internal {
@@ -5412,18 +5421,30 @@ fn write_semantic(
                 "incompatible_index: semantic producer descriptor changed"
             );
             for (ordinal, language) in producer.languages.iter().enumerate() {
-                let language = semantic_variant(language)?;
                 db.execute(
                     "INSERT OR IGNORE INTO semantic_producer_languages VALUES(?1,?2,?3,?4)",
-                    params![producer.id, producer.version, language, ordinal as i64],
+                    params![
+                        producer.id,
+                        producer.version,
+                        semantic_variant(language)?,
+                        ordinal as i64
+                    ],
                 )?;
-                let stored: i64 = db.query_row("SELECT ordinal FROM semantic_producer_languages WHERE id=?1 AND version=?2 AND language=?3",
-                    params![producer.id,producer.version,language], |row| row.get(0))?;
-                ensure!(
-                    stored == ordinal as i64,
-                    "incompatible_index: semantic producer languages changed"
-                );
             }
+            let persisted: Vec<String> = semantic_ordered(
+                db,
+                "SELECT ordinal,language FROM semantic_producer_languages WHERE id=?1 AND version=?2 ORDER BY ordinal",
+                &[&producer.id, &producer.version],
+            )?;
+            let supplied = producer
+                .languages
+                .iter()
+                .map(semantic_variant)
+                .collect::<Result<Vec<_>>>()?;
+            ensure!(
+                persisted == supplied,
+                "incompatible_index: semantic producer languages changed"
+            );
         }
         for coverage in &publication.coverage {
             let producer = publication
@@ -5454,15 +5475,21 @@ fn write_semantic(
         if supplied.is_none() {
             copy_semantic_rows(db, &previous, &key, same_native)?;
         } else {
-            let coverage: Vec<SemanticCoverageRow> = db.prepare(
-                "SELECT tuple_id,producer_id,producer_version,language,path,requested,selected,state,diagnostic FROM semantic_coverage WHERE revision_id=?1 ORDER BY tuple_id"
-            )?.query_map([&previous], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?)))?.collect::<rusqlite::Result<_>>()?;
-            for (_, producer, version, language, path, requested, _, _, _) in coverage {
-                let occupied: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM semantic_coverage WHERE revision_id=?1 AND producer_id=?2 AND language=?3 AND path=?4)",params![key,producer,language,path],|r|r.get(0))?;
-                let applicable: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM revision_documents WHERE revision_id=?1 AND language=?2 AND path=?3)",params![key,language,path],|r|r.get(0))?;
-                if !occupied && applicable {
-                    db.execute("INSERT INTO semantic_coverage(revision_id,producer_id,producer_version,language,path,requested,selected,state,diagnostic) VALUES(?1,?2,?3,?4,?5,?6,0,?7,?8)",params![key,producer,version,language,path,requested,if requested {"omitted"}else{"notRequested"},if requested {Some("semantic producer not run for this revision")}else{None}])?;
-                }
+            let missing = db.prepare("SELECT p.producer_id,p.producer_version,d.language,d.path,
+                EXISTS(SELECT 1 FROM semantic_coverage old WHERE old.revision_id=?1
+                    AND old.producer_id=p.producer_id AND old.language=d.language AND old.requested=1)
+                FROM (SELECT DISTINCT producer_id,producer_version FROM semantic_coverage WHERE revision_id=?1) p
+                JOIN semantic_producer_languages l ON l.id=p.producer_id AND l.version=p.producer_version
+                JOIN revision_documents d ON d.revision_id=?2 AND d.language=l.language
+                WHERE NOT EXISTS(SELECT 1 FROM semantic_coverage current WHERE current.revision_id=?2
+                    AND current.producer_id=p.producer_id AND current.language=d.language AND current.path=d.path)
+                ORDER BY p.producer_id,d.language,d.path")?
+                .query_map(params![previous,key], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,bool>(4)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            for (producer, version, language, path, requested) in missing {
+                db.execute("INSERT INTO semantic_coverage(revision_id,producer_id,producer_version,language,path,requested,selected,state,diagnostic) VALUES(?1,?2,?3,?4,?5,?6,0,?7,?8)",
+                    params![key,producer,version,language,path,requested,if requested {"omitted"} else {"notRequested"},
+                        if requested {Some("semantic producer not run for this revision")} else {None}])?;
             }
         }
     }
@@ -10065,6 +10092,93 @@ impl Store {
         expected_revision: IndexPin,
         cancel: &CancelFlag,
     ) -> Result<IndexPin> {
+        self.publish_native_semantic_with_tx_hook(
+            graph,
+            capture,
+            native,
+            semantic,
+            captured,
+            leader,
+            expected_revision,
+            cancel,
+            |_| Ok(()),
+        )
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn publish_native_semantic_with_sql_fault_for_tests(
+        &self,
+        graph: &Graph,
+        capture: &crate::capture::Capture,
+        native: &crate::native_evidence::Artifact,
+        semantic: &crate::semantic_evidence::SemanticPublication,
+        captured: &crate::semantic_evidence::CapturedComponents,
+        leader: &topology::WriterGuard,
+        expected_revision: IndexPin,
+        cancel: &CancelFlag,
+    ) -> Result<IndexPin> {
+        self.publish_native_semantic_with_tx_hook(
+            graph,
+            capture,
+            native,
+            semantic,
+            captured,
+            leader,
+            expected_revision,
+            cancel,
+            |db| {
+                db.execute(
+                    "INSERT INTO semantic_coverage(revision_id) VALUES ('forced-sql-fault')",
+                    [],
+                )?;
+                Ok(())
+            },
+        )
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn publish_native_semantic_with_precommit_cancel_for_tests(
+        &self,
+        graph: &Graph,
+        capture: &crate::capture::Capture,
+        native: &crate::native_evidence::Artifact,
+        semantic: &crate::semantic_evidence::SemanticPublication,
+        captured: &crate::semantic_evidence::CapturedComponents,
+        leader: &topology::WriterGuard,
+        expected_revision: IndexPin,
+        cancel: &CancelFlag,
+    ) -> Result<IndexPin> {
+        self.publish_native_semantic_with_tx_hook(
+            graph,
+            capture,
+            native,
+            semantic,
+            captured,
+            leader,
+            expected_revision,
+            cancel,
+            |_| {
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn publish_native_semantic_with_tx_hook(
+        &self,
+        graph: &Graph,
+        capture: &crate::capture::Capture,
+        native: &crate::native_evidence::Artifact,
+        semantic: &crate::semantic_evidence::SemanticPublication,
+        captured: &crate::semantic_evidence::CapturedComponents,
+        leader: &topology::WriterGuard,
+        expected_revision: IndexPin,
+        cancel: &CancelFlag,
+        mut hook: impl FnMut(&Connection) -> Result<()>,
+    ) -> Result<IndexPin> {
         self.validate_native_bundle(graph, capture, native, cancel)?;
         crate::semantic_evidence::validate_evidence(semantic, native, captured)?;
         let pin = self.publish_inner_checked_target_with_local(
@@ -10076,7 +10190,13 @@ impl Store {
             },
             cancel,
             (256 * 1024 * 1024 + 16 * 1024, None, None),
-            |_, _| Ok(()),
+            |stage, db| {
+                if matches!(stage, PublishStage::BeforeCommit) {
+                    hook(db)
+                } else {
+                    Ok(())
+                }
+            },
             Some((semantic, captured)),
         )?;
         self.attest_post_acquisition_reconciliation_guard(leader, pin)?;
@@ -13360,6 +13480,22 @@ impl Store {
             }
             other => other,
         }
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn maintain_one_revision_step_for_tests(
+        &self,
+        leader: &topology::WriterGuard,
+    ) -> Result<bool> {
+        let permit = self
+            .maintenance_try_enter()
+            .context("maintenance admission unavailable")?;
+        let probe = self.open_maintenance_queue_probe()?;
+        Ok(matches!(
+            self.maintenance_step(leader, &permit, &probe, || true)?,
+            MaintenanceOutcome::Progress
+        ))
     }
 
     /// Explicit leader cleanup for CLI/test callers. Daemon maintenance uses
