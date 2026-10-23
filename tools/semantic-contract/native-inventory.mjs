@@ -30,6 +30,16 @@ const INVENTORIES = new Map([
   ],
 ]);
 
+/** Every production declaration, excluding conformance-only producers. */
+export function productionInventoryEntries() {
+  return [...INVENTORIES].flatMap(([key, languages]) => {
+    const [id, version] = key.split("\u0000");
+    return id === "trellis.native.syntax"
+      ? [[id, version, Object.entries(languages)]]
+      : [];
+  });
+}
+
 /** The trusted inventory for this producer version and language, or undefined if none. */
 export function trustedInventory(producerId, producerVersion, language) {
   const entry = INVENTORIES.get(`${producerId}\u0000${producerVersion}`);

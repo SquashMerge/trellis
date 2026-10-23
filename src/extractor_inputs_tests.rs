@@ -102,6 +102,12 @@ fn a_listed_module_or_crate_change_changes_the_producer_hash() {
         hash_with(Some(("src/indexer_rust.rs", &edited)), &lock),
         base
     );
+    let mut adapter = read("src/native_capture.rs");
+    adapter.extend_from_slice(b"\n// capture adapter edit\n");
+    assert_ne!(
+        hash_with(Some(("src/native_capture.rs", &adapter)), &lock),
+        base
+    );
     let grammar = lock.replacen(
         "name = \"tree-sitter-java\"\nversion = \"",
         "name = \"tree-sitter-java\"\nversion = \"9",

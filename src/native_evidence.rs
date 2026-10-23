@@ -664,7 +664,7 @@ pub(crate) fn measure_fixture(
     files: &[SourceFile],
     source_set: SourceSet,
     revision: Revision,
-) -> Result<Artifact> {
+) -> Result<(Artifact, FixtureHeaderWitnesses)> {
     let mut artifact = Artifact {
         producer: fixture_producer(),
         source_set,
@@ -676,13 +676,34 @@ pub(crate) fn measure_fixture(
         control_regions: vec![],
     };
     let mut ids = IdentityRegistry::default();
+    let mut witnesses = FixtureHeaderWitnesses::new();
     for file in files {
-        extract(&mut artifact, file, &mut ids)?;
+        let document = artifact
+            .revision
+            .documents
+            .iter()
+            .find(|document| {
+                document.key.path == file.path && document.key.language == file.language
+            })
+            .context("native document not in captured revision")?
+            .clone();
+        extract_known_with_witnesses(
+            &mut artifact,
+            file,
+            &document,
+            &mut ids,
+            &mut |id, field, range| {
+                witnesses
+                    .entry(id.to_owned())
+                    .or_default()
+                    .push((field, range))
+            },
+        )?;
     }
     // The full publisher validator requires checkout-derived source-set/revision IDs.
     // Fixtures deliberately retain their authored labels; extract authenticates each
     // document hash and extraction context before minting its measured rows.
-    Ok(artifact)
+    Ok((artifact, witnesses))
 }
 
 #[cfg(feature = "test-support")]
@@ -1997,16 +2018,30 @@ fn modifier_keyword(value: &str) -> bool {
     )
 }
 
-fn header(n: Node<'_>, f: &SourceFile, key: &Key) -> Header {
+fn header_with_witnesses(
+    n: Node<'_>,
+    f: &SourceFile,
+    key: &Key,
+    _witness: &mut impl FnMut(String, Range),
+) -> Header {
     let from = |node: Node<'_>| f.text.get(node.byte_range()).map(str::to_owned);
-    let field = |field: &str| n.child_by_field_name(field).and_then(from);
-    let mut modifier_tokens: Vec<(usize, usize, String)> = Vec::new();
+    macro_rules! measured {
+        ($field:expr, $node:expr) => {{
+            let node = $node;
+            let _field = || -> String { $field };
+            from(node).inspect(|_value| {
+                #[cfg(feature = "test-support")]
+                _witness(_field(), Range::node(node));
+            })
+        }};
+    }
+    let mut modifier_tokens = Vec::new();
     let mut cursor = n.walk();
     for child in n.children(&mut cursor) {
         match child.kind() {
             "visibility_modifier" => {
                 if let Some(value) = from(child) {
-                    modifier_tokens.push((child.start_byte(), child.end_byte(), value));
+                    modifier_tokens.push((child, value));
                 }
             }
             "modifiers" | "function_modifiers" => {
@@ -2015,7 +2050,7 @@ fn header(n: Node<'_>, f: &SourceFile, key: &Key) -> Header {
                     if let Some(value) = from(token)
                         && (token.is_named() || modifier_keyword(&value))
                     {
-                        modifier_tokens.push((token.start_byte(), token.end_byte(), value));
+                        modifier_tokens.push((token, value));
                     }
                 }
             }
@@ -2023,23 +2058,25 @@ fn header(n: Node<'_>, f: &SourceFile, key: &Key) -> Header {
                 if let Some(value) = from(child)
                     && modifier_keyword(&value)
                 {
-                    modifier_tokens.push((child.start_byte(), child.end_byte(), value));
+                    modifier_tokens.push((child, value));
                 }
             }
             _ => {}
         }
     }
-    modifier_tokens.sort_by_key(|(start, end, _)| (*start, *end));
+    modifier_tokens.sort_by_key(|(node, _)| (node.start_byte(), node.end_byte()));
     let modifiers = modifier_tokens
         .into_iter()
-        .map(|(_, _, value)| value)
+        .enumerate()
+        .filter_map(|(_i, (node, _))| measured!(format!("header.modifiers[{_i}]"), node))
         .collect();
     let type_parameters = n
         .child_by_field_name("type_parameters")
         .map(child_nodes)
         .unwrap_or_default()
         .into_iter()
-        .filter_map(from)
+        .enumerate()
+        .filter_map(|(_i, node)| measured!(format!("header.typeParameters[{_i}]"), node))
         .collect();
     let parameters = n
         .child_by_field_name("parameters")
@@ -2050,7 +2087,8 @@ fn header(n: Node<'_>, f: &SourceFile, key: &Key) -> Header {
             p.kind().contains("parameter")
                 || matches!(p.kind(), "identifier" | "rest_pattern" | "self_parameter")
         })
-        .map(|p| {
+        .enumerate()
+        .map(|(_i, p)| {
             let pname = p
                 .child_by_field_name("name")
                 .or_else(|| {
@@ -2058,9 +2096,11 @@ fn header(n: Node<'_>, f: &SourceFile, key: &Key) -> Header {
                         .into_iter()
                         .find(|c| c.kind() == "identifier")
                 })
-                .and_then(from)
-                .or_else(|| (p.kind() == "identifier").then(|| from(p)).flatten());
-            let type_name = p.child_by_field_name("type").and_then(from);
+                .or_else(|| (p.kind() == "identifier").then_some(p))
+                .and_then(|node| measured!(format!("header.parameters[{_i}].name"), node));
+            let type_name = p
+                .child_by_field_name("type")
+                .and_then(|node| measured!(format!("header.parameters[{_i}].type"), node));
             Parameter {
                 name: pname,
                 type_name,
@@ -2072,17 +2112,19 @@ fn header(n: Node<'_>, f: &SourceFile, key: &Key) -> Header {
             }
         })
         .collect();
-    let result_type = field("return_type").or_else(|| {
-        if f.language == "java" && matches!(key.kind.as_str(), "method") {
-            field("type")
-        } else {
-            None
-        }
-    });
+    let result_type = n
+        .child_by_field_name("return_type")
+        .or_else(|| {
+            (f.language == "java" && key.kind == "method")
+                .then(|| n.child_by_field_name("type"))
+                .flatten()
+        })
+        .and_then(|node| measured!("header.resultType".into(), node));
     let bases = ["superclass", "interfaces", "super_interfaces", "traits"]
         .into_iter()
         .flat_map(|field| n.child_by_field_name(field))
-        .filter_map(from)
+        .enumerate()
+        .filter_map(|(_i, node)| measured!(format!("header.bases[{_i}]"), node))
         .collect();
     Header {
         kind: key.kind.clone(),
@@ -2094,6 +2136,9 @@ fn header(n: Node<'_>, f: &SourceFile, key: &Key) -> Header {
         bases,
     }
 }
+
+#[cfg(feature = "test-support")]
+pub(crate) type FixtureHeaderWitnesses = BTreeMap<String, Vec<(String, Range)>>;
 
 fn callee(n: Node<'_>, f: &SourceFile) -> (Option<String>, Option<Range>) {
     let expr = n
@@ -2151,6 +2196,16 @@ fn extract_known(
     f: &SourceFile,
     document: &Document,
     ids: &mut IdentityRegistry,
+) -> Result<()> {
+    extract_known_with_witnesses(a, f, document, ids, &mut |_, _, _| {})
+}
+
+fn extract_known_with_witnesses(
+    a: &mut Artifact,
+    f: &SourceFile,
+    document: &Document,
+    ids: &mut IdentityRegistry,
+    header_witness: &mut dyn FnMut(&str, String, Range),
 ) -> Result<()> {
     language_order(&f.language)?;
     safe_path(&f.path)?;
@@ -2252,6 +2307,7 @@ fn extract_known(
         saw_call: false,
         visits: 0,
         opaque_rust: false,
+        header_witness,
     };
     state.walk(
         tree.root_node(),
@@ -2323,6 +2379,7 @@ struct ParserState<'a> {
     saw_call: bool,
     visits: usize,
     opaque_rust: bool,
+    header_witness: &'a mut dyn FnMut(&str, String, Range),
 }
 impl ParserState<'_> {
     fn occurrence_input(&self, owner: &str, kind: &str, ordinal: usize) -> Value {
@@ -2463,6 +2520,24 @@ impl ParserState<'_> {
             }
             let id=self.ids.stable(&json!({"sourceSet":self.artifact.source_set.id,"path":self.file.path,"language":self.file.language,"ancestors":ancestry,"declaration":key}))?;
             let named = name(n, self.file);
+            #[cfg(feature = "test-support")]
+            if key.signature.is_some() {
+                for (i, parameter) in n
+                    .child_by_field_name("parameters")
+                    .map(child_nodes)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|p| p.kind().contains("parameter"))
+                    .filter_map(|p| p.child_by_field_name("type"))
+                    .enumerate()
+                {
+                    (self.header_witness)(
+                        &id,
+                        format!("signature.parameterTypes[{i}]"),
+                        Range::node(parameter),
+                    );
+                }
+            }
             self.saw_definition |= k != "module";
             self.artifact.declarations.push(Declaration {
                 syntax_id: id.clone(),
@@ -2479,7 +2554,9 @@ impl ParserState<'_> {
                 key: key.clone(),
                 range: Range::node(n),
                 name_range: named.map(|v| v.1),
-                header: header(n, self.file, &key),
+                header: header_with_witnesses(n, self.file, &key, &mut |field, range| {
+                    (self.header_witness)(&id, field, range);
+                }),
                 provenance_id: self.proof_id.clone(),
             });
             // A lexical declaration key may nest syntax, but its initializer runs in
@@ -3136,15 +3213,9 @@ mod occurrence_identity_tests {
                 "--input-type=module",
                 "-e",
                 r#"
-import { trustedInventory } from './tools/semantic-contract/native-inventory.mjs';
-const declarations = JSON.parse(process.argv[1]);
-console.log(JSON.stringify(declarations.map(([id, version, languages]) => [
-    id, version, languages.map(([language]) => [
-        language, trustedInventory(id, version, language) ?? null,
-    ]),
-])));
+import { productionInventoryEntries } from './tools/semantic-contract/native-inventory.mjs';
+console.log(JSON.stringify(productionInventoryEntries()));
 "#,
-                &rust_inventory.to_string(),
             ])
             .output()
             .expect("Node is required by the repository verification suite");
@@ -3155,6 +3226,12 @@ console.log(JSON.stringify(declarations.map(([id, version, languages]) => [
         );
         let semantic_inventory: Value = serde_json::from_slice(&output.stdout).unwrap();
         check_inventory_registry(&rust_inventory, &semantic_inventory).unwrap();
+        // A stale JS version must not disappear through Rust-driven lookups.
+        let mut extra_js_version = semantic_inventory.clone();
+        let mut stale = extra_js_version[0].clone();
+        stale[1] = json!("native-v3");
+        extra_js_version.as_array_mut().unwrap().push(stale);
+        assert!(check_inventory_registry(&rust_inventory, &extra_js_version).is_err());
         // The same comparison must reject drift on either side, not just a missing entry.
         for change_rust in [false, true] {
             for change_version in [false, true] {

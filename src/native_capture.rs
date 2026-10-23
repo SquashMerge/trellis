@@ -181,10 +181,28 @@ pub fn capture(
             config_hash: revision.config_hash,
             dependency_hash: revision.dependency_hash,
         };
-        let artifact = native_evidence::measure_fixture(&files, source_set, revision)?;
+        let (artifact, header_witnesses) =
+            native_evidence::measure_fixture(&files, source_set, revision)?;
+        for coverage in &artifact.coverage {
+            if coverage.state == "partial" {
+                writeln!(
+                    std::io::stderr().lock(),
+                    "native-capture: partial {}/{}/{}@{}: {}",
+                    coverage.source_set_id,
+                    coverage.language,
+                    coverage.document_path,
+                    coverage.revision_id,
+                    coverage
+                        .diagnostic
+                        .as_deref()
+                        .unwrap_or("partial native coverage")
+                )?;
+            }
+        }
         append_rows(
             &artifact,
             &files,
+            &header_witnesses,
             &mut declarations,
             &mut calls,
             &mut controls,
@@ -251,11 +269,23 @@ fn witness(
     );
     Ok(json!({"field":field, "witness":{"range":position(&range), "text":value}}))
 }
-fn declaration_witnesses(row: &Declaration, source: &str) -> Result<Vec<Value>> {
+fn declaration_witnesses(
+    row: &Declaration,
+    source: &str,
+    header_ranges: &[(String, Range)],
+) -> Result<Vec<Value>> {
     let mut entries = Vec::new();
     let mut add = |field: String, value: Option<&str>, range: Option<&Range>| -> Result<()> {
         if let Some(value) = value {
-            entries.push(witness(&field, value, source, &row.range, range)?);
+            let range = range
+                .or_else(|| {
+                    header_ranges
+                        .iter()
+                        .find(|(measured_field, _)| measured_field == &field)
+                        .map(|(_, range)| range)
+                })
+                .with_context(|| format!("missing measured header witness: {field}"))?;
+            entries.push(witness(&field, value, source, &row.range, Some(range))?);
         }
         Ok(())
     };
@@ -301,6 +331,7 @@ fn declaration_witnesses(row: &Declaration, source: &str) -> Result<Vec<Value>> 
 fn append_rows(
     artifact: &Artifact,
     files: &[SourceFile],
+    header_witnesses: &native_evidence::FixtureHeaderWitnesses,
     declarations: &mut Vec<Value>,
     calls: &mut Vec<Value>,
     controls: &mut Vec<Value>,
@@ -347,7 +378,9 @@ fn append_rows(
         };
         declarations.push(json!({"role":row.role, "ref":reference(&row.syntax_id), "nativeId":row.syntax_id, "document":row.document, "revisionId":row.revision_id,
             "parentRef":parent, "kind":row.kind, "name":row.name, "range":position(&row.range), "nameRange":row.name_range.as_ref().map(position),
-            "header":row.header, "signature":row.key.signature, "witnesses":declaration_witnesses(row, &source.text)?}));
+            "header":row.header, "signature":row.key.signature, "witnesses":declaration_witnesses(row, &source.text,
+                header_witnesses.get(&row.syntax_id)
+                    .map(Vec::as_slice).unwrap_or_default())?}));
     }
     for row in &artifact.calls {
         let source = files

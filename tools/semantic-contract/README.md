@@ -82,9 +82,11 @@ Tests define local finite control rows `{id,baseline,mutate,expectedAssertion,ex
 The registry admits the current `trellis.native.syntax@native-v8` with the
 production `EXTRACTION_INPUTS` inventory (`[]` for Java, Rust, Python and
 JavaScript). Historical v3/v4 descriptors are not admitted. The Rust inventory
-guard queries this JS registry through Node and compares the actual Rust table;
-version/language/component drift fails verification. A new producer version adds
-a new entry instead of changing an existing version's claim.
+guard queries the complete production entry set in this JS registry through Node
+and requires equality with the actual Rust table; missing, extra, version,
+language or component drift fails verification. A new production version replaces
+the old production entry. Historical versions are not retained, and an existing
+version's extraction-input claim is never changed.
 
 Build once on `rust-toolchain.toml` in the owning checkout and an isolated target:
 
@@ -106,17 +108,22 @@ and `--revision` restrict the selected snapshot; without them all listed revisio
 are captured. Output must be a fresh file. Repeating a capture of the same bytes
 and descriptor yields identical output. The existing example fixture remains
 unchanged; the integration test captures its representative sources in a temporary
-native-only draft and normalizes/checks those measured rows.
+native-only draft and normalizes/checks those measured rows. Production `partial`
+document coverage is printed to stderr with its document/revision and diagnostic;
+the raw `NativeArtifact` shape has no coverage field. Capture does not turn
+partial coverage into complete coverage or a per-family unavailable claim.
 
 `--describe` reports the actual compiled producer descriptor, UTF-8 encoding,
 per-language extraction inventory and `hashKind:"nativeExtractor"`. The descriptor
 uses the compiled `TRELLIS_EXTRACTOR_HASH`, including the `test-support` build flag,
 not an environment override or the whole executable's SHA. Record that descriptor
 and the pinned Rust toolchain/source provenance with the capture. Do not copy a
-production-build hash onto a test-support build. The proposed native-specific
-[Decision 0017 Amendment 2](../../docs/semantic-evidence/decisions/0017-conformance-corpus-storage-and-producers.md#proposed-amendment-2-95-production-native-extractor-identity)
-keeps the existing profile pin lookup while changing this native digest's meaning;
-it awaits owner ratification. No real hardware pin or corpus is changed here.
+production-build hash onto a test-support build. The hash covers the fixture
+adapter (`src/native_capture.rs`) as well as the production extraction modules,
+so witness/conversion edits change the capture pin. It identifies this
+test-support capture build, not a release binary. Native extractor-hash pinning
+under Decision 0017 is a proposal in #95's PR body, awaiting owner ruling; it is
+not a ratified identity rule. No real hardware pin or corpus is changed here.
 
 The adapter preserves production declarations, calls and controls; it does not
 reparse source to invent additional measurements or map dynamic evidence to

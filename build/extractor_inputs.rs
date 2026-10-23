@@ -8,6 +8,7 @@
 /// these modules uses a crate module that is neither listed here nor named in
 /// its explicit non-extraction allowlist.
 ///
+/// - `native_capture`: test-support fixture conversion and source witnesses.
 /// - `native_evidence`: tree-sitter measurement, witnesses, revision headers.
 /// - `native_ids`: canonical JSON, digests and ID minting.
 /// - `indexer*`: graph projection and per-language native kinds.
@@ -23,6 +24,7 @@ pub const EXTRACTION_MODULES: &[&str] = &[
     "src/indexer_python.rs",
     "src/indexer_rust.rs",
     "src/model.rs",
+    "src/native_capture.rs",
     "src/native_evidence.rs",
     "src/native_ids.rs",
     "src/parallel.rs",
