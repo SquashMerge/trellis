@@ -200,6 +200,100 @@ async fn lost_active_index_releases_after_read_and_preserves_idle_clocks() {
         "release recreated the lost durable queue"
     );
     assert_eq!(registry.idle_exit_deadline(), Some(due));
+    assert!(registry.advance(due).unwrap().exit);
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn lost_active_index_wakes_cli_index_waiter_without_recreating_queue() {
+    let (base, id, mut registry, now) = fixture();
+    registry.attach_launch(1, &id).unwrap();
+    let runtime = registry.activate(&id.root_key).unwrap();
+    ready(&runtime).await;
+    let roots =
+        TopologyRoots::isolated_for_tests(base.path().join("cache"), base.path().join("data"));
+    // Stores for this root share the queue's in-process wait generation.
+    let store = trellis::store::Store::open(roots, identity(&id.root)).unwrap();
+    let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let holder = runtime.clone();
+    let held = tokio::task::spawn_blocking(move || {
+        holder.hold_worker_step_for_tests(|| {
+            let _ = held_tx.send(());
+            let _ = resume_rx.recv();
+        });
+    });
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, held_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    let (waiting_tx, waiting_rx) = tokio::sync::oneshot::channel();
+    store.set_before_terminal_wait_hook_for_tests(move || {
+        let _ = waiting_tx.send(());
+    });
+    let caller = runtime.clone();
+    let options = trellis::indexer::IndexOptions::new(id.root.clone());
+    let waiter = tokio::task::spawn_blocking(move || caller.cli_index(&options));
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, waiting_rx)
+        .await
+        .expect("CLI did not reach its terminal wait")
+        .unwrap();
+    let seen = store.terminal_generation();
+    assert_eq!(
+        store.earliest_unfinished_request().unwrap().unwrap().state,
+        "queued"
+    );
+    let index_dir = base.path().join("cache/indexes").join(&id.root_key);
+    fs::remove_dir_all(&index_dir).unwrap();
+    let scheduler = runtime.browser_scheduler().unwrap();
+    let retired = tokio::task::spawn_blocking(move || {
+        let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
+        loop {
+            let seen = scheduler.state_version();
+            if scheduler.runtime_phase() == trellis::http::RuntimePhase::Retired {
+                break;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "missing-index worker did not retire");
+            scheduler.wait_state_change(seen, remaining);
+        }
+    });
+    resume_tx.send(()).unwrap();
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, held)
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, retired)
+        .await
+        .expect("missing-index worker did not retire")
+        .unwrap();
+    // The CLI session remains attached until its actual index call returns.
+    assert!(runtime.has_active_resources());
+    let closed_generation = store.terminal_generation();
+    if closed_generation == seen {
+        // Release the real CLI thread before the RED assertion, so a missing
+        // owner wake cannot strand the test runtime's blocking pool.
+        store.wake_terminal_waiters_for_tests();
+    }
+    let error = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, waiter)
+        .await
+        .expect("CLI did not re-read its vanished queue after the wake")
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        error.to_string().starts_with("incompatible_queue:"),
+        "unexpected CLI failure: {error:#}"
+    );
+    assert!(!index_dir.exists(), "CLI recreated the purged queue");
+    registry.disconnect_at(1, now);
+    let due = now + DAEMON_IDLE_DELAY;
+    await_release_after_drain(&mut registry, due, &id.root_key).await;
+    assert!(!runtime.has_active_resources());
+    assert!(registry.advance(due).unwrap().exit);
+    assert_ne!(
+        closed_generation, seen,
+        "missing-index close did not wake the CLI waiter"
+    );
 }
 
 #[tokio::test]

@@ -1527,6 +1527,27 @@ impl Store {
         });
     }
 
+    /// Wake request waiters when the worker closes a missing queue. This is
+    /// not a terminal COMMIT: callers must re-read and report the queue failure.
+    pub(crate) fn notify_request_queue_unavailable(&self) {
+        self.publication_gate.notify_terminal();
+    }
+
+    /// Run once while a request waiter holds the generation lock, just before
+    /// it atomically releases that lock and sleeps.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn set_before_terminal_wait_hook_for_tests(&self, hook: impl FnOnce() + Send + 'static) {
+        self.publication_gate.test_before_terminal_wait.set(hook);
+    }
+
+    /// Unblock a fixture's request waiter during failure cleanup.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn wake_terminal_waiters_for_tests(&self) {
+        self.notify_terminal_waiters();
+    }
+
     /// Read a timeout diagnostic without blocking behind a terminal queue write.
     #[cfg(test)]
     pub(crate) fn test_pending_completion_probe_for_tests(

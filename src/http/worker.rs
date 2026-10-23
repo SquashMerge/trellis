@@ -534,6 +534,7 @@ impl DaemonState {
             _ => None,
         };
         drop(state);
+        self.store.notify_request_queue_unavailable();
         self.close(held);
         Ok(true)
     }
@@ -974,6 +975,58 @@ fn worker_loop(weak: std::sync::Weak<DaemonState>, inbox: Arc<WorkerInbox>) {
 
 #[cfg(test)]
 mod missing_index_tests {
+    #[test]
+    fn purge_at_native_spool_admission_inside_step_never_recreates_index() {
+        let (_tmp, store, state, options) =
+            crate::http::exceptional_recovery_tests::serving_queue_watch_fixture();
+        std::fs::write(
+            options.workspace_root.join("new.js"),
+            "function changed() {}\n",
+        )
+        .unwrap();
+        store.enqueue_request(&options, None).unwrap();
+        let index_dir = store.request_db_path().parent().unwrap().to_owned();
+        let removed = index_dir.clone();
+        let reached = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook_reached = reached.clone();
+        store.set_native_spool_hook(move || {
+            hook_reached.store(true, std::sync::atomic::Ordering::Release);
+            std::fs::remove_dir_all(removed).unwrap();
+        });
+        let _ = state.worker_step();
+        assert!(
+            reached.load(std::sync::atomic::Ordering::Acquire),
+            "full capture did not reach spool admission"
+        );
+        assert!(
+            !index_dir.exists(),
+            "mid-step spool admission recreated the purged index"
+        );
+        state.publish_fifo_pending();
+        state.worker_step().unwrap();
+        assert!(state.retired());
+        assert!(!index_dir.exists());
+    }
+
+    #[test]
+    fn writer_admission_after_activation_never_recreates_purged_index() {
+        for session in [false, true] {
+            let (_tmp, store, _state, _options) =
+                crate::http::exceptional_recovery_tests::serving_queue_watch_fixture();
+            let index_dir = store.request_db_path().parent().unwrap().to_owned();
+            std::fs::remove_dir_all(&index_dir).unwrap();
+            if session {
+                assert!(store.writer_session().is_err());
+            } else {
+                assert!(store.writer().is_err());
+            }
+            assert!(
+                !index_dir.exists(),
+                "writer admission reprovisioned the index"
+            );
+        }
+    }
+
     use crate::http::exceptional_recovery_tests::fixture;
     #[cfg(feature = "test-support")]
     use crate::indexer::IndexOptions;

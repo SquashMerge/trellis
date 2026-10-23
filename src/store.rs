@@ -93,10 +93,12 @@ struct PublicationGate {
     /// `state.waiting`, published for lock-free maintenance checks (#138
     /// item 12): a briefly held state lock never reads as a waiting publisher.
     waiting_published: std::sync::atomic::AtomicUsize,
-    /// Confirmed terminal request COMMITs on this queue, by any Store instance
-    /// (Decision 0009 §8). A waiter records it, re-reads its row, and waits
-    /// for it to change; requests.db stays the only record of outcomes.
+    /// Wake generation after a confirmed terminal request COMMIT or loss of
+    /// the queue's index directory, by any Store instance (Decision 0009 §8).
+    /// A waiter re-reads its row after a wake; requests.db alone records outcomes.
     terminal_commits: Mutex<u64>,
+    #[cfg(feature = "test-support")]
+    test_before_terminal_wait: TestOneShotHook,
     terminal_changed: Condvar,
     /// Set while a live publication's transaction has spilled pages to
     /// `index.db`. In rollback-journal mode that spill takes EXCLUSIVE until
@@ -360,6 +362,8 @@ pub struct Store {
     test_queue_after_root_verify_hook: Arc<TestOneShotHook>,
     #[cfg(test)]
     test_queue_select_hook: Arc<TestOneShotHook>,
+    #[cfg(test)]
+    test_native_spool_hook: Arc<TestOneShotHook>,
     #[cfg(any(test, feature = "test-support"))]
     test_queue_terminal_notify: Arc<Mutex<Option<TestTerminalNotify>>>,
     #[cfg(feature = "test-support")]
@@ -6581,15 +6585,17 @@ impl Store {
         );
     }
 
-    /// The terminal-commit count to record before re-reading a request row.
+    /// The terminal/queue-loss wake generation to record before re-reading a row.
     pub fn terminal_generation(&self) -> u64 {
         *self.publication_gate.terminal_commits.lock().unwrap()
     }
 
-    /// Block until a terminal COMMIT after `seen`; then re-read the row.
+    /// Block until a terminal or queue-loss wake after `seen`; then re-read the row.
     pub fn wait_terminal_change(&self, seen: u64) {
         let gate = &self.publication_gate;
         let commits = gate.terminal_commits.lock().unwrap();
+        #[cfg(feature = "test-support")]
+        gate.test_before_terminal_wait.run();
         drop(
             gate.terminal_changed
                 .wait_while(commits, |current| *current == seen)
@@ -6688,7 +6694,9 @@ impl Store {
         before_publish: impl FnOnce(&Path) -> Result<()>,
     ) -> Result<Self> {
         identity.verify()?;
-        roots.prepare_index(&identity)?;
+        // Activation alone provisions the directory and its sibling use lock.
+        // Release SH before recovery may need EX admission.
+        drop(roots.index_use(&identity)?);
         let store = Self::unopened(roots, identity)?;
         if !index_path_present(&store.roots.index_db(&store.identity))? {
             let leader = store.roots.writer(store.identity.clone())?;
@@ -6810,6 +6818,8 @@ impl Store {
             test_queue_after_root_verify_hook: Arc::new(TestOneShotHook::default()),
             #[cfg(test)]
             test_queue_select_hook: Arc::new(TestOneShotHook::default()),
+            #[cfg(test)]
+            test_native_spool_hook: Arc::new(TestOneShotHook::default()),
             #[cfg(any(test, feature = "test-support"))]
             test_queue_terminal_notify: Arc::new(Mutex::new(None)),
             #[cfg(feature = "test-support")]
@@ -7550,7 +7560,7 @@ impl Store {
         // Stage creation precedes SH admission so its own failure can seek EX
         // to release a deleted inode without upgrading a held shared guard.
         let mut staged = self.create_staged_index(leader, false)?;
-        let use_guard = match self.roots.index_use(&self.identity) {
+        let use_guard = match self.roots.index_use_existing(&self.identity) {
             Ok(guard) => guard,
             Err(error) => {
                 *self.aborted_staged_index.lock().unwrap() = Some(staged);
@@ -8537,12 +8547,19 @@ impl Store {
             counters.reused_occurrence_reads,
         ))
     }
-    /// Managed private scratch directory for an unpublished full-document spool.
-    /// The coordinator must use this Store's roots, including isolated test roots.
+    #[cfg(test)]
+    pub(crate) fn set_native_spool_hook(&self, hook: impl FnOnce() + Send + 'static) {
+        self.test_native_spool_hook.set(hook);
+    }
+
+    /// Existing private scratch directory for an unpublished full-document spool.
+    /// Only Store activation provisions this topology.
     pub(crate) fn native_spool_dir(&self) -> Result<std::path::PathBuf> {
-        self.identity.verify()?;
-        self.roots.prepare_index(&self.identity)?;
-        Ok(self.roots.index_dir(&self.identity))
+        #[cfg(test)]
+        self.test_native_spool_hook.run();
+        // The coordinator already owns SH or recovery EX. A second SH
+        // admission would conflict with its own exclusive recovery lock.
+        self.roots.existing_index_dir(&self.identity)
     }
 
     pub(crate) fn begin_writer_publication(&self, session: &topology::WriterSession) -> Result<()> {

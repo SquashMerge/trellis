@@ -1177,7 +1177,8 @@ async fn multiple_posts_commit_fifo_with_local_writer() {
     assert_eq!(store.request_by_id(&b.id).unwrap().unwrap().state, "done");
 }
 
-fn serving_queue_watch_fixture() -> (tempfile::TempDir, Store, Arc<DaemonState>, IndexOptions) {
+pub(super) fn serving_queue_watch_fixture()
+-> (tempfile::TempDir, Store, Arc<DaemonState>, IndexOptions) {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("workspace");
     std::fs::create_dir(&root).unwrap();
