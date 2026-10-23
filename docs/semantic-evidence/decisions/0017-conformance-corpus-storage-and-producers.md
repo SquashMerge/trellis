@@ -47,3 +47,20 @@ Everything else is unchanged: resolved, proven-external, callable-value negative
 | alias role required | yes | no | no | yes |
 
 The [toolkit README](../../../tools/semantic-contract/README.md) lists the complete floors, and `tools/semantic-contract/counts.mjs` holds them as per-language data.
+
+## Amendment 2 (2026-10-23): hardware profile shape check
+
+- **Status:** owner-approved 2026-10-23.
+- **Amends:** [#25](https://github.com/SquashMerge/trellis/issues/25)'s closed v1 hardware schema in `check-policy.mjs`, for values only.
+
+Decision 2 made the [reference hardware profile](../hardware/mac-mini-m5-pro-v1.json) the attestation source for pinned executable and toolchain captures. It is a measured record that changes on every producer or toolchain re-pin. While `check-policy.mjs` held a literal copy of it, every re-pin had to edit both files.
+
+`check-policy.mjs` now checks the hardware profile's closed shape, not its values:
+
+- the exact key set at every level, with no unknown or missing fields (`toolchains[]` is optional until a corpus pins a toolchain);
+- types: integers for counts, booleans and strings;
+- formats: non-empty version and name strings, `YYYY-MM-DD` dates, `artifactDigest` as `sha256:<64 lowercase hex>` or an npm `sha512-<base64>` integrity, and `executableHash` and `toolchainHash` as 64 lowercase hex;
+- unique `semanticProducers[].name` and `toolchains[].name`;
+- the profile's structural invariants: `version` is 1, `qualification` makes no benchmark claim (`benchmarkEvidence: null`, `passingBenchmarkClaim: false`), `profileId` equals the file name and the policy's `referenceHost.profileId`, `intended` matches the policy's reference-host location and paid-cloud flag, and `cpuCoreGroups` sums to `cpuCores`.
+
+A re-pin edits only the profile. The policy and cohort files are ratified Stage 1 text and stay value-frozen.

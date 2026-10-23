@@ -232,7 +232,7 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
         ["node", "--test", "runtime/acp/runner.test.mjs"],
         ["node", "--test", "tests/mcp-catalog-sdk.test.mjs"],
         ["node", "--test", "tests/factory-config.test.cjs"],
-        ["node", "docs/semantic-evidence/check-policy.mjs"],
+        ["node", "docs/semantic-evidence/check-policy.mjs", "--self-test"],
         ["node", "--check", "web/app.js"],
         ["node", "--test", "tests/question-ui.test.cjs", "tests/browse-ui.test.cjs", "tests/sequence-ui.test.cjs", "tests/token-ui.test.cjs", "tests/external-source-ui.test.cjs", "tests/dependency-ui.test.cjs", "tests/shell-ui.test.cjs", "tests/classes-ui.test.cjs", "tests/navigation-ui.test.cjs"],
       ],
