@@ -280,7 +280,15 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
     assert.equal(earlyFailure.result.error, undefined, "verify did not exit after its lane failed");
     assert.equal(earlyFailure.result.status, 23);
     const installer = Number(readFileSync(hangPid, "utf8"));
-    assert.throws(() => process.kill(installer, 0), { code: "ESRCH" }, "the background install outlived verify");
+    // The stopped install may still be a zombie that init has yet to reap, and
+    // kill(pid, 0) succeeds on a zombie; it holds nothing open, so it counts as stopped.
+    const state = (spawnSync("ps", ["-o", "stat=", "-p", String(installer)], { encoding: "utf8" }).stdout ?? "").trim();
+    if (state === "") {
+      // No ps row (or ps failed): the process itself must be gone.
+      assert.throws(() => process.kill(installer, 0), { code: "ESRCH" }, "the background install outlived verify");
+    } else {
+      assert.ok(state.startsWith("Z"), `the background install outlived verify (state ${state})`);
+    }
     rmSync(log);
     const failure = runVerify({ FAKE_VERIFY_FAIL_CLIPPY: "1" });
     assert.equal(failure.result.status, 23);
