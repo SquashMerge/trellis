@@ -93,10 +93,12 @@ struct PublicationGate {
     /// `state.waiting`, published for lock-free maintenance checks (#138
     /// item 12): a briefly held state lock never reads as a waiting publisher.
     waiting_published: std::sync::atomic::AtomicUsize,
-    /// Confirmed terminal request COMMITs on this queue, by any Store instance
-    /// (Decision 0009 §8). A waiter records it, re-reads its row, and waits
-    /// for it to change; requests.db stays the only record of outcomes.
+    /// Wake generation after a confirmed terminal request COMMIT or loss of
+    /// the queue's index directory, by any Store instance (Decision 0009 §8).
+    /// A waiter re-reads its row after a wake; requests.db alone records outcomes.
     terminal_commits: Mutex<u64>,
+    #[cfg(feature = "test-support")]
+    test_before_terminal_wait: TestOneShotHook,
     terminal_changed: Condvar,
     /// Set while a live publication's transaction has spilled pages to
     /// `index.db`. In rollback-journal mode that spill takes EXCLUSIVE until
@@ -360,6 +362,8 @@ pub struct Store {
     test_queue_after_root_verify_hook: Arc<TestOneShotHook>,
     #[cfg(test)]
     test_queue_select_hook: Arc<TestOneShotHook>,
+    #[cfg(test)]
+    test_native_spool_hook: Arc<TestOneShotHook>,
     #[cfg(any(test, feature = "test-support"))]
     test_queue_terminal_notify: Arc<Mutex<Option<TestTerminalNotify>>>,
     #[cfg(feature = "test-support")]
@@ -6581,15 +6585,17 @@ impl Store {
         );
     }
 
-    /// The terminal-commit count to record before re-reading a request row.
+    /// The terminal/queue-loss wake generation to record before re-reading a row.
     pub fn terminal_generation(&self) -> u64 {
         *self.publication_gate.terminal_commits.lock().unwrap()
     }
 
-    /// Block until a terminal COMMIT after `seen`; then re-read the row.
+    /// Block until a terminal or queue-loss wake after `seen`; then re-read the row.
     pub fn wait_terminal_change(&self, seen: u64) {
         let gate = &self.publication_gate;
         let commits = gate.terminal_commits.lock().unwrap();
+        #[cfg(feature = "test-support")]
+        gate.test_before_terminal_wait.run();
         drop(
             gate.terminal_changed
                 .wait_while(commits, |current| *current == seen)
@@ -6676,123 +6682,6 @@ impl Store {
             && probe.check() == MaintenanceQueueState::Clear
             && std::panic::catch_unwind(std::panic::AssertUnwindSafe(priority)).unwrap_or(false)
     }
-    /// Inspect only already published, inactive index queues. Unknown paths or
-    /// unreadable identities keep the daemon alive rather than abandoning work.
-    pub fn orphan_queues_pending(
-        roots: &topology::TopologyRoots,
-        active: &std::collections::HashSet<String>,
-    ) -> bool {
-        let parent = roots.cache.join("indexes");
-        let dirs = match std::fs::read_dir(&parent) {
-            Ok(dirs) => dirs,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
-            Err(_) => return true,
-        };
-        for entry in dirs {
-            let Ok(entry) = entry else { return true };
-            let Ok(kind) = entry.file_type() else {
-                return true;
-            };
-            if !kind.is_dir() {
-                continue;
-            }
-            let Some(key) = entry.file_name().to_str().map(str::to_owned) else {
-                return true;
-            };
-            if active.contains(&key) {
-                continue;
-            }
-            let pending = Self::orphan_queue_pending_at(roots, &key);
-            // The probe's SH guard and SQLite connection have now ended.
-            // Retire only without another active reader/leader on this index.
-            let lock = parent.join(format!("{key}.lock"));
-            if let Ok(_exclusive) = topology::UseGuard::acquire_existing_readonly_exclusive(&lock) {
-                let dir = parent.join(&key);
-                drop(SqliteWitnessRetirement(vec![
-                    dir.join("index.db"),
-                    dir.join("requests.db"),
-                ]));
-            }
-            if pending.unwrap_or(true) {
-                return true;
-            }
-        }
-        false
-    }
-
-    fn orphan_queue_pending_at(roots: &topology::TopologyRoots, key: &str) -> Result<bool> {
-        use sha2::{Digest, Sha256};
-        ensure!(
-            key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit()),
-            "invalid index key"
-        );
-        let dir = roots.cache.join("indexes").join(key);
-        let metadata = std::fs::symlink_metadata(&dir)?;
-        ensure!(
-            metadata.is_dir() && !metadata.file_type().is_symlink(),
-            "unsafe index directory"
-        );
-        let guard = topology::UseGuard::acquire_existing_readonly(
-            &roots.cache.join("indexes").join(format!("{key}.lock")),
-        )?;
-        let path = dir.join("index.db");
-        match std::fs::symlink_metadata(&path) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let absent = requests::queue_absent_without_sidecars(&dir.join("requests.db"));
-                guard.verify()?;
-                return Ok(!absent);
-            }
-            Err(error) => return Err(error.into()),
-            Ok(_) => {}
-        }
-        // SQLite may recover a hot journal or create shared-memory files even
-        // through a read-only connection. Check all sidecars before opening it.
-        reject_sidecars(&path, true)?;
-        let db = open_index_marker_probe(&path, false, Duration::ZERO)?;
-        let (spelling, device, inode): (String, String, String) = db.query_row(
-            "SELECT root_spelling,root_device,root_inode FROM index_metadata WHERE singleton=1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )?;
-        drop(db);
-        ensure!(
-            hex::encode(Sha256::digest(spelling.as_bytes())) == key,
-            "index identity mismatch"
-        );
-        let root = Path::new(&spelling);
-        // Only a proved pathname loss or new root inode is disposable. Unreadable
-        // paths, malformed metadata and marker errors are not proof that the old
-        // queue may be abandoned.
-        use std::os::unix::fs::MetadataExt;
-        let old_device = device.parse::<u64>()?;
-        let old_inode = inode.parse::<u64>()?;
-        match std::fs::symlink_metadata(root) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(error.into()),
-            Ok(named)
-                if !named.is_dir()
-                    || named.file_type().is_symlink()
-                    || (named.dev(), named.ino()) != (old_device, old_inode) =>
-            {
-                return Ok(false);
-            }
-            Ok(_) => {}
-        }
-        let identity = topology::WorkspaceIdentity::discover_unattached(Some(root), root)?
-            .attach_existing_marker_readonly()?;
-        ensure!(
-            identity.root_key == key
-                && identity.device == old_device
-                && identity.inode == old_inode,
-            "index root changed"
-        );
-        guard.verify()?;
-        let store = Self::unopened(roots.clone(), identity)?;
-        let pending = store.open_maintenance_queue_probe()?.check() != MaintenanceQueueState::Clear;
-        guard.verify()?;
-        Ok(pending)
-    }
-
     pub fn open(
         roots: topology::TopologyRoots,
         identity: topology::WorkspaceIdentity,
@@ -6805,7 +6694,9 @@ impl Store {
         before_publish: impl FnOnce(&Path) -> Result<()>,
     ) -> Result<Self> {
         identity.verify()?;
-        roots.prepare_index(&identity)?;
+        // Activation alone provisions the directory and its sibling use lock.
+        // Release SH before recovery may need EX admission.
+        drop(roots.index_use(&identity)?);
         let store = Self::unopened(roots, identity)?;
         if !index_path_present(&store.roots.index_db(&store.identity))? {
             let leader = store.roots.writer(store.identity.clone())?;
@@ -6927,6 +6818,8 @@ impl Store {
             test_queue_after_root_verify_hook: Arc::new(TestOneShotHook::default()),
             #[cfg(test)]
             test_queue_select_hook: Arc::new(TestOneShotHook::default()),
+            #[cfg(test)]
+            test_native_spool_hook: Arc::new(TestOneShotHook::default()),
             #[cfg(any(test, feature = "test-support"))]
             test_queue_terminal_notify: Arc::new(Mutex::new(None)),
             #[cfg(feature = "test-support")]
@@ -7667,7 +7560,7 @@ impl Store {
         // Stage creation precedes SH admission so its own failure can seek EX
         // to release a deleted inode without upgrading a held shared guard.
         let mut staged = self.create_staged_index(leader, false)?;
-        let use_guard = match self.roots.index_use(&self.identity) {
+        let use_guard = match self.roots.index_use_existing(&self.identity) {
             Ok(guard) => guard,
             Err(error) => {
                 *self.aborted_staged_index.lock().unwrap() = Some(staged);
@@ -8654,12 +8547,19 @@ impl Store {
             counters.reused_occurrence_reads,
         ))
     }
-    /// Managed private scratch directory for an unpublished full-document spool.
-    /// The coordinator must use this Store's roots, including isolated test roots.
+    #[cfg(test)]
+    pub(crate) fn set_native_spool_hook(&self, hook: impl FnOnce() + Send + 'static) {
+        self.test_native_spool_hook.set(hook);
+    }
+
+    /// Existing private scratch directory for an unpublished full-document spool.
+    /// Only Store activation provisions this topology.
     pub(crate) fn native_spool_dir(&self) -> Result<std::path::PathBuf> {
-        self.identity.verify()?;
-        self.roots.prepare_index(&self.identity)?;
-        Ok(self.roots.index_dir(&self.identity))
+        #[cfg(test)]
+        self.test_native_spool_hook.run();
+        // The coordinator already owns SH or recovery EX. A second SH
+        // admission would conflict with its own exclusive recovery lock.
+        self.roots.existing_index_dir(&self.identity)
     }
 
     pub(crate) fn begin_writer_publication(&self, session: &topology::WriterSession) -> Result<()> {

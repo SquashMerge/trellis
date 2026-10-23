@@ -176,6 +176,7 @@ impl TopologyRoots {
         managed_tree(&self.data)?;
         make_private(&self.data.join("workspaces"))
     }
+    /// Provision directory and use lock during Store activation only.
     pub fn index_use(&self, identity: &WorkspaceIdentity) -> Result<UseGuard> {
         self.prepare_index(identity)?;
         UseGuard::acquire(&self.index_use_lock(identity), false, true)
@@ -203,20 +204,22 @@ impl TopologyRoots {
             }
         })
     }
+    /// Inspect existing scratch topology without reacquiring the writer's use lock.
+    pub(super) fn existing_index_dir(&self, identity: &WorkspaceIdentity) -> Result<PathBuf> {
+        identity.verify()?;
+        self.reject_root_overlap(identity)?;
+        let directory = self.index_dir(identity);
+        for path in [&self.cache, &self.cache.join("indexes"), &directory] {
+            private_dir(path)?;
+        }
+        Ok(directory)
+    }
     fn index_use_existing_with_wait(
         &self,
         identity: &WorkspaceIdentity,
         nonblocking: bool,
     ) -> Result<UseGuard> {
-        identity.verify()?;
-        self.reject_root_overlap(identity)?;
-        for path in [
-            &self.cache,
-            &self.cache.join("indexes"),
-            &self.index_dir(identity),
-        ] {
-            private_dir(path)?;
-        }
+        self.existing_index_dir(identity)?;
         UseGuard::acquire_existing(&self.index_use_lock(identity), false, nonblocking).map_err(
             |error| {
                 if error.is::<StorageBusy>() {
@@ -260,7 +263,7 @@ impl TopologyRoots {
     /// use lock stays held for the writer's lifetime; exclusive GC cannot unlink
     /// an index while the writer uses it.
     pub fn writer(&self, identity: Arc<WorkspaceIdentity>) -> Result<WriterGuard> {
-        let use_guard = self.index_use(&identity)?;
+        let use_guard = self.index_use_existing(&identity)?;
         WriterGuard::new(self, identity, use_guard, false)
     }
     /// Activation retains the existing exclusive use lock through publication.

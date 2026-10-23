@@ -44,6 +44,8 @@ Both are policy constants, to be tuned later without a format change.
   - The next client re-attaches it with a catch-up scan and publication.
 - **Daemon exit: 30 minutes** after the last client of any checkout disconnects, counting active browsers as above, and only with no queued or in-flight work anywhere.
 
+**Owner ruling, 2026-10-11 (#130):** “Anywhere” means checkouts activated by this daemon. Idle exit does not scan other index directories or their orphan queues. Unknown entries, unreadable queues and accepted rows in never-activated checkouts cannot veto exit. Those rows remain durable and recover on the next activation (Decision 0008 §3). The 15-minute release and 30-minute exit constants are unchanged.
+
 ## Consequences
 
 - **Fewer processes:** N agent sessions cost one daemon plus N small clients instead of N full servers.

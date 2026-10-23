@@ -202,8 +202,6 @@ pub struct CheckoutRegistry {
     roots: Option<TopologyRoots>,
     runtimes: HashMap<String, Arc<CheckoutRuntime>>,
     idle_exit_at: Option<Instant>,
-    orphan_scan_cache: Option<(Instant, bool)>,
-    orphan_scan_count: u64,
     clock_override: Option<Instant>,
     /// Wakes the lifecycle owner: clients came or went, a runtime retired,
     /// accepted work drained or the last lease was released (Decision 0009 §5).
@@ -233,8 +231,6 @@ impl CheckoutRegistry {
             roots: None,
             runtimes: HashMap::new(),
             idle_exit_at: Some(now + DAEMON_IDLE_DELAY),
-            orphan_scan_cache: None,
-            orphan_scan_count: 0,
             clock_override: None,
             lifecycle: Arc::new(tokio::sync::Notify::new()),
             #[cfg(feature = "test-support")]
@@ -1394,7 +1390,7 @@ impl CheckoutRegistry {
         for key in self.entries.keys().cloned().collect::<Vec<_>>() {
             busy |= self.refresh_pending_work(&key)?;
         }
-        let candidate = self.idle_exit_at.is_some_and(|at| now >= at)
+        let exit = self.idle_exit_at.is_some_and(|at| now >= at)
             && !busy
             // Release may defer on startup reconciliation, a watcher, or an active read just before
             // the later pending-work refresh observes that work finish.
@@ -1403,22 +1399,6 @@ impl CheckoutRegistry {
                 .entries
                 .values()
                 .all(|entry| entry.sessions.is_empty() && entry.browser_until.is_none());
-        // Never scan every index directory on the routine 250-ms tick. A
-        // genuinely pending orphan is checked again after a bounded interval.
-        let exit = if candidate {
-            let pending = match self.orphan_scan_cache {
-                Some((until, pending)) if now < until => pending,
-                _ => {
-                    let pending = self.orphan_queue_pending();
-                    self.orphan_scan_count += 1;
-                    self.orphan_scan_cache = Some((now + Duration::from_secs(5), pending));
-                    pending
-                }
-            };
-            !pending
-        } else {
-            false
-        };
         Ok(LifecycleTick { released, exit })
     }
 
@@ -1434,27 +1414,6 @@ impl CheckoutRegistry {
             }
         }
         last
-    }
-
-    /// Check durable queues even for roots that have not attached since daemon
-    /// startup. An unreadable queue is busy, not permission to abandon work.
-    fn orphan_queue_pending(&self) -> bool {
-        let roots = match self
-            .roots
-            .clone()
-            .map(Ok)
-            .unwrap_or_else(TopologyRoots::production)
-        {
-            Ok(roots) => roots,
-            Err(_) => return true,
-        };
-        let active: HashSet<String> = self.runtimes.keys().cloned().collect();
-        Store::orphan_queues_pending(&roots, &active)
-    }
-
-    #[doc(hidden)]
-    pub fn orphan_scan_count_for_tests(&self) -> u64 {
-        self.orphan_scan_count
     }
 
     pub fn idle_exit_deadline(&self) -> Option<Instant> {
@@ -1473,10 +1432,7 @@ impl CheckoutRegistry {
         self.entries
             .values()
             .flat_map(|entry| [entry.release_at, entry.browser_until])
-            .chain([
-                self.idle_exit_at,
-                self.orphan_scan_cache.map(|(until, _)| until),
-            ])
+            .chain([self.idle_exit_at])
             .flatten()
             .filter(|at| *at > now)
             .min()
@@ -1843,14 +1799,6 @@ impl CheckoutRuntime {
         self.resources.lock().unwrap().is_some()
     }
 
-    fn queue_pending(resources: &ActiveResources) -> bool {
-        if resources.scheduler.checkout_root_loss_retired() {
-            !matches!(resources.store.old_root_unfinished_request(), Ok(None))
-        } else {
-            !matches!(resources.store.earliest_unfinished_request(), Ok(None))
-        }
-    }
-
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
     pub fn notify_on_terminal_request_for_tests(
@@ -1862,6 +1810,16 @@ impl CheckoutRuntime {
             .store
             .notify_on_terminal_request_for_tests(id, notify);
         Ok(())
+    }
+
+    /// Hold the checkout worker at its serial boundary while a fixture edits paths.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn hold_worker_step_for_tests(&self, hold: impl FnOnce()) {
+        self.resources()
+            .unwrap()
+            .scheduler
+            .hold_worker_step_for_tests(hold);
     }
 
     /// Make this checkout's next completion COMMIT durable but report an error.
@@ -1923,7 +1881,7 @@ impl CheckoutRuntime {
     fn catching_up_in(resources: &ActiveResources, phase: RuntimePhase) -> bool {
         match phase {
             RuntimePhase::Ready => {
-                resources.scheduler.checkout_watch_pending() || Self::queue_pending(resources)
+                resources.scheduler.checkout_watch_pending() || resources.scheduler.fifo_pending()
             }
             _ => true,
         }
