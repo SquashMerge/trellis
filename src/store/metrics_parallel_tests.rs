@@ -63,12 +63,24 @@ fn metrics_documents_are_attested_and_computed_concurrently() {
 }
 
 #[test]
-fn the_first_failure_in_manifest_order_is_reported() {
+fn the_first_failure_in_manifest_order_is_reported_when_a_later_one_fails_first() {
     let (_state, _root, store) = published_store(3);
     corrupt(&store, "graph_nodes", "name", "f0.js");
-    corrupt(&store, "graph_nodes", "name", "f2.js");
-    // Derivation charges graph bytes before dispatch, so the first corrupt
-    // document fails during ordered fetch, before later workers can start.
+    // A valid role change leaves graph derivation intact but fails the worker's
+    // native-vs-source attestation with a different error from f0's node check.
+    let db = Connection::open(store.roots.index_db(&store.identity)).unwrap();
+    let changed = db
+        .execute(
+            "UPDATE native_version_declarations
+             SET role=CASE role WHEN 'production' THEN 'test' ELSE 'production' END
+             WHERE version_id=(SELECT document_version_id FROM revision_documents WHERE path='f2.js')",
+            [],
+        )
+        .unwrap();
+    assert!(changed > 0, "f2.js has native declarations");
+    drop(db);
+    // f0 resumes only after f2's worker has returned its distinct failure.
+    hold_until(&store, "f0.js", "f2.js", MetricsDocumentStage::Done);
     let (result, _) = metrics_with(&store, 3, u64::MAX, &mut || Ok(()));
     let error = result.unwrap_err();
     assert!(

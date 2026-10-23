@@ -3,9 +3,13 @@
 `nested.js` is genuine JavaScript source indexed with the unmodified main binary
 `~/projects/odin/trellis-evidence/s123/s3/bin/trellis-main-0532` (SHA-256
 `536cdd7231b66c7a8e807d528084b6f00377a96d425ca6c5183a7a7728ff7d9f`).
-The isolated main home is `/tmp/trellis-s3-tiny-main-home-eg39bmpo`. Its
-`index.db` held the SQL rows for `oracle.json`; do not regenerate the oracle
-with the S-3 writer. `oracle.json` SHA-256:
+The isolated main home was captured from `/tmp/trellis-s3-tiny-main-home-eg39bmpo`
+and preserved at `~/projects/odin/trellis-evidence/s123/s3/main-ties-home/`.
+Its `Library/Caches/dev.squashmerge.trellis/indexes/e70f413d606c08fd26e563b59790e1797d0a918b2930bcada9a77f13c133642f/index.db`
+held the SQL rows for `oracle.json` (483328 bytes, SHA-256
+`f89fddbffb645e05cdfa2e3b76b5fa28ca1559c85bcc9bde56e9d83dd5579afc`).
+The complete six-file home copy was checked byte-for-byte by size and SHA-256;
+do not regenerate the oracle with the S-3 writer. `oracle.json` SHA-256:
 `31d00ec6611cab6e29ebc62533f787e23e436f16b1c1ca2b97fe410b1460c242`.
 
 The SQL capture selected `id,payload` from each `graph_nodes`, `graph_calls`,
@@ -46,8 +50,8 @@ remain untouched.
 
 `native-main.json` freezes the main-produced typed native rows used as the
 projector input. It decodes the `document_versions` and `native_version_*`
-rows of that same isolated home's
-`Library/Caches/dev.squashmerge.trellis/indexes/e70f413d606c08fd26e563b59790e1797d0a918b2930bcada9a77f13c133642f/index.db`
+rows of the preserved main home at
+`~/projects/odin/trellis-evidence/s123/s3/main-ties-home/Library/Caches/dev.squashmerge.trellis/indexes/e70f413d606c08fd26e563b59790e1797d0a918b2930bcada9a77f13c133642f/index.db`
 (SHA-256 `f89fddbffb645e05cdfa2e3b76b5fa28ca1559c85bcc9bde56e9d83dd5579afc`).
 Snapshot SHA-256: `b668a53cd112cee9158db05f2f8db5278924cde3a7ac1b3330d8c118684f2027`.
 The snapshot has original native IDs, ancestor keys, ranges and ordered call

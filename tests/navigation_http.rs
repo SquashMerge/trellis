@@ -527,6 +527,90 @@ async fn source_candidate_count_and_huge_cached_text_have_fixed_output_limits() 
 }
 
 #[tokio::test]
+async fn main_31c_source_filter_order_and_limit_are_stable() {
+    // Frozen from main 31c63fa's HTTP response on a fresh home. The full raw
+    // response and export are retained under odin/trellis-evidence/s123/s3/review/navigation-main31c.
+    let text = include_str!("fixtures/navigation-main-31c-mixed/Mixed.java");
+    let expected: Value = serde_json::from_str(include_str!(
+        "fixtures/navigation-main-31c-mixed/expected-main-31c.json"
+    ))
+    .unwrap();
+    let main_symbols: Value = serde_json::from_str(include_str!(
+        "fixtures/navigation-main-31c-mixed/main-line3-symbols.json"
+    ))
+    .unwrap();
+    let (dir, _store, graph, app, _session) = setup(&[("Mixed.java", text)]);
+    let line_three: Vec<_> = graph
+        .nodes
+        .iter()
+        .filter(|node| node.path == "Mixed.java" && node.range.start_line == 3)
+        .collect();
+    assert_eq!(
+        line_three
+            .iter()
+            .filter(|node| node.kind == SymbolKind::Class)
+            .count(),
+        180
+    );
+    assert_eq!(
+        line_three
+            .iter()
+            .filter(|node| node.kind == SymbolKind::Field)
+            .count(),
+        360
+    );
+    assert_eq!(
+        graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == SymbolKind::Class && node.range.start_line == 2)
+            .count(),
+        190
+    );
+    // SyntaxIds include the absolute checkout root. Use main's frozen DTOs
+    // for root-independent content, and this root's IDs only for the order.
+    let mut eligible: Vec<_> = line_three
+        .iter()
+        .copied()
+        .filter(|node| node.kind == SymbolKind::Class)
+        .collect();
+    eligible.sort_by(|a, b| a.id.cmp(&b.id));
+    assert_eq!(main_symbols.as_object().unwrap().len(), eligible.len());
+    for node in &eligible {
+        let mut stable = serde_json::to_value(node).unwrap();
+        stable.as_object_mut().unwrap().remove("id");
+        stable.as_object_mut().unwrap().remove("parent");
+        assert_eq!(
+            stable,
+            main_symbols[node.name.as_str()],
+            "main 31c {}",
+            node.name
+        );
+    }
+
+    let (status, view) = call(&app, source("Mixed.java", 3, &dir)).await;
+    assert_eq!(status, 200, "{view}");
+    let returned = view["targets"].as_array().unwrap();
+    assert_eq!(
+        returned.len(),
+        expected["targets"].as_array().unwrap().len()
+    );
+    for (target, node) in returned.iter().zip(eligible.iter()) {
+        assert_eq!(target["symbol"]["id"], json!(node.id));
+        let mut stable = target["symbol"].clone();
+        stable.as_object_mut().unwrap().remove("id");
+        stable.as_object_mut().unwrap().remove("parent");
+        assert_eq!(stable, main_symbols[node.name.as_str()]);
+        for key in ["action", "reason", "matchKind"] {
+            assert_eq!(target[key], expected["targets"][0][key], "main 31c {key}");
+        }
+    }
+    for key in ["warnings", "truncated", "requireIndex"] {
+        assert_eq!(view[key], expected[key], "main 31c {key}");
+    }
+}
+
+#[tokio::test]
 async fn java_field_envelope_is_exact_across_comments_lines_shared_declarations_and_utf8() {
     let (dir, _store, graph, app, _session) = setup(&[(
         "Fields.java",

@@ -19,6 +19,11 @@ const TOTAL_ROWS: usize = 256;
 const TARGETS: usize = 64;
 const WARNINGS: usize = 32;
 
+fn compare_enclosing(a: &Symbol, b: &Symbol) -> std::cmp::Ordering {
+    (a.range.end_byte - a.range.start_byte, &a.id)
+        .cmp(&(b.range.end_byte - b.range.start_byte, &b.id))
+}
+
 #[derive(Debug)]
 pub struct InvalidRequest(pub &'static str);
 impl std::fmt::Display for InvalidRequest {
@@ -277,10 +282,7 @@ impl Reader<'_> {
                 })
                 .cloned()
                 .collect();
-            enclosing.sort_by(|a, b| {
-                (a.range.end_byte - a.range.start_byte, &a.id)
-                    .cmp(&(b.range.end_byte - b.range.start_byte, &b.id))
-            });
+            enclosing.sort_by(compare_enclosing);
             for symbol in self.symbol_records(enclosing.into_iter().take(1))? {
                 self.add(symbol, "enclosing", "measured")?;
             }
@@ -426,6 +428,27 @@ mod tests {
             rows: 0,
             output_bytes: 0,
             seen: BTreeSet::new(),
+        }
+    }
+
+    #[test]
+    fn enclosing_equal_span_id_tie_break_is_bytewise_in_both_input_orders() {
+        // Synthetic comparator tie-break test, not a main parity fixture.
+        let mut smaller = symbol(1);
+        smaller.range.start_byte = 10;
+        smaller.range.end_byte = 20;
+        let mut larger = symbol(2);
+        larger.range.start_byte = 30;
+        larger.range.end_byte = 40;
+        assert_eq!(smaller.range.end_byte - smaller.range.start_byte, 10);
+        assert_eq!(larger.range.end_byte - larger.range.start_byte, 10);
+        for mut candidates in [
+            vec![smaller.clone(), larger.clone()],
+            vec![larger.clone(), smaller.clone()],
+        ] {
+            candidates.sort_by(compare_enclosing);
+            assert_eq!(candidates[0].id, smaller.id);
+            assert_eq!(candidates[1].id, larger.id);
         }
     }
 

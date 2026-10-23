@@ -64,6 +64,67 @@ fn compare_rows<T: Serialize>(expected: &Value, rows: &[T], family: &str) {
     }
 }
 
+// SQL vectors are stored in ID order, which can hide writer-order regressions.
+// Derive expected call order from the independently frozen main SQL payloads,
+// and compare it before the byte-level checks sort projected rows by ID.
+fn assert_writer_order(
+    expected: &Value,
+    nodes: &[crate::model::Symbol],
+    calls: &[crate::model::CallSite],
+    regions: &[crate::model::ControlRegion],
+) {
+    for (family, ids) in [
+        (
+            "nodes",
+            nodes.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+        ),
+        (
+            "regions",
+            regions.iter().map(|row| row.id.as_str()).collect(),
+        ),
+    ] {
+        let frozen_ids: Vec<_> = expected[family]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids, frozen_ids,
+            "project_document {family} order before sort"
+        );
+    }
+    let mut frozen_calls: Vec<_> = expected["calls"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| serde_json::from_str::<Value>(row["payload"].as_str().unwrap()).unwrap())
+        .collect();
+    frozen_calls.sort_by(|a, b| {
+        (
+            a["path"].as_str().unwrap(),
+            a["range"]["startByte"].as_u64().unwrap(),
+            a["range"]["endByte"].as_u64().unwrap(),
+            a["id"].as_str().unwrap(),
+        )
+            .cmp(&(
+                b["path"].as_str().unwrap(),
+                b["range"]["startByte"].as_u64().unwrap(),
+                b["range"]["endByte"].as_u64().unwrap(),
+                b["id"].as_str().unwrap(),
+            ))
+    });
+    let expected_ids: Vec<_> = frozen_calls
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    let actual_ids: Vec<_> = calls.iter().map(|row| row.id.as_str()).collect();
+    assert_eq!(
+        actual_ids, expected_ids,
+        "project_document call writer order before sort"
+    );
+}
+
 #[test]
 fn main_writer_graph_payloads_match_one_shared_projection_byte_for_byte() {
     let root =
@@ -136,6 +197,7 @@ fn main_writer_graph_payloads_match_one_shared_projection_byte_for_byte() {
                 &labels,
             )
             .unwrap();
+            assert_writer_order(&old["rows"], &nodes, &calls, &regions);
             nodes.sort_by(|a, b| a.id.cmp(&b.id));
             calls.sort_by(|a, b| a.id.cmp(&b.id));
             regions.sort_by(|a, b| a.id.cmp(&b.id));
@@ -257,6 +319,7 @@ fn main_writer_nested_call_and_query_view_oracle() {
         &BTreeMap::new(),
     )
     .unwrap();
+    assert_writer_order(&frozen["rows"], &nodes, &calls, &regions);
     nodes.sort_by(|a, b| a.id.cmp(&b.id));
     calls.sort_by(|a, b| a.id.cmp(&b.id));
     regions.sort_by(|a, b| a.id.cmp(&b.id));

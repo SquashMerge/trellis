@@ -54,9 +54,9 @@ PARITY = {
  "declarations": "SELECT m.language,m.path,d.syntax_id,d.kind,d.name,d.lookup_key,d.start_byte,d.end_byte FROM revision_documents m JOIN native_version_declarations d ON d.version_id=m.document_version_id WHERE m.revision_id=? ORDER BY m.language,m.path,d.syntax_id",
  "calls": "SELECT m.language,m.path,c.id,c.owner_syntax_id,c.ordinal,c.start_byte,c.end_byte,c.callee_start,c.callee_end,c.spelling FROM revision_documents m JOIN native_version_calls c ON c.version_id=m.document_version_id WHERE m.revision_id=? ORDER BY m.language,m.path,c.id",
  "regions": "SELECT m.language,m.path,c.id,c.owner_syntax_id,c.ordinal,c.kind,c.start_byte,c.end_byte,c.parent_id,c.arm FROM revision_documents m JOIN native_version_control_regions c ON c.version_id=m.document_version_id WHERE m.revision_id=? ORDER BY m.language,m.path,c.id",
- "graph_nodes": "SELECT m.language,m.path,n.id,n.payload FROM revision_documents m JOIN graph_nodes n ON n.projection_id=m.graph_projection_id WHERE m.revision_id=? ORDER BY m.language,m.path,n.id",
- "graph_calls": "SELECT m.language,m.path,n.id,n.payload FROM revision_documents m JOIN graph_calls n ON n.projection_id=m.graph_projection_id WHERE m.revision_id=? ORDER BY m.language,m.path,n.id",
- "graph_regions": "SELECT m.language,m.path,n.id,n.payload FROM revision_documents m JOIN graph_regions n ON n.projection_id=m.graph_projection_id WHERE m.revision_id=? ORDER BY m.language,m.path,n.id",
+ "graph_projection": "SELECT m.language,m.path,g.graph_hash,g.class_extraction_state,g.class_extraction_payload FROM revision_documents m JOIN graph_projections g ON g.id=m.graph_projection_id WHERE m.revision_id=? ORDER BY m.language,m.path",
+ "graph_nodes": "SELECT m.language,m.path,n.id,n.name,n.kind FROM revision_documents m JOIN graph_nodes n ON n.projection_id=m.graph_projection_id WHERE m.revision_id=? ORDER BY m.language,m.path,n.id",
+ "graph_display_labels": "SELECT m.language,m.path,n.id,n.label FROM revision_documents m JOIN graph_display_labels n ON n.projection_id=m.graph_projection_id WHERE m.revision_id=? ORDER BY m.language,m.path,n.id",
  "classes": "SELECT m.language,m.path,n.id,n.payload FROM revision_documents m JOIN classes n ON n.projection_id=m.class_projection_id WHERE m.revision_id=? ORDER BY m.language,m.path,n.id",
  "class_relations": "SELECT m.language,m.path,n.id,n.payload FROM revision_documents m JOIN class_relations n ON n.projection_id=m.class_projection_id WHERE m.revision_id=? ORDER BY m.language,m.path,n.id",
 }

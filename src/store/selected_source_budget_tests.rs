@@ -1,8 +1,58 @@
 use super::*;
 use crate::indexer::{IndexOptions, index_workspace_bundle};
 use std::{fs, sync::atomic::AtomicBool};
+
 #[test]
-fn selected_length_guard_precedes_json_and_blob_decode() {
+fn derived_graph_row_byte_budget_accepts_under_and_rejects_over() {
+    let (_state, _root, store) = super::selected_read_once_tests::published_store(1);
+    let db = Connection::open(store.roots.index_db(&store.identity)).unwrap();
+    let selected = store.read_revision_for(&db, None, true).unwrap();
+    let document = store
+        .selected_graph_document_for(&db, "f0.js", &selected)
+        .unwrap();
+    let source_bytes = document.file.text.len() as i64;
+    let max_row = (source_bytes as u64)
+        .saturating_mul(6)
+        .saturating_add(16 * 1024)
+        .min(256 * 1024 * 1024 + 16 * 1024);
+    let mut node = document.nodes[0].clone();
+    node.name = String::new();
+    node.display_label = Some(String::new());
+    let base = node.id.len() + node.name.len() + node.path.len() + json(&node).unwrap().len();
+    assert!(base < max_row as usize);
+    // ASCII name bytes count in both the name column and compact JSON; label
+    // bytes count only in JSON. Use the label for the final one-byte boundary.
+    let missing = max_row as usize - 1 - base;
+    node.name = "x".repeat(missing / 2);
+    node.display_label = Some("x".repeat(missing % 2));
+    let charge = |node: &Symbol| {
+        node.id.len() + node.name.len() + node.path.len() + json(node).unwrap().len()
+    };
+    assert_eq!(charge(&node), max_row as usize - 1);
+    assert_eq!(
+        derived_graph_bytes(&[node.clone()], &[], &[], source_bytes).unwrap(),
+        (max_row - 1)
+    );
+    node.display_label.as_mut().unwrap().push('x');
+    assert_eq!(charge(&node), max_row as usize);
+    assert_eq!(
+        derived_graph_bytes(&[node.clone()], &[], &[], source_bytes).unwrap(),
+        max_row
+    );
+    node.display_label.as_mut().unwrap().push('x');
+    assert_eq!(charge(&node), max_row as usize + 1);
+    assert!(
+        derived_graph_bytes(&[node], &[], &[], source_bytes)
+            .unwrap_err()
+            .to_string()
+            .contains("graph row byte budget exceeded")
+    );
+}
+
+/// The source-length gate precedes its decode; derived graph guards run after
+/// the selected source and native rows have been decoded.
+#[test]
+fn selected_source_length_guard_precedes_decode_and_graph_guard_follows() {
     let state = tempfile::tempdir().unwrap();
     let root = tempfile::tempdir().unwrap();
     fs::write(root.path().join("one.js"), "function one() {}\n").unwrap();

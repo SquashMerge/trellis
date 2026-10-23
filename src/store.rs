@@ -3567,11 +3567,20 @@ fn resolve_class_id(
     use crate::class_diagram::InvalidRequest;
     let mut current = id.to_owned();
     let mut seen = BTreeSet::new();
+    let mut document: Option<AttestedDocument> = None;
     for depth in 0..64 {
         ensure!(
             seen.insert(current.clone()),
             InvalidRequest("The selected symbol has a cyclic class ancestry.")
         );
+        if depth > 0 {
+            ensure!(
+                document
+                    .as_ref()
+                    .is_some_and(|doc| doc.nodes.iter().any(|node| node.id == current)),
+                InvalidRequest("Choose an indexed Java or Python class or method.")
+            );
+        }
         if db.query_row(
             "SELECT EXISTS(SELECT 1 FROM classes c JOIN revision_documents m ON m.revision_id=?2 AND m.class_projection_id=c.projection_id WHERE c.id=?1)",
             params![current, selected.key],
@@ -3579,14 +3588,18 @@ fn resolve_class_id(
         )? {
             return Ok(current);
         }
-        let path: Option<String> = db.query_row(
-            "SELECT m.path FROM graph_nodes n JOIN revision_documents m ON m.revision_id=?2 AND m.graph_projection_id=n.projection_id WHERE n.id=?1",
-            params![current, selected.key], |r| r.get(0),
-        ).optional().map_err(|error| store.report_selected_failure(error.into()))?;
-        let symbol = path
-            .map(|path| store.selected_graph_document_for(db, &path, selected))
-            .transpose()?
-            .and_then(|doc| doc.nodes.into_iter().find(|node| node.id == current))
+        if document.is_none() {
+            let path: Option<String> = db.query_row(
+                "SELECT m.path FROM graph_nodes n JOIN revision_documents m ON m.revision_id=?2 AND m.graph_projection_id=n.projection_id WHERE n.id=?1",
+                params![current, selected.key], |r| r.get(0),
+            ).optional().map_err(|error| store.report_selected_failure(error.into()))?;
+            document = path
+                .map(|path| store.selected_graph_document_for(db, &path, selected))
+                .transpose()?;
+        }
+        let symbol = document
+            .as_ref()
+            .and_then(|doc| doc.nodes.iter().find(|node| node.id == current))
             .ok_or(InvalidRequest(
                 "Choose an indexed Java or Python class or method.",
             ))?;
@@ -3594,7 +3607,7 @@ fn resolve_class_id(
             depth > 0 || matches!(symbol.kind, SymbolKind::Method | SymbolKind::Function),
             InvalidRequest("Choose an indexed Java or Python class or method.")
         );
-        current = symbol.parent.ok_or(InvalidRequest(
+        current = symbol.parent.clone().ok_or(InvalidRequest(
             "The selected method has no supported enclosing class.",
         ))?;
     }
@@ -4251,17 +4264,10 @@ fn write_graph_document(
         if reused.graph {
             continue;
         }
-        let kind = match n.kind {
-            SymbolKind::Module => "module",
-            SymbolKind::Function => "function",
-            SymbolKind::Method => "method",
-            SymbolKind::Class => "class",
-            SymbolKind::Field => "field",
-            SymbolKind::Variable => "variable",
-            SymbolKind::Parameter => "parameter",
-            SymbolKind::TypeParameter => "typeParameter",
-            SymbolKind::Alias => "alias",
-        };
+        let kind = serde_json::to_value(n.kind)?;
+        let kind = kind
+            .as_str()
+            .context("incompatible_index: selected graph kind invalid")?;
         immutable.insert(
             db,
             "INSERT INTO graph_nodes VALUES(?1,?2,?3,?4)",
@@ -12061,8 +12067,9 @@ impl Store {
 
     /// Authenticate one selected document's normalized records and graph DTOs
     /// against its paired BLOB in the same pinned SQLite transaction.
-    // SQL aggregate touches only the selected path's ancillary native and class rows.
-    // SourceFile JSON and graph node/call/region payloads have separate envelopes.
+    // SQL aggregates the selected path's ancillary native and class rows.
+    // SourceFile JSON has its own envelope; derived graph bytes are checked
+    // after source and native rows are decoded.
     fn selected_ancillary_byte_usage(
         db: &Connection,
         version_id: &str,
@@ -12278,12 +12285,10 @@ impl Store {
             (SELECT count(*) FROM native_version_headers WHERE version_id=?3),
             (SELECT count(*) FROM native_version_header_items WHERE version_id=?3),
             (SELECT count(*) FROM native_version_parameters WHERE version_id=?3),
-            (SELECT count(*) FROM native_version_calls WHERE version_id=?3),
-            (SELECT count(*) FROM native_version_control_regions WHERE version_id=?3),
             (SELECT count(*) FROM native_version_call_regions WHERE version_id=?3)";
         let counts: Vec<i64> =
             db.query_row(counts_sql, params![graph_id, class_id, version_id], |r| {
-                (0..17)
+                (0..15)
                     .map(|i| r.get(i))
                     .collect::<rusqlite::Result<Vec<_>>>()
             })?;
@@ -13590,9 +13595,6 @@ impl Store {
         let (revision, workspace_root, overlays) = self.with_evidence_hook(|tx| {
             let revision = self.read_status(tx)?.revision;
             let workspace = Path::new(&self.workspace_root);
-            let mut valid_stmt = tx.prepare(
-                "SELECT 1 FROM revision_documents m JOIN index_metadata active_manifest ON active_manifest.singleton=1 AND m.revision_id='pin:v1:'||active_manifest.index_generation||':'||active_manifest.index_revision WHERE m.path=?1",
-            )?;
             let mut count_stmt = tx.prepare(
                 "SELECT (SELECT count(*) FROM graph_nodes n WHERE n.projection_id=m.graph_projection_id AND n.kind IN ('function','method')) FROM revision_documents m JOIN index_metadata active_manifest ON active_manifest.singleton=1 AND m.revision_id='pin:v1:'||active_manifest.index_generation||':'||active_manifest.index_revision WHERE m.path=?1",
             )?;
@@ -13601,19 +13603,11 @@ impl Store {
                 let absolute = root.join(&item.path);
                 let Ok(relative) = absolute.strip_prefix(workspace) else { continue };
                 let Some(relative) = relative.to_str() else { continue };
-                let valid: Option<bool> = valid_stmt
+                let count: Option<i64> = count_stmt
                     .query_row([relative], |row| row.get(0))
                     .optional()
                     .map_err(|error| self.report_selected_failure(error.into()))?;
-                let Some(valid) = valid else { continue };
-                if !valid {
-                    return Err(self.report_selected_failure(
-                        SelectedIntegrity("incompatible_index: selected tree node JSON invalid".into()).into(),
-                    ));
-                }
-                let count: i64 = count_stmt
-                    .query_row([relative], |row| row.get(0))
-                    .map_err(|error| self.report_selected_failure(error.into()))?;
+                let Some(count) = count else { continue };
                 overlays.push((index, relative.to_owned(), usize::try_from(count)?));
             }
             Ok((revision, self.workspace_root.clone(), overlays))
@@ -13633,9 +13627,6 @@ impl Store {
     ) -> Result<(IndexPin, String, TreeOverlays)> {
         let revision = self.read_status_for(tx, pre_startup)?.revision;
         let workspace = Path::new(&self.workspace_root);
-        let mut valid_stmt = tx.prepare(
-                "SELECT 1 FROM revision_documents m JOIN index_metadata active_manifest ON active_manifest.singleton=1 AND m.revision_id='pin:v1:'||active_manifest.index_generation||':'||active_manifest.index_revision WHERE m.path=?1",
-            )?;
         let mut count_stmt = tx.prepare(
                 "SELECT (SELECT count(*) FROM graph_nodes n WHERE n.projection_id=m.graph_projection_id AND n.kind IN ('function','method')) FROM revision_documents m JOIN index_metadata active_manifest ON active_manifest.singleton=1 AND m.revision_id='pin:v1:'||active_manifest.index_generation||':'||active_manifest.index_revision WHERE m.path=?1",
             )?;
@@ -13652,20 +13643,11 @@ impl Store {
             let Some(relative) = relative.to_str() else {
                 continue;
             };
-            let valid: Option<bool> = valid_stmt
+            let count: Option<i64> = count_stmt
                 .query_row([relative], |row| row.get(0))
                 .optional()
                 .map_err(|error| self.report_selected_failure(error.into()))?;
-            let Some(valid) = valid else { continue };
-            if !valid {
-                return Err(self.report_selected_failure(
-                    SelectedIntegrity("incompatible_index: selected tree node JSON invalid".into())
-                        .into(),
-                ));
-            }
-            let count: i64 = count_stmt
-                .query_row([relative], |row| row.get(0))
-                .map_err(|error| self.report_selected_failure(error.into()))?;
+            let Some(count) = count else { continue };
             overlays.push((index, relative.to_owned(), usize::try_from(count)?));
         }
         Ok((revision, self.workspace_root.clone(), overlays))
@@ -14031,7 +14013,6 @@ impl Store {
         let Some(path) = selected_path else {
             return Ok(None);
         };
-        let mut documents = BTreeMap::new();
         let seed_document = self.selected_graph_document_for(tx, &path, &selected)?;
         let seed = seed_document
             .nodes
@@ -14039,33 +14020,15 @@ impl Store {
             .find(|symbol| symbol.id == query.seed)
             .cloned()
             .context("incompatible_index: selected view seed missing")?;
-        documents.insert(path, seed_document);
         let mut calls = Vec::new();
         let mut region_ids = BTreeSet::new();
         let mut truncated = false;
         if !query.exclude_paths.iter().any(|p| seed.path.starts_with(p)) {
-            // The native owner index selects candidate documents without scanning
-            // every revision document. Derive each document once, sort globally,
-            // and take the SQL LIMIT before filtering excluded paths.
-            let call_paths: Vec<String> = tx
-                .prepare(
-                    "SELECT DISTINCT m.path FROM native_version_calls c JOIN revision_documents m
-                 ON m.revision_id=?2 AND m.document_version_id=c.version_id
-                 WHERE c.owner_syntax_id=?1 ORDER BY m.path",
-                )?
-                .query_map(params![seed.id, selected.key], |r| r.get(0))?
-                .collect::<rusqlite::Result<_>>()?;
-            for path in call_paths {
-                if !documents.contains_key(&path) {
-                    documents.insert(
-                        path.clone(),
-                        self.selected_graph_document_for(tx, &path, &selected)?,
-                    );
-                }
-            }
-            let mut ordered: Vec<CallSite> = documents
-                .values()
-                .flat_map(|doc| doc.graph_calls.iter())
+            // A call's owner belongs to the seed's document. Sort its calls,
+            // then take the SQL LIMIT before filtering excluded paths.
+            let mut ordered: Vec<CallSite> = seed_document
+                .graph_calls
+                .iter()
                 .filter(|call| call.caller == seed.id)
                 .cloned()
                 .collect();
@@ -14084,9 +14047,9 @@ impl Store {
         }
         let mut regions = BTreeMap::new();
         while let Some(id) = region_ids.pop_first() {
-            let region = documents
-                .values()
-                .flat_map(|doc| doc.graph_regions.iter())
+            let region = seed_document
+                .graph_regions
+                .iter()
                 .find(|region| region.id == id)
                 .cloned();
             if let Some(region) = region {
