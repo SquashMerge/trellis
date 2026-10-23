@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 use tree_sitter::{Node, Parser};
 
 use crate::native_evidence::{Call, ControlRegion, Declaration, Range};
+use crate::store::SelectedIntegrity;
 
 #[cfg(feature = "test-support")]
 thread_local! {
@@ -158,7 +159,9 @@ fn bind(
         check()?;
         let language = declarations
             .first()
-            .context("corrupt: call without declaration")?
+            .context(SelectedIntegrity(
+                "corrupt: call without declaration".into(),
+            ))?
             .document
             .language
             .as_str();
@@ -367,7 +370,7 @@ fn grammar(language: &str) -> Result<tree_sitter::Language> {
         "python" => tree_sitter_python::LANGUAGE.into(),
         "javascript" => tree_sitter_javascript::LANGUAGE.into(),
         "rust" => tree_sitter_rust::LANGUAGE.into(),
-        _ => anyhow::bail!("corrupt: unknown stored language"),
+        _ => return Err(SelectedIntegrity("corrupt: unknown stored language".into()).into()),
     })
 }
 fn syntax_ok(root: Node<'_>, check: &mut impl FnMut() -> Result<()>) -> Result<()> {
@@ -428,7 +431,7 @@ fn compute_source(
                 && d.range.end <= source.len()
                 && source.is_char_boundary(d.range.start)
                 && source.is_char_boundary(d.range.end),
-            "corrupt: invalid declaration range"
+            SelectedIntegrity("corrupt: invalid declaration range".into())
         );
         let nested: Vec<_> = declarations
             .iter()
@@ -508,10 +511,10 @@ fn callable_body(
         stack.extend(node.children(&mut cursor));
     }
     selected.with_context(|| {
-        format!(
+        SelectedIntegrity(format!(
             "corrupt: callable body not found: {} {} {:?} {:?}",
             d.document.language, d.document.path, d.name, d.range
-        )
+        ))
     })
 }
 

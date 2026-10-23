@@ -181,9 +181,9 @@ impl DaemonState {
 
     /// The options startup reconciliation captures with. Explicit registered
     /// options win; otherwise recorded inputs, then the FIFO head's, then the
-    /// daemon defaults. A recreate without trusted inputs needs the FIFO
-    /// head's options (or, for a replaced root, the defaults).
-    fn startup_options(&self) -> anyhow::Result<Option<IndexOptions>> {
+    /// daemon defaults. Recreation uses the FIFO head, retained watcher
+    /// options, then daemon defaults when no explicit options are registered.
+    fn startup_options(&self) -> anyhow::Result<IndexOptions> {
         let config = self.config();
         let explicit = config.explicit_options;
         // The FIFO head is read first, even when unused: a typed failure to
@@ -194,21 +194,33 @@ impl DaemonState {
             .transpose()?;
         if self.store.is_recreate_pending() {
             if explicit {
-                return Ok(Some(config.options.clone()));
+                return Ok(config.options.clone());
             }
-            return Ok(head.or_else(|| {
-                self.store
-                    .is_root_replaced()
-                    .then(|| config.options.clone())
-            }));
+            let watched = self
+                .watcher_work
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|(_, watcher)| watcher.options());
+            return Ok(head.or(watched).unwrap_or_else(|| config.options.clone()));
         }
         if explicit {
-            return Ok(Some(config.options.clone()));
+            return Ok(config.options.clone());
         }
-        Ok(Some(match self.store.recorded_index_options()? {
-            Some(recorded) => recorded,
-            None => head.unwrap_or_else(|| config.options.clone()),
-        }))
+        Ok(match self.store.recorded_index_options() {
+            Ok(Some(recorded)) => recorded,
+            Ok(None) => head.unwrap_or_else(|| config.options.clone()),
+            Err(error) if crate::store::Store::is_rebuild_failure(&error) => {
+                let watched = self
+                    .watcher_work
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|(_, watcher)| watcher.options());
+                watched.or(head).unwrap_or_else(|| config.options.clone())
+            }
+            Err(error) => return Err(error),
+        })
     }
 
     /// The FIFO head as startup reconciliation sees it.
@@ -223,7 +235,10 @@ impl DaemonState {
         self.store.earliest_unfinished_request()
     }
 
-    fn startup_attempt(&self) -> anyhow::Result<Arc<WriterSession>> {
+    fn startup_attempt(
+        &self,
+        retained: Option<(Arc<WriterSession>, Option<IndexOptions>)>,
+    ) -> anyhow::Result<Arc<WriterSession>> {
         self.store.settle_foreign_root_requests()?;
         #[cfg(feature = "test-support")]
         if let Some(hook) = self.startup_hook.lock().unwrap().take() {
@@ -234,10 +249,23 @@ impl DaemonState {
         }
         #[cfg(feature = "test-support")]
         self.startup_captures.fetch_add(1, Ordering::AcqRel);
+        if let Some((session, options)) = retained {
+            let options = match options {
+                Some(options) => options,
+                None => self.startup_options()?,
+            };
+            let coordinator = crate::index_coordinator::IndexJobCoordinator::prepare_with_session(
+                &self.store,
+                None,
+                session.clone(),
+            )?;
+            coordinator.run_serving(&options, &Arc::new(AtomicBool::new(false)), |_| {})?;
+            return Ok(session);
+        }
         let options = self.startup_options()?;
         crate::index_coordinator::establish_serving_session(
             &self.store,
-            options.as_ref(),
+            Some(&options),
             &Arc::new(AtomicBool::new(false)),
         )
     }
@@ -246,11 +274,27 @@ impl DaemonState {
     /// On failure the state waits out a doubling backoff, and only a typed
     /// contention is not reported as a tick failure.
     pub(super) fn run_startup_reconciliation(&self) -> anyhow::Result<()> {
+        self.run_reconciliation(None)
+    }
+
+    pub(super) fn run_rebuild_reconciliation(
+        &self,
+        session: Arc<WriterSession>,
+        options: Option<IndexOptions>,
+    ) -> anyhow::Result<()> {
+        self.run_reconciliation(Some((session, options)))
+    }
+
+    fn run_reconciliation(
+        &self,
+        retained: Option<(Arc<WriterSession>, Option<IndexOptions>)>,
+    ) -> anyhow::Result<()> {
         {
             let mut state = self.runtime.lock().unwrap();
             let attempts = match &*state {
                 RuntimeState::Reconciling { attempts, .. } => *attempts,
                 RuntimeState::Activating => 0,
+                RuntimeState::Ready(_) if retained.is_some() => 0,
                 _ => return Ok(()),
             };
             *state = RuntimeState::Reconciling {
@@ -259,18 +303,19 @@ impl DaemonState {
             };
         }
         self.note_state_change();
-        let outcome =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.startup_attempt()))
-                .unwrap_or_else(|panic| {
-                    let message = panic
-                        .downcast_ref::<&str>()
-                        .map(|text| (*text).to_owned())
-                        .or_else(|| panic.downcast_ref::<String>().cloned())
-                        .unwrap_or_else(|| "unknown panic".to_owned());
-                    Err(anyhow::anyhow!(
-                        "startup reconciliation panicked: {message}"
-                    ))
-                });
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.startup_attempt(retained)
+        }))
+        .unwrap_or_else(|panic| {
+            let message = panic
+                .downcast_ref::<&str>()
+                .map(|text| (*text).to_owned())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".to_owned());
+            Err(anyhow::anyhow!(
+                "startup reconciliation panicked: {message}"
+            ))
+        });
         match outcome {
             Ok(session) => {
                 self.replace_serving_session(Some(session));

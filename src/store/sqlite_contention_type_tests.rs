@@ -159,10 +159,8 @@ fn rollback_writer_busy_is_typed_without_raw_sqlite_cause_or_rebuild() {
             .any(|cause| cause.downcast_ref::<rusqlite::Error>().is_some())
     );
     assert!(transient_storage_contention(&busy));
-    let selected = selected_integrity(busy);
-    assert!(selected.downcast_ref::<SqliteContention>().is_some());
-    assert_eq!(recovery_class(&selected), RecoveryClass::Hard);
-    let contextual = selected.context("outer publication context");
+    assert_eq!(recovery_class(&busy), RecoveryClass::Hard);
+    let contextual = busy.context("outer publication context");
     assert!(transient_storage_contention(&contextual));
     assert!(!transient_storage_contention(&anyhow::anyhow!(
         "storage_busy: cached claim changed"

@@ -186,6 +186,20 @@ pub(super) fn graph_hits(
     .hits(db, query, limit, &[&query, &limit])
 }
 
+/// Reconfirm FTS corruption only during exceptional recovery under exclusive
+/// index use. The default check reads FTS internals, not captured source content.
+pub(super) fn verify_integrity(db: &Connection) -> Result<()> {
+    let transaction = storage_result(db.unchecked_transaction())?;
+    for table in ["native_declaration_trigrams", "graph_node_trigrams"] {
+        storage_result(transaction.execute(
+            &format!("INSERT INTO {table}({table}) VALUES('integrity-check')"),
+            [],
+        ))?;
+    }
+    storage_result(transaction.rollback())?;
+    Ok(())
+}
+
 /// Run one search, selecting `(a, b, rank)`. SQLite contention is the typed,
 /// retried `storage_busy`; every other error, from FTS5 or not, fails the
 /// read. Nothing here retries the literal scan after FTS5 has run.
@@ -378,11 +392,9 @@ mod tests {
             assert_eq!(changed, 1);
         }
         let error = store.symbols("Alpha", 20).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .starts_with("incompatible_index: selected evidence decode failed"),
-            "{error:#}"
+        assert_eq!(
+            super::super::recovery_class(&error),
+            super::super::RecoveryClass::Rebuild
         );
         assert_eq!(
             store.disposition(),
