@@ -471,6 +471,7 @@ fn cli(root: &std::path::Path, home: &std::path::Path, command: &str) -> std::pr
         .env("HOME", home)
         .env_remove("XDG_CACHE_HOME")
         .env_remove("XDG_DATA_HOME")
+        .env("TRELLIS_TEST_DAEMON_PID_FILE", home.join("auto-daemon.pid"))
         .arg(command)
         .arg("--workspace")
         .arg(root);
@@ -493,7 +494,7 @@ fn request_db_under(dir: &std::path::Path) -> Option<std::path::PathBuf> {
 }
 
 #[test]
-fn daemon_watcher_keeps_cli_file_cap_and_selected_export_after_edit() {
+fn daemon_watcher_keeps_cli_file_cap_and_selected_source_after_edit() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("workspace");
     let home = temp.path().join("home");
@@ -531,16 +532,86 @@ fn daemon_watcher_keeps_cli_file_cap_and_selected_export_after_edit() {
             .is_some_and(|r| r > previous)
         {
             assert_eq!(current["stats"]["files"], 1);
-            let exported = cli(&root, &home, "export").output().unwrap();
-            assert!(
-                exported.status.success(),
-                "{}",
-                String::from_utf8_lossy(&exported.stderr)
-            );
-            let graph: serde_json::Value = serde_json::from_slice(&exported.stdout).unwrap();
-            assert!(graph["catchingUp"].is_boolean());
+            assert!(current["catchingUp"].is_boolean());
+            // Stop the elected writer before opening a test-process Store.
+            let marker = home.join("auto-daemon.pid");
+            let pid: u32 = fs::read_to_string(&marker).unwrap().parse().unwrap();
+            let data = if cfg!(target_os = "macos") {
+                home.join("Library/Application Support/dev.squashmerge.trellis")
+            } else {
+                home.join(".local/share/trellis")
+            };
+            let socket = trellis::daemon::SocketPaths::new(&data).socket;
+            let peer = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+            use std::os::fd::AsRawFd;
+            #[cfg(target_os = "macos")]
+            let peer_pid = unsafe {
+                let mut value: libc::pid_t = 0;
+                let mut size = std::mem::size_of_val(&value) as libc::socklen_t;
+                assert_eq!(
+                    libc::getsockopt(
+                        peer.as_raw_fd(),
+                        libc::SOL_LOCAL,
+                        libc::LOCAL_PEERPID,
+                        (&mut value as *mut libc::pid_t).cast(),
+                        &mut size
+                    ),
+                    0
+                );
+                assert_eq!(size as usize, std::mem::size_of_val(&value));
+                value as u32
+            };
+            #[cfg(target_os = "linux")]
+            let peer_pid = unsafe {
+                let mut value: libc::ucred = std::mem::zeroed();
+                let mut size = std::mem::size_of_val(&value) as libc::socklen_t;
+                assert_eq!(
+                    libc::getsockopt(
+                        peer.as_raw_fd(),
+                        libc::SOL_SOCKET,
+                        libc::SO_PEERCRED,
+                        (&mut value as *mut libc::ucred).cast(),
+                        &mut size
+                    ),
+                    0
+                );
+                assert_eq!(size as usize, std::mem::size_of_val(&value));
+                value.pid as u32
+            };
+            assert_eq!(peer_pid, pid);
+            let ps = std::process::Command::new("/bin/ps")
+                .args(["-p", &pid.to_string(), "-o", "command="])
+                .output()
+                .unwrap();
+            assert!(ps.status.success());
             assert_eq!(
-                graph["data"]["files"][0]["text"],
+                String::from_utf8_lossy(&ps.stdout).trim(),
+                format!("{} daemon", env!("CARGO_BIN_EXE_trellis"))
+            );
+            assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGTERM) }, 0);
+            let until = Instant::now() + trellis::testing::HANG_BACKSTOP;
+            while std::os::unix::net::UnixStream::connect(&socket).is_ok() {
+                assert!(Instant::now() < until, "daemon did not release its socket");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            // Inspect the published source in-process; CLI export no longer exists.
+            use trellis::store::topology::{TopologyRoots, WorkspaceIdentity};
+            let (cache, data) = if cfg!(target_os = "macos") {
+                (
+                    home.join("Library/Caches/dev.squashmerge.trellis"),
+                    home.join("Library/Application Support/dev.squashmerge.trellis"),
+                )
+            } else {
+                (
+                    home.join(".cache/trellis"),
+                    home.join(".local/share/trellis"),
+                )
+            };
+            let roots = TopologyRoots::isolated_for_tests(cache, data);
+            let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+            let store = Store::open(roots, identity).unwrap();
+            assert_eq!(
+                store.graph().unwrap().files[0].text,
                 "function after() { return 2; }\n"
             );
             break;

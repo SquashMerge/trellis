@@ -262,6 +262,12 @@ fn isolated_command(home: &std::path::Path) -> Command {
 
 fn command(root: &std::path::Path, state: &std::path::Path, sub: &str) -> Command {
     let mut c = isolated_command(state);
+    // Selected graph oracles must first stop the daemon they would otherwise
+    // compete with; record its test-scoped identity for an attested stop.
+    c.env(
+        "TRELLIS_TEST_DAEMON_PID_FILE",
+        state.join("auto-daemon.pid"),
+    );
     c.arg(sub).arg("--workspace").arg(root);
     if sub == "serve" {
         c.arg("--token-file").arg(state.join("token"));
@@ -863,17 +869,7 @@ fn standalone_takeover_replays_original_relative_presentation_from_another_cwd()
     );
     let status: Value = serde_json::from_slice(&status.stdout).unwrap();
     assert_eq!(status["revision"], initial["publishedRevision"]);
-    let export = command(&root, &home, "export")
-        .current_dir(&second_cwd)
-        .output()
-        .unwrap();
-    assert!(
-        export.status.success(),
-        "{}",
-        String::from_utf8_lossy(&export.stderr)
-    );
-    let graph: Value = serde_json::from_slice(&export.stdout).unwrap();
-    let graph = &graph["data"];
+    let graph = stopped_graph(&root, &home);
     let f = graph["nodes"]
         .as_array()
         .unwrap()
@@ -919,17 +915,16 @@ fn standalone_takeover_keeps_configured_missing_presentation_absent() {
     );
     assert!(!first_cwd.join("index.scip").exists());
     assert!(!first_cwd.join("manifest.json").exists());
-    let export = command(&root, &home, "export")
+    let takeover = command(&root, &home, "status")
         .current_dir(&second_cwd)
         .output()
         .unwrap();
     assert!(
-        export.status.success(),
+        takeover.status.success(),
         "{}",
-        String::from_utf8_lossy(&export.stderr)
+        String::from_utf8_lossy(&takeover.stderr)
     );
-    let graph: Value = serde_json::from_slice(&export.stdout).unwrap();
-    let graph = &graph["data"];
+    let graph = stopped_graph(&root, &home);
     let f = graph["nodes"]
         .as_array()
         .unwrap()
@@ -1088,17 +1083,16 @@ async fn serve_ingress_persists_relative_presentation_paths_before_cross_cwd_tak
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     drop(server);
-    let export = command(&root, &home, "export")
+    let takeover = command(&root, &home, "status")
         .current_dir(&second_cwd)
         .output()
         .unwrap();
     assert!(
-        export.status.success(),
+        takeover.status.success(),
         "{}",
-        String::from_utf8_lossy(&export.stderr)
+        String::from_utf8_lossy(&takeover.stderr)
     );
-    let graph: Value = serde_json::from_slice(&export.stdout).unwrap();
-    let graph = &graph["data"];
+    let graph = stopped_graph(&root, &home);
     let f = graph["nodes"]
         .as_array()
         .unwrap()
@@ -1183,7 +1177,7 @@ fn explicit_cli_index_recreates_corruption_but_bounded_reads_refuse_unknown_opti
     );
     fs::write(&index, b"invalid-sqlite-header-with-at-least-20-bytes").unwrap();
     let corrupt = fs::read(&index).unwrap();
-    for sub in ["status", "symbols", "query", "export"] {
+    for sub in ["status", "symbols", "query"] {
         let mut cmd = command(&root, &home, sub);
         cmd.env("TRELLIS_TEST_DAEMON_PID_FILE", home.join("auto-daemon.pid"));
         match sub {
@@ -1569,33 +1563,11 @@ fn cli_round_trip_uses_persistent_store_and_never_executes_workspace() {
     assert_eq!(view["calls"].as_array().unwrap().len(), 1);
     assert!(view["calls"][0].get("resolution").is_none());
     assert!(view["calls"][0].get("target").is_none());
-    let path = temp.path().join("graph.json");
-    assert!(
-        bounded_cli(
-            temp.path(),
-            "export",
-            command(&root, &state, "export").arg("--output").arg(&path),
-        )
-        .status
-        .success()
-    );
-    let bytes = fs::read(&path).unwrap();
-    let graph: Value = serde_json::from_slice(&bytes).unwrap();
-    let graph = &graph["data"];
+    let graph = stopped_graph(&root, &state);
     assert_eq!(
         graph["files"][0]["text"],
         std::str::from_utf8(&before).unwrap()
     );
-    assert!(
-        !bounded_cli(
-            temp.path(),
-            "export-existing",
-            command(&root, &state, "export").arg("--output").arg(&path),
-        )
-        .status
-        .success()
-    );
-    assert_eq!(fs::read(&path).unwrap(), bytes);
     assert_eq!(fs::read(root.join("flow.js")).unwrap(), before);
     assert!(!root.join("SHOULD_NOT_EXIST").exists());
     assert!(!root.join(".trellis").exists());
@@ -1950,39 +1922,21 @@ fn index_forwards_pair_and_reports_pair() {
     );
 }
 #[test]
-fn export_path_refusals() {
+fn export_is_unknown_command() {
     let temp = TempDir::new().unwrap();
-    let root = temp.path().join("workspace");
-    let home = temp.path().join("home");
-    fs::create_dir(&root).unwrap();
-    fs::write(root.join("a.js"), "function seed() {}").unwrap();
-    assert!(
-        command(&root, &home, "index")
-            .output()
-            .unwrap()
-            .status
-            .success()
-    );
-    let forbidden = root.join("graph.json");
-    let denied = command(&root, &home, "export")
-        .arg("--output")
-        .arg(&forbidden)
+    let result = isolated_command(temp.path())
+        .arg("export")
         .output()
         .unwrap();
-    assert!(!denied.status.success());
-    assert!(!forbidden.exists());
-    let valid = temp.path().join("graph.json");
+    assert!(!result.status.success());
+    assert!(result.stdout.is_empty());
+    let error = String::from_utf8_lossy(&result.stderr);
     assert!(
-        command(&root, &home, "export")
-            .arg("--output")
-            .arg(&valid)
-            .output()
-            .unwrap()
-            .status
-            .success()
+        error.contains("unrecognized subcommand") || error.contains("unknown command"),
+        "{error}"
     );
-    assert!(valid.exists());
 }
+
 #[test]
 fn current_commands_pair_matrix() {
     use std::process::{Output, Stdio};
@@ -2087,11 +2041,13 @@ fn current_commands_pair_matrix() {
         pin["indexGeneration"]
     );
     assert_eq!(query["data"]["revision"], pin);
-    let exported: Value = serde_json::from_slice(
-        &bounded_cli(temp.path(), "export", &mut command(&root, &home, "export")).stdout,
-    )
-    .unwrap();
-    assert_eq!(exported["data"]["files"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        stopped_graph(&root, &home)["files"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
     let status: Value = serde_json::from_slice(
         &bounded_cli(
             temp.path(),
@@ -2109,7 +2065,7 @@ fn current_commands_pair_matrix() {
 }
 
 #[test]
-fn external_destinations_are_rejected_before_git_marker_creation() {
+fn external_token_destination_is_rejected_before_git_marker_creation() {
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("workspace");
     let home = temp.path().join("home");
@@ -2129,21 +2085,12 @@ fn external_destinations_are_rejected_before_git_marker_creation() {
     assert!(!serve.status.success());
     assert!(!root.join(".git/trellis/workspace-id").exists());
     assert!(!token.exists());
-    let output = root.join("graph.json");
-    let export = bounded_invalid_cli(
-        temp.path(),
-        "external-export",
-        command(&root, &home, "export").arg("--output").arg(&output),
-    );
-    assert!(!export.status.success());
-    assert!(!output.exists());
-    assert!(!root.join(".git/trellis/workspace-id").exists());
 }
 
 #[test]
 fn overlapping_git_workspace_refuses_before_marker_or_managed_entries() {
     for fixed in ["cache", "data"] {
-        for sub in ["status", "index", "symbols", "query", "export", "serve"] {
+        for sub in ["status", "index", "symbols", "query", "serve"] {
             let temp = TempDir::new().unwrap();
             let home = temp.path().join("home");
             let (cache, data) = if cfg!(target_os = "macos") {
@@ -2388,6 +2335,35 @@ fn forget_yes_refuses_unknown_sqlite_schema_without_removing_state() {
     assert_eq!(fs::read(&unrelated).unwrap(), b"keep");
 }
 
+// A test-process Store can prepare the index. Never open it beside the elected daemon.
+fn stopped_graph(root: &std::path::Path, home: &std::path::Path) -> Value {
+    FixtureDaemon::new(home).stop_attested().unwrap();
+    selected_graph(root, home)
+}
+
+// Read the selected graph from the real checkout without exercising removed CLI export.
+fn selected_graph(root: &std::path::Path, home: &std::path::Path) -> Value {
+    use trellis::store::{
+        Store,
+        topology::{TopologyRoots, WorkspaceIdentity},
+    };
+    let (cache, data) = if cfg!(target_os = "macos") {
+        (
+            home.join("Library/Caches/dev.squashmerge.trellis"),
+            home.join("Library/Application Support/dev.squashmerge.trellis"),
+        )
+    } else {
+        (
+            home.join(".cache/trellis"),
+            home.join(".local/share/trellis"),
+        )
+    };
+    let roots = TopologyRoots::isolated_for_tests(cache, data);
+    let identity = WorkspaceIdentity::discover(Some(root), root).unwrap();
+    let store = Store::open(roots, identity).unwrap();
+    serde_json::to_value(store.graph().unwrap()).unwrap()
+}
+
 // Read the normalized publication, including every native row, from the real daemon's database.
 fn real_index_db(home: &std::path::Path) -> std::path::PathBuf {
     fn find(dir: &std::path::Path) -> Option<std::path::PathBuf> {
@@ -2616,17 +2592,6 @@ fn same_bytes_evidence(snapshot: &Value) -> Value {
         }
     }
     evidence
-}
-
-fn real_export(root: &std::path::Path, home: &std::path::Path) -> Value {
-    let output = command(root, home, "export").output().unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
-    envelope["data"].clone()
 }
 
 // The provisioned browser serves global control-plane routes only. Keep the
@@ -3221,8 +3186,8 @@ def sink():
         let first: Value = serde_json::from_slice(&indexed.stdout).unwrap();
         let old_pin = first["publishedRevision"].clone();
         assert_eq!(first["status"]["revision"], old_pin, "{name}");
-        let graph_before = real_export(&root, &home);
         daemon.stop_attested().unwrap();
+        let graph_before = selected_graph(&root, &home);
         let native_before = stopped_snapshot(&home);
         assert_eq!(
             native_before["documents"].as_array().unwrap().len(),
@@ -3363,13 +3328,6 @@ def sink():
             let follower_query: Value = serde_json::from_slice(&follower_query.stdout).unwrap();
             assert_eq!(follower_query["data"]["revision"], post_start_pin, "{name}");
         }
-        let follower_export = command(&root, &home, "export").output().unwrap();
-        assert!(follower_export.status.success(), "{name}");
-        assert_eq!(
-            serde_json::from_slice::<Value>(&follower_export.stdout).unwrap()["data"],
-            graph_before,
-            "{name}: CLI/HTTP graph parity"
-        );
         let follower_pin = post_start_pin.clone();
         let request = || {
             client
@@ -3575,14 +3533,13 @@ def sink():
             );
         }
         use sha2::{Digest, Sha256};
-        let graph_after = real_export(&root, &home);
         // Collect every selected response against the same committed pin while
         // the sole daemon is live. Inspect native SQLite only after its stop.
         let mut captured = std::collections::HashMap::<String, (reqwest::StatusCode, Value)>::new();
         let fetch = async |method: reqwest::Method, route: String, body: Option<Value>| {
             real_selected_api(&client, &url, &origin, token, method, &route, body).await
         };
-        for graph_file in graph_after["files"].as_array().unwrap() {
+        for graph_file in graph_before["files"].as_array().unwrap() {
             let path = graph_file["path"].as_str().unwrap();
             let route = format!(
                 "/source?path={path}&indexGeneration={}&indexRevision={}",
@@ -3703,6 +3660,7 @@ def sink():
         );
         daemon.stop_attested().unwrap();
         drop(server);
+        let graph_after = selected_graph(&root, &home);
         let native_after = stopped_snapshot(&home);
         let before_header = &native_before["allRows"]["native_revisions"][0];
         let after_header = &native_after["allRows"]["native_revisions"][0];
@@ -4988,13 +4946,16 @@ fn optional_captured_scip_changes_presentation_without_native_identity_or_full_r
         ),
         "{first_pin}"
     );
-    let original = command(&root, &home, "export")
+    let read_from_other = command(&root, &home, "status")
         .current_dir(&other)
         .output()
         .unwrap();
-    assert!(original.status.success());
-    let original: Value = serde_json::from_slice(&original.stdout).unwrap();
-    let original = &original["data"];
+    assert!(
+        read_from_other.status.success(),
+        "{}",
+        String::from_utf8_lossy(&read_from_other.stderr)
+    );
+    let original = stopped_graph(&root, &home);
     let first_symbol = original["nodes"]
         .as_array()
         .unwrap()
@@ -5020,17 +4981,16 @@ fn optional_captured_scip_changes_presentation_without_native_identity_or_full_r
         String::from_utf8_lossy(&republished.stderr)
     );
     let republished: Value = serde_json::from_slice(&republished.stdout).unwrap();
-    let changed = command(&root, &home, "export")
+    let read_from_other = command(&root, &home, "status")
         .current_dir(&other)
         .output()
         .unwrap();
     assert!(
-        changed.status.success(),
+        read_from_other.status.success(),
         "{}",
-        String::from_utf8_lossy(&changed.stderr)
+        String::from_utf8_lossy(&read_from_other.stderr)
     );
-    let changed: Value = serde_json::from_slice(&changed.stdout).unwrap();
-    let changed = &changed["data"];
+    let changed = stopped_graph(&root, &home);
     let next = changed["nodes"]
         .as_array()
         .unwrap()
@@ -5075,17 +5035,16 @@ fn optional_captured_scip_changes_presentation_without_native_identity_or_full_r
         String::from_utf8_lossy(&republished.stderr)
     );
     let republished: Value = serde_json::from_slice(&republished.stdout).unwrap();
-    let stale = command(&root, &home, "export")
+    let read_from_other = command(&root, &home, "status")
         .current_dir(&other)
         .output()
         .unwrap();
     assert!(
-        stale.status.success(),
+        read_from_other.status.success(),
         "{}",
-        String::from_utf8_lossy(&stale.stderr)
+        String::from_utf8_lossy(&read_from_other.stderr)
     );
-    let stale: Value = serde_json::from_slice(&stale.stdout).unwrap();
-    let stale = &stale["data"];
+    let stale = stopped_graph(&root, &home);
     let symbol = stale["nodes"]
         .as_array()
         .unwrap()
