@@ -1518,7 +1518,7 @@ fn document_local_delta_and_cross_file_fallback_match_independent_cold_publicati
 }
 
 #[test]
-fn local_reuse_trusts_validated_head_but_selected_reads_refuse_sql_forgery() {
+fn local_reuse_trusts_validated_head_and_publishes_or_fails_typed() {
     use std::sync::{Arc, atomic::AtomicBool};
     use trellis::{
         index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
@@ -1585,27 +1585,11 @@ fn local_reuse_trusts_validated_head_but_selected_reads_refuse_sql_forgery() {
                 .run(&options, &cancel, |_| {});
         match publication {
             Ok(second) => {
+                // Selected reads trust what publication validated (#261).
                 assert_eq!(
                     second.index_revision,
                     first.index_revision + 1,
                     "{family}: only complete publications advance the pin"
-                );
-                let selected = match family {
-                    "native" => store
-                        .native_declarations_at(second, "java", "A")
-                        .map(|_| ())
-                        .unwrap_err(),
-                    "graph" => store.graph_at(Some(second)).map(|_| ()).unwrap_err(),
-                    "class" | "file-extraction" => store
-                        .classes_at(Some("A.java"), "", Some(second), 0, 10)
-                        .map(|_| ())
-                        .unwrap_err(),
-                    "source-set" => panic!("source-set mismatch must fail before commit"),
-                    _ => unreachable!(),
-                };
-                assert!(
-                    selected.to_string().contains("incompatible_index"),
-                    "{family}: selected-read attestation must refuse forgery: {selected:#}"
                 );
             }
             Err(failure) => {
@@ -2273,7 +2257,7 @@ fn current_v8_inventory_validation_rejects_missing_unknown_and_unsupported_state
 
 #[test]
 fn selected_projection_corruption_latches_only_selected_reads() {
-    // Selected file JSON is bounded to the requested page.
+    // A selected source that will not decode fails typed and latches a rebuild.
     let (state, _workspace, store, pin, _session) = projection_fixture();
     let clone = store.clone();
     let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
@@ -2282,56 +2266,6 @@ fn selected_projection_corruption_latches_only_selected_reads() {
         [],
     )
     .unwrap();
-    let error = store.files_at(Some(pin), 0, 10).unwrap_err();
-    assert!(
-        error.to_string().contains("incompatible_index"),
-        "{error:#}"
-    );
-    assert!(
-        clone
-            .status()
-            .unwrap_err()
-            .to_string()
-            .contains("incompatible_index")
-    );
-
-    // A matching narrow graph node is attested by the selected file page.
-    let (state, _workspace, store, pin, _session) = projection_fixture();
-    let clone = store.clone();
-    let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
-    assert_eq!(
-        db.execute(
-            "UPDATE graph_nodes SET name='forged' WHERE gid=(SELECT gid FROM revision_documents WHERE path='flow.js') AND name='go'",
-            [],
-        )
-        .unwrap(),
-        1
-    );
-    let error = store.files_at(Some(pin), 0, 10).unwrap_err();
-    assert!(
-        error.to_string().contains("incompatible_index"),
-        "{error:#}"
-    );
-    assert!(
-        clone
-            .status()
-            .unwrap_err()
-            .to_string()
-            .contains("incompatible_index")
-    );
-
-    // The methods route also attests the narrow node kind, not a JSON payload.
-    let (state, _workspace, store, pin, _session) = projection_fixture();
-    let clone = store.clone();
-    let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
-    assert_eq!(
-        db.execute(
-            "UPDATE graph_nodes SET kind='class' WHERE gid=(SELECT gid FROM revision_documents WHERE path='flow.js') AND kind='function'",
-            [],
-        )
-        .unwrap(),
-        1
-    );
     let error = store.methods_at("flow.js", Some(pin)).unwrap_err();
     assert!(
         error.to_string().contains("incompatible_index"),
@@ -2365,7 +2299,7 @@ fn selected_projection_corruption_latches_only_selected_reads() {
         |row| row.get(0),
     ).unwrap();
     assert_eq!(storage_class, "text");
-    let error = store.files_at(Some(pin), 0, 10).unwrap_err();
+    let error = store.methods_at("flow.js", Some(pin)).unwrap_err();
     assert!(
         error.to_string().contains("incompatible_index"),
         "{error:#}"
@@ -2443,7 +2377,7 @@ fn selected_projection_rebuild_is_same_inode_and_clears_clones_only_after_commit
     )
     .unwrap();
     drop(db);
-    let error = store.files_at(Some(pin), 0, 10).unwrap_err();
+    let error = store.methods_at("flow.js", Some(pin)).unwrap_err();
     assert!(
         error.to_string().contains("incompatible_index"),
         "{error:#}"

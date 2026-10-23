@@ -1857,7 +1857,7 @@ fn same_path_different_association_is_missing_but_dangling_revision_fails_closed
     let first_detail = format!("{first:#}");
     assert_eq!(
         first_detail,
-        "incompatible_index: selected evidence decode failed: incompatible_index: selected document missing or ambiguous"
+        "incompatible_index: selected evidence decode failed: incompatible_index: selected native version missing"
     );
     let second = store.saved_view_at("association", Some(pin)).unwrap_err();
     assert_eq!(

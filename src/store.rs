@@ -29,7 +29,7 @@ type TestStreamPreflightHook = Box<dyn FnOnce(&crate::native_evidence::FullDocum
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MetricsDocumentStage {
-    /// Its attestation and metrics work is starting.
+    /// Its metrics work is starting.
     Start,
     /// That work has returned, with success or failure.
     Done,
@@ -353,7 +353,7 @@ pub struct Store {
     writer_before_metadata_hook: Arc<TestOneShotHook>,
     #[cfg(test)]
     test_queue_before_shared_hook: Arc<TestOneShotHook>,
-    /// Called with each metrics document's path as its attestation and metrics work starts.
+    /// Called with each metrics document's path as its metrics work starts.
     #[cfg(test)]
     test_metrics_document_hook: Arc<Mutex<Option<TestMetricsDocumentHook>>>,
     #[cfg(feature = "test-support")]
@@ -725,7 +725,7 @@ impl DerefMut for PublicationConnection {
 struct SelectedReadCounts {
     producer_hashes: usize,
     source_reads: usize,
-    attestations: usize,
+    document_reads: usize,
 }
 #[cfg(test)]
 thread_local! {
@@ -745,25 +745,12 @@ fn take_selected_read_counts() -> SelectedReadCounts {
     SELECTED_READ_COUNTS.with(|counts| counts.take())
 }
 
-/// What `selected_source_witness_with_progress` reparses one selected source under.
-struct WitnessInputs {
-    producer: crate::native_evidence::Producer,
-    source_set: crate::native_evidence::SourceSet,
-    revision: crate::native_evidence::Revision,
-}
-
 /// One selected document's manifest row, after its SQL row and byte budgets
 /// passed and before the rows they bound are read.
 struct SelectedHeader {
     path: String,
     language: String,
-    version_id: String,
-    graph_id: String,
-    class_id: String,
     gid: i64,
-    cid: i64,
-    graph_hash: String,
-    class_hash: Option<String>,
     hash: String,
     bytes: i64,
     scope: V8NativeScope,
@@ -772,29 +759,15 @@ struct SelectedHeader {
     stored_bytes: u64,
 }
 
-/// One selected document's stored rows, read from one snapshot by
-/// `Store::fetch_selected_document` and not yet compared with its source.
+/// One selected document's stored source, native rows and display labels,
+/// read from one snapshot. The indexer validated them before publishing, so
+/// reads trust them (owner ruling 2026-10-23, #261).
 struct FetchedDocument {
-    language: String,
-    version_id: String,
-    graph_id: String,
-    class_id: String,
-    graph_hash: String,
-    class_hash: Option<String>,
     file: SourceFile,
-    witness: WitnessInputs,
-    coverage: crate::native_evidence::Coverage,
     declarations: Vec<crate::native_evidence::Declaration>,
     calls: Vec<crate::native_evidence::Call>,
     regions: Vec<crate::native_evidence::ControlRegion>,
-    node_rows: Vec<(String, String, String)>,
-    label_rows: Vec<(String, String)>,
-    graph_nodes: Vec<Symbol>,
-    graph_calls: Vec<CallSite>,
-    graph_regions: Vec<ControlRegion>,
-    class_rows: Vec<(String, String, String, String, String)>,
-    relation_rows: Vec<(String, String, Option<String>, String)>,
-    stored_f: Option<String>,
+    labels: BTreeMap<String, String>,
     stored_bytes: u64,
 }
 
@@ -843,13 +816,10 @@ fn derived_graph_bytes(
     Ok(total)
 }
 
-/// One selected document's source and native rows, as authenticated by its
-/// attestation in the caller's snapshot.
-struct AttestedDocument {
+/// One selected document's source and native rows with the graph projected
+/// from them once.
+struct SelectedDocument {
     file: SourceFile,
-    declarations: Vec<crate::native_evidence::Declaration>,
-    calls: Vec<crate::native_evidence::Call>,
-    regions: Vec<crate::native_evidence::ControlRegion>,
     nodes: Vec<Symbol>,
     graph_calls: Vec<CallSite>,
     graph_regions: Vec<ControlRegion>,
@@ -861,19 +831,12 @@ struct ReadRevision {
     pin: IndexPin,
     key: String,
     /// Header rows of this immutable selected revision, read once per snapshot
-    /// and shared by every document attested in it.
+    /// and shared by every document read in it.
     headers: Arc<SelectedHeaders>,
 }
 #[derive(Default)]
 struct SelectedHeaders {
     producer_hash: OnceLock<String>,
-    witness: OnceLock<WitnessHeaders>,
-}
-/// The producer, source set and revision a selected witness is measured under.
-struct WitnessHeaders {
-    producer: crate::native_evidence::Producer,
-    source_set: crate::native_evidence::SourceSet,
-    revision: crate::native_evidence::Revision,
 }
 impl ReadRevision {
     fn new(pin: IndexPin, key: String) -> Self {
@@ -1112,8 +1075,8 @@ impl MetricsReadCheck<'_> {
 
 /// Why one revision document did not produce metrics.
 enum MetricsDocumentFailure {
-    /// Attestation failed; reported as a selected-read failure.
-    Attest(anyhow::Error),
+    /// Reading the selected document failed; reported as a selected-read failure.
+    Read(anyhow::Error),
     /// Any other failure.
     Other(anyhow::Error),
     /// The caller's check failed before this document's work.
@@ -1241,9 +1204,9 @@ impl EvidenceResponse {
         let mut files = Vec::new();
         let mut directories: BTreeMap<(String, String), crate::metrics::Accumulator> =
             BTreeMap::new();
-        // Read and attest only the selected version; no checkout filesystem access.
+        // Read only the selected version; no checkout filesystem access.
         // Every SQL read runs in order on this request's connection and snapshot.
-        // The source comparison and metrics run on workers, a chunk behind the
+        // Metrics run on workers, a chunk behind the
         // reads, and are accepted strictly in manifest order: the first failure
         // in that order is the one reported, and nothing after it is accepted.
         let workers = if included.len() > 1 {
@@ -1273,10 +1236,8 @@ impl EvidenceResponse {
              -> std::result::Result<crate::metrics::Computed, MetricsDocumentFailure> {
                 let calls = std::cell::Cell::new(0);
                 let expired = || progress.expired_every(&calls, check_every);
-                // Metrics use the source and native rows exactly as attestation read them.
-                let attested = Store::attest_fetched(fetched, Some(&expired))
-                    .map_err(MetricsDocumentFailure::Attest)?;
-                if attested.file.language != key.language {
+                // Metrics use the stored source and native rows as fetched.
+                if fetched.file.language != key.language {
                     return Err(MetricsDocumentFailure::Other(anyhow::anyhow!(
                         "incompatible_index: metrics language mismatch"
                     )));
@@ -1286,8 +1247,8 @@ impl EvidenceResponse {
                 }
                 let source = crate::metrics::SourceInput {
                     language: &key.language,
-                    content_hash: &attested.file.hash,
-                    text: &attested.file.text,
+                    content_hash: &fetched.file.hash,
+                    text: &fetched.file.text,
                 };
                 let cached = store
                     .metrics_memo
@@ -1297,9 +1258,9 @@ impl EvidenceResponse {
                 crate::metrics::compute_with_cached(
                     cached,
                     source,
-                    &attested.declarations,
-                    &attested.calls,
-                    &attested.regions,
+                    &fetched.declarations,
+                    &fetched.calls,
+                    &fetched.regions,
                     &mut || {
                         if expired() {
                             anyhow::bail!("cancelled")
@@ -1324,7 +1285,7 @@ impl EvidenceResponse {
          -> Result<()> {
             let computed = match outcome {
                 Some(Ok(computed)) => computed,
-                Some(Err(MetricsDocumentFailure::Attest(error))) => {
+                Some(Err(MetricsDocumentFailure::Read(error))) => {
                     return progress.result(Err(self
                         .store
                         .report_selected_failure(selected_integrity(error))));
@@ -1431,8 +1392,8 @@ impl EvidenceResponse {
             loop {
                 // Read the next chunk while the workers compute the previous one.
                 // The two ordinary chunks together stay within the budget.
-                // Graph DTOs must be derived before their charge is known, so
-                // one fully fetched document may be carried past that budget.
+                // A document is charged its stored rows once fetched, so one
+                // fully fetched document may be carried past that budget.
                 // A document over half the budget is computed alone.
                 let mut keys: Vec<&DocumentKey> = Vec::new();
                 let mut fetched: Vec<std::sync::Mutex<Option<Fetched>>> = Vec::new();
@@ -1467,7 +1428,7 @@ impl EvidenceResponse {
                                             Some(&expired),
                                         )
                                     })
-                                    .map_err(MetricsDocumentFailure::Attest)
+                                    .map_err(MetricsDocumentFailure::Read)
                             };
                             match item {
                                 Ok(item) => (key, item),
@@ -1645,10 +1606,6 @@ impl EvidenceResponse {
         let source = self
             .store
             .selected_source_row_for(&self.db, path, &selected)?;
-        if source.is_some() {
-            self.store
-                .attest_selected_document_for(&self.db, path, &selected)?;
-        }
         Ok(source.map(|source| (selected.pin, source)))
     }
     pub fn validate_selected_view(&self, view: &ViewResult, sources: &[SourceFile]) -> Result<()> {
@@ -2912,14 +2869,14 @@ fn open_index_marker_probe(
         storage_result(db.pragma_update(None, "synchronous", "FULL"))?;
     } else {
         storage_result(db.pragma_update(None, "query_only", "ON"))?;
-        // One selected document's attestation reads the same graph and native
-        // pages several times (row budgets, byte budgets, then decoding). A
+        // One selected document read touches the same native pages several
+        // times (row budgets, byte budgets, then decoding). A
         // page cache that holds a document's working set serves those repeats
         // from memory. Negative is KiB; pages are allocated only as used, and
         // the cache is freed with the per-request connection. No mmap: an
         // mmap'd I/O error would be a signal, not a typed error.
         storage_result(db.pragma_update(None, "cache_size", READ_CACHE_KIB))?;
-        // Attestation's per-document statements stay prepared for the request.
+        // Per-document read statements stay prepared for the request.
         db.set_prepared_statement_cache_capacity(64);
     }
     let mode: String = storage_result(db.pragma_query_value(None, "journal_mode", |r| r.get(0)))?;
@@ -3585,7 +3542,7 @@ fn resolve_class_id(
     use crate::class_diagram::InvalidRequest;
     let mut current = id.to_owned();
     let mut seen = BTreeSet::new();
-    let mut document: Option<AttestedDocument> = None;
+    let mut document: Option<SelectedDocument> = None;
     for depth in 0..64 {
         ensure!(
             seen.insert(current.clone()),
@@ -3705,18 +3662,8 @@ fn publication_rows<'a>(
     native: &'a crate::native_evidence::Artifact,
     classes: &'a crate::classes::Catalog,
 ) -> Result<BTreeMap<&'a str, PublicationRows<'a>>> {
-    publication_rows_with_progress(graph, native, classes, None)
-}
-fn publication_rows_with_progress<'a>(
-    graph: &'a Graph,
-    native: &'a crate::native_evidence::Artifact,
-    classes: &'a crate::classes::Catalog,
-    progress: Option<&dyn Fn() -> bool>,
-) -> Result<BTreeMap<&'a str, PublicationRows<'a>>> {
-    optional_hint_check(progress)?;
     let mut rows = BTreeMap::<&str, PublicationRows>::new();
     for file in &graph.files {
-        optional_hint_check(progress)?;
         ensure!(
             rows.insert(&file.path, PublicationRows::default())
                 .is_none(),
@@ -3724,21 +3671,18 @@ fn publication_rows_with_progress<'a>(
         );
     }
     for node in &graph.nodes {
-        optional_hint_check(progress)?;
         rows.get_mut(node.path.as_str())
             .context("graph node path missing")?
             .nodes
             .push(node);
     }
     for call in &graph.calls {
-        optional_hint_check(progress)?;
         rows.get_mut(call.path.as_str())
             .context("graph call path missing")?
             .calls
             .push(call);
     }
     for region in &graph.regions {
-        optional_hint_check(progress)?;
         rows.get_mut(region.path.as_str())
             .context("graph region path missing")?
             .regions
@@ -3746,7 +3690,6 @@ fn publication_rows_with_progress<'a>(
     }
     let mut owners = BTreeMap::new();
     for class in &classes.classes {
-        optional_hint_check(progress)?;
         rows.get_mut(class.symbol.path.as_str())
             .context("class path missing")?
             .classes
@@ -3759,7 +3702,6 @@ fn publication_rows_with_progress<'a>(
         );
     }
     for relation in &classes.relations {
-        optional_hint_check(progress)?;
         let path = owners
             .get(relation.owner.as_str())
             .context("class relation owner missing")?;
@@ -3769,21 +3711,18 @@ fn publication_rows_with_progress<'a>(
             .push(relation);
     }
     for decl in &native.declarations {
-        optional_hint_check(progress)?;
         rows.get_mut(decl.document.path.as_str())
             .context("native declaration path missing")?
             .native_declarations
             .push(decl);
     }
     for call in &native.calls {
-        optional_hint_check(progress)?;
         rows.get_mut(call.document.path.as_str())
             .context("native call path missing")?
             .native_calls
             .push(call);
     }
     for region in &native.control_regions {
-        optional_hint_check(progress)?;
         rows.get_mut(region.document.path.as_str())
             .context("native control path missing")?
             .native_regions
@@ -3830,16 +3769,6 @@ fn v8_document_projection(
     native: &crate::native_evidence::Artifact,
     grouped: &PublicationRows<'_>,
 ) -> Result<V8DocumentProjection> {
-    v8_document_projection_with_progress(file, native, grouped, None)
-}
-// Optional hint attestation checks its budget between phases; required
-// publication passes no progress and computes the same IDs.
-fn v8_document_projection_with_progress(
-    file: &SourceFile,
-    native: &crate::native_evidence::Artifact,
-    grouped: &PublicationRows<'_>,
-    progress: Option<&dyn Fn() -> bool>,
-) -> Result<V8DocumentProjection> {
     let context = crate::native_evidence::native_extraction_context(
         &native.producer,
         &file.language,
@@ -3854,14 +3783,12 @@ fn v8_document_projection_with_progress(
             "producerId": native.producer.id, "producerVersion": native.producer.version,
         }),
     );
-    optional_hint_check(progress)?;
     let mut nodes = grouped.nodes.clone();
     nodes.sort_by(|a, b| a.id.cmp(&b.id));
     let mut calls = grouped.calls.clone();
     calls.sort_by(|a, b| a.id.cmp(&b.id));
     let mut regions = grouped.regions.clone();
     regions.sort_by(|a, b| a.id.cmp(&b.id));
-    optional_hint_check(progress)?;
     let graph_hash = v8_id(
         "",
         b"trellis.graph-projection.v1\0",
@@ -3872,12 +3799,10 @@ fn v8_document_projection_with_progress(
     );
     let graph_hash = graph_hash.trim_start_matches(':').to_owned();
     let graph_id = format!("graph:v1:{graph_hash}");
-    optional_hint_check(progress)?;
     let mut selected_classes = grouped.classes.clone();
     selected_classes.sort_by(|a, b| a.symbol.id.cmp(&b.symbol.id));
     let mut selected_relations = grouped.relations.clone();
     selected_relations.sort_by(|a, b| a.id.cmp(&b.id));
-    optional_hint_check(progress)?;
     let class_hash = v8_id(
         "",
         b"trellis.class-projection.v1\0",
@@ -3888,7 +3813,6 @@ fn v8_document_projection_with_progress(
     );
     let class_hash = class_hash.trim_start_matches(':').to_owned();
     let class_id = format!("class-projection:v1:{class_hash}");
-    optional_hint_check(progress)?;
     Ok(V8DocumentProjection {
         version_id,
         graph_id,
@@ -7821,6 +7745,12 @@ impl Store {
             RecoveryClass::Hard => error,
         }
     }
+    /// A selected read's stored-row failure. Reads trust the published index
+    /// (#261), so a row that does not decode is corruption and schedules a
+    /// re-index rather than returning a bare error.
+    pub(crate) fn report_selected_read(&self, error: anyhow::Error) -> anyhow::Error {
+        self.report_selected_failure(selected_integrity(error))
+    }
     fn report_selected_failure(&self, error: anyhow::Error) -> anyhow::Error {
         match recovery_class(&error) {
             RecoveryClass::Rebuild => {
@@ -9629,8 +9559,7 @@ impl Store {
             );
             // The prior head has already validated these immutable versions.
             // Check their indexed version/projection links without re-parsing
-            // millions of native and graph facts. Selected reads still deeply
-            // attest a requested projection before returning its evidence.
+            // millions of native and graph facts.
             let linked: Option<(String, String, String, String, String)> = db
                 .query_row(
                     "SELECT g.state,c.state,v.extraction_context,v.producer_id,v.producer_version
@@ -9822,8 +9751,8 @@ impl Store {
             // the extractor producer hash is unchanged. measure_persisted_change
             // compares that recorded hash; a changed one takes the full path.
             // The selected head is a prior validated publication. Do not decode
-            // its unchanged fact/projection rows; selected reads still attest
-            // them, and the current captured source bytes are checked below.
+            // its unchanged fact/projection rows; the current captured source
+            // bytes are checked below.
             let previous_options: crate::indexer::ReconcileOptions = db.query_row(
                 "SELECT reconcile_options FROM index_metadata WHERE singleton=1", [],
                 |r| r.get::<_, String>(0))?.parse::<serde_json::Value>()
@@ -9855,8 +9784,7 @@ impl Store {
             // Unchanged prior documents are trusted by their stored, validated
             // content hash (owner ruling, #141): their bytes are not read,
             // re-hashed or decoded here. Only the changed document's bytes are
-            // loaded and witness-checked below. Selected reads still attest
-            // what they serve.
+            // loaded and witness-checked below.
             let mut statement = db.prepare("SELECT r.source_set_id,m.path,m.language,v.content_hash,v.byte_length,NULL,
                 v.extraction_context,v.producer_id,v.producer_version,v.id,
                 g.graph_hash,c.content_hash,g.graph_hash,c.content_hash,
@@ -10173,8 +10101,8 @@ impl Store {
 
     /// R-1: a reused projection's stored row must carry the fresh projection
     /// hash. Its child rows were bound to that hash when Trellis wrote and
-    /// validated them, so they are not decoded again here; selected reads
-    /// still attest what they serve. A mismatch is typed index corruption.
+    /// validated them, so they are not decoded again here. A mismatch is typed
+    /// index corruption.
     fn verify_reusable_projection(
         &self,
         db: &Connection,
@@ -11463,7 +11391,7 @@ impl Store {
     ) -> Result<T> {
         self.with_evidence(|db| {
             let selected = self.read_revision(db, Some(pin))?;
-            read(db, &selected).map_err(|error| self.report_selected_failure(error))
+            read(db, &selected).map_err(|error| self.report_selected_read(error))
         })
     }
 
@@ -12102,124 +12030,6 @@ impl Store {
         Ok(())
     }
 
-    /// The producer, source set and revision header one selected, paired
-    /// source is reparsed under, read in this SQLite snapshot. `file` is the
-    /// selected source the caller read and hash-checked in this snapshot.
-    fn selected_witness_inputs(
-        &self,
-        db: &Connection,
-        path: &str,
-        file: &SourceFile,
-        selected: &ReadRevision,
-        progress: Option<&dyn Fn() -> bool>,
-    ) -> Result<WitnessInputs> {
-        optional_hint_check(progress)?;
-        use crate::native_evidence::{Document, DocumentKey};
-        let (source_set_id, revision_id): (String, String) = db
-            .query_row(
-                "SELECT r.source_set_id,r.native_revision_id FROM revision_documents m
-                 JOIN native_revisions r ON r.id=m.revision_id
-                 WHERE m.path=?1 AND m.revision_id=?2",
-                params![path, selected.key],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?
-            .context("incompatible_index: selected native document absent")?;
-        ensure!(
-            source_set_id == format!("source-set:v1:{}", self.root_id()),
-            "incompatible_index: selected source set mismatch"
-        );
-        ensure!(
-            file.path == path,
-            "incompatible_index: selected graph source absent"
-        );
-        // Every document of one selected revision shares its producer, source
-        // set and revision header; read them once per snapshot.
-        let fresh;
-        let headers = match selected.headers.witness.get() {
-            Some(headers)
-                if headers.source_set.id == source_set_id && headers.revision.id == revision_id =>
-            {
-                headers
-            }
-            Some(_) => {
-                fresh = Self::selected_witness_headers(db, selected, &source_set_id, &revision_id)?;
-                &fresh
-            }
-            None => {
-                let headers =
-                    Self::selected_witness_headers(db, selected, &source_set_id, &revision_id)?;
-                selected.headers.witness.get_or_init(|| headers)
-            }
-        };
-        let mut revision = headers.revision.clone();
-        revision.documents.push(Document {
-            key: DocumentKey {
-                source_set_id,
-                language: file.language.clone(),
-                path: path.into(),
-            },
-            revision_id,
-            content_hash: file.hash.clone(),
-            byte_length: file.text.len(),
-        });
-        Ok(WitnessInputs {
-            producer: headers.producer.clone(),
-            source_set: headers.source_set.clone(),
-            revision,
-        })
-    }
-
-    fn selected_witness_headers(
-        db: &Connection,
-        selected: &ReadRevision,
-        source_set_id: &str,
-        revision_id: &str,
-    ) -> Result<WitnessHeaders> {
-        use crate::native_evidence::{Producer, Revision, SourceSet};
-        let mut producer:Producer=db.query_row(
-            "SELECT id,version,executable_hash,kind,position_encoding FROM native_producers LIMIT 1",[],
-            |r|Ok(Producer{id:r.get(0)?,version:r.get(1)?,executable_hash:r.get(2)?,kind:r.get(3)?,languages:vec![],position_encoding:r.get(4)?}),
-        )?;
-        producer.executable_hash = selected.producer_hash(db)?;
-        producer.languages=db.prepare(
-            "SELECT language FROM native_producer_languages WHERE producer_id=?1 AND producer_version=?2 ORDER BY ordinal"
-        )?.query_map(params![producer.id,producer.version],|r|r.get::<_,String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut source_set: SourceSet = db.query_row(
-            "SELECT id,root_id FROM native_source_sets WHERE id=?1",
-            [source_set_id],
-            |r| {
-                Ok(SourceSet {
-                    id: r.get(0)?,
-                    root_id: r.get(1)?,
-                    languages: vec![],
-                    dependencies: vec![],
-                })
-            },
-        )?;
-        source_set.languages=db.prepare(
-            "SELECT language FROM native_source_set_languages WHERE source_set_id=?1 ORDER BY ordinal"
-        )?.query_map([source_set_id],|r|r.get::<_,String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        source_set.dependencies=db.prepare(
-            "SELECT dependency_id FROM native_source_set_dependencies WHERE source_set_id=?1 ORDER BY ordinal"
-        )?.query_map([source_set_id],|r|r.get::<_,String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        let revision:Revision=db.query_row(
-            "SELECT native_revision_id,source_set_id,toolchain_hash,config_hash,dependency_hash FROM native_revisions WHERE native_revision_id=?1 AND id=?2",
-            params![revision_id, selected.key],|r|Ok(Revision{id:r.get(0)?,source_set_id:r.get(1)?,
-                documents:vec![],toolchain_hash:r.get(2)?,config_hash:r.get(3)?,dependency_hash:r.get(4)?}),
-        )?;
-        Ok(WitnessHeaders {
-            producer,
-            source_set,
-            revision,
-        })
-    }
-
-    /// Authenticate one selected document's normalized records and graph DTOs
-    /// against its paired BLOB in the same pinned SQLite transaction.
     // SQL aggregates the selected path's ancillary native and class rows.
     // SourceFile JSON has its own envelope; derived graph bytes are checked
     // after source and native rows are decoded.
@@ -12241,77 +12051,25 @@ impl Store {
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?)
     }
-    fn attest_selected_document_for(
-        &self,
-        db: &Connection,
-        path: &str,
-        selected: &ReadRevision,
-    ) -> Result<()> {
-        self.attest_selected_document_inner(db, path, selected, None)
-            .map_err(selected_integrity)
-            .map_err(|error| self.report_selected_failure(error))
-    }
-    /// Derive a selected graph exactly once from the attested native rows.
+    /// Read one selected document and project its graph once from the stored
+    /// native rows.
     fn selected_graph_document_for(
         &self,
         db: &Connection,
         path: &str,
         selected: &ReadRevision,
-    ) -> Result<AttestedDocument> {
-        self.attest_selected_document_loaded(db, path, selected, None)
+    ) -> Result<SelectedDocument> {
+        self.fetch_selected_header(db, path, selected, None)
+            .and_then(|header| self.fetch_selected_rows(db, header, selected, None))
+            .and_then(Self::project_fetched)
             .map_err(selected_integrity)
             .map_err(|error| self.report_selected_failure(error))
     }
-    fn attest_selected_document_optional_for(
-        &self,
-        db: &Connection,
-        path: &str,
-        selected: &ReadRevision,
-        expired: &dyn Fn() -> bool,
-    ) -> Result<()> {
-        self.attest_selected_document_loaded_for(db, path, selected, expired)
-            .map(drop)
-    }
-    /// Attest one selected document and return the source and native rows it
-    /// authenticated, so a caller can use them without reading them again.
-    fn attest_selected_document_loaded_for(
-        &self,
-        db: &Connection,
-        path: &str,
-        selected: &ReadRevision,
-        expired: &dyn Fn() -> bool,
-    ) -> Result<AttestedDocument> {
-        self.attest_selected_document_loaded(db, path, selected, Some(expired))
-            .map_err(selected_integrity)
-            .map_err(|error| self.report_selected_failure(error))
-    }
-    fn attest_selected_document_inner(
-        &self,
-        db: &Connection,
-        path: &str,
-        selected: &ReadRevision,
-        progress: Option<&dyn Fn() -> bool>,
-    ) -> Result<()> {
-        self.attest_selected_document_loaded(db, path, selected, progress)
-            .map(drop)
-    }
-    fn attest_selected_document_loaded(
-        &self,
-        db: &Connection,
-        path: &str,
-        selected: &ReadRevision,
-        progress: Option<&dyn Fn() -> bool>,
-    ) -> Result<AttestedDocument> {
-        let header = self.fetch_selected_header(db, path, selected, progress)?;
-        let fetched = self.fetch_selected_rows(db, header, selected, progress)?;
-        Self::attest_fetched(fetched, progress)
-    }
-    /// Read, in this snapshot and in order, everything attestation compares
-    /// for one selected document: first its manifest row and the SQL row and
-    /// byte budgets (`fetch_selected_header`), then, only after those budgets
-    /// pass, the rows they bound (`fetch_selected_rows`). Stored rows are
-    /// decoded and structurally checked as they are read. Nothing is compared
-    /// with the source here: `attest_fetched` does that, off the connection.
+    /// Read one selected document in this snapshot: first its manifest row and
+    /// the SQL row and byte budgets (`fetch_selected_header`), then, only after
+    /// those budgets pass, the rows they bound (`fetch_selected_rows`). Stored
+    /// rows are decoded as they are read; a row that does not decode fails
+    /// typed. They are not compared with the source (#261).
     fn fetch_selected_header(
         &self,
         db: &Connection,
@@ -12320,7 +12078,7 @@ impl Store {
         progress: Option<&dyn Fn() -> bool>,
     ) -> Result<SelectedHeader> {
         #[cfg(test)]
-        count_selected_read(|counts| counts.attestations += 1);
+        count_selected_read(|counts| counts.document_reads += 1);
         use crate::native_evidence::DocumentKey;
         optional_hint_check(progress)?;
         let sql = "SELECT r.source_set_id,m.language,m.path,d.id,g.graph_hash,
@@ -12490,13 +12248,7 @@ impl Store {
         Ok(SelectedHeader {
             path: path.to_owned(),
             language,
-            version_id,
-            graph_id,
-            class_id,
             gid,
-            cid,
-            graph_hash,
-            class_hash,
             hash,
             bytes,
             scope,
@@ -12513,17 +12265,11 @@ impl Store {
         let SelectedHeader {
             path,
             language,
-            version_id,
-            graph_id,
-            class_id,
             gid,
-            cid,
-            graph_hash,
-            class_hash,
             hash,
             bytes,
             scope,
-            stored_bytes: ancillary_bytes,
+            stored_bytes,
         } = header;
         let path = path.as_str();
         let file = Self::selected_source_row_bounded_for_inner(
@@ -12538,33 +12284,44 @@ impl Store {
             file.hash == hash && file.language == language && file.text.len() == bytes as usize,
             "incompatible_index: selected source identity mismatch"
         );
-        let witness = self.selected_witness_inputs(db, path, &file, selected, progress)?;
-        let coverage = read_native_coverage_v8(db, &scope)?;
         let declarations = read_native_declarations_v8_inner(db, &scope, None, true, progress)?;
         optional_hint_check(progress)?;
         let calls = read_native_calls_v8_inner(db, &scope, None, progress)?;
         optional_hint_check(progress)?;
         let regions = read_native_control_regions_v8_inner(db, &scope, None, progress)?;
-        let mut node_rows = Vec::new();
+        let mut labels = BTreeMap::new();
         for row in db
-            .prepare_cached("SELECT id,name,kind FROM graph_nodes WHERE gid=?1 ORDER BY id")?
+            .prepare_cached("SELECT id,label FROM graph_display_labels WHERE gid=?1 ORDER BY id")?
             .query_map([gid], |r| {
-                Ok((stored_id_row(r, 0, false)?, r.get(1)?, r.get(2)?))
+                Ok((stored_id_row(r, 0, false)?, r.get::<_, String>(1)?))
             })?
         {
             optional_hint_check(progress)?;
-            node_rows.push(row?);
+            let (id, label) = row?;
+            labels.insert(id, label);
         }
-        let mut label_rows = Vec::new();
-        for row in db
-            .prepare_cached("SELECT id,label FROM graph_display_labels WHERE gid=?1 ORDER BY id")?
-            .query_map([gid], |r| Ok((stored_id_row(r, 0, false)?, r.get(1)?)))?
-        {
-            optional_hint_check(progress)?;
-            label_rows.push(row?);
-        }
-        let labels: BTreeMap<String, String> = label_rows.iter().cloned().collect();
-        let (graph_nodes, graph_calls, graph_regions) = crate::indexer::project_document(
+        Ok(FetchedDocument {
+            file,
+            declarations,
+            calls,
+            regions,
+            labels,
+            stored_bytes,
+        })
+    }
+
+    /// Project one fetched document's graph from its stored native rows with
+    /// the indexer's shared projector, within the graph byte budget.
+    fn project_fetched(fetched: FetchedDocument) -> Result<SelectedDocument> {
+        let FetchedDocument {
+            file,
+            declarations,
+            calls,
+            regions,
+            labels,
+            stored_bytes: _,
+        } = fetched;
+        let (nodes, graph_calls, graph_regions) = crate::indexer::project_document(
             &file.path,
             file.text.as_bytes(),
             crate::indexer::NativeDocument {
@@ -12575,435 +12332,13 @@ impl Store {
             &labels,
         )
         .context("incompatible_index: selected graph derivation failed")?;
-        let graph_bytes = derived_graph_bytes(&graph_nodes, &graph_calls, &graph_regions, bytes)?;
-        let stored_bytes = ancillary_bytes.saturating_add(graph_bytes);
-        let mut class_rows = Vec::new();
-        for row in db
-            .prepare_cached(
-                "SELECT id,name,qualified_name,path,payload FROM classes WHERE cid=?1 ORDER BY id",
-            )?
-            .query_map([cid], |r| {
-                Ok((
-                    stored_id_row(r, 0, false)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
-                    r.get::<_, String>(4)?,
-                ))
-            })?
-        {
-            optional_hint_check(progress)?;
-            class_rows.push(row?);
-        }
-        let mut relation_rows = Vec::new();
-        for row in db
-            .prepare_cached(
-                "SELECT id,owner,target,payload FROM class_relations WHERE cid=?1 ORDER BY id",
-            )?
-            .query_map([cid], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    stored_id_row(r, 1, false)?,
-                    optional_stored_id_row(r, 2, false)?,
-                    r.get::<_, String>(3)?,
-                ))
-            })?
-        {
-            optional_hint_check(progress)?;
-            relation_rows.push(row?);
-        }
-        optional_hint_check(progress)?;
-        let stored_f: Option<String> = db
-            .prepare_cached("SELECT class_extraction_payload FROM graph_projections WHERE gid=?1")?
-            .query_row([gid], |r| r.get(0))?;
-        Ok(FetchedDocument {
-            language,
-            version_id,
-            graph_id,
-            class_id,
-            graph_hash,
-            class_hash,
+        derived_graph_bytes(&nodes, &graph_calls, &graph_regions, file.text.len() as i64)?;
+        Ok(SelectedDocument {
             file,
-            witness,
-            coverage,
-            declarations,
-            calls,
-            regions,
-            node_rows,
-            label_rows,
-            graph_nodes,
+            nodes,
             graph_calls,
             graph_regions,
-            class_rows,
-            relation_rows,
-            stored_f,
-            stored_bytes,
         })
-    }
-
-    /// Authenticate one fetched document against its source: reparse it,
-    /// then compare the stored native rows, graph and class DTOs, F and the
-    /// projection fingerprint with what the source yields. This touches no
-    /// SQLite handle, so it may run on a worker thread.
-    fn attest_fetched(
-        fetched: FetchedDocument,
-        progress: Option<&dyn Fn() -> bool>,
-    ) -> Result<AttestedDocument> {
-        let FetchedDocument {
-            language,
-            version_id,
-            graph_id,
-            class_id,
-            graph_hash,
-            class_hash,
-            file,
-            witness,
-            coverage,
-            declarations: native_declarations,
-            calls: native_calls,
-            regions: native_regions,
-            node_rows,
-            label_rows,
-            graph_nodes: nodes,
-            graph_calls: calls,
-            graph_regions: regions,
-            class_rows: stored_class_rows,
-            relation_rows,
-            stored_f,
-            stored_bytes: _,
-        } = fetched;
-        let witness = crate::native_evidence::selected_source_witness_with_progress(
-            &file,
-            witness.producer,
-            witness.source_set,
-            witness.revision,
-            progress,
-        )
-        .context("incompatible_index: selected source extraction failed")?;
-        ensure!(
-            witness.coverage == vec![coverage],
-            "incompatible_index: selected native coverage differs from source"
-        );
-        // The store's query order (by syntax_id) is what callers receive; the
-        // comparison sorts both sides without reordering the returned rows.
-        let mut declarations: Vec<&crate::native_evidence::Declaration> =
-            native_declarations.iter().collect();
-        optional_hint_check(progress)?;
-        let mut expected = Vec::new();
-        for declaration in &witness.declarations {
-            optional_hint_check(progress)?;
-            expected.push(declaration);
-        }
-        declarations.sort_by(|a, b| a.syntax_id.cmp(&b.syntax_id));
-        expected.sort_by(|a, b| a.syntax_id.cmp(&b.syntax_id));
-        ensure!(
-            declarations == expected,
-            "incompatible_index: selected native declarations differ from source"
-        );
-        optional_hint_check(progress)?;
-        // Each version's calls and regions were decoded once, ordered (owner,
-        // ordinal) by the store's byte-order query; compare whole lists.
-        let mut expected_calls = witness.calls.clone();
-        expected_calls
-            .sort_by(|a, b| (&a.owner_syntax_id, a.ordinal).cmp(&(&b.owner_syntax_id, b.ordinal)));
-        ensure!(
-            native_calls == expected_calls,
-            "incompatible_index: selected native calls differ from source"
-        );
-        optional_hint_check(progress)?;
-        let mut expected_regions = witness.control_regions.clone();
-        expected_regions
-            .sort_by(|a, b| (&a.owner_syntax_id, a.ordinal).cmp(&(&b.owner_syntax_id, b.ordinal)));
-        ensure!(
-            native_regions == expected_regions,
-            "incompatible_index: selected native regions differ from source"
-        );
-        // Both narrow search rows and display labels must match the shared
-        // native-fact projector in both directions, not just its graph hash.
-        let expected_nodes: Vec<_> = nodes
-            .iter()
-            .map(|node| {
-                let kind = serde_json::to_value(node.kind)?;
-                Ok((
-                    node.id.clone(),
-                    node.name.clone(),
-                    kind.as_str()
-                        .context("incompatible_index: selected graph kind invalid")?
-                        .to_owned(),
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        ensure!(
-            node_rows == expected_nodes,
-            "incompatible_index: selected graph node materialization differs"
-        );
-        let expected_labels: Vec<_> = nodes
-            .iter()
-            .filter_map(|node| {
-                node.display_label
-                    .as_ref()
-                    .map(|label| (node.id.clone(), label.clone()))
-            })
-            .collect();
-        ensure!(
-            label_rows == expected_labels,
-            "incompatible_index: selected graph display labels differ"
-        );
-        let mut class_rows = Vec::new();
-        for (id, name, qualified, path, payload) in stored_class_rows {
-            optional_hint_check(progress)?;
-            let class: crate::classes::ClassDefinition = serde_json::from_str(&payload)?;
-            ensure!(
-                class.symbol.id == id
-                    && class.symbol.name == name
-                    && class.symbol.path == path
-                    && class.qualified_name == qualified
-                    && path == file.path,
-                "incompatible_index: selected class materialization differs"
-            );
-            class_rows.push(class);
-        }
-        let mut class_relations = Vec::new();
-        for (id, owner, target, payload) in relation_rows {
-            optional_hint_check(progress)?;
-            let relation: crate::classes::ClassRelation = serde_json::from_str(&payload)?;
-            ensure!(
-                relation.id == id && relation.owner == owner && relation.target == target,
-                "incompatible_index: selected class relation materialization differs"
-            );
-            class_relations.push(relation);
-        }
-        optional_hint_check(progress)?;
-        let mut graph = Graph {
-            files: vec![file],
-            nodes,
-            calls,
-            regions,
-            ..Graph::default()
-        };
-        graph.stats.files = 1;
-        graph.stats.symbols = graph.nodes.len();
-        graph.stats.calls = graph.calls.len();
-        graph.stats.regions = graph.regions.len();
-        graph.stats.unresolved = graph.calls.len();
-        for coverage in &witness.coverage {
-            optional_hint_check(progress)?;
-            if coverage.state != "complete" {
-                let recovered = coverage
-                    .diagnostic
-                    .as_deref()
-                    .is_some_and(|d| d.contains("parser recovered"));
-                if recovered {
-                    graph.stats.parse_error_files += 1;
-                }
-                graph.diagnostics.push(Diagnostic {
-                    path: Some(coverage.document_path.clone()),
-                    code: if recovered {
-                        "parse-error"
-                    } else {
-                        "native-coverage-partial"
-                    }
-                    .into(),
-                    message: coverage
-                        .diagnostic
-                        .clone()
-                        .unwrap_or_else(|| "Native extraction is incomplete".into()),
-                });
-            }
-        }
-        // The graph was projected from the stored native rows, which equal the
-        // source witness above; re-deriving it against the witness repeats that.
-        if matches!(language.as_str(), "java" | "python") {
-            optional_hint_check(progress)?;
-            let expected_f = crate::classes::FileExtraction::extract_file_with_progress(
-                &graph.files[0],
-                &graph.nodes,
-                &Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                crate::classes::Limits::default(),
-                progress,
-            )?;
-            let recorded_f: Option<crate::classes::FileExtraction> = stored_f
-                .as_deref()
-                .and_then(|raw| serde_json::from_str(raw).ok());
-            optional_hint_check(progress)?;
-            ensure!(
-                recorded_f.as_ref() == Some(&expected_f),
-                "incompatible_index: selected F differs from authenticated source and graph"
-            );
-        } else {
-            ensure!(
-                stored_f.is_none(),
-                "incompatible_index: non-class graph carries F"
-            );
-        }
-        optional_hint_check(progress)?;
-        let catalog = crate::classes::Catalog {
-            classes: class_rows,
-            relations: class_relations,
-            warnings: vec![],
-            truncated: false,
-        };
-        optional_hint_check(progress)?;
-        let rows = publication_rows_with_progress(&graph, &witness, &catalog, progress)?;
-        let grouped = rows
-            .get(graph.files[0].path.as_str())
-            .context("selected rows missing")?;
-        optional_hint_check(progress)?;
-        let ids =
-            v8_document_projection_with_progress(&graph.files[0], &witness, grouped, progress)?;
-        ensure!(
-            ids.version_id == version_id
-                && ids.graph_id == graph_id
-                && ids.class_id == class_id
-                && ids.graph_hash == graph_hash
-                && Some(ids.class_hash) == class_hash,
-            "incompatible_index: selected projection fingerprint mismatch"
-        );
-        Ok(AttestedDocument {
-            file: graph.files.swap_remove(0),
-            declarations: native_declarations,
-            calls: native_calls,
-            regions: native_regions,
-            nodes: graph.nodes,
-            graph_calls: graph.calls,
-            graph_regions: graph.regions,
-        })
-    }
-
-    /// Class DTOs are selected presentation projections; compare only this
-    /// document's rows with a bounded in-memory class build from attested bytes.
-    /// Attest only the returned paths under one pinned read transaction. The
-    /// other files' previously validated F rows are immutable inputs to the
-    /// class catalog (T00); never re-parse the whole selected workspace here.
-    fn attest_selected_classes_for(
-        &self,
-        db: &Connection,
-        paths: &BTreeSet<&str>,
-        selected: &ReadRevision,
-    ) -> Result<()> {
-        if paths.is_empty() {
-            return Ok(());
-        }
-        for path in paths {
-            self.attest_selected_document_for(db, path, selected)?;
-        }
-        self.attest_selected_classes_inner(db, paths, selected)
-            .map_err(selected_integrity)
-            .map_err(|error| self.report_selected_failure(error))
-    }
-
-    fn attest_selected_classes_inner(
-        &self,
-        db: &Connection,
-        paths: &BTreeSet<&str>,
-        selected: &ReadRevision,
-    ) -> Result<()> {
-        let limits = crate::classes::Limits::default();
-        let (stats_length, raw_stats, raw_warnings, truncated): (i64, String, String, bool) = db
-            .query_row(
-            "SELECT length(CAST(graph_stats AS BLOB)),graph_stats,class_warnings,class_truncated
-             FROM native_revisions WHERE id=?1",
-            [&selected.key],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-        )?;
-        ensure!(
-            (0..=GRAPH_FIELD_MAX_BYTES).contains(&stats_length) && raw_warnings.len() <= 256 * 1024,
-            "incompatible_index: selected class metadata byte budget exceeded"
-        );
-        let stats: IndexStats = serde_json::from_str(&raw_stats)?;
-        let warnings: Vec<String> = serde_json::from_str(&raw_warnings)?;
-        let (file_count, class_file_count): (i64, i64) = db.query_row(
-            "SELECT count(*),sum(CASE WHEN language IN ('java','python') THEN 1 ELSE 0 END)
-             FROM revision_documents WHERE revision_id=?1",
-            [&selected.key],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
-        ensure!(
-            file_count >= 0 && file_count as usize == stats.files && class_file_count >= 0,
-            "incompatible_index: selected class inventory differs from graph summary"
-        );
-        let mut extracts = Vec::new();
-        let mut f_bytes = 0usize;
-        let mut statement = db.prepare(
-            "SELECT m.path,g.class_extraction_payload FROM revision_documents m
-             JOIN graph_projections g ON g.gid=m.gid
-               AND g.vid=m.vid
-             WHERE m.revision_id=?1 AND m.language IN ('java','python') ORDER BY m.path",
-        )?;
-        for row in statement.query_map([&selected.key], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-        })? {
-            let (path, raw_f) = row?;
-            f_bytes = f_bytes
-                .checked_add(raw_f.len())
-                .context("incompatible_index: selected F byte budget overflow")?;
-            ensure!(
-                raw_f.len() <= 64 * 1024 * 1024 && f_bytes <= 512 * 1024 * 1024,
-                "incompatible_index: selected F byte budget exceeded"
-            );
-            let extract: crate::classes::FileExtraction = serde_json::from_str(&raw_f)?;
-            ensure!(
-                extract.path == path,
-                "incompatible_index: selected F document identity differs"
-            );
-            extracts.push(extract);
-        }
-        ensure!(
-            extracts.len() == class_file_count as usize,
-            "incompatible_index: selected class extraction inventory incomplete"
-        );
-        let catalog =
-            crate::classes::Catalog::compose(&extracts, stats.files, stats.symbols, limits)?;
-        ensure!(
-            catalog.warnings == warnings && catalog.truncated == truncated,
-            "incompatible_index: selected class catalog metadata differs"
-        );
-        for path in paths {
-            let (language, class_id): (String, i64) = db.query_row(
-                "SELECT language,cid FROM revision_documents
-                 WHERE revision_id=?1 AND path=?2",
-                params![selected.key, path],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )?;
-            if !matches!(language.as_str(), "java" | "python") {
-                continue;
-            }
-            let mut expected: Vec<_> = catalog
-                .classes
-                .iter()
-                .filter(|class| class.symbol.path == *path)
-                .cloned()
-                .collect();
-            let mut actual: Vec<crate::classes::ClassDefinition> = db
-                .prepare("SELECT payload FROM classes WHERE cid=?1 ORDER BY id")?
-                .query_map([&class_id], |r| r.get::<_, String>(0))?
-                .map(|payload| Ok(serde_json::from_str(&payload?)?))
-                .collect::<Result<_>>()?;
-            expected.sort_by(|a, b| a.symbol.id.cmp(&b.symbol.id));
-            actual.sort_by(|a, b| a.symbol.id.cmp(&b.symbol.id));
-            ensure!(
-                actual == expected,
-                "incompatible_index: selected class projection differs from stored F catalog"
-            );
-            let mut expected_relations: Vec<_> = catalog
-                .relations
-                .iter()
-                .filter(|relation| relation.path == *path)
-                .cloned()
-                .collect();
-            let mut actual_relations: Vec<crate::classes::ClassRelation> = db
-                .prepare("SELECT payload FROM class_relations WHERE cid=?1 ORDER BY id")?
-                .query_map([&class_id], |r| r.get::<_, String>(0))?
-                .map(|payload| Ok(serde_json::from_str(&payload?)?))
-                .collect::<Result<_>>()?;
-            expected_relations.sort_by(|a, b| a.id.cmp(&b.id));
-            actual_relations.sort_by(|a, b| a.id.cmp(&b.id));
-            ensure!(
-                actual_relations == expected_relations,
-                "incompatible_index: selected class relationships differ from stored F catalog"
-            );
-        }
-        Ok(())
     }
 
     pub fn native_declarations_at(
@@ -13013,19 +12348,6 @@ impl Store {
         lookup_key: &str,
     ) -> Result<Vec<crate::native_evidence::Declaration>> {
         self.native_at(pin, |db, selected| {
-            let mut paths=db.prepare(
-                "SELECT DISTINCT m.path FROM native_version_declarations d JOIN revision_documents m
-                 ON m.revision_id=?3 AND m.vid=d.vid
-                 WHERE m.language=?1 AND d.lookup_key=?2 ORDER BY m.path LIMIT 5001"
-            )?.query_map(params![language,lookup_key,selected.key],|r|r.get::<_,String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            ensure!(
-                paths.len() <= 5000,
-                "incompatible_index: selected lookup document budget exceeded"
-            );
-            for path in paths.drain(..) {
-                self.attest_selected_document_for(db, &path, selected)?;
-            }
             Self::read_native_declarations_for(
                 db,
                 language,
@@ -13109,7 +12431,6 @@ impl Store {
                 );
                 return Ok(None);
             };
-            self.attest_selected_document_for(db, &key.path, selected)?;
             let source = self
                 .selected_source_row_for(db, &key.path, selected)?
                 .context("incompatible_index: paired graph source missing")?;
@@ -13134,10 +12455,6 @@ impl Store {
         key: &crate::native_evidence::DocumentKey,
     ) -> Result<Option<crate::native_evidence::Coverage>> {
         self.native_at(pin, |db, selected| {
-            let scope = v8_native_scope_for(db, key, selected)?;
-            if scope.is_some() {
-                self.attest_selected_document_for(db, &key.path, selected)?;
-            }
             Self::read_native_coverage_for(db, key, selected)
         })
     }
@@ -13158,7 +12475,6 @@ impl Store {
     ) -> Result<Vec<crate::native_evidence::Call>> {
         self.native_at(pin, |db, selected| {
             if let Some(scope) = v8_owner_scope_for(db, owner, selected)? {
-                self.attest_selected_document_for(db, &scope.key.path, selected)?;
                 read_native_calls_v8(db, &scope, Some(owner))
             } else {
                 let dangling: bool = db.query_row(
@@ -13178,7 +12494,6 @@ impl Store {
     ) -> Result<Vec<crate::native_evidence::ControlRegion>> {
         self.native_at(pin, |db, selected| {
             if let Some(scope)=v8_owner_scope_for(db,owner,selected)? {
-                self.attest_selected_document_for(db,&scope.key.path,selected)?;
                 read_native_control_regions_v8(db,&scope,Some(owner))
             } else {
                 let dangling:bool=db.query_row(
@@ -13215,8 +12530,8 @@ impl Store {
         let selected_path: Option<String> = match request {
             crate::navigation::NavigationRequest::Source(s) => Some(s.path.clone()),
             crate::navigation::NavigationRequest::Member(s) => {
-                // Locate the selected document by identity, not the untrusted
-                // materialized kind. Attest the document before using that kind.
+                // Locate the selected document by identity, not the
+                // materialized kind.
                 tx.query_row(
                     "SELECT m.path FROM graph_nodes n JOIN revision_documents m ON m.revision_id=?2 AND m.gid=n.gid WHERE n.id=?1 LIMIT 1",
                     params![id_codec::encode_sid(&s.class_id), selected.key],
@@ -13379,23 +12694,6 @@ impl Store {
             warnings
                 .push("Class diagrams currently support Java and Python declarations only.".into());
         }
-        let mut paths: BTreeSet<_> = items
-            .iter()
-            .map(|class| class.symbol.path.as_str())
-            .collect();
-        if let Some(selected) = path
-            && matches!(selected.rsplit('.').next(), Some("java" | "py"))
-        {
-            let exists: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM revision_documents WHERE revision_id=?2 AND path=?1)",
-                params![selected, selected_revision.key],
-                |r| r.get(0),
-            )?;
-            if exists {
-                paths.insert(selected);
-            }
-        }
-        self.attest_selected_classes_for(tx, &paths, &selected_revision)?;
         Ok(ClassPage {
             revision,
             items,
@@ -13442,11 +12740,6 @@ impl Store {
                 classes.insert(class.symbol.id.clone(), class);
             }
         }
-        let paths: BTreeSet<_> = classes
-            .values()
-            .map(|class| class.symbol.path.as_str())
-            .collect();
-        self.attest_selected_classes_for(tx, &paths, &selected)?;
         class_diagram::project(
             revision,
             &seeds,
@@ -13726,12 +13019,7 @@ impl Store {
                     let length: i64 = r.get(4)?;
                     let raw = r.get_ref(5)?.as_blob()?;
                     let mut digest = Sha256::new();
-                    for (index, chunk) in raw.chunks(64 * 1024).enumerate() {
-                        if index == 0 && progress.is_some() {
-                            #[cfg(feature = "test-support")]
-                            crate::mcp::phase_hook("outgoing_hint_source_hash_chunk")
-                                .map_err(|error| anyhow::anyhow!(error))?;
-                        }
+                    for chunk in raw.chunks(64 * 1024) {
                         optional_hint_check(progress)?;
                         digest.update(chunk);
                     }
@@ -13770,9 +13058,6 @@ impl Store {
         self.with_evidence(|tx| {
             let selected = self.read_revision(tx, expected_revision)?;
             let source = self.selected_source_row_for(tx, path, &selected)?;
-            if source.is_some() {
-                self.attest_selected_document_for(tx, path, &selected)?;
-            }
             Ok(source.map(|file| (selected.pin, file)))
         })
     }
@@ -13882,28 +13167,38 @@ impl Store {
         let selected = self.read_revision_for(tx, expected, pre_startup)?;
         let revision = selected.pin;
         let mut stmt = tx.prepare(
-            "SELECT m.path,d.language,m.gid FROM revision_documents m
-                 JOIN document_versions d ON d.vid=m.vid
+            "SELECT m.path,d.language,g.gid FROM revision_documents m
+                 LEFT JOIN document_versions d ON d.vid=m.vid
+                   AND d.language=m.language AND d.path=m.path
+                 LEFT JOIN graph_projections g ON g.gid=m.gid AND g.vid=m.vid
                  WHERE m.revision_id=?3 ORDER BY m.path LIMIT ?1 OFFSET ?2",
         )?;
-        let source_rows: Vec<(String, String, i64)> = stmt
+        let source_rows: Vec<(String, Option<String>, Option<i64>)> = stmt
             .query_map(
                 params![(limit + 1) as i64, offset as i64, selected.key],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )?
             .collect::<rusqlite::Result<_>>()?;
         // The extra row only decides whether a next page exists; it isn't
-        // returned, so only the returned rows are attested and counted.
+        // returned, so only the returned rows are checked and counted.
         let next = (source_rows.len() > limit).then_some(offset + limit);
         let mut items = Vec::new();
         for (path, language, projection_id) in source_rows.into_iter().take(limit) {
-            self.attest_selected_document_for(tx, &path, &selected)?;
-            let methods: i64 = tx.query_row(
-                "SELECT count(*) FROM graph_nodes WHERE gid=?1
+            // A manifest row whose version or graph projection is absent is
+            // corruption, not an empty file.
+            let (Some(language), Some(projection_id)) = (language, projection_id) else {
+                return Err(self.report_selected_read(anyhow::anyhow!(
+                    "incompatible_index: selected document projection absent"
+                )));
+            };
+            let methods: i64 = tx
+                .query_row(
+                    "SELECT count(*) FROM graph_nodes WHERE gid=?1
                     AND kind IN ('function','method')",
-                [&projection_id],
-                |r| r.get(0),
-            )?;
+                    [&projection_id],
+                    |r| r.get(0),
+                )
+                .map_err(|error| self.report_selected_read(error.into()))?;
             items.push(serde_json::json!({"path":path,"language":language,"methodCount":methods}));
         }
         Ok(serde_json::json!({"revision":revision,"items":items,"nextOffset":next}))
@@ -14297,9 +13592,9 @@ impl Store {
             )
             .optional()?;
         let (language, path) = selected.context("native declaration target missing")?;
-        store.attest_selected_document_for(db, &path, &revision)?;
         let declarations =
-            Self::read_native_declarations_for(db, &language, None, Some(&path), true, &revision)?;
+            Self::read_native_declarations_for(db, &language, None, Some(&path), true, &revision)
+                .map_err(|error| store.report_selected_read(error))?;
         let focused = anchors::find_selected(target, &declarations)?;
         anchors::capture_anchor(focused, &declarations)
     }
@@ -14327,7 +13622,15 @@ impl Store {
         let Some(revision) = revision else {
             return Ok(None);
         };
-        store.attest_selected_document_for(db, &anchor.document.path, selected)?;
+        // A manifest row without its native version is corruption, not an
+        // orphaned anchor: report it so the index is rebuilt.
+        v8_native_scope_for(db, &anchor.document, selected)
+            .and_then(|scope| {
+                scope
+                    .map(drop)
+                    .context("incompatible_index: selected native version missing")
+            })
+            .map_err(|error| store.report_selected_read(error))?;
         let declarations = Self::read_native_declarations_for(
             db,
             &anchor.document.language,
@@ -14335,7 +13638,8 @@ impl Store {
             Some(&anchor.document.path),
             true,
             selected,
-        )?;
+        )
+        .map_err(|error| store.report_selected_read(error))?;
         ensure!(
             anchors::document_matches(&anchor.document, &declarations),
             "invalid anchor document association"

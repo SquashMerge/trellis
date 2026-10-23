@@ -538,7 +538,8 @@ impl EvidenceResponse {
         for key in keys {
             let scope = v8_native_scope_for(&self.db, &key, &selected)?
                 .context("store_unavailable: missing native coverage scope")?;
-            let row = read_native_coverage_v8(&self.db, &scope)?;
+            let row = read_native_coverage_v8(&self.db, &scope)
+                .map_err(|error| self.store.report_selected_read(error))?;
             ensure!(
                 row.revision_id == scope.native_revision_id
                     && row.producer_id == scope.producer_id
@@ -624,9 +625,8 @@ impl EvidenceResponse {
                 .get(&version)
                 .context("store_unavailable: find scope absent")?;
             if !loaded.contains_key(&version) {
-                self.store
-                    .attest_selected_document_for(&self.db, &scope.key.path, &selected)?;
-                let declarations = read_native_declarations_v8(&self.db, scope, None, true)?
+                let declarations = read_native_declarations_v8(&self.db, scope, None, true)
+                    .map_err(|error| self.store.report_selected_read(error))?
                     .into_iter()
                     .map(|d| (d.syntax_id.clone(), d))
                     .collect();
@@ -788,6 +788,12 @@ impl EvidenceResponse {
         self.mcp_declaration_selected(symbol_id, &selected)
     }
 
+    /// Stored evidence on a required path that disagrees with its selected
+    /// scope is corruption: it fails typed and schedules a re-index (#261).
+    fn corrupt_evidence(&self, message: &'static str) -> anyhow::Error {
+        self.store.report_selected_read(anyhow::Error::msg(message))
+    }
+
     fn mcp_declaration_selected(
         &self,
         symbol_id: &str,
@@ -797,35 +803,41 @@ impl EvidenceResponse {
         let Some(scope) = v8_owner_scope_for(&self.db, symbol_id, selected)? else {
             return Ok(None);
         };
-        self.store
-            .attest_selected_document_for(&self.db, &scope.key.path, selected)?;
-        let declaration = read_native_declarations_v8(&self.db, &scope, None, true)?
+        let declaration = read_native_declarations_v8(&self.db, &scope, None, true)
+            .map_err(|error| self.store.report_selected_read(error))?
             .into_iter()
             .find(|row| row.syntax_id == symbol_id)
-            .context("store_unavailable: selected declaration absent")?;
-        ensure!(
-            declaration.provenance_id == scope.proof_id()
-                && declaration.revision_id == scope.native_revision_id
-                && declaration.document == scope.key,
-            "store_unavailable: selected declaration proof mismatch"
-        );
-        let coverage = read_native_coverage_v8(&self.db, &scope)?;
-        ensure!(
-            coverage.producer_id == scope.producer_id
-                && coverage.language == scope.key.language
-                && coverage.source_set_id == scope.key.source_set_id
-                && coverage.document_path == scope.key.path
-                && coverage.revision_id == scope.native_revision_id
-                && coverage.requested
-                && coverage.selected
-                && matches!(coverage.state.as_str(), "complete" | "partial" | "failed"),
-            "store_unavailable: selected declaration coverage mismatch"
-        );
+            .ok_or_else(|| {
+                self.corrupt_evidence("store_unavailable: selected declaration absent")
+            })?;
+        if !(declaration.provenance_id == scope.proof_id()
+            && declaration.revision_id == scope.native_revision_id
+            && declaration.document == scope.key)
+        {
+            return Err(
+                self.corrupt_evidence("store_unavailable: selected declaration proof mismatch")
+            );
+        }
+        let coverage = read_native_coverage_v8(&self.db, &scope)
+            .map_err(|error| self.store.report_selected_read(error))?;
+        if !(coverage.producer_id == scope.producer_id
+            && coverage.language == scope.key.language
+            && coverage.source_set_id == scope.key.source_set_id
+            && coverage.document_path == scope.key.path
+            && coverage.revision_id == scope.native_revision_id
+            && coverage.requested
+            && coverage.selected
+            && matches!(coverage.state.as_str(), "complete" | "partial" | "failed"))
+        {
+            return Err(
+                self.corrupt_evidence("store_unavailable: selected declaration coverage mismatch")
+            );
+        }
         let hash: String = self.db.query_row(
             "SELECT content_hash FROM document_versions d JOIN native_source_sets s ON s.id=?2 WHERE d.id=?1 AND d.language=?3 AND d.path=?4",
             params![scope.version_id, scope.key.source_set_id, scope.key.language, scope.key.path],
             |r| r.get(0),
-        )?;
+        ).map_err(|error| self.store.report_selected_read(error.into()))?;
         let provenance = Provenance {
             id: scope.proof_id(),
             producer_id: scope.producer_id.clone(),
@@ -1026,15 +1038,18 @@ impl EvidenceResponse {
             source.hash == owner.content_hash,
             "store_unavailable: selected outgoing source hash mismatch"
         );
-        let mut measured = read_native_calls_v8(&self.db, &scope, Some(symbol_id))?;
+        let mut measured = read_native_calls_v8(&self.db, &scope, Some(symbol_id))
+            .map_err(|error| self.store.report_selected_read(error))?;
         for call in &measured {
-            ensure!(
-                call.owner_syntax_id == symbol_id
-                    && call.document == scope.key
-                    && call.revision_id == scope.native_revision_id
-                    && call.provenance_id == scope.proof_id(),
-                "store_unavailable: outgoing call proof mismatch"
-            );
+            if !(call.owner_syntax_id == symbol_id
+                && call.document == scope.key
+                && call.revision_id == scope.native_revision_id
+                && call.provenance_id == scope.proof_id())
+            {
+                return Err(
+                    self.corrupt_evidence("store_unavailable: outgoing call proof mismatch")
+                );
+            }
         }
         measured.sort_by(|a, b| {
             (&a.document.path, a.range.start, a.range.end, &a.id).cmp(&(
@@ -1231,8 +1246,9 @@ impl EvidenceResponse {
                             &|| progress.expired(),
                         )?;
                         let coverage = read_native_coverage_v8(&self.db, &candidate_scope)?;
-                        // Reject an ineligible optional row before the expensive full
-                        // attestation: an omitted candidate must not poison required calls.
+                        // An optional candidate that fails to read or is ineligible is
+                        // skipped without scheduling a rebuild: it must not poison the
+                        // required calls.
                         let Some(declaration) = declarations.iter().find(|row| row.syntax_id == id)
                         else {
                             return Ok(None);
@@ -1254,12 +1270,6 @@ impl EvidenceResponse {
                         {
                             return Ok(None);
                         }
-                        self.store.attest_selected_document_optional_for(
-                            &self.db,
-                            &key.path,
-                            &selected,
-                            &|| progress.expired(),
-                        )?;
                         let hash: String = self.db.query_row(
                             "SELECT content_hash FROM document_versions d JOIN native_source_sets s ON s.id=?2 WHERE d.id=?1 AND d.language=?3 AND d.path=?4",
                             params![version,key.source_set_id,key.language,key.path],|r|r.get(0))?;
@@ -1507,16 +1517,19 @@ impl EvidenceResponse {
                 path,
             };
             let scope = v8_native_scope_for(&self.db, &key, &selected)?
-                .context("store_unavailable: incoming scope absent")?;
-            let coverage = read_native_coverage_v8(&self.db, &scope)?;
-            ensure!(
-                coverage.revision_id == scope.native_revision_id
-                    && coverage.producer_id == scope.producer_id
-                    && coverage.language == key.language
-                    && coverage.source_set_id == key.source_set_id
-                    && coverage.document_path == key.path,
-                "store_unavailable: incoming coverage identity mismatch"
-            );
+                .ok_or_else(|| self.corrupt_evidence("store_unavailable: incoming scope absent"))?;
+            let coverage = read_native_coverage_v8(&self.db, &scope)
+                .map_err(|error| self.store.report_selected_read(error))?;
+            if !(coverage.revision_id == scope.native_revision_id
+                && coverage.producer_id == scope.producer_id
+                && coverage.language == key.language
+                && coverage.source_set_id == key.source_set_id
+                && coverage.document_path == key.path)
+            {
+                return Err(
+                    self.corrupt_evidence("store_unavailable: incoming coverage identity mismatch")
+                );
+            }
             let valid = match coverage.state.as_str() {
                 "notRequested" => {
                     !coverage.requested && !coverage.selected && coverage.diagnostic.is_none()
@@ -1536,11 +1549,11 @@ impl EvidenceResponse {
                 "SELECT m.coverage_selected,m.coverage_state FROM revision_documents m JOIN document_versions d ON d.vid=m.vid JOIN native_source_sets s ON s.id=?3 WHERE m.revision_id=?1 AND d.id=?2 AND m.language=?4 AND m.path=?5",
                 params![selected.key, scope.version_id, key.source_set_id, key.language, key.path],
                 |r| Ok((r.get(0)?, r.get(1)?)),
-            )?;
-            ensure!(
-                valid && manifest.0 == coverage.selected && manifest.1 == coverage.state,
-                "store_unavailable: inconsistent incoming coverage tuple"
-            );
+            ).map_err(|error| self.store.report_selected_read(error.into()))?;
+            if !(valid && manifest.0 == coverage.selected && manifest.1 == coverage.state) {
+                return Err(self
+                    .corrupt_evidence("store_unavailable: inconsistent incoming coverage tuple"));
+            }
             let counts = &mut scope_counts[language_index];
             if coverage.selected {
                 counts[0] += 1;
@@ -1661,53 +1674,54 @@ impl EvidenceResponse {
                     .map_err(|error| self.store.report_selected_failure(error))?;
                 let caller_id = id_codec::decode_sid(&caller_blob)
                     .map_err(|error| self.store.report_selected_failure(error))?;
-                let scope = scopes
-                    .get(&version)
-                    .context("store_unavailable: incoming call scope absent")?;
-                ensure!(
-                    scope.key.path == path
-                        && matches!(coverages[&version].state.as_str(), "complete" | "partial"),
-                    "store_unavailable: incoming call scope mismatch"
-                );
+                let scope = scopes.get(&version).ok_or_else(|| {
+                    self.corrupt_evidence("store_unavailable: incoming call scope absent")
+                })?;
+                if !(scope.key.path == path
+                    && matches!(coverages[&version].state.as_str(), "complete" | "partial"))
+                {
+                    return Err(
+                        self.corrupt_evidence("store_unavailable: incoming call scope mismatch")
+                    );
+                }
                 let role = DeclarationRole::from_stored(&stored_role)?;
                 if !loaded.contains_key(&version) {
-                    self.store.attest_selected_document_for(
-                        &self.db,
-                        &scope.key.path,
-                        &selected,
-                    )?;
-                    let declarations = read_native_declarations_v8(&self.db, scope, None, true)?
+                    let declarations = read_native_declarations_v8(&self.db, scope, None, true)
+                        .map_err(|error| self.store.report_selected_read(error))?
                         .into_iter()
                         .map(|d| (d.syntax_id.clone(), d))
                         .collect::<BTreeMap<_, _>>();
-                    let measured = read_native_calls_v8(&self.db, scope, None)?
+                    let measured = read_native_calls_v8(&self.db, scope, None)
+                        .map_err(|error| self.store.report_selected_read(error))?
                         .into_iter()
                         .map(|c| (c.id.clone(), c))
                         .collect::<BTreeMap<_, _>>();
                     let hash: String = self.db.query_row(
                         "SELECT content_hash FROM document_versions d JOIN native_source_sets s ON s.id=?2 WHERE d.id=?1 AND d.language=?3 AND d.path=?4",
                         params![version, scope.key.source_set_id, scope.key.language, scope.key.path], |r| r.get(0)
-                    )?;
+                    ).map_err(|error| self.store.report_selected_read(error.into()))?;
                     loaded.insert(version.clone(), (declarations, measured, hash));
                 }
                 let (declarations, measured, hash) = &loaded[&version];
-                let caller = declarations
-                    .get(&caller_id)
-                    .context("store_unavailable: incoming caller absent")?;
-                let call = measured
-                    .get(&id)
-                    .context("store_unavailable: incoming call absent")?;
-                ensure!(
-                    caller.role == role
-                        && caller.document == scope.key
-                        && caller.revision_id == scope.native_revision_id
-                        && caller.provenance_id == scope.proof_id()
-                        && call.owner_syntax_id == caller.syntax_id
-                        && call.document == scope.key
-                        && call.revision_id == scope.native_revision_id
-                        && call.provenance_id == scope.proof_id(),
-                    "store_unavailable: incoming call or caller proof mismatch"
-                );
+                let caller = declarations.get(&caller_id).ok_or_else(|| {
+                    self.corrupt_evidence("store_unavailable: incoming caller absent")
+                })?;
+                let call = measured.get(&id).ok_or_else(|| {
+                    self.corrupt_evidence("store_unavailable: incoming call absent")
+                })?;
+                if !(caller.role == role
+                    && caller.document == scope.key
+                    && caller.revision_id == scope.native_revision_id
+                    && caller.provenance_id == scope.proof_id()
+                    && call.owner_syntax_id == caller.syntax_id
+                    && call.document == scope.key
+                    && call.revision_id == scope.native_revision_id
+                    && call.provenance_id == scope.proof_id())
+                {
+                    return Err(self.corrupt_evidence(
+                        "store_unavailable: incoming call or caller proof mismatch",
+                    ));
+                }
                 let provenance = Provenance {
                     id: scope.proof_id(),
                     producer_id: scope.producer_id.clone(),
@@ -2061,6 +2075,59 @@ mod enriched_read_tests {
             );
             assert_eq!(store.disposition(), RecoveryDisposition::Rebuild, "{fault}");
         }
+    }
+
+    #[test]
+    fn inconsistent_declaration_coverage_marks_rebuild() {
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("owner.js"), "function Owner() {}\n").unwrap();
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let (pin, _) = crate::index_coordinator::reconcile_workspace(
+            &store,
+            &IndexOptions::new(workspace.path().to_owned()),
+            &Arc::new(AtomicBool::new(false)),
+            |_| {},
+        )
+        .unwrap();
+        let read = store.evidence_response().unwrap();
+        let owner = read
+            .mcp_find("Owner", 20, Some(pin))
+            .unwrap()
+            .symbols
+            .into_iter()
+            .find(|hit| hit.declaration.name.as_deref() == Some("Owner"))
+            .unwrap()
+            .declaration
+            .syntax_id;
+        read.finish(()).unwrap();
+        drop(read);
+        // SQL constraints admit an unselected 'complete' row with no
+        // diagnostic, so it decodes; the required declaration read rejects it.
+        assert_eq!(
+            store
+                .cache_write()
+                .unwrap()
+                .execute(
+                    "UPDATE revision_documents SET coverage_selected=0
+                     WHERE path='owner.js' AND coverage_state='complete'
+                       AND coverage_diagnostic IS NULL",
+                    [],
+                )
+                .unwrap(),
+            1
+        );
+        let error = store
+            .evidence_response()
+            .unwrap()
+            .mcp_declaration(&owner, Some(pin))
+            .err()
+            .expect("inconsistent coverage must fail");
+        assert_eq!(
+            format!("{error:#}"),
+            "incompatible_index: selected evidence decode failed: store_unavailable: selected declaration coverage mismatch"
+        );
+        assert_eq!(store.disposition(), RecoveryDisposition::Rebuild);
     }
 
     #[test]

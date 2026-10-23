@@ -58,20 +58,20 @@ fn metrics_revision_computes_snapshot_values_once_and_reads_each_source_once() {
             // The selected revision's producer binding is checked once per
             // request, at admission, and shared by the metrics read.
             producer_hashes: 1,
-            // Each document is still attested, reading and hashing its source once.
+            // Each document's stored rows are read once, with its source.
             source_reads: 3,
-            attestations: 3,
+            document_reads: 3,
         }
     );
 }
 
 #[test]
-fn files_page_attests_only_the_rows_it_returns() {
+fn files_page_reads_no_selected_documents() {
     let (_state, _root, store) = published_store(3);
     let (page, counts) = whole_request(|| store.files_at(None, 0, 2).unwrap());
     assert_eq!(page["items"].as_array().unwrap().len(), 2);
     assert_eq!(page["nextOffset"], 2);
-    assert_eq!((counts.producer_hashes, counts.attestations), (1, 2));
+    assert_eq!((counts.producer_hashes, counts.document_reads), (1, 0));
     let (last, counts) = whole_request(|| {
         store
             .evidence_response()
@@ -81,7 +81,7 @@ fn files_page_attests_only_the_rows_it_returns() {
     });
     assert_eq!(last["items"].as_array().unwrap().len(), 1);
     assert!(last["nextOffset"].is_null());
-    assert_eq!((counts.producer_hashes, counts.attestations), (1, 1));
+    assert_eq!((counts.producer_hashes, counts.document_reads), (1, 0));
 }
 
 #[test]
@@ -158,4 +158,29 @@ fn mcp_reads_check_the_producer_binding_once_per_request() {
             ("outgoing", 1)
         ]
     );
+}
+
+#[test]
+fn files_page_reports_a_dangling_graph_projection() {
+    let (_state, _root, store) = published_store(2);
+    {
+        let db = store.cache_write().unwrap();
+        db.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        assert_eq!(
+            db.execute(
+                "UPDATE revision_documents SET gid=-1 WHERE path='f1.js'",
+                []
+            )
+            .unwrap(),
+            1
+        );
+        db.pragma_update(None, "foreign_keys", "ON").unwrap();
+    }
+    // Not a zero method count: the missing projection is corruption.
+    let error = store.files_at(None, 0, 10).unwrap_err();
+    assert_eq!(
+        format!("{error:#}"),
+        "incompatible_index: selected evidence decode failed: incompatible_index: selected document projection absent"
+    );
+    assert_eq!(store.disposition(), RecoveryDisposition::Rebuild);
 }
