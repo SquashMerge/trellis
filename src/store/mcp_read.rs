@@ -538,7 +538,8 @@ impl EvidenceResponse {
         for key in keys {
             let scope = v8_native_scope_for(&self.db, &key, &selected)?
                 .context("store_unavailable: missing native coverage scope")?;
-            let row = read_native_coverage_v8(&self.db, &scope)?;
+            let row = read_native_coverage_v8(&self.db, &scope)
+                .map_err(|error| self.store.report_selected_read(error))?;
             ensure!(
                 row.revision_id == scope.native_revision_id
                     && row.producer_id == scope.producer_id
@@ -624,9 +625,8 @@ impl EvidenceResponse {
                 .get(&version)
                 .context("store_unavailable: find scope absent")?;
             if !loaded.contains_key(&version) {
-                self.store
-                    .attest_selected_document_for(&self.db, &scope.key.path, &selected)?;
-                let declarations = read_native_declarations_v8(&self.db, scope, None, true)?
+                let declarations = read_native_declarations_v8(&self.db, scope, None, true)
+                    .map_err(|error| self.store.report_selected_read(error))?
                     .into_iter()
                     .map(|d| (d.syntax_id.clone(), d))
                     .collect();
@@ -797,9 +797,8 @@ impl EvidenceResponse {
         let Some(scope) = v8_owner_scope_for(&self.db, symbol_id, selected)? else {
             return Ok(None);
         };
-        self.store
-            .attest_selected_document_for(&self.db, &scope.key.path, selected)?;
-        let declaration = read_native_declarations_v8(&self.db, &scope, None, true)?
+        let declaration = read_native_declarations_v8(&self.db, &scope, None, true)
+            .map_err(|error| self.store.report_selected_read(error))?
             .into_iter()
             .find(|row| row.syntax_id == symbol_id)
             .context("store_unavailable: selected declaration absent")?;
@@ -809,7 +808,8 @@ impl EvidenceResponse {
                 && declaration.document == scope.key,
             "store_unavailable: selected declaration proof mismatch"
         );
-        let coverage = read_native_coverage_v8(&self.db, &scope)?;
+        let coverage = read_native_coverage_v8(&self.db, &scope)
+            .map_err(|error| self.store.report_selected_read(error))?;
         ensure!(
             coverage.producer_id == scope.producer_id
                 && coverage.language == scope.key.language
@@ -1026,7 +1026,8 @@ impl EvidenceResponse {
             source.hash == owner.content_hash,
             "store_unavailable: selected outgoing source hash mismatch"
         );
-        let mut measured = read_native_calls_v8(&self.db, &scope, Some(symbol_id))?;
+        let mut measured = read_native_calls_v8(&self.db, &scope, Some(symbol_id))
+            .map_err(|error| self.store.report_selected_read(error))?;
         for call in &measured {
             ensure!(
                 call.owner_syntax_id == symbol_id
@@ -1231,8 +1232,9 @@ impl EvidenceResponse {
                             &|| progress.expired(),
                         )?;
                         let coverage = read_native_coverage_v8(&self.db, &candidate_scope)?;
-                        // Reject an ineligible optional row before the expensive full
-                        // attestation: an omitted candidate must not poison required calls.
+                        // An optional candidate that fails to read or is ineligible is
+                        // skipped without scheduling a rebuild: it must not poison the
+                        // required calls.
                         let Some(declaration) = declarations.iter().find(|row| row.syntax_id == id)
                         else {
                             return Ok(None);
@@ -1254,12 +1256,6 @@ impl EvidenceResponse {
                         {
                             return Ok(None);
                         }
-                        self.store.attest_selected_document_optional_for(
-                            &self.db,
-                            &key.path,
-                            &selected,
-                            &|| progress.expired(),
-                        )?;
                         let hash: String = self.db.query_row(
                             "SELECT content_hash FROM document_versions d JOIN native_source_sets s ON s.id=?2 WHERE d.id=?1 AND d.language=?3 AND d.path=?4",
                             params![version,key.source_set_id,key.language,key.path],|r|r.get(0))?;
@@ -1508,7 +1504,8 @@ impl EvidenceResponse {
             };
             let scope = v8_native_scope_for(&self.db, &key, &selected)?
                 .context("store_unavailable: incoming scope absent")?;
-            let coverage = read_native_coverage_v8(&self.db, &scope)?;
+            let coverage = read_native_coverage_v8(&self.db, &scope)
+                .map_err(|error| self.store.report_selected_read(error))?;
             ensure!(
                 coverage.revision_id == scope.native_revision_id
                     && coverage.producer_id == scope.producer_id
@@ -1671,16 +1668,13 @@ impl EvidenceResponse {
                 );
                 let role = DeclarationRole::from_stored(&stored_role)?;
                 if !loaded.contains_key(&version) {
-                    self.store.attest_selected_document_for(
-                        &self.db,
-                        &scope.key.path,
-                        &selected,
-                    )?;
-                    let declarations = read_native_declarations_v8(&self.db, scope, None, true)?
+                    let declarations = read_native_declarations_v8(&self.db, scope, None, true)
+                        .map_err(|error| self.store.report_selected_read(error))?
                         .into_iter()
                         .map(|d| (d.syntax_id.clone(), d))
                         .collect::<BTreeMap<_, _>>();
-                    let measured = read_native_calls_v8(&self.db, scope, None)?
+                    let measured = read_native_calls_v8(&self.db, scope, None)
+                        .map_err(|error| self.store.report_selected_read(error))?
                         .into_iter()
                         .map(|c| (c.id.clone(), c))
                         .collect::<BTreeMap<_, _>>();

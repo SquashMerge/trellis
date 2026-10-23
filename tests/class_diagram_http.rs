@@ -301,47 +301,6 @@ async fn authentication_strict_requests_revision_and_disconnected_expansion() {
         assert_eq!(app.clone().oneshot(req).await.unwrap().status(), 200);
     }
 }
-#[test]
-fn selected_class_pages_and_diagrams_refuse_fk_valid_f_and_class_forgeries() {
-    for (family, mutation) in [
-        (
-            "F",
-            "UPDATE graph_projections SET class_extraction_payload=json_set(class_extraction_payload,'$.path','forged.java') WHERE gid=(SELECT gid FROM revision_documents WHERE path='Types.java' LIMIT 1)",
-        ),
-        (
-            "class",
-            "UPDATE classes SET payload=json_set(payload,'$.qualifiedName','forged') WHERE cid=(SELECT cid FROM revision_documents WHERE path='Types.java' LIMIT 1) AND id=(SELECT id FROM classes WHERE cid=(SELECT cid FROM revision_documents WHERE path='Types.java' LIMIT 1) LIMIT 1)",
-        ),
-    ] {
-        let (dir, store, graph, _app, _session) = setup();
-        let pin = store.status().unwrap().revision;
-        let page = store
-            .classes_at(Some("Types.java"), "", Some(pin), 0, 10)
-            .unwrap();
-        assert!(page.items.len() >= 4);
-        let diagram = request(id(&graph, "A"), &store);
-        assert!(store.class_diagram_at(&diagram).is_ok());
-        let db = rusqlite::Connection::open(index_db(&dir.path().join("state"))).unwrap();
-        assert_eq!(
-            db.execute(mutation, []).unwrap(),
-            1,
-            "{family}: mutate one real selected row"
-        );
-        drop(db);
-        for error in [
-            store
-                .classes_at(Some("Types.java"), "", Some(pin), 0, 10)
-                .map(|_| ())
-                .unwrap_err(),
-            store.class_diagram_at(&diagram).map(|_| ()).unwrap_err(),
-        ] {
-            assert!(
-                error.to_string().contains("incompatible_index"),
-                "{family}: {error:#}"
-            );
-        }
-    }
-}
 
 #[test]
 fn selected_class_pagination_spans_paths_in_one_revision() {
@@ -801,7 +760,6 @@ fn edge_limit_is_explicit_without_dangling_nodes() {
 }
 #[test]
 fn presentation_byte_budget_clips_members_and_paginates_without_skipping_rows() {
-    use trellis::classes::{ClassDefinition, ClassMember};
     // Real native multi-document source creates measured fields across multiple pages.
     let dir = tempfile::tempdir().unwrap();
     let workspace = dir.path().join("workspace");
@@ -863,56 +821,6 @@ fn presentation_byte_budget_clips_members_and_paginates_without_skipping_rows() 
         "real measured classes should exercise pagination"
     );
     assert_eq!(seen.len(), 100);
-
-    // An out-of-band class-row edit is not source-backed. It must never become
-    // a pagination oracle or leak fabricated fields, even if clipped by a UI cap.
-    let db = rusqlite::Connection::open(index_db(&dir.path().join("state"))).unwrap();
-    let payload: String = db
-        .query_row(
-            "SELECT payload FROM classes ORDER BY qualified_name LIMIT 1",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    let mut forged: ClassDefinition = serde_json::from_str(&payload).unwrap();
-    forged.fields = (0..256)
-        .map(|i| ClassMember {
-            name: format!("forged_field{i}"),
-            type_hint: Some("X".repeat(2048)),
-            symbol_id: None,
-            path: forged.symbol.path.clone(),
-            range: forged.symbol.range.clone(),
-        })
-        .collect();
-    db.execute(
-        "UPDATE classes SET payload=?1 WHERE id=?2",
-        rusqlite::params![
-            serde_json::to_string(&forged).unwrap(),
-            sid_blob(&forged.symbol.id)
-        ],
-    )
-    .unwrap();
-    let error = store
-        .classes_at(None, "", Some(revision), 0, 100)
-        .unwrap_err();
-    assert!(
-        error.to_string().contains("incompatible_index"),
-        "{error:#}"
-    );
-    let stored: ClassDefinition = serde_json::from_str(
-        &db.query_row(
-            "SELECT payload FROM classes ORDER BY qualified_name LIMIT 1",
-            [],
-            |r| r.get::<_, String>(0),
-        )
-        .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(
-        stored.fields.len(),
-        256,
-        "reader must not mutate stored tamper"
-    );
 }
 #[test]
 fn diagram_byte_budget_preserves_expansion_bridges_and_exact_relation_evidence() {
@@ -1171,115 +1079,6 @@ fn publish_bundle(
 }
 
 #[tokio::test]
-async fn same_pin_selected_graph_declaration_rejected_by_class_and_symbol_routes() {
-    let (dir, store, graph, app, _session) = setup();
-    let pin = store.status().unwrap().revision;
-    let seed = id(&graph, "A");
-    let class_url = format!("/api/classes?{}&q=A", pin_query(pin));
-    let symbol_url = format!("/api/symbol?id={seed}&{}", pin_query(pin));
-    assert_eq!(call(&app, "GET", &class_url, Value::Null).await.0, 200);
-    assert_eq!(call(&app, "GET", &symbol_url, Value::Null).await.0, 200);
-    assert_eq!(
-        call(
-            &app,
-            "POST",
-            "/api/class-diagram",
-            json!({"seed":seed,"expectedRevision":pin})
-        )
-        .await
-        .0,
-        200
-    );
-    let db = rusqlite::Connection::open(index_db(&dir.path().join("state"))).unwrap();
-    // No ID, path, index pin, or FK changes: only the selected narrow graph name is forged.
-    db.execute(
-        "UPDATE graph_nodes SET name='Fabricated' WHERE gid=(SELECT gid FROM revision_documents WHERE path='Types.java') AND id=?1",
-        [sid_blob(&seed)],
-    )
-    .unwrap();
-    assert_eq!(store.status().unwrap().revision, pin);
-    for (method, path, body) in [
-        ("GET", class_url.as_str(), Value::Null),
-        ("GET", symbol_url.as_str(), Value::Null),
-        (
-            "POST",
-            "/api/class-diagram",
-            json!({"seed":seed,"expectedRevision":pin}),
-        ),
-    ] {
-        let (status, value) = call(&app, method, path, body).await;
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{path}: {value}");
-        assert_eq!(
-            value["error"]["code"], "incompatible_index",
-            "{path}: {value}"
-        );
-        assert!(!value.to_string().contains("Fabricated"));
-    }
-    let unrelated = store
-        .symbol_at(&id(&graph, "Unsupported"), Some(pin))
-        .unwrap_err();
-    assert!(
-        unrelated.to_string().starts_with("incompatible_index"),
-        "{unrelated:#}"
-    );
-}
-
-#[tokio::test]
-async fn selected_class_and_symbol_routes_reject_same_pin_graph_call_forgery() {
-    let (dir, store, graph, app, _session) = setup_with(
-        "class A { void run() { helper(); } void helper() {} }
-class B {}
-",
-    );
-    let pin = store.status().unwrap().revision;
-    let class_id = id(&graph, "A");
-    let other_id = id(&graph, "Unsupported");
-    let class_url = format!("/api/classes?{}&path=Types.java", pin_query(pin));
-    let symbol_url = format!("/api/symbol?id={class_id}&{}", pin_query(pin));
-    assert_eq!(call(&app, "GET", &class_url, Value::Null).await.0, 200);
-    let db = rusqlite::Connection::open(index_db(&dir.path().join("state"))).unwrap();
-    // Graph calls derive from native call facts. Forge one FK-valid native spelling.
-    let call_id: Vec<u8> = db
-        .query_row(
-            "SELECT c.id FROM native_version_calls c JOIN revision_documents m ON m.vid=c.vid WHERE m.path='Types.java' LIMIT 1",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(
-        db.execute(
-            "UPDATE native_version_calls SET spelling='fabricatedCall' WHERE vid=(SELECT vid FROM revision_documents WHERE path='Types.java') AND id=?1",
-            [&call_id],
-        )
-        .unwrap(),
-        1
-    );
-    assert_eq!(store.status().unwrap().revision, pin);
-    for (method, path, body) in [
-        ("GET", class_url.as_str(), Value::Null),
-        ("GET", symbol_url.as_str(), Value::Null),
-        (
-            "POST",
-            "/api/class-diagram",
-            json!({"seed":class_id,"expectedRevision":pin}),
-        ),
-    ] {
-        let (status, value) = call(&app, method, path, body).await;
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{path}: {value}");
-        assert_eq!(
-            value["error"]["code"], "incompatible_index",
-            "{path}: {value}"
-        );
-        assert!(!value.to_string().contains("fabricatedCall"));
-    }
-    let other_url = format!("/api/symbol?id={other_id}&{}", pin_query(pin));
-    let (status, value) = call(&app, "GET", &other_url, Value::Null).await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{value}");
-    assert_eq!(value["error"]["code"], "incompatible_index");
-    assert!(!value.to_string().contains("fabricatedCall"));
-}
-
-#[tokio::test]
 async fn selected_class_json_decode_and_clipping_fail_closed_without_retyping_invalid_requests() {
     // The first selected catalog decode is typed and closes pre-created clones.
     let (dir, store, graph, app, _session) = setup();
@@ -1339,34 +1138,6 @@ async fn selected_class_json_decode_and_clipping_fail_closed_without_retyping_in
             .contains("incompatible_index")
     );
 
-    // A selected method seed attests its narrow graph node against derived native facts.
-    let (dir, store, graph, app, _session) = setup();
-    let clone = store.clone();
-    let pin = store.status().unwrap().revision;
-    let method_id = id(&graph, "run");
-    let db = rusqlite::Connection::open(index_db(&dir.path().join("state"))).unwrap();
-    db.execute(
-        "UPDATE graph_nodes SET kind='class' WHERE gid=(SELECT gid FROM revision_documents WHERE path='Types.java') AND id=?1",
-        [sid_blob(&method_id)],
-    )
-    .unwrap();
-    let (status, body) = call(
-        &app,
-        "POST",
-        "/api/class-diagram",
-        json!({"seed":method_id,"expectedRevision":pin}),
-    )
-    .await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
-    assert_eq!(body["error"]["code"], "incompatible_index");
-    assert!(
-        clone
-            .status()
-            .unwrap_err()
-            .to_string()
-            .contains("incompatible_index")
-    );
-
     // Valid top-level JSON with a non-object member is refused before clipped JSON1.
     let (dir, store, graph, app, _session) = setup();
     let clone = store.clone();
@@ -1413,7 +1184,7 @@ async fn selected_class_json_decode_and_clipping_fail_closed_without_retyping_in
 }
 
 #[tokio::test]
-async fn ready_file_extraction_is_persisted_and_selected_http_reads_attest_it() {
+async fn ready_file_extraction_is_persisted_and_selected_http_reads_serve_it() {
     let (dir, store, graph, app, _session) = setup();
     let pin = store.status().unwrap().revision;
     let db = rusqlite::Connection::open(index_db(&dir.path().join("state"))).unwrap();
@@ -1442,43 +1213,6 @@ async fn ready_file_extraction_is_persisted_and_selected_http_reads_attest_it() 
         "SELECT class_extraction_state,class_extraction_payload FROM graph_projections g JOIN revision_documents m ON m.gid=g.gid WHERE m.path='unsupported.js'",
         [],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
     assert!(unrelated.is_none());
-    db.execute(
-        "UPDATE graph_projections SET class_extraction_payload=json_set(class_extraction_payload,'$.source_bytes',0) WHERE gid=(SELECT gid FROM revision_documents WHERE path='Types.java')",
-        [],
-    ).unwrap();
-    let mutated: String = db.query_row(
-        "SELECT class_extraction_payload FROM graph_projections WHERE gid=(SELECT gid FROM revision_documents WHERE path='Types.java')",
-        [], |r| r.get(0),
-    ).unwrap();
-    let changed: trellis::classes::FileExtraction = serde_json::from_str(&mutated).unwrap();
-    assert!(expected.source_bytes > 0);
-    assert_eq!(changed.source_bytes, 0);
-    assert_ne!(changed, expected);
-    for path in [&source, &classes] {
-        let (status, value) = call(&app, "GET", path, Value::Null).await;
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{path}: {value}");
-        assert_eq!(value["error"]["code"], "incompatible_index");
-        assert!(!value.to_string().contains("class A extends B"));
-    }
-}
-
-#[tokio::test]
-async fn selected_class_relation_rows_are_witnessed_by_source_and_graph() {
-    let (dir, store, graph, app, _session) = setup();
-    let pin = store.status().unwrap().revision;
-    let seed = id(&graph, "A");
-    let class_url = format!("/api/classes?{}&q=A", pin_query(pin));
-    let (_, baseline) = call(&app, "GET", &class_url, Value::Null).await;
-    assert_eq!(baseline["items"][0]["symbol"]["name"], "A");
-    let db = rusqlite::Connection::open(index_db(&dir.path().join("state"))).unwrap();
-    assert_eq!(db.execute(
-        "UPDATE class_relations SET payload=json_set(payload,'$.typeName','Forged') WHERE cid=(SELECT cid FROM revision_documents WHERE path='Types.java') AND id=(SELECT min(id) FROM class_relations WHERE owner=?1)",
-        [sid_blob(&seed)],
-    ).unwrap(),1);
-    let (status, value) = call(&app, "GET", &class_url, Value::Null).await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{value}");
-    assert_eq!(value["error"]["code"], "incompatible_index");
-    assert!(!value.to_string().contains("Forged"));
 }
 
 fn write_class_scip_labels(root: &std::path::Path, label_version: &str) {

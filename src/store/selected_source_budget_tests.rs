@@ -76,14 +76,6 @@ fn selected_source_length_guard_precedes_decode_and_graph_guard_follows() {
         )
         .unwrap();
     let db = Connection::open(store.roots.index_db(&store.identity)).unwrap();
-    let (node_id, original): (Vec<u8>, String) = db
-        .query_row(
-            "SELECT n.id,n.name FROM graph_nodes n JOIN revision_documents m
-             ON m.gid=n.gid WHERE m.path='one.js' LIMIT 1",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .unwrap();
     let selected = store.read_revision_for(&db, None, true).unwrap();
     let document = store
         .selected_graph_document_for(&db, "one.js", &selected)
@@ -161,21 +153,6 @@ fn selected_source_length_guard_precedes_decode_and_graph_guard_follows() {
             .to_string()
             .contains("graph row byte budget exceeded")
     );
-    db.execute(
-        "UPDATE graph_nodes SET name=?1 WHERE id=?2 AND gid=(SELECT gid FROM revision_documents WHERE path='one.js')",
-        params!["wrong", &node_id],
-    ).unwrap();
-    assert!(
-        store
-            .attest_selected_document_for(&db, "one.js", &selected)
-            .unwrap_err()
-            .to_string()
-            .contains("graph node materialization differs")
-    );
-    db.execute(
-        "UPDATE graph_nodes SET name=?1 WHERE id=?2 AND gid=(SELECT gid FROM revision_documents WHERE path='one.js')",
-        params![original, &node_id],
-    ).unwrap();
     // A tiny test limit exercises the same SQL size gate without a 256 MiB fixture.
     assert!(
         Store::selected_source_row_bounded(&db, "one.js", 4)

@@ -2,19 +2,6 @@ use super::selected_read_once_tests::published_store;
 use super::*;
 use std::sync::mpsc;
 
-/// Corrupt one document's stored graph rows so its attestation fails.
-fn corrupt(store: &Store, table: &str, column: &str, path: &str) {
-    let db = Connection::open(store.roots.index_db(&store.identity)).unwrap();
-    db.pragma_update(None, "foreign_keys", "OFF").unwrap();
-    let changed = db
-        .execute(
-            &format!("UPDATE {table} SET {column}={column}||'x' WHERE gid=(SELECT gid FROM revision_documents WHERE path=?1)"),
-            [path],
-        )
-        .unwrap();
-    assert!(changed > 0, "{table} has rows for {path}");
-}
-
 /// Run one metrics revision with these overrides; return it and what it held.
 fn metrics_with(
     store: &Store,
@@ -53,40 +40,13 @@ fn hold_until(store: &Store, held: &'static str, other: &'static str, stage: Met
 }
 
 #[test]
-fn metrics_documents_are_attested_and_computed_concurrently() {
+fn metrics_documents_are_computed_concurrently() {
     let (_state, _root, store) = published_store(3);
     hold_until(&store, "f0.js", "f1.js", MetricsDocumentStage::Start);
     let (payload, _) = metrics_with(&store, 3, u64::MAX, &mut || Ok(()));
     let payload = payload.unwrap();
     let files: Vec<&str> = payload.files.iter().map(|f| f.path.as_str()).collect();
     assert_eq!(files, ["f0.js", "f1.js", "f2.js"]);
-}
-
-#[test]
-fn the_first_failure_in_manifest_order_is_reported_when_a_later_one_fails_first() {
-    let (_state, _root, store) = published_store(3);
-    corrupt(&store, "graph_nodes", "name", "f0.js");
-    // A valid role change leaves graph derivation intact but fails the worker's
-    // native-vs-source attestation with a different error from f0's node check.
-    let db = Connection::open(store.roots.index_db(&store.identity)).unwrap();
-    let changed = db
-        .execute(
-            "UPDATE native_version_declarations
-             SET role=CASE role WHEN 'production' THEN 'test' ELSE 'production' END
-             WHERE vid=(SELECT vid FROM revision_documents WHERE path='f2.js')",
-            [],
-        )
-        .unwrap();
-    assert!(changed > 0, "f2.js has native declarations");
-    drop(db);
-    // f0 resumes only after f2's worker has returned its distinct failure.
-    hold_until(&store, "f0.js", "f2.js", MetricsDocumentStage::Done);
-    let (result, _) = metrics_with(&store, 3, u64::MAX, &mut || Ok(()));
-    let error = result.unwrap_err();
-    assert!(
-        format!("{error:#}").contains("selected graph node materialization differs"),
-        "{error:#}"
-    );
 }
 
 #[test]

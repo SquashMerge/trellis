@@ -18,7 +18,7 @@ Do not add, and do not ask for:
 - Defenses against hostile same-user replacement of filesystem ancestors (see T02).
 - New per-field read-side size caps beyond the existing request and response bounds, or new re-validation of stored rows against captured source on read.
 
-T00 removes these as *requirements*. It doesn't license removing checks that already exist, such as selected-document read attestation; changing those is an owner decision.
+T00 removes these as *requirements*. It doesn't license removing checks that already exist; changing those is an owner decision. (By owner decision, #261, selected reads no longer re-attest stored rows against source: they trust what the indexer validated and published, and corruption found on read schedules a re-index.)
 
 Do handle, as T00 requires:
 

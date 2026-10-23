@@ -119,4 +119,4 @@ Under this decision, registry caps exclude whole files, `CLASSES` cuts between c
   - The catalog `warnings` and `truncated` move to the revision header.
   - Composition runs before the publication transaction, and the transaction writes only new projections.
 - **`docs/class-diagram-contract.md`.** Its cap rule now points here.
-- **#67 plan.** This is its `class-composition` slice. Selected-document attestation compares a path's stored projection against composition for the pinned revision.
+- **#67 plan.** This is its `class-composition` slice. Selected reads serve a path's stored projection for the pinned revision without recomputing composition (amended 2026-10-23, #261: selected-document read attestation removed by owner ruling).

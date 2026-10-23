@@ -1,6 +1,5 @@
 //! R-1 (#199): reused projections compare fresh hashes with stored witnesses.
-//! Non-reused class hashes are replaced by fresh, validated projections; a
-//! retained selected read still attests its own class rows.
+//! Non-reused class hashes are replaced by fresh, validated projections.
 use super::*;
 use crate::{index_coordinator::IndexJobCoordinator, indexer::IndexOptions};
 use std::{fs, sync::atomic::AtomicBool};
@@ -160,7 +159,7 @@ fn a_stored_graph_hash_mismatch_fails_typed_then_rebaselines() {
 }
 
 #[test]
-fn corrupted_non_reused_class_hash_reprojects_r2_but_retained_r1_fails_typed() {
+fn corrupted_non_reused_class_hash_reprojects_r2() {
     let (_state, _work, store, options, r1) = fixture();
     let expected = store
         .classes_at(Some("A.java"), "", Some(r1), 0, 100)
@@ -203,13 +202,14 @@ fn corrupted_non_reused_class_hash_reprojects_r2_but_retained_r1_fails_typed() {
         serde_json::to_value(&expected.items).unwrap()
     );
 
-    // The selected read returns only an error: no partial class page can escape.
-    let error = store
-        .classes_at(Some("A.java"), "", Some(r1), 0, 100)
-        .unwrap_err();
+    // Reads trust the published index (#261): a well-formed but wrong stored
+    // class hash is not recomputed on read, so a retained r1 still serves.
     assert_eq!(
-        error.to_string(),
-        "incompatible_index: selected evidence decode failed: incompatible_index: selected projection fingerprint mismatch"
+        store
+            .classes_at(Some("A.java"), "", Some(r1), 0, 100)
+            .unwrap()
+            .revision,
+        r1
     );
 
     // A retained r1 read is valid after r2 publication when r1 was not corrupt.

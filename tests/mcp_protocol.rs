@@ -6215,18 +6215,6 @@ async fn mcp_find_selected_snapshot_ranks_and_keeps_zero_hit_scope() {
         current.index_generation.to_string()
     );
     assert!(admitted["indexRevision"].as_u64().unwrap() >= current.index_revision);
-    // This fixture intentionally changed coverage without remeasuring source.
-    // An ID-only find admits those rows and must fail selected attestation; the
-    // `$Caf` name query above never matches a hexadecimal syntax ID by chance.
-    let id_scope = ask(&mut client, 158, "sid:v1:", Some(20), None);
-    tool(&id_scope, Some("store_unavailable"), true);
-    let details: Vec<_> = diagnostics_rx.try_iter().collect();
-    assert!(
-        details
-            .iter()
-            .any(|line| line.contains("selected native coverage differs from source")),
-        "fixture ID-only read did not reach changed coverage: {details:?}"
-    );
     drop(client);
     session.join().unwrap().unwrap();
 }
@@ -6578,12 +6566,8 @@ async fn mcp_find_required_rows_and_coverage_fail_closed() {
         Store,
         topology::{TopologyRoots, WorkspaceIdentity},
     };
-    for fault in [
-        "invalid_coverage",
-        "missing_scope",
-        "missing_header",
-        "bad_digest",
-    ] {
+    // A well-formed but wrong content hash is trusted on read (#261).
+    for fault in ["invalid_coverage", "missing_scope", "missing_header"] {
         let temp = tempfile::tempdir().unwrap();
         let root = checkout(temp.path());
         fs::write(root.join("a.js"), "function Alpha() {}\n").unwrap();
@@ -7392,7 +7376,10 @@ fn mcp_declaration_body_edit_retains_id_but_changes_selected_hash_and_pin() {
 #[test]
 fn mcp_declaration_corrupt_required_proof_refuses_whole_result() {
     use trellis::store::Store;
-    for fault in ["missing_header", "bad_digest"] {
+    // A missing header is corruption; a well-formed but wrong content hash
+    // is trusted on read (#261).
+    {
+        let fault = "missing_header";
         let temp = tempfile::tempdir().unwrap();
         let root = checkout(temp.path());
         fs::write(root.join("a.js"), "function Alpha() {}\n").unwrap();
@@ -8671,12 +8658,12 @@ async fn mcp_outgoing_near_call_deadline_body(accept_delay: Duration) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mcp_outgoing_mid_attestation_expiry_keeps_required_calls_and_prior_hints() {
+async fn mcp_outgoing_mid_verification_expiry_keeps_required_calls_and_prior_hints() {
     // `Local` and `Target` live in their own versions, so each is verified
-    // only inside optional candidate attestation. local.js's source-hash chunks
-    // advance nothing and its hint survives; target.js's first chunk advances
-    // the hint clock inside that SHA phase, so Target's
-    // calls lose their hints while every required call survives.
+    // only inside optional candidate verification. local.js's verification
+    // advances nothing and its hint survives; target.js's verification advances
+    // the hint clock past the budget, so Target's calls lose their hints while
+    // every required call survives.
     let (reply, _) = mcp_outgoing_wire_fixture(
         &[
             (
@@ -8688,11 +8675,11 @@ async fn mcp_outgoing_mid_attestation_expiry_keeps_required_calls_and_prior_hint
         ],
         "Owner",
         None,
-        // Each candidate attestation reads and hashes its source once, and its
-        // native witness reuses those bytes: local.js at no cost, then target.js expires.
+        // Each candidate version is verified once: local.js at no cost, then
+        // target.js expires.
         Some(vec![
-            ("outgoing_hint_source_hash_chunk", 0),
-            ("outgoing_hint_source_hash_chunk", 1001),
+            ("outgoing_hint_verify_version", 0),
+            ("outgoing_hint_verify_version", 1001),
         ]),
         false,
         true,
