@@ -537,16 +537,13 @@ export function checkCounts(
           "assertions",
           "join conflicts with measured candidate or capability",
         );
+      // Decision 0017 Amendment 1: unsupported is a per-document native
+      // capability, so it counts each document with a declared-unavailable
+      // family and a captured producer fact there, not each anchor.
       if (status === "unsupported")
         outcomeKeys
           .get("unsupported")
-          .add(
-            identity([
-              fact.anchor.document,
-              fact.anchor.revisionId,
-              span(loaded, fact.anchor),
-            ]),
-          );
+          .add(identity([fact.anchor.document, fact.anchor.revisionId]));
     } else {
       if (
         status !== "exact" ||
@@ -645,21 +642,61 @@ export function checkCounts(
   return count;
 }
 
+// Per-language corpus floors (Decision 0017 Amendment 1). Each language owns
+// its row; nothing outside this table branches on language. `unsupported`
+// counts documents, so its floor of one is the native-capability
+// requirement.
+const sharedFloors = {
+  scenariosTotal: 32,
+  scenariosPerCategory: 4,
+  measuredCalls: 120,
+  references: 40,
+  callableValueNegatives: 20,
+  typeRelationships: 20,
+  outcomes: {
+    resolved: 20,
+    provenExternal: 20,
+    ambiguous: 20,
+    unresolved: 20,
+    unsupported: 1,
+  },
+  exemptRoles: [],
+};
+const languageFloors = {
+  javascript: sharedFloors,
+  java: {
+    ...sharedFloors,
+    outcomes: { ...sharedFloors.outcomes, ambiguous: 0 },
+    exemptRoles: ["alias"],
+  },
+  python: {
+    ...sharedFloors,
+    outcomes: { ...sharedFloors.outcomes, ambiguous: 0 },
+    exemptRoles: ["alias"],
+  },
+  rust: {
+    ...sharedFloors,
+    typeRelationships: 0,
+    outcomes: { ...sharedFloors.outcomes, ambiguous: 0 },
+  },
+};
+
 // The count inventory is independently source-checked above. Keep the floor
 // predicate separate for direct boundary checks and captured corpus integration.
 export function assertCorpusFloors(count) {
   validate("CountsV1", count);
-  const required = roles.filter(
-    (role) => count.language !== "java" || role !== "alias",
-  );
+  const floors = languageFloors[count.language];
+  const required = roles.filter((role) => !floors.exemptRoles.includes(role));
   if (
-    count.scenariosTotal < 32 ||
-    count.scenariosByCategory.some((x) => x.count < 4) ||
-    count.measuredCalls < 120 ||
-    count.references < 40 ||
-    count.callableValueNegatives < 20 ||
-    count.typeRelationships < 20 ||
-    count.outcomes.some((x) => x.count < 20) ||
+    count.scenariosTotal < floors.scenariosTotal ||
+    count.scenariosByCategory.some(
+      (x) => x.count < floors.scenariosPerCategory,
+    ) ||
+    count.measuredCalls < floors.measuredCalls ||
+    count.references < floors.references ||
+    count.callableValueNegatives < floors.callableValueNegatives ||
+    count.typeRelationships < floors.typeRelationships ||
+    count.outcomes.some((x) => x.count < floors.outcomes[x.disposition]) ||
     required.some((role) => !count.observedRoles.includes(role))
   )
     fail("COUNT.FLOOR", "counts", "corpus-profile minimum not met");
