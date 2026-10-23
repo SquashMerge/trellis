@@ -1,0 +1,35 @@
+{
+  "formatVersion": 1,
+  "document": {
+    "sourceSetId": "main",
+    "language": "javascript",
+    "path": "src/text.js"
+  },
+  "revisionId": "r1",
+  "scenarios": [],
+  "facts": [
+    {
+      "kind": "coverage",
+      "ref": "native-coverage:src/text.js",
+      "record": {
+        "producerId": "native",
+        "language": "javascript",
+        "sourceSetId": "main",
+        "documentPath": "src/text.js",
+        "revisionId": "r1",
+        "requested": true,
+        "selected": true,
+        "state": "complete",
+        "supportedRoles": [
+          "definition",
+          "call"
+        ],
+        "observedRoles": [
+          "definition",
+          "call"
+        ],
+        "diagnostic": null
+      }
+    }
+  ]
+}

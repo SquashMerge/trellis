@@ -1,0 +1,544 @@
+{
+  "formatVersion": 1,
+  "profile": "draft",
+  "language": "javascript",
+  "sourceSets": [
+    {
+      "id": "main",
+      "rootId": "javascript-conformance",
+      "languages": [
+        "javascript"
+      ],
+      "dependencies": []
+    }
+  ],
+  "producers": [
+    {
+      "id": "native",
+      "version": "1",
+      "executableHash": "9576f1f3ec87b33d49cc0355ce898f83a815c662eeab185b566a5df0206bb2e0",
+      "kind": "native",
+      "languages": [
+        "javascript"
+      ],
+      "positionEncoding": "utf16"
+    }
+  ],
+  "revisions": [
+    {
+      "id": "r1",
+      "sourceSetId": "main",
+      "documents": [
+        {
+          "key": {
+            "sourceSetId": "main",
+            "language": "javascript",
+            "path": "src/adapters.js"
+          },
+          "revisionId": "r1",
+          "sourceFile": "snapshots/r1/src/adapters.js"
+        },
+        {
+          "key": {
+            "sourceSetId": "main",
+            "language": "javascript",
+            "path": "src/editor.js"
+          },
+          "revisionId": "r1",
+          "sourceFile": "snapshots/r1/src/editor.js"
+        },
+        {
+          "key": {
+            "sourceSetId": "main",
+            "language": "javascript",
+            "path": "src/history.js"
+          },
+          "revisionId": "r1",
+          "sourceFile": "snapshots/r1/src/history.js"
+        },
+        {
+          "key": {
+            "sourceSetId": "main",
+            "language": "javascript",
+            "path": "src/legacy.js"
+          },
+          "revisionId": "r1",
+          "sourceFile": "snapshots/r1/src/legacy.js"
+        },
+        {
+          "key": {
+            "sourceSetId": "main",
+            "language": "javascript",
+            "path": "src/pipeline.js"
+          },
+          "revisionId": "r1",
+          "sourceFile": "snapshots/r1/src/pipeline.js"
+        },
+        {
+          "key": {
+            "sourceSetId": "main",
+            "language": "javascript",
+            "path": "src/plugins.js"
+          },
+          "revisionId": "r1",
+          "sourceFile": "snapshots/r1/src/plugins.js"
+        },
+        {
+          "key": {
+            "sourceSetId": "main",
+            "language": "javascript",
+            "path": "src/public.js"
+          },
+          "revisionId": "r1",
+          "sourceFile": "snapshots/r1/src/public.js"
+        },
+        {
+          "key": {
+            "sourceSetId": "main",
+            "language": "javascript",
+            "path": "src/stages.js"
+          },
+          "revisionId": "r1",
+          "sourceFile": "snapshots/r1/src/stages.js"
+        },
+        {
+          "key": {
+            "sourceSetId": "main",
+            "language": "javascript",
+            "path": "src/text.js"
+          },
+          "revisionId": "r1",
+          "sourceFile": "snapshots/r1/src/text.js"
+        },
+        {
+          "key": {
+            "sourceSetId": "main",
+            "language": "javascript",
+            "path": "src/workbench.js"
+          },
+          "revisionId": "r1",
+          "sourceFile": "snapshots/r1/src/workbench.js"
+        }
+      ],
+      "toolchainHash": "4255a388254ca4319e2f95f1da375d5deaddf25baf9c7c85070b67f9543b15d0",
+      "configHash": "3838a3c68089a20c51735c090f2e83a12327e3abd94ea6fc03bc68a8d978cc59",
+      "dependencyHash": "d6cd541cf774e6541b9e1bb0651931d02cb77977955c823215f1b8552dcc1cd9"
+    }
+  ],
+  "comparison": {
+    "sourceSetId": "main",
+    "revisionId": "r1",
+    "producers": [
+      {
+        "id": "native",
+        "version": "1",
+        "executableHash": "9576f1f3ec87b33d49cc0355ce898f83a815c662eeab185b566a5df0206bb2e0",
+        "kind": "native",
+        "languages": [
+          "javascript"
+        ],
+        "positionEncoding": "utf16"
+      }
+    ]
+  },
+  "coverageIntents": [
+    {
+      "producerId": "native",
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/adapters.js"
+      },
+      "revisionId": "r1",
+      "requestedRoles": [
+        "definition",
+        "call"
+      ],
+      "measurementSupport": [
+        {
+          "kind": "declarationName",
+          "available": true,
+          "diagnostic": null
+        },
+        {
+          "kind": "callee",
+          "available": true,
+          "diagnostic": null
+        },
+        {
+          "kind": "invocation",
+          "available": true,
+          "diagnostic": null
+        },
+        {
+          "kind": "reference",
+          "available": true,
+          "diagnostic": null
+        }
+      ]
+    },
+    {
+      "producerId": "native",
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/editor.js"
+      },
+      "revisionId": "r1",
+      "requestedRoles": [
+        "definition",
+        "call"
+      ],
+      "measurementSupport": [
+        {
+          "kind": "declarationName",
+          "available": true,
+          "diagnostic": null
+        },
+        {
+          "kind": "callee",
+          "available": true,
+          "diagnostic": null
+        },
+        {
+          "kind": "invocation",
+          "available": true,
+          "diagnostic": null
+        },
+        {
+          "kind": "reference",
+          "available": true,
+          "diagnostic": null
+        }
+      ]
+    },
+    {
+      "producerId": "native",
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/history.js"
+      },
+      "revisionId": "r1",
+      "requestedRoles": [
+        "definition",
+        "call"
+      ],
+      "measurementSupport": [
+        {
+          "kind": "declarationName",
+          "available": true,
+          "diagnostic": null
+        },
+        {
+          "kind": "callee",
+          "available": true,
+          "diagnostic": null
+        },
+        {
+          "kind": "invocation",
+          "available": true,
+          "diagnostic": null
+        },
+        {
+          "kind": "reference",
+          "available": true,
+          "diagnostic": null
+        }
+      ]
+    },
+    {
+      "producerId": "native",
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/legacy.js"
+      },
+      "revisionId": "r1",
+      "requestedRoles": [
+        "definition",
+        "call"
+      ],
+      "measurementSupport": [
+        {
+          "kind": "declarationName",
+          "available": true,
+          "diagnostic": null
+        },
+        {
+          "kind": "callee",
+          "available": true,
+          "diagnostic": null
+        },
+        {
+          "kind": "invocation",
+          "available": true,
+          "diagnostic": null
+        },
+        {
+          "kind": "reference",
+          "available": true,
+          "diagnostic": null
+        }
+      ]
+    },
+    {
+      "producerId": "native",
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/pipeline.js"
+      },
+      "revisionId": "r1",
+      "requestedRoles": [
+        "definition",
+        "call"
+      ],
+      "measurementSupport": [
+        {
+          "kind": "declarationName",
+          "available": true,
+          "diagnostic": null
+        },
+        {
+          "kind": "callee",
+          "available": true,
+          "diagnostic": null
+        },
+        {
+          "kind": "invocation",
+          "available": true,
+          "diagnostic": null
+        },
+        {
+          "kind": "reference",
+          "available": true,
+          "diagnostic": null
+        }
+      ]
+    },
+    {
+      "producerId": "native",
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/plugins.js"
+      },
+      "revisionId": "r1",
+      "requestedRoles": [
+        "definition",
+        "call"
+      ],
+      "measurementSupport": [
+        {
+          "kind": "declarationName",
+          "available": true,
+          "diagnostic": null
+        },
+        {
+          "kind": "callee",
+          "available": true,
+          "diagnostic": null
+        },
+        {
+          "kind": "invocation",
+          "available": true,
+          "diagnostic": null
+        },
+        {
+          "kind": "reference",
+          "available": true,
+          "diagnostic": null
+        }
+      ]
+    },
+    {
+      "producerId": "native",
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/public.js"
+      },
+      "revisionId": "r1",
+      "requestedRoles": [
+        "definition"
+      ],
+      "measurementSupport": [
+        {
+          "kind": "declarationName",
+          "available": true,
+          "diagnostic": null
+        },
+        {
+          "kind": "callee",
+          "available": true,
+          "diagnostic": null
+        },
+        {
+          "kind": "invocation",
+          "available": true,
+          "diagnostic": null
+        },
+        {
+          "kind": "reference",
+          "available": true,
+          "diagnostic": null
+        }
+      ]
+    },
+    {
+      "producerId": "native",
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/stages.js"
+      },
+      "revisionId": "r1",
+      "requestedRoles": [
+        "definition",
+        "call"
+      ],
+      "measurementSupport": [
+        {
+          "kind": "declarationName",
+          "available": true,
+          "diagnostic": null
+        },
+        {
+          "kind": "callee",
+          "available": true,
+          "diagnostic": null
+        },
+        {
+          "kind": "invocation",
+          "available": true,
+          "diagnostic": null
+        },
+        {
+          "kind": "reference",
+          "available": true,
+          "diagnostic": null
+        }
+      ]
+    },
+    {
+      "producerId": "native",
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/text.js"
+      },
+      "revisionId": "r1",
+      "requestedRoles": [
+        "definition",
+        "call"
+      ],
+      "measurementSupport": [
+        {
+          "kind": "declarationName",
+          "available": true,
+          "diagnostic": null
+        },
+        {
+          "kind": "callee",
+          "available": true,
+          "diagnostic": null
+        },
+        {
+          "kind": "invocation",
+          "available": true,
+          "diagnostic": null
+        },
+        {
+          "kind": "reference",
+          "available": true,
+          "diagnostic": null
+        }
+      ]
+    },
+    {
+      "producerId": "native",
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/workbench.js"
+      },
+      "revisionId": "r1",
+      "requestedRoles": [
+        "definition",
+        "call"
+      ],
+      "measurementSupport": [
+        {
+          "kind": "declarationName",
+          "available": true,
+          "diagnostic": null
+        },
+        {
+          "kind": "callee",
+          "available": true,
+          "diagnostic": null
+        },
+        {
+          "kind": "invocation",
+          "available": true,
+          "diagnostic": null
+        },
+        {
+          "kind": "reference",
+          "available": true,
+          "diagnostic": null
+        }
+      ]
+    }
+  ],
+  "nativeArtifact": "captures/native.json",
+  "semanticArtifacts": [],
+  "annotationFiles": [
+    "snapshots/r1/src/adapters.js.annotations.json",
+    "snapshots/r1/src/editor.js.annotations.json",
+    "snapshots/r1/src/history.js.annotations.json",
+    "snapshots/r1/src/legacy.js.annotations.json",
+    "snapshots/r1/src/pipeline.js.annotations.json",
+    "snapshots/r1/src/plugins.js.annotations.json",
+    "snapshots/r1/src/public.js.annotations.json",
+    "snapshots/r1/src/stages.js.annotations.json",
+    "snapshots/r1/src/text.js.annotations.json",
+    "snapshots/r1/src/workbench.js.annotations.json"
+  ],
+  "answersFile": "expected/answers.json",
+  "dispositionsFile": "expected/dispositions.json",
+  "anchorCasesFile": "expected/anchors.json",
+  "captures": [
+    {
+      "ref": "native-executable",
+      "kind": "executable",
+      "pinned": "docs/semantic-evidence/hardware/mac-mini-m5-pro-v1.json#native-conformance-javascript",
+      "hash": "9576f1f3ec87b33d49cc0355ce898f83a815c662eeab185b566a5df0206bb2e0"
+    },
+    {
+      "ref": "node-toolchain",
+      "kind": "toolchain",
+      "pinned": "docs/semantic-evidence/hardware/mac-mini-m5-pro-v1.json#node-24.11.1-darwin-arm64",
+      "hash": "4255a388254ca4319e2f95f1da375d5deaddf25baf9c7c85070b67f9543b15d0"
+    },
+    {
+      "ref": "native-script",
+      "kind": "executable",
+      "file": "capture-native.mjs",
+      "hash": "0ff517d5e639f287241a3ee5f8a660ca079ad2171c5b19e0739de558ab741832"
+    },
+    {
+      "ref": "tsconfig",
+      "kind": "config",
+      "file": "snapshots/r1/tsconfig.json",
+      "hash": "3838a3c68089a20c51735c090f2e83a12327e3abd94ea6fc03bc68a8d978cc59"
+    },
+    {
+      "ref": "package",
+      "kind": "dependency",
+      "file": "snapshots/r1/package.json",
+      "hash": "d6cd541cf774e6541b9e1bb0651931d02cb77977955c823215f1b8552dcc1cd9"
+    }
+  ]
+}
