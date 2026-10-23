@@ -271,15 +271,7 @@ fn validate_join(
         "foreign join anchor"
     );
     let mut candidates = BTreeSet::new();
-    let available = native
-        .coverage
-        .iter()
-        .find(|c| {
-            c.document_path == a.document.path
-                && c.language == a.document.language
-                && c.source_set_id == a.document.source_set_id
-        })
-        .is_none_or(|c| matches!(c.state.as_str(), "complete" | "partial"));
+    // Native publication has no authenticated per-family unavailability witness yet.
     match family {
         JoinKind::DeclarationName => {
             for d in &native.declarations {
@@ -313,8 +305,6 @@ fn validate_join(
         JoinStatus::Exact
     } else if expected.len() >= 2 {
         JoinStatus::Ambiguous
-    } else if !available {
-        JoinStatus::Unsupported
     } else {
         JoinStatus::Unmatched
     };
@@ -1003,7 +993,7 @@ pub fn validate_evidence(
                     && p.document.path == *path
             })
         };
-        for role in &row.observed_roles {
+        for role in &row.supported_roles {
             let from_reference = semantic
                 .references
                 .iter()
@@ -1024,8 +1014,9 @@ pub fn validate_evidence(
                     .iter()
                     .any(|r| observed(&r.provenance_id));
             ensure!(
-                from_reference || from_binding || from_call || from_type,
-                "coverage observed role without admitted evidence"
+                row.observed_roles.contains(role)
+                    == (from_reference || from_binding || from_call || from_type),
+                "coverage observed roles differ from admitted evidence"
             );
         }
     }

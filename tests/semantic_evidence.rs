@@ -638,50 +638,69 @@ fn invalid_roles_and_cross_fact_targets_are_rejected() {
 }
 
 #[test]
-fn unavailable_native_measurement_is_not_an_unmatched_join() {
-    let (mut semantic, mut native, bytes) = fixture();
-    let key = native.revision.documents[0].key.clone();
-    native.coverage.push(n::Coverage {
-        producer_id: native.producer.id.clone(),
-        language: key.language.clone(),
-        source_set_id: key.source_set_id.clone(),
-        document_path: key.path.clone(),
-        revision_id: native.revision.id.clone(),
-        requested: true,
-        selected: true,
-        state: "failed".into(),
-        supported_roles: vec![],
-        observed_roles: vec![],
-        diagnostic: Some("native measurement unavailable".into()),
-    });
-    semantic.declaration_bindings[0].join.anchor.range = n::Range { start: 0, end: 2 };
-    semantic.declaration_bindings[0].join.candidate_ids.clear();
-    semantic.declaration_bindings[0].syntax_id = None;
-    semantic.declaration_bindings[0].join.status = s::JoinStatus::Unsupported;
-    semantic.declaration_bindings[0].join.diagnostic = Some("measurement unavailable".into());
-    s::validate_evidence(&semantic, &native, &bytes).unwrap();
-    semantic.declaration_bindings[0].join.status = s::JoinStatus::Unmatched;
-    assert!(s::validate_evidence(&semantic, &native, &bytes).is_err());
-    semantic.declaration_bindings[0].join.status = s::JoinStatus::Unsupported;
-    semantic.coverage[0]
+fn available_measurement_rejects_unsupported_and_invalid_anchors() {
+    let (base, native, bytes) = fixture();
+    for declaration in [true, false] {
+        let mut semantic = base.clone();
+        let (join, id) = if declaration {
+            let b = &mut semantic.declaration_bindings[0];
+            (&mut b.join, &mut b.syntax_id)
+        } else {
+            let b = &mut semantic.call_bindings[0];
+            (&mut b.join, &mut b.call_id)
+        };
+        join.anchor.range = n::Range { start: 0, end: 2 };
+        join.candidate_ids.clear();
+        *id = None;
+        join.status = s::JoinStatus::Unmatched;
+        join.diagnostic = Some("no measured candidate".into());
+        if !declaration {
+            semantic.coverage[0]
+                .observed_roles
+                .retain(|r| *r != s::Role::Call);
+        }
+        s::validate_evidence(&semantic, &native, &bytes).unwrap();
+        let join = if declaration {
+            &mut semantic.declaration_bindings[0].join
+        } else {
+            &mut semantic.call_bindings[0].join
+        };
+        join.status = s::JoinStatus::Unsupported;
+        assert!(
+            s::validate_evidence(&semantic, &native, &bytes)
+                .unwrap_err()
+                .to_string()
+                .contains("join differs from measured candidates")
+        );
+        let join = if declaration {
+            &mut semantic.declaration_bindings[0].join
+        } else {
+            &mut semantic.call_bindings[0].join
+        };
+        join.anchor.range = n::Range {
+            start: 200,
+            end: 210,
+        };
+        assert!(
+            s::validate_evidence(&semantic, &native, &bytes)
+                .unwrap_err()
+                .to_string()
+                .contains("converted semantic span")
+        );
+    }
+    let mut invocation = base;
+    invocation.call_bindings[0].join.anchor.kind = s::JoinKind::Invocation;
+    invocation.call_bindings[0].join.anchor.range = n::Range { start: 0, end: 2 };
+    invocation.call_bindings[0].join.status = s::JoinStatus::Unmatched;
+    invocation.call_bindings[0].join.candidate_ids.clear();
+    invocation.call_bindings[0].join.diagnostic = Some("no measured invocation".into());
+    invocation.call_bindings[0].call_id = None;
+    invocation.coverage[0]
         .observed_roles
-        .retain(|role| *role != s::Role::Call);
-    semantic.call_bindings[0].join.anchor.range = n::Range { start: 0, end: 2 };
-    semantic.call_bindings[0].join.candidate_ids.clear();
-    semantic.call_bindings[0].call_id = None;
-    semantic.call_bindings[0].join.status = s::JoinStatus::Unsupported;
-    semantic.call_bindings[0].join.diagnostic = Some("measurement unavailable".into());
-    s::validate_evidence(&semantic, &native, &bytes).unwrap();
-    semantic.call_bindings[0].join.anchor.range = n::Range {
-        start: 200,
-        end: 210,
-    };
-    assert!(
-        s::validate_evidence(&semantic, &native, &bytes)
-            .unwrap_err()
-            .to_string()
-            .contains("converted semantic span")
-    );
+        .retain(|r| *r != s::Role::Call);
+    s::validate_evidence(&invocation, &native, &bytes).unwrap();
+    invocation.call_bindings[0].join.status = s::JoinStatus::Unsupported;
+    assert!(s::validate_evidence(&invocation, &native, &bytes).is_err());
 }
 #[test]
 fn exact_invocation_and_distinct_provenances_are_preserved() {
@@ -713,6 +732,80 @@ fn exact_invocation_and_distinct_provenances_are_preserved() {
             .to_string()
             .contains("contradictory resolved call targets")
     );
+}
+
+#[test]
+fn observed_roles_match_selected_fact_roles_in_complete_and_partial_rows() {
+    let (base, native, bytes) = fixture();
+    for state in [s::CoverageState::Complete, s::CoverageState::Partial] {
+        let mut evidence = base.clone();
+        evidence.coverage[0].state = state;
+        if state == s::CoverageState::Partial {
+            evidence.coverage[0].diagnostic = Some("partial analysis".into());
+        }
+        s::validate_evidence(&evidence, &native, &bytes).unwrap();
+        for role in [s::Role::Read, s::Role::Call] {
+            let mut missing = evidence.clone();
+            missing.coverage[0].observed_roles.retain(|r| *r != role);
+            assert!(
+                s::validate_evidence(&missing, &native, &bytes)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("coverage observed roles differ")
+            );
+        }
+    }
+}
+
+#[test]
+fn call_binding_candidates_require_exact_family_count_ids_and_order() {
+    let (base, native, bytes) = fixture();
+    for kind in [s::JoinKind::Callee, s::JoinKind::Invocation] {
+        let mut exact = base.clone();
+        if kind == s::JoinKind::Invocation {
+            exact.call_bindings[0].join.anchor.kind = kind;
+            exact.call_bindings[0].join.anchor.range = n::Range { start: 13, end: 20 };
+        }
+        s::validate_evidence(&exact, &native, &bytes).unwrap();
+        let mut wrong = exact.clone();
+        wrong.call_bindings[0].join.candidate_ids = vec!["occ:v2:".to_owned() + &"f".repeat(32)];
+        assert!(s::validate_evidence(&wrong, &native, &bytes).is_err());
+        let mut wrong = exact.clone();
+        wrong.call_bindings[0].join.candidate_ids.clear();
+        assert!(s::validate_evidence(&wrong, &native, &bytes).is_err());
+        let mut wrong = exact.clone();
+        wrong.call_bindings[0]
+            .join
+            .candidate_ids
+            .push("occ:v2:".to_owned() + &"f".repeat(32));
+        wrong.call_bindings[0].join.candidate_ids.sort();
+        assert!(s::validate_evidence(&wrong, &native, &bytes).is_err());
+        let mut wrong = exact.clone();
+        wrong.call_bindings[0].join.anchor.kind = s::JoinKind::DeclarationName;
+        assert!(
+            s::validate_evidence(&wrong, &native, &bytes)
+                .unwrap_err()
+                .to_string()
+                .contains("wrong join family")
+        );
+    }
+    let mut native = native;
+    let mut second = native.calls[0].clone();
+    second.id = "occ:v2:".to_owned() + &"f".repeat(32);
+    native.calls.push(second.clone());
+    let mut ambiguous = base;
+    let binding = &mut ambiguous.call_bindings[0];
+    binding.call_id = None;
+    binding.join.status = s::JoinStatus::Ambiguous;
+    binding.join.candidate_ids.push(second.id);
+    binding.join.candidate_ids.sort();
+    binding.join.diagnostic = Some("two measured calls".into());
+    ambiguous.coverage[0]
+        .observed_roles
+        .retain(|r| *r != s::Role::Call);
+    s::validate_evidence(&ambiguous, &native, &bytes).unwrap();
+    ambiguous.call_bindings[0].join.candidate_ids.reverse();
+    assert!(s::validate_evidence(&ambiguous, &native, &bytes).is_err());
 }
 
 #[test]
