@@ -2763,6 +2763,7 @@ impl LegacyClient {
         self.request(reqwest::Method::GET, url)
     }
 }
+#[derive(Clone)]
 struct LegacyRequest {
     app: axum::Router,
     method: reqwest::Method,
@@ -2854,6 +2855,129 @@ async fn real_api(
     let response = request.send().await.unwrap();
     let status = response.status();
     (status, response.json().await.unwrap())
+}
+
+async fn saved_item_status(request: LegacyRequest, context: &str) -> anyhow::Result<Value> {
+    let mut attempts = 0;
+    let mut last_observed = "no response".to_owned();
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        loop {
+            attempts += 1;
+            let response = request.clone().send().await.map_err(|error| {
+                anyhow::anyhow!(
+                    "{context} status attempt {attempts}: {error:#}; last observed {last_observed}"
+                )
+            })?;
+            let status = response.status;
+            last_observed = format!(
+                "status={status} body={}",
+                String::from_utf8_lossy(&response.bytes)
+            );
+            let body: Value = serde_json::from_slice(&response.bytes).map_err(|error| {
+                anyhow::anyhow!(
+                    "{context} status attempt {attempts}: {last_observed}; invalid JSON: {error}"
+                )
+            })?;
+            if status == reqwest::StatusCode::OK {
+                return Ok(body);
+            }
+            if status != reqwest::StatusCode::SERVICE_UNAVAILABLE
+                || !matches!(
+                    body["error"]["code"].as_str(),
+                    Some("index_not_ready" | "rebuild_in_progress")
+                )
+            {
+                anyhow::bail!("{context} status attempt {attempts}: {last_observed}");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "{context} status timed out after {attempts} attempts; last observed {last_observed}"
+        )
+    })?
+}
+
+fn saved_item_status_fixture(
+    responses: Vec<(reqwest::StatusCode, &'static str)>,
+) -> (
+    LegacyRequest,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+    use std::sync::{Arc, Mutex, atomic::AtomicUsize};
+    let responses = Arc::new(Mutex::new(std::collections::VecDeque::from(responses)));
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let observed = attempts.clone();
+    let app = axum::Router::new().route(
+        "/api/status",
+        axum::routing::get(move || {
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let response = responses.lock().unwrap().pop_front().unwrap();
+            async move { response }
+        }),
+    );
+    (
+        LegacyRequest {
+            app,
+            method: reqwest::Method::GET,
+            url: "http://127.0.0.1:7331/api/status".to_owned(),
+            token: None,
+            origin: None,
+            body: None,
+        },
+        attempts,
+    )
+}
+
+#[tokio::test]
+async fn saved_item_status_retries_only_typed_startup_refusals() {
+    use reqwest::StatusCode;
+    let (request, attempts) = saved_item_status_fixture(vec![
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            r#"{"error":{"code":"index_not_ready","message":"starting"}}"#,
+        ),
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            r#"{"error":{"code":"rebuild_in_progress","message":"rebuilding"}}"#,
+        ),
+        (
+            StatusCode::OK,
+            r#"{"catchingUp":true,"revision":{"indexRevision":1}}"#,
+        ),
+    ]);
+    let body = saved_item_status(request, "initial").await.unwrap();
+    assert_eq!(body["catchingUp"], true);
+    assert_eq!(body["revision"]["indexRevision"], 1);
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn saved_item_status_rejects_other_responses_with_the_body() {
+    use reqwest::StatusCode;
+    for (status, body) in [
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            r#"{"error":{"code":"corrupt","message":"broken index"}}"#,
+        ),
+        (
+            StatusCode::CONFLICT,
+            r#"{"error":{"code":"index_not_ready"}}"#,
+        ),
+        (StatusCode::SERVICE_UNAVAILABLE, "not JSON: unavailable"),
+    ] {
+        let (request, attempts) = saved_item_status_fixture(vec![(status, body)]);
+        let error = saved_item_status(request, "reopened")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("reopened status attempt 1"), "{error}");
+        assert!(error.contains(&status.to_string()), "{error}");
+        assert!(error.contains(body), "{error}");
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
 }
 
 async fn real_selected_api(
@@ -4458,16 +4582,15 @@ async fn saved_items_real_index_matrix() {
     let initial_pin = indexed["status"]["revision"].clone();
     assert!(home.join("auto-daemon.pid").exists());
     let (_server, client, url) = start_saved_item_server(temp.path(), &root, &home, TOKEN).await;
-    let (status, serving_status) = real_api(
-        &client,
-        &url,
-        TOKEN,
-        reqwest::Method::GET,
-        "/api/status",
-        None,
+    let serving_status = saved_item_status(
+        client
+            .get(format!("{url}/api/status"))
+            .header("Origin", &url)
+            .bearer_auth(TOKEN),
+        "initial",
     )
-    .await;
-    assert_eq!(status, reqwest::StatusCode::OK, "{serving_status}");
+    .await
+    .unwrap();
     let pin = serving_status["revision"].clone();
     assert_eq!(pin["indexGeneration"], initial_pin["indexGeneration"]);
     // The direct router may commit mandatory startup reconciliation after the daemon exits.
@@ -4898,16 +5021,15 @@ async fn saved_items_real_index_matrix() {
     drop(db);
 
     let (_server, client, url) = start_saved_item_server(temp.path(), &root, &home, TOKEN).await;
-    let (status, reopened_status) = real_api(
-        &client,
-        &url,
-        TOKEN,
-        reqwest::Method::GET,
-        "/api/status",
-        None,
+    let reopened_status = saved_item_status(
+        client
+            .get(format!("{url}/api/status"))
+            .header("Origin", &url)
+            .bearer_auth(TOKEN),
+        "reopened",
     )
-    .await;
-    assert_eq!(status, reqwest::StatusCode::OK, "{reopened_status}");
+    .await
+    .unwrap();
     let reopened_pin = reopened_status["revision"].clone();
     assert_eq!(reopened_pin["indexGeneration"], next["indexGeneration"]);
     // Reopening the direct router may publish mandatory startup reconciliation again.

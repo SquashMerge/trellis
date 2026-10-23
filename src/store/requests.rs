@@ -829,16 +829,17 @@ impl Store {
                     self.bootstrap_missing_queue()?;
                     return self
                         .request_connection_for_root_loss(old_root, true)
-                        .map_err(|error| {
+                        .or_else(|error| {
                             if error
                                 .downcast_ref::<std::io::Error>()
                                 .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
                             {
-                                anyhow::anyhow!(
+                                self.identity.verify()?;
+                                anyhow::bail!(
                                     "incompatible_queue: published requests.db disappeared"
                                 )
                             } else {
-                                error
+                                Err(error)
                             }
                         });
                 }
