@@ -1920,6 +1920,15 @@ fn gc_remove_candidate(
                 drop(tx);
                 drop(queue);
             }
+        } else {
+            // Close SQLite before the witness loop opens its own handles: closing
+            // any other descriptor on a live SQLite file drops its POSIX locks.
+            drop(tx);
+            drop(index);
+            if names.iter().any(|n| n == "requests.db") {
+                // Opening registers the queue's witness for the unlink checks.
+                drop(readonly_index_db(&dir.join("requests.db"))?);
+            }
         }
         let mut dbs = Vec::new();
         for name in ["index.db", "requests.db"] {

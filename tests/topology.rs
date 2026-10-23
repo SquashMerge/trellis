@@ -2670,6 +2670,17 @@ fn automatic_gc_deletes_old_schema_indexes_unless_in_use_or_unreadable() {
         db.pragma_update(None, "user_version", version).unwrap();
         drop(db);
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        if version == 7 {
+            // Its request queue, accepted rows or not, is deleted with it.
+            let queue = path.with_file_name("requests.db");
+            let db = rusqlite::Connection::open(&queue).unwrap();
+            db.execute_batch(
+                "CREATE TABLE requests(id TEXT); INSERT INTO requests VALUES('queued');",
+            )
+            .unwrap();
+            drop(db);
+            fs::set_permissions(&queue, fs::Permissions::from_mode(0o600)).unwrap();
+        }
         old.push(identity);
     }
     let unreadable_root = temp.path().join("unreadable");

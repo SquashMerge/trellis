@@ -26,8 +26,9 @@ Durable per-reader pin leases were considered and rejected for now. Renewing a l
 ### 2. Automatic deletion of whole derived indexes
 
 - **Eligible:** a derived index directory whose recorded root is **missing or replaced**, or which has **not been opened for 30 days**. This is the existing `local-topology.md` rule, unchanged; this decision confirms it and adds the conditions below.
+- **Earlier schemas (owner ruling 2026-10-23, #253):** an index whose schema version predates the current one is eligible whatever its layout, root or age. Its directory goes with it, including `requests.db` and any accepted rows in it.
 - **Conditions, all required:**
-  - fresh checks of the exact schema, root identity and recorded age;
+  - for a current-schema index, fresh checks of the exact schema, root identity and recorded age; for an earlier schema, a fresh read of its schema version;
   - a verified **exclusive, non-blocking** use lock;
   - skip anything live, busy, with a hot journal, unknown or unreadable.
 - **Never deleted automatically:** durable records, UUID markers, configured token and ledger trees, and legacy state.
