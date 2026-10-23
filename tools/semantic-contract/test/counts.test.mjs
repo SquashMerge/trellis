@@ -505,7 +505,7 @@ async function specimen(
     const evidenceKind =
       fact.kind === "typeRelationship"
         ? "typeRelationship"
-        : fact.kind === "declarationBinding"
+        : ["declarationBinding", "symbol"].includes(fact.kind)
           ? "declarationBinding"
           : "semanticReference";
     return fact.ref === "fact-b"
@@ -2826,6 +2826,54 @@ test("unresolved outcome counts only in a complete-coverage document", async (t)
     },
   ]);
   for (const control of controls) await runControl(control);
+});
+
+test("unsupported document qualifies with only an authenticated symbol fact, not bookkeeping", async (t) => {
+  const unavailableInvocation = (support) => {
+    const row = support.find((x) => x.kind === "invocation");
+    row.available = false;
+    row.diagnostic = "invocation unavailable";
+  };
+  const unsupported = (s) =>
+    checkCounts(s.loaded, s.records).outcomes.find(
+      (x) => x.disposition === "unsupported",
+    ).count;
+  // Prime's PR #268 symbol-only repro: one captured symbol, no other facts.
+  const symbolOnly = await specimen(t, {
+    normalized: true,
+    facts: [
+      {
+        kind: "symbol",
+        ref: "symbol-only",
+        record: {
+          key: {
+            scheme: "scip",
+            symbol: "pkg target",
+            scope: "global",
+            document: null,
+          },
+          displayName: "target",
+          declarations: [declaredTarget],
+          provenanceId: "proof",
+        },
+      },
+    ],
+    mutateSupport: unavailableInvocation,
+  });
+  assert.equal(symbolOnly.records.symbols.length, 1);
+  assert.equal(unsupported(symbolOnly), 1);
+  // Coverage and provenance facts alone do not qualify the document.
+  const bookkeepingOnly = await specimen(t, {
+    normalized: true,
+    facts: [],
+    mutateSupport: unavailableInvocation,
+  });
+  const bookkeeping = bookkeepingOnly.loaded.annotations[0].facts;
+  assert.ok(bookkeeping.some((x) => x.kind === "coverage"));
+  assert.ok(
+    bookkeeping.every((x) => ["coverage", "provenance"].includes(x.kind)),
+  );
+  assert.equal(unsupported(bookkeepingOnly), 0);
 });
 
 test("unsupported floor: a declared-unavailable native family plus producer facts qualifies the document", async (t) => {

@@ -81,6 +81,8 @@ function proofFor(loaded, records, fact, annotation) {
       {
         typeRelationship: "typeRelationship",
         declarationBinding: "declarationBinding",
+        // Matches record-check/relationships.mjs: symbols are declaration evidence.
+        symbol: "declarationBinding",
         reference: "semanticReference",
         callBinding: "semanticReference",
       }[fact.kind]
@@ -612,16 +614,9 @@ export function checkCounts(
   // A document counts once when its native intent declares a measurement family
   // unavailable and it carries an authenticated captured producer fact; neither
   // the fact's family nor an authored unsupported-join assertion is required.
+  // Coverage and provenance bookkeeping are not producer facts.
   for (const { fact, annotation } of facts.values()) {
-    if (
-      ![
-        "callBinding",
-        "reference",
-        "declarationBinding",
-        "typeRelationship",
-      ].includes(fact.kind)
-    )
-      continue;
+    if (["coverage", "provenance"].includes(fact.kind)) continue;
     const intent = fixture.coverageIntents.find(
       (x) =>
         x.producerId === native.producerId &&
