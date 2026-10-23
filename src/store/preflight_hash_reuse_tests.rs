@@ -207,9 +207,26 @@ fn corrupted_non_reused_class_hash_reprojects_r2_but_retained_r1_fails_typed() {
     let error = store
         .classes_at(Some("A.java"), "", Some(r1), 0, 100)
         .unwrap_err();
-    assert!(
-        error.to_string().starts_with("incompatible_index:"),
-        "{error:#}"
+    assert_eq!(
+        error.to_string(),
+        "incompatible_index: selected evidence decode failed: incompatible_index: selected projection fingerprint mismatch"
+    );
+
+    // A retained r1 read is valid after r2 publication when r1 was not corrupt.
+    let (_clean_state, _clean_work, clean_store, clean_options, clean_r1) = fixture();
+    let clean_expected = clean_store
+        .classes_at(Some("A.java"), "", Some(clean_r1), 0, 100)
+        .unwrap();
+    let clean_r2 = publish_full(&clean_store, &clean_options).unwrap();
+    assert_eq!(clean_r2.index_generation, clean_r1.index_generation);
+    assert_eq!(clean_r2.index_revision, clean_r1.index_revision + 1);
+    let retained = clean_store
+        .classes_at(Some("A.java"), "", Some(clean_r1), 0, 100)
+        .unwrap();
+    assert_eq!(retained.revision, clean_r1);
+    assert_eq!(
+        serde_json::to_value(&retained.items).unwrap(),
+        serde_json::to_value(&clean_expected.items).unwrap()
     );
 }
 

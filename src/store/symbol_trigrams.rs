@@ -348,6 +348,48 @@ mod tests {
         assert_eq!(graph_hits(&reader, "alpha", 50).unwrap().len(), 1);
     }
 
+    #[test]
+    fn corrupt_graph_node_id_fails_search_and_marks_rebuild() {
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("a.js"), "function Alpha() {}\n").unwrap();
+        let store = super::super::Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        crate::index_coordinator::reconcile_workspace(
+            &store,
+            &crate::indexer::IndexOptions::new(workspace.path().to_owned()),
+            &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(store.symbols("Alpha", 20).unwrap().len(), 1);
+        assert_eq!(
+            store.disposition(),
+            super::super::RecoveryDisposition::Ready
+        );
+
+        // The graph's labels reference this key. Simulate an on-disk corrupt
+        // BLOB using Store's connection rather than opening a second FD.
+        {
+            let db = store.cache_write().unwrap();
+            db.pragma_update(None, "foreign_keys", "OFF").unwrap();
+            let changed = db
+                .execute("UPDATE graph_nodes SET id=x'00' WHERE name='Alpha'", [])
+                .unwrap();
+            assert_eq!(changed, 1);
+        }
+        let error = store.symbols("Alpha", 20).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .starts_with("incompatible_index: selected evidence decode failed"),
+            "{error:#}"
+        );
+        assert_eq!(
+            store.disposition(),
+            super::super::RecoveryDisposition::Rebuild
+        );
+    }
+
     /// The triggers keep each table equal to its source rows through inserts,
     /// deletes (as retention and rebaseline delete), updates and reused rowids:
     /// for every query the table's candidates are exactly the literal name

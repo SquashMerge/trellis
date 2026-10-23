@@ -1,7 +1,9 @@
 //! Lossless 16-byte database form of native syntax and occurrence handles.
 //!
 //! The wire representation remains the canonical lowercase 32-hex-digit ID.
-use anyhow::{Result, bail};
+use anyhow::Result;
+
+use super::SelectedIntegrity;
 
 const HANDLE_BYTES: usize = 16;
 
@@ -26,7 +28,9 @@ fn encode(value: &str, prefix: &str) -> Option<Vec<u8>> {
 
 fn decode(value: &[u8], prefix: &str) -> Result<String> {
     if value.len() != HANDLE_BYTES {
-        bail!("incompatible_index: invalid native ID BLOB length");
+        return Err(
+            SelectedIntegrity("incompatible_index: invalid native ID BLOB length".into()).into(),
+        );
     }
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut result = String::with_capacity(prefix.len() + 2 * HANDLE_BYTES);
@@ -89,11 +93,11 @@ mod tests {
                 assert!(encode(&malformed).is_none(), "{malformed}");
             }
             for length in [0, 1, 15, 17, 32] {
-                assert!(
-                    decode(&vec![0; length])
-                        .unwrap_err()
-                        .to_string()
-                        .starts_with("incompatible_index:")
+                let error = decode(&vec![0; length]).unwrap_err();
+                assert!(error.to_string().starts_with("incompatible_index:"));
+                assert_eq!(
+                    super::super::recovery_class(&error),
+                    super::super::RecoveryClass::Rebuild
                 );
             }
         }

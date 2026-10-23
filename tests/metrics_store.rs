@@ -420,7 +420,7 @@ fn selected_fact_corruption_is_typed_and_atomic() {
     let (state, _root, store, _pin) = fixture();
     let db = rusqlite::Connection::open(index_path(state.path())).unwrap();
     db.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
-    db.execute("UPDATE native_version_calls SET owner_syntax_id=X'00' WHERE vid IN (SELECT vid FROM document_versions WHERE path='src/a.js')", []).unwrap();
+    db.execute("UPDATE native_version_calls SET owner_syntax_id=X'00000000000000000000000000000000' WHERE vid IN (SELECT vid FROM document_versions WHERE path='src/a.js')", []).unwrap();
     drop(db);
     let response = store.evidence_response().unwrap();
     let error = response

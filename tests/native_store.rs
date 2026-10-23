@@ -1789,6 +1789,9 @@ fn encoded_keys_keep_selected_ancillary_byte_budget_boundary() {
         language: "javascript".into(),
         path: "flow.js".into(),
     };
+    // This checks budget enforcement, not exact text-key parity. The latter
+    // is asserted against the private production SQL by the store unit test
+    // selected_ancillary_budget_matches_main_text_key_bytes.
     // flow.js is 43 bytes: 256 KiB + 43*64 = 264,896 bytes allowed.
     // 30*8,192 plus ~30*128 bytes in former wire keys/other fields is
     // ~249,600, leaving ~15 KiB for the small original document; 33 rows

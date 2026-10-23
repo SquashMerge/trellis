@@ -13479,7 +13479,14 @@ impl Store {
     ) -> Result<(IndexPin, Vec<Symbol>)> {
         let selected = self.read_revision_for(tx, None, pre_startup)?;
         let revision = selected.pin;
-        let rows = symbol_trigrams::graph_hits(tx, query, limit.min(150) as i64)?;
+        let rows =
+            symbol_trigrams::graph_hits(tx, query, limit.min(150) as i64).map_err(|error| {
+                if error.downcast_ref::<SelectedIntegrity>().is_some() {
+                    self.report_selected_failure(error)
+                } else {
+                    error
+                }
+            })?;
         let mut documents = BTreeMap::new();
         for (path, _) in &rows {
             if !documents.contains_key(path) {
@@ -14613,6 +14620,128 @@ impl Store {
     pub fn delete_annotation(&self, id: &str) -> Result<bool> {
         self.records().delete_annotation(id)
     }
+}
+
+// The SQL runs against encoded BLOB keys. Its budget must still match the old
+// TEXT-key representation, including virtual class and call key components.
+#[cfg(test)]
+#[test]
+fn selected_ancillary_budget_matches_main_text_key_bytes() {
+    let db = Connection::open_in_memory().unwrap();
+    db.execute_batch(CACHE_SCHEMA_V14).unwrap();
+    // The aggregate needs only synthetic child rows; FK behavior is covered by
+    // publication/retention tests, not this isolated budget-SQL fixture.
+    db.pragma_update(None, "foreign_keys", "OFF").unwrap();
+    let version = "version:é";
+    let source_set = "source-set:v1:root-é";
+    let graph_hash = "a".repeat(64);
+    let class_hash = "b".repeat(64);
+    let owner = [0x11; 16];
+    let target = [0x22; 16];
+    let call = [0x33; 16];
+    let region = [0x44; 16];
+    db.execute(
+        "INSERT INTO native_version_coverage_roles(vid,role_kind,role,ordinal)
+         VALUES(1,'supported','definition',0)",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO native_version_declarations(vid,syntax_id,kind,role,name,lookup_key,key_signature_present,
+         key_type_parameter_count,key_variadic,key_ordinal,start_byte,end_byte,
+         name_start,name_end)
+         VALUES(1,?1,'function','production','héllo','hello',1,0,0,0,0,9,0,5)",
+        [&owner[..]],
+    ).unwrap();
+    db.execute(
+        "INSERT INTO native_version_calls(vid,id,owner_syntax_id,ordinal,start_byte,end_byte,language,callee_lookup_key)
+         VALUES(1,?1,?2,0,0,7,'javascript','hello')",
+        params![&call[..], &owner[..]],
+    ).unwrap();
+    db.execute(
+        "INSERT INTO native_version_control_regions(vid,id,owner_syntax_id,ordinal,kind,start_byte,end_byte,arm)
+         VALUES(1,?1,?2,0,'if',0,7,'then')",
+        params![&region[..], &owner[..]],
+    ).unwrap();
+    db.execute(
+        "INSERT INTO native_version_call_regions(vid,call_id,region_id,ordinal) VALUES(1,?1,?2,0)",
+        params![&call[..], &region[..]],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO graph_projections(gid,vid,language,graph_hash,state,class_extraction_state,
+         class_extraction_payload)
+         VALUES(2,1,'java',?1,'ready','ready','{}')",
+        [&graph_hash],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO class_projections(cid,gid,content_hash,state) VALUES(3,2,?1,'ready')",
+        [&class_hash],
+    )
+    .unwrap();
+    for (id, name) in [(&owner[..], "Widget"), (&target[..], "Other")] {
+        db.execute(
+            "INSERT INTO classes(cid,gid,id,name,qualified_name,path,payload)
+             VALUES(3,2,?1,?2,'app.Widget','widget.py','{}')",
+            params![id, name],
+        )
+        .unwrap();
+    }
+    db.execute(
+        "INSERT INTO class_relations(cid,id,owner,target,payload) VALUES(3,'rel-1',?1,?2,'{}')",
+        params![&owner[..], &target[..]],
+    )
+    .unwrap();
+
+    // Compute the former text-key cost from decoded handles and fixture values,
+    // not from the budget SQL or SQLite BLOB lengths. Integer fields are charged
+    // as decimal text, as they were on main.
+    let sid = id_codec::decode_sid(&owner).unwrap();
+    let target_sid = id_codec::decode_sid(&target).unwrap();
+    let call_id = id_codec::decode_occ(&call).unwrap();
+    let region_id = id_codec::decode_occ(&region).unwrap();
+    let bytes = |fields: &[&str]| fields.iter().map(|field| field.len()).sum::<usize>();
+    let decimal = |fields: &[i64]| {
+        fields
+            .iter()
+            .map(|field| field.to_string().len())
+            .sum::<usize>()
+    };
+    let class_projection_id = class_hash.len() + 20;
+    let graph_projection_id = graph_hash.len() + 9;
+    let rows = [
+        version.len() + bytes(&["supported", "definition"]) + decimal(&[0]),
+        version.len()
+            + sid.len()
+            + bytes(&["function", "héllo", "hello"])
+            + decimal(&[1, 0, 0, 0, 0, 9, 0, 5]),
+        version.len()
+            + call_id.len()
+            + sid.len()
+            + decimal(&[0, 0, 7])
+            + source_set.len()
+            + bytes(&["javascript", "hello"]),
+        version.len() + region_id.len() + sid.len() + decimal(&[0, 0, 7]) + bytes(&["if", "then"]),
+        version.len() + call_id.len() + region_id.len() + decimal(&[0]),
+        class_projection_id
+            + graph_projection_id
+            + sid.len()
+            + bytes(&["Widget", "app.Widget", "widget.py", "{}"]),
+        class_projection_id
+            + graph_projection_id
+            + target_sid.len()
+            + bytes(&["Other", "app.Widget", "widget.py", "{}"]),
+        class_projection_id + bytes(&["rel-1", "{}"]) + sid.len() + target_sid.len(),
+    ];
+    let actual = Store::selected_ancillary_byte_usage(&db, 1, 3, version, source_set).unwrap();
+    assert_eq!(
+        actual,
+        (
+            *rows.iter().max().unwrap() as i64,
+            rows.iter().sum::<usize>() as i64,
+        )
+    );
 }
 
 #[cfg(test)]

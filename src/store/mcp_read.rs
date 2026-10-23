@@ -1159,7 +1159,8 @@ impl EvidenceResponse {
                     break;
                 }
                 let version: String = row.get(0)?;
-                let id = id_codec::decode_sid(&row.get::<_, Vec<u8>>(1)?)?;
+                let id = id_codec::decode_sid(&row.get::<_, Vec<u8>>(1)?)
+                    .map_err(|error| self.store.report_selected_failure(error))?;
                 let key = DocumentKey {
                     source_set_id: row.get(2)?,
                     language: row.get(3)?,
@@ -1656,8 +1657,10 @@ impl EvidenceResponse {
             has_more = ranked.len() > limit;
             let mut loaded = BTreeMap::new();
             for (version, id_blob, caller_blob, path, stored_role) in ranked {
-                let id = id_codec::decode_occ(&id_blob)?;
-                let caller_id = id_codec::decode_sid(&caller_blob)?;
+                let id = id_codec::decode_occ(&id_blob)
+                    .map_err(|error| self.store.report_selected_failure(error))?;
+                let caller_id = id_codec::decode_sid(&caller_blob)
+                    .map_err(|error| self.store.report_selected_failure(error))?;
                 let scope = scopes
                     .get(&version)
                     .context("store_unavailable: incoming call scope absent")?;
@@ -1949,6 +1952,116 @@ mod enriched_read_tests {
     use super::*;
     use crate::indexer::IndexOptions;
     use std::sync::{Arc, atomic::AtomicBool};
+
+    #[test]
+    fn corrupt_ranked_ids_mark_rebuild_in_outgoing_hints_and_incoming_calls() {
+        for fault in ["outgoing_hint_sid", "incoming_call_occ"] {
+            // Each arm starts with a fresh selected index; a prior corrupt read
+            // must not affect admission of the next fixture.
+            let state = tempfile::tempdir().unwrap();
+            let workspace = tempfile::tempdir().unwrap();
+            std::fs::write(
+                workspace.path().join("owner.js"),
+                "function Owner() { Target(); }\n",
+            )
+            .unwrap();
+            std::fs::write(workspace.path().join("target.js"), "function Target() {}\n").unwrap();
+            let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+            let (pin, _) = crate::index_coordinator::reconcile_workspace(
+                &store,
+                &IndexOptions::new(workspace.path().to_owned()),
+                &Arc::new(AtomicBool::new(false)),
+                |_| {},
+            )
+            .unwrap();
+            let read = store.evidence_response().unwrap();
+            let id = |name| {
+                read.mcp_find(name, 20, Some(pin))
+                    .unwrap()
+                    .symbols
+                    .into_iter()
+                    .find(|hit| hit.declaration.name.as_deref() == Some(name))
+                    .unwrap()
+                    .declaration
+                    .syntax_id
+            };
+            let owner = id("Owner");
+            let target = id("Target");
+            let now = std::time::Instant::now();
+            assert_eq!(
+                read.mcp_outgoing(
+                    &owner,
+                    20,
+                    Some(pin),
+                    &|| now,
+                    now + std::time::Duration::from_secs(5)
+                )
+                .unwrap()
+                .unwrap()
+                .calls[0]
+                    .candidates
+                    .len(),
+                1,
+                "{fault}: fixture needs an optional candidate"
+            );
+            assert_eq!(
+                read.mcp_incoming_with_lines(&target, 20, Some(pin))
+                    .unwrap()
+                    .unwrap()
+                    .calls
+                    .len(),
+                1,
+                "{fault}: fixture needs a ranked incoming call"
+            );
+            read.finish(()).unwrap();
+            drop(read);
+
+            // Simulate one corrupt stored ID using Store's connection. Turning
+            // off foreign keys allows a malformed key in otherwise valid rows.
+            {
+                let db = store.cache_write().unwrap();
+                db.pragma_update(None, "foreign_keys", "OFF").unwrap();
+                let (sql, expected) = match fault {
+                    "outgoing_hint_sid" => (
+                        "UPDATE native_version_declarations SET syntax_id=x'00' WHERE name='Target'",
+                        1,
+                    ),
+                    "incoming_call_occ" => (
+                        "UPDATE native_version_calls SET id=x'00' WHERE callee_lookup_key='Target'",
+                        1,
+                    ),
+                    _ => unreachable!(),
+                };
+                assert_eq!(db.execute(sql, []).unwrap(), expected, "{fault}");
+                db.pragma_update(None, "foreign_keys", "ON").unwrap();
+            }
+            let read = store.evidence_response().unwrap();
+            let error = match fault {
+                "outgoing_hint_sid" => read
+                    .mcp_outgoing(
+                        &owner,
+                        20,
+                        Some(pin),
+                        &|| now,
+                        now + std::time::Duration::from_secs(5),
+                    )
+                    .err()
+                    .expect("corrupt outgoing hint must fail"),
+                "incoming_call_occ" => read
+                    .mcp_incoming_with_lines(&target, 20, Some(pin))
+                    .err()
+                    .expect("corrupt incoming call must fail"),
+                _ => unreachable!(),
+            };
+            assert!(
+                error
+                    .to_string()
+                    .starts_with("incompatible_index: selected evidence decode failed"),
+                "{fault}: {error:#}"
+            );
+            assert_eq!(store.disposition(), RecoveryDisposition::Rebuild, "{fault}");
+        }
+    }
 
     #[test]
     fn stored_roles_hide_inline_rust_test_helpers_from_production_calls() {
