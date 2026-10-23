@@ -1904,17 +1904,14 @@ fn gc_classifies_current_schema14_but_refuses_spoofed_shapes() {
     assert_eq!(inspect(), ("unknown", "unknown_index_shape"));
     db.execute_batch("DROP TRIGGER unapproved_trigger").unwrap();
     assert_eq!(inspect(), ("unknown", "recent_open"));
-    db.pragma_update(None, "user_version", 7).unwrap();
-    assert_eq!(inspect(), ("unknown", "unknown_index_shape"));
-    db.pragma_update(None, "user_version", 9).unwrap();
+    // Any earlier schema is collectable whatever its layout, root or age (#253).
+    for version in [1, 7, 9, 13] {
+        db.pragma_update(None, "user_version", version).unwrap();
+        assert_eq!(inspect(), ("eligible", "old_schema"), "v{version}");
+    }
+    db.pragma_update(None, "user_version", 0).unwrap();
     assert_eq!(inspect(), ("unknown", "unknown_index_schema"));
-    db.pragma_update(None, "user_version", 10).unwrap();
-    assert_eq!(inspect(), ("unknown", "unknown_index_schema"));
-    db.pragma_update(None, "user_version", 11).unwrap();
-    assert_eq!(inspect(), ("unknown", "unknown_index_schema"));
-    db.pragma_update(None, "user_version", 12).unwrap();
-    assert_eq!(inspect(), ("unknown", "unknown_index_schema"));
-    db.pragma_update(None, "user_version", 13).unwrap();
+    db.pragma_update(None, "user_version", 15).unwrap();
     assert_eq!(inspect(), ("unknown", "unknown_index_schema"));
     db.pragma_update(None, "user_version", 14).unwrap();
     assert_eq!(inspect(), ("unknown", "recent_open"));
@@ -2649,36 +2646,17 @@ fn gc_report_accepts_current_schema14_but_rejects_bad_inventory() {
 
 #[cfg(feature = "test-support")]
 #[test]
-fn automatic_gc_reports_but_never_deletes_older_or_alternate_historical_indexes() {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+fn automatic_gc_deletes_old_schema_indexes_unless_in_use_or_unreadable() {
+    use std::os::unix::fs::PermissionsExt;
     let (temp, roots) = common::fixture();
     let now = 1_800_000_000_i64;
-    let mut candidates = Vec::new();
-    for (name, version, marker, ddl) in [
-        (
-            "old-v7",
-            7_i64,
-            "native-paired-v1",
-            include_str!("fixtures/gc-legacy/v7.sql"),
-        ),
-        (
-            "alternate-v8",
-            8_i64,
-            "native-v4-class-compose-v1",
-            include_str!("fixtures/gc-legacy/v8-native-class-late.sql"),
-        ),
-        (
-            "exact-v8",
-            8_i64,
-            "native-v4-delta-v1",
-            include_str!("fixtures/gc-legacy/v8-current.sql"),
-        ),
-    ] {
+    // Old layouts need no particular shape, metadata, root or age (#253).
+    let mut old = Vec::new();
+    for (name, version) in [("v7", 7_i64), ("v12", 12), ("v13-in-use", 13)] {
         let workspace = temp.path().join(name);
         fs::create_dir(&workspace).unwrap();
         let identity = WorkspaceIdentity::discover(Some(&workspace), &workspace).unwrap();
-        // Create the private use-lock inode of an actual old candidate,
-        // without opening a v9 Store that would retain the old index.db inode.
+        // Create the private use-lock inode without opening a current Store.
         drop(
             roots
                 .writer(std::sync::Arc::new(
@@ -2688,23 +2666,28 @@ fn automatic_gc_reports_but_never_deletes_older_or_alternate_historical_indexes(
         );
         let path = roots.index_db(&identity);
         let db = rusqlite::Connection::open(&path).unwrap();
-        db.execute_batch(ddl).unwrap();
+        db.execute_batch("CREATE TABLE anything(x)").unwrap();
         db.pragma_update(None, "user_version", version).unwrap();
-        db.execute(
-            "INSERT INTO index_metadata(singleton,schema_version,extractor_version,root_spelling,root_device,root_inode,index_generation,index_revision,last_opened_at,indexed_at,stats,diagnostics) VALUES (1,?1,?2,?3,?4,?5,?6,1,?7,'','{}','[]')",
-            rusqlite::params![version, marker, identity.root.to_str().unwrap(), identity.device.to_string(), identity.inode.to_string(), uuid::Uuid::new_v4().to_string(), now - 31 * 86_400],
-        ).unwrap();
         drop(db);
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-        let stat = fs::metadata(&path).unwrap();
-        candidates.push((identity, path.clone(), stat.ino(), fs::read(path).unwrap()));
+        old.push(identity);
     }
-    let exact_v8_root = temp.path().join("exact-v8");
-    let exact_v8 = WorkspaceIdentity::discover(Some(&exact_v8_root), &exact_v8_root).unwrap();
-    assert!(candidates.iter().any(
-        |(identity, path, _, _)| identity.root_key == exact_v8.root_key
-            && *path == roots.index_db(&exact_v8)
-    ));
+    let unreadable_root = temp.path().join("unreadable");
+    fs::create_dir(&unreadable_root).unwrap();
+    let unreadable = WorkspaceIdentity::discover(Some(&unreadable_root), &unreadable_root).unwrap();
+    drop(
+        roots
+            .writer(std::sync::Arc::new(
+                unreadable.verified_clone_for_tests().unwrap(),
+            ))
+            .unwrap(),
+    );
+    fs::write(roots.index_db(&unreadable), b"not a sqlite database").unwrap();
+    fs::set_permissions(
+        roots.index_db(&unreadable),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
     let current_root = temp.path().join("current-gc");
     fs::create_dir(&current_root).unwrap();
     drop(common::open_store(temp.path(), &current_root).unwrap());
@@ -2714,7 +2697,7 @@ fn automatic_gc_reports_but_never_deletes_older_or_alternate_historical_indexes(
             current.verified_clone_for_tests().unwrap(),
         ))
         .unwrap();
-    for (identity, _, _, _) in &candidates {
+    for identity in &old {
         let entry = roots
             .gc_report_at(now)
             .unwrap()
@@ -2722,24 +2705,28 @@ fn automatic_gc_reports_but_never_deletes_older_or_alternate_historical_indexes(
             .into_iter()
             .find(|entry| entry.root_key == identity.root_key)
             .unwrap();
-        assert_eq!((entry.status, entry.reason), ("eligible", "age_30_days"));
+        assert_eq!((entry.status, entry.reason), ("eligible", "old_schema"));
     }
-    assert_eq!(roots.automatic_gc_at(&current, &writer, now).unwrap(), 0);
-    for (identity, path, inode, bytes) in candidates {
-        assert_eq!(
-            fs::metadata(&path).unwrap().ino(),
-            inode,
-            "report-only historical inode must survive: {}",
-            identity.root_key
-        );
-        assert_eq!(
-            fs::read(&path).unwrap(),
-            bytes,
-            "report-only historical bytes must survive: {}",
-            identity.root_key
-        );
-        assert!(roots.index_dir(&identity).exists());
+    let in_use = &old[2];
+    let held = trellis::store::topology::UseGuard::acquire_existing(
+        &roots.index_use_lock(in_use),
+        false,
+        true,
+    )
+    .unwrap();
+    let unreadable_bytes = fs::read(roots.index_db(&unreadable)).unwrap();
+    assert_eq!(roots.automatic_gc_at(&current, &writer, now).unwrap(), 2);
+    for identity in &old[..2] {
+        assert!(!roots.index_dir(identity).exists(), "{}", identity.root_key);
     }
+    assert!(roots.index_db(in_use).exists(), "an index in use survives");
+    assert_eq!(
+        fs::read(roots.index_db(&unreadable)).unwrap(),
+        unreadable_bytes,
+        "an unreadable index stays untouched"
+    );
+    assert!(roots.index_db(&current).exists());
+    drop(held);
 }
 
 #[cfg(feature = "test-support")]
