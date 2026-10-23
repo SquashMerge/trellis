@@ -28,9 +28,9 @@ if not TARGET_DIR.is_absolute():
 BINARY = TARGET_DIR / "release/trellis"
 DEADLINE = time.monotonic() + 1700  # below Factory's 1800-second verifier timeout
 FACTS = """SELECT m.language,SUM(
- (SELECT count(*) FROM native_version_declarations d WHERE d.version_id=m.document_version_id)+
- (SELECT count(*) FROM native_version_calls c WHERE c.version_id=m.document_version_id)+
- (SELECT count(*) FROM native_version_control_regions r WHERE r.version_id=m.document_version_id))
+ (SELECT count(*) FROM native_version_declarations d WHERE d.vid=m.vid)+
+ (SELECT count(*) FROM native_version_calls c WHERE c.vid=m.vid)+
+ (SELECT count(*) FROM native_version_control_regions r WHERE r.vid=m.vid))
  FROM revision_documents m WHERE m.revision_id=? GROUP BY m.language ORDER BY m.language"""
 
 
@@ -88,22 +88,22 @@ def check_selected_local_ids(db, prior, current, changed_path, size, n):
     # Join by the FULL selected document key. Counts alone could
     # hide a second changed path whose IDs coincidentally offset.
     identity = db.execute("""SELECT count(*),
-        sum(a.document_version_id=b.document_version_id),
-        sum(a.graph_projection_id=b.graph_projection_id),
-        sum(a.class_projection_id IS b.class_projection_id),
+        sum(a.vid=b.vid),
+        sum(a.gid=b.gid),
+        sum(a.cid IS b.cid),
         sum(CASE WHEN a.path=?3 AND a.language='python' THEN 1 ELSE 0 END),
         sum(CASE WHEN a.path=?3 AND a.language='python'
-            AND a.document_version_id!=b.document_version_id
-            AND a.graph_projection_id!=b.graph_projection_id
-            AND a.class_projection_id IS NOT b.class_projection_id
+            AND a.vid!=b.vid
+            AND a.gid!=b.gid
+            AND a.cid IS NOT b.cid
             THEN 1 ELSE 0 END),
         sum(CASE WHEN NOT (a.path=?3 AND a.language='python')
-            AND (a.document_version_id!=b.document_version_id
-                 OR a.graph_projection_id!=b.graph_projection_id
-                 OR a.class_projection_id IS NOT b.class_projection_id)
+            AND (a.vid!=b.vid
+                 OR a.gid!=b.gid
+                 OR a.cid IS NOT b.cid)
             THEN 1 ELSE 0 END)
         FROM revision_documents a JOIN revision_documents b
-        USING(source_set_id,language,path)
+        USING(language,path)
         WHERE a.revision_id=?1 AND b.revision_id=?2""",
         (current, prior, changed_path)).fetchone()
     reuse = dict(zip(("documents", "native_versions", "graph_projections",
@@ -175,15 +175,15 @@ def parity_digest(db, revision):
     All hashed rows come from selected manifest joins, never the unselected history.
     """
     sql = {
-        "document": "SELECT m.language,m.path,v.content_hash,hex(v.source_bytes),v.native_witness FROM revision_documents m JOIN document_versions v ON v.id=m.document_version_id WHERE m.revision_id=? ORDER BY m.language,m.path",
-        "declarations": "SELECT m.language,m.path,d.syntax_id,d.kind,d.name,d.lookup_key,d.start_byte,d.end_byte FROM revision_documents m JOIN native_version_declarations d ON d.version_id=m.document_version_id WHERE m.revision_id=? ORDER BY m.language,m.path,d.syntax_id",
-        "calls": "SELECT m.language,m.path,c.id,c.owner_syntax_id,c.ordinal,c.start_byte,c.end_byte,c.callee_start,c.callee_end,c.spelling FROM revision_documents m JOIN native_version_calls c ON c.version_id=m.document_version_id WHERE m.revision_id=? ORDER BY m.language,m.path,c.id",
-        "regions": "SELECT m.language,m.path,c.id,c.owner_syntax_id,c.ordinal,c.kind,c.start_byte,c.end_byte,c.parent_id,c.arm FROM revision_documents m JOIN native_version_control_regions c ON c.version_id=m.document_version_id WHERE m.revision_id=? ORDER BY m.language,m.path,c.id",
-        "graph_projection": "SELECT m.language,m.path,g.graph_hash,g.class_extraction_state,g.class_extraction_payload FROM revision_documents m JOIN graph_projections g ON g.id=m.graph_projection_id WHERE m.revision_id=? ORDER BY m.language,m.path",
-        "graph_nodes": "SELECT m.language,m.path,n.id,n.name,n.kind FROM revision_documents m JOIN graph_nodes n ON n.projection_id=m.graph_projection_id WHERE m.revision_id=? ORDER BY m.language,m.path,n.id",
-        "graph_display_labels": "SELECT m.language,m.path,n.id,n.label FROM revision_documents m JOIN graph_display_labels n ON n.projection_id=m.graph_projection_id WHERE m.revision_id=? ORDER BY m.language,m.path,n.id",
-        "classes": "SELECT m.language,m.path,n.id,n.payload FROM revision_documents m JOIN classes n ON n.projection_id=m.class_projection_id WHERE m.revision_id=? ORDER BY m.language,m.path,n.id",
-        "class_relations": "SELECT m.language,m.path,n.id,n.payload FROM revision_documents m JOIN class_relations n ON n.projection_id=m.class_projection_id WHERE m.revision_id=? ORDER BY m.language,m.path,n.id",
+        "document": "SELECT m.language,m.path,v.content_hash,hex(v.source_bytes),v.native_witness FROM revision_documents m JOIN document_versions v ON v.vid=m.vid WHERE m.revision_id=? ORDER BY m.language,m.path",
+        "declarations": "SELECT m.language,m.path,'sid:v1:'||lower(hex(d.syntax_id)),d.kind,d.name,d.lookup_key,d.start_byte,d.end_byte FROM revision_documents m JOIN native_version_declarations d ON d.vid=m.vid WHERE m.revision_id=? ORDER BY m.language,m.path,d.syntax_id",
+        "calls": "SELECT m.language,m.path,'occ:v2:'||lower(hex(c.id)),'sid:v1:'||lower(hex(c.owner_syntax_id)),c.ordinal,c.start_byte,c.end_byte,c.callee_start,c.callee_end,c.spelling FROM revision_documents m JOIN native_version_calls c ON c.vid=m.vid WHERE m.revision_id=? ORDER BY m.language,m.path,c.id",
+        "regions": "SELECT m.language,m.path,'occ:v2:'||lower(hex(c.id)),'sid:v1:'||lower(hex(c.owner_syntax_id)),c.ordinal,c.kind,c.start_byte,c.end_byte,CASE WHEN c.parent_id IS NULL THEN NULL ELSE 'occ:v2:'||lower(hex(c.parent_id)) END,c.arm FROM revision_documents m JOIN native_version_control_regions c ON c.vid=m.vid WHERE m.revision_id=? ORDER BY m.language,m.path,c.id",
+        "graph_projection": "SELECT m.language,m.path,g.graph_hash,g.class_extraction_state,g.class_extraction_payload FROM revision_documents m JOIN graph_projections g ON g.gid=m.gid WHERE m.revision_id=? ORDER BY m.language,m.path",
+        "graph_nodes": "SELECT m.language,m.path,'sid:v1:'||lower(hex(n.id)),n.name,n.kind FROM revision_documents m JOIN graph_nodes n ON n.gid=m.gid WHERE m.revision_id=? ORDER BY m.language,m.path,n.id",
+        "graph_display_labels": "SELECT m.language,m.path,'sid:v1:'||lower(hex(n.id)),n.label FROM revision_documents m JOIN graph_display_labels n ON n.gid=m.gid WHERE m.revision_id=? ORDER BY m.language,m.path,n.id",
+        "classes": "SELECT m.language,m.path,'sid:v1:'||lower(hex(n.id)),n.payload FROM revision_documents m JOIN classes n ON n.cid=m.cid WHERE m.revision_id=? ORDER BY m.language,m.path,n.id",
+        "class_relations": "SELECT m.language,m.path,n.id,n.payload FROM revision_documents m JOIN class_relations n ON n.cid=m.cid WHERE m.revision_id=? ORDER BY m.language,m.path,n.id",
     }
     result = {}
     for name, query in sql.items():

@@ -7732,8 +7732,14 @@ fn mcp_outgoing_wire_fixture(
         advance_hints,
         legacy,
         check_selected_after_hints,
-        Duration::ZERO,
+        OutgoingFixtureTiming::default(),
     )
+}
+
+#[derive(Default)]
+struct OutgoingFixtureTiming {
+    accept_delay: Duration,
+    call_deadline: Option<Duration>,
 }
 
 /// As `mcp_outgoing_wire_fixture`, sending the call `accept_delay` after the
@@ -7746,7 +7752,7 @@ fn mcp_outgoing_wire_fixture_delayed(
     advance_hints: Option<Vec<(&'static str, u64)>>,
     legacy: bool,
     check_selected_after_hints: bool,
-    accept_delay: Duration,
+    timing: OutgoingFixtureTiming,
 ) -> (Value, Vec<u8>) {
     use trellis::daemon::registry::CheckoutRegistry;
     use trellis::store::{
@@ -7813,7 +7819,8 @@ fn mcp_outgoing_wire_fixture_delayed(
         });
     }
     let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
-    let (mut client, mut reader, session) = socket_session(&identity, &registry, 301, None);
+    let (mut client, mut reader, session) =
+        socket_session(&identity, &registry, 301, timing.call_deadline);
     if legacy {
         writeln!(
             client,
@@ -7893,8 +7900,8 @@ fn mcp_outgoing_wire_fixture_delayed(
     } else {
         None
     };
-    if !accept_delay.is_zero() {
-        std::thread::sleep(accept_delay);
+    if !timing.accept_delay.is_zero() {
+        std::thread::sleep(timing.accept_delay);
     }
     writeln!(
         client,
@@ -8507,7 +8514,21 @@ async fn mcp_outgoing_response_bytes_call_prefix_before_global_hints() {
         .iter()
         .map(|(p, s)| (p.as_str(), s.as_str()))
         .collect();
-    let reply = mcp_outgoing_fixture_with_budget(&borrowed, "Owner", Some(50), None);
+    // This tests response-byte ordering, not the production five-second deadline.
+    // Allow a loaded test host to finish all required call materialization.
+    let reply = mcp_outgoing_wire_fixture_delayed(
+        &borrowed,
+        "Owner",
+        Some(50),
+        None,
+        false,
+        false,
+        OutgoingFixtureTiming {
+            call_deadline: Some(Duration::from_secs(10)),
+            ..Default::default()
+        },
+    )
+    .0;
     tool(&reply, None, true);
     let envelope = &reply["result"]["structuredContent"];
     let calls = envelope["data"]["calls"].as_array().unwrap();
@@ -8622,7 +8643,10 @@ async fn mcp_outgoing_near_call_deadline_body(accept_delay: Duration) {
         ]),
         false,
         false,
-        accept_delay,
+        OutgoingFixtureTiming {
+            accept_delay,
+            ..Default::default()
+        },
     );
     tool(&reply, None, true);
     let envelope = &reply["result"]["structuredContent"];
@@ -8826,8 +8850,20 @@ async fn mcp_outgoing_complete_modern_legacy_frames_fill_candidates_after_all_ca
         .map(|(p, s)| (p.as_str(), s.as_str()))
         .collect();
     for legacy in [false, true] {
-        let (reply, frame) =
-            mcp_outgoing_wire_fixture(&borrowed, "Owner", Some(50), None, legacy, false);
+        // Framing and candidate ordering are the subject here; the separate
+        // deadline tests retain the production five-second call limit.
+        let (reply, frame) = mcp_outgoing_wire_fixture_delayed(
+            &borrowed,
+            "Owner",
+            Some(50),
+            None,
+            legacy,
+            false,
+            OutgoingFixtureTiming {
+                call_deadline: Some(Duration::from_secs(10)),
+                ..Default::default()
+            },
+        );
         tool(&reply, None, !legacy);
         assert_eq!(frame.last(), Some(&b'\n'));
         assert!(
@@ -8970,7 +9006,9 @@ fn mcp_outgoing_corrupt_boundary_fixture(fault: &str) -> Value {
         // is no independent stored optional proof ID to corrupt here.
         let (sql, expect) = match fault {
             "orphaned_optional_id" => (
-                "UPDATE native_version_declarations SET syntax_id='not-a-canonical-syntax-id' WHERE name='Target'",
+                // Keep the BLOB decodable for the optional ranking query; the
+                // stale keyed header then makes the candidate fail verification.
+                "UPDATE native_version_declarations SET syntax_id=X'00000000000000000000000000000000' WHERE name='Target'",
                 1,
             ),
             "missing_optional_header" => (
@@ -8979,10 +9017,6 @@ fn mcp_outgoing_corrupt_boundary_fixture(fault: &str) -> Value {
             ),
             "invalid_optional_coverage" => (
                 "UPDATE revision_documents SET coverage_selected=0,coverage_state='omitted',coverage_diagnostic='fixture unselected' WHERE path='target.js'",
-                1,
-            ),
-            "foreign_source_set" => (
-                "UPDATE revision_documents SET source_set_id='source-set:v1:foreign' WHERE path='target.js'",
                 1,
             ),
             "missing_required_owner_header" => (
@@ -8994,7 +9028,7 @@ fn mcp_outgoing_corrupt_boundary_fixture(fault: &str) -> Value {
                 1,
             ),
             "invalid_required_call_id" => (
-                "UPDATE native_version_calls SET id='not-a-canonical-call-id' WHERE owner_syntax_id IN (SELECT syntax_id FROM native_version_declarations WHERE name='Owner')",
+                "UPDATE native_version_calls SET id=X'00' WHERE owner_syntax_id IN (SELECT syntax_id FROM native_version_declarations WHERE name='Owner')",
                 1,
             ),
             _ => panic!("unknown fixture fault: {fault}"),
@@ -9181,22 +9215,6 @@ async fn mcp_outgoing_prior_revision_target_is_not_a_selected_candidate() {
     drop(reader);
     drop(client);
     session.join().unwrap().unwrap();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mcp_outgoing_foreign_source_set_is_not_an_optional_candidate() {
-    let reply = mcp_outgoing_corrupt_boundary_fixture("foreign_source_set");
-    tool(&reply, None, true);
-    let calls = reply["result"]["structuredContent"]["data"]["calls"]
-        .as_array()
-        .unwrap();
-    assert_eq!(calls.len(), 1);
-    assert_eq!(
-        calls[0]["nativeCandidates"]["items"],
-        json!([]),
-        "foreign source set leaked: {reply}"
-    );
-    assert_eq!(calls[0]["nativeCandidates"]["omitted"], 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

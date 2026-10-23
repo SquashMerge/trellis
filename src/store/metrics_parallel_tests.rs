@@ -8,7 +8,7 @@ fn corrupt(store: &Store, table: &str, column: &str, path: &str) {
     db.pragma_update(None, "foreign_keys", "OFF").unwrap();
     let changed = db
         .execute(
-            &format!("UPDATE {table} SET {column}={column}||'x' WHERE projection_id=(SELECT graph_projection_id FROM revision_documents WHERE path=?1)"),
+            &format!("UPDATE {table} SET {column}={column}||'x' WHERE gid=(SELECT gid FROM revision_documents WHERE path=?1)"),
             [path],
         )
         .unwrap();
@@ -73,7 +73,7 @@ fn the_first_failure_in_manifest_order_is_reported_when_a_later_one_fails_first(
         .execute(
             "UPDATE native_version_declarations
              SET role=CASE role WHEN 'production' THEN 'test' ELSE 'production' END
-             WHERE version_id=(SELECT document_version_id FROM revision_documents WHERE path='f2.js')",
+             WHERE vid=(SELECT vid FROM revision_documents WHERE path='f2.js')",
             [],
         )
         .unwrap();

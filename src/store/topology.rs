@@ -1822,15 +1822,15 @@ fn inspect_index_with_open_hook(
     let tx = connection.transaction()?;
     let db = &tx;
     let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    let current_v13 = version == 13 && super::validate_cache_shape(db).is_ok();
-    let historical_marker = if current_v13 {
-        // Only a complete current-v13 layout can reach GC unlink.
+    let current_v14 = version == 14 && super::validate_cache_shape(db).is_ok();
+    let historical_marker = if current_v14 {
+        // Only a complete current-v14 layout can reach GC unlink.
         // Historical v8 layouts keep report-only authority.
         if super::validate_supersessions(db).is_err() {
             return Ok(("unknown", "invalid_supersession_inventory"));
         }
         None
-    } else if version == 13 {
+    } else if version == 14 {
         return Ok(("unknown", "unknown_index_shape"));
     } else if (4..=8).contains(&version) {
         match historical_index_extractor(db, version)? {
@@ -1908,7 +1908,7 @@ pub enum GcStage {
 // extractor marker matches the current binary.
 fn validate_gc_candidate_shape(db: &rusqlite::Connection) -> Result<()> {
     let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    ensure!(version == 13, "historical GC schema is report-only");
+    ensure!(version == 14, "historical GC schema is report-only");
     super::validate_cache_shape(db)?;
     super::validate_supersessions(db)
 }
@@ -2527,7 +2527,7 @@ mod gc_schema_race_tests {
         assert_eq!(
             (schema, marker.as_str(), generation, revision),
             (
-                13,
+                14,
                 "native-v6-delta-v1",
                 pin.index_generation.to_string(),
                 pin.index_revision as i64
@@ -2795,7 +2795,7 @@ mod gc_schema_race_tests {
     }
 
     #[test]
-    fn exact_v13_gc_candidate_survives_unknown_busy_then_deletes_after_fences_clear() {
+    fn exact_v14_gc_candidate_survives_unknown_busy_then_deletes_after_fences_clear() {
         let state = tempfile::tempdir().unwrap();
         let candidate_root = tempfile::tempdir().unwrap();
         let current_root = tempfile::tempdir().unwrap();
@@ -2909,7 +2909,7 @@ mod gc_schema_race_tests {
         assert_eq!(
             inspect_index(&dir, &identity.root_key, now).unwrap(),
             ("unknown", "recent_open"),
-            "genuine current-v13 cache must pass GC admission"
+            "genuine current-v14 cache must pass GC admission"
         );
 
         let attacker = rusqlite::Connection::open(&path).unwrap();
@@ -2927,7 +2927,7 @@ mod gc_schema_race_tests {
         assert_eq!(
             (schema, marker.as_str(), generation, revision),
             (
-                13,
+                14,
                 "native-v4",
                 pin.index_generation.to_string(),
                 pin.index_revision as i64
@@ -3081,7 +3081,7 @@ mod gc_final_witness_tests {
         assert_eq!(
             db.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            13
+            14
         );
         drop(live);
         assert!(roots.index_use_lock(&candidate).exists());

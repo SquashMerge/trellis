@@ -54,7 +54,7 @@ fn private_stage_build_is_unpublished_and_cleans_only_its_own_inode() {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!((version, metadata_version), (13, 13));
+        assert_eq!((version, metadata_version), (14, 14));
         for name in [
             "document_versions",
             "revision_documents",
@@ -451,8 +451,12 @@ fn delete_reader_pins_snapshot_and_blocks_publish() {
     );
     assert_eq!(revision(), 1);
     assert_eq!(
-        db.query_row("SELECT count(*) FROM graph_nodes n JOIN revision_documents rd ON rd.graph_projection_id=n.projection_id", [], |r| r.get::<_, i64>(0))
-            .unwrap(),
+        db.query_row(
+            "SELECT count(*) FROM graph_nodes n JOIN revision_documents rd ON rd.gid=n.gid",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
         captured.0.nodes.len() as i64
     );
     db.execute_batch("COMMIT").unwrap();
@@ -1294,15 +1298,15 @@ fn cache_loss_never_reuses_revision_tokens_and_sql_enforces_foreign_keys() {
     let db = rusqlite::Connection::open(index_db(state.path())).unwrap();
     db.pragma_update(None, "foreign_keys", true).unwrap();
     assert!(
-        db.execute("DELETE FROM document_versions WHERE id=(SELECT document_version_id FROM revision_documents WHERE path='a.js')", [])
+        db.execute("DELETE FROM document_versions WHERE vid=(SELECT vid FROM revision_documents WHERE path='a.js')", [])
             .is_err()
     );
     // Graph nodes no longer have call-edge FKs in schema 13. Check the
     // retained graph_display_labels -> graph_nodes FK with a dangling label.
     let label_error = db
         .execute(
-            "INSERT INTO graph_display_labels(projection_id,id,label) VALUES ((SELECT graph_projection_id FROM revision_documents WHERE path='a.js'), ?1, 'orphan')",
-            ["missing-node"],
+            "INSERT INTO graph_display_labels(gid,id,label) VALUES ((SELECT gid FROM revision_documents WHERE path='a.js'), ?1, 'orphan')",
+            [vec![0_u8; 16]],
         )
         .unwrap_err();
     assert!(matches!(
@@ -1404,7 +1408,7 @@ fn active_delete_journal_allows_prior_pair_or_busy_and_cold_journal_is_sqlite_ma
     let raw_pair = (|| -> rusqlite::Result<(String, i64, String, String, Vec<u8>, String)> {
         raw_db.busy_timeout(std::time::Duration::ZERO)?;
         raw_db.query_row(
-            "SELECT m.index_generation,m.index_revision,d.path,d.content_hash,d.source_bytes,d.content_hash FROM index_metadata m JOIN native_revisions r ON r.published_index_revision=m.index_revision JOIN revision_documents rd ON rd.revision_id=r.id JOIN document_versions d ON d.id=rd.document_version_id WHERE m.singleton=1 AND rd.path='a.js'",
+            "SELECT m.index_generation,m.index_revision,d.path,d.content_hash,d.source_bytes,d.content_hash FROM index_metadata m JOIN native_revisions r ON r.published_index_revision=m.index_revision JOIN revision_documents rd ON rd.revision_id=r.id JOIN document_versions d ON d.vid=rd.vid WHERE m.singleton=1 AND rd.path='a.js'",
                 [],
                 |row| {
                     Ok((
@@ -1845,10 +1849,7 @@ fn same_path_different_association_is_missing_but_dangling_revision_fails_closed
     let cache = rusqlite::Connection::open(index_db(state.path())).unwrap();
     cache.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
     cache
-        .execute(
-            "UPDATE revision_documents SET document_version_id='document:v1:dangling' WHERE path='b.js'",
-            [],
-        )
+        .execute("UPDATE revision_documents SET vid=-1 WHERE path='b.js'", [])
         .unwrap();
     cache.execute_batch("PRAGMA foreign_keys=ON").unwrap();
 

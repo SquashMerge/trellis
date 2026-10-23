@@ -1,9 +1,9 @@
 //! Revision-bound navigation from cached, measured declarations and scoped type evidence.
 //! This is line navigation, not token go-to-definition or global name resolution.
-use crate::model::IndexPin;
 use crate::{
     classes::ClassMember,
-    model::{Symbol, SymbolKind},
+    model::{IndexPin, Symbol, SymbolKind},
+    store::id_codec,
 };
 use anyhow::{Result, ensure};
 use rusqlite::{Connection, OptionalExtension, Params, params};
@@ -192,8 +192,8 @@ impl Reader<'_> {
             SymbolKind::Function | SymbolKind::Method => "sequence",
             SymbolKind::Class => {
                 if !self.db.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM classes c JOIN revision_documents d ON d.revision_id=?2 AND d.class_projection_id=c.projection_id WHERE c.id=?1)",
-                    params![symbol.id, self.revision_key],
+                    "SELECT EXISTS(SELECT 1 FROM classes c JOIN revision_documents d ON d.revision_id=?2 AND d.cid=c.cid WHERE c.id=?1)",
+                    params![id_codec::encode_sid(&symbol.id), self.revision_key],
                     |r| r.get::<_, bool>(0),
                 )? {
                     return Ok(());
@@ -239,7 +239,7 @@ impl Reader<'_> {
         // Count lines inside SQLite: do not copy even a large cached source into Rust.
         // Byte spans always come from measured symbols, never Unicode character offsets.
         let lines: Option<i64> = self.db.query_row(
-            "SELECT 1+length(v.source_bytes)-length(CAST(replace(CAST(v.source_bytes AS TEXT),char(10),'') AS BLOB)) FROM document_versions v JOIN revision_documents d ON d.revision_id=?2 AND d.document_version_id=v.id WHERE d.path=?1",
+            "SELECT 1+length(v.source_bytes)-length(CAST(replace(CAST(v.source_bytes AS TEXT),char(10),'') AS BLOB)) FROM document_versions v JOIN revision_documents d ON d.revision_id=?2 AND d.vid=v.vid WHERE d.path=?1",
             params![s.path, self.revision_key], |r| r.get(0)).optional()?;
         ensure!(
             lines.is_some_and(|lines| s.line as i64 <= lines),
@@ -297,11 +297,11 @@ impl Reader<'_> {
             return Ok(());
         }
         let matches: i64 = self.db.query_row(
-            "SELECT count(*) FROM (SELECT 1 FROM classes c JOIN revision_documents d ON d.revision_id=?5 AND d.class_projection_id=c.projection_id, json_each(c.payload) a, json_each(a.value) m
+            "SELECT count(*) FROM (SELECT 1 FROM classes c JOIN revision_documents d ON d.revision_id=?5 AND d.cid=c.cid, json_each(c.payload) a, json_each(a.value) m
              WHERE c.id=?1 AND a.key IN ('fields','methods')
              AND json_extract(m.value,'$.name')=?2
              AND json_extract(m.value,'$.range.startByte')=?3 AND json_extract(m.value,'$.range.endByte')=?4 LIMIT 2)",
-            params![s.class_id, s.member_name, s.start_byte as i64, s.end_byte as i64, self.revision_key], |r| r.get(0))?;
+            params![id_codec::encode_sid(&s.class_id), s.member_name, s.start_byte as i64, s.end_byte as i64, self.revision_key], |r| r.get(0))?;
         ensure!(
             matches == 1,
             InvalidRequest("The selector does not match one recorded class member.")
@@ -309,11 +309,11 @@ impl Reader<'_> {
         let revision_key = self.revision_key;
         let members: Vec<ClassMember> = self.records(
             "SELECT CASE WHEN length(CAST(m.value AS BLOB))<=?5 THEN m.value END
-             FROM classes c JOIN revision_documents d ON d.revision_id=?6 AND d.class_projection_id=c.projection_id, json_each(c.payload) a, json_each(a.value) m
+             FROM classes c JOIN revision_documents d ON d.revision_id=?6 AND d.cid=c.cid, json_each(c.payload) a, json_each(a.value) m
              WHERE c.id=?1 AND a.key IN ('fields','methods')
              AND json_extract(m.value,'$.name')=?2
              AND json_extract(m.value,'$.range.startByte')=?3 AND json_extract(m.value,'$.range.endByte')=?4 LIMIT 2",
-            params![s.class_id, s.member_name, s.start_byte as i64, s.end_byte as i64, RECORD_BYTES, revision_key])?;
+            params![id_codec::encode_sid(&s.class_id), s.member_name, s.start_byte as i64, s.end_byte as i64, RECORD_BYTES, revision_key])?;
         let Some(member) = members.first() else {
             self.warn("The recorded member exceeds the navigation evidence budget.");
             return Ok(());

@@ -608,7 +608,7 @@ fn second_connection_adds_legacy_trigger_after_admission_before_publish_lock() {
                     // but has NOT acquired the SQLite writer lock yet.
                     let attacker = Connection::open(&path)?;
                     attacker.execute_batch("CREATE TRIGGER forged_after_admission AFTER INSERT ON graph_nodes BEGIN
-                        UPDATE graph_nodes SET name='FORGED-NOT-MEASURED' WHERE projection_id=NEW.projection_id AND id=NEW.id; END;")?;
+                        UPDATE graph_nodes SET name='FORGED-NOT-MEASURED' WHERE gid=NEW.gid AND id=NEW.id; END;")?;
                     drop(attacker);
                     *after_external.borrow_mut() = Some(fs::read(&path)?);
                 }

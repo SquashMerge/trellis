@@ -1264,9 +1264,12 @@ fn executable_drift_claim_child() {
             [&id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
         let manifest: Vec<String> = db
             .prepare(
-                "SELECT path||' '||document_version_id||' '||graph_projection_id||' '||
-                 coalesce(class_projection_id,'-')||' '||coverage_state
-                 FROM revision_documents WHERE revision_id=?1 ORDER BY ordinal",
+                "SELECT m.path||' '||v.id||' '||('graph:v1:'||g.graph_hash)||' '||
+                 coalesce('class-projection:v1:'||cp.content_hash,'-')||' '||m.coverage_state
+                 FROM revision_documents m JOIN document_versions v ON v.vid=m.vid
+                 JOIN graph_projections g ON g.gid=m.gid
+                 LEFT JOIN class_projections cp ON cp.cid=m.cid
+                 WHERE m.revision_id=?1 ORDER BY m.ordinal",
             )
             .unwrap()
             .query_map([&id], |r| r.get(0))

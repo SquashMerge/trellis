@@ -441,7 +441,7 @@ fn coordinator_rejects_drift_cancel_and_stale_pair_without_partial_publication()
         let db = rusqlite::Connection::open(&index).unwrap();
         let (native_bytes, native_hash): (Vec<u8>, String) = db
             .query_row(
-                "SELECT v.source_bytes,v.content_hash FROM document_versions v JOIN revision_documents m ON m.document_version_id=v.id WHERE m.path='main.js'",
+                "SELECT v.source_bytes,v.content_hash FROM document_versions v JOIN revision_documents m ON m.vid=v.vid WHERE m.path='main.js'",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -623,7 +623,7 @@ fn full_reconcile_replaces_persisted_source_and_input_inventory() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        13
+        14
     );
     let files = db
         .prepare("SELECT path FROM revision_documents WHERE revision_id=?1 ORDER BY path")
@@ -714,6 +714,23 @@ fn sqlite_snapshot(
         })
         .unwrap();
     assert_eq!(violations, 0, "all retained revision FKs must remain valid");
+    // The rowids depend on when retained records were inserted. Compare every
+    // surrogate column by its immutable natural key, without dropping any rows
+    // or normalizing the rest of each stored row.
+    let natural_keys = |sql: &str| -> std::collections::BTreeMap<i64, String> {
+        db.prepare(sql)
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<(i64, String)>>>()
+            .unwrap()
+            .into_iter()
+            .collect()
+    };
+    let versions = natural_keys("SELECT vid,id FROM document_versions");
+    let graphs = natural_keys("SELECT gid,'graph:v1:'||graph_hash FROM graph_projections");
+    let classes =
+        natural_keys("SELECT cid,'class-projection:v1:'||content_hash FROM class_projections");
     let tables: Vec<String> = db
         // Decision 0013's trigram prefilter tables are derived search state, not evidence.
         .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name!='index_metadata' AND name NOT LIKE '%trigrams%' ORDER BY name")
@@ -722,12 +739,12 @@ fn sqlite_snapshot(
         .unwrap()
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
-    // Schema 13 replaces stored graph call/region rows with derived native facts,
-    // retains narrow graph nodes, and stores optional SCIP display labels.
+    // Schema 14 keeps the derived graph and labels, and compacts native IDs
+    // and document/projection references into BLOB keys and surrogates.
     // Supersession state and the paired producer bindings are additive.
     // Check exact names, not just a count: an unknown table must not escape the
     // independent cold-source comparison.
-    const REQUIRED_V13_TABLES: [&str; 31] = [
+    const REQUIRED_V14_TABLES: [&str; 31] = [
         "native_producers",
         "native_producer_languages",
         "native_producer_inputs",
@@ -760,7 +777,7 @@ fn sqlite_snapshot(
         "native_release_candidate_graphs",
         "native_release_candidate_classes",
     ];
-    let required: std::collections::BTreeSet<_> = REQUIRED_V13_TABLES.into_iter().collect();
+    let required: std::collections::BTreeSet<_> = REQUIRED_V14_TABLES.into_iter().collect();
     let actual: std::collections::BTreeSet<_> = tables.iter().map(String::as_str).collect();
     let optional = [
         "native_revision_supersessions",
@@ -770,18 +787,18 @@ fn sqlite_snapshot(
     assert_eq!(
         required.len(),
         31,
-        "v13 mandatory table list must be unique"
+        "v14 mandatory table list must be unique"
     );
     assert!(
         required.is_subset(&actual),
-        "missing v13 evidence tables: {:?}",
+        "missing v14 evidence tables: {:?}",
         required.difference(&actual).collect::<Vec<_>>()
     );
     assert!(
         actual
             .difference(&required)
             .all(|table| optional.contains(table)),
-        "unexpected v13 evidence table: {:?}",
+        "unexpected v14 evidence table: {:?}",
         actual.difference(&required).collect::<Vec<_>>()
     );
     assert_eq!(
@@ -790,7 +807,7 @@ fn sqlite_snapshot(
             .iter()
             .filter(|name| actual.contains(*name))
             .count(),
-        "exact v13 base and optional table count"
+        "exact v14 base and optional table count"
     );
     assert_eq!(
         actual.contains("native_binding_epoch"),
@@ -831,33 +848,48 @@ fn sqlite_snapshot(
                 "native_source_set_languages" | "native_source_set_dependencies" =>
                     ("source_set_id=(SELECT source_set_id FROM native_revisions WHERE id=?1)", ""),
                 "native_producers" | "native_producer_languages" | "native_producer_inputs" =>
-                    ("EXISTS(SELECT 1 FROM document_versions v JOIN revision_documents d ON d.document_version_id=v.id WHERE d.revision_id=?1 AND v.producer_id=selected.producer_id AND v.producer_version=selected.producer_version)", "producer"),
-                "document_versions" => ("id IN (SELECT document_version_id FROM revision_documents WHERE revision_id=?1)", ""),
-                "graph_projections" => ("id IN (SELECT graph_projection_id FROM revision_documents WHERE revision_id=?1)", ""),
+                    ("EXISTS(SELECT 1 FROM document_versions v JOIN revision_documents d ON d.vid=v.vid WHERE d.revision_id=?1 AND v.producer_id=selected.producer_id AND v.producer_version=selected.producer_version)", "producer"),
+                "document_versions" => ("vid IN (SELECT vid FROM revision_documents WHERE revision_id=?1)", ""),
+                "graph_projections" => ("gid IN (SELECT gid FROM revision_documents WHERE revision_id=?1)", ""),
                 "graph_nodes" | "graph_display_labels" =>
-                    ("projection_id IN (SELECT graph_projection_id FROM revision_documents WHERE revision_id=?1)", ""),
-                "class_projections" => ("id IN (SELECT class_projection_id FROM revision_documents WHERE revision_id=?1)", ""),
+                    ("gid IN (SELECT gid FROM revision_documents WHERE revision_id=?1)", ""),
+                "class_projections" => ("cid IN (SELECT cid FROM revision_documents WHERE revision_id=?1)", ""),
                 "classes" | "class_relations" =>
-                    ("projection_id IN (SELECT class_projection_id FROM revision_documents WHERE revision_id=?1)", ""),
+                    ("cid IN (SELECT cid FROM revision_documents WHERE revision_id=?1)", ""),
                 name if name.starts_with("native_version_") =>
-                    ("version_id IN (SELECT document_version_id FROM revision_documents WHERE revision_id=?1)", ""),
-                _ => panic!("unhandled v13 evidence table: {table}"),
+                    ("vid IN (SELECT vid FROM revision_documents WHERE revision_id=?1)", ""),
+                _ => panic!("unhandled v14 evidence table: {table}"),
             };
             // Producer descriptor columns differ: only the parent table uses id/version.
             let where_clause = if table == "native_producers" {
-                "EXISTS(SELECT 1 FROM document_versions v JOIN revision_documents d ON d.document_version_id=v.id WHERE d.revision_id=?1 AND v.producer_id=selected.id AND v.producer_version=selected.version)"
+                "EXISTS(SELECT 1 FROM document_versions v JOIN revision_documents d ON d.vid=v.vid WHERE d.revision_id=?1 AND v.producer_id=selected.id AND v.producer_version=selected.version)"
             } else {
                 where_clause
             };
             let alias = if alias.is_empty() { "" } else { " selected" };
             let sql = format!("SELECT * FROM \"{table}\"{alias} WHERE {where_clause}");
             let mut statement = db.prepare(&sql).unwrap();
-            let columns = statement.column_count();
+            let column_names: Vec<String> = statement
+                .column_names()
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect();
             let mut rows = statement
                 .query_map([&revision_id], |row| {
-                    (0..columns)
+                    (0..column_names.len())
                         .map(|column| match row.get::<_, Value>(column)? {
                             Value::Null => Ok("null".to_owned()),
+                            Value::Integer(value) if matches!(column_names[column].as_str(), "vid" | "gid" | "cid") => {
+                                let natural = match column_names[column].as_str() {
+                                    "vid" => &versions,
+                                    "gid" => &graphs,
+                                    "cid" => &classes,
+                                    _ => unreachable!(),
+                                };
+                                Ok(format!("t:{}", natural.get(&value).unwrap_or_else(|| {
+                                    panic!("unmapped {table}.{}={value}", column_names[column])
+                                })))
+                            }
                             Value::Integer(value) => Ok(format!("i:{value}")),
                             Value::Real(value) => Ok(format!("r:{value:?}")),
                             Value::Text(value) => Ok(format!("t:{value}")),
@@ -1022,7 +1054,7 @@ fn parse_error_retained_pin_matches_independent_cold_and_advisory_uses_exact_tok
             cold_pin,
             true
         ),
-        "all selected v13 evidence tables: source/hash, revision, coverage, provenance, IDs, ordered native children, graph, class/warnings/truncated, and empty current-head release control"
+        "all selected v14 evidence tables: source/hash, revision, coverage, provenance, IDs, ordered native children, graph, class/warnings/truncated, and empty current-head release control"
     );
     assert_eq!(sqlite_snapshot(&path, before, false), old_rows);
     assert_eq!(parsed_graph, cold.graph_at(Some(cold_pin)).unwrap());
@@ -1365,10 +1397,16 @@ fn document_local_delta_and_cross_file_fallback_match_independent_cold_publicati
     );
     let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
     for path in ["A.java", "run.py", "run.rs"] {
-        let version = |pin: trellis::model::IndexPin| -> String {
+        let version = |pin: trellis::model::IndexPin| -> i64 {
             db.query_row(
-            "SELECT document_version_id FROM revision_documents WHERE revision_id=?1 AND path=?2",
-            rusqlite::params![format!("pin:v1:{}:{}",pin.index_generation,pin.index_revision),path],|r|r.get(0)).unwrap()
+                "SELECT vid FROM revision_documents WHERE revision_id=?1 AND path=?2",
+                rusqlite::params![
+                    format!("pin:v1:{}:{}", pin.index_generation, pin.index_revision),
+                    path
+                ],
+                |r| r.get(0),
+            )
+            .unwrap()
         };
         assert_eq!(
             version(first),
@@ -1488,23 +1526,23 @@ fn local_reuse_trusts_validated_head_but_selected_reads_refuse_sql_forgery() {
     for (family, mutation) in [
         (
             "native",
-            "UPDATE native_version_declarations SET name='forged' WHERE version_id=(SELECT document_version_id FROM revision_documents WHERE path='A.java' LIMIT 1) AND name='A'",
+            "UPDATE native_version_declarations SET name='forged' WHERE vid=(SELECT vid FROM revision_documents WHERE path='A.java' LIMIT 1) AND name='A'",
         ),
         (
             "graph",
-            "UPDATE graph_nodes SET name='forged' WHERE projection_id=(SELECT graph_projection_id FROM revision_documents WHERE path='A.java' LIMIT 1) AND id=(SELECT id FROM graph_nodes WHERE projection_id=(SELECT graph_projection_id FROM revision_documents WHERE path='A.java' LIMIT 1) LIMIT 1)",
+            "UPDATE graph_nodes SET name='forged' WHERE gid=(SELECT gid FROM revision_documents WHERE path='A.java' LIMIT 1) AND id=(SELECT id FROM graph_nodes WHERE gid=(SELECT gid FROM revision_documents WHERE path='A.java' LIMIT 1) LIMIT 1)",
         ),
         (
             "class",
-            "UPDATE classes SET payload=json_set(payload,'$.qualifiedName','forged') WHERE projection_id=(SELECT class_projection_id FROM revision_documents WHERE path='A.java' LIMIT 1) AND id=(SELECT id FROM classes WHERE projection_id=(SELECT class_projection_id FROM revision_documents WHERE path='A.java' LIMIT 1) LIMIT 1)",
+            "UPDATE classes SET payload=json_set(payload,'$.qualifiedName','forged') WHERE cid=(SELECT cid FROM revision_documents WHERE path='A.java' LIMIT 1) AND id=(SELECT id FROM classes WHERE cid=(SELECT cid FROM revision_documents WHERE path='A.java' LIMIT 1) LIMIT 1)",
         ),
         (
             "file-extraction",
-            "UPDATE graph_projections SET class_extraction_payload=json_set(class_extraction_payload,'$.path','forged.java') WHERE id=(SELECT graph_projection_id FROM revision_documents WHERE path='A.java' LIMIT 1)",
+            "UPDATE graph_projections SET class_extraction_payload=json_set(class_extraction_payload,'$.path','forged.java') WHERE gid=(SELECT gid FROM revision_documents WHERE path='A.java' LIMIT 1)",
         ),
         (
-            "source-set",
-            "UPDATE revision_documents SET source_set_id='forged-source-set' WHERE path='A.java'",
+            "manifest-language",
+            "UPDATE revision_documents SET language='python' WHERE path='A.java'",
         ),
     ] {
         let (state, workspace) = fixture();
@@ -1525,9 +1563,9 @@ fn local_reuse_trusts_validated_head_but_selected_reads_refuse_sql_forgery() {
         let session = job.session();
         let first = job.run(&options, &cancel, |_| {}).unwrap();
         let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
-        if family == "source-set" {
-            // This adversarial row violates the composite document-version FK;
-            // all existing graph/native/class forgeries above remain FK-valid.
+        if family == "manifest-language" {
+            // This selected manifest edit violates the document language FK;
+            // the graph/native/class mutations above remain FK-valid.
             db.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
         }
         assert_eq!(
@@ -1682,7 +1720,7 @@ fn reconcile_matches_fresh_full_snapshot_after_add_edit_delete_rename_and_ignore
             .unwrap()
             .1
             .iter()
-            .map(|row| row[3].clone())
+            .map(|row| row[2].clone())
             .collect()
     };
     let first_paths = paths(&retained_first);
@@ -1741,7 +1779,7 @@ fn reconcile_matches_fresh_full_snapshot_after_add_edit_delete_rename_and_ignore
     assert_eq!(
         r2,
         sqlite_snapshot(&fresh_path, cold_pin, true),
-        "current r2 must equal a full independent cold build, including every selected v13 evidence table"
+        "current r2 must equal a full independent cold build, including every selected v14 evidence table"
     );
     let metadata = |path: &Path| {
         let db = rusqlite::Connection::open(path).unwrap();
@@ -1899,7 +1937,7 @@ fn extractor_and_typed_mismatch_rebuild_in_place_and_failed_rebuild_stays_closed
 
     let db = rusqlite::Connection::open(&path).unwrap();
     db.execute(
-        "UPDATE document_versions SET source_bytes=x'FF',byte_length=1 WHERE id=(SELECT document_version_id FROM revision_documents WHERE path='one.js')",
+        "UPDATE document_versions SET source_bytes=x'FF',byte_length=1 WHERE vid=(SELECT vid FROM revision_documents WHERE path='one.js')",
         [],
     )
     .unwrap();
@@ -1954,7 +1992,7 @@ fn extractor_and_typed_mismatch_rebuild_in_place_and_failed_rebuild_stays_closed
     assert!(failure.to_string().contains("cancelled"));
     let db = rusqlite::Connection::open(&path).unwrap();
     let malformed: String = db
-        .query_row("SELECT hex(source_bytes) FROM document_versions WHERE id=(SELECT document_version_id FROM revision_documents WHERE path='one.js')", [], |row| {
+        .query_row("SELECT hex(source_bytes) FROM document_versions WHERE vid=(SELECT vid FROM revision_documents WHERE path='one.js')", [], |row| {
             row.get(0)
         })
         .unwrap();
@@ -1979,14 +2017,14 @@ fn extractor_and_typed_mismatch_rebuild_in_place_and_failed_rebuild_stays_closed
     let db = rusqlite::Connection::open(&path).unwrap();
     let (syntax_id, lookup_key): (String, String) = db
         .query_row(
-            "SELECT d.syntax_id,d.lookup_key FROM native_version_declarations d JOIN document_versions v ON v.id=d.version_id WHERE d.lookup_key IS NOT NULL AND v.language='javascript' ORDER BY d.syntax_id LIMIT 1",
+            "SELECT 'sid:v1:'||lower(hex(d.syntax_id)),d.lookup_key FROM native_version_declarations d JOIN document_versions v ON v.vid=d.vid WHERE d.lookup_key IS NOT NULL AND v.language='javascript' ORDER BY d.syntax_id LIMIT 1",
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
     assert_eq!(
         db.execute(
-            "UPDATE native_version_declarations SET key_ordinal=CAST(key_ordinal + 0.5 AS REAL) WHERE syntax_id=?1",
+            "UPDATE native_version_declarations SET key_ordinal=CAST(key_ordinal + 0.5 AS REAL) WHERE syntax_id=unhex(substr(?1,8))",
             [&syntax_id],
         )
         .unwrap(),
@@ -2013,7 +2051,7 @@ fn extractor_and_typed_mismatch_rebuild_in_place_and_failed_rebuild_stays_closed
     let db = rusqlite::Connection::open(&path).unwrap();
     let stored_type: String = db
         .query_row(
-            "SELECT typeof(key_ordinal) FROM native_version_declarations WHERE syntax_id=?1",
+            "SELECT typeof(key_ordinal) FROM native_version_declarations WHERE syntax_id=unhex(substr(?1,8))",
             [&syntax_id],
             |row| row.get(0),
         )
@@ -2240,7 +2278,7 @@ fn selected_projection_corruption_latches_only_selected_reads() {
     let clone = store.clone();
     let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
     db.execute(
-        "UPDATE document_versions SET source_bytes=x'FF',byte_length=1 WHERE id=(SELECT document_version_id FROM revision_documents WHERE path='flow.js')",
+        "UPDATE document_versions SET source_bytes=x'FF',byte_length=1 WHERE vid=(SELECT vid FROM revision_documents WHERE path='flow.js')",
         [],
     )
     .unwrap();
@@ -2263,7 +2301,7 @@ fn selected_projection_corruption_latches_only_selected_reads() {
     let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
     assert_eq!(
         db.execute(
-            "UPDATE graph_nodes SET name='forged' WHERE projection_id=(SELECT graph_projection_id FROM revision_documents WHERE path='flow.js') AND name='go'",
+            "UPDATE graph_nodes SET name='forged' WHERE gid=(SELECT gid FROM revision_documents WHERE path='flow.js') AND name='go'",
             [],
         )
         .unwrap(),
@@ -2288,7 +2326,7 @@ fn selected_projection_corruption_latches_only_selected_reads() {
     let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
     assert_eq!(
         db.execute(
-            "UPDATE graph_nodes SET kind='class' WHERE projection_id=(SELECT graph_projection_id FROM revision_documents WHERE path='flow.js') AND kind='function'",
+            "UPDATE graph_nodes SET kind='class' WHERE gid=(SELECT gid FROM revision_documents WHERE path='flow.js') AND kind='function'",
             [],
         )
         .unwrap(),
@@ -2315,14 +2353,14 @@ fn selected_projection_corruption_latches_only_selected_reads() {
     let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
     assert_eq!(
         db.execute(
-            "UPDATE document_versions SET source_bytes=CAST(source_bytes AS TEXT) WHERE id=(SELECT document_version_id FROM revision_documents WHERE path='flow.js')",
+            "UPDATE document_versions SET source_bytes=CAST(source_bytes AS TEXT) WHERE vid=(SELECT vid FROM revision_documents WHERE path='flow.js')",
             [],
         )
         .unwrap(),
         1
     );
     let storage_class: String = db.query_row(
-        "SELECT typeof(source_bytes) FROM document_versions WHERE id=(SELECT document_version_id FROM revision_documents WHERE path='flow.js')",
+        "SELECT typeof(source_bytes) FROM document_versions WHERE vid=(SELECT vid FROM revision_documents WHERE path='flow.js')",
         [],
         |row| row.get(0),
     ).unwrap();
@@ -2345,7 +2383,7 @@ fn selected_projection_corruption_latches_only_selected_reads() {
     let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
     let expected: i64 = db
         .query_row(
-            "SELECT count(*) FROM graph_nodes WHERE projection_id=(SELECT graph_projection_id FROM revision_documents WHERE path='flow.js') AND kind IN ('function','method')",
+            "SELECT count(*) FROM graph_nodes WHERE gid=(SELECT gid FROM revision_documents WHERE path='flow.js') AND kind IN ('function','method')",
             [],
             |row| row.get(0),
         )
@@ -2400,7 +2438,7 @@ fn selected_projection_rebuild_is_same_inode_and_clears_clones_only_after_commit
     let inode = fs::metadata(&path).unwrap().ino();
     let db = rusqlite::Connection::open(&path).unwrap();
     db.execute(
-        "UPDATE document_versions SET source_bytes=x'FF',byte_length=1 WHERE id=(SELECT document_version_id FROM revision_documents WHERE path='flow.js')",
+        "UPDATE document_versions SET source_bytes=x'FF',byte_length=1 WHERE vid=(SELECT vid FROM revision_documents WHERE path='flow.js')",
         [],
     )
     .unwrap();
@@ -3243,9 +3281,21 @@ fn same_source_new_scip_label_reuses_native_and_reprojects_presentation_at_pinne
     };
     let ids = |pin: IndexPin| {
         let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
-        db.query_row("SELECT document_version_id,graph_projection_id,class_projection_id FROM revision_documents WHERE revision_id=?1 AND path='A.java'",
-            [format!("pin:v1:{}:{}",pin.index_generation,pin.index_revision)],
-            |r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?))).unwrap()
+        db.query_row(
+            "SELECT vid,gid,cid FROM revision_documents WHERE revision_id=?1 AND path='A.java'",
+            [format!(
+                "pin:v1:{}:{}",
+                pin.index_generation, pin.index_revision
+            )],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .unwrap()
     };
     write_label("one", false);
     let first = job.run(&options, &cancel, |_| {}).unwrap();
@@ -3534,7 +3584,7 @@ fn captured_scip_document_cutoff_refuses_optional_java_python_and_javascript_lab
     for (path, name) in [("A.java", "A"), ("a.py", "P"), ("a.js", "J")] {
         let expected = node(&cutoff, path, name);
         let (name, kind): (String, String) = db.query_row(
-            "SELECT n.name,n.kind FROM graph_nodes n JOIN revision_documents m ON n.projection_id=m.graph_projection_id WHERE m.revision_id=?1 AND m.path=?2 AND n.id=?3",
+            "SELECT n.name,n.kind FROM graph_nodes n JOIN revision_documents m ON n.gid=m.gid WHERE m.revision_id=?1 AND m.path=?2 AND n.id=unhex(substr(?3,8))",
             rusqlite::params![current,path,expected.id],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
         assert_eq!(name, expected.name);
         assert_eq!(
@@ -3548,7 +3598,7 @@ fn captured_scip_document_cutoff_refuses_optional_java_python_and_javascript_lab
     }
     for f in &cutoff_f {
         let (state,payload):(String,String)=db.query_row(
-            "SELECT g.class_extraction_state,g.class_extraction_payload FROM graph_projections g JOIN revision_documents m ON m.graph_projection_id=g.id WHERE m.revision_id=?1 AND m.path=?2",
+            "SELECT g.class_extraction_state,g.class_extraction_payload FROM graph_projections g JOIN revision_documents m ON m.gid=g.gid WHERE m.revision_id=?1 AND m.path=?2",
             rusqlite::params![current,f.path],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
         assert_eq!(state, "ready");
         assert_eq!(
@@ -3563,7 +3613,7 @@ fn captured_scip_document_cutoff_refuses_optional_java_python_and_javascript_lab
             .find(|c| c.symbol.path == path && c.symbol.name == name)
             .unwrap();
         let payload:String=db.query_row(
-            "SELECT c.payload FROM classes c JOIN revision_documents m ON m.class_projection_id=c.projection_id WHERE m.revision_id=?1 AND m.path=?2 AND c.id=?3",
+            "SELECT c.payload FROM classes c JOIN revision_documents m ON m.cid=c.cid WHERE m.revision_id=?1 AND m.path=?2 AND c.id=unhex(substr(?3,8))",
             rusqlite::params![current,path,expected.symbol.id],|r|r.get(0)).unwrap();
         assert_eq!(
             serde_json::from_str::<trellis::classes::ClassDefinition>(&payload).unwrap(),

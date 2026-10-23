@@ -362,17 +362,20 @@ fn unchanged_serve_reuses_selected_versions_and_detects_selected_source_corrupti
             std::thread::sleep(Duration::from_millis(40));
         }
     }
-    fn pin_and_ids(db: &rusqlite::Connection) -> (i64, Vec<(i64, String, String, String)>) {
+    type RevisionProjectionIds = (i64, i64, i64, Option<i64>);
+    fn pin_and_ids(db: &rusqlite::Connection) -> (i64, Vec<RevisionProjectionIds>) {
         let rev = db
             .query_row("SELECT index_revision FROM index_metadata", [], |r| {
                 r.get(0)
             })
             .unwrap();
-        let mut statement = db.prepare(
-            "SELECT h.published_index_revision,m.document_version_id,m.graph_projection_id,m.class_projection_id
+        let mut statement = db
+            .prepare(
+                "SELECT h.published_index_revision,m.vid,m.gid,m.cid
              FROM revision_documents m JOIN native_revisions h ON h.id=m.revision_id
              ORDER BY h.published_index_revision,m.path",
-        ).unwrap();
+            )
+            .unwrap();
         let ids = statement
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
             .unwrap()
@@ -570,7 +573,7 @@ fn unchanged_serve_reuses_selected_versions_and_detects_selected_source_corrupti
     let selected_id = &next_ids.last().unwrap().1;
     assert_eq!(
         db.execute(
-            "UPDATE document_versions SET source_bytes=?1 WHERE id=?2",
+            "UPDATE document_versions SET source_bytes=?1 WHERE vid=?2",
             rusqlite::params![vec![b'x'; old_bytes.len()], selected_id]
         )
         .unwrap(),
@@ -2420,7 +2423,7 @@ fn real_native_snapshot(home: &std::path::Path) -> Value {
     ).unwrap();
     let mut documents = Vec::new();
     let mut stmt = db.prepare(
-        "SELECT v.source_set_id,v.language,m.path,m.revision_id,v.content_hash,v.byte_length,v.source_bytes FROM revision_documents m JOIN document_versions v ON v.id=m.document_version_id WHERE m.revision_id=?1 ORDER BY m.path"
+        "SELECT (SELECT source_set_id FROM native_revisions WHERE id=m.revision_id),v.language,m.path,m.revision_id,v.content_hash,v.byte_length,v.source_bytes FROM revision_documents m JOIN document_versions v ON v.vid=m.vid WHERE m.revision_id=?1 ORDER BY m.path"
     ).unwrap();
     let rows = stmt
         .query_map([&pin_id], |r| {
@@ -2474,35 +2477,35 @@ fn real_native_snapshot(home: &std::path::Path) -> Value {
                 "",
             ),
             "native_producers" => (
-                "EXISTS(SELECT 1 FROM document_versions v JOIN revision_documents d ON d.document_version_id=v.id WHERE d.revision_id=?1 AND v.producer_id=selected.id AND v.producer_version=selected.version)",
+                "EXISTS(SELECT 1 FROM document_versions v JOIN revision_documents d ON d.vid=v.vid WHERE d.revision_id=?1 AND v.producer_id=selected.id AND v.producer_version=selected.version)",
                 " selected",
             ),
             "native_producer_languages" | "native_producer_inputs" => (
-                "EXISTS(SELECT 1 FROM document_versions v JOIN revision_documents d ON d.document_version_id=v.id WHERE d.revision_id=?1 AND v.producer_id=selected.producer_id AND v.producer_version=selected.producer_version)",
+                "EXISTS(SELECT 1 FROM document_versions v JOIN revision_documents d ON d.vid=v.vid WHERE d.revision_id=?1 AND v.producer_id=selected.producer_id AND v.producer_version=selected.producer_version)",
                 " selected",
             ),
             "document_versions" => (
-                "id IN (SELECT document_version_id FROM revision_documents WHERE revision_id=?1)",
+                "vid IN (SELECT vid FROM revision_documents WHERE revision_id=?1)",
                 "",
             ),
             "graph_projections" => (
-                "id IN (SELECT graph_projection_id FROM revision_documents WHERE revision_id=?1)",
+                "gid IN (SELECT gid FROM revision_documents WHERE revision_id=?1)",
                 "",
             ),
             "graph_nodes" | "graph_display_labels" => (
-                "projection_id IN (SELECT graph_projection_id FROM revision_documents WHERE revision_id=?1)",
+                "gid IN (SELECT gid FROM revision_documents WHERE revision_id=?1)",
                 "",
             ),
             "class_projections" => (
-                "id IN (SELECT class_projection_id FROM revision_documents WHERE revision_id=?1)",
+                "cid IN (SELECT cid FROM revision_documents WHERE revision_id=?1)",
                 "",
             ),
             "classes" | "class_relations" => (
-                "projection_id IN (SELECT class_projection_id FROM revision_documents WHERE revision_id=?1)",
+                "cid IN (SELECT cid FROM revision_documents WHERE revision_id=?1)",
                 "",
             ),
             table if table.starts_with("native_version_") => (
-                "version_id IN (SELECT document_version_id FROM revision_documents WHERE revision_id=?1)",
+                "vid IN (SELECT vid FROM revision_documents WHERE revision_id=?1)",
                 "",
             ),
             _ => panic!("unexpected v9 evidence table: {name}"),
@@ -2548,7 +2551,7 @@ fn real_native_snapshot(home: &std::path::Path) -> Value {
     assert_eq!(
         all_rows.len(),
         31,
-        "retain every schema-13 evidence table in raw snapshot"
+        "retain every schema-14 evidence table in raw snapshot"
     );
     serde_json::json!({"sourceSet":{"id":source_set.0,"rootId":source_set.1},
         "revision":{"id":revision.0,"sourceSetId":revision.1,"toolchainHash":revision.2,
@@ -3033,6 +3036,13 @@ fn decoded_jev_rows(export: &Value, table: &str) -> Vec<Value> {
         .collect()
 }
 
+fn blob_id(blob: &Value, prefix: &str) -> String {
+    format!(
+        "{prefix}{}",
+        blob["blobHex"].as_str().expect("stored BLOB ID")
+    )
+}
+
 fn assert_native_version_witness(native: &Value, version_id: &Value, path: &str, language: &str) {
     let versions: Vec<_> = native["allRows"]["document_versions"]
         .as_array()
@@ -3045,14 +3055,13 @@ fn assert_native_version_witness(native: &Value, version_id: &Value, path: &str,
         1,
         "one authenticated document version for {path}"
     );
-    assert_eq!(versions[0][1], native["sourceSet"]["id"]);
     assert_eq!(versions[0][2], language);
     assert_eq!(versions[0][3], path);
     let manifests: Vec<_> = native["allRows"]["revision_documents"]
         .as_array()
         .unwrap()
         .iter()
-        .filter(|row| row[4] == *version_id && row[3] == path)
+        .filter(|row| row[3] == *version_id && row[2] == path)
         .collect();
     assert_eq!(
         manifests.len(),
@@ -3060,8 +3069,7 @@ fn assert_native_version_witness(native: &Value, version_id: &Value, path: &str,
         "one admitted revision document for {path}"
     );
     assert_eq!(manifests[0][0], native["revision"]["id"]);
-    assert_eq!(manifests[0][1], native["sourceSet"]["id"]);
-    assert_eq!(manifests[0][2], language);
+    assert_eq!(manifests[0][1], language);
 }
 
 fn assert_fixture_declaration(
@@ -3077,7 +3085,7 @@ fn assert_fixture_declaration(
         .as_array()
         .unwrap()
         .iter()
-        .filter(|row| row[1] == symbol["id"])
+        .filter(|row| blob_id(&row[1], "sid:v1:") == symbol["id"].as_str().unwrap())
         .collect();
     assert_eq!(matching.len(), 1, "one native declaration for {name}");
     let row = matching[0];
@@ -3093,7 +3101,14 @@ fn assert_fixture_declaration(
     assert_eq!(documents.len(), 1, "one captured source for {path}");
     let language = documents[0]["language"].as_str().unwrap();
     assert_native_version_witness(native, &row[0], path, language);
-    assert_eq!(row[2], serde_json::json!(owner), "{name}: native owner");
+    assert_eq!(
+        row[2]
+            .as_object()
+            .map(|_| blob_id(&row[2], "sid:v1:"))
+            .as_deref(),
+        owner,
+        "{name}: native owner"
+    );
     assert_eq!(row[3], kind, "{name}: native declaration kind");
     assert_eq!(row[4], "production", "{name}: native role");
     assert_eq!(row[5], name, "{name}: native measured name");
@@ -3681,7 +3696,7 @@ def sink():
         assert_eq!(
             same_bytes_evidence(&native_after),
             same_bytes_evidence(&post_start_native),
-            "{name}: all 31 schema-13 evidence tables and documents must match after only publication identity normalization"
+            "{name}: all 31 schema-14 evidence tables and documents must match after only publication identity normalization"
         );
         assert_eq!(
             graph_after, graph_before,
@@ -3910,10 +3925,15 @@ def sink():
             assert_eq!(call["range"]["endByte"], expected_end, "{name}");
             assert_native_version_witness(&native_after, &native_call[0], file, name);
             assert_eq!(
-                native_call[1], call["id"],
+                blob_id(&native_call[1], "occ:v2:"),
+                call["id"].as_str().unwrap(),
                 "{name}: same measured native call ID"
             );
-            assert_eq!(native_call[2], seed, "{name}: native call owner");
+            assert_eq!(
+                blob_id(&native_call[2], "sid:v1:"),
+                seed,
+                "{name}: native call owner"
+            );
             assert_eq!(native_call[4], expected_start, "{name}: native start byte");
             assert_eq!(native_call[5], expected_end, "{name}: native end byte");
             assert_eq!(native_call[8], "sink", "{name}: native callee spelling");
@@ -3947,7 +3967,7 @@ def sink():
                         assert_eq!(step["path"], call["path"]);
                         assert_eq!(step["range"], call["range"]);
                         assert!(
-                            native.iter().any(|row| row[1] == id),
+                            native.iter().any(|row| blob_id(&row[1], "occ:v2:") == id),
                             "native call ID absent: {id}"
                         );
                         seen.push(id.to_owned());
@@ -4512,8 +4532,8 @@ async fn saved_items_real_index_matrix() {
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
     assert_eq!(
-        index_version, 13,
-        "derived v13 index inspection is separate"
+        index_version, 14,
+        "derived v14 index inspection is separate"
     );
 
     let edited_view_body = serde_json::json!({

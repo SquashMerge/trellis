@@ -337,9 +337,9 @@ function helper() {}
         .unwrap()
         .join("index.db");
     let db = rusqlite::Connection::open(db_path).unwrap();
-    let version_id: String = db
+    let vid: i64 = db
         .query_row(
-            "SELECT m.document_version_id FROM revision_documents m
+            "SELECT m.vid FROM revision_documents m
              JOIN native_revisions r ON r.id=m.revision_id
              JOIN index_metadata current ON current.index_revision=r.published_index_revision
              WHERE m.path='a.js' LIMIT 1",
@@ -350,9 +350,9 @@ function helper() {}
     assert_eq!(
         db.execute(
             "UPDATE native_version_calls SET spelling='sqlInventedCallee'
-             WHERE version_id=?1 AND id=(SELECT id FROM native_version_calls
-             WHERE version_id=?1 AND spelling IS NOT NULL ORDER BY id LIMIT 1)",
-            [&version_id],
+             WHERE vid=?1 AND id=(SELECT id FROM native_version_calls
+             WHERE vid=?1 AND spelling IS NOT NULL ORDER BY id LIMIT 1)",
+            [vid],
         )
         .unwrap(),
         1,
