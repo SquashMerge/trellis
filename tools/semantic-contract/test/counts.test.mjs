@@ -2020,6 +2020,10 @@ async function generatedCorpus(
     duplicateProducer = false,
     omitRole = null,
     noOverloadSignatures = false,
+    // Drop the 20 invocation-family facts and their unsupported assertions.
+    withoutUnsupportedFacts = false,
+    // Declare every native family available, so no document can qualify.
+    allFamiliesAvailable = false,
   } = {},
 ) {
   const doc = {
@@ -2397,7 +2401,7 @@ async function generatedCorpus(
     callFacts.push(fact);
   }
   const unsupportedFacts = [];
-  for (let i = 0; i < 20; i++) {
+  for (let i = 0; i < (withoutUnsupportedFacts ? 0 : 20); i++) {
     const fact = addFact("callBinding", unsupportedSelectors[i], {
       resolution: "unresolved",
       declaredTarget: null,
@@ -2522,6 +2526,7 @@ async function generatedCorpus(
       rows.controls = [];
     },
     mutateSupport: (support) => {
+      if (allFamiliesAvailable) return;
       support.find((x) => x.kind === "invocation").available = false;
       support.find((x) => x.kind === "invocation").diagnostic =
         "invocation unavailable";
@@ -2642,15 +2647,6 @@ test("integrated captured corpus rejects each count below its exact floor", asyn
         id: "COUNT.corpus.scenario-31",
         mutate: (value) => {
           value.annotations[0].scenarios.pop();
-          return value;
-        },
-      },
-      {
-        id: "COUNT.corpus.outcome-unsupported-none",
-        mutate: (value) => {
-          value.dispositions.assertions = value.dispositions.assertions.filter(
-            (x) => x.disposition !== "unsupported",
-          );
           return value;
         },
       },
@@ -2832,35 +2828,45 @@ test("unresolved outcome counts only in a complete-coverage document", async (t)
   for (const control of controls) await runControl(control);
 });
 
-test("one unsupported document satisfies the native-capability floor; none fails", async (t) => {
-  const s = await generatedCorpus(t);
-  const isUnsupported = (x) => x.disposition === "unsupported";
+test("unsupported floor: a declared-unavailable native family plus producer facts qualifies the document", async (t) => {
+  // Twenty unsupported-join assertions in one document count once.
+  const full = await generatedCorpus(t);
+  const unsupported = (s) =>
+    checkCounts(s.loaded, s.records).outcomes.find(
+      (x) => x.disposition === "unsupported",
+    ).count;
+  assert.equal(unsupported(full), 1);
+  // No invocation-family facts and no unsupported assertions: the unavailable
+  // native invocation capability and the document's other producer facts are
+  // enough (Prime's PR #268 repro).
+  const capabilityOnly = await generatedCorpus(t, {
+    withoutUnsupportedFacts: true,
+  });
   assert.equal(
-    s.loaded.dispositions.assertions.filter(isUnsupported).length,
-    20,
+    capabilityOnly.loaded.dispositions.assertions.some(
+      (x) => x.disposition === "unsupported",
+    ),
+    false,
   );
-  // A single declared-unavailable anchor in the document is enough.
-  const one = structuredClone(s.loaded.dispositions);
-  const first = one.assertions.find(isUnsupported);
-  one.assertions = one.assertions.filter(
-    (x) => !isUnsupported(x) || x === first,
-  );
+  assert.equal(unsupported(capabilityOnly), 1);
   assert.equal(
-    checkCounts({ ...s.loaded, dispositions: one }, s.records).outcomes.find(
-      isUnsupported,
-    ).count,
-    1,
+    checkCounts(capabilityOnly.loaded, capabilityOnly.records).floorsEnforced,
+    true,
   );
+  // A document whose native families are all available does not qualify.
+  const allAvailable = await generatedCorpus(t, {
+    withoutUnsupportedFacts: true,
+    allFamiliesAvailable: true,
+  });
   const controls = registerControls([
     {
-      id: "COUNT.corpus.unsupported-document-required",
-      baseline: () => s.loaded.dispositions,
-      mutate: (rows) => {
-        rows.assertions = rows.assertions.filter((x) => !isUnsupported(x));
-        return rows;
+      id: "COUNT.corpus.unsupported-no-qualifying-document",
+      baseline: () => 0,
+      mutate: () => 1,
+      check: (value) => {
+        const s = value === 0 ? capabilityOnly : allAvailable;
+        return checkCounts(s.loaded, s.records);
       },
-      check: (dispositions) =>
-        checkCounts({ ...s.loaded, dispositions }, s.records),
       expectedAssertion: "COUNT.FLOOR",
       expectedCode: "invalidRecord",
       expectedField: "counts",

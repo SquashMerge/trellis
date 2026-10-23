@@ -537,13 +537,6 @@ export function checkCounts(
           "assertions",
           "join conflicts with measured candidate or capability",
         );
-      // Decision 0017 Amendment 1: unsupported is a per-document native
-      // capability, so it counts each document with a declared-unavailable
-      // family and a captured producer fact there, not each anchor.
-      if (status === "unsupported")
-        outcomeKeys
-          .get("unsupported")
-          .add(identity([fact.anchor.document, fact.anchor.revisionId]));
     } else {
       if (
         status !== "exact" ||
@@ -614,6 +607,32 @@ export function checkCounts(
           ]),
         );
     }
+  }
+  // Decision 0017 Amendment 1: unsupported is a per-document native capability.
+  // A document counts once when its native intent declares a measurement family
+  // unavailable and it carries an authenticated captured producer fact; neither
+  // the fact's family nor an authored unsupported-join assertion is required.
+  for (const { fact, annotation } of facts.values()) {
+    if (
+      ![
+        "callBinding",
+        "reference",
+        "declarationBinding",
+        "typeRelationship",
+      ].includes(fact.kind)
+    )
+      continue;
+    const intent = fixture.coverageIntents.find(
+      (x) =>
+        x.producerId === native.producerId &&
+        x.revisionId === annotation.revisionId &&
+        same(x.document, annotation.document),
+    );
+    if (!intent?.measurementSupport.some((x) => !x.available)) continue;
+    proofFor(loaded, records, fact, annotation);
+    outcomeKeys
+      .get("unsupported")
+      .add(identity([annotation.document, annotation.revisionId]));
   }
   const observed = new Set(
     [...exactReferences.values()].flatMap((x) => x.record.roles),
