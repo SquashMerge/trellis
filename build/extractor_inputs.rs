@@ -8,7 +8,6 @@
 /// these modules uses a crate module that is neither listed here nor named in
 /// its explicit non-extraction allowlist.
 ///
-/// - `native_capture`: test-support fixture conversion and source witnesses.
 /// - `native_evidence`: tree-sitter measurement, witnesses, revision headers.
 /// - `native_ids`: canonical JSON, digests and ID minting.
 /// - `indexer*`: graph projection and per-language native kinds.
@@ -24,11 +23,25 @@ pub const EXTRACTION_MODULES: &[&str] = &[
     "src/indexer_python.rs",
     "src/indexer_rust.rs",
     "src/model.rs",
-    "src/native_capture.rs",
     "src/native_evidence.rs",
     "src/native_ids.rs",
     "src/parallel.rs",
 ];
+
+/// Fixture conversion is compiled only for test-support captures. It must not
+/// invalidate release indexes when the adapter changes.
+const TEST_SUPPORT_EXTRACTION_MODULES: &[&str] = &["src/native_capture.rs"];
+
+pub fn extraction_modules(test_support: bool) -> impl Iterator<Item = &'static str> {
+    EXTRACTION_MODULES
+        .iter()
+        .chain(if test_support {
+            TEST_SUPPORT_EXTRACTION_MODULES
+        } else {
+            &[]
+        })
+        .copied()
+}
 
 /// `Cargo.lock` packages whose code runs during extraction and reaches stored
 /// facts: the tree-sitter runtime and grammars, Unicode normalization of
@@ -46,7 +59,7 @@ pub const EXTRACTION_CRATES: &[&str] = &[
 
 /// The build-time producer hash: SHA-256 over a domain tag, each listed module
 /// path and its exact bytes, the selected `Cargo.lock` package lines and the
-/// `test-support` feature flag. `modules` must follow `EXTRACTION_MODULES`.
+/// `test-support` feature flag. `modules` must follow `extraction_modules(test_support)`.
 pub fn extractor_hash(modules: &[(&str, &[u8])], cargo_lock: &str, test_support: bool) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();

@@ -65,18 +65,21 @@ fn read(path: &str) -> Vec<u8> {
 }
 
 fn hash_with(replace: Option<(&str, &[u8])>, lock: &str) -> String {
-    let files: Vec<(&str, Vec<u8>)> = EXTRACTION_MODULES
-        .iter()
+    hash_with_mode(replace, lock, cfg!(feature = "test-support"))
+}
+
+fn hash_with_mode(replace: Option<(&str, &[u8])>, lock: &str, test_support: bool) -> String {
+    let files: Vec<(&str, Vec<u8>)> = extraction_modules(test_support)
         .map(|path| match replace {
-            Some((replaced, bytes)) if replaced == *path => (*path, bytes.to_vec()),
-            _ => (*path, read(path)),
+            Some((replaced, bytes)) if replaced == path => (path, bytes.to_vec()),
+            _ => (path, read(path)),
         })
         .collect();
     let modules: Vec<(&str, &[u8])> = files
         .iter()
         .map(|(path, bytes)| (*path, bytes.as_slice()))
         .collect();
-    extractor_hash(&modules, lock, cfg!(feature = "test-support"))
+    extractor_hash(&modules, lock, test_support)
 }
 
 fn cargo_lock() -> String {
@@ -102,12 +105,6 @@ fn a_listed_module_or_crate_change_changes_the_producer_hash() {
         hash_with(Some(("src/indexer_rust.rs", &edited)), &lock),
         base
     );
-    let mut adapter = read("src/native_capture.rs");
-    adapter.extend_from_slice(b"\n// capture adapter edit\n");
-    assert_ne!(
-        hash_with(Some(("src/native_capture.rs", &adapter)), &lock),
-        base
-    );
     let grammar = lock.replacen(
         "name = \"tree-sitter-java\"\nversion = \"",
         "name = \"tree-sitter-java\"\nversion = \"9",
@@ -123,6 +120,28 @@ fn a_listed_module_or_crate_change_changes_the_producer_hash() {
     );
     assert_ne!(unrelated, lock, "Cargo.lock lists axum");
     assert_eq!(hash_with(None, &unrelated), base);
+}
+
+#[test]
+fn capture_adapter_affects_only_the_test_support_hash() {
+    assert_eq!(
+        extraction_modules(false).collect::<Vec<_>>(),
+        EXTRACTION_MODULES
+    );
+    assert!(!extraction_modules(false).any(|path| path == "src/native_capture.rs"));
+    assert!(extraction_modules(true).any(|path| path == "src/native_capture.rs"));
+    let lock = cargo_lock();
+    let mut adapter = read("src/native_capture.rs");
+    adapter.extend_from_slice(b"\n// capture adapter edit\n");
+    for test_support in [false, true] {
+        let base = hash_with_mode(None, &lock, test_support);
+        let edited = hash_with_mode(
+            Some(("src/native_capture.rs", &adapter)),
+            &lock,
+            test_support,
+        );
+        assert_eq!(base == edited, !test_support);
+    }
 }
 
 /// Rust source with comments, string and char literals blanked out, so
@@ -316,7 +335,7 @@ fn crate_paths(code: &str) -> BTreeSet<String> {
 }
 
 fn listed_module(name: &str) -> bool {
-    EXTRACTION_MODULES.contains(&format!("src/{name}.rs").as_str())
+    extraction_modules(true).any(|path| path == format!("src/{name}.rs"))
 }
 
 /// Crate modules used by non-test code in the listed extraction modules that
@@ -338,7 +357,7 @@ fn unlisted_uses(path: &str, source: &str) -> Vec<String> {
 #[test]
 fn extraction_modules_use_only_listed_modules_or_declared_non_extraction_items() {
     let mut unlisted = Vec::new();
-    for path in EXTRACTION_MODULES {
+    for path in extraction_modules(true) {
         let source = String::from_utf8(read(path)).unwrap();
         unlisted.extend(unlisted_uses(path, &source));
     }
@@ -384,7 +403,7 @@ fn source_parsers_outside_the_list_are_declared_view_time() {
         let code = code_only(&String::from_utf8(read(&path)).unwrap());
         let parses = code.contains("tree_sitter") || code.contains("icu_normalizer");
         if parses
-            && !EXTRACTION_MODULES.contains(&path.as_str())
+            && !extraction_modules(true).any(|listed| listed == path)
             && !VIEW_TIME_PARSERS.iter().any(|(file, _)| *file == path)
         {
             undeclared.push(path);

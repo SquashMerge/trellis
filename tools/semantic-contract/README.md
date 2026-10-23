@@ -119,8 +119,9 @@ uses the compiled `TRELLIS_EXTRACTOR_HASH`, including the `test-support` build f
 not an environment override or the whole executable's SHA. Record that descriptor
 and the pinned Rust toolchain/source provenance with the capture. Do not copy a
 production-build hash onto a test-support build. The hash covers the fixture
-adapter (`src/native_capture.rs`) as well as the production extraction modules,
-so witness/conversion edits change the capture pin. It identifies this
+adapter (`src/native_capture.rs`) as well as the production extraction modules
+only when `test-support` is enabled. Witness/conversion edits change the capture
+pin but do not change the release hash. It identifies this
 test-support capture build, not a release binary. Native extractor-hash pinning
 under Decision 0017 is a proposal in #95's PR body, awaiting owner ruling; it is
 not a ratified identity rule. No real hardware pin or corpus is changed here.
