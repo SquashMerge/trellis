@@ -585,6 +585,24 @@ export function checkCounts(
           "assertions",
           "resolution contradicts captured exact proof",
         );
+      // Decision 0017 Amendment 1: SCIP has no positive unresolved record, so
+      // absence at an exact join is evidence only when coverage is complete.
+      if (
+        expected === "unresolved" &&
+        !records.coverage.some(
+          (row) =>
+            row.producerId === proof.producerId &&
+            row.sourceSetId === fact.anchor.document.sourceSetId &&
+            row.documentPath === fact.anchor.document.path &&
+            row.revisionId === fact.anchor.revisionId &&
+            row.state === "complete",
+        )
+      )
+        fail(
+          "COUNT.DISPOSITION",
+          "assertions",
+          "unresolved outcome requires complete semantic coverage",
+        );
       outcomeKeys
         .get(expected)
         .add(

@@ -2775,6 +2775,63 @@ test("captured Java corpus with no ambiguous outcomes meets its floors", async (
   assert.equal(count.floorsEnforced, true);
 });
 
+test("unresolved outcome counts only in a complete-coverage document", async (t) => {
+  // A measured call with no producer target, captured as unresolved.
+  const unresolvedCall = (fact) => {
+    fact.record.resolution = "unresolved";
+    fact.record.declaredTarget = null;
+    fact.record.candidates = [];
+  };
+  const complete = await specimen(t, {
+    family: "callee",
+    normalized: true,
+    mutateFact: unresolvedCall,
+  });
+  // Same call, but the requested read role is unmeasurable, so the semantic
+  // tuple is partial and absence of a target is not evidence.
+  const partial = await specimen(t, {
+    family: "callee",
+    normalized: true,
+    mutateFact: unresolvedCall,
+    mutateSupport: (support) => {
+      const reference = support.find((x) => x.kind === "reference");
+      reference.available = false;
+      reference.diagnostic = "reference unavailable";
+    },
+    mutateCoverage: (row) =>
+      row.selected
+        ? { ...row, state: "partial", diagnostic: "reference unavailable" }
+        : row,
+  });
+  for (const s of [complete, partial])
+    s.loaded.dispositions.assertions.push({
+      kind: "resolution",
+      factRef: "fact",
+      disposition: "unresolved",
+    });
+  assert.equal(
+    checkCounts(complete.loaded, complete.records).outcomes.find(
+      (x) => x.disposition === "unresolved",
+    ).count,
+    1,
+  );
+  const controls = registerControls([
+    {
+      id: "COUNT.disposition.unresolved-partial-coverage",
+      baseline: () => 0,
+      mutate: () => 1,
+      check: (value) => {
+        const s = value === 0 ? complete : partial;
+        return checkCounts(s.loaded, s.records);
+      },
+      expectedAssertion: "COUNT.DISPOSITION",
+      expectedCode: "invalidRecord",
+      expectedField: "assertions",
+    },
+  ]);
+  for (const control of controls) await runControl(control);
+});
+
 test("one unsupported document satisfies the native-capability floor; none fails", async (t) => {
   const s = await generatedCorpus(t);
   const isUnsupported = (x) => x.disposition === "unsupported";
