@@ -704,6 +704,8 @@ test("real Chromium validates pinned SVG and source note identity under unchange
       container.scrollTop = 24; container.scrollLeft = 35;
       const before = [container.scrollTop, container.scrollLeft];
       toggle.click();
+      // The async toggle restores focus after its render promise resolves.
+      await Promise.resolve();
       for (let i=0; i<50 && container.querySelector('[data-trellis-step-id="group-alpha"] button')?.getAttribute("aria-expanded") !== "true"; i++)
         await new Promise(resolve => setTimeout(resolve, 10));
       const successor = container.querySelector('[data-trellis-step-id="group-alpha"] button');
