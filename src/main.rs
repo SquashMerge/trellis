@@ -998,6 +998,29 @@ async fn run_daemon() -> Result<()> {
     owner.listener().set_nonblocking(true)?;
     let listener = tokio::net::UnixListener::from_std(owner.listener().try_clone()?)?;
     let registry = Arc::new(tokio::sync::Mutex::new(registry::CheckoutRegistry::new()));
+    #[cfg(feature = "test-support")]
+    if let Some(path) = std::env::var_os("TRELLIS_TEST_DAEMON_STARTUP_SOCKET") {
+        registry
+            .lock()
+            .await
+            .set_next_startup_hook_for_tests(Arc::new(move || {
+                use std::io::{Read, Write};
+                let mut stream = std::os::unix::net::UnixStream::connect(&path)
+                    .expect("connect daemon startup fixture");
+                stream
+                    .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(trellis::testing::HANG_BACKSTOP))
+                    .unwrap();
+                stream
+                    .write_all(&[1])
+                    .expect("report daemon startup fixture arrival");
+                stream
+                    .read_exact(&mut [0])
+                    .expect("release daemon startup fixture");
+            }));
+    }
     let browser = Arc::new(tokio::sync::Mutex::new(daemon::BrowserProvisioner::new()));
     let next_session = Arc::new(std::sync::atomic::AtomicU64::new(1));
     let (browser_shutdown, _) = tokio::sync::watch::channel(false);
