@@ -28,7 +28,7 @@ A document-level measured `module` owns top-level occurrences. Records resolve w
 |---|---|---|---|
 | `Producer.id` | `Text` | Stable nonempty producer identity. | Invalid text rejects descriptor. |
 | `.version` | `Text` | Exact captured version. | Missing/invalid rejects descriptor. |
-| `.executableHash` | `Hash` | Digest of captured executable bytes. | Invalid/mismatch rejects descriptor. |
+| `.executableHash` | `Hash` | Digest of the executable bytes, captured in the fixture or attested by the reference hardware profile ([Decision 0017](decisions/0017-conformance-corpus-storage-and-producers.md)). | Invalid/mismatch rejects descriptor. |
 | `.kind` | `native \| semantic` | Native measures syntax; semantic supplies semantic facts. | Other value rejects descriptor. |
 | `.languages` | `Language[]` | Nonempty and unique. | Empty/duplicate rejects descriptor. |
 | `.positionEncoding` | `utf8 \| utf16 \| unicodeScalar` | Producer metadata, never a common-layer assumption. | Unsupported encoding or an unconvertible position rejects the artifact before publication. |
@@ -69,7 +69,7 @@ Coverage is scoped to the complete `(producerId,language,sourceSetId,documentPat
 |---|---|---|---|
 | `SemanticBasis.producerId` | `Text` | Captured semantic producer; self-matches the provenance and producer descriptor. | Missing, malformed, dangling, or self-mismatching value rejects the semantic artifact atomically. A valid captured producer unavailable in the requested comparison is `possiblyStale`. |
 | `.producerVersion` | `Text` | Exact captured version; self-matches the captured producer descriptor. | Missing, invalid, or self-mismatching value rejects the artifact. A valid captured value different from or unavailable in the requested comparison is `possiblyStale`. |
-| `.producerHash` | `Hash` | Digest of the captured executable bytes; self-matches those bytes and the captured producer descriptor. | Missing, malformed, or digest-self-mismatching value rejects the artifact. A valid captured digest different from or unavailable in the requested comparison is `possiblyStale`. |
+| `.producerHash` | `Hash` | Digest of the executable bytes, captured in the fixture or attested by the reference hardware profile ([Decision 0017](decisions/0017-conformance-corpus-storage-and-producers.md)); self-matches those bytes or that attestation and the captured producer descriptor. | Missing, malformed, or digest-self-mismatching value rejects the artifact. A valid captured digest different from or unavailable in the requested comparison is `possiblyStale`. |
 | `.artifactHash` | `Hash` | Digest of declared captured semantic artifact bytes, empty prefix. | Missing, malformed, or digest-self-mismatching value rejects the artifact atomically; it is not a freshness comparison. |
 | `.language` | `Language` | Captured language; self-matches facts and producer. | Missing, malformed, or self-mismatching value rejects the artifact. A valid captured language not available for the requested comparison is `possiblyStale`. |
 | `.sourceSetId` | `Text` | Captured admitted source set; self-matches the facts. | Missing, invalid, dangling, or self-mismatching value rejects the artifact. A valid captured source set unavailable in the requested comparison is `possiblyStale`. |

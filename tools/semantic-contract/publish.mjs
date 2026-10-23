@@ -39,7 +39,7 @@ function inputPaths(fixture) {
     ...fixture.revisions.flatMap((revision) =>
       revision.documents.map((document) => document.sourceFile),
     ),
-    ...fixture.captures.map((capture) => capture.file),
+    ...fixture.captures.flatMap((capture) => capture.file ?? []),
     fixture.nativeArtifact,
     ...fixture.semanticArtifacts,
     ...fixture.annotationFiles,

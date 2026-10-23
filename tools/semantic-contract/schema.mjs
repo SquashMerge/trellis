@@ -418,18 +418,29 @@ export const types = Object.freeze({
     revisionId: "Text",
     producers: array("Producer"),
   }),
-  CaptureFile: object({
-    ref: "Text",
-    kind: enumOf(
-      "executable",
-      "toolchain",
-      "config",
-      "dependency",
-      "semanticArtifact",
-    ),
-    file: "Path",
-    hash: "Hash",
-  }),
+  // Exactly one of file (stored bytes) or pinned (Decision 0017 profile attestation).
+  CaptureFile: {
+    either: [
+      object({
+        ref: "Text",
+        kind: enumOf(
+          "executable",
+          "toolchain",
+          "config",
+          "dependency",
+          "semanticArtifact",
+        ),
+        file: "Path",
+        hash: "Hash",
+      }),
+      object({
+        ref: "Text",
+        kind: enumOf("executable", "toolchain"),
+        pinned: "Text",
+        hash: "Hash",
+      }),
+    ],
+  },
   MeasurementSupport: object({
     kind: enumOf("declarationName", "callee", "invocation", "reference"),
     available: "boolean",
