@@ -16,7 +16,7 @@
     {
       "id": "native",
       "version": "1",
-      "executableHash": "9576f1f3ec87b33d49cc0355ce898f83a815c662eeab185b566a5df0206bb2e0",
+      "executableHash": "2aa11c2830377fff48c38772b597c94d846766e4c26ecbdf22aa07e2b8f619d5",
       "kind": "native",
       "languages": [
         "javascript"
@@ -132,7 +132,7 @@
       {
         "id": "native",
         "version": "1",
-        "executableHash": "9576f1f3ec87b33d49cc0355ce898f83a815c662eeab185b566a5df0206bb2e0",
+        "executableHash": "2aa11c2830377fff48c38772b597c94d846766e4c26ecbdf22aa07e2b8f619d5",
         "kind": "native",
         "languages": [
           "javascript"
@@ -514,7 +514,7 @@
       "ref": "native-executable",
       "kind": "executable",
       "pinned": "docs/semantic-evidence/hardware/mac-mini-m5-pro-v1.json#native-conformance-javascript",
-      "hash": "9576f1f3ec87b33d49cc0355ce898f83a815c662eeab185b566a5df0206bb2e0"
+      "hash": "2aa11c2830377fff48c38772b597c94d846766e4c26ecbdf22aa07e2b8f619d5"
     },
     {
       "ref": "node-toolchain",
@@ -526,7 +526,7 @@
       "ref": "native-script",
       "kind": "executable",
       "file": "capture-native.mjs",
-      "hash": "0ff517d5e639f287241a3ee5f8a660ca079ad2171c5b19e0739de558ab741832"
+      "hash": "f65f3a80880a492b46bdb1bafd0f701d72729071fad861e072188567005b71cd"
     },
     {
       "ref": "tsconfig",

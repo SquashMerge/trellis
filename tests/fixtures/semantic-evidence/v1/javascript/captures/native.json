@@ -17565,10 +17565,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 237,
+        "start": 249,
         "end": 259
       },
-      "spelling": "clean(line).startsWith",
+      "spelling": "startsWith",
       "regionRefs": [],
       "witnesses": [
         {
@@ -17576,10 +17576,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 237,
+              "start": 249,
               "end": 259
             },
-            "text": "clean(line).startsWith"
+            "text": "startsWith"
           }
         }
       ]
@@ -17709,10 +17709,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 677,
+        "start": 689,
         "end": 693
       },
-      "spelling": "this.events.push",
+      "spelling": "push",
       "regionRefs": [],
       "witnesses": [
         {
@@ -17720,10 +17720,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 677,
+              "start": 689,
               "end": 693
             },
-            "text": "this.events.push"
+            "text": "push"
           }
         }
       ]
@@ -17745,10 +17745,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 723,
+        "start": 735,
         "end": 740
       },
-      "spelling": "this.events.slice",
+      "spelling": "slice",
       "regionRefs": [],
       "witnesses": [
         {
@@ -17756,10 +17756,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 723,
+              "start": 735,
               "end": 740
             },
-            "text": "this.events.slice"
+            "text": "slice"
           }
         }
       ]
@@ -17781,10 +17781,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 870,
+        "start": 878,
         "end": 882
       },
-      "spelling": "console.info",
+      "spelling": "info",
       "regionRefs": [],
       "witnesses": [
         {
@@ -17792,10 +17792,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 870,
+              "start": 878,
               "end": 882
             },
-            "text": "console.info"
+            "text": "info"
           }
         }
       ]
@@ -17817,10 +17817,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 919,
+        "start": 927,
         "end": 930
       },
-      "spelling": "console.log",
+      "spelling": "log",
       "regionRefs": [],
       "witnesses": [
         {
@@ -17828,10 +17828,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 919,
+              "start": 927,
               "end": 930
             },
-            "text": "console.log"
+            "text": "log"
           }
         }
       ]
@@ -17889,10 +17889,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 965,
+        "start": 973,
         "end": 977
       },
-      "spelling": "console.info",
+      "spelling": "info",
       "regionRefs": [],
       "witnesses": [
         {
@@ -17900,10 +17900,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 965,
+              "start": 973,
               "end": 977
             },
-            "text": "console.info"
+            "text": "info"
           }
         }
       ]
@@ -17925,10 +17925,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 1025,
+        "start": 1033,
         "end": 1037
       },
-      "spelling": "console.info",
+      "spelling": "info",
       "regionRefs": [],
       "witnesses": [
         {
@@ -17936,10 +17936,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 1025,
+              "start": 1033,
               "end": 1037
             },
-            "text": "console.info"
+            "text": "info"
           }
         }
       ]
@@ -17997,10 +17997,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 1454,
+        "start": 1459,
         "end": 1462
       },
-      "spelling": "Math.min",
+      "spelling": "min",
       "regionRefs": [],
       "witnesses": [
         {
@@ -18008,10 +18008,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 1454,
+              "start": 1459,
               "end": 1462
             },
-            "text": "Math.min"
+            "text": "min"
           }
         }
       ]
@@ -18145,10 +18145,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 1803,
+        "start": 1809,
         "end": 1816
       },
-      "spelling": "codec.accepts",
+      "spelling": "accepts",
       "regionRefs": [
         "r1:src/adapters.js:control:IfStatement:1798:1842"
       ],
@@ -18158,10 +18158,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 1803,
+              "start": 1809,
               "end": 1816
             },
-            "text": "codec.accepts"
+            "text": "accepts"
           }
         }
       ]
@@ -18183,10 +18183,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 1859,
+        "start": 1865,
         "end": 1871
       },
-      "spelling": "codec.decode",
+      "spelling": "decode",
       "regionRefs": [],
       "witnesses": [
         {
@@ -18194,10 +18194,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 1859,
+              "start": 1865,
               "end": 1871
             },
-            "text": "codec.decode"
+            "text": "decode"
           }
         }
       ]
@@ -18219,10 +18219,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 1904,
+        "start": 1910,
         "end": 1916
       },
-      "spelling": "codec.encode",
+      "spelling": "encode",
       "regionRefs": [],
       "witnesses": [
         {
@@ -18230,10 +18230,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 1904,
+              "start": 1910,
               "end": 1916
             },
-            "text": "codec.encode"
+            "text": "encode"
           }
         }
       ]
@@ -18255,10 +18255,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 1933,
+        "start": 1939,
         "end": 1944
       },
-      "spelling": "codec.label",
+      "spelling": "label",
       "regionRefs": [],
       "witnesses": [
         {
@@ -18266,10 +18266,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 1933,
+              "start": 1939,
               "end": 1944
             },
-            "text": "codec.label"
+            "text": "label"
           }
         }
       ]
@@ -18291,10 +18291,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 1956,
+        "start": 1962,
         "end": 1971
       },
-      "spelling": "codec.extension",
+      "spelling": "extension",
       "regionRefs": [],
       "witnesses": [
         {
@@ -18302,10 +18302,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 1956,
+              "start": 1962,
               "end": 1971
             },
-            "text": "codec.extension"
+            "text": "extension"
           }
         }
       ]
@@ -18403,10 +18403,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 2084,
+        "start": 2089,
         "end": 2093
       },
-      "spelling": "sink.open",
+      "spelling": "open",
       "regionRefs": [],
       "witnesses": [
         {
@@ -18414,10 +18414,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 2084,
+              "start": 2089,
               "end": 2093
             },
-            "text": "sink.open"
+            "text": "open"
           }
         }
       ]
@@ -18439,10 +18439,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 2127,
+        "start": 2132,
         "end": 2137
       },
-      "spelling": "sink.write",
+      "spelling": "write",
       "regionRefs": [
         "r1:src/adapters.js:control:ForOfStatement:2099:2145"
       ],
@@ -18452,10 +18452,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 2127,
+              "start": 2132,
               "end": 2137
             },
-            "text": "sink.write"
+            "text": "write"
           }
         }
       ]
@@ -18477,10 +18477,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 2167,
+        "start": 2172,
         "end": 2177
       },
-      "spelling": "sink.flush",
+      "spelling": "flush",
       "regionRefs": [],
       "witnesses": [
         {
@@ -18488,10 +18488,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 2167,
+              "start": 2172,
               "end": 2177
             },
-            "text": "sink.flush"
+            "text": "flush"
           }
         }
       ]
@@ -18513,10 +18513,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 2197,
+        "start": 2202,
         "end": 2207
       },
-      "spelling": "sink.close",
+      "spelling": "close",
       "regionRefs": [],
       "witnesses": [
         {
@@ -18524,10 +18524,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 2197,
+              "start": 2202,
               "end": 2207
             },
-            "text": "sink.close"
+            "text": "close"
           }
         }
       ]
@@ -18549,10 +18549,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 2254,
+        "start": 2259,
         "end": 2267
       },
-      "spelling": "sink.describe",
+      "spelling": "describe",
       "regionRefs": [],
       "witnesses": [
         {
@@ -18560,10 +18560,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 2254,
+              "start": 2259,
               "end": 2267
             },
-            "text": "sink.describe"
+            "text": "describe"
           }
         }
       ]
@@ -18661,10 +18661,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 2420,
+        "start": 2427,
         "end": 2434
       },
-      "spelling": "policy.accepts",
+      "spelling": "accepts",
       "regionRefs": [],
       "witnesses": [
         {
@@ -18672,10 +18672,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 2420,
+              "start": 2427,
               "end": 2434
             },
-            "text": "policy.accepts"
+            "text": "accepts"
           }
         }
       ]
@@ -18697,10 +18697,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 2453,
+        "start": 2460,
         "end": 2465
       },
-      "spelling": "policy.delay",
+      "spelling": "delay",
       "regionRefs": [],
       "witnesses": [
         {
@@ -18708,10 +18708,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 2453,
+              "start": 2460,
               "end": 2465
             },
-            "text": "policy.delay"
+            "text": "delay"
           }
         }
       ]
@@ -18733,10 +18733,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 2490,
+        "start": 2497,
         "end": 2502
       },
-      "spelling": "policy.limit",
+      "spelling": "limit",
       "regionRefs": [],
       "witnesses": [
         {
@@ -18744,10 +18744,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 2490,
+              "start": 2497,
               "end": 2502
             },
-            "text": "policy.limit"
+            "text": "limit"
           }
         }
       ]
@@ -18769,10 +18769,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 2515,
+        "start": 2522,
         "end": 2525
       },
-      "spelling": "policy.key",
+      "spelling": "key",
       "regionRefs": [],
       "witnesses": [
         {
@@ -18780,10 +18780,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 2515,
+              "start": 2522,
               "end": 2525
             },
-            "text": "policy.key"
+            "text": "key"
           }
         }
       ]
@@ -18805,10 +18805,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 2551,
+        "start": 2558,
         "end": 2566
       },
-      "spelling": "policy.describe",
+      "spelling": "describe",
       "regionRefs": [],
       "witnesses": [
         {
@@ -18816,10 +18816,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 2551,
+              "start": 2558,
               "end": 2566
             },
-            "text": "policy.describe"
+            "text": "describe"
           }
         }
       ]
@@ -18949,10 +18949,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 518,
+        "start": 531,
         "end": 540
       },
-      "spelling": "clean(value).normalize",
+      "spelling": "normalize",
       "regionRefs": [],
       "witnesses": [
         {
@@ -18960,10 +18960,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 518,
+              "start": 531,
               "end": 540
             },
-            "text": "clean(value).normalize"
+            "text": "normalize"
           }
         }
       ]
@@ -19021,10 +19021,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 656,
+        "start": 663,
         "end": 666
       },
-      "spelling": "values.map",
+      "spelling": "map",
       "regionRefs": [],
       "witnesses": [
         {
@@ -19032,10 +19032,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 656,
+              "start": 663,
               "end": 666
             },
-            "text": "values.map"
+            "text": "map"
           }
         }
       ]
@@ -19057,10 +19057,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 225,
+        "start": 240,
         "end": 247
       },
-      "spelling": "batch.children.flatMap",
+      "spelling": "flatMap",
       "regionRefs": [],
       "witnesses": [
         {
@@ -19068,10 +19068,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 225,
+              "start": 240,
               "end": 247
             },
-            "text": "batch.children.flatMap"
+            "text": "flatMap"
           }
         }
       ]
@@ -19093,10 +19093,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 352,
+        "start": 357,
         "end": 367
       },
-      "spelling": "text.charCodeAt",
+      "spelling": "charCodeAt",
       "regionRefs": [],
       "witnesses": [
         {
@@ -19104,10 +19104,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 352,
+              "start": 357,
               "end": 367
             },
-            "text": "text.charCodeAt"
+            "text": "charCodeAt"
           }
         }
       ]
@@ -19461,10 +19461,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 1194,
+        "start": 1207,
         "end": 1210
       },
-      "spelling": "this.entries.set",
+      "spelling": "set",
       "regionRefs": [],
       "witnesses": [
         {
@@ -19472,10 +19472,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 1194,
+              "start": 1207,
               "end": 1210
             },
-            "text": "this.entries.set"
+            "text": "set"
           }
         }
       ]
@@ -19533,10 +19533,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 1282,
+        "start": 1295,
         "end": 1298
       },
-      "spelling": "this.entries.get",
+      "spelling": "get",
       "regionRefs": [],
       "witnesses": [
         {
@@ -19544,10 +19544,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 1282,
+              "start": 1295,
               "end": 1298
             },
-            "text": "this.entries.get"
+            "text": "get"
           }
         }
       ]
@@ -19605,10 +19605,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 1339,
+        "start": 1352,
         "end": 1358
       },
-      "spelling": "this.parent?.lookup",
+      "spelling": "lookup",
       "regionRefs": [],
       "witnesses": [
         {
@@ -19616,10 +19616,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 1339,
+              "start": 1352,
               "end": 1358
             },
-            "text": "this.parent?.lookup"
+            "text": "lookup"
           }
         }
       ]
@@ -19641,10 +19641,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 1395,
+        "start": 1401,
         "end": 1405
       },
-      "spelling": "Array.from",
+      "spelling": "from",
       "regionRefs": [],
       "witnesses": [
         {
@@ -19652,10 +19652,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 1395,
+              "start": 1401,
               "end": 1405
             },
-            "text": "Array.from"
+            "text": "from"
           }
         }
       ]
@@ -19677,10 +19677,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 1395,
+        "start": 1429,
         "end": 1432
       },
-      "spelling": "Array.from(this.entries.values()).map",
+      "spelling": "map",
       "regionRefs": [],
       "witnesses": [
         {
@@ -19688,10 +19688,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 1395,
+              "start": 1429,
               "end": 1432
             },
-            "text": "Array.from(this.entries.values()).map"
+            "text": "map"
           }
         }
       ]
@@ -19713,10 +19713,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 1395,
+        "start": 1443,
         "end": 1447
       },
-      "spelling": "Array.from(this.entries.values()).map(describe).join",
+      "spelling": "join",
       "regionRefs": [],
       "witnesses": [
         {
@@ -19724,10 +19724,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 1395,
+              "start": 1443,
               "end": 1447
             },
-            "text": "Array.from(this.entries.values()).map(describe).join"
+            "text": "join"
           }
         }
       ]
@@ -19749,10 +19749,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 1406,
+        "start": 1419,
         "end": 1425
       },
-      "spelling": "this.entries.values",
+      "spelling": "values",
       "regionRefs": [],
       "witnesses": [
         {
@@ -19760,10 +19760,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 1406,
+              "start": 1419,
               "end": 1425
             },
-            "text": "this.entries.values"
+            "text": "values"
           }
         }
       ]
@@ -19785,10 +19785,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 241,
+        "start": 253,
         "end": 257
       },
-      "spelling": "this.buffer.push",
+      "spelling": "push",
       "regionRefs": [],
       "witnesses": [
         {
@@ -19796,10 +19796,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 241,
+              "start": 253,
               "end": 257
             },
-            "text": "this.buffer.push"
+            "text": "push"
           }
         }
       ]
@@ -19857,10 +19857,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 343,
+        "start": 355,
         "end": 361
       },
-      "spelling": "this.buffer.splice",
+      "spelling": "splice",
       "regionRefs": [],
       "witnesses": [
         {
@@ -19868,10 +19868,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 343,
+              "start": 355,
               "end": 361
             },
-            "text": "this.buffer.splice"
+            "text": "splice"
           }
         }
       ]
@@ -19893,10 +19893,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 416,
+        "start": 429,
         "end": 433
       },
-      "spelling": "LegacySource.call",
+      "spelling": "call",
       "regionRefs": [],
       "witnesses": [
         {
@@ -19904,10 +19904,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 416,
+              "start": 429,
               "end": 433
             },
-            "text": "LegacySource.call"
+            "text": "call"
           }
         }
       ]
@@ -19929,10 +19929,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 494,
+        "start": 501,
         "end": 507
       },
-      "spelling": "Object.create",
+      "spelling": "create",
       "regionRefs": [],
       "witnesses": [
         {
@@ -19940,10 +19940,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 494,
+              "start": 501,
               "end": 507
             },
-            "text": "Object.create"
+            "text": "create"
           }
         }
       ]
@@ -19965,10 +19965,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 636,
+        "start": 666,
         "end": 670
       },
-      "spelling": "LegacySource.prototype.append.call",
+      "spelling": "call",
       "regionRefs": [],
       "witnesses": [
         {
@@ -19976,10 +19976,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 636,
+              "start": 666,
               "end": 670
             },
-            "text": "LegacySource.prototype.append.call"
+            "text": "call"
           }
         }
       ]
@@ -20037,10 +20037,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 801,
+        "start": 807,
         "end": 814
       },
-      "spelling": "lines.forEach",
+      "spelling": "forEach",
       "regionRefs": [],
       "witnesses": [
         {
@@ -20048,10 +20048,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 801,
+              "start": 807,
               "end": 814
             },
-            "text": "lines.forEach"
+            "text": "forEach"
           }
         }
       ]
@@ -20073,10 +20073,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 825,
+        "start": 832,
         "end": 838
       },
-      "spelling": "source.append",
+      "spelling": "append",
       "regionRefs": [],
       "witnesses": [
         {
@@ -20084,10 +20084,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 825,
+              "start": 832,
               "end": 838
             },
-            "text": "source.append"
+            "text": "append"
           }
         }
       ]
@@ -20109,10 +20109,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 856,
+        "start": 863,
         "end": 868
       },
-      "spelling": "source.drain",
+      "spelling": "drain",
       "regionRefs": [],
       "witnesses": [
         {
@@ -20120,10 +20120,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 856,
+              "start": 863,
               "end": 868
             },
-            "text": "source.drain"
+            "text": "drain"
           }
         }
       ]
@@ -20181,10 +20181,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 654,
+        "start": 660,
         "end": 663
       },
-      "spelling": "stage.run",
+      "spelling": "run",
       "regionRefs": [
         "r1:src/pipeline.js:control:ForOfStatement:567:677"
       ],
@@ -20194,10 +20194,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 654,
+              "start": 660,
               "end": 663
             },
-            "text": "stage.run"
+            "text": "run"
           }
         }
       ]
@@ -20219,10 +20219,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 751,
+        "start": 763,
         "end": 766
       },
-      "spelling": "this.stages.map",
+      "spelling": "map",
       "regionRefs": [],
       "witnesses": [
         {
@@ -20230,10 +20230,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 751,
+              "start": 763,
               "end": 766
             },
-            "text": "this.stages.map"
+            "text": "map"
           }
         }
       ]
@@ -20255,10 +20255,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 778,
+        "start": 784,
         "end": 792
       },
-      "spelling": "stage.describe",
+      "spelling": "describe",
       "regionRefs": [],
       "witnesses": [
         {
@@ -20266,10 +20266,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 778,
+              "start": 784,
               "end": 792
             },
-            "text": "stage.describe"
+            "text": "describe"
           }
         }
       ]
@@ -20291,10 +20291,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 920,
+        "start": 925,
         "end": 928
       },
-      "spelling": "this.run",
+      "spelling": "run",
       "regionRefs": [
         "r1:src/pipeline.js:control:ForOfStatement:858:1173",
         "r1:src/pipeline.js:control:TryStatement:892:1167"
@@ -20305,10 +20305,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 920,
+              "start": 925,
               "end": 928
             },
-            "text": "this.run"
+            "text": "run"
           }
         }
       ]
@@ -20330,10 +20330,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 981,
+        "start": 988,
         "end": 992
       },
-      "spelling": "output.push",
+      "spelling": "push",
       "regionRefs": [
         "r1:src/pipeline.js:control:ForOfStatement:858:1173",
         "r1:src/pipeline.js:control:TryStatement:892:1167",
@@ -20345,10 +20345,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 981,
+              "start": 988,
               "end": 992
             },
-            "text": "output.push"
+            "text": "push"
           }
         }
       ]
@@ -20370,10 +20370,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 1011,
+        "start": 1020,
         "end": 1028
       },
-      "spelling": "observer.accepted",
+      "spelling": "accepted",
       "regionRefs": [
         "r1:src/pipeline.js:control:ForOfStatement:858:1173",
         "r1:src/pipeline.js:control:TryStatement:892:1167",
@@ -20385,10 +20385,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 1011,
+              "start": 1020,
               "end": 1028
             },
-            "text": "observer.accepted"
+            "text": "accepted"
           }
         }
       ]
@@ -20410,10 +20410,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 1064,
+        "start": 1073,
         "end": 1080
       },
-      "spelling": "observer.skipped",
+      "spelling": "skipped",
       "regionRefs": [
         "r1:src/pipeline.js:control:ForOfStatement:858:1173",
         "r1:src/pipeline.js:control:TryStatement:892:1167",
@@ -20425,10 +20425,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 1064,
+              "start": 1073,
               "end": 1080
             },
-            "text": "observer.skipped"
+            "text": "skipped"
           }
         }
       ]
@@ -20450,10 +20450,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 1130,
+        "start": 1139,
         "end": 1145
       },
-      "spelling": "observer.failed",
+      "spelling": "failed",
       "regionRefs": [
         "r1:src/pipeline.js:control:ForOfStatement:858:1173",
         "r1:src/pipeline.js:control:TryStatement:892:1167",
@@ -20465,10 +20465,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 1130,
+              "start": 1139,
               "end": 1145
             },
-            "text": "observer.failed"
+            "text": "failed"
           }
         }
       ]
@@ -20490,10 +20490,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 1178,
+        "start": 1187,
         "end": 1195
       },
-      "spelling": "observer.finished",
+      "spelling": "finished",
       "regionRefs": [],
       "witnesses": [
         {
@@ -20501,10 +20501,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 1178,
+              "start": 1187,
               "end": 1195
             },
-            "text": "observer.finished"
+            "text": "finished"
           }
         }
       ]
@@ -20562,10 +20562,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 1333,
+        "start": 1341,
         "end": 1348
       },
-      "spelling": "Promise.resolve",
+      "spelling": "resolve",
       "regionRefs": [],
       "witnesses": [
         {
@@ -20573,10 +20573,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 1333,
+              "start": 1341,
               "end": 1348
             },
-            "text": "Promise.resolve"
+            "text": "resolve"
           }
         }
       ]
@@ -20598,10 +20598,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 1333,
+        "start": 1356,
         "end": 1360
       },
-      "spelling": "Promise.resolve(lines).then",
+      "spelling": "then",
       "regionRefs": [],
       "witnesses": [
         {
@@ -20609,10 +20609,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 1333,
+              "start": 1356,
               "end": 1360
             },
-            "text": "Promise.resolve(lines).then"
+            "text": "then"
           }
         }
       ]
@@ -20634,10 +20634,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 1393,
+        "start": 1399,
         "end": 1402
       },
-      "spelling": "batch.map",
+      "spelling": "map",
       "regionRefs": [],
       "witnesses": [
         {
@@ -20645,10 +20645,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 1393,
+              "start": 1399,
               "end": 1402
             },
-            "text": "batch.map"
+            "text": "map"
           }
         }
       ]
@@ -20670,10 +20670,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 1413,
+        "start": 1422,
         "end": 1425
       },
-      "spelling": "pipeline.run",
+      "spelling": "run",
       "regionRefs": [],
       "witnesses": [
         {
@@ -20681,10 +20681,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 1413,
+              "start": 1422,
               "end": 1425
             },
-            "text": "pipeline.run"
+            "text": "run"
           }
         }
       ]
@@ -20742,10 +20742,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 1554,
+        "start": 1560,
         "end": 1567
       },
-      "spelling": "value.replace",
+      "spelling": "replace",
       "regionRefs": [],
       "witnesses": [
         {
@@ -20753,10 +20753,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 1554,
+              "start": 1560,
               "end": 1567
             },
-            "text": "value.replace"
+            "text": "replace"
           }
         }
       ]
@@ -20850,10 +20850,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 147,
+        "start": 152,
         "end": 159
       },
-      "spelling": "host.connect",
+      "spelling": "connect",
       "regionRefs": [],
       "witnesses": [
         {
@@ -20861,10 +20861,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 147,
+              "start": 152,
               "end": 159
             },
-            "text": "host.connect"
+            "text": "connect"
           }
         }
       ]
@@ -20886,10 +20886,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 182,
+        "start": 190,
         "end": 202
       },
-      "spelling": "session.authenticate",
+      "spelling": "authenticate",
       "regionRefs": [],
       "witnesses": [
         {
@@ -20897,10 +20897,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 182,
+              "start": 190,
               "end": 202
             },
-            "text": "session.authenticate"
+            "text": "authenticate"
           }
         }
       ]
@@ -20922,10 +20922,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 228,
+        "start": 236,
         "end": 245
       },
-      "spelling": "session.subscribe",
+      "spelling": "subscribe",
       "regionRefs": [],
       "witnesses": [
         {
@@ -20933,10 +20933,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 228,
+              "start": 236,
               "end": 245
             },
-            "text": "session.subscribe"
+            "text": "subscribe"
           }
         }
       ]
@@ -20958,10 +20958,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 357,
+        "start": 367,
         "end": 373
       },
-      "spelling": "extension.decode",
+      "spelling": "decode",
       "regionRefs": [],
       "witnesses": [
         {
@@ -20969,10 +20969,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 357,
+              "start": 367,
               "end": 373
             },
-            "text": "extension.decode"
+            "text": "decode"
           }
         }
       ]
@@ -20994,10 +20994,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 402,
+        "start": 412,
         "end": 420
       },
-      "spelling": "extension.validate",
+      "spelling": "validate",
       "regionRefs": [],
       "witnesses": [
         {
@@ -21005,10 +21005,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 402,
+              "start": 412,
               "end": 420
             },
-            "text": "extension.validate"
+            "text": "validate"
           }
         }
       ]
@@ -21030,10 +21030,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 447,
+        "start": 457,
         "end": 463
       },
-      "spelling": "extension.enrich",
+      "spelling": "enrich",
       "regionRefs": [],
       "witnesses": [
         {
@@ -21041,10 +21041,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 447,
+              "start": 457,
               "end": 463
             },
-            "text": "extension.enrich"
+            "text": "enrich"
           }
         }
       ]
@@ -21066,10 +21066,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 476,
+        "start": 484,
         "end": 495
       },
-      "spelling": "session.acknowledge",
+      "spelling": "acknowledge",
       "regionRefs": [],
       "witnesses": [
         {
@@ -21077,10 +21077,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 476,
+              "start": 484,
               "end": 495
             },
-            "text": "session.acknowledge"
+            "text": "acknowledge"
           }
         }
       ]
@@ -21102,10 +21102,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 595,
+        "start": 605,
         "end": 611
       },
-      "spelling": "extension.encode",
+      "spelling": "encode",
       "regionRefs": [],
       "witnesses": [
         {
@@ -21113,10 +21113,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 595,
+              "start": 605,
               "end": 611
             },
-            "text": "extension.encode"
+            "text": "encode"
           }
         }
       ]
@@ -21138,10 +21138,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 622,
+        "start": 630,
         "end": 634
       },
-      "spelling": "session.send",
+      "spelling": "send",
       "regionRefs": [],
       "witnesses": [
         {
@@ -21149,10 +21149,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 622,
+              "start": 630,
               "end": 634
             },
-            "text": "session.send"
+            "text": "send"
           }
         }
       ]
@@ -21174,10 +21174,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 646,
+        "start": 654,
         "end": 664
       },
-      "spelling": "session.checkpoint",
+      "spelling": "checkpoint",
       "regionRefs": [],
       "witnesses": [
         {
@@ -21185,10 +21185,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 646,
+              "start": 654,
               "end": 664
             },
-            "text": "session.checkpoint"
+            "text": "checkpoint"
           }
         }
       ]
@@ -21210,10 +21210,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 748,
+        "start": 758,
         "end": 763
       },
-      "spelling": "extension.flush",
+      "spelling": "flush",
       "regionRefs": [],
       "witnesses": [
         {
@@ -21221,10 +21221,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 748,
+              "start": 758,
               "end": 763
             },
-            "text": "extension.flush"
+            "text": "flush"
           }
         }
       ]
@@ -21246,10 +21246,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 769,
+        "start": 777,
         "end": 788
       },
-      "spelling": "session.unsubscribe",
+      "spelling": "unsubscribe",
       "regionRefs": [],
       "witnesses": [
         {
@@ -21257,10 +21257,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 769,
+              "start": 777,
               "end": 788
             },
-            "text": "session.unsubscribe"
+            "text": "unsubscribe"
           }
         }
       ]
@@ -21282,10 +21282,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 794,
+        "start": 802,
         "end": 807
       },
-      "spelling": "session.close",
+      "spelling": "close",
       "regionRefs": [],
       "witnesses": [
         {
@@ -21293,10 +21293,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 794,
+              "start": 802,
               "end": 807
             },
-            "text": "session.close"
+            "text": "close"
           }
         }
       ]
@@ -21318,10 +21318,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 876,
+        "start": 885,
         "end": 893
       },
-      "spelling": "registry.register",
+      "spelling": "register",
       "regionRefs": [],
       "witnesses": [
         {
@@ -21329,10 +21329,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 876,
+              "start": 885,
               "end": 893
             },
-            "text": "registry.register"
+            "text": "register"
           }
         }
       ]
@@ -21390,10 +21390,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 947,
+        "start": 954,
         "end": 964
       },
-      "spelling": "plugin.initialize",
+      "spelling": "initialize",
       "regionRefs": [],
       "witnesses": [
         {
@@ -21401,10 +21401,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 947,
+              "start": 954,
               "end": 964
             },
-            "text": "plugin.initialize"
+            "text": "initialize"
           }
         }
       ]
@@ -21426,10 +21426,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 1071,
+        "start": 1080,
         "end": 1086
       },
-      "spelling": "registry.lookup",
+      "spelling": "lookup",
       "regionRefs": [],
       "witnesses": [
         {
@@ -21437,10 +21437,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 1071,
+              "start": 1080,
               "end": 1086
             },
-            "text": "registry.lookup"
+            "text": "lookup"
           }
         }
       ]
@@ -21482,10 +21482,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 1183,
+        "start": 1190,
         "end": 1197
       },
-      "spelling": "plugin.dispose",
+      "spelling": "dispose",
       "regionRefs": [],
       "witnesses": [
         {
@@ -21493,10 +21493,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 1183,
+              "start": 1190,
               "end": 1197
             },
-            "text": "plugin.dispose"
+            "text": "dispose"
           }
         }
       ]
@@ -21518,10 +21518,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 1203,
+        "start": 1212,
         "end": 1222
       },
-      "spelling": "registry.unregister",
+      "spelling": "unregister",
       "regionRefs": [],
       "witnesses": [
         {
@@ -21529,10 +21529,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 1203,
+              "start": 1212,
               "end": 1222
             },
-            "text": "registry.unregister"
+            "text": "unregister"
           }
         }
       ]
@@ -21590,10 +21590,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 1383,
+        "start": 1391,
         "end": 1395
       },
-      "spelling": "session.poll",
+      "spelling": "poll",
       "regionRefs": [
         "r1:src/plugins.js:control:TryStatement:1350:1668"
       ],
@@ -21603,10 +21603,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 1383,
+              "start": 1391,
               "end": 1395
             },
-            "text": "session.poll"
+            "text": "poll"
           }
         }
       ]
@@ -21745,10 +21745,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 1595,
+        "start": 1600,
         "end": 1606
       },
-      "spelling": "host.report",
+      "spelling": "report",
       "regionRefs": [
         "r1:src/plugins.js:control:TryStatement:1350:1668",
         "r1:src/plugins.js:control:CatchClause:1575:1618"
@@ -21759,10 +21759,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 1595,
+              "start": 1600,
               "end": 1606
             },
-            "text": "host.report"
+            "text": "report"
           }
         }
       ]
@@ -21823,10 +21823,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 248,
+        "start": 253,
         "end": 260
       },
-      "spelling": "this.accepts",
+      "spelling": "accepts",
       "regionRefs": [
         "r1:src/stages.js:control:ConditionalExpression:248:303"
       ],
@@ -21836,10 +21836,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 248,
+              "start": 253,
               "end": 260
             },
-            "text": "this.accepts"
+            "text": "accepts"
           }
         }
       ]
@@ -21861,10 +21861,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 270,
+        "start": 275,
         "end": 284
       },
-      "spelling": "this.transform",
+      "spelling": "transform",
       "regionRefs": [
         "r1:src/stages.js:control:ConditionalExpression:248:303"
       ],
@@ -21874,10 +21874,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 270,
+              "start": 275,
               "end": 284
             },
-            "text": "this.transform"
+            "text": "transform"
           }
         }
       ]
@@ -22337,10 +22337,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 1724,
+        "start": 1730,
         "end": 1737
       },
-      "spelling": "stage.accepts",
+      "spelling": "accepts",
       "regionRefs": [
         "r1:src/stages.js:control:IfStatement:1719:1763"
       ],
@@ -22350,10 +22350,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 1724,
+              "start": 1730,
               "end": 1737
             },
-            "text": "stage.accepts"
+            "text": "accepts"
           }
         }
       ]
@@ -22375,10 +22375,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 1781,
+        "start": 1787,
         "end": 1796
       },
-      "spelling": "stage.transform",
+      "spelling": "transform",
       "regionRefs": [],
       "witnesses": [
         {
@@ -22386,10 +22386,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 1781,
+              "start": 1787,
               "end": 1796
             },
-            "text": "stage.transform"
+            "text": "transform"
           }
         }
       ]
@@ -22411,10 +22411,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 1823,
+        "start": 1829,
         "end": 1837
       },
-      "spelling": "stage.describe",
+      "spelling": "describe",
       "regionRefs": [],
       "witnesses": [
         {
@@ -22422,10 +22422,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 1823,
+              "start": 1829,
               "end": 1837
             },
-            "text": "stage.describe"
+            "text": "describe"
           }
         }
       ]
@@ -22523,10 +22523,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 1984,
+        "start": 1990,
         "end": 1997
       },
-      "spelling": "stage.accepts",
+      "spelling": "accepts",
       "regionRefs": [],
       "witnesses": [
         {
@@ -22534,10 +22534,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 1984,
+              "start": 1990,
               "end": 1997
             },
-            "text": "stage.accepts"
+            "text": "accepts"
           }
         }
       ]
@@ -22559,10 +22559,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 2019,
+        "start": 2025,
         "end": 2033
       },
-      "spelling": "stage.describe",
+      "spelling": "describe",
       "regionRefs": [],
       "witnesses": [
         {
@@ -22570,10 +22570,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 2019,
+              "start": 2025,
               "end": 2033
             },
-            "text": "stage.describe"
+            "text": "describe"
           }
         }
       ]
@@ -22631,10 +22631,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 108,
+        "start": 128,
         "end": 132
       },
-      "spelling": "String(value ?? \"\").trim",
+      "spelling": "trim",
       "regionRefs": [],
       "witnesses": [
         {
@@ -22642,10 +22642,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 108,
+              "start": 128,
               "end": 132
             },
-            "text": "String(value ?? \"\").trim"
+            "text": "trim"
           }
         }
       ]
@@ -22703,10 +22703,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 186,
+        "start": 199,
         "end": 210
       },
-      "spelling": "clean(value).toLowerCase",
+      "spelling": "toLowerCase",
       "regionRefs": [],
       "witnesses": [
         {
@@ -22714,10 +22714,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 186,
+              "start": 199,
               "end": 210
             },
-            "text": "clean(value).toLowerCase"
+            "text": "toLowerCase"
           }
         }
       ]
@@ -22739,10 +22739,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 186,
+        "start": 213,
         "end": 223
       },
-      "spelling": "clean(value).toLowerCase().replaceAll",
+      "spelling": "replaceAll",
       "regionRefs": [],
       "witnesses": [
         {
@@ -22750,10 +22750,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 186,
+              "start": 213,
               "end": 223
             },
-            "text": "clean(value).toLowerCase().replaceAll"
+            "text": "replaceAll"
           }
         }
       ]
@@ -22775,10 +22775,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 288,
+        "start": 293,
         "end": 298
       },
-      "spelling": "JSON.parse",
+      "spelling": "parse",
       "regionRefs": [],
       "witnesses": [
         {
@@ -22786,10 +22786,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 288,
+              "start": 293,
               "end": 298
             },
-            "text": "JSON.parse"
+            "text": "parse"
           }
         }
       ]
@@ -22919,10 +22919,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 538,
+        "start": 543,
         "end": 546
       },
-      "spelling": "Date.now",
+      "spelling": "now",
       "regionRefs": [],
       "witnesses": [
         {
@@ -22930,10 +22930,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 538,
+              "start": 543,
               "end": 546
             },
-            "text": "Date.now"
+            "text": "now"
           }
         }
       ]
@@ -22955,10 +22955,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 701,
+        "start": 706,
         "end": 715
       },
-      "spelling": "JSON.stringify",
+      "spelling": "stringify",
       "regionRefs": [],
       "witnesses": [
         {
@@ -22966,10 +22966,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 701,
+              "start": 706,
               "end": 715
             },
-            "text": "JSON.stringify"
+            "text": "stringify"
           }
         }
       ]
@@ -23099,10 +23099,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 866,
+        "start": 898,
         "end": 907
       },
-      "spelling": "clean(event.label ?? event.key).normalize",
+      "spelling": "normalize",
       "regionRefs": [],
       "witnesses": [
         {
@@ -23110,10 +23110,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 866,
+              "start": 898,
               "end": 907
             },
-            "text": "clean(event.label ?? event.key).normalize"
+            "text": "normalize"
           }
         }
       ]
@@ -23171,10 +23171,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 961,
+        "start": 973,
         "end": 984
       },
-      "spelling": "café(event).toUpperCase",
+      "spelling": "toUpperCase",
       "regionRefs": [],
       "witnesses": [
         {
@@ -23182,10 +23182,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 961,
+              "start": 973,
               "end": 984
             },
-            "text": "café(event).toUpperCase"
+            "text": "toUpperCase"
           }
         }
       ]
@@ -23207,10 +23207,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 1044,
+        "start": 1051,
         "end": 1054
       },
-      "spelling": "events.map",
+      "spelling": "map",
       "regionRefs": [],
       "witnesses": [
         {
@@ -23218,10 +23218,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 1044,
+              "start": 1051,
               "end": 1054
             },
-            "text": "events.map"
+            "text": "map"
           }
         }
       ]
@@ -23243,10 +23243,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 1044,
+        "start": 1065,
         "end": 1069
       },
-      "spelling": "events.map(describe).join",
+      "spelling": "join",
       "regionRefs": [],
       "witnesses": [
         {
@@ -23254,10 +23254,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 1044,
+              "start": 1065,
               "end": 1069
             },
-            "text": "events.map(describe).join"
+            "text": "join"
           }
         }
       ]
@@ -23315,10 +23315,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 616,
+        "start": 622,
         "end": 625
       },
-      "spelling": "lines.map",
+      "spelling": "map",
       "regionRefs": [],
       "witnesses": [
         {
@@ -23326,10 +23326,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 616,
+              "start": 622,
               "end": 625
             },
-            "text": "lines.map"
+            "text": "map"
           }
         }
       ]
@@ -23351,10 +23351,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 616,
+        "start": 656,
         "end": 662
       },
-      "spelling": "lines.map((line) => pipeline.run(line)).filter",
+      "spelling": "filter",
       "regionRefs": [],
       "witnesses": [
         {
@@ -23362,10 +23362,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 616,
+              "start": 656,
               "end": 662
             },
-            "text": "lines.map((line) => pipeline.run(line)).filter"
+            "text": "filter"
           }
         }
       ]
@@ -23387,10 +23387,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 636,
+        "start": 645,
         "end": 648
       },
-      "spelling": "pipeline.run",
+      "spelling": "run",
       "regionRefs": [],
       "witnesses": [
         {
@@ -23398,10 +23398,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 636,
+              "start": 645,
               "end": 648
             },
-            "text": "pipeline.run"
+            "text": "run"
           }
         }
       ]
@@ -23639,10 +23639,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 1004,
+        "start": 1009,
         "end": 1017
       },
-      "spelling": "text.describe",
+      "spelling": "describe",
       "regionRefs": [],
       "witnesses": [
         {
@@ -23650,10 +23650,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 1004,
+              "start": 1009,
               "end": 1017
             },
-            "text": "text.describe"
+            "text": "describe"
           }
         }
       ]
@@ -23711,10 +23711,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 1161,
+        "start": 1167,
         "end": 1170
       },
-      "spelling": "lines.map",
+      "spelling": "map",
       "regionRefs": [],
       "witnesses": [
         {
@@ -23722,10 +23722,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 1161,
+              "start": 1167,
               "end": 1170
             },
-            "text": "lines.map"
+            "text": "map"
           }
         }
       ]
@@ -23747,10 +23747,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 1161,
+        "start": 1202,
         "end": 1208
       },
-      "spelling": "lines.map((line) => convert(json, line)).filter",
+      "spelling": "filter",
       "regionRefs": [],
       "witnesses": [
         {
@@ -23758,10 +23758,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 1161,
+              "start": 1202,
               "end": 1208
             },
-            "text": "lines.map((line) => convert(json, line)).filter"
+            "text": "filter"
           }
         }
       ]
@@ -23783,10 +23783,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 1161,
+        "start": 1218,
         "end": 1221
       },
-      "spelling": "lines.map((line) => convert(json, line)).filter(Boolean).map",
+      "spelling": "map",
       "regionRefs": [],
       "witnesses": [
         {
@@ -23794,10 +23794,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 1161,
+              "start": 1218,
               "end": 1221
             },
-            "text": "lines.map((line) => convert(json, line)).filter(Boolean).map"
+            "text": "map"
           }
         }
       ]
@@ -23855,10 +23855,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 1285,
+        "start": 1293,
         "end": 1299
       },
-      "spelling": "history.record",
+      "spelling": "record",
       "regionRefs": [
         "r1:src/workbench.js:control:ForOfStatement:1251:1404"
       ],
@@ -23868,10 +23868,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 1285,
+              "start": 1293,
               "end": 1299
             },
-            "text": "history.record"
+            "text": "record"
           }
         }
       ]
@@ -24006,10 +24006,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 1476,
+        "start": 1484,
         "end": 1492
       },
-      "spelling": "history.describe",
+      "spelling": "describe",
       "regionRefs": [],
       "witnesses": [
         {
@@ -24017,10 +24017,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 1476,
+              "start": 1484,
               "end": 1492
             },
-            "text": "history.describe"
+            "text": "describe"
           }
         }
       ]
@@ -24150,10 +24150,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 1856,
+        "start": 1863,
         "end": 1866
       },
-      "spelling": "events.map",
+      "spelling": "map",
       "regionRefs": [],
       "witnesses": [
         {
@@ -24161,10 +24161,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 1856,
+              "start": 1863,
               "end": 1866
             },
-            "text": "events.map"
+            "text": "map"
           }
         }
       ]
@@ -24294,10 +24294,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 2061,
+        "start": 2066,
         "end": 2074
       },
-      "spelling": "text.describe",
+      "spelling": "describe",
       "regionRefs": [],
       "witnesses": [
         {
@@ -24305,10 +24305,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 2061,
+              "start": 2066,
               "end": 2074
             },
-            "text": "text.describe"
+            "text": "describe"
           }
         }
       ]
@@ -24366,10 +24366,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 2406,
+        "start": 2413,
         "end": 2419
       },
-      "spelling": "editor.commit",
+      "spelling": "commit",
       "regionRefs": [],
       "witnesses": [
         {
@@ -24377,10 +24377,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 2406,
+              "start": 2413,
               "end": 2419
             },
-            "text": "editor.commit"
+            "text": "commit"
           }
         }
       ]
@@ -24402,10 +24402,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 2490,
+        "start": 2495,
         "end": 2500
       },
-      "spelling": "host.watch",
+      "spelling": "watch",
       "regionRefs": [],
       "witnesses": [
         {
@@ -24413,10 +24413,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 2490,
+              "start": 2495,
               "end": 2500
             },
-            "text": "host.watch"
+            "text": "watch"
           }
         }
       ]
@@ -24438,10 +24438,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 2512,
+        "start": 2517,
         "end": 2523
       },
-      "spelling": "host.render",
+      "spelling": "render",
       "regionRefs": [],
       "witnesses": [
         {
@@ -24449,10 +24449,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 2512,
+              "start": 2517,
               "end": 2523
             },
-            "text": "host.render"
+            "text": "render"
           }
         }
       ]
@@ -24546,10 +24546,10 @@
       },
       "calleeRange": {
         "encoding": "utf16",
-        "start": 2577,
+        "start": 2582,
         "end": 2587
       },
-      "spelling": "host.clear",
+      "spelling": "clear",
       "regionRefs": [],
       "witnesses": [
         {
@@ -24557,10 +24557,10 @@
           "witness": {
             "range": {
               "encoding": "utf16",
-              "start": 2577,
+              "start": 2582,
               "end": 2587
             },
-            "text": "host.clear"
+            "text": "clear"
           }
         }
       ]
@@ -25790,6 +25790,36 @@
       ]
     },
     {
+      "ref": "r1:src/adapters.js:reference:Identifier:608:614",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/adapters.js"
+      },
+      "revisionId": "r1",
+      "ownerRef": "r1:src/adapters.js:declaration:Constructor:587:622",
+      "range": {
+        "encoding": "utf16",
+        "start": 608,
+        "end": 614
+      },
+      "spelling": "events",
+      "witnesses": [
+        {
+          "field": "spelling",
+          "witness": {
+            "range": {
+              "encoding": "utf16",
+              "start": 608,
+              "end": 614
+            },
+            "text": "events"
+          }
+        }
+      ]
+    },
+    {
       "ref": "r1:src/adapters.js:reference:Identifier:639:645",
       "nativeId": null,
       "document": {
@@ -25815,6 +25845,36 @@
               "end": 645
             },
             "text": "events"
+          }
+        }
+      ]
+    },
+    {
+      "ref": "r1:src/adapters.js:reference:Identifier:646:652",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/adapters.js"
+      },
+      "revisionId": "r1",
+      "ownerRef": "r1:src/adapters.js:declaration:MethodDeclaration:625:659",
+      "range": {
+        "encoding": "utf16",
+        "start": 646,
+        "end": 652
+      },
+      "spelling": "length",
+      "witnesses": [
+        {
+          "field": "spelling",
+          "witness": {
+            "range": {
+              "encoding": "utf16",
+              "start": 646,
+              "end": 652
+            },
+            "text": "length"
           }
         }
       ]
@@ -28370,6 +28430,36 @@
       ]
     },
     {
+      "ref": "r1:src/editor.js:reference:Identifier:186:191",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/editor.js"
+      },
+      "revisionId": "r1",
+      "ownerRef": "r1:src/editor.js:declaration:Constructor:156:211",
+      "range": {
+        "encoding": "utf16",
+        "start": 186,
+        "end": 191
+      },
+      "spelling": "event",
+      "witnesses": [
+        {
+          "field": "spelling",
+          "witness": {
+            "range": {
+              "encoding": "utf16",
+              "start": 186,
+              "end": 191
+            },
+            "text": "event"
+          }
+        }
+      ]
+    },
+    {
       "ref": "r1:src/editor.js:reference:Identifier:199:204",
       "nativeId": null,
       "document": {
@@ -28485,6 +28575,36 @@
               "end": 280
             },
             "text": "event"
+          }
+        }
+      ]
+    },
+    {
+      "ref": "r1:src/editor.js:reference:Identifier:281:284",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/editor.js"
+      },
+      "revisionId": "r1",
+      "ownerRef": "r1:src/editor.js:declaration:SetAccessor:253:309",
+      "range": {
+        "encoding": "utf16",
+        "start": 281,
+        "end": 284
+      },
+      "spelling": "key",
+      "witnesses": [
+        {
+          "field": "spelling",
+          "witness": {
+            "range": {
+              "encoding": "utf16",
+              "start": 281,
+              "end": 284
+            },
+            "text": "key"
           }
         }
       ]
@@ -28635,6 +28755,36 @@
               "end": 390
             },
             "text": "event"
+          }
+        }
+      ]
+    },
+    {
+      "ref": "r1:src/editor.js:reference:Identifier:391:398",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/editor.js"
+      },
+      "revisionId": "r1",
+      "ownerRef": "r1:src/editor.js:declaration:SetAccessor:359:416",
+      "range": {
+        "encoding": "utf16",
+        "start": 391,
+        "end": 398
+      },
+      "spelling": "payload",
+      "witnesses": [
+        {
+          "field": "spelling",
+          "witness": {
+            "range": {
+              "encoding": "utf16",
+              "start": 391,
+              "end": 398
+            },
+            "text": "payload"
           }
         }
       ]
@@ -28850,6 +29000,36 @@
       ]
     },
     {
+      "ref": "r1:src/editor.js:reference:Identifier:510:515",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/editor.js"
+      },
+      "revisionId": "r1",
+      "ownerRef": "r1:src/editor.js:declaration:SetAccessor:480:550",
+      "range": {
+        "encoding": "utf16",
+        "start": 510,
+        "end": 515
+      },
+      "spelling": "label",
+      "witnesses": [
+        {
+          "field": "spelling",
+          "witness": {
+            "range": {
+              "encoding": "utf16",
+              "start": 510,
+              "end": 515
+            },
+            "text": "label"
+          }
+        }
+      ]
+    },
+    {
       "ref": "r1:src/editor.js:reference:Identifier:518:523",
       "nativeId": null,
       "document": {
@@ -29025,6 +29205,36 @@
               "end": 636
             },
             "text": "event"
+          }
+        }
+      ]
+    },
+    {
+      "ref": "r1:src/editor.js:reference:Identifier:637:641",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/editor.js"
+      },
+      "revisionId": "r1",
+      "ownerRef": "r1:src/editor.js:declaration:SetAccessor:607:685",
+      "range": {
+        "encoding": "utf16",
+        "start": 637,
+        "end": 641
+      },
+      "spelling": "tags",
+      "witnesses": [
+        {
+          "field": "spelling",
+          "witness": {
+            "range": {
+              "encoding": "utf16",
+              "start": 637,
+              "end": 641
+            },
+            "text": "tags"
           }
         }
       ]
@@ -30680,6 +30890,36 @@
       ]
     },
     {
+      "ref": "r1:src/history.js:reference:Identifier:1121:1127",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/history.js"
+      },
+      "revisionId": "r1",
+      "ownerRef": "r1:src/history.js:declaration:Constructor:1083:1171",
+      "range": {
+        "encoding": "utf16",
+        "start": 1121,
+        "end": 1127
+      },
+      "spelling": "parent",
+      "witnesses": [
+        {
+          "field": "spelling",
+          "witness": {
+            "range": {
+              "encoding": "utf16",
+              "start": 1121,
+              "end": 1127
+            },
+            "text": "parent"
+          }
+        }
+      ]
+    },
+    {
       "ref": "r1:src/history.js:reference:Identifier:1130:1136",
       "nativeId": null,
       "document": {
@@ -30705,6 +30945,36 @@
               "end": 1136
             },
             "text": "parent"
+          }
+        }
+      ]
+    },
+    {
+      "ref": "r1:src/history.js:reference:Identifier:1147:1154",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/history.js"
+      },
+      "revisionId": "r1",
+      "ownerRef": "r1:src/history.js:declaration:Constructor:1083:1171",
+      "range": {
+        "encoding": "utf16",
+        "start": 1147,
+        "end": 1154
+      },
+      "spelling": "entries",
+      "witnesses": [
+        {
+          "field": "spelling",
+          "witness": {
+            "range": {
+              "encoding": "utf16",
+              "start": 1147,
+              "end": 1154
+            },
+            "text": "entries"
           }
         }
       ]
@@ -31730,6 +32000,36 @@
       ]
     },
     {
+      "ref": "r1:src/legacy.js:reference:Identifier:150:156",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/legacy.js"
+      },
+      "revisionId": "r1",
+      "ownerRef": "r1:src/legacy.js:declaration:FunctionDeclaration:104:188",
+      "range": {
+        "encoding": "utf16",
+        "start": 150,
+        "end": 156
+      },
+      "spelling": "prefix",
+      "witnesses": [
+        {
+          "field": "spelling",
+          "witness": {
+            "range": {
+              "encoding": "utf16",
+              "start": 150,
+              "end": 156
+            },
+            "text": "prefix"
+          }
+        }
+      ]
+    },
+    {
       "ref": "r1:src/legacy.js:reference:Identifier:159:165",
       "nativeId": null,
       "document": {
@@ -31755,6 +32055,36 @@
               "end": 165
             },
             "text": "prefix"
+          }
+        }
+      ]
+    },
+    {
+      "ref": "r1:src/legacy.js:reference:Identifier:174:180",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/legacy.js"
+      },
+      "revisionId": "r1",
+      "ownerRef": "r1:src/legacy.js:declaration:FunctionDeclaration:104:188",
+      "range": {
+        "encoding": "utf16",
+        "start": 174,
+        "end": 180
+      },
+      "spelling": "buffer",
+      "witnesses": [
+        {
+          "field": "spelling",
+          "witness": {
+            "range": {
+              "encoding": "utf16",
+              "start": 174,
+              "end": 180
+            },
+            "text": "buffer"
           }
         }
       ]
@@ -31815,6 +32145,36 @@
               "end": 211
             },
             "text": "prototype"
+          }
+        }
+      ]
+    },
+    {
+      "ref": "r1:src/legacy.js:reference:Identifier:212:218",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/legacy.js"
+      },
+      "revisionId": "r1",
+      "ownerRef": "r1:src/legacy.js:declaration:SourceFile:0:975",
+      "range": {
+        "encoding": "utf16",
+        "start": 212,
+        "end": 218
+      },
+      "spelling": "append",
+      "witnesses": [
+        {
+          "field": "spelling",
+          "witness": {
+            "range": {
+              "encoding": "utf16",
+              "start": 212,
+              "end": 218
+            },
+            "text": "append"
           }
         }
       ]
@@ -32030,6 +32390,36 @@
       ]
     },
     {
+      "ref": "r1:src/legacy.js:reference:Identifier:312:317",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/legacy.js"
+      },
+      "revisionId": "r1",
+      "ownerRef": "r1:src/legacy.js:declaration:SourceFile:0:975",
+      "range": {
+        "encoding": "utf16",
+        "start": 312,
+        "end": 317
+      },
+      "spelling": "drain",
+      "witnesses": [
+        {
+          "field": "spelling",
+          "witness": {
+            "range": {
+              "encoding": "utf16",
+              "start": 312,
+              "end": 317
+            },
+            "text": "drain"
+          }
+        }
+      ]
+    },
+    {
       "ref": "r1:src/legacy.js:reference:Identifier:348:354",
       "nativeId": null,
       "document": {
@@ -32180,6 +32570,36 @@
       ]
     },
     {
+      "ref": "r1:src/legacy.js:reference:Identifier:456:459",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/legacy.js"
+      },
+      "revisionId": "r1",
+      "ownerRef": "r1:src/legacy.js:declaration:FunctionDeclaration:370:468",
+      "range": {
+        "encoding": "utf16",
+        "start": 456,
+        "end": 459
+      },
+      "spelling": "tag",
+      "witnesses": [
+        {
+          "field": "spelling",
+          "witness": {
+            "range": {
+              "encoding": "utf16",
+              "start": 456,
+              "end": 459
+            },
+            "text": "tag"
+          }
+        }
+      ]
+    },
+    {
       "ref": "r1:src/legacy.js:reference:Identifier:462:465",
       "nativeId": null,
       "document": {
@@ -32235,6 +32655,36 @@
               "end": 481
             },
             "text": "TaggedSource"
+          }
+        }
+      ]
+    },
+    {
+      "ref": "r1:src/legacy.js:reference:Identifier:482:491",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/legacy.js"
+      },
+      "revisionId": "r1",
+      "ownerRef": "r1:src/legacy.js:declaration:SourceFile:0:975",
+      "range": {
+        "encoding": "utf16",
+        "start": 482,
+        "end": 491
+      },
+      "spelling": "prototype",
+      "witnesses": [
+        {
+          "field": "spelling",
+          "witness": {
+            "range": {
+              "encoding": "utf16",
+              "start": 482,
+              "end": 491
+            },
+            "text": "prototype"
           }
         }
       ]
@@ -32420,6 +32870,36 @@
       ]
     },
     {
+      "ref": "r1:src/legacy.js:reference:Identifier:556:567",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/legacy.js"
+      },
+      "revisionId": "r1",
+      "ownerRef": "r1:src/legacy.js:declaration:SourceFile:0:975",
+      "range": {
+        "encoding": "utf16",
+        "start": 556,
+        "end": 567
+      },
+      "spelling": "constructor",
+      "witnesses": [
+        {
+          "field": "spelling",
+          "witness": {
+            "range": {
+              "encoding": "utf16",
+              "start": 556,
+              "end": 567
+            },
+            "text": "constructor"
+          }
+        }
+      ]
+    },
+    {
       "ref": "r1:src/legacy.js:reference:Identifier:570:582",
       "nativeId": null,
       "document": {
@@ -32505,6 +32985,36 @@
               "end": 606
             },
             "text": "prototype"
+          }
+        }
+      ]
+    },
+    {
+      "ref": "r1:src/legacy.js:reference:Identifier:607:613",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/legacy.js"
+      },
+      "revisionId": "r1",
+      "ownerRef": "r1:src/legacy.js:declaration:SourceFile:0:975",
+      "range": {
+        "encoding": "utf16",
+        "start": 607,
+        "end": 613
+      },
+      "spelling": "append",
+      "witnesses": [
+        {
+          "field": "spelling",
+          "witness": {
+            "range": {
+              "encoding": "utf16",
+              "start": 607,
+              "end": 613
+            },
+            "text": "append"
           }
         }
       ]
@@ -33710,6 +34220,36 @@
       ]
     },
     {
+      "ref": "r1:src/pipeline.js:reference:Identifier:479:485",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/pipeline.js"
+      },
+      "revisionId": "r1",
+      "ownerRef": "r1:src/pipeline.js:declaration:Constructor:430:523",
+      "range": {
+        "encoding": "utf16",
+        "start": 479,
+        "end": 485
+      },
+      "spelling": "stages",
+      "witnesses": [
+        {
+          "field": "spelling",
+          "witness": {
+            "range": {
+              "encoding": "utf16",
+              "start": 479,
+              "end": 485
+            },
+            "text": "stages"
+          }
+        }
+      ]
+    },
+    {
       "ref": "r1:src/pipeline.js:reference:Identifier:488:494",
       "nativeId": null,
       "document": {
@@ -33735,6 +34275,36 @@
               "end": 494
             },
             "text": "stages"
+          }
+        }
+      ]
+    },
+    {
+      "ref": "r1:src/pipeline.js:reference:Identifier:505:514",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/pipeline.js"
+      },
+      "revisionId": "r1",
+      "ownerRef": "r1:src/pipeline.js:declaration:Constructor:430:523",
+      "range": {
+        "encoding": "utf16",
+        "start": 505,
+        "end": 514
+      },
+      "spelling": "processed",
+      "witnesses": [
+        {
+          "field": "spelling",
+          "witness": {
+            "range": {
+              "encoding": "utf16",
+              "start": 505,
+              "end": 514
+            },
+            "text": "processed"
           }
         }
       ]
@@ -33855,6 +34425,36 @@
               "end": 631
             },
             "text": "undefined"
+          }
+        }
+      ]
+    },
+    {
+      "ref": "r1:src/pipeline.js:reference:Identifier:646:651",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/pipeline.js"
+      },
+      "revisionId": "r1",
+      "ownerRef": "r1:src/pipeline.js:declaration:MethodDeclaration:527:724",
+      "range": {
+        "encoding": "utf16",
+        "start": 646,
+        "end": 651
+      },
+      "spelling": "value",
+      "witnesses": [
+        {
+          "field": "spelling",
+          "witness": {
+            "range": {
+              "encoding": "utf16",
+              "start": 646,
+              "end": 651
+            },
+            "text": "value"
           }
         }
       ]
@@ -44900,6 +45500,36 @@
       ]
     },
     {
+      "ref": "r1:src/workbench.js:reference:Identifier:2207:2210",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/workbench.js"
+      },
+      "revisionId": "r1",
+      "ownerRef": "r1:src/workbench.js:declaration:FunctionDeclaration:2087:2424",
+      "range": {
+        "encoding": "utf16",
+        "start": 2207,
+        "end": 2210
+      },
+      "spelling": "key",
+      "witnesses": [
+        {
+          "field": "spelling",
+          "witness": {
+            "range": {
+              "encoding": "utf16",
+              "start": 2207,
+              "end": 2210
+            },
+            "text": "key"
+          }
+        }
+      ]
+    },
+    {
       "ref": "r1:src/workbench.js:reference:Identifier:2213:2220",
       "nativeId": null,
       "document": {
@@ -45015,6 +45645,36 @@
               "end": 2260
             },
             "text": "editor"
+          }
+        }
+      ]
+    },
+    {
+      "ref": "r1:src/workbench.js:reference:Identifier:2261:2268",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/workbench.js"
+      },
+      "revisionId": "r1",
+      "ownerRef": "r1:src/workbench.js:declaration:FunctionDeclaration:2087:2424",
+      "range": {
+        "encoding": "utf16",
+        "start": 2261,
+        "end": 2268
+      },
+      "spelling": "payload",
+      "witnesses": [
+        {
+          "field": "spelling",
+          "witness": {
+            "range": {
+              "encoding": "utf16",
+              "start": 2261,
+              "end": 2268
+            },
+            "text": "payload"
           }
         }
       ]
@@ -45140,6 +45800,36 @@
       ]
     },
     {
+      "ref": "r1:src/workbench.js:reference:Identifier:2321:2326",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/workbench.js"
+      },
+      "revisionId": "r1",
+      "ownerRef": "r1:src/workbench.js:declaration:FunctionDeclaration:2087:2424",
+      "range": {
+        "encoding": "utf16",
+        "start": 2321,
+        "end": 2326
+      },
+      "spelling": "label",
+      "witnesses": [
+        {
+          "field": "spelling",
+          "witness": {
+            "range": {
+              "encoding": "utf16",
+              "start": 2321,
+              "end": 2326
+            },
+            "text": "label"
+          }
+        }
+      ]
+    },
+    {
       "ref": "r1:src/workbench.js:reference:Identifier:2329:2336",
       "nativeId": null,
       "document": {
@@ -45255,6 +45945,36 @@
               "end": 2375
             },
             "text": "editor"
+          }
+        }
+      ]
+    },
+    {
+      "ref": "r1:src/workbench.js:reference:Identifier:2376:2380",
+      "nativeId": null,
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/workbench.js"
+      },
+      "revisionId": "r1",
+      "ownerRef": "r1:src/workbench.js:declaration:FunctionDeclaration:2087:2424",
+      "range": {
+        "encoding": "utf16",
+        "start": 2376,
+        "end": 2380
+      },
+      "spelling": "tags",
+      "witnesses": [
+        {
+          "field": "spelling",
+          "witness": {
+            "range": {
+              "encoding": "utf16",
+              "start": 2376,
+              "end": 2380
+            },
+            "text": "tags"
           }
         }
       ]

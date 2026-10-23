@@ -142,8 +142,9 @@ function captureDocument(ts, text, path, sourceSetId, revisionId, artifact) {
     const declaration = declarationNodes.get(node);
     if (declaration && callableKinds.has(declaration.kind)) callable = declaration;
     if (ts.isCallExpression(node) || ts.isNewExpression(node)) {
-      const callee = node.expression;
-      const computed = ts.isElementAccessExpression(callee);
+      const expression = node.expression;
+      const computed = ts.isElementAccessExpression(expression);
+      const callee = ts.isPropertyAccessExpression(expression) ? expression.name : expression;
       localCalls.push({
         ...common("call", node), ownerRef: callable.ref, range: range(node),
         calleeRange: computed ? null : range(callee), spelling: computed ? null : spelling(callee),
@@ -161,11 +162,7 @@ function captureDocument(ts, text, path, sourceSetId, revisionId, artifact) {
     else if (ts.isCaseClause(node)) addControl(node, callable, "case");
     else if (ts.isDefaultClause(node)) addControl(node, callable, "default");
     const aliasName = declarationNodes.get(node.parent)?.kind === "alias" && node.parent.name === node;
-    const assignmentTarget = node.parent && ts.isPropertyAccessExpression(node.parent) && node.parent.name === node ? node.parent : node;
-    const writeOnly = assignmentTarget.parent && ts.isBinaryExpression(assignmentTarget.parent) &&
-      assignmentTarget.parent.left === assignmentTarget &&
-      assignmentTarget.parent.operatorToken.kind === ts.SyntaxKind.EqualsToken;
-    if ((ts.isIdentifier(node) || ts.isPrivateIdentifier(node)) && (aliasName || (!isDeclarationName(node) && !writeOnly))) {
+    if ((ts.isIdentifier(node) || ts.isPrivateIdentifier(node)) && (aliasName || !isDeclarationName(node))) {
       artifact.references.push({
         ...common("reference", node), ownerRef: callable.ref, range: range(node), spelling: spelling(node),
         witnesses: [witness("spelling", node)],

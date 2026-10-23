@@ -16,7 +16,7 @@ not 32 validated scenarios or a promise that a producer will emit particular fac
 
 - `fixture.json`: `language: "javascript"`, `profile: "draft"`, source set `main`, revision `r1`.
 - `captures/native.json`: 258 declarations, 196 invocations,
-  34 control regions and 681 candidate reference tokens measured from ASTs.
+  34 control regions and 705 candidate reference tokens measured from ASTs.
 - Generated counts report 196 measured calls; all semantic counts and observed semantic roles are zero.
   Candidate native references are not installed semantic References.
 - Adjacent annotations record native coverage only. All four measurement families
@@ -43,12 +43,13 @@ All input files are registered in `fixture.json`. The hardware profile
 |---|---|
 | Node 24.11.1 darwin-arm64 executable | `4255a388254ca4319e2f95f1da375d5deaddf25baf9c7c85070b67f9543b15d0` |
 | TypeScript 5.9.3 `lib/typescript.js` | `3ae902c92cc44dace175c0e69e13a4b0899f6983c6121d76b9ab8dd5795e7675` |
-| This capture script | `0ff517d5e639f287241a3ee5f8a660ca079ad2171c5b19e0739de558ab741832` |
-| Native producer archive (script + parser) | `9576f1f3ec87b33d49cc0355ce898f83a815c662eeab185b566a5df0206bb2e0` |
+| This capture script | `f65f3a80880a492b46bdb1bafd0f701d72729071fad861e072188567005b71cd` |
+| Native producer archive (script + parser) | `2aa11c2830377fff48c38772b597c94d846766e4c26ecbdf22aa07e2b8f619d5` |
 
 The producer archive lives outside the repository; no executable binary or parser
 bundle is vendored. Its reproducible format is uncompressed Python `tarfile`
-`USTAR_FORMAT`, exactly two members in order: `capture-native.mjs`, `typescript.js`.
+`USTAR_FORMAT`, written with CPython 3.11.16 (`tarfile` from that standard library),
+exactly two members in order: `capture-native.mjs`, `typescript.js`.
 Both have mode `0644`, mtime/uid/gid zero and empty uname/gname. Member bytes are
 exactly the files identified above. This pins the parser too, not just a script
 that could load an arbitrary implementation. To rebuild the archive, set
@@ -86,7 +87,9 @@ node tools/semantic-contract/test/run.mjs
 
 The authoring producer measures actual functions, arrows, classes, accessors,
 constructors, simple variables and import/export alias bindings. Calls include
-`CallExpression`/`NewExpression`; computed callee spellings remain null. Controls
+`CallExpression`/`NewExpression`; member callees (including optional chains)
+use the member-name token, not `receiver.member`. Computed callee spellings
+remain null. Controls
 and occurrences keep nearest callable/module ownership across callbacks. Text
 leaves have exact source witnesses. Node offsets are UTF-16 code units, including
 astral identifiers and text before same-line calls. There are no inferred targets,
@@ -95,8 +98,8 @@ semantic roles, symbols, relationship facts or direct-execution answers.
 Limits: no JSX, decorators, anonymous classes, typed syntax, destructured
 parameters, non-identifier declaration names, synthesized constructors or implicit
 calls. Fields/parameters/destructured bindings have no separate declaration rows;
-tagged templates have no invocation rows. Plain assignment write-only targets are
-not candidate references. No claim of a general production JavaScript frontend is
+tagged templates have no invocation rows. Plain assignment targets are candidate
+references too; read/write roles still require semantic evidence. No claim of a general production JavaScript frontend is
 made. The source avoids unsupported declaration forms.
 
 ## Future semantic scenario inventory — not counted yet
@@ -149,7 +152,7 @@ not fabricated JavaScript overloads. Scoped shadowing also remains in the projec
 - **20 resolved:** direct helpers, imported functions, recursion and constructors are natural candidate anchors; only exact admitted producer joins count.
 - **20 proven-external:** text operations (`String`, `trim`, `toLowerCase`, `replaceAll`, `JSON.parse`, `JSON.stringify`, `Date.now`, `normalize`, `toUpperCase`, map/join), adapter arrays/logging and history `Map`/`Array` methods provide candidates. Built-in namespace merging or absence may change outcomes; do not classify by spelling alone. A local small .d.ts dependency is an optional future owner decision, not required or authored here.
 - **20 ambiguous:** adapters.roundTrip has five conditional codec calls; deliver has five sink calls; planRetry has five policy calls; stages.preview has three union-stage calls and explainIngress has two. These are **20 candidate sites**, not 20 observed conflicts. Only two or more distinct producer targets at the same exact native join may establish ambiguity. If producer inference collapses any union, report the shortfall rather than inventing a second target.
-- **20 unresolved:** plugins.js has independent host/session/extension/registry/factory operations (connect/authenticate/subscribe, decode/validate/enrich/acknowledge, encode/send/checkpoint, flush/unsubscribe/close, register/factory/initialize, lookup/computed operation, dispose/unregister, poll/consume/report). Distinct protocol operations are useful behavior, not repeated padding. A complete producer tuple and exact missing occurrence are required by Decision 0017 Amendment 1. Merely untyped-looking syntax is not an outcome.
+- **20 unresolved:** plugins.js has independent host/session/extension/registry operations (connect/authenticate/subscribe, decode/validate/enrich/acknowledge, encode/send/checkpoint, flush/unsubscribe/close, register/initialize, lookup/computed operation, dispose/unregister, poll/consume/report). Distinct protocol operations are useful behavior, not repeated padding. A complete producer tuple and exact missing occurrence are required by Decision 0017 Amendment 1. Merely untyped-looking syntax is not an outcome.
 - **20 callable-value negatives:** toolPalette has ten helper reads; historyActions has five direct helper reads; previewTools retains eight workbench/history helpers as values. Those 23 direct helper reads are source candidates; member reads in historyActions/adapterMethods add useful dynamic cases but are not needed to assert a design total. Only exact internal callable targets, read without call and outside callee ranges count. Shorthand support and producer joins must be observed, not assumed.
 - **20 relationships:** five functional Stage subclasses each have an explicit extends and three overriding methods (accepts/transform/describe), giving 20 source relationship candidates. Real producer relationship records must establish them. Prototype assignment in legacy.js is deliberately not counted as a class extends edge.
 - **Required roles:** declarations, helper values, state writes (`processed`, history entries and sink buffers), calls, ES imports, alias names, `new` and `extends` supply syntax candidates. Applicable-role counts must come from admitted native and producer records.
@@ -175,3 +178,22 @@ For the final corpus, author semantic annotations and rooted expected answers
 independently from real captured records. Do not copy evaluator output into
 answers, relabel dynamic/possible/external evidence as direct calls, or pad counts.
 Only then may this fixture become `profile: "corpus"` and satisfy the full floors.
+
+## Open review items for the final slice
+
+- **F3 — unsupported per-document floor:** no current document is designed to
+  establish it. A natural future candidate uses tagged templates, which this
+  helper does not measure. It needs genuine unavailable-family coverage with a
+  real diagnostic and authenticated semantic evidence, not dropped records.
+- **F6 — unresolved margin:** `factory` in `plugins.js:32` has a parameter-local
+  producer occurrence, so it is not absent and is excluded from the unresolved
+  candidate list above. The remaining margin is thin; verify actual exact joins
+  before claiming the floor.
+- **F7 — archive reproducibility:** the archive above was written with CPython
+  3.11.16 and its standard-library `tarfile`; that version is now recorded. Final
+  qualification must reproduce the exact digest with the recorded writer and
+  metadata recipe rather than assume arbitrary Python versions are identical.
+
+Producer identity and admission of Trellis's production native extractor remain
+#95 work. Keep this PR open while that work proceeds; this fixture is still a
+native-only DRAFT, not the final semantic corpus.
