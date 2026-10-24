@@ -38,8 +38,8 @@ fn pair_snapshot(index: &std::path::Path) -> PairSnapshot {
             .unwrap();
     assert_eq!(
         tables.len(),
-        57,
-        "compare exact schema-16 derived evidence inventory"
+        60,
+        "compare exact schema-17 derived evidence inventory"
     );
     let expected = vec![
         "class_projections",
@@ -65,6 +65,8 @@ fn pair_snapshot(index: &std::path::Path) -> PairSnapshot {
         "native_version_ancestor_signature_types",
         "native_version_call_regions",
         "native_version_calls",
+        "native_version_capability_families",
+        "native_version_capability_gaps",
         "native_version_control_regions",
         "native_version_coverage_roles",
         "native_version_declaration_ancestors",
@@ -73,6 +75,7 @@ fn pair_snapshot(index: &std::path::Path) -> PairSnapshot {
         "native_version_headers",
         "native_version_own_signature_types",
         "native_version_parameters",
+        "native_version_references",
         "revision_capture_inputs",
         "revision_documents",
         "revision_producer_bindings",
@@ -103,7 +106,7 @@ fn pair_snapshot(index: &std::path::Path) -> PairSnapshot {
     assert_eq!(
         tables.iter().map(String::as_str).collect::<Vec<_>>(),
         expected,
-        "exact schema-16 table names: complete paired native and semantic evidence"
+        "exact schema-17 table names: complete paired native and semantic evidence"
     );
     for required in [
         "document_versions",

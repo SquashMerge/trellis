@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use trellis::{native_evidence as n, native_ids, semantic_evidence as s};
 
 fn fixture() -> (s::SemanticPublication, n::Artifact, s::CapturedComponents) {
-    let bytes = b"fn hello() { hello(); }".to_vec();
+    let bytes = b"fn hello() { hello(); hello(); }".to_vec();
     let h = |b: &[u8]| native_ids::digest(b"", b);
     let document = n::DocumentKey {
         source_set_id: "source-set:v1:root".into(),
@@ -42,7 +42,7 @@ fn fixture() -> (s::SemanticPublication, n::Artifact, s::CapturedComponents) {
     };
     let producer = n::Producer {
         id: "trellis.native.syntax".into(),
-        version: "native-v8".into(),
+        version: "native-v9".into(),
         executable_hash: h(b"native"),
         kind: "native".into(),
         languages: vec!["rust".into()],
@@ -66,7 +66,10 @@ fn fixture() -> (s::SemanticPublication, n::Artifact, s::CapturedComponents) {
         lookup_key: Some("hello".into()),
         ancestors: vec![],
         key,
-        range: n::Range { start: 0, end: 24 },
+        range: n::Range {
+            start: 0,
+            end: bytes.len(),
+        },
         name_range: Some(n::Range { start: 3, end: 8 }),
         header: n::Header {
             kind: "function".into(),
@@ -92,6 +95,21 @@ fn fixture() -> (s::SemanticPublication, n::Artifact, s::CapturedComponents) {
         region_ids: vec![],
         provenance_id: "native-proof".into(),
     };
+    let references = [n::Range { start: 3, end: 8 }, n::Range { start: 13, end: 18 }, n::Range { start: 22, end: 27 }]
+        .into_iter()
+        .enumerate()
+        .map(|(ordinal, range)| n::Reference {
+            id: registry.occurrence(&json!({"contentHash":h(&bytes),"extractionContext":native_ids::extraction_context("rust",&[]).unwrap(),"nativeProducerId":producer.id,"nativeProducerVersion":producer.version,"ownerSyntaxId":syntax_id,"kind":"reference","ordinal":ordinal})).unwrap(),
+            owner_syntax_id: syntax_id.clone(),
+            ordinal,
+            document: document.clone(),
+            revision_id: revision.id.clone(),
+            range,
+            spelling: "hello".into(),
+            lookup_key: "hello".into(),
+            provenance_id: "native-proof".into(),
+        })
+        .collect::<Vec<_>>();
     let native = n::Artifact {
         producer,
         source_set: n::SourceSet {
@@ -106,6 +124,25 @@ fn fixture() -> (s::SemanticPublication, n::Artifact, s::CapturedComponents) {
         declarations: vec![declaration],
         calls: vec![call],
         control_regions: vec![],
+        references,
+        capability_reports: vec![n::CapabilityReport {
+            document: document.clone(),
+            revision_id: revision.id.clone(),
+            families: [
+                n::MeasurementKind::DeclarationName,
+                n::MeasurementKind::Callee,
+                n::MeasurementKind::Invocation,
+                n::MeasurementKind::Reference,
+            ]
+            .into_iter()
+            .map(|kind| n::MeasurementSupport {
+                kind,
+                available: true,
+                diagnostic: None,
+                gaps: vec![],
+            })
+            .collect(),
+        }],
     };
     let semantic_producer = s::Producer {
         id: "semantic".into(),
@@ -174,7 +211,7 @@ fn fixture() -> (s::SemanticPublication, n::Artifact, s::CapturedComponents) {
         candidate_ids: vec![id],
         diagnostic: None,
     };
-    let reference_id = registry.occurrence(&json!({"contentHash":h(&bytes),"extractionContext":native_ids::extraction_context("rust",&[]).unwrap(),"nativeProducerId":native.producer.id,"nativeProducerVersion":native.producer.version,"ownerSyntaxId":syntax_id,"kind":"reference","ordinal":0})).unwrap();
+    let reference_id = native.references[1].id.clone();
     let semantic = s::SemanticPublication {
         producers: vec![semantic_producer],
         coverage: vec![s::Coverage {
@@ -224,7 +261,7 @@ fn fixture() -> (s::SemanticPublication, n::Artifact, s::CapturedComponents) {
         references: vec![s::Reference {
             id: reference_id,
             owner_syntax_id: syntax_id.clone(),
-            ordinal: 0,
+            ordinal: 1,
             document: document.clone(),
             revision_id: revision.id.clone(),
             range: n::Range { start: 13, end: 18 },
@@ -277,9 +314,21 @@ fn fixture() -> (s::SemanticPublication, n::Artifact, s::CapturedComponents) {
     (semantic, native, captured)
 }
 #[test]
-fn all_semantic_families_are_admitted_against_exact_native_bytes() {
+fn all_semantic_families_keep_the_second_native_candidate_ordinal() {
     let (semantic, native, bytes) = fixture();
+    assert_eq!(native.references.len(), 3);
+    assert_eq!(semantic.references.len(), 1);
+    assert_eq!(semantic.references[0].id, native.references[1].id);
+    assert_eq!(semantic.references[0].ordinal, 1);
     s::validate_evidence(&semantic, &native, &bytes).unwrap();
+    let mut renumbered = semantic.clone();
+    renumbered.references[0].ordinal = 0;
+    assert!(
+        s::validate_evidence(&renumbered, &native, &bytes)
+            .unwrap_err()
+            .to_string()
+            .contains("native reference candidate")
+    );
 }
 #[test]
 fn captured_boundary_rejects_invalid_evidence() {
@@ -324,7 +373,7 @@ fn captured_boundary_rejects_invalid_evidence() {
         s::validate_evidence(&variant, &native, &bytes)
             .unwrap_err()
             .to_string()
-            .contains("noncanonical reference")
+            .contains("native reference candidate")
     );
     let mut bytes = bytes;
     bytes.sources.values_mut().next().unwrap()[0] = b'X';
@@ -605,9 +654,15 @@ fn independent_producers_and_duplicate_fact_partitions() {
     let mut call = semantic.call_bindings[0].clone();
     call.provenance_id = "2-ref".into();
     semantic.call_bindings.push(call);
+    let candidate = &native.references[2];
     let mut reference = semantic.references[0].clone();
+    reference.id = candidate.id.clone();
+    reference.ordinal = candidate.ordinal;
+    reference.range = candidate.range.clone();
     reference.provenance_id = "2-ref".into();
     semantic.references.push(reference);
+    assert_eq!(semantic.references[0].ordinal, 1);
+    assert_eq!(semantic.references[1].ordinal, 2);
     s::validate_evidence(&semantic, &native, &captured).unwrap();
     semantic.symbols.push(semantic.symbols[0].clone());
     assert!(
@@ -1068,4 +1123,93 @@ fn contradictory_targets_can_be_reported_as_ambiguous_without_changing_exact_joi
     s::validate_evidence(&semantic, &native, &bytes).unwrap();
     semantic.call_bindings[1].candidates.reverse();
     assert!(s::validate_evidence(&semantic, &native, &bytes).is_err());
+}
+
+#[test]
+fn native_capability_gaps_preserve_exact_joins_and_require_full_containment() {
+    let (base, mut native, bytes) = fixture();
+    let support = native.capability_reports[0]
+        .families
+        .iter_mut()
+        .find(|family| family.kind == n::MeasurementKind::DeclarationName)
+        .unwrap();
+    support.gaps.push(n::MeasurementGap {
+        range: n::Range { start: 9, end: 12 },
+        diagnostic: "opaque test construct".into(),
+    });
+    s::validate_evidence(&base, &native, &bytes).unwrap();
+    let mut gap = base.clone();
+    gap.declaration_bindings[0].syntax_id = None;
+    gap.declaration_bindings[0].join.anchor.range = n::Range { start: 9, end: 11 };
+    gap.declaration_bindings[0].join.status = s::JoinStatus::Unsupported;
+    gap.declaration_bindings[0].join.candidate_ids.clear();
+    gap.declaration_bindings[0].join.diagnostic = Some("opaque test construct".into());
+    gap.coverage[0]
+        .observed_roles
+        .retain(|role| *role != s::Role::Definition);
+    s::validate_evidence(&gap, &native, &bytes).unwrap();
+    let mut wrong = gap.clone();
+    wrong.declaration_bindings[0].join.diagnostic = Some("authored unavailable".into());
+    assert!(s::validate_evidence(&wrong, &native, &bytes).is_err());
+    for range in [
+        n::Range { start: 8, end: 10 },
+        n::Range { start: 11, end: 13 },
+        n::Range { start: 12, end: 13 },
+    ] {
+        let mut overlap = gap.clone();
+        overlap.declaration_bindings[0].join.anchor.range = range;
+        assert!(s::validate_evidence(&overlap, &native, &bytes).is_err());
+        overlap.declaration_bindings[0].join.status = s::JoinStatus::Unmatched;
+        overlap.declaration_bindings[0].join.diagnostic = Some("outside native gap".into());
+        s::validate_evidence(&overlap, &native, &bytes).unwrap();
+    }
+    let family = native.capability_reports[0]
+        .families
+        .iter_mut()
+        .find(|family| family.kind == n::MeasurementKind::DeclarationName)
+        .unwrap();
+    family.gaps[0].range = n::Range { start: 3, end: 8 };
+    assert!(
+        s::validate_evidence(&base, &native, &bytes)
+            .unwrap_err()
+            .to_string()
+            .contains("contradicts native capability gap")
+    );
+}
+
+#[test]
+fn semantic_reference_tuple_must_match_a_complete_native_candidate() {
+    let (base, native, bytes) = fixture();
+    let mut variants = Vec::new();
+    let mut variant = base.clone();
+    variant.references[0].ordinal = 0;
+    variants.push(variant);
+    let mut variant = base.clone();
+    variant.references[0].range = native.references[2].range.clone();
+    variants.push(variant);
+    let mut variant = base.clone();
+    variant.references[0].spelling = "other".into();
+    variants.push(variant);
+    let mut variant = base.clone();
+    variant.references[0].lookup_key = "other".into();
+    variants.push(variant);
+    let mut variant = base.clone();
+    variant.references[0].owner_syntax_id = "sid:v1:".to_owned() + &"0".repeat(32);
+    variants.push(variant);
+    for variant in variants {
+        assert!(
+            s::validate_evidence(&variant, &native, &bytes)
+                .unwrap_err()
+                .to_string()
+                .contains("native reference candidate")
+        );
+    }
+    let mut missing = native.clone();
+    missing.references.remove(1);
+    assert!(
+        s::validate_evidence(&base, &missing, &bytes)
+            .unwrap_err()
+            .to_string()
+            .contains("native reference candidate")
+    );
 }

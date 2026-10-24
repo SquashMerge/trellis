@@ -181,16 +181,20 @@ fn evidence_for(
         candidate_ids: vec![call.id.clone()],
         diagnostic: None,
     };
-    let occurrence_id=native_ids::IdentityRegistry::default().occurrence(&json!({"contentHash":document.content_hash,"extractionContext":native_ids::extraction_context("rust",&[]).unwrap(),"nativeProducerId":native.producer.id,"nativeProducerVersion":native.producer.version,"ownerSyntaxId":declaration.syntax_id,"kind":"reference","ordinal":0})).unwrap();
+    let candidate = native
+        .references
+        .iter()
+        .find(|r| r.document == document.key && Some(&r.range) == declaration.name_range.as_ref())
+        .unwrap();
     let reference = s::Reference {
-        id: occurrence_id,
-        owner_syntax_id: declaration.syntax_id.clone(),
-        ordinal: 0,
-        document: document.key.clone(),
-        revision_id: native.revision.id.clone(),
-        range: declaration.name_range.clone().unwrap(),
-        spelling: "hello".into(),
-        lookup_key: "hello".into(),
+        id: candidate.id.clone(),
+        owner_syntax_id: candidate.owner_syntax_id.clone(),
+        ordinal: candidate.ordinal,
+        document: candidate.document.clone(),
+        revision_id: candidate.revision_id.clone(),
+        range: candidate.range.clone(),
+        spelling: candidate.spelling.clone(),
+        lookup_key: candidate.lookup_key.clone(),
         site: s::ReferenceSite::Declaration,
         roles: vec![s::Role::Definition],
         resolution: s::Resolution::Resolved,
@@ -491,7 +495,13 @@ fn private_stage_admits_typed_evidence_without_changing_live_head() {
         Some(&binding.join.anchor.range)
     );
     let reference = &staged.references[0];
-    assert_eq!(reference.owner_syntax_id, declaration.syntax_id);
+    let native_candidate = native
+        .references
+        .iter()
+        .find(|candidate| candidate.id == reference.id)
+        .unwrap();
+    assert_eq!(reference.owner_syntax_id, native_candidate.owner_syntax_id);
+    assert_ne!(reference.owner_syntax_id, declaration.syntax_id);
     assert_eq!(reference.document, declaration.document);
     assert_eq!(reference.revision_id, staged_revision.id);
     let expected_target = s::Target::Internal {

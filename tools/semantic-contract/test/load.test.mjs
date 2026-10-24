@@ -56,6 +56,7 @@ async function specimen() {
     formatVersion: 1,
     producerId: "native",
     extractionInputs: [],
+    capabilityReports: [],
     declarations: [],
     calls: [],
     controls: [],
@@ -242,7 +243,7 @@ test("IDENTITY.COVERAGE rejects dangling tuples and incomplete support while ret
       "callee",
       "invocation",
       "reference",
-    ].map((kind) => ({ kind, available: true, diagnostic: null })),
+    ].map((kind) => ({ kind, gaps: [], available: true, diagnostic: null })),
   };
   s.fixture.coverageIntents = [intent];
   await s.flush();
@@ -377,7 +378,7 @@ test("IDENTITY.COVERAGE excludes Java alias but admits Java definition and JS al
       "callee",
       "invocation",
       "reference",
-    ].map((kind) => ({ kind, available: true, diagnostic: null })),
+    ].map((kind) => ({ kind, gaps: [], available: true, diagnostic: null })),
   };
   s.fixture.coverageIntents = [intent];
   await s.flush();
@@ -636,6 +637,7 @@ async function relationshipSpecimen(
       formatVersion: 1,
       producerId: "native",
       extractionInputs: [],
+      capabilityReports: [],
       declarations: [value.declaration],
       calls: [],
       controls: [],

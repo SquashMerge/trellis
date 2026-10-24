@@ -6,6 +6,8 @@ import { fileURLToPath } from "node:url";
 import { loadFixture } from "../load.mjs";
 import { normalizeFixture } from "../normalize.mjs";
 import { checkCoverage } from "../record-check/coverage.mjs";
+import { checkMeasurement } from "../record-check/measurement.mjs";
+import { checkJoins } from "../record-check/joins.mjs";
 import { checkCounts } from "../counts.mjs";
 import { contentHash } from "../identity.mjs";
 import { validate } from "../formats.mjs";
@@ -13,6 +15,7 @@ import { validate } from "../formats.mjs";
 const example = fileURLToPath(new URL("../../../tests/fixtures/semantic-evidence/v1/example/", import.meta.url));
 const [mode, root, descriptorPath] = process.argv.slice(2);
 const json = async (path) => JSON.parse(await readFile(path, "utf8"));
+const sameDocument = (left, right) => left.sourceSetId === right.sourceSetId && left.language === right.language && left.path === right.path;
 const save = async (path, value) => {
   await mkdir(dirname(path), { recursive: true });
   await writeFile(path, JSON.stringify(value, null, 2) + "\n");
@@ -40,7 +43,7 @@ if (mode === "prepare") {
   const descriptor = await json(descriptorPath);
   const producer = descriptor.producer;
   assert.equal(producer.id, "trellis.native.syntax");
-  assert.equal(producer.version, "native-v8");
+  assert.equal(producer.version, "native-v9");
   assert.equal(producer.positionEncoding, "utf8");
   assert.equal(descriptor.hashKind, "nativeExtractor");
   const fixture = await json(join(root, "fixture.json"));
@@ -73,27 +76,49 @@ if (mode === "prepare") {
   assert.equal(native.producerId, producer.id);
   assert.deepEqual(native.extractionInputs, []);
   assert.ok(native.declarations.length > 0);
-  assert.deepEqual(native.references, []); // Production emits no reference candidates; never synthesize them.
+  assert.ok(native.references.length > 0); // Measured by the production extractor, not this adapter.
   for (const revision of fixture.revisions) for (const row of revision.documents) {
     const calls = native.calls.filter((call) => call.document.path === row.key.path && call.revisionId === revision.id);
     const requestedRoles = calls.length ? ["call"] : [];
+    const report = native.capabilityReports.find((report) => report.revisionId === revision.id && sameDocument(report.document, row.key));
+    assert.ok(report, "production document capability report");
+    const callGap = report.families.some((family) => ["callee", "invocation"].includes(family.kind) && family.gaps.length);
     fixture.coverageIntents.push({ producerId: producer.id, document: row.key, revisionId: revision.id, requestedRoles,
-      measurementSupport: ["declarationName", "callee", "invocation", "reference"].map((kind) => ({ kind,
-        available: kind !== "reference", diagnostic: kind === "reference" ? "production artifact has no reference candidate family" : null })) });
+      measurementSupport: structuredClone(report.families) });
     const annotationPath = `${row.sourceFile}.annotations.json`;
     fixture.annotationFiles.push(annotationPath);
     await save(join(root, annotationPath), { formatVersion: 1, document: row.key, revisionId: revision.id, scenarios: [], facts: [{
       kind: "coverage", ref: `coverage:${row.key.path}`, record: {
         producerId: producer.id, language: row.key.language, sourceSetId: row.key.sourceSetId, documentPath: row.key.path,
         revisionId: revision.id, requested: calls.length > 0, selected: calls.length > 0,
-        state: calls.length ? "complete" : "notRequested", supportedRoles: ["definition", "call"], observedRoles: requestedRoles, diagnostic: null,
+        state: calls.length ? callGap ? "partial" : "complete" : "notRequested", supportedRoles: ["definition", "call"], observedRoles: requestedRoles, diagnostic: calls.length && callGap ? "native call measurement contains an opaque construct gap" : null,
       },
     }] });
   }
   await save(join(root, "fixture.json"), fixture);
   const loaded = await loadFixture(root, { repository });
   const normalized = normalizeFixture(loaded);
-  checkCoverage(loaded, normalized.records);
+  const verifiedCoverage = checkCoverage(loaded, normalized.records);
+  const verifiedMeasurement = checkMeasurement(loaded, normalized.records);
+  const originalReports = structuredClone(loaded.native.capabilityReports);
+  const rejectsReport = (error) => error.assertion === "JOIN.SUPPORT" && error.field === "capabilityReports";
+  // Each mutation starts from a real captured report; it is never floor evidence.
+  loaded.native.capabilityReports.pop();
+  assert.throws(() => normalizeFixture(loaded), rejectsReport);
+  assert.throws(() => checkJoins(loaded, normalized.records, verifiedCoverage, verifiedMeasurement), rejectsReport);
+  loaded.native.capabilityReports = structuredClone(originalReports);
+  const reportWithGap = loaded.native.capabilityReports.find((report) => report.families.some((family) => family.gaps.length));
+  if (reportWithGap) {
+    const family = reportWithGap.families.find((family) => family.gaps.length);
+    family.gaps[0].range.encoding = "utf16";
+    const intent = loaded.fixture.coverageIntents.find((intent) => intent.producerId === loaded.native.producerId && intent.revisionId === reportWithGap.revisionId && sameDocument(intent.document, reportWithGap.document));
+    const originalSupport = structuredClone(intent.measurementSupport);
+    intent.measurementSupport = structuredClone(reportWithGap.families);
+    assert.throws(() => normalizeFixture(loaded), rejectsReport);
+    assert.throws(() => checkJoins(loaded, normalized.records, verifiedCoverage, verifiedMeasurement), rejectsReport);
+    intent.measurementSupport = originalSupport;
+    loaded.native.capabilityReports = structuredClone(originalReports);
+  }
   let counts;
   try { counts = checkCounts(loaded, normalized.records); }
   catch (error) { error.message = `${fixture.language}: ${error.message}`; throw error; }

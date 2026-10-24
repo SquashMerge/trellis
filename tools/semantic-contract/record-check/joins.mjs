@@ -132,6 +132,7 @@ function closure(field, expected, actual, assertion) {
 // neither normalized joins nor an injected candidate index participates in this lookup.
 export function checkJoins(loaded, records, coverage, measurement) {
   validate("NormalizedRecordsV1", records);
+  validate("NativeArtifact", loaded.native);
   if (
     !(coverage?.semanticProofsById instanceof Map) ||
     typeof coverage.checkUse !== "function"
@@ -208,6 +209,52 @@ export function checkJoins(loaded, records, coverage, measurement) {
     } else if (native.references.includes(row))
       add("reference", row.range, row.ownerRef);
   }
+  const capabilityByTuple = new Map();
+  const reports = [...native.capabilityReports];
+  if (native.producerId !== "trellis.native.syntax")
+    for (const intent of loaded.fixture.coverageIntents.filter((entry) => entry.producerId === native.producerId))
+      if (!reports.some((report) => report.revisionId === intent.revisionId && same(report.document, intent.document)))
+        reports.push({ document: intent.document, revisionId: intent.revisionId, families: intent.measurementSupport });
+  for (const report of reports) {
+    const tuple = key([report.document, report.revisionId]);
+    const revision = loaded.revisions.get(JSON.stringify([report.document.sourceSetId, report.revisionId]));
+    const document = revision?.documents.find((x) => same(x.key, report.document));
+    const source = loaded.sources.get(JSON.stringify([report.document.sourceSetId, report.revisionId, report.document.path]));
+    if (!document || !source || capabilityByTuple.has(tuple))
+      reject("JOIN.SUPPORT", "capabilityReports", "duplicate or unadmitted report tuple");
+    if (report.families.length !== 4 || new Set(report.families.map((entry) => entry.kind)).size !== 4)
+      reject("JOIN.SUPPORT", "capabilityReports", "four unique families required");
+    const intent = loaded.fixture.coverageIntents.find((entry) => entry.producerId === native.producerId && entry.revisionId === report.revisionId && same(entry.document, report.document));
+    const ordered = (entries) => [...entries].sort((a, b) => a.kind.localeCompare(b.kind));
+    if (intent && !same(ordered(intent.measurementSupport), ordered(report.families)))
+      reject("JOIN.SUPPORT", "measurementSupport", "intent does not mirror captured report");
+    const supports = new Map();
+    for (const entry of report.families) {
+      if ((native.producerId === "trellis.native.syntax" && !entry.available) || entry.available !== (entry.diagnostic === null) || (!entry.available && entry.gaps.length))
+        reject("JOIN.SUPPORT", "capabilityReports", "invalid family availability or diagnostic");
+      const gaps = entry.gaps.map((gap) => {
+        if (native.producerId === "trellis.native.syntax" && gap.range.encoding !== "utf8")
+          reject("JOIN.SUPPORT", "capabilityReports", "production gap coordinates must be UTF-8");
+        const range = position(source, gap.range);
+        if (range.start >= range.end)
+          reject("JOIN.SUPPORT", "capabilityReports", "gap must be nonempty");
+        return { range, diagnostic: gap.diagnostic };
+      });
+      for (const encoded of measured.keys()) {
+        const [anchor] = JSON.parse(Buffer.from(encoded, "hex").toString("utf8"));
+        if (anchor.kind !== entry.kind || anchor.revisionId !== report.revisionId || !same(anchor.document, report.document)) continue;
+        if ((native.capabilityReports.includes(report) && !entry.available) || gaps.some(({ range }) => range.start <= anchor.range.start && anchor.range.end <= range.end))
+          reject("JOIN.SUPPORT", "measurementSupport", "candidate is wholly inside claimed unavailable capability");
+      }
+      supports.set(entry.kind, { ...entry, gaps });
+    }
+    capabilityByTuple.set(tuple, supports);
+  }
+  if (native.producerId === "trellis.native.syntax")
+    for (const revision of loaded.fixture.revisions)
+      for (const document of revision.documents)
+        if (!capabilityByTuple.has(key([document.key, revision.id])))
+          reject("JOIN.SUPPORT", "capabilityReports", "production document report missing");
   const verifiedProofs = new Map(records.provenance.map((x) => [x.id, x]));
   const nativeReferences = new Map(
     native.references.map((row) => [row.ref, row]),
@@ -343,7 +390,8 @@ export function checkJoins(loaded, records, coverage, measurement) {
         x.revisionId === selector.revisionId &&
         same(x.document, selector.document),
     );
-    const support = intent?.measurementSupport.find((x) => x.kind === family);
+    const capturedSupport = capabilityByTuple.get(key([selector.document, selector.revisionId]))?.get(family);
+    const support = capturedSupport ?? (native.producerId === "trellis.native.syntax" ? null : intent?.measurementSupport.find((x) => x.kind === family));
     if (!support)
       reject(
         "JOIN.SUPPORT",
@@ -370,7 +418,13 @@ export function checkJoins(loaded, records, coverage, measurement) {
         "measurementSupport",
         "family availability/diagnostic differs",
       );
-    const status = !support.available
+    const gap = support.gaps.find((gap) => {
+      const range = capturedSupport ? gap.range : position(source, gap.range);
+      return range.start <= anchor.range.start && anchor.range.end <= range.end;
+    });
+    if (gap && matches.length)
+      reject("JOIN.SUPPORT", "measurementSupport", "gap contradicts measured candidate");
+    const status = !support.available || gap
       ? "unsupported"
       : candidateIds.length === 0
         ? "unmatched"
@@ -385,7 +439,7 @@ export function checkJoins(loaded, records, coverage, measurement) {
         status === "exact"
           ? null
           : status === "unsupported"
-            ? support.diagnostic
+            ? gap?.diagnostic ?? support.diagnostic
             : status,
     };
     const nativeRefs = status === "exact" ? matches.map((x) => x.ref) : [];

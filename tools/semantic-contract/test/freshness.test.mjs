@@ -791,12 +791,12 @@ test("FRESHNESS.COVERAGE keeps partial fresh, complete stale and failed refresh 
       "callee",
       "invocation",
       "reference",
-    ].map((kind) => ({ kind, available: true, diagnostic: null })),
+    ].map((kind) => ({ kind, gaps: [], available: true, diagnostic: null })),
   };
   s.fixture.coverageIntents = [intent];
   intent.measurementSupport[1] = {
     kind: "callee",
-    available: false,
+    gaps: [], available: false,
     diagnostic: "partial measurement",
   };
   await s.flush();
@@ -808,7 +808,7 @@ test("FRESHNESS.COVERAGE keeps partial fresh, complete stale and failed refresh 
   assert.equal(checkFreshness(base, loaded), "fresh");
   intent.measurementSupport[1] = {
     kind: "callee",
-    available: true,
+    gaps: [], available: true,
     diagnostic: null,
   };
   const coverage = {
