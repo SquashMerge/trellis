@@ -255,6 +255,7 @@ async function specimen(
     formatVersion: 1,
     producerId: "native",
     extractionInputs: [],
+    capabilityReports: [],
     declarations: allDeclarations,
     calls: allCalls,
     controls: [],
@@ -514,7 +515,7 @@ async function specimen(
             "reference",
           ].map((kind) => ({
             kind,
-            available: status !== "unsupported" || kind !== "callee",
+            gaps: [], available: status !== "unsupported" || kind !== "callee",
             diagnostic:
               status === "unsupported" && kind === "callee"
                 ? "unsupported"

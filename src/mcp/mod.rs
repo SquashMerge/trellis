@@ -35,6 +35,11 @@ type EvidenceErrorHook =
 #[doc(hidden)]
 #[derive(Clone, Default)]
 pub struct TransportHooksForTests {
+    /// A paused call clock shared with this fixture's checkout runtime. Its
+    /// presence disables real-time call-expiry wakeups; explicit input or worker
+    /// completion publishes progress. Final-check retry timers stay real-time.
+    pub paused_clock_for_tests:
+        Option<std::sync::Arc<dyn Fn() -> std::time::Instant + Send + Sync>>,
     /// On the reader thread, after each frame is complete and counted, before
     /// it is published to the coordinator.
     pub frame_read: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
@@ -97,6 +102,28 @@ impl OpenedWorkspace {
     pub fn with_call_deadline_for_tests(mut self, deadline: std::time::Duration) -> Self {
         self.call_deadline = deadline;
         self
+    }
+    fn clock_now(&self) -> std::time::Instant {
+        #[cfg(feature = "test-support")]
+        if let Some(clock) = &self.hooks.paused_clock_for_tests {
+            return clock();
+        }
+        std::time::Instant::now()
+    }
+    fn helper_deadline(&self, deadline: std::time::Instant) -> std::time::Instant {
+        #[cfg(feature = "test-support")]
+        if self.hooks.paused_clock_for_tests.is_some() {
+            return std::time::Instant::now()
+                + deadline.saturating_duration_since(self.clock_now());
+        }
+        deadline
+    }
+    fn call_timer_enabled(&self) -> bool {
+        #[cfg(feature = "test-support")]
+        if self.hooks.paused_clock_for_tests.is_some() {
+            return false;
+        }
+        true
     }
     pub fn label(&self) -> &str {
         &self.label
@@ -333,6 +360,7 @@ fn evidence_read(
     daemon_handle: Option<&tokio::runtime::Handle>,
     selected: Option<&crate::daemon::registry::SelectedCheckout>,
     deadline: std::time::Instant,
+    clock_now: &dyn Fn() -> std::time::Instant,
     cancel: &std::sync::atomic::AtomicBool,
     publish: &dyn Fn(bool),
     id: &serde_json::Value,
@@ -354,7 +382,7 @@ fn evidence_read(
         match probe.check() {
             Ok(()) => {}
             Err(error) if crate::store::cli_read_retryable_contention(&error) => {
-                if cancelled() || std::time::Instant::now() >= deadline {
+                if cancelled() || clock_now() >= deadline {
                     anyhow::bail!("deadline_exceeded: MCP selected read deadline");
                 }
                 std::thread::sleep(std::time::Duration::from_millis(1));
@@ -676,6 +704,13 @@ struct InFlight {
     attempted: serde_json::Value,
 }
 
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.cancel
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
 struct CallContext {
     workspace: std::sync::Arc<OpenedWorkspace>,
     registry: Registry,
@@ -687,6 +722,79 @@ struct CallContext {
     deadline: std::time::Instant,
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     resolved: Resolved,
+}
+
+fn commit_selection(
+    registry: &std::sync::Arc<tokio::sync::Mutex<crate::daemon::registry::CheckoutRegistry>>,
+    session: u64,
+    prepared: crate::daemon::registry::PreparedSelection,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<crate::daemon::registry::SelectedCheckout, crate::daemon::registry::SelectionError> {
+    let mut registry = registry.blocking_lock();
+    // EOF cancels before disconnect takes this same guard. Either admission
+    // wins first and disconnect removes it, or a late admission is refused.
+    if cancel.load(std::sync::atomic::Ordering::Acquire) {
+        return Err(crate::daemon::registry::SelectionError::Unavailable);
+    }
+    registry.select_prepared(session, prepared)
+}
+
+#[cfg(test)]
+mod selection_commit_tests {
+    use super::*;
+
+    #[test]
+    fn disconnect_cancels_a_prepared_selection_before_owner_commit() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("checkout");
+        let status = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(&root)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let root = root.canonicalize().unwrap();
+        let identity =
+            crate::store::topology::WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+        let registry = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::daemon::registry::CheckoutRegistry::new(),
+        ));
+        registry
+            .blocking_lock()
+            .attach_launch(7, &identity)
+            .unwrap();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (prepared_tx, prepared_rx) = std::sync::mpsc::sync_channel(0);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(0);
+        let worker_registry = registry.clone();
+        let worker_cancel = cancel.clone();
+        let worker = std::thread::spawn(move || {
+            let probe = worker_registry.blocking_lock().selection_probe();
+            let prepared = probe.prepare(&identity, &root).unwrap();
+            prepared_tx.send(()).unwrap();
+            resume_rx.recv().unwrap();
+            commit_selection(&worker_registry, 7, prepared, &worker_cancel)
+        });
+        prepared_rx
+            .recv_timeout(crate::testing::HANG_BACKSTOP)
+            .unwrap();
+        cancel.store(true, std::sync::atomic::Ordering::Release);
+        registry.blocking_lock().disconnect(7);
+        resume_tx.send(()).unwrap();
+        assert!(matches!(
+            worker.join().unwrap(),
+            Err(crate::daemon::registry::SelectionError::Unavailable)
+        ));
+        let guard = registry.blocking_lock();
+        assert!(guard.idle_exit_deadline().is_some());
+        let tick_at = std::time::Instant::now() + crate::daemon::registry::DAEMON_IDLE_DELAY;
+        drop(guard);
+        let tick = registry.blocking_lock().advance(tick_at).unwrap();
+        assert!(
+            tick.exit,
+            "a late selection must not resurrect the disconnected session"
+        );
+    }
 }
 
 /// One admitted call, run whole on its worker: selection, readiness, the
@@ -711,14 +819,13 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
         .and_then(|o| o.get("workspace"));
     let selected = if let Some((registry, session_id)) = &registry {
         match selection.and_then(serde_json::Value::as_str) {
-            Some(path) => registry
-                .blocking_lock()
-                .select(
-                    *session_id,
-                    workspace.identity(),
-                    std::path::Path::new(path),
-                )
-                .map(Some),
+            Some(path) => {
+                let probe = registry.blocking_lock().selection_probe();
+                probe
+                    .prepare(workspace.identity(), std::path::Path::new(path))
+                    .and_then(|prepared| commit_selection(registry, *session_id, prepared, &cancel))
+                    .map(Some)
+            }
             None => workspace
                 .check()
                 .map(|_| None)
@@ -956,6 +1063,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                     daemon_handle.as_ref(),
                     selected.as_ref(),
                     deadline,
+                    &|| workspace.clock_now(),
                     &cancel,
                     &publish,
                     id,
@@ -1011,14 +1119,11 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
             let Some(path) = selection.and_then(serde_json::Value::as_str) else {
                 unreachable!("validated capacity requires explicit selection")
             };
-            let checked_capacity = {
-                let guard = registry
-                    .as_ref()
-                    .expect("daemon registry required")
-                    .0
-                    .blocking_lock();
-                guard.capacity_witness(workspace.identity(), std::path::Path::new(path))
-            };
+            let checked_capacity =
+                crate::daemon::registry::CheckoutRegistry::capacity_witness_unlocked(
+                    workspace.identity(),
+                    std::path::Path::new(path),
+                );
             match checked_capacity {
                 Ok(witness) => {
                     let catching_up = catching_up(&registry, &witness.identity.root_key);
@@ -1287,6 +1392,7 @@ fn coordinate(
     let reader_sender = sender.clone();
     let window = std::sync::Arc::new(FrameWindow::default());
     let reader_window = window.clone();
+    let reader_workspace = workspace.clone();
     #[cfg(feature = "test-support")]
     let frame_read = workspace.hooks.frame_read.clone();
     let completed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -1303,7 +1409,7 @@ fn coordinate(
                 };
                 // Protocol acceptance: the deadline starts when the frame is
                 // complete, not when the coordinator reaches it.
-                let accepted = Instant::now();
+                let accepted = reader_workspace.clock_now();
                 // Counted when complete, before it is published: a decision
                 // that samples the count waits for every frame it covers.
                 let seq = counter.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
@@ -1418,6 +1524,7 @@ fn coordinate(
                 .min();
             let next = in_flight
                 .values()
+                .filter(|_| workspace.call_timer_enabled())
                 .map(|call| call.deadline)
                 .chain(retry)
                 .min();
@@ -1462,16 +1569,22 @@ fn coordinate(
             };
             let outcome = outcome?;
             let selected = match &outcome.finals {
-                Finals::Selected { witness, .. } if Instant::now() < call.deadline => {
+                Finals::Selected { witness, .. } if workspace.clock_now() < call.deadline => {
                     Some((witness.clone(), "selected_final"))
                 }
-                Finals::Capacity { witness, .. } if Instant::now() < call.deadline => {
+                Finals::Capacity { witness, .. } if workspace.clock_now() < call.deadline => {
                     Some((witness.clone(), "capacity_final"))
                 }
                 _ => None,
             };
             if let Some((witness, stage)) = selected {
-                let running = start_final_check(token, &witness, call.deadline, stage, &sender);
+                let running = start_final_check(
+                    token,
+                    &witness,
+                    workspace.helper_deadline(call.deadline),
+                    stage,
+                    &sender,
+                );
                 let retry_at = (!running).then(|| Instant::now() + FINAL_RECHECK_TICK);
                 checks.insert(
                     token,
@@ -1484,7 +1597,7 @@ fn coordinate(
                 continue;
             }
             let mut result = outcome.result;
-            if Instant::now() < call.deadline
+            if workspace.clock_now() < call.deadline
                 && let Finals::Launch { catching_up } = &outcome.finals
             {
                 phase_hook("launch_final")?;
@@ -1530,7 +1643,7 @@ fn coordinate(
                     capacity: matches!(check.outcome.finals, Finals::Capacity { .. }),
                 }),
                 Err(SelectionError::Unavailable) => {
-                    if Instant::now() < call.deadline {
+                    if workspace.clock_now() < call.deadline {
                         check.running = false;
                         check.retry_at = Some(Instant::now() + FINAL_RECHECK_TICK);
                         checks.insert(token, check);
@@ -1556,7 +1669,11 @@ fn coordinate(
             finished.push((token, check.outcome.result, gate));
         }
         let now = Instant::now();
-        checks.retain(|token, _| in_flight.get(token).is_some_and(|call| now < call.deadline));
+        checks.retain(|token, _| {
+            in_flight
+                .get(token)
+                .is_some_and(|call| workspace.clock_now() < call.deadline)
+        });
         for (token, check) in &mut checks {
             if check.running || check.retry_at.is_some_and(|at| now < at) {
                 continue;
@@ -1566,7 +1683,7 @@ fn coordinate(
             else {
                 unreachable!("only selected calls have final checks")
             };
-            let deadline = in_flight[token].deadline;
+            let deadline = workspace.helper_deadline(in_flight[token].deadline);
             check.running = start_final_check(*token, witness, deadline, "final_recheck", &sender);
             check.retry_at = (!check.running).then(|| now + FINAL_RECHECK_TICK);
         }
@@ -1616,7 +1733,7 @@ fn coordinate(
                 continue;
             };
             phase_hook("call_send")?;
-            let result = if Instant::now() >= call.deadline {
+            let result = if workspace.clock_now() >= call.deadline {
                 deadline_answer(&call)
             } else if let Some(gate) = gate {
                 match gate.witness.verify_at_send(&gate.dirs) {
@@ -1664,7 +1781,7 @@ fn coordinate(
                 wire::write_relayed_response(&mut writer, call.relay, &value)?;
             }
         }
-        let now = Instant::now();
+        let now = workspace.clock_now();
         let mut expired: Vec<u64> = in_flight
             .iter()
             .filter(|(_, call)| call.deadline <= now)
@@ -1713,7 +1830,7 @@ fn coordinate(
                             modern,
                         ))
                     };
-                    if Instant::now() >= deadline {
+                    if workspace.clock_now() >= deadline {
                         // The deadline overrides any outcome still unsent.
                         refuse("deadline_exceeded")
                     } else if tools::validate(name, arguments.as_ref()).is_err() {

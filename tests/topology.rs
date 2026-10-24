@@ -1180,7 +1180,7 @@ fn index_delete_journal_no_wal() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        14
+        17
     );
     drop(db);
     let bytes = fs::read(&index).unwrap();
@@ -1247,6 +1247,7 @@ fn guard_drop_unlocks_even_when_fork_child_keeps_descriptor() {
     let (temp, roots) = common::fixture();
     let work = root(temp.path());
     let id = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
+    drop(roots.index_use(&id).unwrap());
     let guard = roots
         .writer(std::sync::Arc::new(id.verified_clone_for_tests().unwrap()))
         .unwrap();
@@ -1859,7 +1860,7 @@ fn forget_rechecks_sqlite_schema_after_confirmation() {
 }
 
 #[test]
-fn gc_classifies_current_schema14_but_refuses_spoofed_shapes() {
+fn gc_classifies_current_schema17_but_refuses_spoofed_shapes() {
     let (temp, roots) = common::fixture();
     let work = root(temp.path());
     let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
@@ -1905,15 +1906,15 @@ fn gc_classifies_current_schema14_but_refuses_spoofed_shapes() {
     db.execute_batch("DROP TRIGGER unapproved_trigger").unwrap();
     assert_eq!(inspect(), ("unknown", "recent_open"));
     // Any earlier schema is collectable whatever its layout, root or age (#253).
-    for version in [1, 7, 9, 13] {
+    for version in [1, 7, 9, 13, 14, 15] {
         db.pragma_update(None, "user_version", version).unwrap();
         assert_eq!(inspect(), ("eligible", "old_schema"), "v{version}");
     }
     db.pragma_update(None, "user_version", 0).unwrap();
     assert_eq!(inspect(), ("unknown", "unknown_index_schema"));
-    db.pragma_update(None, "user_version", 15).unwrap();
+    db.pragma_update(None, "user_version", 18).unwrap();
     assert_eq!(inspect(), ("unknown", "unknown_index_schema"));
-    db.pragma_update(None, "user_version", 14).unwrap();
+    db.pragma_update(None, "user_version", 17).unwrap();
     assert_eq!(inspect(), ("unknown", "recent_open"));
     db.execute("UPDATE index_metadata SET root_inode='1'", [])
         .unwrap();
@@ -1921,7 +1922,7 @@ fn gc_classifies_current_schema14_but_refuses_spoofed_shapes() {
 }
 
 #[test]
-fn complete_schema14_index_remains_gc_eligible() {
+fn complete_schema17_index_remains_gc_eligible() {
     let (temp, roots) = common::fixture();
     let work = root(temp.path());
     let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
@@ -1930,7 +1931,7 @@ fn complete_schema14_index_remains_gc_eligible() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        14
+        17
     );
     let now = 1_800_000_000_i64;
     db.execute(
@@ -2613,7 +2614,7 @@ fn server_updates_recapture_after_confirmed_delete_and_reject_stale_raw_input() 
 
 #[cfg(feature = "test-support")]
 #[test]
-fn gc_report_accepts_current_schema14_but_rejects_bad_inventory() {
+fn gc_report_accepts_current_schema17_but_rejects_bad_inventory() {
     let (temp, roots) = common::fixture();
     let work = root(temp.path());
     let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
@@ -2656,14 +2657,8 @@ fn automatic_gc_deletes_old_schema_indexes_unless_in_use_or_unreadable() {
         let workspace = temp.path().join(name);
         fs::create_dir(&workspace).unwrap();
         let identity = WorkspaceIdentity::discover(Some(&workspace), &workspace).unwrap();
-        // Create the private use-lock inode without opening a current Store.
-        drop(
-            roots
-                .writer(std::sync::Arc::new(
-                    identity.verified_clone_for_tests().unwrap(),
-                ))
-                .unwrap(),
-        );
+        // Provision the fixture without opening a current Store.
+        drop(roots.index_use(&identity).unwrap());
         let path = roots.index_db(&identity);
         let db = rusqlite::Connection::open(&path).unwrap();
         db.execute_batch("CREATE TABLE anything(x)").unwrap();
@@ -2686,13 +2681,7 @@ fn automatic_gc_deletes_old_schema_indexes_unless_in_use_or_unreadable() {
     let unreadable_root = temp.path().join("unreadable");
     fs::create_dir(&unreadable_root).unwrap();
     let unreadable = WorkspaceIdentity::discover(Some(&unreadable_root), &unreadable_root).unwrap();
-    drop(
-        roots
-            .writer(std::sync::Arc::new(
-                unreadable.verified_clone_for_tests().unwrap(),
-            ))
-            .unwrap(),
-    );
+    drop(roots.index_use(&unreadable).unwrap());
     fs::write(roots.index_db(&unreadable), b"not a sqlite database").unwrap();
     fs::set_permissions(
         roots.index_db(&unreadable),

@@ -47,3 +47,60 @@ Everything else is unchanged: resolved, proven-external, callable-value negative
 | alias role required | yes | no | no | yes |
 
 The [toolkit README](../../../tools/semantic-contract/README.md) lists the complete floors, and `tools/semantic-contract/counts.mjs` holds them as per-language data.
+
+## Amendment 2 (2026-10-23): hardware profile shape check
+
+- **Status:** owner-approved 2026-10-23.
+- **Amends:** [#25](https://github.com/SquashMerge/trellis/issues/25)'s closed v1 hardware schema in `check-policy.mjs`, for values only.
+
+Decision 2 made the [reference hardware profile](../hardware/mac-mini-m5-pro-v1.json) the attestation source for pinned executable and toolchain captures. It is a measured record that changes on every producer or toolchain re-pin. While `check-policy.mjs` held a literal copy of it, every re-pin had to edit both files.
+
+`check-policy.mjs` now checks the hardware profile's closed shape, not its values:
+
+- the exact key set at every level, with no unknown or missing fields (`toolchains[]` is optional until a corpus pins a toolchain);
+- types: integers for counts, booleans and strings;
+- formats: non-empty version and name strings, `YYYY-MM-DD` dates, `artifactDigest` as `sha256:<64 lowercase hex>` or an npm `sha512-<base64>` integrity, and `executableHash` and `toolchainHash` as 64 lowercase hex;
+- unique `semanticProducers[].name` and `toolchains[].name`;
+- the profile's structural invariants: `version` is 1, `qualification` makes no benchmark claim (`benchmarkEvidence: null`, `passingBenchmarkClaim: false`), `profileId` equals the file name and the policy's `referenceHost.profileId`, `intended` matches the policy's reference-host location and paid-cloud flag, and `cpuCoreGroups` sums to `cpuCores`.
+
+A re-pin edits only the profile. The policy and cohort files are ratified Stage 1 text and stay value-frozen.
+
+## Amendment 3 (2026-10-23): production native captures
+
+- **Status:** owner-approved 2026-10-23.
+- **Context:** [#95](https://github.com/SquashMerge/trellis/issues/95) ([#277](https://github.com/SquashMerge/trellis/pull/277)) admitted the production native extractor, `trellis.native.syntax@native-v8`, to the toolkit through a test-support capture command. Its proposals for pinning and for the unsupported floor were ruled on as follows.
+
+1. **Pinning.** A production native capture's `executable` row pins the compiled `TRELLIS_EXTRACTOR_HASH` ([Decision 0005](0005-same-generation-producer-drift.md) R-2) of the pinned test-support capture build, not the SHA-256 of a release binary's bytes. In test-support builds that hash also covers the capture adapter (`src/native_capture.rs`), so an adapter change changes the pin while release extractor hashes stay unchanged. The pin uses decision 2's existing hardware-profile lookup. A `semanticProducers[]` entry, clearly labelled as a test-support capture build, records the producer ID and version, the extractor hash as `executableHash` and as `artifactDigest` (`sha256:<hash>`), and the source commit, pinned Rust toolchain and `test-support` feature in its install text. The checker compares the recorded digest and never rebuilds or runs the producer. A changed hash requires a re-pin and recapture. A changed measurement contract still requires a new native version. The hash enters neither `occ:v2` nor extraction context.
+2. **Reference rows.** native-v8 emits no reference candidates (`references: []`), so the 40-reference, callable-value-negative and imports/aliases floors cannot be met from production native captures. The floors are unchanged. native-v9 ([#279](https://github.com/SquashMerge/trellis/issues/279)) adds a production native reference family. Until then, no reference rows are fabricated, and no fixture that depends on them can be `profile:"corpus"`.
+3. **Unsupported documents.** Amendment 1's unsupported floor is met only by explicit per-family unavailability reports from the production extractor, added in native-v9 ([#279](https://github.com/SquashMerge/trellis/issues/279)). A whole-document `partial` coverage state is not such a report, and no working family is disabled to meet a count. The floor stays 1 for JavaScript (for example tagged templates) and Rust (for example opaque macro and attribute token trees). For Java and Python it is 0, not applicable, until a genuine construct is identified; a further amendment restores it then.
+
+| Floor | JavaScript | Java | Python | Rust |
+|---|---:|---:|---:|---:|
+| unsupported documents | 1 | 0 | 0 | 1 |
+
+Amendment 1's other floors are unchanged.
+
+## Amendment 4 (2026-10-24): production capability reports
+
+- **Status:** ratified by the owner, 2026-10-24.
+- **Amends:** Amendment 3's production report/count wording and its illustrative JavaScript construct, together with [contract v1's capability rules](../contract-v1.md#279-amendment-production-measurement-capabilities). The owner ruling below defers JavaScript's unsupported floor to zero.
+
+1. **Report authority.** Production native captures carry document/revision-scoped reports from the production extractor, with exactly the four families `declarationName`, `callee`, `invocation` and `reference`. Entries are `{kind,available,diagnostic,gaps}`; each gap is `{range,diagnostic}`. The range is the actual nonempty parser-measured UTF-8 span of an opaque construct; the nonempty diagnostic identifies that construct and missing convention. An enabled family has null family diagnostic and may have gaps; an unavailable family has a concrete family diagnostic and no candidates or gaps. Native-v9 enables all four conventions. Missing reports reject production captures. Authored intents may mirror, never override, production reports. Publication, reuse, retained reconstruction and capture preserve the same reports.
+2. **Containment and valid evidence.** After full tuple and coordinate validation, an enabled-family anchor is unsupported only when wholly contained in a same-family gap and without a compatible candidate. It has no candidate IDs and retains the concrete gap diagnostic. A same-family candidate wholly contained in a claimed gap rejects the artifact as contradictory. Boundary overlap or crossing alone is not unsupported; an unmatched anchor outside a gap remains unmatched. Valid measured anchors beside or enclosing a gap survive, as do their supported/observed roles. Native selected coverage is partial when a gap affects requested evidence, without changing independently authenticated semantic completeness or its unresolved-inference rule.
+3. **Distinct-document count.** Count one distinct `(DocumentKey,revisionId)` only when its captured production report has a genuine family gap (or a genuinely unavailable whole convention) **and** that tuple carries at least one authenticated captured semantic producer fact. Any semantic fact kind except coverage/provenance bookkeeping qualifies; it need not lie in the gap or join in its family. Additional gaps, families, facts or unsupported anchors in the tuple add nothing. Authored false flags, asserted unsupported joins, parser recovery and native partial coverage alone count zero. Normalization and checking independently derive joins and counts from captured reports and facts, never from generated rows.
+4. **No manufactured JavaScript gap; floor deferred.** Amendment 3's tagged-template example is not evidence of a missing convention: tagged templates were already measured in native-v8. Keep working measurements and test simple, member, compound and nested tagged templates and substitutions before proposing a gap. Report only genuine skipped syntax and affected families. By the owner ruling on #299, JavaScript's unsupported-document floor is **0**, like Java and Python, until a genuine construct is identified and a further amendment restores it. Rust stays at **1**. Do not disable a working family or remove valid tagged-template measurements to satisfy the floor.
+
+The unsupported floors are JavaScript **0**, Rust **1**, Java **0**, Python **0**. This explicit owner ruling supersedes Amendment 3's JavaScript floor.
+
+## Amendment 5 (2026-10-24): native reference sites and import aliases
+
+- **Status:** ratified by the owner, 2026-10-24.
+- **Amends:** Amendment 3's native-v9 reference-family follow-up, together with [contract v1's identifier-site rules](../contract-v1.md#279-amendment-native-identifier-site-candidates). No corpus floor changes.
+
+Native-v9 measures parser-proved identifier-site candidates, not semantic roles or targets. The complete per-document/owner inventory receives `occ:v2` reference IDs and ordinals before producer joins; semantic subsets retain those identities. Declaration-name candidates use the measured declaration's lexical parent (or itself without a parent), while other candidates retain the existing executable-container ownership. Initializer calls and ordinary uses do not move into variable/parameter declaration ownership.
+
+The alias declarations are deliberately narrow: JavaScript identifier-to-identifier renamed import specifiers and Rust use-as leaves, including grouped use trees. Their name/nameRange is the local alias, range is the import-specifier / use-as clause, and parent is the existing lexical declaration/module. Keep both identifier candidates and infer no semantic alias/definition role or original target. Other binding forms gain no guessed declaration-name anchors. Python alias candidates do not create an exact alias declaration anchor or lift its existing corpus exemption.
+
+Amendment 1's alias floor remains required for JavaScript and Rust, exempt for Java and Python. A counted alias still needs an authenticated semantic reference at the exact measured alias name, roles `definition` and `alias`, and the original declaration as target. The 40-reference and callable-value-negative floors remain unchanged; no fabricated facts or native roles fill them.
+
+**Floor certification deferred (owner ruling, 2026-10-24).** #299 does not certify the per-language 40-reference, 20-callable-value-negative or four imports/aliases scenario floors. Real SCIP facts must first be joined to native-v9 candidates in #88/#89; certification belongs to corpus issues #27–#30 afterward. These required totals are unchanged. [Owner ruling](https://github.com/SquashMerge/trellis/pull/299#issuecomment-6385469679).

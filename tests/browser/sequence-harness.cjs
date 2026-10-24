@@ -9,14 +9,31 @@ const {createConnection} = require("node:net");
 const ROOT = resolve(__dirname,"../..");
 const SOURCE_P = "fn seed(value: i32) -> i32 { old_step(value) }\nfn old_step(value: i32) -> i32 { value + 1 }\n";
 const scoped = (key,suffix) => `/api/checkouts/${encodeURIComponent(key)}/${suffix}`;
-let binary, suiteBinaryDir;
+let binary, suiteBinaryDir, cleanupPromise, closing = false;
+const clients = new Set();
+function ownClient(child) {
+  clients.add(child);
+  child.once("exit", () => clients.delete(child));
+  child.once("error", () => clients.delete(child));
+  return child;
+}
+function interrupted(signal) {
+  cleanup().then(() => process.exit(signal === "SIGINT" ? 130 : 143), error => {
+    console.error(error);
+    process.exit(1);
+  });
+}
+const onInterrupt = () => interrupted("SIGINT");
+const onTerminate = () => interrupted("SIGTERM");
 const delay = ms => new Promise(resolveDelay => setTimeout(resolveDelay, ms));
 // Functional tests assert correctness, not speed: bounds only detect hangs
 // (matches trellis::testing::HANG_BACKSTOP, above serve's replacement wait).
 const HANG_BACKSTOP_MS = 120000;
 function run(command, args, {cwd = ROOT, env = process.env, timeout = 180000} = {}) {
   return new Promise((resolveRun, reject) => {
+    if (command === binary && closing) { reject(new Error("sequence suite is closing")); return; }
     const child = spawn(command, args, {cwd, env, stdio:["ignore", "pipe", "pipe"]});
+    if (command === binary) ownClient(child);
     let stdout = "", stderr = "", settled = false;
     const timer = setTimeout(() => {
       if (settled) return;
@@ -120,8 +137,9 @@ async function listenerDiagnostics(paths) {
   }));
 }
 async function startDaemon(paths, expectedRevision) {
-  const child = spawn(binary, ["serve", "--workspace", paths.workspace, "--bind", "127.0.0.1:0", "--token-file", paths.tokenFile],
-    {cwd:ROOT, env:paths.env, stdio:["ignore","ignore","pipe"]});
+  if (closing) throw new Error("sequence suite is closing");
+  const child = ownClient(spawn(binary, ["serve", "--workspace", paths.workspace, "--bind", "127.0.0.1:0", "--token-file", paths.tokenFile],
+    {cwd:ROOT, env:paths.env, stdio:["ignore","ignore","pipe"]}));
   try {
     let stderr = "", base, rejected;
     const address = new Promise((resolveAddress, rejectAddress) => {
@@ -183,11 +201,14 @@ async function startDaemon(paths, expectedRevision) {
   } catch (error) { child.kill("SIGTERM"); throw error; }
 }
 async function stopDaemon(server) {
-  if (!server?.child || server.child.exitCode !== null) return;
+  if (!server?.child || server.child.exitCode !== null || server.child.signalCode !== null) return;
   server.child.kill("SIGTERM");
   const exited = new Promise(resolveExit => server.child.once("exit",resolveExit));
   if (await Promise.race([exited.then(()=>true),delay(3000).then(()=>false)])) return;
-  server.child.kill("SIGKILL"); await Promise.race([exited,delay(2000)]);
+  server.child.kill("SIGKILL");
+  if (!await Promise.race([exited.then(()=>true),delay(2000).then(()=>false)])) {
+    throw new Error(`suite client ${server.child.pid} did not exit after SIGKILL`);
+  }
 }
 async function api(base, token, method, route, body) {
   const response = await fetch(`${base}${route}`, {method, signal:AbortSignal.timeout(8000),
@@ -263,6 +284,22 @@ async function setup() {
   const built = await builtBinary();
   suiteBinaryDir = mkdtempSync(join(tmpdir(),"trellis-sequence-binary-"));
   binary = join(suiteBinaryDir,basename(built)); copyFileSync(built,binary);
+  process.on("SIGINT", onInterrupt);
+  process.on("SIGTERM", onTerminate);
 }
-async function cleanup() { await stopSuiteDaemons(); if(suiteBinaryDir) rmSync(suiteBinaryDir,{recursive:true,force:true}); }
+function cleanup() {
+  if (!cleanupPromise) {
+    closing = true;
+    cleanupPromise = (async () => {
+      // Stop and reap clients before the daemon inventory: an in-flight CLI
+      // must not elect another detached daemon after that inventory.
+      await Promise.all([...clients].map(child => stopDaemon({child})));
+      await stopSuiteDaemons();
+      if (suiteBinaryDir) rmSync(suiteBinaryDir,{recursive:true,force:true});
+      process.removeListener("SIGINT", onInterrupt);
+      process.removeListener("SIGTERM", onTerminate);
+    })();
+  }
+  return cleanupPromise;
+}
 module.exports = {setup,cleanup,fixture,run,startDaemon,stopDaemon,api,scoped,connect,seedId,indexThroughApi,chromiumPath:undefined,get binary(){return binary;}};

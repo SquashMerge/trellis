@@ -321,8 +321,9 @@ export function checkMeasurement(
       );
     if (
       (row.name === null) !== (row.nameRange === null) ||
-      (row.kind === "module" || row.kind === "anonymousFunction") !==
-        (row.name === null) ||
+      (["module", "anonymousFunction"].includes(row.kind)
+        ? row.name !== null
+        : row.name === null && row.kind !== "implementation") ||
       (nameRange !== null && !contains(range, nameRange))
     )
       reject("MEASUREMENT.WITNESS", "nameRange", "invalid name and range");
@@ -409,7 +410,9 @@ export function checkMeasurement(
         !candidates.some(
           (y) =>
             y !== x &&
-            strict(position.get(x.ref).range, position.get(y.ref).range) &&
+            (strict(position.get(x.ref).range, position.get(y.ref).range) ||
+              (x.kind === "module" && y.kind !== "module" &&
+                equal(position.get(x.ref).range, position.get(y.ref).range))) &&
             contains(position.get(y.ref).range, child),
         ),
     );
@@ -432,7 +435,7 @@ export function checkMeasurement(
       reject(
         "MEASUREMENT.OWNER",
         "parentRef",
-        "not the immediate source container",
+        `not the immediate source container: ${row.ref}`,
       );
     descriptors.set(row.ref, chain);
     visiting.delete(row.ref);

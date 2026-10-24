@@ -38,8 +38,8 @@ fn pair_snapshot(index: &std::path::Path) -> PairSnapshot {
             .unwrap();
     assert_eq!(
         tables.len(),
-        34,
-        "compare exact schema-13 derived evidence inventory"
+        60,
+        "compare exact schema-17 derived evidence inventory"
     );
     let expected = vec![
         "class_projections",
@@ -65,6 +65,8 @@ fn pair_snapshot(index: &std::path::Path) -> PairSnapshot {
         "native_version_ancestor_signature_types",
         "native_version_call_regions",
         "native_version_calls",
+        "native_version_capability_families",
+        "native_version_capability_gaps",
         "native_version_control_regions",
         "native_version_coverage_roles",
         "native_version_declaration_ancestors",
@@ -73,14 +75,38 @@ fn pair_snapshot(index: &std::path::Path) -> PairSnapshot {
         "native_version_headers",
         "native_version_own_signature_types",
         "native_version_parameters",
+        "native_version_references",
         "revision_capture_inputs",
         "revision_documents",
         "revision_producer_bindings",
+        "semantic_basis",
+        "semantic_basis_lookup_dependencies",
+        "semantic_call_bindings",
+        "semantic_call_candidates",
+        "semantic_call_join_candidates",
+        "semantic_call_possible_dispatch",
+        "semantic_coverage",
+        "semantic_coverage_roles",
+        "semantic_declaration_binding_symbols",
+        "semantic_declaration_bindings",
+        "semantic_declaration_join_candidates",
+        "semantic_producer_languages",
+        "semantic_producers",
+        "semantic_provenance",
+        "semantic_reference_candidates",
+        "semantic_reference_roles",
+        "semantic_references",
+        "semantic_requested_producer_languages",
+        "semantic_requested_producers",
+        "semantic_revision_producers",
+        "semantic_symbol_targets",
+        "semantic_symbols",
+        "semantic_type_relationships",
     ];
     assert_eq!(
         tables.iter().map(String::as_str).collect::<Vec<_>>(),
         expected,
-        "exact schema-13 table names: complete paired producer bindings and durable release debt"
+        "exact schema-17 table names: complete paired native and semantic evidence"
     );
     for required in [
         "document_versions",

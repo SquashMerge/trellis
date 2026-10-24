@@ -261,7 +261,7 @@ export async function loadFixture(root, { repository = repositoryRoot } = {}) {
       );
     unique(intent.measurementSupport, (x) => x.kind, "measurementSupport");
     for (const entry of intent.measurementSupport)
-      if (entry.available !== (entry.diagnostic === null))
+      if (entry.available !== (entry.diagnostic === null) || (!entry.available && entry.gaps.length))
         reject(
           "IDENTITY.COVERAGE",
           "measurementSupport",

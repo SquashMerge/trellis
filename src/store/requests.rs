@@ -164,11 +164,6 @@ impl MaintenanceQueueProbe {
     }
 }
 
-pub(crate) fn queue_absent_without_sidecars(path: &Path) -> bool {
-    matches!(fs::symlink_metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
-        && !queue_sidecar_exists(path)
-}
-
 fn queue_sidecar_exists(path: &Path) -> bool {
     // A rollback journal may be hot or in use. SQLite can create WAL shared
     // memory files even when the main database is opened read-only; reject
@@ -498,6 +493,14 @@ impl Store {
     pub fn request_db_path(&self) -> std::path::PathBuf {
         self.roots.requests_db(&self.identity)
     }
+    /// Only loss of the whole index directory permits closing without a queue read.
+    pub(crate) fn index_directory_missing(&self) -> Result<bool> {
+        match fs::symlink_metadata(self.roots.index_dir(&self.identity)) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+            Err(error) => Err(error.into()),
+            Ok(_) => Ok(false),
+        }
+    }
     /// Admit only an existing, known-clean queue for one short maintenance
     /// unit. Never create the queue, recover its journal, wait three seconds,
     /// run quick_check, or acquire a SQLite writer lock.
@@ -806,7 +809,9 @@ impl Store {
         let guard = if old_root {
             self.roots.index_use_existing_without_root(&self.identity)?
         } else {
-            self.roots.index_use(&self.identity)?
+            // Activation provisions the index directory. Queue admission must
+            // not recreate one purged after the worker's boundary check.
+            self.roots.index_use_existing(&self.identity)?
         };
         // A root change while acquiring SH must win over a missing queue.
         // Once SH is held, GC cannot unlink this queue before the read ends.
@@ -1521,6 +1526,27 @@ impl Store {
             id: id.to_owned(),
             notify,
         });
+    }
+
+    /// Wake request waiters when the worker closes a missing queue. This is
+    /// not a terminal COMMIT: callers must re-read and report the queue failure.
+    pub(crate) fn notify_request_queue_unavailable(&self) {
+        self.publication_gate.notify_terminal();
+    }
+
+    /// Run once while a request waiter holds the generation lock, just before
+    /// it atomically releases that lock and sleeps.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn set_before_terminal_wait_hook_for_tests(&self, hook: impl FnOnce() + Send + 'static) {
+        self.publication_gate.test_before_terminal_wait.set(hook);
+    }
+
+    /// Unblock a fixture's request waiter during failure cleanup.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn wake_terminal_waiters_for_tests(&self) {
+        self.notify_terminal_waiters();
     }
 
     /// Read a timeout diagnostic without blocking behind a terminal queue write.

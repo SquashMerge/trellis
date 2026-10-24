@@ -103,6 +103,7 @@ const native = {
   formatVersion: 1,
   producerId: "native",
   extractionInputs: [],
+  capabilityReports: [],
   declarations: [
     declaration("main", "main", 0, 39, 9),
     declaration("target", "target", 40, 60, 49),
@@ -539,7 +540,7 @@ async function specimen(
   const support = ["declarationName", "callee", "invocation", "reference"].map(
     (kind) => ({
       kind,
-      available: !(status === "unsupported" && kind === unsupportedFamily),
+      gaps: [], available: !(status === "unsupported" && kind === unsupportedFamily),
       diagnostic:
         status === "unsupported" && kind === unsupportedFamily
           ? "native family unavailable"
@@ -1737,10 +1738,25 @@ test("measured declaration site supports definition and alias roles once per ref
 
 // Independently authored Decision 0017 Amendment 1 floors, per language.
 const amendedFloors = {
-  javascript: { ambiguous: 20, typeRelationships: 20, exempt: [] },
-  java: { ambiguous: 0, typeRelationships: 20, exempt: ["alias"] },
-  python: { ambiguous: 0, typeRelationships: 20, exempt: ["alias"] },
-  rust: { ambiguous: 0, typeRelationships: 0, exempt: [] },
+  javascript: {
+    ambiguous: 20,
+    unsupported: 0,
+    typeRelationships: 20,
+    exempt: [],
+  },
+  java: {
+    ambiguous: 0,
+    unsupported: 0,
+    typeRelationships: 20,
+    exempt: ["alias"],
+  },
+  python: {
+    ambiguous: 0,
+    unsupported: 0,
+    typeRelationships: 20,
+    exempt: ["alias"],
+  },
+  rust: { ambiguous: 0, unsupported: 1, typeRelationships: 0, exempt: [] },
 };
 const allRoles = [
   "definition",
@@ -1778,7 +1794,7 @@ const countAtFloors = (language) => {
       ["provenExternal", 20],
       ["ambiguous", floors.ambiguous],
       ["unresolved", 20],
-      ["unsupported", 1],
+      ["unsupported", floors.unsupported],
     ].map(([disposition, count]) => ({ disposition, count })),
     observedRoles: allRoles.filter((role) => !floors.exempt.includes(role)),
   };
@@ -1855,6 +1871,43 @@ test("ambiguous floor is 0 for Python, Java and Rust and stays 20 for JavaScript
     },
   ]);
   for (const row of controls) await runControl(row);
+});
+
+test("unsupported floor is 0 for JavaScript, Java and Python and stays 1 for Rust", async () => {
+  for (const language of ["javascript", "java", "python"]) {
+    const count = countAtFloors(language);
+    assert.equal(
+      count.outcomes.find((x) => x.disposition === "unsupported").count,
+      0,
+    );
+    assert.equal(assertCorpusFloors(count), count);
+  }
+  const controls = registerControls(
+    ["rust"].map((language) => ({
+      id: `COUNT.floor.${language}-unsupported-0`,
+      baseline: () => countAtFloors(language),
+      mutate: (row) => {
+        row.outcomes.find((x) => x.disposition === "unsupported").count = 0;
+        return row;
+      },
+      check: assertCorpusFloors,
+      expectedAssertion: "COUNT.FLOOR",
+      expectedCode: "invalidRecord",
+      expectedField: "counts",
+    })),
+  );
+  for (const row of controls) await runControl(row);
+});
+
+test("JavaScript unsupported floor deferral preserves its other outcome floors", () => {
+  const count = countAtFloors("javascript");
+  count.outcomes.find((row) => row.disposition === "unsupported").count = 0;
+  assert.equal(assertCorpusFloors(count), count);
+  count.outcomes.find((row) => row.disposition === "resolved").count = 19;
+  assert.throws(
+    () => assertCorpusFloors(count),
+    (error) => error.assertion === "COUNT.FLOOR" && error.field === "counts",
+  );
 });
 
 test("Rust needs no type relationships; Java, JavaScript and Python still need 20", async () => {
@@ -2902,25 +2955,17 @@ test("unsupported floor: a declared-unavailable native family plus producer fact
     true,
   );
   // A document whose native families are all available does not qualify.
+  // This corpus is Java, whose floor is 0; only Rust retains a floor of one,
+  // checked at the floor boundary.
   const allAvailable = await generatedCorpus(t, {
     withoutUnsupportedFacts: true,
     allFamiliesAvailable: true,
   });
-  const controls = registerControls([
-    {
-      id: "COUNT.corpus.unsupported-no-qualifying-document",
-      baseline: () => 0,
-      mutate: () => 1,
-      check: (value) => {
-        const s = value === 0 ? capabilityOnly : allAvailable;
-        return checkCounts(s.loaded, s.records);
-      },
-      expectedAssertion: "COUNT.FLOOR",
-      expectedCode: "invalidRecord",
-      expectedField: "counts",
-    },
-  ]);
-  for (const control of controls) await runControl(control);
+  assert.equal(unsupported(allAvailable), 0);
+  assert.equal(
+    checkCounts(allAvailable.loaded, allAvailable.records).floorsEnforced,
+    true,
+  );
 });
 
 test("Java overloads accept distinct signatures but reject unrelated names and containers", async (t) => {
@@ -2975,4 +3020,39 @@ test("second captured producer cannot duplicate a directed edge at the corpus fl
   const s = await generatedCorpus(t, { duplicateProducer: true });
   assert.equal(s.records.typeRelationships.length, 21);
   assert.equal(checkCounts(s.loaded, s.records).typeRelationships, 20);
+});
+
+
+test("captured conformance gaps count one document with authenticated facts, never bookkeeping alone", async (t) => {
+  const unsupported = (records) => records.outcomes.find((row) => row.disposition === "unsupported").count;
+  const symbolFact = {
+    kind: "symbol", ref: "symbol-only",
+    record: {
+      key: { scheme: "scip", symbol: "pkg target", scope: "global", document: null },
+      displayName: "target", declarations: [declaredTarget], provenanceId: "proof",
+    },
+  };
+  for (const [name, facts, expected] of [
+    ["symbol alone", [symbolFact], 1],
+    ["bookkeeping alone", [], 0],
+  ]) await t.test(name, async (t) => {
+    const s = await specimen(t, { normalized: true, facts });
+    const intent = s.loaded.fixture.coverageIntents.find((row) => row.producerId === "native");
+    const families = structuredClone(intent.measurementSupport);
+    families.find((row) => row.kind === "invocation").gaps = [
+      { range: span(0, 8), diagnostic: "conformance opaque construct A" },
+      { range: span(40, 48), diagnostic: "conformance opaque construct B" },
+    ];
+    families.find((row) => row.kind === "callee").gaps = [
+      { range: span(0, 8), diagnostic: "conformance opaque callee convention" },
+    ];
+    s.loaded.native.capabilityReports = [{ document, revisionId: "r1", families }];
+    intent.measurementSupport = structuredClone(families);
+    const records = normalizeFixture(s.loaded).records;
+    assert.equal(unsupported(checkCounts(s.loaded, records)), expected);
+    assert.equal(records.coverage.find((row) => row.producerId === "semantic").state, "complete");
+    const badIntent = intent.measurementSupport.find((row) => row.kind === "invocation");
+    badIntent.gaps = [];
+    assert.throws(() => checkCounts(s.loaded, records), (error) => error.assertion === "JOIN.SUPPORT" && error.field === "measurementSupport");
+  });
 });

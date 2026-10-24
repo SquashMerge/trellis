@@ -113,7 +113,7 @@ impl Default for BrowserOptions {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct CheckoutMetadata {
     root: PathBuf,
     root_key: String,
@@ -180,6 +180,187 @@ impl CheckoutMetadata {
     }
 }
 
+struct BrowserCheckoutEntry {
+    identity: CheckoutMetadata,
+    active: bool,
+    replacement_idle: bool,
+    lost_reads: Option<Arc<std::sync::atomic::AtomicUsize>>,
+}
+
+/// An observational listing. It grants no checkout admission or runtime authority.
+pub struct BrowserCheckoutsProbe {
+    roots: Option<TopologyRoots>,
+    entries: HashMap<String, BrowserCheckoutEntry>,
+}
+impl BrowserCheckoutsProbe {
+    pub fn check(self) -> Vec<serde_json::Value> {
+        let mut rows = std::collections::BTreeMap::new();
+        let roots = self
+            .roots
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(TopologyRoots::production);
+        for (key, entry) in &self.entries {
+            let index = roots
+                .as_ref()
+                .ok()
+                .map(|roots| roots.cache.join("indexes").join(key).join("index.db"));
+            let old_verified = entry.identity.rediscover().is_ok();
+            // The old index belongs to the old inode and is never evidence for
+            // its replacement. Listing is observational: a new same-key root is
+            // selectable only after the old runtime has actually released.
+            // browser_identity rechecks and performs the mutable retirement.
+            let replaced_available = !old_verified
+                && entry.replacement_idle
+                && entry
+                    .lost_reads
+                    .as_ref()
+                    .is_none_or(|reads| reads.load(std::sync::atomic::Ordering::Acquire) == 0)
+                && WorkspaceIdentity::discover_unattached(
+                    Some(&entry.identity.root),
+                    &entry.identity.root,
+                )
+                .and_then(WorkspaceIdentity::attach_existing_marker_readonly)
+                .is_ok_and(|new| {
+                    new.root_key == *key
+                        && !entry.identity.matches(&new)
+                        && WorkspaceIdentity::discover_unattached(Some(&new.root), &new.root)
+                            .and_then(WorkspaceIdentity::attach_existing_marker_readonly)
+                            .is_ok_and(|found| {
+                                !entry.identity.matches(&found)
+                                    && found.record_id == new.record_id
+                                    && (found.device, found.inode) == (new.device, new.inode)
+                            })
+                });
+            let state = if replaced_available {
+                "available"
+            } else if !old_verified {
+                "unavailable"
+            } else if index.as_ref().is_some_and(|index| index.is_file()) {
+                roots
+                    .as_ref()
+                    .ok()
+                    .and_then(|roots| Store::browser_index_root_existing(roots, key).err())
+                    .unwrap_or("available")
+            } else {
+                "available"
+            };
+            rows.insert(
+                key.clone(),
+                serde_json::json!({
+                    "rootKey": key, "workspaceRoot": entry.identity.root,
+                    "state": state,
+                    "active": entry.active
+                }),
+            );
+        }
+        if let Ok(roots) = roots
+            && let Ok(indexes) = fs::read_dir(roots.cache.join("indexes"))
+        {
+            for candidate in indexes.flatten() {
+                let key = candidate.file_name().to_string_lossy().to_string();
+                if rows.contains_key(&key)
+                    || key.len() != 64
+                    || !key
+                        .bytes()
+                        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+                {
+                    continue;
+                }
+                let row = match Store::browser_index_root_existing(&roots, &key) {
+                    Ok(spelling)
+                        if WorkspaceIdentity::discover_unattached(
+                            Some(Path::new(&spelling)),
+                            Path::new(&spelling),
+                        )
+                        .and_then(WorkspaceIdentity::attach_existing_marker_readonly)
+                        .is_ok_and(|identity| identity.root_key == key) =>
+                    {
+                        serde_json::json!({"rootKey": key, "workspaceRoot": spelling, "state":"available", "active":false})
+                    }
+                    Ok(spelling) => {
+                        serde_json::json!({"rootKey": key, "workspaceRoot": spelling, "state":"unavailable", "active":false})
+                    }
+                    Err(state) => {
+                        serde_json::json!({"rootKey": key, "state":state, "active":false})
+                    }
+                };
+                rows.insert(key, row);
+            }
+        }
+        rows.into_values().collect()
+    }
+}
+
+/// Captured registry incarnations; preparation performs no registry mutation.
+pub struct SelectionProbe {
+    entries: HashMap<String, CheckoutMetadata>,
+}
+pub struct PreparedSelection {
+    witness: SelectedCheckout,
+    expected: Option<CheckoutMetadata>,
+}
+impl PreparedSelection {
+    pub fn identity(&self) -> &WorkspaceIdentity {
+        &self.witness.identity
+    }
+}
+impl SelectionProbe {
+    pub fn prepare(
+        &self,
+        launch: &WorkspaceIdentity,
+        selected: &Path,
+    ) -> Result<PreparedSelection, SelectionError> {
+        launch
+            .verify_readonly()
+            .map_err(|_| SelectionError::IdentityChanged)?;
+        let root = checkout_root(selected)?;
+        // Membership must be established before marker attachment, which can create
+        // a marker in a previously untouched linked worktree.
+        let unattached = WorkspaceIdentity::discover_unattached(Some(&root), &root)
+            .map_err(|_| SelectionError::Unavailable)?;
+        let launch_common = common_identity(launch)?;
+        let selected_common = common_identity_unattached(&unattached)?;
+        if launch_common != selected_common {
+            return Err(SelectionError::DifferentRepository);
+        }
+        let identity = unattached
+            .attach_marker()
+            .map_err(|_| SelectionError::Unavailable)?;
+        // The worktree and its common directory can change while Git runs.
+        launch
+            .verify_readonly()
+            .map_err(|_| SelectionError::IdentityChanged)?;
+        identity
+            .verify_readonly()
+            .map_err(|_| SelectionError::IdentityChanged)?;
+        if common_identity(launch)? != launch_common
+            || common_identity(&identity)? != selected_common
+        {
+            return Err(SelectionError::IdentityChanged);
+        }
+        // Complete all fallible membership checks before reserving a session slot.
+        // A failed selection must not attach or consume capacity.
+        let witness = SelectedCheckout {
+            launch: Arc::new(
+                launch
+                    .verified_clone()
+                    .map_err(|_| SelectionError::IdentityChanged)?,
+            ),
+            identity: Arc::new(
+                identity
+                    .verified_clone()
+                    .map_err(|_| SelectionError::IdentityChanged)?,
+            ),
+            launch_common,
+            selected_common,
+        };
+        witness.before_answer()?;
+        let expected = self.entries.get(&witness.root_key).cloned();
+        Ok(PreparedSelection { witness, expected })
+    }
+}
+
 struct Entry {
     identity: CheckoutMetadata,
     registration: Option<CheckoutOptions>,
@@ -202,8 +383,6 @@ pub struct CheckoutRegistry {
     roots: Option<TopologyRoots>,
     runtimes: HashMap<String, Arc<CheckoutRuntime>>,
     idle_exit_at: Option<Instant>,
-    orphan_scan_cache: Option<(Instant, bool)>,
-    orphan_scan_count: u64,
     clock_override: Option<Instant>,
     /// Wakes the lifecycle owner: clients came or went, a runtime retired,
     /// accepted work drained or the last lease was released (Decision 0009 §5).
@@ -233,8 +412,6 @@ impl CheckoutRegistry {
             roots: None,
             runtimes: HashMap::new(),
             idle_exit_at: Some(now + DAEMON_IDLE_DELAY),
-            orphan_scan_cache: None,
-            orphan_scan_count: 0,
             clock_override: None,
             lifecycle: Arc::new(tokio::sync::Notify::new()),
             #[cfg(feature = "test-support")]
@@ -372,6 +549,8 @@ impl CheckoutRegistry {
             mcp_clock_skew_ms: std::sync::atomic::AtomicU64::new(0),
             #[cfg(feature = "test-support")]
             mcp_hint_clock_origin: std::sync::Mutex::new(None),
+            #[cfg(feature = "test-support")]
+            mcp_call_clock_origin: std::sync::Mutex::new(None),
             #[cfg(feature = "test-support")]
             mcp_read_hook: std::sync::Mutex::new(None),
             #[cfg(feature = "test-support")]
@@ -609,98 +788,36 @@ impl CheckoutRegistry {
         );
     }
 
-    /// Inspect existing indexes without activating a checkout or changing clocks.
+    /// Capture observational metadata only. Run `check` after releasing the registry.
+    pub fn browser_checkouts_probe(&self) -> BrowserCheckoutsProbe {
+        BrowserCheckoutsProbe {
+            roots: self.roots.clone(),
+            entries: self
+                .entries
+                .iter()
+                .map(|(key, entry)| {
+                    (
+                        key.clone(),
+                        BrowserCheckoutEntry {
+                            identity: entry.identity.clone(),
+                            active: self.runtimes.contains_key(key),
+                            replacement_idle: entry.released
+                                && !self.runtimes.contains_key(key)
+                                && entry.sessions.is_empty()
+                                && entry.browser_until.is_none()
+                                && !entry.pending_work
+                                && !entry.external_work,
+                            lost_reads: entry.lost_reads.clone(),
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    /// Synchronous convenience for fixtures; daemon callers use the probe.
     pub fn browser_checkouts(&self) -> Vec<serde_json::Value> {
-        let mut rows = std::collections::BTreeMap::new();
-        let roots = self
-            .roots
-            .clone()
-            .map(Ok)
-            .unwrap_or_else(TopologyRoots::production);
-        for (key, entry) in &self.entries {
-            let index = roots
-                .as_ref()
-                .ok()
-                .map(|roots| roots.cache.join("indexes").join(key).join("index.db"));
-            let old_verified = entry.identity.rediscover().is_ok();
-            // The old index belongs to the old inode and is never evidence for
-            // its replacement. Listing is observational: a new same-key root is
-            // selectable only after the old runtime has actually released.
-            // browser_identity rechecks and performs the mutable retirement.
-            let replaced_available = !old_verified
-                && entry.released
-                && !self.runtimes.contains_key(key)
-                && entry
-                    .lost_reads
-                    .as_ref()
-                    .is_none_or(|reads| reads.load(std::sync::atomic::Ordering::Acquire) == 0)
-                && WorkspaceIdentity::discover_unattached(
-                    Some(&entry.identity.root),
-                    &entry.identity.root,
-                )
-                .and_then(WorkspaceIdentity::attach_existing_marker_readonly)
-                .is_ok_and(|new| {
-                    new.root_key == *key
-                        && !entry.identity.matches(&new)
-                        && self.can_retire_replaced(&new)
-                });
-            let state = if replaced_available {
-                "available"
-            } else if !old_verified {
-                "unavailable"
-            } else if index.as_ref().is_some_and(|index| index.is_file()) {
-                roots
-                    .as_ref()
-                    .ok()
-                    .and_then(|roots| Store::browser_index_root_existing(roots, key).err())
-                    .unwrap_or("available")
-            } else {
-                "available"
-            };
-            rows.insert(
-                key.clone(),
-                serde_json::json!({
-                    "rootKey": key, "workspaceRoot": entry.identity.root,
-                    "state": state,
-                    "active": self.runtimes.contains_key(key)
-                }),
-            );
-        }
-        if let Ok(roots) = roots
-            && let Ok(indexes) = fs::read_dir(roots.cache.join("indexes"))
-        {
-            for candidate in indexes.flatten() {
-                let key = candidate.file_name().to_string_lossy().to_string();
-                if rows.contains_key(&key)
-                    || key.len() != 64
-                    || !key
-                        .bytes()
-                        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-                {
-                    continue;
-                }
-                let row = match Store::browser_index_root_existing(&roots, &key) {
-                    Ok(spelling)
-                        if WorkspaceIdentity::discover_unattached(
-                            Some(Path::new(&spelling)),
-                            Path::new(&spelling),
-                        )
-                        .and_then(WorkspaceIdentity::attach_existing_marker_readonly)
-                        .is_ok_and(|identity| identity.root_key == key) =>
-                    {
-                        serde_json::json!({"rootKey": key, "workspaceRoot": spelling, "state":"available", "active":false})
-                    }
-                    Ok(spelling) => {
-                        serde_json::json!({"rootKey": key, "workspaceRoot": spelling, "state":"unavailable", "active":false})
-                    }
-                    Err(state) => {
-                        serde_json::json!({"rootKey": key, "state":state, "active":false})
-                    }
-                };
-                rows.insert(key, row);
-            }
-        }
-        rows.into_values().collect()
+        self.browser_checkouts_probe().check()
     }
 
     pub fn active_count(&self) -> usize {
@@ -1084,60 +1201,46 @@ impl CheckoutRegistry {
         self.attach(Some(session), launch)
     }
 
+    /// Capture entry incarnations before the slow filesystem/Git preparation.
+    pub fn selection_probe(&self) -> SelectionProbe {
+        SelectionProbe {
+            entries: self
+                .entries
+                .iter()
+                .map(|(key, entry)| (key.clone(), entry.identity.clone()))
+                .collect(),
+        }
+    }
+
+    /// Synchronous convenience for fixtures. Daemon callers prepare unlocked.
     pub fn select(
         &mut self,
         session: u64,
         launch: &WorkspaceIdentity,
         selected: &Path,
     ) -> Result<SelectedCheckout, SelectionError> {
-        launch
-            .verify_readonly()
-            .map_err(|_| SelectionError::IdentityChanged)?;
-        let root = checkout_root(selected)?;
-        // Membership must be established before marker attachment, which can create
-        // a marker in a previously untouched linked worktree.
-        let unattached = WorkspaceIdentity::discover_unattached(Some(&root), &root)
-            .map_err(|_| SelectionError::Unavailable)?;
-        let launch_common = common_identity(launch)?;
-        let selected_common = common_identity_unattached(&unattached)?;
-        if launch_common != selected_common {
-            return Err(SelectionError::DifferentRepository);
-        }
-        let identity = unattached
-            .attach_marker()
-            .map_err(|_| SelectionError::Unavailable)?;
-        // The worktree and its common directory can change while Git runs.
-        launch
-            .verify_readonly()
-            .map_err(|_| SelectionError::IdentityChanged)?;
-        identity
-            .verify_readonly()
-            .map_err(|_| SelectionError::IdentityChanged)?;
-        if common_identity(launch)? != launch_common
-            || common_identity(&identity)? != selected_common
+        let prepared = self.selection_probe().prepare(launch, selected)?;
+        self.select_prepared(session, prepared)
+    }
+
+    /// Commit prepared membership and Git checks performed outside the registry.
+    /// Shared attachment retains its replacement rechecks and bounded retirement wait.
+    pub fn select_prepared(
+        &mut self,
+        session: u64,
+        prepared: PreparedSelection,
+    ) -> Result<SelectedCheckout, SelectionError> {
+        let PreparedSelection { witness, expected } = prepared;
+        let key = &witness.root_key;
+        let current = self.entries.get(key).map(|entry| &entry.identity);
+        if current != expected.as_ref()
+            && !current.is_some_and(|identity| identity.matches(&witness.identity))
         {
             return Err(SelectionError::IdentityChanged);
         }
-        // Complete all fallible membership checks before reserving a session slot.
-        // A failed selection must not attach or consume capacity.
-        let witness = SelectedCheckout {
-            launch: Arc::new(
-                launch
-                    .verified_clone()
-                    .map_err(|_| SelectionError::IdentityChanged)?,
-            ),
-            identity: Arc::new(
-                identity
-                    .verified_clone()
-                    .map_err(|_| SelectionError::IdentityChanged)?,
-            ),
-            launch_common,
-            selected_common,
-        };
-        witness.before_answer()?;
-        let selected = self.attach(Some(session), &identity)?;
+        let identity = self.attach(Some(session), &witness.identity)?;
         Ok(SelectedCheckout {
-            identity: selected,
+            identity,
             ..witness
         })
     }
@@ -1146,6 +1249,13 @@ impl CheckoutRegistry {
     /// read-only before attributing the error, without reserving a slot.
     pub fn capacity_witness(
         &self,
+        launch: &WorkspaceIdentity,
+        selected: &Path,
+    ) -> Result<SelectedCheckout, SelectionError> {
+        Self::capacity_witness_unlocked(launch, selected)
+    }
+
+    pub fn capacity_witness_unlocked(
         launch: &WorkspaceIdentity,
         selected: &Path,
     ) -> Result<SelectedCheckout, SelectionError> {
@@ -1394,7 +1504,7 @@ impl CheckoutRegistry {
         for key in self.entries.keys().cloned().collect::<Vec<_>>() {
             busy |= self.refresh_pending_work(&key)?;
         }
-        let candidate = self.idle_exit_at.is_some_and(|at| now >= at)
+        let exit = self.idle_exit_at.is_some_and(|at| now >= at)
             && !busy
             // Release may defer on startup reconciliation, a watcher, or an active read just before
             // the later pending-work refresh observes that work finish.
@@ -1403,22 +1513,6 @@ impl CheckoutRegistry {
                 .entries
                 .values()
                 .all(|entry| entry.sessions.is_empty() && entry.browser_until.is_none());
-        // Never scan every index directory on the routine 250-ms tick. A
-        // genuinely pending orphan is checked again after a bounded interval.
-        let exit = if candidate {
-            let pending = match self.orphan_scan_cache {
-                Some((until, pending)) if now < until => pending,
-                _ => {
-                    let pending = self.orphan_queue_pending();
-                    self.orphan_scan_count += 1;
-                    self.orphan_scan_cache = Some((now + Duration::from_secs(5), pending));
-                    pending
-                }
-            };
-            !pending
-        } else {
-            false
-        };
         Ok(LifecycleTick { released, exit })
     }
 
@@ -1434,27 +1528,6 @@ impl CheckoutRegistry {
             }
         }
         last
-    }
-
-    /// Check durable queues even for roots that have not attached since daemon
-    /// startup. An unreadable queue is busy, not permission to abandon work.
-    fn orphan_queue_pending(&self) -> bool {
-        let roots = match self
-            .roots
-            .clone()
-            .map(Ok)
-            .unwrap_or_else(TopologyRoots::production)
-        {
-            Ok(roots) => roots,
-            Err(_) => return true,
-        };
-        let active: HashSet<String> = self.runtimes.keys().cloned().collect();
-        Store::orphan_queues_pending(&roots, &active)
-    }
-
-    #[doc(hidden)]
-    pub fn orphan_scan_count_for_tests(&self) -> u64 {
-        self.orphan_scan_count
     }
 
     pub fn idle_exit_deadline(&self) -> Option<Instant> {
@@ -1473,10 +1546,7 @@ impl CheckoutRegistry {
         self.entries
             .values()
             .flat_map(|entry| [entry.release_at, entry.browser_until])
-            .chain([
-                self.idle_exit_at,
-                self.orphan_scan_cache.map(|(until, _)| until),
-            ])
+            .chain([self.idle_exit_at])
             .flatten()
             .filter(|at| *at > now)
             .min()
@@ -1639,6 +1709,8 @@ pub struct CheckoutRuntime {
     /// a test can pass a call deadline without waiting real seconds.
     #[cfg(feature = "test-support")]
     mcp_clock_skew_ms: std::sync::atomic::AtomicU64,
+    #[cfg(feature = "test-support")]
+    mcp_call_clock_origin: std::sync::Mutex<Option<Instant>>,
     /// Optional hint clock can be frozen separately from the real mandatory deadline.
     #[cfg(feature = "test-support")]
     mcp_hint_clock_origin: std::sync::Mutex<Option<Instant>>,
@@ -1682,6 +1754,21 @@ fn cli_index_contention(error: anyhow::Error, deadline: Instant) -> anyhow::Resu
         return Err(crate::store::topology::StorageBusy.into());
     }
     Ok(())
+}
+
+fn cli_index_request(
+    mut read: impl FnMut() -> anyhow::Result<Option<crate::store::requests::Request>>,
+    deadline: Instant,
+) -> anyhow::Result<Option<crate::store::requests::Request>> {
+    loop {
+        match read() {
+            Ok(row) => return Ok(row),
+            Err(error) => {
+                cli_index_contention(error, deadline)?;
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
 }
 
 impl CheckoutRuntime {
@@ -1788,19 +1875,13 @@ impl CheckoutRuntime {
             // Record the terminal-commit count before re-reading, so a COMMIT
             // between the read and the wait is never missed (Decision 0009 §8).
             let seen = resources.store.terminal_generation();
-            let row = match resources.store.request_by_id(&accepted.id) {
-                Ok(row) => {
-                    busy_deadline = Instant::now() + Duration::from_secs(30);
-                    row
-                }
-                Err(error) => {
-                    // Typed, bounded retry against SQLite contention only.
-                    cli_index_contention(error, busy_deadline)?;
-                    std::thread::sleep(Duration::from_millis(20));
-                    continue;
-                }
-            }
-            .ok_or_else(|| anyhow::anyhow!("storage_busy: accepted request disappeared"))?;
+            let row = cli_index_request(
+                || resources.store.request_by_id(&accepted.id),
+                busy_deadline,
+            )?;
+            busy_deadline = Instant::now() + Duration::from_secs(30);
+            let row =
+                row.ok_or_else(|| anyhow::anyhow!("storage_busy: accepted request disappeared"))?;
             match row.state.as_str() {
                 "done" => {
                     let revision = row.revision.ok_or_else(|| {
@@ -1843,14 +1924,6 @@ impl CheckoutRuntime {
         self.resources.lock().unwrap().is_some()
     }
 
-    fn queue_pending(resources: &ActiveResources) -> bool {
-        if resources.scheduler.checkout_root_loss_retired() {
-            !matches!(resources.store.old_root_unfinished_request(), Ok(None))
-        } else {
-            !matches!(resources.store.earliest_unfinished_request(), Ok(None))
-        }
-    }
-
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
     pub fn notify_on_terminal_request_for_tests(
@@ -1862,6 +1935,16 @@ impl CheckoutRuntime {
             .store
             .notify_on_terminal_request_for_tests(id, notify);
         Ok(())
+    }
+
+    /// Hold the checkout worker at its serial boundary while a fixture edits paths.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn hold_worker_step_for_tests(&self, hold: impl FnOnce()) {
+        self.resources()
+            .unwrap()
+            .scheduler
+            .hold_worker_step_for_tests(hold);
     }
 
     /// Make this checkout's next completion COMMIT durable but report an error.
@@ -1923,7 +2006,7 @@ impl CheckoutRuntime {
     fn catching_up_in(resources: &ActiveResources, phase: RuntimePhase) -> bool {
         match phase {
             RuntimePhase::Ready => {
-                resources.scheduler.checkout_watch_pending() || Self::queue_pending(resources)
+                resources.scheduler.checkout_watch_pending() || resources.scheduler.fifo_pending()
             }
             _ => true,
         }
@@ -1960,8 +2043,8 @@ impl CheckoutRuntime {
         resources.store.verify_committed_writer_claim(&session)
     }
 
-    /// The clock MCP call deadlines are checked against: real time, plus any
-    /// virtual time a test has advanced on this checkout.
+    /// The clock MCP call deadlines are checked against: real time (or a
+    /// paused test origin), plus virtual time advanced on this checkout.
     pub(crate) fn mcp_clock_now(&self) -> Instant {
         #[cfg(feature = "test-support")]
         let skew = Duration::from_millis(
@@ -1970,7 +2053,24 @@ impl CheckoutRuntime {
         );
         #[cfg(not(feature = "test-support"))]
         let skew = Duration::ZERO;
+        #[cfg(feature = "test-support")]
+        if let Some(origin) = *self.mcp_call_clock_origin.lock().unwrap() {
+            return origin + skew;
+        }
         Instant::now() + skew
+    }
+
+    /// Pause mandatory call time; share this clock with the test transport.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn freeze_mcp_call_clock_for_tests(&self, origin: Instant) {
+        *self.mcp_call_clock_origin.lock().unwrap() = Some(origin);
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn mcp_call_clock_now_for_tests(&self) -> Instant {
+        self.mcp_clock_now()
     }
 
     /// Freeze only optional hint accounting. Mandatory call deadlines keep using real time.
@@ -2234,6 +2334,13 @@ fn common_identity_by(
 /// Probe membership before writing a worktree marker. Git output is bounded and
 /// the root identity is checked on both sides of the probe.
 fn common_identity_unattached(identity: &WorkspaceIdentity) -> Result<(u64, u64), SelectionError> {
+    common_identity_unattached_with_executable(identity, Path::new("git"))
+}
+
+fn common_identity_unattached_with_executable(
+    identity: &WorkspaceIdentity,
+    executable: &Path,
+) -> Result<(u64, u64), SelectionError> {
     let root = &identity.root;
     let before = fs::symlink_metadata(root).map_err(|_| SelectionError::Unavailable)?;
     if !before.is_dir()
@@ -2242,7 +2349,7 @@ fn common_identity_unattached(identity: &WorkspaceIdentity) -> Result<(u64, u64)
     {
         return Err(SelectionError::IdentityChanged);
     }
-    let mut child = std::process::Command::new("git")
+    let mut child = std::process::Command::new(executable)
         .arg("-C")
         .arg(root)
         .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
@@ -2254,16 +2361,36 @@ fn common_identity_unattached(identity: &WorkspaceIdentity) -> Result<(u64, u64)
         .spawn()
         .map_err(|_| SelectionError::Unavailable)?;
     let stdout = child.stdout.take().ok_or(SelectionError::Unavailable)?;
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     let reader = std::thread::spawn(move || {
         use std::io::Read;
         let mut output = Vec::new();
-        stdout.take(4097).read_to_end(&mut output).map(|_| output)
+        let result = stdout.take(4097).read_to_end(&mut output);
+        let _ = sender.send(result.map(|_| output));
     });
     let deadline = Instant::now() + Duration::from_millis(750);
+    let output = match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Ok(Ok(output)) if output.len() <= 4096 => output,
+        _ => {
+            let _ = child.kill();
+            let _ = child.wait();
+            // A descendant may keep stdout open after Git exits. Never join
+            // its reader past the same lookup deadline.
+            // At this scale, the detached reader may live until descendant stdout closes.
+            drop(reader);
+            return Err(SelectionError::Unavailable);
+        }
+    };
+    reader.join().map_err(|_| SelectionError::Unavailable)?;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => std::thread::yield_now(),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(
+                    Duration::from_millis(5)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
+            }
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -2271,11 +2398,7 @@ fn common_identity_unattached(identity: &WorkspaceIdentity) -> Result<(u64, u64)
             }
         }
     };
-    let output = reader
-        .join()
-        .map_err(|_| SelectionError::Unavailable)?
-        .map_err(|_| SelectionError::Unavailable)?;
-    if !status.success() || output.len() > 4096 {
+    if !status.success() {
         return Err(SelectionError::Unavailable);
     }
     let path = std::str::from_utf8(&output)
@@ -2337,6 +2460,39 @@ mod selection_tests {
     use super::*;
     use anyhow::Context;
     use std::process::Command;
+
+    #[test]
+    fn cli_index_contention_retries_the_same_accepted_request() {
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let options = IndexOptions::new(workspace.path().to_owned());
+        let accepted = store.enqueue_request(&options, None).unwrap();
+        let mut attempts = 0;
+        let row = cli_index_request(
+            || {
+                attempts += 1;
+                if attempts == 1 {
+                    return Err(crate::store::topology::StorageBusy.into());
+                }
+                store.request_by_id(&accepted.id)
+            },
+            Instant::now() + Duration::from_secs(30),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(attempts, 2);
+        assert_eq!(row.id, accepted.id);
+        assert_eq!(row.seq, accepted.seq);
+        assert_eq!(row.state, "queued");
+        assert_eq!(row.revision, None);
+        assert_eq!(row.error_code, None);
+        let queue = store.earliest_unfinished_request().unwrap().unwrap();
+        assert_eq!(queue.id, accepted.id);
+        assert_eq!(queue.seq, accepted.seq);
+        let next = store.enqueue_request(&options, None).unwrap();
+        assert_eq!(next.seq, accepted.seq + 1, "waiter must never re-enqueue");
+    }
 
     #[test]
     fn cli_index_expired_contention_is_typed_and_keeps_accepted_row_pending() {
@@ -2414,6 +2570,165 @@ mod selection_tests {
     }
 
     #[test]
+    fn listing_probe_releases_registry_before_slow_work() {
+        let temp = tempfile::tempdir().unwrap();
+        let roots =
+            TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+        let registry = Arc::new(std::sync::Mutex::new(CheckoutRegistry::with_roots(roots)));
+        let (captured_tx, captured_rx) = std::sync::mpsc::sync_channel(0);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(0);
+        let worker_registry = registry.clone();
+        let worker = std::thread::spawn(move || {
+            let probe = worker_registry.lock().unwrap().browser_checkouts_probe();
+            captured_tx.send(()).unwrap();
+            resume_rx.recv().unwrap();
+            probe.check()
+        });
+        captured_rx
+            .recv_timeout(crate::testing::HANG_BACKSTOP)
+            .unwrap();
+        assert_eq!(registry.try_lock().unwrap().active_count(), 0);
+        resume_tx.send(()).unwrap();
+        assert!(worker.join().unwrap().is_empty());
+    }
+
+    #[test]
+    fn selection_preparation_does_not_hold_registry() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("checkout");
+        git(temp.path(), &["init", "--quiet", root.to_str().unwrap()]);
+        let root = root.canonicalize().unwrap();
+        let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+        let registry = Arc::new(std::sync::Mutex::new(CheckoutRegistry::new()));
+        let (captured_tx, captured_rx) = std::sync::mpsc::sync_channel(0);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(0);
+        let worker_registry = registry.clone();
+        let worker = std::thread::spawn(move || {
+            let probe = worker_registry.lock().unwrap().selection_probe();
+            captured_tx.send(()).unwrap();
+            resume_rx.recv().unwrap();
+            probe.prepare(&identity, &root)
+        });
+        captured_rx
+            .recv_timeout(crate::testing::HANG_BACKSTOP)
+            .unwrap();
+        assert_eq!(registry.try_lock().unwrap().active_count(), 0);
+        resume_tx.send(()).unwrap();
+        let prepared = worker.join().unwrap().unwrap();
+        assert_eq!(registry.lock().unwrap().active_count(), 0);
+        registry
+            .lock()
+            .unwrap()
+            .select_prepared(1, prepared)
+            .unwrap();
+        assert_eq!(registry.lock().unwrap().active_count(), 1);
+    }
+
+    #[test]
+    fn prepared_selection_accepts_a_concurrent_same_identity_attachment() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("checkout");
+        git(temp.path(), &["init", "--quiet", root.to_str().unwrap()]);
+        let root = root.canonicalize().unwrap();
+        let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+        let mut registry = CheckoutRegistry::new();
+        let prepared = registry
+            .selection_probe()
+            .prepare(&identity, &root)
+            .unwrap();
+        registry.attach_launch(2, &identity).unwrap();
+        let selected = registry.select_prepared(1, prepared).unwrap();
+        assert_eq!(selected.root_key, identity.root_key);
+        assert_eq!(registry.active_count(), 1);
+        assert_eq!(registry.entries.len(), 1);
+        assert_eq!(
+            registry.entries.get(&identity.root_key).unwrap().sessions,
+            HashSet::from([1, 2])
+        );
+    }
+
+    #[test]
+    fn prepared_selection_cannot_replace_a_successor_incarnation() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("checkout");
+        git(temp.path(), &["init", "--quiet", root.to_str().unwrap()]);
+        let root = root.canonicalize().unwrap();
+        let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+        let mut registry = CheckoutRegistry::new();
+        let prepared = registry
+            .selection_probe()
+            .prepare(&identity, &root)
+            .unwrap();
+        let mut successor = CheckoutMetadata::from_identity(&identity);
+        successor.record_id = "successor".to_owned();
+        registry.entries.insert(
+            identity.root_key.clone(),
+            Entry {
+                identity: successor.clone(),
+                registration: None,
+                sessions: HashSet::from([2]),
+                released: false,
+                pending_work: false,
+                external_work: false,
+                browser_until: None,
+                release_at: None,
+                root_lost: false,
+                lost_reads: None,
+            },
+        );
+        assert!(matches!(
+            registry.select_prepared(1, prepared),
+            Err(SelectionError::IdentityChanged)
+        ));
+        let entry = registry.entries.get(&identity.root_key).unwrap();
+        assert!(entry.identity == successor);
+        assert_eq!(entry.sessions, HashSet::from([2]));
+    }
+
+    #[test]
+    fn unattached_git_wait_is_bounded_with_open_or_closed_stdout() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("checkout");
+        git(temp.path(), &["init", "--quiet", root.to_str().unwrap()]);
+        let root = root.canonicalize().unwrap();
+        let identity = WorkspaceIdentity::discover_unattached(Some(&root), &root).unwrap();
+        let executable = temp.path().join("stalled-git");
+        for close_stdout in [false, true] {
+            let close = if close_stdout { "exec 1>&-\n" } else { "" };
+            fs::write(
+                &executable,
+                format!("#!/bin/sh\n{close}exec /bin/sleep 5\n"),
+            )
+            .unwrap();
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+            let start = Instant::now();
+            assert_eq!(
+                common_identity_unattached_with_executable(&identity, &executable),
+                Err(SelectionError::Unavailable),
+                "close_stdout={close_stdout}"
+            );
+            assert!(start.elapsed() < crate::testing::HANG_BACKSTOP);
+        }
+        assert!(!root.join(".git/trellis/workspace-id").exists());
+    }
+
+    #[test]
+    fn unattached_git_wait_preserves_common_identity_without_a_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("checkout");
+        git(temp.path(), &["init", "--quiet", root.to_str().unwrap()]);
+        let root = root.canonicalize().unwrap();
+        let identity = WorkspaceIdentity::discover_unattached(Some(&root), &root).unwrap();
+        let common = fs::metadata(root.join(".git")).unwrap();
+        assert_eq!(
+            common_identity_unattached(&identity),
+            Ok((common.dev(), common.ino()))
+        );
+        assert!(!root.join(".git/trellis/workspace-id").exists());
+    }
+
+    #[test]
     fn rejected_selection_never_attaches_or_creates_a_foreign_marker() {
         let temp = tempfile::tempdir().unwrap();
         let launch = temp.path().join("launch");
@@ -2480,6 +2795,10 @@ mod selection_tests {
         let identity = WorkspaceIdentity::discover(Some(&launch), &launch).unwrap();
         let mut registry = CheckoutRegistry::new();
         registry.attach_launch(17, &identity).unwrap();
+        let prepared = registry
+            .selection_probe()
+            .prepare(&identity, &selected)
+            .unwrap();
         for index in 0..MAX_ACTIVE_CHECKOUTS - 1 {
             let key = format!("fixture-{index}");
             let mut metadata = CheckoutMetadata::from_identity(&identity);
@@ -2502,7 +2821,7 @@ mod selection_tests {
         }
         assert_eq!(registry.active_count(), MAX_ACTIVE_CHECKOUTS);
         assert_eq!(
-            registry.select(17, &identity, &selected).unwrap_err(),
+            registry.select_prepared(17, prepared).unwrap_err(),
             SelectionError::CheckoutCapacity
         );
         assert_eq!(registry.entries.len(), MAX_ACTIVE_CHECKOUTS);

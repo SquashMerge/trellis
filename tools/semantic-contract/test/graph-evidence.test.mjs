@@ -631,6 +631,7 @@ async function admitted(
     formatVersion: 1,
     producerId: "native",
     extractionInputs: [],
+    capabilityReports: [],
     declarations,
     calls: [oldCall, call],
     controls: [],
@@ -784,7 +785,7 @@ async function admitted(
   }));
   const coverageIntents = [],
     support = ["declarationName", "callee", "invocation", "reference"].map(
-      (kind) => ({ kind, available: true, diagnostic: null }),
+      (kind) => ({ kind, gaps: [], available: true, diagnostic: null }),
     );
   for (const id of ["r1", "r2"]) {
     const facts = [];

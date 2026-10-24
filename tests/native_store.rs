@@ -169,6 +169,17 @@ fn four_languages_normalized_rows_and_pinned_bytes_are_coherent() {
             .unwrap()
             .unwrap();
         assert_eq!(
+            store
+                .native_capability_report_at(pin, &document.key)
+                .unwrap()
+                .unwrap(),
+            *artifact
+                .capability_reports
+                .iter()
+                .find(|r| r.document == document.key)
+                .unwrap()
+        );
+        assert_eq!(
             coverage,
             *artifact
                 .coverage
@@ -183,6 +194,17 @@ fn four_languages_normalized_rows_and_pinned_bytes_are_coherent() {
         assert_eq!(source.text.as_bytes(), bytes);
     }
     for declaration in &artifact.declarations {
+        assert_eq!(
+            store
+                .native_references_at(pin, &declaration.syntax_id)
+                .unwrap(),
+            artifact
+                .references
+                .iter()
+                .filter(|r| r.owner_syntax_id == declaration.syntax_id)
+                .cloned()
+                .collect::<Vec<_>>()
+        );
         if let Some(lookup) = &declaration.lookup_key {
             let found = store
                 .native_declarations_at(pin, &declaration.document.language, lookup)
@@ -218,7 +240,7 @@ fn four_languages_normalized_rows_and_pinned_bytes_are_coherent() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        14
+        17
     );
     let count: i64 = db
         .query_row(
@@ -413,6 +435,9 @@ fn empty_workspace_has_native_pair_without_document_rows() {
         "graph_nodes",
         "graph_display_labels",
         "class_projections",
+        "native_version_references",
+        "native_version_capability_families",
+        "native_version_capability_gaps",
         "native_version_calls",
         "native_version_declarations",
     ] {
@@ -665,7 +690,7 @@ fn index_from_another_native_producer_version_is_rebuilt_not_served() {
         let version: String = db
             .query_row("SELECT version FROM native_producers", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, "native-v8");
+        assert_eq!(version, "native-v9");
         let calls: Vec<String> = db
             .prepare("SELECT 'occ:v2:'||lower(hex(id)) FROM native_version_calls")
             .unwrap()
@@ -762,7 +787,7 @@ fn physical_v8_native_v4_index_recreates_before_role_column_read() {
         rebuilt
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        14
+        17
     );
     let stamp: String = rebuilt
         .query_row("SELECT extractor_version FROM index_metadata", [], |row| {
@@ -773,7 +798,7 @@ fn physical_v8_native_v4_index_recreates_before_role_column_read() {
     let version: String = rebuilt
         .query_row("SELECT version FROM native_producers", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, "native-v8");
+    assert_eq!(version, "native-v9");
     let roles = store
         .native_declarations_at(pin, "javascript", "hello")
         .unwrap();
@@ -918,10 +943,20 @@ fn every_encoded_selected_id_rejects_wrong_length_blob() {
         ("native_version_call_regions", "region_id", "vid"),
     ];
     for (table, column, scope) in cases {
+        let call_owner = table == "native_version_calls" && column == "owner_syntax_id";
+        let selection = if call_owner {
+            // Moving ordinal zero after its sibling also corrupts call ordering.
+            // Exercise that failure without pinning which decode phase wins.
+            "AND t.ordinal=0 AND EXISTS(SELECT 1 FROM native_version_calls sibling \
+             WHERE sibling.vid=t.vid AND sibling.owner_syntax_id=t.owner_syntax_id \
+             AND sibling.ordinal=1)"
+        } else {
+            ""
+        };
         let selected = format!(
             "SELECT t.rowid,d.path FROM {table} t JOIN revision_documents d \
              ON t.{scope}=d.{scope} WHERE d.revision_id=?1 \
-             AND t.{column} IS NOT NULL ORDER BY d.path,t.rowid LIMIT 1"
+             AND t.{column} IS NOT NULL {selection} ORDER BY d.path,t.rowid LIMIT 1"
         );
         let (rowid, path): (i64, String) = db
             .query_row(&selected, [&revision], |r| Ok((r.get(0)?, r.get(1)?)))
@@ -936,10 +971,12 @@ fn every_encoded_selected_id_rejects_wrong_length_blob() {
         assert_eq!(original.len(), 16, "{table}.{column}");
         // This deliberately breaks child FKs when an encoded primary key is
         // changed. It exercises read-side decode, not SQLite write validation.
+        // Seventeen FF bytes sort after every valid 16-byte owner key.
+        let invalid: Vec<u8> = if call_owner { vec![0xff; 17] } else { vec![1] };
         assert_eq!(
             db.execute(
-                &format!("UPDATE {table} SET {column}=x'01' WHERE rowid=?1"),
-                [rowid],
+                &format!("UPDATE {table} SET {column}=?1 WHERE rowid=?2"),
+                rusqlite::params![invalid, rowid],
             )
             .unwrap(),
             1
@@ -949,10 +986,9 @@ fn every_encoded_selected_id_rejects_wrong_length_blob() {
         let closed = reader.clone();
         let error = reader.methods_at(&path, Some(pin)).unwrap_err();
         assert!(
-            matches!(
-                error.downcast_ref::<rusqlite::Error>(),
-                Some(rusqlite::Error::FromSqlConversionFailure(..))
-            ) && format!("{error:#}").contains("invalid native ID BLOB length"),
+            error
+                .chain()
+                .any(|cause| cause.to_string().starts_with("incompatible_index:")),
             "{table}.{column}: {error:#}"
         );
         assert!(reader.recovery_pending_for_tests());
@@ -1024,7 +1060,27 @@ fn assert_retained_native_family_parity(
         // Whole DTO equality includes the requested document revision and provenance.
         assert_eq!(actual, expected, "{pin:?}: declaration {language}/{lookup}");
     }
+    for report in &measured.capability_reports {
+        assert_eq!(
+            store
+                .native_capability_report_at(pin, &report.document)
+                .unwrap()
+                .as_ref(),
+            Some(report)
+        );
+    }
     for declaration in &measured.declarations {
+        assert_eq!(
+            store
+                .native_references_at(pin, &declaration.syntax_id)
+                .unwrap(),
+            measured
+                .references
+                .iter()
+                .filter(|r| r.owner_syntax_id == declaration.syntax_id)
+                .cloned()
+                .collect::<Vec<_>>()
+        );
         let mut actual_calls = store.native_calls_at(pin, &declaration.syntax_id).unwrap();
         let mut expected_calls = measured
             .calls
@@ -2904,6 +2960,92 @@ fn compatible_pending_debt_replays_after_verified_leader_restart_in_same_generat
 
 #[test]
 #[cfg(feature = "test-support")]
+fn schema16_index_recreates_exclusively_without_migration_and_preserves_queue() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let (state, root, prior, cancel) = fixture();
+    let queued = prior
+        .enqueue_request(&IndexOptions::new(root.path().to_owned()), None)
+        .unwrap();
+    let path = published_db(state.path(), root.path());
+    drop(prior);
+    fs::remove_file(&path).unwrap();
+    let identity =
+        trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+            .unwrap();
+    let old_generation = uuid::Uuid::new_v4();
+    let db = Connection::open(&path).unwrap();
+    db.execute_batch(include_str!("fixtures/gc-legacy/v16-current.sql"))
+        .unwrap();
+    db.pragma_update(None, "user_version", 16).unwrap();
+    db.execute("INSERT INTO index_metadata VALUES(1,16,'native-v6-delta-v1',?1,?2,?3,?4,0,0,'','{}','[]',NULL)",
+        rusqlite::params![identity.root.to_str().unwrap(),identity.device.to_string(),identity.inode.to_string(),old_generation.to_string()]).unwrap();
+    drop(db);
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    let old_inode = fs::metadata(&path).unwrap().ino();
+    let old_bytes = fs::read(&path).unwrap();
+    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    assert_eq!(fs::metadata(&path).unwrap().ino(), old_inode);
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        old_bytes,
+        "opening must defer obsolete-index replacement"
+    );
+    assert!(
+        store
+            .status()
+            .unwrap_err()
+            .to_string()
+            .contains("recovery_required")
+    );
+    let (pin, _owner) = trellis::index_coordinator::reconcile_workspace(
+        &store,
+        &IndexOptions::new(root.path().to_owned()),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    assert_ne!(pin.index_generation, old_generation);
+    assert_eq!(pin.index_revision, 1);
+    assert_ne!(
+        fs::metadata(&path).unwrap().ino(),
+        old_inode,
+        "disposable schema16 must recreate, never migrate"
+    );
+    assert_eq!(
+        store.request_by_id(&queued.id).unwrap().unwrap().seq,
+        queued.seq
+    );
+    assert_eq!(
+        store.request_by_id(&queued.id).unwrap().unwrap().state,
+        "queued"
+    );
+    let rebuilt = Connection::open(&path).unwrap();
+    assert_eq!(
+        rebuilt
+            .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+            .unwrap(),
+        17
+    );
+    for table in [
+        "native_version_references",
+        "native_version_capability_families",
+        "native_version_capability_gaps",
+    ] {
+        assert_eq!(
+            rebuilt
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+    }
+}
+
+#[test]
+#[cfg(feature = "test-support")]
 fn newer_disposable_schema_is_refused_without_rebuild_or_deletion() {
     use std::os::unix::fs::MetadataExt;
     let (state, root, store, cancel) = fixture();
@@ -2927,7 +3069,7 @@ fn newer_disposable_schema_is_refused_without_rebuild_or_deletion() {
         .join(identity.root_key)
         .join("index.db");
     let db = Connection::open(&path).unwrap();
-    db.execute_batch("PRAGMA user_version=15").unwrap();
+    db.execute_batch("PRAGMA user_version=18").unwrap();
     drop(db);
     let inode = fs::metadata(&path).unwrap().ino();
     let error = Store::open_for_tests(state.path(), root.path()).unwrap_err();
@@ -2947,13 +3089,13 @@ fn newer_disposable_schema_is_refused_without_rebuild_or_deletion() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(version, 15);
+    assert_eq!(version, 18);
     let metadata_version: i64 = db
         .query_row("SELECT schema_version FROM index_metadata", [], |r| {
             r.get(0)
         })
         .unwrap();
-    assert_eq!(metadata_version, 14);
+    assert_eq!(metadata_version, 17);
     assert_eq!(generation, old.index_generation.to_string());
 }
 
@@ -3272,6 +3414,75 @@ fn incoming_call_index_uses_captured_version_and_nullable_measured_keys() {
     ).unwrap();
     assert_eq!(key, "go", "published key must not follow live source edits");
     assert_eq!(store.status().unwrap().revision, pin);
+}
+
+#[test]
+#[cfg(feature = "test-support")]
+fn rust_scoped_final_callee_tokens_publish_and_join_incoming_without_resolution() {
+    let (state, root, store, cancel) = fixture();
+    let source = "fn target() {}
+fn caller() { Self::target(); module::target(); Type::target(); Type::<u8>::target(); module::target::<u8>(); (module::target())(); }
+";
+    fs::write(root.path().join("flow.rs"), source).unwrap();
+    let leader = store.publication_for_tests().unwrap();
+    let pin = publish(
+        &store,
+        root.path(),
+        &cancel,
+        store.index_baseline().unwrap(),
+        &leader,
+    )
+    .unwrap();
+    let db = Connection::open(published_db(state.path(), root.path())).unwrap();
+    let stored: Vec<(i64, i64, String)> = db.prepare("SELECT callee_start,callee_end,spelling FROM native_version_calls WHERE vid=?1 AND callee_lookup_key='target' ORDER BY start_byte")
+        .unwrap().query_map([live_document_version(&db, "flow.rs")], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap().collect::<rusqlite::Result<_>>().unwrap();
+    assert_eq!(
+        stored.len(),
+        6,
+        "five scoped calls and compound inner call only"
+    );
+    for (start, end, spelling) in &stored {
+        assert_eq!(&source[*start as usize..*end as usize], "target");
+        assert_eq!(spelling, "target");
+    }
+    let unmeasured_outer: i64 = db
+        .query_row(
+            "SELECT count(*) FROM native_version_calls WHERE vid=?1 AND callee_lookup_key IS NULL",
+            [live_document_version(&db, "flow.rs")],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        unmeasured_outer, 1,
+        "compound outer call has no lone identifier callee token"
+    );
+    drop(db);
+    let read = store.evidence_response().unwrap();
+    let selected = read
+        .mcp_find("target", 20, Some(pin))
+        .unwrap()
+        .symbols
+        .into_iter()
+        .find(|s| {
+            s.declaration.document.path == "flow.rs"
+                && s.declaration.name.as_deref() == Some("target")
+        })
+        .unwrap()
+        .declaration;
+    let incoming = read
+        .mcp_incoming_with_lines(&selected.syntax_id, 20, Some(pin))
+        .unwrap()
+        .unwrap();
+    assert_eq!(incoming.calls.len(), 6);
+    assert!(
+        incoming
+            .calls
+            .iter()
+            .all(|c| c.callee_text == "target" && c.caller.name.as_deref() == Some("caller"))
+    );
+    assert_eq!(incoming.same_name_declarations, 1);
+    read.finish(()).unwrap();
 }
 
 #[test]
@@ -4058,6 +4269,172 @@ fn escaped_javascript_declarations_publish_without_losing_later_facts() {
 
 #[test]
 #[cfg(feature = "test-support")]
+fn native_reference_and_gap_rows_survive_stream_reuse_and_retained_pins() {
+    let (state, root, store, cancel) = fixture();
+    fs::write(
+        root.path().join("flow.rs"),
+        "fn main() { run(); opaque!(hidden); }
+",
+    )
+    .unwrap();
+    let options = IndexOptions::new(root.path().to_owned());
+    let (first, owner) =
+        trellis::index_coordinator::reconcile_workspace(&store, &options, &cancel, |_| {}).unwrap();
+    drop(owner);
+    let (_, first_native, _) =
+        index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+    let rust_report = first_native
+        .capability_reports
+        .iter()
+        .find(|r| r.document.path == "flow.rs")
+        .unwrap();
+    assert!(rust_report.families.iter().any(|f| !f.gaps.is_empty()));
+    assert_retained_native_family_parity(&store, first, &first_native);
+    fs::write(
+        root.path().join("flow.js"),
+        "function hello(x) { if (x) { obj.changed(); } }
+",
+    )
+    .unwrap();
+    let (second, owner) =
+        trellis::index_coordinator::reconcile_workspace(&store, &options, &cancel, |_| {}).unwrap();
+    let (_, second_native, _) =
+        index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+    assert_retained_native_family_parity(&store, second, &second_native);
+    assert_retained_native_family_parity(&store, first, &first_native);
+    let db = Connection::open(published_db(state.path(), root.path())).unwrap();
+    let versions: i64 = db
+        .query_row(
+            "SELECT count(*) FROM document_versions WHERE path='flow.rs'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        versions, 1,
+        "unchanged Rust rows must reuse one immutable version"
+    );
+    drop(db);
+    drop(owner);
+    drop(store);
+    let reopened = Store::open_for_tests(state.path(), root.path()).unwrap();
+    assert_retained_native_family_parity(&reopened, first, &first_native);
+    assert_retained_native_family_parity(&reopened, second, &second_native);
+}
+
+#[test]
+#[cfg(feature = "test-support")]
+fn malformed_native_reference_ids_fail_at_decode_and_schedule_reindex() {
+    for column in ["id", "owner_syntax_id"] {
+        let (state, root, store, cancel) = fixture();
+        let leader = store.publication_for_tests().unwrap();
+        let pin = publish(
+            &store,
+            root.path(),
+            &cancel,
+            store.index_baseline().unwrap(),
+            &leader,
+        )
+        .unwrap();
+        let (_, native, _) = index_workspace_bundle(
+            &IndexOptions::new(root.path().to_owned()),
+            store.root_id(),
+            &cancel,
+            |_| {},
+        )
+        .unwrap();
+        let reference = native
+            .references
+            .iter()
+            .find(|r| r.document.path == "flow.js")
+            .unwrap();
+        let db = Connection::open(published_db(state.path(), root.path())).unwrap();
+        db.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+        assert_eq!(
+            db.execute(
+                &format!(
+                    "UPDATE native_version_references SET {column}=x'01' WHERE vid=?1 AND id=?2"
+                ),
+                rusqlite::params![
+                    live_document_version(&db, "flow.js"),
+                    hex::decode(reference.id.strip_prefix("occ:v2:").unwrap()).unwrap()
+                ]
+            )
+            .unwrap(),
+            1
+        );
+        drop(db);
+        let error = store
+            .native_references_at(pin, &reference.owner_syntax_id)
+            .unwrap_err();
+        assert!(
+            matches!(
+                error.downcast_ref::<rusqlite::Error>(),
+                Some(rusqlite::Error::FromSqlConversionFailure(..))
+            ),
+            "{error:#}"
+        );
+        assert!(format!("{error:#}").contains("invalid native ID BLOB length"));
+        assert!(store.recovery_pending_for_tests());
+        assert_current_corruption(store.status().unwrap_err());
+    }
+}
+
+#[test]
+#[cfg(feature = "test-support")]
+fn malformed_native_capability_rows_are_typed_corruption() {
+    for sql in [
+        "UPDATE native_version_capability_families SET kind='unknown' WHERE kind='reference'",
+        "UPDATE native_version_capability_gaps SET diagnostic=''",
+        "DELETE FROM native_version_capability_families WHERE kind='reference'",
+    ] {
+        let (state, root, store, cancel) = fixture();
+        fs::write(
+            root.path().join("flow.rs"),
+            "fn main() { run(); opaque!(hidden); }
+",
+        )
+        .unwrap();
+        let leader = store.publication_for_tests().unwrap();
+        let pin = publish(
+            &store,
+            root.path(),
+            &cancel,
+            store.index_baseline().unwrap(),
+            &leader,
+        )
+        .unwrap();
+        let (_, native, _) = index_workspace_bundle(
+            &IndexOptions::new(root.path().to_owned()),
+            store.root_id(),
+            &cancel,
+            |_| {},
+        )
+        .unwrap();
+        let key = &native
+            .revision
+            .documents
+            .iter()
+            .find(|d| d.key.path == "flow.rs")
+            .unwrap()
+            .key;
+        let db = Connection::open(published_db(state.path(), root.path())).unwrap();
+        db.execute_batch("PRAGMA foreign_keys=OFF; PRAGMA ignore_check_constraints=ON")
+            .unwrap();
+        assert!(db.execute(sql, []).unwrap() > 0);
+        drop(db);
+        let error = store.native_capability_report_at(pin, key).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("native capability"),
+            "{error:#}"
+        );
+        assert!(store.recovery_pending_for_tests());
+        assert_current_corruption(store.status().unwrap_err());
+    }
+}
+
+#[test]
+#[cfg(feature = "test-support")]
 fn cold_stream_matches_plain_artifact_publication_rows() {
     let (_plain_state, root, plain, cancel) = fixture();
     let stream_state = tempfile::tempdir().unwrap();
@@ -4122,6 +4499,9 @@ fn cold_stream_matches_plain_artifact_publication_rows() {
         "native_version_parameters",
         "native_version_own_signature_types",
         "native_version_control_regions",
+        "native_version_references",
+        "native_version_capability_families",
+        "native_version_capability_gaps",
         "native_version_calls",
         "native_version_call_regions",
     ] {

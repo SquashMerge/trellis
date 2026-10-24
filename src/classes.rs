@@ -479,7 +479,13 @@ impl FileExtraction {
             } else {
                 tree_sitter_python::LANGUAGE.into()
             })?;
-            let mut cancelled = |_: &tree_sitter::ParseState| cancel.load(Ordering::Relaxed);
+            let mut cancelled = |_: &tree_sitter::ParseState| {
+                if cancel.load(Ordering::Relaxed) {
+                    std::ops::ControlFlow::Break(())
+                } else {
+                    std::ops::ControlFlow::Continue(())
+                }
+            };
             let tree = parser.parse_with_options(
                 &mut |offset, _| &file.text.as_bytes()[offset..],
                 None,

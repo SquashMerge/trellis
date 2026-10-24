@@ -403,11 +403,42 @@ fn nested_occurrences_sort_before_hashing_and_unverifiable_callees_remain_nullab
         }
     }
     let native_wire = serde_json::to_value(&artifact).unwrap();
-    for field in ["references", "symbols", "bindings", "semanticProducer"] {
+    for field in ["symbols", "bindings", "semanticProducer"] {
         assert!(
             native_wire.get(field).is_none(),
             "native artifact fabricated {field}"
         );
+    }
+    assert!(
+        !artifact.references.is_empty(),
+        "native-v9 measures lexical sites"
+    );
+    for reference in &artifact.references {
+        let source = &capture
+            .files
+            .iter()
+            .find(|file| file.path == reference.document.path)
+            .unwrap()
+            .text;
+        assert_eq!(
+            &source[reference.range.start..reference.range.end],
+            reference.spelling
+        );
+        let wire = serde_json::to_value(reference).unwrap();
+        for field in [
+            "site",
+            "roles",
+            "target",
+            "symbol",
+            "binding",
+            "resolution",
+            "candidateSymbols",
+        ] {
+            assert!(
+                wire.get(field).is_none(),
+                "native reference fabricated semantic {field}"
+            );
+        }
     }
     let js: Vec<_> = artifact
         .calls
@@ -474,6 +505,15 @@ fn every_nullable_native_field_requires_presence_even_when_null() {
         language: "rust".into(),
         path: "a.rs".into(),
     };
+    check(
+        &MeasurementSupport {
+            kind: MeasurementKind::Reference,
+            available: true,
+            diagnostic: None,
+            gaps: vec![],
+        },
+        &["diagnostic"],
+    );
     check(
         &Coverage {
             producer_id: "p".into(),
@@ -804,6 +844,55 @@ fn every_native_kind_rejects_well_shaped_forgery_against_immutable_capture() {
                     .find(|c| c.document.language == "javascript")
                     .unwrap()
                     .provenance_id = a.provenance[0].id.clone()
+            }),
+        ),
+        (
+            "reference ordinal",
+            Box::new(|a| a.references[0].ordinal += 1),
+        ),
+        (
+            "reference spelling",
+            Box::new(|a| a.references[0].spelling.push('x')),
+        ),
+        (
+            "reference owner",
+            Box::new(|a| a.references[0].owner_syntax_id = "missing".into()),
+        ),
+        (
+            "reference duplicate",
+            Box::new(|a| a.references.push(a.references[0].clone())),
+        ),
+        (
+            "capability missing",
+            Box::new(|a| {
+                a.capability_reports.pop();
+            }),
+        ),
+        (
+            "capability duplicate family",
+            Box::new(|a| {
+                let family = a.capability_reports[0].families[0].clone();
+                a.capability_reports[0].families.push(family);
+            }),
+        ),
+        (
+            "capability contradicts candidate",
+            Box::new(|a| {
+                let reference = a.references[0].clone();
+                let report = a
+                    .capability_reports
+                    .iter_mut()
+                    .find(|r| r.document == reference.document)
+                    .unwrap();
+                let family = report
+                    .families
+                    .iter_mut()
+                    .find(|f| f.kind == trellis::native_evidence::MeasurementKind::Reference)
+                    .unwrap();
+                family.gaps.push(trellis::native_evidence::MeasurementGap {
+                    range: reference.range,
+                    diagnostic: "invented gap".into(),
+                });
             }),
         ),
         ("call ordinal", Box::new(|a| a.calls[0].ordinal += 1)),
@@ -1721,4 +1810,417 @@ fn native_build_is_deterministic() {
         first.len()
     );
     assert!(first == second, "the same capture built twice differs");
+}
+
+fn native_v9_fixture(files: &[(&str, &str)]) -> trellis::native_evidence::Artifact {
+    use std::sync::{Arc, atomic::AtomicBool};
+    use trellis::{capture::Capture, indexer::IndexOptions, native_evidence::from_capture};
+    let root = tempfile::tempdir().unwrap();
+    for (path, source) in files {
+        std::fs::write(root.path().join(path), source).unwrap();
+    }
+    let identity =
+        trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+            .unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let capture = Capture::admit(&IndexOptions::new(root.path().into()), &cancel, &|_| {}).unwrap();
+    from_capture(&capture, root.path(), &identity.record_id, &cancel).unwrap()
+}
+
+#[test]
+fn native_v9_identifier_candidates_are_source_measured_owned_and_ordered() {
+    let fixtures = [
+        (
+            "A.java",
+            "import p.Type; class A { Type café; void run(Type value) { café = value.member; use(this::run); } } // excluded\n",
+        ),
+        (
+            "a.rs",
+            "use p::Original as Local; use p::{Other as Nested}; fn run(value: Type) { let café = value.member; use_it(café); } // excluded\n",
+        ),
+        (
+            "a.py",
+            "import original as local\ndef run(value: Type):\n    café = value.member\n    use_it(café)\n    return 'excluded'\n",
+        ),
+        (
+            "a.js",
+            "import {original as local} from 'module'; function run(value) { const café = value.member; use_it(café); const obj = {café}; return `excluded ${value}`; } // excluded\n",
+        ),
+    ];
+    let artifact = native_v9_fixture(&fixtures);
+    for (path, source) in fixtures {
+        let rows: Vec<_> = artifact
+            .references
+            .iter()
+            .filter(|r| r.document.path == path)
+            .collect();
+        assert!(rows.iter().any(|r| r.spelling == "café"), "{path}");
+        assert!(rows.iter().any(|r| r.spelling == "member"), "{path}");
+        assert!(
+            !rows
+                .iter()
+                .any(|r| r.spelling == "excluded" || r.spelling == "module"),
+            "{path}"
+        );
+        for r in &rows {
+            assert_eq!(&source[r.range.start..r.range.end], r.spelling);
+            assert_eq!(
+                trellis::native_evidence::lookup(&r.document.language, &r.spelling).unwrap(),
+                r.lookup_key
+            );
+            assert!(
+                artifact
+                    .declarations
+                    .iter()
+                    .any(|d| d.syntax_id == r.owner_syntax_id && d.document == r.document)
+            );
+        }
+        let mut owners = std::collections::BTreeMap::<_, Vec<_>>::new();
+        for r in rows {
+            owners.entry(&r.owner_syntax_id).or_default().push(r);
+        }
+        for rows in owners.values_mut() {
+            rows.sort_by_key(|r| (r.range.start, r.range.end));
+            for (ordinal, r) in rows.iter().enumerate() {
+                assert_eq!(r.ordinal, ordinal);
+            }
+        }
+        let module = artifact
+            .declarations
+            .iter()
+            .find(|d| d.document.path == path && d.kind == "module")
+            .unwrap();
+        let function = artifact
+            .declarations
+            .iter()
+            .find(|d| d.document.path == path && d.name.as_deref() == Some("run"))
+            .unwrap();
+        let declaration_name = artifact
+            .references
+            .iter()
+            .find(|r| r.document.path == path && Some(&r.range) == function.name_range.as_ref())
+            .unwrap();
+        let parent = if path == "A.java" {
+            artifact
+                .declarations
+                .iter()
+                .find(|d| d.document.path == path && d.name.as_deref() == Some("A"))
+                .unwrap()
+        } else {
+            module
+        };
+        assert_eq!(declaration_name.owner_syntax_id, parent.syntax_id);
+        let use_site = artifact
+            .references
+            .iter()
+            .find(|r| r.document.path == path && r.spelling == "member")
+            .unwrap();
+        assert_eq!(use_site.owner_syntax_id, function.syntax_id);
+    }
+    for (path, aliases) in [("a.js", vec!["local"]), ("a.rs", vec!["Local", "Nested"])] {
+        for alias in aliases {
+            let declaration = artifact
+                .declarations
+                .iter()
+                .find(|d| {
+                    d.document.path == path && d.kind == "alias" && d.name.as_deref() == Some(alias)
+                })
+                .unwrap();
+            assert!(declaration.key.signature.is_none());
+            let reference = artifact
+                .references
+                .iter()
+                .find(|r| {
+                    r.document == declaration.document
+                        && Some(&r.range) == declaration.name_range.as_ref()
+                })
+                .unwrap();
+            let module = artifact
+                .declarations
+                .iter()
+                .find(|d| d.document == declaration.document && d.kind == "module")
+                .unwrap();
+            assert_eq!(reference.owner_syntax_id, module.syntax_id);
+        }
+    }
+}
+
+#[test]
+fn native_v9_reference_ownership_does_not_move_initializer_calls() {
+    let artifact = native_v9_fixture(&[(
+        "a.js",
+        "function outer() { const local = schedule(callback); function inner(value) { return value.member; } return inner(local); }",
+    )]);
+    let outer = artifact
+        .declarations
+        .iter()
+        .find(|d| d.name.as_deref() == Some("outer"))
+        .unwrap();
+    let inner = artifact
+        .declarations
+        .iter()
+        .find(|d| d.name.as_deref() == Some("inner"))
+        .unwrap();
+    let inner_name = artifact
+        .references
+        .iter()
+        .find(|r| Some(&r.range) == inner.name_range.as_ref())
+        .unwrap();
+    assert_eq!(inner_name.owner_syntax_id, outer.syntax_id);
+    let member = artifact
+        .references
+        .iter()
+        .find(|r| r.spelling == "member")
+        .unwrap();
+    assert_eq!(member.owner_syntax_id, inner.syntax_id);
+    let callback = artifact
+        .references
+        .iter()
+        .find(|r| r.spelling == "callback")
+        .unwrap();
+    assert_eq!(callback.owner_syntax_id, outer.syntax_id);
+    assert!(
+        !artifact
+            .calls
+            .iter()
+            .any(|c| c.spelling.as_deref() == Some("callback"))
+    );
+    let schedule = artifact
+        .calls
+        .iter()
+        .find(|c| c.spelling.as_deref() == Some("schedule"))
+        .unwrap();
+    assert_eq!(schedule.owner_syntax_id, outer.syntax_id);
+}
+
+#[test]
+fn native_v9_rust_gaps_preserve_working_families_and_exclude_non_identifiers() {
+    use trellis::native_evidence::MeasurementKind;
+    let source = "#[opaque(hidden)] fn run<'life>(value: &'life Type) { 'label: loop { real(value.field); opaque!(invented()); break 'label; } }";
+    let artifact = native_v9_fixture(&[("a.rs", source), ("empty.js", "")]);
+    assert!(
+        artifact
+            .calls
+            .iter()
+            .any(|c| c.spelling.as_deref() == Some("real"))
+    );
+    assert!(
+        !artifact
+            .calls
+            .iter()
+            .any(|c| c.spelling.as_deref() == Some("invented"))
+    );
+    for excluded in ["life", "label", "hidden", "invented", "opaque"] {
+        assert!(
+            !artifact.references.iter().any(|r| r.spelling == excluded),
+            "{excluded}"
+        );
+    }
+    let report = artifact
+        .capability_reports
+        .iter()
+        .find(|r| r.document.path == "a.rs")
+        .unwrap();
+    assert_eq!(report.families.len(), 4);
+    for family in &report.families {
+        assert!(family.available && family.diagnostic.is_none());
+        assert_eq!(family.gaps.len(), 2);
+        assert_eq!(
+            &source[family.gaps[0].range.start..family.gaps[0].range.end],
+            "#[opaque(hidden)]"
+        );
+        assert_eq!(
+            &source[family.gaps[1].range.start..family.gaps[1].range.end],
+            "opaque!(invented())"
+        );
+        assert!(family.gaps.iter().all(|gap| !gap.diagnostic.is_empty()));
+    }
+    assert!(
+        report
+            .families
+            .iter()
+            .any(|f| f.kind == MeasurementKind::Reference)
+    );
+    let empty = artifact
+        .capability_reports
+        .iter()
+        .find(|r| r.document.path == "empty.js")
+        .unwrap();
+    assert!(
+        empty
+            .families
+            .iter()
+            .all(|f| f.available && f.gaps.is_empty())
+    );
+}
+
+#[test]
+fn native_v9_tagged_templates_keep_measurable_calls_and_substitutions() {
+    let source = "function run() { tag`text ${read(value)}`; obj.tag`text ${other}`; tag`outer ${nested`inner ${value}`}`; (choose ? first : second)`text ${last}`; }";
+    let artifact = native_v9_fixture(&[("a.js", source)]);
+    assert_eq!(artifact.coverage[0].state, "complete");
+    assert_eq!(
+        artifact.calls.len(),
+        6,
+        "all tags plus substitution read are invocations"
+    );
+    assert_eq!(
+        artifact
+            .calls
+            .iter()
+            .filter(|c| c.spelling.as_deref() == Some("tag"))
+            .count(),
+        3
+    );
+    for name in ["read", "nested"] {
+        assert!(
+            artifact
+                .calls
+                .iter()
+                .any(|c| c.spelling.as_deref() == Some(name) && c.callee_range.is_some()),
+            "{name}"
+        );
+    }
+    let compound = artifact
+        .calls
+        .iter()
+        .find(|c| c.spelling.as_deref() == Some("(choose ? first : second)"))
+        .unwrap();
+    assert!(compound.callee_range.is_none());
+    for name in ["value", "other", "choose", "first", "second", "last"] {
+        assert!(
+            artifact.references.iter().any(|r| r.spelling == name),
+            "{name}"
+        );
+    }
+    assert!(
+        artifact.capability_reports[0]
+            .families
+            .iter()
+            .all(|f| f.available && f.gaps.is_empty())
+    );
+}
+
+#[test]
+fn native_v9_rust_scoped_and_generic_callees_use_only_final_identifier() {
+    let artifact = native_v9_fixture(&[(
+        "a.rs",
+        "fn run() { module::target(); Type::target::<Item>(); value.method::<Item>(); (choose())(); }",
+    )]);
+    assert_eq!(
+        artifact
+            .calls
+            .iter()
+            .filter(|c| c.spelling.as_deref() == Some("target") && c.callee_range.is_some())
+            .count(),
+        2
+    );
+    assert!(
+        artifact
+            .calls
+            .iter()
+            .any(|c| c.spelling.as_deref() == Some("method") && c.callee_range.is_some())
+    );
+    assert!(
+        artifact
+            .calls
+            .iter()
+            .any(|c| c.spelling.as_deref() == Some("(choose())") && c.callee_range.is_none())
+    );
+}
+
+#[test]
+fn native_v9_java_varargs_share_signature_header_and_parameter_names() {
+    let source = "class A { void f(String a, int... rest) {} void f(String a, String... rest) {} A(String a, long... rest) {} }";
+    let artifact = native_v9_fixture(&[("A.java", source)]);
+    let callables: Vec<_> = artifact
+        .declarations
+        .iter()
+        .filter(|d| matches!(d.kind.as_str(), "method" | "constructor"))
+        .collect();
+    assert_eq!(callables.len(), 3);
+    for (callable, (kind, variadic_type)) in callables.iter().zip([
+        ("method", "int"),
+        ("method", "String"),
+        ("constructor", "long"),
+    ]) {
+        assert_eq!(callable.kind, kind);
+        let signature = callable.key.signature.as_ref().unwrap();
+        assert_eq!(signature.parameter_types, ["String", variadic_type]);
+        assert!(signature.variadic);
+        assert_eq!(callable.header.parameters.len(), 2);
+        let rest = &callable.header.parameters[1];
+        assert_eq!(rest.name.as_deref(), Some("rest"));
+        assert_eq!(rest.type_name.as_deref(), Some(variadic_type));
+        assert!(rest.variadic);
+        assert_eq!(
+            callable.key.ordinal, 0,
+            "distinct type signatures are not sibling collisions"
+        );
+        for name in ["a", "rest"] {
+            let declarations: Vec<_> = artifact
+                .declarations
+                .iter()
+                .filter(|d| {
+                    d.name.as_deref() == Some(name)
+                        && callable.range.start <= d.range.start
+                        && d.range.end <= callable.range.end
+                })
+                .collect();
+            assert_eq!(
+                declarations.len(),
+                1,
+                "{kind} {variadic_type}: one declaration for {name}"
+            );
+            let parameter = declarations[0];
+            assert_eq!(parameter.kind, "parameter");
+            assert_eq!(parameter.ancestors.last(), Some(&callable.key));
+            let range = parameter.name_range.as_ref().unwrap();
+            assert_eq!(&source[range.start..range.end], name);
+            let references: Vec<_> = artifact
+                .references
+                .iter()
+                .filter(|r| r.document == parameter.document && &r.range == range)
+                .collect();
+            assert_eq!(
+                references.len(),
+                1,
+                "one lexical reference at the declarationName anchor"
+            );
+            assert_eq!(references[0].owner_syntax_id, callable.syntax_id);
+            assert_eq!(references[0].spelling, name);
+        }
+        let rest_parameter = artifact
+            .declarations
+            .iter()
+            .find(|d| {
+                d.kind == "parameter"
+                    && d.name.as_deref() == Some("rest")
+                    && callable.range.start <= d.range.start
+                    && d.range.end <= callable.range.end
+            })
+            .unwrap();
+        assert_eq!(
+            &source[rest_parameter.range.start..rest_parameter.range.end],
+            format!("{variadic_type}... rest")
+        );
+    }
+    assert_ne!(callables[0].syntax_id, callables[1].syntax_id);
+    assert_eq!(
+        artifact
+            .declarations
+            .iter()
+            .filter(|d| d.name.as_deref() == Some("rest"))
+            .count(),
+        3
+    );
+}
+
+#[test]
+fn native_v9_rust_underscore_import_does_not_create_alias_declaration() {
+    let artifact = native_v9_fixture(&[("a.rs", "use p::Original as _; use p::{Other as _};")]);
+    assert!(!artifact.declarations.iter().any(|d| d.kind == "alias"));
+    for imported in ["Original", "Other"] {
+        assert!(artifact.references.iter().any(|r| r.spelling == imported));
+    }
 }

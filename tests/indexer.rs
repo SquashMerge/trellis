@@ -1806,10 +1806,8 @@ fn watcher_callback_filters_capture_read_access_without_rediscovering_work() {
     use trellis::watch::WatchSignals;
     let root = tempfile::tempdir().unwrap();
     write(root.path(), "source.js", "f();");
-    let mut watcher = WatchSignals::new(root.path().to_owned(), None, None);
-    if !watcher.watching() {
-        return;
-    }
+    // Isolate ingress filtering from delayed native events for the fixture writes.
+    let mut watcher = WatchSignals::synthetic_for_tests(root.path().to_owned(), None, None);
     let initial = watcher.drain();
     assert!(watcher.acknowledge(&initial));
     let before = watcher.drain();

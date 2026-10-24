@@ -239,7 +239,15 @@ async fn listener_and_control_do_not_postpone_idle_exit() {
         .unwrap();
     assert_eq!(registry.lock().await.active_count(), 0);
     let (_control, _daemon_control) = std::os::unix::net::UnixStream::pair().unwrap();
-    browser.serve_until_idle(registry).await.unwrap();
+    let (shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
+    let serving = browser.spawn_with_shutdown(shutdown_rx).unwrap();
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        trellis::daemon::run_idle_lifecycle(registry).await.unwrap();
+        shutdown.send(true).unwrap();
+        serving.await.unwrap().unwrap();
+    })
+    .await
+    .expect("idle exit did not close the browser listener");
     assert!(tokio::net::TcpStream::connect(address).await.is_err());
 }
 
@@ -370,7 +378,8 @@ async fn later_serve_compares_configuration_while_http_is_running() {
         )
         .await
         .unwrap();
-    let serving = browser.spawn_until_idle(registry.clone()).unwrap();
+    let (shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
+    let serving = browser.spawn_with_shutdown(shutdown_rx).unwrap();
     assert_eq!(browser.address(), Some(address));
     assert_eq!(
         browser
@@ -398,8 +407,8 @@ async fn later_serve_compares_configuration_while_http_is_running() {
             .is_err()
     );
     assert_eq!(registry.lock().await.active_count(), 1);
-    serving.abort();
-    let _ = serving.await;
+    shutdown.send(true).unwrap();
+    serving.await.unwrap().unwrap();
 }
 
 static JEV_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());

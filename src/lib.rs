@@ -29,11 +29,14 @@ mod indexer_rust;
 pub mod mcp;
 pub mod metrics;
 pub mod model;
+#[cfg(feature = "test-support")]
+pub mod native_capture;
 pub mod native_evidence;
 pub mod native_ids;
 pub mod navigation;
 mod parallel;
 mod rust_sources;
+pub mod semantic_evidence;
 pub mod store;
 #[doc(hidden)]
 pub mod testing;

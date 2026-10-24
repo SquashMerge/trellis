@@ -28,6 +28,21 @@ pub const EXTRACTION_MODULES: &[&str] = &[
     "src/parallel.rs",
 ];
 
+/// Fixture conversion is compiled only for test-support captures. It must not
+/// invalidate release indexes when the adapter changes.
+const TEST_SUPPORT_EXTRACTION_MODULES: &[&str] = &["src/native_capture.rs"];
+
+pub fn extraction_modules(test_support: bool) -> impl Iterator<Item = &'static str> {
+    EXTRACTION_MODULES
+        .iter()
+        .chain(if test_support {
+            TEST_SUPPORT_EXTRACTION_MODULES
+        } else {
+            &[]
+        })
+        .copied()
+}
+
 /// `Cargo.lock` packages whose code runs during extraction and reaches stored
 /// facts: the tree-sitter runtime and grammars, Unicode normalization of
 /// lookup keys, the JSON writer behind payloads and canonical bytes, and the
@@ -44,7 +59,7 @@ pub const EXTRACTION_CRATES: &[&str] = &[
 
 /// The build-time producer hash: SHA-256 over a domain tag, each listed module
 /// path and its exact bytes, the selected `Cargo.lock` package lines and the
-/// `test-support` feature flag. `modules` must follow `EXTRACTION_MODULES`.
+/// `test-support` feature flag. `modules` must follow `extraction_modules(test_support)`.
 pub fn extractor_hash(modules: &[(&str, &[u8])], cargo_lock: &str, test_support: bool) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();

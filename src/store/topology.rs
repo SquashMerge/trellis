@@ -176,6 +176,7 @@ impl TopologyRoots {
         managed_tree(&self.data)?;
         make_private(&self.data.join("workspaces"))
     }
+    /// Provision directory and use lock during Store activation only.
     pub fn index_use(&self, identity: &WorkspaceIdentity) -> Result<UseGuard> {
         self.prepare_index(identity)?;
         UseGuard::acquire(&self.index_use_lock(identity), false, true)
@@ -203,20 +204,22 @@ impl TopologyRoots {
             }
         })
     }
+    /// Inspect existing scratch topology without reacquiring the writer's use lock.
+    pub(super) fn existing_index_dir(&self, identity: &WorkspaceIdentity) -> Result<PathBuf> {
+        identity.verify()?;
+        self.reject_root_overlap(identity)?;
+        let directory = self.index_dir(identity);
+        for path in [&self.cache, &self.cache.join("indexes"), &directory] {
+            private_dir(path)?;
+        }
+        Ok(directory)
+    }
     fn index_use_existing_with_wait(
         &self,
         identity: &WorkspaceIdentity,
         nonblocking: bool,
     ) -> Result<UseGuard> {
-        identity.verify()?;
-        self.reject_root_overlap(identity)?;
-        for path in [
-            &self.cache,
-            &self.cache.join("indexes"),
-            &self.index_dir(identity),
-        ] {
-            private_dir(path)?;
-        }
+        self.existing_index_dir(identity)?;
         UseGuard::acquire_existing(&self.index_use_lock(identity), false, nonblocking).map_err(
             |error| {
                 if error.is::<StorageBusy>() {
@@ -260,7 +263,7 @@ impl TopologyRoots {
     /// use lock stays held for the writer's lifetime; exclusive GC cannot unlink
     /// an index while the writer uses it.
     pub fn writer(&self, identity: Arc<WorkspaceIdentity>) -> Result<WriterGuard> {
-        let use_guard = self.index_use(&identity)?;
+        let use_guard = self.index_use_existing(&identity)?;
         WriterGuard::new(self, identity, use_guard, false)
     }
     /// Activation retains the existing exclusive use lock through publication.
@@ -1765,7 +1768,7 @@ fn inspect_index_with_open_hook(
     if old_index_schema(version) {
         return Ok(("eligible", "old_schema"));
     }
-    if version != 14 {
+    if version != i64::from(super::DATABASE_SCHEMA_VERSION) {
         return Ok(("unknown", "unknown_index_schema"));
     }
     if super::validate_cache_shape(db).is_err() {
@@ -1837,10 +1840,10 @@ pub enum GcStage {
     AfterParentSync,
 }
 
-/// Schemas before the current v14 are disposable: no released binary that wrote
+/// Schemas before the current v17 are disposable: no released binary that wrote
 /// one can be served by this one, so GC needs no layout, root or age proof.
 fn old_index_schema(version: i64) -> bool {
-    (1..14).contains(&version)
+    (1..i64::from(super::DATABASE_SCHEMA_VERSION)).contains(&version)
 }
 
 /// Only an earlier schema or the exact current layout can reach the unlink boundary.
@@ -1876,7 +1879,10 @@ fn gc_remove_candidate(
         let tx = index.transaction()?;
         let version: i64 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
         if !old_index_schema(version) {
-            ensure!(version == 14, "unknown GC schema");
+            ensure!(
+                version == i64::from(super::DATABASE_SCHEMA_VERSION),
+                "unknown GC schema"
+            );
             super::validate_cache_shape(&tx)?;
             super::validate_supersessions(&tx)?;
             let (generation, revision, stats, diagnostics): (String, i64, String, String) = tx.query_row(
@@ -2470,7 +2476,7 @@ mod gc_schema_race_tests {
         assert_eq!(
             (schema, marker.as_str(), generation, revision),
             (
-                14,
+                17,
                 "native-v6-delta-v1",
                 pin.index_generation.to_string(),
                 pin.index_revision as i64
@@ -2586,7 +2592,7 @@ mod gc_schema_race_tests {
     }
 
     #[test]
-    fn exact_v14_gc_candidate_survives_unknown_busy_then_deletes_after_fences_clear() {
+    fn exact_v17_gc_candidate_survives_unknown_busy_then_deletes_after_fences_clear() {
         let state = tempfile::tempdir().unwrap();
         let candidate_root = tempfile::tempdir().unwrap();
         let current_root = tempfile::tempdir().unwrap();
@@ -2700,7 +2706,7 @@ mod gc_schema_race_tests {
         assert_eq!(
             inspect_index(&dir, &identity.root_key, now).unwrap(),
             ("unknown", "recent_open"),
-            "genuine current-v14 cache must pass GC admission"
+            "genuine current-v17 cache must pass GC admission"
         );
 
         let attacker = rusqlite::Connection::open(&path).unwrap();
@@ -2718,7 +2724,7 @@ mod gc_schema_race_tests {
         assert_eq!(
             (schema, marker.as_str(), generation, revision),
             (
-                14,
+                17,
                 "native-v4",
                 pin.index_generation.to_string(),
                 pin.index_revision as i64
@@ -2872,7 +2878,7 @@ mod gc_final_witness_tests {
         assert_eq!(
             db.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            14
+            17
         );
         drop(live);
         assert!(roots.index_use_lock(&candidate).exists());
