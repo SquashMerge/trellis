@@ -4676,7 +4676,7 @@ mod full_document_spool_tests {
     }
 
     #[test]
-    fn prepared_multifile_scip_labels_match_full_projection_and_first_duplicate_wins() {
+    fn prepared_multifile_scip_labels_match_full_projection_and_reject_duplicates() {
         use protobuf::Message;
         let state = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
@@ -4692,21 +4692,15 @@ mod full_document_spool_tests {
             manifest.insert(*path, hash(source.as_bytes()));
             let mut doc = scip::types::Document::new();
             doc.relative_path = (*path).into();
+            doc.position_encoding =
+                scip::types::PositionEncoding::UTF16CodeUnitOffsetFromLineStart.into();
             let mut occurrence = scip::types::Occurrence::new();
             occurrence.range = range.clone();
-            occurrence.symbol_roles = if *path == "c.js" { 0 } else { 1 };
+            occurrence.symbol_roles = 1;
             occurrence.symbol = format!("scip display {name}()");
             doc.occurrences.push(occurrence);
             index.documents.push(doc);
         }
-        let mut duplicate = scip::types::Document::new();
-        duplicate.relative_path = "c.js".into();
-        let mut occurrence = scip::types::Occurrence::new();
-        occurrence.range = vec![0, 9, 10];
-        occurrence.symbol_roles = 1;
-        occurrence.symbol = "scip later f()".into();
-        duplicate.occurrences.push(occurrence);
-        index.documents.push(duplicate);
         fs::write(
             workspace.path().join("index.scip"),
             index.write_to_bytes().unwrap(),
@@ -4753,17 +4747,63 @@ mod full_document_spool_tests {
         }
         nodes.sort_by(|a, b| a.id.cmp(&b.id));
         assert_eq!(nodes, baseline.nodes);
-        for name in ["A", "g"] {
+        for name in ["A", "g", "f"] {
             assert!(
                 nodes
                     .iter()
                     .any(|node| node.name == name && node.display_label.is_some())
             );
         }
+        let mut duplicate = scip::types::Document::new();
+        duplicate.relative_path = "c.js".into();
+        duplicate.language = "java".into();
+        index.documents.push(duplicate);
+        fs::write(
+            workspace.path().join("index.scip"),
+            index.write_to_bytes().unwrap(),
+        )
+        .unwrap();
+        let duplicate_capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
+        let duplicate_native =
+            from_capture(&duplicate_capture, &root, store.root_id(), &cancel).unwrap();
+        let duplicate_graph = crate::indexer::project_native(
+            &options,
+            &duplicate_capture,
+            &duplicate_native,
+            &cancel,
+            &|_| {},
+        )
+        .unwrap();
+        let duplicate_spool_capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
+        let duplicate_spool = spool_full_capture(
+            &options,
+            &duplicate_spool_capture,
+            &root,
+            store.root_id(),
+            &cancel,
+            &|_| {},
+            |_, _| {},
+            &store.native_spool_dir().unwrap(),
+        )
+        .unwrap();
+        let mut duplicate_nodes = Vec::new();
+        for index in 0..duplicate_spool.len() {
+            let (_, graph) = duplicate_spool.read(index).unwrap();
+            duplicate_nodes.extend(graph.nodes);
+        }
+        duplicate_nodes.sort_by(|a, b| a.id.cmp(&b.id));
+        assert_eq!(duplicate_nodes, duplicate_graph.nodes);
         assert!(
-            nodes
+            duplicate_nodes
                 .iter()
-                .any(|node| node.name == "f" && node.display_label.is_none())
+                .all(|node| node.display_label.is_none())
+        );
+        assert_eq!(
+            nodes.iter().map(|node| &node.id).collect::<Vec<_>>(),
+            duplicate_nodes
+                .iter()
+                .map(|node| &node.id)
+                .collect::<Vec<_>>()
         );
     }
 

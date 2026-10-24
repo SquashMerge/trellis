@@ -896,6 +896,18 @@ impl Capture {
             16 * 1024 * 1024
         }
     }
+    pub(crate) fn physical_root(&self) -> &Path {
+        &self.root
+    }
+    pub(crate) fn selected_scip_inputs(&self) -> Option<(&Path, &Path)> {
+        let artifact = Path::new(self.reconcile_options.scip_path.as_deref()?);
+        let manifest = Path::new(self.reconcile_options.manifest_path.as_deref()?);
+        if artifact == manifest || self.bytes(artifact).is_none() || self.bytes(manifest).is_none()
+        {
+            return None;
+        }
+        Some((artifact, manifest))
+    }
     pub fn bytes(&self, path: &Path) -> Option<&[u8]> {
         self.input_bytes.get(path).and_then(|b| b.as_deref())
     }

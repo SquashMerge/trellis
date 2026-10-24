@@ -2,11 +2,17 @@
 import { resolve, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { generateFixture, checkPublication } from "./publish.mjs";
+import { checkCapturedScip } from "./captured-scip.mjs";
 
 export function parseArgs(args) {
   const [command, ...rest] = args;
+  if (command === "check-captured-scip") {
+    if (rest.length !== 4 || rest[0] !== "--fixture-root" || rest[2] !== "--expected-manifest-hash" || !rest[1] || !/^[a-f0-9]{64}$/.test(rest[3] ?? ""))
+      throw new Error("CLI.FLAG expected --fixture-root <dir> --expected-manifest-hash <sha256>");
+    return { command, root: resolve(rest[1]), expectedManifestHash: rest[3] };
+  }
   if (!["generate", "check"].includes(command))
-    throw new Error("CLI.COMMAND expected generate or check");
+    throw new Error("CLI.COMMAND expected generate, check or check-captured-scip");
   let fixture = "example",
     root = fileURLToPath(
       new URL("../../tests/fixtures/semantic-evidence/v1/", import.meta.url),
@@ -37,7 +43,8 @@ export function parseArgs(args) {
   return { command, fixture, root, check };
 }
 export async function main(args = process.argv.slice(2)) {
-  const { command, fixture, root, check } = parseArgs(args);
+  const { command, fixture, root, check, expectedManifestHash } = parseArgs(args);
+  if (command === "check-captured-scip") return checkCapturedScip(root, expectedManifestHash);
   const path = join(root, fixture);
   return command === "check"
     ? checkPublication(path)
