@@ -36,6 +36,8 @@ pub mod native_ids;
 pub mod navigation;
 mod parallel;
 mod rust_sources;
+pub mod scip_admission;
+mod scip_raw;
 pub mod semantic_evidence;
 pub mod store;
 #[doc(hidden)]
