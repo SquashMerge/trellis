@@ -13377,6 +13377,13 @@ impl Store {
             None
         };
         if let Some((semantic, captured)) = semantic {
+            ensure!(
+                semantic
+                    .provenance
+                    .iter()
+                    .all(|proof| proof.revision_id == native.revision.id),
+                "captured proof revision differs from candidate native revision"
+            );
             crate::semantic_evidence::validate_evidence(
                 semantic,
                 measured_stream.as_ref().unwrap_or(native),
