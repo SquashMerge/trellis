@@ -1,5 +1,5 @@
 // The parser checks token spellings before JSON.parse can discard duplicate keys or -0.
-export function parseJson(input) {
+export function parseJson(input, { maxDepth = 64 } = {}) {
   const bytes = Buffer.isBuffer(input) || input instanceof Uint8Array;
   if (bytes && input[0] === 0xef && input[1] === 0xbb && input[2] === 0xbf)
     throw new SyntaxError("JSON.INTAKE leading BOM");
@@ -10,6 +10,17 @@ export function parseJson(input) {
     throw new TypeError("JSON input must be UTF-8 bytes or text");
   if (source.charCodeAt(0) === 0xfeff)
     throw new SyntaxError("JSON.INTAKE leading BOM");
+  let depth = 0, quoted = false, escaped = false;
+  for (const c of source) {
+    if (quoted) {
+      if (escaped) escaped = false;
+      else if (c === "\\") escaped = true;
+      else if (c === '"') quoted = false;
+    } else if (c === '"') quoted = true;
+    else if (c === "{" || c === "[") {
+      if (++depth > maxDepth) throw new SyntaxError("JSON.INTAKE nesting limit exceeded");
+    } else if (c === "}" || c === "]") depth--;
+  }
   let i = 0;
   const error = (message) => {
     throw new SyntaxError(`JSON.INTAKE at offset ${i}: ${message}`);
