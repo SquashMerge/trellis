@@ -55,14 +55,7 @@ async function readInput(root, path, limit) {
 function parse(bytes) { try { return parseJson(bytes, { maxDepth: 64 }); } catch (error) { if (error instanceof SyntaxError || error instanceof TypeError) fail("InvalidArtifact", error.message); throw error; } }
 function shape(name, value) { try { validate(name, value); } catch (error) { fail("InvalidArtifact", error.message); } }
 
-// Test-only synthetic profile seam; production CLI calls checkCapturedScip without options.
 export async function checkCapturedScip(root, expectedManifestHash) {
-  return checkWithProfile(root, expectedManifestHash, null);
-}
-export async function checkCapturedScipWithTestProfile(root, expectedManifestHash, profile) {
-  return checkWithProfile(root, expectedManifestHash, profile);
-}
-async function checkWithProfile(root, expectedManifestHash, profile) {
   requireThat(typeof expectedManifestHash === "string" && /^[a-f0-9]{64}$/.test(expectedManifestHash), "independent manifest hash required");
   const physical = await realpath(root);
   const manifestBytes = await readInput(physical, "captured-scip/manifest.json", limits.manifest);
@@ -71,12 +64,12 @@ async function checkWithProfile(root, expectedManifestHash, profile) {
   shape("ScipManifest", manifest);
   if (manifest.sourceDocuments.length > 100000 || manifest.documents.length > limits.documents) fail("LimitExceeded", "manifest document count");
   let actualProfile;
-  try { actualProfile = profile ?? JSON.parse(await readFile(profilePath, "utf8")); }
+  try { actualProfile = JSON.parse(await readFile(profilePath, "utf8")); }
   catch (error) { fail("InvalidAdmission", `profile unavailable: ${error.message}`); }
   const pinned = actualProfile?.semanticProducers?.find((p) => p.name === manifest.producer.name);
   const [language, productionEncoding] = producers[manifest.producer.name] ?? [];
-  const encoding = profile ? profile.expectedPositionEncoding : productionEncoding;
-  requireThat(actualProfile.profileId === manifest.profileId && pinned?.version === manifest.producer.version && pinned.executableHash === manifest.producer.executableHash && encoding === manifest.producer.positionEncoding && (profile === null || profile.expectedProducer === manifest.producer.name), "producer profile mismatch");
+  const encoding = productionEncoding;
+  requireThat(actualProfile.profileId === manifest.profileId && pinned?.version === manifest.producer.version && pinned.executableHash === manifest.producer.executableHash && encoding === manifest.producer.positionEncoding, "producer profile mismatch");
   requireThat(manifest.sourceSet.id === `source-set:v1:${manifest.sourceSet.rootId}` && manifest.sourceSet.rootId.length > 0 && /^revision:v2:[a-f0-9]{64}$/.test(manifest.sourceRevision), "source identity mismatch");
   requireThat(JSON.stringify(manifest.sourceSet.languages) === JSON.stringify(languageOrder) && manifest.sourceSet.dependencies.length === 0, "source set mismatch");
   requireThat(Object.values(manifest.components).every((hash) => /^[a-f0-9]{64}$/.test(hash)), "component hashes invalid");
@@ -86,6 +79,7 @@ async function checkWithProfile(root, expectedManifestHash, profile) {
   requireThat(manifest.sourceDocuments.length > 0 && manifest.documents.length > 0, "document count");
   requireThat(manifest.exclusions.length <= manifest.sourceDocuments.length, "exclusion count");
   sortedUnique(manifest.sourceDocuments); sortedUnique(manifest.documents); sortedUnique(manifest.exclusions);
+  requireThat(new Set(manifest.sourceDocuments.map((row) => row.relativePath)).size === manifest.sourceDocuments.length, "duplicate source path");
   const sourceMap = new Map();
   let total = 0;
   for (const row of manifest.sourceDocuments) {
@@ -100,7 +94,6 @@ async function checkWithProfile(root, expectedManifestHash, profile) {
   }
   const rows = manifest.sourceDocuments.map((row) => ({ document: { sourceSetId: manifest.sourceSet.id, language: row.language, path: row.relativePath }, contentHash: row.contentHash }));
   requireThat(sourceManifestHash(rows) === manifest.sourceManifestHash, "source manifest mismatch");
-  requireThat(new Set(manifest.sourceDocuments.map((row) => row.relativePath)).size === manifest.sourceDocuments.length, "duplicate source path");
   const covered = new Set();
   for (const row of manifest.documents) {
     requireThat(row.language === language && sourceMap.get(row.relativePath)?.row.language === row.language && sourceMap.get(row.relativePath)?.row.contentHash === row.contentHash && !covered.has(row.relativePath), "document coverage mismatch");
