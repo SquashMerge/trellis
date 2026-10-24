@@ -3833,3 +3833,107 @@ fn exported_javascript_and_bare_rust_tail_local_match_independent_cold() {
         );
     }
 }
+
+#[cfg(feature = "test-support")]
+#[test]
+fn full_reuse_small_edit_plain_and_stream_match_independent_cold_publication() {
+    use std::sync::{Arc, atomic::AtomicBool};
+    use trellis::{
+        index_coordinator::IndexJobCoordinator,
+        indexer::{IndexOptions, index_workspace_bundle},
+        model::{CancelFlag, IndexPin},
+    };
+    for stream in [false, true] {
+        let (state, workspace) = fixture();
+        fs::write(
+            workspace.path().join("A.java"),
+            "class A { int run(){ return helper(); } int helper(){ return 1; } }\n",
+        )
+        .unwrap();
+        fs::write(
+            workspace.path().join("a.py"),
+            "class Base: pass\nclass A(Base):\n    def run(self):\n        return 1\n",
+        )
+        .unwrap();
+        fs::write(
+            workspace.path().join("edit.js"),
+            "function edit(){ return 1; }\n",
+        )
+        .unwrap();
+        let options = IndexOptions::new(workspace.path().to_owned());
+        let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let first = IndexJobCoordinator::prepare(&store, None)
+            .unwrap()
+            .run(&options, &cancel, |_| {})
+            .unwrap();
+        let ids = |pin: IndexPin| {
+            let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
+            let mut statement = db.prepare("SELECT path,vid,gid,cid FROM revision_documents WHERE revision_id=?1 AND path!='edit.js' ORDER BY path").unwrap();
+            statement
+                .query_map(
+                    [format!(
+                        "pin:v1:{}:{}",
+                        pin.index_generation, pin.index_revision
+                    )],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                        ))
+                    },
+                )
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        let prior_ids = ids(first);
+        assert_eq!(prior_ids.len(), 2);
+        fs::write(
+            workspace.path().join("edit.js"),
+            "function renamed(){ return 2; }\nrenamed();\n",
+        )
+        .unwrap();
+        // Force the two FULL entrypoints so the later local-path widening
+        // cannot turn this reuse regression into a local-publication test.
+        let session = store.writer_session_for_tests().unwrap();
+        let leader = session.writer_guard().unwrap();
+        let next = if stream {
+            let capture = trellis::capture::Capture::admit(&options, &cancel, &|_| {}).unwrap();
+            store
+                .publish_stream_native_only_for_tests(&options, &capture, leader, &cancel)
+                .unwrap()
+        } else {
+            let (graph, native, capture) =
+                index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+            store
+                .publish_native(&graph, &capture, &native, leader, first, &cancel)
+                .unwrap()
+        };
+        drop(session);
+        assert_eq!(next.index_generation, first.index_generation);
+        assert_eq!(next.index_revision, first.index_revision + 1);
+        assert_eq!(
+            ids(next),
+            prior_ids,
+            "stream={stream}: reuse all three stored IDs"
+        );
+        let cold_state = tempfile::tempdir().unwrap();
+        let cold = Store::open_for_tests(cold_state.path(), workspace.path()).unwrap();
+        let cold_pin = IndexJobCoordinator::prepare(&cold, None)
+            .unwrap()
+            .run(&options, &cancel, |_| {})
+            .unwrap();
+        assert_eq!(
+            sqlite_snapshot(&index_dir(state.path()).join("index.db"), next, true),
+            sqlite_snapshot(
+                &index_dir(cold_state.path()).join("index.db"),
+                cold_pin,
+                true
+            ),
+            "stream={stream}: complete selected evidence must match an independent cold build",
+        );
+    }
+}

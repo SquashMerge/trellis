@@ -1,5 +1,5 @@
-//! R-1 (#199): reused projections compare fresh hashes with stored witnesses.
-//! Non-reused class hashes are replaced by fresh, validated projections.
+//! #225: equal document/graph/class IDs trust the no-drift validated head.
+//! Drift and partial-family reuse keep R-1's witness checks.
 use super::*;
 use crate::{index_coordinator::IndexJobCoordinator, indexer::IndexOptions};
 use std::{fs, sync::atomic::AtomicBool};
@@ -139,13 +139,124 @@ fn stored_mismatch_fails_typed_then_rebaselines(sql: &str, message: &str) {
 }
 
 #[test]
-fn a_stored_native_witness_mismatch_fails_typed_then_rebaselines() {
-    stored_mismatch_fails_typed_then_rebaselines(
-        "UPDATE document_versions SET native_witness=printf('%064d',0)
-         WHERE vid=(SELECT vid FROM revision_documents
-                   WHERE revision_id=?1 AND path=?2)",
-        "reusable normalized native witness mismatch",
-    );
+fn no_drift_matching_ids_trust_stored_native_and_extraction_witnesses() {
+    for stream in [false, true] {
+        let (_state, _work, store, options, pin) = fixture();
+        corrupt(
+            &store,
+            pin,
+            "UPDATE document_versions SET native_witness=printf('%064d',0)
+             WHERE vid=(SELECT vid FROM revision_documents
+                       WHERE revision_id=?1 AND path=?2)",
+        );
+        corrupt(
+            &store,
+            pin,
+            "UPDATE graph_projections SET class_extraction_payload='{}'
+             WHERE gid=(SELECT gid FROM revision_documents
+                       WHERE revision_id=?1 AND path=?2)",
+        );
+        let next = publish_full_route(&store, &options, pin, stream).unwrap();
+        assert_eq!(next.index_generation, pin.index_generation);
+        assert_eq!(next.index_revision, pin.index_revision + 1);
+    }
+}
+
+fn publish_full_route(
+    store: &Store,
+    options: &IndexOptions,
+    pin: IndexPin,
+    stream: bool,
+) -> Result<IndexPin> {
+    fs::write(
+        options.workspace_root.join("c.js"),
+        "function c(){ return 3; }\n",
+    )?;
+    let cancel = Arc::new(AtomicBool::new(false));
+    let leader = store.writer()?;
+    if stream {
+        let capture = crate::capture::Capture::admit(options, &cancel, &|_| {})?;
+        let spool = crate::native_evidence::spool_full_capture(
+            options,
+            &capture,
+            &options.workspace_root,
+            store.root_id(),
+            &cancel,
+            &|_| {},
+            |_, _| {},
+            &store.native_spool_dir()?,
+        )?;
+        store.publish_validated_stream_recovery(
+            &spool,
+            &capture,
+            &leader,
+            store.publication_index_baseline()?,
+            &cancel,
+        )
+    } else {
+        let (graph, native, capture) =
+            crate::indexer::index_workspace_bundle(options, store.root_id(), &cancel, |_| {})?;
+        store.publish_native(&graph, &capture, &native, &leader, pin, &cancel)
+    }
+}
+
+#[test]
+fn producer_drift_keeps_native_witness_comparison_for_both_full_routes() {
+    for stream in [false, true] {
+        let (_state, _work, store, options, pin) = fixture();
+        // Model a validated prior publication from a different executable.
+        let db = store.cache_write().unwrap();
+        let selected = store.read_revision_for(&db, Some(pin), true).unwrap();
+        assert_eq!(db.execute(
+            "UPDATE revision_capture_inputs SET payload=json_set(payload,'$.hash',printf('%064d',0))
+             WHERE revision_id=?1 AND input_key LIKE 'executable:%'",
+            [&selected.key],
+        ).unwrap(), 1);
+        let (producer, binding) = revision_producer_binding(&db, &selected.key).unwrap();
+        assert_eq!(db.execute(
+            "UPDATE revision_producer_bindings SET producer_sha=?2,binding_sha=?3 WHERE revision_id=?1",
+            params![selected.key, producer, binding],
+        ).unwrap(), 1);
+        drop(db);
+        corrupt(
+            &store,
+            pin,
+            "UPDATE document_versions SET native_witness=printf('%064d',0)
+             WHERE vid=(SELECT vid FROM revision_documents
+                       WHERE revision_id=?1 AND path=?2)",
+        );
+        let error = publish_full_route(&store, &options, pin, stream).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("native_producer_version_required"),
+            "{error:#}"
+        );
+        assert_eq!(store.index_baseline().unwrap(), pin);
+    }
+}
+
+#[test]
+fn partial_family_reuse_keeps_native_witness_comparison_for_both_full_routes() {
+    for stream in [false, true] {
+        let (_state, _work, store, options, pin) = fixture();
+        corrupt(
+            &store,
+            pin,
+            "UPDATE document_versions SET native_witness=printf('%064d',0)
+             WHERE vid=(SELECT vid FROM revision_documents WHERE revision_id=?1 AND path=?2)",
+        );
+        corrupt(
+            &store,
+            pin,
+            "UPDATE class_projections SET content_hash=printf('%064d',0)
+             WHERE cid=(SELECT cid FROM revision_documents WHERE revision_id=?1 AND path=?2)",
+        );
+        let error = publish_full_route(&store, &options, pin, stream).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("reusable normalized native witness mismatch"),
+            "{error:#}"
+        );
+        assert_eq!(store.disposition(), RecoveryDisposition::Rebuild);
+    }
 }
 
 #[test]

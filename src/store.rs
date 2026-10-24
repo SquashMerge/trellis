@@ -12980,22 +12980,28 @@ impl Store {
                     "incompatible_index: duplicate prior manifest document"
                 );
             }
-            // R-1: compare each fresh projection ID and native witness with
-            // the stored hashes Trellis wrote and validated at publication,
-            // instead of re-reading and re-canonicalizing every stored row.
-            // Both are pure per-document values, computed on workers.
+            // Equal fresh IDs under the same producer trust the validated head
+            // (#225). Drift and partial-family reuse retain the R-1 witness checks.
+            // These are pure per-document values, computed on workers.
             let never = AtomicBool::new(false);
             let computed = crate::parallel::map_ordered(
                 &graph.files,
                 crate::parallel::default_workers(),
                 &never,
-                |_, file| -> Result<(V8DocumentProjection, Option<String>)> {
+                |_, file| -> Result<(V8DocumentProjection, Option<String>, bool)> {
                     let grouped =
                         rows.get(file.path.as_str()).context("publication rows missing")?;
                     let ids = v8_document_projection(file, native, grouped)?;
                     let reused_version =
                         old.get(&file.path).is_some_and(|(version, _, _)| *version == ids.version_id);
-                    let witness = if drift || reused_version {
+                    let trusted = !drift && old.get(&file.path).is_some_and(
+                        |(version, graph, class)| {
+                            *version == ids.version_id
+                                && *graph == ids.graph_id
+                                && class.as_deref() == Some(ids.class_id.as_str())
+                        },
+                    );
+                    let witness = if !trusted && (drift || reused_version) {
                         Some(publication_native_witness(
                             documents.get(file.path.as_str())
                                 .context("new native document absent")?,
@@ -13007,12 +13013,18 @@ impl Store {
                     } else {
                         None
                     };
-                    Ok((ids, witness))
+                    Ok((ids, witness, trusted))
                 },
             );
             let mut families = BTreeMap::new();
             for (file, computed) in graph.files.iter().zip(computed) {
-                let (ids, measured) = computed.context("preflight projection absent")??;
+                let (ids, measured, trusted) = computed.context("preflight projection absent")??;
+                if trusted {
+                    families.insert(file.path.clone(), ReusedFamilies {
+                        native: true, graph: true, class: true,
+                    });
+                    continue;
+                }
                 // An equal version ID means equal content, extraction context and
                 // producer version; its stored witness binds the measured facts.
                 let prior_witness: Option<String> = match &measured {
@@ -13175,6 +13187,16 @@ impl Store {
                 let rows = publication_rows(&graph, &native, &selected_classes)?;
                 let grouped = rows.get(file.path.as_str()).context("publication rows missing")?;
                 let ids = v8_document_projection(file, &native, grouped)?;
+                if !drift && old.get(&file.path).is_some_and(|(version, graph, class)| {
+                    *version == ids.version_id
+                        && *graph == ids.graph_id
+                        && class.as_deref() == Some(ids.class_id.as_str())
+                }) {
+                    families.insert(file.path.clone(), ReusedFamilies {
+                        native: true, graph: true, class: true,
+                    });
+                    continue;
+                }
                 let reused_version = old.get(&file.path)
                     .is_some_and(|(version, _, _)| *version == ids.version_id);
                 let measured = if drift || reused_version {
