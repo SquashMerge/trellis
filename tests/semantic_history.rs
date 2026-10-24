@@ -364,39 +364,95 @@ fn populated_history_partitions_documents_and_producers() {
         index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
     let (mut semantic, mut captured) = evidence(&native, root.path());
     let other = native.revision.documents[1].key.clone();
-    let mut other_coverage = semantic.coverage[0].clone();
-    other_coverage.document_path = other.path.clone();
-    other_coverage.state = s::CoverageState::Omitted;
-    other_coverage.selected = false;
-    other_coverage.diagnostic = Some("not selected".into());
-    other_coverage.observed_roles.clear();
-    semantic.coverage.push(other_coverage);
-    let mut second_producer = semantic.producers[0].clone();
-    second_producer.id = "semantic.other".into();
-    let mut second_coverage = semantic.coverage[0].clone();
-    second_coverage.producer_id = second_producer.id.clone();
-    second_coverage.state = s::CoverageState::Omitted;
-    second_coverage.selected = false;
-    second_coverage.diagnostic = Some("not selected".into());
-    second_coverage.observed_roles.clear();
-    let mut second_other = semantic.coverage[1].clone();
-    second_other.producer_id = second_producer.id.clone();
-    semantic.coverage.extend([second_coverage, second_other]);
-    semantic.producers.push(second_producer.clone());
-    captured.requested_producers.push(second_producer.clone());
-    captured
-        .producer_executables
-        .insert(second_producer.id.clone(), b"exe".to_vec());
-    captured
-        .artifacts
-        .insert(second_producer.id.clone(), Vec::new());
-
     let doc = native.revision.documents[0].key.clone();
     let syntax = semantic.declaration_bindings[0]
         .syntax_id
         .as_ref()
         .unwrap()
         .clone();
+    let other_declaration = native
+        .declarations
+        .iter()
+        .find(|declaration| declaration.name.as_deref() == Some("other"))
+        .unwrap();
+    let other_target = s::Target::Internal {
+        syntax_id: other_declaration.syntax_id.clone(),
+        document: other.clone(),
+        revision_id: native.revision.id.clone(),
+    };
+    let mut other_coverage = semantic.coverage[0].clone();
+    other_coverage.document_path = other.path.clone();
+    other_coverage.state = s::CoverageState::Partial;
+    other_coverage.diagnostic = Some("partial other document".into());
+    semantic.coverage.push(other_coverage);
+    let mut other_proof = semantic.provenance[0].clone();
+    other_proof.id = "other-doc-bind".into();
+    other_proof.document = other.clone();
+    other_proof.content_hash = native.revision.documents[1].content_hash.clone();
+    semantic.provenance.push(other_proof);
+    let mut other_symbol = semantic.symbols[0].clone();
+    other_symbol.key.symbol = "pkg other".into();
+    other_symbol.declarations = vec![other_target];
+    other_symbol.provenance_id = "other-doc-bind".into();
+    semantic.symbols.push(other_symbol.clone());
+    let mut other_binding = semantic.declaration_bindings[0].clone();
+    other_binding.syntax_id = Some(other_declaration.syntax_id.clone());
+    other_binding.symbols = vec![other_symbol.key];
+    other_binding.join.anchor.document = other.clone();
+    other_binding.join.anchor.content_hash = native.revision.documents[1].content_hash.clone();
+    other_binding.join.anchor.range = other_declaration.name_range.clone().unwrap();
+    other_binding.join.candidate_ids = vec![other_declaration.syntax_id.clone()];
+    other_binding.provenance_id = "other-doc-bind".into();
+    semantic.declaration_bindings.push(other_binding);
+
+    let mut second_producer = semantic.producers[0].clone();
+    second_producer.id = "semantic.other".into();
+    let mut second_coverage = semantic.coverage[0].clone();
+    second_coverage.producer_id = second_producer.id.clone();
+    second_coverage.state = s::CoverageState::Partial;
+    second_coverage.diagnostic = Some("partial second producer".into());
+    let mut second_other = semantic.coverage[1].clone();
+    second_other.producer_id = second_producer.id.clone();
+    second_other.state = s::CoverageState::Omitted;
+    second_other.selected = false;
+    second_other.diagnostic = Some("not selected".into());
+    second_other.observed_roles.clear();
+    semantic.coverage.extend([second_coverage, second_other]);
+    semantic.producers.push(second_producer.clone());
+    let mut producer_proof = semantic.provenance[0].clone();
+    producer_proof.id = "other-producer-bind".into();
+    producer_proof.producer_id = second_producer.id.clone();
+    producer_proof.basis.as_mut().unwrap().producer_id = second_producer.id.clone();
+    semantic.provenance.push(producer_proof);
+    let mut producer_symbol = semantic.symbols[0].clone();
+    producer_symbol.key.symbol = "pkg other producer hello".into();
+    producer_symbol.provenance_id = "other-producer-bind".into();
+    semantic.symbols.push(producer_symbol.clone());
+    for number in 0..64 {
+        let mut unrelated = semantic.symbols[0].clone();
+        unrelated.key.symbol = format!("pkg unrelated {number}");
+        unrelated.declarations = vec![s::Target::External {
+            symbol: s::SymbolKey {
+                scheme: s::SymbolScheme::Scip,
+                symbol: format!("external {number}"),
+                scope: s::SymbolScope::Global,
+                document: None,
+            },
+        }];
+        semantic.symbols.push(unrelated);
+    }
+    let mut producer_binding = semantic.declaration_bindings[0].clone();
+    producer_binding.symbols = vec![producer_symbol.key];
+    producer_binding.provenance_id = "other-producer-bind".into();
+    semantic.declaration_bindings.push(producer_binding);
+    captured.requested_producers.push(second_producer.clone());
+    captured
+        .producer_executables
+        .insert(second_producer.id.clone(), b"exe".to_vec());
+    captured
+        .artifacts
+        .insert(second_producer.id.clone(), b"artifact".to_vec());
+
     let producer = semantic.producers[0].id.clone();
     let leader = store.publication_for_tests().unwrap();
     let first = store
@@ -433,17 +489,58 @@ fn populated_history_partitions_documents_and_producers() {
             .collect::<Vec<_>>(),
         vec!["bind", "rel"]
     );
+    let other_history = store
+        .semantic_history_for(second, &producer, &other, &other_declaration.syntax_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(other_history.coverage.state, s::CoverageState::Partial);
+    assert_eq!(
+        other_history
+            .provenance
+            .iter()
+            .map(|p| p.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["other-doc-bind"]
+    );
+    let producer_history = store
+        .semantic_history_for(second, &second_producer.id, &doc, &syntax)
+        .unwrap()
+        .unwrap();
+    assert_eq!(producer_history.coverage.state, s::CoverageState::Partial);
+    assert_eq!(
+        producer_history
+            .provenance
+            .iter()
+            .map(|p| p.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["other-producer-bind"]
+    );
     assert!(
         store
             .semantic_history_for(second, &producer, &other, &syntax)
             .unwrap()
-            .is_none()
-    );
-    assert!(
-        store
-            .semantic_history_for(second, &second_producer.id, &doc, &syntax)
             .unwrap()
-            .is_none()
+            .provenance
+            .is_empty()
+    );
+    let identity =
+        trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+            .unwrap();
+    let db = rusqlite::Connection::open(
+        state
+            .path()
+            .join("cache/indexes")
+            .join(identity.root_key)
+            .join("index.db"),
+    )
+    .unwrap();
+    let plan = db.prepare("EXPLAIN QUERY PLAN SELECT s.provenance_id FROM semantic_symbols s JOIN semantic_symbol_targets t ON t.symbol_id=s.symbol_id WHERE s.tuple_id=?1 AND t.kind='internal' AND t.internal_syntax_id=?2 AND t.internal_language=?3 AND t.internal_path=?4").unwrap()
+        .query_map(rusqlite::params![1, vec![0_u8; 16], "rust", "hello.rs"], |row| row.get::<_, String>(3)).unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>().unwrap();
+    assert!(
+        plan.iter()
+            .any(|step| step.contains("semantic_symbol_targets_internal_syntax")),
+        "{plan:?}"
     );
 }
 
