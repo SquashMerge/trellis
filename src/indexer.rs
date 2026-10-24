@@ -234,13 +234,14 @@ fn graph_provenance() -> Provenance {
 pub(crate) struct PreparedDisplayLabels<'a> {
     documents: Vec<(scip::types::Document, &'a SourceFile)>,
     by_path: BTreeMap<String, usize>,
+    over_cutoff: bool,
 }
 
 /// A SCIP symbol is strictly untrusted UI copy, keyed only to a captured native SyntaxId.
 /// A malformed/missing/stale optional display artifact contributes no labels.
 /// Parse optional display-only SCIP input once for a full or spooled run. Keep
-/// only first-in-SCIP-order documents with admitted matching source hashes;
-/// malformed inputs and the >1,000-document cutoff still contribute no labels.
+/// only documents with admitted matching source hashes; duplicate paths,
+/// malformed inputs and the >1,000-document cutoff contribute no labels.
 pub(crate) fn prepare_display_labels<'a>(
     options: &IndexOptions,
     capture: &'a Capture,
@@ -248,6 +249,7 @@ pub(crate) fn prepare_display_labels<'a>(
     let empty = || PreparedDisplayLabels {
         documents: Vec::new(),
         by_path: BTreeMap::new(),
+        over_cutoff: false,
     };
     let (Some(scip_path), Some(manifest_path)) = (&options.scip_path, &options.manifest_path)
     else {
@@ -265,23 +267,29 @@ pub(crate) fn prepare_display_labels<'a>(
         return empty();
     };
     if index.documents.len() > 1_000 {
-        return empty();
+        return PreparedDisplayLabels {
+            over_cutoff: true,
+            ..empty()
+        };
     }
     let files: BTreeMap<_, _> = capture.files.iter().map(|f| (f.path.as_str(), f)).collect();
     let mut seen = BTreeSet::new();
+    if index
+        .documents
+        .iter()
+        .any(|doc| !seen.insert(doc.relative_path.as_str()))
+    {
+        return empty();
+    }
     let mut prepared = empty();
     for doc in index.documents {
-        // A later duplicate cannot replace an invalid or stale first document.
-        if !seen.insert(doc.relative_path.clone()) {
-            continue;
-        }
         let Some(file) = files.get(doc.relative_path.as_str()) else {
             continue;
         };
         if !matches!(file.language.as_str(), "javascript" | "java" | "python")
             || manifest.get(&file.path) != Some(&file.hash)
             || doc.occurrences.len() > 10_000
-            || !matches!(doc.position_encoding.value(), 0..=3)
+            || !matches!(doc.position_encoding.value(), 1..=3)
         {
             continue;
         }
@@ -363,7 +371,10 @@ fn measured_display_labels_prepared(
             {
                 continue;
             }
-            let Some(ds) = ranges.get(&occurrence.range) else {
+            let Some(range) = display_primary_range(occurrence) else {
+                continue;
+            };
+            let Some(ds) = ranges.get(&range) else {
                 continue;
             };
             if ds.len() != 1 {
@@ -392,14 +403,47 @@ fn measured_display_labels_prepared(
     labels
 }
 
+fn display_primary_range(occurrence: &scip::types::Occurrence) -> Option<Vec<i32>> {
+    if !occurrence.range.is_empty() && occurrence.typed_range.is_some() {
+        return None;
+    }
+    if occurrence.range.len() == 3 {
+        return Some(occurrence.range.clone());
+    }
+    if let [line, start, end_line, end] = occurrence.range.as_slice() {
+        return Some(if line == end_line {
+            vec![*line, *start, *end]
+        } else {
+            occurrence.range.clone()
+        });
+    }
+    if !occurrence.range.is_empty() {
+        return None;
+    }
+    use scip::types::occurrence::Typed_range;
+    match occurrence.typed_range.as_ref()? {
+        Typed_range::SingleLineRange(r) => Some(vec![r.line, r.start_character, r.end_character]),
+        Typed_range::MultiLineRange(r) if r.start_line == r.end_line => {
+            Some(vec![r.start_line, r.start_character, r.end_character])
+        }
+        Typed_range::MultiLineRange(r) => Some(vec![
+            r.start_line,
+            r.start_character,
+            r.end_line,
+            r.end_character,
+        ]),
+        _ => None,
+    }
+}
+
 fn scip_coordinate(text: &str, byte: usize, encoding: i32) -> Option<(i32, i32)> {
     let prefix = text.get(..byte)?;
     let line = i32::try_from(prefix.bytes().filter(|b| *b == b'\n').count()).ok()?;
     let part = prefix.rsplit('\n').next()?;
     let column = match encoding {
-        1 => part.len(),                      // UTF-8
-        3 => part.chars().count(),            // UTF-32
-        0 | 2 => part.encode_utf16().count(), // SCIP default UTF-16
+        1 => part.len(),                  // UTF-8
+        3 => part.chars().count(),        // UTF-32
+        2 => part.encode_utf16().count(), // UTF-16
         _ => return None,
     };
     Some((line, i32::try_from(column).ok()?))
@@ -937,17 +981,13 @@ pub fn measure_document_fingerprint(
         b"trellis.local-native-fingerprint.v1\0",
         &crate::native_ids::canonical(&native_value),
     );
-    let labels = measured_display_labels(options, capture, native);
+    let prepared = prepare_display_labels(options, capture);
+    let labels = measured_display_labels_prepared(native, &prepared, None);
     let nodes: Vec<_> = graph.nodes.iter().filter(|n| n.path == path).collect();
     let graph_calls: Vec<_> = graph.calls.iter().filter(|c| c.path == path).collect();
     let graph_regions: Vec<_> = graph.regions.iter().filter(|r| r.path == path).collect();
-    let scip_over_cutoff = matches!(file.language.as_str(), "javascript" | "java" | "python")
-        && options
-            .scip_path
-            .as_ref()
-            .and_then(|p| capture.bytes(p))
-            .and_then(|bytes| scip::types::Index::parse_from_bytes(bytes).ok())
-            .is_some_and(|index| index.documents.len() > 1_000);
+    let scip_over_cutoff =
+        matches!(file.language.as_str(), "javascript" | "java" | "python") && prepared.over_cutoff;
     let selected_labels: BTreeMap<_, _> = labels
         .into_iter()
         .filter(|(id, _)| nodes.iter().any(|node| &node.id == id))
