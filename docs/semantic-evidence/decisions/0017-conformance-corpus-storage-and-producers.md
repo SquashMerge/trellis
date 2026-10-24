@@ -91,3 +91,14 @@ Amendment 1's other floors are unchanged.
 4. **No manufactured JavaScript gap.** Amendment 3's tagged-template example is not evidence of a missing convention. Keep working measurements and test simple, member, compound and nested tagged templates and substitutions before proposing a gap. Report only genuine skipped syntax and affected families. If no genuine JavaScript gap is demonstrated, stop for an owner amendment naming a real gap or explicitly deferring its floor to zero. Do not disable a working family or remove valid tagged-template measurements to satisfy the floor.
 
 The unsupported floors remain JavaScript **1**, Rust **1**, Java **0**, Python **0**, as in Amendment 3. This proposal changes no floor constants and does not authorize silently lowering JavaScript's floor. Java/Python stay at zero until a genuine construct and a further owner amendment restore them.
+
+## Proposed Amendment 5 (2026-10-24): native reference sites and import aliases
+
+- **Status:** proposed for owner PR review; pending owner ratification.
+- **Amends:** Amendment 3's native-v9 reference-family follow-up, together with [contract v1's proposed identifier-site rules](../contract-v1.md#proposed-279-amendment-native-identifier-site-candidates). No corpus floor changes.
+
+Native-v9 measures parser-proved identifier-site candidates, not semantic roles or targets. The complete per-document/owner inventory receives `occ:v2` reference IDs and ordinals before producer joins; semantic subsets retain those identities. Declaration-name candidates use the measured declaration's lexical parent (or itself without a parent), while other candidates retain the existing executable-container ownership. Initializer calls and ordinary uses do not move into variable/parameter declaration ownership.
+
+The proposed alias declarations are deliberately narrow: JavaScript identifier-to-identifier renamed import specifiers and Rust use-as leaves, including grouped use trees. Their name/nameRange is the local alias, range is the import-specifier / use-as clause, and parent is the existing lexical declaration/module. Keep both identifier candidates and infer no semantic alias/definition role or original target. Other binding forms gain no guessed declaration-name anchors. Python alias candidates do not create an exact alias declaration anchor or lift its existing corpus exemption.
+
+Amendment 1's alias floor remains required for JavaScript and Rust, exempt for Java and Python. A counted alias still needs an authenticated semantic reference at the exact measured alias name, roles `definition` and `alias`, and the original declaration as target. The 40-reference and callable-value-negative floors remain unchanged; no fabricated facts or native roles fill them.
