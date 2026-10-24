@@ -186,8 +186,18 @@ fn fixture() -> (s::SemanticPublication, n::Artifact, s::CapturedComponents) {
             requested: true,
             selected: true,
             state: s::CoverageState::Complete,
-            supported_roles: vec![s::Role::Read, s::Role::Call],
-            observed_roles: vec![s::Role::Read, s::Role::Call],
+            supported_roles: vec![
+                s::Role::Definition,
+                s::Role::Read,
+                s::Role::Call,
+                s::Role::Type,
+            ],
+            observed_roles: vec![
+                s::Role::Definition,
+                s::Role::Read,
+                s::Role::Call,
+                s::Role::Type,
+            ],
             diagnostic: None,
         }],
         provenance: vec![
@@ -401,6 +411,9 @@ fn joins_use_distinct_measured_candidates_and_preserve_nonexact_evidence() {
     ];
     semantic.declaration_bindings[0].join.candidate_ids.sort();
     semantic.declaration_bindings[0].join.diagnostic = Some("two measured declarations".into());
+    semantic.coverage[0]
+        .observed_roles
+        .retain(|r| *r != s::Role::Definition);
     s::validate_evidence(&semantic, &native, &bytes).unwrap();
     let mut wrong = semantic.clone();
     wrong.declaration_bindings[0].join.candidate_ids.pop();
@@ -411,6 +424,9 @@ fn joins_use_distinct_measured_candidates_and_preserve_nonexact_evidence() {
     unmatched.declaration_bindings[0].join.candidate_ids.clear();
     unmatched.declaration_bindings[0].join.diagnostic = Some("no measured declaration".into());
     unmatched.declaration_bindings[0].syntax_id = None;
+    unmatched.coverage[0]
+        .observed_roles
+        .retain(|r| *r != s::Role::Definition);
     s::validate_evidence(&unmatched, &fixture().1, &bytes).unwrap();
     unmatched.declaration_bindings[0].join.status = s::JoinStatus::Unsupported;
     assert!(s::validate_evidence(&unmatched, &fixture().1, &bytes).is_err());
@@ -574,6 +590,7 @@ fn independent_producers_and_duplicate_fact_partitions() {
     semantic.producers.push(second);
     let mut coverage = semantic.coverage[0].clone();
     coverage.producer_id = "semantic-2".into();
+    coverage.observed_roles = vec![s::Role::Read, s::Role::Call];
     semantic.coverage.push(coverage);
     let originals = semantic.provenance.clone();
     for mut p in originals {
@@ -654,11 +671,12 @@ fn available_measurement_rejects_unsupported_and_invalid_anchors() {
         *id = None;
         join.status = s::JoinStatus::Unmatched;
         join.diagnostic = Some("no measured candidate".into());
-        if !declaration {
-            semantic.coverage[0]
-                .observed_roles
-                .retain(|r| *r != s::Role::Call);
-        }
+        let role = if declaration {
+            s::Role::Definition
+        } else {
+            s::Role::Call
+        };
+        semantic.coverage[0].observed_roles.retain(|r| *r != role);
         s::validate_evidence(&semantic, &native, &bytes).unwrap();
         let join = if declaration {
             &mut semantic.declaration_bindings[0].join
@@ -744,7 +762,12 @@ fn observed_roles_match_selected_fact_roles_in_complete_and_partial_rows() {
             evidence.coverage[0].diagnostic = Some("partial analysis".into());
         }
         s::validate_evidence(&evidence, &native, &bytes).unwrap();
-        for role in [s::Role::Read, s::Role::Call] {
+        for role in [
+            s::Role::Definition,
+            s::Role::Read,
+            s::Role::Call,
+            s::Role::Type,
+        ] {
             let mut missing = evidence.clone();
             missing.coverage[0].observed_roles.retain(|r| *r != role);
             assert!(
@@ -755,6 +778,55 @@ fn observed_roles_match_selected_fact_roles_in_complete_and_partial_rows() {
             );
         }
     }
+}
+
+#[test]
+fn reference_roles_cannot_be_removed_from_both_coverage_lists() {
+    assert_installed_role_requires_coverage(s::Role::Read);
+}
+
+#[test]
+fn exact_call_roles_cannot_be_removed_from_both_coverage_lists() {
+    assert_installed_role_requires_coverage(s::Role::Call);
+}
+
+fn assert_installed_role_requires_coverage(role: s::Role) {
+    let (base, native, bytes) = fixture();
+    for state in [s::CoverageState::Complete, s::CoverageState::Partial] {
+        let mut semantic = base.clone();
+        semantic.coverage[0].state = state;
+        if state == s::CoverageState::Partial {
+            semantic.coverage[0].diagnostic = Some("partial analysis".into());
+        }
+        s::validate_evidence(&semantic, &native, &bytes).unwrap();
+        semantic.coverage[0].supported_roles.retain(|r| *r != role);
+        semantic.coverage[0].observed_roles.retain(|r| *r != role);
+        assert!(
+            s::validate_evidence(&semantic, &native, &bytes).is_err(),
+            "installed {role:?} without coverage in {state:?}"
+        );
+    }
+}
+
+#[test]
+fn empty_complete_coverage_diagnostic_is_rejected() {
+    let (mut semantic, native, bytes) = fixture();
+    semantic.coverage[0].diagnostic = Some(String::new());
+    assert!(s::validate_evidence(&semantic, &native, &bytes).is_err());
+}
+
+#[test]
+fn empty_exact_declaration_join_diagnostic_is_rejected() {
+    let (mut semantic, native, bytes) = fixture();
+    semantic.declaration_bindings[0].join.diagnostic = Some(String::new());
+    assert!(s::validate_evidence(&semantic, &native, &bytes).is_err());
+}
+
+#[test]
+fn empty_exact_call_join_diagnostic_is_rejected() {
+    let (mut semantic, native, bytes) = fixture();
+    semantic.call_bindings[0].join.diagnostic = Some(String::new());
+    assert!(s::validate_evidence(&semantic, &native, &bytes).is_err());
 }
 
 #[test]

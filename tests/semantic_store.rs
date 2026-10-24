@@ -203,8 +203,8 @@ fn evidence(
             requested: true,
             selected: true,
             state: s::CoverageState::Complete,
-            supported_roles: vec![s::Role::Definition],
-            observed_roles: vec![s::Role::Definition],
+            supported_roles: vec![s::Role::Definition, s::Role::Call, s::Role::Type],
+            observed_roles: vec![s::Role::Definition, s::Role::Call, s::Role::Type],
             diagnostic: None,
         }],
         provenance: vec![
@@ -581,6 +581,143 @@ fn rejected_semantic_publication_keeps_prior_pin_and_rows() {
         store.semantic_at(first).unwrap().references,
         semantic.references
     );
+}
+
+#[test]
+fn reference_role_removed_from_both_lists_rejects_without_advancing_pin() {
+    assert_semantic_rejection_keeps_pin("fn hello() { hello(); }\n", |semantic, _| {
+        semantic.coverage[0]
+            .supported_roles
+            .retain(|r| *r != s::Role::Read);
+        semantic.coverage[0]
+            .observed_roles
+            .retain(|r| *r != s::Role::Read);
+    });
+}
+
+#[test]
+fn exact_call_role_removed_from_both_lists_rejects_without_advancing_pin() {
+    assert_semantic_rejection_keeps_pin("fn hello() { hello(); }\n", |semantic, _| {
+        semantic.coverage[0]
+            .supported_roles
+            .retain(|r| *r != s::Role::Call);
+        semantic.coverage[0]
+            .observed_roles
+            .retain(|r| *r != s::Role::Call);
+    });
+}
+
+#[test]
+fn reference_outside_owning_declaration_rejects_without_advancing_pin() {
+    let source = "fn hello() { hello(); }\nfn other() { hello(); }\n";
+    assert_semantic_rejection_keeps_pin(source, |semantic, native| {
+        let reference = &mut semantic.references[0];
+        let start = source.rfind("hello").unwrap();
+        reference.range = n::Range {
+            start,
+            end: start + 5,
+        };
+        reference.site = s::ReferenceSite::Use;
+        reference.roles = vec![s::Role::Read];
+        let owner = native
+            .declarations
+            .iter()
+            .find(|d| d.syntax_id == reference.owner_syntax_id)
+            .unwrap();
+        assert!(reference.range.start >= owner.range.end);
+        let document = &native.revision.documents[0];
+        let claimed_id = native_ids::IdentityRegistry::default()
+            .occurrence(&json!({
+                "contentHash": document.content_hash,
+                "extractionContext": native_ids::extraction_context("rust", &[]).unwrap(),
+                "nativeProducerId": native.producer.id,
+                "nativeProducerVersion": native.producer.version,
+                "ownerSyntaxId": reference.owner_syntax_id,
+                "kind": "reference",
+                "ordinal": 0
+            }))
+            .unwrap();
+        assert_eq!(reference.id, claimed_id);
+    });
+}
+
+#[test]
+fn empty_coverage_diagnostic_rejects_without_advancing_pin() {
+    assert_semantic_rejection_keeps_pin("fn hello() { hello(); }\n", |semantic, _| {
+        semantic.coverage[0].diagnostic = Some(String::new());
+    });
+}
+
+#[test]
+fn empty_declaration_join_diagnostic_rejects_without_advancing_pin() {
+    assert_semantic_rejection_keeps_pin("fn hello() { hello(); }\n", |semantic, _| {
+        semantic.declaration_bindings[0].join.diagnostic = Some(String::new());
+    });
+}
+
+#[test]
+fn empty_call_join_diagnostic_rejects_without_advancing_pin() {
+    assert_semantic_rejection_keeps_pin("fn hello() { hello(); }\n", |semantic, _| {
+        semantic.call_bindings[0].join.diagnostic = Some(String::new());
+    });
+}
+
+fn assert_semantic_rejection_keeps_pin(
+    source: &str,
+    invalidate: impl FnOnce(&mut s::SemanticPublication, &n::Artifact),
+) {
+    let state = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("hello.rs"), source).unwrap();
+    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (graph, native, capture) = index_workspace_bundle(
+        &IndexOptions::new(root.path().to_owned()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    let (mut semantic, captured) = evidence(&native, root.path());
+    let reference = &mut semantic.references[0];
+    let call = native
+        .calls
+        .iter()
+        .find(|c| c.owner_syntax_id == reference.owner_syntax_id && c.callee_range.is_some())
+        .unwrap();
+    reference.range = call.callee_range.clone().unwrap();
+    reference.site = s::ReferenceSite::Use;
+    reference.roles = vec![s::Role::Read];
+    semantic.coverage[0].supported_roles.push(s::Role::Read);
+    semantic.coverage[0].supported_roles.sort();
+    semantic.coverage[0].observed_roles.push(s::Role::Read);
+    semantic.coverage[0].observed_roles.sort();
+    let leader = store.publication_for_tests().unwrap();
+    let first = store
+        .publish_native_semantic(
+            &graph,
+            &capture,
+            &native,
+            &semantic,
+            &captured,
+            &leader,
+            store.index_baseline().unwrap(),
+            &cancel,
+        )
+        .unwrap();
+    let before = store.semantic_at(first).unwrap();
+    let mut invalid = semantic;
+    invalidate(&mut invalid, &native);
+    assert!(s::validate_evidence(&invalid, &native, &captured).is_err());
+    assert!(
+        store
+            .publish_native_semantic(
+                &graph, &capture, &native, &invalid, &captured, &leader, first, &cancel,
+            )
+            .is_err()
+    );
+    assert_eq!(store.index_baseline().unwrap(), first);
+    assert_eq!(store.semantic_at(first).unwrap(), before);
 }
 
 #[test]
@@ -1234,6 +1371,9 @@ fn measured_join_reference_and_dispatch_variants_roundtrip() {
                 join.candidate_ids.clear();
                 join.diagnostic = Some("no measured call".into());
                 semantic.call_bindings[0].call_id = None;
+                semantic.coverage[0]
+                    .observed_roles
+                    .retain(|r| *r != s::Role::Call);
             }
             2 => {
                 let call = native
@@ -1829,4 +1969,88 @@ fn producer_descriptor_language_shrink_is_atomic() {
         store.semantic_at(first).unwrap().producers,
         semantic.producers
     );
+}
+
+#[test]
+fn corrupt_symbol_document_fails_typed_without_partial_result() {
+    assert_corrupt_symbol_documents("semantic_symbols", "key_");
+}
+
+#[test]
+fn corrupt_binding_symbol_document_fails_typed_without_partial_result() {
+    assert_corrupt_symbol_documents("semantic_declaration_binding_symbols", "");
+}
+
+fn assert_corrupt_symbol_documents(table: &str, prefix: &str) {
+    for corruption in [
+        "missing_language",
+        "missing_path",
+        "missing_document",
+        "global_document",
+    ] {
+        let state = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("hello.rs"), "fn hello() { hello(); }\n").unwrap();
+        let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (graph, native, capture) = index_workspace_bundle(
+            &IndexOptions::new(root.path().to_owned()),
+            store.root_id(),
+            &cancel,
+            |_| {},
+        )
+        .unwrap();
+        let (mut semantic, captured) = evidence(&native, root.path());
+        semantic.symbols[0].key.scope = s::SymbolScope::Document;
+        semantic.symbols[0].key.document = Some(native.revision.documents[0].key.clone());
+        semantic.declaration_bindings[0].symbols[0] = semantic.symbols[0].key.clone();
+        let leader = store.publication_for_tests().unwrap();
+        let pin = store
+            .publish_native_semantic(
+                &graph,
+                &capture,
+                &native,
+                &semantic,
+                &captured,
+                &leader,
+                store.index_baseline().unwrap(),
+                &cancel,
+            )
+            .unwrap();
+        let snapshot = store.semantic_at(pin).unwrap();
+        assert_eq!(snapshot.symbols, semantic.symbols);
+        assert_eq!(snapshot.declaration_bindings, semantic.declaration_bindings);
+        let identity =
+            trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+                .unwrap();
+        let db = rusqlite::Connection::open(
+            state
+                .path()
+                .join("cache/indexes")
+                .join(identity.root_key)
+                .join("index.db"),
+        )
+        .unwrap();
+        let assignment = match corruption {
+            "missing_language" => format!("{prefix}document_language=NULL"),
+            "missing_path" => format!("{prefix}document_path=NULL"),
+            "missing_document" => {
+                format!("{prefix}document_language=NULL,{prefix}document_path=NULL")
+            }
+            "global_document" => format!("{prefix}scope='global'"),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            db.execute(&format!("UPDATE {table} SET {assignment}"), [])
+                .unwrap(),
+            1
+        );
+        drop(db);
+        let error = store.semantic_at(pin).unwrap_err();
+        assert!(
+            error.to_string().contains("incompatible_index"),
+            "{table} {corruption}: {error:#}"
+        );
+        assert!(store.recovery_pending_for_tests(), "{table} {corruption}");
+    }
 }

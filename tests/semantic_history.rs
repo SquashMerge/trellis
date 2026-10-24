@@ -207,8 +207,8 @@ fn evidence(
             requested: true,
             selected: true,
             state: s::CoverageState::Complete,
-            supported_roles: vec![s::Role::Definition],
-            observed_roles: vec![s::Role::Definition],
+            supported_roles: vec![s::Role::Definition, s::Role::Call, s::Role::Type],
+            observed_roles: vec![s::Role::Definition, s::Role::Call, s::Role::Type],
             diagnostic: None,
         }],
         provenance: vec![
@@ -383,6 +383,7 @@ fn populated_history_partitions_documents_and_producers() {
     let mut other_coverage = semantic.coverage[0].clone();
     other_coverage.document_path = other.path.clone();
     other_coverage.state = s::CoverageState::Partial;
+    other_coverage.observed_roles = vec![s::Role::Definition];
     other_coverage.diagnostic = Some("partial other document".into());
     semantic.coverage.push(other_coverage);
     let mut other_proof = semantic.provenance[0].clone();
@@ -410,6 +411,7 @@ fn populated_history_partitions_documents_and_producers() {
     let mut second_coverage = semantic.coverage[0].clone();
     second_coverage.producer_id = second_producer.id.clone();
     second_coverage.state = s::CoverageState::Partial;
+    second_coverage.observed_roles = vec![s::Role::Definition];
     second_coverage.diagnostic = Some("partial second producer".into());
     let mut second_other = semantic.coverage[1].clone();
     second_other.producer_id = second_producer.id.clone();
@@ -1041,4 +1043,115 @@ fn no_matching_fact_still_compares_producer_basis() {
     assert_eq!(history.coverage.revision_id, native.revision.id);
     assert_eq!(history.presentation_freshness, s::Freshness::PossiblyStale);
     assert!(history.provenance.is_empty());
+}
+
+#[test]
+fn history_uses_requested_heads_not_captured_descriptors() {
+    for comparison in [
+        "version",
+        "hash",
+        "language",
+        "unavailable",
+        "empty-version",
+        "empty-language",
+    ] {
+        let state = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("hello.rs"), "fn hello() { hello(); }\n").unwrap();
+        let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let options = IndexOptions::new(root.path().to_owned());
+        let (graph, native, capture) =
+            index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+        let (mut semantic, captured) = evidence(&native, root.path());
+        let syntax = semantic.declaration_bindings[0]
+            .syntax_id
+            .as_ref()
+            .unwrap()
+            .clone();
+        if comparison.starts_with("empty-") {
+            semantic.coverage[0].observed_roles.clear();
+            semantic.provenance.clear();
+            semantic.symbols.clear();
+            semantic.declaration_bindings.clear();
+            semantic.references.clear();
+            semantic.call_bindings.clear();
+            semantic.type_relationships.clear();
+        }
+        let producer = &semantic.producers[0].id;
+        let document = &native.revision.documents[0].key;
+        let leader = store.publication_for_tests().unwrap();
+        let first = store
+            .publish_native_semantic(
+                &graph,
+                &capture,
+                &native,
+                &semantic,
+                &captured,
+                &leader,
+                store.index_baseline().unwrap(),
+                &cancel,
+            )
+            .unwrap();
+        let mut requested = captured.clone();
+        match comparison {
+            "version" | "empty-version" => requested.requested_producers[0].version = "v2".into(),
+            "hash" => {
+                requested.requested_producers[0].executable_hash =
+                    native_ids::digest(b"", b"new executable")
+            }
+            "language" | "empty-language" => {
+                requested.requested_producers[0].languages = vec![s::Language::Python]
+            }
+            "unavailable" => requested.requested_producers.clear(),
+            _ => unreachable!(),
+        }
+        let mut failed = semantic.clone();
+        failed.coverage[0].state = s::CoverageState::Failed;
+        failed.coverage[0].diagnostic = Some("requested producer failed".into());
+        failed.coverage[0].observed_roles.clear();
+        failed.provenance.clear();
+        failed.symbols.clear();
+        failed.declaration_bindings.clear();
+        failed.references.clear();
+        failed.call_bindings.clear();
+        failed.type_relationships.clear();
+        s::validate_evidence(&failed, &native, &requested).unwrap();
+        let second = store
+            .publish_native_semantic(
+                &graph, &capture, &native, &failed, &requested, &leader, first, &cancel,
+            )
+            .unwrap();
+        assert_eq!(
+            store.semantic_at(second).unwrap().producers,
+            semantic.producers
+        );
+        let third = store
+            .publish_native(&graph, &capture, &native, &leader, second, &cancel)
+            .unwrap();
+        for pin in [second, third] {
+            for id in [syntax.as_str(), "sid:v1:00000000000000000000000000000000"] {
+                let history = store
+                    .semantic_history_for(pin, producer, document, id)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    history.presentation_freshness,
+                    s::Freshness::PossiblyStale,
+                    "{comparison}"
+                );
+                assert_eq!(history.coverage, semantic.coverage[0]);
+                assert!(
+                    history
+                        .provenance
+                        .iter()
+                        .all(|proof| proof.freshness == s::Freshness::Fresh)
+                );
+            }
+        }
+        assert_eq!(
+            store.semantic_at(first).unwrap().provenance,
+            semantic.provenance
+        );
+    }
 }

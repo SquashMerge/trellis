@@ -218,7 +218,7 @@ fn four_languages_normalized_rows_and_pinned_bytes_are_coherent() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        15
+        16
     );
     let count: i64 = db
         .query_row(
@@ -763,7 +763,7 @@ fn physical_v8_native_v4_index_recreates_before_role_column_read() {
         rebuilt
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        15
+        16
     );
     let stamp: String = rebuilt
         .query_row("SELECT extractor_version FROM index_metadata", [], |row| {
@@ -2924,7 +2924,7 @@ fn newer_disposable_schema_is_refused_without_rebuild_or_deletion() {
         .join(identity.root_key)
         .join("index.db");
     let db = Connection::open(&path).unwrap();
-    db.execute_batch("PRAGMA user_version=16").unwrap();
+    db.execute_batch("PRAGMA user_version=17").unwrap();
     drop(db);
     let inode = fs::metadata(&path).unwrap().ino();
     let error = Store::open_for_tests(state.path(), root.path()).unwrap_err();
@@ -2944,13 +2944,13 @@ fn newer_disposable_schema_is_refused_without_rebuild_or_deletion() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(version, 16);
+    assert_eq!(version, 17);
     let metadata_version: i64 = db
         .query_row("SELECT schema_version FROM index_metadata", [], |r| {
             r.get(0)
         })
         .unwrap();
-    assert_eq!(metadata_version, 15);
+    assert_eq!(metadata_version, 16);
     assert_eq!(generation, old.index_generation.to_string());
 }
 

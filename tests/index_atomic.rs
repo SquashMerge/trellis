@@ -623,7 +623,7 @@ fn full_reconcile_replaces_persisted_source_and_input_inventory() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        15
+        16
     );
     let files = db
         .prepare("SELECT path FROM revision_documents WHERE revision_id=?1 ORDER BY path")
@@ -739,12 +739,12 @@ fn sqlite_snapshot(
         .unwrap()
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
-    // Schema 15 keeps the derived graph and labels, and compacts native IDs
+    // Schema 16 keeps the derived graph and labels, and compacts native IDs
     // and document/projection references into BLOB keys and surrogates.
     // Supersession state and the paired producer bindings are additive.
     // Check exact names, not just a count: an unknown table must not escape the
     // independent cold-source comparison.
-    const REQUIRED_V15_TABLES: [&str; 51] = [
+    const REQUIRED_V16_TABLES: [&str; 54] = [
         "native_producers",
         "native_producer_languages",
         "native_producer_inputs",
@@ -778,6 +778,9 @@ fn sqlite_snapshot(
         "native_release_candidate_classes",
         "semantic_producers",
         "semantic_producer_languages",
+        "semantic_revision_producers",
+        "semantic_requested_producers",
+        "semantic_requested_producer_languages",
         "semantic_coverage",
         "semantic_coverage_roles",
         "semantic_basis",
@@ -797,7 +800,7 @@ fn sqlite_snapshot(
         "semantic_call_join_candidates",
         "semantic_type_relationships",
     ];
-    let required: std::collections::BTreeSet<_> = REQUIRED_V15_TABLES.into_iter().collect();
+    let required: std::collections::BTreeSet<_> = REQUIRED_V16_TABLES.into_iter().collect();
     let actual: std::collections::BTreeSet<_> = tables.iter().map(String::as_str).collect();
     let optional = [
         "native_revision_supersessions",
@@ -806,28 +809,28 @@ fn sqlite_snapshot(
     ];
     assert_eq!(
         required.len(),
-        51,
-        "v15 mandatory table list must be unique"
+        54,
+        "v16 mandatory table list must be unique"
     );
     assert!(
         required.is_subset(&actual),
-        "missing v15 evidence tables: {:?}",
+        "missing v16 evidence tables: {:?}",
         required.difference(&actual).collect::<Vec<_>>()
     );
     assert!(
         actual
             .difference(&required)
             .all(|table| optional.contains(table)),
-        "unexpected v15 evidence table: {:?}",
+        "unexpected v16 evidence table: {:?}",
         actual.difference(&required).collect::<Vec<_>>()
     );
     assert_eq!(
         actual.len(),
-        51 + optional
+        54 + optional
             .iter()
             .filter(|name| actual.contains(*name))
             .count(),
-        "exact v15 base and optional table count"
+        "exact v16 base and optional table count"
     );
     assert_eq!(
         actual.contains("native_binding_epoch"),
@@ -879,7 +882,7 @@ fn sqlite_snapshot(
                 name if name.starts_with("native_version_") =>
                     ("vid IN (SELECT vid FROM revision_documents WHERE revision_id=?1)", ""),
                 name if name.starts_with("semantic_") => ("?1 IS NOT NULL", ""),
-                _ => panic!("unhandled v15 evidence table: {table}"),
+                _ => panic!("unhandled v16 evidence table: {table}"),
             };
             // Producer descriptor columns differ: only the parent table uses id/version.
             let where_clause = if table == "native_producers" {

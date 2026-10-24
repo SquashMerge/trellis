@@ -312,8 +312,11 @@ fn validate_join(
         join.status == status && join.candidate_ids == expected,
         "join differs from measured candidates"
     );
+    if let Some(diagnostic) = &join.diagnostic {
+        text(diagnostic)?;
+    }
     ensure!(
-        join.diagnostic.as_ref().is_some_and(|x| !x.is_empty()) == (status != JoinStatus::Exact),
+        join.diagnostic.is_some() == (status != JoinStatus::Exact),
         "join diagnostic mismatch"
     );
     for id in &join.candidate_ids {
@@ -547,8 +550,11 @@ pub fn validate_evidence(
             },
             "invalid coverage request/selection state"
         );
+        if let Some(diagnostic) = &row.diagnostic {
+            text(diagnostic)?;
+        }
         ensure!(
-            row.diagnostic.as_ref().is_some_and(|s| !s.is_empty())
+            row.diagnostic.is_some()
                 == !matches!(
                     row.state,
                     CoverageState::NotRequested | CoverageState::Complete
@@ -803,7 +809,9 @@ pub fn validate_evidence(
         ensure!(
             decls
                 .get(&r.owner_syntax_id)
-                .is_some_and(|d| d.document == r.document),
+                .is_some_and(|d| d.document == r.document
+                    && d.range.start <= r.range.start
+                    && r.range.end <= d.range.end),
             "unmeasured reference owner"
         );
         let bytes = sources
@@ -993,7 +1001,15 @@ pub fn validate_evidence(
                     && p.document.path == *path
             })
         };
-        for role in &row.supported_roles {
+        for role in &[
+            Role::Definition,
+            Role::Read,
+            Role::Write,
+            Role::Call,
+            Role::Type,
+            Role::Import,
+            Role::Alias,
+        ] {
             let from_reference = semantic
                 .references
                 .iter()

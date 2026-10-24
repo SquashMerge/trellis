@@ -221,8 +221,8 @@ fn evidence_for(
             requested: true,
             selected: true,
             state: s::CoverageState::Complete,
-            supported_roles: vec![s::Role::Definition],
-            observed_roles: vec![s::Role::Definition],
+            supported_roles: vec![s::Role::Definition, s::Role::Call, s::Role::Type],
+            observed_roles: vec![s::Role::Definition, s::Role::Call, s::Role::Type],
             diagnostic: None,
         }],
         provenance: vec![
@@ -777,5 +777,174 @@ fn streamed_new_native_revision_omits_old_facts_and_keeps_producers_separate() {
     assert_eq!(
         store.semantic_at(first).unwrap().references,
         semantic.references
+    );
+}
+
+#[test]
+fn descriptor_languages_cover_new_documents_without_prior_language_tuples() {
+    let (_state, root, store, cancel, options) = setup();
+    let (graph, native, capture) =
+        index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+    let (mut semantic, mut captured) = evidence(&native, root.path());
+    semantic.producers[0].languages.push(s::Language::Python);
+    captured.requested_producers = semantic.producers.clone();
+    let leader = store.publication_for_tests().unwrap();
+    let first = store
+        .publish_native_semantic(
+            &graph,
+            &capture,
+            &native,
+            &semantic,
+            &captured,
+            &leader,
+            store.index_baseline().unwrap(),
+            &cancel,
+        )
+        .unwrap();
+    fs::write(root.path().join("added.py"), "def added():\n    pass\n").unwrap();
+    let (graph, next, capture) =
+        index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+    let second = store
+        .publish_native(&graph, &capture, &next, &leader, first, &cancel)
+        .unwrap();
+    let snapshot = store.semantic_at(second).unwrap();
+    let python = snapshot
+        .coverage
+        .iter()
+        .find(|row| row.language == s::Language::Python && row.document_path == "added.py")
+        .unwrap();
+    assert_eq!(python.state, s::CoverageState::NotRequested);
+    assert!(!python.requested && !python.selected);
+    assert_eq!(snapshot.producers, semantic.producers);
+    assert_eq!(
+        store.semantic_at(first).unwrap().coverage,
+        semantic.coverage
+    );
+}
+
+#[test]
+fn explicit_producer_without_applicable_documents_survives_pins_and_supplied_refresh() {
+    let (state, root, store, cancel, options) = setup();
+    store.set_retention_clock_for_tests(1_000, 0);
+    let (graph, native, capture) =
+        index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+    let (mut semantic, mut captured) = evidence(&native, root.path());
+    semantic.producers[0].languages = vec![s::Language::Python];
+    captured.requested_producers = semantic.producers.clone();
+    semantic.coverage.clear();
+    semantic.provenance.clear();
+    semantic.symbols.clear();
+    semantic.declaration_bindings.clear();
+    semantic.references.clear();
+    semantic.call_bindings.clear();
+    semantic.type_relationships.clear();
+    s::validate_evidence(&semantic, &native, &captured).unwrap();
+    let leader = store.publication_for_tests().unwrap();
+    let first = store
+        .publish_native_semantic(
+            &graph,
+            &capture,
+            &native,
+            &semantic,
+            &captured,
+            &leader,
+            store.index_baseline().unwrap(),
+            &cancel,
+        )
+        .unwrap();
+    assert_eq!(
+        store.semantic_at(first).unwrap().producers,
+        semantic.producers
+    );
+    store.set_retention_clock_for_tests(1_001, 1);
+    let second = store
+        .publish_native(&graph, &capture, &native, &leader, first, &cancel)
+        .unwrap();
+    assert_eq!(
+        store.semantic_at(second).unwrap().producers,
+        semantic.producers
+    );
+    store.set_retention_clock_for_tests(1_901, 901);
+    store.release_revision(first, &leader).unwrap();
+    store.collect_unreferenced(&leader).unwrap();
+    assert!(store.semantic_at(first).is_err());
+    drop(leader);
+    drop(store);
+    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    let current = store.semantic_at(second).unwrap();
+    assert_eq!(current.producers, semantic.producers);
+    assert!(current.coverage.is_empty());
+    let identity =
+        trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+            .unwrap();
+    let db = rusqlite::Connection::open(
+        state
+            .path()
+            .join("cache/indexes")
+            .join(identity.root_key)
+            .join("index.db"),
+    )
+    .unwrap();
+    let violations = db
+        .prepare("PRAGMA foreign_key_check")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert!(violations.is_empty(), "{violations:?}");
+    let first_key = format!("pin:v1:{}:{}", first.index_generation, first.index_revision);
+    for table in [
+        "semantic_revision_producers",
+        "semantic_requested_producers",
+        "semantic_requested_producer_languages",
+    ] {
+        let rows: i64 = db
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE revision_id=?1"),
+                [&first_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0, "{table}");
+    }
+    drop(db);
+    let leader = store.publication_for_tests().unwrap();
+    fs::write(root.path().join("added.py"), "def added():\n    pass\n").unwrap();
+    let (graph, next, capture) =
+        index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+    let (mut refreshed, mut components) = evidence(&next, root.path());
+    refreshed.producers[0].id = "semantic.rust".into();
+    refreshed.coverage[0].producer_id = "semantic.rust".into();
+    for proof in &mut refreshed.provenance {
+        proof.producer_id = "semantic.rust".into();
+        proof.basis.as_mut().unwrap().producer_id = "semantic.rust".into();
+    }
+    components.producer_executables = BTreeMap::from([("semantic.rust".into(), b"exe".to_vec())]);
+    components.artifacts = BTreeMap::from([("semantic.rust".into(), b"artifact".to_vec())]);
+    components.requested_producers = refreshed.producers.clone();
+    let third = store
+        .publish_native_semantic(
+            &graph,
+            &capture,
+            &next,
+            &refreshed,
+            &components,
+            &leader,
+            second,
+            &cancel,
+        )
+        .unwrap();
+    let snapshot = store.semantic_at(third).unwrap();
+    assert!(snapshot.producers.contains(&semantic.producers[0]));
+    assert!(snapshot.coverage.iter().any(|row| {
+        row.producer_id == semantic.producers[0].id
+            && row.language == s::Language::Python
+            && row.document_path == "added.py"
+            && row.state == s::CoverageState::NotRequested
+    }));
+    assert_eq!(
+        store.semantic_at(second).unwrap().producers,
+        semantic.producers
     );
 }
