@@ -918,10 +918,20 @@ fn every_encoded_selected_id_rejects_wrong_length_blob() {
         ("native_version_call_regions", "region_id", "vid"),
     ];
     for (table, column, scope) in cases {
+        let call_owner = table == "native_version_calls" && column == "owner_syntax_id";
+        let selection = if call_owner {
+            // Moving ordinal zero after its sibling also corrupts call ordering.
+            // Exercise that failure without pinning which decode phase wins.
+            "AND t.ordinal=0 AND EXISTS(SELECT 1 FROM native_version_calls sibling \
+             WHERE sibling.vid=t.vid AND sibling.owner_syntax_id=t.owner_syntax_id \
+             AND sibling.ordinal=1)"
+        } else {
+            ""
+        };
         let selected = format!(
             "SELECT t.rowid,d.path FROM {table} t JOIN revision_documents d \
              ON t.{scope}=d.{scope} WHERE d.revision_id=?1 \
-             AND t.{column} IS NOT NULL ORDER BY d.path,t.rowid LIMIT 1"
+             AND t.{column} IS NOT NULL {selection} ORDER BY d.path,t.rowid LIMIT 1"
         );
         let (rowid, path): (i64, String) = db
             .query_row(&selected, [&revision], |r| Ok((r.get(0)?, r.get(1)?)))
@@ -936,10 +946,12 @@ fn every_encoded_selected_id_rejects_wrong_length_blob() {
         assert_eq!(original.len(), 16, "{table}.{column}");
         // This deliberately breaks child FKs when an encoded primary key is
         // changed. It exercises read-side decode, not SQLite write validation.
+        // Seventeen FF bytes sort after every valid 16-byte owner key.
+        let invalid: Vec<u8> = if call_owner { vec![0xff; 17] } else { vec![1] };
         assert_eq!(
             db.execute(
-                &format!("UPDATE {table} SET {column}=x'01' WHERE rowid=?1"),
-                [rowid],
+                &format!("UPDATE {table} SET {column}=?1 WHERE rowid=?2"),
+                rusqlite::params![invalid, rowid],
             )
             .unwrap(),
             1
@@ -949,10 +961,9 @@ fn every_encoded_selected_id_rejects_wrong_length_blob() {
         let closed = reader.clone();
         let error = reader.methods_at(&path, Some(pin)).unwrap_err();
         assert!(
-            matches!(
-                error.downcast_ref::<rusqlite::Error>(),
-                Some(rusqlite::Error::FromSqlConversionFailure(..))
-            ) && format!("{error:#}").contains("invalid native ID BLOB length"),
+            error
+                .chain()
+                .any(|cause| cause.to_string().starts_with("incompatible_index:")),
             "{table}.{column}: {error:#}"
         );
         assert!(reader.recovery_pending_for_tests());
