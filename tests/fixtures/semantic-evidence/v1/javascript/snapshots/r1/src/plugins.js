@@ -29,7 +29,7 @@ export function disconnect(session, extension) {
 
 export function install(registry, name, factory, options) {
   registry.register(name, factory);
-  const plugin = factory(options);
+  const plugin = registry.create(name, options);
   plugin.initialize(options);
   return plugin;
 }

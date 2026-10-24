@@ -14,14 +14,17 @@
   ],
   "producers": [
     {
-      "id": "native",
-      "version": "1",
-      "executableHash": "2aa11c2830377fff48c38772b597c94d846766e4c26ecbdf22aa07e2b8f619d5",
+      "executableHash": "4b9a8088b8dbad38e3b08e043cfe281b5a90affaef98fee9bba12f8fcad2f735",
+      "id": "trellis.native.syntax",
       "kind": "native",
       "languages": [
+        "java",
+        "rust",
+        "python",
         "javascript"
       ],
-      "positionEncoding": "utf16"
+      "positionEncoding": "utf8",
+      "version": "native-v9"
     }
   ],
   "revisions": [
@@ -120,7 +123,7 @@
           "sourceFile": "snapshots/r1/src/workbench.js"
         }
       ],
-      "toolchainHash": "4255a388254ca4319e2f95f1da375d5deaddf25baf9c7c85070b67f9543b15d0",
+      "toolchainHash": "1ba7bb8e273bd64125f4048d2ecce530e0a6470e565ab1b3aecf0b82b532f7b1",
       "configHash": "3838a3c68089a20c51735c090f2e83a12327e3abd94ea6fc03bc68a8d978cc59",
       "dependencyHash": "d6cd541cf774e6541b9e1bb0651931d02cb77977955c823215f1b8552dcc1cd9"
     }
@@ -130,20 +133,23 @@
     "revisionId": "r1",
     "producers": [
       {
-        "id": "native",
-        "version": "1",
-        "executableHash": "2aa11c2830377fff48c38772b597c94d846766e4c26ecbdf22aa07e2b8f619d5",
+        "executableHash": "4b9a8088b8dbad38e3b08e043cfe281b5a90affaef98fee9bba12f8fcad2f735",
+        "id": "trellis.native.syntax",
         "kind": "native",
         "languages": [
+          "java",
+          "rust",
+          "python",
           "javascript"
         ],
-        "positionEncoding": "utf16"
+        "positionEncoding": "utf8",
+        "version": "native-v9"
       }
     ]
   },
   "coverageIntents": [
     {
-      "producerId": "native",
+      "producerId": "trellis.native.syntax",
       "document": {
         "sourceSetId": "main",
         "language": "javascript",
@@ -156,29 +162,33 @@
       ],
       "measurementSupport": [
         {
-          "kind": "declarationName",
           "available": true,
-          "diagnostic": null
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "declarationName"
         },
         {
-          "kind": "callee",
           "available": true,
-          "diagnostic": null
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "callee"
         },
         {
-          "kind": "invocation",
           "available": true,
-          "diagnostic": null
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "invocation"
         },
         {
-          "kind": "reference",
           "available": true,
-          "diagnostic": null
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "reference"
         }
       ]
     },
     {
-      "producerId": "native",
+      "producerId": "trellis.native.syntax",
       "document": {
         "sourceSetId": "main",
         "language": "javascript",
@@ -191,29 +201,33 @@
       ],
       "measurementSupport": [
         {
-          "kind": "declarationName",
           "available": true,
-          "diagnostic": null
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "declarationName"
         },
         {
-          "kind": "callee",
           "available": true,
-          "diagnostic": null
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "callee"
         },
         {
-          "kind": "invocation",
           "available": true,
-          "diagnostic": null
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "invocation"
         },
         {
-          "kind": "reference",
           "available": true,
-          "diagnostic": null
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "reference"
         }
       ]
     },
     {
-      "producerId": "native",
+      "producerId": "trellis.native.syntax",
       "document": {
         "sourceSetId": "main",
         "language": "javascript",
@@ -226,29 +240,33 @@
       ],
       "measurementSupport": [
         {
-          "kind": "declarationName",
           "available": true,
-          "diagnostic": null
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "declarationName"
         },
         {
-          "kind": "callee",
           "available": true,
-          "diagnostic": null
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "callee"
         },
         {
-          "kind": "invocation",
           "available": true,
-          "diagnostic": null
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "invocation"
         },
         {
-          "kind": "reference",
           "available": true,
-          "diagnostic": null
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "reference"
         }
       ]
     },
     {
-      "producerId": "native",
+      "producerId": "trellis.native.syntax",
       "document": {
         "sourceSetId": "main",
         "language": "javascript",
@@ -261,29 +279,33 @@
       ],
       "measurementSupport": [
         {
-          "kind": "declarationName",
           "available": true,
-          "diagnostic": null
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "declarationName"
         },
         {
-          "kind": "callee",
           "available": true,
-          "diagnostic": null
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "callee"
         },
         {
-          "kind": "invocation",
           "available": true,
-          "diagnostic": null
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "invocation"
         },
         {
-          "kind": "reference",
           "available": true,
-          "diagnostic": null
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "reference"
         }
       ]
     },
     {
-      "producerId": "native",
+      "producerId": "trellis.native.syntax",
       "document": {
         "sourceSetId": "main",
         "language": "javascript",
@@ -296,29 +318,33 @@
       ],
       "measurementSupport": [
         {
-          "kind": "declarationName",
           "available": true,
-          "diagnostic": null
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "declarationName"
         },
         {
-          "kind": "callee",
           "available": true,
-          "diagnostic": null
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "callee"
         },
         {
-          "kind": "invocation",
           "available": true,
-          "diagnostic": null
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "invocation"
         },
         {
-          "kind": "reference",
           "available": true,
-          "diagnostic": null
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "reference"
         }
       ]
     },
     {
-      "producerId": "native",
+      "producerId": "trellis.native.syntax",
       "document": {
         "sourceSetId": "main",
         "language": "javascript",
@@ -331,29 +357,33 @@
       ],
       "measurementSupport": [
         {
-          "kind": "declarationName",
           "available": true,
-          "diagnostic": null
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "declarationName"
         },
         {
-          "kind": "callee",
           "available": true,
-          "diagnostic": null
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "callee"
         },
         {
-          "kind": "invocation",
           "available": true,
-          "diagnostic": null
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "invocation"
         },
         {
-          "kind": "reference",
           "available": true,
-          "diagnostic": null
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "reference"
         }
       ]
     },
     {
-      "producerId": "native",
+      "producerId": "trellis.native.syntax",
       "document": {
         "sourceSetId": "main",
         "language": "javascript",
@@ -365,29 +395,33 @@
       ],
       "measurementSupport": [
         {
-          "kind": "declarationName",
           "available": true,
-          "diagnostic": null
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "declarationName"
         },
         {
-          "kind": "callee",
           "available": true,
-          "diagnostic": null
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "callee"
         },
         {
-          "kind": "invocation",
           "available": true,
-          "diagnostic": null
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "invocation"
         },
         {
-          "kind": "reference",
           "available": true,
-          "diagnostic": null
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "reference"
         }
       ]
     },
     {
-      "producerId": "native",
+      "producerId": "trellis.native.syntax",
       "document": {
         "sourceSetId": "main",
         "language": "javascript",
@@ -400,29 +434,33 @@
       ],
       "measurementSupport": [
         {
-          "kind": "declarationName",
           "available": true,
-          "diagnostic": null
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "declarationName"
         },
         {
-          "kind": "callee",
           "available": true,
-          "diagnostic": null
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "callee"
         },
         {
-          "kind": "invocation",
           "available": true,
-          "diagnostic": null
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "invocation"
         },
         {
-          "kind": "reference",
           "available": true,
-          "diagnostic": null
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "reference"
         }
       ]
     },
     {
-      "producerId": "native",
+      "producerId": "trellis.native.syntax",
       "document": {
         "sourceSetId": "main",
         "language": "javascript",
@@ -435,29 +473,33 @@
       ],
       "measurementSupport": [
         {
-          "kind": "declarationName",
           "available": true,
-          "diagnostic": null
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "declarationName"
         },
         {
-          "kind": "callee",
           "available": true,
-          "diagnostic": null
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "callee"
         },
         {
-          "kind": "invocation",
           "available": true,
-          "diagnostic": null
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "invocation"
         },
         {
-          "kind": "reference",
           "available": true,
-          "diagnostic": null
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "reference"
         }
       ]
     },
     {
-      "producerId": "native",
+      "producerId": "trellis.native.syntax",
       "document": {
         "sourceSetId": "main",
         "language": "javascript",
@@ -470,24 +512,28 @@
       ],
       "measurementSupport": [
         {
-          "kind": "declarationName",
           "available": true,
-          "diagnostic": null
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "declarationName"
         },
         {
-          "kind": "callee",
           "available": true,
-          "diagnostic": null
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "callee"
         },
         {
-          "kind": "invocation",
           "available": true,
-          "diagnostic": null
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "invocation"
         },
         {
-          "kind": "reference",
           "available": true,
-          "diagnostic": null
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "reference"
         }
       ]
     }
@@ -513,20 +559,14 @@
     {
       "ref": "native-executable",
       "kind": "executable",
-      "pinned": "docs/semantic-evidence/hardware/mac-mini-m5-pro-v1.json#native-conformance-javascript",
-      "hash": "2aa11c2830377fff48c38772b597c94d846766e4c26ecbdf22aa07e2b8f619d5"
+      "pinned": "docs/semantic-evidence/hardware/mac-mini-m5-pro-v1.json#trellis-native-v9-javascript-test-support",
+      "hash": "4b9a8088b8dbad38e3b08e043cfe281b5a90affaef98fee9bba12f8fcad2f735"
     },
     {
-      "ref": "node-toolchain",
+      "ref": "rust-toolchain",
       "kind": "toolchain",
-      "pinned": "docs/semantic-evidence/hardware/mac-mini-m5-pro-v1.json#node-24.11.1-darwin-arm64",
-      "hash": "4255a388254ca4319e2f95f1da375d5deaddf25baf9c7c85070b67f9543b15d0"
-    },
-    {
-      "ref": "native-script",
-      "kind": "executable",
-      "file": "capture-native.mjs",
-      "hash": "f65f3a80880a492b46bdb1bafd0f701d72729071fad861e072188567005b71cd"
+      "pinned": "docs/semantic-evidence/hardware/mac-mini-m5-pro-v1.json#rustc-1.99.1-aarch64-apple-darwin",
+      "hash": "1ba7bb8e273bd64125f4048d2ecce530e0a6470e565ab1b3aecf0b82b532f7b1"
     },
     {
       "ref": "tsconfig",

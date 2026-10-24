@@ -12,7 +12,7 @@
       "kind": "coverage",
       "ref": "native-coverage:src/public.js",
       "record": {
-        "producerId": "native",
+        "producerId": "trellis.native.syntax",
         "language": "javascript",
         "sourceSetId": "main",
         "documentPath": "src/public.js",
