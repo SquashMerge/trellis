@@ -584,6 +584,107 @@ fn rejected_semantic_publication_keeps_prior_pin_and_rows() {
 }
 
 #[test]
+fn factless_proof_from_prior_native_revision_cannot_publish_as_current() {
+    let state = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("hello.rs"), "fn hello() { hello(); }\n").unwrap();
+    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let options = IndexOptions::new(root.path().to_owned());
+    let (graph, native, capture) =
+        index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+    let (semantic, captured) = evidence(&native, root.path());
+    let leader = store.publication_for_tests().unwrap();
+    let first = store
+        .publish_native_semantic(
+            &graph,
+            &capture,
+            &native,
+            &semantic,
+            &captured,
+            &leader,
+            store.index_baseline().unwrap(),
+            &cancel,
+        )
+        .unwrap();
+    let prior = store.semantic_at(first).unwrap();
+
+    fs::write(
+        root.path().join("rust-toolchain.toml"),
+        "[toolchain]\nchannel = 'stable'\n",
+    )
+    .unwrap();
+    let (next_graph, next_native, next_capture) =
+        index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+    assert_ne!(native.revision.id, next_native.revision.id);
+    let mut stale = semantic.clone();
+    stale.coverage[0].revision_id = next_native.revision.id.clone();
+    stale.coverage[0].observed_roles.clear();
+    stale.provenance.truncate(1);
+    stale.provenance[0].freshness = s::Freshness::PossiblyStale;
+    stale.symbols.clear();
+    stale.declaration_bindings.clear();
+    stale.references.clear();
+    stale.call_bindings.clear();
+    stale.type_relationships.clear();
+    assert!(stale.provenance[0].derived_from.is_none());
+    s::validate_evidence(&stale, &next_native, &captured).unwrap();
+
+    let error = store
+        .publish_native_semantic(
+            &next_graph,
+            &next_capture,
+            &next_native,
+            &stale,
+            &captured,
+            &leader,
+            first,
+            &cancel,
+        )
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("captured proof revision differs from candidate native revision"),
+        "{error:#}"
+    );
+    assert_eq!(store.index_baseline().unwrap(), first);
+    assert_eq!(store.status().unwrap().revision, first);
+    assert_eq!(store.semantic_at(first).unwrap(), prior);
+    let identity =
+        trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+            .unwrap();
+    let db = rusqlite::Connection::open(
+        state
+            .path()
+            .join("cache/indexes")
+            .join(identity.root_key)
+            .join("index.db"),
+    )
+    .unwrap();
+    let second_key = format!(
+        "pin:v1:{}:{}",
+        first.index_generation,
+        first.index_revision + 1
+    );
+    let native_rows: i64 = db
+        .query_row(
+            "SELECT count(*) FROM native_revisions WHERE id=?1",
+            [&second_key],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let semantic_rows: i64 = db
+        .query_row(
+            "SELECT count(*) FROM semantic_coverage WHERE revision_id=?1",
+            [&second_key],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!((native_rows, semantic_rows), (0, 0));
+}
+
+#[test]
 fn cancelled_semantic_publication_does_not_advance_native_head() {
     let state = tempfile::tempdir().unwrap();
     let root = tempfile::tempdir().unwrap();
