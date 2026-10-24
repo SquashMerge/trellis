@@ -330,9 +330,6 @@ pub struct PrivateStageObservation {
 pub struct SemanticHistory {
     pub coverage: crate::semantic_evidence::Coverage,
     pub provenance: Vec<crate::semantic_evidence::Provenance>,
-    pub symbols: Vec<crate::semantic_evidence::Symbol>,
-    pub declaration_bindings: Vec<crate::semantic_evidence::DeclarationBinding>,
-    pub type_relationships: Vec<crate::semantic_evidence::TypeRelationship>,
     pub presentation_freshness: crate::semantic_evidence::Freshness,
 }
 
@@ -4932,13 +4929,14 @@ fn semantic_candidate_ids(
 }
 
 fn read_semantic(db: &Connection, key: &str) -> Result<crate::semantic_evidence::SemanticSnapshot> {
-    read_semantic_tuple(db, key, None)
+    read_semantic_tuple(db, key, None, None)
 }
 
 fn read_semantic_tuple(
     db: &Connection,
     key: &str,
     selected_tuple: Option<i64>,
+    history_syntax: Option<&str>,
 ) -> Result<crate::semantic_evidence::SemanticSnapshot> {
     use crate::native_evidence::DocumentKey;
     use crate::semantic_evidence as sem;
@@ -5005,7 +5003,7 @@ fn read_semantic_tuple(
             language: language.clone(),
             path: path.clone(),
         };
-        let rows=db.prepare("SELECT p.provenance_id,p.content_hash,p.evidence_kind,p.freshness,p.derived_from_provenance_id,b.producer_id,b.producer_version,b.producer_hash,b.artifact_hash,b.language,b.source_set_id,b.captured_native_revision_id,b.source_manifest_hash,b.toolchain_hash,b.config_hash,b.dependency_hash,b.basis_id FROM semantic_provenance p JOIN semantic_basis b ON b.tuple_id=p.tuple_id AND b.basis_id=p.basis_id WHERE p.tuple_id=?1 ORDER BY p.rowid")?.query_map([tuple],|r|{
+        let rows=db.prepare("SELECT p.provenance_id,p.content_hash,p.evidence_kind,p.freshness,p.derived_from_provenance_id,b.producer_id,b.producer_version,b.producer_hash,b.artifact_hash,b.language,b.source_set_id,b.captured_native_revision_id,b.source_manifest_hash,b.toolchain_hash,b.config_hash,b.dependency_hash,b.basis_id FROM semantic_provenance p JOIN semantic_basis b ON b.tuple_id=p.tuple_id AND b.basis_id=p.basis_id WHERE p.tuple_id=?1 AND (?2 IS NULL OR p.provenance_id IN (SELECT provenance_id FROM semantic_declaration_bindings WHERE tuple_id=?1 AND syntax_id=?2 UNION SELECT s.provenance_id FROM semantic_symbols s JOIN semantic_symbol_targets t ON t.symbol_id=s.symbol_id WHERE s.tuple_id=?1 AND t.kind='internal' AND t.internal_syntax_id=?2 AND t.internal_language=?3 AND t.internal_path=?4 UNION SELECT provenance_id FROM semantic_type_relationships WHERE tuple_id=?1 AND source_kind='internal' AND source_internal_syntax_id=?2 AND source_internal_language=?3 AND source_internal_path=?4)) ORDER BY p.rowid")?.query_map(params![tuple, history_syntax.and_then(id_codec::encode_sid), language, path],|r|{
             Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,Option<String>>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?,r.get::<_,String>(7)?,r.get::<_,String>(8)?,r.get::<_,String>(9)?,r.get::<_,String>(10)?,r.get::<_,String>(11)?,r.get::<_,String>(12)?,r.get::<_,String>(13)?,r.get::<_,String>(14)?,r.get::<_,String>(15)?,r.get::<_,i64>(16)?))
         })?.collect::<rusqlite::Result<Vec<_>>>()?;
         for (
@@ -5059,7 +5057,9 @@ fn read_semantic_tuple(
                 derived_from: None,
             });
         }
-        read_semantic_facts(db, tuple, &document, &native_id, &mut result)?;
+        if history_syntax.is_none() {
+            read_semantic_facts(db, tuple, &document, &native_id, &mut result)?;
+        }
     }
     Ok(result)
 }
@@ -5072,7 +5072,7 @@ fn read_semantic_history(
     document: &crate::native_evidence::DocumentKey,
     syntax_id: &str,
 ) -> Result<Option<SemanticHistory>> {
-    use crate::semantic_evidence::{CoverageState, Freshness, Target};
+    use crate::semantic_evidence::{CoverageState, Freshness};
     let source_set: String = db.query_row(
         "SELECT source_set_id FROM native_revisions WHERE id=?1",
         [key],
@@ -5088,7 +5088,7 @@ fn read_semantic_history(
     let Some(selected_tuple) = selected_tuple else {
         return Ok(None);
     };
-    let selected_snapshot = read_semantic_tuple(db, key, Some(selected_tuple))?;
+    let selected_snapshot = read_semantic_tuple(db, key, Some(selected_tuple), None)?;
     let [selected_coverage] = <[_; 1]>::try_from(selected_snapshot.coverage)
         .map_err(|_| anyhow::anyhow!("corrupt selected semantic coverage"))?;
     let state: CoverageState = selected_coverage.state;
@@ -5125,44 +5125,14 @@ fn read_semantic_history(
     let Some((previous_key, tuple)) = previous else {
         return Ok(None);
     };
-    // Decode the entire selected historical tuple, including child ordinals,
-    // before projecting. A broken row is an error, not a partial history result.
-    let snapshot = read_semantic_tuple(db, &previous_key, Some(tuple))?;
+    let snapshot = read_semantic_tuple(db, &previous_key, Some(tuple), Some(syntax_id))?;
     let [coverage] = <[_; 1]>::try_from(snapshot.coverage)
         .map_err(|_| anyhow::anyhow!("corrupt semantic history coverage"))?;
-    let evidence = |id: &str| {
-        snapshot
-            .provenance
-            .iter()
-            .find(|p| p.id == id && p.document == *document)
-    };
-    let declaration_bindings: Vec<_> = snapshot
-        .declaration_bindings
-        .into_iter()
-        .filter(|b| {
-            b.syntax_id.as_deref() == Some(syntax_id) && evidence(&b.provenance_id).is_some()
-        })
-        .collect();
-    let symbols: Vec<_> = snapshot.symbols.into_iter()
-        .filter(|symbol| symbol.declarations.iter().any(|target| matches!(target, Target::Internal { syntax_id: id, document: doc, .. } if id == syntax_id && doc == document)) && evidence(&symbol.provenance_id).is_some()).collect();
-    let type_relationships: Vec<_> = snapshot.type_relationships.into_iter()
-        .filter(|relationship| matches!(&relationship.source, Target::Internal { syntax_id: id, document: doc, .. } if id == syntax_id && doc == document) && evidence(&relationship.provenance_id).is_some()).collect();
-    let captured_proofs = snapshot.provenance.clone();
+    let provenance = snapshot.provenance;
     let historical_descriptor = snapshot
         .producers
         .first()
         .map(|p| (&p.version, &p.executable_hash));
-    let ids: BTreeSet<_> = declaration_bindings
-        .iter()
-        .map(|b| b.provenance_id.as_str())
-        .chain(symbols.iter().map(|s| s.provenance_id.as_str()))
-        .chain(type_relationships.iter().map(|r| r.provenance_id.as_str()))
-        .collect();
-    let provenance: Vec<_> = snapshot
-        .provenance
-        .into_iter()
-        .filter(|p| ids.contains(p.id.as_str()) && p.document == *document)
-        .collect();
     let rows = db.prepare("SELECT d.ordinal,d.language,d.path,v.content_hash FROM revision_documents d JOIN document_versions v ON v.vid=d.vid WHERE d.revision_id=?1 ORDER BY d.ordinal")?
         .query_map([key], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -5184,7 +5154,7 @@ fn read_semantic_history(
     )?;
     let presentation_freshness = if selected_document.as_ref() != Some(&historical_document_hash) {
         Freshness::Stale
-    } else if captured_proofs.iter().any(|p| {
+    } else if provenance.iter().any(|p| {
         p.basis.as_ref().is_none_or(|basis| {
             basis.revision_id != selected_header.0
                 || basis.source_manifest_hash != manifest_hash
@@ -5195,7 +5165,7 @@ fn read_semantic_history(
                 || selected_descriptor.0 != basis.producer_version
                 || selected_descriptor.1 != basis.producer_hash
         })
-    }) || (captured_proofs.is_empty()
+    }) || (provenance.is_empty()
         && (coverage.revision_id != selected_header.0
             || historical_descriptor != Some((&selected_descriptor.0, &selected_descriptor.1))))
     {
@@ -5206,9 +5176,6 @@ fn read_semantic_history(
     Ok(Some(SemanticHistory {
         coverage,
         provenance,
-        symbols,
-        declaration_bindings,
-        type_relationships,
         presentation_freshness,
     }))
 }

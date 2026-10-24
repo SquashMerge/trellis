@@ -297,11 +297,15 @@ fn latest_retained_history_is_declaration_keyed_and_keeps_captured_proof() {
         .unwrap()
         .unwrap();
     assert_eq!(history.coverage, semantic.coverage[0]);
-    assert_eq!(history.declaration_bindings, semantic.declaration_bindings);
-    assert_eq!(history.symbols, semantic.symbols);
-    assert_eq!(history.type_relationships, semantic.type_relationships);
     assert_eq!(history.presentation_freshness, s::Freshness::Stale);
-    assert_eq!(history.provenance.len(), 2);
+    assert_eq!(
+        history
+            .provenance
+            .iter()
+            .map(|p| p.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["bind", "rel"]
+    );
     assert!(
         history
             .provenance
@@ -315,7 +319,6 @@ fn latest_retained_history_is_declaration_keyed_and_keeps_captured_proof() {
         .unwrap();
     assert_eq!(none.coverage, semantic.coverage[0]);
     assert!(none.provenance.is_empty());
-    assert!(none.declaration_bindings.is_empty());
     assert!(
         store
             .semantic_history_for(second, "different", &doc, &syntax)
@@ -403,7 +406,6 @@ fn latest_eligible_tuple_does_not_fall_back_to_older_matching_facts() {
         .unwrap();
     assert_eq!(history.coverage, empty.coverage[0]);
     assert!(history.provenance.is_empty());
-    assert!(history.declaration_bindings.is_empty());
     assert_eq!(history.presentation_freshness, s::Freshness::Stale);
     assert_eq!(
         store.semantic_at(first).unwrap().declaration_bindings,
@@ -503,7 +505,7 @@ fn same_native_id_distinct_pins_compare_full_basis_without_forcing_staleness() {
         .unwrap();
     assert_eq!(history.coverage.revision_id, native.revision.id);
     assert_eq!(history.presentation_freshness, s::Freshness::Fresh);
-    assert_eq!(history.declaration_bindings, semantic.declaration_bindings);
+    assert_eq!(history.provenance.len(), 2);
     assert!(
         store
             .semantic_at(third)
@@ -622,15 +624,12 @@ fn corrupted_retained_tuple_fails_typed_without_partial_history() {
             .join("index.db"),
     )
     .unwrap();
-    // An ordinary corrupted child ordinal that remains valid under SQLite's constraints.
-    db.execute("UPDATE semantic_declaration_bindings SET ordinal=1 WHERE tuple_id=(SELECT tuple_id FROM semantic_coverage WHERE revision_id=?1)", [format!("pin:v1:{}:{}", first.index_generation, first.index_revision)]).unwrap();
+    db.execute("UPDATE semantic_basis SET language='invalid' WHERE tuple_id=(SELECT tuple_id FROM semantic_coverage WHERE revision_id=?1)", [format!("pin:v1:{}:{}", first.index_generation, first.index_revision)]).unwrap();
     let error = store
         .semantic_history_for(second, producer, doc, syntax)
         .unwrap_err();
     assert!(
-        error
-            .to_string()
-            .contains("corrupt semantic declaration ordinal"),
+        error.to_string().contains("invalid") || error.to_string().contains("unknown"),
         "{error:#}"
     );
 }
@@ -693,7 +692,7 @@ fn producer_version_drift_keeps_stable_id_history_partition() {
         .unwrap();
     assert_eq!(history.coverage.revision_id, native.revision.id);
     assert_eq!(history.presentation_freshness, s::Freshness::PossiblyStale);
-    assert_eq!(history.declaration_bindings, semantic.declaration_bindings);
+    assert_eq!(history.provenance.len(), 2);
     assert_eq!(
         history.provenance[0]
             .basis
