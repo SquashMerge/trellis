@@ -10228,6 +10228,8 @@ impl Store {
             expected,
             PublicationTarget::Live,
             cancel,
+            None,
+            |_, _| Ok(()),
         )
     }
 
@@ -10278,9 +10280,12 @@ impl Store {
             expected,
             PublicationTarget::Stage(stage),
             cancel,
+            None,
+            |_, _| Ok(()),
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn publish_validated_stream_target(
         &self,
         spool: &crate::native_evidence::FullDocumentSpool,
@@ -10289,6 +10294,11 @@ impl Store {
         expected: RecoveryBaseline,
         target: PublicationTarget<'_>,
         cancel: &CancelFlag,
+        semantic: Option<(
+            &crate::semantic_evidence::SemanticPublication,
+            &crate::semantic_evidence::CapturedComponents,
+        )>,
+        during_tx: impl FnMut(PublishStage, &Connection) -> Result<()>,
     ) -> Result<IndexPin> {
         capture.verify(cancel)?;
         ensure!(
@@ -10357,8 +10367,140 @@ impl Store {
             },
             cancel,
             (256 * 1024 * 1024 + 16 * 1024, None, Some(spool)),
-            |_, _| Ok(()),
-            None,
+            during_tx,
+            semantic,
+        )
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn publish_private_stage_semantic_for_tests(
+        &self,
+        options: &crate::indexer::IndexOptions,
+        capture: &crate::capture::Capture,
+        semantic: &crate::semantic_evidence::SemanticPublication,
+        captured: &crate::semantic_evidence::CapturedComponents,
+        cancel: &CancelFlag,
+        fail_before_commit: bool,
+    ) -> Result<()> {
+        let use_guard = self.roots.index_use_exclusive_existing(&self.identity)?;
+        let leader = self
+            .roots
+            .writer_under_exclusive(self.identity.clone(), use_guard)?;
+        let stage = self.create_staged_index(&leader, true)?;
+        let result = (|| {
+            let spool = crate::native_evidence::spool_full_capture(
+                options,
+                capture,
+                Path::new(&self.workspace_root),
+                self.root_id(),
+                cancel,
+                &|_| {},
+                |_, _| {},
+                &self.native_spool_dir()?,
+            )?;
+            let bootstrap = open_index(&stage.path, false)?;
+            validate_v8_bootstrap(&bootstrap)?;
+            let baseline = self.recovery_baseline(&bootstrap)?;
+            drop(bootstrap);
+            let pin = self.publish_validated_stream_target(
+                &spool,
+                capture,
+                &leader,
+                baseline,
+                PublicationTarget::Stage(&stage),
+                cancel,
+                Some((semantic, captured)),
+                |point, _| {
+                    ensure!(
+                        !fail_before_commit || !matches!(point, PublishStage::BeforeCommit),
+                        "injected semantic stage failure"
+                    );
+                    Ok(())
+                },
+            )?;
+            self.validate_replacement_index(&stage.path, &stage, &leader, pin)?;
+            let staged = open_index(&stage.path, false)?;
+            let count: i64 =
+                staged.query_row("SELECT count(*) FROM semantic_coverage", [], |row| {
+                    row.get(0)
+                })?;
+            ensure!(
+                count == semantic.coverage.len() as i64,
+                "staged semantic coverage differs"
+            );
+            Ok(())
+        })();
+        self.cleanup_failed_staged_index(stage, Some(&leader))?;
+        result
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn publish_stream_native_only_for_tests(
+        &self,
+        options: &crate::indexer::IndexOptions,
+        capture: &crate::capture::Capture,
+        leader: &topology::WriterGuard,
+        cancel: &CancelFlag,
+    ) -> Result<IndexPin> {
+        let spool = crate::native_evidence::spool_full_capture(
+            options,
+            capture,
+            Path::new(&self.workspace_root),
+            self.root_id(),
+            cancel,
+            &|_| {},
+            |_, _| {},
+            &self.native_spool_dir()?,
+        )?;
+        self.publish_validated_stream_recovery(
+            &spool,
+            capture,
+            leader,
+            self.publication_index_baseline()?,
+            cancel,
+        )
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn publish_stream_semantic_for_tests(
+        &self,
+        options: &crate::indexer::IndexOptions,
+        capture: &crate::capture::Capture,
+        semantic: &crate::semantic_evidence::SemanticPublication,
+        captured: &crate::semantic_evidence::CapturedComponents,
+        leader: &topology::WriterGuard,
+        cancel: &CancelFlag,
+        fail_before_commit: bool,
+    ) -> Result<IndexPin> {
+        let spool = crate::native_evidence::spool_full_capture(
+            options,
+            capture,
+            Path::new(&self.workspace_root),
+            self.root_id(),
+            cancel,
+            &|_| {},
+            |_, _| {},
+            &self.native_spool_dir()?,
+        )?;
+        self.publish_validated_stream_target(
+            &spool,
+            capture,
+            leader,
+            self.publication_index_baseline()?,
+            PublicationTarget::Live,
+            cancel,
+            Some((semantic, captured)),
+            |stage, _| {
+                ensure!(
+                    !fail_before_commit || !matches!(stage, PublishStage::BeforeCommit),
+                    "injected semantic stream failure"
+                );
+                Ok(())
+            },
         )
     }
 
@@ -10374,6 +10516,83 @@ impl Store {
     ) -> Result<IndexPin> {
         let baseline = self.publication_index_baseline()?;
         self.publish_native_recovery_selective(graph, capture, native, leader, baseline, cancel)
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn publish_selective_semantic_for_tests(
+        &self,
+        graph: &Graph,
+        capture: &crate::capture::Capture,
+        native: &crate::native_evidence::Artifact,
+        semantic: &crate::semantic_evidence::SemanticPublication,
+        captured: &crate::semantic_evidence::CapturedComponents,
+        leader: &topology::WriterGuard,
+        cancel: &CancelFlag,
+        fail_before_commit: bool,
+    ) -> Result<IndexPin> {
+        self.validate_native_bundle_with_mode(graph, capture, native, cancel, true)?;
+        self.publish_inner_checked_target_with_local(
+            (graph, capture, native),
+            leader,
+            PublicationPlan {
+                expected: ExpectedPublication::Recovery(Box::new(
+                    self.publication_index_baseline()?,
+                )),
+                target: PublicationTarget::Live,
+            },
+            cancel,
+            (256 * 1024 * 1024 + 16 * 1024, None, None),
+            |stage, _| {
+                ensure!(
+                    !fail_before_commit || !matches!(stage, PublishStage::BeforeCommit),
+                    "injected semantic selective failure"
+                );
+                Ok(())
+            },
+            Some((semantic, captured)),
+        )
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn publish_local_semantic_for_tests(
+        &self,
+        options: &crate::indexer::IndexOptions,
+        capture: &crate::capture::Capture,
+        semantic: &crate::semantic_evidence::SemanticPublication,
+        captured: &crate::semantic_evidence::CapturedComponents,
+        leader: &topology::WriterGuard,
+        cancel: &CancelFlag,
+        fail_before_commit: bool,
+    ) -> Result<IndexPin> {
+        let expected = self.publication_index_baseline()?;
+        let prepared = self
+            .prepare_local_revision(capture, &expected, cancel)?
+            .context("document-local publication unavailable")?;
+        let changed = crate::indexer::project_native_document(
+            options,
+            capture,
+            &prepared.native,
+            &prepared.changed_path,
+            cancel,
+            &|_| {},
+        )?;
+        let graph = self
+            .compose_local_revision(capture, &prepared, changed, cancel)?
+            .context("document-local class projection unavailable")?;
+        self.publish_local_native_recovery_with_semantic(
+            &graph,
+            capture,
+            prepared,
+            leader,
+            expected,
+            cancel,
+            Some((semantic, captured)),
+            fail_before_commit,
+        )
     }
 
     #[allow(dead_code)] // Test seam for the original full-artifact selective rollback matrix.
@@ -10404,6 +10623,26 @@ impl Store {
         leader: &topology::WriterGuard,
         expected: RecoveryBaseline,
         cancel: &CancelFlag,
+    ) -> Result<IndexPin> {
+        self.publish_local_native_recovery_with_semantic(
+            graph, capture, prepared, leader, expected, cancel, None, false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn publish_local_native_recovery_with_semantic(
+        &self,
+        graph: &Graph,
+        capture: &crate::capture::Capture,
+        prepared: LocalPrepared,
+        leader: &topology::WriterGuard,
+        expected: RecoveryBaseline,
+        cancel: &CancelFlag,
+        semantic: Option<(
+            &crate::semantic_evidence::SemanticPublication,
+            &crate::semantic_evidence::CapturedComponents,
+        )>,
+        fail_before_commit: bool,
     ) -> Result<IndexPin> {
         ensure!(
             capture.files == graph.files && expected.pin() == Some(prepared.prior_pin),
@@ -10441,8 +10680,14 @@ impl Store {
             },
             cancel,
             (256 * 1024 * 1024 + 16 * 1024, Some(&prepared), None),
-            |_, _| Ok(()),
-            None,
+            |stage, _| {
+                ensure!(
+                    !fail_before_commit || !matches!(stage, PublishStage::BeforeCommit),
+                    "injected semantic local failure"
+                );
+                Ok(())
+            },
+            semantic,
         )
     }
 
@@ -12857,8 +13102,32 @@ impl Store {
             }
         }
         immutable.finish(&tx).map_err(classify_immutable)?;
+        // The spool header carries the complete revision but no per-document facts.
+        // Reconstruct the measured inventory from that same private spool for the
+        // semantic validator; never validate against the header's empty fact lists.
+        let measured_stream = if semantic.is_some()
+            && let Some(spool) = stream
+        {
+            let mut measured = native.clone();
+            for index in 0..spool.len() {
+                check_cancel(cancel)?;
+                let (document, _) = spool.read(index).map_err(native_spool_read_failure)?;
+                measured.coverage.extend(document.coverage);
+                measured.provenance.extend(document.provenance);
+                measured.declarations.extend(document.declarations);
+                measured.calls.extend(document.calls);
+                measured.control_regions.extend(document.control_regions);
+            }
+            Some(measured)
+        } else {
+            None
+        };
         if let Some((semantic, captured)) = semantic {
-            crate::semantic_evidence::validate_evidence(semantic, native, captured)?;
+            crate::semantic_evidence::validate_evidence(
+                semantic,
+                measured_stream.as_ref().unwrap_or(native),
+                captured,
+            )?;
         }
         write_semantic(
             &tx,
