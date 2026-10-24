@@ -1,9 +1,5 @@
 //! Captured semantic evidence admitted against one validated native snapshot.
-use crate::{
-    native_evidence as native,
-    native_ids::{self, IdentityRegistry},
-    store::id_codec,
-};
+use crate::{native_evidence as native, native_ids, store::id_codec};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::json;
@@ -247,6 +243,30 @@ fn resolution(kind: Resolution, declared: &Option<Target>, candidates: &[Target]
     );
     Ok(())
 }
+fn declaration_name_owner<'a>(
+    declaration: &'a native::Declaration,
+    native: &'a native::Artifact,
+) -> Option<&'a str> {
+    if declaration.kind == "module" && declaration.ancestors.is_empty() {
+        return Some(&declaration.syntax_id);
+    }
+    let mut parents = native.declarations.iter().filter(|candidate| {
+        candidate.document == declaration.document
+            && candidate.syntax_id != declaration.syntax_id
+            && candidate.range.start <= declaration.range.start
+            && candidate.range.end >= declaration.range.end
+            && (if declaration.ancestors.is_empty() {
+                candidate.kind == "module" && candidate.ancestors.is_empty()
+            } else {
+                candidate.key == *declaration.ancestors.last().unwrap()
+                    && candidate.ancestors
+                        == declaration.ancestors[..declaration.ancestors.len() - 1]
+            })
+    });
+    let owner = parents.next().unwrap_or(declaration);
+    parents.next().is_none().then_some(owner.syntax_id.as_str())
+}
+
 fn validate_join(
     join: &Join,
     family: JoinKind,
@@ -271,7 +291,6 @@ fn validate_join(
         "foreign join anchor"
     );
     let mut candidates = BTreeSet::new();
-    // Native publication has no authenticated per-family unavailability witness yet.
     match family {
         JoinKind::DeclarationName => {
             for d in &native.declarations {
@@ -300,8 +319,83 @@ fn validate_join(
         }
         _ => anyhow::bail!("unsupported join family"),
     }
+    let kind = match a.kind {
+        JoinKind::DeclarationName => native::MeasurementKind::DeclarationName,
+        JoinKind::Callee => native::MeasurementKind::Callee,
+        JoinKind::Invocation => native::MeasurementKind::Invocation,
+        JoinKind::Reference => native::MeasurementKind::Reference,
+    };
+    let support = native
+        .capability_reports
+        .iter()
+        .find(|report| report.document == a.document && report.revision_id == a.revision_id)
+        .context("missing native capability report")?
+        .families
+        .iter()
+        .find(|support| support.kind == kind)
+        .context("missing native measurement family")?;
+    let contained = |range: &native::Range, within: &native::Range| {
+        within.start <= range.start && range.end <= within.end
+    };
+    let measured_ranges: Vec<_> = match a.kind {
+        JoinKind::DeclarationName => native
+            .declarations
+            .iter()
+            .filter(|d| d.document == a.document)
+            .filter_map(|d| d.name_range.as_ref())
+            .collect(),
+        JoinKind::Callee => native
+            .calls
+            .iter()
+            .filter(|c| c.document == a.document)
+            .filter_map(|c| c.callee_range.as_ref())
+            .collect(),
+        JoinKind::Invocation => native
+            .calls
+            .iter()
+            .filter(|c| c.document == a.document)
+            .map(|c| &c.range)
+            .collect(),
+        JoinKind::Reference => native
+            .references
+            .iter()
+            .filter(|r| r.document == a.document)
+            .map(|r| &r.range)
+            .collect(),
+    };
+    ensure!(
+        support.available || measured_ranges.is_empty(),
+        "unavailable family has measured candidates"
+    );
+    for gap in &support.gaps {
+        span(source, &gap.range)?;
+        text(&gap.diagnostic)?;
+        ensure!(
+            !measured_ranges
+                .iter()
+                .any(|range| contained(range, &gap.range)),
+            "measured candidate contradicts native capability gap"
+        );
+    }
+    let unsupported = if !support.available {
+        Some(
+            support
+                .diagnostic
+                .as_deref()
+                .context("unavailable family without diagnostic")?,
+        )
+    } else {
+        ensure!(support.diagnostic.is_none(), "enabled family diagnostic");
+        support
+            .gaps
+            .iter()
+            .find(|gap| contained(&a.range, &gap.range))
+            .map(|gap| gap.diagnostic.as_str())
+    };
     let expected: Vec<_> = candidates.into_iter().collect();
-    let status = if expected.len() == 1 {
+    let status = if unsupported.is_some() && expected.is_empty() {
+        JoinStatus::Unsupported
+    } else if expected.len() == 1 {
         JoinStatus::Exact
     } else if expected.len() >= 2 {
         JoinStatus::Ambiguous
@@ -319,6 +413,12 @@ fn validate_join(
         join.diagnostic.is_some() == (status != JoinStatus::Exact),
         "join diagnostic mismatch"
     );
+    if status == JoinStatus::Unsupported {
+        ensure!(
+            join.diagnostic.as_deref() == unsupported,
+            "unsupported join diagnostic differs from native capability"
+        );
+    }
     for id in &join.candidate_ids {
         if family == JoinKind::DeclarationName {
             sid(id)?
@@ -794,8 +894,15 @@ pub fn validate_evidence(
         }
     }
     let mut references = BTreeSet::new();
-    let mut grouped: BTreeMap<(&str, &native::DocumentKey, &str), Vec<&Reference>> =
-        BTreeMap::new();
+    let native_references: BTreeMap<_, _> = native
+        .references
+        .iter()
+        .map(|r| (r.id.as_str(), r))
+        .collect();
+    ensure!(
+        native_references.len() == native.references.len(),
+        "duplicate native reference ID"
+    );
     for r in &semantic.references {
         let p = fact(
             &r.provenance_id,
@@ -806,6 +913,20 @@ pub fn validate_evidence(
         sid(&r.owner_syntax_id)?;
         occ(&r.id)?;
         uint(r.ordinal)?;
+        ensure!(
+            native_references
+                .get(r.id.as_str())
+                .is_some_and(|candidate| {
+                    candidate.owner_syntax_id == r.owner_syntax_id
+                        && candidate.ordinal == r.ordinal
+                        && candidate.document == r.document
+                        && candidate.revision_id == r.revision_id
+                        && candidate.range == r.range
+                        && candidate.spelling == r.spelling
+                        && candidate.lookup_key == r.lookup_key
+                }),
+            "reference differs from native reference candidate"
+        );
         ensure!(
             decls
                 .get(&r.owner_syntax_id)
@@ -850,10 +971,12 @@ pub fn validate_evidence(
         );
         if r.site == ReferenceSite::Declaration {
             ensure!(
-                decls
-                    .get(&r.owner_syntax_id)
-                    .is_some_and(|d| d.name_range.as_ref() == Some(&r.range)
-                        && d.name.as_deref() == Some(&r.spelling)),
+                native.declarations.iter().any(|d| {
+                    d.document == r.document
+                        && d.name_range.as_ref() == Some(&r.range)
+                        && d.name.as_deref() == Some(&r.spelling)
+                        && declaration_name_owner(d, native) == Some(r.owner_syntax_id.as_str())
+                }),
                 "declaration reference site not measured"
             );
         }
@@ -866,30 +989,6 @@ pub fn validate_evidence(
             references.insert((p.producer_id.as_str(), r.id.as_str())),
             "duplicate reference ID"
         );
-        grouped
-            .entry((&p.producer_id, &r.document, &r.owner_syntax_id))
-            .or_default()
-            .push(r);
-    }
-    let mut registry = IdentityRegistry::default();
-    for ((_producer, document, owner), mut group) in grouped {
-        group.sort_by_key(|r| (r.range.start, r.range.end));
-        let content_hash = &revision
-            .documents
-            .iter()
-            .find(|d| &d.key == document)
-            .context("missing reference document")?
-            .content_hash;
-        let context =
-            native::native_extraction_context(&native.producer, &document.language, revision)?;
-        for (i, r) in group.iter().enumerate() {
-            ensure!(
-                i == r.ordinal && (i == 0 || group[i - 1].range != r.range),
-                "reference ordinal/range mismatch"
-            );
-            let id = registry.occurrence(&json!({"contentHash":content_hash,"extractionContext":context,"nativeProducerId":native.producer.id,"nativeProducerVersion":native.producer.version,"ownerSyntaxId":owner,"kind":"reference","ordinal":r.ordinal}))?;
-            ensure!(id == r.id, "noncanonical reference ID");
-        }
     }
     let mut call_facts = BTreeSet::new();
     type TargetClaim = (Resolution, Option<Vec<u8>>, Vec<Vec<u8>>);

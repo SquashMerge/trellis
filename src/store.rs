@@ -641,15 +641,21 @@ SELECT ?3+(CASE WHEN x.id IS NULL THEN 0 ELSE 39 END)+(CASE WHEN x.owner_syntax_
 UNION ALL
 SELECT ?3+(CASE WHEN x.call_id IS NULL THEN 0 ELSE 39 END)+(CASE WHEN x.region_id IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.ordinal AS BLOB)),0) AS row_bytes FROM native_version_call_regions x WHERE x.vid=?1
 UNION ALL
+SELECT ?3+78+COALESCE(length(CAST(x.ordinal AS BLOB)),0)+COALESCE(length(CAST(x.start_byte AS BLOB)),0)+COALESCE(length(CAST(x.end_byte AS BLOB)),0)+length(CAST(x.spelling AS BLOB))+length(CAST(x.lookup_key AS BLOB)) AS row_bytes FROM native_version_references x WHERE x.vid=?1
+UNION ALL
+SELECT ?3+length(CAST(x.kind AS BLOB))+length(CAST(x.available AS BLOB))+COALESCE(length(CAST(x.diagnostic AS BLOB)),0)+length(CAST(x.ordinal AS BLOB)) AS row_bytes FROM native_version_capability_families x WHERE x.vid=?1
+UNION ALL
+SELECT ?3+length(CAST(x.kind AS BLOB))+length(CAST(x.ordinal AS BLOB))+length(CAST(x.start_byte AS BLOB))+length(CAST(x.end_byte AS BLOB))+length(CAST(x.diagnostic AS BLOB)) AS row_bytes FROM native_version_capability_gaps x WHERE x.vid=?1
+UNION ALL
 SELECT (SELECT length(content_hash)+20 FROM class_projections WHERE cid=x.cid)+(SELECT length(graph_hash)+9 FROM graph_projections WHERE gid=x.gid)+39+COALESCE(length(CAST(x.name AS BLOB)),0)+COALESCE(length(CAST(x.qualified_name AS BLOB)),0)+COALESCE(length(CAST(x.path AS BLOB)),0)+COALESCE(length(CAST(x.payload AS BLOB)),0) AS row_bytes FROM classes x WHERE x.cid=?2
 UNION ALL
 SELECT (SELECT length(content_hash)+20 FROM class_projections WHERE cid=x.cid)+COALESCE(length(CAST(x.id AS BLOB)),0)+39+(CASE WHEN x.target IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.payload AS BLOB)),0) AS row_bytes FROM class_relations x WHERE x.cid=?2
 )"#;
-const DATABASE_SCHEMA_VERSION: u32 = 16;
+const DATABASE_SCHEMA_VERSION: u32 = 17;
 const EXTRACTOR_VERSION: &str = "native-v6-delta-v1";
 const EVIDENCE_FORMAT: &str = "terminal-native-graph-v1";
-const CACHE_SCHEMA_V16: &str = r#"
-CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=16), extractor_version TEXT NOT NULL CHECK(extractor_version='native-v6-delta-v1'), root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL, reconcile_options TEXT);
+const CACHE_SCHEMA_V17: &str = r#"
+CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=17), extractor_version TEXT NOT NULL CHECK(extractor_version='native-v6-delta-v1'), root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL, reconcile_options TEXT);
 CREATE TABLE native_producers(id TEXT NOT NULL,version TEXT NOT NULL,executable_hash TEXT NOT NULL CHECK(length(executable_hash)=64),kind TEXT NOT NULL CHECK(kind='native'),position_encoding TEXT NOT NULL CHECK(position_encoding='utf8'),PRIMARY KEY(id,version));
 CREATE TABLE native_producer_languages(producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,language TEXT NOT NULL,inventory_authenticated INTEGER NOT NULL CHECK(inventory_authenticated IN (0,1)),ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(producer_id,producer_version,language),UNIQUE(producer_id,producer_version,ordinal),FOREIGN KEY(producer_id,producer_version) REFERENCES native_producers(id,version) DEFERRABLE INITIALLY DEFERRED);
 CREATE TABLE native_producer_inputs(producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,language TEXT NOT NULL,component_name TEXT NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(producer_id,producer_version,language,component_name),UNIQUE(producer_id,producer_version,language,ordinal),FOREIGN KEY(producer_id,producer_version,language) REFERENCES native_producer_languages(producer_id,producer_version,language) DEFERRABLE INITIALLY DEFERRED);
@@ -699,6 +705,9 @@ CREATE TABLE native_version_ancestor_signature_types(vid INTEGER NOT NULL,syntax
 CREATE TABLE native_version_headers(vid INTEGER NOT NULL,syntax_id BLOB NOT NULL,kind TEXT NOT NULL,name TEXT,result_type TEXT,PRIMARY KEY(vid,syntax_id),FOREIGN KEY(vid,syntax_id) REFERENCES native_version_declarations(vid,syntax_id) DEFERRABLE INITIALLY DEFERRED);
 CREATE TABLE native_version_header_items(vid INTEGER NOT NULL,syntax_id BLOB NOT NULL,item_kind TEXT NOT NULL CHECK(item_kind IN ('modifier','typeParameter','base')),ordinal INTEGER NOT NULL CHECK(ordinal>=0),value TEXT NOT NULL,PRIMARY KEY(vid,syntax_id,item_kind,ordinal),FOREIGN KEY(vid,syntax_id) REFERENCES native_version_headers(vid,syntax_id) DEFERRABLE INITIALLY DEFERRED);
 CREATE TABLE native_version_parameters(vid INTEGER NOT NULL,syntax_id BLOB NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),name TEXT,type_name TEXT,variadic INTEGER NOT NULL CHECK(variadic IN (0,1)),PRIMARY KEY(vid,syntax_id,ordinal),FOREIGN KEY(vid,syntax_id) REFERENCES native_version_headers(vid,syntax_id) DEFERRABLE INITIALLY DEFERRED);
+CREATE TABLE native_version_references(vid INTEGER NOT NULL,id BLOB NOT NULL,owner_syntax_id BLOB NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),start_byte INTEGER NOT NULL,end_byte INTEGER NOT NULL,spelling TEXT NOT NULL,lookup_key TEXT NOT NULL,CHECK(start_byte>=0 AND end_byte>start_byte),PRIMARY KEY(vid,id),UNIQUE(vid,owner_syntax_id,ordinal),FOREIGN KEY(vid,owner_syntax_id) REFERENCES native_version_declarations(vid,syntax_id) DEFERRABLE INITIALLY DEFERRED);
+CREATE TABLE native_version_capability_families(vid INTEGER NOT NULL REFERENCES document_versions(vid) DEFERRABLE INITIALLY DEFERRED,kind TEXT NOT NULL CHECK(kind IN ('declarationName','callee','invocation','reference')),available INTEGER NOT NULL CHECK(available IN (0,1)),diagnostic TEXT,ordinal INTEGER NOT NULL CHECK(ordinal>=0),CHECK((available=1 AND diagnostic IS NULL) OR (available=0 AND length(diagnostic)>0)),PRIMARY KEY(vid,kind),UNIQUE(vid,ordinal));
+CREATE TABLE native_version_capability_gaps(vid INTEGER NOT NULL,kind TEXT NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),start_byte INTEGER NOT NULL,end_byte INTEGER NOT NULL,diagnostic TEXT NOT NULL CHECK(length(diagnostic)>0),CHECK(start_byte>=0 AND end_byte>start_byte),PRIMARY KEY(vid,kind,ordinal),FOREIGN KEY(vid,kind) REFERENCES native_version_capability_families(vid,kind) DEFERRABLE INITIALLY DEFERRED);
 CREATE TABLE native_version_calls(vid INTEGER NOT NULL,id BLOB NOT NULL,owner_syntax_id BLOB NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),start_byte INTEGER NOT NULL,end_byte INTEGER NOT NULL,callee_start INTEGER,callee_end INTEGER,spelling TEXT,language TEXT NOT NULL,callee_lookup_key TEXT,CHECK(start_byte>=0 AND end_byte>start_byte),CHECK((callee_start IS NULL)=(callee_end IS NULL)),CHECK(callee_start IS NULL OR (callee_start>=start_byte AND callee_end<=end_byte AND callee_end>callee_start)),PRIMARY KEY(vid,id),UNIQUE(vid,owner_syntax_id,ordinal),FOREIGN KEY(vid,owner_syntax_id) REFERENCES native_version_declarations(vid,syntax_id) DEFERRABLE INITIALLY DEFERRED);
 CREATE INDEX native_version_calls_incoming ON native_version_calls(language,callee_lookup_key);
 CREATE TABLE native_version_control_regions(vid INTEGER NOT NULL,id BLOB NOT NULL,owner_syntax_id BLOB NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),kind TEXT NOT NULL,start_byte INTEGER NOT NULL,end_byte INTEGER NOT NULL,parent_id BLOB,arm TEXT,CHECK(start_byte>=0 AND end_byte>start_byte),PRIMARY KEY(vid,id),UNIQUE(vid,owner_syntax_id,ordinal),UNIQUE(vid,id,owner_syntax_id),FOREIGN KEY(vid,owner_syntax_id) REFERENCES native_version_declarations(vid,syntax_id) DEFERRABLE INITIALLY DEFERRED,FOREIGN KEY(vid,parent_id,owner_syntax_id) REFERENCES native_version_control_regions(vid,id,owner_syntax_id) DEFERRABLE INITIALLY DEFERRED);
@@ -2640,7 +2649,7 @@ fn validate_cache_shape(db: &Connection) -> Result<()> {
         version == DATABASE_SCHEMA_VERSION,
         "incompatible_index: unknown schema version"
     );
-    expected.execute_batch(CACHE_SCHEMA_V16)?;
+    expected.execute_batch(CACHE_SCHEMA_V17)?;
     control_ensure!(
         objects(db)? == objects(&expected)?,
         "incompatible_index: unknown cache object type, name or shape"
@@ -2753,6 +2762,9 @@ fn cleanup_release_candidate(tx: &Connection, revision: &str, kind: &str) -> Res
             "vid",
             &[
                 "native_version_call_regions",
+                "native_version_references",
+                "native_version_capability_gaps",
+                "native_version_capability_families",
                 "native_version_calls",
                 "native_version_control_regions",
                 "native_version_header_items",
@@ -3746,6 +3758,8 @@ struct PublicationRows<'a> {
     native_declarations: Vec<&'a crate::native_evidence::Declaration>,
     native_calls: Vec<&'a crate::native_evidence::Call>,
     native_regions: Vec<&'a crate::native_evidence::ControlRegion>,
+    native_references: Vec<&'a crate::native_evidence::Reference>,
+    capability_report: Option<&'a crate::native_evidence::CapabilityReport>,
 }
 fn publication_native_witness(
     document: &crate::native_evidence::Document,
@@ -3772,6 +3786,14 @@ fn publication_native_witness(
             .iter()
             .map(|r| (*r).clone())
             .collect::<Vec<_>>(),
+        &grouped
+            .native_references
+            .iter()
+            .map(|r| (*r).clone())
+            .collect::<Vec<_>>(),
+        grouped
+            .capability_report
+            .context("native capability report missing")?,
     )
 }
 fn publication_rows<'a>(
@@ -3844,6 +3866,21 @@ fn publication_rows<'a>(
             .context("native control path missing")?
             .native_regions
             .push(region);
+    }
+    for reference in &native.references {
+        rows.get_mut(reference.document.path.as_str())
+            .context("native reference path missing")?
+            .native_references
+            .push(reference);
+    }
+    for report in &native.capability_reports {
+        let grouped = rows
+            .get_mut(report.document.path.as_str())
+            .context("native capability path missing")?;
+        ensure!(
+            grouped.capability_report.replace(report).is_none(),
+            "duplicate native capability report"
+        );
     }
     Ok(rows)
 }
@@ -4074,6 +4111,9 @@ impl ImmutableAppend {
                     | "native_version_headers"
                     | "native_version_header_items"
                     | "native_version_parameters"
+                    | "native_version_references"
+                    | "native_version_capability_families"
+                    | "native_version_capability_gaps"
                     | "native_version_calls"
                     | "native_version_control_regions"
                     | "native_version_call_regions"
@@ -4112,6 +4152,9 @@ impl ImmutableAppend {
             | "native_version_headers"
             | "native_version_header_items"
             | "native_version_parameters"
+            | "native_version_references"
+            | "native_version_capability_families"
+            | "native_version_capability_gaps"
             | "native_version_calls"
             | "native_version_control_regions"
             | "native_version_call_regions" => Some(Self::key(db, values, 0)?),
@@ -4286,6 +4329,9 @@ impl ImmutableAppend {
                     ("native_version_headers", "vid"),
                     ("native_version_header_items", "vid"),
                     ("native_version_parameters", "vid"),
+                    ("native_version_references", "vid"),
+                    ("native_version_capability_families", "vid"),
+                    ("native_version_capability_gaps", "vid"),
                     ("native_version_calls", "vid"),
                     ("native_version_control_regions", "vid"),
                     ("native_version_call_regions", "vid"),
@@ -6614,6 +6660,68 @@ fn write_native(
             )?;
         }
     }
+    for report in &a.capability_reports {
+        check_cancel(cancel)?;
+        if reuse.for_path(&report.document.path).native {
+            continue;
+        }
+        let vid = storage_ids
+            .get(&report.document.path)
+            .context("native capability missing document")?
+            .0;
+        for (ordinal, family) in report.families.iter().enumerate() {
+            let kind = semantic_variant(&family.kind)?;
+            immutable.insert(
+                db,
+                "INSERT INTO native_version_capability_families VALUES(?1,?2,?3,?4,?5)",
+                params![
+                    vid,
+                    kind,
+                    family.available,
+                    family.diagnostic,
+                    ordinal as i64
+                ],
+            )?;
+            for (gap_ordinal, gap) in family.gaps.iter().enumerate() {
+                immutable.insert(
+                    db,
+                    "INSERT INTO native_version_capability_gaps VALUES(?1,?2,?3,?4,?5,?6)",
+                    params![
+                        vid,
+                        kind,
+                        gap_ordinal as i64,
+                        gap.range.start as i64,
+                        gap.range.end as i64,
+                        gap.diagnostic
+                    ],
+                )?;
+            }
+        }
+    }
+    for reference in &a.references {
+        check_cancel(cancel)?;
+        if reuse.for_path(&reference.document.path).native {
+            continue;
+        }
+        let vid = storage_ids
+            .get(&reference.document.path)
+            .context("native reference missing document")?
+            .0;
+        immutable.insert(
+            db,
+            "INSERT INTO native_version_references VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![
+                vid,
+                stored_occ(&reference.id)?,
+                stored_sid(&reference.owner_syntax_id)?,
+                reference.ordinal as i64,
+                reference.range.start as i64,
+                reference.range.end as i64,
+                reference.spelling,
+                reference.lookup_key
+            ],
+        )?;
+    }
     for r in &a.control_regions {
         check_cancel(cancel)?;
         if reuse.for_path(&r.document.path).native {
@@ -6728,7 +6836,7 @@ fn validate_v8_bootstrap(db: &Connection) -> Result<()> {
         indexed_at.is_empty() && options.is_none(),
         "incompatible_index: invalid v8 bootstrap metadata"
     );
-    // Fixed identifiers from CACHE_SCHEMA_V16 only. Do not read table names from
+    // Fixed identifiers from CACHE_SCHEMA_V17 only. Do not read table names from
     // sqlite_master or treat a partial publication as a valid empty bootstrap.
     for name in [
         "class_projections",
@@ -6747,6 +6855,9 @@ fn validate_v8_bootstrap(db: &Connection) -> Result<()> {
         "native_source_sets",
         "native_version_ancestor_signature_types",
         "native_version_call_regions",
+        "native_version_references",
+        "native_version_capability_gaps",
+        "native_version_capability_families",
         "native_version_calls",
         "native_version_control_regions",
         "native_version_coverage_roles",
@@ -8263,6 +8374,80 @@ fn read_native_control_regions_v8_inner(
     Ok(selected)
 }
 
+fn read_native_references(
+    db: &Connection,
+    scope: &V8NativeScope,
+    owner: Option<&str>,
+) -> Result<Vec<crate::native_evidence::Reference>> {
+    use crate::native_evidence::{Range, Reference};
+    let mut known = BTreeSet::new();
+    for row in db
+        .prepare("SELECT syntax_id FROM native_version_declarations WHERE vid=?1")?
+        .query_map([scope.vid], |r| stored_id_row(r, 0, false))?
+    {
+        known.insert(row?);
+    }
+    let mut references = vec![];
+    let mut ordinals = BTreeMap::<String, usize>::new();
+    for row in db.prepare("SELECT id,owner_syntax_id,ordinal,start_byte,end_byte,spelling,lookup_key FROM native_version_references WHERE vid=?1 ORDER BY owner_syntax_id,ordinal")?
+        .query_map([scope.vid], |r| Ok((stored_id_row(r, 0, true)?, stored_id_row(r, 1, false)?,
+            r.get::<_, i64>(2)?, r.get::<_, i64>(3)?, r.get::<_, i64>(4)?, r.get::<_, String>(5)?, r.get::<_, String>(6)?)))? {
+        let (id, reference_owner, ordinal, start, end, spelling, lookup_key) = row?;
+        selected_ensure!(known.contains(&reference_owner), "orphan native reference owner");
+        selected_ensure!(start >= 0 && end > start, "invalid native reference range");
+        let n = ordinals.entry(reference_owner.clone()).or_default();
+        contiguous(ordinal, *n, "reference")?;
+        *n += 1;
+        references.push(Reference {
+            id, owner_syntax_id: reference_owner, ordinal: ordinal as usize,
+            document: scope.key.clone(), revision_id: scope.native_revision_id.clone(),
+            range: Range { start: start as usize, end: end as usize }, spelling, lookup_key,
+            provenance_id: scope.proof_id(),
+        });
+    }
+    if let Some(owner) = owner {
+        references.retain(|reference| reference.owner_syntax_id == owner);
+    }
+    Ok(references)
+}
+
+fn read_native_capability_report(
+    db: &Connection,
+    scope: &V8NativeScope,
+) -> Result<crate::native_evidence::CapabilityReport> {
+    use crate::native_evidence::{
+        CapabilityReport, MeasurementGap, MeasurementKind, MeasurementSupport, Range,
+    };
+    let mut families = vec![];
+    let mut kinds = BTreeMap::new();
+    for row in db.prepare("SELECT kind,available,diagnostic,ordinal FROM native_version_capability_families WHERE vid=?1 ORDER BY ordinal")?
+        .query_map([scope.vid], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, i64>(3)?)))? {
+        let (kind, available, diagnostic, ordinal) = row?;
+        let decoded: MeasurementKind = serde_json::from_value(serde_json::Value::String(kind.clone()))
+            .context(SelectedIntegrity("invalid native capability kind".into()))?;
+        selected_ensure!(matches!(available, 0 | 1) &&
+            (if available == 1 { diagnostic.is_none() } else { diagnostic.as_ref().is_some_and(|d| !d.is_empty()) }),
+            "invalid native capability availability");
+        contiguous(ordinal, families.len(), "capability family")?;
+        selected_ensure!(kinds.insert(kind, families.len()).is_none(), "duplicate native capability family");
+        families.push(MeasurementSupport { kind: decoded, available: available == 1, diagnostic, gaps: vec![] });
+    }
+    selected_ensure!(families.len() == 4, "incomplete native capability report");
+    for row in db.prepare("SELECT kind,ordinal,start_byte,end_byte,diagnostic FROM native_version_capability_gaps WHERE vid=?1 ORDER BY kind,ordinal")?
+        .query_map([scope.vid], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?, r.get::<_, String>(4)?)))? {
+        let (kind, ordinal, start, end, diagnostic) = row?;
+        let family = &mut families[*kinds.get(&kind).ok_or_else(|| SelectedIntegrity("orphan native capability gap".into()))?];
+        contiguous(ordinal, family.gaps.len(), "capability gap")?;
+        selected_ensure!(family.available && start >= 0 && end > start && !diagnostic.is_empty(), "invalid native capability gap");
+        family.gaps.push(MeasurementGap { range: Range { start: start as usize, end: end as usize }, diagnostic });
+    }
+    Ok(CapabilityReport {
+        document: scope.key.clone(),
+        revision_id: scope.native_revision_id.clone(),
+        families,
+    })
+}
+
 fn native_index_unavailable(error: &anyhow::Error) -> bool {
     error.downcast_ref::<topology::IndexNotReady>().is_some()
 }
@@ -8913,7 +9098,7 @@ impl Store {
             db.pragma_update(None, "synchronous", "FULL")?;
             db.execute_batch("BEGIN IMMEDIATE")?;
             let result = (|| -> Result<()> {
-                db.execute_batch(CACHE_SCHEMA_V16)?;
+                db.execute_batch(CACHE_SCHEMA_V17)?;
                 let age = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
                 ensure!(age <= 9_007_199_254_740_991, "invalid_open_age");
                 db.execute(
@@ -11169,6 +11354,14 @@ impl Store {
                         region.revision_id.clone_from(&native.revision.id);
                     }
                     native.control_regions.extend(regions);
+                    let mut references = read_native_references(db, &scope, None)?;
+                    for reference in &mut references {
+                        reference.revision_id.clone_from(&native.revision.id);
+                    }
+                    native.references.extend(references);
+                    let mut report = read_native_capability_report(db, &scope)?;
+                    report.revision_id.clone_from(&native.revision.id);
+                    native.capability_reports.push(report);
                 }
                 Ok(())
             })?;
@@ -11666,6 +11859,8 @@ impl Store {
         });
         let calls = read_native_calls_v8(db, &scope, None)?;
         let control_regions = read_native_control_regions_v8(db, &scope, None)?;
+        let references = read_native_references(db, &scope, None)?;
+        let capability_report = read_native_capability_report(db, &scope)?;
         let observed = crate::native_evidence::document_witness(
             &document,
             &producer,
@@ -11673,6 +11868,8 @@ impl Store {
             &declarations,
             &calls,
             &control_regions,
+            &references,
+            &capability_report,
         )?;
         selected_ensure!(
             observed == witness,
@@ -11699,6 +11896,8 @@ impl Store {
             declarations,
             calls,
             control_regions,
+            references,
+            capability_report,
         })
     }
 
@@ -13437,6 +13636,8 @@ impl Store {
                 // An incompatible/corrupt generation is explicitly replaced, never served.
                 // Only compatible same-generation publication appends history.
                 tx.execute_batch("DELETE FROM semantic_reference_roles; DELETE FROM semantic_reference_candidates; DELETE FROM semantic_symbol_targets; DELETE FROM semantic_declaration_binding_symbols; DELETE FROM semantic_declaration_join_candidates; DELETE FROM semantic_call_candidates; DELETE FROM semantic_call_possible_dispatch; DELETE FROM semantic_call_join_candidates; DELETE FROM semantic_type_relationships; DELETE FROM semantic_references; DELETE FROM semantic_symbols; DELETE FROM semantic_declaration_bindings; DELETE FROM semantic_call_bindings; DELETE FROM semantic_provenance; DELETE FROM semantic_basis_lookup_dependencies; DELETE FROM semantic_basis; DELETE FROM semantic_coverage_roles; DELETE FROM semantic_coverage; DELETE FROM semantic_requested_producer_languages; DELETE FROM semantic_requested_producers; DELETE FROM semantic_revision_producers; DELETE FROM semantic_producer_languages; DELETE FROM semantic_producers; DELETE FROM revision_documents; DELETE FROM revision_capture_inputs;
+                DELETE FROM native_version_references; DELETE FROM native_version_capability_gaps;
+                DELETE FROM native_version_capability_families;
                 DELETE FROM native_version_call_regions; DELETE FROM native_version_calls;
                 DELETE FROM native_version_control_regions; DELETE FROM native_version_own_signature_types;
                 DELETE FROM native_version_ancestor_signature_types; DELETE FROM native_version_parameters;
@@ -13691,6 +13892,10 @@ impl Store {
                     measured.declarations.extend(document.declarations);
                     measured.calls.extend(document.calls);
                     measured.control_regions.extend(document.control_regions);
+                    measured.references.extend(document.references);
+                    measured
+                        .capability_reports
+                        .extend(document.capability_reports);
                 }
                 Some(measured)
             } else {
@@ -14580,6 +14785,9 @@ impl Store {
             AND NOT EXISTS (SELECT 1 FROM graph_projections g WHERE g.vid=v.vid)";
         for table in [
             "native_version_call_regions",
+            "native_version_references",
+            "native_version_capability_gaps",
+            "native_version_capability_families",
             "native_version_calls",
             "native_version_control_regions",
             "native_version_header_items",
@@ -14790,9 +14998,12 @@ impl Store {
             (SELECT count(*) FROM native_version_headers WHERE vid=?3),
             (SELECT count(*) FROM native_version_header_items WHERE vid=?3),
             (SELECT count(*) FROM native_version_parameters WHERE vid=?3),
-            (SELECT count(*) FROM native_version_call_regions WHERE vid=?3)";
+            (SELECT count(*) FROM native_version_call_regions WHERE vid=?3),
+            (SELECT count(*) FROM native_version_references WHERE vid=?3),
+            (SELECT count(*) FROM native_version_capability_families WHERE vid=?3),
+            (SELECT count(*) FROM native_version_capability_gaps WHERE vid=?3)";
         let counts: Vec<i64> = db.query_row(counts_sql, params![gid, cid, vid], |r| {
-            (0..15)
+            (0..18)
                 .map(|i| r.get(i))
                 .collect::<rusqlite::Result<Vec<_>>>()
         })?;
@@ -15053,6 +15264,40 @@ impl Store {
         v8_native_scope_for(db, key, selected)?
             .map(|scope| read_native_coverage_v8(db, &scope))
             .transpose()
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn native_capability_report_at(
+        &self,
+        pin: IndexPin,
+        key: &crate::native_evidence::DocumentKey,
+    ) -> Result<Option<crate::native_evidence::CapabilityReport>> {
+        self.native_at(pin, |db, selected| {
+            v8_native_scope_for(db, key, selected)?
+                .map(|scope| read_native_capability_report(db, &scope))
+                .transpose()
+        })
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn native_references_at(
+        &self,
+        pin: IndexPin,
+        owner: &str,
+    ) -> Result<Vec<crate::native_evidence::Reference>> {
+        self.native_at(pin, |db, selected| {
+            if let Some(scope) = v8_owner_scope_for(db, owner, selected)? {
+                read_native_references(db, &scope, Some(owner))
+            } else {
+                let dangling: bool = db.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM native_version_references c JOIN revision_documents m ON m.vid=c.vid AND m.revision_id=?2 WHERE c.owner_syntax_id=?1)",
+                    params![id_codec::encode_sid(owner), selected.key], |r| r.get(0))?;
+                selected_ensure!(!dangling, "incompatible_index: native owner absent");
+                Ok(vec![])
+            }
+        })
     }
 
     pub fn native_calls_at(
@@ -16537,7 +16782,7 @@ impl Store {
 #[test]
 fn selected_ancillary_budget_matches_main_text_key_bytes() {
     let db = Connection::open_in_memory().unwrap();
-    db.execute_batch(CACHE_SCHEMA_V16).unwrap();
+    db.execute_batch(CACHE_SCHEMA_V17).unwrap();
     // The aggregate needs only synthetic child rows; FK behavior is covered by
     // publication/retention tests, not this isolated budget-SQL fixture.
     db.pragma_update(None, "foreign_keys", "OFF").unwrap();

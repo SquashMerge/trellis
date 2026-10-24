@@ -587,9 +587,11 @@ fn proved_body_only(old: &SourceFile, new: &SourceFile) -> bool {
             // the edited leaf itself is the last named child of this exact
             // function body's block. Headers, calls and nested expressions do
             // not gain a new proof from this rule.
-            if language == "rust" && kind == "block" && parent.named_child_count() > 0 {
+            if language == "rust" && kind == "block" {
+                let mut cursor = parent.walk();
                 returned |= parent
-                    .named_child(parent.named_child_count() - 1)
+                    .named_children(&mut cursor)
+                    .last()
                     .is_some_and(|last| last.id() == node.id())
                     && parent.parent().is_some_and(|owner| {
                         owner.kind() == "function_item"
@@ -635,7 +637,7 @@ fn proved_body_only(old: &SourceFile, new: &SourceFile) -> bool {
     }
     // Identical tree shape is necessary, not sufficient: the exact bytes outside the
     // one measured leaf must also be unchanged, including the enclosing header/scope.
-    fn shape(node: Node<'_>, result: &mut Vec<&'static str>) {
+    fn shape<'tree>(node: Node<'tree>, result: &mut Vec<&'tree str>) {
         result.push(node.kind());
         for i in 0..node.child_count() {
             if let Some(child) = node.child(i) {
@@ -1496,6 +1498,14 @@ pub(crate) fn native_js_kind(n: Node<'_>) -> Option<&'static str> {
         "variable_declarator" => "variable",
         "field_definition" => "field",
         "formal_parameter" => "parameter",
+        "import_specifier"
+            if n.child_by_field_name("name")
+                .is_some_and(|n| n.kind() == "identifier")
+                && n.child_by_field_name("alias")
+                    .is_some_and(|n| n.kind() == "identifier") =>
+        {
+            "alias"
+        }
         _ => return None,
     })
 }

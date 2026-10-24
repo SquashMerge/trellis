@@ -112,6 +112,8 @@ pub fn capture(
     let mut declarations = Vec::new();
     let mut calls = Vec::new();
     let mut controls = Vec::new();
+    let mut references = Vec::new();
+    let mut capability_reports = Vec::new();
     let mut revision_keys = BTreeSet::new();
     let mut selected = 0;
     for revision in manifest.revisions {
@@ -207,6 +209,14 @@ pub fn capture(
             &mut calls,
             &mut controls,
         )?;
+        append_reference_rows(&artifact, &files, &mut references)?;
+        capability_reports.extend(artifact.capability_reports.iter().map(|report| {
+            json!({"document":report.document,"revisionId":report.revision_id,
+                "families":report.families.iter().map(|family| json!({
+                    "kind":family.kind,"available":family.available,"diagnostic":family.diagnostic,
+                    "gaps":family.gaps.iter().map(|gap| json!({"range":position(&gap.range),"diagnostic":gap.diagnostic})).collect::<Vec<_>>()
+                })).collect::<Vec<_>>()})
+        }));
         selected += 1;
     }
     ensure!(selected > 0, "no matching fixture revision");
@@ -218,7 +228,7 @@ pub fn capture(
         inventories.values().all(|value| value == &json!([])),
         "export requires document-local extraction inventory"
     );
-    let capture = json!({"formatVersion":1, "producerId":descriptor["producer"]["id"], "extractionInputs":[], "declarations":declarations, "calls":calls, "controls":controls, "references":[]});
+    let capture = json!({"formatVersion":1, "producerId":descriptor["producer"]["id"], "extractionInputs":[], "declarations":declarations, "calls":calls, "controls":controls, "references":references, "capabilityReports":capability_reports});
     let parent = output
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -409,6 +419,27 @@ fn append_rows(
     for row in &artifact.control_regions {
         controls.push(json!({"ref":reference(&row.id), "nativeId":row.id, "document":row.document, "revisionId":row.revision_id,
             "ownerRef":reference(&row.owner_syntax_id), "parentRef":row.parent_id.as_ref().map(|id| reference(id)), "kind":row.kind, "range":position(&row.range), "arm":row.arm, "witnesses":[]}));
+    }
+    Ok(())
+}
+
+fn append_reference_rows(
+    artifact: &Artifact,
+    files: &[SourceFile],
+    references: &mut Vec<Value>,
+) -> Result<()> {
+    for row in &artifact.references {
+        let source = files
+            .iter()
+            .find(|file| file.path == row.document.path && file.language == row.document.language)
+            .context("missing measured reference source")?;
+        references.push(json!({
+            "ref":row_ref(&row.revision_id, &row.id), "nativeId":row.id,
+            "document":row.document, "revisionId":row.revision_id,
+            "ownerRef":row_ref(&row.revision_id, &row.owner_syntax_id),
+            "range":position(&row.range), "spelling":row.spelling,
+            "witnesses":[witness("spelling", &row.spelling, &source.text, &row.range, Some(&row.range))?]
+        }));
     }
     Ok(())
 }

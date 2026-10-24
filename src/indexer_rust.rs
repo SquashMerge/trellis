@@ -43,7 +43,13 @@ fn extract_with_limits(
 ) -> Result<()> {
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(&tree_sitter_rust::LANGUAGE.into())?;
-    let mut cancelled = |_: &tree_sitter::ParseState| cancel.load(Ordering::Relaxed);
+    let mut cancelled = |_: &tree_sitter::ParseState| {
+        if cancel.load(Ordering::Relaxed) {
+            std::ops::ControlFlow::Break(())
+        } else {
+            std::ops::ControlFlow::Continue(())
+        }
+    };
     let tree = parser.parse_with_options(
         &mut |offset, _| &file.text.as_bytes()[offset..],
         None,
@@ -258,6 +264,12 @@ pub(crate) fn native_kind(n: Node<'_>) -> Option<&'static str> {
         "closure_expression" => "anonymousFunction",
         "field_declaration" => "field",
         "type_item" => "alias",
+        "use_as_clause"
+            if n.child_by_field_name("alias")
+                .is_some_and(|n| n.kind() == "identifier") =>
+        {
+            "alias"
+        }
         "const_item" | "static_item" => "variable",
         "parameter" => "parameter",
         _ => return None,

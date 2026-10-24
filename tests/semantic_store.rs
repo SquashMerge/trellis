@@ -163,16 +163,20 @@ fn evidence(
         candidate_ids: vec![call.id.clone()],
         diagnostic: None,
     };
-    let occurrence_id=native_ids::IdentityRegistry::default().occurrence(&json!({"contentHash":document.content_hash,"extractionContext":native_ids::extraction_context("rust",&[]).unwrap(),"nativeProducerId":native.producer.id,"nativeProducerVersion":native.producer.version,"ownerSyntaxId":declaration.syntax_id,"kind":"reference","ordinal":0})).unwrap();
+    let candidate = native
+        .references
+        .iter()
+        .find(|r| r.document == document.key && Some(&r.range) == declaration.name_range.as_ref())
+        .unwrap();
     let reference = s::Reference {
-        id: occurrence_id,
-        owner_syntax_id: declaration.syntax_id.clone(),
-        ordinal: 0,
-        document: document.key.clone(),
-        revision_id: native.revision.id.clone(),
-        range: declaration.name_range.clone().unwrap(),
-        spelling: "hello".into(),
-        lookup_key: "hello".into(),
+        id: candidate.id.clone(),
+        owner_syntax_id: candidate.owner_syntax_id.clone(),
+        ordinal: candidate.ordinal,
+        document: candidate.document.clone(),
+        revision_id: candidate.revision_id.clone(),
+        range: candidate.range.clone(),
+        spelling: candidate.spelling.clone(),
+        lookup_key: candidate.lookup_key.clone(),
         site: s::ReferenceSite::Declaration,
         roles: vec![s::Role::Definition],
         resolution: s::Resolution::Resolved,
@@ -634,7 +638,7 @@ fn reference_outside_owning_declaration_rejects_without_advancing_pin() {
                 "nativeProducerVersion": native.producer.version,
                 "ownerSyntaxId": reference.owner_syntax_id,
                 "kind": "reference",
-                "ordinal": 0
+                "ordinal": reference.ordinal
             }))
             .unwrap();
         assert_eq!(reference.id, claimed_id);
@@ -683,9 +687,21 @@ fn assert_semantic_rejection_keeps_pin(
     let call = native
         .calls
         .iter()
-        .find(|c| c.owner_syntax_id == reference.owner_syntax_id && c.callee_range.is_some())
+        .find(|c| c.document == reference.document && c.callee_range.is_some())
         .unwrap();
-    reference.range = call.callee_range.clone().unwrap();
+    let candidate = native
+        .references
+        .iter()
+        .find(|r| {
+            r.document == call.document
+                && r.owner_syntax_id == call.owner_syntax_id
+                && Some(&r.range) == call.callee_range.as_ref()
+        })
+        .unwrap();
+    reference.id = candidate.id.clone();
+    reference.owner_syntax_id = candidate.owner_syntax_id.clone();
+    reference.ordinal = candidate.ordinal;
+    reference.range = candidate.range.clone();
     reference.site = s::ReferenceSite::Use;
     reference.roles = vec![s::Role::Read];
     semantic.coverage[0].supported_roles.push(s::Role::Read);

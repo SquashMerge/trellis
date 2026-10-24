@@ -1840,7 +1840,7 @@ pub enum GcStage {
     AfterParentSync,
 }
 
-/// Schemas before the current v16 are disposable: no released binary that wrote
+/// Schemas before the current v17 are disposable: no released binary that wrote
 /// one can be served by this one, so GC needs no layout, root or age proof.
 fn old_index_schema(version: i64) -> bool {
     (1..i64::from(super::DATABASE_SCHEMA_VERSION)).contains(&version)
@@ -2476,7 +2476,7 @@ mod gc_schema_race_tests {
         assert_eq!(
             (schema, marker.as_str(), generation, revision),
             (
-                16,
+                17,
                 "native-v6-delta-v1",
                 pin.index_generation.to_string(),
                 pin.index_revision as i64
@@ -2592,7 +2592,7 @@ mod gc_schema_race_tests {
     }
 
     #[test]
-    fn exact_v16_gc_candidate_survives_unknown_busy_then_deletes_after_fences_clear() {
+    fn exact_v17_gc_candidate_survives_unknown_busy_then_deletes_after_fences_clear() {
         let state = tempfile::tempdir().unwrap();
         let candidate_root = tempfile::tempdir().unwrap();
         let current_root = tempfile::tempdir().unwrap();
@@ -2706,7 +2706,7 @@ mod gc_schema_race_tests {
         assert_eq!(
             inspect_index(&dir, &identity.root_key, now).unwrap(),
             ("unknown", "recent_open"),
-            "genuine current-v16 cache must pass GC admission"
+            "genuine current-v17 cache must pass GC admission"
         );
 
         let attacker = rusqlite::Connection::open(&path).unwrap();
@@ -2724,7 +2724,7 @@ mod gc_schema_race_tests {
         assert_eq!(
             (schema, marker.as_str(), generation, revision),
             (
-                16,
+                17,
                 "native-v4",
                 pin.index_generation.to_string(),
                 pin.index_revision as i64
@@ -2878,7 +2878,7 @@ mod gc_final_witness_tests {
         assert_eq!(
             db.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            16
+            17
         );
         drop(live);
         assert!(roots.index_use_lock(&candidate).exists());
