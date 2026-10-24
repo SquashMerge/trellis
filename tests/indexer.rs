@@ -212,6 +212,8 @@ fn scip_label_requires_exact_captured_hash_and_name_token_and_never_supplies_ide
     let mut index = scip::types::Index::new();
     let mut document = scip::types::Document::new();
     document.relative_path = "main.js".into();
+    document.position_encoding =
+        scip::types::PositionEncoding::UTF16CodeUnitOffsetFromLineStart.into();
     let mut occurrence = scip::types::Occurrence::new();
     occurrence.range = vec![0, 9, 10];
     occurrence.symbol_roles = 1; // exact declaration-name token, not a call target
@@ -270,6 +272,145 @@ fn scip_label_requires_exact_captured_hash_and_name_token_and_never_supplies_ide
             .iter()
             .all(|n| n.display_label.is_none())
     );
+}
+
+#[test]
+fn scip_display_rejects_unspecified_and_unknown_encoding() {
+    use protobuf::Message;
+    use sha2::{Digest, Sha256};
+    let d = tempfile::tempdir().unwrap();
+    let source = "function f() {}\n";
+    write(d.path(), "main.js", source);
+    let hash = hex::encode(Sha256::digest(source.as_bytes()));
+    fs::write(
+        d.path().join("manifest.json"),
+        serde_json::to_vec(&serde_json::json!({"main.js": hash})).unwrap(),
+    )
+    .unwrap();
+    let mut options = IndexOptions::new(d.path().to_owned());
+    options.scip_path = Some(d.path().join("index.scip"));
+    options.manifest_path = Some(d.path().join("manifest.json"));
+    let baseline = run(&IndexOptions::new(d.path().to_owned()));
+    let mut index = scip::types::Index::new();
+    let mut doc = scip::types::Document::new();
+    doc.relative_path = "main.js".into();
+    let mut occ = scip::types::Occurrence::new();
+    occ.range = vec![0, 9, 10];
+    occ.symbol_roles = 1;
+    occ.symbol = "scip display f()".into();
+    doc.occurrences.push(occ);
+    index.documents.push(doc);
+    for encoding in [0, 77, 2] {
+        index.documents[0].position_encoding = protobuf::EnumOrUnknown::from_i32(encoding);
+        fs::write(d.path().join("index.scip"), index.write_to_bytes().unwrap()).unwrap();
+        let graph = run(&options);
+        let label = graph
+            .nodes
+            .iter()
+            .find(|n| n.name == "f")
+            .unwrap()
+            .display_label
+            .as_deref();
+        assert_eq!(
+            label,
+            if encoding == 2 {
+                Some("scip display f()")
+            } else {
+                None
+            },
+            "encoding {encoding}"
+        );
+        assert_eq!(
+            graph.nodes.iter().map(|n| &n.id).collect::<Vec<_>>(),
+            baseline.nodes.iter().map(|n| &n.id).collect::<Vec<_>>()
+        );
+    }
+}
+
+#[test]
+fn scip_display_typed_ranges_and_duplicate_paths_are_optional_only() {
+    use protobuf::Message;
+    use sha2::{Digest, Sha256};
+    let d = tempfile::tempdir().unwrap();
+    let source = "function f() {}\n";
+    write(d.path(), "main.js", source);
+    let hash = hex::encode(Sha256::digest(source.as_bytes()));
+    fs::write(
+        d.path().join("manifest.json"),
+        serde_json::to_vec(&serde_json::json!({"main.js": hash})).unwrap(),
+    )
+    .unwrap();
+    let mut options = IndexOptions::new(d.path().to_owned());
+    options.scip_path = Some(d.path().join("index.scip"));
+    options.manifest_path = Some(d.path().join("manifest.json"));
+    let baseline = run(&IndexOptions::new(d.path().to_owned()));
+    let mut index = scip::types::Index::new();
+    let mut doc = scip::types::Document::new();
+    doc.relative_path = "main.js".into();
+    doc.position_encoding = scip::types::PositionEncoding::UTF16CodeUnitOffsetFromLineStart.into();
+    let mut occ = scip::types::Occurrence::new();
+    occ.symbol_roles = 1;
+    occ.symbol = "scip display f()".into();
+    doc.occurrences.push(occ);
+    index.documents.push(doc);
+    for variant in 0..5 {
+        let occ = &mut index.documents[0].occurrences[0];
+        occ.range.clear();
+        occ.typed_range = None;
+        match variant {
+            0 => occ.range = vec![0, 9, 10],
+            1 => occ.range = vec![0, 9, 0, 10],
+            2 | 4 => {
+                let mut r = scip::types::SingleLineRange::new();
+                r.line = 0;
+                r.start_character = 9;
+                r.end_character = 10;
+                occ.set_single_line_range(r);
+                if variant == 4 {
+                    occ.range = vec![0, 9, 10];
+                }
+            }
+            _ => {
+                let mut r = scip::types::MultiLineRange::new();
+                r.start_line = 0;
+                r.start_character = 9;
+                r.end_line = 0;
+                r.end_character = 10;
+                occ.set_multi_line_range(r);
+            }
+        }
+        fs::write(d.path().join("index.scip"), index.write_to_bytes().unwrap()).unwrap();
+        let graph = run(&options);
+        assert_eq!(
+            graph
+                .nodes
+                .iter()
+                .find(|n| n.name == "f")
+                .unwrap()
+                .display_label
+                .as_deref(),
+            if variant == 4 {
+                None
+            } else {
+                Some("scip display f()")
+            },
+            "variant {variant}"
+        );
+    }
+    index.documents[0].occurrences[0].typed_range = None;
+    index.documents[0].occurrences[0].range = vec![0, 9, 10];
+    let mut duplicate = scip::types::Document::new();
+    duplicate.relative_path = "main.js".into();
+    duplicate.language = "java".into();
+    index.documents.push(duplicate);
+    fs::write(d.path().join("index.scip"), index.write_to_bytes().unwrap()).unwrap();
+    let graph = run(&options);
+    assert!(graph.nodes.iter().all(|n| n.display_label.is_none()));
+    assert_eq!(
+        graph.nodes.iter().map(|n| &n.id).collect::<Vec<_>>(),
+        baseline.nodes.iter().map(|n| &n.id).collect::<Vec<_>>()
+    );
+    assert_eq!(graph.calls, baseline.calls);
 }
 
 #[test]
@@ -1412,6 +1553,8 @@ fn measured_scip_label_and_cutoff_change_projection_but_not_native_fingerprint()
         let mut index = scip::types::Index::new();
         let mut document = scip::types::Document::new();
         document.relative_path = path.into();
+        document.position_encoding =
+            scip::types::PositionEncoding::UTF16CodeUnitOffsetFromLineStart.into();
         let mut occurrence = scip::types::Occurrence::new();
         let column = source.find("f(").unwrap();
         assert!(column < 30);

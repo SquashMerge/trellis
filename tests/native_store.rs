@@ -855,6 +855,8 @@ fn every_encoded_selected_id_rejects_wrong_length_blob() {
     let mut index = scip::types::Index::new();
     let mut document = scip::types::Document::new();
     document.relative_path = "flow.java".into();
+    document.position_encoding =
+        scip::types::PositionEncoding::UTF16CodeUnitOffsetFromLineStart.into();
     let mut occurrence = scip::types::Occurrence::new();
     occurrence.range = vec![1, 6, 10];
     occurrence.symbol_roles = 1;

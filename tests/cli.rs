@@ -671,6 +671,8 @@ fn write_optional_presentation(dir: &std::path::Path, label: &str, source_hash: 
     let mut index = scip::types::Index::new();
     let mut document = scip::types::Document::new();
     document.relative_path = "main.js".into();
+    document.position_encoding =
+        scip::types::PositionEncoding::UTF16CodeUnitOffsetFromLineStart.into();
     let mut occurrence = scip::types::Occurrence::new();
     occurrence.range = vec![0, 9, 10];
     occurrence.symbol_roles = 1;

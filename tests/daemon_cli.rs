@@ -1472,6 +1472,8 @@ async fn cold_serve_startup_preserves_implicit_scip_and_honors_explicit_default_
         let mut scip = scip::types::Index::new();
         let mut document = scip::types::Document::new();
         document.relative_path = "sample.js".into();
+        document.position_encoding =
+            scip::types::PositionEncoding::UTF16CodeUnitOffsetFromLineStart.into();
         let mut occurrence = scip::types::Occurrence::new();
         occurrence.range = vec![0, 9, 10];
         occurrence.symbol_roles = 1;
