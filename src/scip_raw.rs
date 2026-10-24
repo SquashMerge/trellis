@@ -412,6 +412,15 @@ fn position_walk_hook(flag: &CancelFlag) {
         }
     });
 }
+fn next_newline(bytes: &[u8], flag: &CancelFlag) -> Result<Option<usize>, ScipCaptureError> {
+    for (chunk_index, chunk) in bytes.chunks(65536).enumerate() {
+        cancelled(flag)?;
+        if let Some(at) = chunk.iter().position(|b| *b == b'\n') {
+            return Ok(Some(chunk_index * 65536 + at));
+        }
+    }
+    Ok(None)
+}
 fn validate_positions(
     text: &str,
     enc: u8,
@@ -422,18 +431,12 @@ fn validate_positions(
     if positions.is_empty() {
         return Ok(());
     }
-    let mut starts = vec![0usize];
-    for (i, b) in text.bytes().enumerate() {
-        if i.is_multiple_of(65536) {
-            cancelled(flag)?;
-        }
-        if b == b'\n' {
-            starts.push(i + 1);
-        }
-    }
     positions.sort_unstable();
     positions.dedup();
-    let mut current_line = None;
+    let bytes = text.as_bytes();
+    let mut current_line = 0usize;
+    let mut line_start = 0usize;
+    let mut loaded_line = None;
     let mut chars = "".chars();
     let mut measured = 0usize;
     let mut steps = 0usize;
@@ -441,23 +444,28 @@ fn validate_positions(
         if line < 0 || column < 0 {
             return Err(invalid("negative position"));
         }
-        let line_index = line as usize;
-        if current_line != Some(line_index) {
-            let start = *starts
-                .get(line_index)
-                .ok_or_else(|| invalid("range line outside source"))?;
-            let next = starts.get(line_index + 1).copied();
-            // Exactly one CR immediately before LF is the line-break pair.
-            let end = next.map_or(text.len(), |i| {
-                if i >= 2 && text.as_bytes()[i - 2] == b'\r' {
-                    i - 2
-                } else {
-                    i - 1
+        let target = line as usize;
+        if loaded_line != Some(target) {
+            while current_line < target {
+                let newline = next_newline(&bytes[line_start..], flag)?
+                    .ok_or_else(|| invalid("range line outside source"))?;
+                line_start += newline + 1;
+                current_line += 1;
+            }
+            let end = match next_newline(&bytes[line_start..], flag)? {
+                Some(offset) => {
+                    let end = line_start + offset;
+                    if end > line_start && bytes[end - 1] == b'\r' {
+                        end - 1
+                    } else {
+                        end
+                    }
                 }
-            });
-            chars = text[start..end].chars();
+                None => bytes.len(),
+            };
+            chars = text[line_start..end].chars();
             measured = 0;
-            current_line = Some(line_index);
+            loaded_line = Some(target);
         }
         while measured < column as usize {
             let c = chars
@@ -1441,6 +1449,15 @@ mod tests {
             assert!(check_position("a\r\r\n", 0, 3, enc).is_err());
             assert!(check_position("a\r\r\n", 1, 0, enc).is_ok());
         }
+        let dense = "\n".repeat(50_000);
+        let mut sparse = vec![(0, 0), (49_999, 0), (50_000, 0)];
+        validate_positions(&dense, 1, &mut sparse, &Arc::new(AtomicBool::new(false))).unwrap();
+        assert_eq!(
+            sparse.len(),
+            3,
+            "memory follows requested positions, not newline count"
+        );
+        assert!(check_position(&dense, 50_001, 0, 1).is_err());
         let long = format!("{}z", "x".repeat(120_000));
         let mut many = (0..2000).map(|_| (0, 120_000)).collect::<Vec<_>>();
         validate_positions(&long, 1, &mut many, &Arc::new(AtomicBool::new(false))).unwrap();
