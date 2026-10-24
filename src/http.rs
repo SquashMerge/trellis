@@ -3626,6 +3626,8 @@ pub struct ProvisionedBrowser {
     metrics_deadline_ms: Arc<std::sync::atomic::AtomicU64>,
     metrics_test_cancel: Arc<std::sync::atomic::AtomicBool>,
     metrics_clock_skew_ms: Arc<std::sync::atomic::AtomicU64>,
+    #[cfg(feature = "test-support")]
+    metrics_clock: Arc<Mutex<Option<Instant>>>,
 }
 
 impl ProvisionedBrowser {
@@ -3651,6 +3653,8 @@ impl ProvisionedBrowser {
             metrics_deadline_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             metrics_test_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             metrics_clock_skew_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(feature = "test-support")]
+            metrics_clock: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -3679,6 +3683,11 @@ impl ProvisionedBrowser {
     pub fn set_metrics_clock_skew_for_tests(&self, milliseconds: u64) {
         self.metrics_clock_skew_ms
             .store(milliseconds, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn set_metrics_clock_for_tests(&self, now: Instant) {
+        *self.metrics_clock.lock().unwrap() = Some(now);
     }
 
     pub fn router(self) -> Router {
@@ -3906,6 +3915,8 @@ async fn provisioned_core(
         Err(error) => Err(error),
         Ok(runtime) => {
             let hook = browser.response_hook.lock().unwrap().clone();
+            #[cfg(feature = "test-support")]
+            let frozen_now = *browser.metrics_clock.lock().unwrap();
             let result = provisioned_core_answer(
                 &runtime,
                 &method,
@@ -3922,6 +3933,8 @@ async fn provisioned_core(
                         .load(std::sync::atomic::Ordering::Relaxed),
                     test_cancel: browser.metrics_test_cancel.clone(),
                     clock_skew_ms: browser.metrics_clock_skew_ms.clone(),
+                    #[cfg(feature = "test-support")]
+                    frozen_now,
                 },
             )
             .await;
@@ -4354,6 +4367,18 @@ struct MetricsHttpControls {
     deadline_ms: u64,
     test_cancel: Arc<std::sync::atomic::AtomicBool>,
     clock_skew_ms: Arc<std::sync::atomic::AtomicU64>,
+    #[cfg(feature = "test-support")]
+    frozen_now: Option<Instant>,
+}
+
+impl MetricsHttpControls {
+    fn now(&self) -> Instant {
+        #[cfg(feature = "test-support")]
+        if let Some(now) = self.frozen_now {
+            return now;
+        }
+        Instant::now()
+    }
 }
 
 async fn provisioned_core_answer(
@@ -4387,7 +4412,7 @@ async fn provisioned_core_answer(
                 } else {
                     Duration::from_secs(30)
                 };
-                let deadline = Instant::now() + duration;
+                let deadline = metrics.now() + duration;
                 let work_hook = hook.clone();
                 let finish_hook = hook.clone();
                 let serialize_hook = hook.clone();
@@ -4440,7 +4465,7 @@ async fn provisioned_core_answer(
                             }
                             anyhow::bail!("cancelled");
                         }
-                        if Instant::now()
+                        if metrics.now()
                             + Duration::from_millis(
                                 metrics
                                     .clock_skew_ms

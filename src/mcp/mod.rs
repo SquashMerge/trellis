@@ -35,6 +35,11 @@ type EvidenceErrorHook =
 #[doc(hidden)]
 #[derive(Clone, Default)]
 pub struct TransportHooksForTests {
+    /// A paused call clock shared with this fixture's checkout runtime. Its
+    /// presence disables real-time call-expiry wakeups; explicit input or worker
+    /// completion publishes progress. Final-check retry timers stay real-time.
+    pub paused_clock_for_tests:
+        Option<std::sync::Arc<dyn Fn() -> std::time::Instant + Send + Sync>>,
     /// On the reader thread, after each frame is complete and counted, before
     /// it is published to the coordinator.
     pub frame_read: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
@@ -97,6 +102,28 @@ impl OpenedWorkspace {
     pub fn with_call_deadline_for_tests(mut self, deadline: std::time::Duration) -> Self {
         self.call_deadline = deadline;
         self
+    }
+    fn clock_now(&self) -> std::time::Instant {
+        #[cfg(feature = "test-support")]
+        if let Some(clock) = &self.hooks.paused_clock_for_tests {
+            return clock();
+        }
+        std::time::Instant::now()
+    }
+    fn helper_deadline(&self, deadline: std::time::Instant) -> std::time::Instant {
+        #[cfg(feature = "test-support")]
+        if self.hooks.paused_clock_for_tests.is_some() {
+            return std::time::Instant::now()
+                + deadline.saturating_duration_since(self.clock_now());
+        }
+        deadline
+    }
+    fn call_timer_enabled(&self) -> bool {
+        #[cfg(feature = "test-support")]
+        if self.hooks.paused_clock_for_tests.is_some() {
+            return false;
+        }
+        true
     }
     pub fn label(&self) -> &str {
         &self.label
@@ -333,6 +360,7 @@ fn evidence_read(
     daemon_handle: Option<&tokio::runtime::Handle>,
     selected: Option<&crate::daemon::registry::SelectedCheckout>,
     deadline: std::time::Instant,
+    clock_now: &dyn Fn() -> std::time::Instant,
     cancel: &std::sync::atomic::AtomicBool,
     publish: &dyn Fn(bool),
     id: &serde_json::Value,
@@ -354,7 +382,7 @@ fn evidence_read(
         match probe.check() {
             Ok(()) => {}
             Err(error) if crate::store::cli_read_retryable_contention(&error) => {
-                if cancelled() || std::time::Instant::now() >= deadline {
+                if cancelled() || clock_now() >= deadline {
                     anyhow::bail!("deadline_exceeded: MCP selected read deadline");
                 }
                 std::thread::sleep(std::time::Duration::from_millis(1));
@@ -956,6 +984,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                     daemon_handle.as_ref(),
                     selected.as_ref(),
                     deadline,
+                    &|| workspace.clock_now(),
                     &cancel,
                     &publish,
                     id,
@@ -1287,6 +1316,7 @@ fn coordinate(
     let reader_sender = sender.clone();
     let window = std::sync::Arc::new(FrameWindow::default());
     let reader_window = window.clone();
+    let reader_workspace = workspace.clone();
     #[cfg(feature = "test-support")]
     let frame_read = workspace.hooks.frame_read.clone();
     let completed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -1303,7 +1333,7 @@ fn coordinate(
                 };
                 // Protocol acceptance: the deadline starts when the frame is
                 // complete, not when the coordinator reaches it.
-                let accepted = Instant::now();
+                let accepted = reader_workspace.clock_now();
                 // Counted when complete, before it is published: a decision
                 // that samples the count waits for every frame it covers.
                 let seq = counter.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
@@ -1418,6 +1448,7 @@ fn coordinate(
                 .min();
             let next = in_flight
                 .values()
+                .filter(|_| workspace.call_timer_enabled())
                 .map(|call| call.deadline)
                 .chain(retry)
                 .min();
@@ -1462,16 +1493,22 @@ fn coordinate(
             };
             let outcome = outcome?;
             let selected = match &outcome.finals {
-                Finals::Selected { witness, .. } if Instant::now() < call.deadline => {
+                Finals::Selected { witness, .. } if workspace.clock_now() < call.deadline => {
                     Some((witness.clone(), "selected_final"))
                 }
-                Finals::Capacity { witness, .. } if Instant::now() < call.deadline => {
+                Finals::Capacity { witness, .. } if workspace.clock_now() < call.deadline => {
                     Some((witness.clone(), "capacity_final"))
                 }
                 _ => None,
             };
             if let Some((witness, stage)) = selected {
-                let running = start_final_check(token, &witness, call.deadline, stage, &sender);
+                let running = start_final_check(
+                    token,
+                    &witness,
+                    workspace.helper_deadline(call.deadline),
+                    stage,
+                    &sender,
+                );
                 let retry_at = (!running).then(|| Instant::now() + FINAL_RECHECK_TICK);
                 checks.insert(
                     token,
@@ -1484,7 +1521,7 @@ fn coordinate(
                 continue;
             }
             let mut result = outcome.result;
-            if Instant::now() < call.deadline
+            if workspace.clock_now() < call.deadline
                 && let Finals::Launch { catching_up } = &outcome.finals
             {
                 phase_hook("launch_final")?;
@@ -1530,7 +1567,7 @@ fn coordinate(
                     capacity: matches!(check.outcome.finals, Finals::Capacity { .. }),
                 }),
                 Err(SelectionError::Unavailable) => {
-                    if Instant::now() < call.deadline {
+                    if workspace.clock_now() < call.deadline {
                         check.running = false;
                         check.retry_at = Some(Instant::now() + FINAL_RECHECK_TICK);
                         checks.insert(token, check);
@@ -1556,7 +1593,11 @@ fn coordinate(
             finished.push((token, check.outcome.result, gate));
         }
         let now = Instant::now();
-        checks.retain(|token, _| in_flight.get(token).is_some_and(|call| now < call.deadline));
+        checks.retain(|token, _| {
+            in_flight
+                .get(token)
+                .is_some_and(|call| workspace.clock_now() < call.deadline)
+        });
         for (token, check) in &mut checks {
             if check.running || check.retry_at.is_some_and(|at| now < at) {
                 continue;
@@ -1566,7 +1607,7 @@ fn coordinate(
             else {
                 unreachable!("only selected calls have final checks")
             };
-            let deadline = in_flight[token].deadline;
+            let deadline = workspace.helper_deadline(in_flight[token].deadline);
             check.running = start_final_check(*token, witness, deadline, "final_recheck", &sender);
             check.retry_at = (!check.running).then(|| now + FINAL_RECHECK_TICK);
         }
@@ -1616,7 +1657,7 @@ fn coordinate(
                 continue;
             };
             phase_hook("call_send")?;
-            let result = if Instant::now() >= call.deadline {
+            let result = if workspace.clock_now() >= call.deadline {
                 deadline_answer(&call)
             } else if let Some(gate) = gate {
                 match gate.witness.verify_at_send(&gate.dirs) {
@@ -1664,7 +1705,7 @@ fn coordinate(
                 wire::write_relayed_response(&mut writer, call.relay, &value)?;
             }
         }
-        let now = Instant::now();
+        let now = workspace.clock_now();
         let mut expired: Vec<u64> = in_flight
             .iter()
             .filter(|(_, call)| call.deadline <= now)
@@ -1713,7 +1754,7 @@ fn coordinate(
                             modern,
                         ))
                     };
-                    if Instant::now() >= deadline {
+                    if workspace.clock_now() >= deadline {
                         // The deadline overrides any outcome still unsent.
                         refuse("deadline_exceeded")
                     } else if tools::validate(name, arguments.as_ref()).is_err() {

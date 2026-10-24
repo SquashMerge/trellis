@@ -369,6 +369,8 @@ impl CheckoutRegistry {
             #[cfg(feature = "test-support")]
             mcp_hint_clock_origin: std::sync::Mutex::new(None),
             #[cfg(feature = "test-support")]
+            mcp_call_clock_origin: std::sync::Mutex::new(None),
+            #[cfg(feature = "test-support")]
             mcp_read_hook: std::sync::Mutex::new(None),
             #[cfg(feature = "test-support")]
             mcp_read_gate: std::sync::Mutex::new(None),
@@ -1595,6 +1597,8 @@ pub struct CheckoutRuntime {
     /// a test can pass a call deadline without waiting real seconds.
     #[cfg(feature = "test-support")]
     mcp_clock_skew_ms: std::sync::atomic::AtomicU64,
+    #[cfg(feature = "test-support")]
+    mcp_call_clock_origin: std::sync::Mutex<Option<Instant>>,
     /// Optional hint clock can be frozen separately from the real mandatory deadline.
     #[cfg(feature = "test-support")]
     mcp_hint_clock_origin: std::sync::Mutex<Option<Instant>>,
@@ -1918,8 +1922,8 @@ impl CheckoutRuntime {
         resources.store.verify_committed_writer_claim(&session)
     }
 
-    /// The clock MCP call deadlines are checked against: real time, plus any
-    /// virtual time a test has advanced on this checkout.
+    /// The clock MCP call deadlines are checked against: real time (or a
+    /// paused test origin), plus virtual time advanced on this checkout.
     pub(crate) fn mcp_clock_now(&self) -> Instant {
         #[cfg(feature = "test-support")]
         let skew = Duration::from_millis(
@@ -1928,7 +1932,24 @@ impl CheckoutRuntime {
         );
         #[cfg(not(feature = "test-support"))]
         let skew = Duration::ZERO;
+        #[cfg(feature = "test-support")]
+        if let Some(origin) = *self.mcp_call_clock_origin.lock().unwrap() {
+            return origin + skew;
+        }
         Instant::now() + skew
+    }
+
+    /// Pause mandatory call time; share this clock with the test transport.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn freeze_mcp_call_clock_for_tests(&self, origin: Instant) {
+        *self.mcp_call_clock_origin.lock().unwrap() = Some(origin);
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn mcp_call_clock_now_for_tests(&self) -> Instant {
+        self.mcp_clock_now()
     }
 
     /// Freeze only optional hint accounting. Mandatory call deadlines keep using real time.

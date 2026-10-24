@@ -785,6 +785,15 @@ fn call(legacy: bool, id: Value, name: &str, arguments: Value) -> Value {
     }
 }
 fn phase_barrier(listener: &std::os::unix::net::UnixListener, stage: &str, mutate: impl FnOnce()) {
+    phase_barrier_before_reply(listener, stage, None, mutate);
+}
+
+fn phase_barrier_before_reply(
+    listener: &std::os::unix::net::UnixListener,
+    stage: &str,
+    replies: Option<&Receiver<Value>>,
+    mutate: impl FnOnce(),
+) {
     listener.set_nonblocking(true).unwrap();
     let deadline = std::time::Instant::now() + trellis::testing::HANG_BACKSTOP;
     let mut stream = loop {
@@ -794,6 +803,15 @@ fn phase_barrier(listener: &std::os::unix::net::UnixListener, stage: &str, mutat
                 if error.kind() == std::io::ErrorKind::WouldBlock
                     && std::time::Instant::now() < deadline =>
             {
+                if let Some(replies) = replies {
+                    match replies.try_recv() {
+                        Ok(reply) => panic!("MCP replied before phase {stage}: {reply}"),
+                        Err(mpsc::TryRecvError::Disconnected) => {
+                            panic!("MCP reply reader ended before phase {stage}")
+                        }
+                        Err(mpsc::TryRecvError::Empty) => {}
+                    }
+                }
                 std::thread::yield_now()
             }
             Err(error) => panic!("MCP phase {stage} was not reached: {error}"),
@@ -3011,40 +3029,132 @@ fn stalling_git_path(temp: &Path, flag: &Path, once: bool) -> std::ffi::OsString
 /// #131: a final selected check whose Git lookup outlives its bound (a loaded
 /// host) proves no root change. The call retries within its deadline and
 /// answers; it was `root_changed`.
-#[test]
-fn final_selected_check_survives_a_slow_git_lookup() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn final_selected_check_survives_a_slow_git_lookup() {
+    use trellis::daemon::registry::CheckoutRegistry;
+    use trellis::store::topology::{TopologyRoots, WorkspaceIdentity};
     let temp = tempfile::tempdir().unwrap();
     let (main, linked) = git_linked_fixture(temp.path());
+    let identity = WorkspaceIdentity::discover(Some(&main), &main)
+        .unwrap()
+        .attach_marker()
+        .unwrap();
+    let topology =
+        TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(301, &identity).unwrap();
+    let selected = registry.select(301, &identity, &linked).unwrap();
+    let runtime = registry.activate(&selected.identity.root_key).unwrap();
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        loop {
+            if let Ok((response, catching_up)) = runtime.evidence_response()
+                && response.finish(()).is_ok()
+                && !catching_up
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("linked checkout did not settle before the final-check fixture");
+    runtime
+        .freeze_mcp_call_clock_for_tests(std::time::Instant::now() - trellis::mcp::CALL_DEADLINE);
+    let clock = runtime.clone();
+    let hooks = trellis::mcp::TransportHooksForTests {
+        paused_clock_for_tests: Some(std::sync::Arc::new(move || {
+            clock.mcp_call_clock_now_for_tests()
+        })),
+        ..Default::default()
+    };
     let slow = temp.path().join("slow-next-git");
     let path = stalling_git_path(temp.path(), &slow, true);
     let socket = temp.path().join("phase.sock");
     let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-    let mut peer = Peer::start_with_phase_env(
-        Some(&main),
-        Some(("selected_final", &socket)),
-        &[("PATH", path.as_os_str())],
-    );
-    peer.send_raw(
-        serde_json::to_string(&call(
+    struct FixtureGuard {
+        env: Vec<(&'static str, Option<std::ffi::OsString>)>,
+        client: Option<std::os::unix::net::UnixStream>,
+        session: Option<std::thread::JoinHandle<std::io::Result<()>>>,
+        reader: Option<std::thread::JoinHandle<()>>,
+    }
+    impl Drop for FixtureGuard {
+        fn drop(&mut self) {
+            if let Some(client) = &self.client {
+                let _ = client.shutdown(std::net::Shutdown::Both);
+            }
+            if let Some(reader) = self.reader.take() {
+                let _ = reader.join();
+            }
+            if let Some(session) = self.session.take() {
+                let _ = session.join();
+            }
+            for (key, value) in &self.env {
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+    }
+    let mut cleanup = FixtureGuard {
+        env: [
+            "PATH",
+            "TRELLIS_TEST_MCP_PHASE",
+            "TRELLIS_TEST_MCP_PHASE_SOCKET",
+        ]
+        .into_iter()
+        .map(|key| (key, std::env::var_os(key)))
+        .collect(),
+        client: None,
+        session: None,
+        reader: None,
+    };
+    unsafe {
+        std::env::set_var("PATH", &path);
+        std::env::set_var("TRELLIS_TEST_MCP_PHASE", "selected_final");
+        std::env::set_var("TRELLIS_TEST_MCP_PHASE_SOCKET", &socket);
+    }
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    let (client, mut reader, session) = hooked_session(&identity, &registry, 301, None, hooks);
+    cleanup.client = Some(client);
+    cleanup.session = Some(session);
+    writeln!(
+        cleanup.client.as_mut().unwrap(),
+        "{}",
+        call(
             false,
             json!(1),
             "trellis_workspace_describe",
             json!({"schemaVersion":1,"workspace":linked}),
-        ))
-        .unwrap()
-        .as_bytes(),
-    );
-    phase_barrier(&listener, "selected_final", || {
+        )
+    )
+    .unwrap();
+    let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+    cleanup.reader = Some(std::thread::spawn(move || {
+        let _ = reply_tx.send(next_reply(&mut reader));
+    }));
+    phase_barrier_before_reply(&listener, "selected_final", Some(&reply_rx), || {
         fs::write(&slow, b"").unwrap()
     });
-    let reply = peer.reply();
+    let reply = reply_rx
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .unwrap();
+    cleanup.reader.take().unwrap().join().unwrap();
     assert!(!slow.exists(), "the final check ran no Git lookup");
     tool(&reply, None, true);
     assert_eq!(
         reply["result"]["structuredContent"]["workspace"],
         json!(linked)
     );
-    assert!(peer.finish().0.success());
+    cleanup
+        .client
+        .take()
+        .unwrap()
+        .shutdown(std::net::Shutdown::Both)
+        .unwrap();
+    cleanup.session.take().unwrap().join().unwrap().unwrap();
 }
 
 /// #131 review: a final selected check that keeps stalling waits off the
@@ -7933,6 +8043,7 @@ fn mcp_outgoing_wire_fixture(
 struct OutgoingFixtureTiming {
     accept_delay: Duration,
     call_deadline: Option<Duration>,
+    paused_call_clock: bool,
 }
 
 /// As `mcp_outgoing_wire_fixture`, sending the call `accept_delay` after the
@@ -8012,8 +8123,23 @@ fn mcp_outgoing_wire_fixture_delayed(
         });
     }
     let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    let hooks = if timing.paused_call_clock {
+        // A past origin makes any accidental real-clock check fail immediately.
+        runtime.freeze_mcp_call_clock_for_tests(
+            std::time::Instant::now() - trellis::mcp::CALL_DEADLINE,
+        );
+        let clock = runtime.clone();
+        trellis::mcp::TransportHooksForTests {
+            paused_clock_for_tests: Some(std::sync::Arc::new(move || {
+                clock.mcp_call_clock_now_for_tests()
+            })),
+            ..Default::default()
+        }
+    } else {
+        Default::default()
+    };
     let (mut client, mut reader, session) =
-        socket_session(&identity, &registry, 301, timing.call_deadline);
+        hooked_session(&identity, &registry, 301, timing.call_deadline, hooks);
     if legacy {
         writeln!(
             client,
@@ -8709,8 +8835,7 @@ async fn mcp_outgoing_response_bytes_call_prefix_before_global_hints() {
         .iter()
         .map(|(p, s)| (p.as_str(), s.as_str()))
         .collect();
-    // This tests response-byte ordering, not the production five-second deadline.
-    // Allow a loaded test host to finish all required call materialization.
+    // Byte ordering is independent of elapsed time; deadline tests use real clocks.
     let reply = mcp_outgoing_wire_fixture_delayed(
         &borrowed,
         "Owner",
@@ -8719,7 +8844,7 @@ async fn mcp_outgoing_response_bytes_call_prefix_before_global_hints() {
         false,
         false,
         OutgoingFixtureTiming {
-            call_deadline: Some(Duration::from_secs(10)),
+            paused_call_clock: true,
             ..Default::default()
         },
     )
@@ -9055,7 +9180,7 @@ async fn mcp_outgoing_complete_modern_legacy_frames_fill_candidates_after_all_ca
             legacy,
             false,
             OutgoingFixtureTiming {
-                call_deadline: Some(Duration::from_secs(10)),
+                paused_call_clock: true,
                 ..Default::default()
             },
         );
