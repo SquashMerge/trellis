@@ -1232,6 +1232,8 @@ fn write_class_scip_labels(root: &std::path::Path, label_version: &str) {
         );
         let mut document = scip::types::Document::new();
         document.relative_path = path.into();
+        document.position_encoding =
+            scip::types::PositionEncoding::UTF16CodeUnitOffsetFromLineStart.into();
         let mut occurrence = scip::types::Occurrence::new();
         occurrence.range = vec![0, column, column + 1];
         occurrence.symbol_roles = 1;

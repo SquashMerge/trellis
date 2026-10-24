@@ -3078,6 +3078,8 @@ fn captured_java_python_scip_labels_require_unique_measured_names_and_coordinate
         ] {
             let mut doc = scip::types::Document::new();
             doc.relative_path = path.into();
+            doc.position_encoding =
+                scip::types::PositionEncoding::UTF16CodeUnitOffsetFromLineStart.into();
             let mut occurrence = scip::types::Occurrence::new();
             occurrence.range = range;
             occurrence.symbol_roles = 1;
@@ -3241,6 +3243,8 @@ fn same_source_new_scip_label_reuses_native_and_reprojects_presentation_at_pinne
         let mut index = scip::types::Index::new();
         let mut document = scip::types::Document::new();
         document.relative_path = "A.java".into();
+        document.position_encoding =
+            scip::types::PositionEncoding::UTF16CodeUnitOffsetFromLineStart.into();
         let mut occurrence = scip::types::Occurrence::new();
         occurrence.range = vec![0, 6, 7];
         occurrence.symbol_roles = 1;
@@ -3374,6 +3378,8 @@ fn captured_scip_document_cutoff_refuses_optional_java_python_and_javascript_lab
     ] {
         let mut doc = scip::types::Document::new();
         doc.relative_path = path.into();
+        doc.position_encoding =
+            scip::types::PositionEncoding::UTF16CodeUnitOffsetFromLineStart.into();
         let mut occurrence = scip::types::Occurrence::new();
         occurrence.range = range;
         occurrence.symbol_roles = 1;
