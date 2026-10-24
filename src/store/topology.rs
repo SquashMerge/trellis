@@ -1840,7 +1840,7 @@ pub enum GcStage {
     AfterParentSync,
 }
 
-/// Schemas before the current v17 are disposable: no released binary that wrote
+/// Schemas before the current v19 are disposable: no released binary that wrote
 /// one can be served by this one, so GC needs no layout, root or age proof.
 fn old_index_schema(version: i64) -> bool {
     (1..i64::from(super::DATABASE_SCHEMA_VERSION)).contains(&version)
@@ -2476,7 +2476,7 @@ mod gc_schema_race_tests {
         assert_eq!(
             (schema, marker.as_str(), generation, revision),
             (
-                17,
+                19,
                 "native-v6-delta-v1",
                 pin.index_generation.to_string(),
                 pin.index_revision as i64
@@ -2706,7 +2706,7 @@ mod gc_schema_race_tests {
         assert_eq!(
             inspect_index(&dir, &identity.root_key, now).unwrap(),
             ("unknown", "recent_open"),
-            "genuine current-v17 cache must pass GC admission"
+            "genuine current-v19 cache must pass GC admission"
         );
 
         let attacker = rusqlite::Connection::open(&path).unwrap();
@@ -2724,7 +2724,7 @@ mod gc_schema_race_tests {
         assert_eq!(
             (schema, marker.as_str(), generation, revision),
             (
-                17,
+                19,
                 "native-v4",
                 pin.index_generation.to_string(),
                 pin.index_revision as i64
@@ -2878,7 +2878,7 @@ mod gc_final_witness_tests {
         assert_eq!(
             db.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            17
+            19
         );
         drop(live);
         assert!(roots.index_use_lock(&candidate).exists());

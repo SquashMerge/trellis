@@ -11,7 +11,7 @@ pub use requests::{MaintenanceQueueProbe, MaintenanceQueueState, QueueProbeAdmis
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     ops::{Deref, DerefMut},
     path::Path,
     sync::{
@@ -641,7 +641,7 @@ SELECT ?3+(CASE WHEN x.id IS NULL THEN 0 ELSE 39 END)+(CASE WHEN x.owner_syntax_
 UNION ALL
 SELECT ?3+(CASE WHEN x.call_id IS NULL THEN 0 ELSE 39 END)+(CASE WHEN x.region_id IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.ordinal AS BLOB)),0) AS row_bytes FROM native_version_call_regions x WHERE x.vid=?1
 UNION ALL
-SELECT ?3+78+COALESCE(length(CAST(x.ordinal AS BLOB)),0)+COALESCE(length(CAST(x.start_byte AS BLOB)),0)+COALESCE(length(CAST(x.end_byte AS BLOB)),0)+length(CAST(x.spelling AS BLOB))+length(CAST(x.lookup_key AS BLOB)) AS row_bytes FROM native_version_references x WHERE x.vid=?1
+SELECT ?3+78+COALESCE(length(CAST(x.ordinal AS BLOB)),0)+COALESCE(length(CAST(x.start_byte AS BLOB)),0)+COALESCE(length(CAST(x.end_byte AS BLOB)),0)+length(CAST(x.spelling AS BLOB))+length(CAST(COALESCE(x.lookup_key,x.spelling) AS BLOB)) AS row_bytes FROM native_version_references x WHERE x.vid=?1
 UNION ALL
 SELECT ?3+length(CAST(x.kind AS BLOB))+length(CAST(x.available AS BLOB))+COALESCE(length(CAST(x.diagnostic AS BLOB)),0)+length(CAST(x.ordinal AS BLOB)) AS row_bytes FROM native_version_capability_families x WHERE x.vid=?1
 UNION ALL
@@ -651,11 +651,11 @@ SELECT (SELECT length(content_hash)+20 FROM class_projections WHERE cid=x.cid)+(
 UNION ALL
 SELECT (SELECT length(content_hash)+20 FROM class_projections WHERE cid=x.cid)+COALESCE(length(CAST(x.id AS BLOB)),0)+39+(CASE WHEN x.target IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.payload AS BLOB)),0) AS row_bytes FROM class_relations x WHERE x.cid=?2
 )"#;
-const DATABASE_SCHEMA_VERSION: u32 = 17;
+const DATABASE_SCHEMA_VERSION: u32 = 19;
 const EXTRACTOR_VERSION: &str = "native-v6-delta-v1";
 const EVIDENCE_FORMAT: &str = "terminal-native-graph-v1";
-const CACHE_SCHEMA_V17: &str = r#"
-CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=17), extractor_version TEXT NOT NULL CHECK(extractor_version='native-v6-delta-v1'), root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL, reconcile_options TEXT);
+const CACHE_SCHEMA_V19: &str = r#"
+CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=19), extractor_version TEXT NOT NULL CHECK(extractor_version='native-v6-delta-v1'), root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL, reconcile_options TEXT);
 CREATE TABLE native_producers(id TEXT NOT NULL,version TEXT NOT NULL,executable_hash TEXT NOT NULL CHECK(length(executable_hash)=64),kind TEXT NOT NULL CHECK(kind='native'),position_encoding TEXT NOT NULL CHECK(position_encoding='utf8'),PRIMARY KEY(id,version));
 CREATE TABLE native_producer_languages(producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,language TEXT NOT NULL,inventory_authenticated INTEGER NOT NULL CHECK(inventory_authenticated IN (0,1)),ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(producer_id,producer_version,language),UNIQUE(producer_id,producer_version,ordinal),FOREIGN KEY(producer_id,producer_version) REFERENCES native_producers(id,version) DEFERRABLE INITIALLY DEFERRED);
 CREATE TABLE native_producer_inputs(producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,language TEXT NOT NULL,component_name TEXT NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(producer_id,producer_version,language,component_name),UNIQUE(producer_id,producer_version,language,ordinal),FOREIGN KEY(producer_id,producer_version,language) REFERENCES native_producer_languages(producer_id,producer_version,language) DEFERRABLE INITIALLY DEFERRED);
@@ -705,7 +705,7 @@ CREATE TABLE native_version_ancestor_signature_types(vid INTEGER NOT NULL,syntax
 CREATE TABLE native_version_headers(vid INTEGER NOT NULL,syntax_id BLOB NOT NULL,kind TEXT NOT NULL,name TEXT,result_type TEXT,PRIMARY KEY(vid,syntax_id),FOREIGN KEY(vid,syntax_id) REFERENCES native_version_declarations(vid,syntax_id) DEFERRABLE INITIALLY DEFERRED);
 CREATE TABLE native_version_header_items(vid INTEGER NOT NULL,syntax_id BLOB NOT NULL,item_kind TEXT NOT NULL CHECK(item_kind IN ('modifier','typeParameter','base')),ordinal INTEGER NOT NULL CHECK(ordinal>=0),value TEXT NOT NULL,PRIMARY KEY(vid,syntax_id,item_kind,ordinal),FOREIGN KEY(vid,syntax_id) REFERENCES native_version_headers(vid,syntax_id) DEFERRABLE INITIALLY DEFERRED);
 CREATE TABLE native_version_parameters(vid INTEGER NOT NULL,syntax_id BLOB NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),name TEXT,type_name TEXT,variadic INTEGER NOT NULL CHECK(variadic IN (0,1)),PRIMARY KEY(vid,syntax_id,ordinal),FOREIGN KEY(vid,syntax_id) REFERENCES native_version_headers(vid,syntax_id) DEFERRABLE INITIALLY DEFERRED);
-CREATE TABLE native_version_references(vid INTEGER NOT NULL,id BLOB NOT NULL,owner_syntax_id BLOB NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),start_byte INTEGER NOT NULL,end_byte INTEGER NOT NULL,spelling TEXT NOT NULL,lookup_key TEXT NOT NULL,CHECK(start_byte>=0 AND end_byte>start_byte),PRIMARY KEY(vid,id),UNIQUE(vid,owner_syntax_id,ordinal),FOREIGN KEY(vid,owner_syntax_id) REFERENCES native_version_declarations(vid,syntax_id) DEFERRABLE INITIALLY DEFERRED);
+CREATE TABLE native_version_references(vid INTEGER NOT NULL,id BLOB NOT NULL,owner_syntax_id BLOB NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),start_byte INTEGER NOT NULL,end_byte INTEGER NOT NULL,spelling TEXT NOT NULL,lookup_key TEXT,CHECK(start_byte>=0 AND end_byte>start_byte),PRIMARY KEY(vid,owner_syntax_id,ordinal),FOREIGN KEY(vid,owner_syntax_id) REFERENCES native_version_declarations(vid,syntax_id) DEFERRABLE INITIALLY DEFERRED) WITHOUT ROWID;
 CREATE TABLE native_version_capability_families(vid INTEGER NOT NULL REFERENCES document_versions(vid) DEFERRABLE INITIALLY DEFERRED,kind TEXT NOT NULL CHECK(kind IN ('declarationName','callee','invocation','reference')),available INTEGER NOT NULL CHECK(available IN (0,1)),diagnostic TEXT,ordinal INTEGER NOT NULL CHECK(ordinal>=0),CHECK((available=1 AND diagnostic IS NULL) OR (available=0 AND length(diagnostic)>0)),PRIMARY KEY(vid,kind),UNIQUE(vid,ordinal));
 CREATE TABLE native_version_capability_gaps(vid INTEGER NOT NULL,kind TEXT NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),start_byte INTEGER NOT NULL,end_byte INTEGER NOT NULL,diagnostic TEXT NOT NULL CHECK(length(diagnostic)>0),CHECK(start_byte>=0 AND end_byte>start_byte),PRIMARY KEY(vid,kind,ordinal),FOREIGN KEY(vid,kind) REFERENCES native_version_capability_families(vid,kind) DEFERRABLE INITIALLY DEFERRED);
 CREATE TABLE native_version_calls(vid INTEGER NOT NULL,id BLOB NOT NULL,owner_syntax_id BLOB NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),start_byte INTEGER NOT NULL,end_byte INTEGER NOT NULL,callee_start INTEGER,callee_end INTEGER,spelling TEXT,language TEXT NOT NULL,callee_lookup_key TEXT,CHECK(start_byte>=0 AND end_byte>start_byte),CHECK((callee_start IS NULL)=(callee_end IS NULL)),CHECK(callee_start IS NULL OR (callee_start>=start_byte AND callee_end<=end_byte AND callee_end>callee_start)),PRIMARY KEY(vid,id),UNIQUE(vid,owner_syntax_id,ordinal),FOREIGN KEY(vid,owner_syntax_id) REFERENCES native_version_declarations(vid,syntax_id) DEFERRABLE INITIALLY DEFERRED);
@@ -2649,7 +2649,7 @@ fn validate_cache_shape(db: &Connection) -> Result<()> {
         version == DATABASE_SCHEMA_VERSION,
         "incompatible_index: unknown schema version"
     );
-    expected.execute_batch(CACHE_SCHEMA_V17)?;
+    expected.execute_batch(CACHE_SCHEMA_V19)?;
     control_ensure!(
         objects(db)? == objects(&expected)?,
         "incompatible_index: unknown cache object type, name or shape"
@@ -2853,6 +2853,13 @@ fn cleanup_release_candidate(tx: &Connection, revision: &str, kind: &str) -> Res
                 );
                 let changed = if self_referential {
                     tx.execute(&format!("DELETE FROM {child} WHERE {child_key}=?1"), [id])?
+                } else if *child == "native_version_references" {
+                    tx.execute(
+                        "DELETE FROM native_version_references WHERE (vid,owner_syntax_id,ordinal) IN (
+                         SELECT vid,owner_syntax_id,ordinal FROM native_version_references
+                         WHERE vid=?1 ORDER BY owner_syntax_id,ordinal LIMIT 256)",
+                        [id],
+                    )?
                 } else {
                     tx.execute(
                         &format!("DELETE FROM {child} WHERE rowid IN (SELECT rowid FROM {child} WHERE {child_key}=?1 LIMIT 256)"),
@@ -6718,7 +6725,7 @@ fn write_native(
                 reference.range.start as i64,
                 reference.range.end as i64,
                 reference.spelling,
-                reference.lookup_key
+                (reference.lookup_key != reference.spelling).then_some(&reference.lookup_key)
             ],
         )?;
     }
@@ -6836,7 +6843,7 @@ fn validate_v8_bootstrap(db: &Connection) -> Result<()> {
         indexed_at.is_empty() && options.is_none(),
         "incompatible_index: invalid v8 bootstrap metadata"
     );
-    // Fixed identifiers from CACHE_SCHEMA_V17 only. Do not read table names from
+    // Fixed identifiers from CACHE_SCHEMA_V19 only. Do not read table names from
     // sqlite_master or treat a partial publication as a valid empty bootstrap.
     for name in [
         "class_projections",
@@ -8388,11 +8395,19 @@ fn read_native_references(
         known.insert(row?);
     }
     let mut references = vec![];
+    let mut ids = HashSet::<[u8; 16]>::new();
     let mut ordinals = BTreeMap::<String, usize>::new();
-    for row in db.prepare("SELECT id,owner_syntax_id,ordinal,start_byte,end_byte,spelling,lookup_key FROM native_version_references WHERE vid=?1 ORDER BY owner_syntax_id,ordinal")?
-        .query_map([scope.vid], |r| Ok((stored_id_row(r, 0, true)?, stored_id_row(r, 1, false)?,
-            r.get::<_, i64>(2)?, r.get::<_, i64>(3)?, r.get::<_, i64>(4)?, r.get::<_, String>(5)?, r.get::<_, String>(6)?)))? {
-        let (id, reference_owner, ordinal, start, end, spelling, lookup_key) = row?;
+    for row in db.prepare("SELECT id,owner_syntax_id,ordinal,start_byte,end_byte,spelling,COALESCE(lookup_key,spelling) FROM native_version_references WHERE vid=?1 ORDER BY owner_syntax_id,ordinal")?
+        .query_map([scope.vid], |r| {
+            let id = stored_id_row(r, 0, true)?;
+            // The decoder above checked the BLOB's exact length.
+            let mut raw_id = [0; 16];
+            raw_id.copy_from_slice(r.get_ref(0)?.as_blob()?);
+            Ok((id, raw_id, stored_id_row(r, 1, false)?,
+                r.get::<_, i64>(2)?, r.get::<_, i64>(3)?, r.get::<_, i64>(4)?, r.get::<_, String>(5)?, r.get::<_, String>(6)?))
+        })? {
+        let (id, raw_id, reference_owner, ordinal, start, end, spelling, lookup_key) = row?;
+        selected_ensure!(ids.insert(raw_id), "duplicate native reference ID");
         selected_ensure!(known.contains(&reference_owner), "orphan native reference owner");
         selected_ensure!(start >= 0 && end > start, "invalid native reference range");
         let n = ordinals.entry(reference_owner.clone()).or_default();
@@ -9098,7 +9113,7 @@ impl Store {
             db.pragma_update(None, "synchronous", "FULL")?;
             db.execute_batch("BEGIN IMMEDIATE")?;
             let result = (|| -> Result<()> {
-                db.execute_batch(CACHE_SCHEMA_V17)?;
+                db.execute_batch(CACHE_SCHEMA_V19)?;
                 let age = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
                 ensure!(age <= 9_007_199_254_740_991, "invalid_open_age");
                 db.execute(
@@ -16782,7 +16797,7 @@ impl Store {
 #[test]
 fn selected_ancillary_budget_matches_main_text_key_bytes() {
     let db = Connection::open_in_memory().unwrap();
-    db.execute_batch(CACHE_SCHEMA_V17).unwrap();
+    db.execute_batch(CACHE_SCHEMA_V19).unwrap();
     // The aggregate needs only synthetic child rows; FK behavior is covered by
     // publication/retention tests, not this isolated budget-SQL fixture.
     db.pragma_update(None, "foreign_keys", "OFF").unwrap();
@@ -16848,6 +16863,20 @@ fn selected_ancillary_budget_matches_main_text_key_bytes() {
     )
     .unwrap();
 
+    for (ordinal, spelling, lookup_key) in [(0, "name", None), (1, "Ａ", Some("A"))] {
+        db.execute(
+            "INSERT INTO native_version_references VALUES(1,?1,?2,?3,0,4,?4,?5)",
+            params![
+                &[ordinal as u8; 16][..],
+                &owner[..],
+                ordinal,
+                spelling,
+                lookup_key
+            ],
+        )
+        .unwrap();
+    }
+
     // Compute the former text-key cost from decoded handles and fixture values,
     // not from the budget SQL or SQLite BLOB lengths. Integer fields are charged
     // as decimal text, as they were on main.
@@ -16878,6 +16907,8 @@ fn selected_ancillary_budget_matches_main_text_key_bytes() {
             + bytes(&["javascript", "hello"]),
         version.len() + region_id.len() + sid.len() + decimal(&[0, 0, 7]) + bytes(&["if", "then"]),
         version.len() + call_id.len() + region_id.len() + decimal(&[0]),
+        version.len() + call_id.len() + sid.len() + decimal(&[0, 0, 4]) + bytes(&["name", "name"]),
+        version.len() + call_id.len() + sid.len() + decimal(&[1, 0, 4]) + bytes(&["Ａ", "A"]),
         class_projection_id
             + graph_projection_id
             + sid.len()
@@ -16895,6 +16926,52 @@ fn selected_ancillary_budget_matches_main_text_key_bytes() {
             *rows.iter().max().unwrap() as i64,
             rows.iter().sum::<usize>() as i64,
         )
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn immutable_reference_slot_rejects_changed_payload() {
+    let db = Connection::open_in_memory().unwrap();
+    db.execute_batch(CACHE_SCHEMA_V19).unwrap();
+    db.pragma_update(None, "foreign_keys", "OFF").unwrap();
+    let owner = [0x11u8; 16];
+    let original = [0x22u8; 16];
+    let changed = [0x33u8; 16];
+    let sql = "INSERT INTO native_version_references VALUES(?1,?2,?3,?4,?5,?6,?7,?8)";
+    let mut append = ImmutableAppend::default();
+    for id in [&original[..], &original[..]] {
+        append
+            .insert(
+                &db,
+                sql,
+                params![1, id, &owner[..], 0, 0, 4, "name", None::<&str>],
+            )
+            .unwrap();
+    }
+    let error = append
+        .insert(
+            &db,
+            sql,
+            params![1, &changed[..], &owner[..], 0, 0, 4, "name", None::<&str>],
+        )
+        .unwrap_err();
+    assert!(
+        error.downcast_ref::<ControlIntegrity>().is_some(),
+        "{error:#}"
+    );
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM native_version_references", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.query_row("SELECT id FROM native_version_references", [], |r| r
+            .get::<_, Vec<u8>>(0))
+            .unwrap(),
+        original
     );
 }
 
