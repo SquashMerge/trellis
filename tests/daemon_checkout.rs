@@ -1154,6 +1154,219 @@ async fn failed_startup_backoff_never_releases_accepted_fifo_work() {
     );
 }
 
+#[cfg(feature = "test-support")]
+fn init_selection_checkout(root: &Path, source: &str) -> WorkspaceIdentity {
+    fs::create_dir(root).unwrap();
+    let output = std::process::Command::new("git")
+        .args(["init", "--quiet"])
+        .arg(root)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git init: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fs::write(root.join("a.js"), source).unwrap();
+    identity(root)
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn prepared_selection_waits_for_live_same_key_replacement_retirement() {
+    use trellis::{daemon::registry::SelectionError, http::RuntimePhase};
+    let base = tempfile::tempdir().unwrap();
+    let checkout = base.path().canonicalize().unwrap().join("work");
+    fs::create_dir(&checkout).unwrap();
+    fs::write(checkout.join("a.js"), "function oldSelection() {}\n").unwrap();
+    let old_id = identity(&checkout);
+    let key = old_id.root_key.clone();
+    let mut registry = CheckoutRegistry::with_roots(roots(base.path()));
+    registry
+        .register(&old_id, CheckoutOptions(serde_json::json!({})))
+        .unwrap();
+    registry.attach_launch(1, &old_id).unwrap();
+    let old = registry.activate(&key).unwrap();
+    ready(&old).await;
+    let scheduler = old.browser_scheduler().unwrap();
+    let (release_worker, holder) = hold_worker(scheduler.clone()).await;
+    let (held_read, _) = old.evidence_response().unwrap();
+    // Git initialization replaces the identity without invalidating the old
+    // root's queue reads. Post-step FIFO publication is outside the worker hold,
+    // so a pathname replacement here could conservatively publish pending work.
+    let output = std::process::Command::new("git")
+        .args(["init", "--quiet"])
+        .arg(&checkout)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git init: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fs::write(checkout.join("a.js"), "function newSelection() {}\n").unwrap();
+    let next = identity(&checkout);
+    assert_eq!(old_id.root_key, next.root_key);
+    assert_eq!((old_id.device, old_id.inode), (next.device, next.inode));
+    assert_ne!(old_id.record_id, next.record_id);
+    let prepared = registry
+        .selection_probe()
+        .prepare(&next, &checkout)
+        .unwrap();
+    assert!(matches!(
+        registry.select_prepared(2, prepared),
+        Err(SelectionError::IdentityChanged)
+    ));
+    drop(held_read);
+    assert!(!registry.refresh_pending_work(&key).unwrap());
+    registry.disconnect(1);
+    let prepared = registry
+        .selection_probe()
+        .prepare(&next, &checkout)
+        .unwrap();
+    let (closing_tx, closing_rx) = std::sync::mpsc::sync_channel(1);
+    let closing_old = old.clone();
+    let closing_scheduler = scheduler.clone();
+    scheduler.set_closing_hook_for_tests(move || {
+        closing_tx
+            .send((
+                closing_scheduler.runtime_phase(),
+                closing_old.has_active_resources(),
+            ))
+            .unwrap();
+    });
+    // Selection must request retirement while the old worker is still held.
+    // This observer releases it without ever acquiring the registry.
+    let observer_scheduler = scheduler.clone();
+    let selection_finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observer_finished = selection_finished.clone();
+    let observer = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + trellis::testing::HANG_BACKSTOP;
+        loop {
+            let seen = observer_scheduler.state_version();
+            if observer_scheduler.runtime_phase() == RuntimePhase::RetireRequested {
+                break;
+            }
+            if observer_finished.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(!remaining.is_zero(), "selection never requested retirement");
+            // State signals prove retirement; this short cap only lets an
+            // early selection error stop the observer instead of masking it.
+            observer_scheduler.wait_state_change(seen, remaining.min(Duration::from_millis(20)));
+        }
+        drop(release_worker);
+    });
+    let selected = registry.select_prepared(2, prepared);
+    selection_finished.store(true, std::sync::atomic::Ordering::Release);
+    observer.join().unwrap();
+    holder.join().unwrap();
+    let selected = selected.expect("selection waits for the requested retirement");
+    assert_eq!(closing_rx.recv().unwrap(), (RuntimePhase::Closing, true));
+    selected.before_answer().unwrap();
+    assert_eq!(selected.record_id, next.record_id);
+    assert_eq!((selected.device, selected.inode), (next.device, next.inode));
+    assert!(!old.has_active_resources());
+    assert!(old.evidence_response().is_err());
+    assert!(registry.runtime(&key).is_none());
+    assert!(registry.registration(&key).is_none());
+    assert_eq!(registry.active_count(), 1);
+    let fresh = registry.activate(&key).unwrap();
+    assert!(!std::sync::Arc::ptr_eq(&old, &fresh));
+    ready(&fresh).await;
+    let (answer, _) = fresh.evidence_response().unwrap();
+    let (_, source) = answer.source_at("a.js", None).unwrap().unwrap();
+    assert!(source.text.contains("newSelection"));
+    assert!(!source.text.contains("oldSelection"));
+    answer.finish(()).unwrap();
+    drop(answer);
+    registry.disconnect(2);
+    release_when_idle(&mut registry, &key).await;
+    assert_eq!(registry.active_count(), 0);
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn prepared_selection_rechecks_root_lost_replacement_and_resets_stale_clients() {
+    use trellis::daemon::registry::SelectionError;
+    let base = tempfile::tempdir().unwrap();
+    let checkout = base.path().canonicalize().unwrap().join("work");
+    let old_id = init_selection_checkout(&checkout, "function oldSelection() {}\n");
+    let key = old_id.root_key.clone();
+    let mut registry = CheckoutRegistry::with_roots(roots(base.path()));
+    registry
+        .register(&old_id, CheckoutOptions(serde_json::json!({})))
+        .unwrap();
+    registry.attach_launch(1, &old_id).unwrap();
+    registry
+        .browser_request_at(&old_id, std::time::Instant::now())
+        .unwrap();
+    let old = registry.activate(&key).unwrap();
+    ready(&old).await;
+    let scheduler = old.browser_scheduler().unwrap();
+    let (held_read, _) = old.evidence_response().unwrap();
+    fs::rename(&checkout, base.path().join("old")).unwrap();
+    let next = init_selection_checkout(&checkout, "function intermediateSelection() {}\n");
+    let _ = scheduler.submit_watch_event_for_tests(Ok(notify::Event::new(
+        notify::EventKind::Remove(notify::event::RemoveKind::Any),
+    )));
+    retired(&scheduler).await;
+    assert!(scheduler.checkout_root_loss_retired());
+    let prepared = registry
+        .selection_probe()
+        .prepare(&next, &checkout)
+        .unwrap();
+    assert!(matches!(
+        registry.select_prepared(2, prepared),
+        Err(SelectionError::IdentityChanged)
+    ));
+    drop(held_read);
+    // The prepared replacement itself can change before commit, even when the
+    // registry still contains exactly the old metadata captured by prepare.
+    let stale = registry
+        .selection_probe()
+        .prepare(&next, &checkout)
+        .unwrap();
+    fs::rename(&checkout, base.path().join("intermediate")).unwrap();
+    let latest = init_selection_checkout(&checkout, "function latestSelection() {}\n");
+    assert!(matches!(
+        registry.select_prepared(2, stale),
+        Err(SelectionError::IdentityChanged)
+    ));
+    assert!(registry.registration(&key).is_some());
+    let prepared = registry
+        .selection_probe()
+        .prepare(&latest, &checkout)
+        .unwrap();
+    let selected = registry.select_prepared(2, prepared).unwrap();
+    selected.before_answer().unwrap();
+    assert_eq!(selected.record_id, latest.record_id);
+    assert_eq!(
+        (selected.device, selected.inode),
+        (latest.device, latest.inode)
+    );
+    assert!(!old.has_active_resources());
+    assert!(old.evidence_response().is_err());
+    assert!(registry.runtime(&key).is_none());
+    assert!(registry.registration(&key).is_none());
+    assert_eq!(registry.active_count(), 1);
+    let fresh = registry.activate(&key).unwrap();
+    assert!(!std::sync::Arc::ptr_eq(&old, &fresh));
+    ready(&fresh).await;
+    let (answer, _) = fresh.evidence_response().unwrap();
+    let (_, source) = answer.source_at("a.js", None).unwrap().unwrap();
+    assert!(source.text.contains("latestSelection"));
+    assert!(!source.text.contains("oldSelection"));
+    answer.finish(()).unwrap();
+    drop(answer);
+    // Only the new MCP session owns this entry: neither the stale session nor
+    // the stale browser lease may keep the replacement alive.
+    registry.disconnect(2);
+    release_when_idle(&mut registry, &key).await;
+    assert_eq!(registry.active_count(), 0);
+}
+
 #[tokio::test]
 async fn replaced_path_cold_runtime_publishes_new_identity_not_old_head() {
     let base = tempfile::tempdir().unwrap();

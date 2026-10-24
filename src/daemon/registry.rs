@@ -1221,8 +1221,8 @@ impl CheckoutRegistry {
         self.select_prepared(session, prepared)
     }
 
-    /// The registry owner's atomic commit. Slow identity checks have already
-    /// completed; current capacity, clients, leases and FIFO state decide here.
+    /// Commit prepared membership and Git checks performed outside the registry.
+    /// Shared attachment retains its replacement rechecks and bounded retirement wait.
     pub fn select_prepared(
         &mut self,
         session: u64,
@@ -1236,73 +1236,11 @@ impl CheckoutRegistry {
         {
             return Err(SelectionError::IdentityChanged);
         }
-        let replacing = current.is_some_and(|identity| !identity.matches(&witness.identity));
-        let already_active = self.entries.get(key).is_some_and(|entry| !entry.released);
-        let occupied = self.active_count() - usize::from(replacing && already_active);
-        if (replacing || !already_active) && occupied >= MAX_ACTIVE_CHECKOUTS {
-            return Err(SelectionError::CheckoutCapacity);
-        }
-        if replacing {
-            let root_lost = self.root_lost_runtime(key);
-            self.refresh_pending_work(key)?;
-            let entry = self.entries.get(key).unwrap();
-            if entry
-                .lost_reads
-                .as_ref()
-                .is_some_and(|reads| reads.load(std::sync::atomic::Ordering::Acquire) != 0)
-                || (!root_lost
-                    && (!entry.sessions.is_empty()
-                        || entry.browser_until.is_some()
-                        || entry.pending_work
-                        || entry.external_work))
-            {
-                return Err(SelectionError::IdentityChanged);
-            }
-            if let Some(runtime) = self.runtimes.get(key) {
-                let resources = runtime
-                    .resources()
-                    .map_err(|_| SelectionError::Unavailable)?;
-                if resources.scheduler.leases() != 0 {
-                    return Err(SelectionError::IdentityChanged);
-                }
-                if resources.scheduler.request_retire(|_| true) != http::RetireOutcome::Retired {
-                    return Err(SelectionError::Unavailable);
-                }
-                self.finish_retired(key);
-            }
-            self.entries.remove(key);
-        }
-        let at_capacity = self.active_count() >= MAX_ACTIVE_CHECKOUTS;
-        if let Some(entry) = self.entries.get_mut(key) {
-            if entry.released && at_capacity {
-                return Err(SelectionError::CheckoutCapacity);
-            }
-            entry.sessions.insert(session);
-            entry.release_at = None;
-            entry.released = false;
-        } else {
-            if at_capacity {
-                return Err(SelectionError::CheckoutCapacity);
-            }
-            self.entries.insert(
-                key.clone(),
-                Entry {
-                    identity: CheckoutMetadata::from_identity(&witness.identity),
-                    registration: None,
-                    sessions: HashSet::from([session]),
-                    released: false,
-                    pending_work: false,
-                    external_work: false,
-                    browser_until: None,
-                    release_at: None,
-                    root_lost: false,
-                    lost_reads: None,
-                },
-            );
-        }
-        self.idle_exit_at = None;
-        self.lifecycle.notify_one();
-        Ok(witness)
+        let identity = self.attach(Some(session), &witness.identity)?;
+        Ok(SelectedCheckout {
+            identity,
+            ..witness
+        })
     }
 
     /// Capacity is a resolved-checkout failure: recheck the selected root
@@ -2417,6 +2355,7 @@ fn common_identity_unattached_with_executable(
             let _ = child.wait();
             // A descendant may keep stdout open after Git exits. Never join
             // its reader past the same lookup deadline.
+            // At this scale, the detached reader may live until descendant stdout closes.
             drop(reader);
             return Err(SelectionError::Unavailable);
         }
