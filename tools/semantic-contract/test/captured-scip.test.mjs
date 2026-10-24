@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import { checkCapturedScip } from "../captured-scip.mjs";
 import { parseJson } from "../json.mjs";
 import { sourceManifestHash } from "../identity.mjs";
@@ -282,5 +283,101 @@ test("production checker rejects source symlink and absolute artifact path", asy
   await withFixture(async (f) => {
     f.manifest.artifacts[0].path = "/tmp/escaped.json";
     await assert.rejects(checkCapturedScip(f.root, await f.save()), { code: "InvalidArtifact" });
+  });
+});
+
+async function attestArtifact(f, artifact = f.artifact) {
+  const bytes = Buffer.from(JSON.stringify(artifact));
+  await writeFile(join(f.root, "captured-scip/artifact.json"), bytes);
+  f.manifest.artifacts[0].hash = hash(bytes);
+  return f.save();
+}
+async function attestSource(f, bytes) {
+  await writeFile(join(f.root, "sources/src/A.js"), bytes);
+  f.manifest.sourceDocuments[0].contentHash = hash(bytes);
+  f.manifest.documents[0].contentHash = hash(bytes);
+  f.manifest.sourceManifestHash = sourceManifestHash([{
+    document: { sourceSetId: f.manifest.sourceSet.id, language: f.manifest.sourceDocuments[0].language, path: "src/A.js" },
+    contentHash: hash(bytes),
+  }]);
+}
+for (const [column, valid] of [[4, true], [1, false]]) {
+  test(`source BOM exact-byte range ${column} is ${valid ? "accepted" : "rejected"}`, async () => {
+    await withFixture(async (f) => {
+      await attestSource(f, Buffer.from("\uFEFFx"));
+      const range = { encoding: "singleLine", line: 0, startCharacter: 0, endCharacter: column };
+      f.artifact.documents[0].facts = [{ recordKind: "occurrence", raw: { range, enclosingRange: null, symbol: "A#", symbolRoles: 0, syntaxKind: 0 } }];
+      const expected = await attestArtifact(f);
+      if (valid) {
+        const result = await checkCapturedScip(f.root, expected);
+        assert.deepEqual({ ...result.claims[0].envelope.raw.range }, range);
+      } else {
+        await assert.rejects(checkCapturedScip(f.root, expected), { code: "InvalidArtifact", message: /scalar boundary/ });
+      }
+    });
+  });
+}
+for (const [name, malformed] of [
+  ["null artifact", null], ["empty artifact", {}], ["null documents", { documents: null }],
+  ["null document", { documents: [null] }], ["null facts", { documents: [{ facts: null }] }],
+]) {
+  test(`${name} fails with typed InvalidArtifact, not dereference errors`, async () => {
+    await withFixture(async (f) => {
+      assert.equal((await checkCapturedScip(f.root, f.expected)).claims.length, 5);
+      const expected = await attestArtifact(f, malformed);
+      await assert.rejects(checkCapturedScip(f.root, expected), { code: "InvalidArtifact" });
+    });
+  });
+}
+test("authenticated UTF-16 endpoints retain scalar, CRLF and trailing-line boundaries", async () => {
+  for (const [column, valid] of [[1, true], [3, true], [4, true], [2, false], [5, false]]) {
+    await withFixture(async (f) => {
+      f.manifest.producer = { name: "scip-typescript", version: "0.4.0", executableHash: "fa4c8398393d2743e1306fdc7eaccfaafe488690bbfed481354abbf5a33559b9", positionEncoding: 2 };
+      f.manifest.sourceDocuments[0].language = "javascript";
+      f.manifest.documents[0].language = "javascript";
+      f.manifest.artifacts[0].language = "javascript";
+      const doc = f.artifact.documents[0];
+      doc.language = "javascript";
+      doc.positionEncoding = 2;
+      await attestSource(f, Buffer.from("a😀b\r\nx\n"));
+      const ranges = [
+        { encoding: "singleLine", line: 0, startCharacter: 0, endCharacter: column },
+        { encoding: "multiLine", startLine: 0, startCharacter: 3, endLine: 1, endCharacter: 1 },
+        { encoding: "singleLine", line: 2, startCharacter: 0, endCharacter: 0 },
+      ];
+      doc.facts = ranges.map((range) => ({ recordKind: "occurrence", raw: { range, enclosingRange: null, symbol: "A#", symbolRoles: 0, syntaxKind: 0 } }));
+      const expected = await attestArtifact(f);
+      if (valid) {
+        assert.equal((await checkCapturedScip(f.root, expected)).claims.length, ranges.length, `UTF-16 column ${column}`);
+      } else {
+        await assert.rejects(checkCapturedScip(f.root, expected), { code: "InvalidArtifact", message: /scalar boundary/ }, `UTF-16 column ${column}`);
+      }
+    });
+  }
+});
+test("position validation fits a bounded child heap without per-scalar storage", async () => {
+  await withFixture(async (f) => {
+    // A 4 MiB line is below the existing source cap. The 64 MiB heap isolates
+    // unbounded boundary tables without risking the host's memory.
+    const sourceBytes = 4 * 1024 * 1024;
+    await attestSource(f, Buffer.alloc(sourceBytes, "a"));
+    f.artifact.documents[0].facts = [{ recordKind: "occurrence", raw: {
+      range: { encoding: "singleLine", line: 0, startCharacter: sourceBytes - 1, endCharacter: sourceBytes },
+      enclosingRange: null, symbol: "A#", symbolRoles: 0, syntaxKind: 0,
+    } }];
+    const expected = await attestArtifact(f);
+    const checker = new URL("../captured-scip.mjs", import.meta.url).href;
+    const script = `import { checkCapturedScip } from ${JSON.stringify(checker)};
+      const result = await checkCapturedScip(${JSON.stringify(f.root)}, ${JSON.stringify(expected)});
+      if (result.claims.length !== 1) throw new Error("missing claim");`;
+    const child = spawnSync(process.execPath, ["--max-old-space-size=64", "--input-type=module", "-e", script], {
+      encoding: "utf8",
+      // Liveness backstop only; passing is normal completion, not a timing target.
+      timeout: 30000,
+      maxBuffer: 64 * 1024,
+    });
+    assert.equal(child.error, undefined, child.error?.message);
+    assert.equal(child.signal, null, child.stderr);
+    assert.equal(child.status, 0, child.stderr);
   });
 });

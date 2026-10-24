@@ -32,17 +32,26 @@ function rangeBounds(range) {
 function validateRange(range, text, encoding) {
   const [[sl, sc], [el, ec]] = rangeBounds(range);
   if (sl > el || (sl === el && sc > ec)) fail("InvalidArtifact", "reversed range");
-  const lines = text.split("\n").map((line, index, all) =>
-    index < all.length - 1 && line.endsWith("\r") ? line.slice(0, -1) : line);
-  for (const [line, column] of [[sl, sc], [el, ec]]) {
-    if (line >= lines.length) fail("InvalidArtifact", "line outside source");
-    let offset = 0;
-    const boundaries = new Set([0]);
-    for (const char of lines[line]) {
-      offset += encoding === 1 ? Buffer.byteLength(char) : encoding === 2 ? char.length : 1;
-      boundaries.add(offset);
+  let line = 0, lineStart = 0, cursor = 0, offset = 0;
+  for (const [targetLine, column] of [[sl, sc], [el, ec]]) {
+    while (line < targetLine) {
+      const newline = text.indexOf("\n", lineStart);
+      if (newline === -1) fail("InvalidArtifact", "line outside source");
+      lineStart = newline + 1;
+      line++;
+      cursor = lineStart;
+      offset = 0;
     }
-    if (!boundaries.has(column)) fail("InvalidArtifact", "column outside scalar boundary");
+    // Walk only to the requested endpoints, without per-line or scalar tables.
+    while (offset < column && cursor < text.length) {
+      const scalar = text.codePointAt(cursor);
+      if (scalar === 10 || (scalar === 13 && text.charCodeAt(cursor + 1) === 10)) break;
+      const units = scalar > 0xffff ? 2 : 1;
+      const utf8Width = scalar < 0x80 ? 1 : scalar < 0x800 ? 2 : scalar < 0x10000 ? 3 : 4;
+      offset += encoding === 1 ? utf8Width : encoding === 2 ? units : 1;
+      cursor += units;
+    }
+    if (offset !== column) fail("InvalidArtifact", "column outside scalar boundary");
   }
 }
 function digest(domain, value) { return createHash("sha256").update(domain).update(canonicalBytes(value)).digest("hex"); }
@@ -89,7 +98,7 @@ export async function checkCapturedScip(root, expectedManifestHash) {
     if (total > limits.source) fail("LimitExceeded", "total source bytes");
     requireThat(contentHash(bytes) === row.contentHash, "source hash mismatch");
     let text;
-    try { text = new TextDecoder("utf-8", { fatal: true }).decode(bytes); }
+    try { text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes); }
     catch { fail("InvalidArtifact", "invalid source UTF-8"); }
     sourceMap.set(row.relativePath, { row, text });
   }
@@ -111,9 +120,11 @@ export async function checkCapturedScip(root, expectedManifestHash) {
   const artifactHash = contentHash(artifactBytes);
   requireThat(artifactHash === artifactRow.hash, "artifact hash mismatch");
   const artifact = parse(artifactBytes);
-  if (!Array.isArray(artifact.documents) || artifact.documents.length > limits.documents) fail("LimitExceeded", "artifact document count");
+  if (artifact === null || typeof artifact !== "object" || !Array.isArray(artifact.documents)) fail("InvalidArtifact", "artifact documents must be an array");
+  if (artifact.documents.length > limits.documents) fail("LimitExceeded", "artifact document count");
   for (const document of artifact.documents) {
-    if (!Array.isArray(document.facts) || document.facts.length > limits.candidates) fail("LimitExceeded", "candidate fact count");
+    if (document === null || typeof document !== "object" || !Array.isArray(document.facts)) fail("InvalidArtifact", "document facts must be an array");
+    if (document.facts.length > limits.candidates) fail("LimitExceeded", "candidate fact count");
   }
   shape("ScipFixture", artifact);
   requireThat(artifact.documents.length === manifest.documents.length && artifact.documents.length <= limits.documents, "artifact document count mismatch");
