@@ -280,6 +280,14 @@ A candidate describes a lexical site, not a read or definition. Exclude comments
 
 Other binding sites without a measured declaration remain candidates, but cannot acquire `definition` or `alias` from a guessed declaration-name join. The corpus alias role stays required for JavaScript and Rust, exempt for Java and Python under [Decision 0017 Amendment 1](decisions/0017-conformance-corpus-storage-and-producers.md#amendment-1-2026-10-23-outcome-floors). Python's applicable language role is not proof that its pinned producer supplies an exact alias anchor. No reference or alias floor is changed.
 
+## Owner-ratified native-v9 correction: Java varargs
+
+**Status: owner-ratified 2026-10-24 (#279).** This narrow Java measurement ruling is approved independently; the other new #279 capability and reference amendments above remain pending owner PR review and ratification.
+
+A Java `spread_parameter` produces exactly one measured `kind:"parameter"` declaration, with its actual name and type measured from the parser's spread-parameter structure. Its lexical parent is the containing method or constructor. Do not admit a `variable_declarator` whose direct parent is that `spread_parameter` as a separate variable declaration. Continue traversing the nested syntax so the parameter's identifier remains a native reference candidate; its declaration-name owner is the method or constructor, not a synthetic nested variable.
+
+This deliberately replaces native-v8's nested variable plus nameless parameter with one correctly named and typed parameter in native-v9. Use the same measured parameter parts for signature, header and witnesses, preserve the variadic flag and literal type bytes, and do not fabricate a type or append synthetic `...` to its witness. The change does not alter ordinary variable declarations or call/control ownership, infer semantic roles or targets, change an identity domain or change corpus floors. Any resulting declaration/ancestor identity changes must be explained as this measurement correction, separately from native producer-version occurrence-ID changes.
+
 ## Lookup and reference roles
 
 Stable identity always preserves measured name bytes. Lookup first uses the language's lexically decoded identifier (for example, remove Rust `r#` or decode Java/JavaScript identifier escapes), then applies:
