@@ -623,7 +623,7 @@ fn full_reconcile_replaces_persisted_source_and_input_inventory() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        14
+        15
     );
     let files = db
         .prepare("SELECT path FROM revision_documents WHERE revision_id=?1 ORDER BY path")
@@ -739,12 +739,12 @@ fn sqlite_snapshot(
         .unwrap()
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
-    // Schema 14 keeps the derived graph and labels, and compacts native IDs
+    // Schema 15 keeps the derived graph and labels, and compacts native IDs
     // and document/projection references into BLOB keys and surrogates.
     // Supersession state and the paired producer bindings are additive.
     // Check exact names, not just a count: an unknown table must not escape the
     // independent cold-source comparison.
-    const REQUIRED_V14_TABLES: [&str; 31] = [
+    const REQUIRED_V15_TABLES: [&str; 51] = [
         "native_producers",
         "native_producer_languages",
         "native_producer_inputs",
@@ -776,8 +776,28 @@ fn sqlite_snapshot(
         "native_release_candidate_versions",
         "native_release_candidate_graphs",
         "native_release_candidate_classes",
+        "semantic_producers",
+        "semantic_producer_languages",
+        "semantic_coverage",
+        "semantic_coverage_roles",
+        "semantic_basis",
+        "semantic_basis_lookup_dependencies",
+        "semantic_provenance",
+        "semantic_symbols",
+        "semantic_symbol_targets",
+        "semantic_declaration_bindings",
+        "semantic_declaration_binding_symbols",
+        "semantic_declaration_join_candidates",
+        "semantic_references",
+        "semantic_reference_roles",
+        "semantic_reference_candidates",
+        "semantic_call_bindings",
+        "semantic_call_candidates",
+        "semantic_call_possible_dispatch",
+        "semantic_call_join_candidates",
+        "semantic_type_relationships",
     ];
-    let required: std::collections::BTreeSet<_> = REQUIRED_V14_TABLES.into_iter().collect();
+    let required: std::collections::BTreeSet<_> = REQUIRED_V15_TABLES.into_iter().collect();
     let actual: std::collections::BTreeSet<_> = tables.iter().map(String::as_str).collect();
     let optional = [
         "native_revision_supersessions",
@@ -786,28 +806,28 @@ fn sqlite_snapshot(
     ];
     assert_eq!(
         required.len(),
-        31,
-        "v14 mandatory table list must be unique"
+        51,
+        "v15 mandatory table list must be unique"
     );
     assert!(
         required.is_subset(&actual),
-        "missing v14 evidence tables: {:?}",
+        "missing v15 evidence tables: {:?}",
         required.difference(&actual).collect::<Vec<_>>()
     );
     assert!(
         actual
             .difference(&required)
             .all(|table| optional.contains(table)),
-        "unexpected v14 evidence table: {:?}",
+        "unexpected v15 evidence table: {:?}",
         actual.difference(&required).collect::<Vec<_>>()
     );
     assert_eq!(
         actual.len(),
-        31 + optional
+        51 + optional
             .iter()
             .filter(|name| actual.contains(*name))
             .count(),
-        "exact v14 base and optional table count"
+        "exact v15 base and optional table count"
     );
     assert_eq!(
         actual.contains("native_binding_epoch"),
@@ -858,7 +878,8 @@ fn sqlite_snapshot(
                     ("cid IN (SELECT cid FROM revision_documents WHERE revision_id=?1)", ""),
                 name if name.starts_with("native_version_") =>
                     ("vid IN (SELECT vid FROM revision_documents WHERE revision_id=?1)", ""),
-                _ => panic!("unhandled v14 evidence table: {table}"),
+                name if name.starts_with("semantic_") => ("?1 IS NOT NULL", ""),
+                _ => panic!("unhandled v15 evidence table: {table}"),
             };
             // Producer descriptor columns differ: only the parent table uses id/version.
             let where_clause = if table == "native_producers" {
@@ -900,6 +921,9 @@ fn sqlite_snapshot(
                 .unwrap()
                 .collect::<rusqlite::Result<Vec<_>>>()
                 .unwrap();
+            if table.starts_with("semantic_") {
+                assert!(rows.is_empty(), "native-only selected snapshot has semantic rows in {table}");
+            }
             // A retained old pin may carry its own pending debt. Compare those
             // rows raw; only the currently published head must be empty.
             if pin.index_revision as i64 == published_revision

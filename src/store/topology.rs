@@ -1765,7 +1765,7 @@ fn inspect_index_with_open_hook(
     if old_index_schema(version) {
         return Ok(("eligible", "old_schema"));
     }
-    if version != 14 {
+    if version != i64::from(super::DATABASE_SCHEMA_VERSION) {
         return Ok(("unknown", "unknown_index_schema"));
     }
     if super::validate_cache_shape(db).is_err() {
@@ -1837,10 +1837,10 @@ pub enum GcStage {
     AfterParentSync,
 }
 
-/// Schemas before the current v14 are disposable: no released binary that wrote
+/// Schemas before the current v15 are disposable: no released binary that wrote
 /// one can be served by this one, so GC needs no layout, root or age proof.
 fn old_index_schema(version: i64) -> bool {
-    (1..14).contains(&version)
+    (1..i64::from(super::DATABASE_SCHEMA_VERSION)).contains(&version)
 }
 
 /// Only an earlier schema or the exact current layout can reach the unlink boundary.
@@ -1876,7 +1876,10 @@ fn gc_remove_candidate(
         let tx = index.transaction()?;
         let version: i64 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
         if !old_index_schema(version) {
-            ensure!(version == 14, "unknown GC schema");
+            ensure!(
+                version == i64::from(super::DATABASE_SCHEMA_VERSION),
+                "unknown GC schema"
+            );
             super::validate_cache_shape(&tx)?;
             super::validate_supersessions(&tx)?;
             let (generation, revision, stats, diagnostics): (String, i64, String, String) = tx.query_row(
@@ -2470,7 +2473,7 @@ mod gc_schema_race_tests {
         assert_eq!(
             (schema, marker.as_str(), generation, revision),
             (
-                14,
+                15,
                 "native-v6-delta-v1",
                 pin.index_generation.to_string(),
                 pin.index_revision as i64
@@ -2586,7 +2589,7 @@ mod gc_schema_race_tests {
     }
 
     #[test]
-    fn exact_v14_gc_candidate_survives_unknown_busy_then_deletes_after_fences_clear() {
+    fn exact_v15_gc_candidate_survives_unknown_busy_then_deletes_after_fences_clear() {
         let state = tempfile::tempdir().unwrap();
         let candidate_root = tempfile::tempdir().unwrap();
         let current_root = tempfile::tempdir().unwrap();
@@ -2700,7 +2703,7 @@ mod gc_schema_race_tests {
         assert_eq!(
             inspect_index(&dir, &identity.root_key, now).unwrap(),
             ("unknown", "recent_open"),
-            "genuine current-v14 cache must pass GC admission"
+            "genuine current-v15 cache must pass GC admission"
         );
 
         let attacker = rusqlite::Connection::open(&path).unwrap();
@@ -2718,7 +2721,7 @@ mod gc_schema_race_tests {
         assert_eq!(
             (schema, marker.as_str(), generation, revision),
             (
-                14,
+                15,
                 "native-v4",
                 pin.index_generation.to_string(),
                 pin.index_revision as i64
@@ -2872,7 +2875,7 @@ mod gc_final_witness_tests {
         assert_eq!(
             db.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            14
+            15
         );
         drop(live);
         assert!(roots.index_use_lock(&candidate).exists());
