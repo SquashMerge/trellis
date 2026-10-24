@@ -63,9 +63,9 @@ A document-level measured `module` owns top-level occurrences. Records resolve w
 
 Coverage is scoped to the complete `(producerId,language,sourceSetId,documentPath,revisionId)` tuple. Publish one row for every tuple, including selected, omitted, unsupported, failed, and not-requested documents. Two producers covering one document have two rows. `complete` means all requested, supported evidence for that document; it never means universal language support. A requested unsupported role makes the row `partial` with a diagnostic. Non-applicable roles are excluded rather than reported missing.
 
-## Proposed #279 amendment: production measurement capabilities
+## #279 amendment: production measurement capabilities
 
-**Status: proposed for owner PR review, 2026-10-24; pending owner ratification.** This section proposes native-v9's capability and join rules. It does not mark the contract ratified. [Decision 0017's proposed Amendment 4](decisions/0017-conformance-corpus-storage-and-producers.md#proposed-amendment-4-2026-10-24-production-capability-reports) defines the corresponding corpus count authority. Other join, semantic resolution and publication rules remain unchanged.
+**Status: ratified by the owner, 2026-10-24.** This section defines native-v9's capability and join rules. [Decision 0017's Amendment 4](decisions/0017-conformance-corpus-storage-and-producers.md#amendment-4-2026-10-24-production-capability-reports) defines the corresponding corpus count authority. Other join, semantic resolution and publication rules remain unchanged.
 
 The production native artifact carries one capability report for each `(DocumentKey,revisionId)`, with exactly one entry for each of `declarationName`, `callee`, `invocation` and `reference`. Each entry is `{kind,available,diagnostic,gaps}`, where each gap is `{range,diagnostic}`. The document, revision and ranges use the existing shared types. A gap range is a nonempty, parser-measured UTF-8 scalar-boundary span of the actually opaque source construct, within that document's exact bytes. Its nonempty diagnostic identifies the construct and the missing measurement convention. The enclosing native artifact supplies the producer and source-byte authority.
 
@@ -257,9 +257,9 @@ Join checks are concrete and count distinct compatible measured candidate IDs, n
 
 Join cardinality and semantic resolution are separate. After the one-candidate exact join to `S1`, compatible facts from the selected producer may agree on one semantic target `T1`, yielding a resolved binding to `T1`. If preserved facts with distinct provenances instead assert contradictory exact semantic targets `T1` and `T2`, the measured join remains `{status:exact,candidateIds:[S1],diagnostic:null}`, while resolution becomes `{resolution:ambiguous,declaredTarget:null,candidates:[T1,T2]}`. It is the contradictory target binding, not the number of producer records, that makes resolution ambiguous.
 
-## Proposed #279 amendment: native identifier-site candidates
+## #279 amendment: native identifier-site candidates
 
-**Status: proposed for owner PR review, 2026-10-24; pending owner ratification.** This section proposes native-v9's reference inventory, ownership and narrow import-alias declarations. It distinguishes native measured candidates from the semantic `Reference` record above; it adds no semantic roles, resolution, targets, dispatch or invocation merely because an identifier exists.
+**Status: ratified by the owner, 2026-10-24.** This section defines native-v9's reference inventory, ownership and narrow import-alias declarations. It distinguishes native measured candidates from the semantic `Reference` record above; it adds no semantic roles, resolution, targets, dispatch or invocation merely because an identifier exists.
 
 A native reference candidate carries `{id,ownerSyntaxId,ordinal,document,revisionId,range,spelling,lookupKey,provenanceId}`. These use the existing occurrence, syntax, document, revision, range and lookup types. Spelling is the exact identifier source bytes; provenance is native `measuredSyntax` with no semantic basis. The native producer measures these candidates from its already parsed tree, outside opaque syntax, without a second parser in the capture adapter, whole-source name scanning or reconstruction from SCIP.
 
@@ -282,7 +282,7 @@ Other binding sites without a measured declaration remain candidates, but cannot
 
 ## Owner-ratified native-v9 correction: Java varargs
 
-**Status: owner-ratified 2026-10-24 (#279).** This narrow Java measurement ruling is approved independently; the other new #279 capability and reference amendments above remain pending owner PR review and ratification.
+**Status: owner-ratified 2026-10-24 (#279).** This narrow Java measurement ruling is approved independently; the #279 capability and reference amendments above are also ratified by the owner, 2026-10-24.
 
 A Java `spread_parameter` produces exactly one measured `kind:"parameter"` declaration, with its actual name and type measured from the parser's spread-parameter structure. Its lexical parent is the containing method or constructor. Do not admit a `variable_declarator` whose direct parent is that `spread_parameter` as a separate variable declaration. Continue traversing the nested syntax so the parameter's identifier remains a native reference candidate; its declaration-name owner is the method or constructor, not a synthetic nested variable.
 

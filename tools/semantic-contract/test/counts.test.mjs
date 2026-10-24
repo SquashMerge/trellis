@@ -1740,7 +1740,7 @@ test("measured declaration site supports definition and alias roles once per ref
 const amendedFloors = {
   javascript: {
     ambiguous: 20,
-    unsupported: 1,
+    unsupported: 0,
     typeRelationships: 20,
     exempt: [],
   },
@@ -1873,8 +1873,8 @@ test("ambiguous floor is 0 for Python, Java and Rust and stays 20 for JavaScript
   for (const row of controls) await runControl(row);
 });
 
-test("unsupported floor is 0 for Java and Python and stays 1 for JavaScript and Rust", async () => {
-  for (const language of ["java", "python"]) {
+test("unsupported floor is 0 for JavaScript, Java and Python and stays 1 for Rust", async () => {
+  for (const language of ["javascript", "java", "python"]) {
     const count = countAtFloors(language);
     assert.equal(
       count.outcomes.find((x) => x.disposition === "unsupported").count,
@@ -1883,7 +1883,7 @@ test("unsupported floor is 0 for Java and Python and stays 1 for JavaScript and 
     assert.equal(assertCorpusFloors(count), count);
   }
   const controls = registerControls(
-    ["javascript", "rust"].map((language) => ({
+    ["rust"].map((language) => ({
       id: `COUNT.floor.${language}-unsupported-0`,
       baseline: () => countAtFloors(language),
       mutate: (row) => {
@@ -1897,6 +1897,17 @@ test("unsupported floor is 0 for Java and Python and stays 1 for JavaScript and 
     })),
   );
   for (const row of controls) await runControl(row);
+});
+
+test("JavaScript unsupported floor deferral preserves its other outcome floors", () => {
+  const count = countAtFloors("javascript");
+  count.outcomes.find((row) => row.disposition === "unsupported").count = 0;
+  assert.equal(assertCorpusFloors(count), count);
+  count.outcomes.find((row) => row.disposition === "resolved").count = 19;
+  assert.throws(
+    () => assertCorpusFloors(count),
+    (error) => error.assertion === "COUNT.FLOOR" && error.field === "counts",
+  );
 });
 
 test("Rust needs no type relationships; Java, JavaScript and Python still need 20", async () => {
@@ -2944,8 +2955,8 @@ test("unsupported floor: a declared-unavailable native family plus producer fact
     true,
   );
   // A document whose native families are all available does not qualify.
-  // This corpus is Java, whose floor is 0 (Amendment 3); the JavaScript and
-  // Rust floor of one is checked at the floor boundary.
+  // This corpus is Java, whose floor is 0; only Rust retains a floor of one,
+  // checked at the floor boundary.
   const allAvailable = await generatedCorpus(t, {
     withoutUnsupportedFacts: true,
     allFamiliesAvailable: true,

@@ -674,10 +674,10 @@ export function checkCounts(
   return count;
 }
 
-// Per-language corpus floors (Decision 0017 Amendments 1 and 3). Each language
+// Per-language corpus floors (Decision 0017 Amendments 1, 3 and 4). Each language
 // owns its row; nothing outside this table branches on language. `unsupported`
-// counts documents, so its floor of one is the native-capability
-// requirement; Java and Python have no genuine construct for it yet.
+// counts documents; only Rust retains a floor of one until genuine constructs
+// are identified for JavaScript, Java and Python.
 const sharedFloors = {
   scenariosTotal: 32,
   scenariosPerCategory: 4,
@@ -695,7 +695,10 @@ const sharedFloors = {
   exemptRoles: [],
 };
 const languageFloors = {
-  javascript: sharedFloors,
+  javascript: {
+    ...sharedFloors,
+    outcomes: { ...sharedFloors.outcomes, unsupported: 0 },
+  },
   java: {
     ...sharedFloors,
     outcomes: { ...sharedFloors.outcomes, ambiguous: 0, unsupported: 0 },
