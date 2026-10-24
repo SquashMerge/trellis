@@ -797,9 +797,9 @@ fn typed_next_revision_fills_unsupplied_producer_new_document() {
         && c.state == s::CoverageState::NotRequested));
     assert!(actual.coverage.iter().any(|c| c.producer_id == requested.id
         && c.document_path == "zz.rs"
-        && c.requested
+        && !c.requested
         && !c.selected
-        && c.state == s::CoverageState::Omitted));
+        && c.state == s::CoverageState::NotRequested));
     assert!(actual.coverage.iter().any(|c| c.producer_id == requested.id
         && c.document_path == "hello.rs"
         && c.requested
@@ -869,7 +869,7 @@ fn typed_next_revision_fills_unsupplied_producer_new_document() {
             .iter()
             .any(|c| c.producer_id == requested.id
                 && c.document_path == "zz.rs"
-                && c.state == s::CoverageState::Omitted)
+                && c.state == s::CoverageState::NotRequested)
     );
     assert!(final_sem.references.is_empty());
     assert_eq!(
@@ -985,7 +985,10 @@ fn semantic_change_on_stable_native_id_and_precommit_failures_are_atomic() {
     s::validate_evidence(&changed, &native, &captured).unwrap();
     let failed = store
         .publish_native_semantic_with_sql_fault_for_tests(
-            &graph, &capture, &native, &changed, &captured, &leader, first, &cancel,
+            (&graph, &capture, &native, &changed, &captured),
+            &leader,
+            first,
+            &cancel,
         )
         .unwrap_err();
     assert!(
@@ -997,7 +1000,10 @@ fn semantic_change_on_stable_native_id_and_precommit_failures_are_atomic() {
     assert!(
         store
             .publish_native_semantic_with_precommit_cancel_for_tests(
-                &graph, &capture, &native, &changed, &captured, &leader, first, &cancel
+                (&graph, &capture, &native, &changed, &captured),
+                &leader,
+                first,
+                &cancel
             )
             .is_err()
     );
@@ -1284,8 +1290,14 @@ fn bounded_semantic_children_release_preserves_same_native_id_survivors() {
     reopened.set_retention_clock_for_tests(1_901, 901);
     let leader = reopened.publication_for_tests().unwrap();
     reopened.maintain_revisions(&leader).unwrap();
+    reopened.collect_unreferenced(&leader).unwrap();
     assert_eq!(count(&db, first), 0);
     assert_eq!(count(&db, second), survivor_count);
+    let released_children: i64 = db.query_row(
+        "SELECT count(*) FROM semantic_provenance WHERE tuple_id IN (SELECT tuple_id FROM semantic_coverage WHERE revision_id=?1)",
+        [&pin_key], |r| r.get(0),
+    ).unwrap();
+    assert_eq!(released_children, 0);
     let released = reopened.semantic_at(first).unwrap_err();
     assert!(
         released
@@ -1437,6 +1449,79 @@ fn corrupt_selected_child_and_impossible_enum_fail_without_partial_result() {
             "incompatible_index: reconciliation required after invalid current index"
         );
     }
+}
+
+#[test]
+fn native_only_selective_recovery_keeps_requested_heads_without_old_facts() {
+    let state = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("hello.rs"), "fn hello() { hello(); }\n").unwrap();
+    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let options = IndexOptions::new(root.path().to_owned());
+    let (graph, native, capture) =
+        index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+    let (semantic, captured) = evidence(&native, root.path());
+    let leader = store.publication_for_tests().unwrap();
+    let prior = store
+        .publish_native_semantic(
+            &graph,
+            &capture,
+            &native,
+            &semantic,
+            &captured,
+            &leader,
+            store.index_baseline().unwrap(),
+            &cancel,
+        )
+        .unwrap();
+    fs::write(
+        root.path().join("hello.rs"),
+        "fn hello() { hello(); hello(); }\n",
+    )
+    .unwrap();
+    let (changed_graph, changed_native, changed_capture) =
+        index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+    assert_ne!(changed_native.revision.id, native.revision.id);
+    cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        store
+            .publish_native_recovery_selective_for_tests(
+                &changed_graph,
+                &changed_capture,
+                &changed_native,
+                &leader,
+                &cancel,
+            )
+            .is_err()
+    );
+    assert_eq!(store.index_baseline().unwrap(), prior);
+    assert_eq!(
+        store.semantic_at(prior).unwrap().references,
+        semantic.references
+    );
+    cancel.store(false, std::sync::atomic::Ordering::Relaxed);
+    let next = store
+        .publish_native_recovery_selective_for_tests(
+            &changed_graph,
+            &changed_capture,
+            &changed_native,
+            &leader,
+            &cancel,
+        )
+        .unwrap();
+    let selected = store.semantic_at(next).unwrap();
+    assert_eq!(selected.coverage.len(), 1);
+    assert!(selected.coverage[0].requested);
+    assert!(!selected.coverage[0].selected);
+    assert_eq!(selected.coverage[0].state, s::CoverageState::Omitted);
+    assert_eq!(selected.coverage[0].revision_id, changed_native.revision.id);
+    assert!(selected.provenance.is_empty());
+    assert!(selected.references.is_empty());
+    assert_eq!(
+        store.semantic_at(prior).unwrap().references,
+        semantic.references
+    );
 }
 
 #[test]

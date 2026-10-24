@@ -5477,7 +5477,8 @@ fn write_semantic(
         } else {
             let missing = db.prepare("SELECT p.producer_id,p.producer_version,d.language,d.path,
                 EXISTS(SELECT 1 FROM semantic_coverage old WHERE old.revision_id=?1
-                    AND old.producer_id=p.producer_id AND old.language=d.language AND old.requested=1)
+                    AND old.producer_id=p.producer_id AND old.language=d.language
+                     AND old.path=d.path AND old.requested=1)
                 FROM (SELECT DISTINCT producer_id,producer_version FROM semantic_coverage WHERE revision_id=?1) p
                 JOIN semantic_producer_languages l ON l.id=p.producer_id AND l.version=p.producer_version
                 JOIN revision_documents d ON d.revision_id=?2 AND d.language=l.language
@@ -10109,15 +10110,18 @@ impl Store {
     #[doc(hidden)]
     pub fn publish_native_semantic_with_sql_fault_for_tests(
         &self,
-        graph: &Graph,
-        capture: &crate::capture::Capture,
-        native: &crate::native_evidence::Artifact,
-        semantic: &crate::semantic_evidence::SemanticPublication,
-        captured: &crate::semantic_evidence::CapturedComponents,
+        evidence: (
+            &Graph,
+            &crate::capture::Capture,
+            &crate::native_evidence::Artifact,
+            &crate::semantic_evidence::SemanticPublication,
+            &crate::semantic_evidence::CapturedComponents,
+        ),
         leader: &topology::WriterGuard,
         expected_revision: IndexPin,
         cancel: &CancelFlag,
     ) -> Result<IndexPin> {
+        let (graph, capture, native, semantic, captured) = evidence;
         self.publish_native_semantic_with_tx_hook(
             graph,
             capture,
@@ -10141,15 +10145,18 @@ impl Store {
     #[doc(hidden)]
     pub fn publish_native_semantic_with_precommit_cancel_for_tests(
         &self,
-        graph: &Graph,
-        capture: &crate::capture::Capture,
-        native: &crate::native_evidence::Artifact,
-        semantic: &crate::semantic_evidence::SemanticPublication,
-        captured: &crate::semantic_evidence::CapturedComponents,
+        evidence: (
+            &Graph,
+            &crate::capture::Capture,
+            &crate::native_evidence::Artifact,
+            &crate::semantic_evidence::SemanticPublication,
+            &crate::semantic_evidence::CapturedComponents,
+        ),
         leader: &topology::WriterGuard,
         expected_revision: IndexPin,
         cancel: &CancelFlag,
     ) -> Result<IndexPin> {
+        let (graph, capture, native, semantic, captured) = evidence;
         self.publish_native_semantic_with_tx_hook(
             graph,
             capture,
@@ -10353,6 +10360,20 @@ impl Store {
             |_, _| Ok(()),
             None,
         )
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn publish_native_recovery_selective_for_tests(
+        &self,
+        graph: &Graph,
+        capture: &crate::capture::Capture,
+        native: &crate::native_evidence::Artifact,
+        leader: &topology::WriterGuard,
+        cancel: &CancelFlag,
+    ) -> Result<IndexPin> {
+        let baseline = self.publication_index_baseline()?;
+        self.publish_native_recovery_selective(graph, capture, native, leader, baseline, cancel)
     }
 
     #[allow(dead_code)] // Test seam for the original full-artifact selective rollback matrix.
