@@ -8,9 +8,9 @@ Decision 0003 still governs identity: executable SHA belongs to revision provena
 
 **T00 limit:** The new binding is an *unkeyed persisted consistency check*. It detects missing and unilateral/corrupt fields. It is not an external MAC and does not resist a coordinated same-user rewrite of inputs, binding and header. Never call it tamper-proof. Selected source/native/graph/class row attestation and ordinary SQLite corruption refusal remain required.
 
-## Amendment: fresh-build validation (#199 I-4b, #223, owner ruling 2026-10-19)
+## Amendment: fresh-build validation (#199 I-4b, #223, owner rulings 2026-10-19 and #225 2026-10-24)
 
-"Validation" of a fresh full build means every structural check of the artifact against its capture, the capture freshness checks and every bundle check at publication. When the artifact is this process's own `build_native` output for that same capture, it is not rebuilt a second time and compared; the type `ValidatedArtifact`, constructed only by `native_evidence::from_capture_observed` from its own build, marks those artifacts. `build_native` determinism is checked instead by the verify test `native_build_is_deterministic`, which builds the same capture twice and requires byte-identical artifacts. Every plain `Artifact` handed to the store (`Store::publish_native`, the recreate stage) still runs the full rebuild and comparison, so any input that is not Trellis's own fresh build of that capture in this process keeps the full check.
+"Validation" of a fresh full build means every structural check of the artifact against its capture, the capture freshness checks and every bundle check at publication. Neither this process's own fresh build nor a plain `Artifact` handed to the store (`Store::publish_native`, the recreate stage) is rebuilt a second time and compared. `Artifact::validate` checks the captured header and runs one `validate_structure`, with capture freshness and cancellation checks before and after. The #225 owner ruling of 2026-10-24 supersedes the earlier plain-`Artifact` rebuild-and-comparison requirement. `build_native` determinism is checked instead by the verify test `native_build_is_deterministic`, which builds the same capture twice and requires byte-identical artifacts.
 
 ## Amendment: build-time extractor producer hash (owner-approved 2026-10-19, #199 R-1/R-2)
 

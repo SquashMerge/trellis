@@ -361,19 +361,14 @@ fn invalid_native_and_conflict_never_change_published_pair() {
     }
 }
 
-/// #199 I-4b: only the coordinator's own fresh build skips the rebuild and
-/// comparison. An artifact handed to `publish_native` is caller input, so a
-/// structurally valid forgery is still refused by the full re-derivation,
-/// before any write.
+/// #225: plain caller-supplied artifacts get the same structural validation
+/// without a determinism rebuild. Publication still checks graph consistency.
 #[test]
 #[cfg(feature = "test-support")]
-fn caller_supplied_native_artifact_still_runs_the_full_rebuild() {
-    let (state, root, store, cancel) = fixture();
+fn caller_supplied_native_artifact_uses_structural_validation() {
+    let (_state, root, store, cancel) = fixture();
     let baseline = store.index_baseline().unwrap();
     let leader = store.publication_for_tests().unwrap();
-    let pin = publish(&store, root.path(), &cancel, baseline, &leader).unwrap();
-    let path = published_db(state.path(), root.path());
-    let before = fs::read(&path).unwrap();
     let (graph, mut native, capture) = index_workspace_bundle(
         &IndexOptions::new(root.path().to_owned()),
         store.root_id(),
@@ -381,8 +376,7 @@ fn caller_supplied_native_artifact_still_runs_the_full_rebuild() {
         |_| {},
     )
     .unwrap();
-    // Well-shaped: it passes every structural check, and the graph projection
-    // does not carry modifiers, so only the comparison sees it.
+    // Modifiers are structurally valid and not carried in the graph projection.
     native
         .declarations
         .iter_mut()
@@ -391,15 +385,11 @@ fn caller_supplied_native_artifact_still_runs_the_full_rebuild() {
         .header
         .modifiers
         .push("public".into());
-    let error = store
-        .publish_native(&graph, &capture, &native, &leader, pin, &cancel)
-        .unwrap_err();
-    assert!(
-        format!("{error:#}").contains("native evidence differs from captured source or inputs"),
-        "{error:#}"
-    );
-    assert_eq!(fs::read(&path).unwrap(), before);
-    assert_eq!(store.status().unwrap().revision, pin);
+    let next = store
+        .publish_native(&graph, &capture, &native, &leader, baseline, &cancel)
+        .unwrap();
+    assert_eq!(store.status().unwrap().revision, next);
+    assert_eq!(store.graph().unwrap(), graph);
 }
 
 #[test]

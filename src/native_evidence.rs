@@ -3069,9 +3069,8 @@ impl ParserState<'_> {
 }
 
 impl Artifact {
-    /// Validates a selectively assembled revision. The caller already checked each
-    /// reused stored witness against captured source and normalized immutable rows;
-    /// this checks all resulting IDs/ownership and the full current capture header.
+    /// Validates an assembled revision against the full current capture header
+    /// and checks all resulting IDs, ownership and structure without re-extraction.
     pub(crate) fn validate_selective(
         &self,
         capture: &Capture,
@@ -3099,9 +3098,9 @@ impl Artifact {
         capture.verify(cancel)?;
         self.validate_structure(&capture.files)
     }
-    /// Reconstruct the native syntax from already-admitted immutable buffers; no source file
-    /// is opened or hashed again. Comparison forbids well-shaped fabricated evidence.
-    /// Honors the caller's cancellation before and after the re-derivation.
+    /// Validate the captured header and native structure once, without re-extracting
+    /// facts. Determinism is covered by `native_build_is_deterministic` instead.
+    /// Honors the caller's cancellation before and after validation.
     pub fn validate(
         &self,
         capture: &Capture,
@@ -3109,18 +3108,7 @@ impl Artifact {
         root_id: &str,
         cancel: &CancelFlag,
     ) -> Result<()> {
-        capture.verify(cancel)?;
-        self.validate_structure(&capture.files)?;
-        #[cfg(test)]
-        FULL_VALIDATIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let expected = build_native(capture, root, root_id, cancel)?;
-        capture.verify(cancel)?;
-        expected.validate_structure(&capture.files)?;
-        ensure!(
-            self == &expected,
-            "native evidence differs from captured source or inputs"
-        );
-        Ok(())
+        self.validate_selective(capture, root, root_id, cancel)
     }
     fn validate_structure(&self, files: &[SourceFile]) -> Result<()> {
         ensure!(
@@ -4446,6 +4434,31 @@ mod parallel_extraction_tests {
 
     fn file_name(file: &SourceFile) -> &str {
         file.path.rsplit('/').next().unwrap()
+    }
+
+    #[test]
+    fn plain_artifact_validation_does_not_extract_again() {
+        let f = fixture(&[("main.js", "function run() {}\n".into())]);
+        let artifact = from_capture(&f.capture, &f.root, &f.root_id, &f.cancel).unwrap();
+        assert!(artifact.calls.is_empty() && artifact.control_regions.is_empty());
+        // Extraction always authenticates its context. With no occurrences,
+        // structural validation has no reason to request an extraction context.
+        let _fault = inject_extraction_auth_fault(
+            &artifact.revision.id,
+            "javascript",
+            ExtractionAuthFault::Undeclared,
+        );
+        assert!(build_native(&f.capture, &f.root, &f.root_id, &f.cancel).is_err());
+        artifact
+            .validate(&f.capture, &f.root, &f.root_id, &f.cancel)
+            .unwrap();
+        let mut invalid = artifact.clone();
+        invalid.declarations[0].range.end = f.capture.files[0].text.len() + 1;
+        assert!(
+            invalid
+                .validate(&f.capture, &f.root, &f.root_id, &f.cancel)
+                .is_err()
+        );
     }
 
     /// Several files in each of the four languages, with calls, control
