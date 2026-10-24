@@ -1737,10 +1737,25 @@ test("measured declaration site supports definition and alias roles once per ref
 
 // Independently authored Decision 0017 Amendment 1 floors, per language.
 const amendedFloors = {
-  javascript: { ambiguous: 20, typeRelationships: 20, exempt: [] },
-  java: { ambiguous: 0, typeRelationships: 20, exempt: ["alias"] },
-  python: { ambiguous: 0, typeRelationships: 20, exempt: ["alias"] },
-  rust: { ambiguous: 0, typeRelationships: 0, exempt: [] },
+  javascript: {
+    ambiguous: 20,
+    unsupported: 1,
+    typeRelationships: 20,
+    exempt: [],
+  },
+  java: {
+    ambiguous: 0,
+    unsupported: 0,
+    typeRelationships: 20,
+    exempt: ["alias"],
+  },
+  python: {
+    ambiguous: 0,
+    unsupported: 0,
+    typeRelationships: 20,
+    exempt: ["alias"],
+  },
+  rust: { ambiguous: 0, unsupported: 1, typeRelationships: 0, exempt: [] },
 };
 const allRoles = [
   "definition",
@@ -1778,7 +1793,7 @@ const countAtFloors = (language) => {
       ["provenExternal", 20],
       ["ambiguous", floors.ambiguous],
       ["unresolved", 20],
-      ["unsupported", 1],
+      ["unsupported", floors.unsupported],
     ].map(([disposition, count]) => ({ disposition, count })),
     observedRoles: allRoles.filter((role) => !floors.exempt.includes(role)),
   };
@@ -1854,6 +1869,32 @@ test("ambiguous floor is 0 for Python, Java and Rust and stays 20 for JavaScript
       expectedField: "counts",
     },
   ]);
+  for (const row of controls) await runControl(row);
+});
+
+test("unsupported floor is 0 for Java and Python and stays 1 for JavaScript and Rust", async () => {
+  for (const language of ["java", "python"]) {
+    const count = countAtFloors(language);
+    assert.equal(
+      count.outcomes.find((x) => x.disposition === "unsupported").count,
+      0,
+    );
+    assert.equal(assertCorpusFloors(count), count);
+  }
+  const controls = registerControls(
+    ["javascript", "rust"].map((language) => ({
+      id: `COUNT.floor.${language}-unsupported-0`,
+      baseline: () => countAtFloors(language),
+      mutate: (row) => {
+        row.outcomes.find((x) => x.disposition === "unsupported").count = 0;
+        return row;
+      },
+      check: assertCorpusFloors,
+      expectedAssertion: "COUNT.FLOOR",
+      expectedCode: "invalidRecord",
+      expectedField: "counts",
+    })),
+  );
   for (const row of controls) await runControl(row);
 });
 
@@ -2902,25 +2943,17 @@ test("unsupported floor: a declared-unavailable native family plus producer fact
     true,
   );
   // A document whose native families are all available does not qualify.
+  // This corpus is Java, whose floor is 0 (Amendment 3); the JavaScript and
+  // Rust floor of one is checked at the floor boundary.
   const allAvailable = await generatedCorpus(t, {
     withoutUnsupportedFacts: true,
     allFamiliesAvailable: true,
   });
-  const controls = registerControls([
-    {
-      id: "COUNT.corpus.unsupported-no-qualifying-document",
-      baseline: () => 0,
-      mutate: () => 1,
-      check: (value) => {
-        const s = value === 0 ? capabilityOnly : allAvailable;
-        return checkCounts(s.loaded, s.records);
-      },
-      expectedAssertion: "COUNT.FLOOR",
-      expectedCode: "invalidRecord",
-      expectedField: "counts",
-    },
-  ]);
-  for (const control of controls) await runControl(control);
+  assert.equal(unsupported(allAvailable), 0);
+  assert.equal(
+    checkCounts(allAvailable.loaded, allAvailable.records).floorsEnforced,
+    true,
+  );
 });
 
 test("Java overloads accept distinct signatures but reject unrelated names and containers", async (t) => {
