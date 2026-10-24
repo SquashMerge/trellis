@@ -5133,6 +5133,9 @@ fn read_semantic_history(
         .producers
         .first()
         .map(|p| (&p.version, &p.executable_hash));
+    let historical_bases = db.prepare("SELECT producer_version,producer_hash,source_set_id,captured_native_revision_id,source_manifest_hash,toolchain_hash,config_hash,dependency_hash FROM semantic_basis WHERE tuple_id=?1")?
+        .query_map([tuple], |r| Ok((r.get::<_, String>(0)?,r.get::<_, String>(1)?,r.get::<_, String>(2)?,r.get::<_, String>(3)?,r.get::<_, String>(4)?,r.get::<_, String>(5)?,r.get::<_, String>(6)?,r.get::<_, String>(7)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
     let rows = db.prepare("SELECT d.ordinal,d.language,d.path,v.content_hash FROM revision_documents d JOIN document_versions v ON v.vid=d.vid WHERE d.revision_id=?1 ORDER BY d.ordinal")?
         .query_map([key], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -5154,18 +5157,18 @@ fn read_semantic_history(
     )?;
     let presentation_freshness = if selected_document.as_ref() != Some(&historical_document_hash) {
         Freshness::Stale
-    } else if provenance.iter().any(|p| {
-        p.basis.as_ref().is_none_or(|basis| {
-            basis.revision_id != selected_header.0
-                || basis.source_manifest_hash != manifest_hash
-                || basis.toolchain_hash != selected_header.1
-                || basis.config_hash != selected_header.2
-                || basis.dependency_hash != selected_header.3
-                || basis.source_set_id != document.source_set_id
-                || selected_descriptor.0 != basis.producer_version
-                || selected_descriptor.1 != basis.producer_hash
-        })
-    }) || (provenance.is_empty()
+    } else if historical_bases.iter().any(
+        |(version, hash, source_set, revision, manifest, toolchain, config, dependency)| {
+            version != &selected_descriptor.0
+                || hash != &selected_descriptor.1
+                || source_set != &document.source_set_id
+                || revision != &selected_header.0
+                || manifest != &manifest_hash
+                || toolchain != &selected_header.1
+                || config != &selected_header.2
+                || dependency != &selected_header.3
+        },
+    ) || (historical_bases.is_empty()
         && (coverage.revision_id != selected_header.0
             || historical_descriptor != Some((&selected_descriptor.0, &selected_descriptor.1))))
     {

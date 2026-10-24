@@ -74,7 +74,6 @@ fn evidence(
     let (toolchain, config, dependency) =
         native_components(root, &native.producer.executable_hash, 2 * 1024 * 1024);
     let document = native.revision.documents.first().unwrap();
-    let bytes = fs::read(root.join(&document.key.path)).unwrap();
     let producer = s::Producer {
         id: "semantic.synthetic".into(),
         version: "v1".into(),
@@ -91,9 +90,14 @@ fn evidence(
         language: s::Language::Rust,
         source_set_id: document.key.source_set_id.clone(),
         revision_id: native.revision.id.clone(),
-        source_manifest_hash: h(&native_ids::canonical(
-            &json!([{"document":document.key,"contentHash":document.content_hash}]),
-        )),
+        source_manifest_hash: h(&native_ids::canonical(&json!(
+            native
+                .revision
+                .documents
+                .iter()
+                .map(|d| json!({"document":d.key,"contentHash":d.content_hash}))
+                .collect::<Vec<_>>()
+        ))),
         toolchain_hash: native.revision.toolchain_hash.clone(),
         config_hash: native.revision.config_hash.clone(),
         dependency_hash: native.revision.dependency_hash.clone(),
@@ -237,7 +241,12 @@ fn evidence(
     let captured = s::CapturedComponents {
         producer_executables: BTreeMap::from([(producer.id.clone(), b"exe".to_vec())]),
         artifacts: BTreeMap::from([(producer.id.clone(), b"artifact".to_vec())]),
-        sources: BTreeMap::from([(document.key.clone(), bytes)]),
+        sources: native
+            .revision
+            .documents
+            .iter()
+            .map(|d| (d.key.clone(), fs::read(root.join(&d.key.path)).unwrap()))
+            .collect(),
         captured_revision: native.revision.clone(),
         native_toolchain: toolchain.clone(),
         native_config: config.clone(),
@@ -339,6 +348,179 @@ fn latest_retained_history_is_declaration_keyed_and_keeps_captured_proof() {
         store
             .semantic_history_for(foreign, &producer, &doc, &syntax)
             .is_err()
+    );
+}
+
+#[test]
+fn populated_history_partitions_documents_and_producers() {
+    let state = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("hello.rs"), "fn hello() { hello(); }\n").unwrap();
+    fs::write(root.path().join("z.rs"), "fn other() {}\n").unwrap();
+    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let options = IndexOptions::new(root.path().to_owned());
+    let (graph, native, capture) =
+        index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+    let (mut semantic, mut captured) = evidence(&native, root.path());
+    let other = native.revision.documents[1].key.clone();
+    let mut other_coverage = semantic.coverage[0].clone();
+    other_coverage.document_path = other.path.clone();
+    other_coverage.state = s::CoverageState::Omitted;
+    other_coverage.selected = false;
+    other_coverage.diagnostic = Some("not selected".into());
+    other_coverage.observed_roles.clear();
+    semantic.coverage.push(other_coverage);
+    let mut second_producer = semantic.producers[0].clone();
+    second_producer.id = "semantic.other".into();
+    let mut second_coverage = semantic.coverage[0].clone();
+    second_coverage.producer_id = second_producer.id.clone();
+    second_coverage.state = s::CoverageState::Omitted;
+    second_coverage.selected = false;
+    second_coverage.diagnostic = Some("not selected".into());
+    second_coverage.observed_roles.clear();
+    let mut second_other = semantic.coverage[1].clone();
+    second_other.producer_id = second_producer.id.clone();
+    semantic.coverage.extend([second_coverage, second_other]);
+    semantic.producers.push(second_producer.clone());
+    captured.requested_producers.push(second_producer.clone());
+    captured
+        .producer_executables
+        .insert(second_producer.id.clone(), b"exe".to_vec());
+    captured
+        .artifacts
+        .insert(second_producer.id.clone(), Vec::new());
+
+    let doc = native.revision.documents[0].key.clone();
+    let syntax = semantic.declaration_bindings[0]
+        .syntax_id
+        .as_ref()
+        .unwrap()
+        .clone();
+    let producer = semantic.producers[0].id.clone();
+    let leader = store.publication_for_tests().unwrap();
+    let first = store
+        .publish_native_semantic(
+            &graph,
+            &capture,
+            &native,
+            &semantic,
+            &captured,
+            &leader,
+            store.index_baseline().unwrap(),
+            &cancel,
+        )
+        .unwrap();
+    fs::write(
+        root.path().join("hello.rs"),
+        "fn hello() { hello(); hello(); }\n",
+    )
+    .unwrap();
+    let (graph, next, capture) =
+        index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+    let second = store
+        .publish_native(&graph, &capture, &next, &leader, first, &cancel)
+        .unwrap();
+    let history = store
+        .semantic_history_for(second, &producer, &doc, &syntax)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        history
+            .provenance
+            .iter()
+            .map(|p| p.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["bind", "rel"]
+    );
+    assert!(
+        store
+            .semantic_history_for(second, &producer, &other, &syntax)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .semantic_history_for(second, &second_producer.id, &doc, &syntax)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn pending_release_excludes_history_and_released_requested_pin_expires() {
+    use trellis::store::MaintenanceOutcome;
+    let state = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("hello.rs"), "fn hello() { hello(); }\n").unwrap();
+    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let options = IndexOptions::new(root.path().to_owned());
+    let (graph, native, capture) =
+        index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+    let (semantic, captured) = evidence(&native, root.path());
+    let doc = native.revision.documents[0].key.clone();
+    let syntax = semantic.declaration_bindings[0]
+        .syntax_id
+        .as_ref()
+        .unwrap()
+        .clone();
+    let producer = semantic.producers[0].id.clone();
+    store.set_retention_clock_for_tests(1_000, 0);
+    let leader = store.publication_for_tests().unwrap();
+    let first = store
+        .publish_native_semantic(
+            &graph,
+            &capture,
+            &native,
+            &semantic,
+            &captured,
+            &leader,
+            store.index_baseline().unwrap(),
+            &cancel,
+        )
+        .unwrap();
+    fs::write(
+        root.path().join("hello.rs"),
+        "fn hello() { hello(); hello(); }\n",
+    )
+    .unwrap();
+    let (graph, next, capture) =
+        index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+    store.set_retention_clock_for_tests(1_001, 1);
+    let second = store
+        .publish_native(&graph, &capture, &next, &leader, first, &cancel)
+        .unwrap();
+    assert!(
+        store
+            .semantic_history_for(second, &producer, &doc, &syntax)
+            .unwrap()
+            .is_some()
+    );
+    store.set_retention_clock_for_tests(1_901, 901);
+    let permit = store.maintenance_try_enter().unwrap();
+    let probe = store.open_maintenance_queue_probe().unwrap();
+    assert_eq!(
+        store
+            .maintenance_step(&leader, &permit, &probe, || true)
+            .unwrap(),
+        MaintenanceOutcome::Progress
+    );
+    assert!(
+        store
+            .semantic_history_for(second, &producer, &doc, &syntax)
+            .unwrap()
+            .is_none()
+    );
+    drop(probe);
+    drop(permit);
+    store.maintain_revisions(&leader).unwrap();
+    let error = store
+        .semantic_history_for(first, &producer, &doc, &syntax)
+        .unwrap_err();
+    assert!(
+        error.downcast_ref::<trellis::store::PinExpired>().is_some(),
+        "{error:#}"
     );
 }
 
@@ -701,4 +883,65 @@ fn producer_version_drift_keeps_stable_id_history_partition() {
             .producer_version,
         "v1"
     );
+}
+
+#[test]
+fn no_matching_fact_still_compares_producer_basis() {
+    let state = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("hello.rs"), "fn hello() { hello(); }\n").unwrap();
+    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let options = IndexOptions::new(root.path().to_owned());
+    let (graph, native, capture) =
+        index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+    let (semantic, captured) = evidence(&native, root.path());
+    let producer = &semantic.producers[0].id;
+    let doc = &native.revision.documents[0].key;
+    let syntax = &"sid:v1:00000000000000000000000000000000".to_owned();
+    let leader = store.publication_for_tests().unwrap();
+    let first = store
+        .publish_native_semantic(
+            &graph,
+            &capture,
+            &native,
+            &semantic,
+            &captured,
+            &leader,
+            store.index_baseline().unwrap(),
+            &cancel,
+        )
+        .unwrap();
+    let mut failed = semantic.clone();
+    failed.producers[0].version = "v2".into();
+    failed.coverage[0].state = s::CoverageState::Failed;
+    failed.coverage[0].diagnostic = Some("producer failed".into());
+    failed.coverage[0].observed_roles.clear();
+    failed.provenance.clear();
+    failed.symbols.clear();
+    failed.declaration_bindings.clear();
+    failed.references.clear();
+    failed.call_bindings.clear();
+    failed.type_relationships.clear();
+    let mut captured_v2 = captured.clone();
+    captured_v2.requested_producers = failed.producers.clone();
+    let second = store
+        .publish_native_semantic(
+            &graph,
+            &capture,
+            &native,
+            &failed,
+            &captured_v2,
+            &leader,
+            first,
+            &cancel,
+        )
+        .unwrap();
+    let history = store
+        .semantic_history_for(second, producer, doc, syntax)
+        .unwrap()
+        .unwrap();
+    assert_eq!(history.coverage.revision_id, native.revision.id);
+    assert_eq!(history.presentation_freshness, s::Freshness::PossiblyStale);
+    assert!(history.provenance.is_empty());
 }
