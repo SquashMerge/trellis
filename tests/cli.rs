@@ -2551,7 +2551,7 @@ fn real_native_snapshot(home: &std::path::Path) -> Value {
     assert_eq!(
         all_rows.len(),
         31,
-        "retain every schema-14 evidence table in raw snapshot"
+        "retain every native evidence table in schema-16 raw snapshot"
     );
     serde_json::json!({"sourceSet":{"id":source_set.0,"rootId":source_set.1},
         "revision":{"id":revision.0,"sourceSetId":revision.1,"toolchainHash":revision.2,
@@ -3696,7 +3696,7 @@ def sink():
         assert_eq!(
             same_bytes_evidence(&native_after),
             same_bytes_evidence(&post_start_native),
-            "{name}: all 31 schema-14 evidence tables and documents must match after only publication identity normalization"
+            "{name}: all 31 native schema-16 evidence tables and documents must match after only publication identity normalization"
         );
         assert_eq!(
             graph_after, graph_before,
@@ -4532,8 +4532,8 @@ async fn saved_items_real_index_matrix() {
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
     assert_eq!(
-        index_version, 14,
-        "derived v14 index inspection is separate"
+        index_version, 16,
+        "derived v16 index inspection is separate"
     );
 
     let edited_view_body = serde_json::json!({

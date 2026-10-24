@@ -500,12 +500,32 @@ async fn successful_workspace_index_automatically_rebuilds_catalog() {
     })
     .await
     .unwrap();
-    let new = ready(&fixture.app).await;
-    assert_eq!(
-        new["workspaceRevision"],
-        serde_json::json!(fixture.store.status().unwrap().revision)
-    );
-    assert_ne!(old["catalogId"], new["catalogId"]);
+    let expected = serde_json::json!(fixture.store.status().unwrap().revision);
+    let new = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        loop {
+            let (status, body) = request(&fixture.app, "GET", "/api/dependencies", "").await;
+            assert_eq!(status, 200);
+            assert_eq!(body["workspaceRevision"], expected);
+            if body["state"] == "ready" {
+                assert_ne!(old["catalogId"], body["catalogId"]);
+                break body;
+            }
+            assert!(
+                body["state"] == "loading"
+                    || (body["state"] == "failed"
+                        && body["catalogId"].is_null()
+                        && body["warnings"]
+                            == serde_json::json!([
+                                "Workspace changed; refresh the dependency catalog"
+                            ])),
+                "{body}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("automatic dependency refresh timed out");
+    assert_eq!(new["workspaceRevision"], expected);
 }
 #[cfg(unix)]
 #[tokio::test]
