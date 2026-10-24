@@ -489,6 +489,236 @@ fn daemon_death_interrupts_session_and_next_launch_recovers() {
     client.reaped = true;
 }
 
+// Observe live attachments without selecting a checkout or scanning index directories.
+fn active_checkout_count(home: &Path, root: &Path) -> Value {
+    let token_file = home.join("restart-token");
+    let mut control = UnixStream::connect(socket_ready(home)).unwrap();
+    control
+        .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
+        .unwrap();
+    protocol::write_frame(
+        &mut control,
+        &protocol::Request {
+            id: 50,
+            operation: "serve".into(),
+            payload: json!({"workspace":root,"bind":"127.0.0.1:0",
+            "tokenFile":token_file,"options":{}}),
+        },
+    )
+    .unwrap();
+    let listener: protocol::Reply = protocol::read_frame(&mut control).unwrap();
+    let address = listener.payload["result"]
+        .as_str()
+        .expect("browser listener address");
+    let token = fs::read_to_string(token_file).unwrap();
+    let mut http = std::net::TcpStream::connect(address).unwrap();
+    http.set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
+        .unwrap();
+    write!(http, "GET /api/daemon/status HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n", token.trim()).unwrap();
+    let mut body = String::new();
+    std::io::Read::read_to_string(&mut http, &mut body).unwrap();
+    let body: Value = serde_json::from_str(body.split_once("\r\n\r\n").unwrap().1).unwrap();
+    body["activeCheckouts"].clone()
+}
+
+#[test]
+fn reconnect_handshake_skips_a_replaced_selection_and_keeps_launch_usable() {
+    use trellis::store::topology::WorkspaceIdentity;
+    let home = tempfile::tempdir().unwrap();
+    let root = checkout(home.path());
+    let launch = WorkspaceIdentity::discover_unattached(Some(&root), &root).unwrap();
+    let selected = home.path().join("selected");
+    fs::create_dir_all(selected.join(".git")).unwrap();
+    let identity = WorkspaceIdentity::discover_unattached(Some(&selected), &selected)
+        .unwrap()
+        .attach_marker()
+        .unwrap();
+    let remembered = protocol::McpAttachment::from_identity(&identity);
+    fs::rename(&selected, selected.with_extension("moved")).unwrap();
+    fs::create_dir_all(selected.join(".git")).unwrap();
+    let mut daemon = trellis::testing::owned(Command::new(env!("CARGO_BIN_EXE_trellis")))
+        .arg("daemon")
+        .env("HOME", home.path())
+        .env("XDG_CACHE_HOME", home.path().join("cache"))
+        .env("XDG_DATA_HOME", home.path().join("data"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let socket = socket_ready(home.path());
+    let mut stream = UnixStream::connect(&socket).unwrap();
+    stream
+        .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
+        .unwrap();
+    protocol::write_frame(
+        &mut stream,
+        &protocol::Request {
+            id: 1,
+            operation: "mcp".into(),
+            payload: json!({"workspace":launch.root,"device":launch.device,"inode":launch.inode,
+            "relay":true,"attachments":[remembered]}),
+        },
+    )
+    .unwrap();
+    let reply: protocol::Reply = protocol::read_frame(&mut stream).unwrap();
+    assert_eq!(reply.payload["result"], true, "{reply:?}");
+    assert!(
+        !selected.join(".git/trellis/workspace-id").exists(),
+        "reconnect attached the replacement's marker"
+    );
+    // The same connection stays usable for its launch, not a successor root.
+    writeln!(
+        stream,
+        "2 {}",
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+        "params":{"name":"trellis_workspace_describe","arguments":{"schemaVersion":1},
+            "_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities":{}}}})
+    )
+    .unwrap();
+    let mut line = String::new();
+    BufReader::new(stream.try_clone().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let (_, answer) = relayed(&line);
+    assert_eq!(
+        answer["result"]["structuredContent"]["workspace"],
+        json!(launch.root)
+    );
+    assert_eq!(active_checkout_count(home.path(), &root), 1);
+    drop(stream);
+    daemon.kill().unwrap();
+    daemon.wait().unwrap();
+}
+
+#[test]
+fn reconnect_skips_changed_membership_but_restores_another_selection() {
+    use trellis::store::topology::WorkspaceIdentity;
+    let home = tempfile::tempdir().unwrap();
+    let root = checkout(home.path());
+    let git = |cwd: &Path, args: &[&str]| {
+        let output = Command::new("git")
+            .current_dir(cwd)
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "Fixture")
+            .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
+            .env("GIT_COMMITTER_NAME", "Fixture")
+            .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&root, &["init", "--quiet"]);
+    git(
+        &root,
+        &["commit", "--allow-empty", "--quiet", "-m", "fixture"],
+    );
+    let changed = home.path().join("changed");
+    let valid = home.path().join("valid");
+    for selected in [&changed, &valid] {
+        git(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                selected.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+    }
+    let launch = WorkspaceIdentity::discover_unattached(Some(&root), &root)
+        .unwrap()
+        .attach_marker()
+        .unwrap();
+    let changed_identity = WorkspaceIdentity::discover_unattached(Some(&changed), &changed)
+        .unwrap()
+        .attach_marker()
+        .unwrap();
+    let valid_identity = WorkspaceIdentity::discover_unattached(Some(&valid), &valid)
+        .unwrap()
+        .attach_marker()
+        .unwrap();
+    let other = home.path().join("other");
+    fs::create_dir(&other).unwrap();
+    git(&other, &["init", "--quiet"]);
+    // Keep root inode, Git directory and UUID unchanged; only repository
+    // membership changes, which the relay's identity filter cannot detect.
+    let pointer = fs::read_to_string(changed.join(".git")).unwrap();
+    let admin = Path::new(pointer.trim().strip_prefix("gitdir: ").unwrap());
+    fs::write(
+        admin.join("commondir"),
+        format!("{}\n", other.join(".git").display()),
+    )
+    .unwrap();
+    changed_identity.verify_readonly().unwrap();
+    assert_eq!(
+        changed_identity.git_common_dir().unwrap(),
+        other.join(".git").canonicalize().unwrap()
+    );
+    let mut daemon = trellis::testing::owned(Command::new(env!("CARGO_BIN_EXE_trellis")))
+        .arg("daemon")
+        .env("HOME", home.path())
+        .env("XDG_CACHE_HOME", home.path().join("cache"))
+        .env("XDG_DATA_HOME", home.path().join("data"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stream = UnixStream::connect(socket_ready(home.path())).unwrap();
+    stream
+        .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
+        .unwrap();
+    protocol::write_frame(
+        &mut stream,
+        &protocol::Request {
+            id: 1,
+            operation: "mcp".into(),
+            payload: json!({"workspace":launch.root,"device":launch.device,"inode":launch.inode,
+            "relay":true,"attachments":[protocol::McpAttachment::from_identity(&changed_identity),
+                protocol::McpAttachment::from_identity(&valid_identity)]}),
+        },
+    )
+    .unwrap();
+    let reply: protocol::Reply = protocol::read_frame(&mut stream).unwrap();
+    assert_eq!(reply.payload["result"], true, "{reply:?}");
+    writeln!(
+        stream,
+        "2 {}",
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+        "params":{"name":"trellis_workspace_describe","arguments":{"schemaVersion":1},
+            "_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities":{}}}})
+    )
+    .unwrap();
+    let mut line = String::new();
+    BufReader::new(stream.try_clone().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let (_, answer) = relayed(&line);
+    assert_eq!(
+        answer["result"]["structuredContent"]["workspace"],
+        json!(launch.root)
+    );
+    assert_eq!(
+        active_checkout_count(home.path(), &root),
+        2,
+        "invalid membership blocked launch or the other valid attachment"
+    );
+    drop(stream);
+    daemon.kill().unwrap();
+    daemon.wait().unwrap();
+}
+
 #[test]
 fn legacy_mcp_reconnect_restores_handshake_without_new_client() {
     let home = tempfile::tempdir().unwrap();
@@ -574,6 +804,22 @@ fn legacy_mcp_reconnect_restores_handshake_without_new_client() {
     daemon.kill().unwrap();
     daemon.wait().unwrap();
     assert!(peer.child.try_wait().unwrap().is_none());
+    // Reconnect without selecting again: retained attachments must not change
+    // the contract's launch-workspace default.
+    let launch = peer.ask(
+        30,
+        "tools/call",
+        json!({"name":"trellis_workspace_describe","arguments":{"schemaVersion":1}}),
+    );
+    assert_eq!(
+        launch["result"]["structuredContent"]["workspace"],
+        json!(root.canonicalize().unwrap())
+    );
+    assert_eq!(
+        active_checkout_count(home.path(), &root),
+        2,
+        "linked attachment was not restored before another explicit selection"
+    );
     let result = peer.ask(
         3,
         "tools/call",

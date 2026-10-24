@@ -948,3 +948,178 @@ fn explicit_producer_without_applicable_documents_survives_pins_and_supplied_ref
         semantic.producers
     );
 }
+
+#[test]
+fn semantic_executable_drift_child() {
+    let Ok(state) = std::env::var("TRELLIS_SEMANTIC_DRIFT_STATE") else {
+        return;
+    };
+    let workspace =
+        std::path::PathBuf::from(std::env::var("TRELLIS_SEMANTIC_DRIFT_WORKSPACE").unwrap());
+    let store = Store::open_for_tests(std::path::Path::new(&state), &workspace).unwrap();
+    let previous = store.index_baseline().unwrap();
+    let modes = std::sync::Mutex::new(Vec::new());
+    trellis::index_coordinator::IndexJobCoordinator::prepare(&store, None)
+        .unwrap()
+        .run_serving(
+            &IndexOptions::new(workspace),
+            &Arc::new(AtomicBool::new(false)),
+            |progress| {
+                if progress.phase.starts_with("mode:") {
+                    modes.lock().unwrap().push(progress.phase);
+                }
+            },
+        )
+        .unwrap();
+    assert_eq!(modes.into_inner().unwrap(), vec!["mode:unchanged"]);
+    let fresh = store.status().unwrap().revision;
+    assert_eq!(fresh.index_generation, previous.index_generation);
+    assert_eq!(fresh.index_revision, previous.index_revision + 1);
+}
+
+#[test]
+fn rebuilt_executable_retains_semantic_head_context_without_reusing_evidence() {
+    use sha2::{Digest, Sha256};
+    use std::io::Write;
+
+    let (state, root, store, cancel, options) = setup();
+    let (graph, native, capture) =
+        index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+    let (semantic, captured) = evidence(&native, root.path());
+    let leader = store.publication_for_tests().unwrap();
+    let first = store
+        .publish_native_semantic(
+            &graph,
+            &capture,
+            &native,
+            &semantic,
+            &captured,
+            &leader,
+            store.index_baseline().unwrap(),
+            &cancel,
+        )
+        .unwrap();
+    let prior = store.semantic_at(first).unwrap();
+    assert_eq!(prior.coverage[0].state, s::CoverageState::Complete);
+    drop(leader);
+    drop(store);
+
+    // A fresh process must observe a genuinely different running executable,
+    // while its extractor hash and every repository input remain unchanged.
+    let binary = state.path().join("semantic-rebuilt-executable");
+    fs::copy(std::env::current_exe().unwrap(), &binary).unwrap();
+    let mut image = fs::OpenOptions::new().append(true).open(&binary).unwrap();
+    image
+        .write_all(b"TRELLIS-SEMANTIC-METADATA-ONLY-REBUILD")
+        .unwrap();
+    image.sync_all().unwrap();
+    drop(image);
+    let rebuilt_hash = hex::encode(Sha256::digest(fs::read(&binary).unwrap()));
+    assert_ne!(rebuilt_hash, native.producer.executable_hash);
+    let output = std::process::Command::new(&binary)
+        .arg("--exact")
+        .arg("semantic_executable_drift_child")
+        .arg("--nocapture")
+        .env("TRELLIS_SEMANTIC_DRIFT_STATE", state.path())
+        .env("TRELLIS_SEMANTIC_DRIFT_WORKSPACE", root.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "rebuilt semantic publication failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    let second = store.status().unwrap().revision;
+    assert_eq!(second.index_generation, first.index_generation);
+    assert_eq!(second.index_revision, first.index_revision + 1);
+    let current = store.semantic_at(second).unwrap();
+    assert_eq!(current.producers, prior.producers);
+    assert_eq!(current.coverage.len(), prior.coverage.len());
+    let coverage = &current.coverage[0];
+    assert_eq!(coverage.state, s::CoverageState::Omitted);
+    assert!(coverage.requested);
+    assert!(!coverage.selected);
+    assert_eq!(coverage.producer_id, prior.coverage[0].producer_id);
+    assert_eq!(coverage.language, prior.coverage[0].language);
+    assert_eq!(coverage.source_set_id, prior.coverage[0].source_set_id);
+    assert_eq!(coverage.document_path, prior.coverage[0].document_path);
+    assert_eq!(coverage.supported_roles, prior.coverage[0].supported_roles);
+    assert!(coverage.observed_roles.is_empty());
+    assert_ne!(coverage.revision_id, native.revision.id);
+    assert!(current.provenance.is_empty());
+    assert!(current.symbols.is_empty());
+    assert!(current.declaration_bindings.is_empty());
+    assert!(current.references.is_empty());
+    assert!(current.call_bindings.is_empty());
+    assert!(current.type_relationships.is_empty());
+    assert_eq!(store.semantic_at(first).unwrap(), prior);
+    drop(store);
+
+    let identity =
+        trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+            .unwrap();
+    let db = rusqlite::Connection::open(
+        state
+            .path()
+            .join("cache/indexes")
+            .join(identity.root_key)
+            .join("index.db"),
+    )
+    .unwrap();
+    let first_key = format!("pin:v1:{}:{}", first.index_generation, first.index_revision);
+    let second_key = format!(
+        "pin:v1:{}:{}",
+        second.index_generation, second.index_revision
+    );
+    let rows = |table: &str, columns: &str, key: &str| {
+        db.prepare(&format!(
+            "SELECT json_array({columns}) FROM {table} WHERE revision_id=?1 ORDER BY 1"
+        ))
+        .unwrap()
+        .query_map([key], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+    };
+    for (table, columns) in [
+        ("semantic_revision_producers", "id,version"),
+        ("semantic_requested_producers", "id,version,executable_hash"),
+        (
+            "semantic_requested_producer_languages",
+            "id,language,ordinal",
+        ),
+        ("revision_documents", "language,path,vid,gid,cid"),
+    ] {
+        let previous = rows(table, columns, &first_key);
+        assert!(!previous.is_empty(), "{table}");
+        assert_eq!(rows(table, columns, &second_key), previous, "{table}");
+    }
+    let (revision_id, toolchain_hash): (String, String) = db
+        .query_row(
+            "SELECT native_revision_id,toolchain_hash FROM native_revisions WHERE id=?1",
+            [&second_key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(revision_id, coverage.revision_id);
+    assert_ne!(toolchain_hash, native.revision.toolchain_hash);
+    let bound_hash: String = db
+        .query_row(
+            "SELECT producer_sha FROM revision_producer_bindings WHERE revision_id=?1",
+            [&second_key],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(bound_hash, rebuilt_hash);
+    let violations = db
+        .prepare("PRAGMA foreign_key_check")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert!(violations.is_empty(), "{violations:?}");
+}

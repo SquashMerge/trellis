@@ -436,18 +436,111 @@ fn serve_request_preserves_explicit_default_file_cap_presence() {
     drop(owner);
 }
 
+// Socket acceptance does not imply the virgin checkout's first publication.
+fn status_when_ready(
+    mut read: impl FnMut() -> std::process::Output,
+    on_first_not_ready: impl FnOnce(),
+) -> Value {
+    let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
+    let mut on_first_not_ready = Some(on_first_not_ready);
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        let output = read();
+        if output.status.success() {
+            return serde_json::from_slice(&output.stdout).unwrap();
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.stdout.is_empty(),
+            "failed status emitted partial output"
+        );
+        assert_eq!(
+            stderr.trim(),
+            "Error: index_not_ready: reindex required",
+            "unexpected status failure on attempt {attempts}: {stderr}",
+        );
+        if let Some(release) = on_first_not_ready.take() {
+            release();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "status did not become ready after {attempts} attempts: {stderr}",
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn status_readiness_does_not_retry_other_failures() {
+    use std::os::unix::process::ExitStatusExt;
+    let mut attempts = 0;
+    let mut retry_observed = false;
+    let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        status_when_ready(
+            || {
+                attempts += 1;
+                std::process::Output {
+                    status: std::process::ExitStatus::from_raw(1 << 8),
+                    stdout: Vec::new(),
+                    stderr: b"Error: daemon_unavailable\n".to_vec(),
+                }
+            },
+            || retry_observed = true,
+        );
+    }));
+    assert!(failure.is_err());
+    assert_eq!(attempts, 1, "unrelated failure was retried");
+    assert!(
+        !retry_observed,
+        "unrelated failure entered the readiness retry path"
+    );
+}
+
 #[test]
 fn daemon_keeps_private_socket_after_transient_accept_errors() {
-    use std::os::unix::{fs::MetadataExt, net::UnixStream};
+    use std::os::unix::{
+        fs::MetadataExt,
+        net::{UnixListener, UnixStream},
+    };
+    use std::{
+        io::{Read, Write},
+        sync::mpsc,
+    };
     for fault in ["emfile", "econnaborted"] {
         let temp = short_temp();
         let home = temp.path().join("home");
         fs::create_dir(&home).unwrap();
         let root = checkout(temp.path(), "work");
+        let startup_path = home.join("startup.sock");
+        let startup_listener = UnixListener::bind(&startup_path).unwrap();
+        startup_listener.set_nonblocking(true).unwrap();
+        let (arrived, startup) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let mut accepted = None;
+            trellis::testing::wait_until("daemon startup fixture connection", || {
+                match startup_listener.accept() {
+                    Ok((stream, _)) => {
+                        accepted = Some(stream);
+                        true
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => false,
+                    Err(error) => panic!("accept daemon startup fixture: {error}"),
+                }
+            });
+            let mut stream = accepted.unwrap();
+            stream
+                .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
+                .unwrap();
+            stream.read_exact(&mut [0]).unwrap();
+            // A failed status assertion may already have dropped the receiver.
+            let _ = arrived.send(stream);
+        });
         let mut command = cli(&home);
         command
             .arg("daemon")
-            .env("TRELLIS_TEST_DAEMON_ACCEPT_ERROR_ONCE", fault);
+            .env("TRELLIS_TEST_DAEMON_ACCEPT_ERROR_ONCE", fault)
+            .env("TRELLIS_TEST_DAEMON_STARTUP_SOCKET", &startup_path);
         let mut owner = detached(command);
         let socket = fixture_socket_paths(&home).socket;
         let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
@@ -468,8 +561,25 @@ fn daemon_keeps_private_socket_after_transient_accept_errors() {
             std::thread::sleep(Duration::from_millis(20));
         }
         let inode = fs::metadata(&socket).unwrap().ino();
+        let mut first_refusal_observed = false;
         for _ in 0..2 {
-            let reply = run(&home, "status", &root);
+            let reply = status_when_ready(
+                || {
+                    cli(&home)
+                        .arg("status")
+                        .arg("--workspace")
+                        .arg(&root)
+                        .output()
+                        .unwrap()
+                },
+                || {
+                    let mut stream = startup
+                        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+                        .expect("startup did not reach the pre-publication hook");
+                    stream.write_all(&[1]).unwrap();
+                    first_refusal_observed = true;
+                },
+            );
             assert!(reply.is_object(), "{reply}");
             assert!(
                 owner.0.try_wait().unwrap().is_none(),
@@ -477,6 +587,11 @@ fn daemon_keeps_private_socket_after_transient_accept_errors() {
             );
             assert_eq!(fs::metadata(&socket).unwrap().ino(), inode);
         }
+        assert!(
+            first_refusal_observed,
+            "startup fixture never forced a cold refusal"
+        );
+        waiter.join().unwrap();
     }
 }
 

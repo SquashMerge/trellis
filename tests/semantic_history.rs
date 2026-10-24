@@ -910,9 +910,14 @@ fn corrupted_retained_tuple_fails_typed_without_partial_history() {
         .semantic_history_for(second, producer, doc, syntax)
         .unwrap_err();
     assert!(
+        error.to_string().contains("incompatible_index:"),
+        "{error:#}"
+    );
+    assert!(
         error.to_string().contains("invalid") || error.to_string().contains("unknown"),
         "{error:#}"
     );
+    assert!(store.recovery_pending_for_tests());
 }
 
 #[test]

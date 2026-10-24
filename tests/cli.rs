@@ -1134,7 +1134,7 @@ async fn serve_ingress_persists_relative_presentation_paths_before_cross_cwd_tak
 }
 
 #[test]
-fn explicit_cli_index_recreates_corruption_but_bounded_reads_refuse_unknown_options() {
+fn explicit_cli_index_preserves_custom_options_after_bounded_read_recovery() {
     use std::os::unix::fs::MetadataExt;
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("source");
@@ -1179,7 +1179,17 @@ fn explicit_cli_index_recreates_corruption_but_bounded_reads_refuse_unknown_opti
             .expect("old daemon retained index-use lock"),
     );
     fs::write(&index, b"invalid-sqlite-header-with-at-least-20-bytes").unwrap();
-    let corrupt = fs::read(&index).unwrap();
+    let queue = rusqlite::Connection::open(dir.join("requests.db")).unwrap();
+    let prior_requests: Vec<(String, String, String)> = queue
+        .prepare("SELECT id,state,options_json FROM requests ORDER BY seq")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    drop(queue);
+    assert_eq!(prior_requests.len(), 1);
+    assert_eq!(prior_requests[0].1, "done");
     for sub in ["status", "symbols", "query"] {
         let mut cmd = command(&root, &home, sub);
         cmd.env("TRELLIS_TEST_DAEMON_PID_FILE", home.join("auto-daemon.pid"));
@@ -1192,18 +1202,20 @@ fn explicit_cli_index_recreates_corruption_but_bounded_reads_refuse_unknown_opti
             }
             _ => {}
         }
-        let refused = cmd.output().unwrap();
-        assert!(!refused.status.success(), "{sub} unexpectedly succeeded");
-        assert!(
-            refused.stdout.is_empty(),
-            "{sub} emitted unverified evidence"
-        );
-        assert!(
-            String::from_utf8_lossy(&refused.stderr).contains("recovery_required"),
-            "{sub}: {}",
-            String::from_utf8_lossy(&refused.stderr)
-        );
-        assert_eq!(fs::read(&index).unwrap(), corrupt);
+        let read = cmd.output().unwrap();
+        if read.status.success() {
+            serde_json::from_slice::<Value>(&read.stdout)
+                .unwrap_or_else(|error| panic!("{sub} emitted invalid evidence: {error}"));
+        } else {
+            assert!(read.stdout.is_empty(), "{sub} emitted unverified evidence");
+            let reason = String::from_utf8_lossy(&read.stderr);
+            assert!(
+                reason.contains("recovery_required")
+                    || reason.contains("index_not_ready")
+                    || (sub == "query" && reason.contains("seed not found in current index")),
+                "{sub}: {reason}"
+            );
+        }
     }
     // A bounded read may have elected a new daemon. Retire only its attested
     // socket peer before the cold exceptional-recovery index operation.
@@ -1224,8 +1236,13 @@ fn explicit_cli_index_recreates_corruption_but_bounded_reads_refuse_unknown_opti
     );
     let output: Value = serde_json::from_slice(&recovered.stdout).unwrap();
     assert_eq!(output["publishedRevision"], output["status"]["revision"]);
-    // Recreation publishes r1; the claimed request is unchanged and completes at it.
-    assert_eq!(output["publishedRevision"]["indexRevision"], 1);
+    // A bounded read can already have recreated with configured defaults.
+    assert!(
+        output["publishedRevision"]["indexRevision"]
+            .as_u64()
+            .unwrap()
+            >= 1
+    );
     assert_ne!(
         output["publishedRevision"]["indexGeneration"],
         first["publishedRevision"]["indexGeneration"]
@@ -1247,10 +1264,33 @@ fn explicit_cli_index_recreates_corruption_but_bounded_reads_refuse_unknown_opti
         serde_json::from_str::<Value>(&recorded).unwrap()["maxFileBytes"],
         2_097_152
     );
+    let queue = rusqlite::Connection::open(dir.join("requests.db")).unwrap();
+    for (id, state, options) in prior_requests {
+        let retained: (String, String) = queue
+            .query_row(
+                "SELECT state,options_json FROM requests WHERE id=?1",
+                [&id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            retained,
+            (state, options),
+            "terminal request {id} changed during recreation"
+        );
+    }
+    let done: i64 = queue.query_row(
+        "SELECT count(*) FROM requests WHERE state='done' AND json_extract(options_json,'$.maxFileBytes')=2097152", [],
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(
+        done, 2,
+        "both accepted custom requests must remain completed"
+    );
 }
 
 #[test]
-fn corrupt_read_activation_waits_for_accepted_cli_options_in_same_daemon() {
+fn corrupt_read_activation_then_accepted_cli_options_share_the_same_daemon() {
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("source");
     let home = temp.path().join("home");
@@ -1278,21 +1318,34 @@ fn corrupt_read_activation_waits_for_accepted_cli_options_in_same_daemon() {
         trellis::store::topology::UseGuard::acquire_existing_readonly_exclusive(&use_lock)
             .expect("old daemon retained index-use lock"),
     );
+    let queue = rusqlite::Connection::open(dir.join("requests.db")).unwrap();
+    let prior_request: (String, String) = queue
+        .query_row(
+            "SELECT id,options_json FROM requests WHERE state='done'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    drop(queue);
     fs::write(&index, b"invalid-sqlite-header-with-at-least-20-bytes").unwrap();
-    let corrupt = fs::read(&index).unwrap();
     let cleanup = FixtureDaemon::new(&home);
-    let refused = command(&root, &home, "status")
+    let read = command(&root, &home, "status")
         .env("TRELLIS_TEST_DAEMON_PID_FILE", &marker)
         .output()
         .unwrap();
-    assert!(!refused.status.success());
-    assert!(refused.stdout.is_empty());
-    assert!(
-        String::from_utf8_lossy(&refused.stderr).contains("recovery_required"),
-        "{}",
-        String::from_utf8_lossy(&refused.stderr)
-    );
-    assert_eq!(fs::read(&index).unwrap(), corrupt);
+    if read.status.success() {
+        serde_json::from_slice::<Value>(&read.stdout).unwrap();
+    } else {
+        assert!(
+            read.stdout.is_empty(),
+            "failed status emitted unverified evidence"
+        );
+        let reason = String::from_utf8_lossy(&read.stderr);
+        assert!(
+            reason.contains("recovery_required") || reason.contains("index_not_ready"),
+            "{reason}"
+        );
+    }
     let daemon_pid = fs::read_to_string(&marker).unwrap();
     let recovered = command(&root, &home, "index")
         .env("TRELLIS_TEST_DAEMON_PID_FILE", &marker)
@@ -1308,8 +1361,13 @@ fn corrupt_read_activation_waits_for_accepted_cli_options_in_same_daemon() {
     assert_eq!(fs::read_to_string(&marker).unwrap(), daemon_pid);
     let result: Value = serde_json::from_slice(&recovered.stdout).unwrap();
     assert_eq!(result["publishedRevision"], result["status"]["revision"]);
-    // Startup reconciliation publishes r1; the unchanged claimed request completes at it.
-    assert_eq!(result["publishedRevision"]["indexRevision"], 1);
+    // Read activation may publish configured defaults before the accepted custom request.
+    assert!(
+        result["publishedRevision"]["indexRevision"]
+            .as_u64()
+            .unwrap()
+            >= 1
+    );
     let db = rusqlite::Connection::open(&index).unwrap();
     let recorded: String = db
         .query_row(
@@ -1323,6 +1381,24 @@ fn corrupt_read_activation_waits_for_accepted_cli_options_in_same_daemon() {
         3_145_728
     );
     drop(db);
+    let queue = rusqlite::Connection::open(dir.join("requests.db")).unwrap();
+    let retained: (String, String) = queue
+        .query_row(
+            "SELECT state,options_json FROM requests WHERE id=?1",
+            [&prior_request.0],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(retained, ("done".into(), prior_request.1));
+    let custom_done: i64 = queue.query_row(
+        "SELECT count(*) FROM requests WHERE state='done' AND json_extract(options_json,'$.maxFileBytes')=3145728", [],
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(
+        custom_done, 1,
+        "accepted custom request must complete durably"
+    );
+    drop(queue);
     drop(cleanup);
 }
 
@@ -2687,6 +2763,7 @@ impl LegacyClient {
         self.request(reqwest::Method::GET, url)
     }
 }
+#[derive(Clone)]
 struct LegacyRequest {
     app: axum::Router,
     method: reqwest::Method,
@@ -2778,6 +2855,129 @@ async fn real_api(
     let response = request.send().await.unwrap();
     let status = response.status();
     (status, response.json().await.unwrap())
+}
+
+async fn saved_item_status(request: LegacyRequest, context: &str) -> anyhow::Result<Value> {
+    let mut attempts = 0;
+    let mut last_observed = "no response".to_owned();
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        loop {
+            attempts += 1;
+            let response = request.clone().send().await.map_err(|error| {
+                anyhow::anyhow!(
+                    "{context} status attempt {attempts}: {error:#}; last observed {last_observed}"
+                )
+            })?;
+            let status = response.status;
+            last_observed = format!(
+                "status={status} body={}",
+                String::from_utf8_lossy(&response.bytes)
+            );
+            let body: Value = serde_json::from_slice(&response.bytes).map_err(|error| {
+                anyhow::anyhow!(
+                    "{context} status attempt {attempts}: {last_observed}; invalid JSON: {error}"
+                )
+            })?;
+            if status == reqwest::StatusCode::OK {
+                return Ok(body);
+            }
+            if status != reqwest::StatusCode::SERVICE_UNAVAILABLE
+                || !matches!(
+                    body["error"]["code"].as_str(),
+                    Some("index_not_ready" | "rebuild_in_progress")
+                )
+            {
+                anyhow::bail!("{context} status attempt {attempts}: {last_observed}");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "{context} status timed out after {attempts} attempts; last observed {last_observed}"
+        )
+    })?
+}
+
+fn saved_item_status_fixture(
+    responses: Vec<(reqwest::StatusCode, &'static str)>,
+) -> (
+    LegacyRequest,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+    use std::sync::{Arc, Mutex, atomic::AtomicUsize};
+    let responses = Arc::new(Mutex::new(std::collections::VecDeque::from(responses)));
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let observed = attempts.clone();
+    let app = axum::Router::new().route(
+        "/api/status",
+        axum::routing::get(move || {
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let response = responses.lock().unwrap().pop_front().unwrap();
+            async move { response }
+        }),
+    );
+    (
+        LegacyRequest {
+            app,
+            method: reqwest::Method::GET,
+            url: "http://127.0.0.1:7331/api/status".to_owned(),
+            token: None,
+            origin: None,
+            body: None,
+        },
+        attempts,
+    )
+}
+
+#[tokio::test]
+async fn saved_item_status_retries_only_typed_startup_refusals() {
+    use reqwest::StatusCode;
+    let (request, attempts) = saved_item_status_fixture(vec![
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            r#"{"error":{"code":"index_not_ready","message":"starting"}}"#,
+        ),
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            r#"{"error":{"code":"rebuild_in_progress","message":"rebuilding"}}"#,
+        ),
+        (
+            StatusCode::OK,
+            r#"{"catchingUp":true,"revision":{"indexRevision":1}}"#,
+        ),
+    ]);
+    let body = saved_item_status(request, "initial").await.unwrap();
+    assert_eq!(body["catchingUp"], true);
+    assert_eq!(body["revision"]["indexRevision"], 1);
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn saved_item_status_rejects_other_responses_with_the_body() {
+    use reqwest::StatusCode;
+    for (status, body) in [
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            r#"{"error":{"code":"corrupt","message":"broken index"}}"#,
+        ),
+        (
+            StatusCode::CONFLICT,
+            r#"{"error":{"code":"index_not_ready"}}"#,
+        ),
+        (StatusCode::SERVICE_UNAVAILABLE, "not JSON: unavailable"),
+    ] {
+        let (request, attempts) = saved_item_status_fixture(vec![(status, body)]);
+        let error = saved_item_status(request, "reopened")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("reopened status attempt 1"), "{error}");
+        assert!(error.contains(&status.to_string()), "{error}");
+        assert!(error.contains(body), "{error}");
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
 }
 
 async fn real_selected_api(
@@ -4382,16 +4582,15 @@ async fn saved_items_real_index_matrix() {
     let initial_pin = indexed["status"]["revision"].clone();
     assert!(home.join("auto-daemon.pid").exists());
     let (_server, client, url) = start_saved_item_server(temp.path(), &root, &home, TOKEN).await;
-    let (status, serving_status) = real_api(
-        &client,
-        &url,
-        TOKEN,
-        reqwest::Method::GET,
-        "/api/status",
-        None,
+    let serving_status = saved_item_status(
+        client
+            .get(format!("{url}/api/status"))
+            .header("Origin", &url)
+            .bearer_auth(TOKEN),
+        "initial",
     )
-    .await;
-    assert_eq!(status, reqwest::StatusCode::OK, "{serving_status}");
+    .await
+    .unwrap();
     let pin = serving_status["revision"].clone();
     assert_eq!(pin["indexGeneration"], initial_pin["indexGeneration"]);
     // The direct router may commit mandatory startup reconciliation after the daemon exits.
@@ -4822,16 +5021,15 @@ async fn saved_items_real_index_matrix() {
     drop(db);
 
     let (_server, client, url) = start_saved_item_server(temp.path(), &root, &home, TOKEN).await;
-    let (status, reopened_status) = real_api(
-        &client,
-        &url,
-        TOKEN,
-        reqwest::Method::GET,
-        "/api/status",
-        None,
+    let reopened_status = saved_item_status(
+        client
+            .get(format!("{url}/api/status"))
+            .header("Origin", &url)
+            .bearer_auth(TOKEN),
+        "reopened",
     )
-    .await;
-    assert_eq!(status, reqwest::StatusCode::OK, "{reopened_status}");
+    .await
+    .unwrap();
     let reopened_pin = reopened_status["revision"].clone();
     assert_eq!(reopened_pin["indexGeneration"], next["indexGeneration"]);
     // Reopening the direct router may publish mandatory startup reconciliation again.

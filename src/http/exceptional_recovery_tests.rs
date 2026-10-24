@@ -1,7 +1,7 @@
 use super::*;
 use crate::store::topology::{TopologyRoots, WorkspaceIdentity};
 
-fn fixture() -> (
+pub(super) fn fixture() -> (
     tempfile::TempDir,
     Store,
     Arc<DaemonState>,
@@ -39,7 +39,7 @@ fn fixture() -> (
 }
 
 #[test]
-fn damaged_index_without_accepted_head_never_guesses_startup_options() {
+fn damaged_index_without_accepted_head_uses_configured_startup_options() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("workspace");
     std::fs::create_dir(&root).unwrap();
@@ -73,23 +73,12 @@ fn damaged_index_without_accepted_head_never_guesses_startup_options() {
         "127.0.0.1:7331".parse().unwrap(),
     )
     .unwrap();
-    let started = Instant::now();
-    let error = state.worker_step().unwrap_err();
-    let finished = Instant::now();
-    assert!(
-        error.to_string().starts_with("recovery_required:"),
-        "{error:#}"
-    );
-    assert!(
-        state
-            .recovery_retry_after
-            .lock()
-            .unwrap()
-            .is_some_and(|at| { at >= started && at <= finished + Duration::from_millis(500) })
-    );
-    assert!(state.runtime.lock().unwrap().session().is_none());
+    state.worker_step().unwrap();
+    assert!(state.runtime.lock().unwrap().session().is_some());
     assert!(store.current_request().unwrap().is_none());
-    assert_eq!(std::fs::read(index).unwrap(), damaged);
+    assert!(!store.is_recreate_pending());
+    assert_ne!(std::fs::read(index).unwrap(), damaged);
+    assert!(store.source_at("a.js", None).unwrap().is_some());
 }
 
 #[test]
@@ -666,23 +655,51 @@ async fn timer_tick_with_independent_shared_reader_defers_without_changing_both_
         .retain_serving_session(fixture.old_owner.take().unwrap());
     tokio::time::timeout(crate::testing::HANG_BACKSTOP, selected_rx)
         .await
-        .expect("20-ms timer did not pause in protected SELECT")
+        .expect("worker did not pause in protected SELECT")
         .unwrap();
     assert_eq!(std::fs::read(&queue_path).unwrap(), queue_bytes);
     assert_eq!(std::fs::read(&fixture.index_path).unwrap(), corrupt_index);
+    // This tick has passed after-stream and is held in SELECT. Pause the next
+    // tick before it can replace the preceding attempt's published outcome.
+    let (next_tick_tx, next_tick_rx) = tokio::sync::oneshot::channel();
+    let (release_tick_tx, release_tick_rx) = std::sync::mpsc::channel();
+    fixture.state.test_queue_after_stream.set(move || {
+        let _ = next_tick_tx.send(());
+        let _ = release_tick_rx.recv();
+    });
     release_select_tx.send(()).unwrap();
-    tokio::time::timeout(crate::testing::HANG_BACKSTOP, async {
-        loop {
-            if fixture.state.retained_serving_session().is_err()
-                && fixture.state.step_lock.try_lock().is_ok()
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
+    tokio::time::timeout(crate::testing::HANG_BACKSTOP, next_tick_rx)
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "worker did not reach next step after external SH: phase={:?}, error={:?}, recreate={}, owner={}, retry={:?}, pending={:?}, live_phase={}",
+                fixture.state.runtime_phase(),
+                fixture.state.startup_error.lock().unwrap(),
+                fixture.store.is_recreate_pending(),
+                fixture.state.retained_serving_session().is_ok(),
+                fixture.state.recovery_retry_after.lock().unwrap(),
+                fixture.state.pending_requests.lock().unwrap(),
+                fixture.state.test_queue_current_phase.load(Ordering::Acquire),
+            )
+        })
+        .expect("next-step hook dropped before arrival");
+    assert_eq!(
+        fixture.state.runtime_phase(),
+        RuntimePhase::Reconciling {
+            started: true,
+            waiting: true
         }
-    })
-    .await
-    .expect("tick did not defer after external SH prevented EX");
+    );
+    assert!(fixture.state.retained_serving_session().is_err());
+    assert!(fixture.store.is_recreate_pending());
+    assert!(fixture.state.recovery_retry_after.lock().unwrap().is_some());
+    let startup_error = fixture.state.startup_error.lock().unwrap().clone();
+    assert!(
+        startup_error
+            .as_deref()
+            .is_some_and(|error| error.contains("storage_busy")),
+        "independent SH must publish a typed retryable deferral: {startup_error:?}"
+    );
     assert_eq!(
         std::fs::read(&queue_path).unwrap(),
         queue_bytes,
@@ -727,7 +744,8 @@ async fn timer_tick_with_independent_shared_reader_defers_without_changing_both_
         .await
         .expect("child output drain did not finish")
         .unwrap();
-    // The serial timer admits one FIFO row per turn, then reconciles the
+    release_tick_tx.send(()).unwrap();
+    // The serial worker admits one FIFO row per turn, then reconciles the
     // post-takeover watcher inventory before it may claim the next row.
     // Bound those two independent stages separately. Both notifications
     // come from existing transition hooks, not selected-status SH polling.
@@ -1188,7 +1206,8 @@ async fn multiple_posts_commit_fifo_with_local_writer() {
     assert_eq!(store.request_by_id(&b.id).unwrap().unwrap().state, "done");
 }
 
-fn serving_queue_watch_fixture() -> (tempfile::TempDir, Store, Arc<DaemonState>, IndexOptions) {
+pub(super) fn serving_queue_watch_fixture()
+-> (tempfile::TempDir, Store, Arc<DaemonState>, IndexOptions) {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("workspace");
     std::fs::create_dir(&root).unwrap();
@@ -1888,6 +1907,10 @@ fn failed_nonurgent_full_gate_is_spent_then_next_row_covers_it() {
         state.worker_step().is_err(),
         "the full gate must reject unreadable source text"
     );
+    assert!(
+        !store.recovery_pending_for_tests(),
+        "invalid repository source is not derived index corruption"
+    );
     let first_pin = store
         .request_by_id(&first.id)
         .unwrap()
@@ -1956,6 +1979,10 @@ fn deferred_full_gate_clears_only_matching_explicit_registration() {
         .1
         .set_queue_gate();
     assert!(state.worker_step().is_err());
+    assert!(
+        !store.recovery_pending_for_tests(),
+        "invalid repository source is not derived index corruption"
+    );
     assert!(Arc::ptr_eq(
         state.explicit_pending.lock().unwrap().as_ref().unwrap(),
         &applied

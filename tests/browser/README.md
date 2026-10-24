@@ -7,7 +7,7 @@ This test drives the real Trellis web shell in Playwright Chromium. It starts th
 From the repository root, run `./tools/verify`. Its sequential setup step installs the
 locked `runtime/acp` and `tests/browser` Node packages when missing or stale, then checks
 and repairs the pinned Playwright Chromium bundles. Setup completes before the parallel verification
-lanes start. The package lock pins `playwright` to exactly `1.55.1`; setup never uses `npx`,
+lanes start. The package lock pins `playwright` to exactly `1.64.1`; setup never uses `npx`,
 a system browser, or `--with-deps`. A first run needs npm registry and browser-download access.
 
 By default, setup uses an owner-private, stable **per-checkout** cache under the OS temp
@@ -18,9 +18,11 @@ it has the same safe ownership and permissions. Invalid, symlinked, or in-checko
 paths fail verification; neither missing packages nor a missing browser are skipped.
 Run only one verifier per checkout at a time because `npm ci` replaces ignored dependencies.
 
-Linux still needs Chromium's host libraries. CI installs them with `install --with-deps
-chromium` before `./tools/verify`; local setup does not request privileged OS changes.
-The macOS CI job installs Chromium without `--with-deps`.
+Linux still needs Chromium's host libraries. CI sets `TRELLIS_BROWSER_SYSTEM_DEPS=1`
+so `./tools/verify` runs `install-deps chromium` alongside the build and waits for it
+before browser tests. Local setup does not request privileged OS changes.
+Playwright 1.64.1 supports Ubuntu 26.04, so CI uses `ubuntu-latest` again.
+The macOS CI job only installs the managed Chromium bundles.
 
 ## Run the browser test alone
 
@@ -58,3 +60,23 @@ For focused runs, first provision Chromium using the commands above, build with
 tests/browser/sequence-cost.test.cjs` with `TRELLIS_SUITE_BINARY` set to the
 absolute built binary. Do not run multiple browser suites in parallel against the
 same checkout.
+
+### Sequence fixture cleanup self-test
+
+`sequence-harness.test.cjs` checks normal teardown, a thrown test failure, SIGTERM,
+and SIGINT without launching a browser:
+
+```sh
+TRELLIS_SUITE_BINARY=/absolute/path/to/debug/trellis \
+  node --test tests/browser/sequence-harness.test.cjs
+```
+
+The missed cleanup path was an interrupted suite: Node does not run `test.after`
+on SIGTERM/SIGINT, so its detached, test-elected daemon could outlive the suite.
+The harness now handles those signals through the same cleanup owner as normal
+teardown. It first stops its CLI/serve children, then stops only detached daemons
+whose exact command uses its run-unique suite binary. The self-test waits for an
+IPC readiness hook after real daemon election and serve attachment, interrupts
+that child suite, and checks both owned PIDs are gone. A daemon using another
+suite binary must survive. SIGKILL cannot run JavaScript cleanup. Production
+15-minute checkout/browser and 30-minute daemon idle policy is unchanged.

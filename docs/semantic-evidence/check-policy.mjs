@@ -1,6 +1,9 @@
 /**
- * Closed v1 policy/cohort/hardware schema: EXPECTED below pins every required field,
+ * Closed v1 policy/cohort schema: EXPECTED below pins every required field,
  * ordered array entry, explicit null and literal. Objects may reorder their keys.
+ * The hardware profile is a measured record, re-pinned with each producer or
+ * toolchain (Decision 0017 Amendment 2): HARDWARE_SHAPE closes its key set,
+ * types and formats, and freezes only its schema version and benchmark claim.
  * Pct is 0–100 percent; PercentagePoints is an absolute point difference. Ms,
  * Seconds, MiB and GiB are milliseconds, seconds and binary memory units;
  * hardware GB/TB are advertised decimal units, distinct from observed GiB.
@@ -248,32 +251,6 @@ const EXPECTED = {
     }
   }
 },
-  'hardware/mac-mini-m5-pro-v1.json': {
-  "version": 1,
-  "profileId": "mac-mini-m5-pro-v1",
-  "intended": {"chip": "Apple M5 Pro", "unifiedMemoryGB": 64, "os": "macOS", "storage": "local SSD", "location": "ownerLocal", "paidCloudAuthorized": false},
-  "observed": {
-    "capturedOn": "2026-09-23",
-    "modelIdentifier": "Mac17,16",
-    "chip": "Apple M5 Pro",
-    "cpuCores": 18,
-    "cpuCoreGroups": [6, 12],
-    "gpuCores": 20,
-    "memoryGiB": 64,
-    "ssd": {"model": "APPLE SSD AP1024Z", "capacityTB": 1},
-    "os": {"name": "macOS", "version": "27.0", "build": "26A428"},
-    "rustVersion": "1.98.1",
-    "cargoVersion": "1.98.1",
-    "nodeVersion": "24.11.1"
-  },
-  "semanticProducers": [
-    {"name": "scip-java", "status": "recorded", "version": "0.12.3", "installedAtCapture": true, "capturedOn": "2026-09-27", "installMethod": "coursier bootstrap --standalone com.sourcegraph:scip-java_2.13:0.12.3", "artifactDigest": "sha256:5bef376c8960f1b25fcbf1156bb3f61b4d3f338d94b6bbd1a474d2db957a36ff", "runtime": "coursier-managed Temurin javac selected by the build config jvm field: 17.0.20.1 by default, 25.0.4.1 verified with jvm 25; system OpenJDK 25.0.3"},
-    {"name": "scip-typescript", "status": "recorded", "version": "0.4.0", "installedAtCapture": true, "capturedOn": "2026-09-27", "installMethod": "npm install -g @sourcegraph/scip-typescript@0.4.0", "artifactDigest": "sha512-k+AtsrqmS41Sd5qjkZlHcmvoSQIvBOonRj4jpgp0KNFM6aqvMGpdSuPUqrUcg8ENTKjUbfaUVszgQwq3bCOvwA==", "runtime": "Node 24.11.1"},
-    {"name": "scip-python", "status": "recorded", "version": "0.6.6", "installedAtCapture": true, "capturedOn": "2026-09-27", "installMethod": "npm install -g @sourcegraph/scip-python@0.6.6", "artifactDigest": "sha512-qoKL1Rggg0o5newAFbCFAKlS0AjWxG5MA+mC28BtgxOv0DhO4zdL8u7151FxEppDpXMVvm7+yXSjXotoVH9cMQ==", "runtime": "Node 24.11.1"},
-    {"name": "rust-analyzer", "status": "recorded", "version": "1.98.1 (48a229ce 2026-09-01)", "installedAtCapture": true, "capturedOn": "2026-09-27", "installMethod": "rustup component add rust-analyzer (stable-aarch64-apple-darwin)", "artifactDigest": "sha256:78082ea1a96a008751767bd35f43738b5d4565cbef06ee5b31ad742a316133b5", "runtime": "Rust 1.98.1 toolchain"}
-  ],
-  "qualification": {"producerInventoryComplete": true, "readyForAuthoritativeBaseline": true, "benchmarkEvidence": null, "passingBenchmarkClaim": false}
-},
 };
 
 const MAX_BYTES = 8 * 1024 * 1024;
@@ -295,8 +272,12 @@ function validString(value, path) {
     if (point >= 0xd800 && point <= 0xdfff) fail(path, "lone surrogate");
   }
 }
+// expected is a literal tree; for the hardware shape a function leaf is a
+// validator and optional() marks a key that may be absent.
 function validateExact(actual, expected, path) {
-  if (Array.isArray(expected)) {
+  if (typeof expected === "function") {
+    expected(actual, path);
+  } else if (Array.isArray(expected)) {
     if (!Array.isArray(actual)) fail(path, "expected array");
     if (actual.length !== expected.length) fail(path, `expected ${expected.length} entries, got ${actual.length}`);
     expected.forEach((entry, index) => validateExact(actual[index], entry, `${path}[${index}]`));
@@ -307,20 +288,76 @@ function validateExact(actual, expected, path) {
       if (!own(expected, key)) fail(`${path}.${key}`, "unknown field");
     }
     for (const key of Object.keys(expected)) {
-      if (!own(actual, key)) fail(`${path}.${key}`, "missing field");
+      if (!own(actual, key)) {
+        if (expected[key]?.optional) continue;
+        fail(`${path}.${key}`, "missing field");
+      }
       validateExact(actual[key], expected[key], `${path}.${key}`);
     }
   } else {
     if (typeof actual !== typeof expected || (expected === null && actual !== null))
       fail(path, `expected ${JSON.stringify(expected)}`);
     if (typeof actual === "string") validString(actual, path);
-    if (typeof actual === "number" &&
-        (!Number.isFinite(actual) || Object.is(actual, -0) ||
-         (!FRACTIONAL_PATHS.has(path) && (!Number.isSafeInteger(actual) || actual < 0))))
-      fail(path, "invalid number");
+    if (typeof actual === "number") validNumber(actual, path);
     if (!Object.is(actual, expected)) fail(path, `expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
   }
 }
+function validNumber(value, path) {
+  if (!Number.isFinite(value) || Object.is(value, -0) ||
+      (!FRACTIONAL_PATHS.has(path) && (!Number.isSafeInteger(value) || value < 0)))
+    fail(path, "invalid number");
+}
+
+// Closed hardware profile shape: every key, type and format, but not the
+// measured values, which change on each producer or toolchain re-pin.
+const optional = (shape) => Object.assign((value, path) => validateExact(value, shape, path), {optional: true});
+const text = (pattern) => (value, path) => {
+  validString(value, path);
+  if (!pattern.test(value)) fail(path, `invalid format ${JSON.stringify(value)}`);
+};
+const kind = (type) => (value, path) => {
+  if (typeof value !== type) fail(path, `expected ${type}`);
+  if (type === "number") validNumber(value, path);
+};
+const list = (entry, uniqueKey) => (value, path) => {
+  if (!Array.isArray(value)) fail(path, "expected array");
+  if (!value.length) fail(path, "expected at least 1 entries, got 0");
+  const seen = new Set();
+  value.forEach((item, index) => {
+    validateExact(item, entry, `${path}[${index}]`);
+    if (!uniqueKey) return;
+    if (seen.has(item[uniqueKey])) fail(`${path}[${index}].${uniqueKey}`, `duplicate ${uniqueKey}`);
+    seen.add(item[uniqueKey]);
+  });
+};
+const nonEmpty = text(/\S/);
+const date = text(/^\d{4}-\d{2}-\d{2}$/);
+const hex64 = text(/^[0-9a-f]{64}$/);
+// Single-file producers record sha256:<hex>; npm producers record the registry sha512- integrity.
+const artifactDigest = text(/^(sha256:[0-9a-f]{64}|sha512-[A-Za-z0-9+/]{86}==)$/);
+const count = kind("number");
+const flag = kind("boolean");
+const pin = (hashField) => ({
+  name: nonEmpty, status: nonEmpty, version: nonEmpty, installedAtCapture: flag, capturedOn: date,
+  installMethod: nonEmpty, artifactDigest, [hashField]: hex64, runtime: nonEmpty,
+});
+const HARDWARE = "hardware/mac-mini-m5-pro-v1.json";
+const HARDWARE_SHAPE = {
+  version: 1,
+  profileId: nonEmpty,
+  intended: {chip: nonEmpty, unifiedMemoryGB: count, os: nonEmpty, storage: nonEmpty, location: nonEmpty, paidCloudAuthorized: flag},
+  observed: {
+    capturedOn: date, modelIdentifier: nonEmpty, chip: nonEmpty, cpuCores: count, cpuCoreGroups: list(count),
+    gpuCores: count, memoryGiB: count, ssd: {model: nonEmpty, capacityTB: count},
+    os: {name: nonEmpty, version: nonEmpty, build: nonEmpty},
+    rustVersion: nonEmpty, cargoVersion: nonEmpty, nodeVersion: nonEmpty,
+  },
+  semanticProducers: list(pin("executableHash"), "name"),
+  // Decision 0017: each corpus PR that pins a toolchain adds its toolchains[] entry.
+  toolchains: optional(list(pin("toolchainHash"), "name")),
+  qualification: {producerInventoryComplete: flag, readyForAuthoritativeBaseline: flag, benchmarkEvidence: null, passingBenchmarkClaim: false},
+};
+const SCHEMAS = {...EXPECTED, [HARDWARE]: HARDWARE_SHAPE};
 
 // JSON.parse owns grammar checking. This bounded lexical pass only tracks nesting
 // and decoded object keys, so escaped Unicode names share the same identity.
@@ -368,7 +405,7 @@ function parseStrict(bytes, file) {
 }
 function checkDocument(bytes, file) {
   const value = parseStrict(bytes, file);
-  validateExact(value, EXPECTED[file], `${file}:$`);
+  validateExact(value, SCHEMAS[file], `${file}:$`);
   return value;
 }
 function crossFileTests(documents) {
@@ -382,9 +419,12 @@ function crossFileTests(documents) {
   identical([...policy.quality.languages].sort(),
     Object.keys(policy.quality.realProducerQualification.floorsPct).sort(),
     "benchmark-policy-v1.json:$.quality.realProducerQualification.floorsPct");
-  identical(policy.referenceHost.profileId, hardware.profileId, "hardware/mac-mini-m5-pro-v1.json:$.profileId");
+  identical(policy.referenceHost.profileId, hardware.profileId, `${HARDWARE}:$.profileId`);
+  identical(HARDWARE.slice("hardware/".length, -".json".length), hardware.profileId, `${HARDWARE}:$.profileId file name`);
+  identical([policy.referenceHost.location, policy.referenceHost.paidCloudAuthorized],
+    [hardware.intended.location, hardware.intended.paidCloudAuthorized], `${HARDWARE}:$.intended`);
   identical(hardware.observed.cpuCoreGroups.reduce((sum, count) => sum + count, 0),
-    hardware.observed.cpuCores, "hardware/mac-mini-m5-pro-v1.json:$.observed.cpuCoreGroups");
+    hardware.observed.cpuCores, `${HARDWARE}:$.observed.cpuCoreGroups`);
   identical(cohort.conformance.categories.length * cohort.conformance.minimumScenariosPerCategoryPerLanguage,
     cohort.conformance.minimumScenariosPerLanguage, "cohorts-v1.json:$.conformance.categories");
   const pins = EXPECTED[names[1]].realProjects.projects;
@@ -398,7 +438,7 @@ function crossFileTests(documents) {
     seen.add(project.repository);
   }
 }
-const names = Object.keys(EXPECTED);
+const names = Object.keys(SCHEMAS);
 function loadStrictJson(name) {
   const url = new URL(`./${name}`, import.meta.url);
   if (fs.statSync(url).size > MAX_BYTES) fail(name, "input exceeds 8 MiB");
@@ -410,8 +450,8 @@ function validateFiles() {
   return documents;
 }
 
-function selfTest() {
-  const snapshots = Object.fromEntries(names.map((name) => [name, structuredClone(EXPECTED[name])]));
+function selfTest(documents) {
+  const snapshots = Object.fromEntries(names.map((name) => [name, structuredClone(EXPECTED[name] ?? documents[name])]));
   const buffer = (value) => Buffer.from(JSON.stringify(value));
   const reject = (raw, name, label, pattern) =>
     assert.throws(() => checkDocument(raw, name), pattern, `${name}: ${label}`);
@@ -423,8 +463,7 @@ function selfTest() {
   // Literal groups independently check each committed file before mutations.
   function policyLiteralTests() { assert.doesNotThrow(() => checkDocument(buffer(snapshots[names[0]]), names[0])); }
   function cohortLiteralTests() { assert.doesNotThrow(() => checkDocument(buffer(snapshots[names[1]]), names[1])); }
-  function hardwareLiteralTests() { assert.doesNotThrow(() => checkDocument(buffer(snapshots[names[2]]), names[2])); }
-  policyLiteralTests(); cohortLiteralTests(); hardwareLiteralTests();
+  policyLiteralTests(); cohortLiteralTests();
   const changeScalar = (value) => value === null ? "invented" :
     typeof value === "number" ? value + 1 : typeof value === "boolean" ? !value : `${value}X`;
   let cases = 0;
@@ -458,7 +497,41 @@ function selfTest() {
       }); cases++;
     }
   }
-  for (const name of names) allFieldMutationTests(name, snapshots[name]);
+  for (const name of Object.keys(EXPECTED)) allFieldMutationTests(name, snapshots[name]);
+  // The hardware profile's values are free, so its tests derive every fixture and
+  // mutation from the profile under test instead of today's measured values.
+  const hardwareMutation = (base, label, change, pattern = /expected|missing|unknown|invalid|entries/) => {
+    const document = structuredClone(base);
+    change(document);
+    reject(buffer(document), HARDWARE, label, pattern); cases++;
+  };
+  // Every key, extra field and kind of the profile under test is checked.
+  function hardwareShapeMutationTests(base, value = base, route = []) {
+    const at = (document) => route.reduce((item, key) => item[key], document);
+    const label = route.length ? route.join(".") : "$";
+    if (Array.isArray(value)) {
+      hardwareMutation(base, `${label} add`, (document) => at(document).push(null));
+      hardwareMutation(base, `${label} empty`, (document) => at(document).splice(0));
+      value.forEach((entry, i) => hardwareShapeMutationTests(base, entry, [...route, i]));
+    } else if (plain(value)) {
+      for (const key of Object.keys(value)) {
+        if (!route.length && HARDWARE_SHAPE[key]?.optional) {
+          const document = structuredClone(base);
+          delete document[key];
+          assert.doesNotThrow(() => checkDocument(buffer(document), HARDWARE), `optional ${key}`);
+        } else {
+          hardwareMutation(base, `${label} missing ${key}`, (document) => { delete at(document)[key]; });
+        }
+        hardwareShapeMutationTests(base, value[key], [...route, key]);
+      }
+      hardwareMutation(base, `${label} extra`, (document) => { at(document).__unknown = true; });
+    } else {
+      hardwareMutation(base, `${label} kind`, (document) => {
+        const parent = route.slice(0, -1).reduce((item, key) => item[key], document);
+        parent[route.at(-1)] = typeof value === "string" ? 77 : "wrong-kind";
+      });
+    }
+  }
   function policyGuardMutationTests() {
     const name = names[0];
     for (const [route, value] of [
@@ -482,11 +555,102 @@ function selfTest() {
       mutation(names[1], `revision ${i}`, (document) => { document.realProjects.projects[i].revision = "different"; }); cases++;
     }
   }
-  function hardwareMutationTests() {
-    mutation(names[2], "producer version", (document) => { document.semanticProducers[0].version = "1.0"; }); cases++;
-    mutation(names[2], "baseline claim", (document) => { document.qualification.passingBenchmarkClaim = true; }); cases++;
+  const hex = "ab".repeat(32);
+  const otherHex = (current) => current === hex ? "cd".repeat(32) : hex;
+  const entry = (name, hashField, digest) => ({name, status: "recorded", version: "2.0.0", installedAtCapture: true,
+    capturedOn: "2026-10-23", installMethod: "test install", artifactDigest: digest, [hashField]: hex, runtime: "test"});
+  const freshName = (taken, prefix) => {
+    let name = prefix;
+    for (let i = 1; taken.includes(name); i++) name = `${prefix}-${i}`;
+    return name;
+  };
+  function hardwareRepinTests(profile) {
+    const repinned = structuredClone(profile);
+    const taken = repinned.semanticProducers.map((producer) => producer.name);
+    repinned.semanticProducers.push(entry(freshName(taken, "scip-go"), "executableHash", `sha256:${hex}`));
+    repinned.semanticProducers[0].version += "-repin";
+    repinned.semanticProducers[0].executableHash = otherHex(repinned.semanticProducers[0].executableHash);
+    repinned.toolchains = [entry("node-test", "toolchainHash", `sha512-${"A".repeat(86)}==`)];
+    repinned.observed.nodeVersion += "-repin";
+    assert.doesNotThrow(() => checkDocument(buffer(repinned), HARDWARE), "re-pinned profile");
+    assert.doesNotThrow(() => crossFileTests({...snapshots, [HARDWARE]: repinned}), "re-pinned cross-file");
   }
-  policyGuardMutationTests(); cohortMutationTests(); hardwareMutationTests();
+  function hardwareFieldTests(profile) {
+    // Fixed synthetic inventories give known positions and names that cannot collide.
+    const fixture = structuredClone(profile);
+    fixture.semanticProducers = [entry("producer-a", "executableHash", `sha256:${hex}`),
+      entry("producer-b", "executableHash", `sha512-${"A".repeat(86)}==`), entry("producer-c", "executableHash", `sha256:${hex}`)];
+    fixture.toolchains = [entry("toolchain-a", "toolchainHash", `sha256:${hex}`)];
+    assert.doesNotThrow(() => checkDocument(buffer(fixture), HARDWARE), "synthetic fixture");
+    const shape = (label, pattern, change) => hardwareMutation(fixture, label, change, pattern);
+    shape("unknown producer field", /semanticProducers\[0\]\.extra: unknown field/, (d) => { d.semanticProducers[0].extra = "x"; });
+    shape("unknown top-level field", /\$\.extra: unknown field/, (d) => { d.extra = {}; });
+    shape("missing digest", /semanticProducers\[1\]\.artifactDigest: missing field/, (d) => { delete d.semanticProducers[1].artifactDigest; });
+    shape("missing toolchain hash", /toolchains\[0\]\.toolchainHash: missing field/, (d) => { delete d.toolchains[0].toolchainHash; });
+    shape("missing observed field", /observed\.rustVersion: missing field/, (d) => { delete d.observed.rustVersion; });
+    const set = (route, value) => (d) => { route.slice(0, -1).reduce((item, key) => item[key], d)[route.at(-1)] = value; };
+    for (const [label, route, value] of [
+      ["uppercase sha256", ["semanticProducers", 0, "artifactDigest"], `sha256:${hex.toUpperCase()}`],
+      ["short sha256", ["semanticProducers", 0, "artifactDigest"], "sha256:abcd"],
+      ["bare artifact hex", ["semanticProducers", 0, "artifactDigest"], hex],
+      ["short sha512", ["semanticProducers", 1, "artifactDigest"], "sha512-abc=="],
+      ["other algorithm", ["semanticProducers", 0, "artifactDigest"], `md5:${hex}`],
+      ["prefixed executable hash", ["semanticProducers", 0, "executableHash"], `sha256:${hex}`],
+      ["short toolchain hash", ["toolchains", 0, "toolchainHash"], hex.slice(1)],
+      ["empty version", ["semanticProducers", 2, "version"], ""],
+      ["blank observed version", ["observed", "nodeVersion"], " "],
+      ["bad date", ["semanticProducers", 0, "capturedOn"], "2026-9-27"],
+    ]) shape(label, /invalid format/, set(route, value));
+    for (const [label, route, value] of [
+      ["negative count", ["observed", "gpuCores"], -1],
+      ["fractional count", ["observed", "memoryGiB"], 1.5],
+      ["unsafe count", ["intended", "unifiedMemoryGB"], 2 ** 53],
+      ["negative list count", ["observed", "cpuCoreGroups", 0], -1],
+      ["fractional nested count", ["observed", "ssd", "capacityTB"], 0.5],
+    ]) shape(label, /invalid number/, set(route, value));
+    shape("duplicate producer", /semanticProducers\[3\]\.name: duplicate name/, (d) => { d.semanticProducers.push({...d.semanticProducers[0]}); });
+    shape("duplicate toolchain", /toolchains\[1\]\.name: duplicate name/, (d) => { d.toolchains.push({...d.toolchains[0]}); });
+    shape("empty toolchains", /toolchains: expected at least 1 entries/, (d) => { d.toolchains = []; });
+    shape("schema version", /\$\.version: expected 1/, (d) => { d.version = 2; });
+    shape("baseline claim", /passingBenchmarkClaim: expected false/, (d) => { d.qualification.passingBenchmarkClaim = true; });
+    shape("benchmark evidence", /benchmarkEvidence: expected null/, (d) => { d.qualification.benchmarkEvidence = "run-1"; });
+  }
+  function hardwareCrossFileTests(profile) {
+    const copies = {...structuredClone(snapshots), [HARDWARE]: structuredClone(profile)};
+    const hardware = copies[HARDWARE];
+    hardware.profileId = "other";
+    assert.throws(() => crossFileTests(copies), /profileId: cross-file mismatch/); cases++;
+    copies[names[0]].referenceHost.profileId = "other";
+    assert.throws(() => crossFileTests(copies), /profileId file name: cross-file mismatch/); cases++;
+    copies[names[0]].referenceHost.profileId = hardware.profileId = profile.profileId;
+    hardware.intended.paidCloudAuthorized = !profile.intended.paidCloudAuthorized;
+    assert.throws(() => crossFileTests(copies), /intended: cross-file mismatch/); cases++;
+    hardware.intended.paidCloudAuthorized = profile.intended.paidCloudAuthorized;
+    hardware.observed.cpuCoreGroups[0] += 1;
+    assert.throws(() => crossFileTests(copies), /cpuCoreGroups: cross-file mismatch/); cases++;
+  }
+  function hardwareTests(label, profile) {
+    assert.doesNotThrow(() => checkDocument(buffer(profile), HARDWARE), `${label} profile`);
+    assert.doesNotThrow(() => crossFileTests({...snapshots, [HARDWARE]: profile}), `${label} cross-file`);
+    hardwareShapeMutationTests(profile); hardwareRepinTests(profile); hardwareFieldTests(profile); hardwareCrossFileTests(profile);
+  }
+  // Valid re-pins must pass the whole hardware suite without a checker edit.
+  const variant = (change) => { const profile = structuredClone(snapshots[HARDWARE]); change(profile); return profile; };
+  hardwareTests("committed", snapshots[HARDWARE]);
+  hardwareTests("regrouped CPU", variant((p) => { p.observed.cpuCores = 18; p.observed.cpuCoreGroups = [7, 11]; }));
+  hardwareTests("added scip-go", variant((p) => {
+    p.semanticProducers = p.semanticProducers.filter((producer) => producer.name !== "scip-go");
+    p.semanticProducers.push(entry("scip-go", "executableHash", `sha256:${hex}`));
+  }));
+  hardwareTests("one producer", variant((p) => {
+    p.semanticProducers = p.semanticProducers.slice(0, 1);
+    p.qualification.producerInventoryComplete = false;
+  }));
+  hardwareTests("only scip-go", variant((p) => {
+    p.semanticProducers = [entry("scip-go", "executableHash", `sha256:${hex}`)];
+    p.qualification.producerInventoryComplete = false;
+  }));
+  policyGuardMutationTests(); cohortMutationTests();
   function strictInputTests() {
     const file = names[0];
     for (const [label, raw, pattern] of [
@@ -517,20 +681,14 @@ function selfTest() {
   const checkedReorder = Object.fromEntries(names.map((name) =>
     [name, checkDocument(buffer(reorderedFloors[name]), name)]));
   assert.doesNotThrow(() => crossFileTests(checkedReorder));
-  const copies = structuredClone(snapshots);
-  copies[names[2]].profileId = "other";
-  assert.throws(() => crossFileTests(copies), /profileId: cross-file mismatch/); cases++;
-  copies[names[2]].profileId = snapshots[names[2]].profileId;
-  copies[names[2]].observed.cpuCoreGroups[0] = 7;
-  assert.throws(() => crossFileTests(copies), /cpuCoreGroups: cross-file mismatch/); cases++;
   console.log(`policy checker self-test passed (${cases} negative mutations); not benchmark qualification`);
 }
 try {
   if (process.argv.length > 3 || (process.argv.length === 3 && process.argv[2] !== "--self-test"))
     fail("arguments", "usage: node docs/semantic-evidence/check-policy.mjs [--self-test]");
-  validateFiles();
+  const documents = validateFiles();
   console.log("policy/cohort/hardware validation passed; not benchmark qualification");
-  if (process.argv[2] === "--self-test") selfTest();
+  if (process.argv[2] === "--self-test") selfTest(documents);
 } catch (error) {
   console.error(`policy checker failed: ${error.message}`);
   process.exitCode = 1;

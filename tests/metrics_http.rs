@@ -596,7 +596,7 @@ async fn selected_metrics_atomic_bounds_and_deadlines() {
     browser.set_metrics_controls_for_tests(64 * 1024 * 1024, None, false);
 
     // The blocking hook holds the request at each named phase. The test clock
-    // expires while the HTTP caller still waits, then releases the worker.
+    // advances only after the phase is reached, then releases the worker.
     for (stage, cap) in [
         ("metrics_parser_progress", 64 * 1024 * 1024),
         ("metrics_serialize_last", full_len + 1),
@@ -615,7 +615,7 @@ async fn selected_metrics_atomic_bounds_and_deadlines() {
         } else {
             String::new()
         };
-        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::channel(1);
         let (resume_tx, resume_rx) = mpsc::sync_channel(1);
         let resume = Mutex::new(resume_rx);
         let once = AtomicBool::new(true);
@@ -626,22 +626,33 @@ async fn selected_metrics_atomic_bounds_and_deadlines() {
                 callbacks_in_hook.fetch_add(1, Ordering::Relaxed);
             }
             if called == stage && once.swap(false, Ordering::AcqRel) {
-                entered_tx.send(()).unwrap();
-                resume.lock().unwrap().recv().unwrap();
+                let _ = entered_tx.try_send(());
+                let _ = resume.lock().unwrap().recv();
             }
         }));
-        browser.set_metrics_controls_for_tests(cap, Some(Duration::from_millis(1000)), false);
+        let deadline = Duration::from_millis(1000);
+        browser.set_metrics_clock_for_tests(std::time::Instant::now() - deadline);
+        browser.set_metrics_controls_for_tests(cap, Some(deadline), false);
         let app = browser.clone().router();
         let request_key = key.clone();
         let request_query = query.clone();
-        let worker = tokio::spawn(async move { request(app, &request_key, &request_query).await });
-        tokio::time::timeout(
-            trellis::testing::HANG_BACKSTOP,
-            tokio::task::spawn_blocking(move || entered_rx.recv().unwrap()),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let mut worker =
+            tokio::spawn(async move { request(app, &request_key, &request_query).await });
+        let entered = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+            tokio::select! {
+                entered = entered_rx.recv() => {
+                    assert!(entered.is_some(), "metrics phase {stage} hook disconnected");
+                }
+                result = &mut worker => {
+                    panic!("metrics phase {stage} was not reached: HTTP worker finished {result:?}");
+                }
+            }
+        })
+        .await;
+        if entered.is_err() {
+            worker.abort();
+        }
+        entered.unwrap_or_else(|_| panic!("metrics phase {stage} was not reached before backstop"));
         browser.set_metrics_clock_skew_for_tests(1001);
         resume_tx.send(()).unwrap();
         let (status, value) = worker.await.unwrap();

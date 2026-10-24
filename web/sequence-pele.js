@@ -166,14 +166,9 @@
     try {
       const projection = project(view, expandedGroups, options);
       if (typeof window.pele?.render !== "function") unsupported("Pele asset unavailable");
-      let timer;
-      let result;
-      try {
-        result = await Promise.race([
-          Promise.resolve().then(() => window.pele.render(projection.source, {}).svg),
-          new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("Pele render timed out")), 5000); })
-        ]);
-      } finally { clearTimeout(timer); }
+      // Pele renders synchronously. Input caps bound the work; a timer cannot
+      // interrupt it. Output byte/node caps are checked before installation.
+      const result = window.pele.render(projection.source, {}).svg;
       if (!current()) return {status:"stale"};
       const {root, notes} = validatedSvg(result, projection);
       const selected = {id:options.selectedId || null};

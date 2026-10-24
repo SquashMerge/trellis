@@ -1,5 +1,6 @@
 import { readFile, readdir, realpath, lstat } from "node:fs/promises";
 import { basename, resolve, relative, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { validate } from "./formats.mjs";
 import { parseJson } from "./json.mjs";
 import { contentHash, sourceManifestHash } from "./identity.mjs";
@@ -111,7 +112,36 @@ function admitDescriptor(root, fixture) {
   if (!profiles.includes(fixture.profile) || fixture.language !== language)
     reject("DISCOVERY.PROFILE", root, "fixture descriptor mismatch");
 }
-export async function loadFixture(root) {
+// Decision 0017: an executable or toolchain capture may be attested by the
+// reference hardware profile instead of stored bytes. Profiles are trusted
+// repository files (T00), so the pin is checked against the recorded digest only.
+const repositoryRoot = fileURLToPath(new URL("../..", import.meta.url));
+const pinSections = {
+  executable: ["semanticProducers", "executableHash"],
+  toolchain: ["toolchains", "toolchainHash"],
+};
+async function verifyPin(repository, capture) {
+  const [path, name, extra] = capture.pinned.split("#");
+  if (
+    !name ||
+    extra !== undefined ||
+    !path.startsWith("docs/semantic-evidence/hardware/")
+  )
+    reject("IDENTITY.PATH", capture.pinned, "pin outside hardware profiles");
+  const [section, field] = pinSections[capture.kind];
+  const entries = parseJson(await confinedFile(repository, path))[section];
+  const entry = Array.isArray(entries)
+    ? entries.find((x) => x?.name === name)
+    : undefined;
+  if (!entry) reject("IDENTITY.DIGEST", capture.pinned, `no ${section} entry`);
+  if (entry[field] !== capture.hash)
+    reject(
+      "IDENTITY.DIGEST",
+      capture.pinned,
+      `pinned digest differs: expected ${capture.hash}, profile ${entry[field]}`,
+    );
+}
+export async function loadFixture(root, { repository = repositoryRoot } = {}) {
   root = await realpath(root);
   const { value: fixture } = await jsonFile(root, "fixture.json", "FixtureV1");
   admitDescriptor(root, fixture);
@@ -120,7 +150,8 @@ export async function loadFixture(root) {
   unique(fixture.comparison.producers, (x) => x.id, "comparison.producers");
   unique(fixture.revisions, (x) => key([x.sourceSetId, x.id]), "revisions");
   unique(fixture.captures, (x) => x.ref, "captures.ref");
-  unique(fixture.captures, (x) => x.file, "captures.file");
+  const stored = fixture.captures.filter((x) => x.file !== undefined);
+  unique(stored, (x) => x.file, "captures.file");
   const sources = new Map(),
     sourceFiles = [],
     revisions = new Map(),
@@ -169,7 +200,7 @@ export async function loadFixture(root) {
   );
   for (const path of [
     ...fixture.revisions.flatMap((x) => x.documents.map((d) => d.sourceFile)),
-    ...fixture.captures.map((x) => x.file),
+    ...stored.map((x) => x.file),
     fixture.nativeArtifact,
     ...fixture.annotationFiles,
     fixture.answersFile,
@@ -299,6 +330,11 @@ export async function loadFixture(root) {
     .get(fixture.comparison.sourceSetId)
     .indexOf(selected);
   for (const capture of fixture.captures) {
+    captures.set(capture.ref, capture);
+    if (capture.pinned !== undefined) {
+      await verifyPin(repository, capture);
+      continue;
+    }
     const bytes = await confinedFile(root, capture.file);
     const actualHash = contentHash(bytes);
     if (actualHash !== capture.hash)
@@ -307,7 +343,6 @@ export async function loadFixture(root) {
         capture.file,
         `captured bytes differ: expected ${capture.hash}, actual ${actualHash}`,
       );
-    captures.set(capture.ref, capture);
     captureBytes.set(capture.ref, bytes);
   }
   const matching = (kind, hash) =>
@@ -594,7 +629,7 @@ export async function loadFixture(root) {
   ).value;
   await inventory(root, [
     ...new Set(sourceFiles),
-    ...fixture.captures.map((x) => x.file),
+    ...stored.map((x) => x.file),
     fixture.nativeArtifact,
     ...fixture.annotationFiles,
     fixture.answersFile,

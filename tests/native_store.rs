@@ -504,12 +504,11 @@ fn metadata_status_and_selected_source_reads_do_not_conflate_other_documents() {
     let original_clone = store.clone();
     let selected = store.native_source_at(pin, &corrupted).unwrap_err();
     assert!(
-        selected.to_string().contains("incompatible_index")
-            && selected.to_string().contains(
-                "incompatible_index: selected evidence decode failed: incompatible_index: source hash mismatch"
-            ),
+        selected.to_string().starts_with("incompatible_index:")
+            && format!("{selected:#}").contains("source hash mismatch"),
         "{selected:#}"
     );
+    assert!(store.recovery_pending_for_tests());
     let closed = original_clone.source_at("flow.rs", Some(pin)).unwrap_err();
     assert_current_corruption(closed);
 
@@ -519,8 +518,8 @@ fn metadata_status_and_selected_source_reads_do_not_conflate_other_documents() {
     let reopened_clone = reopened.clone();
     let selected = reopened.source_at("flow.rs", Some(pin)).unwrap_err();
     assert!(
-        selected.to_string().contains("incompatible_index")
-            && selected.to_string().contains("source hash mismatch"),
+        selected.to_string().starts_with("incompatible_index:")
+            && format!("{selected:#}").contains("source hash mismatch"),
         "{selected:#}"
     );
     for closed in [
@@ -827,11 +826,11 @@ fn selected_class_payload_oversize_refuses_before_json_decode() {
     let selected_clone = store.clone();
     let error = store.symbol_at(&id, Some(pin)).unwrap_err();
     assert!(
-        error
-            .to_string()
-            .contains("selected evidence byte budget exceeded"),
+        error.to_string().starts_with("incompatible_index:")
+            && format!("{error:#}").contains("selected evidence byte budget exceeded"),
         "{error:#}"
     );
+    assert!(store.recovery_pending_for_tests());
     let rust_id: String = db
         .query_row(
             "SELECT 'sid:v1:'||lower(hex(syntax_id)) FROM native_version_declarations WHERE vid=?1 AND name='main'",
@@ -950,9 +949,13 @@ fn every_encoded_selected_id_rejects_wrong_length_blob() {
         let closed = reader.clone();
         let error = reader.methods_at(&path, Some(pin)).unwrap_err();
         assert!(
-            error.to_string().contains("invalid native ID BLOB length"),
+            matches!(
+                error.downcast_ref::<rusqlite::Error>(),
+                Some(rusqlite::Error::FromSqlConversionFailure(..))
+            ) && format!("{error:#}").contains("invalid native ID BLOB length"),
             "{table}.{column}: {error:#}"
         );
+        assert!(reader.recovery_pending_for_tests());
         // The failure latched a rebuild: status now requires reconciliation.
         assert_current_corruption(closed.status().unwrap_err());
         db.execute(
@@ -3184,13 +3187,10 @@ fn declaration_roles_round_trip_and_invalid_stored_role_fails_typed_read() {
         .native_declarations_at(pin, "rust", "inline_helper")
         .unwrap_err();
     assert!(
-        error.to_string().contains("incompatible_index"),
+        format!("{error:#}").contains("invalid declaration role"),
         "{error:#}"
     );
-    assert!(
-        error.to_string().contains("invalid declaration role"),
-        "{error:#}"
-    );
+    assert!(store.recovery_pending_for_tests());
     assert!(
         db.execute(
             "UPDATE native_version_declarations SET role=NULL WHERE syntax_id=unhex(substr(?1,8))",
@@ -3606,12 +3606,23 @@ fn incoming_read_rejects_mismatched_indexed_call_language() {
         .err()
         .unwrap();
     assert!(
-        error
-            .to_string()
-            .contains("incoming indexed call scope mismatch"),
+        format!("{error:#}").contains("incoming indexed call scope mismatch"),
         "{error:#}"
     );
-    read.finish(()).unwrap();
+    // Direct response helpers detect the fault; the public native read owns
+    // recovery reporting for the same malformed stored call.
+    let caller = store
+        .native_declarations_at(pin, "javascript", "Caller")
+        .unwrap()[0]
+        .syntax_id
+        .clone();
+    let reported = store.native_calls_at(pin, &caller).unwrap_err();
+    assert!(
+        format!("{reported:#}").contains("native call document mismatch"),
+        "{reported:#}"
+    );
+    assert!(store.recovery_pending_for_tests());
+    assert_current_corruption(read.finish(()).unwrap_err());
 }
 
 #[test]
@@ -3726,9 +3737,18 @@ fn incoming_read_invalid_role_after_limited_valid_hits_fails_typed() {
     );
     let error = outcome.err().unwrap();
     assert!(
-        error.to_string().contains("invalid declaration role"),
+        format!("{error:#}").contains("invalid declaration role"),
         "{error:#}"
     );
+    let reported = store
+        .native_declarations_at(pin, "javascript", "BadCaller")
+        .unwrap_err();
+    assert!(
+        format!("{reported:#}").contains("invalid declaration role"),
+        "{reported:#}"
+    );
+    assert!(store.recovery_pending_for_tests());
+    assert_current_corruption(read.finish(()).unwrap_err());
 }
 
 #[test]

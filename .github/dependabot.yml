@@ -1,0 +1,47 @@
+# Weekly grouped version updates: one PR per ecosystem and directory.
+# Security updates are enabled separately in the repository settings and open
+# their own PRs as advisories appear.
+#
+# Deliberately not managed here:
+# - the Rust toolchain, pinned in rust-toolchain.toml and .github/workflows/rust.yml;
+# - semantic producers pinned by digest in docs/semantic-evidence/hardware/
+#   (Decision 0017), e.g. @sourcegraph/scip-typescript;
+# - tools/synthetic-cohorts/test/composition, whose grammars are pinned with `=`;
+# - tools/metrics-oracle, a manual tool pinned to a git revision.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      # Listed first so these never fall into the routine group. A PR from this
+      # group is a reminder, never merged as-is: tree-sitter changes the native
+      # producer's identity, and sha2 underlies every identity hash. Upgrade
+      # them deliberately (#279).
+      native-producer:
+        patterns: ["tree-sitter*", "sha2"]
+      cargo:
+        patterns: ["*"]
+
+  - package-ecosystem: npm
+    directories:
+      - /runtime/acp
+      - /tests/browser
+      - /tools/selection
+      - /tools/extraction
+    schedule:
+      interval: weekly
+    ignore:
+      - dependency-name: "@sourcegraph/scip-typescript"
+    groups:
+      npm:
+        patterns: ["*"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]

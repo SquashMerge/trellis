@@ -81,6 +81,8 @@ function proofFor(loaded, records, fact, annotation) {
       {
         typeRelationship: "typeRelationship",
         declarationBinding: "declarationBinding",
+        // Matches record-check/relationships.mjs: symbols are declaration evidence.
+        symbol: "declarationBinding",
         reference: "semanticReference",
         callBinding: "semanticReference",
       }[fact.kind]
@@ -537,16 +539,6 @@ export function checkCounts(
           "assertions",
           "join conflicts with measured candidate or capability",
         );
-      if (status === "unsupported")
-        outcomeKeys
-          .get("unsupported")
-          .add(
-            identity([
-              fact.anchor.document,
-              fact.anchor.revisionId,
-              span(loaded, fact.anchor),
-            ]),
-          );
     } else {
       if (
         status !== "exact" ||
@@ -588,6 +580,24 @@ export function checkCounts(
           "assertions",
           "resolution contradicts captured exact proof",
         );
+      // Decision 0017 Amendment 1: SCIP has no positive unresolved record, so
+      // absence at an exact join is evidence only when coverage is complete.
+      if (
+        expected === "unresolved" &&
+        !records.coverage.some(
+          (row) =>
+            row.producerId === proof.producerId &&
+            row.sourceSetId === fact.anchor.document.sourceSetId &&
+            row.documentPath === fact.anchor.document.path &&
+            row.revisionId === fact.anchor.revisionId &&
+            row.state === "complete",
+        )
+      )
+        fail(
+          "COUNT.DISPOSITION",
+          "assertions",
+          "unresolved outcome requires complete semantic coverage",
+        );
       outcomeKeys
         .get(expected)
         .add(
@@ -599,6 +609,25 @@ export function checkCounts(
           ]),
         );
     }
+  }
+  // Decision 0017 Amendment 1: unsupported is a per-document native capability.
+  // A document counts once when its native intent declares a measurement family
+  // unavailable and it carries an authenticated captured producer fact; neither
+  // the fact's family nor an authored unsupported-join assertion is required.
+  // Coverage and provenance bookkeeping are not producer facts.
+  for (const { fact, annotation } of facts.values()) {
+    if (["coverage", "provenance"].includes(fact.kind)) continue;
+    const intent = fixture.coverageIntents.find(
+      (x) =>
+        x.producerId === native.producerId &&
+        x.revisionId === annotation.revisionId &&
+        same(x.document, annotation.document),
+    );
+    if (!intent?.measurementSupport.some((x) => !x.available)) continue;
+    proofFor(loaded, records, fact, annotation);
+    outcomeKeys
+      .get("unsupported")
+      .add(identity([annotation.document, annotation.revisionId]));
   }
   const observed = new Set(
     [...exactReferences.values()].flatMap((x) => x.record.roles),
@@ -645,21 +674,61 @@ export function checkCounts(
   return count;
 }
 
+// Per-language corpus floors (Decision 0017 Amendments 1 and 3). Each language
+// owns its row; nothing outside this table branches on language. `unsupported`
+// counts documents, so its floor of one is the native-capability
+// requirement; Java and Python have no genuine construct for it yet.
+const sharedFloors = {
+  scenariosTotal: 32,
+  scenariosPerCategory: 4,
+  measuredCalls: 120,
+  references: 40,
+  callableValueNegatives: 20,
+  typeRelationships: 20,
+  outcomes: {
+    resolved: 20,
+    provenExternal: 20,
+    ambiguous: 20,
+    unresolved: 20,
+    unsupported: 1,
+  },
+  exemptRoles: [],
+};
+const languageFloors = {
+  javascript: sharedFloors,
+  java: {
+    ...sharedFloors,
+    outcomes: { ...sharedFloors.outcomes, ambiguous: 0, unsupported: 0 },
+    exemptRoles: ["alias"],
+  },
+  python: {
+    ...sharedFloors,
+    outcomes: { ...sharedFloors.outcomes, ambiguous: 0, unsupported: 0 },
+    exemptRoles: ["alias"],
+  },
+  rust: {
+    ...sharedFloors,
+    typeRelationships: 0,
+    outcomes: { ...sharedFloors.outcomes, ambiguous: 0 },
+  },
+};
+
 // The count inventory is independently source-checked above. Keep the floor
 // predicate separate for direct boundary checks and captured corpus integration.
 export function assertCorpusFloors(count) {
   validate("CountsV1", count);
-  const required = roles.filter(
-    (role) => count.language !== "java" || role !== "alias",
-  );
+  const floors = languageFloors[count.language];
+  const required = roles.filter((role) => !floors.exemptRoles.includes(role));
   if (
-    count.scenariosTotal < 32 ||
-    count.scenariosByCategory.some((x) => x.count < 4) ||
-    count.measuredCalls < 120 ||
-    count.references < 40 ||
-    count.callableValueNegatives < 20 ||
-    count.typeRelationships < 20 ||
-    count.outcomes.some((x) => x.count < 20) ||
+    count.scenariosTotal < floors.scenariosTotal ||
+    count.scenariosByCategory.some(
+      (x) => x.count < floors.scenariosPerCategory,
+    ) ||
+    count.measuredCalls < floors.measuredCalls ||
+    count.references < floors.references ||
+    count.callableValueNegatives < floors.callableValueNegatives ||
+    count.typeRelationships < floors.typeRelationships ||
+    count.outcomes.some((x) => x.count < floors.outcomes[x.disposition]) ||
     required.some((role) => !count.observedRoles.includes(role))
   )
     fail("COUNT.FLOOR", "counts", "corpus-profile minimum not met");

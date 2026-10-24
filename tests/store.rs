@@ -898,11 +898,11 @@ fn live_current_decode_failure_hard_latches_saved_views() {
         .unwrap();
     let first = stats_store.annotations().unwrap_err();
     assert!(
-        first
-            .to_string()
-            .contains("incompatible_index: live index decode failed"),
+        first.to_string().starts_with("incompatible_index:")
+            && format!("{first:#}").contains("native header/control graph metadata mismatch"),
         "{first:#}"
     );
+    assert!(stats_store.recovery_pending_for_tests());
     for closed in [
         stats_store.view("legacy-view").unwrap_err(),
         stats_clone.view("legacy-view").unwrap_err(),
@@ -1857,8 +1857,9 @@ fn same_path_different_association_is_missing_but_dangling_revision_fails_closed
     let first_detail = format!("{first:#}");
     assert_eq!(
         first_detail,
-        "incompatible_index: selected evidence decode failed: incompatible_index: selected native version missing"
+        "incompatible_index: selected native version missing"
     );
+    assert!(store.recovery_pending_for_tests());
     let second = store.saved_view_at("association", Some(pin)).unwrap_err();
     assert_eq!(
         second.to_string(),

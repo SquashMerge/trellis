@@ -85,7 +85,7 @@ rust() {
   cargo clippy --locked --all-targets --features test-support -- -D warnings
   cargo build --locked --bin trellis
   browser_system_deps
-  TRELLIS_SUITE_BINARY="$target_dir/debug/trellis" node --test --test-concurrency=1 tests/browser/saved-items.test.cjs tests/browser/sequence-pele.test.cjs tests/browser/sequence.test.cjs tests/browser/sequence-cost.test.cjs
+  TRELLIS_SUITE_BINARY="$target_dir/debug/trellis" node --test --test-concurrency=1 tests/browser/saved-items.test.cjs tests/browser/sequence-harness.test.cjs tests/browser/sequence-pele.test.cjs tests/browser/sequence.test.cjs tests/browser/sequence-cost.test.cjs
 }
 tests() {
   if ! cargo nextest --version >/dev/null 2>&1; then
@@ -105,7 +105,7 @@ checks() {
   node --test tests/mcp-catalog-sdk.test.mjs
   python3 tools/stage3-watcher-runner-test.py
   node --test tests/factory-config.test.cjs
-  node docs/semantic-evidence/check-policy.mjs
+  node docs/semantic-evidence/check-policy.mjs --self-test
   node --check web/app.js
   node --test tests/question-ui.test.cjs tests/browse-ui.test.cjs tests/sequence-ui.test.cjs tests/token-ui.test.cjs tests/external-source-ui.test.cjs tests/dependency-ui.test.cjs tests/shell-ui.test.cjs tests/classes-ui.test.cjs tests/navigation-ui.test.cjs
 }

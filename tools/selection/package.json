@@ -10,8 +10,8 @@
     "prepare:hard": "node prepare-hard.mjs --run"
   },
   "dependencies": {
-    "@agentclientprotocol/claude-agent-acp": "0.79.0",
-    "@agentclientprotocol/sdk": "1.4.0",
-    "@modelcontextprotocol/sdk": "1.30.0"
+    "@agentclientprotocol/claude-agent-acp": "0.94.0",
+    "@agentclientprotocol/sdk": "2.0.0",
+    "@modelcontextprotocol/sdk": "1.32.1"
   }
 }

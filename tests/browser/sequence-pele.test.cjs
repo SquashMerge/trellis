@@ -148,7 +148,7 @@ test("changed visible positional note text with intact IDs refuses source action
  assert.equal(await page.evaluate(()=>window.picks.length),0);
  assert.equal(await page.evaluate(()=>window.sourceActions.length),0);
 });
-test("failed async group expansion visibly installs complete legacy DTO",async()=>{
+test("failed group expansion visibly installs complete legacy DTO",async()=>{
  const view=fixture("rust"),group=structuredClone(view.steps[0]),entry=structuredClone(view.steps[0]);
  group.id="unsupported-group";group.kind="group";group.callId=null;group.label="original complete group";
  entry.id="unsupported-child";delete entry.hidden;group.children=[entry];view.steps=[group];
@@ -171,8 +171,8 @@ test("failed async group expansion visibly installs complete legacy DTO",async()
  assert.ok(await page.locator('[data-source-step-id="unsupported-child"]').count(),"expanded legacy view retains original child");
 });
 
-// AC4: old callbacks and detached notes cannot affect a distinct newer pin.
-test("late Pele success, failure, and timeout leave the newer pinned diagram untouched", async () => {
+// AC4: obsolete renderer outcomes and detached notes cannot affect a newer pin.
+test("stale synchronous Pele success and failure leave the newer pinned diagram untouched", async () => {
  const oldView=fixture("rust"),newView=fixture("rust");
  newView.revision.indexRevision+=1;
  newView.steps=[{...newView.steps[0],id:"new-pin-evidence",label:"new pinned evidence"}];
@@ -180,7 +180,7 @@ test("late Pele success, failure, and timeout leave the newer pinned diagram unt
    const container=document.querySelector("#sequence-diagram"), state=document.querySelector("#state");
    const original=window.pele, results=[];
    try {
-     for(const scenario of ["success","failure","timeout","source-success","source-failure","source-timeout"]) {
+     for(const scenario of ["success","failure","source-success","source-failure"]) {
        const sourceOnly=scenario.startsWith("source-");
        const completion=scenario.replace(/^source-/,"");
        let activePin="old",selections=0,sources=0,oldSelections=0,oldSources=0;
@@ -190,23 +190,24 @@ test("late Pele success, failure, and timeout leave the newer pinned diagram unt
          {isCurrent:oldCurrent,...(sourceOnly?{}:{onSelect:()=>oldSelections++})});
        if(initial.status!=="rendered") throw Error(initial.reason);
        const staleNote=container.querySelector('.pele-note[data-trellis-step-id]');
-       let resolveWork,rejectWork;
-       window.pele={render:()=>({get svg(){return new Promise((resolve,reject)=>{resolveWork=resolve;rejectWork=reject;});}})};
-       const oldRequest=TrellisPeleSequence.render(container,oldView,()=>oldSources++,new Set(),{
+       let newerRequest,currentDiagram;
+       window.pele={render:(...args)=>{
+         // A synchronous renderer can change the current snapshot before its
+         // output or exception returns. Publish the new pin at that boundary.
+         activePin="new";window.pele=original;
+         newerRequest=TrellisPeleSequence.render(container,newView,()=>sources++,new Set(),
+           {isCurrent:newCurrent,...(sourceOnly?{}:{onSelect:()=>selections++})});
+         currentDiagram=container.firstElementChild;
+         state.textContent="new pinned revision";
+         if(completion==="failure") throw new Error("old renderer failed");
+         return original.render(...args);
+       }};
+       const outcome=await TrellisPeleSequence.render(container,oldView,()=>oldSources++,new Set(),{
          isCurrent:oldCurrent,...(sourceOnly?{}:{onSelect:()=>oldSelections++}),
          onUnsupported:()=>{state.textContent="old fallback";}
        });
-       await Promise.resolve();
-       if(!resolveWork || !rejectWork) throw Error("old Pele work did not start");
-       activePin="new";window.pele=original;
-       const newer=await TrellisPeleSequence.render(container,newView,()=>sources++,new Set(),
-         {isCurrent:newCurrent,...(sourceOnly?{}:{onSelect:()=>selections++})});
-       if(newer.status!=="rendered") throw Error(newer.reason);
-       state.textContent="new pinned revision";
-       const currentDiagram=container.firstElementChild;
-       if(completion==="success") resolveWork(original.render(TrellisPeleSequence.project(oldView).source,{}).svg);
-       if(completion==="failure") rejectWork(new Error("old renderer failed"));
-       const outcome=await oldRequest; // timeout uses the real production 5-second timer.
+       const newer=await newerRequest;
+       if(newer?.status!=="rendered") throw Error(newer?.reason||"new pin did not render");
        staleNote.dispatchEvent(new MouseEvent("click",{bubbles:true}));
        staleNote.dispatchEvent(new KeyboardEvent("keydown",{key:"Enter",bubbles:true}));
        staleNote.dispatchEvent(new KeyboardEvent("keydown",{key:" ",bubbles:true}));
@@ -317,12 +318,12 @@ test("12,000 SVG nodes allowed and 12,001 reject with no partial SVG or selectio
  assert.equal(result.selections,0);assert.equal(result.sources,0);
 });
 
-test("currently pinned 5-second Pele timeout visibly falls back to complete legacy evidence",async()=>{
+test("currently pinned synchronous Pele failure visibly falls back to complete legacy evidence",async()=>{
  const view=fixture("rust"),result=await page.evaluate(async view=>{
    const container=document.querySelector("#sequence-diagram"),state=document.querySelector("#state"),original=window.pele;
    container.replaceChildren();state.textContent="Pele pending";
    let selections=0,sources=0,started=false;
-   window.pele={render:()=>({get svg(){started=true;return new Promise(()=>{});}})};
+   window.pele={render:()=>{started=true;throw new Error("Pele renderer failed");}};
    try {
      const outcome=await TrellisPeleSequence.render(container,view,()=>sources++,new Set(),
        {isCurrent:()=>true,onSelect:()=>selections++});
@@ -336,6 +337,6 @@ test("currently pinned 5-second Pele timeout visibly falls back to complete lega
        text:container.textContent,selections,sources};
    }finally{window.pele=original;}
  },view);
- assert.equal(result.started,true);assert.match(result.reason,/timed out/);
+ assert.equal(result.started,true);assert.match(result.reason,/Pele renderer failed/);
  assertVisibleFallback(result,steps(view.steps).map(step=>step.id),view.steps[0].label);
 });

@@ -216,15 +216,16 @@ fn browser_symbols_are_identical_through_the_prefilter_and_the_literal_scan() {
     assert_eq!(names("fill").len(), 60);
 }
 
-/// A malformed trigram table fails the read as `store_unavailable`. It is
-/// never answered by the literal scan, which still serves short queries.
+/// A malformed trigram table fails without a literal fallback and closes
+/// subsequent admission until the exceptional index has been recreated.
 #[test]
 fn a_corrupt_trigram_table_is_store_unavailable_without_fallback() {
-    let (_state, _workspace, store, pin) = fixture();
+    let (_state, workspace, store, pin) = fixture();
     store.corrupt_symbol_trigrams_for_tests().unwrap();
     let read = store.evidence_response().unwrap();
     let error = read
         .mcp_find_with_lines("alpha", 20, Some(pin))
+        .map_err(|error| read.report_index_failure(error))
         .err()
         .unwrap();
     assert!(
@@ -232,20 +233,37 @@ fn a_corrupt_trigram_table_is_store_unavailable_without_fallback() {
         "{error:#}"
     );
     assert_eq!(super::evidence_failure_code(&error), "store_unavailable");
+    drop(read);
+    let next = store.evidence_response();
+    assert!(
+        next.is_err(),
+        "corrupt FTS read did not close admission: {error:#}"
+    );
+    drop(next);
+    let error = store
+        .symbols_at("al", 50)
+        .expect_err("even a short query must wait for index recovery");
+    assert!(
+        !crate::store::cli_read_retryable_contention(&error),
+        "{error:#}"
+    );
+    let (rebuilt, _) = crate::index_coordinator::reconcile_workspace(
+        &store,
+        &crate::indexer::IndexOptions::new(workspace.path().to_owned()),
+        &Arc::new(AtomicBool::new(false)),
+        |_| {},
+    )
+    .unwrap();
+    let read = store.evidence_response().unwrap();
     assert!(
         !read
-            .mcp_find("al", 20, Some(pin))
+            .mcp_find_with_lines("alpha", 20, Some(rebuilt))
             .unwrap()
             .symbols
             .is_empty()
     );
     read.finish(()).unwrap();
-    let error = store.symbols_at("alpha", 50).err().unwrap();
-    assert!(
-        !crate::store::cli_read_retryable_contention(&error),
-        "{error:#}"
-    );
-    assert_eq!(super::evidence_failure_code(&error), "store_unavailable");
+    assert!(!store.symbols_at("alpha", 50).unwrap().1.is_empty());
     assert!(!store.symbols_at("al", 50).unwrap().1.is_empty());
 }
 

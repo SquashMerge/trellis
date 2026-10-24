@@ -180,7 +180,7 @@ fn files_page_reports_a_dangling_graph_projection() {
     let error = store.files_at(None, 0, 10).unwrap_err();
     assert_eq!(
         format!("{error:#}"),
-        "incompatible_index: selected evidence decode failed: incompatible_index: selected document projection absent"
+        "incompatible_index: selected document projection absent"
     );
     assert_eq!(store.disposition(), RecoveryDisposition::Rebuild);
 }
