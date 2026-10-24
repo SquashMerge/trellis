@@ -610,11 +610,9 @@ export function checkCounts(
         );
     }
   }
-  // Decision 0017 Amendment 1: unsupported is a per-document native capability.
-  // A document counts once when its native intent declares a measurement family
-  // unavailable and it carries an authenticated captured producer fact; neither
-  // the fact's family nor an authored unsupported-join assertion is required.
-  // Coverage and provenance bookkeeping are not producer facts.
+  // Count captured production capability, not authored flags or unsupported joins.
+  // Conformance producers author their own honest capability intent. Coverage and
+  // provenance bookkeeping are not authenticated semantic producer facts.
   for (const { fact, annotation } of facts.values()) {
     if (["coverage", "provenance"].includes(fact.kind)) continue;
     const intent = fixture.coverageIntents.find(
@@ -623,7 +621,9 @@ export function checkCounts(
         x.revisionId === annotation.revisionId &&
         same(x.document, annotation.document),
     );
-    if (!intent?.measurementSupport.some((x) => !x.available)) continue;
+    const report = native.capabilityReports.find((x) => x.revisionId === annotation.revisionId && same(x.document, annotation.document));
+    const families = report?.families ?? (native.producerId === "trellis.native.syntax" ? [] : intent?.measurementSupport ?? []);
+    if (!families.some((x) => !x.available || x.gaps.length > 0)) continue;
     proofFor(loaded, records, fact, annotation);
     outcomeKeys
       .get("unsupported")

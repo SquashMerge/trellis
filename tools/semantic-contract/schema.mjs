@@ -441,10 +441,20 @@ export const types = Object.freeze({
       }),
     ],
   },
+  MeasurementGap: object({
+    range: "PositionRange",
+    diagnostic: "Text",
+  }),
+  CapabilityReport: object({
+    document: "DocumentKey",
+    revisionId: "Text",
+    families: array("MeasurementSupport"),
+  }),
   MeasurementSupport: object({
     kind: enumOf("declarationName", "callee", "invocation", "reference"),
     available: "boolean",
     diagnostic: nullable("Text"),
+    gaps: array("MeasurementGap"),
   }),
   CoverageIntent: object({
     producerId: "Text",
@@ -535,6 +545,7 @@ export const types = Object.freeze({
     calls: array("NativeCall"),
     controls: array("NativeControl"),
     references: array("NativeReference"),
+    capabilityReports: array("CapabilityReport"),
   }),
   IdentityRef: object({ ref: "Text" }),
   RecordRef: object({ recordRef: "Text" }),

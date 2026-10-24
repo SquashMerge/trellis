@@ -103,6 +103,7 @@ const native = {
   formatVersion: 1,
   producerId: "native",
   extractionInputs: [],
+  capabilityReports: [],
   declarations: [
     declaration("main", "main", 0, 39, 9),
     declaration("target", "target", 40, 60, 49),
@@ -539,7 +540,7 @@ async function specimen(
   const support = ["declarationName", "callee", "invocation", "reference"].map(
     (kind) => ({
       kind,
-      available: !(status === "unsupported" && kind === unsupportedFamily),
+      gaps: [], available: !(status === "unsupported" && kind === unsupportedFamily),
       diagnostic:
         status === "unsupported" && kind === unsupportedFamily
           ? "native family unavailable"
@@ -3008,4 +3009,39 @@ test("second captured producer cannot duplicate a directed edge at the corpus fl
   const s = await generatedCorpus(t, { duplicateProducer: true });
   assert.equal(s.records.typeRelationships.length, 21);
   assert.equal(checkCounts(s.loaded, s.records).typeRelationships, 20);
+});
+
+
+test("captured conformance gaps count one document with authenticated facts, never bookkeeping alone", async (t) => {
+  const unsupported = (records) => records.outcomes.find((row) => row.disposition === "unsupported").count;
+  const symbolFact = {
+    kind: "symbol", ref: "symbol-only",
+    record: {
+      key: { scheme: "scip", symbol: "pkg target", scope: "global", document: null },
+      displayName: "target", declarations: [declaredTarget], provenanceId: "proof",
+    },
+  };
+  for (const [name, facts, expected] of [
+    ["symbol alone", [symbolFact], 1],
+    ["bookkeeping alone", [], 0],
+  ]) await t.test(name, async (t) => {
+    const s = await specimen(t, { normalized: true, facts });
+    const intent = s.loaded.fixture.coverageIntents.find((row) => row.producerId === "native");
+    const families = structuredClone(intent.measurementSupport);
+    families.find((row) => row.kind === "invocation").gaps = [
+      { range: span(0, 8), diagnostic: "conformance opaque construct A" },
+      { range: span(40, 48), diagnostic: "conformance opaque construct B" },
+    ];
+    families.find((row) => row.kind === "callee").gaps = [
+      { range: span(0, 8), diagnostic: "conformance opaque callee convention" },
+    ];
+    s.loaded.native.capabilityReports = [{ document, revisionId: "r1", families }];
+    intent.measurementSupport = structuredClone(families);
+    const records = normalizeFixture(s.loaded).records;
+    assert.equal(unsupported(checkCounts(s.loaded, records)), expected);
+    assert.equal(records.coverage.find((row) => row.producerId === "semantic").state, "complete");
+    const badIntent = intent.measurementSupport.find((row) => row.kind === "invocation");
+    badIntent.gaps = [];
+    assert.throws(() => checkCounts(s.loaded, records), (error) => error.assertion === "JOIN.SUPPORT" && error.field === "measurementSupport");
+  });
 });

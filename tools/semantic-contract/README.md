@@ -24,8 +24,8 @@ A relationship fact requires `kind:"typeRelationship"` **and** `relationshipKind
 Start with one new directory, such as `tests/fixtures/semantic-evidence/v1/java/`. Keep the primary sources and exact producer captures from one frozen snapshot. Use `example/` for shapes, not for Java facts or precomputed answers. The schema for every nested field is in `schema.mjs`; the normative meaning and enum order are in `docs/semantic-evidence/contract-v1.md`.
 
 1. **Describe the snapshot in `fixture.json`.** Set `formatVersion:1`, `profile:"draft"` while the corpus is being built (then `"corpus"` in its final change), and one `language` (`java`, `rust`, `python`, or `javascript`). `sourceSets[]` supplies stable `id`, `rootId`, admitted `languages` and `dependencies` (not absolute paths). `producers[]` captures each native/semantic `id`, exact `version`, `executableHash`, `kind`, `languages`, and `positionEncoding`. Pin each semantic producer's observed encoding, because SCIP indexes leave it undeclared: `utf16` for scip-typescript, scip-python and scip-java, and `utf8` for rust-analyzer (Decision 0017 Amendment 1). Semantic anchors must use that encoding. `revisions[]` is chronological and each row supplies immutable `id`, `sourceSetId`, sorted `documents[]` (`key:{sourceSetId,language,path}`, `revisionId`, `sourceFile`), plus `toolchainHash`, `configHash`, and `dependencyHash`. Paths are confined relative to the fixture root; `DocumentKey.path` is relative to the admitted source set, not to `snapshots/`. `comparison` selects one `sourceSetId`/`revisionId` and requested `producers[]` _separately_ from captured producers. Do not substitute old captured bytes for an unavailable comparison producer.
-2. **Declare capture bytes and coverage requests.** `captures[]` gives each capture `ref`, `kind` (`executable`, `toolchain`, `config`, `dependency`, `semanticArtifact`), actual relative `file`, and SHA-256 `hash`. An `executable` or `toolchain` capture may instead carry `pinned:"docs/semantic-evidence/hardware/<profile>.json#<name>"` in place of `file`; the checker matches `hash` against that profile entry's `executableHash` or `toolchainHash` and stores no bytes ([Decision 0017](../../docs/semantic-evidence/decisions/0017-conformance-corpus-storage-and-producers.md)). Every producer executable and every revision's toolchain/config/dependency hash must have the right captured kind. List `nativeArtifact`, all `semanticArtifacts[]` and adjacent `annotationFiles[]`; set `answersFile`, `dispositionsFile`, `anchorCasesFile` to authored relative paths. `coverageIntents[]` identifies each producer/document/revision tuple with `requestedRoles[]` in role enum order and exactly four `measurementSupport[]` entries (`declarationName`, `callee`, `invocation`, `reference`), each `{kind,available,diagnostic}`; available needs null diagnostic. Each captured tuple needs its own coverage fact later, including omitted/failed ones.
-3. **Capture native measurements in `nativeArtifact`.** The object has `formatVersion:1`, `producerId`, the required `extractionInputs` inventory (the sorted, unique non-source capture kinds `config`, `dependency`, `toolchain` the native producer reads; an explicit `[]` when it reads none, never omitted), and arrays `declarations`, `calls`, `controls`, `references`. Every row gets a unique `ref`, `nativeId` (including explicit `null`), `document`, `revisionId`, and measured `range:{encoding,start,end}`. A declaration also has `parentRef` (or null for top level), `kind`, `name`/`nameRange` (nullable for modules/anonymous functions), `signature` (nullable), and full `header:{kind,name,modifiers,typeParameters,parameters,resultType,bases}`. A call gets `ownerRef`, nullable `calleeRange`/`spelling`, and `regionRefs[]`. A control gets `ownerRef`, nullable `parentRef`/`arm`, and measured `kind`; a reference gets `ownerRef` and literal `spelling`. Put a `witnesses[]` entry `{field,witness:{range,text}}` for every non-null source-derived leaf, including header pieces and spelling. Ranges use the producer's declared encoding and must map to the exact source bytes. An invocation is not a call solely because a callable value was read or passed. Native IDs are diagnostics, never stable identity.
+2. **Declare capture bytes and coverage requests.** `captures[]` gives each capture `ref`, `kind` (`executable`, `toolchain`, `config`, `dependency`, `semanticArtifact`), actual relative `file`, and SHA-256 `hash`. An `executable` or `toolchain` capture may instead carry `pinned:"docs/semantic-evidence/hardware/<profile>.json#<name>"` in place of `file`; the checker matches `hash` against that profile entry's `executableHash` or `toolchainHash` and stores no bytes ([Decision 0017](../../docs/semantic-evidence/decisions/0017-conformance-corpus-storage-and-producers.md)). Every producer executable and every revision's toolchain/config/dependency hash must have the right captured kind. List `nativeArtifact`, all `semanticArtifacts[]` and adjacent `annotationFiles[]`; set `answersFile`, `dispositionsFile`, `anchorCasesFile` to authored relative paths. `coverageIntents[]` identifies each producer/document/revision tuple with `requestedRoles[]` in role enum order and exactly four `measurementSupport[]` entries (`declarationName`, `callee`, `invocation`, `reference`), each `{kind,available,diagnostic,gaps}`; available means the convention is enabled and needs null diagnostic. A gap is `{range:{encoding:"utf8",start,end},diagnostic}` with a nonempty source span and concrete diagnostic. Each captured tuple needs its own coverage fact later, including omitted/failed ones.
+3. **Capture native measurements in `nativeArtifact`.** The object has `formatVersion:1`, `producerId`, the required `extractionInputs` inventory (the sorted, unique non-source capture kinds `config`, `dependency`, `toolchain` the native producer reads; an explicit `[]` when it reads none, never omitted), and arrays `declarations`, `calls`, `controls`, `references`, `capabilityReports`. Production reports contain `{document,revisionId,families}` for every captured document/revision, exactly one entry per measurement kind. Native coverage intents mirror the captured families exactly. Synthetic `native@1` conformance captures may use `capabilityReports:[]` with honest authored native intent as their capability authority. Every row gets a unique `ref`, `nativeId` (including explicit `null`), `document`, `revisionId`, and measured `range:{encoding,start,end}`. A declaration also has `parentRef` (or null for top level), `kind`, `name`/`nameRange` (nullable for modules/anonymous functions), `signature` (nullable), and full `header:{kind,name,modifiers,typeParameters,parameters,resultType,bases}`. A call gets `ownerRef`, nullable `calleeRange`/`spelling`, and `regionRefs[]`. A control gets `ownerRef`, nullable `parentRef`/`arm`, and measured `kind`; a reference gets `ownerRef` and literal `spelling`. Put a `witnesses[]` entry `{field,witness:{range,text}}` for every non-null source-derived leaf, including header pieces and spelling. Ranges use the producer's declared encoding and must map to the exact source bytes. An invocation is not a call solely because a callable value was read or passed. Native IDs are diagnostics, never stable identity.
 4. **Compute source-backed authoring values, then verify the capture.** For example, from the repository root:
 
    ```sh
@@ -56,7 +56,7 @@ The floors are per-language data in `counts.mjs`, as amended by Decision 0017 [A
 | unsupported documents | 1 | 0 | 0 | 1 |
 | alias role required | yes | no | no | yes |
 
-- **unsupported** counts documents, not anchors: a document and revision count once when the native producer's coverage intent declares a measurement family unavailable there and the same document and revision carry at least one authenticated captured producer fact (any semantic fact kind, including `symbol`; `coverage` and `provenance` bookkeeping does not count). The fact need not join in the unavailable family, and no `unsupported` join assertion is required; any that is authored is still checked against the native capability. More anchors in the same document add nothing. Java and Python have no floor until a genuine construct exists (Amendment 3).
+- **unsupported** counts documents, not anchors: a document/revision counts once when its production capability report has a genuine family gap or wholly unavailable convention and that tuple carries at least one authenticated captured semantic producer fact (including `symbol`; excluding `coverage` and `provenance` bookkeeping). Authored false flags, native partial coverage and asserted unsupported joins are not production authority. The fact need not lie in the gap or use its family. Synthetic conformance captures retain honest authored native capability intent as their authority. Java and Python have no floor until a genuine construct exists; JavaScript and Rust remain at 1.
 - **unresolved** is authored as a `callBinding` (or `reference`) fact with `resolution:"unresolved"`, `declaredTarget:null` and no candidates, on the exact join of a measured call or reference that has no producer occurrence, in a document whose semantic coverage tuple is `complete`. SCIP has no positive unresolved record, so absence at an exact measured join in a complete document is the evidence. The checker rejects an `unresolved` resolution disposition (`COUNT.DISPOSITION`) unless that producer's coverage tuple for the document is `complete`.
 - **alias** is satisfied by a reference fact at the measured alias name (`site:"declaration"`, roles `definition` and `alias`) whose target is the original declaration; that is what the producers report at the alias name. Java and Python are exempt from the alias floor.
 
@@ -79,7 +79,7 @@ Tests define local finite control rows `{id,baseline,mutate,expectedAssertion,ex
 
 ## Capture with the production native extractor (#95)
 
-The registry admits the current `trellis.native.syntax@native-v8` with the
+The registry admits the current `trellis.native.syntax@native-v9` with the
 production `EXTRACTION_INPUTS` inventory (`[]` for Java, Rust, Python and
 JavaScript). Historical v3/v4 descriptors are not admitted. The Rust inventory
 guard queries the complete production entry set in this JS registry through Node
@@ -126,10 +126,13 @@ test-support capture build, not a release binary. Decision 0017
 [Amendment 3](../../docs/semantic-evidence/decisions/0017-conformance-corpus-storage-and-producers.md#amendment-3-2026-10-23-production-native-captures)
 pins production native captures by this hash; no real hardware pin exists yet.
 
-The adapter preserves production declarations, calls and controls; it does not
-reparse source to invent additional measurements or map dynamic evidence to
-execution. Production currently emits no reference-candidate family, so the raw
-capture's `references` array is empty; native-v9 (#279) adds one. The toolkit accepts unnamed Rust
+The adapter preserves production declarations, calls, controls, identifier-site reference
+candidates and per-document capability reports. It does not reparse source, infer
+semantic roles or targets, or turn identifier candidates into calls. Reference IDs
+and ordinals come from the full native inventory, not a semantic producer's subset.
+A declaration-name candidate uses its declarationName owner's `parentRef ?? self`.
+Only the ratified JavaScript explicit named-import and Rust explicit use-as aliases
+gain narrow measured alias declarations. The toolkit accepts unnamed Rust
 `implementation` declarations and treats the synthetic module as outermost when
 its range equals a real declaration's range; nested declarations still require
 the real immediate source parent. Witnesses attest the actual header/spelling
@@ -137,7 +140,17 @@ leaves against the captured UTF-8 source, and native IDs are diagnostic labels,
 never generated stable IDs. A field that cannot be witnessed, or a production signature inconsistent with
 its measured header (currently possible for Java varargs), fails capture rather
 than being silently rewritten. Fixing those production measurements requires its
-own producer-version decision; the adapter must not invent missing types. Keep annotations/coverage honest about the families
-present; this capture path does not implement per-construct family-unavailability
-or qualify the unsupported floor. Per-family unavailability reports come with
-native-v9 (#279), under Amendment 3.
+own producer-version decision; the adapter must not invent missing types. Keep annotations/coverage honest about the families present. Native-v9 enables all
+four conventions, including in empty documents. Actual opaque constructs are
+reported as narrow per-family gaps, never as fabricated disabled working families.
+
+A join is unsupported only if its entire half-open anchor lies inside one reported
+gap and no measured candidate matches. Crossing or merely touching a gap is not
+unsupported. Same-family candidates wholly inside a reported gap invalidate the
+capture, even without semantic facts there. Enclosing invocations and valid
+outside anchors remain usable. Normalizer and checker derive these rules
+independently from source coordinates and captured reports. A requested native
+family gap makes native coverage partial with a diagnostic without erasing
+supported/observed roles. It does not by itself falsify complete semantic producer
+coverage. Production reports must be complete and native intents must mirror them;
+missing reports and authored overrides fail closed.

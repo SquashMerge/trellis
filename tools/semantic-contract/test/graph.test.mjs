@@ -895,6 +895,7 @@ async function admittedGraph(
     formatVersion: 1,
     producerId: "native",
     extractionInputs: [],
+    capabilityReports: [],
     declarations,
     calls: [oldCall, call],
     controls: [],
@@ -1070,7 +1071,7 @@ async function admittedGraph(
   };
   const coverageIntents = [],
     support = ["declarationName", "callee", "invocation", "reference"].map(
-      (kind) => ({ kind, available: true, diagnostic: null }),
+      (kind) => ({ kind, gaps: [], available: true, diagnostic: null }),
     );
   for (const id of revisionIds) {
     const facts = [];
@@ -1117,7 +1118,7 @@ async function admittedGraph(
                 row.kind === (unsupportedCurrent ? "callee" : "invocation")
                   ? {
                       kind: row.kind,
-                      available: false,
+                      gaps: [], available: false,
                       diagnostic: `${row.kind} measurement unavailable`,
                     }
                   : row,
