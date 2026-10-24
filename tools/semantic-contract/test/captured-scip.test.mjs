@@ -184,6 +184,30 @@ test("production UTF-8 scalar boundary, CRLF and raw zero preserve digest value"
   }
 });
 
+test("authenticated standalone CR stays on its source line", async () => {
+  await withFixture(async (f) => {
+    const bytes = Buffer.from("a\rb");
+    await writeFile(join(f.root, "sources/src/A.js"), bytes);
+    f.manifest.sourceDocuments[0].contentHash = hash(bytes);
+    f.manifest.documents[0].contentHash = hash(bytes);
+    f.manifest.sourceManifestHash = sourceManifestHash([{ document: { sourceSetId: f.manifest.sourceSet.id, language: "rust", path: "src/A.js" }, contentHash: hash(bytes) }]);
+    const range = { encoding: "singleLine", line: 0, startCharacter: 0, endCharacter: 2 };
+    f.artifact.documents[0].facts = [{ recordKind: "occurrence", raw: { range, enclosingRange: null, symbol: "A#", symbolRoles: 0, syntaxKind: 0 } }];
+    async function attestedCheck() {
+      const artifactBytes = Buffer.from(JSON.stringify(f.artifact));
+      await writeFile(join(f.root, "captured-scip/artifact.json"), artifactBytes);
+      f.manifest.artifacts[0].hash = hash(artifactBytes);
+      return checkCapturedScip(f.root, await f.save());
+    }
+    const accepted = await attestedCheck();
+    assert.equal(accepted.claims.length, 1);
+    assert.equal(accepted.claims[0].envelope.raw.range.line, 0);
+    assert.equal(accepted.claims[0].envelope.raw.range.endCharacter, 2);
+    range.line = 1;
+    await assert.rejects(attestedCheck(), { code: "InvalidArtifact" });
+  });
+});
+
 test("per-document occurrence count is charged before deduplication", async () => {
   await withFixture(async (f) => {
     f.artifact.documents[0].facts = Array.from({ length: 10001 }, () => f.artifact.documents[0].facts[0]);

@@ -32,7 +32,8 @@ function rangeBounds(range) {
 function validateRange(range, text, encoding) {
   const [[sl, sc], [el, ec]] = rangeBounds(range);
   if (sl > el || (sl === el && sc > ec)) fail("InvalidArtifact", "reversed range");
-  const lines = text.split(/\r\n|\n|\r/);
+  const lines = text.split("\n").map((line, index, all) =>
+    index < all.length - 1 && line.endsWith("\r") ? line.slice(0, -1) : line);
   for (const [line, column] of [[sl, sc], [el, ec]]) {
     if (line >= lines.length) fail("InvalidArtifact", "line outside source");
     let offset = 0;
