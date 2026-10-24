@@ -313,6 +313,17 @@ struct TestTerminalNotify {
 #[cfg(feature = "test-support")]
 pub type RetentionStateForTests = ((String, i64, i64), (i64, i64));
 
+#[cfg(feature = "test-support")]
+#[derive(Debug)]
+#[doc(hidden)]
+pub struct PrivateStageObservation {
+    pub pin: IndexPin,
+    pub semantic: crate::semantic_evidence::SemanticSnapshot,
+    pub native_revision: crate::native_evidence::Revision,
+    pub declarations: Vec<crate::native_evidence::Declaration>,
+    pub calls: Vec<crate::native_evidence::Call>,
+}
+
 #[derive(Clone)]
 pub struct Store {
     roots: topology::TopologyRoots,
@@ -10228,6 +10239,8 @@ impl Store {
             expected,
             PublicationTarget::Live,
             cancel,
+            None,
+            |_, _| Ok(()),
         )
     }
 
@@ -10278,9 +10291,12 @@ impl Store {
             expected,
             PublicationTarget::Stage(stage),
             cancel,
+            None,
+            |_, _| Ok(()),
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn publish_validated_stream_target(
         &self,
         spool: &crate::native_evidence::FullDocumentSpool,
@@ -10289,6 +10305,11 @@ impl Store {
         expected: RecoveryBaseline,
         target: PublicationTarget<'_>,
         cancel: &CancelFlag,
+        semantic: Option<(
+            &crate::semantic_evidence::SemanticPublication,
+            &crate::semantic_evidence::CapturedComponents,
+        )>,
+        during_tx: impl FnMut(PublishStage, &Connection) -> Result<()>,
     ) -> Result<IndexPin> {
         capture.verify(cancel)?;
         ensure!(
@@ -10357,8 +10378,205 @@ impl Store {
             },
             cancel,
             (256 * 1024 * 1024 + 16 * 1024, None, Some(spool)),
-            |_, _| Ok(()),
-            None,
+            during_tx,
+            semantic,
+        )
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn publish_private_stage_semantic_for_tests(
+        &self,
+        options: &crate::indexer::IndexOptions,
+        capture: &crate::capture::Capture,
+        semantic: &crate::semantic_evidence::SemanticPublication,
+        captured: &crate::semantic_evidence::CapturedComponents,
+        cancel: &CancelFlag,
+        fail_before_commit: bool,
+    ) -> Result<PrivateStageObservation> {
+        let use_guard = self.roots.index_use_exclusive_existing(&self.identity)?;
+        let leader = self
+            .roots
+            .writer_under_exclusive(self.identity.clone(), use_guard)?;
+        let stage = self.create_staged_index(&leader, true)?;
+        let result = (|| {
+            let spool = crate::native_evidence::spool_full_capture(
+                options,
+                capture,
+                Path::new(&self.workspace_root),
+                self.root_id(),
+                cancel,
+                &|_| {},
+                |_, _| {},
+                &self.native_spool_dir()?,
+            )?;
+            let bootstrap = open_index(&stage.path, false)?;
+            validate_v8_bootstrap(&bootstrap)?;
+            let baseline = self.recovery_baseline(&bootstrap)?;
+            drop(bootstrap);
+            let published = self.publish_validated_stream_target(
+                &spool,
+                capture,
+                &leader,
+                baseline,
+                PublicationTarget::Stage(&stage),
+                cancel,
+                Some((semantic, captured)),
+                |point, _| {
+                    ensure!(
+                        !fail_before_commit || !matches!(point, PublishStage::BeforeCommit),
+                        "injected semantic stage failure"
+                    );
+                    Ok(())
+                },
+            );
+            if let Err(error) = published {
+                if fail_before_commit {
+                    let staged = open_index(&stage.path, false)?;
+                    for table in [
+                        "native_revisions",
+                        "revision_documents",
+                        "semantic_coverage",
+                        "semantic_references",
+                    ] {
+                        let count: i64 = staged.query_row(
+                            &format!("SELECT count(*) FROM {table}"),
+                            [],
+                            |row| row.get(0),
+                        )?;
+                        ensure!(
+                            count == 0,
+                            "failed staged transaction retained {table} rows"
+                        );
+                    }
+                }
+                return Err(error);
+            }
+            let pin = published?;
+            self.validate_replacement_index(&stage.path, &stage, &leader, pin)?;
+            let staged = open_index(&stage.path, false)?;
+            let key = format!("pin:v1:{}:{}", pin.index_generation, pin.index_revision);
+            let snapshot = read_semantic(&staged, &key)?;
+            let (source_set_id, native_revision_id, toolchain_hash, config_hash, dependency_hash):
+                (String, String, String, String, String) = staged.query_row(
+                "SELECT source_set_id,native_revision_id,toolchain_hash,config_hash,dependency_hash FROM native_revisions WHERE id=?1",
+                [&key],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )?;
+            let documents = staged
+                .prepare(
+                    "SELECT m.language,m.path,d.content_hash,d.byte_length
+                 FROM revision_documents m JOIN document_versions d ON d.vid=m.vid
+                 WHERE m.revision_id=?1 ORDER BY m.language,m.path",
+                )?
+                .query_map([&key], |row| {
+                    Ok(crate::native_evidence::Document {
+                        key: crate::native_evidence::DocumentKey {
+                            source_set_id: source_set_id.clone(),
+                            language: row.get(0)?,
+                            path: row.get(1)?,
+                        },
+                        revision_id: native_revision_id.clone(),
+                        content_hash: row.get(2)?,
+                        byte_length: row.get::<_, i64>(3)? as usize,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let selected = ReadRevision::new(pin, key);
+            let mut declarations = vec![];
+            let mut calls = vec![];
+            for document in &documents {
+                let scope = v8_native_scope_for(&staged, &document.key, &selected)?
+                    .context("staged native document missing")?;
+                declarations.extend(read_native_declarations_v8(&staged, &scope, None, true)?);
+                calls.extend(read_native_calls_v8(&staged, &scope, None)?);
+            }
+            let revision = crate::native_evidence::Revision {
+                id: native_revision_id,
+                source_set_id,
+                documents,
+                toolchain_hash,
+                config_hash,
+                dependency_hash,
+            };
+            Ok(PrivateStageObservation {
+                pin,
+                semantic: snapshot,
+                native_revision: revision,
+                declarations,
+                calls,
+            })
+        })();
+        self.cleanup_failed_staged_index(stage, Some(&leader))?;
+        result
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn publish_stream_native_only_for_tests(
+        &self,
+        options: &crate::indexer::IndexOptions,
+        capture: &crate::capture::Capture,
+        leader: &topology::WriterGuard,
+        cancel: &CancelFlag,
+    ) -> Result<IndexPin> {
+        let spool = crate::native_evidence::spool_full_capture(
+            options,
+            capture,
+            Path::new(&self.workspace_root),
+            self.root_id(),
+            cancel,
+            &|_| {},
+            |_, _| {},
+            &self.native_spool_dir()?,
+        )?;
+        self.publish_validated_stream_recovery(
+            &spool,
+            capture,
+            leader,
+            self.publication_index_baseline()?,
+            cancel,
+        )
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn publish_stream_semantic_for_tests(
+        &self,
+        options: &crate::indexer::IndexOptions,
+        capture: &crate::capture::Capture,
+        semantic: &crate::semantic_evidence::SemanticPublication,
+        captured: &crate::semantic_evidence::CapturedComponents,
+        leader: &topology::WriterGuard,
+        cancel: &CancelFlag,
+        fail_before_commit: bool,
+    ) -> Result<IndexPin> {
+        let spool = crate::native_evidence::spool_full_capture(
+            options,
+            capture,
+            Path::new(&self.workspace_root),
+            self.root_id(),
+            cancel,
+            &|_| {},
+            |_, _| {},
+            &self.native_spool_dir()?,
+        )?;
+        self.publish_validated_stream_target(
+            &spool,
+            capture,
+            leader,
+            self.publication_index_baseline()?,
+            PublicationTarget::Live,
+            cancel,
+            Some((semantic, captured)),
+            |stage, _| {
+                ensure!(
+                    !fail_before_commit || !matches!(stage, PublishStage::BeforeCommit),
+                    "injected semantic stream failure"
+                );
+                Ok(())
+            },
         )
     }
 
@@ -10374,6 +10592,83 @@ impl Store {
     ) -> Result<IndexPin> {
         let baseline = self.publication_index_baseline()?;
         self.publish_native_recovery_selective(graph, capture, native, leader, baseline, cancel)
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn publish_selective_semantic_for_tests(
+        &self,
+        graph: &Graph,
+        capture: &crate::capture::Capture,
+        native: &crate::native_evidence::Artifact,
+        semantic: &crate::semantic_evidence::SemanticPublication,
+        captured: &crate::semantic_evidence::CapturedComponents,
+        leader: &topology::WriterGuard,
+        cancel: &CancelFlag,
+        fail_before_commit: bool,
+    ) -> Result<IndexPin> {
+        self.validate_native_bundle_with_mode(graph, capture, native, cancel, true)?;
+        self.publish_inner_checked_target_with_local(
+            (graph, capture, native),
+            leader,
+            PublicationPlan {
+                expected: ExpectedPublication::Recovery(Box::new(
+                    self.publication_index_baseline()?,
+                )),
+                target: PublicationTarget::Live,
+            },
+            cancel,
+            (256 * 1024 * 1024 + 16 * 1024, None, None),
+            |stage, _| {
+                ensure!(
+                    !fail_before_commit || !matches!(stage, PublishStage::BeforeCommit),
+                    "injected semantic selective failure"
+                );
+                Ok(())
+            },
+            Some((semantic, captured)),
+        )
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn publish_local_semantic_for_tests(
+        &self,
+        options: &crate::indexer::IndexOptions,
+        capture: &crate::capture::Capture,
+        semantic: &crate::semantic_evidence::SemanticPublication,
+        captured: &crate::semantic_evidence::CapturedComponents,
+        leader: &topology::WriterGuard,
+        cancel: &CancelFlag,
+        fail_before_commit: bool,
+    ) -> Result<IndexPin> {
+        let expected = self.publication_index_baseline()?;
+        let prepared = self
+            .prepare_local_revision(capture, &expected, cancel)?
+            .context("document-local publication unavailable")?;
+        let changed = crate::indexer::project_native_document(
+            options,
+            capture,
+            &prepared.native,
+            &prepared.changed_path,
+            cancel,
+            &|_| {},
+        )?;
+        let graph = self
+            .compose_local_revision(capture, &prepared, changed, cancel)?
+            .context("document-local class projection unavailable")?;
+        self.publish_local_native_recovery_with_semantic(
+            &graph,
+            capture,
+            prepared,
+            leader,
+            expected,
+            cancel,
+            Some((semantic, captured)),
+            fail_before_commit,
+        )
     }
 
     #[allow(dead_code)] // Test seam for the original full-artifact selective rollback matrix.
@@ -10405,6 +10700,26 @@ impl Store {
         expected: RecoveryBaseline,
         cancel: &CancelFlag,
     ) -> Result<IndexPin> {
+        self.publish_local_native_recovery_with_semantic(
+            graph, capture, prepared, leader, expected, cancel, None, false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn publish_local_native_recovery_with_semantic(
+        &self,
+        graph: &Graph,
+        capture: &crate::capture::Capture,
+        prepared: LocalPrepared,
+        leader: &topology::WriterGuard,
+        expected: RecoveryBaseline,
+        cancel: &CancelFlag,
+        semantic: Option<(
+            &crate::semantic_evidence::SemanticPublication,
+            &crate::semantic_evidence::CapturedComponents,
+        )>,
+        fail_before_commit: bool,
+    ) -> Result<IndexPin> {
         ensure!(
             capture.files == graph.files && expected.pin() == Some(prepared.prior_pin),
             "revision conflict: changed-only graph or expected head differs"
@@ -10420,17 +10735,55 @@ impl Store {
             "native_evidence_required: incomplete selected capture"
         );
         let mut native = prepared.native.clone();
-        for file in &capture.files {
-            if file.path == prepared.changed_path {
-                continue;
+        if semantic.is_some() {
+            // Reused versions belong to the selected, previously validated pin.
+            // Read their measured rows through that pin, not from the changed-only
+            // artifact or from a newly fabricated measurement.
+            self.native_at(prepared.prior_pin, |db, selected| {
+                for document in &native.revision.documents {
+                    if document.key.path == prepared.changed_path {
+                        continue;
+                    }
+                    let scope = v8_native_scope_for(db, &document.key, selected)?
+                        .context("reused native document missing from selected pin")?;
+                    ensure!(
+                        scope.version_id == prepared.prior_ids[&document.key.path].version_id,
+                        "reused native version differs from selected pin"
+                    );
+                    let mut coverage = read_native_coverage_v8(db, &scope)?;
+                    coverage.revision_id.clone_from(&native.revision.id);
+                    native.coverage.push(coverage);
+                    let mut declarations = read_native_declarations_v8(db, &scope, None, true)?;
+                    for declaration in &mut declarations {
+                        declaration.revision_id.clone_from(&native.revision.id);
+                    }
+                    native.declarations.extend(declarations);
+                    let mut calls = read_native_calls_v8(db, &scope, None)?;
+                    for call in &mut calls {
+                        call.revision_id.clone_from(&native.revision.id);
+                    }
+                    native.calls.extend(calls);
+                    let mut regions = read_native_control_regions_v8(db, &scope, None)?;
+                    for region in &mut regions {
+                        region.revision_id.clone_from(&native.revision.id);
+                    }
+                    native.control_regions.extend(regions);
+                }
+                Ok(())
+            })?;
+        } else {
+            for file in &capture.files {
+                if file.path == prepared.changed_path {
+                    continue;
+                }
+                let mut coverage = prepared
+                    .prior_coverage
+                    .get(&file.path)
+                    .context("reused document coverage missing from selected head")?
+                    .clone();
+                coverage.revision_id.clone_from(&native.revision.id);
+                native.coverage.push(coverage);
             }
-            let mut coverage = prepared
-                .prior_coverage
-                .get(&file.path)
-                .context("reused document coverage missing from selected head")?
-                .clone();
-            coverage.revision_id.clone_from(&native.revision.id);
-            native.coverage.push(coverage);
         }
         self.publish_inner_checked_target_with_local(
             (graph, capture, &native),
@@ -10441,8 +10794,14 @@ impl Store {
             },
             cancel,
             (256 * 1024 * 1024 + 16 * 1024, Some(&prepared), None),
-            |_, _| Ok(()),
-            None,
+            |stage, _| {
+                ensure!(
+                    !fail_before_commit || !matches!(stage, PublishStage::BeforeCommit),
+                    "injected semantic local failure"
+                );
+                Ok(())
+            },
+            semantic,
         )
     }
 
@@ -12857,8 +13216,32 @@ impl Store {
             }
         }
         immutable.finish(&tx).map_err(classify_immutable)?;
+        // The spool header carries the complete revision but no per-document facts.
+        // Reconstruct the measured inventory from that same private spool for the
+        // semantic validator; never validate against the header's empty fact lists.
+        let measured_stream = if semantic.is_some()
+            && let Some(spool) = stream
+        {
+            let mut measured = native.clone();
+            for index in 0..spool.len() {
+                check_cancel(cancel)?;
+                let (document, _) = spool.read(index).map_err(native_spool_read_failure)?;
+                measured.coverage.extend(document.coverage);
+                measured.provenance.extend(document.provenance);
+                measured.declarations.extend(document.declarations);
+                measured.calls.extend(document.calls);
+                measured.control_regions.extend(document.control_regions);
+            }
+            Some(measured)
+        } else {
+            None
+        };
         if let Some((semantic, captured)) = semantic {
-            crate::semantic_evidence::validate_evidence(semantic, native, captured)?;
+            crate::semantic_evidence::validate_evidence(
+                semantic,
+                measured_stream.as_ref().unwrap_or(native),
+                captured,
+            )?;
         }
         write_semantic(
             &tx,
