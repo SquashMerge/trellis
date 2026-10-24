@@ -625,21 +625,56 @@ mod tests {
     }
     #[test]
     fn scip_admission_rejects_captured_symlinked_ancestor_role() {
-        let (root, _, selection, _, cancel) = fixture();
+        let (root, _, mut selection, mut manifest, cancel) = fixture();
+        let physical = fs::canonicalize(root.path()).unwrap();
+        let linked = physical.join("linked");
+        fs::create_dir(&linked).unwrap();
+        fs::write(linked.join("artifact.scip"), hex::decode(WIRE).unwrap()).unwrap();
+        manifest["artifacts"][0]["path"] = json!("linked/artifact.scip");
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        fs::write(physical.join("manifest.json"), &bytes).unwrap();
+        selection.expected_manifest_hash = scip_raw::sha(&bytes);
+        let options = IndexOptions {
+            workspace_root: physical.clone(),
+            scip_path: Some(linked.join("artifact.scip")),
+            manifest_path: Some(physical.join("manifest.json")),
+            max_file_bytes: 2 * 1024 * 1024,
+        };
+        let baseline = Capture::admit(&options, &cancel, &|_| {}).unwrap();
+        let identity =
+            crate::store::topology::WorkspaceIdentity::discover(Some(&physical), &physical)
+                .unwrap();
+        let (_, revision) =
+            captured_revision_header(&baseline, &physical, &identity.record_id).unwrap();
+        manifest["sourceRevision"] = json!(revision.id);
+        manifest["components"] = json!({
+            "toolchainHash": revision.toolchain_hash,
+            "configHash": revision.config_hash,
+            "dependencyHash": revision.dependency_hash,
+        });
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        fs::write(physical.join("manifest.json"), &bytes).unwrap();
+        selection.expected_manifest_hash = scip_raw::sha(&bytes);
+        let baseline = Capture::admit(&options, &cancel, &|_| {}).unwrap();
+        let admitted =
+            ReferenceProfileAdmission::from_trusted_selection(&baseline, &selection, &cancel)
+                .unwrap();
+        assert_eq!(
+            decode_reference_profile(&admitted, &cancel)
+                .unwrap()
+                .claims
+                .len(),
+            2
+        );
+
         let outside = tempfile::tempdir().unwrap();
         fs::write(
             outside.path().join("artifact.scip"),
             hex::decode(WIRE).unwrap(),
         )
         .unwrap();
-        let physical = fs::canonicalize(root.path()).unwrap();
-        std::os::unix::fs::symlink(outside.path(), physical.join("linked")).unwrap();
-        let options = IndexOptions {
-            workspace_root: physical.clone(),
-            scip_path: Some(physical.join("linked/artifact.scip")),
-            manifest_path: Some(physical.join("manifest.json")),
-            max_file_bytes: 2 * 1024 * 1024,
-        };
+        fs::remove_dir_all(&linked).unwrap();
+        std::os::unix::fs::symlink(outside.path(), &linked).unwrap();
         let capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
         assert!(
             capture.selected_scip_inputs().is_some(),
@@ -647,7 +682,7 @@ mod tests {
         );
         assert!(matches!(
             ReferenceProfileAdmission::from_trusted_selection(&capture, &selection, &cancel),
-            Err(ScipCaptureError::InvalidAdmission(_))
+            Err(ScipCaptureError::InvalidAdmission(message)) if message == "symlinked selected role"
         ));
     }
     #[test]

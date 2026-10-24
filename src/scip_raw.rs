@@ -250,10 +250,7 @@ fn wire(
         }
         if matches!(node, Node::Occurrence) && matches!(n, 1 | 7 | 8 | 9 | 10 | 11) {
             let mask = if matches!(n, 1 | 8 | 9) { 1 } else { 2 };
-            if n >= 8 && ranges & mask != 0
-                || n == 1 && ranges & 4 != 0
-                || n == 7 && ranges & 8 != 0
-            {
+            if n >= 8 && ranges & mask != 0 {
                 return Err(invalid("competing range tags"));
             }
             if n >= 8 {
@@ -932,6 +929,15 @@ mod tests {
         source: &[u8],
         enc: u8,
     ) -> Result<CapturedScipInventory, ScipCaptureError> {
+        custom_document(bytes, source, enc, "src/A.js", "javascript")
+    }
+    fn custom_document(
+        bytes: &[u8],
+        source: &[u8],
+        enc: u8,
+        path: &str,
+        language: &str,
+    ) -> Result<CapturedScipInventory, ScipCaptureError> {
         let input = AuthenticatedScipInput {
             artifact_hash: sha(bytes),
             artifact_bytes: bytes,
@@ -949,8 +955,8 @@ mod tests {
             protocol_version: 0,
             text_document_encoding: 1,
             documents: vec![AuthenticatedScipDocument {
-                language: "javascript".into(),
-                relative_path: "src/A.js".into(),
+                language: language.into(),
+                relative_path: path.into(),
                 source_bytes: source,
                 content_hash: sha(source),
             }],
@@ -1021,6 +1027,156 @@ mod tests {
             inventory.lookup(&call.captured_proof_id, "relationship", &call.fact_digest),
             Err(ScipCaptureError::MissingProof)
         ));
+    }
+    fn assert_repeated_legacy_equivalent(primary: &[u8], enclosing: &[u8]) {
+        let packed_primary = [0x0a, 3, 0, 9, 10];
+        let packed_enclosing = [0x3a, 3, 0, 0, 17];
+        let baseline = custom(
+            &base_doc(
+                message(2, &[packed_primary.as_slice(), &packed_enclosing].concat()),
+                1,
+            ),
+            b"function f(){g();}\n",
+            1,
+        )
+        .expect("packed range baseline");
+        let bytes = base_doc(message(2, &[primary, enclosing].concat()), 1);
+        let generated = types::Index::parse_from_bytes(&bytes).expect("legal repeated int32 wire");
+        assert_eq!(generated.documents[0].occurrences[0].range, [0, 9, 10]);
+        assert_eq!(
+            generated.documents[0].occurrences[0].enclosing_range,
+            [0, 0, 17]
+        );
+        let actual = custom(&bytes, b"function f(){g();}\n", 1)
+            .expect("legal repeated legacy fields must concatenate");
+        assert_eq!(actual.claims.len(), 1);
+        assert_eq!(
+            actual.claims[0].canonical_bytes,
+            baseline.claims[0].canonical_bytes
+        );
+        assert_eq!(actual.claims[0].fact_digest, baseline.claims[0].fact_digest);
+    }
+    #[test]
+    fn scip_repeated_legacy_unpacked_primary() {
+        assert_repeated_legacy_equivalent(&[8, 0, 8, 9, 8, 10], &[0x3a, 3, 0, 0, 17]);
+    }
+    #[test]
+    fn scip_repeated_legacy_chunked_primary() {
+        assert_repeated_legacy_equivalent(&[0x0a, 1, 0, 0x0a, 2, 9, 10], &[0x3a, 3, 0, 0, 17]);
+    }
+    #[test]
+    fn scip_repeated_legacy_unpacked_enclosing() {
+        assert_repeated_legacy_equivalent(&[0x0a, 3, 0, 9, 10], &[0x38, 0, 0x38, 0, 0x38, 17]);
+    }
+    #[test]
+    fn scip_repeated_legacy_chunked_enclosing() {
+        assert_repeated_legacy_equivalent(&[0x0a, 3, 0, 9, 10], &[0x3a, 1, 0, 0x3a, 2, 0, 17]);
+    }
+    #[test]
+    fn scip_repeated_legacy_mixed_packed_and_unpacked() {
+        assert_repeated_legacy_equivalent(&[8, 0, 0x0a, 2, 9, 10], &[0x3a, 2, 0, 0, 0x38, 17]);
+        let baseline = base_doc(message(2, &[0x0a, 4, 0, 9, 0, 10, 0x3a, 4, 0, 0, 0, 17]), 1);
+        let repeated = base_doc(
+            message(
+                2,
+                &[8, 0, 8, 9, 8, 0, 8, 10, 0x38, 0, 0x38, 0, 0x38, 0, 0x38, 17],
+            ),
+            1,
+        );
+        let expected = custom(&baseline, b"function f(){g();}\n", 1).unwrap();
+        let actual = custom(&repeated, b"function f(){g();}\n", 1).unwrap();
+        assert_eq!(
+            actual.claims[0].canonical_bytes,
+            expected.claims[0].canonical_bytes
+        );
+        assert_eq!(actual.claims[0].fact_digest, expected.claims[0].fact_digest);
+    }
+    #[test]
+    fn scip_legacy_typed_and_competing_typed_ranges_still_reject() {
+        let primary = vec![0x0a, 3, 0, 9, 10];
+        let enclosing = vec![0x3a, 3, 0, 0, 17];
+        let typed = message(8, &[0x10, 9, 0x18, 10]);
+        let multi = message(9, &[0x10, 9, 0x20, 10]);
+        for fields in [
+            [primary.clone(), typed.clone()].concat(),
+            [primary.clone(), enclosing, message(10, &[0x18, 17])].concat(),
+            [typed, multi].concat(),
+            [primary, message(10, &[0x18, 17]), message(11, &[0x20, 17])].concat(),
+        ] {
+            assert!(matches!(
+                custom(
+                    &base_doc(message(2, &fields), 1),
+                    b"function f(){g();}\n",
+                    1
+                ),
+                Err(ScipCaptureError::InvalidArtifact(_))
+            ));
+        }
+    }
+    #[test]
+    fn scip_complete_negative_int32_coordinates_reject() {
+        let source = b"function f(){g();}\n";
+        for occurrence in [vec![0x0a, 3, 0, 0, 0], message(8, &[])] {
+            custom(&base_doc(message(2, &occurrence), 1), source, 1)
+                .expect("zero-coordinate baseline");
+        }
+        for occurrence in [
+            hex::decode("0a0c0000ffffffffffffffffff01").unwrap(),
+            message(8, &hex::decode("18ffffffffffffffffff01").unwrap()),
+        ] {
+            let bytes = base_doc(message(2, &occurrence), 1);
+            let generated =
+                types::Index::parse_from_bytes(&bytes).expect("complete signed int32 wire");
+            let occurrence = &generated.documents[0].occurrences[0];
+            let mut positions = Vec::new();
+            assert!(matches!(
+                range(occurrence, false, &mut positions),
+                Err(ScipCaptureError::InvalidArtifact(reason)) if reason == "range components"
+            ));
+            assert!(matches!(
+                custom(&bytes, source, 1),
+                Err(ScipCaptureError::InvalidArtifact(reason)) if reason == "range components"
+            ));
+        }
+    }
+    #[test]
+    fn scip_int32_overflow_rejects_in_generated_decoder() {
+        for occurrence in [
+            hex::decode("0a0700008080808010").unwrap(),
+            message(8, &hex::decode("188080808010").unwrap()),
+        ] {
+            let bytes = base_doc(message(2, &occurrence), 1);
+            assert!(types::Index::parse_from_bytes(&bytes).is_err());
+            assert!(matches!(
+                custom(&bytes, b"function f(){g();}\n", 1),
+                Err(ScipCaptureError::InvalidArtifact(_))
+            ));
+        }
+    }
+    #[test]
+    fn scip_rust_utf8_bom_is_a_source_scalar() {
+        for (end, should_accept) in [(4, true), (1, false)] {
+            let occurrence = message(2, &[0x0a, 3, 0, 0, end]);
+            let bytes = message(
+                2,
+                &[
+                    message(1, b"src/A.rs"),
+                    message(4, b"rust"),
+                    occurrence,
+                    vec![0x30, 1],
+                ]
+                .concat(),
+            );
+            let result = custom_document(&bytes, &[0xef, 0xbb, 0xbf, b'x'], 1, "src/A.rs", "rust");
+            if should_accept {
+                assert_eq!(result.unwrap().claims.len(), 1);
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(ScipCaptureError::InvalidArtifact(reason)) if reason == "split codepoint"
+                ));
+            }
+        }
     }
     #[test]
     fn scip_wire_preflight_rejects_ambiguity_and_unknowns() {
@@ -1096,14 +1252,34 @@ mod tests {
         );
     }
     #[test]
-    fn scip_unknown_enums_and_duplicate_documents_reject() {
-        let mut duplicate = hex::decode(FULL).unwrap();
-        duplicate
-            .extend(hex::decode("12180a087372632f422e6a73220a6a6176617363726970743001").unwrap());
-        assert!(matches!(
-            decoded(&hex::encode(duplicate)),
-            Err(ScipCaptureError::InvalidArtifact(_))
-        ));
+    fn scip_duplicate_documents_reject_before_language_binding() {
+        let source = b"function f(){g();}\n";
+        for (first_language, second_language) in [
+            ("javascript", "javascript"),
+            ("javascript", "python"),
+            ("python", "javascript"),
+        ] {
+            let document = |language: &str| {
+                message(
+                    2,
+                    &[message(1, b"src/A.js"), message(4, language.as_bytes())].concat(),
+                )
+            };
+            let first = document(first_language);
+            custom_document(&first, source, 1, "src/A.js", first_language)
+                .expect("single admitted document baseline");
+            let bytes = [first, document(second_language)].concat();
+            assert!(
+                matches!(
+                    custom_document(&bytes, source, 1, "src/A.js", first_language),
+                    Err(ScipCaptureError::InvalidArtifact(reason)) if reason == "duplicate document path"
+                ),
+                "{first_language}/{second_language}"
+            );
+        }
+    }
+    #[test]
+    fn scip_unknown_protocol_enum_rejects() {
         let enum_wire = format!("0a020863{FULL}");
         assert!(matches!(
             decoded(&enum_wire),
@@ -1162,13 +1338,34 @@ mod tests {
                 Err(ScipCaptureError::LimitExceeded(_))
             ));
         }
-        let repeated = std::iter::repeat_n([0x12, 0], 100001)
-            .flatten()
+    }
+    #[test]
+    fn scip_global_candidate_wire_budget_is_independent_of_per_document_limit() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let occurrence = message(2, &[0x0a, 3, 0, 0, 1]);
+        let document = |number: usize, count: usize| {
+            message(
+                2,
+                &[
+                    message(1, format!("src/{number}.js").as_bytes()),
+                    message(4, b"javascript"),
+                    occurrence.repeat(count),
+                    vec![0x30, 1],
+                ]
+                .concat(),
+            )
+        };
+        let baseline = (0..10)
+            .flat_map(|number| document(number, 10000))
             .collect::<Vec<_>>();
         let mut budget = WireBudget::default();
+        wire(&baseline, Node::Index, 0, &mut budget, &flag)
+            .expect("100000 candidates within per-document and global wire caps");
+        assert_eq!(budget.candidates, 100000);
+        let bytes = [baseline, document(10, 1)].concat();
         assert!(matches!(
-            wire(&repeated, Node::Document, 0, &mut budget, &flag),
-            Err(ScipCaptureError::LimitExceeded(_))
+            wire(&bytes, Node::Index, 0, &mut WireBudget::default(), &flag),
+            Err(ScipCaptureError::LimitExceeded(reason)) if reason == "global entries"
         ));
     }
     #[test]
@@ -1342,25 +1539,30 @@ mod tests {
             ),
             Err(ScipCaptureError::InvalidArtifact(_))
         ));
-        let mismatched_tool = [message(1, b"wrong-producer"), message(2, b"1.0.0")].concat();
-        let metadata = message(2, &mismatched_tool);
-        assert!(matches!(
-            custom(
+        for (name, version, should_accept) in [
+            ("scip-test", "1.0.0", true),
+            ("wrong-producer", "1.0.0", false),
+            ("scip-test", "wrong-version", false),
+        ] {
+            let tool = [message(1, name.as_bytes()), message(2, version.as_bytes())].concat();
+            let metadata = [vec![0x20, 1], message(2, &tool)].concat();
+            let result = custom(
                 &[message(1, &metadata), doc.clone()].concat(),
                 b"function f(){g();}\n",
-                1
-            ),
-            Err(ScipCaptureError::InvalidArtifact(_))
-        ));
-        let tool = message(2, b"wrong-version");
-        assert!(matches!(
-            custom(
-                &[message(1, &message(2, &tool)), doc].concat(),
-                b"function f(){g();}\n",
-                1
-            ),
-            Err(ScipCaptureError::InvalidArtifact(_))
-        ));
+                1,
+            );
+            if should_accept {
+                result.expect("matching tool and text encoding baseline");
+            } else {
+                assert!(
+                    matches!(
+                        result,
+                        Err(ScipCaptureError::InvalidArtifact(reason)) if reason == "tool binding"
+                    ),
+                    "{name}/{version}"
+                );
+            }
+        }
     }
     #[test]
     fn scip_document_source_and_encoding_bindings() {
@@ -1383,8 +1585,6 @@ mod tests {
         unlisted.extend(message(4, b"javascript"));
         assert!(custom(&message(2, &unlisted), source, 1).is_err());
         assert!(custom(&[], source, 1).is_err());
-        let negative = message(2, &[0x0a, 0x03, 0x00, 0x09, 0xff]);
-        assert!(custom(&base_doc(negative, 1), source, 1).is_err());
         let outside = message(2, &[0x0a, 0x03, 0x00, 0x64, 0x65]);
         assert!(custom(&base_doc(outside, 1), source, 1).is_err());
     }
