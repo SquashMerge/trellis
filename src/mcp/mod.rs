@@ -676,6 +676,13 @@ struct InFlight {
     attempted: serde_json::Value,
 }
 
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.cancel
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
 struct CallContext {
     workspace: std::sync::Arc<OpenedWorkspace>,
     registry: Registry,
@@ -687,6 +694,79 @@ struct CallContext {
     deadline: std::time::Instant,
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     resolved: Resolved,
+}
+
+fn commit_selection(
+    registry: &std::sync::Arc<tokio::sync::Mutex<crate::daemon::registry::CheckoutRegistry>>,
+    session: u64,
+    prepared: crate::daemon::registry::PreparedSelection,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<crate::daemon::registry::SelectedCheckout, crate::daemon::registry::SelectionError> {
+    let mut registry = registry.blocking_lock();
+    // EOF cancels before disconnect takes this same guard. Either admission
+    // wins first and disconnect removes it, or a late admission is refused.
+    if cancel.load(std::sync::atomic::Ordering::Acquire) {
+        return Err(crate::daemon::registry::SelectionError::Unavailable);
+    }
+    registry.select_prepared(session, prepared)
+}
+
+#[cfg(test)]
+mod selection_commit_tests {
+    use super::*;
+
+    #[test]
+    fn disconnect_cancels_a_prepared_selection_before_owner_commit() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("checkout");
+        let status = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(&root)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let root = root.canonicalize().unwrap();
+        let identity =
+            crate::store::topology::WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+        let registry = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::daemon::registry::CheckoutRegistry::new(),
+        ));
+        registry
+            .blocking_lock()
+            .attach_launch(7, &identity)
+            .unwrap();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (prepared_tx, prepared_rx) = std::sync::mpsc::sync_channel(0);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(0);
+        let worker_registry = registry.clone();
+        let worker_cancel = cancel.clone();
+        let worker = std::thread::spawn(move || {
+            let probe = worker_registry.blocking_lock().selection_probe();
+            let prepared = probe.prepare(&identity, &root).unwrap();
+            prepared_tx.send(()).unwrap();
+            resume_rx.recv().unwrap();
+            commit_selection(&worker_registry, 7, prepared, &worker_cancel)
+        });
+        prepared_rx
+            .recv_timeout(crate::testing::HANG_BACKSTOP)
+            .unwrap();
+        cancel.store(true, std::sync::atomic::Ordering::Release);
+        registry.blocking_lock().disconnect(7);
+        resume_tx.send(()).unwrap();
+        assert!(matches!(
+            worker.join().unwrap(),
+            Err(crate::daemon::registry::SelectionError::Unavailable)
+        ));
+        let guard = registry.blocking_lock();
+        assert!(guard.idle_exit_deadline().is_some());
+        let tick_at = std::time::Instant::now() + crate::daemon::registry::DAEMON_IDLE_DELAY;
+        drop(guard);
+        let tick = registry.blocking_lock().advance(tick_at).unwrap();
+        assert!(
+            tick.exit,
+            "a late selection must not resurrect the disconnected session"
+        );
+    }
 }
 
 /// One admitted call, run whole on its worker: selection, readiness, the
@@ -711,14 +791,13 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
         .and_then(|o| o.get("workspace"));
     let selected = if let Some((registry, session_id)) = &registry {
         match selection.and_then(serde_json::Value::as_str) {
-            Some(path) => registry
-                .blocking_lock()
-                .select(
-                    *session_id,
-                    workspace.identity(),
-                    std::path::Path::new(path),
-                )
-                .map(Some),
+            Some(path) => {
+                let probe = registry.blocking_lock().selection_probe();
+                probe
+                    .prepare(workspace.identity(), std::path::Path::new(path))
+                    .and_then(|prepared| commit_selection(registry, *session_id, prepared, &cancel))
+                    .map(Some)
+            }
             None => workspace
                 .check()
                 .map(|_| None)
@@ -1011,14 +1090,11 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
             let Some(path) = selection.and_then(serde_json::Value::as_str) else {
                 unreachable!("validated capacity requires explicit selection")
             };
-            let checked_capacity = {
-                let guard = registry
-                    .as_ref()
-                    .expect("daemon registry required")
-                    .0
-                    .blocking_lock();
-                guard.capacity_witness(workspace.identity(), std::path::Path::new(path))
-            };
+            let checked_capacity =
+                crate::daemon::registry::CheckoutRegistry::capacity_witness_unlocked(
+                    workspace.identity(),
+                    std::path::Path::new(path),
+                );
             match checked_capacity {
                 Ok(witness) => {
                     let catching_up = catching_up(&registry, &witness.identity.root_key);

@@ -3827,7 +3827,17 @@ impl ProvisionedBrowser {
             .route(
                 "/api/checkouts",
                 get(|State(state): State<Arc<Self>>| async move {
-                    Json(json!({"checkouts":state.registry.lock().await.browser_checkouts()}))
+                    let probe = state.registry.lock().await.browser_checkouts_probe();
+                    let checkouts = tokio::task::spawn_blocking(move || probe.check())
+                        .await
+                        .map_err(|_| {
+                            ApiError(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                "internal_error",
+                                "Operation failed",
+                            )
+                        })?;
+                    Ok::<_, ApiError>(Json(json!({"checkouts": checkouts})))
                 }),
             )
             .route(
@@ -3860,6 +3870,111 @@ async fn provision_guard(
     guard_common(&state.token, &state.hosts, &state.origins, req, next).await
 }
 
+#[derive(Clone, Copy)]
+enum BrowserCoreRoute {
+    Metrics,
+    RefreshDependencies,
+    JevStatus,
+    AcpStatus,
+    Dependencies,
+    DependencySymbols,
+    DependencySource,
+    RustSources,
+    RustSourceTree,
+    RustSourceFile,
+    Status,
+    Tree,
+    Files,
+    Methods,
+    Classes,
+    Symbols,
+    Symbol,
+    Sequence,
+    ClassDiagram,
+    Navigation,
+    Views,
+    Annotations,
+    PreviewQuestion,
+    Source,
+    Query,
+    Index,
+    CurrentJob,
+    QuestionProvider,
+    View,
+    Annotation,
+    QuestionAction,
+    Job,
+}
+
+impl BrowserCoreRoute {
+    fn parse(method: &axum::http::Method, suffix: &str) -> Option<Self> {
+        use axum::http::Method;
+        match (method, suffix) {
+            (&Method::GET, "metrics") => Some(Self::Metrics),
+            (&Method::POST, "dependencies/refresh") => Some(Self::RefreshDependencies),
+            (&Method::GET, "jev/status") => Some(Self::JevStatus),
+            (&Method::GET, "acp/status") => Some(Self::AcpStatus),
+            (&Method::GET, "dependencies") => Some(Self::Dependencies),
+            (&Method::GET, "dependencies/symbols") => Some(Self::DependencySymbols),
+            (&Method::GET, "dependencies/source") => Some(Self::DependencySource),
+            (&Method::GET, "rust-sources") => Some(Self::RustSources),
+            (&Method::GET, "rust-sources/tree") => Some(Self::RustSourceTree),
+            (&Method::GET, "rust-sources/file") => Some(Self::RustSourceFile),
+            (&Method::GET, "status") => Some(Self::Status),
+            (&Method::GET, "tree") => Some(Self::Tree),
+            (&Method::GET, "files") => Some(Self::Files),
+            (&Method::GET, "methods") => Some(Self::Methods),
+            (&Method::GET, "classes") => Some(Self::Classes),
+            (&Method::GET, "symbols") => Some(Self::Symbols),
+            (&Method::GET, "symbol") => Some(Self::Symbol),
+            (&Method::POST, "sequence") => Some(Self::Sequence),
+            (&Method::POST, "class-diagram") => Some(Self::ClassDiagram),
+            (&Method::POST, "navigation") => Some(Self::Navigation),
+            (&Method::GET, "views") => Some(Self::Views),
+            (&Method::GET, "annotations") => Some(Self::Annotations),
+            (&Method::POST, "questions/preview") => Some(Self::PreviewQuestion),
+            (&Method::GET, "source") => Some(Self::Source),
+            (&Method::POST, "query") => Some(Self::Query),
+            (&Method::POST, "index") => Some(Self::Index),
+            (&Method::GET, "jobs/current") => Some(Self::CurrentJob),
+            _ => {
+                let (family, tail) = suffix.split_once('/')?;
+                let single_id = !tail.is_empty() && !tail.contains('/');
+                match (method, family) {
+                    (&Method::GET | &Method::PUT | &Method::DELETE, "views") if single_id => {
+                        Some(Self::View)
+                    }
+                    (&Method::PUT | &Method::DELETE, "annotations") if single_id => {
+                        Some(Self::Annotation)
+                    }
+                    (_, "questions") => {
+                        let (id, action) = tail.split_once('/')?;
+                        if id.is_empty() || action.contains('/') {
+                            return None;
+                        }
+                        match (method, action) {
+                            (&Method::POST, "jev-run" | "acp-answer") => {
+                                Some(Self::QuestionProvider)
+                            }
+                            (&Method::GET, "jev-request")
+                            | (&Method::POST, "jev-response" | "selection") => {
+                                Some(Self::QuestionAction)
+                            }
+                            _ => None,
+                        }
+                    }
+                    (&Method::GET, "jobs") if single_id => Some(Self::Job),
+                    (&Method::POST, "jobs") => {
+                        let id = tail.strip_suffix("/cancel")?;
+                        (!id.is_empty() && !id.contains('/')).then_some(Self::Job)
+                    }
+                    _ => None,
+                }
+            }
+        }
+    }
+}
+
 /// The provisioned listener has one selection boundary for core checkout routes.
 /// The direct single-checkout router is a test-support fixture only.
 async fn provisioned_core(
@@ -3870,6 +3985,9 @@ async fn provisioned_core(
     body: Bytes,
 ) -> Response {
     use crate::daemon::registry::SelectionError;
+    let Some(route) = BrowserCoreRoute::parse(&method, &suffix) else {
+        return missing().into_response();
+    };
     let identity = {
         let mut registry = browser.registry.lock().await;
         match registry.browser_identity(&root_key) {
@@ -3908,10 +4026,13 @@ async fn provisioned_core(
             let hook = browser.response_hook.lock().unwrap().clone();
             let result = provisioned_core_answer(
                 &runtime,
-                &method,
-                &suffix,
-                &uri,
-                body,
+                BrowserCoreRequest {
+                    route,
+                    method: &method,
+                    suffix: &suffix,
+                    uri: &uri,
+                    body,
+                },
                 hook.clone(),
                 MetricsHttpControls {
                     limit: browser
@@ -4356,18 +4477,30 @@ struct MetricsHttpControls {
     clock_skew_ms: Arc<std::sync::atomic::AtomicU64>,
 }
 
+struct BrowserCoreRequest<'a> {
+    route: BrowserCoreRoute,
+    method: &'a axum::http::Method,
+    suffix: &'a str,
+    uri: &'a axum::http::Uri,
+    body: Bytes,
+}
+
 async fn provisioned_core_answer(
     runtime: &Arc<crate::daemon::registry::CheckoutRuntime>,
-    method: &axum::http::Method,
-    suffix: &str,
-    uri: &axum::http::Uri,
-    body: Bytes,
+    request: BrowserCoreRequest<'_>,
     hook: Option<SelectedResponseHook>,
     metrics: MetricsHttpControls,
 ) -> Result<(Response, bool), ApiError> {
     use axum::http::Method;
-    match (method, suffix) {
-        (&Method::GET, "metrics") => {
+    let BrowserCoreRequest {
+        route,
+        method,
+        suffix,
+        uri,
+        body,
+    } = request;
+    match route {
+        BrowserCoreRoute::Metrics => {
             let options = metrics_query(uri)?;
             let runtime = runtime.clone();
             // The guard belongs to this request future, not to the blocking worker.
@@ -4484,7 +4617,7 @@ async fn provisioned_core_answer(
                 catching_up,
             ))
         }
-        (&Method::POST, "dependencies/refresh") => {
+        BrowserCoreRoute::RefreshDependencies => {
             let request: Value = serde_json::from_slice(&body).map_err(|_| invalid())?;
             if !request.as_object().is_some_and(|object| object.is_empty()) {
                 return Err(invalid());
@@ -4530,10 +4663,7 @@ async fn provisioned_core_answer(
                 .insert("X-Trellis-Mutation-Outcome", "committed".parse().unwrap());
             Ok((response, catching_up))
         }
-        _ if method == Method::POST
-            && suffix.starts_with("questions/")
-            && (suffix.ends_with("/jev-run") || suffix.ends_with("/acp-answer")) =>
-        {
+        BrowserCoreRoute::QuestionProvider => {
             let tail = suffix.strip_prefix("questions/").unwrap();
             let (id, action) = tail.split_once('/').ok_or_else(missing)?;
             if id.is_empty() || action.contains('/') {
@@ -4635,7 +4765,7 @@ async fn provisioned_core_answer(
                 Ok((response, catching_up))
             }
         }
-        (&Method::GET, "jev/status") | (&Method::GET, "acp/status") => {
+        BrowserCoreRoute::JevStatus | BrowserCoreRoute::AcpStatus => {
             if uri.query().is_some() {
                 return Err(invalid());
             }
@@ -4658,7 +4788,7 @@ async fn provisioned_core_answer(
             }).await?;
             Ok((Json(value).into_response(), catching_up))
         }
-        (&Method::GET, "dependencies") => {
+        BrowserCoreRoute::Dependencies => {
             if uri.query().is_some() {
                 return Err(invalid());
             }
@@ -4687,7 +4817,7 @@ async fn provisioned_core_answer(
             .await?;
             Ok((Json(payload).into_response(), catching_up))
         }
-        (&Method::GET, "dependencies/symbols") => {
+        BrowserCoreRoute::DependencySymbols => {
             let Query(q) =
                 Query::<DependencySymbolsQuery>::try_from_uri(uri).map_err(|_| invalid())?;
             if q.catalog_id.is_empty()
@@ -4719,7 +4849,7 @@ async fn provisioned_core_answer(
             }).await?;
             Ok((Json(payload).into_response(), catching_up))
         }
-        (&Method::GET, "dependencies/source") => {
+        BrowserCoreRoute::DependencySource => {
             let Query(q) =
                 Query::<DependencySourceQuery>::try_from_uri(uri).map_err(|_| invalid())?;
             if q.catalog_id.is_empty()
@@ -4750,7 +4880,7 @@ async fn provisioned_core_answer(
             }).await?;
             Ok((Json(payload).into_response(), catching_up))
         }
-        (&Method::GET, "rust-sources") => {
+        BrowserCoreRoute::RustSources => {
             if uri.query().is_some() {
                 return Err(invalid());
             }
@@ -4763,7 +4893,7 @@ async fn provisioned_core_answer(
             }).await?;
             Ok((Json(payload).into_response(), catching_up))
         }
-        (&Method::GET, "rust-sources/tree") => {
+        BrowserCoreRoute::RustSourceTree => {
             let Query(q) = Query::<RustTreeQuery>::try_from_uri(uri).map_err(|_| invalid())?;
             if !crate::file_tree::valid_path(&q.path)
                 || !(1..=200).contains(&q.limit)
@@ -4798,7 +4928,7 @@ async fn provisioned_core_answer(
             .await?;
             Ok((Json(page).into_response(), catching_up))
         }
-        (&Method::GET, "rust-sources/file") => {
+        BrowserCoreRoute::RustSourceFile => {
             let Query(q) = Query::<RustFileQuery>::try_from_uri(uri).map_err(|_| invalid())?;
             if q.path.is_empty()
                 || !crate::file_tree::valid_path(&q.path)
@@ -4820,7 +4950,7 @@ async fn provisioned_core_answer(
             .await?;
             Ok((Json(file).into_response(), catching_up))
         }
-        (&Method::GET, "status") => {
+        BrowserCoreRoute::Status => {
             if uri.query().is_some() {
                 return Err(invalid());
             }
@@ -4844,7 +4974,7 @@ async fn provisioned_core_answer(
             })??;
             Ok((Json(status).into_response(), catching_up))
         }
-        (&Method::GET, "tree") => {
+        BrowserCoreRoute::Tree => {
             let Query(q) = Query::<TreeQuery>::try_from_uri(uri).map_err(|_| browse_invalid())?;
             if !crate::file_tree::valid_path(&q.path)
                 || !(1..=200).contains(&q.limit)
@@ -4893,7 +5023,7 @@ async fn provisioned_core_answer(
             .await?;
             Ok((Json(page).into_response(), catching_up))
         }
-        (&Method::GET, "files") => {
+        BrowserCoreRoute::Files => {
             let Query(q) = Query::<FilesQuery>::try_from_uri(uri).map_err(|_| browse_invalid())?;
             if !(1..=200).contains(&q.limit) || q.offset > i64::MAX as usize {
                 return Err(browse_invalid());
@@ -4904,7 +5034,7 @@ async fn provisioned_core_answer(
                     .await?;
             Ok((Json(value).into_response(), catching_up))
         }
-        (&Method::GET, "methods") => {
+        BrowserCoreRoute::Methods => {
             let Query(q) = Query::<SourceQuery>::try_from_uri(uri).map_err(|_| browse_invalid())?;
             if q.path.is_empty()
                 || q.path.len() > 8192
@@ -4923,7 +5053,7 @@ async fn provisioned_core_answer(
                 catching_up,
             ))
         }
-        (&Method::GET, "classes") => {
+        BrowserCoreRoute::Classes => {
             let Query(q) = Query::<ClassesQuery>::try_from_uri(uri).map_err(|_| invalid())?;
             let pin = q.pin.pin()?;
             let (value, catching_up) = selected_evidence(runtime, hook, move |r| {
@@ -4932,7 +5062,7 @@ async fn provisioned_core_answer(
             .await?;
             Ok((Json(value).into_response(), catching_up))
         }
-        (&Method::GET, "symbols") => {
+        BrowserCoreRoute::Symbols => {
             let Query(q) = Query::<SymbolsQuery>::try_from_uri(uri).map_err(|_| invalid())?;
             if q.q.len() > 8192 || !(1..=150).contains(&q.limit) {
                 return Err(invalid());
@@ -4944,7 +5074,7 @@ async fn provisioned_core_answer(
                 catching_up,
             ))
         }
-        (&Method::GET, "symbol") => {
+        BrowserCoreRoute::Symbol => {
             let Query(q) = Query::<SymbolQuery>::try_from_uri(uri).map_err(|_| invalid())?;
             if q.id.is_empty() || q.id.len() > 8192 || q.id.contains('\0') {
                 return Err(invalid());
@@ -4958,7 +5088,7 @@ async fn provisioned_core_answer(
                 catching_up,
             ))
         }
-        (&Method::POST, "sequence") => {
+        BrowserCoreRoute::Sequence => {
             let q: SequenceRequest = serde_json::from_slice(&body).map_err(|_| browse_invalid())?;
             if q.seed.is_empty() || q.seed.len() > 8192 || q.seed.contains('\0') {
                 return Err(browse_invalid());
@@ -4972,7 +5102,7 @@ async fn provisioned_core_answer(
                 catching_up,
             ))
         }
-        (&Method::POST, "class-diagram") => {
+        BrowserCoreRoute::ClassDiagram => {
             let q: crate::class_diagram::ClassDiagramRequest =
                 serde_json::from_slice(&body).map_err(|_| invalid())?;
             q.validate()?;
@@ -4980,7 +5110,7 @@ async fn provisioned_core_answer(
                 selected_evidence(runtime, hook, move |r| r.class_diagram_at(&q)).await?;
             Ok((Json(value).into_response(), catching_up))
         }
-        (&Method::POST, "navigation") => {
+        BrowserCoreRoute::Navigation => {
             if body.len() > 32 * 1024 {
                 return Err(invalid());
             }
@@ -4991,21 +5121,21 @@ async fn provisioned_core_answer(
                 selected_evidence(runtime, hook, move |r| r.navigation_at(&q)).await?;
             Ok((Json(value).into_response(), catching_up))
         }
-        (&Method::GET, "views") => {
+        BrowserCoreRoute::Views => {
             let Query(q) = Query::<PinQuery>::try_from_uri(uri).map_err(|_| invalid())?;
             let pin = q.pin()?;
             let (value, catching_up) =
                 selected_evidence(runtime, hook, move |r| r.saved_views_at(pin)).await?;
             Ok((Json(value).into_response(), catching_up))
         }
-        (&Method::GET, "annotations") => {
+        BrowserCoreRoute::Annotations => {
             let Query(q) = Query::<PinQuery>::try_from_uri(uri).map_err(|_| invalid())?;
             let pin = q.pin()?;
             let (value, catching_up) =
                 selected_evidence(runtime, hook, move |r| r.saved_annotations_at(pin)).await?;
             Ok((Json(value).into_response(), catching_up))
         }
-        (&Method::POST, "questions/preview") => {
+        BrowserCoreRoute::PreviewQuestion => {
             let request: QuestionRequest = serde_json::from_slice(&body).map_err(|_| invalid())?;
             request.validate().map_err(|_| invalid())?;
             let state = runtime.browser_scheduler()?;
@@ -5034,7 +5164,7 @@ async fn provisioned_core_answer(
             .await?;
             Ok((Json(value).into_response(), catching_up))
         }
-        (&Method::GET, "source") => {
+        BrowserCoreRoute::Source => {
             let Query(q) = Query::<SourceQuery>::try_from_uri(uri).map_err(|_| invalid())?;
             if q.path.is_empty()
                 || q.path.len() > 8192
@@ -5066,7 +5196,7 @@ async fn provisioned_core_answer(
                 catching_up,
             ))
         }
-        (&Method::POST, "query") => {
+        BrowserCoreRoute::Query => {
             let Query(pin) = Query::<PinQuery>::try_from_uri(uri).map_err(|_| invalid())?;
             let expected = pin.pin()?;
             let q: ViewQuery = serde_json::from_slice(&body).map_err(|_| invalid())?;
@@ -5087,7 +5217,7 @@ async fn provisioned_core_answer(
             })??;
             Ok((Json(view.ok_or_else(missing)?).into_response(), catching_up))
         }
-        _ if suffix.starts_with("views/") => {
+        BrowserCoreRoute::View => {
             let id = suffix.strip_prefix("views/").unwrap();
             if id.contains('/') {
                 return Err(missing());
@@ -5143,7 +5273,7 @@ async fn provisioned_core_answer(
                 _ => Err(missing()),
             }
         }
-        _ if suffix.starts_with("annotations/") => {
+        BrowserCoreRoute::Annotation => {
             let id = suffix.strip_prefix("annotations/").unwrap();
             if id.contains('/') {
                 return Err(missing());
@@ -5187,7 +5317,7 @@ async fn provisioned_core_answer(
                 _ => Err(missing()),
             }
         }
-        _ if suffix.starts_with("questions/") => {
+        BrowserCoreRoute::QuestionAction => {
             let tail = suffix.strip_prefix("questions/").unwrap();
             let Some((id, action)) = tail.split_once('/') else {
                 return Err(missing());
@@ -5246,7 +5376,7 @@ async fn provisioned_core_answer(
             .await?;
             Ok((Json(result).into_response(), catching_up))
         }
-        (&Method::POST, "index") | (&Method::GET, "jobs/current") => {
+        BrowserCoreRoute::Index | BrowserCoreRoute::CurrentJob => {
             let state = runtime.browser_scheduler()?;
             let response = if method == Method::POST {
                 start_index(State(state), body).await?.into_response()
@@ -5255,7 +5385,7 @@ async fn provisioned_core_answer(
             };
             Ok((response, runtime.catching_up()))
         }
-        _ if suffix.starts_with("jobs/") => {
+        BrowserCoreRoute::Job => {
             let state = runtime.browser_scheduler()?;
             let tail = suffix.strip_prefix("jobs/").unwrap();
             let response = if method == Method::GET && !tail.contains('/') {
@@ -5275,9 +5405,37 @@ async fn provisioned_core_answer(
             };
             Ok((response, runtime.catching_up()))
         }
-        _ => Err(missing()),
     }
 }
 
 #[cfg(all(test, feature = "test-support", unix))]
 mod selected_provider_postflight_tests;
+
+#[cfg(test)]
+mod browser_core_route_tests {
+    use super::BrowserCoreRoute;
+    use axum::http::Method;
+
+    #[test]
+    fn dynamic_routes_match_only_their_supported_method_and_shape() {
+        for (method, suffix) in [
+            (Method::GET, "views/id"),
+            (Method::PUT, "views/id"),
+            (Method::DELETE, "views/id"),
+            (Method::PUT, "annotations/id"),
+            (Method::DELETE, "annotations/id"),
+            (Method::GET, "questions/id/jev-request"),
+            (Method::POST, "questions/id/jev-response"),
+            (Method::POST, "questions/id/selection"),
+            (Method::POST, "questions/id/jev-run"),
+            (Method::POST, "questions/id/acp-answer"),
+            (Method::GET, "jobs/id"),
+            (Method::POST, "jobs/id/cancel"),
+        ] {
+            assert!(
+                BrowserCoreRoute::parse(&method, suffix).is_some(),
+                "{method} {suffix}"
+            );
+        }
+    }
+}

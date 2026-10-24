@@ -258,6 +258,7 @@ fn read_reply_until(
 fn attach_mcp(
     mut stream: UnixStream,
     workspace: &crate::store::topology::WorkspaceIdentity,
+    attachments: &[protocol::McpAttachment],
 ) -> io::Result<UnixStream> {
     let request = Request {
         id: 1,
@@ -268,6 +269,7 @@ fn attach_mcp(
             "inode": workspace.inode,
             // Frames carry the relay's own ID (Decision 0009 §7).
             "relay": true,
+            "attachments": attachments,
         }),
     };
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
@@ -671,6 +673,26 @@ fn spawn_ringing_frame_reader(
     Ok((receiver, fence))
 }
 
+/// Capture the selected root before sending; the daemon alone verifies membership.
+fn explicit_selection(
+    value: &serde_json::Value,
+) -> Option<crate::store::topology::WorkspaceIdentity> {
+    if value.get("method")?.as_str()? != "tools/call" {
+        return None;
+    }
+    let name = value.pointer("/params/name")?.as_str()?;
+    if !crate::mcp::catalog::known(name)
+        || crate::mcp::tools::validate(name, value.pointer("/params/arguments")).is_err()
+    {
+        return None;
+    }
+    let path = Path::new(value.pointer("/params/arguments/workspace")?.as_str()?);
+    if !path.is_absolute() {
+        return None;
+    }
+    crate::store::topology::WorkspaceIdentity::discover_unattached(Some(path), path).ok()
+}
+
 /// A request forwarded to the daemon under the relay's own ID and not yet
 /// decided (Decision 0009 §7).
 struct Forwarded {
@@ -685,9 +707,14 @@ struct Forwarded {
     deadline: Instant,
     /// An interrupted read is replayed once, never more.
     retried: bool,
+    /// Captured before forwarding; only an attested attachment reply retains it.
+    selection: Option<crate::store::topology::WorkspaceIdentity>,
     /// Its outcome is waiting for a fence: a late daemon reply is dropped.
     due: bool,
 }
+
+type Reconnect<'a> =
+    Box<dyn FnMut(u64, &[protocol::McpAttachment]) -> io::Result<DaemonConnection> + 'a>;
 
 /// One daemon connection generation: replies from it carry its number.
 struct DaemonConnection {
@@ -892,7 +919,9 @@ struct Relay<'a, W: std::io::Write> {
     stdout: W,
     daemon: Option<DaemonConnection>,
     generation: u64,
-    connect: Box<dyn FnMut(u64) -> io::Result<DaemonConnection> + 'a>,
+    connect: Reconnect<'a>,
+    attachments:
+        std::collections::BTreeMap<std::path::PathBuf, crate::store::topology::WorkspaceIdentity>,
     legacy_init: Option<Vec<u8>>,
     legacy_ready: bool,
     next_relay: u64,
@@ -955,7 +984,15 @@ impl<W: std::io::Write> Relay<'_, W> {
         use std::io::Write;
         if self.daemon.is_none() {
             self.generation += 1;
-            let Ok(mut connection) = (self.connect)(self.generation) else {
+            // A vanished selected root cannot silently attach its successor or
+            // prevent recovery of the still-valid launch checkout.
+            let attachments: Vec<_> = self
+                .attachments
+                .values()
+                .filter(|identity| identity.verify_readonly().is_ok())
+                .map(protocol::McpAttachment::from_identity)
+                .collect();
+            let Ok(mut connection) = (self.connect)(self.generation, &attachments) else {
                 return false;
             };
             if let (Some(init), true) = (&self.legacy_init, legacy && self.legacy_ready) {
@@ -1124,6 +1161,7 @@ impl<W: std::io::Write> Relay<'_, W> {
         self.next_relay += 1;
         // A completed handshake is replayed only before later requests.
         let legacy = method != "initialize";
+        let selection = explicit_selection(&value);
         let connected = self.daemon.is_some();
         let mut sent = self.send(relay, &line, legacy);
         if !sent && connected {
@@ -1145,6 +1183,7 @@ impl<W: std::io::Write> Relay<'_, W> {
                     call,
                     deadline: deadline.unwrap_or_else(|| Instant::now() + RELAY_REPLY_BOUND),
                     retried: !connected,
+                    selection,
                     due: false,
                 },
             );
@@ -1175,14 +1214,31 @@ impl<W: std::io::Write> Relay<'_, W> {
                         // Decided at its deadline: a late reply is dropped.
                         continue;
                     }
-                    let id_matches = serde_json::from_slice::<serde_json::Value>(&line)
-                        .ok()
+                    let reply = serde_json::from_slice::<serde_json::Value>(&line).ok();
+                    let id_matches = reply
+                        .as_ref()
                         .is_some_and(|reply| reply.get("id") == request.value.get("id"));
                     if !id_matches {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             "daemon MCP reply ID mismatch",
                         ));
+                    }
+                    if let Some(selection) = request.selection.take()
+                        && selection.root != self.workspace.root
+                        && reply.as_ref().is_some_and(|reply| {
+                            reply
+                                .pointer("/result/structuredContent/error/code")
+                                .and_then(|code| code.as_str())
+                                != Some("checkout_capacity")
+                                && reply
+                                    .pointer("/result/structuredContent/workspace")
+                                    .and_then(|path| path.as_str())
+                                    == selection.root.to_str()
+                        })
+                        && let Ok(selection) = selection.attach_existing_marker_readonly()
+                    {
+                        self.attachments.insert(selection.root.clone(), selection);
                     }
                     request.due = true;
                     let deadline = request.call.then_some(request.deadline);
@@ -1422,14 +1478,17 @@ pub fn relay_stdio(
     let (reply_sender, replies) = std::sync::mpsc::channel::<DaemonReply>();
     let open = {
         let doorbell = doorbell.clone();
-        move |stream: io::Result<UnixStream>, generation: u64| -> io::Result<DaemonConnection> {
-            let stream = attach_mcp(stream?, workspace)?;
+        move |stream: io::Result<UnixStream>,
+              generation: u64,
+              attachments: &[protocol::McpAttachment]|
+              -> io::Result<DaemonConnection> {
+            let stream = attach_mcp(stream?, workspace, attachments)?;
             stream.set_read_timeout(None)?;
             spawn_reply_reader(&stream, generation, reply_sender.clone(), doorbell.clone())?;
             Ok(DaemonConnection { stream, generation })
         }
     };
-    let first = open(Ok(stream), 0)?;
+    let first = open(Ok(stream), 0, &[])?;
     let mut relay = Relay {
         workspace,
         receiver: &receiver,
@@ -1442,7 +1501,10 @@ pub fn relay_stdio(
         stdout: io::stdout().lock(),
         daemon: Some(first),
         generation: 0,
-        connect: Box::new(move |generation| open(reconnect(), generation)),
+        connect: Box::new(move |generation, attachments| {
+            open(reconnect(), generation, attachments)
+        }),
+        attachments: Default::default(),
         legacy_init: None,
         legacy_ready: false,
         next_relay: SETUP_RELAY_ID + 1,
@@ -1639,7 +1701,8 @@ mod reply_gate_tests {
                 stdout: Vec::new(),
                 daemon: None,
                 generation: 0,
-                connect: Box::new(|_| Err(io::Error::other("no daemon in this fixture"))),
+                connect: Box::new(|_, _| Err(io::Error::other("no daemon in this fixture"))),
+                attachments: Default::default(),
                 legacy_init: None,
                 legacy_ready: false,
                 next_relay: 1,
@@ -1675,6 +1738,7 @@ mod reply_gate_tests {
                     call: false,
                     deadline: bound,
                     retried: true,
+                    selection: None,
                     due: true,
                 },
             );
@@ -1768,6 +1832,102 @@ mod reply_gate_tests {
         );
     }
 
+    #[test]
+    fn reconnect_retains_only_attached_selections_and_filters_lost_roots() {
+        for code in [None, Some("index_not_ready"), Some("checkout_capacity")] {
+            let fixture = Fixture::new();
+            let selected = fixture._temp.path().join("selected");
+            std::fs::create_dir_all(selected.join(".git")).unwrap();
+            let value = json!({"jsonrpc":"2.0","id":8,"method":"tools/call",
+                "params":{"name":"trellis_workspace_describe",
+                    "arguments":{"schemaVersion":1,"workspace":selected}}});
+            let captured = explicit_selection(&value).unwrap();
+            let identity = crate::store::topology::WorkspaceIdentity::discover_unattached(
+                Some(&selected),
+                &selected,
+            )
+            .unwrap()
+            .attach_marker()
+            .unwrap();
+            let expected = protocol::McpAttachment::from_identity(&identity);
+            let mut relay = fixture.relay_on(&fixture.frames);
+            let (stream, _peer) = UnixStream::pair().unwrap();
+            relay.daemon = Some(DaemonConnection {
+                stream,
+                generation: 0,
+            });
+            relay.forwarded.insert(
+                1,
+                Forwarded {
+                    value,
+                    line: Vec::new(),
+                    key: None,
+                    call: true,
+                    deadline: Instant::now() + crate::testing::HANG_BACKSTOP,
+                    retried: false,
+                    selection: Some(captured),
+                    due: false,
+                },
+            );
+            let mut envelope = json!({"workspace":identity.root});
+            if let Some(code) = code {
+                envelope["error"] = json!({"code":code});
+            }
+            let reply = json!({"jsonrpc":"2.0","id":8,
+                "result":{"isError":code.is_some(),"structuredContent":envelope}});
+            let (tx, rx) = std::sync::mpsc::channel();
+            tx.send((0, Ok((1, serde_json::to_vec(&reply).unwrap()))))
+                .unwrap();
+            relay.collect_replies(&rx).unwrap();
+            assert_eq!(
+                relay.attachments.len(),
+                usize::from(code != Some("checkout_capacity"))
+            );
+            if code == Some("checkout_capacity") {
+                continue;
+            }
+            assert!(expected.matches(relay.attachments.get(&identity.root).unwrap()));
+            // A changed root is skipped, not forgotten, and never attached as
+            // its successor. A second valid selection still reconnects.
+            let valid = fixture._temp.path().join("valid");
+            std::fs::create_dir_all(valid.join(".git")).unwrap();
+            let valid = crate::store::topology::WorkspaceIdentity::discover_unattached(
+                Some(&valid),
+                &valid,
+            )
+            .unwrap()
+            .attach_marker()
+            .unwrap();
+            relay.attachments.insert(valid.root.clone(), valid);
+            std::fs::rename(&selected, selected.with_extension("moved")).unwrap();
+            std::fs::create_dir_all(selected.join(".git")).unwrap();
+            let recorded = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let seen = recorded.clone();
+            let (stream, _peer) = UnixStream::pair().unwrap();
+            let mut stream = Some(stream);
+            relay.connect = Box::new(move |generation, attachments| {
+                *seen.lock().unwrap() = attachments.to_vec();
+                Ok(DaemonConnection {
+                    stream: stream.take().unwrap(),
+                    generation,
+                })
+            });
+            relay.daemon = None;
+            assert!(relay.send(9, b"{}", false));
+            let restored = recorded.lock().unwrap();
+            assert_eq!(restored.len(), 1);
+            assert_eq!(
+                restored[0].root,
+                fixture._temp.path().join("valid").canonicalize().unwrap()
+            );
+            assert_eq!(
+                relay.attachments.len(),
+                2,
+                "a transient refusal must not forget identity"
+            );
+        }
+    }
+
     /// A cancel removes everything live under its ID: a duplicate-ID refusal
     /// and the original forwarded request.
     #[test]
@@ -1789,6 +1949,7 @@ mod reply_gate_tests {
                 call: false,
                 deadline: Instant::now() + RELAY_REPLY_BOUND,
                 retried: true,
+                selection: None,
                 due: false,
             },
         );

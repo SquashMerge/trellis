@@ -13,6 +13,35 @@ pub struct Request {
     pub payload: serde_json::Value,
 }
 
+/// A previously verified explicit MCP attachment, carried across daemon generations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpAttachment {
+    pub root: std::path::PathBuf,
+    pub root_key: String,
+    pub record_id: String,
+    pub device: u64,
+    pub inode: u64,
+}
+
+impl McpAttachment {
+    pub fn from_identity(identity: &crate::store::topology::WorkspaceIdentity) -> Self {
+        Self {
+            root: identity.root.clone(),
+            root_key: identity.root_key.clone(),
+            record_id: identity.record_id.clone(),
+            device: identity.device,
+            inode: identity.inode,
+        }
+    }
+
+    pub fn matches(&self, identity: &crate::store::topology::WorkspaceIdentity) -> bool {
+        self.root == identity.root
+            && self.root_key == identity.root_key
+            && self.record_id == identity.record_id
+            && (self.device, self.inode) == (identity.device, identity.inode)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Reply {
     pub id: u64,

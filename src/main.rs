@@ -1215,12 +1215,49 @@ fn dispatch_connection(
             TopologyRoots::production()?.reject_root_overlap(&identity)?;
             ensure!(identity.root.join(".git").exists(), "not a Git checkout");
             let identity = identity.attach_marker()?;
+            let attachments: Vec<protocol::McpAttachment> = request
+                .payload
+                .get("attachments")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()?
+                .unwrap_or_default();
+            let probe = runtime.block_on(async { registry.lock().await.selection_probe() });
+            let mut prepared = Vec::new();
+            for attachment in attachments {
+                // A failed old attachment cannot block the still-valid launch
+                // workspace or attach a new incarnation at its old path.
+                let restored = (|| -> Result<_> {
+                    let captured = WorkspaceIdentity::discover_unattached(
+                        Some(&attachment.root),
+                        &attachment.root,
+                    )
+                    .and_then(WorkspaceIdentity::attach_existing_marker_readonly)?;
+                    ensure!(attachment.matches(&captured), "selected identity changed");
+                    let selection = probe
+                        .prepare(&identity, &attachment.root)
+                        .map_err(|error| anyhow::anyhow!("{}", error.reason()))?;
+                    ensure!(
+                        attachment.matches(selection.identity()),
+                        "selected identity changed"
+                    );
+                    Ok(selection)
+                })();
+                if let Ok(selection) = restored {
+                    prepared.push(selection);
+                }
+            }
             runtime.block_on(async {
+                let mut registry = registry.lock().await;
                 registry
-                    .lock()
-                    .await
                     .attach_launch(session, &identity)
-                    .map_err(|error| anyhow::anyhow!("{}", error.reason()))
+                    .map_err(|error| anyhow::anyhow!("{}", error.reason()))?;
+                for selection in prepared {
+                    // Capacity or an incarnation change can race preparation.
+                    // Restore the other selections and keep launch usable.
+                    let _ = registry.select_prepared(session, selection);
+                }
+                Ok::<_, anyhow::Error>(())
             })?;
             Ok(mcp::OpenedWorkspace::new(identity))
         })();

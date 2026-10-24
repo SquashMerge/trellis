@@ -199,6 +199,202 @@ async fn reattach_reports_catching_up_and_keeps_complete_head_until_startup() {
 
 #[cfg(feature = "test-support")]
 #[tokio::test]
+async fn fresh_registry_restart_serves_prior_head_without_startup_mutation_or_fifo_authority() {
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, StatusCode},
+    };
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+    use tower::ServiceExt;
+    use trellis::{daemon::registry::CheckoutRuntime, http::RuntimePhase};
+
+    async fn startup_committed(runtime: Arc<CheckoutRuntime>) {
+        tokio::task::spawn_blocking(move || {
+            let scheduler = runtime.browser_scheduler().unwrap();
+            let deadline = std::time::Instant::now() + trellis::testing::HANG_BACKSTOP;
+            loop {
+                let seen = runtime.state_version();
+                if scheduler.runtime_phase() == RuntimePhase::Ready {
+                    break;
+                }
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                assert!(
+                    !remaining.is_zero(),
+                    "startup reconciliation did not commit"
+                );
+                runtime.wait_state_change(seen, remaining);
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn release(registry: &mut CheckoutRegistry, key: &str) {
+        let signal = registry.lifecycle_signal();
+        tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+            while !registry.release(key).unwrap() {
+                signal.notified().await;
+            }
+        })
+        .await
+        .expect("checkout did not retire");
+    }
+
+    let base = tempfile::tempdir().unwrap();
+    let checkout = base.path().join("work");
+    fs::create_dir(&checkout).unwrap();
+    fs::write(checkout.join("a.js"), "function oldHead() {}\n").unwrap();
+    let id = identity(&checkout);
+    let topology = roots(base.path());
+    let mut original = CheckoutRegistry::with_roots(topology.clone());
+    original.attach_launch(1, &id).unwrap();
+    let runtime = original.activate(&id.root_key).unwrap();
+    startup_committed(runtime.clone()).await;
+    let (unhold, holder) = hold_worker(runtime.browser_scheduler().unwrap()).await;
+    let (prior, _) = runtime.evidence_response().unwrap();
+    let first = prior.status().unwrap().revision;
+    assert_eq!(
+        prior.source_at("a.js", None).unwrap().unwrap().1.text,
+        "function oldHead() {}\n"
+    );
+    prior.finish(()).unwrap();
+    drop(prior);
+    drop(unhold);
+    holder.join().unwrap();
+    original.disconnect(1);
+    release(&mut original, &id.root_key).await;
+    assert!(!runtime.has_active_resources());
+    drop(runtime);
+    drop(original);
+
+    fs::write(checkout.join("a.js"), "function newHead() {}\n").unwrap();
+    let mut restarted = CheckoutRegistry::with_roots(topology.clone());
+    restarted.attach_launch(2, &id).unwrap();
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let resume_rx = std::sync::Mutex::new(resume_rx);
+    restarted.set_next_startup_hook_for_tests(Arc::new(move || {
+        entered_tx.send(()).unwrap();
+        // A failed assertion drops the sender and releases the worker too.
+        let _ = resume_rx.lock().unwrap().recv();
+    }));
+    let resumed = restarted.activate(&id.root_key).unwrap();
+    entered(entered_rx, "fresh-registry startup reconciliation").await;
+    let (prior, catching_up) = resumed.evidence_response().unwrap();
+    assert!(catching_up);
+    assert_eq!(prior.status().unwrap().revision, first);
+    let (pin, source) = prior.source_at("a.js", None).unwrap().unwrap();
+    assert_eq!(pin, first);
+    assert_eq!(source.text, "function oldHead() {}\n");
+    prior.finish(()).unwrap();
+    drop(prior);
+
+    let store = Store::open(topology, identity(&checkout)).unwrap();
+    let queued = store
+        .enqueue_request(&trellis::indexer::IndexOptions::new(checkout.clone()), None)
+        .unwrap();
+    let terminal = Arc::new(tokio::sync::Notify::new());
+    resumed
+        .notify_on_terminal_request_for_tests(&queued.id, terminal.clone())
+        .unwrap();
+    let registry = Arc::new(Mutex::new(restarted));
+    let token = "0123456789abcdef".repeat(4);
+    let app = trellis::http::ProvisionedBrowser::new(
+        registry.clone(),
+        token.clone(),
+        "127.0.0.1:7331".parse().unwrap(),
+    )
+    .unwrap()
+    .router();
+    let refused = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/checkouts/{}/views/missing", id.root_key))
+                .header("host", "127.0.0.1:7331")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(refused.headers()["X-Trellis-Catching-Up"], "true");
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(refused.into_body(), 64 * 1024).await.unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "index_not_ready");
+    let pending = store.request_by_id(&queued.id).unwrap().unwrap();
+    assert_eq!(
+        pending.state, "queued",
+        "FIFO cannot claim before startup commits"
+    );
+    assert!(pending.revision.is_none());
+    assert_eq!(
+        resumed
+            .browser_scheduler()
+            .unwrap()
+            .startup_captures_for_tests(),
+        0
+    );
+
+    resume_tx.send(()).unwrap();
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, terminal.notified())
+        .await
+        .expect("queued request did not finish after restarted startup");
+    let done = store.request_by_id(&queued.id).unwrap().unwrap();
+    assert_eq!(done.state, "done");
+    let published = done.revision.unwrap();
+    assert_eq!(published.index_generation, first.index_generation);
+    assert!(published.index_revision > first.index_revision);
+    let scheduler = resumed.browser_scheduler().unwrap();
+    let (unhold, holder) = hold_worker(scheduler.clone()).await;
+    assert_eq!(scheduler.runtime_phase(), RuntimePhase::Ready);
+    // A terminal FIFO commit does not drain later native watcher hints.
+    let (current, _catching_up) = resumed.evidence_response().unwrap();
+    assert!(current.status().unwrap().revision.index_revision >= published.index_revision);
+    assert_eq!(
+        current.source_at("a.js", None).unwrap().unwrap().1.text,
+        "function newHead() {}\n"
+    );
+    current.finish(()).unwrap();
+    drop(current);
+    assert_eq!(
+        resumed
+            .browser_scheduler()
+            .unwrap()
+            .startup_captures_for_tests(),
+        1
+    );
+    let allowed = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/checkouts/{}/views/missing", id.root_key))
+                .header("host", "127.0.0.1:7331")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(allowed.status(), StatusCode::NO_CONTENT);
+    drop(allowed);
+    drop(unhold);
+    holder.join().unwrap();
+    drop(store);
+    let mut restarted = registry.lock().await;
+    restarted.disconnect(2);
+    restarted
+        .advance(std::time::Instant::now() + Duration::from_secs(30 * 60))
+        .unwrap();
+    release(&mut restarted, &id.root_key).await;
+    assert!(!resumed.has_active_resources());
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
 async fn symbols_and_graph_reads_use_the_admitted_prior_head_during_startup() {
     let base = tempfile::tempdir().unwrap();
     let checkout = base.path().join("work");
