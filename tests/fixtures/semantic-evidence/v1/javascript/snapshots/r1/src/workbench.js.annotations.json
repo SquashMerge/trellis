@@ -1,0 +1,35 @@
+{
+  "formatVersion": 1,
+  "document": {
+    "sourceSetId": "main",
+    "language": "javascript",
+    "path": "src/workbench.js"
+  },
+  "revisionId": "r1",
+  "scenarios": [],
+  "facts": [
+    {
+      "kind": "coverage",
+      "ref": "native-coverage:src/workbench.js",
+      "record": {
+        "producerId": "trellis.native.syntax",
+        "language": "javascript",
+        "sourceSetId": "main",
+        "documentPath": "src/workbench.js",
+        "revisionId": "r1",
+        "requested": true,
+        "selected": true,
+        "state": "complete",
+        "supportedRoles": [
+          "definition",
+          "call"
+        ],
+        "observedRoles": [
+          "definition",
+          "call"
+        ],
+        "diagnostic": null
+      }
+    }
+  ]
+}
