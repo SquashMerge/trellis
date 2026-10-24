@@ -324,6 +324,15 @@ pub struct PrivateStageObservation {
     pub calls: Vec<crate::native_evidence::Call>,
 }
 
+/// A retained tuple is presented at its own native revision. Freshness is a
+/// separate comparison with the requested pin; captured provenance is unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SemanticHistory {
+    pub coverage: crate::semantic_evidence::Coverage,
+    pub provenance: Vec<crate::semantic_evidence::Provenance>,
+    pub presentation_freshness: crate::semantic_evidence::Freshness,
+}
+
 #[derive(Clone)]
 pub struct Store {
     roots: topology::TopologyRoots,
@@ -697,6 +706,7 @@ CREATE TABLE semantic_provenance(tuple_id INTEGER NOT NULL,provenance_id TEXT NO
 CREATE TABLE semantic_symbols(symbol_id INTEGER PRIMARY KEY,tuple_id INTEGER NOT NULL,ordinal INTEGER NOT NULL,key_scheme TEXT NOT NULL,key_symbol TEXT NOT NULL,key_scope TEXT NOT NULL CHECK(key_scope IN ('global','document')),key_document_language TEXT,key_document_path TEXT,display_name TEXT,provenance_id TEXT NOT NULL,UNIQUE(tuple_id,ordinal),FOREIGN KEY(tuple_id,provenance_id) REFERENCES semantic_provenance(tuple_id,provenance_id));
 CREATE UNIQUE INDEX semantic_symbols_key ON semantic_symbols(tuple_id,key_scheme,key_symbol,key_scope,COALESCE(key_document_language,''),COALESCE(key_document_path,''));
 CREATE TABLE semantic_symbol_targets(symbol_id INTEGER NOT NULL REFERENCES semantic_symbols(symbol_id),ordinal INTEGER NOT NULL,kind TEXT NOT NULL CHECK(kind IN ('internal','external')),internal_syntax_id BLOB,internal_language TEXT,internal_path TEXT,internal_native_revision_id TEXT,external_scheme TEXT,external_symbol TEXT,external_scope TEXT,external_language TEXT,external_path TEXT,CHECK((kind='internal' AND length(internal_syntax_id)=16 AND internal_language IS NOT NULL AND internal_path IS NOT NULL AND internal_native_revision_id IS NOT NULL AND external_scheme IS NULL AND external_symbol IS NULL AND external_scope IS NULL AND external_language IS NULL AND external_path IS NULL) OR (kind='external' AND internal_syntax_id IS NULL AND internal_language IS NULL AND internal_path IS NULL AND internal_native_revision_id IS NULL AND external_scheme IS NOT NULL AND external_symbol IS NOT NULL AND external_scope IN ('global','document') AND ((external_scope='global' AND external_language IS NULL AND external_path IS NULL) OR (external_scope='document' AND external_language IS NOT NULL AND external_path IS NOT NULL)))),PRIMARY KEY(symbol_id,ordinal));
+CREATE INDEX semantic_symbol_targets_internal_syntax ON semantic_symbol_targets(internal_syntax_id,internal_language,internal_path,symbol_id) WHERE kind='internal';
 CREATE TABLE semantic_declaration_bindings(binding_id INTEGER PRIMARY KEY,tuple_id INTEGER NOT NULL,ordinal INTEGER NOT NULL,syntax_id BLOB CHECK(syntax_id IS NULL OR length(syntax_id)=16),provenance_id TEXT NOT NULL,join_document_language TEXT NOT NULL,join_document_path TEXT NOT NULL,join_native_revision_id TEXT NOT NULL,join_content_hash TEXT NOT NULL,join_start INTEGER NOT NULL,join_end INTEGER NOT NULL,join_kind TEXT NOT NULL CHECK(join_kind='declarationName'),join_status TEXT NOT NULL CHECK(join_status IN ('exact','ambiguous','unmatched','unsupported')),join_diagnostic TEXT,UNIQUE(tuple_id,ordinal),FOREIGN KEY(tuple_id,provenance_id) REFERENCES semantic_provenance(tuple_id,provenance_id));
 CREATE INDEX semantic_declaration_bindings_syntax ON semantic_declaration_bindings(tuple_id,syntax_id);
 CREATE TABLE semantic_declaration_binding_symbols(binding_id INTEGER NOT NULL REFERENCES semantic_declaration_bindings(binding_id),ordinal INTEGER NOT NULL,scheme TEXT NOT NULL,symbol TEXT NOT NULL,scope TEXT NOT NULL,document_language TEXT,document_path TEXT,PRIMARY KEY(binding_id,ordinal));
@@ -4920,6 +4930,15 @@ fn semantic_candidate_ids(
 }
 
 fn read_semantic(db: &Connection, key: &str) -> Result<crate::semantic_evidence::SemanticSnapshot> {
+    read_semantic_tuple(db, key, None, None)
+}
+
+fn read_semantic_tuple(
+    db: &Connection,
+    key: &str,
+    selected_tuple: Option<i64>,
+    history_syntax: Option<&str>,
+) -> Result<crate::semantic_evidence::SemanticSnapshot> {
     use crate::native_evidence::DocumentKey;
     use crate::semantic_evidence as sem;
     let (source_set, native_id): (String, String) = db.query_row(
@@ -4937,7 +4956,7 @@ fn read_semantic(db: &Connection, key: &str) -> Result<crate::semantic_evidence:
         call_bindings: vec![],
         type_relationships: vec![],
     };
-    let descriptors=db.prepare("SELECT DISTINCT p.id,p.version,p.executable_hash,p.kind,p.position_encoding FROM semantic_coverage c JOIN semantic_producers p ON p.id=c.producer_id AND p.version=c.producer_version WHERE c.revision_id=?1 ORDER BY p.id,p.version")?.query_map([key],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let descriptors=db.prepare("SELECT DISTINCT p.id,p.version,p.executable_hash,p.kind,p.position_encoding FROM semantic_coverage c JOIN semantic_producers p ON p.id=c.producer_id AND p.version=c.producer_version WHERE c.revision_id=?1 AND (?2 IS NULL OR c.tuple_id=?2) ORDER BY p.id,p.version")?.query_map(params![key, selected_tuple],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
     for (id, version, executable_hash, kind, encoding) in descriptors {
         let languages = semantic_ordered(
             db,
@@ -4953,7 +4972,7 @@ fn read_semantic(db: &Connection, key: &str) -> Result<crate::semantic_evidence:
             position_encoding: semantic_enum(encoding)?,
         });
     }
-    let tuples=db.prepare("SELECT tuple_id,producer_id,producer_version,language,path,requested,selected,state,diagnostic FROM semantic_coverage WHERE revision_id=?1 ORDER BY tuple_id")?.query_map([key],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,bool>(5)?,r.get::<_,bool>(6)?,r.get::<_,String>(7)?,r.get::<_,Option<String>>(8)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let tuples=db.prepare("SELECT tuple_id,producer_id,producer_version,language,path,requested,selected,state,diagnostic FROM semantic_coverage WHERE revision_id=?1 AND (?2 IS NULL OR tuple_id=?2) ORDER BY tuple_id")?.query_map(params![key, selected_tuple],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,bool>(5)?,r.get::<_,bool>(6)?,r.get::<_,String>(7)?,r.get::<_,Option<String>>(8)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
     for (tuple, producer_id, _version, language, path, requested, selected, state, diagnostic) in
         tuples
     {
@@ -4985,7 +5004,7 @@ fn read_semantic(db: &Connection, key: &str) -> Result<crate::semantic_evidence:
             language: language.clone(),
             path: path.clone(),
         };
-        let rows=db.prepare("SELECT p.provenance_id,p.content_hash,p.evidence_kind,p.freshness,p.derived_from_provenance_id,b.producer_id,b.producer_version,b.producer_hash,b.artifact_hash,b.language,b.source_set_id,b.captured_native_revision_id,b.source_manifest_hash,b.toolchain_hash,b.config_hash,b.dependency_hash,b.basis_id FROM semantic_provenance p JOIN semantic_basis b ON b.tuple_id=p.tuple_id AND b.basis_id=p.basis_id WHERE p.tuple_id=?1 ORDER BY p.rowid")?.query_map([tuple],|r|{
+        let rows=db.prepare("SELECT p.provenance_id,p.content_hash,p.evidence_kind,p.freshness,p.derived_from_provenance_id,b.producer_id,b.producer_version,b.producer_hash,b.artifact_hash,b.language,b.source_set_id,b.captured_native_revision_id,b.source_manifest_hash,b.toolchain_hash,b.config_hash,b.dependency_hash,b.basis_id FROM semantic_provenance p JOIN semantic_basis b ON b.tuple_id=p.tuple_id AND b.basis_id=p.basis_id WHERE p.tuple_id=?1 AND (?2 IS NULL OR p.provenance_id IN (SELECT provenance_id FROM semantic_declaration_bindings WHERE tuple_id=?1 AND syntax_id=?2 UNION SELECT s.provenance_id FROM semantic_symbols s JOIN semantic_symbol_targets t ON t.symbol_id=s.symbol_id WHERE s.tuple_id=?1 AND t.kind='internal' AND t.internal_syntax_id=?2 AND t.internal_language=?3 AND t.internal_path=?4 UNION SELECT provenance_id FROM semantic_type_relationships WHERE tuple_id=?1 AND source_kind='internal' AND source_internal_syntax_id=?2 AND source_internal_language=?3 AND source_internal_path=?4)) ORDER BY p.rowid")?.query_map(params![tuple, history_syntax.and_then(id_codec::encode_sid), language, path],|r|{
             Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,Option<String>>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?,r.get::<_,String>(7)?,r.get::<_,String>(8)?,r.get::<_,String>(9)?,r.get::<_,String>(10)?,r.get::<_,String>(11)?,r.get::<_,String>(12)?,r.get::<_,String>(13)?,r.get::<_,String>(14)?,r.get::<_,String>(15)?,r.get::<_,i64>(16)?))
         })?.collect::<rusqlite::Result<Vec<_>>>()?;
         for (
@@ -5039,9 +5058,130 @@ fn read_semantic(db: &Connection, key: &str) -> Result<crate::semantic_evidence:
                 derived_from: None,
             });
         }
-        read_semantic_facts(db, tuple, &document, &native_id, &mut result)?;
+        if history_syntax.is_none() {
+            read_semantic_facts(db, tuple, &document, &native_id, &mut result)?;
+        }
     }
     Ok(result)
+}
+
+fn read_semantic_history(
+    db: &Connection,
+    key: &str,
+    index_revision: u64,
+    producer_id: &str,
+    document: &crate::native_evidence::DocumentKey,
+    syntax_id: &str,
+) -> Result<Option<SemanticHistory>> {
+    use crate::semantic_evidence::{CoverageState, Freshness};
+    let source_set: String = db.query_row(
+        "SELECT source_set_id FROM native_revisions WHERE id=?1",
+        [key],
+        |r| r.get(0),
+    )?;
+    if source_set != document.source_set_id {
+        return Ok(None);
+    }
+    let selected_tuple: Option<i64> = db.query_row(
+        "SELECT tuple_id FROM semantic_coverage WHERE revision_id=?1 AND producer_id=?2 AND language=?3 AND path=?4",
+        params![key, producer_id, document.language, document.path], |r| r.get(0),
+    ).optional()?;
+    let Some(selected_tuple) = selected_tuple else {
+        return Ok(None);
+    };
+    let selected_snapshot = read_semantic_tuple(db, key, Some(selected_tuple), None)?;
+    let [selected_coverage] = <[_; 1]>::try_from(selected_snapshot.coverage)
+        .map_err(|_| anyhow::anyhow!("corrupt selected semantic coverage"))?;
+    let state: CoverageState = selected_coverage.state;
+    if !matches!(state, CoverageState::Failed | CoverageState::Omitted) {
+        return Ok(None);
+    }
+    ensure!(
+        selected_snapshot.provenance.is_empty()
+            && selected_snapshot.symbols.is_empty()
+            && selected_snapshot.declaration_bindings.is_empty()
+            && selected_snapshot.references.is_empty()
+            && selected_snapshot.call_bindings.is_empty()
+            && selected_snapshot.type_relationships.is_empty(),
+        "corrupt unselected semantic tuple contains facts"
+    );
+    let selected_document: Option<String> = db.query_row(
+        "SELECT v.content_hash FROM revision_documents d JOIN document_versions v ON v.vid=d.vid WHERE d.revision_id=?1 AND d.language=?2 AND d.path=?3",
+        params![key, document.language, document.path], |r| r.get(0),
+    ).optional()?;
+    let selected_header: (String, String, String, String) = db.query_row(
+        "SELECT native_revision_id,toolchain_hash,config_hash,dependency_hash FROM native_revisions WHERE id=?1",
+        [key], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+    )?;
+    let [selected_producer] = <[_; 1]>::try_from(selected_snapshot.producers)
+        .map_err(|_| anyhow::anyhow!("corrupt selected semantic producer"))?;
+    let selected_descriptor = (selected_producer.version, selected_producer.executable_hash);
+    // published_index_revision orders storage pins; never order immutable IDs or
+    // fall through to an older tuple when the newest eligible one has no fact.
+    let previous: Option<(String, i64)> = db.query_row(
+        "SELECT r.id,c.tuple_id FROM semantic_coverage c JOIN native_revisions r ON r.id=c.revision_id JOIN native_revision_supersessions s ON s.revision_id=r.id AND s.state='retained' WHERE c.producer_id=?1 AND c.language=?2 AND c.path=?3 AND r.source_set_id=?4 AND c.state IN ('complete','partial') AND r.published_index_revision<?5 AND NOT EXISTS (SELECT 1 FROM revision_capture_inputs i WHERE i.revision_id=r.id AND i.input_key IN ('__released:v1','__pending_release:v1')) ORDER BY r.published_index_revision DESC LIMIT 1",
+        params![producer_id, document.language, document.path, document.source_set_id, index_revision as i64],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    ).optional()?;
+    let Some((previous_key, tuple)) = previous else {
+        return Ok(None);
+    };
+    let snapshot = read_semantic_tuple(db, &previous_key, Some(tuple), Some(syntax_id))?;
+    let [coverage] = <[_; 1]>::try_from(snapshot.coverage)
+        .map_err(|_| anyhow::anyhow!("corrupt semantic history coverage"))?;
+    let provenance = snapshot.provenance;
+    let historical_descriptor = snapshot
+        .producers
+        .first()
+        .map(|p| (&p.version, &p.executable_hash));
+    let historical_bases = db.prepare("SELECT producer_version,producer_hash,source_set_id,captured_native_revision_id,source_manifest_hash,toolchain_hash,config_hash,dependency_hash FROM semantic_basis WHERE tuple_id=?1")?
+        .query_map([tuple], |r| Ok((r.get::<_, String>(0)?,r.get::<_, String>(1)?,r.get::<_, String>(2)?,r.get::<_, String>(3)?,r.get::<_, String>(4)?,r.get::<_, String>(5)?,r.get::<_, String>(6)?,r.get::<_, String>(7)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let rows = db.prepare("SELECT d.ordinal,d.language,d.path,v.content_hash FROM revision_documents d JOIN document_versions v ON v.vid=d.vid WHERE d.revision_id=?1 ORDER BY d.ordinal")?
+        .query_map([key], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut manifest = Vec::with_capacity(rows.len());
+    for (ordinal, language, path, content_hash) in rows {
+        ensure!(
+            ordinal == manifest.len() as i64,
+            "corrupt semantic history manifest ordinal"
+        );
+        manifest.push(serde_json::json!({"document":{"sourceSetId":document.source_set_id,"language":language,"path":path},"contentHash":content_hash}));
+    }
+    let manifest_hash = crate::native_ids::digest(
+        b"",
+        &crate::native_ids::canonical(&serde_json::json!(manifest)),
+    );
+    let historical_document_hash: String = db.query_row(
+        "SELECT v.content_hash FROM revision_documents d JOIN document_versions v ON v.vid=d.vid WHERE d.revision_id=?1 AND d.language=?2 AND d.path=?3",
+        params![previous_key, document.language, document.path], |r| r.get(0),
+    )?;
+    let presentation_freshness = if selected_document.as_ref() != Some(&historical_document_hash) {
+        Freshness::Stale
+    } else if historical_bases.iter().any(
+        |(version, hash, source_set, revision, manifest, toolchain, config, dependency)| {
+            version != &selected_descriptor.0
+                || hash != &selected_descriptor.1
+                || source_set != &document.source_set_id
+                || revision != &selected_header.0
+                || manifest != &manifest_hash
+                || toolchain != &selected_header.1
+                || config != &selected_header.2
+                || dependency != &selected_header.3
+        },
+    ) || (historical_bases.is_empty()
+        && (coverage.revision_id != selected_header.0
+            || historical_descriptor != Some((&selected_descriptor.0, &selected_descriptor.1))))
+    {
+        Freshness::PossiblyStale
+    } else {
+        Freshness::Fresh
+    };
+    Ok(Some(SemanticHistory {
+        coverage,
+        provenance,
+        presentation_freshness,
+    }))
 }
 
 fn read_semantic_facts(
@@ -13422,6 +13562,31 @@ impl Store {
     /// Materialize the complete normalized semantic tree owned by this selected pin.
     pub fn semantic_at(&self, pin: IndexPin) -> Result<crate::semantic_evidence::SemanticSnapshot> {
         self.native_at(pin, |db, selected| read_semantic(db, &selected.key))
+    }
+
+    /// Return only the latest eligible retained tuple for a failed or omitted
+    /// selected producer/document, with declaration-keyed facts at their own pin.
+    pub fn semantic_history_for(
+        &self,
+        pin: IndexPin,
+        producer_id: &str,
+        document: &crate::native_evidence::DocumentKey,
+        syntax_id: &str,
+    ) -> Result<Option<SemanticHistory>> {
+        ensure!(
+            id_codec::encode_sid(syntax_id).is_some(),
+            "invalid syntax ID"
+        );
+        self.native_at(pin, |db, selected| {
+            read_semantic_history(
+                db,
+                &selected.key,
+                pin.index_revision,
+                producer_id,
+                document,
+                syntax_id,
+            )
+        })
     }
 
     /// Set a deterministic UTC and monotonic clock for an isolated test store.
