@@ -66,15 +66,20 @@ fn native_components(
     (toolchain, config, dependencies)
 }
 
-fn evidence(
+fn evidence_for(
     native: &n::Artifact,
     root: &std::path::Path,
+    path: &str,
 ) -> (s::SemanticPublication, s::CapturedComponents) {
     let h = |bytes: &[u8]| native_ids::digest(b"", bytes);
     let (toolchain, config, dependency) =
         native_components(root, &native.producer.executable_hash, 2 * 1024 * 1024);
-    let document = native.revision.documents.first().unwrap();
-    let bytes = fs::read(root.join(&document.key.path)).unwrap();
+    let document = native
+        .revision
+        .documents
+        .iter()
+        .find(|d| d.key.path == path)
+        .unwrap();
     let producer = s::Producer {
         id: "semantic.synthetic".into(),
         version: "v1".into(),
@@ -91,15 +96,24 @@ fn evidence(
         language: s::Language::Rust,
         source_set_id: document.key.source_set_id.clone(),
         revision_id: native.revision.id.clone(),
-        source_manifest_hash: h(&native_ids::canonical(
-            &json!([{"document":document.key,"contentHash":document.content_hash}]),
-        )),
+        source_manifest_hash: h(&native_ids::canonical(&json!(
+            native
+                .revision
+                .documents
+                .iter()
+                .map(|d| json!({"document":d.key,"contentHash":d.content_hash}))
+                .collect::<Vec<_>>()
+        ))),
         toolchain_hash: native.revision.toolchain_hash.clone(),
         config_hash: native.revision.config_hash.clone(),
         dependency_hash: native.revision.dependency_hash.clone(),
         lookup_dependencies: vec!["hello".into()],
     };
-    let declarations = &native.declarations;
+    let declarations = native
+        .declarations
+        .iter()
+        .filter(|d| d.document == document.key)
+        .collect::<Vec<_>>();
     let declaration = declarations
         .iter()
         .find(|d| d.name.as_deref() == Some("hello") && d.name_range.is_some())
@@ -119,7 +133,7 @@ fn evidence(
     };
     let key = s::SymbolKey {
         scheme: s::SymbolScheme::Scip,
-        symbol: "pkg hello".into(),
+        symbol: format!("pkg {path} hello"),
         scope: s::SymbolScope::Global,
         document: None,
     };
@@ -136,7 +150,7 @@ fn evidence(
         diagnostic: None,
     };
     let proof = |id: &str, kind| s::Provenance {
-        id: id.into(),
+        id: format!("{path}:{id}"),
         producer_id: producer.id.clone(),
         document: document.key.clone(),
         revision_id: native.revision.id.clone(),
@@ -149,7 +163,11 @@ fn evidence(
     let call = native
         .calls
         .iter()
-        .find(|call| call.callee_range.is_some() && call.spelling.as_deref() == Some("hello"))
+        .find(|call| {
+            call.document == document.key
+                && call.callee_range.is_some()
+                && call.spelling.as_deref() == Some("hello")
+        })
         .unwrap();
     let call_join = s::Join {
         anchor: s::MeasuredAnchor {
@@ -178,7 +196,7 @@ fn evidence(
         resolution: s::Resolution::Resolved,
         declared_target: Some(target.clone()),
         candidates: vec![],
-        provenance_id: "reference".into(),
+        provenance_id: format!("{path}:reference"),
     };
     let call_binding = s::CallBinding {
         call_id: Some(call.id.clone()),
@@ -190,7 +208,7 @@ fn evidence(
         possible_dispatch: vec![target.clone(), external.clone()],
         possible_dispatch_complete: false,
         stale_target: None,
-        provenance_id: "call".into(),
+        provenance_id: format!("{path}:call"),
     };
     let semantic = s::SemanticPublication {
         producers: vec![producer.clone()],
@@ -217,13 +235,13 @@ fn evidence(
             key: key.clone(),
             display_name: Some("hello".into()),
             declarations: vec![target.clone(), external.clone()],
-            provenance_id: "bind".into(),
+            provenance_id: format!("{path}:bind"),
         }],
         declaration_bindings: vec![s::DeclarationBinding {
             syntax_id: Some(declaration.syntax_id.clone()),
             symbols: vec![key],
             join,
-            provenance_id: "bind".into(),
+            provenance_id: format!("{path}:bind"),
         }],
         references: vec![reference],
         call_bindings: vec![call_binding],
@@ -231,13 +249,18 @@ fn evidence(
             kind: s::RelationshipKind::Overrides,
             source: target,
             target: external,
-            provenance_id: "rel".into(),
+            provenance_id: format!("{path}:rel"),
         }],
     };
     let captured = s::CapturedComponents {
         producer_executables: BTreeMap::from([(producer.id.clone(), b"exe".to_vec())]),
         artifacts: BTreeMap::from([(producer.id.clone(), b"artifact".to_vec())]),
-        sources: BTreeMap::from([(document.key.clone(), bytes)]),
+        sources: native
+            .revision
+            .documents
+            .iter()
+            .map(|d| (d.key.clone(), fs::read(root.join(&d.key.path)).unwrap()))
+            .collect(),
         captured_revision: native.revision.clone(),
         native_toolchain: toolchain.clone(),
         native_config: config.clone(),
@@ -249,6 +272,13 @@ fn evidence(
         native_extraction_components: BTreeMap::new(),
     };
     (semantic, captured)
+}
+
+fn evidence(
+    native: &n::Artifact,
+    root: &std::path::Path,
+) -> (s::SemanticPublication, s::CapturedComponents) {
+    evidence_for(native, root, "hello.rs")
 }
 
 fn setup() -> (
@@ -396,7 +426,21 @@ fn private_stage_admits_typed_evidence_without_changing_live_head() {
     let (graph, native, capture) =
         index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
     let (semantic, captured) = evidence(&native, root.path());
-    let head = store.index_baseline().unwrap();
+    let leader = store.publication_for_tests().unwrap();
+    let head = store
+        .publish_native_semantic(
+            &graph,
+            &capture,
+            &native,
+            &semantic,
+            &captured,
+            &leader,
+            store.index_baseline().unwrap(),
+            &cancel,
+        )
+        .unwrap();
+    let live = store.semantic_at(head).unwrap();
+    drop(leader);
     let stage_capture = trellis::capture::Capture::admit(&options, &cancel, &|_| {}).unwrap();
     let error = store
         .publish_private_stage_semantic_for_tests(
@@ -416,7 +460,7 @@ fn private_stage_admits_typed_evidence_without_changing_live_head() {
     );
     assert_eq!(store.index_baseline().unwrap(), head);
     let next_capture = trellis::capture::Capture::admit(&options, &cancel, &|_| {}).unwrap();
-    store
+    let (staged_pin, staged, native_rows) = store
         .publish_private_stage_semantic_for_tests(
             &options,
             &next_capture,
@@ -426,20 +470,23 @@ fn private_stage_admits_typed_evidence_without_changing_live_head() {
             false,
         )
         .unwrap();
+    assert_ne!(staged_pin.index_generation, head.index_generation);
+    assert_eq!(staged_pin.index_revision, 1);
+    assert_eq!(native_rows, native.revision.documents.len() as i64);
+    assert_eq!(staged.coverage, semantic.coverage);
+    assert_eq!(staged.provenance, semantic.provenance);
+    assert_eq!(staged.references, semantic.references);
+    assert_eq!(staged.call_bindings, semantic.call_bindings);
+    assert_eq!(staged.declaration_bindings, semantic.declaration_bindings);
+    assert_eq!(staged.type_relationships, semantic.type_relationships);
     assert_eq!(store.index_baseline().unwrap(), head);
-    // A private stage is not a live pin; normal publication remains independent.
-    let leader = store.publication_for_tests().unwrap();
-    let pin = store
-        .publish_native_semantic(
-            &graph, &capture, &native, &semantic, &captured, &leader, head, &cancel,
-        )
-        .unwrap();
-    assert_eq!(store.semantic_at(pin).unwrap().coverage, semantic.coverage);
+    assert_eq!(store.semantic_at(head).unwrap(), live);
 }
 
 #[test]
 fn changed_local_semantics_bind_new_revision_and_keep_old_pin_isolated() {
     let (_state, root, store, cancel, options) = setup();
+    fs::write(root.path().join("other.rs"), "fn hello() { hello(); }\n").unwrap();
     fs::write(
         root.path().join("hello.rs"),
         "fn hello() { hello(); } fn number() -> i32 { 1 }\n",
@@ -447,7 +494,17 @@ fn changed_local_semantics_bind_new_revision_and_keep_old_pin_isolated() {
     .unwrap();
     let (graph, native, capture) =
         index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
-    let (semantic, captured) = evidence(&native, root.path());
+    let (mut semantic, captured) = evidence(&native, root.path());
+    let (other, _) = evidence_for(&native, root.path(), "other.rs");
+    semantic.coverage.extend(other.coverage);
+    semantic.provenance.extend(other.provenance);
+    semantic.symbols.extend(other.symbols);
+    semantic
+        .declaration_bindings
+        .extend(other.declaration_bindings);
+    semantic.references.extend(other.references);
+    semantic.call_bindings.extend(other.call_bindings);
+    semantic.type_relationships.extend(other.type_relationships);
     let leader = store.publication_for_tests().unwrap();
     let first = store
         .publish_native_semantic(
@@ -470,7 +527,19 @@ fn changed_local_semantics_bind_new_revision_and_keep_old_pin_isolated() {
         index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
     let new_capture = trellis::capture::Capture::admit(&options, &cancel, &|_| {}).unwrap();
     assert_ne!(native.revision.id, new_native.revision.id);
-    let (new_semantic, new_components) = evidence(&new_native, root.path());
+    let (mut new_semantic, new_components) = evidence(&new_native, root.path());
+    let (reused, _) = evidence_for(&new_native, root.path(), "other.rs");
+    new_semantic.coverage.extend(reused.coverage);
+    new_semantic.provenance.extend(reused.provenance);
+    new_semantic.symbols.extend(reused.symbols);
+    new_semantic
+        .declaration_bindings
+        .extend(reused.declaration_bindings);
+    new_semantic.references.extend(reused.references);
+    new_semantic.call_bindings.extend(reused.call_bindings);
+    new_semantic
+        .type_relationships
+        .extend(reused.type_relationships);
     let err = store
         .publish_local_semantic_for_tests(
             &options,
@@ -487,6 +556,10 @@ fn changed_local_semantics_bind_new_revision_and_keep_old_pin_isolated() {
         "{err:#}"
     );
     assert_eq!(store.status().unwrap().revision, first);
+    assert_eq!(
+        store.semantic_at(first).unwrap().references,
+        semantic.references
+    );
     let retry_capture = trellis::capture::Capture::admit(&options, &cancel, &|_| {}).unwrap();
     let second = store
         .publish_local_semantic_for_tests(
@@ -508,11 +581,82 @@ fn changed_local_semantics_bind_new_revision_and_keep_old_pin_isolated() {
         store.semantic_at(second).unwrap().references,
         new_semantic.references
     );
-    assert_eq!(
-        store.semantic_at(second).unwrap().coverage[0].revision_id,
-        new_native.revision.id
+    let current = store.semantic_at(second).unwrap();
+    assert_eq!(current.coverage.len(), 2);
+    assert!(
+        current
+            .coverage
+            .iter()
+            .all(|c| c.revision_id == new_native.revision.id)
     );
-    assert_ne!(new_graph.files[0].hash, graph.files[0].hash);
+    assert_eq!(
+        current.declaration_bindings,
+        new_semantic.declaration_bindings
+    );
+    assert_eq!(current.call_bindings, new_semantic.call_bindings);
+    assert_eq!(current.type_relationships, new_semantic.type_relationships);
+    assert_eq!(current.provenance, new_semantic.provenance);
+    let previous = store.semantic_at(first).unwrap();
+    assert_eq!(previous.declaration_bindings, semantic.declaration_bindings);
+    assert_eq!(previous.call_bindings, semantic.call_bindings);
+    assert_eq!(previous.type_relationships, semantic.type_relationships);
+    assert_ne!(
+        current.references[0].revision_id,
+        previous.references[0].revision_id
+    );
+    assert!(
+        current
+            .references
+            .iter()
+            .any(|r| r.document.path == "other.rs")
+    );
+    assert!(
+        previous
+            .references
+            .iter()
+            .any(|r| r.document.path == "other.rs")
+    );
+    let old_other = native
+        .revision
+        .documents
+        .iter()
+        .find(|d| d.key.path == "other.rs")
+        .unwrap();
+    let new_other = new_native
+        .revision
+        .documents
+        .iter()
+        .find(|d| d.key.path == "other.rs")
+        .unwrap();
+    assert_eq!(old_other.content_hash, new_other.content_hash);
+    assert_eq!(
+        previous
+            .references
+            .iter()
+            .find(|r| r.document.path == "other.rs")
+            .unwrap()
+            .id,
+        current
+            .references
+            .iter()
+            .find(|r| r.document.path == "other.rs")
+            .unwrap()
+            .id
+    );
+    assert_ne!(
+        new_graph
+            .files
+            .iter()
+            .find(|f| f.path == "hello.rs")
+            .unwrap()
+            .hash,
+        graph
+            .files
+            .iter()
+            .find(|f| f.path == "hello.rs")
+            .unwrap()
+            .hash
+    );
 }
 
 #[test]

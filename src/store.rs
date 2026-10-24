@@ -10382,7 +10382,7 @@ impl Store {
         captured: &crate::semantic_evidence::CapturedComponents,
         cancel: &CancelFlag,
         fail_before_commit: bool,
-    ) -> Result<()> {
+    ) -> Result<(IndexPin, crate::semantic_evidence::SemanticSnapshot, i64)> {
         let use_guard = self.roots.index_use_exclusive_existing(&self.identity)?;
         let leader = self
             .roots
@@ -10403,7 +10403,7 @@ impl Store {
             validate_v8_bootstrap(&bootstrap)?;
             let baseline = self.recovery_baseline(&bootstrap)?;
             drop(bootstrap);
-            let pin = self.publish_validated_stream_target(
+            let published = self.publish_validated_stream_target(
                 &spool,
                 capture,
                 &leader,
@@ -10418,18 +10418,40 @@ impl Store {
                     );
                     Ok(())
                 },
-            )?;
+            );
+            if let Err(error) = published {
+                if fail_before_commit {
+                    let staged = open_index(&stage.path, false)?;
+                    for table in [
+                        "native_revisions",
+                        "revision_documents",
+                        "semantic_coverage",
+                        "semantic_references",
+                    ] {
+                        let count: i64 = staged.query_row(
+                            &format!("SELECT count(*) FROM {table}"),
+                            [],
+                            |row| row.get(0),
+                        )?;
+                        ensure!(
+                            count == 0,
+                            "failed staged transaction retained {table} rows"
+                        );
+                    }
+                }
+                return Err(error);
+            }
+            let pin = published?;
             self.validate_replacement_index(&stage.path, &stage, &leader, pin)?;
             let staged = open_index(&stage.path, false)?;
-            let count: i64 =
-                staged.query_row("SELECT count(*) FROM semantic_coverage", [], |row| {
-                    row.get(0)
-                })?;
-            ensure!(
-                count == semantic.coverage.len() as i64,
-                "staged semantic coverage differs"
-            );
-            Ok(())
+            let key = format!("pin:v1:{}:{}", pin.index_generation, pin.index_revision);
+            let snapshot = read_semantic(&staged, &key)?;
+            let native_rows: i64 = staged.query_row(
+                "SELECT count(*) FROM revision_documents WHERE revision_id=?1",
+                [&key],
+                |row| row.get(0),
+            )?;
+            Ok((pin, snapshot, native_rows))
         })();
         self.cleanup_failed_staged_index(stage, Some(&leader))?;
         result
@@ -10659,17 +10681,55 @@ impl Store {
             "native_evidence_required: incomplete selected capture"
         );
         let mut native = prepared.native.clone();
-        for file in &capture.files {
-            if file.path == prepared.changed_path {
-                continue;
+        if semantic.is_some() {
+            // Reused versions belong to the selected, previously validated pin.
+            // Read their measured rows through that pin, not from the changed-only
+            // artifact or from a newly fabricated measurement.
+            self.native_at(prepared.prior_pin, |db, selected| {
+                for document in &native.revision.documents {
+                    if document.key.path == prepared.changed_path {
+                        continue;
+                    }
+                    let scope = v8_native_scope_for(db, &document.key, selected)?
+                        .context("reused native document missing from selected pin")?;
+                    ensure!(
+                        scope.version_id == prepared.prior_ids[&document.key.path].version_id,
+                        "reused native version differs from selected pin"
+                    );
+                    let mut coverage = read_native_coverage_v8(db, &scope)?;
+                    coverage.revision_id.clone_from(&native.revision.id);
+                    native.coverage.push(coverage);
+                    let mut declarations = read_native_declarations_v8(db, &scope, None, true)?;
+                    for declaration in &mut declarations {
+                        declaration.revision_id.clone_from(&native.revision.id);
+                    }
+                    native.declarations.extend(declarations);
+                    let mut calls = read_native_calls_v8(db, &scope, None)?;
+                    for call in &mut calls {
+                        call.revision_id.clone_from(&native.revision.id);
+                    }
+                    native.calls.extend(calls);
+                    let mut regions = read_native_control_regions_v8(db, &scope, None)?;
+                    for region in &mut regions {
+                        region.revision_id.clone_from(&native.revision.id);
+                    }
+                    native.control_regions.extend(regions);
+                }
+                Ok(())
+            })?;
+        } else {
+            for file in &capture.files {
+                if file.path == prepared.changed_path {
+                    continue;
+                }
+                let mut coverage = prepared
+                    .prior_coverage
+                    .get(&file.path)
+                    .context("reused document coverage missing from selected head")?
+                    .clone();
+                coverage.revision_id.clone_from(&native.revision.id);
+                native.coverage.push(coverage);
             }
-            let mut coverage = prepared
-                .prior_coverage
-                .get(&file.path)
-                .context("reused document coverage missing from selected head")?
-                .clone();
-            coverage.revision_id.clone_from(&native.revision.id);
-            native.coverage.push(coverage);
         }
         self.publish_inner_checked_target_with_local(
             (graph, capture, &native),
