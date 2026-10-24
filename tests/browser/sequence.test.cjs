@@ -148,10 +148,10 @@ test("published truncated producer shows bound while retaining original call wit
 
 // Exercise the app's own unsupported branch, not a test-side legacy render.
 // The response is based on a real published SequenceView and keeps its pin/seed.
-test("published app visibly falls back for witnessed targets and current depth, Mermaid, SVG and timeout limits",{timeout:240000},async()=>published(source,async({page,dto,pin})=>{
+test("published app visibly falls back for witnessed targets, depth, Mermaid, SVG and renderer failures",{timeout:240000},async()=>published(source,async({page,dto,pin})=>{
  const original=structuredClone(dto),leaf=original.steps.find(s=>s.kind==="call");
  assert.ok(leaf,"published call witness required");
- const cases=["target","depth","mermaid","svg","timeout"];
+ const cases=["target","depth","mermaid","svg","renderer-failure"];
  for(const scenario of cases) {
    const changed=structuredClone(original);
    const ids=[];
@@ -199,7 +199,7 @@ test("published app visibly falls back for witnessed targets and current depth, 
          const modified=svg.replace("</svg>",'<g class="pele-test-padding"></g>'.repeat(12001-count)+"</svg>");
          return {...result,svg:modified};
        }};
-       if(scenario==="timeout") window.pele={render:()=>({get svg(){return new Promise(()=>{});}})};
+       if(scenario==="renderer-failure") window.pele={render:()=>{throw new Error("Pele renderer failed");}};
      },scenario);
      // This actual app control invokes loadSequence and consumes the routed,
      // published-pinned response. Show all is required to retain large labels.
@@ -212,7 +212,7 @@ test("published app visibly falls back for witnessed targets and current depth, 
        .catch(async error=>{throw new Error(`${scenario}: ${error.message}; state=${await page.locator("#sequence-state").textContent()}; responses=${JSON.stringify(responseRequests)}; pageErrors=${JSON.stringify(await page.evaluate(()=>({text:document.querySelector("#sequence-diagram")?.textContent?.slice(0,500),nodes:window.__testPeleNodes})))}`);});
      const state=await page.locator("#sequence-state").textContent();
      assert.match(state,/Pele fell back:/,scenario);
-     const reason={target:/Witnessed call target: target links are not shown in either sequence renderer/,depth:/depth/,mermaid:/Mermaid source too large/,svg:/SVG element/,timeout:/timed out/}[scenario];
+     const reason={target:/Witnessed call target: target links are not shown in either sequence renderer/,depth:/depth/,mermaid:/Mermaid source too large/,svg:/SVG element/,"renderer-failure":/Pele renderer failed/}[scenario];
      assert.match(state,reason,scenario);
      assert.ok(responseRequests.length>=1,`${scenario}: app did not fetch sequence`);
      assert.equal(await page.locator("#sequence-diagram svg.pele").count(),0,scenario);

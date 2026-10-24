@@ -427,9 +427,11 @@ fn selected_fact_corruption_is_typed_and_atomic() {
         .metrics_at(&MetricsOptions::default(), &mut || Ok(()))
         .unwrap_err();
     assert!(
-        error.to_string().contains("incompatible_index"),
+        format!("{error:#}").contains("orphan native call owner"),
         "{error:#}"
     );
+    assert!(store.recovery_pending_for_tests());
+    assert!(response.finish(()).is_err());
 }
 
 #[test]

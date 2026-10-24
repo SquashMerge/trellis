@@ -76,6 +76,7 @@ export async function authorValues(root, command) {
   if (command === "hashes") {
     const captures = [];
     for (const capture of fixture.captures) {
+      if (capture.pinned !== undefined) continue; // attested by profile, no bytes
       const actualHash = contentHash(await confinedFile(root, capture.file));
       captures.push({
         ref: capture.ref,

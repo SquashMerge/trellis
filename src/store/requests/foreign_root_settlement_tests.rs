@@ -487,6 +487,91 @@ fn exhausted_preaccept_admission_returns_busy_without_row() {
 }
 
 #[test]
+fn bootstrap_reopen_during_root_loss_is_root_changed_not_a_vanished_queue() {
+    use std::sync::mpsc;
+    let state = tempfile::tempdir().unwrap();
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("workspace");
+    fs::create_dir(&root).unwrap();
+    let store = Store::open_for_tests(state.path(), &root).unwrap();
+    assert!(!store.request_db_path().exists());
+    let (arrived_tx, arrived_rx) = mpsc::channel();
+    let (resume_tx, resume_rx) = mpsc::channel();
+    let hook = store.test_queue_before_shared_hook.clone();
+    store.test_queue_before_shared_hook.set(move || {
+        hook.set(move || {
+            arrived_tx.send(()).unwrap();
+            resume_rx
+                .recv_timeout(crate::testing::HANG_BACKSTOP)
+                .unwrap();
+        });
+    });
+    let reader = store.clone();
+    let worker = std::thread::spawn(move || reader.request_connection().map(|_| ()));
+    // The second admission is the recursive reopen after publication.
+    let arrived = arrived_rx.recv_timeout(crate::testing::HANG_BACKSTOP);
+    let published = store.request_db_path().exists();
+    let renamed = arrived
+        .as_ref()
+        .ok()
+        .map(|_| fs::rename(&root, parent.path().join("old-workspace")));
+    // Release and join before asserting, including on a missed arrival.
+    let _ = resume_tx.send(());
+    let result = worker.join();
+    arrived.unwrap();
+    assert!(
+        published,
+        "bootstrap must publish before the recursive reopen"
+    );
+    renamed.unwrap().unwrap();
+    assert!(!root.exists());
+    let error = result.unwrap().unwrap_err();
+    assert!(error.to_string().starts_with("root_changed"), "{error:#}");
+}
+
+#[test]
+fn bootstrap_reopen_with_vanished_queue_is_incompatible_queue() {
+    use std::sync::mpsc;
+    let state = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    assert!(!store.request_db_path().exists());
+    let (arrived_tx, arrived_rx) = mpsc::channel();
+    let (resume_tx, resume_rx) = mpsc::channel();
+    let hook = store.test_queue_before_shared_hook.clone();
+    store.test_queue_before_shared_hook.set(move || {
+        hook.set(move || {
+            arrived_tx.send(()).unwrap();
+            resume_rx
+                .recv_timeout(crate::testing::HANG_BACKSTOP)
+                .unwrap();
+        });
+    });
+    let reader = store.clone();
+    let worker = std::thread::spawn(move || reader.request_connection().map(|_| ()));
+    let arrived = arrived_rx.recv_timeout(crate::testing::HANG_BACKSTOP);
+    let published = store.request_db_path().exists();
+    let removed = arrived
+        .as_ref()
+        .ok()
+        .map(|_| fs::remove_file(store.request_db_path()));
+    let _ = resume_tx.send(());
+    let result = worker.join();
+    arrived.unwrap();
+    assert!(
+        published,
+        "bootstrap must publish before the recursive reopen"
+    );
+    removed.unwrap().unwrap();
+    store.identity.verify().unwrap();
+    let error = result.unwrap().unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "incompatible_queue: published requests.db disappeared"
+    );
+}
+
+#[test]
 fn root_replaced_missing_queue_does_not_publish() {
     let state = tempfile::tempdir().unwrap();
     let parent = tempfile::tempdir().unwrap();

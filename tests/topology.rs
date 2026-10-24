@@ -1247,6 +1247,7 @@ fn guard_drop_unlocks_even_when_fork_child_keeps_descriptor() {
     let (temp, roots) = common::fixture();
     let work = root(temp.path());
     let id = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
+    drop(roots.index_use(&id).unwrap());
     let guard = roots
         .writer(std::sync::Arc::new(id.verified_clone_for_tests().unwrap()))
         .unwrap();
@@ -2656,14 +2657,8 @@ fn automatic_gc_deletes_old_schema_indexes_unless_in_use_or_unreadable() {
         let workspace = temp.path().join(name);
         fs::create_dir(&workspace).unwrap();
         let identity = WorkspaceIdentity::discover(Some(&workspace), &workspace).unwrap();
-        // Create the private use-lock inode without opening a current Store.
-        drop(
-            roots
-                .writer(std::sync::Arc::new(
-                    identity.verified_clone_for_tests().unwrap(),
-                ))
-                .unwrap(),
-        );
+        // Provision the fixture without opening a current Store.
+        drop(roots.index_use(&identity).unwrap());
         let path = roots.index_db(&identity);
         let db = rusqlite::Connection::open(&path).unwrap();
         db.execute_batch("CREATE TABLE anything(x)").unwrap();
@@ -2686,13 +2681,7 @@ fn automatic_gc_deletes_old_schema_indexes_unless_in_use_or_unreadable() {
     let unreadable_root = temp.path().join("unreadable");
     fs::create_dir(&unreadable_root).unwrap();
     let unreadable = WorkspaceIdentity::discover(Some(&unreadable_root), &unreadable_root).unwrap();
-    drop(
-        roots
-            .writer(std::sync::Arc::new(
-                unreadable.verified_clone_for_tests().unwrap(),
-            ))
-            .unwrap(),
-    );
+    drop(roots.index_use(&unreadable).unwrap());
     fs::write(roots.index_db(&unreadable), b"not a sqlite database").unwrap();
     fs::set_permissions(
         roots.index_db(&unreadable),

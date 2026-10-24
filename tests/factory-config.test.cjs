@@ -220,7 +220,7 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
         ["cargo", "clippy", "--locked", "--all-targets", "--", "-D", "warnings"],
         ["cargo", "clippy", "--locked", "--all-targets", "--features", "test-support", "--", "-D", "warnings"],
         ["cargo", "build", "--locked", "--bin", "trellis"],
-        ["node", "--test", "--test-concurrency=1", "tests/browser/saved-items.test.cjs", "tests/browser/sequence-pele.test.cjs", "tests/browser/sequence.test.cjs", "tests/browser/sequence-cost.test.cjs"],
+        ["node", "--test", "--test-concurrency=1", "tests/browser/saved-items.test.cjs", "tests/browser/sequence-harness.test.cjs", "tests/browser/sequence-pele.test.cjs", "tests/browser/sequence.test.cjs", "tests/browser/sequence-cost.test.cjs"],
       ],
       tests: [
         ["cargo", "nextest", "--version"],
@@ -232,7 +232,7 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
         ["node", "--test", "runtime/acp/runner.test.mjs"],
         ["node", "--test", "tests/mcp-catalog-sdk.test.mjs"],
         ["node", "--test", "tests/factory-config.test.cjs"],
-        ["node", "docs/semantic-evidence/check-policy.mjs"],
+        ["node", "docs/semantic-evidence/check-policy.mjs", "--self-test"],
         ["node", "--check", "web/app.js"],
         ["node", "--test", "tests/question-ui.test.cjs", "tests/browse-ui.test.cjs", "tests/sequence-ui.test.cjs", "tests/token-ui.test.cjs", "tests/external-source-ui.test.cjs", "tests/dependency-ui.test.cjs", "tests/shell-ui.test.cjs", "tests/classes-ui.test.cjs", "tests/navigation-ui.test.cjs"],
       ],

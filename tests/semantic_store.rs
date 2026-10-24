@@ -1172,9 +1172,7 @@ fn malformed_nullable_targets_fail_typed_selected_read_and_schedule_recovery() {
         drop(db);
         let error = store.semantic_at(pin).unwrap_err();
         assert!(
-            error
-                .to_string()
-                .starts_with("incompatible_index: selected evidence decode failed:"),
+            error.to_string().contains("incompatible_index:"),
             "{error:#}"
         );
         assert!(
@@ -1183,6 +1181,7 @@ fn malformed_nullable_targets_fail_typed_selected_read_and_schedule_recovery() {
                 .contains("corrupt semantic target payload"),
             "{error:#}"
         );
+        assert!(store.recovery_pending_for_tests());
         assert_eq!(
             store.status().unwrap_err().to_string(),
             "incompatible_index: reconciliation required after invalid current index"
@@ -1680,11 +1679,16 @@ fn corrupt_selected_child_and_impossible_enum_fail_without_partial_result() {
         drop(db);
         let error = store.semantic_at(pin).unwrap_err();
         assert!(
-            error
-                .to_string()
-                .starts_with("incompatible_index: selected evidence decode failed:"),
+            error.to_string().contains("incompatible_index:"),
             "{error:#}"
         );
+        let detail = if variant == 0 {
+            "corrupt semantic child ordinal"
+        } else {
+            "impossible-state"
+        };
+        assert!(error.to_string().contains(detail), "{error:#}");
+        assert!(store.recovery_pending_for_tests());
         assert_eq!(
             store.status().unwrap_err().to_string(),
             "incompatible_index: reconciliation required after invalid current index"
@@ -2049,6 +2053,12 @@ fn assert_corrupt_symbol_documents(table: &str, prefix: &str) {
         let error = store.semantic_at(pin).unwrap_err();
         assert!(
             error.to_string().contains("incompatible_index"),
+            "{table} {corruption}: {error:#}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("corrupt semantic symbol scope/document"),
             "{table} {corruption}: {error:#}"
         );
         assert!(store.recovery_pending_for_tests(), "{table} {corruption}");

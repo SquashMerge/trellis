@@ -29,6 +29,8 @@ mod indexer_rust;
 pub mod mcp;
 pub mod metrics;
 pub mod model;
+#[cfg(feature = "test-support")]
+pub mod native_capture;
 pub mod native_evidence;
 pub mod native_ids;
 pub mod navigation;

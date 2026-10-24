@@ -505,7 +505,7 @@ async function specimen(
     const evidenceKind =
       fact.kind === "typeRelationship"
         ? "typeRelationship"
-        : fact.kind === "declarationBinding"
+        : ["declarationBinding", "symbol"].includes(fact.kind)
           ? "declarationBinding"
           : "semanticReference";
     return fact.ref === "fact-b"
@@ -1735,10 +1735,42 @@ test("measured declaration site supports definition and alias roles once per ref
   assert.deepEqual(actual.observedRoles, ["definition", "alias"]);
 });
 
-test("each independent corpus minimum and each of eight category and five outcome floors", async () => {
-  const full = {
+// Independently authored Decision 0017 Amendment 1 floors, per language.
+const amendedFloors = {
+  javascript: {
+    ambiguous: 20,
+    unsupported: 1,
+    typeRelationships: 20,
+    exempt: [],
+  },
+  java: {
+    ambiguous: 0,
+    unsupported: 0,
+    typeRelationships: 20,
+    exempt: ["alias"],
+  },
+  python: {
+    ambiguous: 0,
+    unsupported: 0,
+    typeRelationships: 20,
+    exempt: ["alias"],
+  },
+  rust: { ambiguous: 0, unsupported: 1, typeRelationships: 0, exempt: [] },
+};
+const allRoles = [
+  "definition",
+  "read",
+  "write",
+  "call",
+  "type",
+  "import",
+  "alias",
+];
+const countAtFloors = (language) => {
+  const floors = amendedFloors[language];
+  return {
     formatVersion: 1,
-    language: "javascript",
+    language,
     profile: "corpus",
     floorsEnforced: true,
     scenariosTotal: 32,
@@ -1755,51 +1787,106 @@ test("each independent corpus minimum and each of eight category and five outcom
     measuredCalls: 120,
     references: 40,
     callableValueNegatives: 20,
-    typeRelationships: 20,
+    typeRelationships: floors.typeRelationships,
     outcomes: [
-      "resolved",
-      "provenExternal",
-      "ambiguous",
-      "unresolved",
-      "unsupported",
-    ].map((disposition) => ({ disposition, count: 20 })),
-    observedRoles: [
-      "definition",
-      "read",
-      "write",
-      "call",
-      "type",
-      "import",
-      "alias",
-    ],
+      ["resolved", 20],
+      ["provenExternal", 20],
+      ["ambiguous", floors.ambiguous],
+      ["unresolved", 20],
+      ["unsupported", floors.unsupported],
+    ].map(([disposition, count]) => ({ disposition, count })),
+    observedRoles: allRoles.filter((role) => !floors.exempt.includes(role)),
   };
-  assert.equal(assertCorpusFloors(full), full);
-  const mutations = [
-    ...[
-      "scenariosTotal",
-      "measuredCalls",
-      "references",
-      "callableValueNegatives",
-      "typeRelationships",
-    ].map((field) => (row) => {
-      row[field]--;
-    }),
-    ...full.scenariosByCategory.map((_, i) => (row) => {
-      row.scenariosByCategory[i].count--;
-    }),
-    ...full.outcomes.map((_, i) => (row) => {
-      row.outcomes[i].count--;
-    }),
-    ...full.observedRoles.map((role) => (row) => {
-      row.observedRoles = row.observedRoles.filter((value) => value !== role);
-    }),
-  ];
-  const controls = registerControls(
-    mutations.map((mutate, i) => ({
-      id: `COUNT.floor.boundary.${i}`,
-      baseline: () => full,
+};
+
+test("each independent corpus minimum and each nonzero category and outcome floor, per language", async () => {
+  for (const language of Object.keys(amendedFloors)) {
+    const full = countAtFloors(language);
+    assert.equal(assertCorpusFloors(full), full);
+    const mutations = [
+      ...[
+        "scenariosTotal",
+        "measuredCalls",
+        "references",
+        "callableValueNegatives",
+        "typeRelationships",
+      ]
+        .filter((field) => full[field] > 0)
+        .map((field) => (row) => {
+          row[field]--;
+        }),
+      ...full.scenariosByCategory.map((_, i) => (row) => {
+        row.scenariosByCategory[i].count--;
+      }),
+      ...full.outcomes
+        .map((x, i) => [x, i])
+        .filter(([x]) => x.count > 0)
+        .map(([, i]) => (row) => {
+          row.outcomes[i].count--;
+        }),
+      ...full.observedRoles.map((role) => (row) => {
+        row.observedRoles = row.observedRoles.filter((value) => value !== role);
+      }),
+    ];
+    const controls = registerControls(
+      mutations.map((mutate, i) => ({
+        id: `COUNT.floor.boundary.${language}.${i}`,
+        baseline: () => full,
+        mutate: (row) => {
+          mutate(row);
+          return row;
+        },
+        check: assertCorpusFloors,
+        expectedAssertion: "COUNT.FLOOR",
+        expectedCode: "invalidRecord",
+        expectedField: "counts",
+      })),
+    );
+    for (const row of controls) await runControl(row);
+  }
+});
+
+test("ambiguous floor is 0 for Python, Java and Rust and stays 20 for JavaScript", async () => {
+  for (const language of ["python", "java", "rust"]) {
+    const count = countAtFloors(language);
+    assert.equal(
+      count.outcomes.find((x) => x.disposition === "ambiguous").count,
+      0,
+    );
+    assert.equal(assertCorpusFloors(count), count);
+  }
+  const controls = registerControls([
+    {
+      id: "COUNT.floor.javascript-ambiguous-19",
+      baseline: () => countAtFloors("javascript"),
       mutate: (row) => {
-        mutate(row);
+        row.outcomes.find((x) => x.disposition === "ambiguous").count = 19;
+        return row;
+      },
+      check: assertCorpusFloors,
+      expectedAssertion: "COUNT.FLOOR",
+      expectedCode: "invalidRecord",
+      expectedField: "counts",
+    },
+  ]);
+  for (const row of controls) await runControl(row);
+});
+
+test("unsupported floor is 0 for Java and Python and stays 1 for JavaScript and Rust", async () => {
+  for (const language of ["java", "python"]) {
+    const count = countAtFloors(language);
+    assert.equal(
+      count.outcomes.find((x) => x.disposition === "unsupported").count,
+      0,
+    );
+    assert.equal(assertCorpusFloors(count), count);
+  }
+  const controls = registerControls(
+    ["javascript", "rust"].map((language) => ({
+      id: `COUNT.floor.${language}-unsupported-0`,
+      baseline: () => countAtFloors(language),
+      mutate: (row) => {
+        row.outcomes.find((x) => x.disposition === "unsupported").count = 0;
         return row;
       },
       check: assertCorpusFloors,
@@ -1809,12 +1896,78 @@ test("each independent corpus minimum and each of eight category and five outcom
     })),
   );
   for (const row of controls) await runControl(row);
-  const java = {
-    ...full,
-    language: "java",
-    observedRoles: full.observedRoles.filter((role) => role !== "alias"),
+});
+
+test("Rust needs no type relationships; Java, JavaScript and Python still need 20", async () => {
+  const rust = countAtFloors("rust");
+  assert.equal(rust.typeRelationships, 0);
+  assert.equal(assertCorpusFloors(rust), rust);
+  const controls = registerControls(
+    ["java", "javascript", "python"].map((language) => ({
+      id: `COUNT.floor.${language}-relationships-19`,
+      baseline: () => countAtFloors(language),
+      mutate: (row) => {
+        row.typeRelationships = 19;
+        return row;
+      },
+      check: assertCorpusFloors,
+      expectedAssertion: "COUNT.FLOOR",
+      expectedCode: "invalidRecord",
+      expectedField: "counts",
+    })),
+  );
+  for (const row of controls) await runControl(row);
+});
+
+test("alias role is exempt for Java and Python and required for JavaScript and Rust", async () => {
+  for (const language of ["java", "python"]) {
+    const count = countAtFloors(language);
+    assert.equal(count.observedRoles.includes("alias"), false);
+    assert.equal(assertCorpusFloors(count), count);
+  }
+  const controls = registerControls(
+    ["javascript", "rust"].map((language) => ({
+      id: `COUNT.floor.${language}-alias-required`,
+      baseline: () => countAtFloors(language),
+      mutate: (row) => {
+        row.observedRoles = row.observedRoles.filter((x) => x !== "alias");
+        return row;
+      },
+      check: assertCorpusFloors,
+      expectedAssertion: "COUNT.FLOOR",
+      expectedCode: "invalidRecord",
+      expectedField: "counts",
+    })),
+  );
+  for (const row of controls) await runControl(row);
+});
+
+test("alias-name reference resolving to the original declaration counts toward alias", async (t) => {
+  // The producer reports the alias name as a reference to the original
+  // declaration; the measured alias name is a declaration site, and its target
+  // is a different, original declaration.
+  const s = await specimen(t, {
+    declarationSite: true,
+    mutateFact: (fact) => {
+      fact.record.site = "declaration";
+      fact.record.roles = ["definition", "alias"];
+      fact.record.declaredTarget = {
+        kind: "internal",
+        declarationRef: "main",
+        revisionId: "r1",
+      };
+    },
+  });
+  // Independently authored normalized row: the alias site targets `main`.
+  s.records.references[0].declaredTarget = {
+    kind: "internal",
+    syntaxId: mainId,
+    document,
+    revisionId: "r1",
   };
-  assert.equal(assertCorpusFloors(java), java);
+  const actual = checkCounts(s.loaded, s.records);
+  assert.equal(actual.references, 1);
+  assert.deepEqual(actual.observedRoles, ["definition", "alias"]);
 });
 
 test("captured proof cannot be relabelled to an unrelated fact", async (t) => {
@@ -1908,6 +2061,10 @@ async function generatedCorpus(
     duplicateProducer = false,
     omitRole = null,
     noOverloadSignatures = false,
+    // Drop the 20 invocation-family facts and their unsupported assertions.
+    withoutUnsupportedFacts = false,
+    // Declare every native family available, so no document can qualify.
+    allFamiliesAvailable = false,
   } = {},
 ) {
   const doc = {
@@ -2285,7 +2442,7 @@ async function generatedCorpus(
     callFacts.push(fact);
   }
   const unsupportedFacts = [];
-  for (let i = 0; i < 20; i++) {
+  for (let i = 0; i < (withoutUnsupportedFacts ? 0 : 20); i++) {
     const fact = addFact("callBinding", unsupportedSelectors[i], {
       resolution: "unresolved",
       declaredTarget: null,
@@ -2410,6 +2567,7 @@ async function generatedCorpus(
       rows.controls = [];
     },
     mutateSupport: (support) => {
+      if (allFamiliesAvailable) return;
       support.find((x) => x.kind === "invocation").available = false;
       support.find((x) => x.kind === "invocation").diagnostic =
         "invocation unavailable";
@@ -2451,9 +2609,10 @@ test("temporary captured Java corpus reaches each exact floor through checkCount
   assert.equal(count.references, 40);
   assert.equal(count.callableValueNegatives, 20);
   assert.equal(count.typeRelationships, 20);
+  // Twenty unsupported anchors share one document, so they count once.
   assert.deepEqual(
     count.outcomes.map((x) => x.count),
-    Array(5).fill(20),
+    [20, 20, 20, 20, 1],
   );
   assert.deepEqual(count.observedRoles, [
     "definition",
@@ -2533,13 +2692,6 @@ test("integrated captured corpus rejects each count below its exact floor", asyn
         },
       },
       {
-        id: "COUNT.corpus.outcome-unsupported-19",
-        mutate: (value) => {
-          value.dispositions.assertions.pop();
-          return value;
-        },
-      },
-      {
         id: "COUNT.corpus.negative-19",
         mutate: (value) => {
           value.dispositions.callableValueNegatives.pop();
@@ -2611,7 +2763,8 @@ test("integrated captured corpus rejects each count below its exact floor", asyn
           return value;
         },
       })),
-      ...["resolved", "provenExternal", "ambiguous", "unresolved"].map(
+      // Java has no ambiguous floor (Decision 0017 Amendment 1).
+      ...["resolved", "provenExternal", "unresolved"].map(
         (disposition) => ({
           id: `COUNT.corpus.outcome-${disposition}-19`,
           mutate: (value) => {
@@ -2643,6 +2796,164 @@ test("integrated captured corpus rejects each count below its exact floor", asyn
     })),
   );
   for (const control of controls) await runControl(control);
+});
+
+test("captured Java corpus with no ambiguous outcomes meets its floors", async (t) => {
+  const s = await generatedCorpus(t);
+  const dispositions = structuredClone(s.loaded.dispositions);
+  dispositions.assertions = dispositions.assertions.filter(
+    (x) => x.disposition !== "ambiguous",
+  );
+  const count = checkCounts({ ...s.loaded, dispositions }, s.records);
+  assert.equal(
+    count.outcomes.find((x) => x.disposition === "ambiguous").count,
+    0,
+  );
+  assert.equal(count.floorsEnforced, true);
+});
+
+test("unresolved outcome counts only in a complete-coverage document", async (t) => {
+  // A measured call with no producer target, captured as unresolved.
+  const unresolvedCall = (fact) => {
+    fact.record.resolution = "unresolved";
+    fact.record.declaredTarget = null;
+    fact.record.candidates = [];
+  };
+  const complete = await specimen(t, {
+    family: "callee",
+    normalized: true,
+    mutateFact: unresolvedCall,
+  });
+  // Same call, but the requested read role is unmeasurable, so the semantic
+  // tuple is partial and absence of a target is not evidence.
+  const partial = await specimen(t, {
+    family: "callee",
+    normalized: true,
+    mutateFact: unresolvedCall,
+    mutateSupport: (support) => {
+      const reference = support.find((x) => x.kind === "reference");
+      reference.available = false;
+      reference.diagnostic = "reference unavailable";
+    },
+    mutateCoverage: (row) =>
+      row.selected
+        ? { ...row, state: "partial", diagnostic: "reference unavailable" }
+        : row,
+  });
+  for (const s of [complete, partial])
+    s.loaded.dispositions.assertions.push({
+      kind: "resolution",
+      factRef: "fact",
+      disposition: "unresolved",
+    });
+  assert.equal(
+    checkCounts(complete.loaded, complete.records).outcomes.find(
+      (x) => x.disposition === "unresolved",
+    ).count,
+    1,
+  );
+  const controls = registerControls([
+    {
+      id: "COUNT.disposition.unresolved-partial-coverage",
+      baseline: () => 0,
+      mutate: () => 1,
+      check: (value) => {
+        const s = value === 0 ? complete : partial;
+        return checkCounts(s.loaded, s.records);
+      },
+      expectedAssertion: "COUNT.DISPOSITION",
+      expectedCode: "invalidRecord",
+      expectedField: "assertions",
+    },
+  ]);
+  for (const control of controls) await runControl(control);
+});
+
+test("unsupported document qualifies with only an authenticated symbol fact, not bookkeeping", async (t) => {
+  const unavailableInvocation = (support) => {
+    const row = support.find((x) => x.kind === "invocation");
+    row.available = false;
+    row.diagnostic = "invocation unavailable";
+  };
+  const unsupported = (s) =>
+    checkCounts(s.loaded, s.records).outcomes.find(
+      (x) => x.disposition === "unsupported",
+    ).count;
+  // Prime's PR #268 symbol-only repro: one captured symbol, no other facts.
+  const symbolOnly = await specimen(t, {
+    normalized: true,
+    facts: [
+      {
+        kind: "symbol",
+        ref: "symbol-only",
+        record: {
+          key: {
+            scheme: "scip",
+            symbol: "pkg target",
+            scope: "global",
+            document: null,
+          },
+          displayName: "target",
+          declarations: [declaredTarget],
+          provenanceId: "proof",
+        },
+      },
+    ],
+    mutateSupport: unavailableInvocation,
+  });
+  assert.equal(symbolOnly.records.symbols.length, 1);
+  assert.equal(unsupported(symbolOnly), 1);
+  // Coverage and provenance facts alone do not qualify the document.
+  const bookkeepingOnly = await specimen(t, {
+    normalized: true,
+    facts: [],
+    mutateSupport: unavailableInvocation,
+  });
+  const bookkeeping = bookkeepingOnly.loaded.annotations[0].facts;
+  assert.ok(bookkeeping.some((x) => x.kind === "coverage"));
+  assert.ok(
+    bookkeeping.every((x) => ["coverage", "provenance"].includes(x.kind)),
+  );
+  assert.equal(unsupported(bookkeepingOnly), 0);
+});
+
+test("unsupported floor: a declared-unavailable native family plus producer facts qualifies the document", async (t) => {
+  // Twenty unsupported-join assertions in one document count once.
+  const full = await generatedCorpus(t);
+  const unsupported = (s) =>
+    checkCounts(s.loaded, s.records).outcomes.find(
+      (x) => x.disposition === "unsupported",
+    ).count;
+  assert.equal(unsupported(full), 1);
+  // No invocation-family facts and no unsupported assertions: the unavailable
+  // native invocation capability and the document's other producer facts are
+  // enough (Prime's PR #268 repro).
+  const capabilityOnly = await generatedCorpus(t, {
+    withoutUnsupportedFacts: true,
+  });
+  assert.equal(
+    capabilityOnly.loaded.dispositions.assertions.some(
+      (x) => x.disposition === "unsupported",
+    ),
+    false,
+  );
+  assert.equal(unsupported(capabilityOnly), 1);
+  assert.equal(
+    checkCounts(capabilityOnly.loaded, capabilityOnly.records).floorsEnforced,
+    true,
+  );
+  // A document whose native families are all available does not qualify.
+  // This corpus is Java, whose floor is 0 (Amendment 3); the JavaScript and
+  // Rust floor of one is checked at the floor boundary.
+  const allAvailable = await generatedCorpus(t, {
+    withoutUnsupportedFacts: true,
+    allFamiliesAvailable: true,
+  });
+  assert.equal(unsupported(allAvailable), 0);
+  assert.equal(
+    checkCounts(allAvailable.loaded, allAvailable.records).floorsEnforced,
+    true,
+  );
 });
 
 test("Java overloads accept distinct signatures but reject unrelated names and containers", async (t) => {

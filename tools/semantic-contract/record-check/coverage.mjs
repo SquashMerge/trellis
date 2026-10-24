@@ -69,8 +69,9 @@ function capture(loaded, kind, hash) {
     (x) =>
       x.kind === kind &&
       x.hash === hash &&
-      loaded.captureBytes.has(x.ref) &&
-      contentHash(loaded.captureBytes.get(x.ref)) === hash,
+      (x.pinned !== undefined ||
+        (loaded.captureBytes.has(x.ref) &&
+          contentHash(loaded.captureBytes.get(x.ref)) === hash)),
   );
 }
 function documentAt(loaded, document, revisionId) {

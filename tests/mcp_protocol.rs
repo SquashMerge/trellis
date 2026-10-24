@@ -785,6 +785,15 @@ fn call(legacy: bool, id: Value, name: &str, arguments: Value) -> Value {
     }
 }
 fn phase_barrier(listener: &std::os::unix::net::UnixListener, stage: &str, mutate: impl FnOnce()) {
+    phase_barrier_before_reply(listener, stage, None, mutate);
+}
+
+fn phase_barrier_before_reply(
+    listener: &std::os::unix::net::UnixListener,
+    stage: &str,
+    replies: Option<&Receiver<Value>>,
+    mutate: impl FnOnce(),
+) {
     listener.set_nonblocking(true).unwrap();
     let deadline = std::time::Instant::now() + trellis::testing::HANG_BACKSTOP;
     let mut stream = loop {
@@ -794,6 +803,15 @@ fn phase_barrier(listener: &std::os::unix::net::UnixListener, stage: &str, mutat
                 if error.kind() == std::io::ErrorKind::WouldBlock
                     && std::time::Instant::now() < deadline =>
             {
+                if let Some(replies) = replies {
+                    match replies.try_recv() {
+                        Ok(reply) => panic!("MCP replied before phase {stage}: {reply}"),
+                        Err(mpsc::TryRecvError::Disconnected) => {
+                            panic!("MCP reply reader ended before phase {stage}")
+                        }
+                        Err(mpsc::TryRecvError::Empty) => {}
+                    }
+                }
                 std::thread::yield_now()
             }
             Err(error) => panic!("MCP phase {stage} was not reached: {error}"),
@@ -3011,40 +3029,132 @@ fn stalling_git_path(temp: &Path, flag: &Path, once: bool) -> std::ffi::OsString
 /// #131: a final selected check whose Git lookup outlives its bound (a loaded
 /// host) proves no root change. The call retries within its deadline and
 /// answers; it was `root_changed`.
-#[test]
-fn final_selected_check_survives_a_slow_git_lookup() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn final_selected_check_survives_a_slow_git_lookup() {
+    use trellis::daemon::registry::CheckoutRegistry;
+    use trellis::store::topology::{TopologyRoots, WorkspaceIdentity};
     let temp = tempfile::tempdir().unwrap();
     let (main, linked) = git_linked_fixture(temp.path());
+    let identity = WorkspaceIdentity::discover(Some(&main), &main)
+        .unwrap()
+        .attach_marker()
+        .unwrap();
+    let topology =
+        TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(301, &identity).unwrap();
+    let selected = registry.select(301, &identity, &linked).unwrap();
+    let runtime = registry.activate(&selected.identity.root_key).unwrap();
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        loop {
+            if let Ok((response, catching_up)) = runtime.evidence_response()
+                && response.finish(()).is_ok()
+                && !catching_up
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("linked checkout did not settle before the final-check fixture");
+    runtime
+        .freeze_mcp_call_clock_for_tests(std::time::Instant::now() - trellis::mcp::CALL_DEADLINE);
+    let clock = runtime.clone();
+    let hooks = trellis::mcp::TransportHooksForTests {
+        paused_clock_for_tests: Some(std::sync::Arc::new(move || {
+            clock.mcp_call_clock_now_for_tests()
+        })),
+        ..Default::default()
+    };
     let slow = temp.path().join("slow-next-git");
     let path = stalling_git_path(temp.path(), &slow, true);
     let socket = temp.path().join("phase.sock");
     let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-    let mut peer = Peer::start_with_phase_env(
-        Some(&main),
-        Some(("selected_final", &socket)),
-        &[("PATH", path.as_os_str())],
-    );
-    peer.send_raw(
-        serde_json::to_string(&call(
+    struct FixtureGuard {
+        env: Vec<(&'static str, Option<std::ffi::OsString>)>,
+        client: Option<std::os::unix::net::UnixStream>,
+        session: Option<std::thread::JoinHandle<std::io::Result<()>>>,
+        reader: Option<std::thread::JoinHandle<()>>,
+    }
+    impl Drop for FixtureGuard {
+        fn drop(&mut self) {
+            if let Some(client) = &self.client {
+                let _ = client.shutdown(std::net::Shutdown::Both);
+            }
+            if let Some(reader) = self.reader.take() {
+                let _ = reader.join();
+            }
+            if let Some(session) = self.session.take() {
+                let _ = session.join();
+            }
+            for (key, value) in &self.env {
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+    }
+    let mut cleanup = FixtureGuard {
+        env: [
+            "PATH",
+            "TRELLIS_TEST_MCP_PHASE",
+            "TRELLIS_TEST_MCP_PHASE_SOCKET",
+        ]
+        .into_iter()
+        .map(|key| (key, std::env::var_os(key)))
+        .collect(),
+        client: None,
+        session: None,
+        reader: None,
+    };
+    unsafe {
+        std::env::set_var("PATH", &path);
+        std::env::set_var("TRELLIS_TEST_MCP_PHASE", "selected_final");
+        std::env::set_var("TRELLIS_TEST_MCP_PHASE_SOCKET", &socket);
+    }
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    let (client, mut reader, session) = hooked_session(&identity, &registry, 301, None, hooks);
+    cleanup.client = Some(client);
+    cleanup.session = Some(session);
+    writeln!(
+        cleanup.client.as_mut().unwrap(),
+        "{}",
+        call(
             false,
             json!(1),
             "trellis_workspace_describe",
             json!({"schemaVersion":1,"workspace":linked}),
-        ))
-        .unwrap()
-        .as_bytes(),
-    );
-    phase_barrier(&listener, "selected_final", || {
+        )
+    )
+    .unwrap();
+    let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+    cleanup.reader = Some(std::thread::spawn(move || {
+        let _ = reply_tx.send(next_reply(&mut reader));
+    }));
+    phase_barrier_before_reply(&listener, "selected_final", Some(&reply_rx), || {
         fs::write(&slow, b"").unwrap()
     });
-    let reply = peer.reply();
+    let reply = reply_rx
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .unwrap();
+    cleanup.reader.take().unwrap().join().unwrap();
     assert!(!slow.exists(), "the final check ran no Git lookup");
     tool(&reply, None, true);
     assert_eq!(
         reply["result"]["structuredContent"]["workspace"],
         json!(linked)
     );
-    assert!(peer.finish().0.success());
+    cleanup
+        .client
+        .take()
+        .unwrap()
+        .shutdown(std::net::Shutdown::Both)
+        .unwrap();
+    cleanup.session.take().unwrap().join().unwrap().unwrap();
 }
 
 /// #131 review: a final selected check that keeps stalling waits off the
@@ -4594,6 +4704,153 @@ async fn describe_cold_initial_startup_reports_indexing_without_prior_coverage()
         "trellis_workspace_describe: 1 workspace; full result in structuredContent."
     );
     resume_tx.send(()).unwrap();
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn obsolete_cold_index_recovers_over_mcp_without_explicit_options_or_fifo() {
+    use trellis::daemon::registry::CheckoutRegistry;
+    use trellis::store::{
+        Store,
+        topology::{TopologyRoots, WorkspaceIdentity},
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let root = checkout(temp.path());
+    fs::write(root.join("a.js"), "function UpgradeTarget() {}\n").unwrap();
+    let identity = WorkspaceIdentity::discover(Some(&root), &root)
+        .unwrap()
+        .attach_marker()
+        .unwrap();
+    let topology =
+        TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+    let store = Store::open_for_tests(temp.path(), &root).unwrap();
+    store.mcp_prepare_virgin_queue_for_tests().unwrap();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
+        &trellis::indexer::IndexOptions::new(root.clone()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    let writer = store.publication_for_tests().unwrap();
+    let original = store
+        .publish_native(
+            &graph,
+            &capture,
+            &native,
+            &writer,
+            store.index_baseline().unwrap(),
+            &cancel,
+        )
+        .unwrap();
+    assert!(store.earliest_unfinished_request().unwrap().is_none());
+    drop(writer);
+    drop(store);
+    // No live SQLite handle remains while changing the stored format marker.
+    let db = rusqlite::Connection::open(topology.index_db(&identity)).unwrap();
+    db.execute_batch(
+        "PRAGMA ignore_check_constraints=ON; UPDATE index_metadata SET schema_version=7;",
+    )
+    .unwrap();
+    drop(db);
+
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(1930, &identity).unwrap();
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (resume_tx, resume_rx) = mpsc::sync_channel(1);
+    let resume_rx = std::sync::Mutex::new(resume_rx);
+    registry.set_next_startup_hook_for_tests(std::sync::Arc::new(move || {
+        entered_tx.send(()).unwrap();
+        resume_rx
+            .lock()
+            .unwrap()
+            .recv_timeout(trellis::testing::HANG_BACKSTOP)
+            .unwrap();
+    }));
+    let runtime = registry.activate(&identity.root_key).unwrap();
+    tokio::task::spawn_blocking(move || {
+        entered_rx
+            .recv_timeout(trellis::testing::HANG_BACKSTOP)
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    let (mut client, mut reader, session) = socket_session(&identity, &registry, 1930, None);
+    writeln!(client, "{}", modern(json!(1931), "tools/call", json!({
+        "name":"trellis_find_symbols", "arguments":{"schemaVersion":1,"query":"UpgradeTarget"}
+    }))).unwrap();
+    let pending = next_reply(&mut reader);
+    tool(&pending, Some("index_not_ready"), true);
+    writeln!(
+        client,
+        "{}",
+        modern(
+            json!(1932),
+            "tools/call",
+            json!({
+                "name":"trellis_workspace_describe", "arguments":{"schemaVersion":1}
+            })
+        )
+    )
+    .unwrap();
+    let described = next_reply(&mut reader);
+    tool(&described, None, true);
+    let pending = &described["result"]["structuredContent"];
+    assert_eq!(pending["catchingUp"], true, "{described}");
+    assert_eq!(pending["data"]["indexState"], "reconciling", "{described}");
+    assert!(pending["evidenceBasis"].is_null());
+
+    let version = runtime.state_version();
+    resume_tx.send(()).unwrap();
+    let ready_runtime = runtime.clone();
+    tokio::task::spawn_blocking(move || {
+        ready_runtime.wait_state_change(version, trellis::testing::HANG_BACKSTOP);
+        assert_ne!(
+            ready_runtime.state_version(),
+            version,
+            "startup did not publish a state transition"
+        );
+        assert!(
+            ready_runtime.reconciliation_error().is_none(),
+            "{:?}",
+            ready_runtime.reconciliation_error()
+        );
+    })
+    .await
+    .unwrap();
+    writeln!(
+        client,
+        "{}",
+        modern(
+            json!(1933),
+            "tools/call",
+            json!({
+                "name":"trellis_workspace_describe", "arguments":{"schemaVersion":1}
+            })
+        )
+    )
+    .unwrap();
+    let ready = next_reply(&mut reader);
+    tool(&ready, None, true);
+    let ready = &ready["result"]["structuredContent"];
+    assert_eq!(ready["data"]["indexState"], "ready");
+    assert_ne!(
+        ready["evidenceBasis"]["indexGeneration"],
+        original.index_generation.to_string()
+    );
+    writeln!(client, "{}", modern(json!(1934), "tools/call", json!({
+        "name":"trellis_find_symbols", "arguments":{"schemaVersion":1,"query":"UpgradeTarget"}
+    }))).unwrap();
+    let found = next_reply(&mut reader);
+    tool(&found, None, true);
+    assert_eq!(
+        found["result"]["structuredContent"]["data"]["symbols"][0]["name"],
+        "UpgradeTarget"
+    );
+    drop(reader);
     drop(client);
     session.join().unwrap().unwrap();
 }
@@ -6500,62 +6757,121 @@ async fn mcp_deadline_before_read_admission_uses_the_pre_resolution_shape() {
 /// counts leave the store. A corrupt row in an unrelated document fails a
 /// zero-hit query, and a query whose hit lies elsewhere, as store_unavailable,
 /// never a successful answer with counts.
-#[test]
-fn mcp_find_unrelated_corrupt_scope_row_fails_zero_hit_and_elsewhere_hits() {
-    use trellis::store::Store;
-    let temp = tempfile::tempdir().unwrap();
-    let root = checkout(temp.path());
-    fs::write(root.join("a.js"), "function Alpha() {}\n").unwrap();
-    fs::write(root.join("b.js"), "function Beta() {}\n").unwrap();
-    let store = Store::open_for_tests(temp.path(), &root).unwrap();
-    store.mcp_prepare_virgin_queue_for_tests().unwrap();
-    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
-        &trellis::indexer::IndexOptions::new(root.clone()),
-        store.root_id(),
-        &cancel,
-        |_| {},
-    )
-    .unwrap();
-    let writer = store.publication_for_tests().unwrap();
-    store
-        .publish_native(
-            &graph,
-            &capture,
-            &native,
-            &writer,
-            store.index_baseline().unwrap(),
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_find_unrelated_corrupt_scope_row_fails_zero_hit_and_elsewhere_hits() {
+    use trellis::daemon::registry::CheckoutRegistry;
+    use trellis::store::{
+        Store,
+        topology::{TopologyRoots, WorkspaceIdentity},
+    };
+    for query in ["no_such_name", "Alpha"] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = checkout(temp.path());
+        fs::write(root.join("a.js"), "function Alpha() {}\n").unwrap();
+        fs::write(root.join("b.js"), "function Beta() {}\n").unwrap();
+        let store = Store::open_for_tests(temp.path(), &root).unwrap();
+        store.mcp_prepare_virgin_queue_for_tests().unwrap();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
+            &trellis::indexer::IndexOptions::new(root.clone()),
+            store.root_id(),
             &cancel,
+            |_| {},
         )
         .unwrap();
-    drop(writer);
-    let response = store.evidence_response().unwrap();
-    assert!(
-        response
-            .mcp_find("no_such_name", 20, None)
-            .unwrap()
-            .symbols
-            .is_empty()
-    );
-    assert_eq!(
-        response.mcp_find("Alpha", 20, None).unwrap().symbols.len(),
-        1
-    );
-    response.finish(()).unwrap();
-    drop(response);
-    // Only b.js's tuple becomes inconsistent (unselected yet "failed").
-    let writer = store.publication_for_tests().unwrap();
-    store
-        .mcp_set_coverage_for_tests(&writer, "b.js", false, "failed")
-        .unwrap();
-    drop(writer);
-    let response = store.evidence_response().unwrap();
-    for query in ["no_such_name", "Alpha"] {
-        let error = response.mcp_find(query, 20, None).map(|_| ()).unwrap_err();
+        let writer = store.publication_for_tests().unwrap();
+        store
+            .publish_native(
+                &graph,
+                &capture,
+                &native,
+                &writer,
+                store.index_baseline().unwrap(),
+                &cancel,
+            )
+            .unwrap();
+        drop(writer);
+        let response = store.evidence_response().unwrap();
         assert!(
-            error.to_string().starts_with("store_unavailable"),
-            "{query}: {error:#}"
+            response
+                .mcp_find("no_such_name", 20, None)
+                .unwrap()
+                .symbols
+                .is_empty()
         );
+        assert_eq!(
+            response.mcp_find("Alpha", 20, None).unwrap().symbols.len(),
+            1
+        );
+        response.finish(()).unwrap();
+        drop(response);
+        let identity = WorkspaceIdentity::discover(Some(&root), &root)
+            .unwrap()
+            .attach_marker()
+            .unwrap();
+        let topology =
+            TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+        let mut registry = CheckoutRegistry::with_roots(topology);
+        registry.attach_launch(2621, &identity).unwrap();
+        let runtime = registry.activate(&identity.root_key).unwrap();
+        tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+            loop {
+                if let Ok((response, catching_up)) = runtime.evidence_response()
+                    && response.finish(()).is_ok()
+                    && !catching_up
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("runtime did not finish valid startup before corruption");
+        let scheduler = runtime.browser_scheduler().unwrap();
+        let _worker = scheduler.hold_worker_for_tests();
+        // Only b.js's tuple becomes inconsistent (unselected yet "failed").
+        let writer = store.publication_for_tests().unwrap();
+        store
+            .mcp_set_coverage_for_tests(&writer, "b.js", false, "failed")
+            .unwrap();
+        drop(writer);
+        let response = store.evidence_response().unwrap();
+        let error = response.mcp_find(query, 20, None).map(|_| ()).unwrap_err();
+        let reason = format!("{error:#}");
+        assert!(
+            reason.contains("store_unavailable: inconsistent native coverage tuple"),
+            "{query}: {reason}"
+        );
+        drop(response);
+        let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+        let (mut client, mut reader, session) = socket_session(&identity, &registry, 2621, None);
+        writeln!(
+            client,
+            "{}",
+            modern(
+                json!(1),
+                "tools/call",
+                json!({
+                    "name":"trellis_find_symbols", "arguments":{"schemaVersion":1,"query":query}
+                })
+            )
+        )
+        .unwrap();
+        let reply = next_reply(&mut reader);
+        tool(&reply, Some("store_unavailable"), true);
+        let envelope = &reply["result"]["structuredContent"];
+        assert!(envelope.get("data").is_none(), "{query}: {reply}");
+        assert!(
+            envelope["error"]["currentBasis"].is_null(),
+            "{query}: {reply}"
+        );
+        assert!(
+            runtime.evidence_response().is_err(),
+            "tool boundary did not latch recovery: {query}"
+        );
+        drop(reader);
+        drop(client);
+        session.join().unwrap().unwrap();
     }
 }
 
@@ -7727,6 +8043,7 @@ fn mcp_outgoing_wire_fixture(
 struct OutgoingFixtureTiming {
     accept_delay: Duration,
     call_deadline: Option<Duration>,
+    paused_call_clock: bool,
 }
 
 /// As `mcp_outgoing_wire_fixture`, sending the call `accept_delay` after the
@@ -7806,8 +8123,23 @@ fn mcp_outgoing_wire_fixture_delayed(
         });
     }
     let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    let hooks = if timing.paused_call_clock {
+        // A past origin makes any accidental real-clock check fail immediately.
+        runtime.freeze_mcp_call_clock_for_tests(
+            std::time::Instant::now() - trellis::mcp::CALL_DEADLINE,
+        );
+        let clock = runtime.clone();
+        trellis::mcp::TransportHooksForTests {
+            paused_clock_for_tests: Some(std::sync::Arc::new(move || {
+                clock.mcp_call_clock_now_for_tests()
+            })),
+            ..Default::default()
+        }
+    } else {
+        Default::default()
+    };
     let (mut client, mut reader, session) =
-        socket_session(&identity, &registry, 301, timing.call_deadline);
+        hooked_session(&identity, &registry, 301, timing.call_deadline, hooks);
     if legacy {
         writeln!(
             client,
@@ -7996,6 +8328,8 @@ async fn mcp_corrupt_find_declaration_outgoing_omit_current_basis_but_stale_pin_
     })
     .await
     .expect("runtime did not complete startup");
+    let scheduler = runtime.browser_scheduler().unwrap();
+    let _worker = scheduler.hold_worker_for_tests();
     let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
     for corrupt in [false, true] {
         if corrupt {
@@ -8501,8 +8835,7 @@ async fn mcp_outgoing_response_bytes_call_prefix_before_global_hints() {
         .iter()
         .map(|(p, s)| (p.as_str(), s.as_str()))
         .collect();
-    // This tests response-byte ordering, not the production five-second deadline.
-    // Allow a loaded test host to finish all required call materialization.
+    // Byte ordering is independent of elapsed time; deadline tests use real clocks.
     let reply = mcp_outgoing_wire_fixture_delayed(
         &borrowed,
         "Owner",
@@ -8511,7 +8844,7 @@ async fn mcp_outgoing_response_bytes_call_prefix_before_global_hints() {
         false,
         false,
         OutgoingFixtureTiming {
-            call_deadline: Some(Duration::from_secs(10)),
+            paused_call_clock: true,
             ..Default::default()
         },
     )
@@ -8847,7 +9180,7 @@ async fn mcp_outgoing_complete_modern_legacy_frames_fill_candidates_after_all_ca
             legacy,
             false,
             OutgoingFixtureTiming {
-                call_deadline: Some(Duration::from_secs(10)),
+                paused_call_clock: true,
                 ..Default::default()
             },
         );
@@ -9618,23 +9951,21 @@ async fn mcp_source_required_selected_path_and_digest_refuse_corrupt_rows() {
         })
         .await
         .expect("runtime did not finish valid startup before corruption");
+        let scheduler = runtime.browser_scheduler().unwrap();
+        let _worker = scheduler.hold_worker_for_tests();
         let writer = store.publication_for_tests().unwrap();
         store.mcp_corrupt_find_for_tests(&writer, fault).unwrap();
         drop(writer);
         let selected = store.evidence_response().unwrap();
         let error = selected.mcp_source("a.js", 1, 1, None, None).err().unwrap();
-        assert!(
-            error.to_string().contains("store_unavailable"),
-            "{fault}: {error:#}"
-        );
+        let reason = format!("{error:#}");
+        let expected = if fault == "missing_scope" {
+            "store_unavailable: selected raw source identity mismatch"
+        } else {
+            "store_unavailable: selected raw source length or digest mismatch"
+        };
+        assert!(reason.contains(expected), "{fault}: {reason}");
         drop(selected);
-        // Only stored bytes disagreeing with their recorded length or hash
-        // schedule a rebuild; a missing manifest scope does not.
-        assert_eq!(
-            store.recovery_pending_for_tests(),
-            fault != "missing_scope",
-            "{fault}"
-        );
         let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
         for legacy in [false, true] {
             let (mut client, mut reader, session) = socket_session(&identity, &registry, 145, None);
@@ -9685,6 +10016,10 @@ async fn mcp_source_required_selected_path_and_digest_refuse_corrupt_rows() {
                 "{fault}: {reply}"
             );
             assert!(envelope.get("data").is_none(), "{fault}: {reply}");
+            assert!(
+                runtime.evidence_response().is_err(),
+                "tool boundary did not latch recovery: {fault}"
+            );
             drop(reader);
             drop(client);
             session.join().unwrap().unwrap();

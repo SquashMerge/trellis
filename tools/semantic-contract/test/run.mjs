@@ -25,6 +25,8 @@ const shared = [
   "load",
   "lookup",
   "normalization",
+  "native-inventory",
+  "pinned-captures",
   "publication",
   "record-bindings",
   "record-coverage",

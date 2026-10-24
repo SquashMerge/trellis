@@ -188,10 +188,10 @@ fn injected_sql_failure_after_insert_preserves_previous_revision() {
         &cancel,
     )
     .unwrap_err();
+    let reason = format!("{failure:#}");
     assert!(
-        failure
-            .to_string()
-            .contains("incompatible_index: unknown cache object")
+        reason.contains("incompatible_index: unknown cache object"),
+        "{reason}"
     );
     assert_eq!(fs::read(index_db(&state)).unwrap(), unchanged);
     assert!(

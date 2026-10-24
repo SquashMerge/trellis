@@ -181,9 +181,9 @@ impl DaemonState {
 
     /// The options startup reconciliation captures with. Explicit registered
     /// options win; otherwise recorded inputs, then the FIFO head's, then the
-    /// daemon defaults. A recreate without trusted inputs needs the FIFO
-    /// head's options (or, for a replaced root, the defaults).
-    fn startup_options(&self) -> anyhow::Result<Option<IndexOptions>> {
+    /// daemon defaults. Recreation uses the FIFO head, retained watcher
+    /// options, then daemon defaults when no explicit options are registered.
+    fn startup_options(&self) -> anyhow::Result<IndexOptions> {
         let config = self.config();
         let explicit = config.explicit_options;
         // The FIFO head is read first, even when unused: a typed failure to
@@ -194,21 +194,33 @@ impl DaemonState {
             .transpose()?;
         if self.store.is_recreate_pending() {
             if explicit {
-                return Ok(Some(config.options.clone()));
+                return Ok(config.options.clone());
             }
-            return Ok(head.or_else(|| {
-                self.store
-                    .is_root_replaced()
-                    .then(|| config.options.clone())
-            }));
+            let watched = self
+                .watcher_work
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|(_, watcher)| watcher.options());
+            return Ok(head.or(watched).unwrap_or_else(|| config.options.clone()));
         }
         if explicit {
-            return Ok(Some(config.options.clone()));
+            return Ok(config.options.clone());
         }
-        Ok(Some(match self.store.recorded_index_options()? {
-            Some(recorded) => recorded,
-            None => head.unwrap_or_else(|| config.options.clone()),
-        }))
+        Ok(match self.store.recorded_index_options() {
+            Ok(Some(recorded)) => recorded,
+            Ok(None) => head.unwrap_or_else(|| config.options.clone()),
+            Err(error) if crate::store::Store::is_rebuild_failure(&error) => {
+                let watched = self
+                    .watcher_work
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|(_, watcher)| watcher.options());
+                watched.or(head).unwrap_or_else(|| config.options.clone())
+            }
+            Err(error) => return Err(error),
+        })
     }
 
     /// The FIFO head as startup reconciliation sees it.
@@ -223,7 +235,10 @@ impl DaemonState {
         self.store.earliest_unfinished_request()
     }
 
-    fn startup_attempt(&self) -> anyhow::Result<Arc<WriterSession>> {
+    fn startup_attempt(
+        &self,
+        retained: Option<(Arc<WriterSession>, Option<IndexOptions>)>,
+    ) -> anyhow::Result<Arc<WriterSession>> {
         self.store.settle_foreign_root_requests()?;
         #[cfg(feature = "test-support")]
         if let Some(hook) = self.startup_hook.lock().unwrap().take() {
@@ -234,10 +249,23 @@ impl DaemonState {
         }
         #[cfg(feature = "test-support")]
         self.startup_captures.fetch_add(1, Ordering::AcqRel);
+        if let Some((session, options)) = retained {
+            let options = match options {
+                Some(options) => options,
+                None => self.startup_options()?,
+            };
+            let coordinator = crate::index_coordinator::IndexJobCoordinator::prepare_with_session(
+                &self.store,
+                None,
+                session.clone(),
+            )?;
+            coordinator.run_serving(&options, &Arc::new(AtomicBool::new(false)), |_| {})?;
+            return Ok(session);
+        }
         let options = self.startup_options()?;
         crate::index_coordinator::establish_serving_session(
             &self.store,
-            options.as_ref(),
+            Some(&options),
             &Arc::new(AtomicBool::new(false)),
         )
     }
@@ -246,11 +274,27 @@ impl DaemonState {
     /// On failure the state waits out a doubling backoff, and only a typed
     /// contention is not reported as a tick failure.
     pub(super) fn run_startup_reconciliation(&self) -> anyhow::Result<()> {
+        self.run_reconciliation(None)
+    }
+
+    pub(super) fn run_rebuild_reconciliation(
+        &self,
+        session: Arc<WriterSession>,
+        options: Option<IndexOptions>,
+    ) -> anyhow::Result<()> {
+        self.run_reconciliation(Some((session, options)))
+    }
+
+    fn run_reconciliation(
+        &self,
+        retained: Option<(Arc<WriterSession>, Option<IndexOptions>)>,
+    ) -> anyhow::Result<()> {
         {
             let mut state = self.runtime.lock().unwrap();
             let attempts = match &*state {
                 RuntimeState::Reconciling { attempts, .. } => *attempts,
                 RuntimeState::Activating => 0,
+                RuntimeState::Ready(_) if retained.is_some() => 0,
                 _ => return Ok(()),
             };
             *state = RuntimeState::Reconciling {
@@ -259,18 +303,19 @@ impl DaemonState {
             };
         }
         self.note_state_change();
-        let outcome =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.startup_attempt()))
-                .unwrap_or_else(|panic| {
-                    let message = panic
-                        .downcast_ref::<&str>()
-                        .map(|text| (*text).to_owned())
-                        .or_else(|| panic.downcast_ref::<String>().cloned())
-                        .unwrap_or_else(|| "unknown panic".to_owned());
-                    Err(anyhow::anyhow!(
-                        "startup reconciliation panicked: {message}"
-                    ))
-                });
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.startup_attempt(retained)
+        }))
+        .unwrap_or_else(|panic| {
+            let message = panic
+                .downcast_ref::<&str>()
+                .map(|text| (*text).to_owned())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".to_owned());
+            Err(anyhow::anyhow!(
+                "startup reconciliation panicked: {message}"
+            ))
+        });
         match outcome {
             Ok(session) => {
                 self.replace_serving_session(Some(session));
@@ -456,14 +501,61 @@ impl DaemonState {
             && Instant::now() >= self.maintenance_due_at()
     }
 
+    /// A purged checkout index has no queue left to drain. Only its exact
+    /// directory's absence permits closing; all other failures remain errors.
+    /// The worker owns this transition and never closes across an admitted read
+    /// or an enqueue already in flight.
+    pub(super) fn close_if_index_missing(&self) -> anyhow::Result<bool> {
+        if !self.store.index_directory_missing()? {
+            return Ok(false);
+        }
+        let mut state = self.runtime.lock().unwrap();
+        if matches!(*state, RuntimeState::Closing | RuntimeState::Retired) {
+            return Ok(true);
+        }
+        if self.leases.load(Ordering::Acquire) != 0 || !self.store.try_begin_closing() {
+            // External filesystem loss has no completion signal. Retry using
+            // the worker's existing bounded backoff, without reopening the queue.
+            *self.recovery_retry_after.lock().unwrap() = Some(Instant::now() + STEP_RETRY);
+            return Ok(true);
+        }
+        // Recheck at the owning transition: a recreated directory may already
+        // contain accepted work, which must follow the normal queue path.
+        match self.store.index_directory_missing() {
+            Ok(true) => {}
+            result => {
+                self.store.end_closing();
+                return result.map(|_| false);
+            }
+        }
+        let held = match std::mem::replace(&mut *state, RuntimeState::Closing) {
+            RuntimeState::Ready(session) => Some(session),
+            RuntimeState::RetireRequested { session, .. } => session,
+            _ => None,
+        };
+        drop(state);
+        self.store.notify_request_queue_unavailable();
+        self.close(held);
+        Ok(true)
+    }
+
     /// Publish whether accepted FIFO work remains (an unreadable queue counts
     /// as pending). When it drains, wake the lifecycle: a declined release
     /// may now proceed.
     fn publish_fifo_pending(&self) {
-        let pending = match &*self.runtime.lock().unwrap() {
-            // Nothing is claimed on a retired runtime; never reopen its queue.
-            RuntimeState::Closing | RuntimeState::Retired => false,
-            _ => !matches!(self.store.earliest_unfinished_request(), Ok(None)),
+        let pending = if matches!(
+            *self.runtime.lock().unwrap(),
+            RuntimeState::Closing | RuntimeState::Retired
+        ) {
+            false
+        } else {
+            // A deletion can race the step. Never recreate the directory in
+            // this publication probe, even when an admitted read delays close.
+            match self.close_if_index_missing() {
+                Ok(true) => !self.retired(),
+                Ok(false) => !matches!(self.store.earliest_unfinished_request(), Ok(None)),
+                Err(_) => true,
+            }
         };
         let was = self.fifo_pending.swap(pending, Ordering::AcqRel);
         if was
@@ -599,6 +691,9 @@ impl DaemonState {
             if let Some(hook) = hook {
                 hook();
             }
+        }
+        if self.close_if_index_missing()? {
+            return Ok(());
         }
         // A root replaced since the step's own check takes the same path:
         // settle its accepted rows, mark the loss, then close. A failed check
@@ -875,5 +970,219 @@ fn worker_loop(weak: std::sync::Weak<DaemonState>, inbox: Arc<WorkerInbox>) {
                 Some(Instant::now() + STEP_RETRY)
             }
         };
+    }
+}
+
+#[cfg(test)]
+mod missing_index_tests {
+    #[test]
+    fn purge_at_native_spool_admission_inside_step_never_recreates_index() {
+        let (_tmp, store, state, options) =
+            crate::http::exceptional_recovery_tests::serving_queue_watch_fixture();
+        std::fs::write(
+            options.workspace_root.join("new.js"),
+            "function changed() {}\n",
+        )
+        .unwrap();
+        store.enqueue_request(&options, None).unwrap();
+        let index_dir = store.request_db_path().parent().unwrap().to_owned();
+        let removed = index_dir.clone();
+        let reached = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook_reached = reached.clone();
+        store.set_native_spool_hook(move || {
+            hook_reached.store(true, std::sync::atomic::Ordering::Release);
+            std::fs::remove_dir_all(removed).unwrap();
+        });
+        let _ = state.worker_step();
+        assert!(
+            reached.load(std::sync::atomic::Ordering::Acquire),
+            "full capture did not reach spool admission"
+        );
+        assert!(
+            !index_dir.exists(),
+            "mid-step spool admission recreated the purged index"
+        );
+        state.publish_fifo_pending();
+        state.worker_step().unwrap();
+        assert!(state.retired());
+        assert!(!index_dir.exists());
+    }
+
+    #[test]
+    fn writer_admission_after_activation_never_recreates_purged_index() {
+        for session in [false, true] {
+            let (_tmp, store, _state, _options) =
+                crate::http::exceptional_recovery_tests::serving_queue_watch_fixture();
+            let index_dir = store.request_db_path().parent().unwrap().to_owned();
+            std::fs::remove_dir_all(&index_dir).unwrap();
+            if session {
+                assert!(store.writer_session().is_err());
+            } else {
+                assert!(store.writer().is_err());
+            }
+            assert!(
+                !index_dir.exists(),
+                "writer admission reprovisioned the index"
+            );
+        }
+    }
+
+    use crate::http::exceptional_recovery_tests::fixture;
+    #[cfg(feature = "test-support")]
+    use crate::indexer::IndexOptions;
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn purge_between_worker_probe_and_existing_queue_open_does_not_recreate_index() {
+        for enqueue in [false, true] {
+            let (_tmp, store, state, roots, identity) = fixture();
+            state.worker_step().unwrap();
+            let index_dir = roots.index_dir(&identity);
+            let removed = index_dir.clone();
+            store.set_after_queue_root_verify_hook_for_tests(move || {
+                std::fs::remove_dir_all(removed).unwrap();
+            });
+            if enqueue {
+                assert!(
+                    store
+                        .enqueue_request(&IndexOptions::new(identity.root.clone()), None)
+                        .is_err()
+                );
+            } else {
+                let _ = state.worker_step();
+            }
+            assert!(
+                !index_dir.exists(),
+                "queue admission recreated purged index"
+            );
+            state.publish_fifo_pending();
+            state.worker_step().unwrap();
+            assert!(state.retired());
+            assert!(!index_dir.exists());
+        }
+    }
+
+    #[test]
+    fn storage_busy_defers_without_authorizing_missing_index_close() {
+        let (_tmp, store, state, roots, identity) = fixture();
+        // Hold EX before startup creates a serving session's retained SH guard.
+        let lock = roots
+            .cache
+            .join("indexes")
+            .join(format!("{}.lock", identity.root_key));
+        let exclusive =
+            crate::store::topology::UseGuard::acquire_existing(&lock, true, true).unwrap();
+        let error = store.earliest_unfinished_request().unwrap_err();
+        assert!(
+            error.is::<crate::store::topology::StorageBusy>(),
+            "{error:#}"
+        );
+        assert!(!state.close_if_index_missing().unwrap());
+        state.publish_fifo_pending();
+        assert!(!state.retired());
+        assert!(state.fifo_pending());
+        drop(exclusive);
+        state.worker_step().unwrap();
+        state.publish_fifo_pending();
+        assert!(!state.fifo_pending());
+    }
+
+    #[test]
+    fn index_directory_inspection_error_stays_pending() {
+        let (_tmp, store, state, roots, identity) = fixture();
+        state.worker_step().unwrap();
+        let indexes = roots.index_dir(&identity).parent().unwrap().to_owned();
+        let moved = indexes.with_extension("retained");
+        std::fs::rename(&indexes, &moved).unwrap();
+        std::fs::write(&indexes, b"not a directory").unwrap();
+        assert!(store.index_directory_missing().is_err());
+        assert!(state.worker_step().is_err());
+        state.publish_fifo_pending();
+        assert!(!state.retired());
+        assert!(state.fifo_pending());
+        std::fs::remove_file(indexes).unwrap();
+    }
+
+    #[test]
+    fn queue_or_lock_file_loss_is_not_missing_index_authority() {
+        for remove_lock in [false, true] {
+            let (_tmp, store, state, roots, identity) = fixture();
+            state.worker_step().unwrap();
+            let path = if remove_lock {
+                roots
+                    .cache
+                    .join("indexes")
+                    .join(format!("{}.lock", identity.root_key))
+            } else {
+                roots.requests_db(&identity)
+            };
+            std::fs::remove_file(path).unwrap();
+            assert!(!store.index_directory_missing().unwrap());
+            // The step may defer without error; neither outcome authorizes close.
+            let _ = state.worker_step();
+            state.publish_fifo_pending();
+            assert!(!state.retired());
+            assert!(state.fifo_pending());
+        }
+    }
+
+    #[test]
+    fn missing_index_waits_for_an_enqueue_already_in_flight() {
+        let (_tmp, store, state, roots, identity) = fixture();
+        state.worker_step().unwrap();
+        let enqueue = store.enqueue_in_flight();
+        let index_dir = roots.index_dir(&identity);
+        std::fs::remove_dir_all(&index_dir).unwrap();
+        state.worker_step().unwrap();
+        state.publish_fifo_pending();
+        assert!(!state.retired());
+        assert!(state.fifo_pending());
+        assert!(!index_dir.exists());
+        drop(enqueue);
+        state.worker_step().unwrap();
+        state.publish_fifo_pending();
+        assert!(state.retired());
+        assert!(!state.fifo_pending());
+        assert!(!index_dir.exists());
+    }
+
+    #[test]
+    fn missing_index_directory_retires_without_recreating_the_queue() {
+        for remove_root in [false, true] {
+            let (_tmp, _store, state, roots, identity) = fixture();
+            state.worker_step().unwrap();
+            let index_dir = roots.index_dir(&identity);
+            std::fs::remove_dir_all(&index_dir).unwrap();
+            if remove_root {
+                std::fs::remove_dir_all(&identity.root).unwrap();
+            }
+            let step = state.worker_step();
+            state.publish_fifo_pending();
+            assert!(state.retired(), "lost index vetoed retirement: {step:?}");
+            assert!(!state.fifo_pending());
+            assert!(!index_dir.exists(), "queue probe recreated a lost index");
+        }
+    }
+
+    #[test]
+    fn missing_index_directory_defers_close_until_the_admitted_read_finishes() {
+        let (_tmp, _store, state, roots, identity) = fixture();
+        state.worker_step().unwrap();
+        let lease = state.admission_lease().unwrap();
+        let index_dir = roots.index_dir(&identity);
+        std::fs::remove_dir_all(&index_dir).unwrap();
+        let step = state.worker_step();
+        state.publish_fifo_pending();
+        assert!(!state.retired(), "admitted read must fence a fresh runtime");
+        assert!(
+            !index_dir.exists(),
+            "queue probe recreated a lost index: {step:?}"
+        );
+        drop(lease);
+        state.worker_step().unwrap();
+        state.publish_fifo_pending();
+        assert!(state.retired());
+        assert!(!state.fifo_pending());
+        assert!(!index_dir.exists());
     }
 }

@@ -638,21 +638,21 @@ async fn cached_java_source_budget_and_unproven_member_shape_do_not_guess() {
         .native_source_at(native_pin, &native_key)
         .unwrap_err();
     assert!(
-        native_error.to_string().contains("incompatible_index")
-            && native_error
-                .to_string()
-                .contains("incompatible_index: selected evidence decode failed: incompatible_index: source hash mismatch"),
+        native_error.to_string().starts_with("incompatible_index:")
+            && format!("{native_error:#}").contains("source hash mismatch"),
         "{native_error:#}"
     );
+    assert!(native_store.recovery_pending_for_tests());
     let closed = native_clone.source_at("Large.java", None).unwrap_err();
     assert!(
         closed.to_string().contains("incompatible_index"),
         "{closed:#}"
     );
 
-    let (_http_store, http_app) = reopen();
+    let (http_store, http_app) = reopen();
     let (status, corrupted) = call(&http_app, selector).await;
     assert_eq!(status, 503, "{corrupted}");
+    assert!(http_store.recovery_pending_for_tests());
     assert_eq!(corrupted["error"]["code"], "incompatible_index");
     assert!(corrupted.get("targets").is_none());
     let response = http_app

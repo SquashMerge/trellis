@@ -413,31 +413,6 @@ impl BrowserProvisioner {
 
     /// Start serving without consuming the provisioner. New explicit serve
     /// registrations can still compare against its retained bind and token.
-    /// The caller monitors the task and closes serve control on idle exit.
-    pub fn spawn_until_idle(
-        &mut self,
-        registry: std::sync::Arc<tokio::sync::Mutex<registry::CheckoutRegistry>>,
-    ) -> anyhow::Result<tokio::task::JoinHandle<anyhow::Result<()>>> {
-        let listener = self
-            .listener
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("browser not provisioned"))?;
-        let browser = self
-            .browser
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("browser not provisioned"))?;
-        let closed = self.closed.clone();
-        Ok(tokio::spawn(async move {
-            let server = axum::serve(listener, browser.router());
-            let result = tokio::select! {
-                outcome = server => outcome.map_err(anyhow::Error::from),
-                outcome = run_idle_lifecycle(registry) => outcome.map_err(|error| anyhow::anyhow!("{}", error.reason())),
-            };
-            closed.store(true, std::sync::atomic::Ordering::Release);
-            result
-        }))
-    }
-
     /// The elected socket owner drives the only lifecycle clock. Browser
     /// hosting observes its shutdown signal instead of advancing the same
     /// registry independently.
@@ -464,14 +439,5 @@ impl BrowserProvisioner {
             closed.store(true, std::sync::atomic::Ordering::Release);
             result
         }))
-    }
-
-    /// Convenience for a single serve control owner; socket dispatch should
-    /// instead keep this provisioner and monitor the spawned task.
-    pub async fn serve_until_idle(
-        mut self,
-        registry: std::sync::Arc<tokio::sync::Mutex<registry::CheckoutRegistry>>,
-    ) -> anyhow::Result<()> {
-        self.spawn_until_idle(registry)?.await?
     }
 }
