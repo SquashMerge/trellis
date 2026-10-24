@@ -129,6 +129,15 @@ fn relative(root: &Path, p: &Path) -> Result<String, ScipCaptureError> {
     if !path(r) {
         return Err(admission("invalid role path"));
     }
+    let mut current = root.to_owned();
+    for component in r.split('/') {
+        current.push(component);
+        let metadata =
+            std::fs::symlink_metadata(&current).map_err(|_| admission("selected role absent"))?;
+        if metadata.file_type().is_symlink() {
+            return Err(admission("symlinked selected role"));
+        }
+    }
     Ok(r.into())
 }
 fn file_uri(root: &Path) -> Result<String, ScipCaptureError> {
@@ -612,6 +621,33 @@ mod tests {
         assert!(matches!(
             ReferenceProfileAdmission::from_trusted_selection(&capture, &selection, &cancel),
             Err(ScipCaptureError::LimitExceeded(_))
+        ));
+    }
+    #[test]
+    fn scip_admission_rejects_captured_symlinked_ancestor_role() {
+        let (root, _, selection, _, cancel) = fixture();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(
+            outside.path().join("artifact.scip"),
+            hex::decode(WIRE).unwrap(),
+        )
+        .unwrap();
+        let physical = fs::canonicalize(root.path()).unwrap();
+        std::os::unix::fs::symlink(outside.path(), physical.join("linked")).unwrap();
+        let options = IndexOptions {
+            workspace_root: physical.clone(),
+            scip_path: Some(physical.join("linked/artifact.scip")),
+            manifest_path: Some(physical.join("manifest.json")),
+            max_file_bytes: 2 * 1024 * 1024,
+        };
+        let capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
+        assert!(
+            capture.selected_scip_inputs().is_some(),
+            "ancestor leaf bytes were captured"
+        );
+        assert!(matches!(
+            ReferenceProfileAdmission::from_trusted_selection(&capture, &selection, &cancel),
+            Err(ScipCaptureError::InvalidAdmission(_))
         ));
     }
     #[test]

@@ -329,8 +329,7 @@ fn unknown(f: &protobuf::SpecialFields) -> Result<(), ScipCaptureError> {
 fn range(
     o: &types::Occurrence,
     enclosing: bool,
-    text: &str,
-    enc: u8,
+    positions: &mut Vec<(i32, i32)>,
 ) -> Result<Value, ScipCaptureError> {
     let legacy = if enclosing {
         &o.enclosing_range
@@ -391,8 +390,8 @@ fn range(
     if (sl, sc) > (el, ec) {
         return Err(invalid("reversed range"));
     }
-    check_position(text, sl, sc, enc)?;
-    check_position(text, el, ec, enc)?;
+    positions.push((sl, sc));
+    positions.push((el, ec));
     Ok(match shape {
         0 => json!({"encoding":"legacy","values":values}),
         1 => json!({"encoding":"singleLine","line":sl,"startCharacter":sc,"endCharacter":ec}),
@@ -401,34 +400,102 @@ fn range(
         }
     })
 }
-fn check_position(text: &str, line: i32, column: i32, enc: u8) -> Result<(), ScipCaptureError> {
-    let part = text
-        .split('\n')
-        .nth(line as usize)
-        .ok_or_else(|| invalid("range line outside source"))?
-        .trim_end_matches('\r');
-    let mut count = 0usize;
-    for c in part.chars() {
-        if count == column as usize {
-            return Ok(());
+#[cfg(test)]
+type PositionWalkHook = Box<dyn Fn(&CancelFlag)>;
+#[cfg(test)]
+thread_local! {static POSITION_WALK_HOOK: std::cell::RefCell<Option<PositionWalkHook>> = std::cell::RefCell::new(None);}
+#[cfg(test)]
+fn position_walk_hook(flag: &CancelFlag) {
+    POSITION_WALK_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow().as_ref() {
+            hook(flag);
         }
-        count += match enc {
-            1 => c.len_utf8(),
-            2 => c.len_utf16(),
-            3 => 1,
-            _ => return Err(invalid("position encoding")),
-        };
-        if count > column as usize {
+    });
+}
+fn validate_positions(
+    text: &str,
+    enc: u8,
+    positions: &mut Vec<(i32, i32)>,
+    flag: &CancelFlag,
+) -> Result<(), ScipCaptureError> {
+    cancelled(flag)?;
+    if positions.is_empty() {
+        return Ok(());
+    }
+    let mut starts = vec![0usize];
+    for (i, b) in text.bytes().enumerate() {
+        if i.is_multiple_of(65536) {
+            cancelled(flag)?;
+        }
+        if b == b'\n' {
+            starts.push(i + 1);
+        }
+    }
+    positions.sort_unstable();
+    positions.dedup();
+    let mut current_line = None;
+    let mut chars = "".chars();
+    let mut measured = 0usize;
+    let mut steps = 0usize;
+    for &(line, column) in positions.iter() {
+        if line < 0 || column < 0 {
+            return Err(invalid("negative position"));
+        }
+        let line_index = line as usize;
+        if current_line != Some(line_index) {
+            let start = *starts
+                .get(line_index)
+                .ok_or_else(|| invalid("range line outside source"))?;
+            let next = starts.get(line_index + 1).copied();
+            // Exactly one CR immediately before LF is the line-break pair.
+            let end = next.map_or(text.len(), |i| {
+                if i >= 2 && text.as_bytes()[i - 2] == b'\r' {
+                    i - 2
+                } else {
+                    i - 1
+                }
+            });
+            chars = text[start..end].chars();
+            measured = 0;
+            current_line = Some(line_index);
+        }
+        while measured < column as usize {
+            let c = chars
+                .next()
+                .ok_or_else(|| invalid("range column outside source"))?;
+            steps += 1;
+            if steps.is_multiple_of(1024) {
+                #[cfg(test)]
+                position_walk_hook(flag);
+                cancelled(flag)?;
+            }
+            measured += match enc {
+                1 => c.len_utf8(),
+                2 => c.len_utf16(),
+                3 => 1,
+                _ => return Err(invalid("position encoding")),
+            };
+        }
+        if measured != column as usize {
             return Err(invalid("split codepoint"));
         }
     }
-    if count == column as usize {
-        Ok(())
-    } else {
-        Err(invalid("range column outside source"))
-    }
+    Ok(())
 }
-fn occurrence(o: &types::Occurrence, text: &str, enc: u8) -> Result<Value, ScipCaptureError> {
+#[cfg(test)]
+fn check_position(text: &str, line: i32, column: i32, enc: u8) -> Result<(), ScipCaptureError> {
+    validate_positions(
+        text,
+        enc,
+        &mut vec![(line, column)],
+        &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+}
+
+fn occurrence(
+    o: &types::Occurrence,
+    positions: &mut Vec<(i32, i32)>,
+) -> Result<Value, ScipCaptureError> {
     unknown(&o.special_fields)?;
     let syntax = known(o.syntax_kind)?;
     if o.symbol_roles < 0 || o.symbol_roles & !0x7f != 0 {
@@ -463,14 +530,67 @@ fn occurrence(o: &types::Occurrence, text: &str, enc: u8) -> Result<Value, ScipC
         }
     }
     Ok(
-        json!({"range":range(o,false,text,enc)?,"enclosingRange":range(o,true,text,enc)?,"symbol":o.symbol,"symbolRoles":o.symbol_roles,"syntaxKind":syntax}),
+        json!({"range":range(o,false,positions)?,"enclosingRange":range(o,true,positions)?,"symbol":o.symbol,"symbolRoles":o.symbol_roles,"syntaxKind":syntax}),
     )
+}
+// Conservative envelope expansion bound before any relationship JSON or canonical bytes exist.
+// Strings may be copied into JSON and canonical output; fixed overhead covers keys/escaping.
+const MAX_CLAIM_BYTES: usize = 128 * 1024 * 1024;
+fn reserve_claim(total: &mut usize, strings: &[&str]) -> Result<(), ScipCaptureError> {
+    let bytes = strings
+        .iter()
+        .try_fold(512usize, |size, text| {
+            size.checked_add(text.len().checked_mul(6)?)
+        })
+        .ok_or_else(|| limit("claim expansion"))?;
+    *total = total
+        .checked_add(bytes)
+        .filter(|v| *v <= MAX_CLAIM_BYTES)
+        .ok_or_else(|| limit("claim expansion"))?;
+    Ok(())
+}
+fn claim_budget(index: &types::Index, flag: &CancelFlag) -> Result<(), ScipCaptureError> {
+    let mut total = 0usize;
+    let mut traversed = 0usize;
+    for d in &index.documents {
+        for o in &d.occurrences {
+            reserve_claim(&mut total, &[&d.relative_path, &d.language, &o.symbol])?;
+            traversed += 1;
+            if traversed.is_multiple_of(1024) {
+                cancelled(flag)?;
+            }
+        }
+        for s in &d.symbols {
+            reserve_claim(
+                &mut total,
+                &[
+                    &d.relative_path,
+                    &d.language,
+                    &s.symbol,
+                    &s.display_name,
+                    &s.enclosing_symbol,
+                ],
+            )?;
+            for r in &s.relationships {
+                reserve_claim(
+                    &mut total,
+                    &[&d.relative_path, &d.language, &s.symbol, &r.symbol],
+                )?;
+                traversed += 1;
+                if traversed.is_multiple_of(1024) {
+                    cancelled(flag)?;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 fn symbol(
     s: &types::SymbolInformation,
     enc: u8,
     flag: &CancelFlag,
     traversed: &mut usize,
+    emit_relationships: bool,
 ) -> Result<(Value, Vec<Value>), ScipCaptureError> {
     unknown(&s.special_fields)?;
     let kind = known(s.kind)?;
@@ -479,13 +599,15 @@ fn symbol(
         if sig.occurrences.len() > 10000 {
             return Err(limit("signature occurrences"));
         }
+        let mut positions = Vec::with_capacity(sig.occurrences.len() * 4);
         for o in &sig.occurrences {
             *traversed += 1;
             if (*traversed).is_multiple_of(1024) {
                 cancelled(flag)?;
             }
-            occurrence(o, &sig.text, enc)?;
+            occurrence(o, &mut positions)?;
         }
+        validate_positions(&sig.text, enc, &mut positions, flag)?;
     }
     let mut relationships = Vec::new();
     for r in &s.relationships {
@@ -494,7 +616,9 @@ fn symbol(
             cancelled(flag)?;
         }
         unknown(&r.special_fields)?;
-        relationships.push(json!({"sourceSymbol":s.symbol,"targetSymbol":r.symbol,"isReference":r.is_reference,"isImplementation":r.is_implementation,"isTypeDefinition":r.is_type_definition,"isDefinition":r.is_definition}));
+        if emit_relationships {
+            relationships.push(json!({"sourceSymbol":s.symbol,"targetSymbol":r.symbol,"isReference":r.is_reference,"isImplementation":r.is_implementation,"isTypeDefinition":r.is_type_definition,"isDefinition":r.is_definition}));
+        }
     }
     Ok((
         json!({"symbol":s.symbol,"kind":kind,"displayName":s.display_name,"enclosingSymbol":s.enclosing_symbol}),
@@ -584,6 +708,7 @@ pub(crate) fn decode_authenticated(
     if index.documents.len() > 1000 || index.external_symbols.len() > 10000 {
         return Err(limit("index entries"));
     }
+    claim_budget(&index, flag)?;
     let mut count = 0usize;
     let mut traversed = 0usize;
     let mut relationships = 0usize;
@@ -592,8 +717,8 @@ pub(crate) fn decode_authenticated(
         if traversed.is_multiple_of(1024) {
             cancelled(flag)?;
         }
-        let (_, rel) = symbol(s, input.position_encoding, flag, &mut traversed)?;
-        relationships += rel.len();
+        let _ = symbol(s, input.position_encoding, flag, &mut traversed, false)?;
+        relationships += s.relationships.len();
     }
     let mut admitted = BTreeMap::new();
     for d in &input.documents {
@@ -631,6 +756,7 @@ pub(crate) fn decode_authenticated(
         }
         let text =
             std::str::from_utf8(source.source_bytes).map_err(|_| invalid("non-UTF8 source"))?;
+        let mut positions = Vec::with_capacity(d.occurrences.len() * 4);
         for o in &d.occurrences {
             count += 1;
             if count > 100000 {
@@ -644,15 +770,16 @@ pub(crate) fn decode_authenticated(
                 input,
                 d,
                 "occurrence",
-                occurrence(o, text, input.position_encoding)?,
+                occurrence(o, &mut positions)?,
             );
         }
+        validate_positions(text, input.position_encoding, &mut positions, flag)?;
         for s in &d.symbols {
             traversed += 1;
             if traversed.is_multiple_of(1024) {
                 cancelled(flag)?;
             }
-            let (info, rels) = symbol(s, input.position_encoding, flag, &mut traversed)?;
+            let (info, rels) = symbol(s, input.position_encoding, flag, &mut traversed, true)?;
             count += 1;
             relationships += rels.len();
             if count + rels.len() > 100000 {
@@ -1095,6 +1222,40 @@ mod tests {
         let mut o = occ.clone();
         o.extend(message(8, &unknown));
         cases.push(("typed range", base_doc(message(2, &o), 1)));
+        let typed_single = message(8, &[0x10, 0x00, 0x18, 0x01]);
+        let typed_multi = message(9, &[0x10, 0x00, 0x20, 0x01]);
+        let unknown_single = message(
+            8,
+            &[vec![0x10, 0x00, 0x18, 0x01], unknown.to_vec()].concat(),
+        );
+        let unknown_multi = message(
+            9,
+            &[vec![0x10, 0x00, 0x20, 0x01], unknown.to_vec()].concat(),
+        );
+        let unknown_enclosing = message(
+            10,
+            &[vec![0x10, 0x00, 0x18, 0x01], unknown.to_vec()].concat(),
+        );
+        cases.push(("typed single", base_doc(message(2, &unknown_single), 1)));
+        cases.push(("typed multi", base_doc(message(2, &unknown_multi), 1)));
+        cases.push((
+            "typed enclosing",
+            base_doc(
+                message(2, &[typed_single.clone(), unknown_enclosing].concat()),
+                1,
+            ),
+        ));
+        cases.push((
+            "typed multi enclosing",
+            base_doc(
+                message(2, &[typed_multi, message(11, &unknown)].concat()),
+                1,
+            ),
+        ));
+        cases.push((
+            "external nested relationship",
+            message(3, &message(4, &unknown)),
+        ));
         let mut o = occ.clone();
         o.extend(message(6, &unknown));
         cases.push(("diagnostic", base_doc(message(2, &o), 1)));
@@ -1162,6 +1323,38 @@ mod tests {
         }
     }
     #[test]
+    fn scip_metadata_and_tool_context_reject_mismatches() {
+        let doc = base_doc(vec![], 1);
+        let metadata = [vec![0x20, 0x02], message(3, b"file:///synthetic")].concat();
+        assert!(matches!(
+            custom(
+                &[message(1, &metadata), doc.clone()].concat(),
+                b"function f(){g();}\n",
+                1
+            ),
+            Err(ScipCaptureError::InvalidArtifact(_))
+        ));
+        let mismatched_tool = [message(1, b"wrong-producer"), message(2, b"1.0.0")].concat();
+        let metadata = message(2, &mismatched_tool);
+        assert!(matches!(
+            custom(
+                &[message(1, &metadata), doc.clone()].concat(),
+                b"function f(){g();}\n",
+                1
+            ),
+            Err(ScipCaptureError::InvalidArtifact(_))
+        ));
+        let tool = message(2, b"wrong-version");
+        assert!(matches!(
+            custom(
+                &[message(1, &message(2, &tool)), doc].concat(),
+                b"function f(){g();}\n",
+                1
+            ),
+            Err(ScipCaptureError::InvalidArtifact(_))
+        ));
+    }
+    #[test]
     fn scip_document_source_and_encoding_bindings() {
         let source = b"function f(){g();}\n";
         let occ = hex::decode("0a0300090a120241231801").unwrap();
@@ -1186,6 +1379,23 @@ mod tests {
         assert!(custom(&base_doc(negative, 1), source, 1).is_err());
         let outside = message(2, &[0x0a, 0x03, 0x00, 0x64, 0x65]);
         assert!(custom(&base_doc(outside, 1), source, 1).is_err());
+    }
+    #[test]
+    fn scip_fanout_expansion_is_bounded_before_materialization() {
+        let source = "x".repeat(12_000);
+        let mut symbol = types::SymbolInformation::new();
+        symbol.symbol = source;
+        symbol.relationships = (0..2000).map(|_| types::Relationship::new()).collect();
+        let mut doc = types::Document::new();
+        doc.relative_path = "src/A.js".into();
+        doc.language = "javascript".into();
+        doc.symbols.push(symbol);
+        let mut index = types::Index::new();
+        index.documents.push(doc);
+        assert!(matches!(
+            claim_budget(&index, &Arc::new(AtomicBool::new(false))),
+            Err(ScipCaptureError::LimitExceeded(_))
+        ));
     }
     #[test]
     fn scip_duplicate_symbols_and_relationships_deduplicate() {
@@ -1225,6 +1435,24 @@ mod tests {
         assert!(check_position("a😀b\r\n", 0, 3, 2).is_ok());
         assert!(check_position("a😀b\r\n", 0, 2, 3).is_ok());
         assert!(check_position("a😀b\r\n", 1, 1, 3).is_err());
+        for enc in 1..=3 {
+            assert!(check_position("a\r", 0, 2, enc).is_ok());
+            assert!(check_position("a\r\r\n", 0, 2, enc).is_ok());
+            assert!(check_position("a\r\r\n", 0, 3, enc).is_err());
+            assert!(check_position("a\r\r\n", 1, 0, enc).is_ok());
+        }
+        let long = format!("{}z", "x".repeat(120_000));
+        let mut many = (0..2000).map(|_| (0, 120_000)).collect::<Vec<_>>();
+        validate_positions(&long, 1, &mut many, &Arc::new(AtomicBool::new(false))).unwrap();
+        let flag = Arc::new(AtomicBool::new(false));
+        POSITION_WALK_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|flag| flag.store(true, Ordering::Relaxed)))
+        });
+        let mut far = vec![(0, 120_000)];
+        let result = validate_positions(&long, 1, &mut far, &flag);
+        POSITION_WALK_HOOK.with(|hook| *hook.borrow_mut() = None);
+        assert!(matches!(result, Err(ScipCaptureError::Cancelled)));
+        assert!(flag.load(Ordering::Relaxed));
         let flag = Arc::new(AtomicBool::new(true));
         assert_eq!(
             wire(&[], Node::Index, 0, &mut WireBudget::default(), &flag),
@@ -1299,10 +1527,35 @@ mod tests {
                 .map(|c| (&c.canonical_bytes, &c.fact_digest))
                 .collect::<Vec<_>>()
         );
-        assert_ne!(
-            base.claims[0].captured_proof_id,
-            external.claims[0].captured_proof_id
-        );
+        for (fact, proof) in [
+            (
+                "138cf48a43d4bedcee1dc8236317c40d691ef5fda117d1e30c15526c8bda21dc",
+                "5f06a5a26e82a671ac92c9f60ecd804aa0a1161e9933ae6b3b96b3eb77f5e9b6",
+            ),
+            (
+                "e49f19eab6e6c590aa18b0e4257c9627bbc8ee998cc31c2567d8de168467c54f",
+                "3a5a01c21df6e88eca70514edb3d9433e0b03ae9a84eb0cad409aa4641f314d1",
+            ),
+            (
+                "40a8a56aa6ed4e8011c75c28ab01cb9f23a0bdc504fb4ec97025142e00f1f7a6",
+                "82b53fe23ca439ff9517ce43979039dce1b2d4cbd7ee59c316801c3c3cc1700a",
+            ),
+            (
+                "39d9337353c729180a48d4489882e6740625199bd54fe9a98b59ad3eab98ec9f",
+                "aadefd7776bc74f80c4b600b3e0421e9bc0c4122cec7b6125a085721855299c1",
+            ),
+            (
+                "e38fa5f77ba73cee8bbe54eeec279ff98c4b250366f3b59dc8288015bd538fb0",
+                "f5f084bbb2ac6624e3e5f2d7d8b5550a40e355523dee30d9906edf2525e21e97",
+            ),
+        ] {
+            let claim = external
+                .claims
+                .iter()
+                .find(|c| c.fact_digest == fact)
+                .expect("129-byte fact");
+            assert_eq!(claim.captured_proof_id, proof);
+        }
         assert_eq!(signature.claims.len(), 2);
         assert_eq!(
             signature
@@ -1316,9 +1569,22 @@ mod tests {
                 .map(|c| &c.fact_digest)
                 .collect::<Vec<_>>()
         );
-        assert!(signature.claims.iter().any(|c| c.fact_digest
-            == "48eecbae6ce056236cc3decb2fb3c25c46bcd2fe54cc9badb5fb9a12ae318dc7"
-            && c.captured_proof_id
-                == "f5399701a43a9ebf56cd5766360985d57f066a2c8093d8f07361fac3b11f042f"));
+        for (fact, proof) in [
+            (
+                "48eecbae6ce056236cc3decb2fb3c25c46bcd2fe54cc9badb5fb9a12ae318dc7",
+                "1ad7595f3e9fd3d984cf62c564cd1e72f48e912389a83d5a7b67abefb3fb3328",
+            ),
+            (
+                "68953b47a29e361cf99726fe506d7449dfc9a4c2c1a250aa0a6f52d0a96cc561",
+                "3eef2daff2d27a4dcdbc9d7e75ed9575ba60c47538ff362f80471f6100b411ac",
+            ),
+        ] {
+            let claim = omitted
+                .claims
+                .iter()
+                .find(|c| c.fact_digest == fact)
+                .expect("48-byte fact");
+            assert_eq!(claim.captured_proof_id, proof);
+        }
     }
 }
