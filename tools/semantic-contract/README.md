@@ -47,16 +47,16 @@ The literal `example/` is the **sole** `profile=example` exemption from corpus c
 
 ### Corpus count floors
 
-The floors are per-language data in `counts.mjs`, as amended by [Decision 0017 Amendment 1](../../docs/semantic-evidence/decisions/0017-conformance-corpus-storage-and-producers.md#amendment-1-2026-10-23-outcome-floors). Every full corpus needs 32 independently anchored scenarios (four per category), 120 measured calls, 40 references, 20 callable-value negatives, 20 each of resolved, proven-external and unresolved outcomes, and every applicable role. The rest differ by language:
+The floors are per-language data in `counts.mjs`, as amended by Decision 0017 [Amendment 1](../../docs/semantic-evidence/decisions/0017-conformance-corpus-storage-and-producers.md#amendment-1-2026-10-23-outcome-floors) and [Amendment 3](../../docs/semantic-evidence/decisions/0017-conformance-corpus-storage-and-producers.md#amendment-3-2026-10-23-production-native-captures). Every full corpus needs 32 independently anchored scenarios (four per category), 120 measured calls, 40 references, 20 callable-value negatives, 20 each of resolved, proven-external and unresolved outcomes, and every applicable role. The rest differ by language:
 
 | Floor | JavaScript | Java | Python | Rust |
 |---|---:|---:|---:|---:|
 | ambiguous outcomes | 20 | 0 | 0 | 0 |
 | type relationships | 20 | 20 | 20 | 0 |
-| unsupported documents | 1 | 1 | 1 | 1 |
+| unsupported documents | 1 | 0 | 0 | 1 |
 | alias role required | yes | no | no | yes |
 
-- **unsupported** counts documents, not anchors: a document and revision count once when the native producer's coverage intent declares a measurement family unavailable there and the same document and revision carry at least one authenticated captured producer fact (any semantic fact kind, including `symbol`; `coverage` and `provenance` bookkeeping does not count). The fact need not join in the unavailable family, and no `unsupported` join assertion is required; any that is authored is still checked against the native capability. More anchors in the same document add nothing.
+- **unsupported** counts documents, not anchors: a document and revision count once when the native producer's coverage intent declares a measurement family unavailable there and the same document and revision carry at least one authenticated captured producer fact (any semantic fact kind, including `symbol`; `coverage` and `provenance` bookkeeping does not count). The fact need not join in the unavailable family, and no `unsupported` join assertion is required; any that is authored is still checked against the native capability. More anchors in the same document add nothing. Java and Python have no floor until a genuine construct exists (Amendment 3).
 - **unresolved** is authored as a `callBinding` (or `reference`) fact with `resolution:"unresolved"`, `declaredTarget:null` and no candidates, on the exact join of a measured call or reference that has no producer occurrence, in a document whose semantic coverage tuple is `complete`. SCIP has no positive unresolved record, so absence at an exact measured join in a complete document is the evidence. The checker rejects an `unresolved` resolution disposition (`COUNT.DISPOSITION`) unless that producer's coverage tuple for the document is `complete`.
 - **alias** is satisfied by a reference fact at the measured alias name (`site:"declaration"`, roles `definition` and `alias`) whose target is the original declaration; that is what the producers report at the alias name. Java and Python are exempt from the alias floor.
 
@@ -122,14 +122,14 @@ production-build hash onto a test-support build. The hash covers the fixture
 adapter (`src/native_capture.rs`) as well as the production extraction modules
 only when `test-support` is enabled. Witness/conversion edits change the capture
 pin but do not change the release hash. It identifies this
-test-support capture build, not a release binary. Native extractor-hash pinning
-under Decision 0017 is a proposal in #95's PR body, awaiting owner ruling; it is
-not a ratified identity rule. No real hardware pin or corpus is changed here.
+test-support capture build, not a release binary. Decision 0017
+[Amendment 3](../../docs/semantic-evidence/decisions/0017-conformance-corpus-storage-and-producers.md#amendment-3-2026-10-23-production-native-captures)
+pins production native captures by this hash; no real hardware pin exists yet.
 
 The adapter preserves production declarations, calls and controls; it does not
 reparse source to invent additional measurements or map dynamic evidence to
 execution. Production currently emits no reference-candidate family, so the raw
-capture's `references` array is empty. The toolkit accepts unnamed Rust
+capture's `references` array is empty; native-v9 (#279) adds one. The toolkit accepts unnamed Rust
 `implementation` declarations and treats the synthetic module as outermost when
 its range equals a real declaration's range; nested declarations still require
 the real immediate source parent. Witnesses attest the actual header/spelling
@@ -139,5 +139,5 @@ its measured header (currently possible for Java varargs), fails capture rather
 than being silently rewritten. Fixing those production measurements requires its
 own producer-version decision; the adapter must not invent missing types. Keep annotations/coverage honest about the families
 present; this capture path does not implement per-construct family-unavailability
-or qualify the unsupported floor. That owner question is proposed separately in
-#95's PR body.
+or qualify the unsupported floor. Per-family unavailability reports come with
+native-v9 (#279), under Amendment 3.

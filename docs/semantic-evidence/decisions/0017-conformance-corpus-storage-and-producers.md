@@ -64,3 +64,18 @@ Decision 2 made the [reference hardware profile](../hardware/mac-mini-m5-pro-v1.
 - the profile's structural invariants: `version` is 1, `qualification` makes no benchmark claim (`benchmarkEvidence: null`, `passingBenchmarkClaim: false`), `profileId` equals the file name and the policy's `referenceHost.profileId`, `intended` matches the policy's reference-host location and paid-cloud flag, and `cpuCoreGroups` sums to `cpuCores`.
 
 A re-pin edits only the profile. The policy and cohort files are ratified Stage 1 text and stay value-frozen.
+
+## Amendment 3 (2026-10-23): production native captures
+
+- **Status:** owner-approved 2026-10-23.
+- **Context:** [#95](https://github.com/SquashMerge/trellis/issues/95) ([#277](https://github.com/SquashMerge/trellis/pull/277)) admitted the production native extractor, `trellis.native.syntax@native-v8`, to the toolkit through a test-support capture command. Its proposals for pinning and for the unsupported floor were ruled on as follows.
+
+1. **Pinning.** A production native capture's `executable` row pins the compiled `TRELLIS_EXTRACTOR_HASH` ([Decision 0005](0005-same-generation-producer-drift.md) R-2) of the pinned test-support capture build, not the SHA-256 of a release binary's bytes. In test-support builds that hash also covers the capture adapter (`src/native_capture.rs`), so an adapter change changes the pin while release extractor hashes stay unchanged. The pin uses decision 2's existing hardware-profile lookup. A `semanticProducers[]` entry, clearly labelled as a test-support capture build, records the producer ID and version, the extractor hash as `executableHash` and as `artifactDigest` (`sha256:<hash>`), and the source commit, pinned Rust toolchain and `test-support` feature in its install text. The checker compares the recorded digest and never rebuilds or runs the producer. A changed hash requires a re-pin and recapture. A changed measurement contract still requires a new native version. The hash enters neither `occ:v2` nor extraction context.
+2. **Reference rows.** native-v8 emits no reference candidates (`references: []`), so the 40-reference, callable-value-negative and imports/aliases floors cannot be met from production native captures. The floors are unchanged. native-v9 ([#279](https://github.com/SquashMerge/trellis/issues/279)) adds a production native reference family. Until then, no reference rows are fabricated, and no fixture that depends on them can be `profile:"corpus"`.
+3. **Unsupported documents.** Amendment 1's unsupported floor is met only by explicit per-family unavailability reports from the production extractor, added in native-v9 ([#279](https://github.com/SquashMerge/trellis/issues/279)). A whole-document `partial` coverage state is not such a report, and no working family is disabled to meet a count. The floor stays 1 for JavaScript (for example tagged templates) and Rust (for example opaque macro and attribute token trees). For Java and Python it is 0, not applicable, until a genuine construct is identified; a further amendment restores it then.
+
+| Floor | JavaScript | Java | Python | Rust |
+|---|---:|---:|---:|---:|
+| unsupported documents | 1 | 0 | 0 | 1 |
+
+Amendment 1's other floors are unchanged.
