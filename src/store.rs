@@ -313,6 +313,17 @@ struct TestTerminalNotify {
 #[cfg(feature = "test-support")]
 pub type RetentionStateForTests = ((String, i64, i64), (i64, i64));
 
+#[cfg(feature = "test-support")]
+#[derive(Debug)]
+#[doc(hidden)]
+pub struct PrivateStageObservation {
+    pub pin: IndexPin,
+    pub semantic: crate::semantic_evidence::SemanticSnapshot,
+    pub native_revision: crate::native_evidence::Revision,
+    pub declarations: Vec<crate::native_evidence::Declaration>,
+    pub calls: Vec<crate::native_evidence::Call>,
+}
+
 #[derive(Clone)]
 pub struct Store {
     roots: topology::TopologyRoots,
@@ -10382,7 +10393,7 @@ impl Store {
         captured: &crate::semantic_evidence::CapturedComponents,
         cancel: &CancelFlag,
         fail_before_commit: bool,
-    ) -> Result<(IndexPin, crate::semantic_evidence::SemanticSnapshot, i64)> {
+    ) -> Result<PrivateStageObservation> {
         let use_guard = self.roots.index_use_exclusive_existing(&self.identity)?;
         let leader = self
             .roots
@@ -10446,12 +10457,55 @@ impl Store {
             let staged = open_index(&stage.path, false)?;
             let key = format!("pin:v1:{}:{}", pin.index_generation, pin.index_revision);
             let snapshot = read_semantic(&staged, &key)?;
-            let native_rows: i64 = staged.query_row(
-                "SELECT count(*) FROM revision_documents WHERE revision_id=?1",
+            let (source_set_id, native_revision_id, toolchain_hash, config_hash, dependency_hash):
+                (String, String, String, String, String) = staged.query_row(
+                "SELECT source_set_id,native_revision_id,toolchain_hash,config_hash,dependency_hash FROM native_revisions WHERE id=?1",
                 [&key],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
             )?;
-            Ok((pin, snapshot, native_rows))
+            let documents = staged
+                .prepare(
+                    "SELECT m.language,m.path,d.content_hash,d.byte_length
+                 FROM revision_documents m JOIN document_versions d ON d.vid=m.vid
+                 WHERE m.revision_id=?1 ORDER BY m.language,m.path",
+                )?
+                .query_map([&key], |row| {
+                    Ok(crate::native_evidence::Document {
+                        key: crate::native_evidence::DocumentKey {
+                            source_set_id: source_set_id.clone(),
+                            language: row.get(0)?,
+                            path: row.get(1)?,
+                        },
+                        revision_id: native_revision_id.clone(),
+                        content_hash: row.get(2)?,
+                        byte_length: row.get::<_, i64>(3)? as usize,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let selected = ReadRevision::new(pin, key);
+            let mut declarations = vec![];
+            let mut calls = vec![];
+            for document in &documents {
+                let scope = v8_native_scope_for(&staged, &document.key, &selected)?
+                    .context("staged native document missing")?;
+                declarations.extend(read_native_declarations_v8(&staged, &scope, None, true)?);
+                calls.extend(read_native_calls_v8(&staged, &scope, None)?);
+            }
+            let revision = crate::native_evidence::Revision {
+                id: native_revision_id,
+                source_set_id,
+                documents,
+                toolchain_hash,
+                config_hash,
+                dependency_hash,
+            };
+            Ok(PrivateStageObservation {
+                pin,
+                semantic: snapshot,
+                native_revision: revision,
+                declarations,
+                calls,
+            })
         })();
         self.cleanup_failed_staged_index(stage, Some(&leader))?;
         result

@@ -460,7 +460,7 @@ fn private_stage_admits_typed_evidence_without_changing_live_head() {
     );
     assert_eq!(store.index_baseline().unwrap(), head);
     let next_capture = trellis::capture::Capture::admit(&options, &cancel, &|_| {}).unwrap();
-    let (staged_pin, staged, native_rows) = store
+    let observation = store
         .publish_private_stage_semantic_for_tests(
             &options,
             &next_capture,
@@ -470,9 +470,49 @@ fn private_stage_admits_typed_evidence_without_changing_live_head() {
             false,
         )
         .unwrap();
+    let staged_pin = observation.pin;
+    let staged = observation.semantic;
+    let staged_revision = observation.native_revision;
+    let staged_declarations = observation.declarations;
+    let staged_calls = observation.calls;
     assert_ne!(staged_pin.index_generation, head.index_generation);
     assert_eq!(staged_pin.index_revision, 1);
-    assert_eq!(native_rows, native.revision.documents.len() as i64);
+    assert_eq!(staged_revision, native.revision);
+    let binding = &staged.declaration_bindings[0];
+    let candidate = &binding.join.candidate_ids[0];
+    let declaration = staged_declarations
+        .iter()
+        .find(|declaration| &declaration.syntax_id == candidate)
+        .unwrap();
+    assert_eq!(declaration.document, binding.join.anchor.document);
+    assert_eq!(declaration.revision_id, staged_revision.id);
+    assert_eq!(
+        declaration.name_range.as_ref(),
+        Some(&binding.join.anchor.range)
+    );
+    let reference = &staged.references[0];
+    assert_eq!(reference.owner_syntax_id, declaration.syntax_id);
+    assert_eq!(reference.document, declaration.document);
+    assert_eq!(reference.revision_id, staged_revision.id);
+    let expected_target = s::Target::Internal {
+        syntax_id: declaration.syntax_id.clone(),
+        document: declaration.document.clone(),
+        revision_id: staged_revision.id.clone(),
+    };
+    assert_eq!(reference.declared_target.as_ref(), Some(&expected_target));
+    let call_binding = &staged.call_bindings[0];
+    let call = staged_calls
+        .iter()
+        .find(|call| Some(&call.id) == call_binding.call_id.as_ref())
+        .unwrap();
+    assert_eq!(call.document, call_binding.join.anchor.document);
+    assert_eq!(call.revision_id, staged_revision.id);
+    assert_eq!(
+        call.callee_range.as_ref(),
+        Some(&call_binding.join.anchor.range)
+    );
+    assert_eq!(call_binding.join.candidate_ids, vec![call.id.clone()]);
+    assert!(call_binding.candidates.contains(&expected_target));
     assert_eq!(staged.coverage, semantic.coverage);
     assert_eq!(staged.provenance, semantic.provenance);
     assert_eq!(staged.references, semantic.references);
