@@ -7,14 +7,16 @@ read-only references, rule check/explain tools, a proposal prompt and
 `trellis rules check --format json`. See the [MCP wire contract](mcp-readonly-pilot-contract.md)
 for transport, attribution and limits.
 
-## Start with explicit layer policy
+## Start with reviewed layers
 
 ```toml
 version = 1
 
-[layer_policy]
-peers = "forbid"
-shared_outbound = "forbid"
+# Cross-peer and shared-to-ordered references default to forbid.
+# To allow either direction explicitly, add before the layer tables:
+# [layer_policy]
+# peers = "allow"
+# shared_outbound = "allow"
 
 [layers.web]
 order = 1
@@ -33,9 +35,11 @@ shared = true
 paths = ["src/model.rs", "src/testing.rs"]
 ```
 
-This example makes two **reviewed choices**, not hidden defaults: prohibit
-cross-peer references and shared-to-ordered references. Omit either policy and an
-observed affected edge is `unknown` with `layer_policy_unspecified`.
+Cross-peer references and shared-to-ordered references are deviations by default.
+Omitting `[layer_policy]` or either key is equivalent to setting that key to
+`"forbid"`. Set `peers = "allow"` or `shared_outbound = "allow"` explicitly to
+allow that direction. An exact reviewed exception can approve an individual pair
+without changing its underlying deviation status.
 
 An integer `order` is explicit: lower means higher, equal integers are peers.
 Table order has no meaning. A layer has either `order` or `shared = true`, never
@@ -50,9 +54,9 @@ For an observed production structural reference pair:
 | Same layer | conforms |
 | Ordered source to larger order (downward, including skipped levels) | conforms |
 | Ordered source to smaller order (upward) | deviates |
-| Different ordered layers with equal order | configured `peers` policy, otherwise unknown |
+| Different ordered layers with equal order | deviates unless `peers = "allow"` |
 | Any source into shared, including shared into shared | conforms |
-| Shared into ordered | configured `shared_outbound` policy, otherwise unknown |
+| Shared into ordered | deviates unless `shared_outbound = "allow"` |
 | Unassigned endpoint or unresolved mapping/ownership | unknown |
 
 Conformance describes **that observed structural pair**, not the absence of hidden

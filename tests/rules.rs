@@ -180,11 +180,8 @@ paths=["src/shared.rs"]
         ("src/lib.rs", "src/peer.rs"),
         ("src/shared.rs", "src/entry.rs"),
     ] {
-        assert_eq!(pair(&data, s, t)["status"], "unknown");
-        assert_eq!(
-            pair(&data, s, t)["unresolved"],
-            json!(["layer_policy_unspecified"])
-        );
+        assert_eq!(pair(&data, s, t)["status"], "deviates");
+        assert_eq!(pair(&data, s, t)["unresolved"], json!([]));
     }
     assert!(
         data["unassigned"]
@@ -214,6 +211,45 @@ paths=["src/shared.rs"]
         "",
     ) + "\n[layers.storage]\norder=3\npaths=[\"src/service.rs\"]\n";
     assert_eq!(data["instances"], evaluate(&reordered, &input)["instances"]);
+}
+#[test]
+fn rules_absent_policy_keys_default_to_forbid_with_independent_allow_overrides() {
+    let input = snapshot(&[
+        ("src/lib.rs", "fn run(){crate::peer::run();}"),
+        ("src/peer.rs", "pub fn run(){}"),
+        ("src/shared.rs", "pub fn run(){crate::peer::run();}"),
+    ]);
+    let text = r#"version=1
+[layers.entry]
+order=1
+paths=["src/lib.rs"]
+[layers.peer]
+order=1
+paths=["src/peer.rs"]
+[layers.shared]
+shared=true
+paths=["src/shared.rs"]
+"#;
+    for (policy, peer_status, shared_status) in [
+        ("", "deviates", "deviates"),
+        ("[layer_policy]", "deviates", "deviates"),
+        ("[layer_policy]\npeers='allow'", "conforms", "deviates"),
+        (
+            "[layer_policy]\nshared_outbound='allow'",
+            "deviates",
+            "conforms",
+        ),
+    ] {
+        let data = evaluate(&format!("{text}\n{policy}"), &input);
+        for (source, expected) in [
+            ("src/lib.rs", peer_status),
+            ("src/shared.rs", shared_status),
+        ] {
+            let row = pair(&data, source, "src/peer.rs");
+            assert_eq!(row["status"], expected, "{policy}: {source}");
+            assert_eq!(row["unresolved"], json!([]));
+        }
+    }
 }
 #[test]
 fn rules_layer_exceptions_are_exact_edge_pairs_and_tests_stay_separate() {

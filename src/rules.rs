@@ -637,10 +637,10 @@ fn layer_status(
         (Some(_), Some(_)) => config.peers.as_deref(),
         _ => config.shared_outbound.as_deref(),
     };
-    match policy {
-        Some("allow") => ("conforms", vec![]),
-        Some("forbid") => ("deviates", vec![]),
-        _ => ("unknown", vec!["layer_policy_unspecified".into()]),
+    if policy == Some("allow") {
+        ("conforms", vec![])
+    } else {
+        ("deviates", vec![])
     }
 }
 fn decorate(config: &Config, row: &mut Value) {
