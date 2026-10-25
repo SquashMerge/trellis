@@ -31,7 +31,7 @@ const LANGUAGES: [&str; 4] = ["java", "rust", "python", "javascript"];
 pub(crate) const PRODUCER: &str = "trellis.native.syntax";
 /// Native producer descriptor version. Any change that can alter a native measured field or
 /// projection, or that starts reading another input, must change it (Decision 0003).
-pub(crate) const NATIVE_VERSION: &str = "native-v9";
+pub(crate) const NATIVE_VERSION: &str = "native-v8.1";
 /// The build-time producer hash of this executable's extraction inputs: the
 /// listed extraction modules and crates (`build/extractor_inputs.rs`). Each
 /// revision records it; an executable rebuild with an equal hash keeps the
@@ -3394,8 +3394,8 @@ console.log(JSON.stringify(productionInventoryEntries()));
         };
         assert_eq!(
             witness(&a),
-            "68145a39292dea496c1aaea5d56d8d1a7260dbfd47b6b4aba2fbe6c4e5ab90a7",
-            "native-v9 witness includes declaration role and the producer version"
+            "990ae82c7d80950f788d604ed1bf7fd9a25ee8de7f732dbdb0f67eeb7fbdebe4",
+            "native-v8.1 witness includes declaration role and the producer version"
         );
         assert_eq!(
             witness(&a),
