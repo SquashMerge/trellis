@@ -250,12 +250,16 @@ async fn strict_errors_revisions_and_auth() {
     }
 }
 #[tokio::test]
-async fn cached_snapshot_is_independent_of_workspace_and_raw_query() {
+async fn cached_sequence_and_source_are_independent_of_workspace() {
     let (dir, store, graph, app, _session) = setup();
     let pin = store.status().unwrap().revision;
     let seed = &graph.nodes.iter().find(|n| n.name == "seed").unwrap().id;
-    let query = json!({"seed":seed});
-    let raw_before = call(&app, "POST", "/api/query", query.clone()).await;
+    let source_path = format!(
+        "/api/source?path=a.js&indexGeneration={}&indexRevision={}",
+        pin.index_generation, pin.index_revision
+    );
+    let source_before = call(&app, "GET", &source_path, Value::Null).await;
+    assert_eq!(source_before.0, 200, "{:?}", source_before.1);
     let request = json!({"seed":seed,"expectedRevision":pin});
     let sequence_before = call(&app, "POST", "/api/sequence", request.clone()).await;
     assert_eq!(sequence_before.0, 200, "{:?}", sequence_before.1);
@@ -265,7 +269,10 @@ async fn cached_snapshot_is_independent_of_workspace_and_raw_query() {
         call(&app, "POST", "/api/sequence", request).await,
         sequence_before
     );
-    assert_eq!(call(&app, "POST", "/api/query", query).await, raw_before);
+    assert_eq!(
+        call(&app, "GET", &source_path, Value::Null).await,
+        source_before
+    );
     assert_eq!(
         call(
             &app,

@@ -1051,16 +1051,16 @@ fn exceptional_activation_is_atomic_and_keeps_pending_on_ambiguous_failure() {
                 &cancel,
             )
             .unwrap();
-        store
-            .put_annotation(&Annotation {
-                id: "saved".into(),
-                node_id: "unattached".into(),
-                body: "keep me".into(),
-            })
-            .unwrap();
         let index = store.roots.index_db(&store.identity);
         let dir = store.roots.index_dir(&store.identity);
-        let record = store.roots.record_db(&store.identity);
+        let record = store
+            .roots
+            .data
+            .join("workspaces")
+            .join(&store.identity.record_id)
+            .join("workspace.db");
+        fs::create_dir_all(record.parent().unwrap()).unwrap();
+        fs::write(&record, b"retired record bytes").unwrap();
         let requests = dir.join("requests.db");
         let facts = dir.join("facts.db");
         let neighbor = dir.join("unrelated-record");

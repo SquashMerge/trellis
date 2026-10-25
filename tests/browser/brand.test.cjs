@@ -102,7 +102,38 @@ test("real shell loads local brand fonts, preserves Connect and source, and rend
     assert.ok(bounds && bounds.x >= 0 && bounds.x + bounds.width <= 390,"mobile token input remains in viewport");
     assert.equal(await page.locator("#connect-form button").isVisible(),true);
     await page.setViewportSize({width:1440,height:900});
+    const checkoutRequests=[];
+    page.on("request",request=>{
+      const pathname=new URL(request.url()).pathname;
+      if(pathname.startsWith("/api/checkouts/")) checkoutRequests.push(pathname.split("/").slice(4).join("/"));
+    });
     await H.connect(page,server,paths.token);
+    const tabs=page.getByRole("tablist",{name:"Workspace views"}).getByRole("tab");
+    assert.deepEqual(await tabs.allTextContents(),["Sequence","Classes","Libraries"]);
+    async function activeTab(name) {
+      const tab=tabs.filter({hasText:new RegExp(`^${name}$`)});
+      assert.equal(await tab.getAttribute("aria-selected"),"true");
+      assert.equal(await tab.evaluate(node=>node.tabIndex),0);
+      assert.equal(await tab.evaluate(node=>document.activeElement===node),true);
+      const panel=page.locator(`#${await tab.getAttribute("aria-controls")}`);
+      assert.equal(await panel.isVisible(),true);
+      assert.equal(await panel.getAttribute("aria-labelledby"),await tab.getAttribute("id"));
+      assert.equal(await tabs.evaluateAll(nodes=>nodes.filter(node=>node.getAttribute("aria-selected")==="false").length),2);
+      assert.equal(await tabs.evaluateAll(nodes=>nodes.filter(node=>node.tabIndex===0).length),1);
+    }
+    await page.locator("#view-sequence").focus();
+    await page.keyboard.press("ArrowRight");await activeTab("Classes");
+    await page.keyboard.press("ArrowRight");await activeTab("Libraries");
+    await page.keyboard.press("ArrowRight");await activeTab("Sequence");
+    await page.keyboard.press("ArrowLeft");await activeTab("Libraries");
+    await page.keyboard.press("Home");await activeTab("Sequence");
+    await page.keyboard.press("End");await activeTab("Libraries");
+    await page.keyboard.press("Home");await activeTab("Sequence");
+    await page.locator("#refresh").click();
+    await page.waitForFunction(()=>!document.querySelector("#refresh").disabled);
+    assert.equal(await page.locator("#error").isVisible(),false);
+    assert.ok(checkoutRequests.includes("jobs/current"),"checkout selection still loads the current index job");
+    assert.ok(checkoutRequests.every(route=>! /^(?:symbols|symbol|query|views|annotations|questions|jev|acp)(?:\/|$)/.test(route)),JSON.stringify(checkoutRequests));
     for (const selector of ["#checkout-select","#refresh"]) {
       await readable(page,selector);
       const boundary = await contrast(page,selector,{border:true});
@@ -126,6 +157,7 @@ test("real shell loads local brand fonts, preserves Connect and source, and rend
     for (const file of ["inter-variable.woff2","manrope-variable.woff2","jetbrains-mono-latin.woff2"]) {
       assert.ok(fontResponses.some(response => response.url === `${server.base}/fonts/${file}` && response.status === 200),`local font response missing: ${file}; ${JSON.stringify(fontResponses)}`);
     }
+    assert.ok(checkoutRequests.every(route=>! /^(?:symbols|symbol|query|views|annotations|questions|jev|acp)(?:\/|$)/.test(route)),JSON.stringify(checkoutRequests));
     assert.deepEqual(errors,[],"no CSP, font, or application errors");
     if (process.env.TRELLIS_BRAND_REPORT) {
       const report = resolve(process.env.TRELLIS_BRAND_REPORT);

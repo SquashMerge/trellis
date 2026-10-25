@@ -1,5 +1,7 @@
 # Multi-project viability
 
+> Historical validation/analysis. Saved views, notes and Jev/ACP providers described below were retired by the [owner ruling 2026-10-24, #305](https://github.com/SquashMerge/trellis/issues/305#issuecomment-6394175295). Their old files remain in place and ignored. Historical observations are not current feature or startup instructions.
+
 > **Topology decision (2026-09-23).** The facts below about the current code still hold. For agents, the
 > chosen topology is not the one-daemon registry recommended here but one index per checkout reached through
 > a stdio `trellis mcp` server; see the [local topology](local-topology.md). A registry may still back a

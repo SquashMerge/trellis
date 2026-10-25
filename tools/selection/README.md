@@ -1,5 +1,7 @@
 # Trellis view-selection tools
 
+**Historical research only.** The Tools/provider runtime was retired by the [owner ruling 2026-10-24, #305](https://github.com/SquashMerge/trellis/issues/305#issuecomment-6394175295). This harness is not a supported runtime provider and is not run by normal startup or verification. Its closed fixture ledger and outputs are retained evidence, not a new execution allowance. Do not run provider or replay entrypoints or change the closed budget without separate owner authorization.
+
 Compare a deterministic graph baseline, Jev typed relevance decisions, and a Claude
 agent reached through ACP with graph tools exposed over MCP. This is a controlled
 selection experiment, not a test of unrestricted agent investigation.

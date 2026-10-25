@@ -103,7 +103,7 @@
 * { box-sizing: border-box; }
 html, body { height: 100%; }
 body { margin: 0; display: flex; flex-direction: column; overflow: hidden; background: var(--bg); color: var(--ink); font: 13px/1.5 var(--sans); }
-button, input, select, textarea { font: inherit; color: var(--ink); background: var(--node); border: 1px solid var(--line-strong); border-radius: 4px; padding: 6px 9px; }
+button, input, select { font: inherit; color: var(--ink); background: var(--node); border: 1px solid var(--line-strong); border-radius: 4px; padding: 6px 9px; }
 button { cursor: pointer; font-weight: 500; transition: background-color 120ms ease-out, border-color 120ms ease-out; }
 button:hover { background: var(--node); border-color: var(--muted); }
 button:active { background: var(--node); }
@@ -112,11 +112,10 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 button:disabled:hover { background: var(--node); border-color: var(--line-strong); }
 button.selected { color: var(--on-selected); }
 button.selected :is(span, strong, small, code, .detail, .muted, .badge) { color: inherit; }
-input, select, textarea { min-width: 0; max-width: 100%; }
-input::placeholder, textarea::placeholder { color: var(--secondary); opacity: 1; }
+input, select { min-width: 0; max-width: 100%; }
+input::placeholder { color: var(--secondary); opacity: 1; }
 input[type=checkbox] { accent-color: var(--primary); vertical-align: middle; margin: 0 5px 2px 0; }
-input[type=search], #view-title { flex: 1; width: 130px; }
-textarea { display: block; width: 100%; margin: 6px 0 10px; resize: vertical; }
+input[type=search] { flex: 1; width: 130px; }
 label { color: var(--secondary); }
 :focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; }
 a { color: var(--link); text-decoration: underline; text-underline-offset: 3px; }
@@ -126,7 +125,7 @@ h2 { margin: 0; font-size: 13px; font-weight: 600; }
 h3 { margin: 14px 0 8px; font-size: 13px; font-weight: 600; }
 h4 { margin: 20px 0 8px; font-size: 12px; font-weight: 500; color: var(--secondary); }
 p { margin: 8px 0; overflow-wrap: anywhere; }
-section, aside, main, .content { min-width: 0; }
+section, aside, main { min-width: 0; }
 summary { cursor: pointer; color: var(--secondary); }
 summary:hover { color: var(--ink); }
 pre { font: 12px/1.7 var(--mono); overflow: auto; background: var(--rail); padding: 12px; tab-size: 4; }
@@ -312,51 +311,11 @@ main:has(#workspace[hidden]) { overflow: auto; }
 #external-sources { margin: 20px 0; padding: 12px 0; border-top: 1px solid var(--line); }
 .external-tree ul { margin-left: 12px; }
 .external-tree button, #external-definitions button { text-align: left; overflow-wrap: anywhere; }
-/* Existing question, hierarchy and annotation controls retain their explicit opt-ins. */
-#tools-panel { padding: 16px 18px; }
-#secondary-tools > summary { font-weight: 500; padding: 0 0 14px; color: var(--ink); }
-.layout { display: grid; grid-template-columns: minmax(160px, 230px) minmax(0, 1fr); gap: 22px; }
-.layout section { padding: 14px 0; border-bottom: 1px solid var(--line); }
-.layout h2 { margin-bottom: 10px; }
-.symbol { width: 100%; }
-#question-form > label, #annotation-form > label { display: block; margin-top: 8px; }
-#note-title { display: block; width: min(100%, 560px); margin: 6px 0 10px; }
-.saved-title { display: block; color: var(--ink); overflow-wrap: anywhere; }
-.saved-actions { margin-top: 6px; }
-.saved-actions button { font-size: 12px; padding: 4px 8px; }
-.saved-reason { margin-top: 4px; max-width: 65ch; }
-#focus-terms { width: min(100%, 560px); }
-.question-options { margin: 12px 0 6px; }
-#max-visible { width: 5em; }
-#packet-actions { margin-top: 12px; }
-.file-label { font-weight: 500; }
-#import-jev { max-width: 100%; font-size: 12px; }
-#focus-state, #focus-counts, #jev-status, #acp-status, #answer-state { font-size: 12px; }
-#seed { font-weight: 500; }
-.plain .call-row { padding: 8px 0; }
-.call-heading { display: flex; align-items: baseline; flex-wrap: wrap; gap: 8px; }
-.call-heading strong { font: 500 13px/1.5 var(--mono); overflow-wrap: anywhere; }
-.call-heading .badge { margin: 0; font-size: 11px; }
-.call-evidence { margin-top: 3px; font-size: 12px; }
-.call-row .expand-call { font-size: 12px; padding: 3px 7px; margin: 4px 0 0; }
-.call-row .call-branch { margin: 6px 0 0 10px; padding-left: 12px; border-left: 1px solid var(--line); }
-.hierarchy-root { background: var(--node); padding: 10px !important; }
-.hierarchy-root > button, #return-raw { font-size: 12px; padding: 3px 7px; }
-.plain .call-heading .call-name { font: 500 13px/1.5 var(--mono); border: 0; background: var(--clear); padding: 0; margin: 0; color: var(--ink); text-align: left; overflow-wrap: anywhere; }
-.plain .call-heading .call-name:hover { color: var(--link); text-decoration: underline; }
-#run-jev, #explain-acp { border-color: var(--line-strong); color: var(--ink); }
-#jev-status, #acp-status, #answer-state, #answer-content { max-width: 75ch; }
-#answer-content h3 { font-size: 14px; margin: 18px 0 6px; }
-.answer-claim { margin: 12px 0 16px; }
-.answer-claim p { white-space: pre-wrap; }
-.answer-citations { display: flex; flex-wrap: wrap; gap: 6px; }
-.answer-citations button { font-size: 12px; padding: 3px 7px; color: var(--link); text-decoration: underline; text-underline-offset: 3px; overflow-wrap: anywhere; max-width: 100%; text-align: left; }
-#answer-content li { overflow-wrap: anywhere; }
 footer { display: flex; flex: none; justify-content: space-between; align-items: center; gap: 14px; padding: 5px 16px; border-top: 1px solid var(--line); background: var(--rail); color: var(--muted); font-size: 11px; }
 .local-indicator::before { content: ''; display: inline-block; width: 5px; height: 5px; border-radius: 50%; margin-right: 7px; background: var(--muted); vertical-align: middle; }
 footer details > p { position: absolute; bottom: 30px; right: 12px; width: min(520px, calc(100vw - 24px)); padding: 16px; margin: 0; background: var(--card); border: 1px solid var(--line-strong); color: var(--secondary); z-index: 20; }
 @media (min-width: 1600px) { .workspace-frame { grid-template-columns: 268px minmax(0, 1fr) 310px; } }
-@media (max-width: 1200px) { .workspace-frame { grid-template-columns: 214px minmax(0, 1fr) 250px; } .layout { grid-template-columns: 1fr; gap: 4px; } .sequence-toolbar { align-items: flex-start; } }
+@media (max-width: 1200px) { .workspace-frame { grid-template-columns: 214px minmax(0, 1fr) 250px; } .sequence-toolbar { align-items: flex-start; } }
 @media (max-width: 900px) {
   .app-header { gap: 14px; padding: 0 12px; }
   .workspace-identity { padding-left: 14px; }
@@ -398,13 +357,11 @@ footer details > p { position: absolute; bottom: 30px; right: 12px; width: min(5
   #connect-form { margin: 16px 0; padding: 18px; gap: 12px; }
   #connect-form > label { font-size: 12px; }
   #token-file { width: 100%; }
-  #dependency-library, #tools-panel { padding: 14px 12px; }
+  #dependency-library { padding: 14px 12px; }
   .dependency-layout { grid-template-columns: 1fr; gap: 8px; }
   .source-dock-bar { padding: 0 4px; }
   .dock-tabs button { font-size: 11px; padding: 8px; }
   #source-dock { min-height: 150px; }
-  .call-row .call-branch { margin-left: 4px; padding-left: 8px; }
-  #import-jev { width: 100%; }
   footer { padding: 5px 10px; font-size: 10px; }
 }
 @media (max-height: 560px) { #notice { display: none; } .sequence-toolbar { padding-top: 8px; } .sequence-context { padding-bottom: 3px; } #source-dock { min-height: 110px; } }

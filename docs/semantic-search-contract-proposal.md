@@ -406,8 +406,8 @@ typed, and needs no new rule; the plan's citation should be fixed.
 **Touches.**
 
 - `local-topology.md` § T02, the fixed-locations table. Its rows are the derived index, use lock,
-  explicit requests, optional facts (`<cache>/facts.db`), durable record and use lock, and tokens
-  and ledgers.
+  explicit requests, optional facts (`<cache>/facts.db`), and tokens. Retired record and ledger
+  paths remain ignored under #305.
 - `local-topology.md` § T02: "The fact cache cannot be authoritative: a missing, corrupt,
   conflicting or unavailable entry falls back to extraction".
 - `local-topology.md` § T06: "Optional facts may be evicted without changing evidence."
@@ -517,7 +517,7 @@ adding to the size problem #199 is working on.
 
 - `contract-v1.md` § Identity and coverage: `Producer.id`, `.version`, `.executableHash`.
 - `semantic-search-plan.md` § Model: "The model is pinned like a producer".
-- `local-topology.md` § T02: "Tokens and Jev/ACP ledgers | Explicitly configured external paths".
+- `local-topology.md` § T02: "Tokens | Explicitly configured external paths".
 
 **Proposed change.**
 
@@ -533,7 +533,7 @@ adding to the size problem #199 is working on.
   weightsSha256)` triples. A configured model whose hashes don't match is reported as
   `searchIndex.state:"unavailable"`. It is never loaded under another identity.
 - **Weights.** They come from an explicitly configured path. This is a new proposed placement:
-  T02's configured external paths cover tokens and ledgers today, not model weights. Trellis
+  T02's configured external paths cover tokens today, not model weights. Trellis
   never downloads them (D8). The weights are hashed once when the daemon loads the model, then
   pinned for that daemon's lifetime.
 - **Not a producer.** The model is not a #22 producer and gets no `Producer` row, because its
@@ -647,8 +647,8 @@ Out of scope, per T00: signing or authenticating cached vectors against a same-u
 - `mcp-readonly-pilot-contract.md` opening: tools never "invoke a provider".
 - `semantic-search-plan.md` § Model: "A remote embedding API is available only as an explicit
   opt-in."
-- The live Jev rules (`live-jev.md`): explicit opt-in, a key from the environment, and a budget
-  ledger.
+- The retired live Jev runtime is not a provider or accounting contract for future search.
+  A remote provider would need separate owner approval and an explicit accounting contract.
 
 **Proposed change.** None now. voyage-code-4 sends repository code, and query text, to a hosted
 service. It is **out of scope** until the owner opts in. It would then need:

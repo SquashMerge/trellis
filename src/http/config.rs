@@ -1,10 +1,8 @@
 //! A checkout's browser configuration as one immutable, versioned value
 //! (Decision 0009 §6). `serve` replaces it in place; handlers pin one version.
 
-use crate::acp::Acp;
 use crate::dependencies::CatalogOptions;
 use crate::indexer::IndexOptions;
-use crate::live_jev::LiveJev;
 use std::sync::Arc;
 
 pub struct BrowserConfig {
@@ -15,21 +13,16 @@ pub struct BrowserConfig {
     pub browser: crate::file_tree::SourceDir,
     pub rust_sources: Vec<crate::rust_sources::Root>,
     pub dependency_options: Option<CatalogOptions>,
-    pub provider: Option<Arc<LiveJev>>,
-    pub acp: Option<Arc<Acp>>,
 }
 
 impl BrowserConfig {
     /// Build and validate every part, or fail without a partial value.
-    #[allow(clippy::too_many_arguments)]
     pub fn build(
         options: IndexOptions,
         explicit_options: bool,
         browse_root: &std::path::Path,
         source_roots: Vec<(String, std::path::PathBuf)>,
         dependency_options: Option<CatalogOptions>,
-        provider: Option<Arc<LiveJev>>,
-        acp: Option<Arc<Acp>>,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             options,
@@ -37,8 +30,6 @@ impl BrowserConfig {
             browser: crate::file_tree::SourceDir::open(browse_root)?,
             rust_sources: crate::rust_sources::open_roots(source_roots)?,
             dependency_options,
-            provider,
-            acp,
         })
     }
 }

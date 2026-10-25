@@ -21,7 +21,7 @@ C4Container
     Container(core, "Browser daemon", "Rust", "Serves the workbench; stores artifacts")
     ContainerDb(registry, "Project registry", "Optional local durable store", "Lists checkouts for the browser picker; not needed by agents")
     ContainerDb(stores, "Per-checkout index", "SQLite cache, per-user, keyed by path", "Disposable evidence; written only by the leader")
-    ContainerDb(durable, "Durable state", "SQLite outside the checkout", "Views, notes, artifacts, tokens, ledgers")
+    ContainerDb(durable, "Durable state", "SQLite outside the checkout", "Proposed artifacts and tokens; retired records ignored")
     ContainerDb(facts, "Shared fact cache", "SQLite, per-user cache", "Per-file extraction by content hash")
   }
   Rel(user, ui, "Inspects code and operates agent tabs", "Local HTTP")
@@ -37,7 +37,7 @@ C4Container
   Rel(core, ui, "Notifies of available artifact versions", "Proposed metadata event stream")
   Rel(core, registry, "Looks up authorized project bindings", "Local storage")
   Rel(core, stores, "Reads snapshots; watches and writes when leader", "SQLite")
-  Rel(core, durable, "Persists views, notes and artifacts", "SQLite")
+  Rel(core, durable, "Persists proposed artifacts", "SQLite")
   Rel(core, herdr, "Optionally discovers and reconciles metadata", "Versioned local socket adapter")
 ```
 

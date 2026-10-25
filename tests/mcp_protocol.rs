@@ -568,8 +568,8 @@ fn validate_structured_content(pairs: &[Value]) {
     let script = r#"
 const {createRequire} = require('node:module');
 const {readFileSync} = require('node:fs');
-const requireFromRuntime = createRequire(process.cwd() + '/runtime/acp/package.json');
-const Ajv2020 = requireFromRuntime('ajv/dist/2020.js').default;
+const requireFromTests = createRequire(process.cwd() + '/tests/mcp/package.json');
+const Ajv2020 = requireFromTests('ajv/dist/2020.js').default;
 const ajv = new Ajv2020({strict: false, allErrors: true});
 const catalog = JSON.parse(readFileSync('tests/fixtures/mcp/catalog.json', 'utf8'));
 const inputs = JSON.parse(readFileSync(0, 'utf8'));

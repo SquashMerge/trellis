@@ -16,15 +16,14 @@ Retain the compact 13–14px body and existing pane layout, not the packet's lar
 scale. Primary action buttons use a 44px minimum height and 8px radius.
 The full logo lockup is Connect-only, with clear space. App headers use the provisional, unreviewed
 symbol plus “Trellis by SquashMerge”; no favicon ships before a reviewed compact mark exists.
-This amendment does not retire Tools, add unshipped tabs, or authorize fictional compiler,
-class-diagram, agent or terminal capabilities. Gated capabilities remain hidden until accepted.
+The Tools tab is retired by the [owner ruling 2026-10-24, #305](https://github.com/SquashMerge/trellis/issues/305#issuecomment-6394175295). This does not add unshipped tabs or authorize fictional compiler, agent or terminal capabilities. Gated capabilities remain hidden until accepted.
 
-The explorer stays beside the sequence canvas on desktop. Libraries and Tools have their
+The explorer stays beside the sequence canvas on desktop. Classes and Libraries have their
 own tabs. Selected calls and controls populate the inspector. Explicit source actions open
 a source dock. Small screens use exclusive explorer/inspector drawers and scroll diagrams
 inside the canvas. Selecting a method or opening source closes obstructing drawers.
 
-Existing form/control IDs, authentication, token opt-in and provider confirmations remain.
+Retained form/control IDs, authentication and token opt-in remain.
 All content is rendered as text. Font and script routes retain the existing Host/Origin/CSP
 checks. Font licenses ship under `web/fonts/`.
 
@@ -33,7 +32,7 @@ checks. Font licenses ship under `web/fonts/`.
 `window.TrellisShell` is presentation-only. It never fetches, indexes or calls a provider:
 
 - `setConnected(bool)`, `updateWorkspace(status)`
-- `showView("sequence" | "libraries" | "tools")`
+- `showView("sequence" | "classes" | "libraries")`
 - `showSource("workspace" | "library")`
 - `selectStep(step, view, openSourceCallback)`
 - `resetInspector()`, `reset()`

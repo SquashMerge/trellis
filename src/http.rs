@@ -1,17 +1,9 @@
 //! Loopback-only HTTP API. Database and indexing work runs on blocking workers.
-#[cfg(feature = "test-support")]
-use crate::planning::FocusedView;
-#[cfg(feature = "test-support")]
-use crate::store::{EvidenceFence, EvidenceFencePolicy};
 use crate::{
-    acp::Acp,
     auth::valid_token,
     dependencies::{Catalog, CatalogOptions},
     indexer::IndexOptions,
-    jev,
-    live_jev::LiveJev,
     model::*,
-    planning::{self, QuestionPacket, QuestionPreview, QuestionRequest, SelectionEnvelope},
     store::Store,
 };
 use anyhow::Context;
@@ -25,17 +17,14 @@ use axum::{
     routing::get,
 };
 #[cfg(feature = "test-support")]
-use axum::{
-    extract::DefaultBodyLimit,
-    routing::{post, put},
-};
+use axum::{extract::DefaultBodyLimit, routing::post};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::BTreeMap,
     net::SocketAddr,
     sync::{
         Arc, Mutex,
@@ -67,46 +56,6 @@ struct Jobs {
     current: Option<String>,
     jobs: BTreeMap<String, IndexJob>,
     cancel: CancelFlag,
-}
-const MAX_PACKETS: usize = 8;
-const MAX_PACKET_BYTES: usize = 1024 * 1024;
-const MAX_CACHE_BYTES: usize = 8 * MAX_PACKET_BYTES;
-#[derive(Default, Clone)]
-struct PacketCache {
-    packets: VecDeque<(Arc<QuestionPacket>, usize)>,
-    bytes: usize,
-}
-impl PacketCache {
-    fn remember(&mut self, packet: Arc<QuestionPacket>, bytes: usize) {
-        if let Some(index) = self
-            .packets
-            .iter()
-            .position(|(p, _)| p.packet_id == packet.packet_id)
-        {
-            self.bytes -= self.packets.remove(index).unwrap().1;
-        }
-        while self.packets.len() >= MAX_PACKETS || self.bytes + bytes > MAX_CACHE_BYTES {
-            self.bytes -= self.packets.pop_front().unwrap().1;
-        }
-        self.bytes += bytes;
-        self.packets.push_back((packet, bytes));
-    }
-    // The final fence runs after admission while this mutex is held. A failed
-    // response cannot evict an earlier packet or replace its same-ID entry.
-    fn remember_fenced(
-        &mut self,
-        packet: Arc<QuestionPacket>,
-        bytes: usize,
-        finish: impl FnOnce() -> anyhow::Result<()>,
-    ) -> anyhow::Result<()> {
-        let prior = self.clone();
-        self.remember(packet, bytes);
-        if let Err(error) = finish() {
-            *self = prior;
-            return Err(error);
-        }
-        Ok(())
-    }
 }
 struct DependencyIndex {
     generation: u64,
@@ -275,8 +224,6 @@ pub struct DaemonState {
     dependency_capture_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(all(test, feature = "test-support"))]
     outer_fence_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
-    #[cfg(all(test, feature = "test-support"))]
-    preview_finish_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(feature = "test-support")]
     token: String,
     #[cfg(feature = "test-support")]
@@ -340,7 +287,6 @@ pub struct DaemonState {
     test_queue_after_watcher_reconcile: crate::store::TestOneShotHook,
     #[cfg(test)]
     test_queue_current_phase: std::sync::atomic::AtomicU8,
-    packets: Mutex<PacketCache>,
 }
 impl Drop for DaemonState {
     /// A lossless shutdown: an idle worker waiting without a deadline exits.
@@ -361,56 +307,23 @@ pub fn new(
     token: String,
     address: SocketAddr,
 ) -> anyhow::Result<Arc<DaemonState>> {
-    new_with_jev(store, index_options, token, address, None)
-}
-pub fn new_with_jev(
-    store: Store,
-    index_options: IndexOptions,
-    token: String,
-    address: SocketAddr,
-    provider: Option<Arc<LiveJev>>,
-) -> anyhow::Result<Arc<DaemonState>> {
-    new_with_providers(store, index_options, token, address, provider, None)
-}
-pub fn new_with_providers(
-    store: Store,
-    index_options: IndexOptions,
-    token: String,
-    address: SocketAddr,
-    jev: Option<Arc<LiveJev>>,
-    acp: Option<Arc<Acp>>,
-) -> anyhow::Result<Arc<DaemonState>> {
     let browse_root = index_options.workspace_root.clone();
-    new_with_browser_root(store, index_options, token, address, jev, acp, browse_root)
+    new_with_browser_root(store, index_options, token, address, browse_root)
 }
 pub fn new_with_browser_root(
     store: Store,
     index_options: IndexOptions,
     token: String,
     address: SocketAddr,
-    jev: Option<Arc<LiveJev>>,
-    acp: Option<Arc<Acp>>,
     browse_root: std::path::PathBuf,
 ) -> anyhow::Result<Arc<DaemonState>> {
-    new_with_source_roots(
-        store,
-        index_options,
-        token,
-        address,
-        jev,
-        acp,
-        browse_root,
-        vec![],
-    )
+    new_with_source_roots(store, index_options, token, address, browse_root, vec![])
 }
-#[allow(clippy::too_many_arguments)]
 pub fn new_with_source_roots(
     store: Store,
     index_options: IndexOptions,
     token: String,
     address: SocketAddr,
-    jev: Option<Arc<LiveJev>>,
-    acp: Option<Arc<Acp>>,
     browse_root: std::path::PathBuf,
     source_roots: Vec<(String, std::path::PathBuf)>,
 ) -> anyhow::Result<Arc<DaemonState>> {
@@ -419,22 +332,17 @@ pub fn new_with_source_roots(
         index_options,
         token,
         address,
-        jev,
-        acp,
         browse_root,
         source_roots,
         None,
     )
 }
 /// Catalog roots are trusted daemon configuration, never request parameters.
-#[allow(clippy::too_many_arguments)]
 pub fn new_with_dependency_options(
     store: Store,
     index_options: IndexOptions,
     token: String,
     address: SocketAddr,
-    jev: Option<Arc<LiveJev>>,
-    acp: Option<Arc<Acp>>,
     browse_root: std::path::PathBuf,
     source_roots: Vec<(String, std::path::PathBuf)>,
     catalog_options: Option<CatalogOptions>,
@@ -445,8 +353,6 @@ pub fn new_with_dependency_options(
         &browse_root,
         source_roots,
         catalog_options,
-        jev,
-        acp,
     )?;
     new_with_config(store, config, token, address)
 }
@@ -525,8 +431,6 @@ pub fn new_with_config(
         dependency_capture_hook: Mutex::new(None),
         #[cfg(all(test, feature = "test-support"))]
         outer_fence_hook: Mutex::new(None),
-        #[cfg(all(test, feature = "test-support"))]
-        preview_finish_hook: Mutex::new(None),
         #[cfg(feature = "test-support")]
         token,
         #[cfg(feature = "test-support")]
@@ -535,7 +439,6 @@ pub fn new_with_config(
         origins,
         config: std::sync::RwLock::new(Arc::new(config)),
         explicit_pending: Mutex::new(None),
-        packets: Mutex::new(PacketCache::default()),
         worker_started: AtomicBool::new(false),
         watcher_cancel: Arc::new(AtomicBool::new(false)),
         #[cfg(feature = "test-support")]
@@ -1425,7 +1328,6 @@ impl DaemonState {
             #[cfg(test)]
             self.test_queue_current_phase.store(3, Ordering::Release);
             if processed > 0 {
-                *self.packets.lock().unwrap() = PacketCache::default();
                 self.start_dependency_index();
                 self.step_progress.store(true, Ordering::Release);
             }
@@ -1710,9 +1612,6 @@ impl DaemonState {
                     vec!["Dependency indexing cancelled during shutdown".into()];
             }
         }
-        if let Some(acp) = self.config().acp.clone() {
-            acp.cancel_all();
-        }
         self.jobs
             .lock()
             .unwrap()
@@ -1786,27 +1685,13 @@ impl From<anyhow::Error> for ApiError {
                 "revision_conflict",
                 "The index revision changed",
             )
-        } else if e.to_string() == "packet_missing" {
-            missing()
-        } else if e.to_string() == "invalid_question_selection" {
-            ApiError(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "invalid_question_selection",
-                "Invalid question or selection",
-            )
-        } else if e.chain().any(|cause| {
-            matches!(
-                cause.to_string().as_str(),
-                "saved view target replacement is not allowed"
-                    | "saved annotation target replacement is not allowed"
-                    | "native declaration target missing"
-            )
-        }) {
+        } else if e
+            .chain()
+            .any(|cause| cause.to_string() == "native declaration target missing")
+        {
             invalid()
         } else {
-            // Context must not hide an exact allowlisted refusal from the
-            // public API. An IOERR_RDLOCK is NOT busy/locked and still maps
-            // to 500; never mask broken SQLite locking as retryable work.
+            // Context must not hide an exact allowlisted refusal from the public API.
             for cause in e.chain() {
                 let text = cause.to_string();
                 for (prefix, status, code) in [
@@ -1831,16 +1716,6 @@ impl From<anyhow::Error> for ApiError {
                         "incompatible_index",
                         StatusCode::SERVICE_UNAVAILABLE,
                         "incompatible_index",
-                    ),
-                    (
-                        "incompatible_record",
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "incompatible_record",
-                    ),
-                    (
-                        "incomplete_record",
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "incomplete_record",
                     ),
                     (
                         "recovery_required",
@@ -2106,13 +1981,6 @@ pub fn router(state: Arc<DaemonState>) -> Router {
         )
         .route("/favicon.ico", get(|| async { StatusCode::NO_CONTENT }))
         .route("/api/status", get(status))
-        .route("/api/jev/status", get(jev_status))
-        .route("/api/acp/status", get(acp_status))
-        .route(
-            "/api/questions/{packet_id}/acp-answer",
-            post(question_answer),
-        )
-        .route("/api/questions/{packet_id}/jev-run", post(question_run))
         .route("/api/index", post(start_index))
         .route("/api/jobs/current", get(current_job))
         .route("/api/jobs/{id}", get(job))
@@ -2194,33 +2062,7 @@ pub fn router(state: Arc<DaemonState>) -> Router {
                 )
             }),
         )
-        .route("/api/symbols", get(symbols))
-        .route("/api/symbol", get(symbol))
         .route("/api/source", get(source))
-        .route("/api/query", post(query))
-        .route("/api/questions/preview", post(question_preview))
-        .route(
-            "/api/questions/{packet_id}/jev-request",
-            get(question_export),
-        )
-        .route(
-            "/api/questions/{packet_id}/jev-response",
-            post(question_import),
-        )
-        .route(
-            "/api/questions/{packet_id}/selection",
-            post(question_selection),
-        )
-        .route("/api/views", get(views))
-        .route(
-            "/api/views/{id}",
-            get(view).put(save_view).delete(delete_view),
-        )
-        .route("/api/annotations", get(annotations))
-        .route(
-            "/api/annotations/{id}",
-            put(save_annotation).delete(delete_annotation),
-        )
         .fallback(|| async { missing().into_response() })
         .layer(DefaultBodyLimit::max(1024 * 1024))
         .layer(middleware::from_fn_with_state(
@@ -2231,7 +2073,7 @@ pub fn router(state: Arc<DaemonState>) -> Router {
         .with_state(state)
 }
 // Only endpoints that include a native snapshot need this outer response fence.
-// Durable records and external-source-only routes keep their independent policy.
+// External-source-only routes keep their independent policy.
 #[cfg(feature = "test-support")]
 fn native_response_route(path: &str) -> bool {
     matches!(
@@ -2244,10 +2086,7 @@ fn native_response_route(path: &str) -> bool {
             | "/api/classes"
             | "/api/class-diagram"
             | "/api/navigation"
-            | "/api/symbols"
-            | "/api/symbol"
             | "/api/source"
-            | "/api/query"
             | "/api/dependencies"
             | "/api/dependencies/symbols"
             | "/api/dependencies/source"
@@ -2268,7 +2107,7 @@ async fn evidence_response_guard(
     // already-materialized coherent unpinned response.
     let admitted = db(state.clone(), |store| {
         let snapshot = store.evidence_response()?;
-        Ok(snapshot.into_fence(EvidenceFencePolicy::T03))
+        Ok(snapshot.into_fence(crate::store::EvidenceFencePolicy::T03))
     })
     .await;
     let response = next.run(request).await;
@@ -3051,49 +2890,6 @@ async fn cancel_job(
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct SymbolsQuery {
-    #[serde(default)]
-    q: String,
-    #[serde(default = "limit")]
-    limit: usize,
-}
-fn limit() -> usize {
-    50
-}
-#[cfg(feature = "test-support")]
-async fn symbols(
-    State(s): State<Arc<DaemonState>>,
-    Query(q): Query<SymbolsQuery>,
-) -> Result<Json<Value>, ApiError> {
-    if q.q.len() > 8192 || !(1..=150).contains(&q.limit) {
-        return Err(invalid());
-    }
-    let (revision, items) = db(s, move |s| s.symbols_at(&q.q, q.limit)).await?;
-    Ok(Json(json!({"revision":revision,"items":items})))
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SymbolQuery {
-    id: String,
-    #[serde(flatten)]
-    pin: PinQuery,
-}
-#[cfg(feature = "test-support")]
-async fn symbol(
-    State(s): State<Arc<DaemonState>>,
-    Query(q): Query<SymbolQuery>,
-) -> Result<Json<Value>, ApiError> {
-    if q.id.is_empty() || q.id.len() > 8192 || q.id.contains('\0') {
-        return Err(invalid());
-    }
-    let pin = q.pin.pin()?;
-    let (revision, symbol) = db(s, move |s| s.symbol_at(&q.id, pin))
-        .await?
-        .ok_or_else(missing)?;
-    Ok(Json(json!({"revision":revision,"symbol":symbol})))
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct SourceQuery {
     path: String,
     #[serde(flatten)]
@@ -3118,512 +2914,6 @@ async fn source(
         .await?
         .ok_or_else(missing)?;
     Ok(Json(json!({"revision":revision,"file":file})))
-}
-#[cfg(feature = "test-support")]
-async fn query(
-    State(s): State<Arc<DaemonState>>,
-    pin: Result<Query<PinQuery>, axum::extract::rejection::QueryRejection>,
-    body: Result<Json<ViewQuery>, axum::extract::rejection::JsonRejection>,
-) -> Result<Json<ViewResult>, ApiError> {
-    let Query(pin) = pin.map_err(|_| invalid())?;
-    let expected = pin.pin()?;
-    let Json(q) = body.map_err(|_| invalid())?;
-    q.validate().map_err(|_| invalid())?;
-    Ok(Json(
-        db(s, move |s| s.query_view_at(&q, expected.as_ref()))
-            .await?
-            .ok_or_else(missing)?,
-    ))
-}
-#[cfg(feature = "test-support")]
-async fn views(
-    State(s): State<Arc<DaemonState>>,
-    pin: Result<Query<PinQuery>, axum::extract::rejection::QueryRejection>,
-) -> Result<Json<Vec<SavedViewState>>, ApiError> {
-    let Query(pin) = pin.map_err(|_| invalid())?;
-    let expected = pin.pin()?;
-    Ok(Json(db(s, move |s| s.saved_views_at(expected)).await?))
-}
-#[cfg(feature = "test-support")]
-async fn view(
-    State(s): State<Arc<DaemonState>>,
-    Path(id): Path<String>,
-    pin: Result<Query<PinQuery>, axum::extract::rejection::QueryRejection>,
-) -> Result<Json<SavedViewState>, ApiError> {
-    validate_record_id(&id).map_err(|_| invalid())?;
-    let Query(pin) = pin.map_err(|_| invalid())?;
-    let expected = pin.pin()?;
-    Ok(Json(
-        db(s, move |s| s.saved_view_at(&id, expected))
-            .await?
-            .ok_or_else(missing)?,
-    ))
-}
-#[cfg(feature = "test-support")]
-async fn save_view(
-    State(s): State<Arc<DaemonState>>,
-    Path(id): Path<String>,
-    pin: Result<Query<PinQuery>, axum::extract::rejection::QueryRejection>,
-    body: Result<Json<SavedViewRequest>, axum::extract::rejection::JsonRejection>,
-) -> Result<Json<SavedViewState>, ApiError> {
-    let Query(pin) = pin.map_err(|_| invalid())?;
-    let pin = pin.pin()?.ok_or_else(invalid)?;
-    let Json(v) = body.map_err(|_| invalid())?;
-    if v.id != id {
-        return Err(invalid());
-    }
-    v.validate().map_err(|_| invalid())?;
-    Ok(Json(db(s, move |s| s.save_view_at(pin, &v)).await?))
-}
-#[cfg(feature = "test-support")]
-async fn delete_view(
-    State(s): State<Arc<DaemonState>>,
-    Path(id): Path<String>,
-) -> Result<StatusCode, ApiError> {
-    validate_record_id(&id).map_err(|_| invalid())?;
-    db(s, move |s| s.delete_view(&id)).await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-#[cfg(feature = "test-support")]
-async fn annotations(
-    State(s): State<Arc<DaemonState>>,
-    pin: Result<Query<PinQuery>, axum::extract::rejection::QueryRejection>,
-) -> Result<Json<Vec<AnnotationState>>, ApiError> {
-    let Query(pin) = pin.map_err(|_| invalid())?;
-    let expected = pin.pin()?;
-    Ok(Json(
-        db(s, move |s| s.saved_annotations_at(expected)).await?,
-    ))
-}
-#[cfg(feature = "test-support")]
-async fn save_annotation(
-    State(s): State<Arc<DaemonState>>,
-    Path(id): Path<String>,
-    pin: Result<Query<PinQuery>, axum::extract::rejection::QueryRejection>,
-    body: Result<Json<AnnotationRequest>, axum::extract::rejection::JsonRejection>,
-) -> Result<Json<AnnotationState>, ApiError> {
-    let Query(pin) = pin.map_err(|_| invalid())?;
-    let pin = pin.pin()?.ok_or_else(invalid)?;
-    let Json(a) = body.map_err(|_| invalid())?;
-    if a.id != id {
-        return Err(invalid());
-    }
-    a.validate().map_err(|_| invalid())?;
-    Ok(Json(db(s, move |s| s.save_annotation_at(pin, &a)).await?))
-}
-#[cfg(feature = "test-support")]
-async fn delete_annotation(
-    State(s): State<Arc<DaemonState>>,
-    Path(id): Path<String>,
-) -> Result<StatusCode, ApiError> {
-    validate_record_id(&id).map_err(|_| invalid())?;
-    db(s, move |s| s.delete_annotation(&id)).await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-// These endpoints only transform locally indexed evidence. They never contact a provider.
-fn question_error(e: anyhow::Error) -> ApiError {
-    let message = e.to_string();
-    if e.chain()
-        .any(|cause| cause.downcast_ref::<crate::store::PinExpired>().is_some())
-        || message.starts_with("revision conflict")
-        || [
-            "root_changed",
-            "root_key_collision",
-            "workspace_id_changed",
-            "index_not_ready",
-            "storage_busy",
-            "rebuild_in_progress",
-            "incompatible_index",
-            "incompatible_record",
-            "incomplete_record",
-            "recovery_required",
-            "unsafe_index",
-        ]
-        .iter()
-        .any(|prefix| message.starts_with(prefix))
-        || e.chain().any(|cause| {
-            cause
-                .downcast_ref::<rusqlite::Error>()
-                .is_some_and(|error| {
-                    matches!(error, rusqlite::Error::SqliteFailure(info, _) if matches!(info.code,
-                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked))
-                })
-        })
-    {
-        e.into()
-    } else if message == "question seed not found" {
-        missing()
-    } else if message.contains("176000") {
-        ApiError(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "evidence_too_large",
-            "Jev request exceeds 176000 bytes. Narrow the evidence scope; complete source files cannot be truncated.",
-        )
-    } else if message.contains("1 MiB") {
-        ApiError(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "evidence_too_large",
-            "Complete question packet exceeds 1 MiB. Narrow the evidence scope; sources cannot be truncated.",
-        )
-    } else {
-        ApiError(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "invalid_question_selection",
-            "Invalid question or selection. Use this packet's exact candidate IDs and provide one valid decision per candidate.",
-        )
-    }
-}
-#[cfg(feature = "test-support")]
-async fn question_work<T: Send + 'static>(
-    work: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
-) -> Result<T, ApiError> {
-    tokio::task::spawn_blocking(work)
-        .await
-        .map_err(|_| {
-            ApiError(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal_error",
-                "Operation failed",
-            )
-        })?
-        .map_err(question_error)
-}
-#[cfg(feature = "test-support")]
-async fn question_preview(
-    State(s): State<Arc<DaemonState>>,
-    body: Result<Json<QuestionRequest>, axum::extract::rejection::JsonRejection>,
-) -> Result<Response, ApiError> {
-    let Json(request) = body.map_err(|_| invalid())?;
-    request.validate().map_err(|_| invalid())?;
-    question_work(move || {
-        let response = s.store.evidence_response()?;
-        response.validate_pin(request.expected_revision)?;
-        let packet = planning::prepare_in(&response, request)?;
-        let selection = planning::preview(&packet)?;
-        let view = planning::assemble(&packet, &selection, "localPreview")?;
-        let bytes = serde_json::to_vec(&packet)?.len();
-        anyhow::ensure!(
-            bytes <= MAX_PACKET_BYTES,
-            "complete question packet exceeds 1 MiB"
-        );
-        let cached = Arc::new(packet.clone());
-        let result = Json(QuestionPreview {
-            packet,
-            selection,
-            view,
-        })
-        .into_response();
-        // Admission to the cache is part of response assembly, before the final fence.
-        s.packets
-            .lock()
-            .unwrap()
-            .remember_fenced(cached, bytes, || {
-                #[cfg(test)]
-                if let Some(hook) = s.preview_finish_hook.lock().unwrap().as_ref() {
-                    hook();
-                }
-                response.finish(())
-            })?;
-        Ok(result)
-    })
-    .await
-}
-#[cfg(feature = "test-support")]
-async fn cached_packet(
-    s: Arc<DaemonState>,
-    id: String,
-) -> Result<(Arc<QuestionPacket>, EvidenceFence), ApiError> {
-    // Gate readiness before touching cached evidence, including stale packets.
-    let response = s.store.evidence_response()?;
-    let revision = response.status()?.revision;
-    let packet = {
-        let cache = s.packets.lock().unwrap();
-        cache
-            .packets
-            .iter()
-            .find(|(p, _)| p.packet_id == id)
-            .map(|(p, _)| p.clone())
-            .ok_or_else(missing)?
-    };
-    if revision != packet.revision {
-        return Err(ApiError(
-            StatusCode::CONFLICT,
-            "revision_conflict",
-            "The index revision changed",
-        ));
-    }
-    // A packet hash authenticates only the in-memory copy. Recheck its exact
-    // selected graph and source witnesses under one pinned SQLite snapshot
-    // before exporting, displaying, or sending cached evidence to a provider.
-    let witness = packet.clone();
-    response.validate_selected_view(&witness.context, &witness.source_files)?;
-    let fence = response.into_fence(EvidenceFencePolicy::ExactPin(packet.revision));
-    Ok((packet, fence))
-}
-// Always run the post-materialization fence, even when assembly fails. Preserve
-// the original materialization error, as Store::with_evidence does.
-#[cfg(feature = "test-support")]
-fn finish_packet_result(
-    fence: &EvidenceFence,
-    result: Result<Response, ApiError>,
-) -> Result<Response, ApiError> {
-    let checked = fence.finish(()).map_err(ApiError::from);
-    match result {
-        Err(error) => Err(error),
-        Ok(response) => {
-            checked?;
-            Ok(response)
-        }
-    }
-}
-#[cfg(feature = "test-support")]
-async fn question_export(
-    State(s): State<Arc<DaemonState>>,
-    Path(id): Path<String>,
-) -> Result<Response, ApiError> {
-    let (packet, fence) = cached_packet(s, id).await?;
-    let result = question_work(move || jev::request_for(&packet))
-        .await
-        .map(|value| Json(value).into_response());
-    finish_packet_result(&fence, result)
-}
-#[derive(Serialize)]
-#[cfg(feature = "test-support")]
-struct QuestionSelection {
-    selection: SelectionEnvelope,
-    view: FocusedView,
-}
-#[cfg(feature = "test-support")]
-async fn question_import(
-    State(s): State<Arc<DaemonState>>,
-    Path(id): Path<String>,
-    Json(response): Json<Value>,
-) -> Result<Response, ApiError> {
-    let (packet, fence) = cached_packet(s, id).await?;
-    let result = question_work(move || {
-        let selection = jev::parse_response(&packet, &response)?;
-        let warnings = jev::response_warnings(&response);
-        let mut view = planning::assemble(&packet, &selection, "importedJev")?;
-        view.warnings.extend(warnings);
-        Ok(QuestionSelection { selection, view })
-    })
-    .await
-    .map(|value| Json(value).into_response());
-    finish_packet_result(&fence, result)
-}
-#[cfg(feature = "test-support")]
-async fn question_selection(
-    State(s): State<Arc<DaemonState>>,
-    Path(id): Path<String>,
-    Json(selection): Json<SelectionEnvelope>,
-) -> Result<Response, ApiError> {
-    let (packet, fence) = cached_packet(s, id).await?;
-    let result = question_work(move || {
-        let view = planning::assemble(&packet, &selection, "manual")?;
-        Ok(QuestionSelection { selection, view })
-    })
-    .await
-    .map(|value| Json(value).into_response());
-    finish_packet_result(&fence, result)
-}
-
-// Status only reads the local ledger. No endpoint other than jev-run contacts Jev.
-#[cfg(feature = "test-support")]
-async fn acp_status(State(s): State<Arc<DaemonState>>) -> Result<Json<Value>, ApiError> {
-    let Some(provider) = s.config().acp.clone() else {
-        return Ok(Json(json!({"enabled":false,"status":null})));
-    };
-    let status = tokio::task::spawn_blocking(move || provider.status())
-        .await
-        .map_err(|_| acp_error(anyhow::anyhow!("status unavailable")))?
-        .map_err(acp_error)?;
-    Ok(Json(json!({"enabled":true,"status":status})))
-}
-fn acp_error(e: anyhow::Error) -> ApiError {
-    match e.to_string().as_str() {
-        "ACP allowance exhausted" => ApiError(
-            StatusCode::TOO_MANY_REQUESTS,
-            "acp_exhausted",
-            "ACP attempt allowance exhausted",
-        ),
-        "ACP invalid answer" => ApiError(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "acp_invalid_answer",
-            "ACP answer failed citation validation. Any reservation is retained; no automatic retry was made.",
-        ),
-        "ACP invalid request" => ApiError(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "acp_invalid_request",
-            "Evidence exceeds the ACP request limits. Prepare a smaller packet. No provider call was made.",
-        ),
-        "ACP authentication required" => ApiError(
-            StatusCode::BAD_GATEWAY,
-            "acp_auth_required",
-            "ACP could not verify Claude subscription access. Check the Claude Code subscription sign-in on this daemon host. API-key fallback is disabled. The attempt reservation is retained; no automatic retry was made.",
-        ),
-        "ACP model unavailable" => ApiError(
-            StatusCode::BAD_GATEWAY,
-            "acp_model_unavailable",
-            "Sonnet is unavailable to this Claude subscription session. Check account access to Sonnet before retrying. No alternate model was used. The attempt reservation is retained; no automatic retry was made.",
-        ),
-        "ACP model mismatch" => ApiError(
-            StatusCode::BAD_GATEWAY,
-            "acp_model_mismatch",
-            "ACP could not confirm Sonnet was selected. Check the configured runner and Claude adapter before retrying. No answer was accepted. The attempt reservation is retained; no automatic retry was made.",
-        ),
-        _ => ApiError(
-            StatusCode::BAD_GATEWAY,
-            "acp_failed",
-            "ACP attempt failed. Any reservation is retained; no automatic retry was made.",
-        ),
-    }
-}
-#[cfg(feature = "test-support")]
-async fn question_answer(
-    State(s): State<Arc<DaemonState>>,
-    Path(id): Path<String>,
-    body: Bytes,
-) -> Result<Response, ApiError> {
-    // Accept only an empty object: never take client prompts, sources or provider overrides.
-    let request: Value = serde_json::from_slice(&body).map_err(|_| invalid())?;
-    if !request.as_object().is_some_and(|object| object.is_empty()) {
-        return Err(invalid());
-    }
-    db(s.clone(), |store| store.status().map(|_| ())).await?;
-    let provider = s.config().acp.clone().ok_or(ApiError(
-        StatusCode::SERVICE_UNAVAILABLE,
-        "acp_disabled",
-        "Live ACP is disabled",
-    ))?;
-    let (packet, admission) = cached_packet(s.clone(), id).await?;
-    // The selected packet has been attested. Never retain its DELETE-journal
-    // reader during an external provider call: startup reconciliation may need to COMMIT meanwhile.
-    admission.finish(()).map_err(ApiError::from)?;
-    drop(admission);
-    let response = provider.run(&packet).await;
-    // Recheck on provider success AND failure. A fresh selected snapshot must
-    // still match the exact pin, source bytes, and graph witnesses.
-    let selected = s.store.evidence_response()?;
-    if selected.status()?.revision != packet.revision {
-        return Err(ApiError(
-            StatusCode::CONFLICT,
-            "revision_conflict",
-            "The index revision changed",
-        ));
-    }
-    selected.validate_selected_view(&packet.context, &packet.source_files)?;
-    let fence = selected.into_fence(EvidenceFencePolicy::ExactPin(packet.revision));
-    let result = response.map_err(acp_error).map(|response| {
-        Json(
-            json!({"packetId":packet.packet_id,"revision":packet.revision,
-            "source":"liveAcp","attemptId":response.attempt_id,"answer":response.answer,
-            "latencyMs":response.latency_ms,"estimatedUsd":response.estimated_usd}),
-        )
-        .into_response()
-    });
-    finish_packet_result(&fence, result)
-}
-
-#[cfg(feature = "test-support")]
-async fn jev_status(State(s): State<Arc<DaemonState>>) -> Result<Json<Value>, ApiError> {
-    let Some(provider) = s.config().provider.clone() else {
-        return Ok(Json(json!({"enabled":false,"budget":null})));
-    };
-    let budget = db(s, move |_| provider.budget()).await?;
-    Ok(Json(json!({"enabled":true,"budget":budget})))
-}
-fn live_jev_error(e: anyhow::Error) -> ApiError {
-    let message = e.to_string();
-    if message.starts_with("Jev budget exhausted") {
-        ApiError(
-            StatusCode::TOO_MANY_REQUESTS,
-            "jev_budget_exhausted",
-            "Jev budget exhausted",
-        )
-    } else if message.starts_with("invalid Jev request") {
-        ApiError(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "invalid_jev_request",
-            "Jev request is invalid or exceeds the request limit. Reduce evidence depth or choose a smaller root, then prepare a new preview. Complete source files cannot be truncated. No provider call was made.",
-        )
-    } else if message.starts_with("Jev requires at least one candidate") {
-        ApiError(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "jev_no_candidates",
-            "This packet has no candidate calls. Choose a root with outgoing calls and prepare a new preview. No provider call was made.",
-        )
-    } else if message == "Jev attempt failed: invalid_selection" {
-        ApiError(
-            StatusCode::BAD_GATEWAY,
-            "jev_invalid_response",
-            "The provider response failed validation and was saved for inspection. The attempt reservation is retained; no automatic retry was made.",
-        )
-    } else if message == "Jev attempt failed: context_exceeded" {
-        ApiError(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "jev_context_exceeded",
-            "The provider context limit was exceeded. Reduce evidence depth or choose a smaller root, then prepare a new preview. Complete source files cannot be truncated. The attempt reservation is retained; no automatic retry was made.",
-        )
-    } else {
-        ApiError(
-            StatusCode::BAD_GATEWAY,
-            "jev_failed",
-            "Jev attempt failed. Any reservation is retained; no automatic retry was made.",
-        )
-    }
-}
-
-#[cfg(feature = "test-support")]
-async fn question_run(
-    State(s): State<Arc<DaemonState>>,
-    Path(id): Path<String>,
-    body: Bytes,
-) -> Result<Response, ApiError> {
-    // No caller-supplied source, credentials, URL, or budget overrides.
-    if !body.is_empty() && body.as_ref() != b"{}" {
-        return Err(invalid());
-    }
-    let provider = s.config().provider.clone().ok_or(ApiError(
-        StatusCode::SERVICE_UNAVAILABLE,
-        "jev_disabled",
-        "Live Jev is disabled",
-    ))?;
-    let (packet, admission) = cached_packet(s.clone(), id).await?;
-    // Never retain a DELETE-journal reader across an external provider call.
-    // The packet was fully attested on the selected snapshot before this call.
-    admission.finish(()).map_err(ApiError::from)?;
-    drop(admission);
-    let response = provider.run(&packet).await;
-    // Recheck even failed attempts. A fresh selected snapshot both admits the
-    // current head and reattests the packet's source and graph witnesses.
-    let selected = s.store.evidence_response()?;
-    if selected.status()?.revision != packet.revision {
-        return Err(ApiError(
-            StatusCode::CONFLICT,
-            "revision_conflict",
-            "The index revision changed",
-        ));
-    }
-    selected.validate_selected_view(&packet.context, &packet.source_files)?;
-    let fence = selected.into_fence(EvidenceFencePolicy::ExactPin(packet.revision));
-    let result = match response.map_err(live_jev_error) {
-        Err(error) => Err(error),
-        Ok(response) => {
-            let selection = response.selection.clone();
-            question_work(move || planning::assemble(&packet, &selection, "liveJev"))
-                .await
-                .map(|mut view| {
-                    view.warnings.extend(response.warnings.clone());
-                    Json(json!({"selection":response.selection,"view":view,
-                        "attemptId":response.attempt_id,"latencyMs":response.latency_ms,
-                        "estimatedUsd":response.estimated_usd,"usage":response.usage,
-                        "warnings":response.warnings}))
-                    .into_response()
-                })
-        }
-    };
-    finish_packet_result(&fence, result)
 }
 
 #[cfg(all(test, feature = "test-support"))]
@@ -4071,8 +3361,6 @@ enum BrowserCoreRoute {
     GitDiff,
     Metrics,
     RefreshDependencies,
-    JevStatus,
-    AcpStatus,
     Dependencies,
     DependencySymbols,
     DependencySource,
@@ -4084,22 +3372,12 @@ enum BrowserCoreRoute {
     Files,
     Methods,
     Classes,
-    Symbols,
-    Symbol,
     Sequence,
     ClassDiagram,
     Navigation,
-    Views,
-    Annotations,
-    PreviewQuestion,
     Source,
-    Query,
     Index,
     CurrentJob,
-    QuestionProvider,
-    View,
-    Annotation,
-    QuestionAction,
     Job,
 }
 
@@ -4111,8 +3389,6 @@ impl BrowserCoreRoute {
             (&Method::GET, "git/diff") => Some(Self::GitDiff),
             (&Method::GET, "metrics") => Some(Self::Metrics),
             (&Method::POST, "dependencies/refresh") => Some(Self::RefreshDependencies),
-            (&Method::GET, "jev/status") => Some(Self::JevStatus),
-            (&Method::GET, "acp/status") => Some(Self::AcpStatus),
             (&Method::GET, "dependencies") => Some(Self::Dependencies),
             (&Method::GET, "dependencies/symbols") => Some(Self::DependencySymbols),
             (&Method::GET, "dependencies/source") => Some(Self::DependencySource),
@@ -4124,44 +3400,16 @@ impl BrowserCoreRoute {
             (&Method::GET, "files") => Some(Self::Files),
             (&Method::GET, "methods") => Some(Self::Methods),
             (&Method::GET, "classes") => Some(Self::Classes),
-            (&Method::GET, "symbols") => Some(Self::Symbols),
-            (&Method::GET, "symbol") => Some(Self::Symbol),
             (&Method::POST, "sequence") => Some(Self::Sequence),
             (&Method::POST, "class-diagram") => Some(Self::ClassDiagram),
             (&Method::POST, "navigation") => Some(Self::Navigation),
-            (&Method::GET, "views") => Some(Self::Views),
-            (&Method::GET, "annotations") => Some(Self::Annotations),
-            (&Method::POST, "questions/preview") => Some(Self::PreviewQuestion),
             (&Method::GET, "source") => Some(Self::Source),
-            (&Method::POST, "query") => Some(Self::Query),
             (&Method::POST, "index") => Some(Self::Index),
             (&Method::GET, "jobs/current") => Some(Self::CurrentJob),
             _ => {
                 let (family, tail) = suffix.split_once('/')?;
                 let single_id = !tail.is_empty() && !tail.contains('/');
                 match (method, family) {
-                    (&Method::GET | &Method::PUT | &Method::DELETE, "views") if single_id => {
-                        Some(Self::View)
-                    }
-                    (&Method::PUT | &Method::DELETE, "annotations") if single_id => {
-                        Some(Self::Annotation)
-                    }
-                    (_, "questions") => {
-                        let (id, action) = tail.split_once('/')?;
-                        if id.is_empty() || action.contains('/') {
-                            return None;
-                        }
-                        match (method, action) {
-                            (&Method::POST, "jev-run" | "acp-answer") => {
-                                Some(Self::QuestionProvider)
-                            }
-                            (&Method::GET, "jev-request")
-                            | (&Method::POST, "jev-response" | "selection") => {
-                                Some(Self::QuestionAction)
-                            }
-                            _ => None,
-                        }
-                    }
                     (&Method::GET, "jobs") if single_id => Some(Self::Job),
                     (&Method::POST, "jobs") => {
                         let id = tail.strip_suffix("/cancel")?;
@@ -4343,23 +3591,6 @@ async fn selected_evidence<T: Send + 'static>(
     hook: Option<SelectedResponseHook>,
     work: impl FnOnce(&crate::daemon::registry::CheckoutEvidence) -> anyhow::Result<T> + Send + 'static,
 ) -> Result<(T, bool), ApiError> {
-    selected_evidence_map(runtime, hook, work, ApiError::from).await
-}
-
-async fn selected_question<T: Send + 'static>(
-    runtime: &Arc<crate::daemon::registry::CheckoutRuntime>,
-    hook: Option<SelectedResponseHook>,
-    work: impl FnOnce(&crate::daemon::registry::CheckoutEvidence) -> anyhow::Result<T> + Send + 'static,
-) -> Result<(T, bool), ApiError> {
-    selected_evidence_map(runtime, hook, work, question_error).await
-}
-
-async fn selected_evidence_map<T: Send + 'static>(
-    runtime: &Arc<crate::daemon::registry::CheckoutRuntime>,
-    hook: Option<SelectedResponseHook>,
-    work: impl FnOnce(&crate::daemon::registry::CheckoutEvidence) -> anyhow::Result<T> + Send + 'static,
-    map_error: fn(anyhow::Error) -> ApiError,
-) -> Result<(T, bool), ApiError> {
     let runtime = runtime.clone();
     tokio::task::spawn_blocking(move || {
         let (response, catching_up) = runtime.evidence_response()?;
@@ -4380,10 +3611,10 @@ async fn selected_evidence_map<T: Send + 'static>(
             "Operation failed",
         )
     })?
-    .map_err(map_error)
+    .map_err(ApiError::from)
 }
 
-async fn selected_provider_read<T: Send + 'static>(
+async fn selected_catalog_read<T: Send + 'static>(
     runtime: &Arc<crate::daemon::registry::CheckoutRuntime>,
     hook: Option<SelectedResponseHook>,
     work: impl FnOnce(&crate::daemon::registry::CheckoutEvidence) -> Result<T, ApiError>
@@ -4423,49 +3654,23 @@ fn selected_catalog(
         .ok_or_else(dependency_stale)
 }
 
-async fn selected_provider_preflight(
+async fn selected_refresh_preflight(
     runtime: &Arc<crate::daemon::registry::CheckoutRuntime>,
     hook: Option<SelectedResponseHook>,
-    packet_id: Option<String>,
-) -> Result<(Option<Arc<QuestionPacket>>, IndexPin, bool), ApiError> {
+) -> Result<(IndexPin, bool), ApiError> {
     let runtime = runtime.clone();
     tokio::task::spawn_blocking(move || {
-        runtime.require_mutation_ready().map_err(question_error)?;
-        let (response, catching_up) = runtime.evidence_response().map_err(question_error)?;
-        response.require_mutation_ready().map_err(question_error)?;
-        let revision = response.status().map_err(question_error)?.revision;
-        let packet = if let Some(id) = packet_id {
-            let state = runtime.browser_scheduler().map_err(question_error)?;
-            let packet = state
-                .packets
-                .lock()
-                .unwrap()
-                .packets
-                .iter()
-                .find(|(packet, _)| packet.packet_id == id)
-                .map(|(packet, _)| packet.clone())
-                .ok_or_else(missing)?;
-            if packet.revision != revision {
-                return Err(ApiError(
-                    StatusCode::CONFLICT,
-                    "revision_conflict",
-                    "The index revision changed",
-                ));
-            }
-            response
-                .validate_selected_view(&packet.context, &packet.source_files)
-                .map_err(question_error)?;
-            Some(packet)
-        } else {
-            None
-        };
-        response.finish(()).map_err(question_error)?;
+        runtime.require_mutation_ready()?;
+        let (response, catching_up) = runtime.evidence_response()?;
+        response.require_mutation_ready()?;
+        let revision = response.status()?.revision;
+        response.finish(())?;
         if let Some(hook) = hook {
             hook("before_mutation");
         }
-        runtime.require_mutation_ready().map_err(question_error)?;
-        response.finish(()).map_err(question_error)?;
-        Ok((packet, revision, catching_up))
+        runtime.require_mutation_ready()?;
+        response.finish(())?;
+        Ok::<_, anyhow::Error>((revision, catching_up))
     })
     .await
     .map_err(|_| {
@@ -4475,12 +3680,12 @@ async fn selected_provider_preflight(
             "Operation failed",
         )
     })?
+    .map_err(ApiError::from)
 }
 
-async fn selected_provider_postflight(
+async fn selected_refresh_postflight(
     runtime: &Arc<crate::daemon::registry::CheckoutRuntime>,
     revision: IndexPin,
-    packet: Option<Arc<QuestionPacket>>,
 ) -> Result<(), ApiError> {
     let runtime = runtime.clone();
     tokio::task::spawn_blocking(move || {
@@ -4489,13 +3694,8 @@ async fn selected_provider_postflight(
         response.require_mutation_ready()?;
         anyhow::ensure!(
             response.status()?.revision == revision,
-            "revision conflict: provider basis changed"
+            "revision conflict: refresh basis changed"
         );
-        // The external call holds no SQLite snapshot. Reattest its original
-        // packet on a fresh selected snapshot, even when the provider failed.
-        if let Some(packet) = packet {
-            response.validate_selected_view(&packet.context, &packet.source_files)?;
-        }
         response.finish(())?;
         runtime.require_mutation_ready()
     })
@@ -4523,65 +3723,6 @@ fn selected_mutation_error(error: ApiError, outcome: &str) -> Response {
         .headers_mut()
         .insert("X-Trellis-Mutation-Outcome", outcome.parse().unwrap());
     response
-}
-
-/// Only a strict current head grants sidecar write eligibility. Once the
-/// sidecar is called, later failures carry an explicit committed/unknown
-/// outcome; they cannot claim that the write was rolled back.
-async fn selected_mutation<T: IntoResponse + Send + 'static>(
-    runtime: &Arc<crate::daemon::registry::CheckoutRuntime>,
-    hook: Option<SelectedResponseHook>,
-    preflight: impl FnOnce(&crate::daemon::registry::CheckoutEvidence) -> anyhow::Result<()>
-    + Send
-    + 'static,
-    work: impl FnOnce(&crate::daemon::registry::CheckoutEvidence) -> anyhow::Result<T> + Send + 'static,
-) -> Result<(Response, bool), ApiError> {
-    let runtime = runtime.clone();
-    tokio::task::spawn_blocking(move || {
-        runtime.require_mutation_ready()?;
-        let (response, catching_up) = runtime.evidence_response()?;
-        response.require_mutation_ready()?;
-        preflight(&response)?;
-        response.finish(())?;
-        if let Some(hook) = &hook {
-            hook("before_mutation");
-        }
-        runtime.require_mutation_ready()?;
-        response.finish(())?;
-        let result = work(&response);
-        if let Some(hook) = hook {
-            hook("before_read_finish");
-        }
-        let mut answer = match result {
-            Ok(value) => match response.finish(value) {
-                Ok(value) => value.into_response(),
-                Err(error) => selected_mutation_error(ApiError::from(error), "committed"),
-            },
-            Err(_) => selected_mutation_error(
-                ApiError(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "outcome_unknown",
-                    "Write outcome is unknown; inspect the saved record before retrying",
-                ),
-                "unknown",
-            ),
-        };
-        if !answer.headers().contains_key("X-Trellis-Mutation-Outcome") {
-            answer
-                .headers_mut()
-                .insert("X-Trellis-Mutation-Outcome", "committed".parse().unwrap());
-        }
-        Ok::<_, anyhow::Error>((answer, catching_up))
-    })
-    .await
-    .map_err(|_| {
-        ApiError(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "internal_error",
-            "Operation failed",
-        )
-    })?
-    .map_err(ApiError::from)
 }
 
 fn metrics_query(uri: &axum::http::Uri) -> Result<crate::store::MetricsOptions, ApiError> {
@@ -4876,8 +4017,7 @@ async fn provisioned_core_answer(
             let state = runtime.browser_scheduler()?;
             // One configuration version for the whole request (Decision 0009 §6).
             let config = state.config();
-            let (_, revision, catching_up) =
-                selected_provider_preflight(runtime, hook, None).await?;
+            let (revision, catching_up) = selected_refresh_preflight(runtime, hook).await?;
             if config.dependency_options.is_none() {
                 return Err(ApiError(
                     StatusCode::CONFLICT,
@@ -4894,7 +4034,7 @@ async fn provisioned_core_answer(
             }
             // Check once more immediately before scheduling work. Once scheduled,
             // a later root or head change cannot undo the requested refresh.
-            selected_provider_postflight(runtime, revision, None).await?;
+            selected_refresh_postflight(runtime, revision).await?;
             runtime.require_mutation_ready()?;
             // Scheduled only for the configuration version this request
             // checked; a registration in between refuses it.
@@ -4905,7 +4045,7 @@ async fn provisioned_core_answer(
                     "The checkout configuration changed; retry the refresh",
                 ));
             }
-            let mut response = match selected_provider_postflight(runtime, revision, None).await {
+            let mut response = match selected_refresh_postflight(runtime, revision).await {
                 Ok(()) => (StatusCode::ACCEPTED, Json(json!({"state":"loading"}))).into_response(),
                 Err(error) => selected_mutation_error(error, "committed"),
             };
@@ -4914,137 +4054,12 @@ async fn provisioned_core_answer(
                 .insert("X-Trellis-Mutation-Outcome", "committed".parse().unwrap());
             Ok((response, catching_up))
         }
-        BrowserCoreRoute::QuestionProvider => {
-            let tail = suffix.strip_prefix("questions/").unwrap();
-            let (id, action) = tail.split_once('/').ok_or_else(missing)?;
-            if id.is_empty() || action.contains('/') {
-                return Err(missing());
-            }
-            let jev = action == "jev-run";
-            if jev {
-                if !body.is_empty() && body.as_ref() != b"{}" {
-                    return Err(invalid());
-                }
-            } else {
-                let request: Value = serde_json::from_slice(&body).map_err(|_| invalid())?;
-                if !request.as_object().is_some_and(|object| object.is_empty()) {
-                    return Err(invalid());
-                }
-            }
-            let state = runtime.browser_scheduler()?;
-            // One configuration version for the whole request (Decision 0009 §6).
-            let config = state.config();
-            let (packet, revision, catching_up) =
-                selected_provider_preflight(runtime, hook, Some(id.to_owned())).await?;
-            let packet = packet.unwrap();
-            if jev {
-                let provider = config.provider.clone().ok_or(ApiError(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "jev_disabled",
-                    "Live Jev is disabled",
-                ))?;
-                // No await before the final current-head check or the provider call.
-                selected_provider_postflight(runtime, revision, Some(packet.clone())).await?;
-                let result = provider.run(&packet).await;
-                if let Err(error) =
-                    selected_provider_postflight(runtime, revision, Some(packet.clone())).await
-                {
-                    return Ok((selected_mutation_error(error, "unknown"), catching_up));
-                }
-                let response = match result {
-                    Err(error) => live_jev_error(error).into_response(),
-                    Ok(result) => {
-                        let selection = result.selection.clone();
-                        let mut view = match planning::assemble(&packet, &selection, "liveJev") {
-                            Ok(view) => view,
-                            Err(error) => {
-                                return Ok((
-                                    selected_mutation_error(question_error(error), "unknown"),
-                                    catching_up,
-                                ));
-                            }
-                        };
-                        view.warnings.extend(result.warnings.clone());
-                        Json(json!({"selection":result.selection,"view":view,
-                            "attemptId":result.attempt_id,"latencyMs":result.latency_ms,
-                            "estimatedUsd":result.estimated_usd,"usage":result.usage,
-                            "warnings":result.warnings}))
-                        .into_response()
-                    }
-                };
-                let mut response = response;
-                let outcome = if response.status().is_success() {
-                    "committed"
-                } else {
-                    "unknown"
-                };
-                response
-                    .headers_mut()
-                    .insert("X-Trellis-Mutation-Outcome", outcome.parse().unwrap());
-                Ok((response, catching_up))
-            } else {
-                let provider = config.acp.clone().ok_or(ApiError(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "acp_disabled",
-                    "Live ACP is disabled",
-                ))?;
-                selected_provider_postflight(runtime, revision, Some(packet.clone())).await?;
-                let result = provider.run(&packet).await;
-                if let Err(error) =
-                    selected_provider_postflight(runtime, revision, Some(packet.clone())).await
-                {
-                    return Ok((selected_mutation_error(error, "unknown"), catching_up));
-                }
-                let response = match result {
-                    Err(error) => acp_error(error).into_response(),
-                    Ok(result) => Json(
-                        json!({"packetId":packet.packet_id,"revision":packet.revision,
-                        "source":"liveAcp","attemptId":result.attempt_id,"answer":result.answer,
-                        "latencyMs":result.latency_ms,"estimatedUsd":result.estimated_usd}),
-                    )
-                    .into_response(),
-                };
-                let mut response = response;
-                let outcome = if response.status().is_success() {
-                    "committed"
-                } else {
-                    "unknown"
-                };
-                response
-                    .headers_mut()
-                    .insert("X-Trellis-Mutation-Outcome", outcome.parse().unwrap());
-                Ok((response, catching_up))
-            }
-        }
-        BrowserCoreRoute::JevStatus | BrowserCoreRoute::AcpStatus => {
-            if uri.query().is_some() {
-                return Err(invalid());
-            }
-            let state = runtime.browser_scheduler()?;
-            // One configuration version for the whole request (Decision 0009 §6).
-            let config = state.config();
-            let jev = suffix == "jev/status";
-            let (value, catching_up) = selected_provider_read(runtime, hook, move |_| {
-                if jev {
-                    match &config.provider {
-                        Some(provider) => Ok(json!({"enabled":true,"budget":provider.budget().map_err(ApiError::from)?})),
-                        None => Ok(json!({"enabled":false,"budget":null})),
-                    }
-                } else {
-                    match &config.acp {
-                        Some(provider) => Ok(json!({"enabled":true,"status":provider.status().map_err(acp_error)?})),
-                        None => Ok(json!({"enabled":false,"status":null})),
-                    }
-                }
-            }).await?;
-            Ok((Json(value).into_response(), catching_up))
-        }
         BrowserCoreRoute::Dependencies => {
             if uri.query().is_some() {
                 return Err(invalid());
             }
             let state = runtime.browser_scheduler()?;
-            let (payload, catching_up) = selected_provider_read(runtime, hook, move |r| {
+            let (payload, catching_up) = selected_catalog_read(runtime, hook, move |r| {
                 let revision = r.status().map_err(ApiError::from)?.revision;
                 let (index_state, catalog, mut warnings) = {
                     let index = state.dependencies.lock().unwrap();
@@ -5081,7 +4096,7 @@ async fn provisioned_core_answer(
                 return Err(invalid());
             }
             let state = runtime.browser_scheduler()?;
-            let (payload, catching_up) = selected_provider_read(runtime, hook, move |r| {
+            let (payload, catching_up) = selected_catalog_read(runtime, hook, move |r| {
                 let revision = r.status().map_err(ApiError::from)?.revision;
                 let catalog = selected_catalog(&state, revision, &q.catalog_id)?;
                 if q.package_id.as_ref().is_some_and(|id| !catalog.packages.iter().any(|p| &p.id == id)) { return Err(missing()); }
@@ -5111,7 +4126,7 @@ async fn provisioned_core_answer(
                 return Err(invalid());
             }
             let state = runtime.browser_scheduler()?;
-            let (payload, catching_up) = selected_provider_read(runtime, hook, move |r| {
+            let (payload, catching_up) = selected_catalog_read(runtime, hook, move |r| {
                 let revision = r.status().map_err(ApiError::from)?.revision;
                 let catalog = selected_catalog(&state, revision, &q.catalog_id)?;
                 let source = catalog.sources.get(&q.source_ref).ok_or_else(missing)?;
@@ -5138,7 +4153,7 @@ async fn provisioned_core_answer(
             let state = runtime.browser_scheduler()?;
             // One configuration version for the whole request (Decision 0009 §6).
             let config = state.config();
-            let (payload, catching_up) = selected_provider_read(runtime, hook, move |_| {
+            let (payload, catching_up) = selected_catalog_read(runtime, hook, move |_| {
                 Ok(json!({"roots":config.rust_sources.iter().map(|r| json!({"id":r.label,"label":r.label,
                     "path":r.directory.root.to_string_lossy()})).collect::<Vec<_>>() }))
             }).await?;
@@ -5155,7 +4170,7 @@ async fn provisioned_core_answer(
             let state = runtime.browser_scheduler()?;
             // One configuration version for the whole request (Decision 0009 §6).
             let config = state.config();
-            let (page, catching_up) = selected_provider_read(runtime, hook, move |r| {
+            let (page, catching_up) = selected_catalog_read(runtime, hook, move |r| {
                 let revision = r.status().map_err(ApiError::from)?.revision;
                 let root = config
                     .rust_sources
@@ -5190,7 +4205,7 @@ async fn provisioned_core_answer(
             let state = runtime.browser_scheduler()?;
             // One configuration version for the whole request (Decision 0009 §6).
             let config = state.config();
-            let (file, catching_up) = selected_provider_read(runtime, hook, move |_| {
+            let (file, catching_up) = selected_catalog_read(runtime, hook, move |_| {
                 let root = config
                     .rust_sources
                     .iter()
@@ -5313,32 +4328,6 @@ async fn provisioned_core_answer(
             .await?;
             Ok((Json(value).into_response(), catching_up))
         }
-        BrowserCoreRoute::Symbols => {
-            let Query(q) = Query::<SymbolsQuery>::try_from_uri(uri).map_err(|_| invalid())?;
-            if q.q.len() > 8192 || !(1..=150).contains(&q.limit) {
-                return Err(invalid());
-            }
-            let ((revision, items), catching_up) =
-                selected_evidence(runtime, hook, move |r| r.symbols_at(&q.q, q.limit)).await?;
-            Ok((
-                Json(json!({"revision":revision,"items":items})).into_response(),
-                catching_up,
-            ))
-        }
-        BrowserCoreRoute::Symbol => {
-            let Query(q) = Query::<SymbolQuery>::try_from_uri(uri).map_err(|_| invalid())?;
-            if q.id.is_empty() || q.id.len() > 8192 || q.id.contains('\0') {
-                return Err(invalid());
-            }
-            let pin = q.pin.pin()?;
-            let (value, catching_up) =
-                selected_evidence(runtime, hook, move |r| r.symbol_at(&q.id, pin)).await?;
-            let (revision, symbol) = value.ok_or_else(missing)?;
-            Ok((
-                Json(json!({"revision":revision,"symbol":symbol})).into_response(),
-                catching_up,
-            ))
-        }
         BrowserCoreRoute::Sequence => {
             let q: SequenceRequest = serde_json::from_slice(&body).map_err(|_| browse_invalid())?;
             if q.seed.is_empty() || q.seed.len() > 8192 || q.seed.contains('\0') {
@@ -5370,49 +4359,6 @@ async fn provisioned_core_answer(
             q.validate()?;
             let (value, catching_up) =
                 selected_evidence(runtime, hook, move |r| r.navigation_at(&q)).await?;
-            Ok((Json(value).into_response(), catching_up))
-        }
-        BrowserCoreRoute::Views => {
-            let Query(q) = Query::<PinQuery>::try_from_uri(uri).map_err(|_| invalid())?;
-            let pin = q.pin()?;
-            let (value, catching_up) =
-                selected_evidence(runtime, hook, move |r| r.saved_views_at(pin)).await?;
-            Ok((Json(value).into_response(), catching_up))
-        }
-        BrowserCoreRoute::Annotations => {
-            let Query(q) = Query::<PinQuery>::try_from_uri(uri).map_err(|_| invalid())?;
-            let pin = q.pin()?;
-            let (value, catching_up) =
-                selected_evidence(runtime, hook, move |r| r.saved_annotations_at(pin)).await?;
-            Ok((Json(value).into_response(), catching_up))
-        }
-        BrowserCoreRoute::PreviewQuestion => {
-            let request: QuestionRequest = serde_json::from_slice(&body).map_err(|_| invalid())?;
-            request.validate().map_err(|_| invalid())?;
-            let state = runtime.browser_scheduler()?;
-            let (value, catching_up) = selected_question(runtime, hook, move |r| {
-                r.validate_pin(request.expected_revision)?;
-                let packet = planning::prepare_in(r, request)?;
-                let selection = planning::preview(&packet)?;
-                let view = planning::assemble(&packet, &selection, "localPreview")?;
-                let bytes = serde_json::to_vec(&packet)?.len();
-                anyhow::ensure!(
-                    bytes <= MAX_PACKET_BYTES,
-                    "complete question packet exceeds 1 MiB"
-                );
-                let result = QuestionPreview {
-                    packet: packet.clone(),
-                    selection,
-                    view,
-                };
-                state
-                    .packets
-                    .lock()
-                    .unwrap()
-                    .remember_fenced(Arc::new(packet), bytes, || r.finish(()))?;
-                Ok(result)
-            })
-            .await?;
             Ok((Json(value).into_response(), catching_up))
         }
         BrowserCoreRoute::Source => {
@@ -5447,186 +4393,6 @@ async fn provisioned_core_answer(
                 catching_up,
             ))
         }
-        BrowserCoreRoute::Query => {
-            let Query(pin) = Query::<PinQuery>::try_from_uri(uri).map_err(|_| invalid())?;
-            let expected = pin.pin()?;
-            let q: ViewQuery = serde_json::from_slice(&body).map_err(|_| invalid())?;
-            q.validate().map_err(|_| invalid())?;
-            let runtime = runtime.clone();
-            let (view, catching_up) = tokio::task::spawn_blocking(move || {
-                let (response, catching_up) = runtime.evidence_response()?;
-                let view = response.query_view_at(&q, expected.as_ref())?;
-                Ok::<_, anyhow::Error>((response.finish(view)?, catching_up))
-            })
-            .await
-            .map_err(|_| {
-                ApiError(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal_error",
-                    "Operation failed",
-                )
-            })??;
-            Ok((Json(view.ok_or_else(missing)?).into_response(), catching_up))
-        }
-        BrowserCoreRoute::View => {
-            let id = suffix.strip_prefix("views/").unwrap();
-            if id.contains('/') {
-                return Err(missing());
-            }
-            validate_record_id(id).map_err(|_| invalid())?;
-            match *method {
-                Method::GET => {
-                    let Query(q) = Query::<PinQuery>::try_from_uri(uri).map_err(|_| invalid())?;
-                    let pin = q.pin()?;
-                    let id = id.to_owned();
-                    let (value, catching_up) =
-                        selected_evidence(runtime, hook, move |r| r.saved_view_at(&id, pin))
-                            .await?;
-                    Ok((
-                        Json(value.ok_or_else(missing)?).into_response(),
-                        catching_up,
-                    ))
-                }
-                Method::PUT => {
-                    let Query(q) = Query::<PinQuery>::try_from_uri(uri).map_err(|_| invalid())?;
-                    let pin = q.pin()?.ok_or_else(invalid)?;
-                    let value: SavedViewRequest =
-                        serde_json::from_slice(&body).map_err(|_| invalid())?;
-                    if value.id != id {
-                        return Err(invalid());
-                    }
-                    value.validate().map_err(|_| invalid())?;
-                    return selected_mutation(
-                        runtime,
-                        hook,
-                        move |r| {
-                            r.validate_pin(pin)?;
-                            anyhow::ensure!(
-                                r.status()?.revision == pin,
-                                "revision conflict: mutation requires head"
-                            );
-                            Ok(())
-                        },
-                        move |r| r.save_view_at(pin, &value).map(Json),
-                    )
-                    .await;
-                }
-                Method::DELETE => {
-                    let id = id.to_owned();
-                    return selected_mutation(
-                        runtime,
-                        hook,
-                        |_| Ok(()),
-                        move |r| r.delete_view(&id).map(|_| StatusCode::NO_CONTENT),
-                    )
-                    .await;
-                }
-                _ => Err(missing()),
-            }
-        }
-        BrowserCoreRoute::Annotation => {
-            let id = suffix.strip_prefix("annotations/").unwrap();
-            if id.contains('/') {
-                return Err(missing());
-            }
-            validate_record_id(id).map_err(|_| invalid())?;
-            match *method {
-                Method::PUT => {
-                    let Query(q) = Query::<PinQuery>::try_from_uri(uri).map_err(|_| invalid())?;
-                    let pin = q.pin()?.ok_or_else(invalid)?;
-                    let value: AnnotationRequest =
-                        serde_json::from_slice(&body).map_err(|_| invalid())?;
-                    if value.id != id {
-                        return Err(invalid());
-                    }
-                    value.validate().map_err(|_| invalid())?;
-                    return selected_mutation(
-                        runtime,
-                        hook,
-                        move |r| {
-                            r.validate_pin(pin)?;
-                            anyhow::ensure!(
-                                r.status()?.revision == pin,
-                                "revision conflict: mutation requires head"
-                            );
-                            Ok(())
-                        },
-                        move |r| r.save_annotation_at(pin, &value).map(Json),
-                    )
-                    .await;
-                }
-                Method::DELETE => {
-                    let id = id.to_owned();
-                    return selected_mutation(
-                        runtime,
-                        hook,
-                        |_| Ok(()),
-                        move |r| r.delete_annotation(&id).map(|_| StatusCode::NO_CONTENT),
-                    )
-                    .await;
-                }
-                _ => Err(missing()),
-            }
-        }
-        BrowserCoreRoute::QuestionAction => {
-            let tail = suffix.strip_prefix("questions/").unwrap();
-            let Some((id, action)) = tail.split_once('/') else {
-                return Err(missing());
-            };
-            if id.is_empty() || action.contains('/') {
-                return Err(missing());
-            }
-            if !matches!(
-                (method.clone(), action),
-                (Method::GET, "jev-request")
-                    | (Method::POST, "jev-response")
-                    | (Method::POST, "selection")
-            ) {
-                return Err(missing());
-            }
-            let state = runtime.browser_scheduler()?;
-            let id = id.to_owned();
-            let bytes = body.clone();
-            let action = action.to_owned();
-            let (result, catching_up) = selected_question(runtime, hook, move |r| {
-                let revision = r.status()?.revision;
-                let packet = state
-                    .packets
-                    .lock()
-                    .unwrap()
-                    .packets
-                    .iter()
-                    .find(|(packet, _)| packet.packet_id == id)
-                    .map(|(packet, _)| packet.clone())
-                    .ok_or_else(|| anyhow::anyhow!("question seed not found"))?;
-                anyhow::ensure!(
-                    revision == packet.revision,
-                    "revision conflict: cached packet changed"
-                );
-                r.validate_selected_view(&packet.context, &packet.source_files)?;
-                match action.as_str() {
-                    "jev-request" => Ok(serde_json::to_value(jev::request_for(&packet)?)?),
-                    "jev-response" => {
-                        let value: Value = serde_json::from_slice(&bytes)
-                            .map_err(|_| anyhow::anyhow!("invalid_question_selection"))?;
-                        let selection = jev::parse_response(&packet, &value)?;
-                        let warnings = jev::response_warnings(&value);
-                        let mut view = planning::assemble(&packet, &selection, "importedJev")?;
-                        view.warnings.extend(warnings);
-                        Ok(json!({"selection":selection,"view":view}))
-                    }
-                    "selection" => {
-                        let selection: SelectionEnvelope = serde_json::from_slice(&bytes)
-                            .map_err(|_| anyhow::anyhow!("invalid_question_selection"))?;
-                        let view = planning::assemble(&packet, &selection, "manual")?;
-                        Ok(json!({"selection":selection,"view":view}))
-                    }
-                    _ => unreachable!(),
-                }
-            })
-            .await?;
-            Ok((Json(result).into_response(), catching_up))
-        }
         BrowserCoreRoute::Index | BrowserCoreRoute::CurrentJob => {
             let state = runtime.browser_scheduler()?;
             let response = if method == Method::POST {
@@ -5659,9 +4425,6 @@ async fn provisioned_core_answer(
     }
 }
 
-#[cfg(all(test, feature = "test-support", unix))]
-mod selected_provider_postflight_tests;
-
 #[cfg(test)]
 mod browser_core_route_tests {
     use super::BrowserCoreRoute;
@@ -5681,16 +4444,6 @@ mod browser_core_route_tests {
         for (method, suffix) in [
             (Method::GET, "git"),
             (Method::GET, "git/diff"),
-            (Method::GET, "views/id"),
-            (Method::PUT, "views/id"),
-            (Method::DELETE, "views/id"),
-            (Method::PUT, "annotations/id"),
-            (Method::DELETE, "annotations/id"),
-            (Method::GET, "questions/id/jev-request"),
-            (Method::POST, "questions/id/jev-response"),
-            (Method::POST, "questions/id/selection"),
-            (Method::POST, "questions/id/jev-run"),
-            (Method::POST, "questions/id/acp-answer"),
             (Method::GET, "jobs/id"),
             (Method::POST, "jobs/id/cancel"),
         ] {

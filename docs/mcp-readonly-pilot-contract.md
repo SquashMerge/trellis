@@ -34,7 +34,7 @@ For `-32022`, include required JSON-RPC `error.data:{supported:["2026-07-28","20
 | --- | --- |
 | Pinned [MCP TypeScript SDK 1.30.0](../tools/selection/package.json), [supported revisions](https://github.com/modelcontextprotocol/typescript-sdk/blob/1.30.0/src/types.ts#L4-L6), [client initialization](https://github.com/modelcontextprotocol/typescript-sdk/blob/1.30.0/src/client/index.ts#L464-L505) and [offline initialize/list/call smoke](../tools/selection/acp-smoke.test.mjs) | Supports `2025-11-25`; justifies the legacy target, **not** tested Trellis interoperability. |
 | [Claude Code 2.1.266, Claude ACP 0.79.0 and underlying Claude Agent SDK 0.3.274](research/selection/ACP-SETUP.md); [successful Claude ACP experiment](research/selection/SMOKE-RESULTS.md) | Initialize-era MCP and an ACP experiment are recorded. ACP wire version 1 is **not** an MCP revision. Exact MCP negotiation was not recorded; legacy mode is a target for #17 fixture verification, not certified Claude/modern support. |
-| [Codex CLI 0.150.1, Codex ACP 1.12.0 and legacy ACP 0.16.0](codex-acp-check.md) | Considered, not certified. CLI inference smoke proves neither ACP/MCP interoperability nor the evidence-only boundary. |
+| Codex CLI 0.150.1, Codex ACP 1.12.0 and legacy ACP 0.16.0 (historical evaluation of the retired answer adapter) | Considered, not certified. CLI inference smoke proves neither ACP/MCP interoperability nor the evidence-only boundary. |
 
 ## Shared schema and limits
 

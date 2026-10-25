@@ -1071,27 +1071,6 @@ fn four_language_noncallable_native_declarations_keep_exact_kind_and_are_not_exe
                 "{path}: {} is not executable",
                 n.name
             );
-            let request = serde_json::from_value(serde_json::json!({
-                "seed": n.id, "question": "Which exact source declares this name?", "expectedRevision": pin
-            })).unwrap();
-            let packet = trellis::planning::prepare(&store, request).unwrap();
-            assert_eq!(
-                packet.context.nodes,
-                vec![n.clone()],
-                "{path}: source-only declaration"
-            );
-            assert!(
-                packet.context.calls.is_empty() && packet.context.regions.is_empty(),
-                "{path}: no executable call evidence"
-            );
-            assert_eq!(packet.source_files.len(), 1);
-            assert_eq!(packet.source_files[0].text, text);
-            assert!(
-                packet
-                    .warnings
-                    .iter()
-                    .any(|w| w.contains("source-only") && w.contains("noncallable"))
-            );
         }
         assert_eq!(store.source(path).unwrap().unwrap().text, text);
     }

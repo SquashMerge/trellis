@@ -146,17 +146,22 @@ async fn validation_and_limit() {
         assert_eq!(call(&app, "GET", path, Value::Null).await.0, 400)
     }
     assert_eq!(
-        call(&app, "POST", "/api/query", json!({"seed":"x","depth":6}))
-            .await
-            .0,
+        call(
+            &app,
+            "POST",
+            "/api/sequence",
+            json!({"seed":"x","expectedRevision":6})
+        )
+        .await
+        .0,
         400
     );
     assert_eq!(
         call(
             &app,
-            "PUT",
-            "/api/views/test",
-            json!({"id":"other","title":"v","query":{"seed":"x"}})
+            "POST",
+            "/api/navigation",
+            json!({"path":"../secret","line":1})
         )
         .await
         .0,
@@ -589,7 +594,6 @@ async fn live_control_corruption_returns_typed_503_and_hard_latches_clones() {
             |_| {},
         )
         .unwrap();
-        let symbol_id = graph.nodes[0].id.clone();
         let pin = store
             .publish_native(
                 &graph,
@@ -627,7 +631,7 @@ async fn live_control_corruption_returns_typed_503_and_hard_latches_clones() {
                 )
                 .unwrap();
                 format!(
-                    "/api/symbol?id={symbol_id}&indexGeneration={}&indexRevision={}",
+                    "/api/files?indexGeneration={}&indexRevision={}",
                     pin.index_generation, pin.index_revision
                 )
             }
@@ -989,7 +993,7 @@ async fn verified_leader_expires_due_pin_on_idle_tick_without_publication() {
 }
 
 #[tokio::test]
-async fn expired_pin_saved_items_require_explicit_head_reattachment() {
+async fn expired_pin_reads_require_an_explicit_head_request() {
     // Control retention with the explicit clock and forced ticks below.
     let (dir, store, state, app) = setup_without_tick();
     let workspace = dir.path().join("workspace");
@@ -1033,32 +1037,15 @@ async fn expired_pin_saved_items_require_explicit_head_reattachment() {
             pin.index_revision
         )
     };
-    let view = json!({"id":"saved-view","title":"Saved", "query":{"seed":seed}});
-    let note = json!({"id":"saved-note","nodeId":seed,"body":"Durable note"});
-    for (route, payload) in [
-        ("/api/views/saved-view", &view),
-        ("/api/annotations/saved-note", &note),
-    ] {
-        let (status, saved) = call(&app, "PUT", &pin_route(route, old), payload.clone()).await;
-        assert_eq!(status, StatusCode::OK, "{saved}");
-        assert_eq!(saved["attachment"]["result"]["status"], "attached");
-    }
     let head = publish(old); // identical source and measured IDs, but a different revision.
     assert_eq!(store.status().unwrap().revision, head);
     store.set_retention_clock_for_tests(1_900, 900);
     state.force_retention_idle_tick_for_tests().unwrap();
     for (method, route, payload) in [
         ("GET", "/api/source?path=a.js", Value::Null),
-        ("GET", "/api/symbol?id=missing", Value::Null),
         ("GET", "/api/files", Value::Null),
         ("GET", "/api/methods?path=a.js", Value::Null),
         ("GET", "/api/classes", Value::Null),
-        ("POST", "/api/query", json!({"seed":seed})),
-        ("GET", "/api/views", Value::Null),
-        ("GET", "/api/views/saved-view", Value::Null),
-        ("GET", "/api/annotations", Value::Null),
-        ("PUT", "/api/views/saved-view", view.clone()),
-        ("PUT", "/api/annotations/saved-note", note.clone()),
     ] {
         let (status, body) = call(&app, method, &pin_route(route, old), payload).await;
         assert_eq!(status, StatusCode::CONFLICT, "{method} {route}: {body}");
@@ -1076,15 +1063,6 @@ async fn expired_pin_saved_items_require_explicit_head_reattachment() {
     .await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["error"]["code"], "pin_expired");
-    let (status, body) = call(
-        &app,
-        "POST",
-        "/api/questions/preview",
-        json!({"seed":seed,"question":"What does seed do?", "expectedRevision":old}),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert_eq!(body["error"]["code"], "pin_expired");
     let foreign = IndexPin {
         index_generation: uuid::Uuid::new_v4(),
         ..old
@@ -1094,7 +1072,7 @@ async fn expired_pin_saved_items_require_explicit_head_reattachment() {
         ..old
     };
     for invalid in [foreign, missing] {
-        for route in ["/api/views/saved-view", "/api/annotations"] {
+        for route in ["/api/files", "/api/source?path=a.js"] {
             let (status, body) = call(&app, "GET", &pin_route(route, invalid), Value::Null).await;
             assert_eq!(status, StatusCode::CONFLICT, "{route}: {body}");
             assert_eq!(
@@ -1103,29 +1081,11 @@ async fn expired_pin_saved_items_require_explicit_head_reattachment() {
             );
         }
     }
-    // An explicit head read, not a retry at the expired pin, is the only reattachment.
-    for (route, expected) in [
-        ("/api/views/saved-view", &view),
-        ("/api/annotations", &note),
-    ] {
+    // An explicit head read must succeed without falling back from the expired pin.
+    for route in ["/api/files", "/api/source?path=a.js"] {
         let (status, body) = call(&app, "GET", &pin_route(route, head), Value::Null).await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        let attached = if route == "/api/annotations" {
-            &body[0]
-        } else {
-            &body
-        };
-        assert_eq!(
-            attached["attachment"]["result"]["status"], "attached",
-            "{body}"
-        );
-        let durable = if route == "/api/annotations" {
-            &attached["annotation"]
-        } else {
-            &attached["view"]
-        };
-        assert_eq!(durable["id"], expected["id"]);
-        assert_eq!(attached["indexRevision"], head.index_revision);
+        assert_eq!(body["revision"], json!(head));
     }
     assert_eq!(store.status().unwrap().revision, head);
 }

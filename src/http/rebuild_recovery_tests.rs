@@ -215,8 +215,6 @@ fn cold_recovery_uses_fifo_options_or_existing_defaults_when_recorded_options_ar
                     &defaults.workspace_root,
                     Vec::new(),
                     None,
-                    None,
-                    None,
                 )
                 .unwrap(),
             );

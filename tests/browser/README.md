@@ -1,11 +1,11 @@
-# Browser acceptance: saved items and sequence
+# Browser acceptance: sequence and shell
 
 This test drives the real Trellis web shell in Playwright Chromium. It starts the compiled daemon with an isolated workspace, token, home, and XDG directories. It does not mock or intercept application requests.
 
 ## Verify from a clean checkout
 
 From the repository root, run `./tools/verify`. Its sequential setup step installs the
-locked `runtime/acp` and `tests/browser` Node packages when missing or stale, then checks
+locked `tests/mcp` and `tests/browser` Node packages when missing or stale, then checks
 and repairs the pinned Playwright Chromium bundles. Setup completes before the parallel verification
 lanes start. The package lock pins `playwright` to exactly `1.64.1`; setup never uses `npx`,
 a system browser, or `--with-deps`. A first run needs npm registry and browser-download access.
@@ -37,7 +37,7 @@ npm_config_cache="$TRELLIS_RUN_CACHE/npm-cache" \
 PLAYWRIGHT_BROWSERS_PATH="$TRELLIS_RUN_CACHE/playwright-browsers" \
   node tests/browser/node_modules/playwright/cli.js install chromium
 PLAYWRIGHT_BROWSERS_PATH="$TRELLIS_RUN_CACHE/playwright-browsers" \
-  node tests/browser/saved-items.test.cjs
+  node --test tests/browser/sequence.test.cjs
 ```
 
 The harness fails if the environment variable, locked package, managed Chromium executable, Cargo build, daemon, or any browser assertion is unavailable. It has no synthetic-DOM fallback and never skips acceptance.

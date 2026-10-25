@@ -485,13 +485,11 @@ fn invalid_document_revision_and_continuity_associations_fail_closed() {
 #[test]
 fn capture_from_native_snapshot_includes_unnamed_and_ignores_live_source_edits() {
     use std::{
-        collections::BTreeMap,
         fs,
         sync::{Arc, atomic::AtomicBool},
     };
     use trellis::{
         indexer::{IndexOptions, index_workspace_bundle},
-        model::{Position, SavedView, ViewQuery},
         store::Store,
     };
     let state = tempfile::tempdir().unwrap();
@@ -515,8 +513,8 @@ fn capture_from_native_snapshot_includes_unnamed_and_ignores_live_source_edits()
         .declarations
         .iter()
         .find(|row| row.name.is_none())
-        .expect("fixture must expose an unnamed native declaration")
-        .clone();
+        .expect("fixture must expose an unnamed native declaration");
+    let anchor = capture_anchor(unnamed, &native.declarations).unwrap();
     let leader = store.publication_for_tests().unwrap();
     let pin = store
         .publish_native(
@@ -528,46 +526,44 @@ fn capture_from_native_snapshot_includes_unnamed_and_ignores_live_source_edits()
             &cancel,
         )
         .unwrap();
-    let view = SavedView {
-        id: "unnamed".into(),
-        title: "Unnamed".into(),
-        query: ViewQuery {
-            seed: unnamed.syntax_id.clone(),
-            depth: 1,
-            max_nodes: 40,
-            max_calls: 200,
-            include_callbacks: false,
-            exclude_paths: vec![],
-        },
-        pins: BTreeMap::<String, Position>::new(),
-        hidden: vec![],
-    };
-    let saved = store.save_view_at(pin, &view).unwrap();
-    let raw_before = saved.view.anchor.as_ref().unwrap().get().to_owned();
-    assert_eq!(
-        saved.attachment.result.as_ref().unwrap().status,
-        AnchorStatus::Attached
-    );
     fs::write(&source, "this is deliberately not indexed\n").unwrap();
-    let reread = store.saved_view_at("unnamed", Some(pin)).unwrap().unwrap();
-    assert_eq!(reread.view.anchor.as_ref().unwrap().get(), raw_before);
+    let (_, bytes) = store
+        .native_source_at(pin, &anchor.document)
+        .unwrap()
+        .unwrap();
     assert_eq!(
-        reread.attachment.result.unwrap().status,
+        bytes,
+        b"const f = () => 1; function named() { return 1; }\n"
+    );
+    let declarations = native.declarations;
+    let current = declarations
+        .iter()
+        .find(|row| row.syntax_id == anchor.syntax_id)
+        .unwrap();
+    assert_eq!(capture_anchor(current, &declarations).unwrap(), anchor);
+    assert_eq!(
+        audit_anchor(
+            &anchor,
+            &current.revision_id,
+            Some(current),
+            &declarations,
+            None
+        )
+        .unwrap()
+        .status,
         AnchorStatus::Attached
     );
 }
 
 #[cfg(feature = "test-support")]
 #[test]
-fn production_duplicate_cross_revision_is_never_inferred_unchanged() {
+fn native_duplicate_cross_revision_is_never_inferred_unchanged() {
     use std::{
-        collections::BTreeMap,
         fs,
         sync::{Arc, atomic::AtomicBool},
     };
     use trellis::{
         indexer::{IndexOptions, index_workspace_bundle},
-        model::{AnnotationRequest, SavedView, ViewQuery},
         store::Store,
     };
     let state = tempfile::tempdir().unwrap();
@@ -580,22 +576,15 @@ fn production_duplicate_cross_revision_is_never_inferred_unchanged() {
     .unwrap();
     let store = Store::open_for_tests(state.path(), work.path()).unwrap();
     let cancel = Arc::new(AtomicBool::new(false));
-    let build = |store: &Store| {
-        index_workspace_bundle(
-            &IndexOptions::new(work.path().to_owned()),
-            store.root_id(),
-            &cancel,
-            |_| {},
-        )
-        .unwrap()
-    };
-    let (graph, native, capture) = build(&store);
+    let options = IndexOptions::new(work.path().to_owned());
+    let (graph, native, capture) =
+        index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
     let selected = native
         .declarations
         .iter()
         .find(|row| row.name.as_deref() == Some("same") && row.key.ordinal == 0)
-        .unwrap()
-        .clone();
+        .unwrap();
+    let anchor = capture_anchor(selected, &native.declarations).unwrap();
     let leader = store.publication_for_tests().unwrap();
     let first = store
         .publish_native(
@@ -607,54 +596,33 @@ fn production_duplicate_cross_revision_is_never_inferred_unchanged() {
             &cancel,
         )
         .unwrap();
-    let view = SavedView {
-        id: "duplicate".into(),
-        title: "Duplicate".into(),
-        query: ViewQuery {
-            seed: selected.syntax_id.clone(),
-            depth: 1,
-            max_nodes: 40,
-            max_calls: 200,
-            include_callbacks: false,
-            exclude_paths: vec![],
-        },
-        pins: BTreeMap::new(),
-        hidden: vec![],
-    };
-    store.save_view_at(first, &view).unwrap();
-    let note = store
-        .save_annotation_at(
-            first,
-            &AnnotationRequest {
-                id: "duplicate-note".into(),
-                node_id: selected.syntax_id.clone(),
-                body: "note".into(),
-                title: Some("Title".into()),
-            },
-        )
-        .unwrap();
-    let note_raw = note.annotation.anchor.as_ref().unwrap().get().to_owned();
     fs::write(
         &source,
         "function same() { return 2; }\nfunction same() { return 1; }\n",
     )
     .unwrap();
-    let (graph, native, capture) = build(&store);
+    let (graph, native, capture) =
+        index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
     let second = store
         .publish_native(&graph, &capture, &native, &leader, first, &cancel)
         .unwrap();
-    let reread = store
-        .saved_view_at("duplicate", Some(second))
-        .unwrap()
+    let declarations = store
+        .native_declarations_at(second, "javascript", "same")
+        .unwrap();
+    let current = declarations
+        .iter()
+        .find(|row| row.syntax_id == anchor.syntax_id)
         .unwrap();
     assert_eq!(
-        reread.attachment.result.unwrap().reason,
+        audit_anchor(
+            &anchor,
+            &current.revision_id,
+            Some(current),
+            &declarations,
+            None
+        )
+        .unwrap()
+        .reason,
         AnchorReason::UnprovenContinuity
     );
-    let note = store.saved_annotations_at(Some(second)).unwrap().remove(0);
-    assert_eq!(
-        note.attachment.result.unwrap().reason,
-        AnchorReason::UnprovenContinuity
-    );
-    assert_eq!(note.annotation.anchor.unwrap().get(), note_raw);
 }
