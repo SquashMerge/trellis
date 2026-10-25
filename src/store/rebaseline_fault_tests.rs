@@ -388,7 +388,7 @@ fn canonical_medium_local_update_writes_only_changed_fact_families() {
     assert_eq!(
         fs::read(output.join("manifest.json")).unwrap(),
         fs::read(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tools/synthetic-cohorts/manifest-v1.json")
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tools/synthetic-cohorts/manifest-v2.json")
         )
         .unwrap()
     );
@@ -498,7 +498,7 @@ fn canonical_cohort_produced_native_fact_floors() {
     assert_eq!(
         fs::read(output.join("manifest.json")).unwrap(),
         fs::read(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tools/synthetic-cohorts/manifest-v1.json")
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tools/synthetic-cohorts/manifest-v2.json")
         )
         .unwrap(),
         "only exact pinned cohort bytes are eligible"
