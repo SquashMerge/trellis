@@ -16,6 +16,7 @@ pub mod dependency_rust_symbols;
 #[cfg(test)]
 mod extractor_inputs_tests;
 pub mod file_tree;
+pub mod files_view;
 pub mod git_status;
 pub mod http;
 pub mod index_coordinator;

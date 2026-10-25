@@ -8,6 +8,7 @@
   <link rel="stylesheet" href="/style.css">
   <link rel="stylesheet" href="/classes.css">
   <link rel="stylesheet" href="/navigation.css">
+  <link rel="stylesheet" href="/files.css">
   <script src="/vendor/pele-1.6.0.js" defer></script>
   <script src="/sequence.js" defer></script>
   <script src="/sequence-pele.js" defer></script>
@@ -15,6 +16,7 @@
   <script src="/classes.js" defer></script>
   <script src="/navigation.js" defer></script>
   <script src="/viewer-metrics.js" defer></script>
+  <script src="/files.js" defer></script>
   <script src="/app.js" defer></script>
 </head>
 <body>
@@ -25,7 +27,7 @@
     </a>
     <nav class="section-nav" aria-label="App sections">
       <button id="section-diagrams" type="button" aria-controls="workspace" disabled>Diagrams</button>
-      <button id="section-files" type="button" aria-controls="explorer-panel" disabled>Files</button>
+      <button id="section-files" type="button" aria-controls="workspace-source-panel" disabled>Files</button>
     </nav>
     <section id="checkout-picker" class="checkout-picker" aria-label="Checkout selection" hidden>
       <label for="checkout-select">Checkout</label>
@@ -82,12 +84,12 @@
           </section>
           <h2 id="files-title">Files</h2><p class="browse-root" id="browse-root"></p><details class="browse-scope"><summary>Index scope &amp; file access</summary><p class="detail" id="browse-scope">Working directory files · indexed files have methods</p></details><label class="file-filter-label" for="file-filter">Filter loaded entries</label><input id="file-filter" placeholder="Path contains…" type="search"/><details class="browse-options"><summary>Display options</summary><p><label><input id="all-methods" type="checkbox"/> Show all methods</label></p></details><div class="bar"><button hidden="" id="reveal-method">Reveal selected method</button><button hidden="" id="retry-files">Retry file list</button></div><p id="files-state" role="status"></p><ul class="file-tree plain" id="file-tree"></ul><button hidden="" id="more-files">Load more files</button></aside>
         <div class="canvas-area">
-          <nav class="view-tabs" aria-label="Workspace views" role="tablist">
+          <nav id="diagram-tabs" class="view-tabs" aria-label="Workspace views" role="tablist">
             <button id="view-sequence" role="tab" type="button" aria-selected="true" aria-controls="sequence-panel">Sequence</button>
             <button id="view-classes" role="tab" type="button" aria-selected="false" aria-controls="classes-panel" tabindex="-1">Classes</button>
             <button id="view-libraries" role="tab" type="button" aria-selected="false" aria-controls="dependency-library" tabindex="-1">Libraries</button>
           </nav>
-          <div class="metric-controls" role="group" aria-label="File tree metrics">
+          <div id="diagram-metrics" class="metric-controls" role="group" aria-label="File tree metrics">
             <label for="metric-color">Color by</label>
             <select id="metric-color">
               <option value="cognitive">Cognitive</option>
@@ -121,12 +123,18 @@
           <section id="dependency-library" hidden role="tabpanel" aria-labelledby="view-libraries"><div class="bar"><h2 id="dependency-title">Libraries</h2><button id="dependency-refresh" type="button">Refresh library status</button></div><p class="detail">Local declaration catalog · Rust/Cargo first. No downloads or project commands. Libraries remain separate from workspace evidence.</p><p aria-live="polite" id="dependency-state" role="status">Connect to load library status.</p><details class="warning-disclosure"><summary>Library diagnostics</summary><ul class="plain" id="dependency-warnings"></ul></details><div class="dependency-layout"><div><h3>Packages</h3><ul class="plain" id="dependency-packages"></ul></div><div><h3>Indexed definitions</h3><form class="bar" id="dependency-search-form"><label for="dependency-filter">Filter definitions</label><input disabled="" id="dependency-filter" maxlength="200" placeholder="Class, type or method…" type="search"/><button disabled="" id="dependency-search" type="submit">Filter</button></form><p id="dependency-symbol-state" role="status">Select a package. No source file knowledge needed.</p><ul class="plain" id="dependency-symbols"></ul><div class="bar"><button disabled="" id="dependency-previous" type="button">Previous definitions</button><button disabled="" id="dependency-next" type="button">Next definitions</button></div></div></div><p class="detail"><span class="badge">Syntax candidates</span><span class="badge">Terminal library boundary</span>Declarations do not prove resolved types, callees or dispatch. Source opens only when you select a definition. The selected method and diagram stay unchanged.</p><details id="external-sources"><summary>Manual Rust source roots · fallback</summary><p class="detail">Browse configured roots only when the automatic catalog cannot find a library.</p><button id="external-load" type="button">Load configured roots</button><p id="external-state" role="status">Not loaded. Load configured roots to browse.</p><ul class="plain external-tree" id="external-roots"></ul></details></section>
           <section id="source-dock" aria-label="Read-only source" hidden>
             <div class="source-dock-bar"><div class="dock-tabs" role="tablist" aria-label="Source views"><button id="dock-workspace" role="tab" type="button" aria-selected="true" aria-controls="workspace-source-panel">Workspace source</button><button id="dock-library" role="tab" type="button" aria-selected="false" aria-controls="library-source-panel">Library source</button></div><button id="source-dock-close" type="button" aria-label="Close source panel">Close</button></div>
-            <div id="workspace-source-panel" role="tabpanel" aria-labelledby="dock-workspace"><section aria-labelledby="source-title"><h2 id="source-title">Indexed source <span class="muted">· read only</span></h2><p id="source-path">Choose a call to read its cached source snapshot.</p><pre aria-label="Read-only indexed source" id="source" tabindex="0"></pre></section></div>
+            <div id="workspace-source-panel" role="tabpanel" aria-labelledby="dock-workspace"><section aria-labelledby="source-title"><div id="files-source-toolbar" hidden><div role="group" aria-label="Source basis"><button id="files-indexed" type="button" aria-pressed="true">Indexed</button><button id="files-working" type="button" aria-pressed="false" hidden>Working tree · uncommitted vs HEAD</button></div><p id="files-git-state" role="status"></p><p id="files-basis-note"></p></div><h2 id="source-title">Source <span class="muted">· read only</span></h2><div id="files-empty" hidden><h3>Read an indexed file</h3><p>Choose a file in the explorer. Source and symbols stay on the shown indexed revision.</p></div><div id="files-diff" role="region" aria-label="Uncommitted changes against HEAD" tabindex="0" hidden></div><p id="source-path">Choose a call to read its cached source snapshot.</p><pre aria-label="Read-only indexed source" id="source" tabindex="0"></pre></section></div>
             <div id="library-source-panel" role="tabpanel" aria-labelledby="dock-library" hidden><h3>Candidate source <span class="muted">· read only</span></h3><p id="external-source-path" role="status">Choose an indexed definition or a manual source file to read a candidate snapshot.</p><ul class="plain" id="external-warnings"></ul><label for="external-filter">Filter loaded definitions</label><input disabled="" id="external-filter" placeholder="OpenOptions…" type="search"/><ul class="plain" id="external-definitions"></ul><div class="bar"><button disabled="" id="external-previous" type="button">Previous lines</button><button disabled="" id="external-next" type="button">Next lines</button></div><pre aria-label="Read-only external candidate source" id="external-source" tabindex="0"></pre></div>
           </section>
         </div>
         <aside id="call-inspector" class="call-inspector" aria-labelledby="inspector-heading">
           <div class="inspector-header"><h2 id="inspector-heading">Inspector</h2><button id="inspector-clear" type="button" disabled>Clear</button></div>
+          <section id="files-inspector" hidden aria-label="Indexed symbol evidence">
+            <p id="files-symbol-kind" class="detail">Indexed symbol</p><h3 id="files-symbol-title">Choose a symbol</h3>
+            <p id="files-symbol-location" class="detail"></p><pre id="files-symbol-header"></pre><p id="files-symbol-return" class="detail"></p>
+            <section aria-labelledby="files-mini-title"><div class="bar"><h4 id="files-mini-title">Sequence · measured</h4><button id="files-open-full" type="button" disabled>Open full</button></div><p id="files-mini-state" role="status">Select a callable to preview its measured sequence.</p><div id="files-mini-sequence" class="sequence-scroll" tabindex="0" aria-label="Measured sequence preview"></div></section>
+            <section aria-labelledby="files-matches-title"><h4 id="files-matches-title">Syntax matches · same spelling, not compiler-resolved</h4><p class="detail">Matches concern the selected declaration. Homonyms and shadowing may refer to other declarations.</p><p id="files-matches-state" role="status"></p><ul id="files-matches" class="plain"></ul><button id="files-matches-more" type="button" hidden>More syntax matches</button><button id="files-matches-retry" type="button" hidden>Retry syntax matches</button></section>
+          </section>
           <div id="inspector-empty" class="inspector-empty"><span class="inspector-symbol" aria-hidden="true">↗</span><h3>Inspect a source step</h3><p>Select a call or control to inspect measured source text. Targets are unverified.</p><p class="detail">Source text does not prove a path or runtime behavior.</p></div>
           <div id="inspector-content" hidden>
             <span id="inspector-kind" class="badge"></span><h3 id="inspector-title"></h3>
