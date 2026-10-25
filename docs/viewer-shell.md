@@ -37,8 +37,12 @@ are not equal pins. Existing busy/replacement and authentication semantics remai
 
 ## Metric tree and inspector
 
-Use [`metrics:v1`](metrics.md), scoped to **all indexed callables**. Default color is cognitive
-complexity and default aggregate is max. Max, sum and mean are server projections over declaration
+Use [`metrics:v1`](metrics.md), explicitly scoped to **production callables** by default. The
+unchecked **Include tests in metrics** checkbox switches the selection to `all`; unchecking it
+requests `production`. API/CLI omission still defaults to `all`, and `test` is available there.
+Stored native declaration roles are authoritative for Rust, Java, Python and JavaScript under
+Decision 0011; the browser does not classify filenames. Default color is cognitive complexity
+and default aggregate is max. Max, sum and mean are server projections over declaration
 scores, never client folds of file aggregates. One revision projection supplies file and directory
 swatches; one selected-scope request supplies the inspector and `topCognitive=3`.
 
@@ -53,7 +57,10 @@ has been deleted. That catalog is not a claim about the current filesystem or Gi
 The inspector shows every metric leaf at the named aggregate. Null stays `—`; explicit unavailable
 reasons, including fan-in, stay visible. Highest-cognitive rows use raw callable scores and native
 nullable names, kinds and byte ranges. Anonymous functions are not assigned invented names.
-These rows are informational, not guessed native-SID-to-source links.
+These rows are informational, not guessed native-SID-to-source links. Labels and highest-cognitive
+rankings follow the selected role. Test-only files have unavailable production heat, not zero.
+Callable-range LOC/SLOC may overlap and are not production physical file lines. Per-file
+`roleCounts` describe all measured production/test callables at the pin, not physical line coverage.
 
 Heat cut values are quartiles of finite metric values on the **currently displayed file/directory
 rows**, after loaded-entry filtering, expansion and pagination. Sort values ascending; for n values
@@ -61,7 +68,10 @@ choose cuts at `min(n-1,floor(n*p))` for p=0.25,0.5,0.75. The band is the number
 less than the value, so ties remain together and repeated cuts may leave empty bands. The legend
 shows the actual cuts (`≤a`, `>a–b`, `>b–c`, `>c`); an empty sample has no invented zero cuts.
 Maintainability reverses color severity only, retaining the original values and higher-is-better label.
-Color selection does not fetch; aggregation refreshes the pinned projection. Failures clear stale
+Color selection does not fetch; aggregation refreshes the pinned projection. Role changes clear
+old heat and inspection before fetching; response-currentness checks include role alongside
+aggregate, checkout/session, full pin and request serial. A late same-pin response from another
+role cannot repaint the current choice. Failures clear stale
 metric values and show an actionable error. The existing 15-second browser request timeout remains;
 a timeout is not evidence that the server finished or that values are zero.
 

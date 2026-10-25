@@ -26,15 +26,17 @@
     fanOut:"Fan-out (call sites)", fanIn:"Fan-in", halstead:"Halstead", parameters:"Parameters", exits:"Exits"};
   function create({request, context, readSource, onConflict = () => {}, onInspect = () => {}}) {
     let serial = 0, renderSerial = 0, selectionSerial = 0, view = null, basis = null;
-    let metric = "cognitive", aggregate = "max", showTests = false;
+    let metric = "cognitive", aggregate = "max", role = "production", showTests = false;
+    const callables = () => role === "all" ? "indexed callables" : "production callables";
+    const population = () => role === "all" ? "all indexed callables" : callables();
     const state = (message, kind = "ready") => { get("architecture-state").textContent = message; get("architecture-state").dataset.state = kind; };
     function capture() {
       const c = context();
-      return {rootKey:c.rootKey, session:c.session, pin:c.pin && window.TrellisIndexPin.copy(c.pin), aggregate, serial};
+      return {rootKey:c.rootKey, session:c.session, pin:c.pin && window.TrellisIndexPin.copy(c.pin), aggregate, role, serial};
     }
     function current(c) {
       const now = context();
-      return c && c.serial === serial && c.aggregate === aggregate && c.rootKey === now.rootKey && c.session === now.session &&
+      return c && c.serial === serial && c.aggregate === aggregate && c.role === role && c.rootKey === now.rootKey && c.session === now.session &&
         !!c.pin && window.TrellisIndexPin.equal(c.pin, now.pin);
     }
     function usable() { return view && current(basis) && view.rulesFile?.contentHash === basis.rulesHash; }
@@ -54,8 +56,8 @@
       if (!payload || !window.TrellisIndexPin.equal(payload, c.pin)) {
         const error = new Error("Architecture snapshot changed. Refresh status."); error.code = "revision_conflict"; error.status = 409; throw error;
       }
-      if (!["ready", "missing_rules", "no_layers"].includes(payload.state) || payload.aggregate !== aggregate ||
-          payload.metricsVersion !== "metrics:v1" || payload.metricsScope !== "all-indexed-callables" ||
+      if (!["ready", "missing_rules", "no_layers"].includes(payload.state) || payload.aggregate !== c.aggregate || payload.role !== c.role ||
+          payload.metricsVersion !== "metrics:v1" ||
           payload.evidenceTier !== "syntax" || payload.semanticComplete !== false ||
           !Array.isArray(payload.layers) || !Array.isArray(payload.modules) || !Array.isArray(payload.edges) ||
           (payload.state === "ready" && (typeof payload.rulesFile?.contentHash !== "string" || !payload.rulesFile.contentHash))) {
@@ -69,7 +71,7 @@
     }
     function coverage() {
       const target = get("architecture-notice-content"); target.replaceChildren();
-      paragraph(target, `Code ${window.TrellisIndexPin.label(view)} · rules ${view.rulesFile.contentHash} · ${aggregate} · all indexed callables.`);
+      paragraph(target, `Code ${window.TrellisIndexPin.label(view)} · rules ${view.rulesFile.contentHash} · ${aggregate} · ${population()}.`);
       const references = view.references;
       paragraph(target, `${references?.counts?.mappedSites ?? 0} structurally mapped reference sites · ${references?.counts?.unresolvedSites ?? 0} unresolved. Missing sites do not prove absence.`);
       for (const limitation of references?.limitations || []) paragraph(target, limitation);
@@ -104,8 +106,8 @@
     function legend(cuts) {
       const target = get("architecture-legend"); target.replaceChildren();
       if (metric === "layer") { paragraph(target, "Layer membership · neutral chips; no metric heat."); return; }
-      paragraph(target, `${metric} · ${aggregate} · visible native file modules · all indexed callables${metric === "maintainabilityIndex" ? " · higher is better; heat inverted" : ""}`);
-      if (!cuts.length) { paragraph(target, "No measured values · — is unavailable, not zero."); return; }
+      paragraph(target, `${metric} · ${aggregate} · visible native file modules · ${population()}${metric === "maintainabilityIndex" ? " · higher is better; heat inverted" : ""}`);
+      if (!cuts.length) { paragraph(target, `No measured values · ${population()} · — is unavailable, not zero.`); return; }
       const ranges = [`≤${cuts[0]}`, `>${cuts[0]}–${cuts[1]}`, `>${cuts[1]}–${cuts[2]}`, `>${cuts[2]}`];
       ranges.forEach((range, rank) => {
         const entry = make("span", undefined, "metric-legend-entry");
@@ -135,7 +137,7 @@
         if (outcome?.status !== "ready") throw new Error(outcome?.reason || outcome?.error?.message || "Architecture mapping failed. Nothing displayed.");
         const production = payload.edges.filter(edge => edge.role === "production").reduce((sum, edge) => sum + edge.count, 0);
         const tests = payload.edges.filter(edge => edge.role === "test").reduce((sum, edge) => sum + edge.count, 0);
-        state(`${payload.modules.length} native file modules · ${production} production / ${tests} test-only cross-layer reference sites${showTests ? " · tests shown" : " · tests hidden"}. Metrics: ${aggregate}, all indexed callables.`, "ready");
+        state(`${payload.modules.length} native file modules · ${production} production / ${tests} test-only cross-layer reference sites${showTests ? " · tests shown" : " · tests hidden"}. Metrics: ${aggregate}, ${population()}.`, "ready");
       } catch (error) {
         if (!active()) return;
         get("architecture-diagram").replaceChildren(); get("architecture-legend").replaceChildren(); clearInspection();
@@ -148,7 +150,7 @@
       if (!c.rootKey || !c.pin) { state("Choose an indexed checkout, then open Architecture.", "empty"); return; }
       state("Reading indexed architecture and reviewed rules…", "loading"); get("architecture-diagram").setAttribute("aria-busy", "true");
       try {
-        const query = new URLSearchParams({aggregate, indexGeneration:c.pin.indexGeneration, indexRevision:String(c.pin.indexRevision)});
+        const query = new URLSearchParams({aggregate:c.aggregate, role:c.role, indexGeneration:c.pin.indexGeneration, indexRevision:String(c.pin.indexRevision)});
         const data = await request(`/api/architecture?${query}`, () => current(c));
         if (!current(c)) return;
         const payload = payloadOf(data, c);
@@ -206,9 +208,10 @@
       const references = payload.references;
       if (kind === "module") {
         title.textContent = record.identity.path;
-        paragraph(target, `Layer: ${record.layer ?? "Unassigned / unknown"} · ${record.physicalLines} physical file lines · ${record.declarationCount} indexed callables.`);
-        paragraph(target, `${aggregate} · metrics:v1 · all indexed callables. Callable-range LOC may overlap; it is not physical file lines.`);
+        paragraph(target, `Layer: ${record.layer ?? "Unassigned / unknown"} · ${record.physicalLines} physical file lines · ${record.declarationCount} ${callables()}.`);
+        paragraph(target, `${aggregate} · metrics:v1 · ${population()}. Callable-range LOC may overlap; it is not physical file lines.`);
         disclosure(target, "Native file-module identity and captured source", {identity:record.identity, revisionId:record.revisionId, contentHash:record.contentHash, provenanceId:record.provenanceId});
+        if (record.declarationCount === 0) paragraph(target, `No ${callables()}. Numeric aggregates are unavailable, not zero.`);
         values(target, record.metrics);
         if (record.physicalLines > 0) {
           const button = make("button", "Read indexed file source"); button.type = "button";
@@ -248,6 +251,12 @@
     }
     get("architecture-color").value = metric; get("architecture-aggregate").value = aggregate;
     get("architecture-tests").checked = showTests;
+    get("architecture-metric-tests").checked = false;
+    get("architecture-metric-tests").addEventListener("change", event => {
+      const next = event.target.checked ? "all" : "production";
+      if (next === role) return;
+      role = next; return refresh();
+    });
     get("architecture-refresh").addEventListener("click", refresh);
     get("architecture-color").addEventListener("change", event => { metric = event.target.value; return render(); });
     get("architecture-tests").addEventListener("change", event => { showTests = event.target.checked; return render(); });

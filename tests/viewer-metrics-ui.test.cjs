@@ -11,7 +11,7 @@ function harness() {
   let changes = 0, shown = 0, cleared = 0;
   const state = {rootKey:"checkout-a", session:1, pin:{...pin}, treeRoot:"/repo", indexedWorkspace:"/repo"};
   function node(tagName) {
-    return {tagName, children:[], textContent:"", className:"", attrs:{}, listeners:{}, value:"", parent:null,
+    return {tagName, children:[], textContent:"", className:"", attrs:{}, listeners:{}, value:"", checked:false, parent:null,
       append(...items) { for (const item of items) { item.parent = this; this.children.push(item); } },
       replaceChildren(...items) { this.children = []; this.textContent = ""; this.append(...items); },
       remove() { if (this.parent) this.parent.children = this.parent.children.filter(item => item !== this); this.parent = null; },
@@ -26,14 +26,17 @@ function harness() {
   const controller = window.TrellisMetrics.create({context:() => state, request(url) {
     return new Promise((resolve, reject) => requests.push({url, resolve, reject}));
   }, onChange() { changes++; }, onConflict(error) { conflicts.push(error); }});
-  const change = (id, value) => { get(id).value = value; get(id).listeners.change({target:get(id)}); };
+  const change = (id, value) => {
+    if (typeof value === "boolean") get(id).checked = value; else get(id).value = value;
+    get(id).listeners.change({target:get(id)});
+  };
   return {controller, helpers:window.TrellisMetrics, state, requests, conflicts, get, node, change,
     counts:() => ({changes, shown, cleared})};
 }
 const text = node => [node.textContent, ...node.children.map(text)].join(" ");
-const row = (path, value, extra = {}) => ({sourceSetId:"source-set:v1:test", language:"javascript", path, declarationCount:1,
+const row = (path, value, extra = {}) => ({sourceSetId:"source-set:v1:test", language:"javascript", path, declarationCount:1, roleCounts:{production:1, test:0},
   metrics:{cognitive:value, cyclomatic:0, maintainabilityIndex:value, halstead:{volume:value}}, ...extra});
-const payload = (files = [], options = {}) => ({payload:{metricsVersion:"metrics:v1", ...pin, scope:"revision", aggregate:"max", files,
+const payload = (files = [], options = {}) => ({payload:{metricsVersion:"metrics:v1", ...pin, scope:"revision", aggregate:"max", role:"production", files,
   directories:[], ...options}});
 const settle = async () => { await Promise.resolve(); await Promise.resolve(); };
 async function publish(h, files, options) {
@@ -58,6 +61,8 @@ test("one pinned revision request; actual displayed rows define cuts and color c
   await publish(h, [row("zero.js", 0), row("two.js", 2), row("five.js", 5), row("ten.js", 10), row("hidden.js", 1000), row("empty.js", null)]);
   const query = new URL(h.requests[0].url, "http://local").searchParams;
   assert.equal(query.get("scope"), "revision"); assert.equal(query.get("aggregate"), "max");
+  assert.equal(query.get("role"), "production"); assert.equal(h.get("metric-include-tests").checked, false);
+  assert.match(text(h.get("metrics-state")), /production callables/);
   assert.equal(query.get("indexGeneration"), generation); assert.equal(query.get("indexRevision"), "1");
   const displayed = ["zero.js", "two.js", "five.js", "ten.js", "empty.js"].map(path => h.controller.decorate(h.node("button"), {scope:"file", path}));
   h.controller.renderLegend(displayed);
@@ -102,7 +107,7 @@ test("single selected-scope request renders every nested leaf, exact unavailable
     fanIn:{value:null, unavailable:"call resolution not yet produced (#40/#68)"}, fanOut:0, parameters:0, exits:{return:0, throw:1}};
   const file = row("<img>.js", 0, {metrics}); await publish(h, [file]);
   const work = h.controller.inspect({scope:"file", path:file.path});
-  h.requests.at(-1).resolve(payload([file], {scope:"file", topCognitive:[{...file, name:"<script>alert(1)</script>", kind:"function", sid:"not-a-graph-id",
+  h.requests.at(-1).resolve(payload([file], {scope:"file", topCognitive:[{...file, role:"production", name:"<script>alert(1)</script>", kind:"function", sid:"not-a-graph-id",
     range:{start:0, end:17}, metrics:{cognitive:4, cyclomatic:2, maxNesting:1}}]})); await work;
   assert.equal(h.requests.length, 2);
   const values = text(h.get("metric-inspector-values"));
@@ -124,7 +129,7 @@ test("directory uses its server aggregate without child fanout; empty callables 
   const query = new URL(h.requests.at(-1).url, "http://local").searchParams;
   assert.equal(query.get("scope"), "directory"); assert.equal(query.has("language"), false);
   h.requests.at(-1).resolve(payload([], {scope:"directory", directories:[directory], topCognitive:[]})); await work;
-  assert.equal(h.requests.length, 2); assert.match(text(h.get("metric-inspector-state")), /No indexed callables/);
+  assert.equal(h.requests.length, 2); assert.match(text(h.get("metric-inspector-state")), /No production callables/);
   assert.match(text(h.get("metric-inspector-values")), /Cognitive\s+—/);
 });
 
@@ -197,4 +202,54 @@ test("new aggregation revision wins over late prior success and error", async ()
     const visible = h.controller.decorate(h.node("button"), {scope:"file", path:"current.js"});
     assert.match(text(visible.node), /3/); assert.equal(h.conflicts.length, 0);
   }
+});
+
+test("role change clears inspection and heat, and fences late same-pin refresh and inspection outcomes", async () => {
+  for (const reject of [false, true]) {
+    const h = harness(); await publish(h, [row("mixed.rs", 2, {roleCounts:{production:1,test:1}})]);
+    const inspection = h.controller.inspect({scope:"file", path:"mixed.rs"});
+    const old = h.controller.refresh();
+    const decoration = h.controller.decorate(h.node("button"), {scope:"file", path:"mixed.rs"});
+    const cleared = h.counts().cleared;
+    h.change("metric-include-tests", true);
+    assert.equal(decoration.node.parent, null); assert.ok(h.counts().cleared > cleared);
+    assert.equal(new URL(h.requests[3].url, "http://local").searchParams.get("role"), "all");
+    h.requests[3].resolve(payload([row("mixed.rs", 9, {roleCounts:{production:1,test:1}})], {role:"all"})); await settle();
+    const before = {changes:h.counts().changes, shown:h.counts().shown, state:text(h.get("metrics-state"))};
+    for (const index of [1, 2]) {
+      if (reject) h.requests[index].reject(Object.assign(new Error("late production conflict"), {status:409, code:"revision_conflict"}));
+      else h.requests[index].resolve(payload([row("mixed.rs", 99)], {scope:index === 1 ? "file" : "revision", topCognitive:[]}));
+    }
+    await Promise.all([inspection, old]);
+    assert.deepEqual({changes:h.counts().changes, shown:h.counts().shown, state:text(h.get("metrics-state"))}, before);
+    assert.equal(h.conflicts.length, 0); assert.equal(h.requests.length, 4);
+    assert.match(before.state, /all indexed callables/);
+    const work = h.controller.inspect({scope:"file", path:"mixed.rs"});
+    assert.match(h.requests[4].url, /role=all/);
+    h.requests[4].resolve(payload([row("mixed.rs", 9)], {role:"all", scope:"file", topCognitive:[]})); await work;
+    assert.match(text(h.get("metric-inspector-scope")), /all indexed callables/);
+    assert.match(text(h.get("metric-inspector-values")), /Cognitive\s+9/);
+    h.change("metric-include-tests", false);
+    assert.match(h.requests[5].url, /role=production/);
+    h.requests[5].resolve(payload([])); await settle();
+  }
+});
+
+test("response role must echo selection; test-only file has unavailable production heat and honest empty inspection", async () => {
+  const h = harness(); const wrong = h.controller.refresh();
+  h.requests[0].resolve(payload([row("test.rs", 99)], {role:"all"})); await wrong;
+  assert.match(text(h.get("metrics-state")), /Invalid metrics response/);
+  const file = row("test.rs", null, {declarationCount:0, roleCounts:{production:0,test:2}});
+  await publish(h, [file]);
+  const decoration = h.controller.decorate(h.node("button"), {scope:"file", path:"test.rs"});
+  h.controller.renderLegend([decoration]);
+  assert.match(text(decoration.node), /—/); assert.match(decoration.swatch.className, /neutral/);
+  assert.match(text(h.get("metric-legend")), /production callables/);
+  const wrongInspection = h.controller.inspect({scope:"file", path:"test.rs"});
+  h.requests.at(-1).resolve(payload([row("test.rs", 99)], {scope:"file", role:"all", topCognitive:[]})); await wrongInspection;
+  assert.match(text(h.get("metric-inspector-state")), /Invalid metrics response/);
+  const empty = h.controller.inspect({scope:"file", path:"test.rs"});
+  h.requests.at(-1).resolve(payload([file], {scope:"file", topCognitive:[]})); await empty;
+  assert.match(text(h.get("metric-inspector-state")), /No production callables.*unavailable, not zero/);
+  assert.match(text(h.get("metric-inspector-top")), /Highest cognitive complexity · production callables.*No production callables/);
 });

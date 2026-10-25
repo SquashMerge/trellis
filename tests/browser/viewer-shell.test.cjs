@@ -28,6 +28,33 @@ const otherSource = `function moderate(value) {
 function tiny() { return 1; }
 function smaller(value) { return value; }
 `;
+const mixedSource = `pub fn production(value: i32) -> i32 {
+    if value > 0 { return value; }
+    0
+}
+#[cfg(feature = "test-support")]
+pub fn support() -> i32 { 1 }
+#[cfg(test)] mod checks {
+    fn nested(value: i32) -> i32 {
+        if value > 0 {
+            if value > 1 { return value; }
+        }
+        0
+    }
+}
+`;
+const testOnlySource = `#![cfg(test)]
+fn only(value: i32) -> i32 {
+    if value > 0 { return value; }
+    0
+}
+`;
+async function capture(page, name) {
+  const directory = process.env.TRELLIS_BROWSER_SCREENSHOTS;
+  if (!directory) return;
+  mkdirSync(directory, {recursive:true});
+  await page.screenshot({path:join(directory, `${name}.png`), fullPage:true});
+}
 test.before(async () => H.setup(), {timeout:960000});
 test.after(async () => H.cleanup());
 
@@ -37,6 +64,9 @@ async function published(callback) {
   writeFileSync(join(paths.workspace, "src", "flow.js"), flowSource);
   writeFileSync(join(paths.workspace, "src", "nested", "other.js"), otherSource);
   writeFileSync(join(paths.workspace, maliciousName), "function safeName() { return 2; }\n");
+  mkdirSync(join(paths.workspace, "roles"));
+  writeFileSync(join(paths.workspace, "roles", "mixed.rs"), mixedSource);
+  writeFileSync(join(paths.workspace, "roles", "only.rs"), testOnlySource);
   let server, browser, context;
   try {
     const indexed = await H.run(H.binary, ["index", "--workspace", paths.workspace], {env:paths.env, timeout:120000});
@@ -72,6 +102,7 @@ async function published(callback) {
       assert.equal(url.pathname, H.scoped(server.rootKey, "metrics"));
       assert.equal(url.searchParams.get("indexGeneration"), pin.indexGeneration);
       assert.equal(url.searchParams.get("indexRevision"), String(pin.indexRevision));
+      assert.ok(["production", "all"].includes(url.searchParams.get("role")), "browser explicitly selects its metric population");
     }
   } finally {
     await context?.close();
@@ -80,14 +111,17 @@ async function published(callback) {
     rmSync(paths.temp, {recursive:true, force:true, maxRetries:10, retryDelay:100});
   }
 }
-async function metrics(server, paths, pin, aggregate, scope = "revision", row) {
-  const query = new URLSearchParams({...pin, aggregate, scope});
+async function metrics(server, paths, pin, aggregate, scope = "revision", row, role = "production") {
+  const query = new URLSearchParams({...pin, aggregate, scope, role});
   if (row) {
     query.set("sourceSetId", row.sourceSetId); query.set("path", row.path); query.set("topCognitive", "3");
     if (scope === "file") query.set("language", row.language);
   }
   const response = await H.api(server.base, paths.token, "GET", H.scoped(server.rootKey, `metrics?${query}`));
   assert.equal(response.status, 200, JSON.stringify(response.data));
+  assert.equal(response.data.payload.role, role);
+  assert.equal(response.data.payload.indexGeneration, pin.indexGeneration);
+  assert.equal(response.data.payload.indexRevision, pin.indexRevision);
   return response.data.payload;
 }
 const labels = {loc:"LOC (callable ranges)", sloc:"SLOC (callable ranges)", commentLines:"Comment lines (callable ranges)",
@@ -114,14 +148,16 @@ async function assertInspection(page, payload, scope, path) {
     return JSON.stringify(pairs) === JSON.stringify(expected);
   }, displayedMetrics(row.metrics));
   assert.equal(await page.locator("#metric-inspector-title").textContent(), path);
-  assert.match(await page.locator("#metric-inspector-scope").textContent(), new RegExp(`${scope} · ${payload.aggregate} · indexed snapshot · all indexed callables`));
-  assert.match(await page.locator("#metric-inspector-state").textContent(), new RegExp(`${row.declarationCount} indexed callables`));
+  const population = payload.role === "production" ? "production callables" : "all indexed callables";
+  assert.match(await page.locator("#metric-inspector-scope").textContent(), new RegExp(`${scope} · ${payload.aggregate} · indexed snapshot · ${population}`));
+  assert.match(await page.locator("#metric-inspector-state").textContent(), new RegExp(`${row.declarationCount} ${payload.role === "all" ? "indexed callables" : population}`));
+  assert.match(await page.locator("#metric-inspector-top li").first().textContent(), new RegExp(population));
   const labelWidths = await page.locator("#metric-inspector-values dt").evaluateAll(nodes => nodes.map(node => node.getBoundingClientRect().width));
   assert.ok(labelWidths.every(width => width >= 80), "metric labels retain readable columns beside long unavailable reasons");
   const top = await page.locator("#metric-inspector-top li").allTextContents();
   assert.equal(top.length, payload.topCognitive.length + 1);
   for (const [index, callable] of payload.topCognitive.entries()) {
-    for (const value of [callable.name, callable.kind, callable.sourceSetId, callable.language, callable.path,
+    for (const value of [callable.name, callable.role, callable.kind, callable.sourceSetId, callable.language, callable.path,
       `UTF-8 bytes [${callable.range.start}, ${callable.range.end})`, `Cognitive ${callable.metrics.cognitive}`,
       `Cyclomatic ${callable.metrics.cyclomatic}`, `Max nesting ${callable.metrics.maxNesting}`]) assert.ok(top[index + 1].includes(value), value);
   }
@@ -242,6 +278,120 @@ test("real indexed viewer exposes snapshot metrics, numeric heat legend, raw top
   const canvas = await page.locator(".canvas-area").boundingBox();
   const inspector = await page.locator("#call-inspector").boundingBox();
   assert.ok(explorer.x + explorer.width <= canvas.x && canvas.x + canvas.width <= inspector.x, "desktop keeps separate explorer, canvas and inspector columns");
+}));
+
+test("Viewer starts with production heat and includes stored tests at the same complete pin", {timeout:240000}, async () => published(async ({page, paths, server, pin, requests}) => {
+  assert.equal(await page.locator("#metric-include-tests").isChecked(), false);
+  assert.match(await page.locator("#metrics-state").textContent(), /production callables/);
+  assert.ok(requests.filter(row => row.url.pathname.endsWith("/metrics")).every(row => row.url.searchParams.get("role") === "production"));
+  await page.locator('.directory-pick[title="roles/"]').click();
+  const initial = await metrics(server, paths, pin, "max");
+  const mixed = initial.files.find(row => row.path === "roles/mixed.rs");
+  const only = initial.files.find(row => row.path === "roles/only.rs");
+  assert.deepEqual(mixed.roleCounts, {production:2, test:1});
+  assert.deepEqual(only.roleCounts, {production:0, test:1});
+  const fixtureScores = {production:[1, 0], all:[1, 0, 3]};
+  const expectedCognitive = {production:{max:1, sum:1, mean:0.5}, all:{max:3, sum:4, mean:1.333333}};
+  // Hand count: one production if, zero in test-support, and two nested test ifs (1 + 2).
+  for (const role of ["production", "all"]) {
+    if (role === "all") {
+      await page.locator("#metric-include-tests").check();
+      await page.waitForFunction(() => document.querySelector("#metrics-state")?.textContent.includes("all indexed callables"));
+    }
+    for (const aggregate of ["max", "sum", "mean"]) {
+      await page.locator("#metric-aggregate").selectOption(aggregate);
+      await page.waitForFunction(value => document.querySelector("#metrics-state")?.textContent.includes(`Indexed snapshot · ${value} ·`), aggregate);
+      const payload = await metrics(server, paths, pin, aggregate, "file", mixed, role);
+      const scores = fixtureScores[role], file = payload.files.find(row => row.path === mixed.path);
+      assert.equal(file.metrics.cognitive, expectedCognitive[role][aggregate], `${role} ${aggregate} is hand-checked at the contract's six-decimal precision`);
+      assert.equal(file.declarationCount, scores.length);
+      assert.deepEqual(file.roleCounts, mixed.roleCounts, "population counts do not depend on selected role");
+      assert.deepEqual(payload.topCognitive.map(row => [row.name, row.role, row.metrics.cognitive]).sort(),
+        [["production", "production", 1], ["support", "production", 0], ...(role === "all" ? [["nested", "test", 3]] : [])].sort());
+      assert.equal(payload.declarations.length, payload.topCognitive.length, "the three-row top list covers every fixture callable");
+      for (const top of payload.topCognitive) {
+        const declarations = payload.declarations.filter(row => row.sourceSetId === top.sourceSetId && row.language === top.language && row.path === top.path && row.sid === top.sid);
+        assert.equal(declarations.length, 1, "named top row binds to exactly one full native declaration identity");
+        assert.equal(declarations[0].role, top.role);
+        assert.deepEqual(declarations[0].range, top.range);
+        assert.equal(declarations[0].metrics.cognitive, top.metrics.cognitive);
+      }
+      await page.locator('.file-pick[title="roles/mixed.rs"]').click();
+      await assertInspection(page, payload, "file", mixed.path);
+      assert.match(await page.locator("#metric-legend").textContent(), new RegExp(role === "production" ? "production callables" : "all indexed callables"));
+    }
+    if (role === "all") {
+      assert.equal(await page.locator('.file-pick[title="roles/only.rs"] .metric-value > span:last-child').textContent(), "1", "including tests makes the test-only callable measured");
+      assert.doesNotMatch(await page.locator('.file-pick[title="roles/only.rs"] .metric-swatch').getAttribute("class"), /neutral/);
+    }
+    await capture(page, `viewer-${role}-desktop`);
+    await page.setViewportSize({width:390, height:844});
+    if (await page.locator("#inspector-toggle").getAttribute("aria-expanded") === "true") await page.locator("#inspector-toggle").click();
+    assert.equal(await page.locator("#metric-include-tests").isVisible(), true);
+    await capture(page, `viewer-${role}-mobile`);
+    await page.locator("#inspector-toggle").click();
+    await capture(page, `viewer-${role}-mobile-inspector`);
+    await page.setViewportSize({width:1440, height:900});
+    if (role === "production") {
+      await page.locator('.file-pick[title="roles/only.rs"]').click();
+      await page.waitForFunction(() => document.querySelector("#metric-inspector-state")?.textContent.includes("No production callables"));
+      assert.equal(await page.locator('.file-pick[title="roles/only.rs"] .metric-value > span:last-child').textContent(), "—");
+      assert.match(await page.locator('.file-pick[title="roles/only.rs"] .metric-swatch').getAttribute("class"), /neutral/);
+      assert.match(await page.locator("#metric-inspector-top").textContent(), /No production callables/);
+      assert.equal((await metrics(server, paths, pin, "mean", "file", only)).files[0].metrics.cognitive, null);
+    }
+  }
+  assert.equal(requests.some(row => row.url.pathname.endsWith("/source")), false, "population changes never read source");
+}));
+
+test("Viewer rejects a proven late production response after include-tests wins at the same pin", {timeout:240000}, async () => published(async ({page, paths, server, pin}) => {
+  const production = await metrics(server, paths, pin, "max");
+  let entered, release;
+  const seen = new Promise(resolve => { entered = resolve; });
+  const gate = new Promise(resolve => { release = resolve; });
+  const pattern = "**/api/checkouts/*/metrics?*";
+  const respond = async route => {
+    const url = new URL(route.request().url());
+    if (url.searchParams.get("scope") !== "revision" || url.searchParams.get("role") !== "production") return route.continue();
+    entered(); await gate;
+    await route.fulfill({status:200, contentType:"application/json", body:JSON.stringify({payload:production})});
+  };
+  await page.evaluate(() => {
+    const original = window.fetch;
+    window.__roleFetch = original;
+    window.fetch = async (...args) => {
+      const response = await original(...args), url = new URL(args[0], location.href);
+      if (url.pathname.endsWith("/metrics") && url.searchParams.get("role") === "production" && url.searchParams.get("scope") === "revision") {
+        const json = response.json.bind(response);
+        response.json = async () => { const data = await json(); window.__lateProductionConsumed = true; return data; };
+      }
+      return response;
+    };
+  });
+  try {
+    await page.locator("#metric-include-tests").check();
+    await page.waitForFunction(() => document.querySelector("#metrics-state")?.textContent.includes("all indexed callables"));
+    await page.locator('.directory-pick[title="roles/"]').click();
+    await page.locator('.file-pick[title="roles/mixed.rs"]').click();
+    await page.waitForFunction(() => document.querySelector("#metric-inspector-values dt"));
+    await page.route(pattern, respond);
+    await page.locator("#metric-include-tests").uncheck();
+    await seen;
+    assert.equal(await page.locator("#metric-inspector-values dt").count(), 0, "changing role clears inspection before a response exists");
+    assert.equal(await page.locator("#file-tree .heat-0, #file-tree .heat-1, #file-tree .heat-2, #file-tree .heat-3").count(), 0, "old population heat is cleared while production is blocked");
+    await page.locator("#metric-include-tests").check();
+    await page.waitForFunction(() => document.querySelector("#metrics-state")?.textContent.includes("all indexed callables"));
+    const allHeat = await page.locator("#file-tree").textContent();
+    release();
+    await page.waitForFunction(() => window.__lateProductionConsumed === true);
+    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+    assert.match(await page.locator("#metrics-state").textContent(), /all indexed callables/);
+    assert.equal(await page.locator("#metric-include-tests").isChecked(), true);
+    assert.equal(await page.locator("#file-tree").textContent(), allHeat, "the consumed old response cannot repaint the chosen population");
+  } finally {
+    release(); await page.unroute(pattern, respond);
+    await page.evaluate(() => { window.fetch = window.__roleFetch; delete window.__roleFetch; delete window.__lateProductionConsumed; });
+  }
 }));
 
 test("390px drawers and explicit Files section retain selected evidence without fetching source or parsing filenames as HTML", {timeout:240000}, async () => published(async ({page, requests}) => {
