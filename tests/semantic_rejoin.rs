@@ -99,6 +99,7 @@ fn fixture() -> (
 
 fn two_document_fixture(
     conflicting_target: bool,
+    plain_reference: bool,
 ) -> (
     tempfile::TempDir,
     native::Artifact,
@@ -129,7 +130,7 @@ fn two_document_fixture(
         occurrence.symbol = symbol.into();
         occurrence.symbol_roles = roles;
         occurrence.syntax_kind = EnumOrUnknown::from_i32(0);
-        if roles == 0 {
+        if roles == 0 && !plain_reference {
             occurrence.enclosing_range = vec![0, start as i32, (start + 8) as i32];
         }
         doc.occurrences.push(occurrence.clone());
@@ -513,7 +514,7 @@ fn missing_destination_source_anchor_fails_even_when_bytes_and_occurrence_ids_ma
 }
 #[test]
 fn contradictory_exact_targets_remain_ambiguous_with_all_raw_links() {
-    let (_root, captured, sources, inventory) = two_document_fixture(true);
+    let (_root, captured, sources, inventory) = two_document_fixture(true, false);
     let result = rejoin_inventory(
         &inventory,
         &captured,
@@ -568,8 +569,270 @@ fn contradictory_exact_targets_remain_ambiguous_with_all_raw_links() {
 }
 
 #[test]
+fn contradictory_plain_references_keep_both_raw_proofs_on_one_r2_reference() {
+    let (_root, captured, sources, inventory) = two_document_fixture(true, true);
+    let result = rejoin_inventory(
+        &inventory,
+        &captured,
+        &sources,
+        &captured,
+        &sources,
+        producer(),
+        &basis(&captured, &inventory),
+        2,
+    )
+    .unwrap();
+    let a = captured
+        .revision
+        .documents
+        .iter()
+        .find(|d| d.key.path == "src/A.js")
+        .unwrap()
+        .key
+        .clone();
+    let reference = result
+        .publication
+        .references
+        .iter()
+        .find(|r| r.document == a && r.spelling == "target")
+        .unwrap();
+    assert_eq!(reference.resolution, semantic::Resolution::Ambiguous);
+    assert_eq!(reference.candidates.len(), 2);
+    let raw_ids: std::collections::BTreeSet<_> = inventory
+        .claims
+        .iter()
+        .filter(|c| {
+            c.envelope.record_kind == "occurrence"
+                && c.envelope.relative_path == a.path
+                && c.envelope.raw["symbolRoles"] == 0
+        })
+        .map(|c| c.captured_proof_id.clone())
+        .collect();
+    assert_eq!(raw_ids.len(), 2);
+    let proofs: Vec<_> = result
+        .publication
+        .provenance
+        .iter()
+        .filter(|p| p.document == a && p.evidence_kind == semantic::EvidenceKind::SemanticReference)
+        .collect();
+    for raw_id in &raw_ids {
+        let raw = inventory
+            .claims
+            .iter()
+            .find(|c| &c.captured_proof_id == raw_id)
+            .unwrap();
+        assert!(
+            proofs.iter().any(|p| p.revision_id == captured.revision.id
+                && p.derived_from
+                    .as_ref()
+                    .is_some_and(|d| d.provenance_id == *raw_id
+                        && d.record_kind == semantic::RecordKind::Occurrence
+                        && d.fact_digest == raw.fact_digest)),
+            "raw={raw_id} raw_ids={raw_ids:?} proofs={proofs:?} reference={reference:?}"
+        );
+    }
+    assert_eq!(result.report["documents"][0]["ambiguous"], 2);
+    assert_eq!(result.report["documents"][0]["skipped"], 0);
+}
+
+#[test]
+fn required_call_invocation_and_reference_must_both_be_unique_at_r2() {
+    let (_root, captured, sources, inventory) = two_document_fixture(false, false);
+    let a = captured
+        .revision
+        .documents
+        .iter()
+        .find(|d| d.key.path == "src/A.js")
+        .unwrap()
+        .key
+        .clone();
+    let baseline = rejoin_inventory(
+        &inventory,
+        &captured,
+        &sources,
+        &captured,
+        &sources,
+        producer(),
+        &basis(&captured, &inventory),
+        2,
+    )
+    .unwrap();
+    assert!(
+        baseline
+            .publication
+            .call_bindings
+            .iter()
+            .any(|c| c.join.anchor.document == a)
+    );
+    assert_eq!(baseline.report["documents"][0]["state"], "complete");
+    for failure in [
+        "missing_invocation",
+        "missing_reference",
+        "ambiguous_invocation",
+        "ambiguous_reference",
+    ] {
+        let mut destination = captured.clone();
+        match failure {
+            "missing_invocation" => {
+                destination.calls.retain(|call| call.document != a);
+                assert!(destination.references.iter().any(|r| r.document == a));
+            }
+            "missing_reference" => {
+                destination
+                    .references
+                    .retain(|reference| reference.document != a);
+                assert!(destination.calls.iter().any(|c| c.document == a));
+            }
+            "ambiguous_invocation" => {
+                let mut other = destination
+                    .calls
+                    .iter()
+                    .find(|call| call.document == a)
+                    .unwrap()
+                    .clone();
+                other.id = destination
+                    .references
+                    .iter()
+                    .find(|r| r.document == a)
+                    .unwrap()
+                    .id
+                    .clone();
+                destination.calls.push(other);
+            }
+            "ambiguous_reference" => {
+                let mut other = destination
+                    .references
+                    .iter()
+                    .find(|r| r.document == a && r.spelling == "target")
+                    .unwrap()
+                    .clone();
+                other.id = destination
+                    .calls
+                    .iter()
+                    .find(|call| call.document == a)
+                    .unwrap()
+                    .id
+                    .clone();
+                destination.references.push(other);
+            }
+            _ => unreachable!(),
+        }
+        let result = rejoin_inventory(
+            &inventory,
+            &captured,
+            &sources,
+            &destination,
+            &sources,
+            producer(),
+            &basis(&captured, &inventory),
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            result
+                .publication
+                .coverage
+                .iter()
+                .find(|c| c.document_path == a.path)
+                .unwrap()
+                .state,
+            semantic::CoverageState::Failed,
+            "{failure}"
+        );
+        assert!(
+            result
+                .publication
+                .provenance
+                .iter()
+                .all(|p| p.document != a),
+            "{failure}"
+        );
+        assert!(result.publication.call_bindings.is_empty(), "{failure}");
+        assert_eq!(result.report["documents"][0]["matched"], 0, "{failure}");
+        assert_eq!(
+            result.report["documents"][0]["skipped"], result.report["documents"][0]["requested"],
+            "{failure}"
+        );
+    }
+}
+
+#[test]
+fn enclosing_range_without_captured_call_witness_cannot_gain_a_call_at_r2() {
+    let (_root, measured, sources, inventory) = two_document_fixture(false, false);
+    let mut captured = measured.clone();
+    captured.calls.retain(|c| c.document.path != "src/A.js");
+    let result = rejoin_inventory(
+        &inventory,
+        &captured,
+        &sources,
+        &measured,
+        &sources,
+        producer(),
+        &basis(&captured, &inventory),
+        2,
+    )
+    .unwrap();
+    assert!(result.publication.call_bindings.is_empty());
+    assert!(
+        result
+            .publication
+            .references
+            .iter()
+            .any(|r| r.spelling == "target")
+    );
+}
+
+#[test]
+fn plain_reference_needs_reference_even_with_exact_callee() {
+    let (_root, captured, sources, inventory) = two_document_fixture(false, true);
+    let a = captured
+        .revision
+        .documents
+        .iter()
+        .find(|d| d.key.path == "src/A.js")
+        .unwrap()
+        .key
+        .clone();
+    let mut destination = captured.clone();
+    destination.references.retain(|r| r.document != a);
+    assert!(destination.calls.iter().any(|c| c.document == a));
+    let result = rejoin_inventory(
+        &inventory,
+        &captured,
+        &sources,
+        &destination,
+        &sources,
+        producer(),
+        &basis(&captured, &inventory),
+        2,
+    )
+    .unwrap();
+    assert_eq!(
+        result
+            .publication
+            .coverage
+            .iter()
+            .find(|c| c.document_path == a.path)
+            .unwrap()
+            .state,
+        semantic::CoverageState::Failed
+    );
+    assert!(
+        result
+            .publication
+            .provenance
+            .iter()
+            .all(|p| p.document != a)
+    );
+    assert_eq!(
+        result.report["documents"][0]["skipped"],
+        result.report["documents"][0]["requested"]
+    );
+}
+
+#[test]
 fn changed_target_rejoins_only_with_one_measured_stable_id() {
-    let (root, captured, sources, inventory) = two_document_fixture(false);
+    let (root, captured, sources, inventory) = two_document_fixture(false, false);
     let a = captured
         .revision
         .documents

@@ -1441,38 +1441,54 @@ pub fn rejoin_inventory(
             let roles = claim.envelope.raw["symbolRoles"]
                 .as_u64()
                 .context("invalid raw roles")?;
-            // Both revisions must measure A. Equal occurrence IDs alone never establish a join.
-            let primary = [
-                semantic::JoinKind::DeclarationName,
-                semantic::JoinKind::Reference,
-                semantic::JoinKind::Callee,
-            ]
-            .into_iter()
-            .filter(|kind| {
-                if roles & 1 != 0 {
-                    *kind == semantic::JoinKind::DeclarationName
-                } else {
-                    *kind != semantic::JoinKind::DeclarationName
-                }
-            })
-            .any(|kind| {
-                let first = r1.join(&doc, range.clone(), kind);
-                let second = r2.join(&doc, range.clone(), kind);
-                matches!((first, second), (Ok(a), Ok(b)) if a.status == semantic::JoinStatus::Exact
-                        && b.status == semantic::JoinStatus::Exact)
-            });
-            let call = if roles & 1 == 0 && !claim.envelope.raw["enclosingRange"].is_null() {
-                let mut enclosing = claim.clone();
-                enclosing.envelope.raw["range"] = claim.envelope.raw["enclosingRange"].clone();
-                let call_range = occurrence_range(&enclosing, bytes, admitted_encoding)?;
-                let first = r1.join(&doc, call_range.clone(), semantic::JoinKind::Invocation)?;
-                let second = r2.join(&doc, call_range, semantic::JoinKind::Invocation)?;
-                first.status == semantic::JoinStatus::Exact
-                    && second.status == semantic::JoinStatus::Exact
+            // Rejoin only the families that actually authored a captured source fact.
+            // A tempting callee at the same bytes cannot replace a missing reference,
+            // nor can an enclosing range alone turn a plain reference into a call.
+            let required = if roles & 1 != 0 {
+                semantic::JoinKind::DeclarationName
             } else {
-                false
+                semantic::JoinKind::Reference
             };
-            if primary || call {
+            let first = r1.join(&doc, range.clone(), required)?;
+            let second = r2.join(&doc, range, required)?;
+            let mut exact = first.status == semantic::JoinStatus::Exact
+                && second.status == semantic::JoinStatus::Exact;
+            let captured_call = captured.call_bindings.iter().find(|binding| {
+                binding.provenance_id == claim.captured_proof_id && binding.call_id.is_some()
+            });
+            if let Some(binding) = captured_call {
+                let call = r2.join(
+                    &doc,
+                    binding.join.anchor.range.clone(),
+                    binding.join.anchor.kind,
+                )?;
+                let first_call = r1.join(
+                    &doc,
+                    binding.join.anchor.range.clone(),
+                    binding.join.anchor.kind,
+                )?;
+                exact &= call.status == semantic::JoinStatus::Exact
+                    && first_call.status == semantic::JoinStatus::Exact
+                    && first_call.candidate_ids == binding.join.candidate_ids;
+                // The selected reference and invocation must belong to that same
+                // measured call, not merely be independent exact spans.
+                exact &= second.candidate_ids.first().is_some_and(|id| {
+                    destination_native.references.iter().any(|reference| {
+                        &reference.id == id
+                            && destination_native.calls.iter().any(|candidate| {
+                                call.candidate_ids == vec![candidate.id.clone()]
+                                    && candidate.owner_syntax_id == reference.owner_syntax_id
+                                    && candidate.range.start <= reference.range.start
+                                    && reference.range.end <= candidate.range.end
+                                    && candidate
+                                        .callee_range
+                                        .as_ref()
+                                        .is_none_or(|callee| callee == &reference.range)
+                            })
+                    })
+                });
+            }
+            if exact {
                 eligible.insert(doc);
             } else {
                 failed.insert(doc);
@@ -1641,11 +1657,12 @@ pub fn rejoin_inventory(
         .collect();
     let mut calls = Vec::new();
     for mut call in facts.call_bindings {
-        if let Some((resolution, target, candidates)) = old_targets.get(&call.provenance_id) {
-            call.resolution = *resolution;
-            call.declared_target = target.clone();
-            call.candidates = candidates.clone();
-        }
+        let Some((resolution, target, candidates)) = old_targets.get(&call.provenance_id) else {
+            continue;
+        };
+        call.resolution = *resolution;
+        call.declared_target = target.clone();
+        call.candidates = candidates.clone();
         if call
             .declared_target
             .iter_mut()
@@ -1700,6 +1717,87 @@ pub fn rejoin_inventory(
             references.push(reference);
         } else {
             omitted.insert(Some(reference.document.clone()));
+        }
+    }
+    // A canonical native reference has one stored row, but each distinct exact raw
+    // claim contributing to its ambiguity must keep its own r2 raw-linked proof.
+    let mut additional_reference_proofs = BTreeSet::new();
+    for claim in &filtered.claims {
+        if claim.envelope.record_kind != "occurrence"
+            || captured
+                .call_bindings
+                .iter()
+                .any(|b| b.provenance_id == claim.captured_proof_id)
+            || references
+                .iter()
+                .any(|r| r.provenance_id == claim.captured_proof_id)
+        {
+            continue;
+        }
+        let Some((_, joined)) = facts.joins.iter().find(|(id, join)| {
+            id == &claim.captured_proof_id
+                && join.anchor.kind == semantic::JoinKind::Reference
+                && join.status == semantic::JoinStatus::Exact
+        }) else {
+            continue;
+        };
+        let Some((_, captured_join)) = captured.joins.iter().find(|(id, join)| {
+            id == &claim.captured_proof_id
+                && join.anchor.kind == semantic::JoinKind::Reference
+                && join.status == semantic::JoinStatus::Exact
+        }) else {
+            continue;
+        };
+        let Some(reference) = references.iter().find(|r| {
+            r.id == joined.candidate_ids[0]
+                && r.document == joined.anchor.document
+                && r.range == joined.anchor.range
+                && r.resolution == semantic::Resolution::Ambiguous
+        }) else {
+            continue;
+        };
+        ensure!(
+            captured_join.anchor.document == reference.document
+                && captured_join.anchor.range == reference.range,
+            "captured reference anchor differs"
+        );
+        let symbol = claim.envelope.raw["symbol"]
+            .as_str()
+            .context("missing raw reference symbol")?;
+        let mut asserted: Vec<_> = captured_targets
+            .iter()
+            .filter(|((document, key), _)| {
+                key == symbol && (!symbol.starts_with("local ") || document == &reference.document)
+            })
+            .flat_map(|(_, targets)| targets.iter().cloned())
+            .collect();
+        asserted.sort_by_key(|target| {
+            native_ids::canonical(&serde_json::to_value(target).expect("serializable target"))
+        });
+        asserted.dedup();
+        if asserted.is_empty()
+            && !symbol.starts_with("local ")
+            && !inventory.claims.iter().any(|other| {
+                other.envelope.raw["symbol"].as_str() == Some(symbol)
+                    && (other.envelope.record_kind == "symbolInformation"
+                        || other.envelope.raw["symbolRoles"]
+                            .as_u64()
+                            .is_some_and(|roles| roles & 1 != 0))
+            })
+        {
+            asserted.push(semantic::Target::External {
+                symbol: symbol_key(symbol, &reference.document),
+            });
+        }
+        if asserted.len() == 1
+            && retarget(&mut asserted[0])
+            && reference.candidates.contains(&asserted[0])
+        {
+            additional_reference_proofs.insert(claim.captured_proof_id.clone());
+            provenance_sources.insert((
+                claim.captured_proof_id.clone(),
+                semantic::EvidenceKind::SemanticReference,
+            ));
         }
     }
     let mut relationships = Vec::new();
@@ -1832,6 +1930,9 @@ pub fn rejoin_inventory(
                 1
             },
         );
+    }
+    for raw_id in &additional_reference_proofs {
+        outcomes.insert(raw_id.clone(), 3);
     }
     for row in &relationships {
         outcomes.insert(row.provenance_id.clone(), 1);
