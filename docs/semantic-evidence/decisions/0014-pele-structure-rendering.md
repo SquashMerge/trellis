@@ -18,4 +18,4 @@ The scratch Pele 1.6.0 probe for #182 reconstructed one real indexed Rust sequen
 
 ## Amendment: patched Pele build (owner decision 2026-10-25)
 
-Until an upstream Pele release includes the treemap fix from [obsidianmd/pele#91](https://github.com/obsidianmd/pele/pull/91), Trellis vendors Pele 1.6.0 plus that patch, built from source as `web/vendor/pele-1.6.0-trellis.1.js` (base, commits, build and hash in `web/vendor/README.md`). Once a release includes it, Trellis returns to an unchanged upstream release. Nothing else in this decision changes.
+Trellis vendors Pele 1.10.0 plus the treemap patch from [obsidianmd/pele#91](https://github.com/obsidianmd/pele/pull/91), built from source as `web/vendor/pele-1.10.0-trellis.1.js` (base, commits, build and hash in `web/vendor/README.md`), until an upstream release includes that patch. Then Trellis returns to an unchanged upstream release. Its actual output is pinned by `tests/fixtures/pele-1.10.0-trellis.1/` under point 4. Nothing else in this decision changes.

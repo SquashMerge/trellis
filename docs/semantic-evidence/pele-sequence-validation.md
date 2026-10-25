@@ -5,11 +5,12 @@
 - Exact locally served `pele` 1.6.0 browser JS: 682,005 raw bytes;
   254,221 bytes with Node `zlib.gzipSync` at its default level; SHA-256
   `b82d1bcd435302779a945e1e0f4a54ea56fb26e010ce3f2122f4216fcfc095d7`.
-  Its MIT license is in `web/vendor/pele-1.6.0-trellis.1.LICENSE`; pinned npm tarball,
-  integrity, acquisition and attribution are in `web/vendor/README.md`. Since
-  2026-10-25 Trellis serves `pele-1.6.0-trellis.1.js` (1.6.0 plus the
-  obsidianmd/pele#91 treemap fix, 682,396 bytes); these measurements were taken
-  on the unpatched 1.6.0 bundle.
+  Since 2026-10-25 Trellis serves `web/vendor/pele-1.10.0-trellis.1.js`
+  (Pele 1.10.0 plus the obsidianmd/pele#91 treemap fix, 709,743 bytes; license,
+  provenance and build in `web/vendor/README.md`). The measurements below were
+  taken on the unpatched 1.6.0 bundle. Under the new build, the Sequence output
+  for all four producer fixtures and the grammar fixture is byte-identical; the frozen `sequence` fixture
+  changes only the line spacing of a wrapped `alt` label.
 - Host: Darwin 27.0.0 arm64, Apple M5 Pro; managed Playwright 1.55.1
   HeadlessChrome 140.0.7339.186, loopback daemon with exact embedded assets.
   Both cohorts use temporary indexed Rust checkouts and actual published
