@@ -226,6 +226,8 @@ fn bind(
             path: d.document.path.clone(),
             sid: d.syntax_id.clone(),
             range: d.range.clone(),
+            name: d.name.clone(),
+            kind: d.kind.clone(),
             metrics,
         });
     }
@@ -277,6 +279,10 @@ pub struct DeclarationMetrics {
     pub path: String,
     pub sid: String,
     pub range: Range,
+    #[serde(skip)]
+    pub name: Option<String>,
+    #[serde(skip)]
+    pub kind: String,
     pub metrics: Score,
 }
 

@@ -682,6 +682,10 @@ receives an inbox event/deep link; publication must not steal focus, run a provi
 
 ## 9. Rendering
 
+The current diagrams-only browser frame follows the [Viewer shell contract](docs/viewer-shell.md).
+It keeps Sequence, Classes and Libraries, with observed per-checkout freshness and pinned metric
+file/directory inspection. Files focuses the existing browser, not a separate source page.
+
 **Target: generate Mermaid from the revision-bound structure model and render it with a
 locally served, exact-version-pinned Pele asset.** Mermaid is both the rendered source
 and an export format; it does not define evidence. Start with a read-only sequence

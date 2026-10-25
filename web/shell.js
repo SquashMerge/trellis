@@ -7,7 +7,39 @@
   const make = (tag, value) => { const node = document.createElement(tag); if (value !== undefined) node.textContent = value; return node; };
   const describe = value => typeof value === "string" ? value : JSON.stringify(value, null, 2);
   const views = {sequence:"sequence-panel", classes:"classes-panel", libraries:"dependency-library"};
-  let openSource = null, sourceReturnFocus = null, activeView = "sequence";
+  let openSource = null, sourceReturnFocus = null, activeView = "sequence", inspectorClearCallback = null;
+  function showFiles() {
+    if (get("workspace")?.hidden) return;
+    if (!get("source-dock")?.hidden) get("source-dock")?.scrollIntoView?.({block:"nearest"});
+    drawer("explorer", true);
+    get("file-filter")?.focus();
+  }
+  function showDiagrams() {
+    if (get("workspace")?.hidden) return;
+    drawer("explorer", false);
+    drawer("inspector", false);
+    get(`view-${activeView}`)?.focus();
+  }
+  function clearMetricInspector() {
+    hide("metric-inspector", true);
+    document.body.classList.remove("metric-inspector-active");
+    drawer("inspector", false);
+    for (const id of ["metric-inspector-title", "metric-inspector-scope", "metric-inspector-values", "metric-inspector-top", "metric-inspector-state"]) get(id)?.replaceChildren();
+    hide("inspector-empty", !get("inspector-content")?.hidden);
+    if (get("inspector-clear")) get("inspector-clear").disabled = !!get("inspector-content")?.hidden;
+  }
+  function showMetricInspector() {
+    openSource = null;
+    hide("inspector-empty", true); hide("inspector-content", true);
+    if (get("inspector-open-source")) get("inspector-open-source").disabled = true;
+    hide("metric-inspector", false);
+    document.body.classList.add("metric-inspector-active");
+    if (get("inspector-clear")) get("inspector-clear").disabled = false;
+    drawer("inspector", true);
+  }
+  function setInspectorClearCallback(callback) {
+    inspectorClearCallback = typeof callback === "function" ? callback : null;
+  }
   function drawer(name, open) {
     if (open && window.matchMedia?.("(max-width: 900px)").matches) drawer(name === "explorer" ? "inspector" : "explorer", false);
     document.body.classList.toggle(`${name}-open`, open);
@@ -66,6 +98,7 @@
     });
   }
   function resetInspector() {
+    clearMetricInspector();
     openSource = null;
     drawer("inspector", false);
     hide("inspector-empty", false); hide("inspector-content", true);
@@ -151,6 +184,9 @@
     text("workspace-name", root.split(/[\\/]/).filter(Boolean).at(-1) || "No workspace");
     text("workspace-meta", status ? `Revision ${status.revision.indexGeneration.slice(0, 8)}:${status.revision.indexRevision} · ${status.stats?.files ?? 0} files · ${"Syntax only · SCIP display metadata is not proof"}` : checkoutRoot ? "Index status unavailable" : "Connect to a local daemon");
     if (get("workspace-name")) get("workspace-name").title = root;
+    const state = status ? (status.catchingUp === true ? "catching-up" : "fresh") : "unknown";
+    get("workspace-index-state")?.setAttribute("data-state", state);
+    text("workspace-index-label", status ? `${status.catchingUp === true ? "Catching up" : "Fresh"} · revision ${status.revision.indexGeneration.slice(0, 8)}:${status.revision.indexRevision}` : checkoutRoot ? "Index status unavailable" : "No checkout selected");
   }
   function reset() {
     resetInspector(); showView("sequence"); hide("source-dock", true); sourceReturnFocus = null;
@@ -158,12 +194,15 @@
   }
   function setConnected(connected) {
     document.body.classList.toggle("connected", !!connected);
+    for (const id of ["section-diagrams", "section-files"]) if (get(id)) get(id).disabled = !connected;
     if (!connected) reset();
   }
   wireTabs(Object.keys(views), "view-", showView);
   wireTabs(["workspace", "library"], "dock-", showSource);
   get("inspector-open-source")?.addEventListener("click", () => { if (openSource) return openSource(); });
-  get("inspector-clear")?.addEventListener("click", resetInspector);
+  get("inspector-clear")?.addEventListener("click", () => { resetInspector(); inspectorClearCallback?.(); });
+  get("section-diagrams")?.addEventListener("click", showDiagrams);
+  get("section-files")?.addEventListener("click", showFiles);
   get("source-dock-close")?.addEventListener("click", closeSource);
   for (const name of ["explorer", "inspector"]) get(`${name}-toggle`)?.addEventListener("click", () => drawer(name, !document.body.classList.contains(`${name}-open`)));
   document.addEventListener("keydown", event => {
@@ -173,6 +212,6 @@
     else if (mobile && document.body.classList.contains("explorer-open")) { drawer("explorer", false); get("explorer-toggle")?.focus(); }
     else if (get("source-dock") && !get("source-dock").hidden) closeSource();
   });
-  window.TrellisShell = {setConnected, updateCheckout, formatGit, updateWorkspace, showView, showSource, closeSource, selectStep, resetInspector, reset};
+  window.TrellisShell = {setConnected, updateCheckout, formatGit, updateWorkspace, showView, showSource, closeSource, showFiles, showDiagrams, showMetricInspector, clearMetricInspector, setInspectorClearCallback, selectStep, resetInspector, reset};
   reset();
 })();

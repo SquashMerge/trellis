@@ -13,20 +13,25 @@ use trellis::{
 };
 
 fn fixture() -> (tempfile::TempDir, tempfile::TempDir, Store, IndexPin) {
+    fixture_with_sources(&[
+        (
+            "src/a.js",
+            "function first() { return 1; }\nfunction second() { first(); first(); return 2; }\n",
+        ),
+        ("src/b.js", "function third() { return 3; }\n"),
+        ("empty.js", "// empty\n"),
+    ])
+}
+fn fixture_with_sources(
+    sources: &[(&str, &str)],
+) -> (tempfile::TempDir, tempfile::TempDir, Store, IndexPin) {
     let state = tempfile::tempdir().unwrap();
     let root = tempfile::tempdir().unwrap();
-    fs::create_dir(root.path().join("src")).unwrap();
-    fs::write(
-        root.path().join("src/a.js"),
-        "function first() { return 1; }\nfunction second() { first(); first(); return 2; }\n",
-    )
-    .unwrap();
-    fs::write(
-        root.path().join("src/b.js"),
-        "function third() { return 3; }\n",
-    )
-    .unwrap();
-    fs::write(root.path().join("empty.js"), "// empty\n").unwrap();
+    for (path, source) in sources {
+        let path = root.path().join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, source).unwrap();
+    }
     let store = Store::open_for_tests(state.path(), root.path()).unwrap();
     let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
     let baseline = store.index_baseline().unwrap();
@@ -109,6 +114,140 @@ fn options(scope: &str, path: &str) -> MetricsOptions {
         ..Default::default()
     }
 }
+
+#[test]
+fn top_cognitive_is_bounded_raw_and_scope_selected() {
+    let (_state, _root, store, pin) = fixture_with_sources(&[
+        (
+            "src/a.js",
+            "function earlier(x) { if (x) return 1; return 0; }\nfunction later(x) { if (x) return 1; return 0; }\n",
+        ),
+        (
+            "src/b.js",
+            "function tied(x) { if (x) return 1; return 0; }\nconst unnamed = x => { if (x) { if (x > 1) return 2; } return 0; };\n",
+        ),
+        (
+            "outside.js",
+            "function outside(x) { if (x) { if (x > 1) { if (x > 2) return 3; } } return 0; }\n",
+        ),
+        ("empty.js", "// empty\n"),
+    ]);
+    let response = store.evidence_response().unwrap();
+    let ordinary = response
+        .metrics_at(&MetricsOptions::default(), &mut || Ok(()))
+        .unwrap();
+    assert!(
+        serde_json::to_value(&ordinary)
+            .unwrap()
+            .get("topCognitive")
+            .is_none()
+    );
+    let source_set_id = ordinary.files[0].source_set_id.clone();
+    let revision_top = response
+        .metrics_at(
+            &MetricsOptions {
+                pin: Some(pin),
+                top_cognitive: Some(1),
+                ..Default::default()
+            },
+            &mut || Ok(()),
+        )
+        .unwrap();
+    assert_eq!(
+        revision_top.top_cognitive.as_ref().unwrap()[0]
+            .name
+            .as_deref(),
+        Some("outside")
+    );
+    assert!(revision_top.declarations.is_empty());
+    let mut selected = MetricsOptions {
+        pin: Some(pin),
+        scope: "directory".into(),
+        source_set_id: Some(source_set_id.clone()),
+        path: Some("src".into()),
+        top_cognitive: Some(3),
+        metrics: vec!["loc".into()],
+        ..Default::default()
+    };
+    let mut raw_top = None;
+    for aggregate in ["sum", "max", "mean"] {
+        selected.aggregate = aggregate.into();
+        let payload = response.metrics_at(&selected, &mut || Ok(())).unwrap();
+        assert!(payload.declarations.is_empty());
+        let top = payload.top_cognitive.as_ref().unwrap();
+        assert_eq!(top.len(), 3);
+        assert_eq!(top[0].name, None);
+        assert_eq!(top[0].kind, "anonymousFunction");
+        assert_eq!(top[0].path, "src/b.js");
+        assert!(top[0].metrics.cognitive > top[1].metrics.cognitive);
+        assert_eq!(top[0].metrics.cyclomatic, 3);
+        assert_eq!(top[0].metrics.max_nesting, 2);
+        assert_eq!(top[1].name.as_deref(), Some("earlier"));
+        assert_eq!(top[2].name.as_deref(), Some("later"));
+        assert!(top.iter().all(|row| row.source_set_id == source_set_id));
+        assert_eq!(payload.index_generation, pin.index_generation.to_string());
+        assert_eq!(payload.index_revision, pin.index_revision);
+        let encoded = bytes(top);
+        if let Some(expected) = &raw_top {
+            assert_eq!(&encoded, expected);
+        }
+        raw_top = Some(encoded);
+    }
+    selected.scope = "file".into();
+    selected.path = Some("src/b.js".into());
+    selected.language = Some("javascript".into());
+    selected.metrics.clear();
+    let file = response.metrics_at(&selected, &mut || Ok(())).unwrap();
+    assert_eq!(file.declarations.len(), 2);
+    assert!(
+        serde_json::to_value(&file.declarations[0])
+            .unwrap()
+            .get("name")
+            .is_none()
+    );
+    let callable = &file.top_cognitive.as_ref().unwrap()[0];
+    let measured = file
+        .declarations
+        .iter()
+        .find(|row| row.sid == callable.sid && row.range == callable.range)
+        .unwrap();
+    assert_eq!(measured.metrics["cognitive"], callable.metrics.cognitive);
+    assert_eq!(measured.metrics["cyclomatic"], callable.metrics.cyclomatic);
+    assert_eq!(measured.metrics["maxNesting"], callable.metrics.max_nesting);
+    selected.scope = "declaration".into();
+    selected.language = None;
+    selected.sid = Some(file.top_cognitive.as_ref().unwrap()[1].sid.clone());
+    let declaration = response.metrics_at(&selected, &mut || Ok(())).unwrap();
+    assert_eq!(declaration.top_cognitive.as_ref().unwrap().len(), 1);
+    assert_eq!(
+        declaration.top_cognitive.as_ref().unwrap()[0]
+            .name
+            .as_deref(),
+        Some("tied")
+    );
+    selected.scope = "file".into();
+    selected.language = Some("javascript".into());
+    selected.sid = None;
+    selected.path = Some("empty.js".into());
+    assert!(
+        response
+            .metrics_at(&selected, &mut || Ok(()))
+            .unwrap()
+            .top_cognitive
+            .unwrap()
+            .is_empty()
+    );
+    selected.pin = Some(IndexPin {
+        index_revision: pin.index_revision + 1,
+        ..pin
+    });
+    assert!(response.metrics_at(&selected, &mut || Ok(())).is_err());
+    for count in [0, 11] {
+        selected.top_cognitive = Some(count);
+        assert!(selected.validate().is_err());
+    }
+}
+
 #[test]
 fn revision_and_scopes_include_zero_callable_files_and_mean_over_declarations() {
     let (_state, _root, store, pin) = fixture();

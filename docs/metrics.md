@@ -42,6 +42,33 @@ Reject the entire request with typed `invalid_source_syntax` if *any* selected p
 
 Select from canonical order `loc,sloc,commentLines,cyclomatic,cognitive,maxNesting,halstead,maintainabilityIndex,fanOut,fanIn,parameters,exits`. For every numeric leaf (including Halstead derived values, MI and exits), `sum`, `max` or `mean` folds declaration scores, never means of file means and never recalculates derived metrics from aggregate inputs. Round fractional means to six decimals. Empty aggregates have null numeric leaves; fanIn remains unavailable. An unavailable constituent yields null with its specific reason, never zero substitution. An empty revision has empty arrays; an existing empty file or directory succeeds with count zero. Revision and directory process every selected declaration but omit declaration rows; file returns all its declarations, and declaration returns its uniquely selected `(sourceSetId,path,sid)` row. File and directory rows follow byte ordering. Revision includes all files and directory ancestors, including each source-set root. No on-disk empty-directory inference. The complete serialized success envelope has a 64 MiB limit and fails atomically with `response_too_large` if exceeded.
 
+
+## Browser transport and highest cognitive callables
+
+`GET /api/checkouts/{rootKey}/metrics` returns `{catchingUp,payload}`. The payload carries
+`metricsVersion,indexGeneration,indexRevision,scope,aggregate,selectedMetrics,declarations,files,directories`.
+The optional paired pin is supplied as `indexGeneration` and `indexRevision`. File selectors require
+`sourceSetId,language,path`; directory selectors require `sourceSetId,path` (empty path means the
+source-set root); declaration selectors require `sourceSetId,path,sid` and no language. Source-set IDs
+accept the emitted canonical `source-set:v1:path-<64 lowercase hex>` and
+`source-set:v1:<lowercase hyphenated UUID>` forms. Never derive a source-set ID from the browser root key.
+
+The optional `topCognitive=1..10` query adds `payload.topCognitive`; absent means this field is omitted.
+It contains at most the requested count of callable rows from the selected scope, ordered by raw
+`cognitive` descending, then byte ordering of `(sourceSetId,language,path,range.start,range.end,sid)`.
+Each row has `sourceSetId,language,path,sid,range,name,kind,metrics`, where `name` is the native nullable
+name, `kind` is the native callable kind, and `metrics` contains raw `cognitive,cyclomatic,maxNesting`.
+Ranges remain half-open byte intervals. Anonymous names remain null, not invented labels. These three
+raw scores are independent of `aggregate` and `selectedMetrics`; requesting `metrics=loc` does not
+remove them. Empty measured scopes have an empty top list. Declaration scope ranks only its selected
+callable. Existing declaration arrays and all fields when the option is absent remain unchanged.
+
+Candidates are selected during the same pinned source computation and declaration fold, with only a
+bounded top list retained, not additional per-file requests or a methods/name join. The existing
+complete-envelope response bound, cancellation, deadline and final snapshot fence cover this list.
+Metrics currently include **all indexed callable roles**, not a production-only subset. A browser must
+not infer production status from filenames or treat the live filesystem tree as indexed evidence.
+
 ## Hand-checked control-flow expectations
 
 The `controls` fixtures intentionally cover mixed Boolean sequences and loops: Java `Controls.calc` cyclomatic/cognitive 7 (base, for, if, AND, OR, do, switch case); Python `controls.calc` cyclomatic/cognitive 7 (base, for, if, AND, OR, elif, while); JavaScript `controls.calc` cyclomatic/cognitive 6 (base, for-in, if, AND, OR, do); Rust `controls.calc` cyclomatic/cognitive 6 (base, for, if, AND, OR, while). Each `example` fixture has a non-default switch/match branch, a Boolean AND, and a conditional; Java/JavaScript have catch, Python has except, and Rust has no catch: expected cyclomatic Java 5, Python 5, JavaScript 5, Rust 4; expected cognitive Java/Python/JavaScript 4 and Rust 3 (if + Boolean sequence + switch/match, plus catch/except where present). `callback`/`test_callback` fixtures exercise test callbacks, anonymous lambdas/closures and named syntactic recursion; an anonymous callback does not create an Arborist function row. Hand-check named `calc` in each callback fixture as cyclomatic 2 (base + if); cognitive is 2 in Java/Python/JavaScript (if + syntactic self-call) and 3 in Rust (if + else + syntactic self-call). The **enclosing named test** rows in Java `testCalc`, Python `test_calc` and Rust `test_calc` each score cyclomatic 1 and cognitive 0: their separately represented callback bodies are excluded. Their separate native anonymous callable rows score Java 2/2, Python 2/2 and Rust 2/3 (cyclomatic/cognitive). JavaScript `test("calc", () => ...)` has no named enclosing test-function row: its outer anonymous callback scores 1/0, while its nested `callback = x => ...` scores 2/3; neither is an Arborist function row. Rust `?` is deliberately zero and implicit tail `n` is not a return. For `fn f() -> Result<i32,E> { let n = g()?; Ok(n) }`, hand-check cyclomatic = 1, cognitive = 0 and explicit exits = 0; the fallible call remains one call site. Check source changes against these counts rather than silently updating expected data.

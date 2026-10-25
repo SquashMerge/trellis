@@ -264,3 +264,45 @@ test("Git header shows measured branch, last-fetch counts, detached HEAD and una
   assert.equal(h.get("workspace-git").hidden,true);
   assert.deepEqual(h.requests,[]);
 });
+
+test("Files action focuses browsing and opens only its drawer without changing view or requesting data", () => {
+  const h = harness();
+  h.context.window.matchMedia = () => ({matches:true});
+  h.shell.showView("libraries");
+  h.shell.showMetricInspector();
+  h.get("section-files").listeners.click();
+  assert.equal(h.get("file-filter").focused,true);
+  assert.equal(h.document.body.classList.contains("explorer-open"),true);
+  assert.equal(h.document.body.classList.contains("inspector-open"),false);
+  assert.equal(h.get("dependency-library").hidden,false);
+  assert.equal(h.get("source-dock").hidden,true);
+  assert.equal(h.get("metric-inspector").hidden,false,"opening files does not discard the inspection");
+  assert.deepEqual(h.requests,[]);
+});
+
+test("Clear removes metric exception and drawers, notifies the controller, and erases call source callbacks", () => {
+  const h = harness(); let cleared = 0, opened = 0;
+  h.shell.setInspectorClearCallback(() => cleared++);
+  h.shell.selectStep(call(),view(),() => opened++);
+  h.shell.showMetricInspector();
+  h.get("metric-inspector-title").textContent="main.rs";
+  h.get("metric-inspector-values").append(h.get("synthetic-value"));
+  assert.equal(h.document.body.classList.contains("metric-inspector-active"),true);
+  h.get("inspector-clear").listeners.click();
+  assert.equal(cleared,1);
+  assert.equal(h.document.body.classList.contains("metric-inspector-active"),false);
+  assert.equal(h.document.body.classList.contains("inspector-open"),false);
+  assert.equal(h.get("metric-inspector").hidden,true);
+  assert.equal(h.get("metric-inspector-title").textContent,"");
+  assert.equal(h.get("metric-inspector-values").children.length,0);
+  assert.equal(h.get("inspector-clear").disabled,true);
+  h.get("inspector-open-source").listeners.click();
+  assert.equal(opened,0);
+  h.shell.selectStep(call(),view(),() => opened++);
+  h.get("inspector-clear").listeners.click();
+  h.get("inspector-open-source").listeners.click();
+  assert.equal(cleared,2);
+  assert.equal(opened,0);
+  assert.equal(h.get("inspector-open-source").disabled,true);
+  assert.deepEqual(h.requests,[]);
+});

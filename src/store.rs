@@ -897,6 +897,7 @@ pub struct MetricsOptions {
     pub aggregate: String,
     /// Empty means all metrics; transport rejects an explicitly empty list.
     pub metrics: Vec<String>,
+    pub top_cognitive: Option<usize>,
 }
 impl Default for MetricsOptions {
     fn default() -> Self {
@@ -909,6 +910,7 @@ impl Default for MetricsOptions {
             sid: None,
             aggregate: "sum".into(),
             metrics: vec![],
+            top_cognitive: None,
         }
     }
 }
@@ -931,6 +933,11 @@ impl MetricsOptions {
                 .all(|m| crate::metrics::METRIC_ORDER.contains(&m.as_str()))
                 && self.metrics.iter().collect::<BTreeSet<_>>().len() == self.metrics.len(),
             "invalid metrics"
+        );
+        ensure!(
+            self.top_cognitive
+                .is_none_or(|count| (1..=10).contains(&count)),
+            "invalid top cognitive count"
         );
         let located = self.scope != "revision";
         ensure!(
@@ -987,6 +994,25 @@ pub struct MetricsDeclarationRow {
 }
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct MetricsTopCognitiveRow {
+    pub source_set_id: String,
+    pub language: String,
+    pub path: String,
+    pub sid: String,
+    pub range: crate::native_evidence::Range,
+    pub name: Option<String>,
+    pub kind: String,
+    pub metrics: MetricsTopCognitiveScore,
+}
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MetricsTopCognitiveScore {
+    pub cognitive: usize,
+    pub cyclomatic: usize,
+    pub max_nesting: usize,
+}
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MetricsPayload {
     pub metrics_version: &'static str,
     pub index_generation: String,
@@ -997,6 +1023,8 @@ pub struct MetricsPayload {
     pub declarations: Vec<MetricsDeclarationRow>,
     pub files: Vec<MetricsFileRow>,
     pub directories: Vec<MetricsDirectoryRow>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_cognitive: Option<Vec<MetricsTopCognitiveRow>>,
 }
 
 /// One coherent native read snapshot retained until its owned result passes T03.
@@ -1256,6 +1284,9 @@ impl EvidenceResponse {
         }
         let mut declarations = Vec::new();
         let mut files = Vec::new();
+        let mut top_cognitive = options
+            .top_cognitive
+            .map(|_| Vec::<MetricsTopCognitiveRow>::new());
         let mut directories: BTreeMap<(String, String), crate::metrics::Accumulator> =
             BTreeMap::new();
         // Read only the selected version; no checkout filesystem access.
@@ -1399,8 +1430,48 @@ impl EvidenceResponse {
                 }
             }
             for row in rows {
-                if options.scope == "file"
-                    || (options.scope == "declaration" && options.sid.as_ref() == Some(&row.sid))
+                let selected_callable =
+                    options.scope != "declaration" || options.sid.as_ref() == Some(&row.sid);
+                if selected_callable
+                    && let (Some(count), Some(top)) = (options.top_cognitive, &mut top_cognitive)
+                {
+                    top.push(MetricsTopCognitiveRow {
+                        source_set_id: row.source_set_id.clone(),
+                        language: row.language.clone(),
+                        path: row.path.clone(),
+                        sid: row.sid.clone(),
+                        range: row.range.clone(),
+                        name: row.name.clone(),
+                        kind: row.kind.clone(),
+                        metrics: MetricsTopCognitiveScore {
+                            cognitive: row.metrics.cognitive,
+                            cyclomatic: row.metrics.cyclomatic,
+                            max_nesting: row.metrics.max_nesting,
+                        },
+                    });
+                    top.sort_by(|a, b| {
+                        b.metrics.cognitive.cmp(&a.metrics.cognitive).then_with(|| {
+                            (
+                                &a.source_set_id,
+                                &a.language,
+                                &a.path,
+                                a.range.start,
+                                a.range.end,
+                                &a.sid,
+                            )
+                                .cmp(&(
+                                    &b.source_set_id,
+                                    &b.language,
+                                    &b.path,
+                                    b.range.start,
+                                    b.range.end,
+                                    &b.sid,
+                                ))
+                        })
+                    });
+                    top.truncate(count);
+                }
+                if options.scope == "file" || (options.scope == "declaration" && selected_callable)
                 {
                     let mut projected = serde_json::to_value(&row.metrics)?;
                     projected
@@ -1637,6 +1708,7 @@ impl EvidenceResponse {
             declarations,
             files,
             directories: directory_rows,
+            top_cognitive,
         })
     }
     pub(crate) fn report_index_failure(&self, error: anyhow::Error) -> anyhow::Error {
@@ -6855,58 +6927,71 @@ impl Store {
         );
         let store = Self::unopened(roots, identity)?;
         let guard = store.roots.index_use_existing_readonly(&store.identity)?;
-        // Even a read-only SQLite open can try to recover a hot journal or
-        // create WAL shared-memory sidecars. Status explicitly reports busy
-        // instead of recovering, creating sidecars or ignoring live WAL.
-        for suffix in ["-wal", "-shm", "-journal"] {
-            let sidecar = index.with_file_name(format!(
-                "{}{}",
-                index
-                    .file_name()
-                    .context("index filename missing")?
-                    .to_string_lossy(),
-                suffix
-            ));
-            match std::fs::symlink_metadata(sidecar) {
-                Ok(_) => anyhow::bail!("storage_busy: index journal sidecar present"),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
+        let observed = (|| {
+            // Even a read-only SQLite open can try to recover a hot journal or
+            // create WAL shared-memory sidecars. Status explicitly reports busy
+            // instead of recovering, creating sidecars or ignoring live WAL.
+            for suffix in ["-wal", "-shm", "-journal"] {
+                let sidecar = index.with_file_name(format!(
+                    "{}{}",
+                    index
+                        .file_name()
+                        .context("index filename missing")?
+                        .to_string_lossy(),
+                    suffix
+                ));
+                match std::fs::symlink_metadata(sidecar) {
+                    Ok(_) => anyhow::bail!("storage_busy: index journal sidecar present"),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
             }
+            let db = open_index(&index, false).map_err(|error| {
+                if recovery_class(&error) == RecoveryClass::RecreatePending {
+                    anyhow::anyhow!(
+                        "recovery_required: exceptional index format; run explicit trellis index"
+                    )
+                } else {
+                    error
+                }
+            })?;
+            // Status does not replay saved options, but malformed/relative saved
+            // inputs must still refuse rather than look like a healthy publication.
+            let (revision, raw_options): (i64, Option<String>) = db.query_row(
+                "SELECT index_revision,reconcile_options FROM index_metadata WHERE singleton=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            ensure!(revision > 0, "index_not_ready: no published revision");
+            let raw_options =
+                raw_options.context("incompatible_index: missing reconcile options")?;
+            let options: crate::indexer::ReconcileOptions = serde_json::from_str(&raw_options)
+                .context(SelectedIntegrity(
+                    "incompatible_index: stored JSON decode failed".into(),
+                ))
+                .context("incompatible_index: invalid reconcile options")?;
+            ensure!(
+                json(&options)? == raw_options && options.version == 1,
+                "incompatible_index: unsupported reconcile options"
+            );
+            options.require_absolute_optional_inputs().context(
+                "recovery_required: recorded relative index input; run explicit trellis index",
+            )?;
+            let status = store.read_status(&db)?;
+            store.identity.verify_readonly()?;
+            guard.verify()?;
+            Ok(status)
+        })();
+        drop(guard);
+        let lock = store
+            .roots
+            .cache
+            .join("indexes")
+            .join(format!("{}.lock", store.identity.root_key));
+        if let Ok(_exclusive) = topology::UseGuard::acquire_existing_readonly_exclusive(&lock) {
+            drop(SqliteWitnessRetirement(vec![index]));
         }
-        let db = open_index(&index, false).map_err(|error| {
-            if recovery_class(&error) == RecoveryClass::RecreatePending {
-                anyhow::anyhow!(
-                    "recovery_required: exceptional index format; run explicit trellis index"
-                )
-            } else {
-                error
-            }
-        })?;
-        // Status does not replay saved options, but malformed/relative saved
-        // inputs must still refuse rather than look like a healthy publication.
-        let (revision, raw_options): (i64, Option<String>) = db.query_row(
-            "SELECT index_revision,reconcile_options FROM index_metadata WHERE singleton=1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        ensure!(revision > 0, "index_not_ready: no published revision");
-        let raw_options = raw_options.context("incompatible_index: missing reconcile options")?;
-        let options: crate::indexer::ReconcileOptions = serde_json::from_str(&raw_options)
-            .context(SelectedIntegrity(
-                "incompatible_index: stored JSON decode failed".into(),
-            ))
-            .context("incompatible_index: invalid reconcile options")?;
-        ensure!(
-            json(&options)? == raw_options && options.version == 1,
-            "incompatible_index: unsupported reconcile options"
-        );
-        options.require_absolute_optional_inputs().context(
-            "recovery_required: recorded relative index input; run explicit trellis index",
-        )?;
-        let status = store.read_status(&db)?;
-        store.identity.verify_readonly()?;
-        guard.verify()?;
-        Ok(status)
+        observed
     }
     /// Isolated roots for integration fixtures; production startup calls `open` with ProjectDirs.
     #[cfg(test)]
