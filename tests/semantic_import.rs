@@ -1790,11 +1790,12 @@ fn import_bit_without_measured_alias_declaration_never_grants_alias() {
 }
 
 #[test]
-fn type_role_requires_source_clause_not_just_matching_symbol() {
-    let source = "class Base {} class Child extends Base { Base field; }";
+fn type_role_marks_field_type_not_value_with_same_symbol() {
+    let source = "class Base {} class Child extends Base { Base field; void use(){ Base; } }";
     let decl = source.find("Base").unwrap();
     let base = source.find("extends Base").unwrap() + 8;
-    let field = source.rfind("Base").unwrap();
+    let field = source.find("Base field").unwrap();
+    let value = source.rfind("Base").unwrap();
     let child = source.find("Child").unwrap();
     let (_root, native, sources, inventory) = admitted_case(
         "java",
@@ -1804,6 +1805,7 @@ fn type_role_requires_source_clause_not_just_matching_symbol() {
             (child, child + 5, "global pkg Child#", 1),
             (base, base + 4, "global pkg Base#", 8),
             (field, field + 4, "global pkg Base#", 8),
+            (value, value + 4, "global pkg Base#", 8),
         ],
         vec![
             ("global pkg Base#", 7, vec![]),
@@ -1825,7 +1827,13 @@ fn type_role_requires_source_clause_not_just_matching_symbol() {
         output
             .references
             .iter()
-            .any(|r| r.range.start == field && !r.roles.contains(&semantic::Role::Type))
+            .any(|r| r.range.start == field && r.roles.contains(&semantic::Role::Type))
+    );
+    assert!(
+        output
+            .references
+            .iter()
+            .any(|r| r.range.start == value && !r.roles.contains(&semantic::Role::Type))
     );
 }
 
@@ -1864,4 +1872,135 @@ fn nonexact_invocation_does_not_grant_role_or_binding_even_with_exact_callee() {
             .all(|r| !r.roles.contains(&semantic::Role::Call))
     );
     assert!(output.call_bindings.is_empty());
+}
+
+#[test]
+fn javascript_instanceof_is_type_use_but_matching_value_identifier_is_not() {
+    let source = "class Base {} function f(value){ return value instanceof Base && Base; }";
+    let decl = source.find("Base").unwrap();
+    let instance = source.find("instanceof Base").unwrap() + 11;
+    let value = source.rfind("Base").unwrap();
+    let (_root, native, sources, inventory) = admitted_case(
+        "javascript",
+        source,
+        vec![
+            (decl, decl + 4, "typescript pkg Base#", 1),
+            (instance, instance + 4, "typescript pkg Base#", 8),
+            (value, value + 4, "typescript pkg Base#", 8),
+        ],
+        vec![("typescript pkg Base#", 7, vec![])],
+    );
+    let output = join_inventory(&inventory, &native, &sources, 2).unwrap();
+    assert!(
+        output
+            .references
+            .iter()
+            .any(|r| r.range.start == instance && r.roles.contains(&semantic::Role::Type))
+    );
+    assert!(
+        output
+            .references
+            .iter()
+            .any(|r| r.range.start == value && !r.roles.contains(&semantic::Role::Type))
+    );
+}
+
+#[test]
+fn imported_name_needs_source_site_besides_authenticated_import_bit() {
+    for (language, source, imported, value, encoding) in [
+        (
+            "java",
+            "import pkg.Base; class A { Base other; Base field; }",
+            "Base",
+            "Base field",
+            2,
+        ),
+        (
+            "javascript",
+            "import {Base} from 'pkg'; function use(Base){ return Base; }",
+            "Base",
+            "Base;",
+            2,
+        ),
+        ("python", "import pkg\npkg.value\n", "pkg", "pkg.value", 2),
+        (
+            "rust",
+            "use pkg::Base; fn f(){ let _=Base; }",
+            "Base",
+            "Base;",
+            1,
+        ),
+    ] {
+        let at = source.find(imported).unwrap();
+        let use_at = source.rfind(value).unwrap();
+        let use_at = use_at + value.find(imported).unwrap();
+        let sym = "external pkg Imported#";
+        let (_root, native, sources, inventory) = admitted_case(
+            language,
+            source,
+            vec![
+                (at, at + imported.len(), sym, 2),
+                (use_at, use_at + imported.len(), sym, 2),
+            ],
+            vec![],
+        );
+        let output = join_inventory(&inventory, &native, &sources, encoding).unwrap();
+        assert!(
+            output
+                .references
+                .iter()
+                .any(|r| r.range.start == at && r.roles.contains(&semantic::Role::Import)),
+            "{language} import site"
+        );
+        assert!(
+            output
+                .references
+                .iter()
+                .filter(|r| r.range.start == use_at)
+                .all(|r| !r.roles.contains(&semantic::Role::Import)),
+            "{language} ordinary value"
+        );
+        if language == "java" {
+            assert!(
+                output.references.iter().any(|r| r.range.start == use_at),
+                "Java ordinary non-import native reference"
+            );
+        }
+    }
+}
+
+#[test]
+fn annotation_and_explicit_type_contexts_are_not_heritage_only() {
+    for (language, source, needle, encoding) in [
+        (
+            "python",
+            "class Base: pass\ndef f(x: Base):\n    return x\n",
+            "x: Base",
+            2,
+        ),
+        ("rust", "struct Base; fn f(x: Base) {}", "x: Base", 1),
+        (
+            "java",
+            "class Base {} class A { void f(Base value) {} }",
+            "Base value",
+            2,
+        ),
+    ] {
+        let at = source.find(needle).unwrap() + needle.find("Base").unwrap();
+        let (_root, native, sources, inventory) = admitted_case(
+            language,
+            source,
+            vec![(at, at + 4, "external pkg Base#", 8)],
+            vec![],
+        );
+        let output = join_inventory(&inventory, &native, &sources, encoding).unwrap();
+        assert!(
+            output
+                .references
+                .iter()
+                .any(|r| r.range.start == at && r.roles.contains(&semantic::Role::Type)),
+            "{language} explicit type context: {:?}",
+            output.references
+        );
+    }
 }

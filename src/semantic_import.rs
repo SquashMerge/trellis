@@ -450,44 +450,13 @@ pub fn join_inventory(
         });
     }
     let mut reference_claims: BTreeMap<String, Vec<(String, semantic::Target)>> = BTreeMap::new();
-    let type_spans: BTreeMap<native::DocumentKey, BTreeSet<(usize, usize)>> = sources
+    let role_sites: BTreeMap<_, _> = sources
         .iter()
         .map(|(doc, bytes)| {
-            let spans = match doc.language.as_str() {
-                "java" => direct_java_types(bytes).map(|items| {
-                    items
-                        .into_iter()
-                        .map(|(_, base, _)| (base.start, base.end))
-                        .collect()
-                }),
-                "javascript" => direct_script_types(
-                    bytes,
-                    tree_sitter_javascript::LANGUAGE.into(),
-                    "class_declaration",
-                    "class_heritage",
-                )
-                .map(|items| {
-                    items
-                        .into_iter()
-                        .map(|(_, base, _)| (base.start, base.end))
-                        .collect()
-                }),
-                "python" => direct_script_types(
-                    bytes,
-                    tree_sitter_python::LANGUAGE.into(),
-                    "class_definition",
-                    "argument_list",
-                )
-                .map(|items| {
-                    items
-                        .into_iter()
-                        .map(|(_, base, _)| (base.start, base.end))
-                        .collect()
-                }),
-                "rust" => rust_type_spans(bytes),
-                _ => Ok(BTreeSet::new()),
-            }?;
-            Ok((doc.clone(), spans))
+            Ok((
+                doc.clone(),
+                source_role_sites(doc.language.as_str(), bytes)?,
+            ))
         })
         .collect::<Result<_>>()?;
     let mut call_reference_ids: BTreeMap<String, String> = BTreeMap::new();
@@ -587,15 +556,20 @@ pub fn join_inventory(
             if declaration_site {
                 assigned.insert(semantic::Role::Definition);
             }
-            if roles & 2 != 0 {
+            let site = (r.range.start, r.range.end);
+            if roles & 2 != 0
+                && role_sites
+                    .get(&doc)
+                    .is_some_and(|sites: &RoleSites| sites.imports.contains(&site))
+            {
                 assigned.insert(semantic::Role::Import);
             }
             if !declaration_site
-                && type_spans
+                && role_sites
                     .get(&doc)
-                    .is_some_and(|spans| spans.contains(&(r.range.start, r.range.end)))
+                    .is_some_and(|sites: &RoleSites| sites.types.contains(&site))
                 && type_uses
-                    .get(&(doc.clone(), r.range.start, r.range.end))
+                    .get(&(doc.clone(), site.0, site.1))
                     .is_some_and(|keys| keys.len() == 1 && keys.contains(&symbol))
             {
                 assigned.insert(semantic::Role::Type);
@@ -1134,37 +1108,177 @@ fn direct_java_types(
     Ok(result)
 }
 
-fn rust_type_spans(source: &[u8]) -> Result<BTreeSet<(usize, usize)>> {
+#[derive(Default)]
+struct RoleSites {
+    types: BTreeSet<(usize, usize)>,
+    imports: BTreeSet<(usize, usize)>,
+}
+
+fn source_role_sites(language: &str, source: &[u8]) -> Result<RoleSites> {
+    let grammar: tree_sitter::Language = match language {
+        "java" => tree_sitter_java::LANGUAGE.into(),
+        "javascript" => tree_sitter_javascript::LANGUAGE.into(),
+        "python" => tree_sitter_python::LANGUAGE.into(),
+        "rust" => tree_sitter_rust::LANGUAGE.into(),
+        _ => return Ok(RoleSites::default()),
+    };
     let mut parser = tree_sitter::Parser::new();
-    parser.set_language(&tree_sitter_rust::LANGUAGE.into())?;
+    parser.set_language(&grammar)?;
     let tree = parser
         .parse(source, None)
-        .context("Rust type parser failed")?;
-    let mut result = BTreeSet::new();
+        .context("semantic role source parser failed")?;
+    let mut sites = RoleSites::default();
     let mut stack = vec![tree.root_node()];
     while let Some(node) = stack.pop() {
-        if matches!(
-            node.kind(),
-            "trait_item" | "impl_item" | "struct_item" | "enum_item"
-        ) {
-            for field in ["bounds", "trait", "type"] {
-                if let Some(clause) = node.child_by_field_name(field) {
-                    let mut todo = vec![clause];
-                    while let Some(item) = todo.pop() {
-                        if item.kind() == "type_identifier" {
-                            result.insert((item.start_byte(), item.end_byte()));
-                        } else {
-                            let mut cursor = item.walk();
-                            todo.extend(item.named_children(&mut cursor));
-                        }
-                    }
+        let kind = node.kind();
+        let type_field = match language {
+            "java"
+                if matches!(
+                    kind,
+                    "field_declaration"
+                        | "local_variable_declaration"
+                        | "formal_parameter"
+                        | "spread_parameter"
+                        | "catch_formal_parameter"
+                        | "cast_expression"
+                        | "instanceof_expression"
+                        | "method_declaration"
+                        | "constructor_declaration"
+                        | "object_creation_expression"
+                        | "array_creation_expression"
+                        | "superclass"
+                        | "super_interfaces"
+                        | "extends_interfaces"
+                        | "type_arguments"
+                        | "type_parameters"
+                        | "array_type"
+                ) =>
+            {
+                Some("type")
+            }
+            "python"
+                if matches!(
+                    kind,
+                    "typed_parameter"
+                        | "typed_default_parameter"
+                        | "assignment"
+                        | "function_definition"
+                ) =>
+            {
+                Some("type")
+            }
+            "rust"
+                if matches!(
+                    kind,
+                    "trait_item" | "impl_item" | "struct_item" | "enum_item"
+                ) =>
+            {
+                Some("bounds")
+            }
+            "rust"
+                if matches!(
+                    kind,
+                    "field_declaration"
+                        | "let_declaration"
+                        | "parameter"
+                        | "function_item"
+                        | "type_item"
+                        | "const_item"
+                        | "static_item"
+                ) =>
+            {
+                Some("type")
+            }
+            _ => None,
+        };
+        if let Some(field) = type_field.and_then(|name| node.child_by_field_name(name)) {
+            collect_role_leaf_spans(field, language, &mut sites.types);
+        }
+        if language == "rust" && kind == "impl_item" {
+            for field in ["trait", "type"] {
+                if let Some(child) = node.child_by_field_name(field) {
+                    collect_role_leaf_spans(child, language, &mut sites.types);
                 }
+            }
+        }
+        if language == "java"
+            && matches!(
+                kind,
+                "superclass" | "super_interfaces" | "extends_interfaces"
+            )
+        {
+            collect_role_leaf_spans(node, language, &mut sites.types);
+        }
+        if language == "javascript" && kind == "class_heritage" {
+            collect_role_leaf_spans(node, language, &mut sites.types);
+        }
+        if language == "python" && kind == "class_definition" {
+            let mut cursor = node.walk();
+            for child in node
+                .named_children(&mut cursor)
+                .filter(|c| c.kind() == "argument_list")
+            {
+                collect_role_leaf_spans(child, language, &mut sites.types);
+            }
+        }
+        if language == "javascript"
+            && kind == "binary_expression"
+            && let (Some(operator), Some(right)) = (
+                node.child_by_field_name("operator"),
+                node.child_by_field_name("right"),
+            )
+            && source.get(operator.byte_range()) == Some(b"instanceof".as_slice())
+        {
+            collect_role_leaf_spans(right, language, &mut sites.types);
+        }
+        let import_root = match language {
+            "java" => kind == "import_declaration",
+            "javascript" => kind == "import_statement",
+            "python" => matches!(kind, "import_statement" | "import_from_statement"),
+            "rust" => kind == "use_declaration",
+            _ => false,
+        };
+        if import_root {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if language == "python"
+                    && kind == "import_from_statement"
+                    && node.child_by_field_name("module_name") == Some(child)
+                {
+                    continue;
+                }
+                collect_role_leaf_spans(child, language, &mut sites.imports);
             }
         }
         let mut cursor = node.walk();
         stack.extend(node.named_children(&mut cursor));
     }
-    Ok(result)
+    Ok(sites)
+}
+
+fn collect_role_leaf_spans(
+    node: tree_sitter::Node<'_>,
+    language: &str,
+    spans: &mut BTreeSet<(usize, usize)>,
+) {
+    let leaf = match language {
+        "java" => matches!(node.kind(), "identifier" | "type_identifier"),
+        "javascript" => matches!(
+            node.kind(),
+            "identifier" | "property_identifier" | "shorthand_property_identifier"
+        ),
+        "python" => node.kind() == "identifier",
+        "rust" => matches!(node.kind(), "identifier" | "type_identifier"),
+        _ => false,
+    };
+    if leaf {
+        spans.insert((node.start_byte(), node.end_byte()));
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_role_leaf_spans(child, language, spans);
+    }
 }
 
 fn direct_script_types(
