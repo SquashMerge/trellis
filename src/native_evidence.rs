@@ -1771,6 +1771,10 @@ pub(crate) fn measure_captured_documents(
     let documents = std::mem::take(&mut artifact.revision.documents);
     for (file, document) in selected.iter().zip(&documents) {
         ensure!(
+            file.path == document.key.path,
+            "selected native source path mismatch"
+        );
+        ensure!(
             !cancel.load(std::sync::atomic::Ordering::Acquire),
             "indexing cancelled"
         );
@@ -3223,13 +3227,13 @@ impl Artifact {
                 text(d)?;
             }
         }
-        let mut proofs = BTreeSet::new();
+        let mut proofs = BTreeMap::new();
         for proof in &self.provenance {
             let f = docs
                 .get(&proof.document)
                 .context("native proof dangling document")?;
             ensure!(
-                proofs.insert(proof.id.clone())
+                proofs.insert(proof.id.as_str(), &proof.document).is_none()
                     && proof.producer_id == PRODUCER
                     && proof.revision_id == self.revision.id
                     && proof.content_hash == f.hash
@@ -3279,7 +3283,7 @@ impl Artifact {
                     .context("native declaration dangling document")?;
                 ensure!(
                     d.revision_id == self.revision.id
-                        && proofs.contains(&d.provenance_id)
+                        && proofs.get(d.provenance_id.as_str()) == Some(&&d.document)
                         && matches!(
                             d.kind.as_str(),
                             "module"
@@ -3473,7 +3477,7 @@ impl Artifact {
                 ensure!(
                     owner.document == c.document
                         && c.revision_id == self.revision.id
-                        && proofs.contains(&c.provenance_id)
+                        && proofs.get(c.provenance_id.as_str()) == Some(&&c.document)
                         && calls.insert(c.id.clone()),
                     "native call ownership/duplicate"
                 );
@@ -3511,7 +3515,7 @@ impl Artifact {
             ensure!(
                 owner.document == r.document
                     && r.revision_id == self.revision.id
-                    && proofs.contains(&r.provenance_id)
+                    && proofs.get(r.provenance_id.as_str()) == Some(&&r.document)
                     && references.insert(r.id.as_str()),
                 "native reference ownership/duplicate"
             );
@@ -3621,7 +3625,7 @@ impl Artifact {
                 ensure!(
                     owner.document == region.document
                         && region.revision_id == self.revision.id
-                        && proofs.contains(&region.provenance_id),
+                        && proofs.get(region.provenance_id.as_str()) == Some(&&region.document),
                     "native control ownership"
                 );
                 span(&file.text, &region.range, false)?;

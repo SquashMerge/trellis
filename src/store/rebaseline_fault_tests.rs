@@ -2002,6 +2002,49 @@ fn real_source_above_injected_ancillary_cap_keeps_selected_source_available() {
 }
 
 #[test]
+fn local_composition_preserves_prior_stats_metadata() {
+    use crate::{capture::Capture, model::SemanticState};
+    let (_state, work, store, options, _pin) = local_edit_fixture();
+    let cancel = Arc::new(AtomicBool::new(false));
+    fs::write(
+        work.path().join("local.js"),
+        "function local(){if (ready()) { return next(); } return 2;}\nfunction added(){return local();}\n",
+    )
+    .unwrap();
+    let capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
+    let expected = store.recovery_index_baseline().unwrap();
+    let mut prepared = store
+        .prepare_local_revision(&capture, &expected, &cancel)
+        .unwrap()
+        .expect("the JavaScript edit uses local composition");
+    prepared.old_stats.semantic_state = SemanticState::Stale;
+    prepared.old_stats.changed_files = vec!["prior-change.js".into()];
+    prepared.old_stats.internal = 3;
+    prepared.old_stats.external = 4;
+    prepared.old_stats.ambiguous = 5;
+    let changed = crate::indexer::project_native_documents(
+        &options,
+        &capture,
+        &prepared.native,
+        &prepared.changed_paths,
+        &cancel,
+        &|_| {},
+    )
+    .unwrap();
+    let graph = store
+        .compose_local_revision(&capture, &prepared, changed, &cancel)
+        .unwrap();
+    let (full, _, _) = index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+    let mut expected_stats = full.stats;
+    expected_stats.semantic_state = prepared.old_stats.semantic_state;
+    expected_stats.changed_files = prepared.old_stats.changed_files.clone();
+    expected_stats.internal = prepared.old_stats.internal;
+    expected_stats.external = prepared.old_stats.external;
+    expected_stats.ambiguous = prepared.old_stats.ambiguous;
+    assert_eq!(graph.stats, expected_stats);
+}
+
+#[test]
 fn local_class_only_refresh_writes_new_class_rows_and_rolls_back_atomically() {
     use crate::{capture::Capture, index_coordinator::IndexJobCoordinator};
     let state = tempfile::tempdir().unwrap();

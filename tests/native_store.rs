@@ -394,6 +394,65 @@ fn caller_supplied_native_artifact_uses_structural_validation() {
 
 #[test]
 #[cfg(feature = "test-support")]
+fn caller_supplied_cross_document_proof_does_not_publish_or_change_head() {
+    let (_state, root, store, cancel) = fixture();
+    let leader = store.publication_for_tests().unwrap();
+    let pin = publish(
+        &store,
+        root.path(),
+        &cancel,
+        store.index_baseline().unwrap(),
+        &leader,
+    )
+    .unwrap();
+    let prior_graph = store.graph().unwrap();
+    let prior_source = store.source_at("flow.js", Some(pin)).unwrap().unwrap();
+    fs::write(
+        root.path().join("flow.js"),
+        "function updated(value) { if (value) { obj.changed(); } }\n",
+    )
+    .unwrap();
+    let (graph, mut native, capture) = index_workspace_bundle(
+        &IndexOptions::new(root.path().to_owned()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    let canonical_root = fs::canonicalize(root.path()).unwrap();
+    native
+        .validate(&capture, &canonical_root, store.root_id(), &cancel)
+        .unwrap();
+    assert_ne!(graph, prior_graph);
+    let call = native
+        .calls
+        .iter_mut()
+        .find(|call| call.document.path == "flow.js")
+        .unwrap();
+    call.provenance_id = native
+        .provenance
+        .iter()
+        .find(|proof| proof.document != call.document)
+        .unwrap()
+        .id
+        .clone();
+    assert!(
+        store
+            .publish_native(&graph, &capture, &native, &leader, pin, &cancel)
+            .is_err(),
+        "caller-supplied call accepted a proof belonging to another document"
+    );
+    assert_eq!(store.index_baseline().unwrap(), pin);
+    assert_eq!(store.status().unwrap().revision, pin);
+    assert_eq!(store.graph().unwrap(), prior_graph);
+    assert_eq!(
+        store.source_at("flow.js", Some(pin)).unwrap().unwrap(),
+        prior_source
+    );
+}
+
+#[test]
+#[cfg(feature = "test-support")]
 fn empty_workspace_has_native_pair_without_document_rows() {
     let state = tempfile::tempdir().unwrap();
     let root = tempfile::tempdir().unwrap();

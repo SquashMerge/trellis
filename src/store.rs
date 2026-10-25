@@ -12554,7 +12554,7 @@ impl Store {
                 old_parse_errors,
                 changed.stats.parse_error_files,
             )?,
-            ..IndexStats::default()
+            ..prepared.old_stats.clone()
         };
         let mut diagnostics: Vec<_> = prepared
             .old_diagnostics

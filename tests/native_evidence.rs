@@ -911,16 +911,6 @@ fn native_validation_rejects_invalid_structure_against_immutable_capture() {
             }),
         ),
         (
-            "call proof from other document",
-            Box::new(|a| {
-                a.calls
-                    .iter_mut()
-                    .find(|c| c.document.language == "javascript")
-                    .unwrap()
-                    .provenance_id = a.provenance[0].id.clone()
-            }),
-        ),
-        (
             "control kind",
             Box::new(|a| a.control_regions[0].kind = "for_statement".into()),
         ),
@@ -945,6 +935,85 @@ fn native_validation_rejects_invalid_structure_against_immutable_capture() {
         .unwrap();
     for ops in capture.source_operations.values() {
         assert_eq!((ops.opens, ops.complete_reads, ops.hashes), (1, 1, 1));
+    }
+}
+
+#[test]
+fn native_validation_rejects_cross_document_proof_for_every_fact_family() {
+    use std::{
+        fs,
+        sync::{Arc, atomic::AtomicBool},
+    };
+    use trellis::{
+        capture::Capture,
+        indexer::IndexOptions,
+        model::CancelFlag,
+        native_evidence::{Artifact, from_capture},
+    };
+    let root = tempfile::tempdir().unwrap();
+    for (path, source) in [
+        ("a.js", "function first(value) { if (value) { one(); } }"),
+        ("b.js", "function second(value) { if (value) { two(); } }"),
+    ] {
+        fs::write(root.path().join(path), source).unwrap();
+    }
+    let identity =
+        trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+            .unwrap();
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let capture = Capture::admit(&IndexOptions::new(root.path().into()), &cancel, &|_| {}).unwrap();
+    let artifact = from_capture(&capture, root.path(), &identity.record_id, &cancel).unwrap();
+    artifact
+        .validate(&capture, root.path(), &identity.record_id, &cancel)
+        .unwrap();
+    type Mutation = (&'static str, fn(&mut Artifact));
+    let mutations: [Mutation; 4] = [
+        ("declaration", |a| {
+            a.declarations[0].provenance_id = a
+                .provenance
+                .iter()
+                .find(|p| p.document != a.declarations[0].document)
+                .unwrap()
+                .id
+                .clone();
+        }),
+        ("call", |a| {
+            a.calls[0].provenance_id = a
+                .provenance
+                .iter()
+                .find(|p| p.document != a.calls[0].document)
+                .unwrap()
+                .id
+                .clone();
+        }),
+        ("reference", |a| {
+            a.references[0].provenance_id = a
+                .provenance
+                .iter()
+                .find(|p| p.document != a.references[0].document)
+                .unwrap()
+                .id
+                .clone();
+        }),
+        ("control region", |a| {
+            a.control_regions[0].provenance_id = a
+                .provenance
+                .iter()
+                .find(|p| p.document != a.control_regions[0].document)
+                .unwrap()
+                .id
+                .clone();
+        }),
+    ];
+    for (family, mutate) in mutations {
+        let mut changed = artifact.clone();
+        mutate(&mut changed);
+        assert!(
+            changed
+                .validate(&capture, root.path(), &identity.record_id, &cancel)
+                .is_err(),
+            "{family} accepted a proof belonging to another document"
+        );
     }
 }
 
