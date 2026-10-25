@@ -38,8 +38,8 @@ fn pair_snapshot(index: &std::path::Path) -> PairSnapshot {
             .unwrap();
     assert_eq!(
         tables.len(),
-        60,
-        "compare exact schema-17 derived evidence inventory"
+        63,
+        "compare exact schema-21 derived evidence inventory"
     );
     let expected = vec![
         "class_projections",
@@ -90,9 +90,12 @@ fn pair_snapshot(index: &std::path::Path) -> PairSnapshot {
         "semantic_declaration_binding_symbols",
         "semantic_declaration_bindings",
         "semantic_declaration_join_candidates",
+        "semantic_import_reports",
         "semantic_producer_languages",
         "semantic_producers",
         "semantic_provenance",
+        "semantic_raw_captures",
+        "semantic_raw_proofs",
         "semantic_reference_candidates",
         "semantic_reference_roles",
         "semantic_references",
@@ -106,7 +109,7 @@ fn pair_snapshot(index: &std::path::Path) -> PairSnapshot {
     assert_eq!(
         tables.iter().map(String::as_str).collect::<Vec<_>>(),
         expected,
-        "exact schema-17 table names: complete paired native and semantic evidence"
+        "exact schema-21 table names: complete paired native and semantic evidence"
     );
     for required in [
         "document_versions",
