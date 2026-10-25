@@ -3646,7 +3646,7 @@ fn canonical_medium_java_prefix_literal_local_matches_independent_cold_and_retai
             "{:x}",
             Sha256::digest(fs::read(corpus.join("manifest.json")).unwrap())
         ),
-        "03faaaa04c61ba7c18051e12386201898cd31625758c36a0202ff8da65da8882"
+        "ab4a058fac22dd9f324a476990755a3af07ab32f977f32c977d6eeea79627259"
     );
     let workspace = corpus.join("medium");
     let relative = "java/Cmedium0000.java";

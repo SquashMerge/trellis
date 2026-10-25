@@ -10,7 +10,7 @@ import { spawnSync } from "node:child_process";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const generator = join(here, "..", "generate.mjs");
-const pin = join(here, "..", "manifest-v1.json");
+const pin = join(here, "..", "manifest-v2.json");
 const expected = {
   small: { files: 100, sourceBytes: 1677722, each: [419431, 419431, 419430, 419430], count: 25 },
   medium: { files: 1000, sourceBytes: 16777216, each: [4194304, 4194304, 4194304, 4194304], count: 250 },
@@ -41,7 +41,7 @@ function inventory(root) {
 // Inspect the disk without importing generator code or trusting its manifest hashes.
 function verify(root, manifestBytes) {
   const manifest = JSON.parse(manifestBytes);
-  assert.equal(manifest.version, 1);
+  assert.equal(manifest.version, 2);
   assert.equal(manifest.seed, "trellis-synthetic-cohorts-v1");
   assert.equal(manifest.hashAlgorithm, "sha256");
   assert.deepEqual(Object.keys(manifest.totals), Object.keys(expected));

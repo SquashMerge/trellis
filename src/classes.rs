@@ -97,7 +97,7 @@ impl Default for Limits {
             output_text: OUTPUT_TEXT,
             registry_text: REGISTRY_TEXT,
             files: 100_000,
-            symbols: 1_000_000,
+            symbols: 2_000_000,
         }
     }
 }
