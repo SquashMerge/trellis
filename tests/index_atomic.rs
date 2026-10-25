@@ -623,7 +623,7 @@ fn full_reconcile_replaces_persisted_source_and_input_inventory() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        21
+        22
     );
     let files = db
         .prepare("SELECT path FROM revision_documents WHERE revision_id=?1 ORDER BY path")
@@ -809,6 +809,9 @@ fn sqlite_snapshot(
         "native_revision_supersessions",
         "native_binding_epoch",
         "revision_producer_bindings",
+        "semantic_import_reports",
+        "semantic_raw_captures",
+        "semantic_raw_proofs",
     ];
     assert_eq!(
         required.len(),
@@ -949,10 +952,10 @@ fn sqlite_snapshot(
             if table == "native_revisions" {
                 assert_eq!(rows.len(), 1);
                 assert_eq!(rows[0][0], format!("t:{revision_id}"));
-                assert_eq!(rows[0][13], format!("i:{}", pin.index_revision));
+                assert_eq!(rows[0][16], format!("i:{}", pin.index_revision));
                 if normalize_current_publication {
                     rows[0][0] = "t:<current-pin>".into();
-                    rows[0][13] = "i:<current-revision>".into();
+                    rows[0][16] = "i:<current-revision>".into();
                 }
             } else if matches!(table.as_str(), "revision_capture_inputs" | "revision_documents") {
                 for row in &mut rows {
@@ -2489,7 +2492,7 @@ fn current_v8_inventory_validation_rejects_missing_unknown_and_unsupported_state
     for mutation in [
         "DELETE FROM revision_capture_inputs WHERE input_key='config:package.json'",
         "INSERT INTO revision_capture_inputs(revision_id,input_key,payload) SELECT id,'unknown:slot','{\"state\":\"absent\"}' FROM native_revisions WHERE published_index_revision=(SELECT index_revision FROM index_metadata)",
-        "UPDATE index_metadata SET reconcile_options=json_set(reconcile_options,'$.version',2)",
+        "UPDATE index_metadata SET reconcile_options=json_set(reconcile_options,'$.version',3)",
         "UPDATE revision_capture_inputs SET payload=json_set(payload,'$.hash','invalid-digest') WHERE input_key='config:package.json'",
     ] {
         let (state, workspace) = fixture();
@@ -2503,9 +2506,7 @@ fn current_v8_inventory_validation_rejects_missing_unknown_and_unsupported_state
         let manifest = workspace.path().join("labels.json");
         fs::write(&scip, b"captured presentation bytes").unwrap();
         fs::write(&manifest, b"{}").unwrap();
-        let mut options = IndexOptions::new(workspace.path().to_owned());
-        options.scip_path = Some(scip.clone());
-        options.manifest_path = Some(manifest.clone());
+        let options = IndexOptions::new(workspace.path().to_owned());
         let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
         let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
         let job = IndexJobCoordinator::prepare(&store, None).unwrap();
@@ -2541,8 +2542,7 @@ fn current_v8_inventory_validation_rejects_missing_unknown_and_unsupported_state
             .unwrap()
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
-        assert!(keys.contains(&format!("presentation-scip:{}", scip.display())));
-        assert!(keys.contains(&format!("presentation-manifest:{}", manifest.display())));
+        assert!(!keys.iter().any(|key| key.starts_with("presentation-")));
         assert!(keys.contains(&"config:package.json".to_owned()));
         assert!(!keys.iter().any(|key| key.starts_with("unknown:")));
     }
@@ -3304,575 +3304,25 @@ fn live_control_corruption_status_first_is_typed_and_clone_shared() {
 }
 
 #[test]
-fn captured_java_python_scip_labels_require_unique_measured_names_and_coordinates() {
-    use protobuf::Message;
-    use sha2::{Digest, Sha256};
-    use std::sync::{Arc, atomic::AtomicBool};
-    use trellis::{
-        indexer::{IndexOptions, index_workspace_bundle},
-        model::{CancelFlag, SymbolKind},
-    };
-    let (state, workspace) = fixture();
-    let java = "/*é*/ class A {}\n";
-    let python = "class P: pass\n";
-    fs::write(workspace.path().join("A.java"), java).unwrap();
-    fs::write(workspace.path().join("a.py"), python).unwrap();
-    fs::write(workspace.path().join("a.js"), "class J {}\n").unwrap();
-    fs::write(workspace.path().join("a.rs"), "struct R {}\n").unwrap();
-    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
-    let scip = state.path().join("labels.scip");
-    let manifest = state.path().join("labels.json");
-    let mut options = IndexOptions::new(workspace.path().to_owned());
-    options.scip_path = Some(scip.clone());
-    options.manifest_path = Some(manifest.clone());
-    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
-    let occurrences = |version: &str| {
-        let mut index = scip::types::Index::new();
-        for (path, range, name) in [
-            ("A.java", vec![0, 12, 13], "A"), // default UTF-16; UTF-8 byte columns are 13..14.
-            ("a.py", vec![0, 6, 7], "P"),
-            ("a.js", vec![0, 6, 7], "J"),
-            ("a.rs", vec![0, 7, 8], "R"),
-        ] {
-            let mut doc = scip::types::Document::new();
-            doc.relative_path = path.into();
-            doc.position_encoding =
-                scip::types::PositionEncoding::UTF16CodeUnitOffsetFromLineStart.into();
-            let mut occurrence = scip::types::Occurrence::new();
-            occurrence.range = range;
-            occurrence.symbol_roles = 1;
-            occurrence.symbol = format!("scip {version} {name}");
-            doc.occurrences.push(occurrence);
-            index.documents.push(doc);
-        }
-        index
-    };
-    let correct_hashes = serde_json::json!({
-        "A.java":hex::encode(Sha256::digest(java.as_bytes())),
-        "a.py":hex::encode(Sha256::digest(python.as_bytes())),
-        "a.js":hex::encode(Sha256::digest(b"class J {}\n")),
-        "a.rs":hex::encode(Sha256::digest(b"struct R {}\n")),
-    });
-    let run = |index: &scip::types::Index, hashes: &serde_json::Value| {
-        fs::write(&scip, index.write_to_bytes().unwrap()).unwrap();
-        fs::write(&manifest, serde_json::to_vec(hashes).unwrap()).unwrap();
-        index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap()
-    };
-    let valid = occurrences("valid");
-    let (baseline, base_native, _) = run(&valid, &correct_hashes);
-    let node = |graph: &trellis::model::Graph, path: &str, name: &str| {
-        graph
-            .nodes
-            .iter()
-            .find(|n| n.path == path && n.name == name && n.kind == SymbolKind::Class)
-            .unwrap()
-            .clone()
-    };
-    for (path, name) in [("A.java", "A"), ("a.py", "P"), ("a.js", "J")] {
-        assert_eq!(
-            node(&baseline, path, name).display_label.as_deref(),
-            Some(format!("scip valid {name}").as_str())
-        );
-    }
-    assert!(
-        baseline
-            .nodes
-            .iter()
-            .filter(|n| n.path == "a.rs")
-            .all(|n| n.display_label.is_none())
-    );
-    let baseline_ids: Vec<_> = baseline
-        .nodes
-        .iter()
-        .map(|n| (&n.id, &n.provenance))
-        .collect();
-    for scenario in [
-        "stale-manifest",
-        "missing-manifest",
-        "wrong-range",
-        "wrong-name",
-        "reference-role",
-        "duplicate",
-        "ambiguous-range",
-        "unicode-byte-column",
-    ] {
-        let mut index = valid.clone();
-        let mut hashes = correct_hashes.clone();
-        let java_doc = index
-            .documents
-            .iter_mut()
-            .find(|d| d.relative_path == "A.java")
-            .unwrap();
-        match scenario {
-            "stale-manifest" => hashes["A.java"] = serde_json::json!("deadbeef"),
-            "missing-manifest" => {
-                hashes.as_object_mut().unwrap().remove("A.java");
-            }
-            "wrong-range" => java_doc.occurrences[0].range = vec![0, 5, 6],
-            "wrong-name" => java_doc.occurrences[0].symbol = "scip wrong Q".into(),
-            "reference-role" => java_doc.occurrences[0].symbol_roles = 0,
-            "duplicate" => java_doc.occurrences.push(java_doc.occurrences[0].clone()),
-            "ambiguous-range" => {
-                // A second, same-coordinate presentation cannot choose a label.
-                let mut other = java_doc.occurrences[0].clone();
-                other.symbol = "scip second A".into();
-                java_doc.occurrences.push(other);
-            }
-            "unicode-byte-column" => java_doc.occurrences[0].range = vec![0, 13, 14],
-            _ => unreachable!(),
-        }
-        let (graph, native, _) = run(&index, &hashes);
-        assert_eq!(
-            node(&graph, "A.java", "A").display_label,
-            None,
-            "{scenario}"
-        );
-        assert_eq!(
-            node(&graph, "a.py", "P").display_label,
-            node(&baseline, "a.py", "P").display_label
-        );
-        assert_eq!(
-            node(&graph, "a.js", "J").display_label,
-            node(&baseline, "a.js", "J").display_label
-        );
-        assert!(
-            graph
-                .nodes
-                .iter()
-                .filter(|n| n.path == "a.rs")
-                .all(|n| n.display_label.is_none())
-        );
-        assert_eq!(
-            graph
-                .nodes
-                .iter()
-                .map(|n| (&n.id, &n.provenance))
-                .collect::<Vec<_>>(),
-            baseline_ids,
-            "native IDs and provenance must not change with SCIP presentation: {scenario}"
-        );
-        assert_eq!(native.producer, base_native.producer);
-        assert_eq!(
-            native
-                .declarations
-                .iter()
-                .map(|d| &d.syntax_id)
-                .collect::<Vec<_>>(),
-            base_native
-                .declarations
-                .iter()
-                .map(|d| &d.syntax_id)
-                .collect::<Vec<_>>()
-        );
-    }
-}
-
-#[test]
-fn same_source_new_scip_label_reuses_native_and_reprojects_presentation_at_pinned_revisions() {
-    use protobuf::Message;
-    use sha2::{Digest, Sha256};
-    use std::sync::{Arc, atomic::AtomicBool};
-    use trellis::{
-        index_coordinator::IndexJobCoordinator,
-        indexer::IndexOptions,
-        model::{CancelFlag, IndexPin, SymbolKind},
-    };
-    let (state, workspace) = fixture();
-    let java = "class A {}\n";
-    fs::write(workspace.path().join("A.java"), java).unwrap();
-    let scip = state.path().join("labels.scip");
-    let manifest = state.path().join("labels.json");
-    fs::write(
-        &manifest,
-        serde_json::to_vec(&serde_json::json!({
-            "A.java":hex::encode(Sha256::digest(java.as_bytes()))
-        }))
-        .unwrap(),
+fn native_index_does_not_project_optional_scip_labels() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("a.js"), "function f() {}\n").unwrap();
+    let options = trellis::indexer::IndexOptions::new(root.path().to_owned());
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (before, _) =
+        trellis::indexer::index_workspace_with_capture(&options, &cancel, |_| {}).unwrap();
+    std::fs::write(
+        root.path().join("artifact.scip"),
+        b"old optional artifact ignored",
     )
     .unwrap();
-    let mut options = IndexOptions::new(workspace.path().to_owned());
-    options.scip_path = Some(scip.clone());
-    options.manifest_path = Some(manifest);
-    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
-    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
-    let job = IndexJobCoordinator::prepare(&store, None).unwrap();
-    let session = job.session();
-    let write_label = |label: &str, cutoff: bool| {
-        let mut index = scip::types::Index::new();
-        let mut document = scip::types::Document::new();
-        document.relative_path = "A.java".into();
-        document.position_encoding =
-            scip::types::PositionEncoding::UTF16CodeUnitOffsetFromLineStart.into();
-        let mut occurrence = scip::types::Occurrence::new();
-        occurrence.range = vec![0, 6, 7];
-        occurrence.symbol_roles = 1;
-        occurrence.symbol = format!("scip {label} A");
-        document.occurrences.push(occurrence);
-        index.documents.push(document);
-        if cutoff {
-            for ordinal in 0..1000 {
-                let mut extra = scip::types::Document::new();
-                extra.relative_path = format!("extra-{ordinal}.java");
-                index.documents.push(extra);
-            }
-        }
-        fs::write(&scip, index.write_to_bytes().unwrap()).unwrap();
-    };
-    let label = |pin: IndexPin| {
-        store
-            .graph_at(Some(pin))
-            .unwrap()
-            .nodes
-            .into_iter()
-            .find(|n| n.path == "A.java" && n.kind == SymbolKind::Class)
-            .unwrap()
-    };
-    let ids = |pin: IndexPin| {
-        let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
-        db.query_row(
-            "SELECT vid,gid,cid FROM revision_documents WHERE revision_id=?1 AND path='A.java'",
-            [format!(
-                "pin:v1:{}:{}",
-                pin.index_generation, pin.index_revision
-            )],
-            |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, i64>(2)?,
-                ))
-            },
-        )
-        .unwrap()
-    };
-    write_label("one", false);
-    let first = job.run(&options, &cancel, |_| {}).unwrap();
-    write_label("two", false);
-    let second = IndexJobCoordinator::prepare_with_session(&store, Some(first), session.clone())
-        .unwrap()
-        .run(&options, &cancel, |_| {})
-        .unwrap();
-    assert_eq!(label(first).display_label.as_deref(), Some("scip one A"));
-    assert_eq!(label(second).display_label.as_deref(), Some("scip two A"));
-    assert_eq!(label(first).id, label(second).id);
-    assert_eq!(label(first).provenance, label(second).provenance);
-    let (native_first, graph_first, class_first) = ids(first);
-    let (native_second, graph_second, class_second) = ids(second);
-    assert_eq!(
-        native_first, native_second,
-        "same captured source reuses native version"
-    );
-    assert_ne!(graph_first, graph_second, "label is graph presentation");
-    assert_ne!(
-        class_first, class_second,
-        "class projection follows graph label"
-    );
-    write_label("cutoff", true);
-    let third = IndexJobCoordinator::prepare_with_session(&store, Some(second), session.clone())
-        .unwrap()
-        .run(&options, &cancel, |_| {})
-        .unwrap();
-    assert_eq!(
-        label(third).display_label,
-        None,
-        "over-1000 SCIP docs refuse all labels"
-    );
-    assert_eq!(
-        ids(third).0,
-        native_first,
-        "presentation cutoff never alters native version"
-    );
-    assert_eq!(
-        label(second).display_label.as_deref(),
-        Some("scip two A"),
-        "old pin keeps label"
-    );
+    let (after, _) =
+        trellis::indexer::index_workspace_with_capture(&options, &cancel, |_| {}).unwrap();
+    assert_eq!(before.nodes, after.nodes);
+    assert!(after.nodes.iter().all(|node| node.display_label.is_none()));
 }
 
 #[cfg(feature = "test-support")]
-#[test]
-fn captured_scip_document_cutoff_refuses_optional_java_python_and_javascript_labels() {
-    use protobuf::Message;
-    use sha2::{Digest, Sha256};
-    use std::sync::{Arc, atomic::AtomicBool};
-    use trellis::{
-        classes::{Catalog, FileExtraction, Limits},
-        indexer::{IndexOptions, index_workspace_bundle},
-        model::{CancelFlag, Graph, SymbolKind},
-    };
-    let (state, workspace) = fixture();
-    let sources = [
-        ("A.java", "/*é*/ class A {}\n"),
-        ("a.py", "class P: pass\n"),
-        ("a.js", "class J {}\n"),
-        ("a.rs", "struct R {}\n"),
-    ];
-    for (path, text) in sources {
-        fs::write(workspace.path().join(path), text).unwrap();
-    }
-    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
-    let session = store.writer_session_for_tests().unwrap();
-    let scip = state.path().join("cutoff.scip");
-    let manifest = state.path().join("cutoff.json");
-    let mut options = IndexOptions::new(workspace.path().to_owned());
-    options.scip_path = Some(scip.clone());
-    options.manifest_path = Some(manifest.clone());
-    let hashes: serde_json::Map<String, serde_json::Value> = sources
-        .iter()
-        .map(|(path, text)| {
-            (
-                (*path).to_owned(),
-                serde_json::json!(hex::encode(Sha256::digest(text.as_bytes()))),
-            )
-        })
-        .collect();
-    fs::write(&manifest, serde_json::to_vec(&hashes).unwrap()).unwrap();
-    let mut index = scip::types::Index::new();
-    for (path, range, name) in [
-        ("A.java", vec![0, 12, 13], "A"),
-        ("a.py", vec![0, 6, 7], "P"),
-        ("a.js", vec![0, 6, 7], "J"),
-        ("a.rs", vec![0, 7, 8], "R"),
-    ] {
-        let mut doc = scip::types::Document::new();
-        doc.relative_path = path.into();
-        doc.position_encoding =
-            scip::types::PositionEncoding::UTF16CodeUnitOffsetFromLineStart.into();
-        let mut occurrence = scip::types::Occurrence::new();
-        occurrence.range = range;
-        occurrence.symbol_roles = 1;
-        occurrence.symbol = format!("scip cutoff {name}");
-        doc.occurrences.push(occurrence);
-        index.documents.push(doc);
-    }
-    for n in 0..996 {
-        let mut doc = scip::types::Document::new();
-        doc.relative_path = format!("absent{n:04}.java");
-        index.documents.push(doc);
-    }
-    assert_eq!(index.documents.len(), 1_000);
-    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
-    let run = |index: &scip::types::Index| {
-        let bytes = index.write_to_bytes().unwrap();
-        assert!(
-            bytes.len() < 128 * 1024,
-            "tiny captured SCIP fixture must stay bounded"
-        );
-        fs::write(&scip, bytes).unwrap();
-        index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap()
-    };
-    let (positive, positive_native, positive_capture) = run(&index);
-    fn node<'a>(graph: &'a Graph, path: &str, name: &str) -> &'a trellis::model::Symbol {
-        graph
-            .nodes
-            .iter()
-            .find(|n| n.path == path && n.name == name && n.kind == SymbolKind::Class)
-            .unwrap()
-    }
-    for (path, name) in [("A.java", "A"), ("a.py", "P"), ("a.js", "J")] {
-        assert_eq!(
-            node(&positive, path, name).display_label.as_deref(),
-            Some(format!("scip cutoff {name}").as_str())
-        );
-    }
-    assert!(
-        positive
-            .nodes
-            .iter()
-            .filter(|n| n.path == "a.rs")
-            .all(|n| n.display_label.is_none())
-    );
-    let extract = |graph: &Graph, capture: &trellis::capture::Capture| {
-        let files: Vec<_> = capture
-            .files
-            .iter()
-            .filter(|f| matches!(f.language.as_str(), "java" | "python"))
-            .map(|f| {
-                FileExtraction::extract_file(f, &graph.nodes, &cancel, Limits::default()).unwrap()
-            })
-            .collect();
-        let catalog = Catalog::compose(
-            &files,
-            capture.files.len(),
-            graph.nodes.len(),
-            Limits::default(),
-        )
-        .unwrap();
-        (files, catalog)
-    };
-    let (positive_f, positive_classes) = extract(&positive, &positive_capture);
-    for (path, name) in [("A.java", "A"), ("a.py", "P")] {
-        assert_eq!(
-            positive_classes
-                .classes
-                .iter()
-                .find(|c| c.symbol.path == path && c.symbol.name == name)
-                .unwrap()
-                .symbol
-                .display_label
-                .as_deref(),
-            Some(format!("scip cutoff {name}").as_str())
-        );
-    }
-    let first_pin = store
-        .publish_native(
-            &positive,
-            &positive_capture,
-            &positive_native,
-            session.writer_guard().unwrap(),
-            store.index_baseline().unwrap(),
-            &cancel,
-        )
-        .unwrap();
-    assert_eq!(first_pin.index_revision, 1);
-
-    let mut extra = scip::types::Document::new();
-    extra.relative_path = "absent0996.java".into();
-    index.documents.push(extra);
-    assert_eq!(index.documents.len(), 1_001);
-    let (cutoff, cutoff_native, cutoff_capture) = run(&index);
-    assert_eq!(positive_capture.files, cutoff_capture.files);
-    assert_eq!(
-        positive_capture.hashes.get("A.java"),
-        cutoff_capture.hashes.get("A.java")
-    );
-    assert_eq!(positive_native.producer, cutoff_native.producer);
-    assert_eq!(
-        positive_native
-            .declarations
-            .iter()
-            .map(|d| &d.syntax_id)
-            .collect::<Vec<_>>(),
-        cutoff_native
-            .declarations
-            .iter()
-            .map(|d| &d.syntax_id)
-            .collect::<Vec<_>>()
-    );
-    assert_eq!(
-        positive
-            .nodes
-            .iter()
-            .map(|n| (&n.id, &n.provenance))
-            .collect::<Vec<_>>(),
-        cutoff
-            .nodes
-            .iter()
-            .map(|n| (&n.id, &n.provenance))
-            .collect::<Vec<_>>()
-    );
-    for (path, name) in [("A.java", "A"), ("a.py", "P"), ("a.js", "J")] {
-        assert_eq!(
-            node(&cutoff, path, name).display_label,
-            None,
-            "global 1001-document cutoff: {path}"
-        );
-    }
-    assert!(
-        cutoff
-            .nodes
-            .iter()
-            .filter(|n| n.path == "a.rs")
-            .all(|n| n.display_label.is_none())
-    );
-    let mut without_labels = positive.nodes.clone();
-    for n in &mut without_labels {
-        n.display_label = None;
-    }
-    assert_eq!(
-        without_labels, cutoff.nodes,
-        "SCIP only changes optional graph presentation"
-    );
-    let (cutoff_f, cutoff_classes) = extract(&cutoff, &cutoff_capture);
-    assert_eq!(positive_f.len(), cutoff_f.len());
-    let mut unlabelled_f = positive_f.clone();
-    for f in &mut unlabelled_f {
-        for class in &mut f.classes {
-            class.symbol.display_label = None;
-        }
-    }
-    assert_eq!(
-        unlabelled_f, cutoff_f,
-        "F must retain native classes/relations without labels"
-    );
-    let mut unlabelled_classes = positive_classes.clone();
-    for class in &mut unlabelled_classes.classes {
-        class.symbol.display_label = None;
-    }
-    assert_eq!(
-        unlabelled_classes, cutoff_classes,
-        "composed classes must follow label cutoff only"
-    );
-    for (path, name) in [("A.java", "A"), ("a.py", "P")] {
-        assert_eq!(
-            cutoff_classes
-                .classes
-                .iter()
-                .find(|c| c.symbol.path == path && c.symbol.name == name)
-                .unwrap()
-                .symbol
-                .display_label,
-            None
-        );
-    }
-    let second_pin = store
-        .publish_native(
-            &cutoff,
-            &cutoff_capture,
-            &cutoff_native,
-            session.writer_guard().unwrap(),
-            first_pin,
-            &cancel,
-        )
-        .unwrap();
-    assert_eq!(second_pin.index_revision, 2);
-    let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
-    let current = format!(
-        "pin:v1:{}:{}",
-        second_pin.index_generation, second_pin.index_revision
-    );
-    for (path, name) in [("A.java", "A"), ("a.py", "P"), ("a.js", "J")] {
-        let expected = node(&cutoff, path, name);
-        let (name, kind): (String, String) = db.query_row(
-            "SELECT n.name,n.kind FROM graph_nodes n JOIN revision_documents m ON n.gid=m.gid WHERE m.revision_id=?1 AND m.path=?2 AND n.id=unhex(substr(?3,8))",
-            rusqlite::params![current,path,expected.id],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
-        assert_eq!(name, expected.name);
-        assert_eq!(
-            kind.as_str(),
-            serde_json::to_value(expected.kind)
-                .unwrap()
-                .as_str()
-                .unwrap()
-        );
-        assert!(expected.display_label.is_none());
-    }
-    for f in &cutoff_f {
-        let (state,payload):(String,String)=db.query_row(
-            "SELECT g.class_extraction_state,g.class_extraction_payload FROM graph_projections g JOIN revision_documents m ON m.gid=g.gid WHERE m.revision_id=?1 AND m.path=?2",
-            rusqlite::params![current,f.path],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
-        assert_eq!(state, "ready");
-        assert_eq!(
-            serde_json::from_str::<FileExtraction>(&payload).unwrap(),
-            *f
-        );
-    }
-    for (path, name) in [("A.java", "A"), ("a.py", "P")] {
-        let expected = cutoff_classes
-            .classes
-            .iter()
-            .find(|c| c.symbol.path == path && c.symbol.name == name)
-            .unwrap();
-        let payload:String=db.query_row(
-            "SELECT c.payload FROM classes c JOIN revision_documents m ON m.cid=c.cid WHERE m.revision_id=?1 AND m.path=?2 AND c.id=unhex(substr(?3,8))",
-            rusqlite::params![current,path,expected.symbol.id],|r|r.get(0)).unwrap();
-        assert_eq!(
-            serde_json::from_str::<trellis::classes::ClassDefinition>(&payload).unwrap(),
-            *expected
-        );
-        assert!(expected.symbol.display_label.is_none());
-    }
-}
-
 #[test]
 #[ignore = "pinned medium Cmedium0000 Java prefix insertion requires two cold indices; run explicitly"]
 fn canonical_medium_java_prefix_literal_local_matches_independent_cold_and_retains_old_pin() {

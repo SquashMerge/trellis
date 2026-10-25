@@ -290,6 +290,26 @@ fn direct_semantic_publication_reads_typed_rows_at_owning_pin() {
         )
         .unwrap();
     let snapshot = store.semantic_at(pin).unwrap();
+    let (retained, sources) = store.retained_native_snapshot_at(pin).unwrap();
+    assert_eq!(retained.revision, native.revision);
+    assert_eq!(retained.declarations.len(), native.declarations.len());
+    assert!(
+        native
+            .declarations
+            .iter()
+            .all(|d| retained.declarations.contains(d))
+    );
+    assert_eq!(retained.references.len(), native.references.len());
+    assert!(
+        native
+            .references
+            .iter()
+            .all(|r| retained.references.contains(r))
+    );
+    assert_eq!(
+        sources[&native.revision.documents[0].key],
+        fs::read(root.path().join("hello.rs")).unwrap()
+    );
     assert_eq!(snapshot.producers, semantic.producers);
     assert_eq!(snapshot.coverage, semantic.coverage);
     assert_eq!(snapshot.provenance, semantic.provenance);
@@ -2079,4 +2099,1081 @@ fn assert_corrupt_symbol_documents(table: &str, prefix: &str) {
         );
         assert!(store.recovery_pending_for_tests(), "{table} {corruption}");
     }
+}
+
+const WIRE: &str = "122e0a087372632f412e6a73220a6a617661736372697074120b0a0300090a1202412318011a090a0241232811320166";
+
+fn admitted_raw_fixture() -> (
+    tempfile::TempDir,
+    n::Artifact,
+    BTreeMap<n::DocumentKey, Vec<u8>>,
+    trellis::scip_admission::CapturedScipInventory,
+) {
+    let root = tempfile::tempdir().unwrap();
+    let physical = fs::canonicalize(root.path()).unwrap();
+    fs::create_dir(physical.join("src")).unwrap();
+    let text = "function f(){g();}\n";
+    fs::write(physical.join("src/A.js"), text).unwrap();
+    fs::write(physical.join("artifact.scip"), hex::decode(WIRE).unwrap()).unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let options = IndexOptions::new(physical.clone());
+    let first = trellis::capture::Capture::admit(&options, &cancel, &|_| {}).unwrap();
+    let identity =
+        trellis::store::topology::WorkspaceIdentity::discover(Some(&physical), &physical).unwrap();
+    let first_native = n::from_capture(&first, &physical, &identity.record_id, &cancel).unwrap();
+    let (set, rev) = (first_native.source_set, first_native.revision);
+    let file = &first.files[0];
+    let doc = json!({"language":"javascript","relativePath":"src/A.js","contentHash":file.hash});
+    let source_manifest_hash = native_ids::digest(
+        b"",
+        &native_ids::canonical(
+            &json!([{"document":{"sourceSetId":set.id,"language":"javascript","path":"src/A.js"},"contentHash":file.hash}]),
+        ),
+    );
+    let profile: serde_json::Value = serde_json::from_str(include_str!(
+        "../docs/semantic-evidence/hardware/mac-mini-m5-pro-v1.json"
+    ))
+    .unwrap();
+    let producer = profile["semanticProducers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "scip-typescript")
+        .unwrap();
+    let bytes = hex::decode(WIRE).unwrap();
+    let uri = format!("file://{}", physical.display());
+    let manifest = json!({"formatVersion":1,"trustOrigin":"referenceProfile","completion":"complete","decoderVersion":"scip-0.10.0/CapturedScipFactV1/1","profileId":profile["profileId"],
+        "producer":{"name":producer["name"],"version":producer["version"],"executableHash":producer["executableHash"],"positionEncoding":2},
+        "sourceSet":{"id":set.id,"rootId":set.root_id,"languages":set.languages,"dependencies":set.dependencies},
+        "sourceRevision":rev.id,"sourceManifestHash":source_manifest_hash,
+        "components":{"toolchainHash":rev.toolchain_hash,"configHash":rev.config_hash,"dependencyHash":rev.dependency_hash},
+        "metadata":{"protocolVersion":0,"projectRoot":uri,"textDocumentEncoding":1},
+        "sourceDocuments":[doc],"documents":[doc],"exclusions":[],
+        "artifacts":[{"kind":"scipBinary","path":"artifact.scip","hash":native_ids::digest(b"", &bytes),"language":"javascript","documents":["src/A.js"]}]});
+    let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+    fs::write(physical.join("manifest.json"), &manifest_bytes).unwrap();
+    let capture = trellis::capture::Capture::admit(&options, &cancel, &|_| {}).unwrap();
+    let selection = trellis::scip_admission::TrustedSelection {
+        expected_manifest_hash: native_ids::digest(b"", &manifest_bytes),
+        profile_id: "mac-mini-m5-pro-v1".into(),
+        producer_name: "scip-typescript".into(),
+    };
+    let admission = trellis::scip_admission::ReferenceProfileAdmission::from_trusted_selection(
+        &capture,
+        &physical.join("artifact.scip"),
+        &bytes,
+        &physical.join("manifest.json"),
+        &manifest_bytes,
+        &selection,
+        &cancel,
+    )
+    .unwrap();
+    let inventory = trellis::scip_admission::decode_reference_profile(&admission, &cancel).unwrap();
+    let native = n::from_capture(&capture, &physical, &identity.record_id, &cancel).unwrap();
+    let sources = capture
+        .files
+        .iter()
+        .map(|f| {
+            (
+                n::DocumentKey {
+                    source_set_id: native.revision.source_set_id.clone(),
+                    language: f.language.clone(),
+                    path: f.path.clone(),
+                },
+                f.text.as_bytes().to_vec(),
+            )
+        })
+        .collect();
+    (root, native, sources, inventory)
+}
+
+fn conflicting_plain_reference_fixture() -> (
+    tempfile::TempDir,
+    n::Artifact,
+    BTreeMap<n::DocumentKey, Vec<u8>>,
+    trellis::scip_admission::CapturedScipInventory,
+) {
+    let root = tempfile::tempdir().unwrap();
+    let physical = fs::canonicalize(root.path()).unwrap();
+    fs::create_dir(physical.join("src")).unwrap();
+    let text = "function f(){g();}\n";
+    fs::write(physical.join("src/A.js"), text).unwrap();
+    use protobuf::{EnumOrUnknown, Message};
+    let mut binary = scip::types::Index::new();
+    let mut document = scip::types::Document::new();
+    document.language = "javascript".into();
+    document.relative_path = "src/A.js".into();
+    document.position_encoding = EnumOrUnknown::from_i32(2);
+    for symbol in ["external pkg A#", "external pkg B#"] {
+        let mut occurrence = scip::types::Occurrence::new();
+        let position = text.find('g').unwrap() as i32;
+        occurrence.range = vec![0, position, position + 1];
+        occurrence.symbol = symbol.into();
+        occurrence.syntax_kind = EnumOrUnknown::from_i32(0);
+        document.occurrences.push(occurrence);
+    }
+    binary.documents.push(document);
+    let wire = binary.write_to_bytes().unwrap();
+    fs::write(physical.join("artifact.scip"), &wire).unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let options = IndexOptions::new(physical.clone());
+    let first = trellis::capture::Capture::admit(&options, &cancel, &|_| {}).unwrap();
+    let identity =
+        trellis::store::topology::WorkspaceIdentity::discover(Some(&physical), &physical).unwrap();
+    let first_native = n::from_capture(&first, &physical, &identity.record_id, &cancel).unwrap();
+    let (set, rev) = (first_native.source_set, first_native.revision);
+    let file = &first.files[0];
+    let doc = json!({"language":"javascript","relativePath":"src/A.js","contentHash":file.hash});
+    let source_manifest_hash = native_ids::digest(
+        b"",
+        &native_ids::canonical(
+            &json!([{"document":{"sourceSetId":set.id,"language":"javascript","path":"src/A.js"},"contentHash":file.hash}]),
+        ),
+    );
+    let profile: serde_json::Value = serde_json::from_str(include_str!(
+        "../docs/semantic-evidence/hardware/mac-mini-m5-pro-v1.json"
+    ))
+    .unwrap();
+    let producer = profile["semanticProducers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "scip-typescript")
+        .unwrap();
+    let bytes = wire;
+    let uri = format!("file://{}", physical.display());
+    let manifest = json!({"formatVersion":1,"trustOrigin":"referenceProfile","completion":"complete","decoderVersion":"scip-0.10.0/CapturedScipFactV1/1","profileId":profile["profileId"],
+        "producer":{"name":producer["name"],"version":producer["version"],"executableHash":producer["executableHash"],"positionEncoding":2},
+        "sourceSet":{"id":set.id,"rootId":set.root_id,"languages":set.languages,"dependencies":set.dependencies},
+        "sourceRevision":rev.id,"sourceManifestHash":source_manifest_hash,
+        "components":{"toolchainHash":rev.toolchain_hash,"configHash":rev.config_hash,"dependencyHash":rev.dependency_hash},
+        "metadata":{"protocolVersion":0,"projectRoot":uri,"textDocumentEncoding":1},
+        "sourceDocuments":[doc],"documents":[doc],"exclusions":[],
+        "artifacts":[{"kind":"scipBinary","path":"artifact.scip","hash":native_ids::digest(b"", &bytes),"language":"javascript","documents":["src/A.js"]}]});
+    let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+    fs::write(physical.join("manifest.json"), &manifest_bytes).unwrap();
+    let capture = trellis::capture::Capture::admit(&options, &cancel, &|_| {}).unwrap();
+    let selection = trellis::scip_admission::TrustedSelection {
+        expected_manifest_hash: native_ids::digest(b"", &manifest_bytes),
+        profile_id: "mac-mini-m5-pro-v1".into(),
+        producer_name: "scip-typescript".into(),
+    };
+    let admission = trellis::scip_admission::ReferenceProfileAdmission::from_trusted_selection(
+        &capture,
+        &physical.join("artifact.scip"),
+        &bytes,
+        &physical.join("manifest.json"),
+        &manifest_bytes,
+        &selection,
+        &cancel,
+    )
+    .unwrap();
+    let inventory = trellis::scip_admission::decode_reference_profile(&admission, &cancel).unwrap();
+    let native = n::from_capture(&capture, &physical, &identity.record_id, &cancel).unwrap();
+    let sources = capture
+        .files
+        .iter()
+        .map(|f| {
+            (
+                n::DocumentKey {
+                    source_set_id: native.revision.source_set_id.clone(),
+                    language: f.language.clone(),
+                    path: f.path.clone(),
+                },
+                f.text.as_bytes().to_vec(),
+            )
+        })
+        .collect();
+    (root, native, sources, inventory)
+}
+
+#[test]
+fn contradictory_plain_reference_proofs_survive_store_selected_roundtrip() {
+    let (root, _, _, inventory) = conflicting_plain_reference_fixture();
+    let state = tempfile::tempdir().unwrap();
+    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let physical = fs::canonicalize(root.path()).unwrap();
+    let options = IndexOptions::new(physical.clone());
+    let (graph, native, capture) =
+        index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+    let leader = store.publication_for_tests().unwrap();
+    let selected = store
+        .publish_native(
+            &graph,
+            &capture,
+            &native,
+            &leader,
+            store.index_baseline().unwrap(),
+            &cancel,
+        )
+        .unwrap();
+    let (r1, sources) = store.retained_native_snapshot_at(selected).unwrap();
+    let profile: serde_json::Value = serde_json::from_str(include_str!(
+        "../docs/semantic-evidence/hardware/mac-mini-m5-pro-v1.json"
+    ))
+    .unwrap();
+    let pinned = profile["semanticProducers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "scip-typescript")
+        .unwrap();
+    let producer = s::Producer {
+        id: pinned["name"].as_str().unwrap().into(),
+        version: pinned["version"].as_str().unwrap().into(),
+        executable_hash: pinned["executableHash"].as_str().unwrap().into(),
+        kind: s::SemanticKind::Semantic,
+        languages: vec![s::Language::Javascript],
+        position_encoding: s::PositionEncoding::Utf16,
+    };
+    let doc = &r1.revision.documents[0];
+    let basis = s::SemanticBasis {
+        producer_id: producer.id.clone(),
+        producer_version: producer.version.clone(),
+        producer_hash: producer.executable_hash.clone(),
+        artifact_hash: inventory.artifact_hash.clone(),
+        language: s::Language::Javascript,
+        source_set_id: doc.key.source_set_id.clone(),
+        revision_id: r1.revision.id.clone(),
+        source_manifest_hash: inventory.source_manifest_hash.clone(),
+        toolchain_hash: r1.revision.toolchain_hash.clone(),
+        config_hash: r1.revision.config_hash.clone(),
+        dependency_hash: r1.revision.dependency_hash.clone(),
+        lookup_dependencies: vec![],
+    };
+    let result = trellis::semantic_import::rejoin_inventory(
+        &inventory,
+        &r1,
+        &sources,
+        &r1,
+        &sources,
+        producer.clone(),
+        &BTreeMap::from([(doc.key.clone(), basis)]),
+        2,
+    )
+    .unwrap();
+    assert_eq!(result.report["documents"][0]["ambiguous"], 2);
+    assert_eq!(result.publication.references.len(), 1);
+    let (toolchain, mut config, dependency) =
+        native_components(&physical, &r1.producer.executable_hash, 2 * 1024 * 1024);
+    config.push(json!({"path":"src/.gitignore","type":"absent"}));
+    config.push(json!({"path":"src/.ignore","type":"absent"}));
+    let raw = trellis::store::SemanticRawCapture {
+        producer_id: producer.id.clone(),
+        source_set_id: doc.key.source_set_id.clone(),
+        captured_revision: r1.revision.id.clone(),
+        binary_bytes: fs::read(physical.join("artifact.scip")).unwrap(),
+        manifest_bytes: fs::read(physical.join("manifest.json")).unwrap(),
+        inventory: inventory.clone(),
+    };
+    let captured = s::CapturedComponents {
+        producer_executables: BTreeMap::new(),
+        artifacts: BTreeMap::from([(producer.id.clone(), raw.binary_bytes.clone())]),
+        sources: sources.clone(),
+        captured_revision: r1.revision.clone(),
+        native_toolchain: toolchain.clone(),
+        native_config: config.clone(),
+        native_dependencies: dependency.clone(),
+        requested_producers: vec![producer.clone()],
+        toolchain: native_ids::canonical(&toolchain),
+        config: native_ids::canonical(&json!(config)),
+        dependency: native_ids::canonical(&json!(dependency)),
+        native_extraction_components: BTreeMap::new(),
+    };
+    let docs = BTreeMap::from([(
+        (doc.key.language.clone(), doc.key.path.clone()),
+        doc.content_hash.clone(),
+    )]);
+    let next = store
+        .publish_semantic_import(
+            selected,
+            &docs,
+            &result.publication,
+            &captured,
+            &r1,
+            &raw,
+            &result.report,
+            &leader,
+            &cancel,
+        )
+        .unwrap();
+    let stored = store.semantic_at(next).unwrap();
+    let reference = stored
+        .references
+        .iter()
+        .find(|r| r.spelling == "g")
+        .unwrap();
+    assert_eq!(reference.resolution, s::Resolution::Ambiguous);
+    assert_eq!(reference.candidates.len(), 2);
+    assert_eq!(
+        store.semantic_import_report_at(next, &producer.id).unwrap(),
+        Some(result.report)
+    );
+    let selected_proofs: Vec<_> = stored
+        .provenance
+        .iter()
+        .filter(|p| {
+            p.producer_id == producer.id && p.evidence_kind == s::EvidenceKind::SemanticReference
+        })
+        .collect();
+    assert_eq!(selected_proofs.len(), 2);
+    for proof in selected_proofs {
+        let link = proof.derived_from.as_ref().unwrap();
+        let raw_claim = inventory
+            .lookup(&link.provenance_id, "occurrence", &link.fact_digest)
+            .unwrap();
+        let persisted = store
+            .semantic_raw_proof_at(
+                &producer.id,
+                &inventory.artifact_hash,
+                &doc.key.source_set_id,
+                &r1.revision.id,
+                &link.provenance_id,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.fact_digest, raw_claim.fact_digest);
+        assert_eq!(persisted.record_kind, "occurrence");
+        assert_eq!(persisted.canonical_bytes, raw_claim.canonical_bytes);
+        let measured =
+            trellis::semantic_import::occurrence_range(raw_claim, &sources[&doc.key], 2).unwrap();
+        assert_eq!(proof.document, reference.document);
+        assert_eq!(measured, reference.range);
+        let target = s::Target::External {
+            symbol: s::SymbolKey {
+                scheme: s::SymbolScheme::Scip,
+                symbol: raw_claim.envelope.raw["symbol"].as_str().unwrap().into(),
+                scope: s::SymbolScope::Global,
+                document: None,
+            },
+        };
+        assert!(reference.candidates.contains(&target));
+    }
+}
+
+#[test]
+fn raw_proof_import_cas_and_selected_read_are_atomic() {
+    let (root, _, _, inventory) = admitted_raw_fixture();
+    let state = tempfile::tempdir().unwrap();
+    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let options = IndexOptions::new(root.path().to_owned());
+    let (graph, native, capture) =
+        index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+    let leader = store.publication_for_tests().unwrap();
+    let document = &native.revision.documents[0];
+    let profile: serde_json::Value = serde_json::from_str(include_str!(
+        "../docs/semantic-evidence/hardware/mac-mini-m5-pro-v1.json"
+    ))
+    .unwrap();
+    let pinned = profile["semanticProducers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "scip-typescript")
+        .unwrap();
+    let producer = s::Producer {
+        id: pinned["name"].as_str().unwrap().into(),
+        version: pinned["version"].as_str().unwrap().into(),
+        executable_hash: pinned["executableHash"].as_str().unwrap().into(),
+        kind: s::SemanticKind::Semantic,
+        languages: vec![s::Language::Javascript],
+        position_encoding: s::PositionEncoding::Utf16,
+    };
+    let (toolchain, mut config, dependency) = native_components(
+        root.path(),
+        &native.producer.executable_hash,
+        2 * 1024 * 1024,
+    );
+    config.push(json!({"path":"src/.gitignore","type":"absent"}));
+    config.push(json!({"path":"src/.ignore","type":"absent"}));
+    let manifest_hash = native_ids::digest(
+        b"",
+        &native_ids::canonical(
+            &json!([{"document":document.key,"contentHash":document.content_hash}]),
+        ),
+    );
+    let basis = s::SemanticBasis {
+        producer_id: producer.id.clone(),
+        producer_version: producer.version.clone(),
+        producer_hash: producer.executable_hash.clone(),
+        artifact_hash: inventory.artifact_hash.clone(),
+        language: s::Language::Javascript,
+        source_set_id: document.key.source_set_id.clone(),
+        revision_id: native.revision.id.clone(),
+        source_manifest_hash: manifest_hash,
+        toolchain_hash: native.revision.toolchain_hash.clone(),
+        config_hash: native.revision.config_hash.clone(),
+        dependency_hash: native.revision.dependency_hash.clone(),
+        lookup_dependencies: vec![],
+    };
+    let claim = inventory
+        .claims
+        .iter()
+        .find(|c| c.envelope.record_kind == "occurrence")
+        .unwrap();
+    let raw = trellis::store::SemanticRawCapture {
+        producer_id: producer.id.clone(),
+        source_set_id: document.key.source_set_id.clone(),
+        captured_revision: native.revision.id.clone(),
+        binary_bytes: fs::read(root.path().join("artifact.scip")).unwrap(),
+        manifest_bytes: fs::read(root.path().join("manifest.json")).unwrap(),
+        inventory: inventory.clone(),
+    };
+    let derived = s::DerivedFrom {
+        provenance_id: claim.captured_proof_id.clone(),
+        record_kind: s::RecordKind::Occurrence,
+        fact_digest: claim.fact_digest.clone(),
+    };
+    let provenance = s::Provenance {
+        id: "r2-proof".into(),
+        producer_id: producer.id.clone(),
+        document: document.key.clone(),
+        revision_id: native.revision.id.clone(),
+        content_hash: document.content_hash.clone(),
+        evidence_kind: s::EvidenceKind::DeclarationBinding,
+        basis: Some(basis),
+        freshness: s::Freshness::Fresh,
+        derived_from: Some(derived),
+    };
+    let coverage = s::Coverage {
+        producer_id: producer.id.clone(),
+        language: s::Language::Javascript,
+        source_set_id: document.key.source_set_id.clone(),
+        document_path: document.key.path.clone(),
+        revision_id: native.revision.id.clone(),
+        requested: true,
+        selected: true,
+        state: s::CoverageState::Complete,
+        supported_roles: vec![s::Role::Definition],
+        observed_roles: vec![],
+        diagnostic: None,
+    };
+    let declaration = native
+        .declarations
+        .iter()
+        .find(|d| d.name.as_deref() == Some("f") && d.name_range.is_some())
+        .unwrap();
+    let join = s::Join {
+        anchor: s::MeasuredAnchor {
+            document: document.key.clone(),
+            revision_id: native.revision.id.clone(),
+            content_hash: document.content_hash.clone(),
+            range: declaration.name_range.clone().unwrap(),
+            kind: s::JoinKind::DeclarationName,
+        },
+        status: s::JoinStatus::Exact,
+        candidate_ids: vec![declaration.syntax_id.clone()],
+        diagnostic: None,
+    };
+    let symbol = s::SymbolKey {
+        scheme: s::SymbolScheme::Scip,
+        symbol: "pkg f".into(),
+        scope: s::SymbolScope::Global,
+        document: None,
+    };
+    let mut semantic = s::SemanticPublication {
+        producers: vec![producer.clone()],
+        coverage: vec![coverage],
+        provenance: vec![provenance],
+        symbols: vec![s::Symbol {
+            key: symbol.clone(),
+            display_name: Some("f".into()),
+            declarations: vec![s::Target::Internal {
+                syntax_id: declaration.syntax_id.clone(),
+                document: document.key.clone(),
+                revision_id: native.revision.id.clone(),
+            }],
+            provenance_id: "r2-proof".into(),
+        }],
+        declaration_bindings: vec![s::DeclarationBinding {
+            syntax_id: Some(declaration.syntax_id.clone()),
+            symbols: vec![symbol],
+            join,
+            provenance_id: "r2-proof".into(),
+        }],
+        references: vec![],
+        call_bindings: vec![],
+        type_relationships: vec![],
+    };
+    semantic.coverage[0].observed_roles = vec![s::Role::Definition];
+    assert_eq!(
+        native.revision.toolchain_hash,
+        native_ids::digest(b"", &native_ids::canonical(&toolchain)),
+        "toolchain"
+    );
+    assert_eq!(
+        native.revision.config_hash,
+        native_ids::digest(b"", &native_ids::canonical(&json!(config))),
+        "config"
+    );
+    assert_eq!(
+        native.revision.dependency_hash,
+        native_ids::digest(b"", &native_ids::canonical(&json!(dependency))),
+        "dependency"
+    );
+    let captured = s::CapturedComponents {
+        producer_executables: BTreeMap::new(),
+        artifacts: BTreeMap::from([(producer.id.clone(), raw.binary_bytes.clone())]),
+        sources: BTreeMap::from([(
+            document.key.clone(),
+            fs::read(root.path().join(&document.key.path)).unwrap(),
+        )]),
+        captured_revision: native.revision.clone(),
+        native_toolchain: toolchain.clone(),
+        native_config: config.clone(),
+        native_dependencies: dependency.clone(),
+        requested_producers: vec![producer],
+        toolchain: native_ids::canonical(&toolchain),
+        config: native_ids::canonical(&json!(config)),
+        dependency: native_ids::canonical(&json!(dependency)),
+        native_extraction_components: BTreeMap::new(),
+    };
+    let mut other = semantic.clone();
+    other.producers[0].id = "other.semantic".into();
+    other.producers[0].executable_hash = native_ids::digest(b"", b"exe");
+    other.coverage[0].producer_id = "other.semantic".into();
+    other.provenance[0].producer_id = "other.semantic".into();
+    other.provenance[0].derived_from = None;
+    other.provenance[0].basis.as_mut().unwrap().producer_id = "other.semantic".into();
+    other.provenance[0].basis.as_mut().unwrap().producer_hash =
+        other.producers[0].executable_hash.clone();
+    let mut other_captured = captured.clone();
+    other_captured.producer_executables =
+        BTreeMap::from([("other.semantic".into(), b"exe".to_vec())]);
+    other_captured.artifacts =
+        BTreeMap::from([("other.semantic".into(), raw.binary_bytes.clone())]);
+    other_captured.requested_producers = other.producers.clone();
+    let first = store
+        .publish_native_semantic(
+            &graph,
+            &capture,
+            &native,
+            &other,
+            &other_captured,
+            &leader,
+            store.index_baseline().unwrap(),
+            &cancel,
+        )
+        .unwrap();
+    assert_eq!(
+        store.semantic_at(first).unwrap().declaration_bindings,
+        other.declaration_bindings
+    );
+    let other_report = json!({"other":"retained"});
+    let identity =
+        trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+            .unwrap();
+    let db_path = state
+        .path()
+        .join("cache/indexes")
+        .join(identity.root_key)
+        .join("index.db");
+    let db = rusqlite::Connection::open(&db_path).unwrap();
+    db.execute("INSERT INTO semantic_import_reports(revision_id,producer_id,report_json) VALUES(?1,'other.semantic',?2)",rusqlite::params![format!("pin:v1:{}:{}",first.index_generation,first.index_revision),other_report.to_string()]).unwrap();
+    drop(db);
+    let docs = BTreeMap::from([(
+        (document.key.language.clone(), document.key.path.clone()),
+        document.content_hash.clone(),
+    )]);
+    let report = json!({"requested":1,"matched":1});
+    assert!(
+        s::validate_evidence_with_raw(&semantic, &native, &captured, Some(&raw)).is_err(),
+        "caller-owned raw inventory must not bypass executable bytes"
+    );
+    let mut synthetic_wrong_bytes = other_captured.clone();
+    synthetic_wrong_bytes
+        .producer_executables
+        .insert("other.semantic".into(), b"wrong".to_vec());
+    assert!(
+        s::validate_evidence(&other, &native, &synthetic_wrong_bytes).is_err(),
+        "ordinary synthetic publication keeps executable-byte authentication"
+    );
+    for mutation in ["version", "hash"] {
+        let mut wrong = semantic.clone();
+        if mutation == "version" {
+            wrong.producers[0].version = "unreviewed".into();
+        } else {
+            wrong.producers[0].executable_hash = native_ids::digest(b"", b"unreviewed");
+        }
+        assert!(
+            store
+                .publish_semantic_import(
+                    first, &docs, &wrong, &captured, &native, &raw, &report, &leader, &cancel
+                )
+                .is_err(),
+            "{mutation}"
+        );
+    }
+    let mut wrong_requested = captured.clone();
+    wrong_requested.requested_producers[0].version = "unreviewed".into();
+    assert!(
+        store
+            .publish_semantic_import(
+                first,
+                &docs,
+                &semantic,
+                &wrong_requested,
+                &native,
+                &raw,
+                &report,
+                &leader,
+                &cancel
+            )
+            .is_err()
+    );
+    for field in [
+        "futureTopLevel",
+        "futureProducer",
+        "futureDocument",
+        "futureArtifact",
+    ] {
+        let mut extra = raw.clone();
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&extra.manifest_bytes).unwrap();
+        match field {
+            "futureTopLevel" => manifest[field] = json!(true),
+            "futureProducer" => manifest["producer"][field] = json!(true),
+            "futureDocument" => manifest["sourceDocuments"][0][field] = json!(true),
+            "futureArtifact" => manifest["artifacts"][0][field] = json!(true),
+            _ => unreachable!(),
+        }
+        extra.manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        assert!(
+            store
+                .publish_semantic_import(
+                    first, &docs, &semantic, &captured, &native, &extra, &report, &leader, &cancel
+                )
+                .is_err(),
+            "{field}"
+        );
+    }
+    assert!(
+        raw.inventory.claims.len() >= 2,
+        "fixture must decode distinct raw proofs"
+    );
+    let mut missing_claim = raw.clone();
+    missing_claim.inventory.claims.remove(0);
+    assert!(
+        store
+            .publish_semantic_import(
+                first,
+                &docs,
+                &semantic,
+                &captured,
+                &native,
+                &missing_claim,
+                &report,
+                &leader,
+                &cancel
+            )
+            .is_err()
+    );
+    let mut forged = raw.clone();
+    let mut invented = claim.clone();
+    invented.envelope.raw = json!({"invented":"not in original binary"});
+    invented.canonical_bytes = native_ids::canonical(
+        &json!({"formatVersion":invented.envelope.format_version,"recordKind":invented.envelope.record_kind,"relativePath":invented.envelope.relative_path,"positionEncoding":invented.envelope.position_encoding,"raw":invented.envelope.raw}),
+    );
+    invented.fact_digest =
+        native_ids::digest(b"trellis.semantic-fact.v1\0", &invented.canonical_bytes);
+    invented.captured_proof_id = native_ids::digest(
+        b"trellis.capture-proof.v1\0",
+        &native_ids::canonical(
+            &json!({"producerId":raw.producer_id,"artifactHash":raw.inventory.artifact_hash,"sourceSetId":raw.source_set_id,"sourceRevision":raw.captured_revision,"language":invented.language,"relativePath":invented.envelope.relative_path,"factDigest":invented.fact_digest}),
+        ),
+    );
+    forged.inventory.claims.push(invented);
+    assert!(
+        store
+            .publish_semantic_import(
+                first, &docs, &semantic, &captured, &native, &forged, &report, &leader, &cancel
+            )
+            .is_err()
+    );
+    assert!(
+        store
+            .publish_semantic_import_with_fault_for_tests(
+                first, &docs, &semantic, &captured, &native, &raw, &report, &leader, &cancel, false
+            )
+            .is_err()
+    );
+    assert_eq!(store.status().unwrap().revision, first);
+    assert!(
+        store
+            .semantic_raw_proof_at(
+                &raw.producer_id,
+                &raw.inventory.artifact_hash,
+                &raw.source_set_id,
+                &raw.captured_revision,
+                &claim.captured_proof_id
+            )
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .semantic_import_report_at(first, "scip-typescript")
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store.semantic_at(first).unwrap().declaration_bindings,
+        other.declaration_bindings
+    );
+    assert!(
+        store
+            .publish_semantic_import_with_fault_for_tests(
+                first, &docs, &semantic, &captured, &native, &raw, &report, &leader, &cancel, true
+            )
+            .is_err()
+    );
+    assert_eq!(store.status().unwrap().revision, first);
+    assert!(
+        store
+            .semantic_raw_proof_at(
+                &raw.producer_id,
+                &raw.inventory.artifact_hash,
+                &raw.source_set_id,
+                &raw.captured_revision,
+                &claim.captured_proof_id
+            )
+            .unwrap()
+            .is_none()
+    );
+    cancel.store(false, std::sync::atomic::Ordering::Relaxed);
+    let selected_native = store.retained_native_snapshot_at(first).unwrap().0;
+    assert_eq!(selected_native.revision, native.revision);
+    assert_eq!(
+        selected_native.declarations.len(),
+        native.declarations.len()
+    );
+    assert_eq!(selected_native.calls, native.calls);
+    store.set_retention_clock_for_tests(1_001, 1);
+    let newer = store
+        .publish_semantic_import(
+            first, &docs, &semantic, &captured, &native, &raw, &report, &leader, &cancel,
+        )
+        .unwrap();
+    assert_eq!(store.semantic_at(newer).unwrap().provenance.len(), 2);
+    let (r1_native, r1_sources) = store.retained_native_snapshot_at(first).unwrap();
+    let (r2_native, r2_sources) = store.retained_native_snapshot_at(newer).unwrap();
+    let engine = trellis::semantic_import::rejoin_inventory(
+        &raw.inventory,
+        &r1_native,
+        &r1_sources,
+        &r2_native,
+        &r2_sources,
+        semantic.producers[0].clone(),
+        &BTreeMap::from([(
+            document.key.clone(),
+            semantic.provenance[0].basis.clone().unwrap(),
+        )]),
+        2,
+    )
+    .unwrap();
+    assert!(
+        !engine.publication.provenance.is_empty(),
+        "production rejoin must author stored facts"
+    );
+    assert!(
+        engine
+            .publication
+            .provenance
+            .iter()
+            .all(|p| p.derived_from.is_some())
+    );
+    assert!(
+        store
+            .semantic_at(newer)
+            .unwrap()
+            .provenance
+            .contains(&semantic.provenance[0])
+    );
+    assert_eq!(
+        store
+            .semantic_import_report_at(newer, "scip-typescript")
+            .unwrap(),
+        Some(report.clone())
+    );
+    assert_eq!(
+        store.semantic_at(first).unwrap().provenance,
+        other.provenance
+    );
+    assert_eq!(
+        store.semantic_at(newer).unwrap().declaration_bindings.len(),
+        2
+    );
+    assert_eq!(
+        store
+            .semantic_import_report_at(newer, "other.semantic")
+            .unwrap(),
+        Some(other_report.clone())
+    );
+    assert_eq!(
+        store.retained_native_snapshot_at(newer).unwrap().0,
+        selected_native
+    );
+    let stored = store
+        .semantic_raw_proof_at(
+            &raw.producer_id,
+            &raw.inventory.artifact_hash,
+            &raw.source_set_id,
+            &raw.captured_revision,
+            &claim.captured_proof_id,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.record_kind, claim.envelope.record_kind);
+    assert_eq!(stored.canonical_bytes, claim.canonical_bytes);
+    assert!(
+        store
+            .semantic_raw_proof_at(
+                &raw.producer_id,
+                &raw.inventory.artifact_hash,
+                &raw.source_set_id,
+                &raw.captured_revision,
+                "nonexistent"
+            )
+            .unwrap()
+            .is_none()
+    );
+    let mut fabricated_native = native.clone();
+    let altered = fabricated_native
+        .declarations
+        .iter_mut()
+        .find(|d| d.syntax_id == declaration.syntax_id)
+        .unwrap();
+    altered.name_range = None;
+    let fabricated_error = store
+        .publish_semantic_import(
+            newer,
+            &docs,
+            &semantic,
+            &captured,
+            &fabricated_native,
+            &raw,
+            &report,
+            &leader,
+            &cancel,
+        )
+        .unwrap_err();
+    assert!(
+        fabricated_error
+            .to_string()
+            .contains("measured native snapshot differs"),
+        "{fabricated_error:#}"
+    );
+    assert!(
+        store
+            .publish_semantic_import(
+                first,
+                &docs,
+                &semantic,
+                &captured,
+                &native,
+                &raw,
+                &json!({}),
+                &leader,
+                &cancel
+            )
+            .is_err()
+    );
+    let mut wrong = semantic.clone();
+    wrong.provenance[0]
+        .derived_from
+        .as_mut()
+        .unwrap()
+        .fact_digest = "0".repeat(64);
+    assert!(
+        store
+            .publish_semantic_import(
+                newer,
+                &docs,
+                &wrong,
+                &captured,
+                &native,
+                &raw,
+                &json!({}),
+                &leader,
+                &cancel
+            )
+            .is_err()
+    );
+    for mutation in ["id", "kind"] {
+        let mut invalid = semantic.clone();
+        let derived = invalid.provenance[0].derived_from.as_mut().unwrap();
+        if mutation == "id" {
+            derived.provenance_id = "missing-proof".into();
+        } else {
+            derived.record_kind = s::RecordKind::Relationship;
+        }
+        assert!(
+            store
+                .publish_semantic_import(
+                    newer,
+                    &docs,
+                    &invalid,
+                    &captured,
+                    &native,
+                    &raw,
+                    &json!({}),
+                    &leader,
+                    &cancel
+                )
+                .is_err(),
+            "{mutation}"
+        );
+    }
+    let wrong_docs = BTreeMap::from([(
+        (document.key.language.clone(), document.key.path.clone()),
+        "0".repeat(64),
+    )]);
+    assert!(
+        store
+            .publish_semantic_import(
+                newer,
+                &wrong_docs,
+                &semantic,
+                &captured,
+                &native,
+                &raw,
+                &json!({}),
+                &leader,
+                &cancel
+            )
+            .is_err()
+    );
+    assert_eq!(store.status().unwrap().revision, newer);
+    let replacement_report = json!({"requested":1,"matched":1,"replacement":true});
+    let replaced = store
+        .publish_semantic_import(
+            newer,
+            &docs,
+            &semantic,
+            &captured,
+            &native,
+            &raw,
+            &replacement_report,
+            &leader,
+            &cancel,
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .semantic_at(replaced)
+            .unwrap()
+            .declaration_bindings
+            .len(),
+        2
+    );
+    assert_eq!(
+        store
+            .semantic_import_report_at(replaced, "scip-typescript")
+            .unwrap(),
+        Some(replacement_report)
+    );
+    assert_eq!(
+        store
+            .semantic_import_report_at(replaced, "other.semantic")
+            .unwrap(),
+        Some(other_report)
+    );
+    assert_eq!(
+        store.retained_native_snapshot_at(replaced).unwrap().0,
+        selected_native
+    );
+    let rejoined = store
+        .publish_semantic_import(
+            replaced,
+            &docs,
+            &engine.publication,
+            &captured,
+            &r2_native,
+            &raw,
+            &engine.report,
+            &leader,
+            &cancel,
+        )
+        .unwrap();
+    let selected_rejoin = store.semantic_at(rejoined).unwrap();
+    assert!(!selected_rejoin.provenance.is_empty());
+    for proof in selected_rejoin
+        .provenance
+        .iter()
+        .filter(|p| p.producer_id == raw.producer_id)
+    {
+        let derived = proof.derived_from.as_ref().unwrap();
+        let stored = store
+            .semantic_raw_proof_at(
+                &raw.producer_id,
+                &raw.inventory.artifact_hash,
+                &raw.source_set_id,
+                &raw.captured_revision,
+                &derived.provenance_id,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.fact_digest, derived.fact_digest);
+    }
+    store.set_retention_clock_for_tests(1_901, 901);
+    store.release_revision(first, &leader).unwrap();
+    assert!(
+        store
+            .semantic_raw_proof_at(
+                &raw.producer_id,
+                &raw.inventory.artifact_hash,
+                &raw.source_set_id,
+                &raw.captured_revision,
+                &claim.captured_proof_id
+            )
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        store
+            .semantic_at(rejoined)
+            .unwrap()
+            .declaration_bindings
+            .len(),
+        other.declaration_bindings.len() + engine.publication.declaration_bindings.len()
+    );
+    let identity =
+        trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+            .unwrap();
+    let db = rusqlite::Connection::open(
+        state
+            .path()
+            .join("cache/indexes")
+            .join(identity.root_key)
+            .join("index.db"),
+    )
+    .unwrap();
+    db.execute(
+        "UPDATE semantic_raw_proofs SET record_kind='relationship' WHERE proof_id=?1",
+        [&claim.captured_proof_id],
+    )
+    .unwrap();
+    drop(db);
+    let direct = store
+        .semantic_raw_proof_at(
+            &raw.producer_id,
+            &raw.inventory.artifact_hash,
+            &raw.source_set_id,
+            &raw.captured_revision,
+            &claim.captured_proof_id,
+        )
+        .unwrap_err();
+    assert!(
+        direct
+            .to_string()
+            .contains("incompatible_index: corrupt raw proof inventory"),
+        "{direct:#}"
+    );
+    assert!(store.recovery_pending_for_tests());
+    assert!(
+        store.semantic_at(newer).is_err(),
+        "corrupt selected read must not return a partial tree"
+    );
 }

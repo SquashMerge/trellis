@@ -203,214 +203,15 @@ fn graph_ids_and_ranges_are_exact_native_artifact_projection() {
 }
 
 #[test]
-fn scip_label_requires_exact_captured_hash_and_name_token_and_never_supplies_identity() {
-    use protobuf::Message;
-    use sha2::{Digest, Sha256};
-    let d = tempfile::tempdir().unwrap();
-    let source = "function f() {}\nf();\n";
-    write(d.path(), "main.js", source);
-    let mut index = scip::types::Index::new();
-    let mut document = scip::types::Document::new();
-    document.relative_path = "main.js".into();
-    document.position_encoding =
-        scip::types::PositionEncoding::UTF16CodeUnitOffsetFromLineStart.into();
-    let mut occurrence = scip::types::Occurrence::new();
-    occurrence.range = vec![0, 9, 10];
-    occurrence.symbol_roles = 1; // exact declaration-name token, not a call target
-    occurrence.symbol = "scip npm display 1 main.js/f().".into();
-    document.occurrences.push(occurrence);
-    index.documents.push(document);
-    fs::write(d.path().join("index.scip"), index.write_to_bytes().unwrap()).unwrap();
-    let source_hash = hex::encode(Sha256::digest(source.as_bytes()));
-    fs::write(
-        d.path().join("manifest.json"),
-        serde_json::to_vec(&serde_json::json!({"main.js":source_hash})).unwrap(),
-    )
-    .unwrap();
-    let base = run(&IndexOptions::new(d.path().to_owned()));
-    let mut options = IndexOptions::new(d.path().to_owned());
-    options.scip_path = Some(d.path().join("index.scip"));
-    options.manifest_path = Some(d.path().join("manifest.json"));
-    let with_label = run(&options);
-    let declaration = with_label.nodes.iter().find(|n| n.name == "f").unwrap();
-    assert_eq!(
-        declaration.display_label.as_deref(),
-        Some("scip npm display 1 main.js/f().")
-    );
-    assert_eq!(
-        base.nodes.iter().map(|n| &n.id).collect::<Vec<_>>(),
-        with_label.nodes.iter().map(|n| &n.id).collect::<Vec<_>>()
-    );
-    assert_eq!(base.calls, with_label.calls);
-    assert_eq!(declaration.provenance.semantic, SemanticState::Unavailable);
-    write(d.path(), "manifest.json", "{\"main.js\":\"stale\"}");
-    assert!(
-        run(&options)
-            .nodes
-            .iter()
-            .all(|n| n.display_label.is_none())
-    );
-    fs::write(
-        d.path().join("manifest.json"),
-        serde_json::to_vec(&serde_json::json!({"main.js":source_hash})).unwrap(),
-    )
-    .unwrap();
-    index.documents[0].occurrences[0].range = vec![1, 0, 1]; // call site, not definition
-    fs::write(d.path().join("index.scip"), index.write_to_bytes().unwrap()).unwrap();
-    assert!(
-        run(&options)
-            .nodes
-            .iter()
-            .all(|n| n.display_label.is_none())
-    );
-    index.documents[0].occurrences[0].range = vec![0, 9, 10];
-    index.documents[0].occurrences[0].symbol = "scip npm display 1 other().".into();
-    fs::write(d.path().join("index.scip"), index.write_to_bytes().unwrap()).unwrap();
-    assert!(
-        run(&options)
-            .nodes
-            .iter()
-            .all(|n| n.display_label.is_none())
-    );
-}
-
-#[test]
-fn scip_display_rejects_unspecified_and_unknown_encoding() {
-    use protobuf::Message;
-    use sha2::{Digest, Sha256};
-    let d = tempfile::tempdir().unwrap();
-    let source = "function f() {}\n";
-    write(d.path(), "main.js", source);
-    let hash = hex::encode(Sha256::digest(source.as_bytes()));
-    fs::write(
-        d.path().join("manifest.json"),
-        serde_json::to_vec(&serde_json::json!({"main.js": hash})).unwrap(),
-    )
-    .unwrap();
-    let mut options = IndexOptions::new(d.path().to_owned());
-    options.scip_path = Some(d.path().join("index.scip"));
-    options.manifest_path = Some(d.path().join("manifest.json"));
-    let baseline = run(&IndexOptions::new(d.path().to_owned()));
-    let mut index = scip::types::Index::new();
-    let mut doc = scip::types::Document::new();
-    doc.relative_path = "main.js".into();
-    let mut occ = scip::types::Occurrence::new();
-    occ.range = vec![0, 9, 10];
-    occ.symbol_roles = 1;
-    occ.symbol = "scip display f()".into();
-    doc.occurrences.push(occ);
-    index.documents.push(doc);
-    for encoding in [0, 77, 2] {
-        index.documents[0].position_encoding = protobuf::EnumOrUnknown::from_i32(encoding);
-        fs::write(d.path().join("index.scip"), index.write_to_bytes().unwrap()).unwrap();
-        let graph = run(&options);
-        let label = graph
-            .nodes
-            .iter()
-            .find(|n| n.name == "f")
-            .unwrap()
-            .display_label
-            .as_deref();
-        assert_eq!(
-            label,
-            if encoding == 2 {
-                Some("scip display f()")
-            } else {
-                None
-            },
-            "encoding {encoding}"
-        );
-        assert_eq!(
-            graph.nodes.iter().map(|n| &n.id).collect::<Vec<_>>(),
-            baseline.nodes.iter().map(|n| &n.id).collect::<Vec<_>>()
-        );
-    }
-}
-
-#[test]
-fn scip_display_typed_ranges_and_duplicate_paths_are_optional_only() {
-    use protobuf::Message;
-    use sha2::{Digest, Sha256};
-    let d = tempfile::tempdir().unwrap();
-    let source = "function f() {}\n";
-    write(d.path(), "main.js", source);
-    let hash = hex::encode(Sha256::digest(source.as_bytes()));
-    fs::write(
-        d.path().join("manifest.json"),
-        serde_json::to_vec(&serde_json::json!({"main.js": hash})).unwrap(),
-    )
-    .unwrap();
-    let mut options = IndexOptions::new(d.path().to_owned());
-    options.scip_path = Some(d.path().join("index.scip"));
-    options.manifest_path = Some(d.path().join("manifest.json"));
-    let baseline = run(&IndexOptions::new(d.path().to_owned()));
-    let mut index = scip::types::Index::new();
-    let mut doc = scip::types::Document::new();
-    doc.relative_path = "main.js".into();
-    doc.position_encoding = scip::types::PositionEncoding::UTF16CodeUnitOffsetFromLineStart.into();
-    let mut occ = scip::types::Occurrence::new();
-    occ.symbol_roles = 1;
-    occ.symbol = "scip display f()".into();
-    doc.occurrences.push(occ);
-    index.documents.push(doc);
-    for variant in 0..5 {
-        let occ = &mut index.documents[0].occurrences[0];
-        occ.range.clear();
-        occ.typed_range = None;
-        match variant {
-            0 => occ.range = vec![0, 9, 10],
-            1 => occ.range = vec![0, 9, 0, 10],
-            2 | 4 => {
-                let mut r = scip::types::SingleLineRange::new();
-                r.line = 0;
-                r.start_character = 9;
-                r.end_character = 10;
-                occ.set_single_line_range(r);
-                if variant == 4 {
-                    occ.range = vec![0, 9, 10];
-                }
-            }
-            _ => {
-                let mut r = scip::types::MultiLineRange::new();
-                r.start_line = 0;
-                r.start_character = 9;
-                r.end_line = 0;
-                r.end_character = 10;
-                occ.set_multi_line_range(r);
-            }
-        }
-        fs::write(d.path().join("index.scip"), index.write_to_bytes().unwrap()).unwrap();
-        let graph = run(&options);
-        assert_eq!(
-            graph
-                .nodes
-                .iter()
-                .find(|n| n.name == "f")
-                .unwrap()
-                .display_label
-                .as_deref(),
-            if variant == 4 {
-                None
-            } else {
-                Some("scip display f()")
-            },
-            "variant {variant}"
-        );
-    }
-    index.documents[0].occurrences[0].typed_range = None;
-    index.documents[0].occurrences[0].range = vec![0, 9, 10];
-    let mut duplicate = scip::types::Document::new();
-    duplicate.relative_path = "main.js".into();
-    duplicate.language = "java".into();
-    index.documents.push(duplicate);
-    fs::write(d.path().join("index.scip"), index.write_to_bytes().unwrap()).unwrap();
-    let graph = run(&options);
-    assert!(graph.nodes.iter().all(|n| n.display_label.is_none()));
-    assert_eq!(
-        graph.nodes.iter().map(|n| &n.id).collect::<Vec<_>>(),
-        baseline.nodes.iter().map(|n| &n.id).collect::<Vec<_>>()
-    );
-    assert_eq!(graph.calls, baseline.calls);
+fn native_index_does_not_read_optional_label_files() {
+    let root = tempfile::tempdir().unwrap();
+    write(root.path(), "main.js", "function f() {}\n");
+    let before = run(&IndexOptions::new(root.path().to_owned()));
+    fs::write(root.path().join("artifact.scip"), b"not a scip binary").unwrap();
+    fs::write(root.path().join("manifest.json"), b"not a manifest").unwrap();
+    let after = run(&IndexOptions::new(root.path().to_owned()));
+    assert_eq!(before.nodes, after.nodes);
+    assert!(after.nodes.iter().all(|node| node.display_label.is_none()));
 }
 
 #[test]
@@ -637,9 +438,7 @@ fn untrusted_display_metadata_never_promotes_graph_edges_or_ids() {
     let base = run(&IndexOptions::new(d.path().to_owned()));
     write(d.path(), "metadata.scip", "not a valid scip artifact");
     write(d.path(), "metadata.hashes", "{\"main.js\":\"forged\"}");
-    let mut options = IndexOptions::new(d.path().to_owned());
-    options.scip_path = Some(d.path().join("metadata.scip"));
-    options.manifest_path = Some(d.path().join("metadata.hashes"));
+    let options = IndexOptions::new(d.path().to_owned());
     let with_metadata = run(&options);
     assert_eq!(base.nodes, with_metadata.nodes);
     assert_eq!(base.calls, with_metadata.calls);
@@ -697,13 +496,13 @@ fn direct_symlink_artifacts_and_config_are_never_read() {
     let p = d.path();
     write(p, "main.js", "f();");
     write(p, "index.scip", "captured optional metadata");
-    let mut o = IndexOptions::new(p.to_owned());
+    let o = IndexOptions::new(p.to_owned());
     std::os::unix::fs::symlink(p.join("main.js"), p.join("package.json")).unwrap();
     assert!(index_workspace(&o, &cancel(), |_| {}).is_err());
     fs::remove_file(p.join("package.json")).unwrap();
+    let before = run(&o);
     std::os::unix::fs::symlink(p.join("index.scip"), p.join("linked.scip")).unwrap();
-    o.scip_path = Some(p.join("linked.scip"));
-    assert!(index_workspace(&o, &cancel(), |_| {}).is_err());
+    assert_eq!(run(&o), before);
 }
 
 #[test]
@@ -881,34 +680,7 @@ fn capture_rejects_absent_present_and_cancellation_but_accepts_empty_root() {
 }
 
 #[test]
-fn identity_aliases_and_nonregular_sources_fail_admission() {
-    for (alias, field) in [
-        ("lexical", "scip"),
-        ("hardlink", "scip"),
-        ("lexical", "manifest"),
-        ("hardlink", "manifest"),
-    ] {
-        let d = tempfile::tempdir().unwrap();
-        write(d.path(), "main.js", "f();");
-        let path = if alias == "lexical" {
-            d.path().join("./main.js")
-        } else {
-            let alias = d.path().join("display.scip");
-            fs::hard_link(d.path().join("main.js"), &alias).unwrap();
-            alias
-        };
-        let mut options = IndexOptions::new(d.path().to_owned());
-        if field == "scip" {
-            options.scip_path = Some(path);
-        } else {
-            options.manifest_path = Some(path);
-        }
-        let error = index_workspace(&options, &cancel(), |_| {}).unwrap_err();
-        assert!(
-            error.to_string().contains("aliases source"),
-            "{alias}/{field}: {error:#}"
-        );
-    }
+fn nonregular_sources_fail_admission() {
     let d = tempfile::tempdir().unwrap();
     let fifo = d.path().join("blocked.js");
     use std::os::unix::ffi::OsStrExt;
@@ -945,26 +717,14 @@ fn stable_capture_counts_one_open_read_hash_per_source_and_verifies_unchanged() 
 
 #[test]
 fn declared_inputs_and_root_refuse_cutoff_drift() {
-    for scenario in [
-        "root",
-        "root-replaced",
-        "toolchain",
-        "config",
-        "ignore",
-        "display",
-        "manifest",
-    ] {
+    for scenario in ["root", "root-replaced", "toolchain", "config", "ignore"] {
         let d = tempfile::tempdir().unwrap();
         let root = d.path();
         write(root, "main.js", "f();");
         write(root, "rust-toolchain", "stable\n");
         write(root, "package.json", "{}\n");
         write(root, ".ignore", "*.tmp\n");
-        write(root, "display.scip", "invalid-scip");
-        write(root, "display.hashes", "{}\n");
-        let mut options = IndexOptions::new(root.to_owned());
-        options.scip_path = Some(root.join("display.scip"));
-        options.manifest_path = Some(root.join("display.hashes"));
+        let options = IndexOptions::new(root.to_owned());
         let moved = root.with_extension("moved");
         let error = index_workspace(&options, &cancel(), |progress| {
             if progress.phase != "parse" {
@@ -979,8 +739,6 @@ fn declared_inputs_and_root_refuse_cutoff_drift() {
                 "toolchain" => write(root, "rust-toolchain", "nightly\n"),
                 "config" => write(root, "package.json", "[]\n"),
                 "ignore" => write(root, ".ignore", "*.log\n"),
-                "display" => write(root, "display.scip", "changed-scip"),
-                "manifest" => write(root, "display.hashes", "[]\n"),
                 _ => unreachable!(),
             }
         })
@@ -994,30 +752,6 @@ fn declared_inputs_and_root_refuse_cutoff_drift() {
         }
         assert!(error.to_string().contains("drift"), "{scenario}: {error:#}");
     }
-}
-
-#[test]
-fn hard_linked_nonsource_inputs_share_immutable_bytes() {
-    use trellis::capture::Capture;
-    let d = tempfile::tempdir().unwrap();
-    let root = fs::canonicalize(d.path()).unwrap();
-    let root = root.as_path();
-    write(root, "main.js", "f();");
-    write(root, "package.json", "{}\n");
-    fs::hard_link(root.join("package.json"), root.join("display.scip")).unwrap();
-    let mut options = IndexOptions::new(root.to_owned());
-    options.scip_path = Some(root.join("display.scip"));
-    let flag = cancel();
-    let capture = Capture::admit(&options, &flag, &|_| {}).unwrap();
-    assert_eq!(
-        capture.bytes(&root.join("package.json")),
-        Some(b"{}\n".as_slice())
-    );
-    assert_eq!(
-        capture.bytes(&root.join("display.scip")),
-        capture.bytes(&root.join("package.json"))
-    );
-    capture.verify(&flag).unwrap();
 }
 
 #[test]
@@ -1527,127 +1261,6 @@ fn captured_classifier_falls_back_on_each_unproved_surface_effect() {
 }
 
 #[test]
-fn measured_scip_label_and_cutoff_change_projection_but_not_native_fingerprint() {
-    use protobuf::Message;
-    use sha2::{Digest, Sha256};
-    use trellis::{
-        indexer::{index_workspace_bundle, measure_document_fingerprint},
-        store::topology::WorkspaceIdentity,
-    };
-    for (language, path, source) in [
-        ("javascript", "main.js", "function f(){ return 1; }\n"),
-        ("java", "Main.java", "class Main { int f(){ return 1; } }\n"),
-        ("python", "main.py", "def f():\n    return 1\n"),
-        ("rust", "main.rs", "fn f(){ 1; }\n"),
-    ] {
-        let d = tempfile::tempdir().unwrap();
-        write(d.path(), path, source);
-        let mut options = IndexOptions::new(d.path().to_owned());
-        let source_hash = hex::encode(Sha256::digest(source.as_bytes()));
-        let manifest = serde_json::json!({path:source_hash});
-        fs::write(
-            d.path().join("manifest.json"),
-            serde_json::to_vec(&manifest).unwrap(),
-        )
-        .unwrap();
-        let mut index = scip::types::Index::new();
-        let mut document = scip::types::Document::new();
-        document.relative_path = path.into();
-        document.position_encoding =
-            scip::types::PositionEncoding::UTF16CodeUnitOffsetFromLineStart.into();
-        let mut occurrence = scip::types::Occurrence::new();
-        let column = source.find("f(").unwrap();
-        assert!(column < 30);
-        occurrence.range = vec![0, column as i32, column as i32 + 1];
-        occurrence.symbol_roles = 1;
-        occurrence.symbol = "scip display f() version one".into();
-        document.occurrences.push(occurrence);
-        index.documents.push(document);
-        options.scip_path = Some(d.path().join("index.scip"));
-        options.manifest_path = Some(d.path().join("manifest.json"));
-        let root_id = WorkspaceIdentity::discover(Some(d.path()), d.path())
-            .unwrap()
-            .record_id;
-        fs::write(d.path().join("index.scip"), index.write_to_bytes().unwrap()).unwrap();
-        let (first_graph, first_native, first_capture) =
-            index_workspace_bundle(&options, &root_id, &cancel(), |_| {}).unwrap();
-        let first = measure_document_fingerprint(
-            &first_capture,
-            &first_native,
-            &first_graph,
-            path,
-            &options,
-        )
-        .unwrap();
-        index.documents[0].occurrences[0].symbol = "scip display f() version two".into();
-        fs::write(d.path().join("index.scip"), index.write_to_bytes().unwrap()).unwrap();
-        let (second_graph, second_native, second_capture) =
-            index_workspace_bundle(&options, &root_id, &cancel(), |_| {}).unwrap();
-        let second = measure_document_fingerprint(
-            &second_capture,
-            &second_native,
-            &second_graph,
-            path,
-            &options,
-        )
-        .unwrap();
-        assert!(first.reusable_native(&second), "{language}");
-        assert_eq!(
-            first_native
-                .declarations
-                .iter()
-                .map(|d| &d.syntax_id)
-                .collect::<Vec<_>>(),
-            second_native
-                .declarations
-                .iter()
-                .map(|d| &d.syntax_id)
-                .collect::<Vec<_>>(),
-            "{language}"
-        );
-        if language == "rust" {
-            assert!(first.reusable_projection(&second));
-            assert!(second_graph.nodes.iter().all(|n| n.display_label.is_none()));
-        } else {
-            assert!(!first.reusable_projection(&second), "{language}");
-            assert!(
-                second_graph.nodes.iter().any(|n| n.name == "f"
-                    && n.display_label.as_deref() == Some("scip display f() version two")),
-                "{language}"
-            );
-        }
-        if language != "javascript" {
-            continue;
-        }
-        // Exactly 1,000 documents is admitted; 1,001 drops all optional labels.
-        for n in 1..1_000 {
-            let mut ghost = scip::types::Document::new();
-            ghost.relative_path = format!("absent-{n}.js");
-            index.documents.push(ghost);
-        }
-        fs::write(d.path().join("index.scip"), index.write_to_bytes().unwrap()).unwrap();
-        let (at_graph, at_native, at_capture) =
-            index_workspace_bundle(&options, &root_id, &cancel(), |_| {}).unwrap();
-        let at = measure_document_fingerprint(&at_capture, &at_native, &at_graph, path, &options)
-            .unwrap();
-        assert!(second.reusable_projection(&at));
-        assert_eq!(index.documents.len(), 1_000);
-        let mut ghost = scip::types::Document::new();
-        ghost.relative_path = "absent-1000.js".into();
-        index.documents.push(ghost);
-        fs::write(d.path().join("index.scip"), index.write_to_bytes().unwrap()).unwrap();
-        let (over_graph, over_native, over_capture) =
-            index_workspace_bundle(&options, &root_id, &cancel(), |_| {}).unwrap();
-        let over =
-            measure_document_fingerprint(&over_capture, &over_native, &over_graph, path, &options)
-                .unwrap();
-        assert!(at.reusable_native(&over));
-        assert!(!at.reusable_projection(&over));
-        assert!(over_graph.nodes.iter().all(|n| n.display_label.is_none()));
-    }
-}
-
-#[test]
 fn full_reuse_fingerprint_authenticates_bytes_admission_producer_coverage_owner_and_projection() {
     use trellis::{
         indexer::{index_workspace_bundle, measure_document_fingerprint},
@@ -1714,134 +1327,6 @@ fn full_reuse_fingerprint_authenticates_bytes_admission_producer_coverage_owner_
 }
 
 #[test]
-fn captured_optional_labels_are_projection_only_but_admission_or_toolchain_changes_fallback() {
-    use trellis::{
-        capture::Capture,
-        indexer::{CapturedChange, measure_captured_change},
-    };
-    let d = tempfile::tempdir().unwrap();
-    write(d.path(), "main.js", "function f(){ return 10; }\n");
-    let mut options = IndexOptions::new(d.path().to_owned());
-    options.scip_path = Some(d.path().join("absent.scip"));
-    options.manifest_path = Some(d.path().join("absent.json"));
-    let old = Capture::admit(&options, &cancel(), &|_| {}).unwrap();
-    fs::write(
-        d.path().join("absent.scip"),
-        b"invalid optional presentation",
-    )
-    .unwrap();
-    let optional = Capture::admit(&options, &cancel(), &|_| {}).unwrap();
-    assert_eq!(
-        measure_captured_change(&old, &optional),
-        CapturedChange::Unchanged
-    );
-    write(d.path(), "Cargo.toml", "[package]\nname='different'\n");
-    let config = Capture::admit(&options, &cancel(), &|_| {}).unwrap();
-    assert_eq!(
-        measure_captured_change(&optional, &config),
-        CapturedChange::FullNative {
-            reason: "captured native input changed",
-        }
-    );
-    let mut altered = options.clone();
-    altered.max_file_bytes += 1;
-    let admitted = Capture::admit(&altered, &cancel(), &|_| {}).unwrap();
-    assert_eq!(
-        measure_captured_change(&config, &admitted),
-        CapturedChange::FullNative {
-            reason: "capture admission changed",
-        }
-    );
-}
-
-#[test]
-fn optional_native_input_aliases_force_full_native_fallback() {
-    use trellis::{
-        capture::Capture,
-        indexer::{CapturedChange, measure_captured_change, measure_captured_native_change},
-        store::topology::WorkspaceIdentity,
-    };
-    for (relative, old_input, new_input) in [
-        (
-            "Cargo.toml",
-            "[package]\nname='one'\n",
-            "[package]\nname='two'\n",
-        ),
-        ("nested/.ignore", "# old ignore\n", "# changed ignore\n"),
-    ] {
-        let d = tempfile::tempdir().unwrap();
-        fs::create_dir_all(d.path().join("nested")).unwrap();
-        write(d.path(), "a.js", "function f(){ return 10; }\n");
-        write(d.path(), relative, old_input);
-        let mut options = IndexOptions::new(d.path().to_owned());
-        // Same admitted pathname carries both presentation-scip and native
-        // config/ignore roles. Malformed SCIP bytes remain optional UI copy.
-        options.scip_path = Some(d.path().join(relative));
-        let before = Capture::admit(&options, &cancel(), &|_| {}).unwrap();
-        write(d.path(), relative, new_input);
-        write(d.path(), "a.js", "function f(){ return 20; }\n");
-        let after = Capture::admit(&options, &cancel(), &|_| {}).unwrap();
-        assert_eq!(
-            before.files[0].text.as_bytes(),
-            b"function f(){ return 10; }\n"
-        );
-        assert_eq!(
-            after.files[0].text.as_bytes(),
-            b"function f(){ return 20; }\n"
-        );
-        assert_eq!(
-            measure_captured_change(&before, &after),
-            CapturedChange::FullNative {
-                reason: "captured native input changed",
-            },
-            "{relative}"
-        );
-        let root = d.path().canonicalize().unwrap();
-        let root_id = WorkspaceIdentity::discover(Some(&root), &root)
-            .unwrap()
-            .record_id;
-        let mut observed = vec![];
-        let staged =
-            measure_captured_native_change(&before, &after, &root, &root_id, &cancel(), |key| {
-                observed.push(key.path.clone())
-            })
-            .unwrap();
-        assert!(matches!(staged.decision, CapturedChange::FullNative { .. }));
-        assert!(staged.selected.is_none());
-        assert!(
-            observed.is_empty(),
-            "fallback has no selected-only native measurement"
-        );
-    }
-}
-
-#[test]
-fn optional_executable_alias_keeps_authenticated_native_role_without_editing_binary() {
-    use trellis::{
-        capture::Capture,
-        indexer::{CapturedChange, measure_captured_change},
-    };
-    let executable = std::env::current_exe().unwrap();
-    if fs::metadata(&executable).unwrap().len() > 256 * 1024 * 1024 {
-        // The optional SCIP capture itself has a 256 MiB admission ceiling.
-        return;
-    }
-    let d = tempfile::tempdir().unwrap();
-    write(d.path(), "a.js", "function f(){ return 10; }\n");
-    let mut options = IndexOptions::new(d.path().to_owned());
-    options.scip_path = Some(executable);
-    let before = Capture::admit(&options, &cancel(), &|_| {}).unwrap();
-    write(d.path(), "a.js", "function f(){ return 20; }\n");
-    let after = Capture::admit(&options, &cancel(), &|_| {}).unwrap();
-    assert_eq!(
-        measure_captured_change(&before, &after),
-        CapturedChange::DocumentLocal {
-            path: "a.js".into()
-        }
-    );
-}
-
-#[test]
 fn watcher_coalesces_renames_and_retains_signals_until_verified_ack() {
     use notify::{
         Event, EventKind,
@@ -1849,7 +1334,7 @@ fn watcher_coalesces_renames_and_retains_signals_until_verified_ack() {
     };
     use trellis::watch::WatchSignals;
     let root = tempfile::tempdir().unwrap();
-    let mut watcher = WatchSignals::new(root.path().to_owned(), None, None);
+    let mut watcher = WatchSignals::new(root.path().to_owned());
     let takeover = watcher.drain();
     assert!(takeover.full);
     if !watcher.watching() {
@@ -1880,7 +1365,7 @@ fn watcher_promotes_ignore_unknown_and_bulk_changes_to_full_inventory() {
     use notify::{Event, EventKind, event::ModifyKind};
     use trellis::watch::WatchSignals;
     let root = tempfile::tempdir().unwrap();
-    let mut watcher = WatchSignals::new(root.path().to_owned(), None, None);
+    let mut watcher = WatchSignals::new(root.path().to_owned());
     if !watcher.watching() {
         return;
     }
@@ -1928,7 +1413,7 @@ fn explicit_unchanged_capture_freshly_hashes_every_source() {
 fn watcher_registration_failure_keeps_full_inventory_active() {
     use trellis::watch::WatchSignals;
     let root = tempfile::tempdir().unwrap();
-    let mut watcher = WatchSignals::new(root.path().join("missing-root"), None, None);
+    let mut watcher = WatchSignals::new(root.path().join("missing-root"));
     assert!(watcher.degraded());
     assert!(!watcher.watching());
     let batch = watcher.drain();
@@ -1950,7 +1435,7 @@ fn watcher_callback_filters_capture_read_access_without_rediscovering_work() {
     let root = tempfile::tempdir().unwrap();
     write(root.path(), "source.js", "f();");
     // Isolate ingress filtering from delayed native events for the fixture writes.
-    let mut watcher = WatchSignals::synthetic_for_tests(root.path().to_owned(), None, None);
+    let mut watcher = WatchSignals::synthetic_for_tests(root.path().to_owned());
     let initial = watcher.drain();
     assert!(watcher.acknowledge(&initial));
     let before = watcher.drain();
@@ -1982,7 +1467,7 @@ fn watcher_bounded_callback_overflow_and_runtime_error_force_full() {
     use trellis::watch::WatchSignals;
     let root = tempfile::tempdir().unwrap();
     write(root.path(), "source.js", "f();");
-    let mut watcher = WatchSignals::synthetic_for_tests(root.path().to_owned(), None, None);
+    let mut watcher = WatchSignals::synthetic_for_tests(root.path().to_owned());
     let initial = watcher.drain();
     assert!(watcher.acknowledge(&initial));
     for _ in 0..1025 {
@@ -2015,7 +1500,7 @@ fn watcher_has_quiet_and_absolute_deadlines_without_blocking_drain() {
     use trellis::watch::WatchSignals;
     let root = tempfile::tempdir().unwrap();
     write(root.path(), "source.js", "f();");
-    let mut watcher = WatchSignals::synthetic_for_tests(root.path().to_owned(), None, None);
+    let mut watcher = WatchSignals::synthetic_for_tests(root.path().to_owned());
     let initial = watcher.drain();
     assert!(watcher.acknowledge(&initial));
     for attempt in 0..50 {
@@ -2047,7 +1532,7 @@ fn watcher_queued_burst_on_one_path_stays_partial_until_ack() {
     use trellis::watch::WatchSignals;
     let root = tempfile::tempdir().unwrap();
     write(root.path(), "source.js", "f();");
-    let mut watcher = WatchSignals::synthetic_for_tests(root.path().to_owned(), None, None);
+    let mut watcher = WatchSignals::synthetic_for_tests(root.path().to_owned());
     let initial = watcher.drain();
     assert!(watcher.acknowledge(&initial));
     for attempt in 0..50 {
@@ -2065,42 +1550,6 @@ fn watcher_queued_burst_on_one_path_stays_partial_until_ack() {
 }
 
 #[test]
-fn optional_input_and_symlink_suffix_force_full_reconcile() {
-    use notify::{Event, EventKind, event::ModifyKind};
-    use trellis::watch::WatchSignals;
-    let root = tempfile::tempdir().unwrap();
-    fs::create_dir(root.path().join("ignored")).unwrap();
-    write(root.path(), "ignored/.ignore", "presentation.js\n");
-    write(root.path(), "ignored/presentation.js", "{ }\n");
-    let optional = root.path().join("ignored/presentation.js");
-    let mut watcher = WatchSignals::new(root.path().to_owned(), Some(optional.clone()), None);
-    if !watcher.watching() {
-        return;
-    }
-    let initial = watcher.drain();
-    assert!(watcher.acknowledge(&initial));
-    watcher.observe_event(&Event::new(EventKind::Modify(ModifyKind::Any)).add_path(optional));
-    let batch = watcher.drain();
-    assert!(
-        batch.full,
-        "ignored optional input is not a source-only change"
-    );
-    assert!(watcher.acknowledge(&batch));
-    std::os::unix::fs::symlink(
-        root.path().join("ignored/presentation.js"),
-        root.path().join("alias.js"),
-    )
-    .unwrap();
-    watcher.observe_event(
-        &Event::new(EventKind::Modify(ModifyKind::Any)).add_path(root.path().join("alias.js")),
-    );
-    assert!(
-        watcher.drain().full,
-        "symlink suffix is not proof of regular source"
-    );
-}
-
-#[test]
 fn failed_capture_does_not_ack_relevant_input_cutoff_or_absent_input() {
     use notify::{Event, EventKind, event::ModifyKind};
     use trellis::{capture::Capture, watch::WatchSignals};
@@ -2110,7 +1559,7 @@ fn failed_capture_does_not_ack_relevant_input_cutoff_or_absent_input() {
         if !absent_at_admission {
             write(root.path(), "Cargo.toml", "abc");
         }
-        let mut watcher = WatchSignals::new(root.path().to_owned(), None, None);
+        let mut watcher = WatchSignals::new(root.path().to_owned());
         let initial = watcher.drain();
         assert!(watcher.acknowledge(&initial));
         let capture = Capture::admit(

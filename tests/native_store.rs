@@ -240,7 +240,7 @@ fn four_languages_normalized_rows_and_pinned_bytes_are_coherent() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        21
+        22
     );
     let count: i64 = db
         .query_row(
@@ -836,7 +836,7 @@ fn physical_v8_native_v4_index_recreates_before_role_column_read() {
         rebuilt
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        21
+        22
     );
     let stamp: String = rebuilt
         .query_row("SELECT extractor_version FROM index_metadata", [], |row| {
@@ -919,36 +919,10 @@ fn selected_class_payload_oversize_refuses_before_json_decode() {
 #[test]
 #[cfg(feature = "test-support")]
 fn every_encoded_selected_id_rejects_wrong_length_blob() {
-    use protobuf::Message;
-    use sha2::{Digest, Sha256};
     let (state, root, store, cancel) = fixture();
     let java = "class Base {}\nclass Demo<T> extends Base {\n  <U> U map(U input) { if (input != null) { if (input.hashCode() > 0) { helper(); } } return input; }\n  void helper() {}\n}\n";
     fs::write(root.path().join("flow.java"), java).unwrap();
-    let scip_path = state.path().join("labels.scip");
-    let manifest_path = state.path().join("labels.json");
-    let mut index = scip::types::Index::new();
-    let mut document = scip::types::Document::new();
-    document.relative_path = "flow.java".into();
-    document.position_encoding =
-        scip::types::PositionEncoding::UTF16CodeUnitOffsetFromLineStart.into();
-    let mut occurrence = scip::types::Occurrence::new();
-    occurrence.range = vec![1, 6, 10];
-    occurrence.symbol_roles = 1;
-    occurrence.symbol = "scip test Demo".into();
-    document.occurrences.push(occurrence);
-    index.documents.push(document);
-    fs::write(&scip_path, index.write_to_bytes().unwrap()).unwrap();
-    fs::write(
-        &manifest_path,
-        serde_json::to_vec(&serde_json::json!({
-            "flow.java": hex::encode(Sha256::digest(java.as_bytes()))
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-    let mut options = IndexOptions::new(root.path().to_owned());
-    options.scip_path = Some(scip_path);
-    options.manifest_path = Some(manifest_path);
+    let options = IndexOptions::new(root.path().to_owned());
     let (graph, native, capture) =
         index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
     let leader = store.publication_for_tests().unwrap();
@@ -972,7 +946,6 @@ fn every_encoded_selected_id_rejects_wrong_length_blob() {
     // Reads trust the published index (#261), but a row that will not decode
     // is corruption: it fails typed and schedules a re-index.
     let cases = [
-        ("graph_display_labels", "id", "gid"),
         ("native_version_declarations", "syntax_id", "vid"),
         ("native_version_declarations", "owner_syntax_id", "vid"),
         ("native_version_declaration_ancestors", "syntax_id", "vid"),
@@ -3084,7 +3057,7 @@ fn schemas16_and19_recreate_exclusively_without_migration_and_preserve_queue() {
             rebuilt
                 .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
                 .unwrap(),
-            21
+            22
         );
         assert_eq!(
             rebuilt
@@ -3093,7 +3066,7 @@ fn schemas16_and19_recreate_exclusively_without_migration_and_preserve_queue() {
                     0
                 ))
                 .unwrap(),
-            21
+            22
         );
         for table in [
             "native_version_references",
@@ -3138,7 +3111,7 @@ fn newer_disposable_schema_is_refused_without_rebuild_or_deletion() {
         .join(identity.root_key)
         .join("index.db");
     let db = Connection::open(&path).unwrap();
-    db.execute_batch("PRAGMA user_version=22").unwrap();
+    db.execute_batch("PRAGMA user_version=23").unwrap();
     drop(db);
     let inode = fs::metadata(&path).unwrap().ino();
     let error = Store::open_for_tests(state.path(), root.path()).unwrap_err();
@@ -3158,13 +3131,13 @@ fn newer_disposable_schema_is_refused_without_rebuild_or_deletion() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(version, 22);
+    assert_eq!(version, 23);
     let metadata_version: i64 = db
         .query_row("SELECT schema_version FROM index_metadata", [], |r| {
             r.get(0)
         })
         .unwrap();
-    assert_eq!(metadata_version, 21);
+    assert_eq!(metadata_version, 22);
     assert_eq!(generation, old.index_generation.to_string());
 }
 

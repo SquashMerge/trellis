@@ -297,8 +297,7 @@ fn degraded_watcher_reconciles_once_then_waits_for_periodic_scan() {
     // inventory, but an accounted idle generation must not veto maintenance.
     let absent_watch_root = workspace.path().join("absent_watch_root");
     assert!(!absent_watch_root.exists());
-    work.watch =
-        crate::watch::WatchSignals::publishing(absent_watch_root, None, None, work.health.clone());
+    work.watch = crate::watch::WatchSignals::publishing(absent_watch_root, work.health.clone());
     assert!(work.watch.degraded());
     assert!(work.accepted_watch_intent(&options));
     assert!(

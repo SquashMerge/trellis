@@ -544,12 +544,8 @@ impl WatcherWork {
         health: Arc<crate::watch::WatcherHealth>,
     ) -> Result<Self> {
         store.verify_writer_session(session)?;
-        let watch = crate::watch::WatchSignals::publishing(
-            options.workspace_root.clone(),
-            options.scip_path.clone(),
-            options.manifest_path.clone(),
-            health.clone(),
-        );
+        let watch =
+            crate::watch::WatchSignals::publishing(options.workspace_root.clone(), health.clone());
         Ok(Self {
             health,
             watch,
@@ -631,8 +627,6 @@ impl WatcherWork {
         (self.options.workspace_root != options.workspace_root
             && std::fs::canonicalize(&self.options.workspace_root).ok()
                 != std::fs::canonicalize(&options.workspace_root).ok())
-            || self.options.scip_path != options.scip_path
-            || self.options.manifest_path != options.manifest_path
             || self.options.max_file_bytes != options.max_file_bytes
     }
 
@@ -834,12 +828,7 @@ impl WatcherWork {
     #[doc(hidden)]
     pub fn suppress_watch_signals_for_tests(&mut self, absent_watch_root: std::path::PathBuf) {
         assert!(!absent_watch_root.exists());
-        self.watch = crate::watch::WatchSignals::publishing(
-            absent_watch_root,
-            None,
-            None,
-            self.health.clone(),
-        );
+        self.watch = crate::watch::WatchSignals::publishing(absent_watch_root, self.health.clone());
         assert!(self.watch.degraded());
         self.last_accounted_generation = Some(self.watch.drain().generation);
     }
@@ -992,8 +981,6 @@ impl WatcherWork {
         if self.options_differ(options) {
             let next = crate::watch::WatchSignals::publishing(
                 options.workspace_root.clone(),
-                options.scip_path.clone(),
-                options.manifest_path.clone(),
                 self.health.clone(),
             );
             if let Some(waker) = &self.waker {
@@ -1329,6 +1316,23 @@ fn drain_requests_observed_with_cancel(
         }
         #[cfg(feature = "test-support")]
         store.run_after_claim_hook_for_tests();
+        #[cfg(feature = "test-support")]
+        if std::env::var_os("TRELLIS_TEST_SEMANTIC_AMBIGUOUS_TERMINAL").is_some()
+            && request.request_kind == crate::store::requests::RequestKind::SemanticImport
+        {
+            store.fail_next_completion_after_commit_for_tests();
+        }
+        #[cfg(all(feature = "test-support", unix))]
+        if request.request_kind == crate::store::requests::RequestKind::SemanticImport
+            && let Some(path) = std::env::var_os("TRELLIS_TEST_SEMANTIC_CRASH_AFTER_CLAIM_SOCKET")
+        {
+            use std::os::unix::net::UnixListener;
+            let path = std::path::PathBuf::from(path);
+            if !path.with_extension("done").exists() {
+                let listener = UnixListener::bind(&path)?;
+                let (_stream, _) = listener.accept()?;
+            }
+        }
         // Capture the authenticated expected pin from the same publication
         // admission. A BUSY COMMIT can be safely retried only if its terminal
         // queue reread and current control pin still match this baseline.
@@ -1338,6 +1342,10 @@ fn drain_requests_observed_with_cancel(
         let diagnostic_mode = std::sync::Mutex::new("unknown");
         let mut completion_diagnostic = None;
         let outcome = (|| {
+            if request.request_kind == crate::store::requests::RequestKind::SemanticImport {
+                before_publish = Some(Some(store.index_baseline()?));
+                return run_semantic_request(store, session, &request, watcher, cancel);
+            }
             let options = request.options(std::path::Path::new(store.workspace_root()))?;
             let mut coordinator = IndexJobCoordinator::prepare_with_session(
                 store,
@@ -1477,6 +1485,17 @@ fn drain_requests_observed_with_cancel(
                 Some(pin) => pin,
                 None => store.recovery_index_baseline()?.pin(),
             };
+            if request.request_kind == crate::store::requests::RequestKind::SemanticImport
+                && let Some(selected) = store.recovery_index_baseline()?.pin()
+                && Some(selected) != before
+            {
+                // A changed pin might be our committed import or an unrelated
+                // native publication. Read the selected overlay for integrity,
+                // but never infer a terminal result from the pin alone.
+                let _ = store.semantic_at(selected)?;
+                let options = request.semantic_options()?;
+                let _ = store.semantic_import_report_at(selected, &options.producer_name)?;
+            }
             store.requeue_busy_claim(session, &request, before)?;
             return Ok(completed);
         }
@@ -1511,6 +1530,407 @@ fn drain_requests_observed_with_cancel(
         }
     }
     Ok(completed)
+}
+
+fn read_semantic_input(
+    root: &std::path::Path,
+    path: &std::path::Path,
+    max: u64,
+) -> Result<Vec<u8>> {
+    read_semantic_input_before_open(root, path, max, || {})
+}
+
+fn read_semantic_input_before_open(
+    root: &std::path::Path,
+    path: &std::path::Path,
+    max: u64,
+    before_open: impl FnOnce(),
+) -> Result<Vec<u8>> {
+    use std::io::Read;
+    crate::scip_admission::validate_selected_role(root, path)
+        .map_err(|error| anyhow::anyhow!("invalid_request: {error}"))?;
+    let metadata = std::fs::symlink_metadata(path)?;
+    ensure!(
+        metadata.is_file(),
+        "invalid_request: semantic input must be a regular file"
+    );
+    ensure!(
+        metadata.len() <= max,
+        "invalid_request: semantic import input bound"
+    );
+    before_open();
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|error| anyhow::anyhow!("invalid_request: semantic input open: {error}"))?;
+    ensure!(
+        file.metadata()?.is_file(),
+        "invalid_request: semantic input must be a regular file"
+    );
+    let mut bytes = Vec::new();
+    file.take(max + 1).read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() as u64 <= max,
+        "invalid_request: semantic import input bound"
+    );
+    Ok(bytes)
+}
+
+#[cfg(test)]
+mod semantic_input_tests {
+    use super::read_semantic_input;
+
+    #[test]
+    fn selected_input_replaced_by_symlink_before_open_is_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("selected.scip");
+        let replacement = root.path().join("other.scip");
+        std::fs::write(&path, b"abc").unwrap();
+        std::fs::write(&replacement, b"abc").unwrap();
+        let result = super::read_semantic_input_before_open(root.path(), &path, 3, || {
+            std::fs::remove_file(&path).unwrap();
+            std::os::unix::fs::symlink(&replacement, &path).unwrap();
+        });
+        assert!(result.is_err(), "must not follow a replacement symlink");
+    }
+
+    #[test]
+    fn selected_input_replaced_by_fifo_before_open_is_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("selected.scip");
+        std::fs::write(&path, b"abc").unwrap();
+        let result = super::read_semantic_input_before_open(root.path(), &path, 3, || {
+            std::fs::remove_file(&path).unwrap();
+            let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        });
+        assert!(
+            result.is_err(),
+            "replacement FIFO must not block or be read"
+        );
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"next").unwrap();
+        assert_eq!(read_semantic_input(root.path(), &path, 4).unwrap(), b"next");
+    }
+
+    #[test]
+    fn bounded_regular_input_accepts_limit_and_rejects_limit_plus_one() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("selected.scip");
+        std::fs::write(&path, b"abc").unwrap();
+        assert_eq!(read_semantic_input(root.path(), &path, 3).unwrap(), b"abc");
+        assert!(read_semantic_input(root.path(), &path, 2).is_err());
+        let fifo = root.path().join("pipe.scip");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        assert!(read_semantic_input(root.path(), &fifo, 3).is_err());
+    }
+}
+
+fn run_semantic_request(
+    store: &Store,
+    session: &Arc<WriterSession>,
+    request: &Request,
+    watcher: Option<&OwningWatcher>,
+    cancel: &CancelFlag,
+) -> Result<IndexPin> {
+    use crate::{
+        native_ids,
+        scip_admission::{ReferenceProfileAdmission, TrustedSelection, decode_reference_profile},
+        semantic_evidence as semantic,
+    };
+    use std::{collections::BTreeMap, path::Path};
+    let options = request.semantic_options()?;
+    let root = Path::new(store.workspace_root());
+    let binary = read_semantic_input(root, Path::new(&options.scip), 64 * 1024 * 1024)?;
+    let manifest = read_semantic_input(root, Path::new(&options.manifest), 1024 * 1024)?;
+    let selection = TrustedSelection {
+        expected_manifest_hash: options.manifest_sha256,
+        profile_id: options.profile_id,
+        producer_name: options.producer_name,
+    };
+    // Bind original binary/manifest bytes to their retained r1, not whichever
+    // native revision is selected when this accepted FIFO row gets claimed.
+    let manifest_header: serde_json::Value = serde_json::from_slice(&manifest)?;
+    let source_revision = manifest_header["sourceRevision"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("invalid_request: manifest source revision"))?;
+    let source_set = manifest_header["sourceSet"]["id"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("invalid_request: manifest source set"))?;
+    let r1_pin = store.retained_native_pin_for(source_revision, source_set)?;
+    let (r1, r1_sources) = store.retained_native_snapshot_at(r1_pin)?;
+    let (toolchain, config, dependencies) = store.retained_native_components_at(r1_pin)?;
+    let admission = ReferenceProfileAdmission::from_retained_native(
+        root,
+        &r1,
+        &r1_sources,
+        Path::new(&options.scip),
+        &binary,
+        Path::new(&options.manifest),
+        &manifest,
+        &selection,
+        cancel,
+    )?;
+    let producer = admission.producer();
+    let encoding = admission.admitted_encoding();
+    let inventory = decode_reference_profile(&admission, cancel)?;
+    let mut basis = BTreeMap::new();
+    for document in &r1.revision.documents {
+        if producer.languages.iter().any(|language| {
+            serde_json::to_value(language)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_owned))
+                .as_deref()
+                == Some(&document.key.language)
+        }) {
+            basis.insert(
+                document.key.clone(),
+                semantic::SemanticBasis {
+                    producer_id: producer.id.clone(),
+                    producer_version: producer.version.clone(),
+                    producer_hash: producer.executable_hash.clone(),
+                    artifact_hash: inventory.artifact_hash.clone(),
+                    language: serde_json::from_value(serde_json::json!(document.key.language))?,
+                    source_set_id: document.key.source_set_id.clone(),
+                    revision_id: r1.revision.id.clone(),
+                    source_manifest_hash: inventory.source_manifest_hash.clone(),
+                    toolchain_hash: r1.revision.toolchain_hash.clone(),
+                    config_hash: r1.revision.config_hash.clone(),
+                    dependency_hash: r1.revision.dependency_hash.clone(),
+                    lookup_dependencies: vec![],
+                },
+            );
+        }
+    }
+    let captured = semantic::CapturedComponents {
+        producer_executables: BTreeMap::new(),
+        artifacts: BTreeMap::from([(producer.id.clone(), binary.clone())]),
+        sources: r1_sources.clone(),
+        captured_revision: r1.revision.clone(),
+        native_toolchain: toolchain.clone(),
+        native_config: config.clone(),
+        native_dependencies: dependencies.clone(),
+        requested_producers: vec![producer.clone()],
+        toolchain: native_ids::canonical(&toolchain),
+        config: native_ids::canonical(&serde_json::json!(config)),
+        dependency: native_ids::canonical(&serde_json::json!(dependencies)),
+        native_extraction_components: BTreeMap::new(),
+    };
+    let raw = crate::store::SemanticRawCapture {
+        producer_id: producer.id.clone(),
+        source_set_id: r1.revision.source_set_id.clone(),
+        captured_revision: r1.revision.id.clone(),
+        binary_bytes: binary,
+        manifest_bytes: manifest,
+        inventory: inventory.clone(),
+    };
+    let mut native_options = store
+        .recorded_index_options()?
+        .unwrap_or_else(|| IndexOptions::new(root.to_owned()));
+    native_options.workspace_root = root.to_owned();
+    for _ in 0..8 {
+        store.verify_writer_session(session)?;
+        let destination_pin = store.index_baseline()?;
+        let (destination, sources) = store.retained_native_snapshot_at(destination_pin)?;
+        #[cfg(feature = "test-support")]
+        let candidate = {
+            let mut candidate = destination.clone();
+            if std::env::var_os("TRELLIS_TEST_SEMANTIC_DUPLICATE_B_TARGET").is_some()
+                && r1.revision.id != destination.revision.id
+                && let Some(declaration) = candidate
+                    .declarations
+                    .iter()
+                    .find(|d| d.document.path == "src/B.js" && d.name.as_deref() == Some("target"))
+                    .cloned()
+            {
+                candidate.declarations.push(declaration);
+            }
+            if std::env::var_os("TRELLIS_TEST_SEMANTIC_DUPLICATE_A_REFERENCE").is_some()
+                && r1.revision.id != destination.revision.id
+                && let Some(reference) = candidate
+                    .references
+                    .iter()
+                    .find(|r| r.document.path == "src/A.js" && r.spelling == "target")
+                    .cloned()
+            {
+                let mut competing = reference;
+                competing.id = format!("{}-candidate-only", competing.id);
+                candidate.references.push(competing);
+            }
+            if std::env::var_os("TRELLIS_TEST_SEMANTIC_MISSING_A_REFERENCE").is_some()
+                && r1.revision.id != destination.revision.id
+            {
+                candidate
+                    .references
+                    .retain(|r| !(r.document.path == "src/A.js" && r.spelling == "target"));
+            }
+            candidate
+        };
+        #[cfg(not(feature = "test-support"))]
+        let candidate = destination.clone();
+        let outcome = crate::semantic_import::rejoin_inventory(
+            &inventory,
+            &r1,
+            &r1_sources,
+            &candidate,
+            &sources,
+            producer.clone(),
+            &basis,
+            encoding,
+        )?;
+        #[cfg(all(feature = "test-support", unix))]
+        if r1.revision.id != destination.revision.id
+            && let Some(path) = std::env::var_os("TRELLIS_TEST_SEMANTIC_CUTOFF_SOCKET")
+        {
+            use std::os::unix::net::UnixListener;
+            let path = std::path::PathBuf::from(path);
+            if !path.exists() {
+                let listener = UnixListener::bind(&path)?;
+                let (_stream, _) = listener.accept()?;
+            }
+        }
+        let documents = destination
+            .revision
+            .documents
+            .iter()
+            .map(|doc| {
+                (
+                    (doc.key.language.clone(), doc.key.path.clone()),
+                    doc.content_hash.clone(),
+                )
+            })
+            .collect();
+        // The owner drains accepted watcher intent before the import cutoff.
+        if let Some(watcher) = watcher {
+            let mut held = watcher.lock().unwrap();
+            if let Some((owner, work)) = held.as_mut()
+                && owner
+                    .upgrade()
+                    .is_some_and(|owner| Arc::ptr_eq(&owner, session))
+            {
+                work.reconcile_due(store, session, &native_options, cancel, true)?;
+            }
+        }
+        if store.index_baseline()? != destination_pin {
+            continue;
+        }
+        let generation = watcher.and_then(|watcher| {
+            watcher
+                .lock()
+                .ok()
+                .and_then(|held| held.as_ref().map(|(_, work)| work.generation_handle()))
+        });
+        let before_generation = generation.as_ref().map(|g| g.load(Ordering::SeqCst));
+        let capture = Capture::admit(&native_options, cancel, &|_| {})?;
+        let baseline = store.publication_index_baseline()?;
+        if baseline.pin() != Some(destination_pin)
+            || !store.selected_capture_unchanged(
+                &capture,
+                session.writer_guard()?,
+                &baseline,
+                cancel,
+            )?
+            || generation.as_ref().map(|g| g.load(Ordering::SeqCst)) != before_generation
+        {
+            if let Some(watcher) = watcher {
+                let mut held = watcher.lock().unwrap();
+                if let Some((owner, work)) = held.as_mut()
+                    && owner
+                        .upgrade()
+                        .is_some_and(|owner| Arc::ptr_eq(&owner, session))
+                {
+                    work.reconcile_due(store, session, &native_options, cancel, true)?;
+                    continue;
+                }
+            }
+            anyhow::bail!("revision conflict: semantic import native reconciliation required");
+        }
+        let publication = store.enter_publication(cancel, std::time::Duration::from_millis(250))?;
+        if generation.as_ref().map(|g| g.load(Ordering::SeqCst)) != before_generation
+            || store.index_baseline()? != destination_pin
+        {
+            drop(publication);
+            continue;
+        }
+        #[cfg(feature = "test-support")]
+        if std::env::var_os("TRELLIS_TEST_SEMANTIC_BUSY_ONCE").is_some_and(|marker| {
+            let marker = std::path::PathBuf::from(marker);
+            if marker.exists() {
+                false
+            } else {
+                std::fs::write(marker, b"busy injected").is_ok()
+            }
+        }) {
+            drop(publication);
+            return Err(crate::store::topology::StorageBusy.into());
+        }
+        #[cfg(feature = "test-support")]
+        let pin = if std::env::var_os("TRELLIS_TEST_SEMANTIC_SQL_FAULT").is_some_and(|marker| {
+            let marker = std::path::PathBuf::from(marker);
+            if marker.exists() {
+                false
+            } else {
+                std::fs::write(marker, b"fault injected").is_ok()
+            }
+        }) {
+            store.publish_semantic_import_with_fault_for_tests(
+                destination_pin,
+                &documents,
+                &outcome.publication,
+                &captured,
+                &destination,
+                &raw,
+                &outcome.report,
+                session.writer_guard()?,
+                cancel,
+                false,
+            )
+        } else {
+            store.publish_semantic_import(
+                destination_pin,
+                &documents,
+                &outcome.publication,
+                &captured,
+                &destination,
+                &raw,
+                &outcome.report,
+                session.writer_guard()?,
+                cancel,
+            )
+        };
+        #[cfg(not(feature = "test-support"))]
+        let pin = store.publish_semantic_import(
+            destination_pin,
+            &documents,
+            &outcome.publication,
+            &captured,
+            &destination,
+            &raw,
+            &outcome.report,
+            session.writer_guard()?,
+            cancel,
+        );
+        #[cfg(all(feature = "test-support", unix))]
+        if pin.is_ok()
+            && let Some(path) = std::env::var_os("TRELLIS_TEST_SEMANTIC_CRASH_AFTER_PUBLISH_SOCKET")
+        {
+            use std::os::unix::net::UnixListener;
+            let path = std::path::PathBuf::from(path);
+            if !path.with_extension("done").exists() {
+                let listener = UnixListener::bind(&path)?;
+                let (_stream, _) = listener.accept()?;
+            }
+        }
+        drop(publication);
+        match pin {
+            Err(error) if error.to_string().starts_with("revision conflict") => continue,
+            result => return result,
+        }
+    }
+    anyhow::bail!("storage_busy: semantic import retry budget exceeded")
 }
 
 pub(crate) fn retryable_completion_error(error: &anyhow::Error) -> bool {

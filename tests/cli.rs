@@ -666,27 +666,6 @@ fn daemon_status_uses_selected_head_and_reports_typed_contention() {
     assert_eq!(report["derived"][0]["status"], "busy");
 }
 
-fn write_optional_presentation(dir: &std::path::Path, label: &str, source_hash: &str) {
-    use protobuf::Message;
-    let mut index = scip::types::Index::new();
-    let mut document = scip::types::Document::new();
-    document.relative_path = "main.js".into();
-    document.position_encoding =
-        scip::types::PositionEncoding::UTF16CodeUnitOffsetFromLineStart.into();
-    let mut occurrence = scip::types::Occurrence::new();
-    occurrence.range = vec![0, 9, 10];
-    occurrence.symbol_roles = 1;
-    occurrence.symbol = label.into();
-    document.occurrences.push(occurrence);
-    index.documents.push(document);
-    fs::write(dir.join("index.scip"), index.write_to_bytes().unwrap()).unwrap();
-    fs::write(
-        dir.join("manifest.json"),
-        serde_json::to_vec(&serde_json::json!({"main.js":source_hash})).unwrap(),
-    )
-    .unwrap();
-}
-
 #[test]
 fn cli_helper_uses_isolated_home_instead_of_inherited_xdg_roots() {
     let temp = TempDir::new().unwrap();
@@ -789,350 +768,35 @@ fn daemon_index_records_nondefault_file_cap() {
 }
 
 #[test]
-fn standalone_takeover_replays_original_relative_presentation_from_another_cwd() {
-    use sha2::{Digest, Sha256};
+fn index_rejects_removed_scip_flags_before_request() {
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("source");
-    let home = temp.path().join("home");
-    let first_cwd = temp.path().join("ingress");
-    let second_cwd = temp.path().join("takeover");
-    for dir in [&root, &first_cwd, &second_cwd] {
-        fs::create_dir(dir).unwrap();
-    }
-    let ingress_cwd = first_cwd.canonicalize().unwrap();
-    let source = "function f() {}\nf();\n";
-    fs::write(root.join("main.js"), source).unwrap();
-    let source_hash = hex::encode(Sha256::digest(source.as_bytes()));
-    let original_label = "scip npm display 1 main.js/f().";
-    write_optional_presentation(&first_cwd, original_label, &source_hash);
-    // A cwd-rebound replay would use this same-name but wrong presentation.
-    write_optional_presentation(&second_cwd, "scip npm display 1 other().", "stale");
-    let indexed = command(&root, &home, "index")
-        .current_dir(&first_cwd)
-        .arg("--scip")
-        .arg("index.scip")
-        .arg("--manifest")
-        .arg("manifest.json")
-        .output()
-        .unwrap();
-    assert!(
-        indexed.status.success(),
-        "{}",
-        String::from_utf8_lossy(&indexed.stderr)
-    );
-    let initial: Value = serde_json::from_slice(&indexed.stdout).unwrap();
-    // Startup reconciliation publishes r1. If its capture already used the
-    // accepted request's SCIP options, the request is unchanged and completes
-    // at r1 (Decision 0006 §3); otherwise it publishes r2 for the new inputs.
-    assert!(
-        (1..=2).contains(
-            &initial["publishedRevision"]["indexRevision"]
-                .as_u64()
-                .unwrap()
-        ),
-        "{initial}"
-    );
-    let indexes = if cfg!(target_os = "macos") {
-        home.join("Library/Caches/dev.squashmerge.trellis/indexes")
-    } else {
-        home.join(".cache/trellis/indexes")
-    };
-    let index_db = fs::read_dir(indexes)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .find(|path| path.is_dir())
-        .unwrap()
-        .join("index.db");
-    let recorded_options = || -> Value {
-        let db = rusqlite::Connection::open(&index_db).unwrap();
-        let text: String = db
-            .query_row(
-                "SELECT reconcile_options FROM index_metadata WHERE singleton=1",
-                [],
-                |row| row.get(0),
-            )
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("main.js"), "function f() {}\n").unwrap();
+    for flag in ["--scip", "--manifest"] {
+        let output = command(&root, &temp.path().join("home"), "index")
+            .arg(flag)
+            .arg("artifact")
+            .output()
             .unwrap();
-        serde_json::from_str(&text).unwrap()
-    };
-    let recorded = recorded_options();
-    assert_eq!(
-        recorded["scipPath"],
-        ingress_cwd.join("index.scip").to_str().unwrap()
-    );
-    assert_eq!(
-        recorded["manifestPath"],
-        ingress_cwd.join("manifest.json").to_str().unwrap()
-    );
-    let status = command(&root, &home, "status")
-        .current_dir(&second_cwd)
-        .output()
-        .unwrap();
-    assert!(
-        status.status.success(),
-        "{}",
-        String::from_utf8_lossy(&status.stderr)
-    );
-    let status: Value = serde_json::from_slice(&status.stdout).unwrap();
-    assert_eq!(status["revision"], initial["publishedRevision"]);
-    let graph = stopped_graph(&root, &home);
-    let f = graph["nodes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|node| node["name"] == "f")
-        .unwrap();
-    assert_eq!(f["displayLabel"], original_label);
-    assert_eq!(
-        recorded_options(),
-        recorded,
-        "takeovers must retain ingress identities"
-    );
-}
-
-#[test]
-fn standalone_takeover_keeps_configured_missing_presentation_absent() {
-    use sha2::{Digest, Sha256};
-    let temp = TempDir::new().unwrap();
-    let root = temp.path().join("source");
-    let home = temp.path().join("home");
-    let first_cwd = temp.path().join("ingress");
-    let second_cwd = temp.path().join("takeover");
-    for dir in [&root, &first_cwd, &second_cwd] {
-        fs::create_dir(dir).unwrap();
+        assert!(!output.status.success(), "removed {flag} must not index");
     }
-    let source = "function f() {}\nf();\n";
-    fs::write(root.join("main.js"), source).unwrap();
-    let source_hash = hex::encode(Sha256::digest(source.as_bytes()));
-    // Inputs with these names exist only in B, never in the configured A.
-    write_optional_presentation(&second_cwd, "scip npm display 1 main.js/f().", &source_hash);
-    let indexed = command(&root, &home, "index")
-        .current_dir(&first_cwd)
-        .arg("--scip")
-        .arg("index.scip")
-        .arg("--manifest")
-        .arg("manifest.json")
-        .output()
-        .unwrap();
-    assert!(
-        indexed.status.success(),
-        "{}",
-        String::from_utf8_lossy(&indexed.stderr)
-    );
-    assert!(!first_cwd.join("index.scip").exists());
-    assert!(!first_cwd.join("manifest.json").exists());
-    let takeover = command(&root, &home, "status")
-        .current_dir(&second_cwd)
-        .output()
-        .unwrap();
-    assert!(
-        takeover.status.success(),
-        "{}",
-        String::from_utf8_lossy(&takeover.stderr)
-    );
-    let graph = stopped_graph(&root, &home);
-    let f = graph["nodes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|node| node["name"] == "f")
-        .unwrap();
-    assert!(
-        f["displayLabel"].is_null(),
-        "absent A inputs must not become B labels"
-    );
 }
 
 #[tokio::test]
-async fn serve_ingress_persists_relative_presentation_paths_before_cross_cwd_takeover() {
-    use sha2::{Digest, Sha256};
-    use std::{os::unix::fs::PermissionsExt, process::Stdio};
-    struct Server(Option<std::process::Child>);
-    impl Drop for Server {
-        fn drop(&mut self) {
-            if let Some(mut child) = self.0.take() {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-        }
-    }
+async fn serve_rejects_removed_optional_artifact_flags() {
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("source");
-    let home = temp.path().join("home");
-    let _daemon = FixtureDaemon::new(&home);
-    let first_cwd = temp.path().join("ingress");
-    let second_cwd = temp.path().join("takeover");
-    for dir in [&root, &first_cwd, &second_cwd] {
-        fs::create_dir(dir).unwrap();
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("main.js"), "function f() {}\n").unwrap();
+    for flag in ["--scip", "--manifest"] {
+        let output = command(&root, &temp.path().join("home"), "serve")
+            .arg(flag)
+            .arg("artifact")
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "removed {flag} must not serve");
     }
-    let ingress_cwd = first_cwd.canonicalize().unwrap();
-    let source = "function f() {}\nf();\n";
-    fs::write(root.join("main.js"), source).unwrap();
-    let source_hash = hex::encode(Sha256::digest(source.as_bytes()));
-    let original_label = "scip npm display 1 main.js/f().";
-    write_optional_presentation(&first_cwd, original_label, &source_hash);
-    write_optional_presentation(&second_cwd, "scip npm display 1 other().", "stale");
-    const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    let token = temp.path().join("token");
-    fs::write(&token, TOKEN).unwrap();
-    fs::set_permissions(&token, fs::Permissions::from_mode(0o600)).unwrap();
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    // Keep the daemon's stderr open through readiness and shutdown. Reading
-    // only the first banner line from a pipe closed its reader while later
-    // workers still wrote diagnostics on Linux CI.
-    let stderr_path = temp.path().join("serve-ingress-stderr.log");
-    let stderr_file = fs::File::create(&stderr_path).unwrap();
-    let child = isolated_command(&home)
-        .env("TRELLIS_TEST_DAEMON_PID_FILE", home.join("auto-daemon.pid"))
-        .arg("serve")
-        .arg("--workspace")
-        .arg(&root)
-        .arg("--bind")
-        .arg(format!("127.0.0.1:{port}"))
-        .arg("--token-file")
-        .arg(&token)
-        .arg("--scip")
-        .arg("index.scip")
-        .arg("--manifest")
-        .arg("manifest.json")
-        .current_dir(&first_cwd)
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(stderr_file))
-        .spawn()
-        .unwrap();
-    let mut server = Server(Some(child));
-    let startup = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
-        loop {
-            let log = fs::read(&stderr_path).unwrap();
-            if log
-                .windows(b"Trellis:".len())
-                .any(|window| window == b"Trellis:")
-            {
-                break log;
-            }
-            if let Some(exit) = server.0.as_mut().unwrap().try_wait().unwrap() {
-                panic!(
-                    "daemon exited before banner: {exit}; category={}",
-                    readiness_stderr_category(&log)
-                );
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("daemon startup timed out");
-    assert!(home.join("auto-daemon.pid").exists());
-    assert!(
-        !String::from_utf8_lossy(&startup).contains("Evidence unavailable at startup"),
-        "unexpected startup evidence: {}",
-        readiness_stderr_category(&startup)
-    );
-    // The banner precedes axum polling its SIGTERM handler; a successful
-    // response, not a logged banner, proves the listener is actually ready.
-    let mut last_health = String::from("no_response");
-    let mut ready = false;
-    let health = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
-        loop {
-            match reqwest::get(format!("http://127.0.0.1:{port}/healthz")).await {
-                Ok(response) if response.status().is_success() => {
-                    ready = true;
-                    break;
-                }
-                Ok(response) => last_health = format!("http_status_{}", response.status().as_u16()),
-                Err(error) => {
-                    last_health = if error.is_connect() {
-                        "connection_error".into()
-                    } else if error.is_timeout() {
-                        "request_timeout".into()
-                    } else {
-                        "other_request_error".into()
-                    }
-                }
-            }
-            if server.0.as_mut().unwrap().try_wait().unwrap().is_some() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await;
-    assert!(
-        health.is_ok() && ready,
-        "daemon health endpoint did not become ready: child={:?}, last_health={}, stderr_category={}",
-        server.0.as_mut().unwrap().try_wait().unwrap(),
-        last_health,
-        readiness_stderr_category(&fs::read(&stderr_path).unwrap())
-    );
-    // The banner precedes an asynchronous queue tick. SIGKILL can interrupt
-    // requests.db creation before its schema transaction commits; that partial
-    // queue must remain incompatible. Model a clean cross-CWD takeover instead:
-    // SIGTERM lets the daemon finish in-flight blocking work before it exits.
-    let pid = server.0.as_ref().unwrap().id();
-    assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGTERM) }, 0);
-    let deadline = tokio::time::Instant::now() + trellis::testing::HANG_BACKSTOP;
-    loop {
-        if let Some(status) = server.0.as_mut().unwrap().try_wait().unwrap() {
-            // Reaped children must not be killed again by the cleanup guard.
-            let _ = server.0.take();
-            assert!(
-                status.success(),
-                "daemon failed graceful shutdown: {status}"
-            );
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "daemon did not stop gracefully before cross-CWD takeover"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    drop(server);
-    let takeover = command(&root, &home, "status")
-        .current_dir(&second_cwd)
-        .output()
-        .unwrap();
-    assert!(
-        takeover.status.success(),
-        "{}",
-        String::from_utf8_lossy(&takeover.stderr)
-    );
-    let graph = stopped_graph(&root, &home);
-    let f = graph["nodes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|node| node["name"] == "f")
-        .unwrap();
-    assert_eq!(f["displayLabel"], original_label);
-    let indexes = if cfg!(target_os = "macos") {
-        home.join("Library/Caches/dev.squashmerge.trellis/indexes")
-    } else {
-        home.join(".cache/trellis/indexes")
-    };
-    let index_db = fs::read_dir(indexes)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .find(|path| path.is_dir())
-        .unwrap()
-        .join("index.db");
-    let db = rusqlite::Connection::open(&index_db).unwrap();
-    let recorded: String = db
-        .query_row(
-            "SELECT reconcile_options FROM index_metadata WHERE singleton=1",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    let recorded: Value = serde_json::from_str(&recorded).unwrap();
-    assert_eq!(
-        recorded["scipPath"],
-        ingress_cwd.join("index.scip").to_str().unwrap()
-    );
-    assert_eq!(
-        recorded["manifestPath"],
-        ingress_cwd.join("manifest.json").to_str().unwrap()
-    );
 }
 
 #[test]
@@ -2651,7 +2315,7 @@ fn same_bytes_evidence(snapshot: &Value) -> Value {
     let header = header[0].as_array().unwrap();
     assert_eq!(header[0], pin);
     assert!(header[5].as_str().is_some_and(|id| !id.is_empty()));
-    assert!(header[13].as_i64().is_some_and(|revision| revision > 0));
+    assert!(header[16].as_i64().is_some_and(|revision| revision > 0));
     for table in ["revision_capture_inputs", "revision_documents"] {
         for row in snapshot["allRows"][table].as_array().unwrap() {
             assert_eq!(row[0], pin, "{table} must reference the admitted pin");
@@ -2671,7 +2335,7 @@ fn same_bytes_evidence(snapshot: &Value) -> Value {
         .as_array_mut()
         .unwrap();
     header[0] = serde_json::json!("<current-pin>");
-    header[13] = serde_json::json!("<current-revision>");
+    header[16] = serde_json::json!("<current-revision>");
     for table in ["revision_capture_inputs", "revision_documents"] {
         for row in evidence["allRows"][table].as_array_mut().unwrap() {
             row[0] = serde_json::json!("<current-pin>");
@@ -3890,7 +3554,7 @@ def sink():
             before_header, after_header,
             "{name}: unchanged startup and request publish no revision"
         );
-        assert_eq!(after_header[13], pin["indexRevision"], "{name}");
+        assert_eq!(after_header[16], pin["indexRevision"], "{name}");
         assert_eq!(
             after_header[0],
             format!(
@@ -4738,8 +4402,8 @@ async fn saved_items_real_index_matrix() {
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
     assert_eq!(
-        index_version, 21,
-        "derived v21 index inspection is separate"
+        index_version, 22,
+        "derived v22 index inspection is separate"
     );
 
     let edited_view_body = serde_json::json!({
@@ -5131,169 +4795,6 @@ async fn saved_items_real_index_matrix() {
     assert_eq!(legacy_note["attachment"]["availability"], "anchorless");
     assert!(raw_anchor(&stored_payload(&record_db, "views", "legacy-view")).is_none());
     assert!(raw_anchor(&stored_payload(&record_db, "annotations", "legacy-note")).is_none());
-}
-
-#[test]
-fn optional_captured_scip_changes_presentation_without_native_identity_or_full_rewrite_breakage() {
-    use sha2::{Digest, Sha256};
-    let temp = TempDir::new().unwrap();
-    let root = temp.path().join("source");
-    let home = temp.path().join("home");
-    let ingress = temp.path().join("ingress");
-    let other = temp.path().join("other");
-    for dir in [&root, &ingress, &other] {
-        fs::create_dir(dir).unwrap();
-    }
-    let source = "function f() {}\nf();\n";
-    fs::write(root.join("main.js"), source).unwrap();
-    let first = command(&root, &home, "index")
-        .current_dir(&ingress)
-        .arg("--scip")
-        .arg("index.scip")
-        .arg("--manifest")
-        .arg("manifest.json")
-        .output()
-        .unwrap();
-    assert!(
-        first.status.success(),
-        "{}",
-        String::from_utf8_lossy(&first.stderr)
-    );
-    let first_pin: Value = serde_json::from_slice(&first.stdout).unwrap();
-    // Startup reconciliation publishes r1. If its capture already used the
-    // accepted request's SCIP options, the request is unchanged and completes
-    // at r1 (Decision 0006 §3); otherwise it publishes r2 for the new inputs.
-    assert!(
-        (1..=2).contains(
-            &first_pin["publishedRevision"]["indexRevision"]
-                .as_u64()
-                .unwrap()
-        ),
-        "{first_pin}"
-    );
-    let read_from_other = command(&root, &home, "status")
-        .current_dir(&other)
-        .output()
-        .unwrap();
-    assert!(
-        read_from_other.status.success(),
-        "{}",
-        String::from_utf8_lossy(&read_from_other.stderr)
-    );
-    let original = stopped_graph(&root, &home);
-    let first_symbol = original["nodes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|n| n["name"] == "f")
-        .unwrap();
-    let first_id = first_symbol["id"].clone();
-    assert!(first_symbol["displayLabel"].is_null());
-    let hash = hex::encode(Sha256::digest(source.as_bytes()));
-    write_optional_presentation(&ingress, "scip npm display 1 main.js/f().", &hash);
-    // An unrelated cwd never becomes the base of the recorded optional inputs.
-    write_optional_presentation(&other, "scip npm display 1 other().", "stale");
-    let republished = command(&root, &home, "index")
-        .arg("--scip")
-        .arg(ingress.join("index.scip"))
-        .arg("--manifest")
-        .arg(ingress.join("manifest.json"))
-        .output()
-        .unwrap();
-    assert!(
-        republished.status.success(),
-        "{}",
-        String::from_utf8_lossy(&republished.stderr)
-    );
-    let republished: Value = serde_json::from_slice(&republished.stdout).unwrap();
-    let read_from_other = command(&root, &home, "status")
-        .current_dir(&other)
-        .output()
-        .unwrap();
-    assert!(
-        read_from_other.status.success(),
-        "{}",
-        String::from_utf8_lossy(&read_from_other.stderr)
-    );
-    let changed = stopped_graph(&root, &home);
-    let next = changed["nodes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|n| n["name"] == "f")
-        .unwrap();
-    assert_eq!(next["id"], first_id);
-    assert_eq!(next["displayLabel"], "scip npm display 1 main.js/f().");
-    assert_eq!(
-        changed["files"][0]["text"].as_str().unwrap().as_bytes(),
-        source.as_bytes()
-    );
-    let status = command(&root, &home, "status")
-        .current_dir(&other)
-        .output()
-        .unwrap();
-    assert!(status.status.success());
-    let status: Value = serde_json::from_slice(&status.stdout).unwrap();
-    // Read commands do not claim a writer. The daemon watcher can publish
-    // another revision when selected presentation inputs change.
-    assert!(
-        status["revision"]["indexRevision"].as_u64().unwrap()
-            >= republished["publishedRevision"]["indexRevision"]
-                .as_u64()
-                .unwrap()
-    );
-    assert_eq!(
-        status["revision"]["indexGeneration"],
-        first_pin["publishedRevision"]["indexGeneration"]
-    );
-    write_optional_presentation(&ingress, "scip npm display 1 main.js/f().", "bad-hash");
-    let republished = command(&root, &home, "index")
-        .arg("--scip")
-        .arg(ingress.join("index.scip"))
-        .arg("--manifest")
-        .arg(ingress.join("manifest.json"))
-        .output()
-        .unwrap();
-    assert!(
-        republished.status.success(),
-        "{}",
-        String::from_utf8_lossy(&republished.stderr)
-    );
-    let republished: Value = serde_json::from_slice(&republished.stdout).unwrap();
-    let read_from_other = command(&root, &home, "status")
-        .current_dir(&other)
-        .output()
-        .unwrap();
-    assert!(
-        read_from_other.status.success(),
-        "{}",
-        String::from_utf8_lossy(&read_from_other.stderr)
-    );
-    let stale = stopped_graph(&root, &home);
-    let symbol = stale["nodes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|n| n["name"] == "f")
-        .unwrap();
-    assert_eq!(symbol["id"], first_id);
-    assert!(symbol["displayLabel"].is_null());
-    let latest = command(&root, &home, "status")
-        .current_dir(&other)
-        .output()
-        .unwrap();
-    assert!(latest.status.success());
-    let latest: Value = serde_json::from_slice(&latest.stdout).unwrap();
-    assert_eq!(
-        latest["revision"]["indexGeneration"],
-        first_pin["publishedRevision"]["indexGeneration"]
-    );
-    assert!(
-        latest["revision"]["indexRevision"].as_u64().unwrap()
-            >= republished["publishedRevision"]["indexRevision"]
-                .as_u64()
-                .unwrap()
-    );
 }
 
 #[test]

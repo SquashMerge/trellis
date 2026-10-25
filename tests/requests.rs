@@ -358,7 +358,7 @@ fn request_rejects_relative_external_input_before_ack() {
     let workspace = tempfile::tempdir().unwrap();
     let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
     let mut options = IndexOptions::new(workspace.path().to_owned());
-    options.scip_path = Some("relative.scip".into());
+    options.max_file_bytes = 0;
     assert!(store.enqueue_request(&options, None).is_err());
     assert!(store.current_request().unwrap().is_none());
 }
@@ -443,7 +443,7 @@ fn incompatible_or_corrupt_existing_queue_never_gets_fresh_ack() {
     let accepted = store.enqueue_request(&options, None).unwrap();
     let path = store.request_db_path();
     let db = rusqlite::Connection::open(&path).unwrap();
-    db.pragma_update(None, "user_version", 2).unwrap();
+    db.pragma_update(None, "user_version", 3).unwrap();
     drop(db);
     assert!(
         store
@@ -453,7 +453,7 @@ fn incompatible_or_corrupt_existing_queue_never_gets_fresh_ack() {
             .contains("incompatible_queue")
     );
     let db = rusqlite::Connection::open(&path).unwrap();
-    db.pragma_update(None, "user_version", 1).unwrap();
+    db.pragma_update(None, "user_version", 2).unwrap();
     db.execute(
         "UPDATE queue_identity SET root_key='wrong' WHERE singleton=1",
         [],
@@ -813,7 +813,7 @@ fn replacement_refuses_missing_or_foreign_queue_without_swapping_index() {
                     db.execute("UPDATE queue_identity SET root_key='foreign'", [])
                         .unwrap();
                 } else {
-                    db.pragma_update(None, "user_version", 2).unwrap();
+                    db.pragma_update(None, "user_version", 3).unwrap();
                 }
             }
         }

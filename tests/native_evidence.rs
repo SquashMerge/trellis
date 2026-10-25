@@ -1378,7 +1378,7 @@ fn required_inputs_are_rehashed_when_stats_look_unchanged_and_ignore_changes_are
 }
 
 #[test]
-fn presentation_inputs_are_recaptured_but_excluded_from_native_revision_identity() {
+fn unselected_scip_files_do_not_change_native_revision_identity() {
     use std::{
         fs,
         sync::{Arc, atomic::AtomicBool},
@@ -1393,9 +1393,7 @@ fn presentation_inputs_are_recaptured_but_excluded_from_native_revision_identity
     let manifest = root.path().join("labels.json");
     fs::write(&scip, b"first presentation").unwrap();
     fs::write(&manifest, b"{}").unwrap();
-    let mut options = IndexOptions::new(root.path().to_owned());
-    options.scip_path = Some(scip.clone());
-    options.manifest_path = Some(manifest.clone());
+    let options = IndexOptions::new(root.path().to_owned());
     let identity =
         trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
             .unwrap();

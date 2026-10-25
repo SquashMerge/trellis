@@ -837,6 +837,48 @@ pub(crate) fn captured_revision_header(
     Ok((artifact.source_set, artifact.revision))
 }
 
+/// The canonical captured root-input components used in the native revision ID.
+/// Store retains these original values for imports after mutable files change.
+pub(crate) fn captured_components(
+    capture: &Capture,
+    executable_hash: &str,
+) -> Result<(Value, Vec<Value>, Vec<Value>)> {
+    let root = capture.physical_root();
+    let root_inputs: Vec<_> = crate::capture::ROOT_INPUTS[..22]
+        .iter()
+        .map(|name| root.join(name))
+        .collect();
+    let dependencies: Vec<Value> = root_inputs
+        .iter()
+        .map(|p| entry(root, p, capture.bytes(p)))
+        .collect::<Result<_>>()?;
+    let mut config = dependencies.clone();
+    let selectors: Vec<_> = crate::capture::ROOT_INPUTS[22..]
+        .iter()
+        .map(|n| root.join(n))
+        .collect();
+    for p in &selectors {
+        config.push(entry(root, p, capture.bytes(p))?);
+    }
+    config.push(
+        json!({"nativeAdmission":{"maxFileBytes":capture.reconcile_options().max_file_bytes}}),
+    );
+    for (p, b) in capture.admitted_inputs() {
+        if p.file_name()
+            .is_some_and(|n| n == ".gitignore" || n == ".ignore")
+            && p.starts_with(root)
+        {
+            config.push(entry(root, p, b)?);
+        }
+    }
+    let selectors: Vec<Value> = selectors
+        .iter()
+        .map(|p| entry(root, p, capture.bytes(p)))
+        .collect::<Result<_>>()?;
+    let toolchain = json!({"nativeExecutable":executable_hash,"rootRustToolchain":selectors[0],"rootRustToolchainToml":selectors[1]});
+    Ok((toolchain, config, dependencies))
+}
+
 /// The full captured revision header is shared by full and selected measurement.
 /// Selecting one file must never change the source-set, producer or revision ID.
 fn build_native_header<'a>(
@@ -870,38 +912,7 @@ fn build_native_header<'a>(
         languages: producer.languages.clone(),
         dependencies: vec![],
     };
-    let root_inputs: Vec<_> = crate::capture::ROOT_INPUTS[..22]
-        .iter()
-        .map(|name| root.join(name))
-        .collect();
-    let dependencies: Vec<Value> = root_inputs
-        .iter()
-        .map(|p| entry(root, p, capture.bytes(p)))
-        .collect::<Result<_>>()?;
-    let mut config = dependencies.clone();
-    let selectors: Vec<_> = crate::capture::ROOT_INPUTS[22..]
-        .iter()
-        .map(|n| root.join(n))
-        .collect();
-    for p in &selectors {
-        config.push(entry(root, p, capture.bytes(p))?);
-    }
-    config.push(
-        json!({"nativeAdmission":{"maxFileBytes":capture.reconcile_options().max_file_bytes}}),
-    );
-    for (p, b) in capture.admitted_inputs() {
-        if p.file_name()
-            .is_some_and(|n| n == ".gitignore" || n == ".ignore")
-            && p.starts_with(root)
-        {
-            config.push(entry(root, p, b)?);
-        }
-    }
-    let selectors: Vec<Value> = selectors
-        .iter()
-        .map(|p| entry(root, p, capture.bytes(p)))
-        .collect::<Result<_>>()?;
-    let toolchain = json!({"nativeExecutable":executable_hash,"rootRustToolchain":selectors[0],"rootRustToolchainToml":selectors[1]});
+    let (toolchain, config, dependencies) = captured_components(capture, &executable_hash)?;
     let mut files: Vec<_> = capture.files.iter().collect();
     files.sort_by(|a, b| {
         language_order(&a.language)
@@ -1414,20 +1425,18 @@ fn prepare_spooled_document(
     document: &Document,
     file: &SourceFile,
     cancel: &CancelFlag,
-    labels: &crate::indexer::PreparedDisplayLabels<'_>,
     before_validate: &(dyn Fn(&Document, &mut Artifact) -> Result<()> + Sync),
     after_class: &(dyn Fn(&Document, &crate::classes::FileExtraction) -> Result<()> + Sync),
 ) -> Result<PreparedSpoolDocument> {
     before_validate(document, &mut facts)?;
     validate_spooled_document(&mut facts, document, file)?;
-    let graph = crate::indexer::project_native_spooled_document(
+    let graph = crate::indexer::project_native_document(
         options,
         capture,
         &facts,
         &document.key.path,
         cancel,
         &|_| {},
-        labels,
     )?;
     crate::indexer::validate_native_graph_records(&graph, &facts, cancel)?;
     let extraction = if matches!(file.language.as_str(), "java" | "python") {
@@ -1563,7 +1572,6 @@ fn spool_full_capture_with(
     // Only one graph projection is allowed for this capture. Per-document
     // projection does not claim again. Keep source/producer checks before work.
     capture.claim_graph_projection()?;
-    let prepared_labels = crate::indexer::prepare_display_labels(options, capture);
     let mut ids = IdentityRegistry::default();
     spool.conn.execute_batch("BEGIN IMMEDIATE")?;
     for (chunk_index, chunk) in pairs.chunks(plan.chunk.max(1)).enumerate() {
@@ -1590,7 +1598,6 @@ fn spool_full_capture_with(
                             document,
                             file,
                             cancel,
-                            &prepared_labels,
                             before_validate,
                             after_class,
                         )
@@ -5335,7 +5342,7 @@ mod full_document_spool_tests {
     }
 
     #[test]
-    fn prepared_multifile_scip_labels_match_full_projection_and_reject_duplicates() {
+    fn native_multifile_spool_ignores_unselected_scip_documents() {
         use protobuf::Message;
         let state = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
@@ -5371,9 +5378,7 @@ mod full_document_spool_tests {
         )
         .unwrap();
         let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
-        let mut options = IndexOptions::new(workspace.path().to_owned());
-        options.scip_path = Some(workspace.path().join("index.scip"));
-        options.manifest_path = Some(workspace.path().join("manifest.json"));
+        let options = IndexOptions::new(workspace.path().to_owned());
         let root = fs::canonicalize(workspace.path()).unwrap();
         let cancel = Arc::new(AtomicBool::new(false));
         let baseline_capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
@@ -5406,13 +5411,7 @@ mod full_document_spool_tests {
         }
         nodes.sort_by(|a, b| a.id.cmp(&b.id));
         assert_eq!(nodes, baseline.nodes);
-        for name in ["A", "g", "f"] {
-            assert!(
-                nodes
-                    .iter()
-                    .any(|node| node.name == name && node.display_label.is_some())
-            );
-        }
+        assert!(nodes.iter().all(|node| node.display_label.is_none()));
         let mut duplicate = scip::types::Document::new();
         duplicate.relative_path = "c.js".into();
         duplicate.language = "java".into();

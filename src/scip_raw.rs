@@ -409,24 +409,33 @@ fn position_walk_hook(flag: &CancelFlag) {
         }
     });
 }
+#[cfg(test)]
+thread_local! { static POSITION_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+#[cfg(test)]
+pub(crate) fn take_position_work() -> usize {
+    POSITION_WORK.with(|work| work.replace(0))
+}
 fn next_newline(bytes: &[u8], flag: &CancelFlag) -> Result<Option<usize>, ScipCaptureError> {
     for (chunk_index, chunk) in bytes.chunks(65536).enumerate() {
         cancelled(flag)?;
-        if let Some(at) = chunk.iter().position(|b| *b == b'\n') {
+        let newline = chunk.iter().position(|b| *b == b'\n');
+        #[cfg(test)]
+        POSITION_WORK.with(|work| work.set(work.get() + newline.map_or(chunk.len(), |at| at + 1)));
+        if let Some(at) = newline {
             return Ok(Some(chunk_index * 65536 + at));
         }
     }
     Ok(None)
 }
-fn validate_positions(
+pub(crate) fn source_byte_offsets(
     text: &str,
     enc: u8,
     positions: &mut Vec<(i32, i32)>,
     flag: &CancelFlag,
-) -> Result<(), ScipCaptureError> {
+) -> Result<BTreeMap<(i32, i32), usize>, ScipCaptureError> {
     cancelled(flag)?;
-    if positions.is_empty() {
-        return Ok(());
+    if !matches!(enc, 1..=3) {
+        return Err(invalid("position encoding"));
     }
     positions.sort_unstable();
     positions.dedup();
@@ -436,7 +445,9 @@ fn validate_positions(
     let mut loaded_line = None;
     let mut chars = "".chars();
     let mut measured = 0usize;
+    let mut byte_offset = 0usize;
     let mut steps = 0usize;
+    let mut result = BTreeMap::new();
     for &(line, column) in positions.iter() {
         if line < 0 || column < 0 {
             return Err(invalid("negative position"));
@@ -462,6 +473,7 @@ fn validate_positions(
             };
             chars = text[line_start..end].chars();
             measured = 0;
+            byte_offset = line_start;
             loaded_line = Some(target);
         }
         while measured < column as usize {
@@ -469,6 +481,8 @@ fn validate_positions(
                 .next()
                 .ok_or_else(|| invalid("range column outside source"))?;
             steps += 1;
+            #[cfg(test)]
+            POSITION_WORK.with(|work| work.set(work.get() + c.len_utf8()));
             if steps.is_multiple_of(1024) {
                 #[cfg(test)]
                 position_walk_hook(flag);
@@ -478,14 +492,24 @@ fn validate_positions(
                 1 => c.len_utf8(),
                 2 => c.len_utf16(),
                 3 => 1,
-                _ => return Err(invalid("position encoding")),
+                _ => unreachable!(),
             };
+            byte_offset += c.len_utf8();
         }
         if measured != column as usize {
             return Err(invalid("split codepoint"));
         }
+        result.insert((line, column), byte_offset);
     }
-    Ok(())
+    Ok(result)
+}
+fn validate_positions(
+    text: &str,
+    enc: u8,
+    positions: &mut Vec<(i32, i32)>,
+    flag: &CancelFlag,
+) -> Result<(), ScipCaptureError> {
+    source_byte_offsets(text, enc, positions, flag).map(|_| ())
 }
 #[cfg(test)]
 fn check_position(text: &str, line: i32, column: i32, enc: u8) -> Result<(), ScipCaptureError> {
@@ -1634,6 +1658,33 @@ mod tests {
                 .len(),
             3
         );
+    }
+    #[test]
+    fn authenticated_coordinate_conversion_and_zero_fallback() {
+        let source = "a😀b\r\nz";
+        let flag = Arc::new(AtomicBool::new(false));
+        for (encoding, end) in [(1, 5), (2, 3), (3, 2)] {
+            let mut positions = vec![(1, 1), (0, end), (0, 1), (1, 0), (0, end)];
+            let bytes = source_byte_offsets(source, encoding, &mut positions, &flag).unwrap();
+            assert_eq!(bytes[&(0, 1)], 1);
+            assert_eq!(bytes[&(0, end)], 5);
+            assert_eq!(bytes[&(1, 0)], 8);
+            assert_eq!(bytes[&(1, 1)], 9);
+            assert_eq!(positions.len(), 4);
+            assert!(source_byte_offsets(source, encoding, &mut vec![(0, end + 2)], &flag).is_err());
+            if encoding != 3 {
+                assert!(
+                    source_byte_offsets(source, encoding, &mut vec![(0, end - 1)], &flag).is_err()
+                );
+            }
+        }
+        let occ = hex::decode("0a03000103120241231801").unwrap();
+        let raw_zero = base_doc(message(2, &occ), 0);
+        assert!(custom(&raw_zero, source.as_bytes(), 2).is_ok());
+        assert!(
+            matches!(custom(&raw_zero, source.as_bytes(), 1), Err(ScipCaptureError::InvalidArtifact(reason)) if reason == "split codepoint")
+        );
+        assert!(custom(&base_doc(message(2, &occ), 1), source.as_bytes(), 2).is_err());
     }
     #[test]
     fn scip_position_scalar_boundaries_and_cancel() {

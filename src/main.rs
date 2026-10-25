@@ -32,6 +32,8 @@ enum Command {
     NativeCapture(NativeCaptureArgs),
     /// Build and atomically publish a complete index. Does not execute repository code.
     Index(IndexArgs),
+    /// Explicitly import pinned SCIP evidence into the selected native index.
+    Semantic(SemanticCommand),
     /// Run the elected user-level socket service.
     Daemon,
     /// Serve one read-only MCP connection on line-framed stdin/stdout.
@@ -91,15 +93,33 @@ struct WorkspaceArgs {
 struct IndexArgs {
     #[command(flatten)]
     workspace: WorkspaceArgs,
-    /// Existing binary SCIP artifact. No semantic indexer is executed.
-    #[arg(long)]
-    scip: Option<PathBuf>,
-    /// Paired flat JSON map of relative input paths to SHA-256 hashes.
-    #[arg(long, requires = "scip")]
-    manifest: Option<PathBuf>,
     /// Larger files are skipped with a diagnostic; valid range 1..16777216.
     #[arg(long)]
     max_file_bytes: Option<u64>,
+}
+#[derive(Args)]
+struct SemanticCommand {
+    #[command(subcommand)]
+    action: SemanticAction,
+}
+#[derive(Subcommand)]
+enum SemanticAction {
+    Import(SemanticImportArgs),
+}
+#[derive(Args)]
+struct SemanticImportArgs {
+    #[command(flatten)]
+    workspace: WorkspaceArgs,
+    #[arg(long)]
+    scip: PathBuf,
+    #[arg(long)]
+    manifest: PathBuf,
+    #[arg(long)]
+    profile: String,
+    #[arg(long)]
+    producer: String,
+    #[arg(long = "manifest-sha256")]
+    manifest_sha256: String,
 }
 #[derive(Args)]
 struct ServeArgs {
@@ -294,6 +314,7 @@ async fn main() -> Result<()> {
             eprintln!("Forgot record {}", args.record_id);
         }
         command @ (Command::Index(_)
+        | Command::Semantic(_)
         | Command::Status(_)
         | Command::Symbols(_)
         | Command::Query(_)
@@ -605,7 +626,7 @@ fn send_daemon(request: &protocol::Request, read_only: bool) -> Result<serde_jso
     let cli_bound = CLI_REPLY_BOUND;
     #[cfg(feature = "test-support")]
     let cli_bound = metrics_test_duration("TRELLIS_TEST_CLI_REPLY_BOUND_MS").unwrap_or(cli_bound);
-    let reply_bound = if request.operation == "index" {
+    let reply_bound = if matches!(request.operation.as_str(), "index" | "semantic_import") {
         index_bound
     } else {
         cli_bound
@@ -749,11 +770,42 @@ fn dispatch_cli(command: &Command) -> Result<()> {
             "index",
             &args.workspace,
             serde_json::json!({
-                "scip": args.scip, "manifest": args.manifest,
                 "maxFileBytes": args.max_file_bytes
             }),
             false,
         ),
+        Command::Semantic(SemanticCommand {
+            action: SemanticAction::Import(args),
+        }) => {
+            let anchor = |path: &PathBuf| -> Result<String> {
+                let absolute = if path.is_absolute() {
+                    path.clone()
+                } else {
+                    std::env::current_dir()?.join(path)
+                };
+                Ok(absolute
+                    .to_str()
+                    .context("invalid_request: non-UTF8 input path")?
+                    .to_owned())
+            };
+            ensure!(
+                args.manifest_sha256.len() == 64
+                    && args
+                        .manifest_sha256
+                        .bytes()
+                        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+                "invalid_request: manifest digest"
+            );
+            (
+                "semantic_import",
+                &args.workspace,
+                serde_json::json!({
+                    "version":1,"scip":anchor(&args.scip)?,"manifest":anchor(&args.manifest)?,
+                    "profileId":args.profile,"producerName":args.producer,"manifestSha256":args.manifest_sha256
+                }),
+                false,
+            )
+        }
         _ => unreachable!(),
     };
     let (_roots, identity) = workspace.resolve_unattached()?;
@@ -770,12 +822,6 @@ fn dispatch_cli(command: &Command) -> Result<()> {
             (1..=16_777_216).contains(&args.max_file_bytes.unwrap_or(2_097_152)),
             "max-file-bytes must be 1..16777216"
         );
-        let mut options = IndexOptions::new(identity.root.clone());
-        options.scip_path = args.scip.clone();
-        options.manifest_path = args.manifest.clone();
-        options.anchor_optional_inputs(&std::env::current_dir()?)?;
-        payload["scip"] = serde_json::to_value(options.scip_path)?;
-        payload["manifest"] = serde_json::to_value(options.manifest_path)?;
         if args.max_file_bytes.is_none() {
             payload
                 .as_object_mut()
@@ -862,14 +908,11 @@ async fn serve_via_daemon(args: &ServeArgs) -> Result<()> {
             .context("serve token file needs a name")?,
     );
     let mut index_options = IndexOptions::new(identity.root.clone());
-    index_options.scip_path = args.index.scip.clone();
-    index_options.manifest_path = args.index.manifest.clone();
     index_options.max_file_bytes = args.index.max_file_bytes.unwrap_or(2_097_152);
     ensure!(
         (1..=16_777_216).contains(&index_options.max_file_bytes),
         "max-file-bytes must be 1..16777216"
     );
-    index_options.anchor_optional_inputs(&std::env::current_dir()?)?;
     let rust_library = if let Some(path) = args
         .rust_library
         .clone()
@@ -886,8 +929,6 @@ async fn serve_via_daemon(args: &ServeArgs) -> Result<()> {
             &index_options,
             args.browse_root.clone(),
         )),
-        scip: index_options.scip_path,
-        manifest: index_options.manifest_path,
         max_file_bytes: index_options.max_file_bytes,
         rust_source_roots: args.rust_source_roots.clone(),
         rust_library,
@@ -914,12 +955,6 @@ async fn serve_via_daemon(args: &ServeArgs) -> Result<()> {
         .expect("browser options object");
     // Only index options actually supplied by this caller can supersede a
     // durable option. Other BrowserOptions fields retain their normal shape.
-    if args.index.scip.is_none() {
-        fields.remove("scip");
-    }
-    if args.index.manifest.is_none() {
-        fields.remove("manifest");
-    }
     if args.index.max_file_bytes.is_none() {
         fields.remove("maxFileBytes");
     }
@@ -1114,17 +1149,13 @@ mod serve_option_transport_tests {
     fn daemon_receipt_keeps_omitted_and_explicit_default_distinct() {
         let options = serde_json::to_value(registry::BrowserOptions::default()).unwrap();
         let mut omitted = options.clone();
-        for key in ["scip", "manifest", "maxFileBytes"] {
-            omitted.as_object_mut().unwrap().remove(key);
-        }
+        omitted.as_object_mut().unwrap().remove("maxFileBytes");
         let absent = checked_serve_options(omitted).unwrap();
         let explicit = checked_serve_options(options).unwrap();
-        for key in ["scip", "manifest", "maxFileBytes"] {
-            assert!(absent.0.get(key).is_none(), "{}", absent.0);
-        }
+        assert!(absent.0.get("maxFileBytes").is_none());
         assert_eq!(explicit.0["maxFileBytes"], 2_097_152);
-        assert_eq!(explicit.0.get("scip"), Some(&serde_json::Value::Null));
-        assert_eq!(explicit.0.get("manifest"), Some(&serde_json::Value::Null));
+        assert!(explicit.0.get("scip").is_none());
+        assert!(explicit.0.get("manifest").is_none());
     }
 }
 
@@ -1394,7 +1425,7 @@ fn dispatch_connection(
         ensure!(
             matches!(
                 request.operation.as_str(),
-                "status" | "symbols" | "query" | "index" | "metrics"
+                "status" | "symbols" | "query" | "index" | "semantic_import" | "metrics"
             ),
             "unknown daemon operation"
         );
@@ -1577,9 +1608,13 @@ fn dispatch_connection(
                     Ok(value)
                 }
                 "index" => {
+                    ensure!(
+                        args.as_object().is_some_and(|values| values
+                            .keys()
+                            .all(|key| matches!(key.as_str(), "workspace" | "maxFileBytes"))),
+                        "invalid_request: unknown index option"
+                    );
                     let mut options = IndexOptions::new(identity.root.clone());
-                    options.scip_path = serde_json::from_value(args["scip"].clone())?;
-                    options.manifest_path = serde_json::from_value(args["manifest"].clone())?;
                     if let Some(value) = args.get("maxFileBytes") {
                         options.max_file_bytes = value.as_u64().context("invalid maxFileBytes")?;
                     }
@@ -1587,14 +1622,20 @@ fn dispatch_connection(
                         (1..=16_777_216).contains(&options.max_file_bytes),
                         "max-file-bytes must be 1..16777216"
                     );
-                    options.anchor_optional_inputs(&std::env::current_dir()?)?;
                     checkout.cli_index(&options)
+                }
+                "semantic_import" => {
+                    let options: trellis::store::requests::SemanticImportOptions =
+                        serde_json::from_value(args.clone()).map_err(|_| {
+                            anyhow::anyhow!("invalid_request: semantic import options")
+                        })?;
+                    checkout.cli_semantic_import(&options)
                 }
                 _ => anyhow::bail!("unknown daemon operation"),
             };
             // Mandatory startup reconciliation may be running when a CLI read first attaches.
             // This only repeats read-only calls; index is never replayed.
-            if request.operation != "index"
+            if !matches!(request.operation.as_str(), "index" | "semantic_import")
                 && selected
                     .as_ref()
                     .err()

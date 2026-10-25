@@ -2,7 +2,7 @@ use super::*;
 use std::fs;
 
 #[test]
-fn takeover_head_manifest_options_survive_ack_and_idle_watcher() {
+fn takeover_head_native_limit_survives_ack_and_idle_watcher() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("workspace");
     fs::create_dir(&root).unwrap();
@@ -18,7 +18,7 @@ fn takeover_head_manifest_options_survive_ack_and_idle_watcher() {
     .unwrap();
     drop(old);
     let mut head = defaults.clone();
-    head.manifest_path = Some(root.join("optional-manifest.json"));
+    head.max_file_bytes = 8192;
     let queued = store.enqueue_request(&head, None).unwrap();
     let state = new(
         store.clone(),
@@ -37,8 +37,8 @@ fn takeover_head_manifest_options_survive_ack_and_idle_watcher() {
             .recorded_index_options()
             .unwrap()
             .unwrap()
-            .manifest_path,
-        head.manifest_path
+            .max_file_bytes,
+        head.max_file_bytes
     );
     state.worker_step().unwrap();
     assert_eq!(
@@ -51,8 +51,8 @@ fn takeover_head_manifest_options_survive_ack_and_idle_watcher() {
             .recorded_index_options()
             .unwrap()
             .unwrap()
-            .manifest_path,
-        head.manifest_path
+            .max_file_bytes,
+        head.max_file_bytes
     );
 }
 
@@ -695,11 +695,11 @@ async fn local_writer_uses_claimed_clients_options_not_daemon_defaults() {
     )
     .unwrap();
     let follower_store = Store::open_for_tests(&state_root, &root).unwrap();
-    let mut bad_daemon_options = own_options.clone();
-    bad_daemon_options.scip_path = Some(root.clone()); // directory is an invalid optional input
+    let mut daemon_options = own_options.clone();
+    daemon_options.max_file_bytes = 4096;
     let state = new(
         follower_store.clone(),
-        bad_daemon_options,
+        daemon_options,
         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
         "127.0.0.1:7331".parse().unwrap(),
     )

@@ -144,16 +144,8 @@ fn main_writer_graph_payloads_match_one_shared_projection_byte_for_byte() {
         &root,
         "8c47ae03958e0955b1e42d5d3310d6cb38be1b72d34658509a4392cd148d762d",
     );
-    for mode in ["plain", "scip"] {
-        let mut options = IndexOptions::new(root.clone());
-        if mode == "scip" {
-            options.scip_path = Some(root.join("labels.scip"));
-            options.manifest_path = Some(root.join("labels-manifest.json"));
-            assert_eq!(
-                sha(&fs::read(root.join("labels.scip")).unwrap()),
-                frozen["modes"][mode]["scipSha256"]
-            );
-        }
+    for mode in ["plain"] {
+        let options = IndexOptions::new(root.clone());
         let capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
         let documents = frozen["modes"][mode]["documents"].as_object().unwrap();
         assert_eq!(documents.len(), 5);
@@ -169,14 +161,6 @@ fn main_writer_graph_payloads_match_one_shared_projection_byte_for_byte() {
                 old["sourceSha256"],
                 "{mode} {path} input drift"
             );
-            let mut labels = BTreeMap::new();
-            for node in old["rows"]["nodes"].as_array().unwrap() {
-                let payload: Value =
-                    serde_json::from_str(node["payload"].as_str().unwrap()).unwrap();
-                if let Some(label) = payload["displayLabel"].as_str() {
-                    labels.insert(node["id"].as_str().unwrap().to_owned(), label.to_owned());
-                }
-            }
             let facts = &native[path];
             assert_eq!(facts.document_version_id, old["documentVersionId"]);
             let mut declarations: Vec<_> = facts.declarations.iter().collect();
@@ -194,7 +178,6 @@ fn main_writer_graph_payloads_match_one_shared_projection_byte_for_byte() {
                     calls,
                     control_regions,
                 },
-                &labels,
             )
             .unwrap();
             assert_writer_order(&old["rows"], &nodes, &calls, &regions);
@@ -316,7 +299,6 @@ fn main_writer_nested_call_and_query_view_oracle() {
             calls,
             control_regions,
         },
-        &BTreeMap::new(),
     )
     .unwrap();
     assert_writer_order(&frozen["rows"], &nodes, &calls, &regions);
