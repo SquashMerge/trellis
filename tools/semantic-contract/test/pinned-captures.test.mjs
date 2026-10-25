@@ -31,7 +31,7 @@ async function pinnedExample(t, edit = () => {}) {
   await cp(example, root, { recursive: true });
   const fixture = JSON.parse(await readFile(join(root, "fixture.json")));
   const profile = {
-    semanticProducers: [{ name: "P", executableHash: hashOf("P") }],
+    semanticProducers: [{ name: "P", executableHash: hashOf("P"), positionEncoding: "utf8" }],
     toolchains: [{ name: "tool", toolchainHash: hashOf("tool") }],
   };
   for (const capture of fixture.captures)
@@ -70,6 +70,15 @@ test("PIN.DIGEST rejects a pinned hash that differs from the profile", async (t)
       error.assertion === "IDENTITY.DIGEST" &&
       error.message.includes("pinned digest differs"),
   );
+});
+test("PIN.ENCODING rejects a pinned producer convention mismatch", async (t) => {
+  const load = await pinnedExample(t, (_, profile) => {
+    profile.semanticProducers[0].positionEncoding = "utf16";
+  });
+  await assert.rejects(load(), {
+    assertion: "IDENTITY.PRODUCER",
+    message: /pinned position encoding differs/,
+  });
 });
 test("PIN.ENTRY rejects a pin naming a missing profile entry or profile", async (t) => {
   const missingEntry = await pinnedExample(t, (fixture) => {
