@@ -651,11 +651,11 @@ SELECT (SELECT length(content_hash)+20 FROM class_projections WHERE cid=x.cid)+(
 UNION ALL
 SELECT (SELECT length(content_hash)+20 FROM class_projections WHERE cid=x.cid)+COALESCE(length(CAST(x.id AS BLOB)),0)+39+(CASE WHEN x.target IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.payload AS BLOB)),0) AS row_bytes FROM class_relations x WHERE x.cid=?2
 )"#;
-const DATABASE_SCHEMA_VERSION: u32 = 21;
+const DATABASE_SCHEMA_VERSION: u32 = 22;
 const EXTRACTOR_VERSION: &str = "native-v6-delta-v1";
 const EVIDENCE_FORMAT: &str = "terminal-native-graph-v1";
 const CACHE_SCHEMA_V17: &str = r#"
-CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=21), extractor_version TEXT NOT NULL CHECK(extractor_version='native-v6-delta-v1'), root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL, reconcile_options TEXT);
+CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=22), extractor_version TEXT NOT NULL CHECK(extractor_version='native-v6-delta-v1'), root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL, reconcile_options TEXT);
 CREATE TABLE native_producers(id TEXT NOT NULL,version TEXT NOT NULL,executable_hash TEXT NOT NULL CHECK(length(executable_hash)=64),kind TEXT NOT NULL CHECK(kind='native'),position_encoding TEXT NOT NULL CHECK(position_encoding='utf8'),PRIMARY KEY(id,version));
 CREATE TABLE native_producer_languages(producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,language TEXT NOT NULL,inventory_authenticated INTEGER NOT NULL CHECK(inventory_authenticated IN (0,1)),ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(producer_id,producer_version,language),UNIQUE(producer_id,producer_version,ordinal),FOREIGN KEY(producer_id,producer_version) REFERENCES native_producers(id,version) DEFERRABLE INITIALLY DEFERRED);
 CREATE TABLE native_producer_inputs(producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,language TEXT NOT NULL,component_name TEXT NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(producer_id,producer_version,language,component_name),UNIQUE(producer_id,producer_version,language,ordinal),FOREIGN KEY(producer_id,producer_version,language) REFERENCES native_producer_languages(producer_id,producer_version,language) DEFERRABLE INITIALLY DEFERRED);
@@ -669,7 +669,7 @@ CREATE TABLE native_revision_release_debt(revision_id TEXT PRIMARY KEY REFERENCE
 CREATE TABLE native_release_candidate_versions(revision_id TEXT NOT NULL REFERENCES native_revisions(id) DEFERRABLE INITIALLY DEFERRED,vid INTEGER NOT NULL REFERENCES document_versions(vid) DEFERRABLE INITIALLY DEFERRED,PRIMARY KEY(revision_id,vid));
 CREATE TABLE native_release_candidate_graphs(revision_id TEXT NOT NULL REFERENCES native_revisions(id) DEFERRABLE INITIALLY DEFERRED,gid INTEGER NOT NULL REFERENCES graph_projections(gid) DEFERRABLE INITIALLY DEFERRED,PRIMARY KEY(revision_id,gid));
 CREATE TABLE native_release_candidate_classes(revision_id TEXT NOT NULL REFERENCES native_revisions(id) DEFERRABLE INITIALLY DEFERRED,cid INTEGER NOT NULL REFERENCES class_projections(cid) DEFERRABLE INITIALLY DEFERRED,PRIMARY KEY(revision_id,cid));
-CREATE TABLE native_revisions(id TEXT PRIMARY KEY,source_set_id TEXT NOT NULL REFERENCES native_source_sets(id) DEFERRABLE INITIALLY DEFERRED,toolchain_hash TEXT NOT NULL CHECK(length(toolchain_hash)=64),config_hash TEXT NOT NULL CHECK(length(config_hash)=64),dependency_hash TEXT NOT NULL CHECK(length(dependency_hash)=64),native_revision_id TEXT NOT NULL,source_inventory TEXT NOT NULL,dependency_observations TEXT NOT NULL,reconcile_options TEXT,class_warnings TEXT NOT NULL,class_truncated INTEGER NOT NULL CHECK(class_truncated IN (0,1)),graph_stats TEXT NOT NULL CHECK(json_valid(graph_stats) AND json_type(graph_stats)='object'),graph_diagnostics TEXT NOT NULL CHECK(json_valid(graph_diagnostics) AND json_type(graph_diagnostics)='array'),published_index_revision INTEGER NOT NULL CHECK(published_index_revision BETWEEN 0 AND 9007199254740991));
+CREATE TABLE native_revisions(id TEXT PRIMARY KEY,source_set_id TEXT NOT NULL REFERENCES native_source_sets(id) DEFERRABLE INITIALLY DEFERRED,toolchain_hash TEXT NOT NULL CHECK(length(toolchain_hash)=64),config_hash TEXT NOT NULL CHECK(length(config_hash)=64),dependency_hash TEXT NOT NULL CHECK(length(dependency_hash)=64),native_revision_id TEXT NOT NULL,source_inventory TEXT NOT NULL,dependency_observations TEXT NOT NULL,retained_toolchain TEXT NOT NULL,retained_config TEXT NOT NULL,retained_dependencies TEXT NOT NULL,reconcile_options TEXT,class_warnings TEXT NOT NULL,class_truncated INTEGER NOT NULL CHECK(class_truncated IN (0,1)),graph_stats TEXT NOT NULL CHECK(json_valid(graph_stats) AND json_type(graph_stats)='object'),graph_diagnostics TEXT NOT NULL CHECK(json_valid(graph_diagnostics) AND json_type(graph_diagnostics)='array'),published_index_revision INTEGER NOT NULL CHECK(published_index_revision BETWEEN 0 AND 9007199254740991));
 CREATE UNIQUE INDEX native_revisions_pin ON native_revisions(published_index_revision);
 CREATE INDEX native_revisions_header_cover ON native_revisions(source_set_id,published_index_revision,id);
 CREATE TABLE revision_capture_inputs(revision_id TEXT NOT NULL REFERENCES native_revisions(id) DEFERRABLE INITIALLY DEFERRED,input_key TEXT NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(revision_id,input_key));
@@ -6731,6 +6731,31 @@ fn write_native(
         revision.index_generation, revision.index_revision
     );
     if write_header {
+        let (retained_toolchain, retained_config, retained_dependencies) =
+            crate::native_evidence::captured_components(
+                capture,
+                capture.physical_root(),
+                &a.producer.executable_hash,
+            )?;
+        for (expected, canonical) in [
+            (
+                &a.revision.toolchain_hash,
+                crate::native_ids::canonical(&retained_toolchain),
+            ),
+            (
+                &a.revision.config_hash,
+                crate::native_ids::canonical(&serde_json::json!(retained_config)),
+            ),
+            (
+                &a.revision.dependency_hash,
+                crate::native_ids::canonical(&serde_json::json!(retained_dependencies)),
+            ),
+        ] {
+            ensure!(
+                expected == &crate::native_ids::digest(b"", &canonical),
+                "native_evidence_required: retained component differs from measured revision"
+            );
+        }
         let origin: Option<(String,String,String,String,String)> = db.query_row(
         "SELECT id,version,executable_hash,kind,position_encoding FROM native_producers LIMIT 1",
         [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)),
@@ -6793,7 +6818,7 @@ fn write_native(
         }
         immutable.insert_manifest(
             db,
-            "INSERT INTO native_revisions VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+            "INSERT INTO native_revisions VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
             params![
                 revision_key,
                 a.revision.source_set_id,
@@ -6803,6 +6828,9 @@ fn write_native(
                 a.revision.id,
                 json(&a.revision.documents)?,
                 json(&a.source_set.dependencies)?,
+                json(&retained_toolchain)?,
+                json(&retained_config)?,
+                json(&retained_dependencies)?,
                 json(capture.reconcile_options())?,
                 json(&classes.warnings)?,
                 classes.truncated,
@@ -11302,7 +11330,7 @@ impl Store {
                 .context("revision overflow")?,
         };
         let next_key = semantic_pin_key(next);
-        tx.execute("INSERT INTO native_revisions SELECT ?1,source_set_id,toolchain_hash,config_hash,dependency_hash,native_revision_id,source_inventory,dependency_observations,reconcile_options,class_warnings,class_truncated,graph_stats,graph_diagnostics,?2 FROM native_revisions WHERE id=?3",params![next_key,next.index_revision as i64,old_key])?;
+        tx.execute("INSERT INTO native_revisions SELECT ?1,source_set_id,toolchain_hash,config_hash,dependency_hash,native_revision_id,source_inventory,dependency_observations,retained_toolchain,retained_config,retained_dependencies,reconcile_options,class_warnings,class_truncated,graph_stats,graph_diagnostics,?2 FROM native_revisions WHERE id=?3",params![next_key,next.index_revision as i64,old_key])?;
         tx.execute("INSERT INTO revision_documents SELECT ?1,language,path,vid,gid,cid,capture_stat,coverage_requested,coverage_selected,coverage_state,coverage_diagnostic,ordinal FROM revision_documents WHERE revision_id=?2",params![next_key,old_key])?;
         tx.execute("INSERT INTO revision_capture_inputs SELECT ?1,input_key,payload FROM revision_capture_inputs WHERE revision_id=?2",params![next_key,old_key])?;
         let (producer_sha, binding_sha) = revision_producer_binding(&tx, &next_key)?;
@@ -11325,6 +11353,17 @@ impl Store {
         self.identity.verify()?;
         check_cancel(cancel)?;
         storage_result(tx.commit())?;
+        #[cfg(feature = "test-support")]
+        if std::env::var_os("TRELLIS_TEST_SEMANTIC_AMBIGUOUS_COMMIT").is_some_and(|marker| {
+            let marker = std::path::PathBuf::from(marker);
+            if marker.exists() {
+                false
+            } else {
+                std::fs::write(marker, b"semantic commit succeeded").is_ok()
+            }
+        }) {
+            return Err(topology::StorageBusy.into());
+        }
         Ok(next)
     }
 
@@ -12901,15 +12940,29 @@ impl Store {
             "pin:v1:{}:{}",
             revision.index_generation, revision.index_revision
         );
+        let (retained_toolchain, _, _) = crate::native_evidence::captured_components(
+            capture,
+            Path::new(&self.workspace_root),
+            executing_hash,
+        )?;
+        ensure!(
+            header.toolchain_hash
+                == crate::native_ids::digest(
+                    b"",
+                    &crate::native_ids::canonical(&retained_toolchain)
+                ),
+            "native_evidence_required: rebuilt toolchain component differs"
+        );
         let copied = tx.execute(
-                "INSERT INTO native_revisions SELECT ?1,source_set_id,?4,config_hash,             dependency_hash,?5,?6,dependency_observations,             reconcile_options,class_warnings,class_truncated,graph_stats,graph_diagnostics,?2             FROM native_revisions WHERE id=?3",
+                "INSERT INTO native_revisions SELECT ?1,source_set_id,?4,config_hash,             dependency_hash,?5,?6,dependency_observations,?7,retained_config,retained_dependencies,             reconcile_options,class_warnings,class_truncated,graph_stats,graph_diagnostics,?2             FROM native_revisions WHERE id=?3",
                 params![
                     revision_key,
                     revision.index_revision as i64,
                     selected.key,
                     header.toolchain_hash,
                     header.id,
-                    json(&header.documents)?
+                    json(&header.documents)?,
+                    json(&retained_toolchain)?
                 ],
             )?;
         selected_ensure!(
@@ -15869,6 +15922,42 @@ impl Store {
         }
         declarations.sort_by(|a, b| a.syntax_id.cmp(&b.syntax_id));
         Ok(declarations)
+    }
+
+    /// Resolve an authenticated manifest's native revision to a retained historical pin.
+    pub fn retained_native_pin_for(&self, revision: &str, source_set: &str) -> Result<IndexPin> {
+        let generation = self.index_baseline()?.index_generation;
+        self.with_evidence(|db| {
+            let revision: i64 = db.query_row(
+                "SELECT published_index_revision FROM native_revisions r WHERE native_revision_id=?1 AND source_set_id=?2 AND NOT EXISTS(SELECT 1 FROM revision_capture_inputs WHERE revision_id=r.id AND input_key IN ('__released:v1','__pending_release:v1')) ORDER BY published_index_revision DESC LIMIT 1",
+                rusqlite::params![revision,source_set], |row|row.get(0),
+            ).context("capture_unavailable: retained native revision missing")?;
+            Ok(IndexPin { index_generation:generation, index_revision:u64::try_from(revision)? })
+        })
+    }
+
+    /// The original canonical native root inputs retained with the selected revision.
+    pub fn retained_native_components_at(
+        &self,
+        pin: IndexPin,
+    ) -> Result<(
+        serde_json::Value,
+        Vec<serde_json::Value>,
+        Vec<serde_json::Value>,
+    )> {
+        self.native_at(pin, |db, selected| {
+            let (toolchain, config, dependencies): (String, String, String) = db.query_row(
+                "SELECT retained_toolchain,retained_config,retained_dependencies FROM native_revisions WHERE id=?1",
+                [&selected.key], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+            )?;
+            let toolchain = serde_json::from_str(&toolchain)
+                .context(SelectedIntegrity("incompatible_index: corrupt retained toolchain".into()))?;
+            let config = serde_json::from_str(&config)
+                .context(SelectedIntegrity("incompatible_index: corrupt retained config".into()))?;
+            let dependencies = serde_json::from_str(&dependencies)
+                .context(SelectedIntegrity("incompatible_index: corrupt retained dependencies".into()))?;
+            Ok((toolchain, config, dependencies))
+        })
     }
 
     /// Captured source bytes and measured native facts from one retained pin, without disk reads.

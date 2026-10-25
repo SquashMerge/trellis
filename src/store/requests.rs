@@ -505,6 +505,23 @@ pub(crate) struct PendingCompletion {
 }
 
 impl Request {
+    pub fn semantic_options(&self) -> Result<SemanticImportOptions> {
+        ensure!(
+            self.request_kind == RequestKind::SemanticImport,
+            "invalid request kind for semantic import"
+        );
+        ensure!(
+            self.options_json.len() <= 4096,
+            "invalid request options length"
+        );
+        let options: SemanticImportOptions = serde_json::from_str(&self.options_json)?;
+        ensure!(
+            options.version == 1,
+            "invalid semantic import options version"
+        );
+        Ok(options)
+    }
+
     pub fn options(&self, root: &Path) -> Result<IndexOptions> {
         ensure!(
             self.request_kind == RequestKind::Index,
@@ -1198,21 +1215,68 @@ impl Store {
         after_write_lock: impl FnOnce(),
         after_insert: impl FnOnce(),
     ) -> Result<Request> {
+        ensure!(
+            (1..=16_777_216).contains(&options.max_file_bytes),
+            "invalid request options"
+        );
+        self.enqueue_typed_request(
+            &options.workspace_root,
+            &ReconcileOptions::from(options),
+            RequestKind::Index,
+            expected,
+            after_write_lock,
+            after_insert,
+        )
+    }
+
+    /// Accept a closed semantic job without reading mutable SCIP inputs yet.
+    pub fn enqueue_semantic_import(
+        &self,
+        root: &Path,
+        options: &SemanticImportOptions,
+    ) -> Result<Request> {
+        ensure!(
+            options.version == 1
+                && !options.scip.is_empty()
+                && !options.manifest.is_empty()
+                && !options.profile_id.is_empty()
+                && !options.producer_name.is_empty()
+                && options.manifest_sha256.len() == 64
+                && options
+                    .manifest_sha256
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+            "invalid_request: semantic import options"
+        );
+        self.enqueue_typed_request(
+            root,
+            options,
+            RequestKind::SemanticImport,
+            None,
+            || {},
+            || {},
+        )
+    }
+
+    fn enqueue_typed_request<T: Serialize>(
+        &self,
+        root: &Path,
+        options: &T,
+        request_kind: RequestKind,
+        expected: Option<IndexPin>,
+        after_write_lock: impl FnOnce(),
+        after_insert: impl FnOnce(),
+    ) -> Result<Request> {
         // In flight from before the transaction until after the wake.
         let _in_flight = self.enqueue_in_flight();
         self.identity.verify()?;
-        let selected = std::fs::symlink_metadata(&options.workspace_root)?;
+        let selected = std::fs::symlink_metadata(root)?;
         ensure!(
             selected.is_dir()
                 && !selected.file_type().is_symlink()
                 && (selected.dev(), selected.ino()) == (self.identity.device, self.identity.inode)
-                && std::fs::canonicalize(&options.workspace_root)? == self.identity.root,
+                && std::fs::canonicalize(root)? == self.identity.root,
             "root_changed: request workspace mismatch"
-        );
-        let options = ReconcileOptions::from(options);
-        ensure!(
-            options.version == 2 && (1..=16_777_216).contains(&options.max_file_bytes),
-            "invalid request options"
         );
         let encoded = serde_json::to_string(&options)?;
         ensure!(encoded.len() <= 4096, "invalid request options length");
@@ -1227,7 +1291,11 @@ impl Store {
         let submitted_at = now();
         let root_device = self.identity.device.to_string();
         let root_inode = self.identity.inode.to_string();
-        tx.execute("INSERT INTO requests (id,root_device,root_inode,options_json,request_kind,expected_generation,expected_revision,state,submitted_at) VALUES (?1,?2,?3,?4,'index',?5,?6,'queued',?7)", params![id,root_device,root_inode,encoded,expected.map(|p|p.index_generation.to_string()),expected.map(|p|p.index_revision as i64),submitted_at])?;
+        let kind = match request_kind {
+            RequestKind::Index => "index",
+            RequestKind::SemanticImport => "semanticImport",
+        };
+        tx.execute("INSERT INTO requests (id,root_device,root_inode,options_json,request_kind,expected_generation,expected_revision,state,submitted_at) VALUES (?1,?2,?3,?4,?5,?6,?7,'queued',?8)", params![id,root_device,root_inode,encoded,kind,expected.map(|p|p.index_generation.to_string()),expected.map(|p|p.index_revision as i64),submitted_at])?;
         let seq = tx.last_insert_rowid();
         after_insert();
         tx.commit()?;
@@ -1243,7 +1311,7 @@ impl Store {
         Ok(Request {
             seq,
             id,
-            request_kind: RequestKind::Index,
+            request_kind,
             state: "queued".into(),
             root_device,
             root_inode,

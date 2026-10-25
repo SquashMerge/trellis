@@ -204,34 +204,6 @@ impl<'a> MeasuredFacts<'a> {
     }
 }
 
-fn point(source: &str, line: u64, column: u64, encoding: u8) -> Result<usize> {
-    let mut start = 0;
-    for _ in 0..line {
-        let next = source[start..]
-            .find('\n')
-            .context("SCIP line outside source")?;
-        start += next + 1;
-    }
-    let rest = &source[start..];
-    let end = rest.find('\n').unwrap_or(rest.len());
-    let line = rest[..end].strip_suffix('\r').unwrap_or(&rest[..end]);
-    let mut width = 0u64;
-    for (offset, c) in line.char_indices() {
-        if width == column {
-            return Ok(start + offset);
-        }
-        width += match encoding {
-            1 => c.len_utf8() as u64,
-            2 => c.len_utf16() as u64,
-            3 => 1,
-            _ => anyhow::bail!("invalid SCIP position encoding"),
-        };
-        ensure!(width <= column, "SCIP column splits scalar");
-    }
-    ensure!(width == column, "SCIP column outside source");
-    Ok(start + line.len())
-}
-
 /// Convert the admitted raw numeric range using authenticated source bytes only.
 pub fn occurrence_range(
     claim: &CapturedClaim,
@@ -277,12 +249,22 @@ pub fn occurrence_range(
         "SCIP encoding differs from admission"
     );
     let text = std::str::from_utf8(source).context("non-UTF8 authenticated source")?;
-    let start = point(text, values[0], values[1], encoding)?;
-    let end = if values.len() == 3 {
-        point(text, values[0], values[2], encoding)?
-    } else {
-        point(text, values[2], values[3], encoding)?
-    };
+    let mut positions = Vec::with_capacity(values.len());
+    for pair in values.as_chunks::<2>().0 {
+        positions.push((i32::try_from(pair[0])?, i32::try_from(pair[1])?));
+    }
+    if values.len() == 3 {
+        positions.push((i32::try_from(values[0])?, i32::try_from(values[2])?));
+    }
+    let endpoints = (positions[0], positions[1]);
+    let offsets = crate::scip_raw::source_byte_offsets(
+        text,
+        encoding,
+        &mut positions,
+        &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )?;
+    let start = offsets[&endpoints.0];
+    let end = offsets[&endpoints.1];
     ensure!(start < end, "empty or reversed SCIP range");
     Ok(native::Range { start, end })
 }
@@ -1395,6 +1377,8 @@ pub fn rejoin_inventory(
         admitted_encoding,
     )?;
     let mut eligible = BTreeSet::new();
+    let mut unsupported_claims = BTreeSet::new();
+    let mut unsupported_documents = BTreeSet::new();
     let mut failed = BTreeSet::new();
     let mut requested = BTreeSet::new();
     for document in &captured_native.revision.documents {
@@ -1451,6 +1435,20 @@ pub fn rejoin_inventory(
             };
             let first = r1.join(&doc, range.clone(), required)?;
             let second = r2.join(&doc, range, required)?;
+            if first.status == semantic::JoinStatus::Unsupported
+                && second.status == semantic::JoinStatus::Unsupported
+            {
+                unsupported_claims.insert(claim.captured_proof_id.clone());
+                unsupported_documents.insert(doc.clone());
+                eligible.insert(doc);
+                continue;
+            }
+            if first.status == semantic::JoinStatus::Unmatched
+                && second.status == semantic::JoinStatus::Unmatched
+            {
+                eligible.insert(doc);
+                continue;
+            }
             let mut exact = first.status == semantic::JoinStatus::Exact
                 && second.status == semantic::JoinStatus::Exact;
             let captured_call = captured.call_bindings.iter().find(|binding| {
@@ -1906,6 +1904,9 @@ pub fn rejoin_inventory(
     {
         outcomes.insert(claim.captured_proof_id.clone(), 2);
     }
+    for raw_id in &unsupported_claims {
+        outcomes.insert(raw_id.clone(), 4);
+    }
     for row in &bindings {
         if row.syntax_id.is_some() {
             outcomes.insert(row.provenance_id.clone(), 1);
@@ -1981,8 +1982,9 @@ pub fn rejoin_inventory(
         }
         let requested = requested.contains(&doc.key);
         let failed = failed.contains(&doc.key);
-        let partial =
-            omitted.contains(&Some(doc.key.clone())) || facts.diagnostics.contains_key(&doc.key);
+        let partial = unsupported_documents.contains(&doc.key)
+            || omitted.contains(&Some(doc.key.clone()))
+            || facts.diagnostics.contains_key(&doc.key);
         let state = if !requested {
             semantic::CoverageState::NotRequested
         } else if failed {
@@ -2037,6 +2039,8 @@ pub fn rejoin_inventory(
             observed_roles: observed.into_iter().collect(),
             diagnostic: if failed {
                 Some("unmeasurable_source_anchor".into())
+            } else if unsupported_documents.contains(&doc.key) {
+                Some("unsupported_native_gap".into())
             } else if partial {
                 Some("unmeasurable_internal_target".into())
             } else {
@@ -2096,6 +2100,17 @@ pub fn rejoin_inventory(
             })
         })
         .collect();
+    #[cfg(feature = "test-support")]
+    if let Ok(bytes) = std::env::var("TRELLIS_TEST_SEMANTIC_REPORT_PADDING")
+        && let Ok(bytes) = bytes.parse::<usize>()
+        && bytes <= 1024 * 1024
+    {
+        document_counts.push((
+            semantic::Language::Java,
+            "test-only report padding".into(),
+            serde_json::json!({"diagnostic":"x".repeat(bytes)}),
+        ));
+    }
     let report = serde_json::json!({"producerId":producer.id,"sourceSetId":destination_native.revision.source_set_id,
         "capturedRevision":captured_native.revision.id,"destinationRevision":destination_native.revision.id,
         "languages":languages,"documents":document_counts.into_iter().map(|(_,_,row)|row).collect::<Vec<_>>()});

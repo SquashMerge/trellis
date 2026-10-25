@@ -174,7 +174,7 @@ fn admitted_raw_coordinates_reject_split_utf16_scalar_and_crlf() {
         occurrence_range(&claim, text, 2)
             .unwrap_err()
             .to_string()
-            .contains("splits scalar")
+            .contains("split codepoint")
     );
     claim.envelope.raw["range"] =
         json!({"encoding":"singleLine","line":0,"startCharacter":0,"endCharacter":2});

@@ -2310,7 +2310,7 @@ fn same_bytes_evidence(snapshot: &Value) -> Value {
     let header = header[0].as_array().unwrap();
     assert_eq!(header[0], pin);
     assert!(header[5].as_str().is_some_and(|id| !id.is_empty()));
-    assert!(header[13].as_i64().is_some_and(|revision| revision > 0));
+    assert!(header[16].as_i64().is_some_and(|revision| revision > 0));
     for table in ["revision_capture_inputs", "revision_documents"] {
         for row in snapshot["allRows"][table].as_array().unwrap() {
             assert_eq!(row[0], pin, "{table} must reference the admitted pin");
@@ -2330,7 +2330,7 @@ fn same_bytes_evidence(snapshot: &Value) -> Value {
         .as_array_mut()
         .unwrap();
     header[0] = serde_json::json!("<current-pin>");
-    header[13] = serde_json::json!("<current-revision>");
+    header[16] = serde_json::json!("<current-revision>");
     for table in ["revision_capture_inputs", "revision_documents"] {
         for row in evidence["allRows"][table].as_array_mut().unwrap() {
             row[0] = serde_json::json!("<current-pin>");
@@ -3549,7 +3549,7 @@ def sink():
             before_header, after_header,
             "{name}: unchanged startup and request publish no revision"
         );
-        assert_eq!(after_header[13], pin["indexRevision"], "{name}");
+        assert_eq!(after_header[16], pin["indexRevision"], "{name}");
         assert_eq!(
             after_header[0],
             format!(
@@ -4397,7 +4397,7 @@ async fn saved_items_real_index_matrix() {
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
     assert_eq!(
-        index_version, 21,
+        index_version, 22,
         "derived v21 index inspection is separate"
     );
 
