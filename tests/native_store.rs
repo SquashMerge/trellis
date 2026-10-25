@@ -594,7 +594,7 @@ fn status_many_documents_only_checks_paired_metadata_not_every_blob() {
 #[test]
 #[cfg(feature = "test-support")]
 fn index_from_another_native_producer_version_is_rebuilt_not_served() {
-    for old_version in ["native-v2", "native-v3"] {
+    for old_version in ["native-v2", "native-v3", "native-v8"] {
         let (state, root, store, cancel) = fixture();
         let leader = store.publication_for_tests().unwrap();
         let first = publish(
@@ -607,7 +607,7 @@ fn index_from_another_native_producer_version_is_rebuilt_not_served() {
         .unwrap();
         drop(leader);
         drop(store);
-        // Both withdrawn v2 and immediate v3 predecessor must be refused; v3 used occ:v2 IDs.
+        // Withdrawn versions and the immediate v8 predecessor must all be refused.
         let path = published_db(state.path(), root.path());
         let db = Connection::open(&path).unwrap();
         // Rewrite every producer-version FK in one deferred transaction. This
@@ -665,7 +665,7 @@ fn index_from_another_native_producer_version_is_rebuilt_not_served() {
         let version: String = db
             .query_row("SELECT version FROM native_producers", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, "native-v8");
+        assert_eq!(version, "native-v9");
         let calls: Vec<String> = db
             .prepare("SELECT 'occ:v2:'||lower(hex(id)) FROM native_version_calls")
             .unwrap()
@@ -773,7 +773,7 @@ fn physical_v8_native_v4_index_recreates_before_role_column_read() {
     let version: String = rebuilt
         .query_row("SELECT version FROM native_producers", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, "native-v8");
+    assert_eq!(version, "native-v9");
     let roles = store
         .native_declarations_at(pin, "javascript", "hello")
         .unwrap();

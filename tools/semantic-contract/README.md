@@ -79,7 +79,7 @@ Tests define local finite control rows `{id,baseline,mutate,expectedAssertion,ex
 
 ## Capture with the production native extractor (#95)
 
-The registry admits the current `trellis.native.syntax@native-v8` with the
+The registry admits the current `trellis.native.syntax@native-v9` with the
 production `EXTRACTION_INPUTS` inventory (`[]` for Java, Rust, Python and
 JavaScript). Historical v3/v4 descriptors are not admitted. The Rust inventory
 guard queries the complete production entry set in this JS registry through Node
@@ -129,7 +129,7 @@ pins production native captures by this hash; no real hardware pin exists yet.
 The adapter preserves production declarations, calls and controls; it does not
 reparse source to invent additional measurements or map dynamic evidence to
 execution. Production currently emits no reference-candidate family, so the raw
-capture's `references` array is empty; native-v9 (#279) adds one. The toolkit accepts unnamed Rust
+capture's `references` array is empty; #279 adds one in a later producer version. The toolkit accepts unnamed Rust
 `implementation` declarations and treats the synthetic module as outermost when
 its range equals a real declaration's range; nested declarations still require
 the real immediate source parent. Witnesses attest the actual header/spelling
@@ -140,4 +140,4 @@ than being silently rewritten. Fixing those production measurements requires its
 own producer-version decision; the adapter must not invent missing types. Keep annotations/coverage honest about the families
 present; this capture path does not implement per-construct family-unavailability
 or qualify the unsupported floor. Per-family unavailability reports come with
-native-v9 (#279), under Amendment 3.
+#279 in a later producer version, under Amendment 3.

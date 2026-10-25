@@ -31,7 +31,7 @@ const LANGUAGES: [&str; 4] = ["java", "rust", "python", "javascript"];
 pub(crate) const PRODUCER: &str = "trellis.native.syntax";
 /// Native producer descriptor version. Any change that can alter a native measured field or
 /// projection, or that starts reading another input, must change it (Decision 0003).
-pub(crate) const NATIVE_VERSION: &str = "native-v8";
+pub(crate) const NATIVE_VERSION: &str = "native-v9";
 /// The build-time producer hash of this executable's extraction inputs: the
 /// listed extraction modules and crates (`build/extractor_inputs.rs`). Each
 /// revision records it; an executable rebuild with an equal hash keeps the
@@ -2267,6 +2267,13 @@ fn extract_known_with_witnesses(
     let module_id=ids.stable(&json!({"sourceSet":a.source_set.id,"path":f.path,"language":f.language,"ancestors":[],"declaration":module_key}))?;
     // A file-level inner `#![cfg(test)]` makes the whole document test code.
     let file_test = test_path(&f.path) || local_test_marker(tree.root_node(), f);
+    let mut module_range = Range::node(tree.root_node());
+    if !f.text.is_empty() && module_range.start == module_range.end {
+        module_range = Range {
+            start: 0,
+            end: f.text.len(),
+        };
+    }
     a.declarations.push(Declaration {
         syntax_id: module_id.clone(),
         role: declaration_role(file_test),
@@ -2277,7 +2284,7 @@ fn extract_known_with_witnesses(
         lookup_key: None,
         ancestors: vec![],
         key: module_key,
-        range: Range::node(tree.root_node()),
+        range: module_range,
         name_range: None,
         header: Header {
             kind: "module".into(),
@@ -3387,8 +3394,8 @@ console.log(JSON.stringify(productionInventoryEntries()));
         };
         assert_eq!(
             witness(&a),
-            "c465bc7cbd360dd051f09f6a66bda6d7f491bbc93385ce3175c71652be247382",
-            "native-v8 witness includes declaration role and the producer version"
+            "68145a39292dea496c1aaea5d56d8d1a7260dbfd47b6b4aba2fbe6c4e5ab90a7",
+            "native-v9 witness includes declaration role and the producer version"
         );
         assert_eq!(
             witness(&a),
