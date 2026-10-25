@@ -1,4 +1,4 @@
-# Browser acceptance: sequence and shell
+# Browser acceptance: diagrams and shell
 
 This test drives the real Trellis web shell in Playwright Chromium. It starts the compiled daemon with an isolated workspace, token, home, and XDG directories. It does not mock or intercept application requests.
 
@@ -108,3 +108,28 @@ The suite runs in the canonical `./tools/verify` browser lane. For a focused run
 setup and build, set `TRELLIS_SUITE_BINARY` to the absolute built binary and run
 `node --test --test-concurrency=1 tests/browser/files.test.cjs` with the same external
 `PLAYWRIGHT_BROWSERS_PATH`.
+
+## Architecture acceptance
+
+`architecture.test.cjs` uses an isolated real daemon, authenticated checkout selection and
+40 indexed Rust file modules. Authored rules exercise ordered and peer bands, shared and
+empty layers, and explicit unassigned evidence. Hand-counted `crate::` references include
+forward/skipped, reverse, same-layer, cross-peer, shared-outbound and unresolved sites.
+Mixed production/test declarations retain stored roles: `test-support` remains production.
+The suite compares the browser Architecture DTO to the existing references CLI at the same
+complete pin, then checks exact summary counts and UI evidence. No API request is intercepted.
+Separate pre-start fixtures cover missing, empty and malformed configuration without watcher races.
+
+The UI checks cover hostile layer text under the real CSP, mouse/Enter/Space selection,
+production/test visibility, pinned cached-source actions and narrow-screen containment.
+Module Flow (#324) and the treemap action (#121) remain deferred; no placeholder claims
+that navigation works. `architecture-pele.test.cjs` checks pinned-renderer mapping, DOM-order independence,
+negative SVG admission and atomic render failure in real Chromium; timing-sensitive pin/rules races use deterministic unit/HTTP
+hooks rather than editing a running browser fixture.
+
+After the normal setup and build above, set `TRELLIS_SUITE_BINARY` to the absolute built
+binary and use the same external `PLAYWRIGHT_BROWSERS_PATH`, then run:
+
+```sh
+node --test --test-concurrency=1 tests/browser/architecture.test.cjs
+```

@@ -14,7 +14,7 @@ that imply those capabilities already work.
 ## Product frame
 
 - Compact explorer on the left; Diagrams files expand to methods. Files uses a pinned indexed-file catalog and an all-symbol outline, including noncallables.
-- Diagrams keeps Sequence, Classes and Libraries. Files is a real section of the same checkout/session frame, not another application. No placeholder capability tabs.
+- Diagrams keeps Sequence, Architecture, Classes and Libraries. Architecture shows authored layer bands and counted structural-reference summaries, not module Flow; see the [Architecture contract](docs/architecture-view.md). Files is a real section of the same checkout/session frame, not another application. No placeholder capability tabs.
 - Section switching alone never selects a file, reads source or starts indexing. Explicit Files selection opens cached indexed source; cached files remain reachable after live deletion.
 - The left pane lists local checkouts and their observed index state above the filtered file tree.
 - Classes uses the full canvas without the call inspector; explicit file/directory metric selection may show the metric inspector. Class menus expose related classes and cached source.

@@ -1304,6 +1304,189 @@ impl EvidenceResponse {
         Ok(payload)
     }
 
+    /// Browser-only layer summary, references and metrics from this admitted read.
+    pub fn architecture_view(
+        &self,
+        options: &MetricsOptions,
+        check: &mut (impl FnMut() -> Result<()> + Send),
+    ) -> Result<serde_json::Value> {
+        options.validate()?;
+        check()?;
+        let config = crate::rules::load(Path::new(self.store.workspace_root()))?;
+        let selected = self.store.read_revision_for(&self.db, options.pin, true)?;
+        let layers = config
+            .as_ref()
+            .map(crate::rules::view_layers)
+            .unwrap_or_default();
+        let mut payload = serde_json::json!({
+            "indexGeneration": selected.pin.index_generation.to_string(),
+            "indexRevision": selected.pin.index_revision,
+            "state": if config.is_none() { "missing_rules" } else if layers.is_empty() { "no_layers" } else { "ready" },
+            "rulesFile": config.as_ref().map(crate::rules::descriptor),
+            "aggregate": options.aggregate, "metricsVersion": "metrics:v1",
+            "metricsScope": "all-indexed-callables", "evidenceTier": "syntax", "semanticComplete": false,
+            "layers": layers, "modules": [], "edges": [], "references": null, "rules": null
+        });
+        if payload["state"] != "ready" {
+            check()?;
+            return Ok(payload);
+        }
+        let config = config.as_ref().expect("ready config");
+        let snapshot = self
+            .architecture_snapshot(Some(selected.pin), check)
+            .map_err(|error| self.store.report_index_failure(error))?;
+        let mut references = crate::references::project(&snapshot, &[], 5, check)?;
+        let mut rules = crate::rules::evaluate(config, &snapshot, &references, &[], check)?;
+        let metrics = self.metrics_at(
+            &MetricsOptions {
+                pin: Some(snapshot.pin),
+                aggregate: options.aggregate.clone(),
+                ..MetricsOptions::default()
+            },
+            check,
+        )?;
+        let files: BTreeMap<_, _> = metrics
+            .files
+            .iter()
+            .map(|file| {
+                (
+                    (
+                        file.source_set_id.as_str(),
+                        file.language.as_str(),
+                        file.path.as_str(),
+                    ),
+                    file,
+                )
+            })
+            .collect();
+        let documents: BTreeMap<_, _> = snapshot
+            .documents
+            .iter()
+            .map(|doc| {
+                (
+                    (
+                        doc.key.source_set_id.as_str(),
+                        doc.key.language.as_str(),
+                        doc.key.path.as_str(),
+                    ),
+                    doc,
+                )
+            })
+            .collect();
+        let mut modules = Vec::new();
+        for module in references.data["modules"]
+            .as_array()
+            .context("store_unavailable: references modules")?
+        {
+            check()?;
+            let target = &module["identity"];
+            let key = (
+                target["sourceSetId"]
+                    .as_str()
+                    .context("store_unavailable: module source set")?,
+                target["language"]
+                    .as_str()
+                    .context("store_unavailable: module language")?,
+                target["path"]
+                    .as_str()
+                    .context("store_unavailable: module path")?,
+            );
+            let file = files
+                .get(&key)
+                .context("store_unavailable: architecture metrics join")?;
+            let doc = documents
+                .get(&key)
+                .context("store_unavailable: architecture source join")?;
+            let mut row = module.clone();
+            row["layer"] = serde_json::json!(crate::rules::layer_for(config, key.2)?);
+            row["physicalLines"] = serde_json::json!(doc.file.text.lines().count());
+            row["declarationCount"] = serde_json::json!(file.declaration_count);
+            row["metrics"] = file.metrics.clone();
+            modules.push(row);
+        }
+        // Keep policy and exception contributions separate even on the same pair.
+        type SummaryKey = (String, String, String, String, bool, Option<String>);
+        let mut summaries: BTreeMap<SummaryKey, serde_json::Value> = BTreeMap::new();
+        for (field, evaluated, role) in [
+            ("production", "instances", "production"),
+            ("tests", "testOnly", "test"),
+        ] {
+            let verdicts: BTreeMap<_, _> = rules[evaluated]
+                .as_array()
+                .context("store_unavailable: layer verdicts")?
+                .iter()
+                .filter(|row| row["rule"] == "$layers" && !row["destination"].is_null())
+                .map(|row| {
+                    (
+                        (row["target"].to_string(), row["destination"].to_string()),
+                        row,
+                    )
+                })
+                .collect();
+            for pair in references.data[field]
+                .as_array()
+                .context("store_unavailable: reference pairs")?
+            {
+                check()?;
+                let verdict = verdicts
+                    .get(&(pair["source"].to_string(), pair["target"].to_string()))
+                    .context("store_unavailable: architecture verdict join")?;
+                let (Some(source), Some(destination)) = (
+                    verdict["sourceLayer"].as_str(),
+                    verdict["destinationLayer"].as_str(),
+                ) else {
+                    continue;
+                };
+                if source == destination {
+                    continue;
+                }
+                let status = verdict["status"]
+                    .as_str()
+                    .context("store_unavailable: layer status")?;
+                let excepted = verdict["excepted"]
+                    .as_bool()
+                    .context("store_unavailable: layer exception")?;
+                let reason = verdict["exceptionReason"].as_str().map(str::to_owned);
+                let summary = summaries
+                    .entry((
+                        source.into(),
+                        destination.into(),
+                        role.into(),
+                        status.into(),
+                        excepted,
+                        reason.clone(),
+                    ))
+                    .or_insert_with(|| {
+                        serde_json::json!({
+                            "sourceLayer": source, "destinationLayer": destination, "role": role,
+                            "status": status, "excepted": excepted, "exceptionReason": reason,
+                            "count": 0, "pairs": []
+                        })
+                    });
+                summary["count"] = serde_json::json!(
+                    summary["count"].as_u64().unwrap_or(0)
+                        + pair["count"]
+                            .as_u64()
+                            .context("store_unavailable: reference count")?
+                );
+                summary["pairs"]
+                    .as_array_mut()
+                    .expect("constructed pairs")
+                    .push(pair.clone());
+            }
+        }
+        for value in [&mut references.data, &mut rules] {
+            value["indexGeneration"] = serde_json::json!(snapshot.pin.index_generation.to_string());
+            value["indexRevision"] = serde_json::json!(snapshot.pin.index_revision);
+        }
+        payload["modules"] = serde_json::json!(modules);
+        payload["edges"] = serde_json::json!(summaries.into_values().collect::<Vec<_>>());
+        payload["references"] = references.data;
+        payload["rules"] = rules;
+        check()?;
+        Ok(payload)
+    }
+
     /// Read each selected native document once; never reopen source from the checkout.
     fn architecture_snapshot(
         &self,

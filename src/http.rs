@@ -1909,6 +1909,33 @@ pub fn router(state: Arc<DaemonState>) -> Router {
             }),
         )
         .route(
+            "/architecture.js",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                    include_str!("../web/architecture.js"),
+                )
+            }),
+        )
+        .route(
+            "/architecture-pele.js",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                    include_str!("../web/architecture-pele.js"),
+                )
+            }),
+        )
+        .route(
+            "/architecture.css",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+                    include_str!("../web/architecture.css"),
+                )
+            }),
+        )
+        .route(
             "/files.css",
             get(|| async {
                 (
@@ -3143,6 +3170,33 @@ impl ProvisionedBrowser {
                 }),
             )
             .route(
+                "/architecture.js",
+                get(|| async {
+                    (
+                        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                        include_str!("../web/architecture.js"),
+                    )
+                }),
+            )
+            .route(
+                "/architecture-pele.js",
+                get(|| async {
+                    (
+                        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                        include_str!("../web/architecture-pele.js"),
+                    )
+                }),
+            )
+            .route(
+                "/architecture.css",
+                get(|| async {
+                    (
+                        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+                        include_str!("../web/architecture.css"),
+                    )
+                }),
+            )
+            .route(
                 "/files.css",
                 get(|| async {
                     (
@@ -3474,6 +3528,7 @@ enum BrowserCoreRoute {
     GitStatus,
     GitDiff,
     Metrics,
+    Architecture,
     RefreshDependencies,
     Dependencies,
     DependencySymbols,
@@ -3504,6 +3559,7 @@ impl BrowserCoreRoute {
             (&Method::GET, "git") => Some(Self::GitStatus),
             (&Method::GET, "git/diff") => Some(Self::GitDiff),
             (&Method::GET, "metrics") => Some(Self::Metrics),
+            (&Method::GET, "architecture") => Some(Self::Architecture),
             (&Method::POST, "dependencies/refresh") => Some(Self::RefreshDependencies),
             (&Method::GET, "dependencies") => Some(Self::Dependencies),
             (&Method::GET, "dependencies/symbols") => Some(Self::DependencySymbols),
@@ -3843,6 +3899,27 @@ fn selected_mutation_error(error: ApiError, outcome: &str) -> Response {
     response
 }
 
+fn architecture_query(uri: &axum::http::Uri) -> Result<crate::store::MetricsOptions, ApiError> {
+    let mut options = metrics_query(uri)?;
+    // metrics_query already decodes and rejects duplicate/unknown fields. Architecture
+    // accepts only the complete pin and aggregation, not metrics selectors.
+    if let Some(query) = uri.query() {
+        for pair in query.split('&') {
+            let name = pair.split_once('=').ok_or_else(invalid)?.0;
+            if !matches!(name, "indexGeneration" | "indexRevision" | "aggregate") {
+                return Err(invalid());
+            }
+        }
+    }
+    if !uri
+        .query()
+        .is_some_and(|query| query.split('&').any(|pair| pair.starts_with("aggregate=")))
+    {
+        options.aggregate = "max".into();
+    }
+    Ok(options)
+}
+
 fn metrics_query(uri: &axum::http::Uri) -> Result<crate::store::MetricsOptions, ApiError> {
     use std::collections::BTreeMap;
     fn decode(value: &str) -> Result<String, ApiError> {
@@ -4022,8 +4099,13 @@ async fn provisioned_core_answer(
         BrowserCoreRoute::GitStatus | BrowserCoreRoute::GitDiff => {
             unreachable!("Git reads bypass index activation")
         }
-        BrowserCoreRoute::Metrics => {
-            let options = metrics_query(uri)?;
+        BrowserCoreRoute::Metrics | BrowserCoreRoute::Architecture => {
+            let architecture = matches!(route, BrowserCoreRoute::Architecture);
+            let options = if architecture {
+                architecture_query(uri)?
+            } else {
+                metrics_query(uri)?
+            };
             let runtime = runtime.clone();
             // The guard belongs to this request future, not to the blocking worker.
             struct CancelOnDrop(Arc<std::sync::atomic::AtomicBool>);
@@ -4034,7 +4116,7 @@ async fn provisioned_core_answer(
             }
             let guard = CancelOnDrop(Arc::new(std::sync::atomic::AtomicBool::new(false)));
             let cancellation = guard.0.clone();
-            let (body, catching_up) = tokio::task::spawn_blocking(move || {
+            let result = tokio::task::spawn_blocking(move || {
                 let duration = if metrics.deadline_ms != 0 {
                     Duration::from_millis(metrics.deadline_ms)
                 } else if matches!(options.scope.as_str(), "revision" | "directory") {
@@ -4082,40 +4164,41 @@ async fn provisioned_core_answer(
                         });
                     }
                 };
-                let result = runtime.metrics_response(
-                    &options,
-                    &mut || {
-                        if cancellation.load(std::sync::atomic::Ordering::Acquire)
-                            || metrics
-                                .test_cancel
-                                .load(std::sync::atomic::Ordering::Relaxed)
-                        {
-                            if let Some(hook) = &check_hook {
-                                hook("metrics_cancelled");
-                            }
-                            anyhow::bail!("cancelled");
+                let mut check = || {
+                    if cancellation.load(std::sync::atomic::Ordering::Acquire)
+                        || metrics
+                            .test_cancel
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        if let Some(hook) = &check_hook {
+                            hook("metrics_cancelled");
                         }
-                        if metrics.now()
-                            + Duration::from_millis(
-                                metrics
-                                    .clock_skew_ms
-                                    .load(std::sync::atomic::Ordering::Relaxed),
-                            )
-                            >= deadline
-                        {
-                            anyhow::bail!("deadline_exceeded");
-                        }
-                        Ok(())
-                    },
-                    crate::daemon::registry::MetricsResponseHooks {
-                        before_work: &mut before_work,
-                        before_finish: &mut before_finish,
-                        after_finish: &mut after_finish,
-                        on_write: &mut on_write,
-                        on_progress: &mut on_progress,
-                    },
-                    metrics.limit,
-                );
+                        anyhow::bail!("cancelled");
+                    }
+                    if metrics.now()
+                        + Duration::from_millis(
+                            metrics
+                                .clock_skew_ms
+                                .load(std::sync::atomic::Ordering::Relaxed),
+                        )
+                        >= deadline
+                    {
+                        anyhow::bail!("deadline_exceeded");
+                    }
+                    Ok(())
+                };
+                let hooks = crate::daemon::registry::MetricsResponseHooks {
+                    before_work: &mut before_work,
+                    before_finish: &mut before_finish,
+                    after_finish: &mut after_finish,
+                    on_write: &mut on_write,
+                    on_progress: &mut on_progress,
+                };
+                let result = if architecture {
+                    runtime.architecture_response(&options, &mut check, hooks, metrics.limit)
+                } else {
+                    runtime.metrics_response(&options, &mut check, hooks, metrics.limit)
+                };
                 if let Some(hook) = &hook {
                     hook("metrics_worker_done");
                 }
@@ -4128,8 +4211,24 @@ async fn provisioned_core_answer(
                     "internal_error",
                     "Operation failed",
                 )
-            })??;
+            })?;
             drop(guard);
+            let (body, catching_up) = match result {
+                Ok(answer) => answer,
+                Err(error) => {
+                    if architecture && let Some(diagnostic) = crate::rules::diagnostic(&error) {
+                        return Ok((
+                            (
+                                StatusCode::UNPROCESSABLE_ENTITY,
+                                Json(json!({"error": diagnostic})),
+                            )
+                                .into_response(),
+                            false,
+                        ));
+                    }
+                    return Err(ApiError::from(error));
+                }
+            };
             Ok((
                 (
                     [(axum::http::header::CONTENT_TYPE, "application/json")],

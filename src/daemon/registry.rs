@@ -2189,6 +2189,33 @@ impl CheckoutRuntime {
         hooks: MetricsResponseHooks<'_>,
         max_bytes: usize,
     ) -> anyhow::Result<(Vec<u8>, bool)> {
+        self.projected_response(check, hooks, max_bytes, |response, check| {
+            response.metrics_at(options, &mut || check())
+        })
+    }
+
+    pub fn architecture_response(
+        &self,
+        options: &crate::store::MetricsOptions,
+        check: &mut (impl FnMut() -> anyhow::Result<()> + Send),
+        hooks: MetricsResponseHooks<'_>,
+        max_bytes: usize,
+    ) -> anyhow::Result<(Vec<u8>, bool)> {
+        self.projected_response(check, hooks, max_bytes, |response, check| {
+            response.architecture_view(options, &mut || check())
+        })
+    }
+
+    fn projected_response<P: serde::Serialize, F: FnMut() -> anyhow::Result<()> + Send>(
+        &self,
+        check: &mut F,
+        hooks: MetricsResponseHooks<'_>,
+        max_bytes: usize,
+        materialize: impl FnOnce(
+            &CheckoutEvidence,
+            &mut (dyn FnMut() -> anyhow::Result<()> + Send),
+        ) -> anyhow::Result<P>,
+    ) -> anyhow::Result<(Vec<u8>, bool)> {
         use serde::Serialize;
         struct Bounded<'a, F> {
             bytes: Vec<u8>,
@@ -2217,17 +2244,36 @@ impl CheckoutRuntime {
         }
         #[derive(Serialize)]
         #[serde(rename_all = "camelCase")]
-        struct Envelope<'a> {
+        struct Envelope<'a, P> {
             catching_up: bool,
-            payload: &'a crate::store::MetricsPayload,
+            payload: &'a P,
         }
         let (response, catching_up) = self.evidence_response()?;
         (hooks.before_work)();
         check()?;
-        let payload = response.metrics_at(options, &mut || {
+        let payload = match materialize(&response, &mut || {
             (hooks.on_progress)();
             check()
-        })?;
+        }) {
+            Ok(payload) => payload,
+            Err(error) => {
+                // Located config failures are public evidence too. Fence and bound
+                // them before the HTTP layer preserves the structured diagnostic.
+                if let Some(diagnostic) = crate::rules::diagnostic(&error) {
+                    crate::metrics::serialize_checked(
+                        &serde_json::json!({"error": diagnostic}),
+                        max_bytes,
+                        check,
+                    )?;
+                    (hooks.before_finish)();
+                    check()?;
+                    response.finish(())?;
+                    (hooks.after_finish)();
+                    check()?;
+                }
+                return Err(error);
+            }
+        };
         let mut writer = Bounded {
             bytes: Vec::new(),
             check,
