@@ -651,11 +651,11 @@ SELECT (SELECT length(content_hash)+20 FROM class_projections WHERE cid=x.cid)+(
 UNION ALL
 SELECT (SELECT length(content_hash)+20 FROM class_projections WHERE cid=x.cid)+COALESCE(length(CAST(x.id AS BLOB)),0)+39+(CASE WHEN x.target IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.payload AS BLOB)),0) AS row_bytes FROM class_relations x WHERE x.cid=?2
 )"#;
-const DATABASE_SCHEMA_VERSION: u32 = 20;
+const DATABASE_SCHEMA_VERSION: u32 = 21;
 const EXTRACTOR_VERSION: &str = "native-v6-delta-v1";
 const EVIDENCE_FORMAT: &str = "terminal-native-graph-v1";
-const CACHE_SCHEMA_V20: &str = r#"
-CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=20), extractor_version TEXT NOT NULL CHECK(extractor_version='native-v6-delta-v1'), root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL, reconcile_options TEXT);
+const CACHE_SCHEMA_V21: &str = r#"
+CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=21), extractor_version TEXT NOT NULL CHECK(extractor_version='native-v6-delta-v1'), root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL, reconcile_options TEXT);
 CREATE TABLE native_producers(id TEXT NOT NULL,version TEXT NOT NULL,executable_hash TEXT NOT NULL CHECK(length(executable_hash)=64),kind TEXT NOT NULL CHECK(kind='native'),position_encoding TEXT NOT NULL CHECK(position_encoding='utf8'),PRIMARY KEY(id,version));
 CREATE TABLE native_producer_languages(producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,language TEXT NOT NULL,inventory_authenticated INTEGER NOT NULL CHECK(inventory_authenticated IN (0,1)),ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(producer_id,producer_version,language),UNIQUE(producer_id,producer_version,ordinal),FOREIGN KEY(producer_id,producer_version) REFERENCES native_producers(id,version) DEFERRABLE INITIALLY DEFERRED);
 CREATE TABLE native_producer_inputs(producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,language TEXT NOT NULL,component_name TEXT NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(producer_id,producer_version,language,component_name),UNIQUE(producer_id,producer_version,language,ordinal),FOREIGN KEY(producer_id,producer_version,language) REFERENCES native_producer_languages(producer_id,producer_version,language) DEFERRABLE INITIALLY DEFERRED);
@@ -674,7 +674,7 @@ CREATE UNIQUE INDEX native_revisions_pin ON native_revisions(published_index_rev
 CREATE INDEX native_revisions_header_cover ON native_revisions(source_set_id,published_index_revision,id);
 CREATE TABLE revision_capture_inputs(revision_id TEXT NOT NULL REFERENCES native_revisions(id) DEFERRABLE INITIALLY DEFERRED,input_key TEXT NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(revision_id,input_key));
 CREATE TABLE document_versions(vid INTEGER PRIMARY KEY,id TEXT NOT NULL UNIQUE,language TEXT NOT NULL,path TEXT NOT NULL,content_hash TEXT NOT NULL CHECK(length(content_hash)=64),extraction_context TEXT NOT NULL CHECK(length(extraction_context)=64),producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,byte_length INTEGER NOT NULL CHECK(byte_length>=0 AND byte_length=length(source_bytes)),source_bytes BLOB NOT NULL,native_witness TEXT NOT NULL CHECK(length(native_witness)=64),UNIQUE(language,path,content_hash,extraction_context,producer_id,producer_version),UNIQUE(vid,language,path),UNIQUE(vid,language),FOREIGN KEY(producer_id,producer_version,language) REFERENCES native_producer_languages(producer_id,producer_version,language) DEFERRABLE INITIALLY DEFERRED);
-CREATE TABLE graph_projections(gid INTEGER PRIMARY KEY,vid INTEGER NOT NULL,language TEXT NOT NULL,graph_hash TEXT NOT NULL UNIQUE CHECK(length(graph_hash)=64),state TEXT NOT NULL CHECK(state IN ('staged','ready','unavailable')),class_extraction_state TEXT NOT NULL CHECK(class_extraction_state IN ('notApplicable','ready')),class_extraction_payload TEXT,CHECK((class_extraction_state='ready')=(class_extraction_payload IS NOT NULL)),CHECK((language IN ('java','python'))=(class_extraction_state IN ('ready'))),UNIQUE(vid,graph_hash),UNIQUE(gid,vid),FOREIGN KEY(vid,language) REFERENCES document_versions(vid,language) DEFERRABLE INITIALLY DEFERRED);
+CREATE TABLE graph_projections(gid INTEGER PRIMARY KEY,vid INTEGER NOT NULL,language TEXT NOT NULL,graph_hash TEXT NOT NULL UNIQUE CHECK(length(graph_hash)=64),state TEXT NOT NULL CHECK(state IN ('staged','ready','unavailable')),class_extraction_state TEXT NOT NULL CHECK(class_extraction_state IN ('notApplicable','ready')),class_extraction_payload TEXT,class_summary_payload TEXT,CHECK((class_extraction_state='ready')=(class_extraction_payload IS NOT NULL)),CHECK((class_extraction_state='ready')=(class_summary_payload IS NOT NULL)),CHECK((language IN ('java','python'))=(class_extraction_state IN ('ready'))),UNIQUE(vid,graph_hash),UNIQUE(gid,vid),FOREIGN KEY(vid,language) REFERENCES document_versions(vid,language) DEFERRABLE INITIALLY DEFERRED);
 CREATE TABLE graph_nodes(gid INTEGER NOT NULL REFERENCES graph_projections(gid) DEFERRABLE INITIALLY DEFERRED,id BLOB NOT NULL,name TEXT NOT NULL,kind TEXT NOT NULL,PRIMARY KEY(gid,id));
 CREATE TABLE graph_display_labels(gid INTEGER NOT NULL,id BLOB NOT NULL,label TEXT NOT NULL,PRIMARY KEY(gid,id),FOREIGN KEY(gid,id) REFERENCES graph_nodes(gid,id) DEFERRABLE INITIALLY DEFERRED);
 CREATE VIRTUAL TABLE graph_node_trigrams USING fts5(name,content='',columnsize=0,tokenize='trigram case_sensitive 1');
@@ -686,7 +686,7 @@ CREATE TABLE classes(cid INTEGER NOT NULL,gid INTEGER NOT NULL,id BLOB NOT NULL,
 CREATE TABLE class_relations(cid INTEGER NOT NULL,id TEXT NOT NULL,owner BLOB NOT NULL,target BLOB,payload TEXT NOT NULL,PRIMARY KEY(cid,id),FOREIGN KEY(cid,owner) REFERENCES classes(cid,id) DEFERRABLE INITIALLY DEFERRED,FOREIGN KEY(cid,target) REFERENCES classes(cid,id) DEFERRABLE INITIALLY DEFERRED);
 CREATE INDEX class_relations_owner ON class_relations(cid,owner,id);
 CREATE INDEX class_relations_target ON class_relations(cid,target,id);
-CREATE TABLE revision_documents(revision_id TEXT NOT NULL REFERENCES native_revisions(id) DEFERRABLE INITIALLY DEFERRED,language TEXT NOT NULL,path TEXT NOT NULL,vid INTEGER NOT NULL,gid INTEGER NOT NULL,cid INTEGER,capture_stat TEXT,coverage_requested INTEGER NOT NULL CHECK(coverage_requested IN (0,1)),coverage_selected INTEGER NOT NULL CHECK(coverage_selected IN (0,1)),coverage_state TEXT NOT NULL CHECK(coverage_state IN ('notRequested','omitted','unsupported','failed','partial','complete')),coverage_diagnostic TEXT,ordinal INTEGER NOT NULL CHECK(ordinal>=0),CHECK((coverage_state='complete')=(coverage_diagnostic IS NULL)),PRIMARY KEY(revision_id,language,path),UNIQUE(revision_id,ordinal),FOREIGN KEY(vid,language,path) REFERENCES document_versions(vid,language,path) DEFERRABLE INITIALLY DEFERRED,FOREIGN KEY(gid,vid) REFERENCES graph_projections(gid,vid) DEFERRABLE INITIALLY DEFERRED,FOREIGN KEY(cid,gid) REFERENCES class_projections(cid,gid) DEFERRABLE INITIALLY DEFERRED);
+CREATE TABLE revision_documents(revision_id TEXT NOT NULL REFERENCES native_revisions(id) DEFERRABLE INITIALLY DEFERRED,language TEXT NOT NULL,path TEXT NOT NULL,vid INTEGER NOT NULL,gid INTEGER NOT NULL,cid INTEGER,capture_stat TEXT,coverage_requested INTEGER NOT NULL CHECK(coverage_requested IN (0,1)),coverage_selected INTEGER NOT NULL CHECK(coverage_selected IN (0,1)),coverage_state TEXT NOT NULL CHECK(coverage_state IN ('notRequested','omitted','unsupported','failed','partial','complete')),coverage_diagnostic TEXT,ordinal INTEGER NOT NULL CHECK(ordinal>=0),class_complete INTEGER NOT NULL CHECK(class_complete IN (0,1)),CHECK((coverage_state='complete')=(coverage_diagnostic IS NULL)),PRIMARY KEY(revision_id,language,path),UNIQUE(revision_id,ordinal),FOREIGN KEY(vid,language,path) REFERENCES document_versions(vid,language,path) DEFERRABLE INITIALLY DEFERRED,FOREIGN KEY(gid,vid) REFERENCES graph_projections(gid,vid) DEFERRABLE INITIALLY DEFERRED,FOREIGN KEY(cid,gid) REFERENCES class_projections(cid,gid) DEFERRABLE INITIALLY DEFERRED);
 CREATE INDEX revision_documents_version ON revision_documents(vid,revision_id);
 CREATE INDEX revision_documents_graph ON revision_documents(gid,revision_id);
 CREATE INDEX revision_documents_class ON revision_documents(cid,revision_id);
@@ -2649,7 +2649,7 @@ fn validate_cache_shape(db: &Connection) -> Result<()> {
         version == DATABASE_SCHEMA_VERSION,
         "incompatible_index: unknown schema version"
     );
-    expected.execute_batch(CACHE_SCHEMA_V20)?;
+    expected.execute_batch(CACHE_SCHEMA_V21)?;
     control_ensure!(
         objects(db)? == objects(&expected)?,
         "incompatible_index: unknown cache object type, name or shape"
@@ -3087,14 +3087,14 @@ fn open_index(path: &Path, writable: bool) -> Result<ProtectedSqliteConnection> 
     storage_result(db.prepare(
         "SELECT index_generation,index_revision,indexed_at,stats,diagnostics FROM index_metadata",
     ))?;
-    storage_result(
-        db.prepare("SELECT revision_id,language,path,vid,gid,cid FROM revision_documents"),
-    )?;
+    storage_result(db.prepare(
+        "SELECT revision_id,language,path,vid,gid,cid,class_complete FROM revision_documents",
+    ))?;
     storage_result(
         db.prepare("SELECT vid,id,language,path,content_hash,source_bytes FROM document_versions"),
     )?;
     storage_result(
-        db.prepare("SELECT gid,vid,language,class_extraction_state FROM graph_projections"),
+        db.prepare("SELECT gid,vid,language,class_extraction_state,class_summary_payload FROM graph_projections"),
     )?;
     storage_result(db.prepare("SELECT gid,id,name,kind FROM graph_nodes"))?;
     storage_result(db.prepare("SELECT gid,id,label FROM graph_display_labels"))?;
@@ -4013,7 +4013,8 @@ pub(crate) struct LocalPrepared {
     prior_pin: IndexPin,
     prior_ids: BTreeMap<String, V8DocumentProjection>,
     prior_coverage: BTreeMap<String, crate::native_evidence::Coverage>,
-    prior_extractions: BTreeMap<String, crate::classes::FileExtraction>,
+    prior_summaries: BTreeMap<String, crate::classes::FileSummary>,
+    prior_class_complete: BTreeMap<String, bool>,
     old_stats: IndexStats,
     old_diagnostics: Vec<Diagnostic>,
     old_changed_counts: (usize, usize, usize),
@@ -4486,6 +4487,8 @@ fn write_graph_document(
 #[cfg(test)]
 thread_local! {
     static WRITER_SOURCE_SQL_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static LOCAL_CLASS_EXTRACTION_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static LOCAL_CLASS_PROJECTION_HASHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 #[cfg(test)]
 fn writer_source_sql_reads_for_tests() -> usize {
@@ -6241,6 +6244,7 @@ fn write_native(
     reuse: &PreflightReuse,
     rows: &BTreeMap<&str, PublicationRows<'_>>,
     full_diagnostics: &[Diagnostic],
+    class_complete: bool,
     mode: NativeWrite<'_>,
 ) -> Result<BTreeMap<String, V8DocumentProjection>> {
     let (write_header, ordinal_start, captured_file, precomputed) = match mode {
@@ -6488,7 +6492,7 @@ fn write_native(
         if !reuse.for_path(&file.path).graph {
             immutable.insert(
                 db,
-                "INSERT INTO graph_projections(vid,language,graph_hash,state,class_extraction_state,class_extraction_payload) VALUES(?1,?2,?3,?4,?5,?6)",
+                "INSERT INTO graph_projections(vid,language,graph_hash,state,class_extraction_state,class_extraction_payload,class_summary_payload) VALUES(?1,?2,?3,?4,?5,?6,?7)",
                 params![
                     vid,
                     file.language,
@@ -6500,6 +6504,7 @@ fn write_native(
                         "notApplicable"
                     },
                     extractions.get(&file.path).map(json).transpose()?,
+                    extractions.get(&file.path).map(|extraction| json(&extraction.summary())).transpose()?,
                 ],
             )?;
         }
@@ -6528,7 +6533,7 @@ fn write_native(
         );
         immutable.insert_manifest(
             db,
-            "INSERT INTO revision_documents VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+            "INSERT INTO revision_documents VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
             params![
                 revision_key,
                 file.language,
@@ -6542,6 +6547,7 @@ fn write_native(
                 coverage.state,
                 coverage.diagnostic,
                 ordinal as i64,
+                class_complete || !matches!(file.language.as_str(), "java" | "python"),
             ],
         )?;
         for (kind, roles) in [
@@ -6837,7 +6843,7 @@ fn validate_v8_bootstrap(db: &Connection) -> Result<()> {
         indexed_at.is_empty() && options.is_none(),
         "incompatible_index: invalid v8 bootstrap metadata"
     );
-    // Fixed identifiers from CACHE_SCHEMA_V20 only. Do not read table names from
+    // Fixed identifiers from CACHE_SCHEMA_V21 only. Do not read table names from
     // sqlite_master or treat a partial publication as a valid empty bootstrap.
     for name in [
         "class_projections",
@@ -9099,7 +9105,7 @@ impl Store {
             db.pragma_update(None, "synchronous", "FULL")?;
             db.execute_batch("BEGIN IMMEDIATE")?;
             let result = (|| -> Result<()> {
-                db.execute_batch(CACHE_SCHEMA_V20)?;
+                db.execute_batch(CACHE_SCHEMA_V21)?;
                 let age = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
                 ensure!(age <= 9_007_199_254_740_991, "invalid_open_age");
                 db.execute(
@@ -12295,7 +12301,7 @@ impl Store {
             )?;
         }
         let copied = tx.execute(
-            "INSERT INTO revision_documents SELECT ?1,language,path,vid,             gid,cid,capture_stat,coverage_requested,             coverage_selected,coverage_state,coverage_diagnostic,ordinal             FROM revision_documents WHERE revision_id=?2",
+            "INSERT INTO revision_documents SELECT ?1,language,path,vid,             gid,cid,capture_stat,coverage_requested,             coverage_selected,coverage_state,coverage_diagnostic,ordinal,class_complete             FROM revision_documents WHERE revision_id=?2",
             params![revision_key, selected.key],
         )?;
         selected_ensure!(
@@ -12398,7 +12404,8 @@ impl Store {
             let mut previous = Vec::new();
             let mut prior_ids = BTreeMap::new();
             let mut prior_coverage = BTreeMap::new();
-            let mut prior_extractions = BTreeMap::new();
+            let mut prior_summaries = BTreeMap::new();
+            let mut prior_class_complete = BTreeMap::new();
             let source_set_id = format!("source-set:v1:{}", self.root_id());
             let producer_id = crate::native_evidence::PRODUCER;
             let producer_version = crate::native_evidence::NATIVE_VERSION;
@@ -12409,8 +12416,8 @@ impl Store {
             let mut statement = db.prepare("SELECT r.source_set_id,m.path,m.language,v.content_hash,v.byte_length,NULL,
                 v.extraction_context,v.producer_id,v.producer_version,v.id,
                 g.graph_hash,c.content_hash,g.graph_hash,c.content_hash,
-                g.class_extraction_payload,m.coverage_requested,m.coverage_selected,
-                m.coverage_state,m.coverage_diagnostic
+                g.class_summary_payload,m.coverage_requested,m.coverage_selected,
+                m.coverage_state,m.coverage_diagnostic,m.class_complete
                 FROM revision_documents m JOIN native_revisions r ON r.id=m.revision_id
                 JOIN document_versions v ON v.vid=m.vid
                 JOIN graph_projections g ON g.gid=m.gid
@@ -12424,10 +12431,10 @@ impl Store {
                     class_id_row(r,11)?, r.get::<_, String>(12)?,
                     r.get::<_, Option<String>>(13)?, r.get::<_, Option<String>>(14)?,
                     r.get::<_, bool>(15)?, r.get::<_, bool>(16)?,
-                    r.get::<_, String>(17)?, r.get::<_, Option<String>>(18)?))
+                    r.get::<_, String>(17)?, r.get::<_, Option<String>>(18)?, r.get::<_, i64>(19)?))
             })? {
                 let (row_source_set_id,path,language,hash,length,(),context,id,version,version_id,
-                    graph_id,class_id,graph_hash,class_hash,extraction,requested,covered,state,diagnostic)=row?;
+                    graph_id,class_id,graph_hash,class_hash,summary,requested,covered,state,diagnostic,class_complete)=row?;
                 selected_ensure!(row_source_set_id == source_set_id,
                     "incompatible_index: prior manifest source-set identity mismatch");
                 selected_ensure!(length >= 0 && hash.len() == 64,
@@ -12451,8 +12458,13 @@ impl Store {
                     supported_roles:vec!["definition".into(),"call".into()],
                     observed_roles:Vec::new(),
                 });
-                if let Some(payload) = extraction {
-                    prior_extractions.insert(path.clone(), serde_json::from_str(&payload).context(SelectedIntegrity("incompatible_index: stored JSON decode failed".into()))?);
+                selected_ensure!(matches!(class_complete, 0 | 1),
+                    "incompatible_index: invalid class selection completeness");
+                prior_class_complete.insert(path.clone(), class_complete == 1);
+                selected_ensure!(summary.is_some() == matches!(language.as_str(), "java" | "python"),
+                    "incompatible_index: class summary missing or unexpected");
+                if let Some(payload) = summary {
+                    prior_summaries.insert(path.clone(), serde_json::from_str(&payload).context(SelectedIntegrity("incompatible_index: stored class summary decode failed".into()))?);
                 }
             }
             let Some(affected_paths) = crate::indexer::measure_persisted_change(
@@ -12495,7 +12507,7 @@ impl Store {
                  FROM index_metadata m JOIN native_revisions r ON r.id=?1 WHERE m.singleton=1",
                 [&selected.key],|r|Ok((r.get(0)?,r.get(1)?)))?;
             Ok(Some(LocalPrepared {changed_paths,removed_paths,native,prior_pin:selected.pin,
-                prior_ids,prior_coverage,prior_extractions,
+                prior_ids,prior_coverage,prior_summaries,prior_class_complete,
                 old_stats:serde_json::from_str(&stats).context(SelectedIntegrity("incompatible_index: stored JSON decode failed".into()))?,old_diagnostics:serde_json::from_str(&diagnostics).context(SelectedIntegrity("incompatible_index: stored JSON decode failed".into()))?,
                 old_changed_counts}))
         })
@@ -12714,6 +12726,7 @@ impl Store {
         graph: &Graph,
         prepared: &LocalPrepared,
         rows: &BTreeMap<&str, PublicationRows<'_>>,
+        class_complete: bool,
     ) -> Result<PreflightReuse> {
         self.with_prior_publication_snapshot(|db| {
             let selected = ReadRevision::current(db)?;
@@ -12800,11 +12813,18 @@ impl Store {
                         hash == file.hash,
                         "incompatible_index: reusable captured content hash differs"
                     );
-                    let grouped = rows
-                        .get(path.as_str())
-                        .context("local class projection rows missing")?;
-                    let (next_class_id, next_class_hash) =
-                        v8_class_projection(&old.graph_id, grouped);
+                    let (next_class_id, next_class_hash) = if class_complete
+                        && prepared.prior_class_complete.get(&path) == Some(&true)
+                    {
+                        (old.class_id.clone(), old.class_hash.clone())
+                    } else {
+                        let grouped = rows
+                            .get(path.as_str())
+                            .context("local class projection rows missing")?;
+                        #[cfg(test)]
+                        LOCAL_CLASS_PROJECTION_HASHES.with(|count| count.set(count.get() + 1));
+                        v8_class_projection(&old.graph_id, grouped)
+                    };
                     selected_ensure!(
                         families
                             .insert(
@@ -13006,11 +13026,53 @@ impl Store {
         })
     }
 
+    /// Read recovery extractions only after the compact plan selected the paths.
+    fn load_local_class_extractions(
+        &self,
+        prepared: &LocalPrepared,
+        paths: &BTreeSet<String>,
+        cancel: &CancelFlag,
+    ) -> Result<BTreeMap<String, crate::classes::FileExtraction>> {
+        if paths.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        self.with_prior_publication_snapshot(|db| {
+            let selected = ReadRevision::current(db)?;
+            ensure!(
+                selected.pin == prepared.prior_pin,
+                "revision conflict: local class recovery head changed"
+            );
+            let mut statement = db.prepare(
+                "SELECT g.class_extraction_payload FROM revision_documents m
+                 JOIN graph_projections g ON g.gid=m.gid
+                 WHERE m.revision_id=?1 AND m.path=?2",
+            )?;
+            let mut extractions = BTreeMap::new();
+            for path in paths {
+                check_cancel(cancel)?;
+                let payload: Option<String> =
+                    statement.query_row(params![selected.key, path], |row| row.get(0))?;
+                let payload = payload.context(SelectedIntegrity(
+                    "incompatible_index: class recovery extraction missing".into(),
+                ))?;
+                #[cfg(test)]
+                LOCAL_CLASS_EXTRACTION_READS.with(|count| count.set(count.get() + 1));
+                extractions.insert(
+                    path.clone(),
+                    serde_json::from_str(&payload).context(SelectedIntegrity(
+                        "incompatible_index: stored class extraction decode failed".into(),
+                    ))?,
+                );
+            }
+            Ok(extractions)
+        })
+    }
+
     fn prepare_stream_class_catalog(
         spool: &crate::native_evidence::FullDocumentSpool,
         order: &[usize],
         cancel: &CancelFlag,
-    ) -> Result<crate::classes::Catalog> {
+    ) -> Result<(crate::classes::Catalog, bool)> {
         let limits = crate::classes::Limits::default();
         // All Java/Python files were extracted and stored by the sorted native
         // owner before this publisher was entered. Replay in the same path
@@ -13025,22 +13087,28 @@ impl Store {
                 .as_bytes()
                 .cmp(spool.header().revision.documents[*b].key.path.as_bytes())
         });
+        let mut summaries = Vec::new();
         for index in replay {
-            if !composer.is_open() {
-                break;
-            }
             let document = &spool.header().revision.documents[index];
             if matches!(document.key.language.as_str(), "java" | "python") {
                 check_cancel(cancel)?;
                 let extraction = spool
                     .read_extraction(index)
                     .map_err(native_spool_read_failure)?;
-                if !composer.push(&extraction) {
-                    break;
+                summaries.push(extraction.summary());
+                if composer.is_open() {
+                    composer.push(&extraction);
                 }
             }
         }
-        Ok(composer.finish())
+        let complete = crate::classes::plan_complete_catalog(
+            &summaries,
+            spool.len(),
+            spool.stats().symbols,
+            limits,
+        )
+        .is_some();
+        Ok((composer.finish(), complete))
     }
 
     fn preflight_stream_reuse(
@@ -13281,16 +13349,14 @@ impl Store {
             "unsupported graph schema"
         );
         check_cancel(cancel)?;
-        let (stats, classes, extractions) = if let Some(spool) = stream {
+        let (stats, classes, extractions, class_complete) = if let Some(spool) = stream {
             ensure!(
                 local.is_none(),
                 "local and streamed publication cannot be combined"
             );
-            (
-                spool.stats().clone(),
-                Self::prepare_stream_class_catalog(spool, &stream_order, cancel)?,
-                BTreeMap::new(),
-            )
+            let (classes, complete) =
+                Self::prepare_stream_class_catalog(spool, &stream_order, cancel)?;
+            (spool.stats().clone(), classes, BTreeMap::new(), complete)
         } else {
             let stats = if let Some(prepared) = local {
                 ensure!(
@@ -13326,67 +13392,100 @@ impl Store {
                         .push(node.clone());
                 }
             }
-            let extractions: BTreeMap<String, crate::classes::FileExtraction> =
-                if let Some(prepared) = local {
-                    let mut extractions: BTreeMap<_, _> = prepared
-                        .prior_extractions
-                        .iter()
-                        .filter(|(path, _)| {
-                            class_paths.contains(path.as_str())
-                                && !prepared.changed_paths.contains(path.as_str())
-                        })
-                        .map(|(path, extraction)| (path.clone(), extraction.clone()))
-                        .collect();
-                    for file in graph.files.iter().filter(|file| {
-                        prepared.changed_paths.contains(&file.path)
-                            && matches!(file.language.as_str(), "java" | "python")
-                    }) {
-                        extractions.insert(
-                            file.path.clone(),
-                            crate::classes::FileExtraction::extract_file(
-                                file,
-                                class_symbols
-                                    .get(file.path.as_str())
-                                    .map(Vec::as_slice)
-                                    .unwrap_or(&[]),
-                                cancel,
-                                limits,
-                            )?,
-                        );
+            let mut extractions: BTreeMap<String, crate::classes::FileExtraction> = graph
+                .files
+                .iter()
+                .filter(|file| {
+                    class_paths.contains(file.path.as_str())
+                        && local.is_none_or(|prepared| prepared.changed_paths.contains(&file.path))
+                })
+                .map(|file| {
+                    Ok((
+                        file.path.clone(),
+                        crate::classes::FileExtraction::extract_file(
+                            file,
+                            class_symbols
+                                .get(file.path.as_str())
+                                .map(Vec::as_slice)
+                                .unwrap_or(&[]),
+                            cancel,
+                            limits,
+                        )?,
+                    ))
+                })
+                .collect::<Result<_>>()?;
+            let mut summaries: BTreeMap<_, _> = extractions
+                .iter()
+                .map(|(path, extraction)| (path.clone(), extraction.summary()))
+                .collect();
+            if let Some(prepared) = local {
+                for path in &class_paths {
+                    if !prepared.changed_paths.contains(*path) {
+                        let summary =
+                            prepared
+                                .prior_summaries
+                                .get(*path)
+                                .context(SelectedIntegrity(
+                                    "incompatible_index: local class summary inventory incomplete"
+                                        .into(),
+                                ))?;
+                        summaries.insert((*path).to_owned(), summary.clone());
                     }
-                    if extractions.len() != class_paths.len() {
-                        return Err(self.report_index_failure(
-                            SelectedIntegrity(
-                                "incompatible_index: local class extraction inventory incomplete"
-                                    .into(),
-                            )
-                            .into(),
-                        ));
-                    }
-                    extractions
-                } else {
-                    graph
-                        .files
-                        .iter()
-                        .filter(|f| matches!(f.language.as_str(), "java" | "python"))
-                        .map(|file| {
-                            Ok((
-                                file.path.clone(),
-                                crate::classes::FileExtraction::extract_file(
-                                    file,
-                                    class_symbols
-                                        .get(file.path.as_str())
-                                        .map(Vec::as_slice)
-                                        .unwrap_or(&[]),
-                                    cancel,
-                                    limits,
-                                )?,
-                            ))
-                        })
-                        .collect::<Result<_>>()?
+                }
+            }
+            selected_ensure!(
+                summaries.len() == class_paths.len(),
+                "incompatible_index: local class summary inventory incomplete"
+            );
+            let metadata = crate::classes::plan_complete_catalog(
+                summaries.values(),
+                graph.files.len(),
+                graph.stats.symbols,
+                limits,
+            );
+            let complete = metadata.is_some();
+            if let Some(prepared) = local {
+                let recovery_paths = class_paths
+                    .iter()
+                    .filter(|path| {
+                        !prepared.changed_paths.contains(**path)
+                            && (!complete
+                                || !prepared
+                                    .prior_class_complete
+                                    .get(**path)
+                                    .copied()
+                                    .unwrap_or(false))
+                    })
+                    .map(|path| (*path).to_owned())
+                    .collect();
+                extractions.extend(self.load_local_class_extractions(
+                    prepared,
+                    &recovery_paths,
+                    cancel,
+                )?);
+            }
+            let classes = if local.is_some()
+                && let Some(metadata) = metadata
+            {
+                // Sparse payload: complete unchanged selections keep their immutable CID.
+                // Only changed and recovered files contribute class rows here.
+                let mut classes = crate::classes::Catalog {
+                    classes: Vec::new(),
+                    relations: Vec::new(),
+                    warnings: metadata.warnings,
+                    truncated: metadata.truncated,
                 };
-            let classes = Self::compose_selected_class_catalog(graph, &extractions, limits)?;
-            (stats, classes, extractions)
+                for extraction in extractions.values() {
+                    check_cancel(cancel)?;
+                    let file = crate::classes::complete_file_catalog(extraction);
+                    classes.classes.extend(file.classes);
+                    classes.relations.extend(file.relations);
+                }
+                classes
+            } else {
+                Self::compose_selected_class_catalog(graph, &extractions, limits)?
+            };
+            (stats, classes, extractions, complete)
         };
         // The public read_status guard has this exact singleton JSON ceiling.
         // Refuse over-limit catalog warnings before paired CAS.
@@ -13439,7 +13538,7 @@ impl Store {
                     matches!(target, PublicationTarget::Live),
                     "local evidence cannot use a private stage"
                 );
-                self.preflight_local_reuse(graph, prepared, &rows)?
+                self.preflight_local_reuse(graph, prepared, &rows, class_complete)?
             } else if let Some(spool) = stream {
                 self.preflight_stream_reuse(spool, &stream_order, &classes, &expected, cancel)?
             } else if matches!(target, PublicationTarget::Live) {
@@ -13642,6 +13741,7 @@ impl Store {
                     &reuse,
                     &header_rows,
                     &graph.diagnostics,
+                    class_complete,
                     NativeWrite::Header { ordinal_start: 0 },
                 )?;
                 // Decode a bounded batch, hash its projections and witnesses on
@@ -13739,6 +13839,7 @@ impl Store {
                             &reuse,
                             rows,
                             &graph.diagnostics,
+                            class_complete,
                             NativeWrite::Document {
                                 ordinal: *ordinal,
                                 captured_file: source_files
@@ -13785,6 +13886,7 @@ impl Store {
                     &reuse,
                     &rows,
                     &graph.diagnostics,
+                    class_complete,
                     NativeWrite::Header { ordinal_start: 0 },
                 )?
             };
@@ -16732,7 +16834,7 @@ impl Store {
 #[test]
 fn selected_ancillary_budget_matches_main_text_key_bytes() {
     let db = Connection::open_in_memory().unwrap();
-    db.execute_batch(CACHE_SCHEMA_V20).unwrap();
+    db.execute_batch(CACHE_SCHEMA_V21).unwrap();
     // The aggregate needs only synthetic child rows; FK behavior is covered by
     // publication/retention tests, not this isolated budget-SQL fixture.
     db.pragma_update(None, "foreign_keys", "OFF").unwrap();
@@ -16774,8 +16876,8 @@ fn selected_ancillary_budget_matches_main_text_key_bytes() {
     .unwrap();
     db.execute(
         "INSERT INTO graph_projections(gid,vid,language,graph_hash,state,class_extraction_state,
-         class_extraction_payload)
-         VALUES(2,1,'java',?1,'ready','ready','{}')",
+         class_extraction_payload,class_summary_payload)
+         VALUES(2,1,'java',?1,'ready','ready','{}','{}')",
         [&graph_hash],
     )
     .unwrap();
@@ -16868,7 +16970,7 @@ fn selected_ancillary_budget_matches_main_text_key_bytes() {
 #[test]
 fn immutable_reference_slot_rejects_changed_payload() {
     let db = Connection::open_in_memory().unwrap();
-    db.execute_batch(CACHE_SCHEMA_V20).unwrap();
+    db.execute_batch(CACHE_SCHEMA_V21).unwrap();
     db.pragma_update(None, "foreign_keys", "OFF").unwrap();
     let owner = [0x11u8; 16];
     let original = [0x22u8; 16];
@@ -16945,5 +17047,7 @@ mod live_sqlite_witness_tests;
 #[cfg(test)]
 mod sqlite_deleted_witness_tests;
 
+#[cfg(test)]
+mod catalog_summary_tests;
 #[cfg(test)]
 mod preflight_hash_reuse_tests;

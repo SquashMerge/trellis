@@ -141,7 +141,18 @@ fn selective_publication_faults_rollback_and_retry_same_expected_pin() {
             crate::native_evidence::ExtractionAuthFault::Mismatched,
         );
         let mismatch = store
-            .preflight_local_reuse(&graph, &prepared, &BTreeMap::new())
+            .preflight_local_reuse(
+                &graph,
+                &prepared,
+                &BTreeMap::new(),
+                crate::classes::plan_complete_catalog(
+                    prepared.prior_summaries.values(),
+                    graph.files.len(),
+                    graph.stats.symbols,
+                    crate::classes::Limits::default(),
+                )
+                .is_some(),
+            )
             .err()
             .expect("synthetic mismatched declared component must refuse local reuse");
         assert!(
@@ -2089,7 +2100,15 @@ fn local_class_only_refresh_writes_new_class_rows_and_rolls_back_atomically() {
         .compose_local_revision(&capture, &prepared, changed, &cancel)
         .unwrap();
     assert!(graph.nodes.iter().all(|node| node.path == "a.py"));
-    let mut extractions = prepared.prior_extractions.clone();
+    let prior_paths = prepared
+        .prior_summaries
+        .keys()
+        .filter(|path| !prepared.changed_paths.contains(*path))
+        .cloned()
+        .collect();
+    let mut extractions = store
+        .load_local_class_extractions(&prepared, &prior_paths, &cancel)
+        .unwrap();
     let changed_file = graph.files.iter().find(|file| file.path == "a.py").unwrap();
     extractions.insert(
         "a.py".into(),
@@ -2101,15 +2120,26 @@ fn local_class_only_refresh_writes_new_class_rows_and_rolls_back_atomically() {
         )
         .unwrap(),
     );
-    let catalog = Store::compose_selected_class_catalog(
-        &graph,
-        &extractions,
-        crate::classes::Limits {
-            records: 1,
-            ..crate::classes::Limits::default()
-        },
+    let limits = crate::classes::Limits {
+        records: 1,
+        ..crate::classes::Limits::default()
+    };
+    let summaries: Vec<_> = extractions
+        .values()
+        .map(|extraction| extraction.summary())
+        .collect();
+    let class_complete = crate::classes::plan_complete_catalog(
+        &summaries,
+        graph.files.len(),
+        graph.stats.symbols,
+        limits,
     )
-    .unwrap();
+    .is_some();
+    assert!(
+        !class_complete,
+        "the fixture must exhaust a global detail budget"
+    );
+    let catalog = Store::compose_selected_class_catalog(&graph, &extractions, limits).unwrap();
     assert!(catalog.truncated);
     assert!(
         catalog
@@ -2125,7 +2155,7 @@ fn local_class_only_refresh_writes_new_class_rows_and_rolls_back_atomically() {
     native.coverage.push(coverage);
     let rows = publication_rows(&graph, &native, &catalog).unwrap();
     let reuse = store
-        .preflight_local_reuse(&graph, &prepared, &rows)
+        .preflight_local_reuse(&graph, &prepared, &rows, class_complete)
         .unwrap();
     let families = reuse.for_path("z.py");
     assert!(families.native && families.graph && !families.class);
@@ -2162,6 +2192,7 @@ fn local_class_only_refresh_writes_new_class_rows_and_rolls_back_atomically() {
         &reuse,
         &rows,
         &graph.diagnostics,
+        class_complete,
         NativeWrite::Header { ordinal_start: 0 },
     )
     .unwrap();

@@ -1129,8 +1129,8 @@ async fn navigation_selected_document_without_native_evidence_refuses() {
         [version], |row| row.get(0),
     ).unwrap();
     let orphan_gid: i64 = missing_db.query_row(
-        "INSERT INTO graph_projections(vid,language,graph_hash,state,class_extraction_state,class_extraction_payload)
-         SELECT ?1,language,(CASE substr(graph_hash,1,1) WHEN '0' THEN '1' ELSE '0' END)||substr(graph_hash,2),state,class_extraction_state,class_extraction_payload
+        "INSERT INTO graph_projections(vid,language,graph_hash,state,class_extraction_state,class_extraction_payload,class_summary_payload)
+         SELECT ?1,language,(CASE substr(graph_hash,1,1) WHEN '0' THEN '1' ELSE '0' END)||substr(graph_hash,2),state,class_extraction_state,class_extraction_payload,class_summary_payload
          FROM graph_projections WHERE gid=?2 RETURNING gid",
         rusqlite::params![orphan_vid, graph], |row| row.get(0),
     ).unwrap();
@@ -1168,8 +1168,8 @@ async fn navigation_selected_document_without_native_evidence_refuses() {
         )
         .unwrap();
     assert_eq!(missing_db.execute(
-        "INSERT INTO revision_documents(revision_id,language,path,vid,gid,cid,capture_stat,coverage_requested,coverage_selected,coverage_state,coverage_diagnostic,ordinal)
-         SELECT revision_id,language,'orphan.java',?2,?3,?4,capture_stat,coverage_requested,coverage_selected,coverage_state,coverage_diagnostic,
+        "INSERT INTO revision_documents(revision_id,language,path,vid,gid,cid,capture_stat,coverage_requested,coverage_selected,coverage_state,coverage_diagnostic,class_complete,ordinal)
+         SELECT revision_id,language,'orphan.java',?2,?3,?4,capture_stat,coverage_requested,coverage_selected,coverage_state,coverage_diagnostic,class_complete,
                 (SELECT max(ordinal)+1 FROM revision_documents WHERE revision_id=?1)
          FROM revision_documents WHERE revision_id=?1 AND path='B.java'",
         rusqlite::params![revision, orphan_vid, orphan_gid, orphan_cid],

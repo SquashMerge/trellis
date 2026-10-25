@@ -126,6 +126,25 @@ pub struct FileExtraction {
     pub classes: Vec<ClassDefinition>,
     pub items: Vec<DetailItem>,
 }
+/// Charges and intrinsic metadata for one extraction, before workspace limits.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct FileSummary {
+    pub source_bytes: usize,
+    pub registry_bytes: usize,
+    pub declarations: usize,
+    pub detail_records: usize,
+    pub detail_text: usize,
+    pub warnings: Vec<String>,
+    pub truncated: bool,
+    pub registry_incomplete: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CatalogMetadata {
+    pub warnings: Vec<String>,
+    pub truncated: bool,
+}
+
 #[derive(Default)]
 struct Scope {
     parent: Option<usize>,
@@ -374,6 +393,105 @@ impl CatalogComposer {
     }
 }
 
+/// Plans the no-global-limit-hit case without loading extraction payloads.
+/// Summaries must be in the same path order used by `CatalogComposer`.
+pub(crate) fn plan_complete_catalog<'a>(
+    ordered: impl IntoIterator<Item = &'a FileSummary>,
+    file_count: usize,
+    symbol_count: usize,
+    limits: Limits,
+) -> Option<CatalogMetadata> {
+    if file_count > limits.files || symbol_count > limits.symbols {
+        return None;
+    }
+    let mut source = 0usize;
+    let mut registry = 0usize;
+    let mut declarations = 0usize;
+    let mut records = 0usize;
+    let mut detail = 0usize;
+    let mut registry_complete = true;
+    let mut result = Catalog::default();
+    for summary in ordered {
+        source = source.checked_add(summary.source_bytes)?;
+        registry = registry.checked_add(summary.registry_bytes)?;
+        declarations = declarations.checked_add(summary.declarations)?;
+        records = records.checked_add(summary.detail_records)?;
+        detail = detail.checked_add(summary.detail_text)?;
+        if source > limits.total_bytes
+            || registry > limits.registry_text
+            || declarations > limits.classes
+            || records > limits.records
+            || detail > limits.output_text
+        {
+            return None;
+        }
+        for warning in &summary.warnings {
+            result.add_warning(warning, limits.text);
+        }
+        result.truncated |= summary.truncated;
+        registry_complete &= !summary.registry_incomplete;
+    }
+    append_complete_catalog_warnings(&mut result, declarations != 0, registry_complete);
+    Some(CatalogMetadata {
+        warnings: result.warnings,
+        truncated: result.truncated,
+    })
+}
+
+fn append_complete_catalog_warnings(
+    result: &mut Catalog,
+    has_classes: bool,
+    registry_complete: bool,
+) {
+    if has_classes {
+        result.warnings.push("Declared types are terminal source text, not class relationships. Direct Java/Python declarations only; no function-body, conditional/anonymous class, generated member, wildcard-import, type-alias or dependency discovery.".into());
+    }
+    if !registry_complete {
+        result
+            .warnings
+            .push("Incomplete class declaration registry: some declarations may be absent.".into());
+    }
+}
+
+/// Reconstructs all admitted per-file rows, without applying workspace limits.
+pub(crate) fn complete_file_catalog(extraction: &FileExtraction) -> Catalog {
+    let mut result = Catalog {
+        truncated: extraction.truncated,
+        ..Catalog::default()
+    };
+    for warning in &extraction.warnings {
+        result.add_warning(warning, Limits::default().text);
+    }
+    for (index, class) in extraction.classes.iter().enumerate() {
+        let mut class = class.clone();
+        class.fields.clear();
+        class.methods.clear();
+        for item in extraction.items.iter().filter(|i| i.class_index == index) {
+            match &item.value {
+                DetailValue::Field(value) => class.fields.push(value.clone()),
+                DetailValue::Method(value) => class.methods.push(value.clone()),
+                DetailValue::Relation(value) => result.relations.push(value.clone()),
+                DetailValue::ScopeText => (),
+            }
+        }
+        result.classes.push(class);
+    }
+    result.classes.sort_by(|a, b| {
+        (&a.symbol.path, a.symbol.range.start_byte, &a.symbol.id).cmp(&(
+            &b.symbol.path,
+            b.symbol.range.start_byte,
+            &b.symbol.id,
+        ))
+    });
+    result.relations.sort_by(|a, b| {
+        (&a.path, a.range.start_byte, &a.id).cmp(&(&b.path, b.range.start_byte, &b.id))
+    });
+    result.relations.dedup_by(|a, b| a.id == b.id);
+    let has_classes = !result.classes.is_empty();
+    append_complete_catalog_warnings(&mut result, has_classes, !extraction.registry_incomplete);
+    result
+}
+
 impl Catalog {
     pub fn build(files: &[SourceFile], nodes: &[Symbol], cancel: &CancelFlag) -> Result<Self> {
         Self::build_with_limits(files, nodes, cancel, Limits::default())
@@ -433,6 +551,29 @@ impl Catalog {
     }
 }
 impl FileExtraction {
+    pub(crate) fn summary(&self) -> FileSummary {
+        let mut detail_records = 0usize;
+        let mut detail_text = 0usize;
+        for item in self
+            .items
+            .iter()
+            .filter(|item| item.class_index < self.classes.len())
+        {
+            detail_records = detail_records.saturating_add(item.records);
+            detail_text = detail_text.saturating_add(item.text);
+        }
+        FileSummary {
+            source_bytes: self.source_bytes,
+            registry_bytes: self.registry_bytes,
+            declarations: self.classes.len(),
+            detail_records,
+            detail_text,
+            warnings: self.warnings.clone(),
+            truncated: self.truncated,
+            registry_incomplete: self.registry_incomplete,
+        }
+    }
+
     pub fn extract_file(
         file: &SourceFile,
         nodes: &[Symbol],
@@ -1660,5 +1801,305 @@ mod budget_tests {
             capped.finish(),
             Catalog::compose(&files, 3, 3, limits).unwrap()
         );
+    }
+}
+
+#[cfg(test)]
+mod summary_tests {
+    use super::*;
+    use std::sync::{Arc, atomic::AtomicBool};
+
+    fn extraction(path: &str) -> FileExtraction {
+        FileExtraction {
+            path: path.into(),
+            source_bytes: 7,
+            registry_bytes: 5,
+            warnings: vec![format!("warning {path}")],
+            truncated: false,
+            registry_incomplete: false,
+            classes: vec![ClassDefinition {
+                symbol: Symbol {
+                    id: format!("class:{path}"),
+                    name: "C".into(),
+                    display_label: None,
+                    kind: SymbolKind::Class,
+                    path: path.into(),
+                    range: SourceRange::default(),
+                    parent: None,
+                    accessor: false,
+                    provenance: crate::model::Provenance {
+                        source: "syntax".into(),
+                        semantic: crate::model::SemanticState::Unavailable,
+                    },
+                },
+                qualified_name: "C".into(),
+                language: "python".into(),
+                declaration_kind: "class".into(),
+                fields: vec![],
+                methods: vec![],
+                truncated: false,
+            }],
+            items: vec![DetailItem {
+                class_index: 0,
+                records: 2,
+                text: 3,
+                value: DetailValue::ScopeText,
+            }],
+        }
+    }
+
+    fn assert_metadata(files: &[FileExtraction], limits: Limits) {
+        let mut ordered: Vec<_> = files.iter().collect();
+        ordered.sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
+        let summaries: Vec<_> = ordered.iter().map(|f| f.summary()).collect();
+        let planned = plan_complete_catalog(&summaries, files.len(), 2, limits).unwrap();
+        let expected = Catalog::compose(files, files.len(), 2, limits).unwrap();
+        assert_eq!(planned.warnings, expected.warnings);
+        assert_eq!(planned.truncated, expected.truncated);
+    }
+
+    #[test]
+    fn summaries_match_composition_at_every_global_boundary() {
+        let files = [extraction("b.py"), extraction("a.py")];
+        let summaries: Vec<_> = files.iter().map(FileExtraction::summary).collect();
+        let exact = Limits {
+            files: 2,
+            symbols: 2,
+            total_bytes: 14,
+            registry_text: 10,
+            classes: 2,
+            records: 4,
+            output_text: 6,
+            ..Limits::default()
+        };
+        assert_metadata(&files, exact);
+        for limits in [
+            Limits { files: 1, ..exact },
+            Limits {
+                symbols: 1,
+                ..exact
+            },
+            Limits {
+                total_bytes: 13,
+                ..exact
+            },
+            Limits {
+                registry_text: 9,
+                ..exact
+            },
+            Limits {
+                classes: 1,
+                ..exact
+            },
+            Limits {
+                records: 3,
+                ..exact
+            },
+            Limits {
+                output_text: 5,
+                ..exact
+            },
+        ] {
+            assert!(plan_complete_catalog(&summaries, 2, 2, limits).is_none());
+            assert!(Catalog::compose(&files, 2, 2, limits).unwrap().truncated);
+        }
+    }
+
+    #[test]
+    fn summary_counts_scope_text_and_ignores_unknown_class_indices() {
+        let mut file = extraction("a.py");
+        file.items.push(DetailItem {
+            class_index: 1,
+            records: usize::MAX,
+            text: usize::MAX,
+            value: DetailValue::ScopeText,
+        });
+        let summary = file.summary();
+        assert_eq!(summary.detail_records, 2);
+        assert_eq!(summary.detail_text, 3);
+        assert_metadata(&[file.clone()], Limits::default());
+        file.classes.clear();
+        let summary = file.summary();
+        assert_eq!(summary.declarations, 0);
+        assert_eq!(summary.detail_records, 0);
+        assert_eq!(summary.detail_text, 0);
+        let limits = Limits {
+            registry_text: file.registry_bytes,
+            classes: 0,
+            records: 0,
+            output_text: 0,
+            ..Limits::default()
+        };
+        assert_metadata(&[file], limits);
+        assert!(
+            plan_complete_catalog(
+                [&summary],
+                1,
+                0,
+                Limits {
+                    registry_text: 4,
+                    ..limits
+                }
+            )
+            .is_none()
+        );
+        let mut overflow = extraction("overflow.py");
+        overflow.items[0].records = usize::MAX;
+        overflow.items[0].text = usize::MAX;
+        overflow.items.push(overflow.items[0].clone());
+        let overflow = overflow.summary();
+        assert_eq!(overflow.detail_records, usize::MAX);
+        assert_eq!(overflow.detail_text, usize::MAX);
+        assert!(plan_complete_catalog([&overflow], 1, 0, Limits::default()).is_none());
+        let mut huge_source = summary.clone();
+        huge_source.source_bytes = usize::MAX;
+        assert!(
+            plan_complete_catalog(
+                [&huge_source, &summary],
+                2,
+                0,
+                Limits {
+                    total_bytes: usize::MAX,
+                    registry_text: usize::MAX,
+                    ..Limits::default()
+                }
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn summary_metadata_preserves_warning_clamps_order_and_intrinsic_flags() {
+        let mut first = extraction("a.py");
+        first.warnings = vec!["duplicate".into(), "duplicate".into(), "ééééééééé".into()];
+        first.warnings.extend((0..105).map(|i| format!("warn{i}")));
+        first.truncated = true;
+        first.registry_incomplete = true;
+        first.classes[0].truncated = true;
+        let mut second = extraction("b.py");
+        second.warnings = vec!["later".into()];
+        assert_metadata(
+            &[second, first],
+            Limits {
+                text: 8,
+                ..Limits::default()
+            },
+        );
+        let mut empty = extraction("empty.py");
+        empty.classes.clear();
+        empty.registry_incomplete = true;
+        assert_metadata(&[empty], Limits::default());
+        assert_metadata(&[], Limits::default());
+    }
+
+    #[test]
+    fn complete_catalog_rebuilds_members_and_uses_native_sort_and_dedup() {
+        let mut file = extraction("a.py");
+        let member = ClassMember {
+            name: "member".into(),
+            type_hint: None,
+            symbol_id: None,
+            path: file.path.clone(),
+            range: SourceRange::default(),
+        };
+        file.classes[0].symbol.range.start_byte = 20;
+        file.classes[0].fields.push(member.clone());
+        file.classes[0].methods.push(member.clone());
+        let mut earlier = file.classes[0].clone();
+        earlier.symbol.id = "earlier".into();
+        earlier.symbol.range.start_byte = 1;
+        file.classes.push(earlier);
+        for value in [
+            DetailValue::Field(member.clone()),
+            DetailValue::Method(member),
+        ] {
+            file.items.push(DetailItem {
+                class_index: 0,
+                records: 1,
+                text: 1,
+                value,
+            });
+        }
+        for (id, start_byte) in [("later", 10), ("earlier", 2), ("earlier", 2)] {
+            file.items.push(DetailItem {
+                class_index: 0,
+                records: 1,
+                text: 1,
+                value: DetailValue::Relation(ClassRelation {
+                    id: id.into(),
+                    owner: file.classes[0].symbol.id.clone(),
+                    target: None,
+                    type_name: "C".into(),
+                    kind: "field".into(),
+                    path: file.path.clone(),
+                    range: SourceRange {
+                        start_byte,
+                        ..SourceRange::default()
+                    },
+                    candidate_ids: vec![],
+                    match_kind: "unmatched".into(),
+                }),
+            });
+        }
+        file.source_bytes = TOTAL_BYTES + 1;
+        file.registry_bytes = REGISTRY_TEXT + 1;
+        file.items[0].records = RECORDS + 1;
+        file.items[0].text = OUTPUT_TEXT + 1;
+        let unlimited = Limits {
+            total_bytes: usize::MAX,
+            registry_text: usize::MAX,
+            classes: usize::MAX,
+            records: usize::MAX,
+            output_text: usize::MAX,
+            ..Limits::default()
+        };
+        let actual = complete_file_catalog(&file);
+        assert_eq!(actual, Catalog::compose(&[file], 1, 0, unlimited).unwrap());
+        assert_eq!(actual.classes[0].symbol.id, "earlier");
+        assert!(actual.classes[0].fields.is_empty());
+        assert!(actual.classes[0].methods.is_empty());
+        assert_eq!(actual.classes[1].fields.len(), 1);
+        assert_eq!(actual.classes[1].methods.len(), 1);
+        assert_eq!(
+            actual
+                .relations
+                .iter()
+                .map(|r| r.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["earlier", "later"]
+        );
+    }
+
+    #[test]
+    fn source_fixture_summaries_and_complete_catalogs_match_existing_composer() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("A.java"),
+            "package p; class Target {} class A extends Target { Target field; Target method(Target value) { return value; } }").unwrap();
+        std::fs::write(workspace.path().join("b.py"),
+            "class Target: pass\nclass B(Target):\n    field: Target\n    def method(self, value: Target) -> Target: return value\n").unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let graph = crate::indexer::index_workspace(
+            &crate::indexer::IndexOptions::new(workspace.path().to_owned()),
+            &cancel,
+            |_| {},
+        )
+        .unwrap();
+        let files: Vec<_> = graph
+            .files
+            .iter()
+            .map(|file| {
+                FileExtraction::extract_file(file, &graph.nodes, &cancel, Limits::default())
+                    .unwrap()
+            })
+            .collect();
+        assert_metadata(&files, Limits::default());
+        for file in files {
+            assert!(!file.classes.is_empty());
+            assert!(!file.items.is_empty());
+            assert_eq!(
+                complete_file_catalog(&file),
+                Catalog::compose(&[file], 1, graph.nodes.len(), Limits::default()).unwrap()
+            );
+        }
     }
 }
