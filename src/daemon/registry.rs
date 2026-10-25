@@ -1902,6 +1902,49 @@ impl CheckoutRuntime {
         }
     }
 
+    pub fn cli_semantic_import(
+        &self,
+        options: &crate::store::requests::SemanticImportOptions,
+    ) -> anyhow::Result<serde_json::Value> {
+        let resources = self.resources()?;
+        let accepted = resources.scheduler.enqueue_semantic_import(options)?;
+        let mut busy_deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let seen = resources.store.terminal_generation();
+            let row = cli_index_request(
+                || resources.store.request_by_id(&accepted.id),
+                busy_deadline,
+            )?
+            .ok_or_else(|| anyhow::anyhow!("storage_busy: accepted request disappeared"))?;
+            busy_deadline = Instant::now() + Duration::from_secs(30);
+            match row.state.as_str() {
+                "done" => {
+                    let pin = row.revision.ok_or_else(|| {
+                        anyhow::anyhow!("store_unavailable: completed semantic request missing pin")
+                    })?;
+                    let report = resources
+                        .store
+                        .semantic_import_report_at(pin, &options.producer_name)?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "store_unavailable: completed semantic request missing report"
+                            )
+                        })?;
+                    return Ok(
+                        serde_json::json!({"requestId":accepted.id,"publishedRevision":pin,"report":report}),
+                    );
+                }
+                "failed" => anyhow::bail!(
+                    "{}: request {} failed",
+                    row.error_code.as_deref().unwrap_or("index_failed"),
+                    accepted.id
+                ),
+                "queued" | "running" => resources.store.wait_terminal_change(seen),
+                _ => anyhow::bail!("store_unavailable: invalid request state"),
+            }
+        }
+    }
+
     /// A retained runtime handle cannot keep the released Store or watcher alive.
     pub fn has_active_resources(&self) -> bool {
         self.resources.lock().unwrap().is_some()

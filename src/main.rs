@@ -32,6 +32,8 @@ enum Command {
     NativeCapture(NativeCaptureArgs),
     /// Build and atomically publish a complete index. Does not execute repository code.
     Index(IndexArgs),
+    /// Explicitly import pinned SCIP evidence into the selected native index.
+    Semantic(SemanticCommand),
     /// Run the elected user-level socket service.
     Daemon,
     /// Serve one read-only MCP connection on line-framed stdin/stdout.
@@ -94,6 +96,30 @@ struct IndexArgs {
     /// Larger files are skipped with a diagnostic; valid range 1..16777216.
     #[arg(long)]
     max_file_bytes: Option<u64>,
+}
+#[derive(Args)]
+struct SemanticCommand {
+    #[command(subcommand)]
+    action: SemanticAction,
+}
+#[derive(Subcommand)]
+enum SemanticAction {
+    Import(SemanticImportArgs),
+}
+#[derive(Args)]
+struct SemanticImportArgs {
+    #[command(flatten)]
+    workspace: WorkspaceArgs,
+    #[arg(long)]
+    scip: PathBuf,
+    #[arg(long)]
+    manifest: PathBuf,
+    #[arg(long)]
+    profile: String,
+    #[arg(long)]
+    producer: String,
+    #[arg(long = "manifest-sha256")]
+    manifest_sha256: String,
 }
 #[derive(Args)]
 struct ServeArgs {
@@ -288,6 +314,7 @@ async fn main() -> Result<()> {
             eprintln!("Forgot record {}", args.record_id);
         }
         command @ (Command::Index(_)
+        | Command::Semantic(_)
         | Command::Status(_)
         | Command::Symbols(_)
         | Command::Query(_)
@@ -599,7 +626,7 @@ fn send_daemon(request: &protocol::Request, read_only: bool) -> Result<serde_jso
     let cli_bound = CLI_REPLY_BOUND;
     #[cfg(feature = "test-support")]
     let cli_bound = metrics_test_duration("TRELLIS_TEST_CLI_REPLY_BOUND_MS").unwrap_or(cli_bound);
-    let reply_bound = if request.operation == "index" {
+    let reply_bound = if matches!(request.operation.as_str(), "index" | "semantic_import") {
         index_bound
     } else {
         cli_bound
@@ -747,6 +774,38 @@ fn dispatch_cli(command: &Command) -> Result<()> {
             }),
             false,
         ),
+        Command::Semantic(SemanticCommand {
+            action: SemanticAction::Import(args),
+        }) => {
+            let anchor = |path: &PathBuf| -> Result<String> {
+                let absolute = if path.is_absolute() {
+                    path.clone()
+                } else {
+                    std::env::current_dir()?.join(path)
+                };
+                Ok(absolute
+                    .to_str()
+                    .context("invalid_request: non-UTF8 input path")?
+                    .to_owned())
+            };
+            ensure!(
+                args.manifest_sha256.len() == 64
+                    && args
+                        .manifest_sha256
+                        .bytes()
+                        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+                "invalid_request: manifest digest"
+            );
+            (
+                "semantic_import",
+                &args.workspace,
+                serde_json::json!({
+                    "version":1,"scip":anchor(&args.scip)?,"manifest":anchor(&args.manifest)?,
+                    "profileId":args.profile,"producerName":args.producer,"manifestSha256":args.manifest_sha256
+                }),
+                false,
+            )
+        }
         _ => unreachable!(),
     };
     let (_roots, identity) = workspace.resolve_unattached()?;
@@ -1366,7 +1425,7 @@ fn dispatch_connection(
         ensure!(
             matches!(
                 request.operation.as_str(),
-                "status" | "symbols" | "query" | "index" | "metrics"
+                "status" | "symbols" | "query" | "index" | "semantic_import" | "metrics"
             ),
             "unknown daemon operation"
         );
@@ -1565,11 +1624,18 @@ fn dispatch_connection(
                     );
                     checkout.cli_index(&options)
                 }
+                "semantic_import" => {
+                    let options: trellis::store::requests::SemanticImportOptions =
+                        serde_json::from_value(args.clone()).map_err(|_| {
+                            anyhow::anyhow!("invalid_request: semantic import options")
+                        })?;
+                    checkout.cli_semantic_import(&options)
+                }
                 _ => anyhow::bail!("unknown daemon operation"),
             };
             // Mandatory startup reconciliation may be running when a CLI read first attaches.
             // This only repeats read-only calls; index is never replayed.
-            if request.operation != "index"
+            if !matches!(request.operation.as_str(), "index" | "semantic_import")
                 && selected
                     .as_ref()
                     .err()

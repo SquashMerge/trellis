@@ -834,6 +834,48 @@ pub(crate) fn captured_revision_header(
     Ok((artifact.source_set, artifact.revision))
 }
 
+/// The canonical captured root-input components used in the native revision ID.
+/// Store retains these original values for imports after mutable files change.
+pub(crate) fn captured_components(
+    capture: &Capture,
+    root: &Path,
+    executable_hash: &str,
+) -> Result<(Value, Vec<Value>, Vec<Value>)> {
+    let root_inputs: Vec<_> = crate::capture::ROOT_INPUTS[..22]
+        .iter()
+        .map(|name| root.join(name))
+        .collect();
+    let dependencies: Vec<Value> = root_inputs
+        .iter()
+        .map(|p| entry(root, p, capture.bytes(p)))
+        .collect::<Result<_>>()?;
+    let mut config = dependencies.clone();
+    let selectors: Vec<_> = crate::capture::ROOT_INPUTS[22..]
+        .iter()
+        .map(|n| root.join(n))
+        .collect();
+    for p in &selectors {
+        config.push(entry(root, p, capture.bytes(p))?);
+    }
+    config.push(
+        json!({"nativeAdmission":{"maxFileBytes":capture.reconcile_options().max_file_bytes}}),
+    );
+    for (p, b) in capture.admitted_inputs() {
+        if p.file_name()
+            .is_some_and(|n| n == ".gitignore" || n == ".ignore")
+            && p.starts_with(root)
+        {
+            config.push(entry(root, p, b)?);
+        }
+    }
+    let selectors: Vec<Value> = selectors
+        .iter()
+        .map(|p| entry(root, p, capture.bytes(p)))
+        .collect::<Result<_>>()?;
+    let toolchain = json!({"nativeExecutable":executable_hash,"rootRustToolchain":selectors[0],"rootRustToolchainToml":selectors[1]});
+    Ok((toolchain, config, dependencies))
+}
+
 /// The full captured revision header is shared by full and selected measurement.
 /// Selecting one file must never change the source-set, producer or revision ID.
 fn build_native_header<'a>(
@@ -867,38 +909,7 @@ fn build_native_header<'a>(
         languages: producer.languages.clone(),
         dependencies: vec![],
     };
-    let root_inputs: Vec<_> = crate::capture::ROOT_INPUTS[..22]
-        .iter()
-        .map(|name| root.join(name))
-        .collect();
-    let dependencies: Vec<Value> = root_inputs
-        .iter()
-        .map(|p| entry(root, p, capture.bytes(p)))
-        .collect::<Result<_>>()?;
-    let mut config = dependencies.clone();
-    let selectors: Vec<_> = crate::capture::ROOT_INPUTS[22..]
-        .iter()
-        .map(|n| root.join(n))
-        .collect();
-    for p in &selectors {
-        config.push(entry(root, p, capture.bytes(p))?);
-    }
-    config.push(
-        json!({"nativeAdmission":{"maxFileBytes":capture.reconcile_options().max_file_bytes}}),
-    );
-    for (p, b) in capture.admitted_inputs() {
-        if p.file_name()
-            .is_some_and(|n| n == ".gitignore" || n == ".ignore")
-            && p.starts_with(root)
-        {
-            config.push(entry(root, p, b)?);
-        }
-    }
-    let selectors: Vec<Value> = selectors
-        .iter()
-        .map(|p| entry(root, p, capture.bytes(p)))
-        .collect::<Result<_>>()?;
-    let toolchain = json!({"nativeExecutable":executable_hash,"rootRustToolchain":selectors[0],"rootRustToolchainToml":selectors[1]});
+    let (toolchain, config, dependencies) = captured_components(capture, root, &executable_hash)?;
     let mut files: Vec<_> = capture.files.iter().collect();
     files.sort_by(|a, b| {
         language_order(&a.language)

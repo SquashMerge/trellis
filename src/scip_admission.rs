@@ -26,6 +26,33 @@ pub struct TrustedSelection {
 }
 pub struct ReferenceProfileAdmission<'a> {
     input: AuthenticatedScipInput<'a>,
+    producer_hash: String,
+}
+impl ReferenceProfileAdmission<'_> {
+    pub fn admitted_encoding(&self) -> u8 {
+        self.input.position_encoding
+    }
+    pub fn producer(&self) -> crate::semantic_evidence::Producer {
+        let language = match self.input.producer_id.as_str() {
+            "scip-java" => crate::semantic_evidence::Language::Java,
+            "scip-typescript" => crate::semantic_evidence::Language::Javascript,
+            "scip-python" => crate::semantic_evidence::Language::Python,
+            "rust-analyzer" => crate::semantic_evidence::Language::Rust,
+            _ => unreachable!("closed reference profile"),
+        };
+        crate::semantic_evidence::Producer {
+            id: self.input.producer_id.clone(),
+            version: self.input.producer_version.clone(),
+            executable_hash: self.producer_hash.clone(),
+            kind: crate::semantic_evidence::SemanticKind::Semantic,
+            languages: vec![language],
+            position_encoding: match self.input.position_encoding {
+                1 => crate::semantic_evidence::PositionEncoding::Utf8,
+                2 => crate::semantic_evidence::PositionEncoding::Utf16,
+                _ => crate::semantic_evidence::PositionEncoding::UnicodeScalar,
+            },
+        }
+    }
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -135,6 +162,12 @@ fn path(s: &str) -> bool {
         && !s.contains(['\\', '\0'])
         && s.split('/').all(|p| !p.is_empty() && p != "." && p != "..")
 }
+pub(crate) fn validate_selected_role(root: &Path, p: &Path) -> Result<String, ScipCaptureError> {
+    if !p.is_absolute() {
+        return Err(admission("selected role is not absolute"));
+    }
+    relative(root, p)
+}
 fn relative(root: &Path, p: &Path) -> Result<String, ScipCaptureError> {
     let r = p
         .strip_prefix(root)
@@ -209,6 +242,79 @@ impl<'a> ReferenceProfileAdmission<'a> {
             return Err(ScipCaptureError::Cancelled);
         }
         let root = capture.physical_root();
+        let identity = crate::store::topology::WorkspaceIdentity::discover(Some(root), root)
+            .map_err(|_| admission("workspace identity"))?;
+        identity
+            .verify()
+            .map_err(|_| admission("workspace identity changed"))?;
+        let (source_set, revision) = captured_revision_header(capture, root, &identity.record_id)
+            .map_err(|_| admission("native captured header"))?;
+        let sources: BTreeMap<_, _> = capture
+            .files
+            .iter()
+            .map(|f| ((f.language.as_str(), f.path.as_str()), f.text.as_bytes()))
+            .collect();
+        Self::from_native_sources(
+            root,
+            &source_set,
+            &revision,
+            &sources,
+            artifact_path,
+            artifact_bytes,
+            manifest_path,
+            manifest_bytes,
+            selection,
+            cancel,
+        )
+    }
+
+    /// Admit original producer bytes against a retained native revision and its exact source bytes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_retained_native(
+        root: &Path,
+        native: &crate::native_evidence::Artifact,
+        sources: &'a BTreeMap<crate::native_evidence::DocumentKey, Vec<u8>>,
+        artifact_path: &Path,
+        artifact_bytes: &'a [u8],
+        manifest_path: &Path,
+        manifest_bytes: &'a [u8],
+        selection: &TrustedSelection,
+        cancel: &CancelFlag,
+    ) -> Result<Self, ScipCaptureError> {
+        let files: BTreeMap<_, _> = sources
+            .iter()
+            .map(|(key, bytes)| ((key.language.as_str(), key.path.as_str()), bytes.as_slice()))
+            .collect();
+        Self::from_native_sources(
+            root,
+            &native.source_set,
+            &native.revision,
+            &files,
+            artifact_path,
+            artifact_bytes,
+            manifest_path,
+            manifest_bytes,
+            selection,
+            cancel,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_native_sources(
+        root: &Path,
+        source_set: &crate::native_evidence::SourceSet,
+        revision: &crate::native_evidence::Revision,
+        files: &BTreeMap<(&str, &str), &'a [u8]>,
+        artifact_path: &Path,
+        artifact_bytes: &'a [u8],
+        manifest_path: &Path,
+        manifest_bytes: &'a [u8],
+        selection: &TrustedSelection,
+        cancel: &CancelFlag,
+    ) -> Result<Self, ScipCaptureError> {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(ScipCaptureError::Cancelled);
+        }
         if manifest_bytes.len() > 1024 * 1024 || artifact_bytes.len() > 64 * 1024 * 1024 {
             return Err(ScipCaptureError::LimitExceeded("admitted bytes".into()));
         }
@@ -258,13 +364,6 @@ impl<'a> ReferenceProfileAdmission<'a> {
         {
             return Err(admission("producer profile pin"));
         }
-        let identity = crate::store::topology::WorkspaceIdentity::discover(Some(root), root)
-            .map_err(|_| admission("workspace identity"))?;
-        identity
-            .verify()
-            .map_err(|_| admission("workspace identity changed"))?;
-        let (source_set, revision) = captured_revision_header(capture, root, &identity.record_id)
-            .map_err(|_| admission("native captured header"))?;
         if source_set.id != revision.source_set_id
             || manifest.source_set.id != source_set.id
             || manifest.source_set.root_id != source_set.root_id
@@ -293,27 +392,22 @@ impl<'a> ReferenceProfileAdmission<'a> {
         }
         checked_docs(&manifest.source_documents)?;
         checked_docs(&manifest.documents)?;
-        if manifest.source_documents.len() != capture.files.len()
+        if manifest.source_documents.len() != files.len()
             || manifest.source_documents.len() != revision.documents.len()
             || manifest.documents.is_empty()
             || manifest.documents.len() > 1000
         {
             return Err(admission("document count"));
         }
-        if capture.files.len() > 100000 {
+        if files.len() > 100000 {
             return Err(ScipCaptureError::LimitExceeded("source files".into()));
         }
-        let files: BTreeMap<_, _> = capture
-            .files
-            .iter()
-            .map(|f| ((f.language.as_str(), f.path.as_str()), f))
-            .collect();
         let rev: BTreeMap<_, _> = revision
             .documents
             .iter()
             .map(|d| ((d.key.language.as_str(), d.key.path.as_str()), d))
             .collect();
-        if files.len() != capture.files.len() || rev.len() != revision.documents.len() {
+        if rev.len() != revision.documents.len() {
             return Err(admission("duplicate captured source"));
         }
         let mut source_keys = BTreeSet::new();
@@ -333,12 +427,11 @@ impl<'a> ReferenceProfileAdmission<'a> {
             let r = rev
                 .get(&key)
                 .ok_or_else(|| admission("missing revision source"))?;
-            if f.hash != d.content_hash
-                || r.content_hash != d.content_hash
+            if r.content_hash != d.content_hash
                 || r.key.source_set_id != source_set.id
                 || r.revision_id != revision.id
-                || r.byte_length != f.text.len()
-                || scip_raw::sha(f.text.as_bytes()) != d.content_hash
+                || r.byte_length != f.len()
+                || scip_raw::sha(f) != d.content_hash
                 || !source_keys.insert(key)
             {
                 return Err(admission("captured source hash"));
@@ -371,7 +464,7 @@ impl<'a> ReferenceProfileAdmission<'a> {
                 .get(&key)
                 .ok_or_else(|| admission("unlisted covered source"))?;
             if d.language != language
-                || d.content_hash != f.hash
+                || d.content_hash != scip_raw::sha(f)
                 || !doc_paths.insert(d.relative_path.as_str())
                 || !source_keys.contains(&key)
             {
@@ -381,7 +474,7 @@ impl<'a> ReferenceProfileAdmission<'a> {
             docs.push(AuthenticatedScipDocument {
                 language: d.language.clone(),
                 relative_path: d.relative_path.clone(),
-                source_bytes: f.text.as_bytes(),
+                source_bytes: f,
                 content_hash: d.content_hash.clone(),
             });
         }
@@ -427,13 +520,14 @@ impl<'a> ReferenceProfileAdmission<'a> {
             return Err(ScipCaptureError::Cancelled);
         }
         Ok(Self {
+            producer_hash: pinned.executable_hash.clone(),
             input: AuthenticatedScipInput {
                 artifact_bytes,
                 artifact_hash: artifact.hash.clone(),
                 producer_id: pinned.name.clone(),
                 profile_id: profile.profile_id,
-                source_set_id: source_set.id,
-                source_revision: revision.id,
+                source_set_id: source_set.id.clone(),
+                source_revision: revision.id.clone(),
                 source_manifest_hash: manifest.source_manifest_hash,
                 decoder_version: scip_raw::DECODER_VERSION,
                 completion: manifest.completion,
