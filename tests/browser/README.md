@@ -42,6 +42,19 @@ PLAYWRIGHT_BROWSERS_PATH="$TRELLIS_RUN_CACHE/playwright-browsers" \
 
 The harness fails if the environment variable, locked package, managed Chromium executable, Cargo build, daemon, or any browser assertion is unavailable. It has no synthetic-DOM fallback and never skips acceptance.
 
+## Pele block-label vendor regression
+
+`pele-block-labels.test.cjs` serves the exact vendored Pele bundle to Chromium and
+installs its unchanged raw SVG. It checks label bounding boxes and ordinary mouse
+clicks on original node and edge text for vertical, horizontal and repeated
+same-pair block edges. A passive listener observes the browser's native target and
+stable Pele `data-id`; no wrapper routes clicks or rewrites SVG.
+This upstream-only host has no CSP because raw Pele owns inline SVG styles. It is
+not evidence about Trellis's CSP; the product adapter tests below retain the strict
+no-inline policy. After normal browser provisioning, run it alone with
+`node --test tests/browser/pele-block-labels.test.cjs` and the same external
+`PLAYWRIGHT_BROWSERS_PATH`. It also runs in `./tools/verify`.
+
 ## Pele sequence acceptance
 
 `sequence-pele.test.cjs` serves the exact local browser assets and four producer-validated

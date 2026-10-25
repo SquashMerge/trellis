@@ -6,9 +6,9 @@ const {createServer} = require("node:http");
 const {resolve,join} = require("node:path");
 const {chromium} = require("playwright");
 const ROOT = resolve(__dirname,"../..");
-const files = {"/vendor/pele-1.10.0-trellis.1.js":"web/vendor/pele-1.10.0-trellis.1.js","/sequence-pele.js":"web/sequence-pele.js","/sequence.js":"web/sequence.js","/style.css":"web/style.css"};
+const files = {"/vendor/pele-1.10.0-trellis.2.js":"web/vendor/pele-1.10.0-trellis.2.js","/sequence-pele.js":"web/sequence-pele.js","/sequence.js":"web/sequence.js","/style.css":"web/style.css"};
 const fixture = language => JSON.parse(readFileSync(join(ROOT,`tests/fixtures/sequence-pele/${language}.json`)));
-const html = '<!doctype html><html><head><link rel="stylesheet" href="/style.css"><script src="/vendor/pele-1.10.0-trellis.1.js" defer></script><script src="/sequence.js" defer></script><script src="/sequence-pele.js" defer></script></head><body><p id="state"></p><div id="sequence-diagram" class="sequence-scroll"></div></body></html>';
+const html = '<!doctype html><html><head><link rel="stylesheet" href="/style.css"><script src="/vendor/pele-1.10.0-trellis.2.js" defer></script><script src="/sequence.js" defer></script><script src="/sequence-pele.js" defer></script></head><body><p id="state"></p><div id="sequence-diagram" class="sequence-scroll"></div></body></html>';
 const policy = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'";
 let server,base,browser,page,violations;
 test.before(async()=>{

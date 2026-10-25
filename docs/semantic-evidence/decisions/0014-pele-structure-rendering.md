@@ -19,3 +19,10 @@ The scratch Pele 1.6.0 probe for #182 reconstructed one real indexed Rust sequen
 ## Amendment: patched Pele build (owner decision 2026-10-25)
 
 Trellis vendors Pele 1.10.0 plus the treemap patch from [obsidianmd/pele#91](https://github.com/obsidianmd/pele/pull/91), built from source as `web/vendor/pele-1.10.0-trellis.1.js` (base, commits, build and hash in `web/vendor/README.md`), until an upstream release includes that patch. Then Trellis returns to an unchanged upstream release. Its actual output is pinned by `tests/fixtures/pele-1.10.0-trellis.1/` under point 4. Nothing else in this decision changes.
+
+
+## Amendment: native block labels (owner decision 2026-10-25, #310 prerequisite)
+
+The temporary build is now `web/vendor/pele-1.10.0-trellis.2.js`: the same Pele 1.10.0 base and five unchanged #91 commits, plus the native block-edge label-overlap fix. Exact source commit, checked-in format-patch, assembly order, independent rebuild comparison, toolchain and deployed SHA-256 are recorded in `web/vendor/README.md`. The owner submits the block fix upstream from their own fork; this record does not claim an upstream PR has already been opened. Return to an unchanged upstream release once it includes **both** fixes.
+
+The block fix measures repeated/opposite labels within an unordered endpoint pair and routes affected native edges through their final label centers. Native identities and deterministic output remain required; native route coordinates may change. It is not a global label or node-obstacle solver. New lane clearance is four SVG units; existing background padding and comparison allowance are unchanged. Bounded conservative placement can widen the SVG. Exact output and native browser click regressions live under `tests/fixtures/pele-1.10.0-trellis.2/` and `tests/browser/pele-block-labels.test.cjs`; Sequence and representative frozen output remains unchanged. No app-side route workaround, semantic binding, DTO or persistence expansion is authorized by this amendment. Architecture #310 is a separate implementation and PR.
