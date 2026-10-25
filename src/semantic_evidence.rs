@@ -317,7 +317,18 @@ fn validate_join(
                 }
             }
         }
-        _ => anyhow::bail!("unsupported join family"),
+        JoinKind::Reference => {
+            for reference in &native.references {
+                if reference.document == a.document
+                    && reference.range == a.range
+                    && reference.spelling == slice
+                    && native::lookup(&a.document.language, slice)? == reference.lookup_key
+                {
+                    candidates.insert(reference.id.clone());
+                }
+            }
+        }
+        JoinKind::Invocation => anyhow::bail!("invocation is a call anchor, not a fact family"),
     }
     let kind = match a.kind {
         JoinKind::DeclarationName => native::MeasurementKind::DeclarationName,
