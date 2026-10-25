@@ -1,9 +1,9 @@
 # Local interface fonts
 
 Trellis serves these fonts and their SIL Open Font License 1.1 texts locally.
-No runtime request goes to a font CDN. The historical `-latin.woff2` names are
-retained, but Inter and Manrope contain their complete upstream character sets;
-they have not been subsetted or instantiated.
+No runtime request goes to a font CDN. Inter and Manrope use `-variable.woff2`
+names and contain their complete upstream character sets. They have not been
+subsetted or instantiated.
 
 ## Inter
 
@@ -11,7 +11,7 @@ they have not been subsetted or instantiated.
   tag commit `e3a3d4c57d5ecc01453a575621882a384c1995a3`.
 - Download: https://github.com/rsms/inter/releases/download/v4.1/Inter-4.1.zip
 - Archive SHA-256: `9883fdd4a49d4fb66bd8177ba6625ef9a64aa45899767dde3d36aa425756b11e`.
-- `inter-latin.woff2` is the archive's `web/InterVariable.woff2`, copied unchanged.
+- `inter-variable.woff2` is the archive's `web/InterVariable.woff2`, copied unchanged.
   Normal variable font: `wght` 100–900; `opsz` 14–32.
 - `Inter-OFL.txt` is the archive's `LICENSE.txt`, copied unchanged. It also matches
   [the license at the pinned commit](https://github.com/rsms/inter/blob/e3a3d4c57d5ecc01453a575621882a384c1995a3/LICENSE.txt).
@@ -24,7 +24,7 @@ they have not been subsetted or instantiated.
 - Input: [Manrope[wght].ttf](https://raw.githubusercontent.com/google/fonts/b31870aff700ab7a1d74fa0c6887d95beb9e0037/ofl/manrope/Manrope%5Bwght%5D.ttf),
   internal version **4.505**, normal `wght` 200–800, 742 glyphs.
 - Input SHA-256: `3ae11c49db0455a3cc33e37d380f20fdb8c7f8b41dc07625c177e3d87a9d6ae6`.
-- The pinned Google Fonts directory provides TTF, not WOFF2. `manrope-latin.woff2`
+- The pinned Google Fonts directory provides TTF, not WOFF2. `manrope-variable.woff2`
   is a WOFF2 encoding of that full TTF, produced with fonttools **4.60.1** and
   brotli **1.1.0** in a separate utility environment. No project dependency was added.
 - `Manrope-OFL.txt` and `Manrope-FONTLOG.txt` are unchanged copies of
@@ -47,7 +47,7 @@ font.save(sys.argv[2], reorderTables=True)
 ```
 
 ```sh
-uv run --no-project --with fonttools==4.60.1 --with brotli==1.1.0 python convert-manrope.py 'Manrope[wght].ttf' manrope-latin.woff2
+uv run --no-project --with fonttools==4.60.1 --with brotli==1.1.0 python convert-manrope.py 'Manrope[wght].ttf' manrope-variable.woff2
 ```
 
 ## JetBrains Mono (unchanged)
@@ -65,6 +65,6 @@ Copyright: The JetBrains Mono Project Authors. License: SIL OFL 1.1.
 | `JetBrainsMono-OFL.txt` | `a76abf002c49097d146e86740a3105a5d00450b1592e820a1109a8c5680cd697` |
 | `Manrope-FONTLOG.txt` | `b6b54bcc1dbd1b18d5afd087ec0b578097644b1c9ec3e0a642d4df7808f449c2` |
 | `Manrope-OFL.txt` | `58172e0c0fac2cda8a37b348164bb55e44b0e69051e557e92b1d3f6910141f7b` |
-| `inter-latin.woff2` | `693b77d4f32ee9b8bfc995589b5fad5e99adf2832738661f5402f9978429a8e3` |
+| `inter-variable.woff2` | `693b77d4f32ee9b8bfc995589b5fad5e99adf2832738661f5402f9978429a8e3` |
 | `jetbrains-mono-latin.woff2` | `2c32b9b3ee358c119e210f6f5195f9bd34894d78a785ff2e95d60e718e400af4` |
-| `manrope-latin.woff2` | `30b83738add8c9edd9e3450b98036a9a8fb5668d0cbd4eb0ce5fe6761197f21f` |
+| `manrope-variable.woff2` | `30b83738add8c9edd9e3450b98036a9a8fb5668d0cbd4eb0ce5fe6761197f21f` |

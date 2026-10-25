@@ -123,7 +123,7 @@ test("real shell loads local brand fonts, preserves Connect and source, and rend
     assert.match(await page.locator("#source").evaluate(node => getComputedStyle(node).fontFamily),/^"?JetBrains Mono"?(?:,|$)/);
     await readable(page,"#source .source-line.highlight");
     await loadedFonts(page);
-    for (const file of ["inter-latin.woff2","manrope-latin.woff2","jetbrains-mono-latin.woff2"]) {
+    for (const file of ["inter-variable.woff2","manrope-variable.woff2","jetbrains-mono-latin.woff2"]) {
       assert.ok(fontResponses.some(response => response.url === `${server.base}/fonts/${file}` && response.status === 200),`local font response missing: ${file}; ${JSON.stringify(fontResponses)}`);
     }
     assert.deepEqual(errors,[],"no CSP, font, or application errors");

@@ -2029,20 +2029,20 @@ pub fn router(state: Arc<DaemonState>) -> Router {
             }),
         )
         .route(
-            "/fonts/inter-latin.woff2",
+            "/fonts/inter-variable.woff2",
             get(|| async {
                 (
                     [(header::CONTENT_TYPE, "font/woff2")],
-                    &include_bytes!("../web/fonts/inter-latin.woff2")[..],
+                    &include_bytes!("../web/fonts/inter-variable.woff2")[..],
                 )
             }),
         )
         .route(
-            "/fonts/manrope-latin.woff2",
+            "/fonts/manrope-variable.woff2",
             get(|| async {
                 (
                     [(header::CONTENT_TYPE, "font/woff2")],
-                    &include_bytes!("../web/fonts/manrope-latin.woff2")[..],
+                    &include_bytes!("../web/fonts/manrope-variable.woff2")[..],
                 )
             }),
         )
@@ -2083,11 +2083,11 @@ pub fn router(state: Arc<DaemonState>) -> Router {
             }),
         )
         .route(
-            "/brand/trellis-logo-dark-v1.png",
+            "/brand/trellis-logo-dark-v1.webp",
             get(|| async {
                 (
-                    [(header::CONTENT_TYPE, "image/png")],
-                    &include_bytes!("../web/brand/trellis-logo-dark-v1.png")[..],
+                    [(header::CONTENT_TYPE, "image/webp")],
+                    &include_bytes!("../web/brand/trellis-logo-dark-v1.webp")[..],
                 )
             }),
         )
@@ -3838,20 +3838,20 @@ impl ProvisionedBrowser {
                 }),
             )
             .route(
-                "/fonts/inter-latin.woff2",
+                "/fonts/inter-variable.woff2",
                 get(|| async {
                     (
                         [(header::CONTENT_TYPE, "font/woff2")],
-                        &include_bytes!("../web/fonts/inter-latin.woff2")[..],
+                        &include_bytes!("../web/fonts/inter-variable.woff2")[..],
                     )
                 }),
             )
             .route(
-                "/fonts/manrope-latin.woff2",
+                "/fonts/manrope-variable.woff2",
                 get(|| async {
                     (
                         [(header::CONTENT_TYPE, "font/woff2")],
-                        &include_bytes!("../web/fonts/manrope-latin.woff2")[..],
+                        &include_bytes!("../web/fonts/manrope-variable.woff2")[..],
                     )
                 }),
             )
@@ -3892,11 +3892,11 @@ impl ProvisionedBrowser {
                 }),
             )
             .route(
-                "/brand/trellis-logo-dark-v1.png",
+                "/brand/trellis-logo-dark-v1.webp",
                 get(|| async {
                     (
-                        [(header::CONTENT_TYPE, "image/png")],
-                        &include_bytes!("../web/brand/trellis-logo-dark-v1.png")[..],
+                        [(header::CONTENT_TYPE, "image/webp")],
+                        &include_bytes!("../web/brand/trellis-logo-dark-v1.webp")[..],
                     )
                 }),
             )
