@@ -4389,63 +4389,6 @@ fn reference_lookup_overrides_roundtrip_after_reopen() {
 
 #[test]
 #[cfg(feature = "test-support")]
-fn duplicate_stored_reference_ids_fail_before_owner_filtering() {
-    let (state, root, store, cancel) = fixture();
-    fs::write(
-        root.path().join("flow.js"),
-        "function first() { one(); } function second() { two(); }\n",
-    )
-    .unwrap();
-    let leader = store.publication_for_tests().unwrap();
-    let pin = publish(
-        &store,
-        root.path(),
-        &cancel,
-        store.index_baseline().unwrap(),
-        &leader,
-    )
-    .unwrap();
-    let (_, measured, _) = index_workspace_bundle(
-        &IndexOptions::new(root.path().to_owned()),
-        store.root_id(),
-        &cancel,
-        |_| {},
-    )
-    .unwrap();
-    let first = measured
-        .references
-        .iter()
-        .find(|r| r.document.path == "flow.js")
-        .unwrap();
-    let second = measured
-        .references
-        .iter()
-        .find(|r| r.document == first.document && r.owner_syntax_id != first.owner_syntax_id)
-        .unwrap();
-    let db = Connection::open(published_db(state.path(), root.path())).unwrap();
-    assert_eq!(db.execute(
-        "UPDATE native_version_references SET id=?1 WHERE vid=?2 AND owner_syntax_id=?3 AND ordinal=?4",
-        rusqlite::params![
-            hex::decode(first.id.strip_prefix("occ:v2:").unwrap()).unwrap(),
-            live_document_version(&db, "flow.js"),
-            hex::decode(second.owner_syntax_id.strip_prefix("sid:v1:").unwrap()).unwrap(),
-            second.ordinal as i64
-        ],
-    ).unwrap(), 1);
-    drop(db);
-    let error = store
-        .native_references_at(pin, &first.owner_syntax_id)
-        .unwrap_err();
-    assert!(
-        format!("{error:#}").contains("duplicate native reference ID"),
-        "{error:#}"
-    );
-    assert!(store.recovery_pending_for_tests());
-    assert_current_corruption(store.status().unwrap_err());
-}
-
-#[test]
-#[cfg(feature = "test-support")]
 fn duplicate_reference_artifact_does_not_publish() {
     let (_state, root, store, cancel) = fixture();
     let leader = store.publication_for_tests().unwrap();

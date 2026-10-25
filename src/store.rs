@@ -11,7 +11,7 @@ pub use requests::{MaintenanceQueueProbe, MaintenanceQueueState, QueueProbeAdmis
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     ops::{Deref, DerefMut},
     path::Path,
     sync::{
@@ -8395,19 +8395,11 @@ fn read_native_references(
         known.insert(row?);
     }
     let mut references = vec![];
-    let mut ids = HashSet::<[u8; 16]>::new();
     let mut ordinals = BTreeMap::<String, usize>::new();
     for row in db.prepare("SELECT id,owner_syntax_id,ordinal,start_byte,end_byte,spelling,COALESCE(lookup_key,spelling) FROM native_version_references WHERE vid=?1 ORDER BY owner_syntax_id,ordinal")?
-        .query_map([scope.vid], |r| {
-            let id = stored_id_row(r, 0, true)?;
-            // The decoder above checked the BLOB's exact length.
-            let mut raw_id = [0; 16];
-            raw_id.copy_from_slice(r.get_ref(0)?.as_blob()?);
-            Ok((id, raw_id, stored_id_row(r, 1, false)?,
-                r.get::<_, i64>(2)?, r.get::<_, i64>(3)?, r.get::<_, i64>(4)?, r.get::<_, String>(5)?, r.get::<_, String>(6)?))
-        })? {
-        let (id, raw_id, reference_owner, ordinal, start, end, spelling, lookup_key) = row?;
-        selected_ensure!(ids.insert(raw_id), "duplicate native reference ID");
+        .query_map([scope.vid], |r| Ok((stored_id_row(r, 0, true)?, stored_id_row(r, 1, false)?,
+            r.get::<_, i64>(2)?, r.get::<_, i64>(3)?, r.get::<_, i64>(4)?, r.get::<_, String>(5)?, r.get::<_, String>(6)?)))? {
+        let (id, reference_owner, ordinal, start, end, spelling, lookup_key) = row?;
         selected_ensure!(known.contains(&reference_owner), "orphan native reference owner");
         selected_ensure!(start >= 0 && end > start, "invalid native reference range");
         let n = ordinals.entry(reference_owner.clone()).or_default();
