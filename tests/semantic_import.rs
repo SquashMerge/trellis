@@ -951,7 +951,7 @@ fn admitted_java_local_forward_override_keeps_full_opaque_overload() {
         vec![
             (b, 7, vec![]),
             (c, 7, vec![(b, true, false)]),
-            (first, 26, vec![]),
+            (first, 26, vec![(derived, true, true)]),
             (other, 26, vec![]),
             (derived, 26, vec![(first, true, true), (other, true, true)]),
         ],
@@ -973,6 +973,45 @@ fn admitted_java_local_forward_override_keeps_full_opaque_overload() {
         methods[0].target,
         semantic::Target::Internal { .. }
     ));
+    let direct_proof = inventory
+        .claims
+        .iter()
+        .find(|claim| {
+            claim.envelope.record_kind == "relationship"
+                && claim.envelope.raw["sourceSymbol"].as_str() == Some(derived)
+                && claim.envelope.raw["targetSymbol"].as_str() == Some(first)
+        })
+        .unwrap();
+    let reverse = inventory
+        .claims
+        .iter()
+        .find(|claim| {
+            claim.envelope.record_kind == "relationship"
+                && claim.envelope.raw["sourceSymbol"].as_str() == Some(first)
+                && claim.envelope.raw["targetSymbol"].as_str() == Some(derived)
+        })
+        .unwrap();
+    let mismatch = inventory
+        .claims
+        .iter()
+        .find(|claim| {
+            claim.envelope.record_kind == "relationship"
+                && claim.envelope.raw["sourceSymbol"].as_str() == Some(derived)
+                && claim.envelope.raw["targetSymbol"].as_str() == Some(other)
+        })
+        .unwrap();
+    assert_eq!(methods[0].provenance_id, direct_proof.captured_proof_id);
+    assert!(
+        output
+            .type_relationships
+            .iter()
+            .all(|edge| edge.provenance_id != reverse.captured_proof_id
+                && edge.provenance_id != mismatch.captured_proof_id)
+    );
+    assert!(
+        output.diagnostics.is_empty(),
+        "reverse/local descriptor mismatch is provably skipped, not partial"
+    );
 }
 
 #[test]
@@ -1053,6 +1092,7 @@ fn admitted_script_direct_local_external_and_reverse_transitive_exclusion() {
                 ("typescript pkg Mid#", "typescript pkg Base#"),
                 ("typescript pkg Leaf#", "typescript pkg Mid#"),
                 ("typescript pkg Leaf#", "typescript pkg Base#"),
+                ("typescript pkg Base#", "typescript pkg Mid#"),
                 ("typescript pkg X#", "typescript ext Outside#"),
             ],
         ),
@@ -1074,13 +1114,14 @@ fn admitted_script_direct_local_external_and_reverse_transitive_exclusion() {
                 ("python pkg Mid#", "python pkg Base#"),
                 ("python pkg Leaf#", "python pkg Mid#"),
                 ("python pkg Leaf#", "python pkg Base#"),
+                ("python pkg Base#", "python pkg Mid#"),
                 ("python pkg X#", "python ext Outside#"),
             ],
         ),
     ] {
         let mut occurrences = Vec::new();
         let mut symbols = Vec::new();
-        for (name, symbol) in classes {
+        for &(name, symbol) in &classes {
             let declaration = source.find(&format!("class {name}")).unwrap() + 6;
             occurrences.push((declaration, declaration + name.len(), symbol, 1));
             let relationships = edges
@@ -1097,21 +1138,95 @@ fn admitted_script_direct_local_external_and_reverse_transitive_exclusion() {
         let (_root, native, sources, inventory) =
             admitted_case(language, source, occurrences, symbols);
         let output = join_inventory(&inventory, &native, &sources, 2).unwrap();
+        let doc = native.revision.documents[0].key.clone();
+        let declaration = |symbol: &str| {
+            let proof = inventory
+                .claims
+                .iter()
+                .find(|c| {
+                    c.envelope.record_kind == "occurrence"
+                        && c.envelope.raw["symbol"].as_str() == Some(symbol)
+                        && c.envelope.raw["symbolRoles"] == 1
+                })
+                .unwrap();
+            output
+                .declaration_bindings
+                .iter()
+                .find(|b| b.provenance_id == proof.captured_proof_id)
+                .unwrap()
+                .syntax_id
+                .clone()
+                .unwrap()
+        };
+        let direct = [
+            (classes[1].1, classes[0].1),
+            (classes[2].1, classes[1].1),
+            (classes[3].1, "external"),
+        ];
         assert_eq!(
             output.type_relationships.len(),
             3,
             "{language} direct only: {:?}",
             output.type_relationships
         );
-        assert_eq!(
-            output
+        for (source_symbol, target_symbol) in direct {
+            let claim = inventory
+                .claims
+                .iter()
+                .find(|c| {
+                    c.envelope.record_kind == "relationship"
+                        && c.envelope.raw["sourceSymbol"].as_str() == Some(source_symbol)
+                        && (target_symbol == "external"
+                            || c.envelope.raw["targetSymbol"].as_str() == Some(target_symbol))
+                })
+                .unwrap();
+            let edge = output
                 .type_relationships
                 .iter()
-                .filter(|r| matches!(r.target, semantic::Target::External { .. }))
-                .count(),
-            1,
-            "{language} external"
-        );
+                .find(|e| e.provenance_id == claim.captured_proof_id)
+                .expect("exact direct proof");
+            assert_eq!(edge.kind, semantic::RelationshipKind::Extends);
+            assert_eq!(
+                edge.source,
+                semantic::Target::Internal {
+                    syntax_id: declaration(source_symbol),
+                    document: doc.clone(),
+                    revision_id: native.revision.id.clone()
+                }
+            );
+            if target_symbol == "external" {
+                assert!(matches!(edge.target, semantic::Target::External { .. }));
+            } else {
+                assert_eq!(
+                    edge.target,
+                    semantic::Target::Internal {
+                        syntax_id: declaration(target_symbol),
+                        document: doc.clone(),
+                        revision_id: native.revision.id.clone()
+                    }
+                );
+            }
+        }
+        for (source_symbol, target_symbol) in
+            [(classes[2].1, classes[0].1), (classes[0].1, classes[1].1)]
+        {
+            let claim = inventory
+                .claims
+                .iter()
+                .find(|c| {
+                    c.envelope.record_kind == "relationship"
+                        && c.envelope.raw["sourceSymbol"].as_str() == Some(source_symbol)
+                        && c.envelope.raw["targetSymbol"].as_str() == Some(target_symbol)
+                })
+                .unwrap();
+            assert!(
+                output
+                    .type_relationships
+                    .iter()
+                    .all(|edge| edge.provenance_id != claim.captured_proof_id),
+                "{language} reverse/transitive must not publish"
+            );
+        }
     }
 }
 
@@ -1323,4 +1438,430 @@ fn admitted_distinct_call_claims_reconcile_ambiguous_targets() {
         output.references[0].resolution,
         semantic::Resolution::Ambiguous
     );
+}
+
+#[test]
+fn call_role_requires_the_same_exact_raw_invocation_as_binding() {
+    let source = "function f(){ f(); }";
+    let at = source.rfind('f').unwrap();
+    let (_root, native, sources, mut inventory) = admitted_case_with_calls(
+        "javascript",
+        source,
+        vec![(at, at + 1, "external pkg f.", 8)],
+        vec![],
+        &[at],
+    );
+    let raw = inventory
+        .claims
+        .iter_mut()
+        .find(|c| c.envelope.record_kind == "occurrence")
+        .unwrap();
+    raw.envelope.raw["enclosingRange"] = json!({"encoding":"legacy","values":[0,at,at+1]});
+    let output = join_inventory(&inventory, &native, &sources, 2).unwrap();
+    assert!(output.call_bindings.is_empty());
+    assert!(
+        output
+            .references
+            .iter()
+            .all(|r| !r.roles.contains(&semantic::Role::Call))
+    );
+    assert!(
+        output
+            .joins
+            .iter()
+            .any(|(_, j)| j.anchor.kind == semantic::JoinKind::Invocation
+                && j.status == semantic::JoinStatus::Unmatched)
+    );
+}
+
+#[test]
+fn admitted_type_use_roles_require_exact_direct_clause_and_raw_identity() {
+    for (language, source, owner, base) in [
+        (
+            "java",
+            "class Base {} class Child extends Base {}",
+            "Child",
+            "Base",
+        ),
+        (
+            "javascript",
+            "class Base {} class Child extends Base {}",
+            "Child",
+            "Base",
+        ),
+        (
+            "python",
+            "class Base: pass\nclass Child(Base): pass\n",
+            "Child",
+            "Base",
+        ),
+        (
+            "rust",
+            "trait Base {} trait Child: Base {}",
+            "Child",
+            "Base",
+        ),
+    ] {
+        let owner_at = source.find(owner).unwrap();
+        let base_decl = source.find(base).unwrap();
+        let base_use = source.rfind(base).unwrap();
+        let sym_base = "global pkg Base#";
+        let sym_child = "global pkg Child#";
+        let (_root, native, sources, inventory) = admitted_case(
+            language,
+            source,
+            vec![
+                (owner_at, owner_at + owner.len(), sym_child, 1),
+                (base_decl, base_decl + base.len(), sym_base, 1),
+                (base_use, base_use + base.len(), sym_base, 8),
+            ],
+            vec![
+                (sym_child, 7, vec![(sym_base, true, false)]),
+                (sym_base, 7, vec![]),
+            ],
+        );
+        let output = join_inventory(
+            &inventory,
+            &native,
+            &sources,
+            if language == "rust" { 1 } else { 2 },
+        )
+        .unwrap();
+        let reference = output
+            .references
+            .iter()
+            .find(|r| r.range.start == base_use)
+            .expect("native exact type reference");
+        assert!(
+            reference.roles.contains(&semantic::Role::Type),
+            "{language}: {:?}",
+            reference.roles
+        );
+    }
+}
+
+#[test]
+fn admitted_import_alias_requires_exact_native_alias_declaration() {
+    for (language, source, alias) in [
+        (
+            "javascript",
+            "import {original as local} from 'pkg'; local;",
+            "local",
+        ),
+        (
+            "rust",
+            "use pkg::original as local; fn f(){ let _ = local; }",
+            "local",
+        ),
+    ] {
+        let at = source.find(alias).unwrap();
+        let (_root, native, sources, inventory) = admitted_case(
+            language,
+            source,
+            vec![(at, at + alias.len(), "local alias", 1 | 2)],
+            vec![("local alias", 0, vec![])],
+        );
+        assert!(
+            native
+                .declarations
+                .iter()
+                .any(|d| d.kind == "alias" && d.name_range.as_ref().is_some_and(|r| r.start == at)),
+            "{language} exact alias declaration"
+        );
+        let output = join_inventory(
+            &inventory,
+            &native,
+            &sources,
+            if language == "rust" { 1 } else { 2 },
+        )
+        .unwrap();
+        let reference = output
+            .references
+            .iter()
+            .find(|r| r.range.start == at)
+            .expect("alias reference");
+        assert!(
+            reference.roles.contains(&semantic::Role::Definition),
+            "{language}: {:?}",
+            reference.roles
+        );
+        assert!(
+            reference.roles.contains(&semantic::Role::Import),
+            "{language}: {:?}",
+            reference.roles
+        );
+        assert!(
+            reference.roles.contains(&semantic::Role::Alias),
+            "{language}: {:?}",
+            reference.roles
+        );
+    }
+}
+
+#[test]
+fn non_alias_python_and_ordinary_import_never_invent_alias_role() {
+    for (language, source, name) in [
+        ("python", "import pkg as local\nlocal\n", "local"),
+        (
+            "java",
+            "import pkg.Local; class A { Local value; }",
+            "Local",
+        ),
+    ] {
+        let at = source.find(name).unwrap();
+        let (_root, native, sources, inventory) = admitted_case(
+            language,
+            source,
+            vec![(at, at + name.len(), "global pkg Local#", 2 | 1)],
+            vec![],
+        );
+        let output = join_inventory(&inventory, &native, &sources, 2).unwrap();
+        assert!(
+            output
+                .references
+                .iter()
+                .all(|r| !r.roles.contains(&semantic::Role::Alias)),
+            "{language}"
+        );
+    }
+}
+
+#[test]
+fn admitted_java_transitive_override_claim_skips_without_partial() {
+    let source = "class Base { void f(int x) {} } class Mid extends Base { @Override void f(int x) {} } class Leaf extends Mid { @Override void f(int x) {} }";
+    let b = "scip-java pkg Base#";
+    let m = "scip-java pkg Mid#";
+    let l = "scip-java pkg Leaf#";
+    let fb = "scip-java pkg Base#f(I).";
+    let fm = "scip-java pkg Mid#f(I).";
+    let fl = "scip-java pkg Leaf#f(I).";
+    let word = |term: &str| {
+        source
+            .match_indices(term)
+            .map(|(at, _)| at)
+            .collect::<Vec<_>>()
+    };
+    let mut occurrences = vec![];
+    for (name, symbol) in [("Base", b), ("Mid", m), ("Leaf", l)] {
+        let spans = word(name);
+        occurrences.push((spans[0], spans[0] + name.len(), symbol, 1));
+        if spans.len() > 1 {
+            occurrences.push((spans[1], spans[1] + name.len(), symbol, 8));
+        }
+    }
+    let fs = word("f(int");
+    for (idx, symbol) in [fb, fm, fl].iter().enumerate() {
+        occurrences.push((fs[idx], fs[idx] + 1, *symbol, 1));
+    }
+    let (_root, native, sources, inventory) = admitted_case(
+        "java",
+        source,
+        occurrences,
+        vec![
+            (b, 7, vec![]),
+            (m, 7, vec![(b, true, false)]),
+            (l, 7, vec![(m, true, false)]),
+            (fb, 26, vec![]),
+            (fm, 26, vec![(fb, true, true)]),
+            (fl, 26, vec![(fm, true, true), (fb, true, true)]),
+        ],
+    );
+    let output = join_inventory(&inventory, &native, &sources, 2).unwrap();
+    let transitive = inventory
+        .claims
+        .iter()
+        .find(|c| {
+            c.envelope.record_kind == "relationship"
+                && c.envelope.raw["sourceSymbol"].as_str() == Some(fl)
+                && c.envelope.raw["targetSymbol"].as_str() == Some(fb)
+        })
+        .unwrap();
+    assert!(
+        output
+            .type_relationships
+            .iter()
+            .all(|e| e.provenance_id != transitive.captured_proof_id)
+    );
+    let method_edges: Vec<_> = output
+        .type_relationships
+        .iter()
+        .filter(|e| e.kind == semantic::RelationshipKind::Overrides)
+        .collect();
+    assert_eq!(
+        method_edges.len(),
+        2,
+        "only local direct overrides: {method_edges:?}"
+    );
+    for (source_symbol, target_symbol) in [(fm, fb), (fl, fm)] {
+        let proof = inventory
+            .claims
+            .iter()
+            .find(|c| {
+                c.envelope.record_kind == "relationship"
+                    && c.envelope.raw["sourceSymbol"].as_str() == Some(source_symbol)
+                    && c.envelope.raw["targetSymbol"].as_str() == Some(target_symbol)
+            })
+            .unwrap();
+        let edge = method_edges
+            .iter()
+            .find(|e| e.provenance_id == proof.captured_proof_id)
+            .expect("exact forward proof");
+        assert_eq!(edge.kind, semantic::RelationshipKind::Overrides);
+        assert!(
+            matches!(edge.source, semantic::Target::Internal { .. })
+                && matches!(edge.target, semantic::Target::Internal { .. })
+        );
+    }
+    assert!(
+        output.diagnostics.is_empty(),
+        "known transitive owner skips without partial"
+    );
+}
+
+#[test]
+fn callback_and_method_reference_never_become_calls_from_native_shape() {
+    for (language, source, needle) in [
+        (
+            "javascript",
+            "function f() {} function use(g){ g(f); }",
+            "f);",
+        ),
+        (
+            "java",
+            "class A { void f(){} void use(){ Runnable r = this::f; } }",
+            "f;",
+        ),
+    ] {
+        let at = source.rfind(needle).unwrap();
+        let (_root, native, sources, inventory) = admitted_case(
+            language,
+            source,
+            vec![(at, at + 1, "external pkg f.", 8)],
+            vec![],
+        );
+        let output = join_inventory(&inventory, &native, &sources, 2).unwrap();
+        assert!(
+            output
+                .references
+                .iter()
+                .all(|r| !r.roles.contains(&semantic::Role::Call)),
+            "{language}"
+        );
+        assert!(output.call_bindings.is_empty(), "{language}");
+    }
+}
+
+#[test]
+fn import_bit_without_measured_alias_declaration_never_grants_alias() {
+    for (language, source, needle) in [
+        (
+            "javascript",
+            "import Default from 'pkg'; Default;",
+            "Default",
+        ),
+        (
+            "rust",
+            "use pkg::original; fn f(){ let _=original; }",
+            "original",
+        ),
+    ] {
+        let at = source.find(needle).unwrap();
+        let (_root, native, sources, inventory) = admitted_case(
+            language,
+            source,
+            vec![(at, at + needle.len(), "global pkg original#", 3)],
+            vec![],
+        );
+        let output = join_inventory(
+            &inventory,
+            &native,
+            &sources,
+            if language == "rust" { 1 } else { 2 },
+        )
+        .unwrap();
+        assert!(
+            output
+                .references
+                .iter()
+                .all(|r| !r.roles.contains(&semantic::Role::Alias)),
+            "{language}"
+        );
+    }
+}
+
+#[test]
+fn type_role_requires_source_clause_not_just_matching_symbol() {
+    let source = "class Base {} class Child extends Base { Base field; }";
+    let decl = source.find("Base").unwrap();
+    let base = source.find("extends Base").unwrap() + 8;
+    let field = source.rfind("Base").unwrap();
+    let child = source.find("Child").unwrap();
+    let (_root, native, sources, inventory) = admitted_case(
+        "java",
+        source,
+        vec![
+            (decl, decl + 4, "global pkg Base#", 1),
+            (child, child + 5, "global pkg Child#", 1),
+            (base, base + 4, "global pkg Base#", 8),
+            (field, field + 4, "global pkg Base#", 8),
+        ],
+        vec![
+            ("global pkg Base#", 7, vec![]),
+            (
+                "global pkg Child#",
+                7,
+                vec![("global pkg Base#", true, false)],
+            ),
+        ],
+    );
+    let output = join_inventory(&inventory, &native, &sources, 2).unwrap();
+    assert!(
+        output
+            .references
+            .iter()
+            .any(|r| r.range.start == base && r.roles.contains(&semantic::Role::Type))
+    );
+    assert!(
+        output
+            .references
+            .iter()
+            .any(|r| r.range.start == field && !r.roles.contains(&semantic::Role::Type))
+    );
+}
+
+#[test]
+fn nonexact_invocation_does_not_grant_role_or_binding_even_with_exact_callee() {
+    let source = "function f(){ f(); }";
+    let at = source.rfind('f').unwrap();
+    let (_root, mut native, sources, inventory) = admitted_case_with_calls(
+        "javascript",
+        source,
+        vec![(at, at + 1, "external pkg f.", 8)],
+        vec![],
+        &[at],
+    );
+    let call = native
+        .calls
+        .iter()
+        .find(|c| c.callee_range.as_ref().is_some_and(|r| r.start == at))
+        .unwrap()
+        .clone();
+    let mut duplicate = call.clone();
+    duplicate.id = native.references[0].id.clone();
+    native.calls.push(duplicate);
+    let output = join_inventory(&inventory, &native, &sources, 2).unwrap();
+    assert!(
+        output
+            .joins
+            .iter()
+            .any(|(_, j)| j.anchor.kind == semantic::JoinKind::Invocation
+                && j.status == semantic::JoinStatus::Ambiguous)
+    );
+    assert!(
+        output
+            .references
+            .iter()
+            .all(|r| !r.roles.contains(&semantic::Role::Call))
+    );
+    assert!(output.call_bindings.is_empty());
 }

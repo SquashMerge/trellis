@@ -450,6 +450,46 @@ pub fn join_inventory(
         });
     }
     let mut reference_claims: BTreeMap<String, Vec<(String, semantic::Target)>> = BTreeMap::new();
+    let type_spans: BTreeMap<native::DocumentKey, BTreeSet<(usize, usize)>> = sources
+        .iter()
+        .map(|(doc, bytes)| {
+            let spans = match doc.language.as_str() {
+                "java" => direct_java_types(bytes).map(|items| {
+                    items
+                        .into_iter()
+                        .map(|(_, base, _)| (base.start, base.end))
+                        .collect()
+                }),
+                "javascript" => direct_script_types(
+                    bytes,
+                    tree_sitter_javascript::LANGUAGE.into(),
+                    "class_declaration",
+                    "class_heritage",
+                )
+                .map(|items| {
+                    items
+                        .into_iter()
+                        .map(|(_, base, _)| (base.start, base.end))
+                        .collect()
+                }),
+                "python" => direct_script_types(
+                    bytes,
+                    tree_sitter_python::LANGUAGE.into(),
+                    "class_definition",
+                    "argument_list",
+                )
+                .map(|items| {
+                    items
+                        .into_iter()
+                        .map(|(_, base, _)| (base.start, base.end))
+                        .collect()
+                }),
+                "rust" => rust_type_spans(bytes),
+                _ => Ok(BTreeSet::new()),
+            }?;
+            Ok((doc.clone(), spans))
+        })
+        .collect::<Result<_>>()?;
     let mut call_reference_ids: BTreeMap<String, String> = BTreeMap::new();
     for (claim, doc, symbol, roles, binding, reference, call) in occurrences {
         let key = symbol_key(&symbol, &doc);
@@ -500,12 +540,21 @@ pub fn join_inventory(
                 } else {
                     vec![]
                 },
-                join: binding,
+                join: binding.clone(),
                 provenance_id: claim.captured_proof_id.clone(),
             });
         }
         out.joins
             .push((claim.captured_proof_id.clone(), reference.clone()));
+        let invocation = if roles & 1 == 0 && !claim.envelope.raw["enclosingRange"].is_null() {
+            let source = sources.get(&doc).context("missing occurrence source")?;
+            let mut enclosing_claim = claim.clone();
+            enclosing_claim.envelope.raw["range"] = claim.envelope.raw["enclosingRange"].clone();
+            let span = occurrence_range(&enclosing_claim, source, admitted_encoding)?;
+            Some(measured.join(&doc, span, semantic::JoinKind::Invocation)?)
+        } else {
+            None
+        };
         if reference.status == semantic::JoinStatus::Exact {
             let r = native
                 .references
@@ -518,25 +567,38 @@ pub fn join_inventory(
                         && d.name_range.as_ref() == Some(&r.range)
                         && d.name.as_deref() == Some(&r.spelling)
                 });
-            let is_call = roles & 1 == 0
-                && !claim.envelope.raw["enclosingRange"].is_null()
-                && native.calls.iter().any(|c| {
-                    c.document == doc
-                        && c.owner_syntax_id == r.owner_syntax_id
-                        && c.range.start <= r.range.start
-                        && r.range.end <= c.range.end
-                        && c.spelling.as_deref() == Some(&r.spelling)
-                        && c.callee_range
-                            .as_ref()
-                            .is_none_or(|callee| callee == &r.range)
-                })
-                && reference.status == semantic::JoinStatus::Exact;
+            let is_call = invocation.as_ref().is_some_and(|j| {
+                j.status == semantic::JoinStatus::Exact
+                    && native.calls.iter().any(|c| {
+                        c.id == j.candidate_ids[0]
+                            && c.document == doc
+                            && c.owner_syntax_id == r.owner_syntax_id
+                            && c.range.start <= r.range.start
+                            && r.range.end <= c.range.end
+                            && c.spelling.as_deref() == Some(&r.spelling)
+                            && c.callee_range
+                                .as_ref()
+                                .is_none_or(|callee| callee == &r.range)
+                            && (call.status != semantic::JoinStatus::Exact
+                                || call.candidate_ids == j.candidate_ids)
+                    })
+            });
             let mut assigned = BTreeSet::new();
             if declaration_site {
                 assigned.insert(semantic::Role::Definition);
             }
             if roles & 2 != 0 {
                 assigned.insert(semantic::Role::Import);
+            }
+            if !declaration_site
+                && type_spans
+                    .get(&doc)
+                    .is_some_and(|spans| spans.contains(&(r.range.start, r.range.end)))
+                && type_uses
+                    .get(&(doc.clone(), r.range.start, r.range.end))
+                    .is_some_and(|keys| keys.len() == 1 && keys.contains(&symbol))
+            {
+                assigned.insert(semantic::Role::Type);
             }
             if roles & 4 != 0 {
                 assigned.insert(semantic::Role::Write);
@@ -547,7 +609,17 @@ pub fn join_inventory(
             if !declaration_site && roles & 4 == 0 && roles & 2 == 0 {
                 assigned.insert(semantic::Role::Read);
             }
-            if declaration_site && roles & 2 != 0 && doc.language == "python" {
+            if declaration_site
+                && roles & 2 != 0
+                && matches!(doc.language.as_str(), "javascript" | "rust")
+                && binding.status == semantic::JoinStatus::Exact
+                && native.declarations.iter().any(|d| {
+                    d.syntax_id == binding.candidate_ids[0]
+                        && d.document == doc
+                        && d.kind == "alias"
+                        && d.name_range.as_ref() == Some(&r.range)
+                })
+            {
                 assigned.insert(semantic::Role::Alias);
             }
             if !assigned.is_empty() {
@@ -583,15 +655,6 @@ pub fn join_inventory(
         }
         if roles & 1 == 0 {
             let source = sources.get(&doc).context("missing occurrence source")?;
-            let enclosing = &claim.envelope.raw["enclosingRange"];
-            let invocation = if enclosing.is_null() {
-                None
-            } else {
-                let mut enclosing_claim = claim.clone();
-                enclosing_claim.envelope.raw["range"] = enclosing.clone();
-                let span = occurrence_range(&enclosing_claim, source, admitted_encoding)?;
-                Some(measured.join(&doc, span, semantic::JoinKind::Invocation)?)
-            };
             if let Some(join) = &invocation {
                 out.joins
                     .push((claim.captured_proof_id.clone(), join.clone()));
@@ -795,10 +858,12 @@ pub fn join_inventory(
                     })
                     .collect();
                 let [source_method] = source_methods.as_slice() else {
-                    out.diagnostics
-                        .entry(doc.clone())
-                        .or_default()
-                        .insert("unmeasurable_override_endpoint".into());
+                    if source_methods.is_empty() && target(doc, source_symbol).is_none() {
+                        out.diagnostics
+                            .entry(doc.clone())
+                            .or_default()
+                            .insert("unmeasurable_override_endpoint".into());
+                    }
                     continue;
                 };
                 let Some(source_target) = target(doc, source_symbol) else {
@@ -890,10 +955,14 @@ pub fn join_inventory(
                     && method_descriptor_matches
                     && target_owner_matches;
                 if !owner_matches {
-                    out.diagnostics
-                        .entry(doc.clone())
-                        .or_default()
-                        .insert("unmeasurable_override_endpoint".into());
+                    if target_method.is_none()
+                        && direct_base.is_none_or(|base| target_owner_key.as_ref() != Some(base))
+                    {
+                        out.diagnostics
+                            .entry(doc.clone())
+                            .or_default()
+                            .insert("unmeasurable_override_endpoint".into());
+                    }
                     continue;
                 }
                 let destination = target(doc, target_symbol).or_else(|| {
@@ -1055,6 +1124,39 @@ fn direct_java_types(
                     } else {
                         let mut cursor = item.walk();
                         todo.extend(item.named_children(&mut cursor));
+                    }
+                }
+            }
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    Ok(result)
+}
+
+fn rust_type_spans(source: &[u8]) -> Result<BTreeSet<(usize, usize)>> {
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&tree_sitter_rust::LANGUAGE.into())?;
+    let tree = parser
+        .parse(source, None)
+        .context("Rust type parser failed")?;
+    let mut result = BTreeSet::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if matches!(
+            node.kind(),
+            "trait_item" | "impl_item" | "struct_item" | "enum_item"
+        ) {
+            for field in ["bounds", "trait", "type"] {
+                if let Some(clause) = node.child_by_field_name(field) {
+                    let mut todo = vec![clause];
+                    while let Some(item) = todo.pop() {
+                        if item.kind() == "type_identifier" {
+                            result.insert((item.start_byte(), item.end_byte()));
+                        } else {
+                            let mut cursor = item.walk();
+                            todo.extend(item.named_children(&mut cursor));
+                        }
                     }
                 }
             }
