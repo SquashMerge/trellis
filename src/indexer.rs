@@ -313,7 +313,7 @@ fn measured_display_labels(
 fn measured_display_labels_prepared(
     native: &native_evidence::Artifact,
     prepared: &PreparedDisplayLabels<'_>,
-    selected: Option<&str>,
+    selected: Option<&BTreeSet<String>>,
 ) -> BTreeMap<String, String> {
     let mut labels = BTreeMap::new();
     if prepared.documents.is_empty() {
@@ -323,8 +323,12 @@ fn measured_display_labels_prepared(
     for d in &native.declarations {
         declarations.entry(&d.document.path).or_default().push(d);
     }
-    let indexes: Box<dyn Iterator<Item = usize> + '_> = if let Some(path) = selected {
-        Box::new(prepared.by_path.get(path).copied().into_iter())
+    let indexes: Box<dyn Iterator<Item = usize> + '_> = if let Some(paths) = selected {
+        Box::new(
+            paths
+                .iter()
+                .filter_map(|path| prepared.by_path.get(path.as_str()).copied()),
+        )
     } else {
         Box::new(0..prepared.documents.len())
     };
@@ -787,11 +791,9 @@ pub(crate) fn measure_persisted_change(
     previous_options: &ReconcileOptions,
     previous_inputs: &BTreeMap<String, crate::capture::CaptureInputObservation>,
     current: &Capture,
-) -> Result<CapturedChange> {
+) -> Result<Option<BTreeSet<String>>> {
     if previous_options != current.reconcile_options() {
-        return Ok(CapturedChange::FullNative {
-            reason: "capture admission changed",
-        });
+        return Ok(None);
     }
     let current_inputs = current.persisted_inputs()?;
     let native_inputs = |inputs: &BTreeMap<String, crate::capture::CaptureInputObservation>| {
@@ -807,44 +809,20 @@ pub(crate) fn measure_persisted_change(
             .collect::<BTreeMap<_, _>>()
     };
     if native_inputs(previous_inputs) != native_inputs(&current_inputs) {
-        return Ok(CapturedChange::FullNative {
-            reason: "captured native input changed",
-        });
+        return Ok(None);
     }
     let before: BTreeMap<_, _> = previous.iter().map(|f| (f.path.as_str(), f)).collect();
     let after: BTreeMap<_, _> = current.files.iter().map(|f| (f.path.as_str(), f)).collect();
-    if before.keys().ne(after.keys()) {
-        return Ok(CapturedChange::FullNative {
-            reason: "source inventory changed (add/delete/rename)",
-        });
-    }
-    let mut changed = None;
-    for (path, old) in before {
-        let new = after[path];
-        if old.language != new.language {
-            return Ok(CapturedChange::FullNative {
-                reason: "source language changed",
-            });
-        }
-        if old.hash == new.hash {
-            continue;
-        }
-        if changed.is_some() {
-            return Ok(CapturedChange::FullNative {
-                reason: "multiple source documents changed",
-            });
-        }
-        changed = Some((path, old, new));
-    }
-    Ok(match changed {
-        None => CapturedChange::Unchanged,
-        Some((path, old, new)) if proved_body_only(old, new) => CapturedChange::DocumentLocal {
-            path: path.to_owned(),
-        },
-        Some(_) => CapturedChange::FullNative {
-            reason: "cross-file effect not proved local",
-        },
-    })
+    let changed = before
+        .keys()
+        .chain(after.keys())
+        .filter(|path| match (before.get(**path), after.get(**path)) {
+            (Some(old), Some(new)) => old.language != new.language || old.hash != new.hash,
+            _ => true,
+        })
+        .map(|path| (*path).to_owned())
+        .collect();
+    Ok(Some(changed))
 }
 
 /// A diagnostic selected-document measurement for two caller-supplied captures.
@@ -1017,19 +995,6 @@ pub(crate) fn project_native(
     project_native_selected(options, capture, native, cancel, progress, None, None)
 }
 
-/// The fast local path projects only the fully validated changed document.
-/// The writer retains prior projection IDs for every unchanged manifest entry.
-pub(crate) fn project_native_document(
-    options: &IndexOptions,
-    capture: &Capture,
-    native: &native_evidence::Artifact,
-    path: &str,
-    cancel: &CancelFlag,
-    progress: &impl Fn(IndexProgress),
-) -> Result<Graph> {
-    project_native_document_with_labels(options, capture, native, path, cancel, progress, None)
-}
-
 /// Internal full-spool projection uses the same selected-document transform,
 /// but optional SCIP and manifest inputs were parsed once for this capture.
 pub(crate) fn project_native_spooled_document(
@@ -1078,8 +1043,28 @@ fn project_native_document_with_labels(
         native,
         cancel,
         progress,
-        Some(path),
+        Some(&BTreeSet::from([path.to_owned()])),
         labels,
+    )
+}
+
+pub(crate) fn project_native_documents(
+    options: &IndexOptions,
+    capture: &Capture,
+    native: &native_evidence::Artifact,
+    paths: &BTreeSet<String>,
+    cancel: &CancelFlag,
+    progress: &impl Fn(IndexProgress),
+) -> Result<Graph> {
+    let labels = prepare_display_labels(options, capture);
+    project_native_selected(
+        options,
+        capture,
+        native,
+        cancel,
+        progress,
+        Some(paths),
+        Some(&labels),
     )
 }
 
@@ -1224,7 +1209,7 @@ fn project_native_selected(
     native: &native_evidence::Artifact,
     cancel: &CancelFlag,
     progress: &impl Fn(IndexProgress),
-    selected: Option<&str>,
+    selected: Option<&BTreeSet<String>>,
     prepared_labels: Option<&PreparedDisplayLabels<'_>>,
 ) -> Result<Graph> {
     ensure!(!cancel.load(Ordering::Relaxed), "indexing cancelled");
@@ -1234,11 +1219,11 @@ fn project_native_selected(
     let selected_files: Vec<_> = capture
         .files
         .iter()
-        .filter(|f| selected.is_none_or(|path| f.path == path))
+        .filter(|f| selected.is_none_or(|paths| paths.contains(&f.path)))
         .cloned()
         .collect();
     ensure!(
-        selected.is_none() || selected_files.len() == 1,
+        selected.is_none_or(|paths| selected_files.len() == paths.len()),
         "selected graph source is missing or ambiguous"
     );
     let mut graph = Graph {

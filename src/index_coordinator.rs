@@ -256,10 +256,20 @@ impl IndexJobCoordinator {
         capture: Capture,
         cutoff: impl FnMut() -> Result<()>,
     ) -> Result<(IndexPin, PublishPermit)> {
+        let diagnostic_incarnation = diagnostics().map(|_| self.session.incarnation().to_string());
+        let diagnostic_mode = std::sync::Mutex::new("unknown");
         let pin = self.run_with_capture(
             options,
             cancel,
-            |_| {},
+            |progress| {
+                if diagnostic_incarnation.is_some() {
+                    match progress.phase.as_str() {
+                        "mode:local" => *diagnostic_mode.lock().unwrap() = "local",
+                        "mode:full" => *diagnostic_mode.lock().unwrap() = "full",
+                        _ => {}
+                    }
+                }
+            },
             |_| {},
             |_, _| {},
             PublicationAdmission {
@@ -269,6 +279,21 @@ impl IndexJobCoordinator {
             },
             || {},
         )?;
+        if let Some(incarnation) = diagnostic_incarnation.as_deref() {
+            let mode = *diagnostic_mode.lock().unwrap();
+            let mut detail = format!(
+                "generation={} revision={} mode={}",
+                pin.index_generation, pin.index_revision, mode
+            );
+            // Attribute counters before releasing this publication's ownership.
+            if matches!(mode, "local" | "full")
+                && let Some(writer) = self.store.last_writer_diagnostic()
+            {
+                detail.push(' ');
+                detail.push_str(&writer);
+            }
+            diagnostic_marker(incarnation, "index_watcher_complete", &detail);
+        }
         Ok((pin, self.publication.take().expect("publication admitted")))
     }
 
@@ -343,49 +368,44 @@ impl IndexJobCoordinator {
         {
             report("measure", phase_start.elapsed());
             phase_start = std::time::Instant::now();
-            let changed = indexer::project_native_document(
+            let changed = indexer::project_native_documents(
                 options,
                 &capture,
                 &prepared.native,
-                &prepared.changed_path,
+                &prepared.changed_paths,
                 cancel,
                 &progress,
             )?;
-            if let Some(graph) = self
+            let graph = self
                 .store
-                .compose_local_revision(&capture, &prepared, changed, cancel)?
-            {
-                progress(IndexProgress {
-                    phase: "mode:local".into(),
-                    completed: 0,
-                    total: 1,
-                });
-                report("compose", phase_start.elapsed());
-                phase_start = std::time::Instant::now();
-                capture.verify(cancel)?;
-                observe(&capture);
-                ensure!(!cancel.load(Ordering::Acquire), "index cancelled");
-                self.store.verify_writer_session(&self.session)?;
-                report("attest", phase_start.elapsed());
-                phase_start = std::time::Instant::now();
-                cutoff()?;
-                let pin = self.store.publish_local_native_recovery(
-                    &graph,
-                    &capture,
-                    prepared,
-                    self.session.writer_guard()?,
-                    self.expected.clone(),
-                    cancel,
-                )?;
-                report("publish", phase_start.elapsed());
-                self.store
-                    .attest_post_acquisition_reconciliation(&self.session, pin)
-                    .map_err(|error| self.store.report_index_failure(error))?;
-                return Ok(pin);
-            }
-            // A moved D4 class cut is unproved: recalculate every native fact
-            // from the SAME authenticated capture, without a second admission.
+                .compose_local_revision(&capture, &prepared, changed, cancel)?;
+            progress(IndexProgress {
+                phase: "mode:local".into(),
+                completed: 0,
+                total: 1,
+            });
+            report("compose", phase_start.elapsed());
             phase_start = std::time::Instant::now();
+            capture.verify(cancel)?;
+            observe(&capture);
+            ensure!(!cancel.load(Ordering::Acquire), "index cancelled");
+            self.store.verify_writer_session(&self.session)?;
+            report("attest", phase_start.elapsed());
+            phase_start = std::time::Instant::now();
+            cutoff()?;
+            let pin = self.store.publish_local_native_recovery(
+                &graph,
+                &capture,
+                prepared,
+                self.session.writer_guard()?,
+                self.expected.clone(),
+                cancel,
+            )?;
+            report("publish", phase_start.elapsed());
+            self.store
+                .attest_post_acquisition_reconciliation(&self.session, pin)
+                .map_err(|error| self.store.report_index_failure(error))?;
+            return Ok(pin);
         }
         progress(IndexProgress {
             phase: "mode:full".into(),
@@ -1314,6 +1334,9 @@ fn drain_requests_observed_with_cancel(
         // queue reread and current control pin still match this baseline.
         let mut before_publish = None;
         let mut publication = None;
+        let diagnostic_incarnation = diagnostics().map(|_| session.incarnation().to_string());
+        let diagnostic_mode = std::sync::Mutex::new("unknown");
+        let mut completion_diagnostic = None;
         let outcome = (|| {
             let options = request.options(std::path::Path::new(store.workspace_root()))?;
             let mut coordinator = IndexJobCoordinator::prepare_with_session(
@@ -1326,7 +1349,27 @@ fn drain_requests_observed_with_cancel(
             let result = coordinator.run_with_capture(
                 &options,
                 cancel,
-                |p| progress(&request.id, p),
+                |p| {
+                    if let Some(incarnation) = diagnostic_incarnation.as_deref() {
+                        match p.phase.as_str() {
+                            "mode:local" => *diagnostic_mode.lock().unwrap() = "local",
+                            "mode:full" => *diagnostic_mode.lock().unwrap() = "full",
+                            "mode:unchanged" => *diagnostic_mode.lock().unwrap() = "unchanged",
+                            _ => {}
+                        }
+                        if p.phase.starts_with("mode:") || p.phase.starts_with("timing:") {
+                            diagnostic_marker(
+                                incarnation,
+                                "index_request_progress",
+                                &format!(
+                                    "request={} phase={} completed={} total={}",
+                                    request.id, p.phase, p.completed, p.total
+                                ),
+                            );
+                        }
+                    }
+                    progress(&request.id, p);
+                },
                 |capture| {
                     if let Some(cert) = candidate.borrow_mut().as_mut() {
                         cert.verified = capture.covers_watcher_request(
@@ -1356,6 +1399,27 @@ fn drain_requests_observed_with_cancel(
                     }
                 },
             );
+            if diagnostic_incarnation.is_some()
+                && let Ok(pin) = &result
+            {
+                let mode = *diagnostic_mode.lock().unwrap();
+                // Copy counters while this operation still owns publication.
+                // An unchanged result did not write: its stored counters are old.
+                let writer = if matches!(mode, "local" | "full") {
+                    store.last_writer_diagnostic()
+                } else {
+                    None
+                };
+                let mut detail = format!(
+                    "request={} generation={} revision={} mode={}",
+                    request.id, pin.index_generation, pin.index_revision, mode
+                );
+                if let Some(writer) = writer {
+                    detail.push(' ');
+                    detail.push_str(&writer);
+                }
+                completion_diagnostic = Some(detail);
+            }
             // A post-COMMIT error can be ambiguous. Retain the permit through
             // terminal ACK, cached completion or typed busy requeue even then.
             publication = coordinator.publication.take();
@@ -1426,6 +1490,11 @@ fn drain_requests_observed_with_cancel(
         // No unverified worker can mark a request terminal. On fencing loss leave it running
         // for the next daemon activation to reclaim after complete root reconciliation.
         store.record_and_finish_request(session, &request, outcome)?;
+        if let (Some(incarnation), Some(detail)) =
+            (diagnostic_incarnation.as_deref(), completion_diagnostic)
+        {
+            diagnostic_marker(incarnation, "index_request_complete", &detail);
+        }
         if let Some(watcher) = watcher {
             let mut guard = watcher.lock().unwrap();
             if let Some((owner, work)) = guard.as_mut()

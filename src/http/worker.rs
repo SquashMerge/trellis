@@ -984,6 +984,13 @@ mod missing_index_tests {
             "function changed() {}\n",
         )
         .unwrap();
+        // Inventory changes can publish locally; changed native configuration
+        // keeps this purge at the full spool admission boundary.
+        std::fs::write(
+            options.workspace_root.join("package.json"),
+            r#"{"type":"module"}"#,
+        )
+        .unwrap();
         store.enqueue_request(&options, None).unwrap();
         let index_dir = store.request_db_path().parent().unwrap().to_owned();
         let removed = index_dir.clone();

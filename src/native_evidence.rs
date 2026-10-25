@@ -1740,36 +1740,51 @@ pub(crate) fn measure_captured_document(
     })
 }
 
-/// Authenticate a newly measured document on its own. Unchanged rows in the
-/// captured revision are already validated immutable rows of this generation;
-/// callers carry only their manifest identities, not their occurrence records.
-pub(crate) fn validated_changed_artifact(
+/// Measure the current changed documents once against one full revision header.
+/// Unchanged documents retain their validated stored facts; an empty selection
+/// represents a deletion-only publication.
+pub(crate) fn measure_captured_documents(
     capture: &Capture,
-    selected: SelectedDocument,
+    root: &Path,
+    root_id: &str,
+    paths: &BTreeSet<String>,
     cancel: &CancelFlag,
+    mut on_extract: impl FnMut(&DocumentKey),
 ) -> Result<Artifact> {
-    let file = capture
-        .files
+    capture.verify(cancel)?;
+    let (mut artifact, files) = build_native_header(capture, root, root_id)?;
+    let full_documents = std::mem::take(&mut artifact.revision.documents);
+    artifact.revision.documents = full_documents
         .iter()
-        .find(|file| file.path == selected.document.key.path)
-        .context("changed native source missing from capture")?;
-    let full_documents = selected.revision.documents.clone();
-    let mut artifact = Artifact {
-        producer: selected.producer,
-        source_set: selected.source_set,
-        revision: Revision {
-            documents: vec![selected.document],
-            ..selected.revision
-        },
-        coverage: vec![selected.coverage],
-        provenance: vec![selected.provenance],
-        declarations: selected.declarations,
-        calls: selected.calls,
-        control_regions: selected.control_regions,
-        references: selected.references,
-        capability_reports: vec![selected.capability_report],
-    };
-    artifact.validate_structure(std::slice::from_ref(file))?;
+        .filter(|document| paths.contains(&document.key.path))
+        .cloned()
+        .collect();
+    ensure!(
+        artifact.revision.documents.len() == paths.len(),
+        "selected native source must be unique and admitted"
+    );
+    let selected: Vec<_> = files
+        .into_iter()
+        .filter(|file| paths.contains(&file.path))
+        .collect();
+    let mut ids = IdentityRegistry::default();
+    let documents = std::mem::take(&mut artifact.revision.documents);
+    for (file, document) in selected.iter().zip(&documents) {
+        ensure!(
+            !cancel.load(std::sync::atomic::Ordering::Acquire),
+            "indexing cancelled"
+        );
+        ensure!(
+            capture.hashes.get(&file.path) == Some(&file.hash)
+                && file.hash == hash(file.text.as_bytes()),
+            "selected native source bytes/hash mismatch"
+        );
+        extract_known(&mut artifact, file, document, &mut ids)?;
+        on_extract(&document.key);
+    }
+    artifact.revision.documents = documents;
+    let selected_files: Vec<_> = selected.into_iter().cloned().collect();
+    artifact.validate_structure(&selected_files)?;
     capture.verify(cancel)?;
     artifact.revision.documents = full_documents;
     Ok(artifact)
@@ -4411,6 +4426,120 @@ mod parallel_extraction_tests {
         )
     }
 
+    #[test]
+    fn changed_batch_extracts_exact_selection_and_keeps_full_header() {
+        let f = fixture(&[
+            (
+                "a.java",
+                "class A { int value; int read(){ return value; } }\n".into(),
+            ),
+            ("b.py", "def broken(:\n".into()),
+            ("c.js", "function c(){ return value; }\n".into()),
+            (
+                "d.rs",
+                "fn read(value: i32) -> i32 { opaque!(value); value }\n".into(),
+            ),
+        ]);
+        let full = from_capture(&f.capture, &f.root, &f.root_id, &f.cancel).unwrap();
+        assert!(!full.references.is_empty());
+        assert!(
+            full.capability_reports
+                .iter()
+                .any(|report| report.document.path == "d.rs"
+                    && report.families.iter().any(|family| !family.gaps.is_empty()))
+        );
+        let all: BTreeSet<_> = full
+            .revision
+            .documents
+            .iter()
+            .map(|document| document.key.path.clone())
+            .collect();
+        for paths in [
+            BTreeSet::new(),
+            BTreeSet::from(["b.py".to_owned()]),
+            BTreeSet::from(["c.js".to_owned(), "d.rs".to_owned()]),
+            all,
+        ] {
+            let mut extracted = Vec::new();
+            let artifact = measure_captured_documents(
+                &f.capture,
+                &f.root,
+                &f.root_id,
+                &paths,
+                &f.cancel,
+                |key| extracted.push(key.path.clone()),
+            )
+            .unwrap();
+            let expected_order: Vec<_> = full
+                .revision
+                .documents
+                .iter()
+                .filter(|document| paths.contains(&document.key.path))
+                .map(|document| document.key.path.clone())
+                .collect();
+            assert_eq!(extracted, expected_order);
+            assert_eq!(artifact.revision, full.revision);
+            assert_eq!(artifact.coverage.len(), paths.len());
+            assert_eq!(artifact.capability_reports.len(), paths.len());
+            assert!(
+                artifact
+                    .declarations
+                    .iter()
+                    .all(|row| paths.contains(&row.document.path))
+            );
+            assert_eq!(
+                artifact.references,
+                full.references
+                    .iter()
+                    .filter(|row| paths.contains(&row.document.path))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                artifact.capability_reports,
+                full.capability_reports
+                    .iter()
+                    .filter(|row| paths.contains(&row.document.path))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            );
+            if paths.contains("b.py") {
+                assert_eq!(
+                    artifact
+                        .coverage
+                        .iter()
+                        .find(|c| c.document_path == "b.py")
+                        .unwrap()
+                        .state,
+                    "partial"
+                );
+            }
+            let mut selected = artifact.clone();
+            selected
+                .revision
+                .documents
+                .retain(|document| paths.contains(&document.key.path));
+            let files: Vec<_> = f
+                .capture
+                .files
+                .iter()
+                .filter(|file| paths.contains(&file.path))
+                .cloned()
+                .collect();
+            selected.validate_structure(&files).unwrap();
+            if !paths.is_empty() {
+                let mut missing_report = selected.clone();
+                missing_report.capability_reports.pop();
+                assert!(missing_report.validate_structure(&files).is_err());
+            }
+            if !selected.references.is_empty() {
+                selected.references[0].spelling.push('x');
+                assert!(selected.validate_structure(&files).is_err());
+            }
+        }
+        assert_eq!(f.capture.graph_projection_count(), 0);
+    }
+
     const SEQUENTIAL: ExtractionPlan = ExtractionPlan {
         workers: 1,
         chunk: usize::MAX,
@@ -4438,9 +4567,15 @@ mod parallel_extraction_tests {
 
     #[test]
     fn plain_artifact_validation_does_not_extract_again() {
-        let f = fixture(&[("main.js", "function run() {}\n".into())]);
+        let f = fixture(&[("main.js", "// No identifier occurrences.\n".into())]);
         let artifact = from_capture(&f.capture, &f.root, &f.root_id, &f.cancel).unwrap();
-        assert!(artifact.calls.is_empty() && artifact.control_regions.is_empty());
+        assert_eq!(artifact.declarations.len(), 1);
+        assert_eq!(artifact.declarations[0].kind, "module");
+        assert!(
+            artifact.references.is_empty()
+                && artifact.calls.is_empty()
+                && artifact.control_regions.is_empty()
+        );
         // Extraction always authenticates its context. With no occurrences,
         // structural validation has no reason to request an extraction context.
         let _fault = inject_extraction_auth_fault(

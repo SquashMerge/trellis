@@ -651,11 +651,11 @@ SELECT (SELECT length(content_hash)+20 FROM class_projections WHERE cid=x.cid)+(
 UNION ALL
 SELECT (SELECT length(content_hash)+20 FROM class_projections WHERE cid=x.cid)+COALESCE(length(CAST(x.id AS BLOB)),0)+39+(CASE WHEN x.target IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.payload AS BLOB)),0) AS row_bytes FROM class_relations x WHERE x.cid=?2
 )"#;
-const DATABASE_SCHEMA_VERSION: u32 = 19;
+const DATABASE_SCHEMA_VERSION: u32 = 20;
 const EXTRACTOR_VERSION: &str = "native-v6-delta-v1";
 const EVIDENCE_FORMAT: &str = "terminal-native-graph-v1";
-const CACHE_SCHEMA_V19: &str = r#"
-CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=19), extractor_version TEXT NOT NULL CHECK(extractor_version='native-v6-delta-v1'), root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL, reconcile_options TEXT);
+const CACHE_SCHEMA_V20: &str = r#"
+CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=20), extractor_version TEXT NOT NULL CHECK(extractor_version='native-v6-delta-v1'), root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL, reconcile_options TEXT);
 CREATE TABLE native_producers(id TEXT NOT NULL,version TEXT NOT NULL,executable_hash TEXT NOT NULL CHECK(length(executable_hash)=64),kind TEXT NOT NULL CHECK(kind='native'),position_encoding TEXT NOT NULL CHECK(position_encoding='utf8'),PRIMARY KEY(id,version));
 CREATE TABLE native_producer_languages(producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,language TEXT NOT NULL,inventory_authenticated INTEGER NOT NULL CHECK(inventory_authenticated IN (0,1)),ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(producer_id,producer_version,language),UNIQUE(producer_id,producer_version,ordinal),FOREIGN KEY(producer_id,producer_version) REFERENCES native_producers(id,version) DEFERRABLE INITIALLY DEFERRED);
 CREATE TABLE native_producer_inputs(producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,language TEXT NOT NULL,component_name TEXT NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(producer_id,producer_version,language,component_name),UNIQUE(producer_id,producer_version,language,ordinal),FOREIGN KEY(producer_id,producer_version,language) REFERENCES native_producer_languages(producer_id,producer_version,language) DEFERRABLE INITIALLY DEFERRED);
@@ -2649,7 +2649,7 @@ fn validate_cache_shape(db: &Connection) -> Result<()> {
         version == DATABASE_SCHEMA_VERSION,
         "incompatible_index: unknown schema version"
     );
-    expected.execute_batch(CACHE_SCHEMA_V19)?;
+    expected.execute_batch(CACHE_SCHEMA_V20)?;
     control_ensure!(
         objects(db)? == objects(&expected)?,
         "incompatible_index: unknown cache object type, name or shape"
@@ -3925,6 +3925,24 @@ fn stream_document_classes(
     }
 }
 
+fn v8_class_projection(graph_id: &str, grouped: &PublicationRows<'_>) -> (String, String) {
+    let mut selected_classes = grouped.classes.clone();
+    selected_classes.sort_by(|a, b| a.symbol.id.cmp(&b.symbol.id));
+    let mut selected_relations = grouped.relations.clone();
+    selected_relations.sort_by(|a, b| a.id.cmp(&b.id));
+    let class_hash = v8_id(
+        "",
+        b"trellis.class-projection.v1\0",
+        serde_json::json!({
+            "graphProjectionId": graph_id,
+            "classes": selected_classes, "relations": selected_relations,
+        }),
+    );
+    let class_hash = class_hash.trim_start_matches(':').to_owned();
+    let class_id = format!("class-projection:v1:{class_hash}");
+    (class_id, class_hash)
+}
+
 fn v8_document_projection(
     file: &SourceFile,
     native: &crate::native_evidence::Artifact,
@@ -3960,20 +3978,7 @@ fn v8_document_projection(
     );
     let graph_hash = graph_hash.trim_start_matches(':').to_owned();
     let graph_id = format!("graph:v1:{graph_hash}");
-    let mut selected_classes = grouped.classes.clone();
-    selected_classes.sort_by(|a, b| a.symbol.id.cmp(&b.symbol.id));
-    let mut selected_relations = grouped.relations.clone();
-    selected_relations.sort_by(|a, b| a.id.cmp(&b.id));
-    let class_hash = v8_id(
-        "",
-        b"trellis.class-projection.v1\0",
-        serde_json::json!({
-            "graphProjectionId": graph_id,
-            "classes": selected_classes, "relations": selected_relations,
-        }),
-    );
-    let class_hash = class_hash.trim_start_matches(':').to_owned();
-    let class_id = format!("class-projection:v1:{class_hash}");
+    let (class_id, class_hash) = v8_class_projection(&graph_id, grouped);
     Ok(V8DocumentProjection {
         version_id,
         graph_id,
@@ -4002,7 +4007,8 @@ struct PreflightReuse {
 }
 
 pub(crate) struct LocalPrepared {
-    pub(crate) changed_path: String,
+    pub(crate) changed_paths: BTreeSet<String>,
+    removed_paths: BTreeSet<String>,
     pub(crate) native: crate::native_evidence::Artifact,
     prior_pin: IndexPin,
     prior_ids: BTreeMap<String, V8DocumentProjection>,
@@ -4010,8 +4016,6 @@ pub(crate) struct LocalPrepared {
     prior_extractions: BTreeMap<String, crate::classes::FileExtraction>,
     old_stats: IndexStats,
     old_diagnostics: Vec<Diagnostic>,
-    old_class_warnings: Vec<String>,
-    old_class_truncated: bool,
     old_changed_counts: (usize, usize, usize),
 }
 impl PreflightReuse {
@@ -4415,16 +4419,12 @@ fn write_graph_document(
     reused: ReusedFamilies,
     immutable: &mut ImmutableAppend,
 ) -> Result<()> {
-    let gid: i64 = db.query_row(
-        "SELECT gid FROM graph_projections WHERE graph_hash=?1",
-        [&ids.graph_hash],
-        |row| row.get(0),
-    )?;
-    let cid: i64 = db.query_row(
-        "SELECT cid FROM class_projections WHERE content_hash=?1",
-        [&ids.class_hash],
-        |row| row.get(0),
-    )?;
+    let gid: i64 = db
+        .prepare_cached("SELECT gid FROM graph_projections WHERE graph_hash=?1")?
+        .query_row([&ids.graph_hash], |row| row.get(0))?;
+    let cid: i64 = db
+        .prepare_cached("SELECT cid FROM class_projections WHERE content_hash=?1")?
+        .query_row([&ids.class_hash], |row| row.get(0))?;
     for n in &grouped.nodes {
         if reused.graph {
             continue;
@@ -6482,11 +6482,9 @@ fn write_native(
                 ],
             )?;
         }
-        let vid: i64 = db.query_row(
-            "SELECT vid FROM document_versions WHERE id=?1",
-            [&ids.version_id],
-            |row| row.get(0),
-        )?;
+        let vid: i64 = db
+            .prepare_cached("SELECT vid FROM document_versions WHERE id=?1")?
+            .query_row([&ids.version_id], |row| row.get(0))?;
         if !reuse.for_path(&file.path).graph {
             immutable.insert(
                 db,
@@ -6505,11 +6503,9 @@ fn write_native(
                 ],
             )?;
         }
-        let gid: i64 = db.query_row(
-            "SELECT gid FROM graph_projections WHERE graph_hash=?1",
-            [&ids.graph_hash],
-            |row| row.get(0),
-        )?;
+        let gid: i64 = db
+            .prepare_cached("SELECT gid FROM graph_projections WHERE graph_hash=?1")?
+            .query_row([&ids.graph_hash], |row| row.get(0))?;
         if !reuse.for_path(&file.path).class {
             immutable.insert(
                 db,
@@ -6517,11 +6513,9 @@ fn write_native(
                 params![gid, ids.class_hash, "ready"],
             )?;
         }
-        let cid: i64 = db.query_row(
-            "SELECT cid FROM class_projections WHERE content_hash=?1",
-            [&ids.class_hash],
-            |row| row.get(0),
-        )?;
+        let cid: i64 = db
+            .prepare_cached("SELECT cid FROM class_projections WHERE content_hash=?1")?
+            .query_row([&ids.class_hash], |row| row.get(0))?;
         storage_ids.insert(file.path.clone(), (vid, gid, cid));
         let coverage = coverages
             .get(file.path.as_str())
@@ -6843,7 +6837,7 @@ fn validate_v8_bootstrap(db: &Connection) -> Result<()> {
         indexed_at.is_empty() && options.is_none(),
         "incompatible_index: invalid v8 bootstrap metadata"
     );
-    // Fixed identifiers from CACHE_SCHEMA_V19 only. Do not read table names from
+    // Fixed identifiers from CACHE_SCHEMA_V20 only. Do not read table names from
     // sqlite_master or treat a partial publication as a valid empty bootstrap.
     for name in [
         "class_projections",
@@ -9105,7 +9099,7 @@ impl Store {
             db.pragma_update(None, "synchronous", "FULL")?;
             db.execute_batch("BEGIN IMMEDIATE")?;
             let result = (|| -> Result<()> {
-                db.execute_batch(CACHE_SCHEMA_V19)?;
+                db.execute_batch(CACHE_SCHEMA_V20)?;
                 let age = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
                 ensure!(age <= 9_007_199_254_740_991, "invalid_open_age");
                 db.execute(
@@ -11241,17 +11235,15 @@ impl Store {
         let prepared = self
             .prepare_local_revision(capture, &expected, cancel)?
             .context("document-local publication unavailable")?;
-        let changed = crate::indexer::project_native_document(
+        let changed = crate::indexer::project_native_documents(
             options,
             capture,
             &prepared.native,
-            &prepared.changed_path,
+            &prepared.changed_paths,
             cancel,
             &|_| {},
         )?;
-        let graph = self
-            .compose_local_revision(capture, &prepared, changed, cancel)?
-            .context("document-local class projection unavailable")?;
+        let graph = self.compose_local_revision(capture, &prepared, changed, cancel)?;
         self.publish_local_native_recovery_with_semantic(
             &graph,
             capture,
@@ -11334,7 +11326,7 @@ impl Store {
             // artifact or from a newly fabricated measurement.
             self.native_at(prepared.prior_pin, |db, selected| {
                 for document in &native.revision.documents {
-                    if document.key.path == prepared.changed_path {
+                    if prepared.changed_paths.contains(&document.key.path) {
                         continue;
                     }
                     let scope = v8_native_scope_for(db, &document.key, selected)?
@@ -11361,6 +11353,8 @@ impl Store {
                         region.revision_id.clone_from(&native.revision.id);
                     }
                     native.control_regions.extend(regions);
+                    // Native-v9 candidates and reports retain their measured inventory;
+                    // only their containing revision changes for semantic validation.
                     let mut references = read_native_references(db, &scope, None)?;
                     for reference in &mut references {
                         reference.revision_id.clone_from(&native.revision.id);
@@ -11374,7 +11368,7 @@ impl Store {
             })?;
         } else {
             for file in &capture.files {
-                if file.path == prepared.changed_path {
+                if prepared.changed_paths.contains(&file.path) {
                     continue;
                 }
                 let mut coverage = prepared
@@ -11386,6 +11380,16 @@ impl Store {
                 native.coverage.push(coverage);
             }
         }
+        let order: BTreeMap<_, _> = native
+            .revision
+            .documents
+            .iter()
+            .enumerate()
+            .map(|(ordinal, document)| (document.key.path.as_str(), ordinal))
+            .collect();
+        native
+            .coverage
+            .sort_by_key(|coverage| order.get(coverage.document_path.as_str()).copied());
         self.publish_inner_checked_target_with_local(
             (graph, capture, &native),
             leader,
@@ -11991,24 +11995,23 @@ impl Store {
                 "incompatible_index: selected final inventory source differs"
             );
             let linked: Option<(String, String, String, String, String)> = db
-                .query_row(
+                .prepare_cached(
                     "SELECT g.state,c.state,v.extraction_context,v.producer_id,v.producer_version
                  FROM revision_documents m
                  JOIN document_versions v ON v.vid=m.vid AND v.language=m.language AND v.path=m.path
                  JOIN graph_projections g ON g.gid=m.gid AND g.vid=m.vid AND g.language=m.language
                  JOIN class_projections c ON c.cid=m.cid AND c.gid=m.gid
                  WHERE m.revision_id=?1 AND m.path=?2",
-                    params![selected.key, source.path],
-                    |row| {
-                        Ok((
-                            row.get(0)?,
-                            row.get(1)?,
-                            row.get(2)?,
-                            row.get(3)?,
-                            row.get(4)?,
-                        ))
-                    },
-                )
+                )?
+                .query_row(params![selected.key, source.path], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                })
                 .optional()?;
             let (graph, class, context, producer, version) = linked.ok_or_else(|| {
                 SelectedIntegrity(
@@ -12164,7 +12167,7 @@ impl Store {
             // Check their indexed version/projection links without re-parsing
             // millions of native and graph facts.
             let linked: Option<(String, String, String, String, String)> = db
-                .query_row(
+                .prepare_cached(
                     "SELECT g.state,c.state,v.extraction_context,v.producer_id,v.producer_version
                  FROM revision_documents m
                  JOIN document_versions v ON v.vid=m.vid
@@ -12174,17 +12177,16 @@ impl Store {
                  JOIN class_projections c ON c.cid=m.cid
                    AND c.gid=m.gid
                  WHERE m.revision_id=?1 AND m.path=?2",
-                    params![selected.key, source.path],
-                    |row| {
-                        Ok((
-                            row.get(0)?,
-                            row.get(1)?,
-                            row.get(2)?,
-                            row.get(3)?,
-                            row.get(4)?,
-                        ))
-                    },
-                )
+                )?
+                .query_row(params![selected.key, source.path], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                })
                 .optional()?;
             let (graph_state, class_state, context, producer_id, producer_version) = linked
                 .ok_or_else(|| {
@@ -12354,7 +12356,7 @@ impl Store {
         expected: &RecoveryBaseline,
         cancel: &CancelFlag,
     ) -> Result<Option<LocalPrepared>> {
-        use crate::{indexer::CapturedChange, native_evidence};
+        use crate::native_evidence;
         use sha2::Digest;
         if !expected.compatible
             || self.disposition() != RecoveryDisposition::Ready
@@ -12366,12 +12368,12 @@ impl Store {
             let selected = ReadRevision::current(db)?;
             ensure!(expected.pin() == Some(selected.pin),
                 "revision conflict: local source snapshot changed");
-            // Decision 0005 (2026-10 amendment): a proved single-body edit may
+            // Decision 0005: changed documents may
             // reuse unchanged documents under a rebuilt executable only while
             // the extractor producer hash is unchanged. measure_persisted_change
             // compares that recorded hash; a changed one takes the full path.
             // The selected head is a prior validated publication. Do not decode
-            // its unchanged fact/projection rows; the current captured source
+            // its unchanged fact/projection rows; the changed captured source
             // bytes are checked below.
             let previous_options: crate::indexer::ReconcileOptions = db.query_row(
                 "SELECT reconcile_options FROM index_metadata WHERE singleton=1", [],
@@ -12397,7 +12399,6 @@ impl Store {
             let mut prior_ids = BTreeMap::new();
             let mut prior_coverage = BTreeMap::new();
             let mut prior_extractions = BTreeMap::new();
-            let mut changed_counts = BTreeMap::new();
             let source_set_id = format!("source-set:v1:{}", self.root_id());
             let producer_id = crate::native_evidence::PRODUCER;
             let producer_version = crate::native_evidence::NATIVE_VERSION;
@@ -12440,7 +12441,7 @@ impl Store {
                 let source = SourceFile {path:path.clone(),language:language.clone(),hash:hash.clone(),text:String::new()};
                 previous.push(source);
                 selected_ensure!(prior_ids.insert(path.clone(), V8DocumentProjection {
-                    version_id, graph_id, class_id:class_id.context(SelectedIntegrity("class projection missing".into()))?,
+                    version_id:version_id.clone(), graph_id, class_id:class_id.context(SelectedIntegrity("class projection missing".into()))?,
                     graph_hash,class_hash:class_hash.context(SelectedIntegrity("class hash missing".into()))?,
                 }).is_none(),"incompatible_index: duplicate local manifest path");
                 prior_coverage.insert(path.clone(), native_evidence::Coverage {
@@ -12448,22 +12449,23 @@ impl Store {
                     source_set_id:source_set_id.clone(),document_path:path.clone(),
                     revision_id:String::new(),requested,selected:covered,state,diagnostic,
                     supported_roles:vec!["definition".into(),"call".into()],
-                    observed_roles:vec!["definition".into(),"call".into()],
+                    observed_roles:Vec::new(),
                 });
                 if let Some(payload) = extraction {
                     prior_extractions.insert(path.clone(), serde_json::from_str(&payload).context(SelectedIntegrity("incompatible_index: stored JSON decode failed".into()))?);
                 }
-                changed_counts.insert(path, (0_usize,0_usize,0_usize));
             }
-            // The one document whose old text matters (proved_body_only reads
-            // it) is the only one whose stored bytes are read and checked.
-            let current_hashes: BTreeMap<&str, &str> =
-                capture.files.iter().map(|f| (f.path.as_str(), f.hash.as_str())).collect();
-            let changed_paths: Vec<usize> = previous.iter().enumerate()
-                .filter(|(_, old)| current_hashes.get(old.path.as_str()).is_some_and(|new| *new != old.hash))
-                .map(|(i, _)| i).collect();
-            if let [i] = changed_paths[..] {
-                let old = &mut previous[i];
+            let Some(affected_paths) = crate::indexer::measure_persisted_change(
+                &previous, &previous_options, &previous_inputs, capture)? else { return Ok(None); };
+            if affected_paths.is_empty() { return Ok(None); }
+            let current_paths: BTreeSet<_> = capture.files.iter().map(|f| f.path.clone()).collect();
+            let changed_paths: BTreeSet<_> = affected_paths.intersection(&current_paths).cloned().collect();
+            let removed_paths: BTreeSet<_> = affected_paths.difference(&current_paths).cloned().collect();
+            let mut old_changed_counts = (0_usize, 0_usize, 0_usize);
+            for old in previous.iter().filter(|old| affected_paths.contains(&old.path)) {
+                let stored = &prior_ids[&old.path];
+                // Retain the existing changed-source witness check for every
+                // replaced prior document, including removed paths.
                 let (length, bytes): (i64, Vec<u8>) = db.query_row(
                     "SELECT v.byte_length,v.source_bytes FROM revision_documents m
                      JOIN document_versions v ON v.vid=m.vid
@@ -12472,193 +12474,113 @@ impl Store {
                 selected_ensure!(length >= 0 && length as usize == bytes.len()
                     && old.hash == hex::encode(sha2::Sha256::digest(&bytes)),
                     "incompatible_index: prior captured source witness mismatch");
-                old.text = String::from_utf8(bytes).context(SelectedIntegrity("incompatible_index: stored source encoding".into()))?;
+                let _: String = String::from_utf8(bytes).context(SelectedIntegrity("incompatible_index: stored source encoding".into()))?;
+                let old_nodes: i64 = db.query_row(
+                    "SELECT count(*) FROM graph_nodes WHERE gid=(SELECT gid FROM graph_projections WHERE graph_hash=?1)",
+                    [&stored.graph_hash], |r| r.get(0))?;
+                let old_calls: i64 = db.query_row(
+                    "SELECT count(*) FROM native_version_calls WHERE vid=(SELECT vid FROM document_versions WHERE id=?1)",
+                    [&stored.version_id], |r| r.get(0))?;
+                let old_regions: i64 = db.query_row(
+                    "SELECT count(*) FROM native_version_control_regions WHERE vid=(SELECT vid FROM document_versions WHERE id=?1)",
+                    [&stored.version_id], |r| r.get(0))?;
+                old_changed_counts.0 = old_changed_counts.0.checked_add(old_nodes as usize).context("invalid prior symbol count")?;
+                old_changed_counts.1 = old_changed_counts.1.checked_add(old_calls as usize).context("invalid prior call count")?;
+                old_changed_counts.2 = old_changed_counts.2.checked_add(old_regions as usize).context("invalid prior region count")?;
             }
-            let decision = crate::indexer::measure_persisted_change(
-                &previous, &previous_options, &previous_inputs, capture)?;
-            let path = match decision {
-                CapturedChange::DocumentLocal {path} => path,
-                _ => return Ok(None),
-            };
-            let old_coverage=prior_coverage.get(&path).context("local coverage missing")?;
-            if old_coverage.state != "complete" { return Ok(None); }
-            let changed_file=capture.files.iter().find(|f|f.path==path).context("changed file missing")?;
-            let stored=prior_ids.get(&path).context("prior changed version missing")?;
-            // The captured root has one source-set identity; the selected SQL
-            // rows above must belong to it. Reject collisions instead of letting
-            // a same-path row in another language silently shadow an old fact.
-            let previous_by_key: BTreeMap<(&str, &str, &str), &SourceFile> = previous
-                .iter()
-                .map(|f| ((source_set_id.as_str(), f.language.as_str(), f.path.as_str()), f))
-                .collect();
-            selected_ensure!(previous_by_key.len() == previous.len(),
-                "incompatible_index: duplicate prior document identity");
-            let changed_key = (source_set_id.as_str(), changed_file.language.as_str(), path.as_str());
-            let prior_changed = previous_by_key.get(&changed_key)
-                .ok_or_else(|| SelectedIntegrity("incompatible_index: changed document identity missing".into()))?;
-            ensure!(prior_changed.language == changed_file.language
-                && prior_changed.hash != changed_file.hash,
-                "local edit did not change captured content hash");
-            // The new document is extracted and fully checked; prior versions
-            // are linked only by exact captured identity and selected ancestry.
-            for file in &capture.files {
-                if file.path != path {
-                    let key = (source_set_id.as_str(), file.language.as_str(), file.path.as_str());
-                    let old = previous_by_key.get(&key)
-                        .ok_or_else(|| SelectedIntegrity("incompatible_index: unchanged document identity missing".into()))?;
-                    selected_ensure!(old.language == file.language && old.hash == file.hash,
-                        "incompatible_index: unchanged document identity mismatch");
-                }
-            }
-            let measured=native_evidence::measure_captured_document(
-                capture,Path::new(&self.workspace_root),self.root_id(),&path,cancel,|_|{})?;
-            if measured.coverage.state != "complete" { return Ok(None); }
-            let native=native_evidence::validated_changed_artifact(capture,measured,cancel)?;
-            // The prior graph counts are used only for this changed path's
-            // header delta, not to authorize any old semantic fact. Native calls
-            // and regions determine the two derived graph row counts.
-            let old_nodes: i64 = db.query_row(
-                "SELECT count(*) FROM graph_nodes WHERE gid=?1",
-                [db.query_row("SELECT gid FROM graph_projections WHERE graph_hash=?1", [&stored.graph_hash], |r| r.get::<_,i64>(0))?], |r| r.get(0))?;
-            let old_calls: i64 = db.query_row(
-                "SELECT count(*) FROM native_version_calls WHERE vid=?1",
-                [db.query_row("SELECT vid FROM document_versions WHERE id=?1", [&stored.version_id], |r| r.get::<_,i64>(0))?], |r| r.get(0))?;
-            let old_regions: i64 = db.query_row(
-                "SELECT count(*) FROM native_version_control_regions WHERE vid=?1",
-                [db.query_row("SELECT vid FROM document_versions WHERE id=?1", [&stored.version_id], |r| r.get::<_,i64>(0))?], |r| r.get(0))?;
-            let old_changed_counts=(old_nodes as usize, old_calls as usize, old_regions as usize);
-            let (stats,diagnostics,warnings,truncated):(String,String,String,bool)=db.query_row(
-                "SELECT m.stats,m.diagnostics,r.class_warnings,r.class_truncated
+            let native = native_evidence::measure_captured_documents(
+                capture, Path::new(&self.workspace_root), self.root_id(), &changed_paths, cancel, |_| {})?;
+            let (stats,diagnostics):(String,String)=db.query_row(
+                "SELECT m.stats,m.diagnostics
                  FROM index_metadata m JOIN native_revisions r ON r.id=?1 WHERE m.singleton=1",
-                [&selected.key],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
-            let _: BTreeMap<_, _> = changed_counts;
-            Ok(Some(LocalPrepared {changed_path:path,native,prior_pin:selected.pin,
+                [&selected.key],|r|Ok((r.get(0)?,r.get(1)?)))?;
+            Ok(Some(LocalPrepared {changed_paths,removed_paths,native,prior_pin:selected.pin,
                 prior_ids,prior_coverage,prior_extractions,
                 old_stats:serde_json::from_str(&stats).context(SelectedIntegrity("incompatible_index: stored JSON decode failed".into()))?,old_diagnostics:serde_json::from_str(&diagnostics).context(SelectedIntegrity("incompatible_index: stored JSON decode failed".into()))?,
-                old_class_warnings:serde_json::from_str(&warnings).context(SelectedIntegrity("incompatible_index: stored JSON decode failed".into()))?,old_class_truncated:truncated,
                 old_changed_counts}))
         })
     }
 
-    /// Finalize a changed-only graph before claiming the capture's sole graph
-    /// projection. A moving class cap or changed per-file F uses the existing
-    /// full-native same-capture fallback instead of reusing an unproved class.
+    /// Compose full revision summaries from changed facts and the selected head.
     pub(crate) fn compose_local_revision(
         &self,
         capture: &crate::capture::Capture,
         prepared: &LocalPrepared,
         changed: Graph,
         cancel: &CancelFlag,
-    ) -> Result<Option<Graph>> {
+    ) -> Result<Graph> {
         ensure!(
-            changed.files.len() == 1 && changed.files[0].path == prepared.changed_path,
-            "selected graph must cover exactly the measured document"
+            changed
+                .files
+                .iter()
+                .map(|f| f.path.clone())
+                .collect::<BTreeSet<_>>()
+                == prepared.changed_paths,
+            "selected graph must cover exactly the measured documents"
         );
         crate::indexer::validate_native_graph_records(&changed, &prepared.native, cancel)?;
-        let mut stats = prepared.old_stats.clone();
+        let delta = |old: usize, removed: usize, added: usize| -> Result<usize> {
+            old.checked_sub(removed)
+                .and_then(|n| n.checked_add(added))
+                .ok_or_else(|| {
+                    self.report_index_failure(
+                        SelectedIntegrity("incompatible_index: invalid prior graph summary".into())
+                            .into(),
+                    )
+                })
+        };
         let (old_nodes, old_calls, old_regions) = prepared.old_changed_counts;
-        stats.symbols = stats
-            .symbols
-            .checked_sub(old_nodes)
-            .and_then(|n| n.checked_add(changed.nodes.len()))
-            .ok_or_else(|| {
-                self.report_index_failure(
-                    SelectedIntegrity("incompatible_index: invalid prior symbol summary".into())
-                        .into(),
-                )
-            })?;
-        stats.calls = stats
-            .calls
-            .checked_sub(old_calls)
-            .and_then(|n| n.checked_add(changed.calls.len()))
-            .ok_or_else(|| {
-                self.report_index_failure(
-                    SelectedIntegrity("incompatible_index: invalid prior call summary".into())
-                        .into(),
-                )
-            })?;
-        stats.regions = stats
-            .regions
-            .checked_sub(old_regions)
-            .and_then(|n| n.checked_add(changed.regions.len()))
-            .ok_or_else(|| {
-                self.report_index_failure(
-                    SelectedIntegrity("incompatible_index: invalid prior region summary".into())
-                        .into(),
-                )
-            })?;
-        stats.unresolved = stats.calls;
-        if stats.files != capture.files.len()
-            || prepared
-                .old_diagnostics
-                .iter()
-                .any(|d| d.path.as_deref() == Some(&prepared.changed_path))
-        {
-            return Err(self.report_index_failure(
-                SelectedIntegrity(
-                    "incompatible_index: local graph summary differs from complete coverage".into(),
-                )
-                .into(),
-            ));
-        }
-        ensure!(
-            changed.diagnostics.is_empty(),
-            "local graph diagnostics differ from complete coverage"
-        );
-        let composed = Graph {
+        let affected = |path: &str| {
+            prepared.changed_paths.contains(path) || prepared.removed_paths.contains(path)
+        };
+        let old_parse_errors = prepared
+            .old_diagnostics
+            .iter()
+            .filter(|d| d.code == "parse-error" && d.path.as_deref().is_some_and(affected))
+            .count();
+        let calls = delta(prepared.old_stats.calls, old_calls, changed.stats.calls)?;
+        let stats = IndexStats {
+            files: capture.files.len(),
+            symbols: delta(prepared.old_stats.symbols, old_nodes, changed.stats.symbols)?,
+            calls,
+            regions: delta(
+                prepared.old_stats.regions,
+                old_regions,
+                changed.stats.regions,
+            )?,
+            unresolved: calls,
+            parse_error_files: delta(
+                prepared.old_stats.parse_error_files,
+                old_parse_errors,
+                changed.stats.parse_error_files,
+            )?,
+            ..IndexStats::default()
+        };
+        let mut diagnostics: Vec<_> = prepared
+            .old_diagnostics
+            .iter()
+            .filter(|d| !d.path.as_deref().is_some_and(affected))
+            .cloned()
+            .collect();
+        diagnostics.extend(changed.diagnostics);
+        let order: BTreeMap<_, _> = prepared
+            .native
+            .revision
+            .documents
+            .iter()
+            .enumerate()
+            .map(|(ordinal, document)| (document.key.path.as_str(), ordinal))
+            .collect();
+        diagnostics.sort_by_key(|d| d.path.as_deref().and_then(|path| order.get(path)).copied());
+        Ok(Graph {
             files: capture.files.clone(),
             nodes: changed.nodes,
             calls: changed.calls,
             regions: changed.regions,
-            diagnostics: prepared.old_diagnostics.clone(),
+            diagnostics,
             stats,
             ..Graph::default()
-        };
-        if matches!(
-            composed
-                .files
-                .iter()
-                .find(|f| f.path == prepared.changed_path)
-                .map(|f| f.language.as_str()),
-            Some("java" | "python")
-        ) {
-            let file = composed
-                .files
-                .iter()
-                .find(|f| f.path == prepared.changed_path)
-                .context("changed class source absent")?;
-            let extracted = crate::classes::FileExtraction::extract_file(
-                file,
-                &composed.nodes,
-                cancel,
-                crate::classes::Limits::default(),
-            )?;
-            if prepared.prior_extractions.get(&file.path) != Some(&extracted) {
-                let mut next = prepared.prior_extractions.clone();
-                if next.insert(file.path.clone(), extracted).is_none() {
-                    return Err(self.report_index_failure(
-                        SelectedIntegrity(
-                            "incompatible_index: prior class extraction absent".into(),
-                        )
-                        .into(),
-                    ));
-                }
-                let catalog = Self::compose_selected_class_catalog(
-                    &composed,
-                    &next,
-                    crate::classes::Limits::default(),
-                )?;
-                // If this method-body edit moves a class cap or warning, use
-                // the full same-capture fallback. Equal F takes the original
-                // one-composition fast path and never pays a second O(files).
-                if catalog.warnings != prepared.old_class_warnings
-                    || catalog.truncated != prepared.old_class_truncated
-                {
-                    return Ok(None);
-                }
-            }
-        }
-        Ok(Some(composed))
+        })
     }
 
     /// Produce a selectively assembled native revision only for a proved local edit
@@ -12670,7 +12592,7 @@ impl Store {
         expected: &RecoveryBaseline,
         cancel: &CancelFlag,
     ) -> Result<Option<crate::native_evidence::Artifact>> {
-        use crate::{indexer::CapturedChange, native_evidence};
+        use crate::native_evidence;
         if !expected.compatible
             || self.disposition() != RecoveryDisposition::Ready
             || !expected.pin().is_some_and(|p| p.index_revision > 0)
@@ -12715,26 +12637,14 @@ impl Store {
                     "incompatible_index: prior captured source witness mismatch");
                 previous.push(SourceFile {path,language,hash,text:String::from_utf8(bytes).context(SelectedIntegrity("incompatible_index: stored source encoding".into()))?});
             }
-            let decision=crate::indexer::measure_persisted_change(
-                &previous,&previous_options,&previous_inputs,capture)?;
-            let selected_path=match decision {
-                CapturedChange::FullNative {..} => return Ok(None),
-                CapturedChange::DocumentLocal {path} => Some(path),
-                CapturedChange::Unchanged => None,
-            };
+            let Some(selected_paths) = crate::indexer::measure_persisted_change(
+                &previous,&previous_options,&previous_inputs,capture)? else { return Ok(None); };
             let root=Path::new(&self.workspace_root);
             let mut measured=vec![];
             for file in &capture.files {
-                if selected_path.as_deref()==Some(&file.path) {
-                    // A previously failed/partial source cannot be transferred as a
-                    // successful local proof, even if the changed token is body-only.
-                    let previous_file=previous.iter().find(|old|old.path==file.path)
-                        .context("prior local source absent")?;
-                    let old=self.selected_reusable_native(db,&selected,previous_file).context("incompatible_index: prior native witness invalid")?;
-                    if old.coverage.state!="complete" { return Ok(None); }
+                if selected_paths.contains(&file.path) {
                     let changed=native_evidence::measure_captured_document(
                         capture,root,self.root_id(),&file.path,cancel, |_| {})?;
-                    if changed.coverage.state!="complete" { return Ok(None); }
                     measured.push(changed);
                 } else {
                     measured.push(self.selected_reusable_native(db,&selected,file).context("incompatible_index: prior native witness invalid")?);
@@ -12803,6 +12713,7 @@ impl Store {
         &self,
         graph: &Graph,
         prepared: &LocalPrepared,
+        rows: &BTreeMap<&str, PublicationRows<'_>>,
     ) -> Result<PreflightReuse> {
         self.with_prior_publication_snapshot(|db| {
             let selected = ReadRevision::current(db)?;
@@ -12815,10 +12726,6 @@ impl Store {
                 .iter()
                 .map(|file| (file.path.as_str(), file))
                 .collect();
-            selected_ensure!(
-                files.len() == prepared.prior_ids.len(),
-                "incompatible_index: local manifest inventory changed"
-            );
             let mut families = BTreeMap::new();
             let mut existing_ids = BTreeMap::new();
             let mut count = 0;
@@ -12866,7 +12773,16 @@ impl Store {
                         && Some(old.class_id.as_str()) == class_id.as_deref(),
                     "incompatible_index: local selected manifest changed"
                 );
-                let file = files.get(path.as_str()).context("local source missing")?;
+                let Some(file) = files.get(path.as_str()) else {
+                    selected_ensure!(
+                        prepared.removed_paths.contains(&path),
+                        "incompatible_index: unrecorded local removal"
+                    );
+                    continue;
+                };
+                if prepared.changed_paths.contains(&path) {
+                    continue;
+                }
                 selected_ensure!(
                     file.language == language
                         && producer_id == prepared.native.producer.id
@@ -12879,11 +12795,16 @@ impl Store {
                             )?,
                     "incompatible_index: local producer or extraction context changed"
                 );
-                if path != prepared.changed_path {
+                {
                     selected_ensure!(
                         hash == file.hash,
                         "incompatible_index: reusable captured content hash differs"
                     );
+                    let grouped = rows
+                        .get(path.as_str())
+                        .context("local class projection rows missing")?;
+                    let (next_class_id, next_class_hash) =
+                        v8_class_projection(&old.graph_id, grouped);
                     selected_ensure!(
                         families
                             .insert(
@@ -12891,7 +12812,7 @@ impl Store {
                                 ReusedFamilies {
                                     native: true,
                                     graph: true,
-                                    class: true,
+                                    class: next_class_hash == old.class_hash,
                                 }
                             )
                             .is_none(),
@@ -12902,15 +12823,16 @@ impl Store {
                         V8DocumentProjection {
                             version_id,
                             graph_id,
-                            class_id: old.class_id.clone(),
+                            class_id: next_class_id,
                             graph_hash: old.graph_hash.clone(),
-                            class_hash: old.class_hash.clone(),
+                            class_hash: next_class_hash,
                         },
                     );
                 }
             }
             selected_ensure!(
-                count == files.len() && existing_ids.len() + 1 == count,
+                count == prepared.prior_ids.len()
+                    && existing_ids.len() + prepared.changed_paths.len() == files.len(),
                 "incompatible_index: local selected head incomplete"
             );
             Ok(PreflightReuse {
@@ -13406,7 +13328,33 @@ impl Store {
             }
             let extractions: BTreeMap<String, crate::classes::FileExtraction> =
                 if let Some(prepared) = local {
-                    if prepared.prior_extractions.len() != class_paths.len() {
+                    let mut extractions: BTreeMap<_, _> = prepared
+                        .prior_extractions
+                        .iter()
+                        .filter(|(path, _)| {
+                            class_paths.contains(path.as_str())
+                                && !prepared.changed_paths.contains(path.as_str())
+                        })
+                        .map(|(path, extraction)| (path.clone(), extraction.clone()))
+                        .collect();
+                    for file in graph.files.iter().filter(|file| {
+                        prepared.changed_paths.contains(&file.path)
+                            && matches!(file.language.as_str(), "java" | "python")
+                    }) {
+                        extractions.insert(
+                            file.path.clone(),
+                            crate::classes::FileExtraction::extract_file(
+                                file,
+                                class_symbols
+                                    .get(file.path.as_str())
+                                    .map(Vec::as_slice)
+                                    .unwrap_or(&[]),
+                                cancel,
+                                limits,
+                            )?,
+                        );
+                    }
+                    if extractions.len() != class_paths.len() {
                         return Err(self.report_index_failure(
                             SelectedIntegrity(
                                 "incompatible_index: local class extraction inventory incomplete"
@@ -13414,29 +13362,6 @@ impl Store {
                             )
                             .into(),
                         ));
-                    }
-                    let mut extractions = prepared.prior_extractions.clone();
-                    if let Some(file) = graph.files.iter().find(|f| {
-                        f.path == prepared.changed_path
-                            && matches!(f.language.as_str(), "java" | "python")
-                    }) {
-                        let extracted = crate::classes::FileExtraction::extract_file(
-                            file,
-                            class_symbols
-                                .get(file.path.as_str())
-                                .map(Vec::as_slice)
-                                .unwrap_or(&[]),
-                            cancel,
-                            limits,
-                        )?;
-                        if extractions.insert(file.path.clone(), extracted).is_none() {
-                            return Err(self.report_index_failure(
-                                SelectedIntegrity(
-                                    "incompatible_index: prior class extraction absent".into(),
-                                )
-                                .into(),
-                            ));
-                        }
                     }
                     extractions
                 } else {
@@ -13461,13 +13386,6 @@ impl Store {
                         .collect::<Result<_>>()?
                 };
             let classes = Self::compose_selected_class_catalog(graph, &extractions, limits)?;
-            if let Some(prepared) = local {
-                ensure!(
-                    classes.warnings == prepared.old_class_warnings
-                        && classes.truncated == prepared.old_class_truncated,
-                    "incompatible_index: local class catalog differs from trusted head"
-                );
-            }
             (stats, classes, extractions)
         };
         // The public read_status guard has this exact singleton JSON ceiling.
@@ -13521,7 +13439,7 @@ impl Store {
                     matches!(target, PublicationTarget::Live),
                     "local evidence cannot use a private stage"
                 );
-                self.preflight_local_reuse(graph, prepared)?
+                self.preflight_local_reuse(graph, prepared, &rows)?
             } else if let Some(spool) = stream {
                 self.preflight_stream_reuse(spool, &stream_order, &classes, &expected, cancel)?
             } else if matches!(target, PublicationTarget::Live) {
@@ -15851,7 +15769,7 @@ impl Store {
         let sql = format!(
             "SELECT length(d.source_bytes),length(CAST(r.source_set_id AS BLOB)),length(CAST(d.language AS BLOB)),length(CAST(d.path AS BLOB)),length(CAST(d.content_hash AS BLOB)) {selected_sql} LIMIT 2"
         );
-        let mut stmt = db.prepare(&sql)?;
+        let mut stmt = db.prepare_cached(&sql)?;
         let mut sizes = stmt.query(params![path, selected.key])?;
         let mut present = false;
         while let Some(row) = sizes.next()? {
@@ -15869,6 +15787,8 @@ impl Store {
                 "incompatible_index: selected source byte budget exceeded"
             );
         }
+        drop(sizes);
+        drop(stmt);
         if !present {
             let declared: bool = db.query_row(
                 "SELECT EXISTS(SELECT 1 FROM revision_documents WHERE revision_id=?1 AND path=?2)",
@@ -15885,33 +15805,34 @@ impl Store {
             "SELECT r.source_set_id,d.language,d.path,d.content_hash,d.byte_length,d.source_bytes {selected_sql}"
         );
         let checked: Result<(String, String, String, String, Vec<u8>)> =
-            db.query_row(&sql, params![path, selected.key], |r| {
-                Ok((|| -> Result<_> {
-                    use sha2::{Digest, Sha256};
-                    let source_set: String = r.get(0)?;
-                    let language: String = r.get(1)?;
-                    let stored_path: String = r.get(2)?;
-                    let hash: String = r.get(3)?;
-                    let length: i64 = r.get(4)?;
-                    let raw = r.get_ref(5)?.as_blob().context(SelectedIntegrity(
-                        "incompatible_index: stored source is not a BLOB".into(),
-                    ))?;
-                    let mut digest = Sha256::new();
-                    for chunk in raw.chunks(64 * 1024) {
+            db.prepare_cached(&sql)?
+                .query_row(params![path, selected.key], |r| {
+                    Ok((|| -> Result<_> {
+                        use sha2::{Digest, Sha256};
+                        let source_set: String = r.get(0)?;
+                        let language: String = r.get(1)?;
+                        let stored_path: String = r.get(2)?;
+                        let hash: String = r.get(3)?;
+                        let length: i64 = r.get(4)?;
+                        let raw = r.get_ref(5)?.as_blob().context(SelectedIntegrity(
+                            "incompatible_index: stored source is not a BLOB".into(),
+                        ))?;
+                        let mut digest = Sha256::new();
+                        for chunk in raw.chunks(64 * 1024) {
+                            optional_hint_check(progress)?;
+                            digest.update(chunk);
+                        }
                         optional_hint_check(progress)?;
-                        digest.update(chunk);
-                    }
-                    optional_hint_check(progress)?;
-                    selected_ensure!(
-                        source_set.starts_with("source-set:v1:")
-                            && stored_path == path
-                            && length == raw.len() as i64
-                            && hash == hex::encode(digest.finalize()),
-                        "incompatible_index: source hash mismatch"
-                    );
-                    Ok((source_set, language, stored_path, hash, raw.to_vec()))
-                })())
-            })?;
+                        selected_ensure!(
+                            source_set.starts_with("source-set:v1:")
+                                && stored_path == path
+                                && length == raw.len() as i64
+                                && hash == hex::encode(digest.finalize()),
+                            "incompatible_index: source hash mismatch"
+                        );
+                        Ok((source_set, language, stored_path, hash, raw.to_vec()))
+                    })())
+                })?;
         let (_source_set, language, stored_path, hash, bytes) = checked?;
         optional_hint_check(progress)?;
         let file = SourceFile {
@@ -16811,7 +16732,7 @@ impl Store {
 #[test]
 fn selected_ancillary_budget_matches_main_text_key_bytes() {
     let db = Connection::open_in_memory().unwrap();
-    db.execute_batch(CACHE_SCHEMA_V19).unwrap();
+    db.execute_batch(CACHE_SCHEMA_V20).unwrap();
     // The aggregate needs only synthetic child rows; FK behavior is covered by
     // publication/retention tests, not this isolated budget-SQL fixture.
     db.pragma_update(None, "foreign_keys", "OFF").unwrap();
@@ -16947,7 +16868,7 @@ fn selected_ancillary_budget_matches_main_text_key_bytes() {
 #[test]
 fn immutable_reference_slot_rejects_changed_payload() {
     let db = Connection::open_in_memory().unwrap();
-    db.execute_batch(CACHE_SCHEMA_V19).unwrap();
+    db.execute_batch(CACHE_SCHEMA_V20).unwrap();
     db.pragma_update(None, "foreign_keys", "OFF").unwrap();
     let owner = [0x11u8; 16];
     let original = [0x22u8; 16];
