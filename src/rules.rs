@@ -600,7 +600,14 @@ fn native_evidence(d: &Declaration) -> Value {
 fn glob_matches(patterns: &[GlobSet], path: &str) -> bool {
     patterns.is_empty() || patterns.iter().any(|p| p.is_match(path))
 }
-fn layer_for<'a>(config: &'a Config, path: &str) -> Result<Option<&'a str>> {
+/// Browser-only authored inventory; does not change the closed rules payload.
+pub fn view_layers(config: &Config) -> Vec<Value> {
+    config.layers.iter().map(|(name, layer)| {
+        json!({"name": name, "order": layer.order, "shared": layer.order.is_none()})
+    }).collect()
+}
+
+pub(crate) fn layer_for<'a>(config: &'a Config, path: &str) -> Result<Option<&'a str>> {
     let mut selected = None;
     for (name, layer) in &config.layers {
         if layer.patterns.iter().any(|p| p.is_match(path)) {

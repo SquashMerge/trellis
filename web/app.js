@@ -55,9 +55,9 @@ function selectedUrl(path, method, root) {
   }
   const suffix = path.startsWith("/api/") ? path.slice(5) : "";
   const route = suffix.split("?", 1)[0];
-  const simple = new Set(["status", "git", "git/diff", "metrics", "index", "tree", "files", "methods", "symbols", "syntax-matches", "sequence", "classes", "class-diagram", "navigation", "source", "jobs/current", "dependencies", "dependencies/refresh", "dependencies/symbols", "dependencies/source", "rust-sources", "rust-sources/tree", "rust-sources/file"]);
+  const simple = new Set(["status", "git", "git/diff", "metrics", "architecture", "index", "tree", "files", "methods", "symbols", "syntax-matches", "sequence", "classes", "class-diagram", "navigation", "source", "jobs/current", "dependencies", "dependencies/refresh", "dependencies/symbols", "dependencies/source", "rust-sources", "rust-sources/tree", "rust-sources/file"]);
   if (route === "syntax-matches" && method !== "POST") throw new Error("Syntax match requests must be POST.");
-  if (["git", "git/diff", "metrics", "symbols"].includes(route) && method !== "GET") throw new Error("Read-only API requests must be GET.");
+  if (["git", "git/diff", "metrics", "architecture", "symbols"].includes(route) && method !== "GET") throw new Error("Read-only API requests must be GET.");
   const item = /^jobs\/[^/?]+(?:\/cancel)?$/.test(route);
   if (!simple.has(route) && !item || /[#\s]/.test(suffix) || suffix.includes("//")) throw new Error("Unknown checkout API route.");
   if (!root || !uniqueSelectableRoot(root)) throw new Error("Choose an available checkout first.");
@@ -94,6 +94,7 @@ async function api(path, method = "GET", body, callerCurrent = () => true) {
     error.status = response.status;
     error.code = data?.error?.code;
     error.reason = data?.error?.reason;
+    if (error.code === "invalid_rules") error.diagnostic = data.error;
     error.workspaceRoot = response.headers?.get?.("X-Trellis-Workspace") || null;
     if (error.status === 401 || error.status === 403) disconnect(`Authentication failed (${error.code || error.status}). Connect with a daemon token again.`);
     else if (root && error.code === "workspace_selection_failed") invalidateSelection("Checkout identity changed. Choose an available checkout again.");
@@ -182,7 +183,11 @@ async function refreshStatus(followup = false) {
   window.TrellisShell?.updateWorkspace(nextPin ? status : null);
   $("catching-up").hidden = data.catchingUp !== true || !nextPin;
   renderCheckoutList();
-  if (browseChanged && nextPin) { void viewerMetrics?.refresh(); await loadTreeRoot(); }
+  if (browseChanged && nextPin) {
+    void viewerMetrics?.refresh();
+    if (section === "diagrams" && !$("architecture-panel").hidden) void architecture?.refresh();
+    await loadTreeRoot();
+  }
   if (serial !== statusSerial || session !== epoch || status !== data) return;
   const stats = status.stats || {};
   $("status").textContent = `${status.workspaceRoot} · ${status.revision ? `Revision ${IndexPin.label(status.revision)}` : "Index not ready"} · ${stats.files ?? 0} files · ${stats.symbols ?? 0} symbols · ${stats.calls ?? 0} calls · Semantic proof unavailable · SCIP (if present): display only · Indexed: ${status.indexedAt ? new Date(Number(status.indexedAt)).toLocaleString() : "not yet"}`;
@@ -541,7 +546,8 @@ $("refresh").addEventListener("click", () => perform(async () => {
       else { await selectFilesFile(file); if (basis === "working") await setFilesBasis("working"); }
     }
   }
-  if (section !== "files" && selectedMethod) await loadSequence();
+  if (section !== "files" && !$("architecture-panel").hidden) await architecture?.refresh();
+  else if (section !== "files" && selectedMethod) await loadSequence();
   schedulePoll();
 }, $("refresh")));
 function activeJob(value) { return ["queued", "running"].includes(value.state); }
@@ -605,6 +611,7 @@ async function setSection(name) {
     const target = name === "files" ? filesBasis === "working" ? $("files-diff") : workspaceSource ? $("source") : $("file-filter") : $("view-sequence");
     target?.focus(); return;
   }
+  architecture?.reset();
   section = name; sectionSerial++; sourceSerial++; filesDiffSerial++;
   for (const state of fileStates.values()) if (state.outlineLoading) {
     state.serial++; state.outlineLoading = false; state.outlineError = "Symbol read interrupted. Retry to read this indexed outline.";
@@ -617,7 +624,8 @@ async function setSection(name) {
     renderFiles();
     const cached = workspaceSource, surface = sectionSerial, session = epoch, root = selectedRootKey, sourceAtStart = sourceSerial;
     const current = () => section === "diagrams" && surface === sectionSerial && session === epoch && root === selectedRootKey && sourceAtStart === sourceSerial && IndexPin.equal(cached?.data.revision, status?.revision);
-    if (diagramSequence && selectedMethod?.id === diagramSequence.seed.id) await loadSequence(diagramSequence, true);
+    if (!$("architecture-panel").hidden) await architecture?.refresh();
+    else if (diagramSequence && selectedMethod?.id === diagramSequence.seed.id) await loadSequence(diagramSequence, true);
     if (cached && current()) paintCachedSource(cached.data, cached.range, current);
     return;
   }
@@ -841,6 +849,7 @@ const directories = new Map();
 function clearBrowse(message = "Expand a file and select a method.") {
   clearFilesEvidence();
   window.TrellisClasses?.reset();
+  architecture?.reset();
   if ($("method-class")) $("method-class").disabled = true;
   window.TrellisShell?.resetInspector();
   if ($("sequence-warning-count")) $("sequence-warning-count").textContent = "0";
@@ -1102,7 +1111,19 @@ const viewerMetrics = window.TrellisMetrics?.create({
   onConflict: pin => unexpectedPair("Index changed. Refresh status before inspecting metrics.", pin),
   onChange: () => renderFiles(),
 });
-window.TrellisShell?.setInspectorClearCallback?.(() => viewerMetrics?.clearInspection());
+const architecture = window.TrellisArchitecture?.create({
+  request: (path, current) => api(path, "GET", undefined, current),
+  context: () => ({rootKey:selectedRootKey, session:epoch, pin:status?.revision}),
+  readSource: (site, pin, current) => perform(() => showCachedSource(site.path, site.range, pin, current)),
+  onConflict: () => unexpectedPair("Architecture snapshot changed. Refresh status before reopening Architecture."),
+  onInspect: () => { viewerMetrics?.clearInspection(); clearSource(); },
+});
+window.TrellisShell?.setViewCallback?.(name => {
+  architecture?.clearInspection();
+  if (name === "architecture" && section === "diagrams") void architecture?.refresh();
+  else architecture?.reset();
+});
+window.TrellisShell?.setInspectorClearCallback?.(() => { viewerMetrics?.clearInspection(); architecture?.clearInspection(); });
 function metricDirectorySelection(path) {
   if (!treeRoot || !indexedWorkspace) return null;
   const absolute = `${treeRoot.replace(/\/$/, "")}${path ? "/" + path : ""}`;
@@ -1111,6 +1132,7 @@ function metricDirectorySelection(path) {
   return relative == null ? null : {scope:"directory", path:relative};
 }
 function inspectTreeSelection(selection) {
+  architecture?.clearInspection();
   if (selection) void viewerMetrics?.inspect(selection);
   else viewerMetrics?.clearInspection();
 }
@@ -1599,6 +1621,7 @@ $("dependency-next")?.addEventListener("click", () => { if (!$("dependency-next"
 // a sequence participant's type or call a provider.
 function classLanguage(path) { return /\.(?:java|py)$/i.test(path || ""); }
 async function openClasses(options = {}) {
+  architecture?.clearInspection();
   if (!token || !status || !window.TrellisClasses) return;
   viewerMetrics?.clearInspection();
   clearSource(); window.TrellisShell?.resetInspector();

@@ -6,8 +6,8 @@
   const hide = (id, value) => { if (get(id)) get(id).hidden = value; };
   const make = (tag, value) => { const node = document.createElement(tag); if (value !== undefined) node.textContent = value; return node; };
   const describe = value => typeof value === "string" ? value : JSON.stringify(value, null, 2);
-  const views = {sequence:"sequence-panel", classes:"classes-panel", libraries:"dependency-library"};
-  let openSource = null, sourceReturnFocus = null, activeView = "sequence", inspectorClearCallback = null, sectionCallback = null;
+  const views = {architecture:"architecture-panel", sequence:"sequence-panel", classes:"classes-panel", libraries:"dependency-library"};
+  let openSource = null, sourceReturnFocus = null, activeView = "sequence", inspectorClearCallback = null, sectionCallback = null, viewCallback = null;
   function setSection(name) {
     const files = name === "files";
     window.TrellisNavigation?.reset(); window.TrellisClasses?.closeContextMenu?.();
@@ -16,10 +16,11 @@
     drawer("explorer", false); drawer("inspector", false);
     get("section-files")?.setAttribute("aria-current", files ? "page" : "false");
     get("section-diagrams")?.setAttribute("aria-current", files ? "false" : "page");
-    for (const id of ["diagram-tabs", "diagram-metrics"]) hide(id, files);
+    hide("diagram-tabs", files);
+    hide("diagram-metrics", files || activeView === "architecture");
     for (const [key, panel] of Object.entries(views)) hide(panel, files || key !== activeView);
     hide("files-inspector", !files); hide("files-source-toolbar", !files);
-    for (const id of ["inspector-empty", "inspector-content", "metric-inspector"]) {
+    for (const id of ["inspector-empty", "inspector-content", "metric-inspector", "architecture-inspector"]) {
       if (files) hide(id, true);
     }
     hide("inspector-clear", files);
@@ -27,7 +28,7 @@
       hide("source-dock", false); hide("workspace-source-panel", false); hide("library-source-panel", true);
       get("file-filter")?.focus();
     } else {
-      hide("inspector-empty", !get("inspector-content")?.hidden || !get("metric-inspector")?.hidden);
+      hide("inspector-empty", !get("inspector-content")?.hidden || !get("metric-inspector")?.hidden || !get("architecture-inspector")?.hidden);
       get(`view-${activeView}`)?.focus();
     }
   }
@@ -51,6 +52,7 @@
     if (get("inspector-clear")) get("inspector-clear").disabled = !!get("inspector-content")?.hidden;
   }
   function showMetricInspector() {
+    clearArchitectureInspector();
     openSource = null;
     hide("inspector-empty", true); hide("inspector-content", true);
     if (get("inspector-open-source")) get("inspector-open-source").disabled = true;
@@ -59,6 +61,26 @@
     if (get("inspector-clear")) get("inspector-clear").disabled = false;
     drawer("inspector", true);
   }
+  function clearArchitectureInspector() {
+    const wasOpen = get("architecture-inspector") && !get("architecture-inspector").hidden;
+    hide("architecture-inspector", true);
+    if (wasOpen) {
+      drawer("inspector", false);
+      hide("inspector-empty", document.body.classList.contains("files-section"));
+      if (get("inspector-clear")) get("inspector-clear").disabled = true;
+    }
+    get("architecture-inspector-title")?.replaceChildren();
+    get("architecture-inspector-content")?.replaceChildren();
+    document.body.classList.remove("architecture-inspector-active");
+  }
+  function showArchitectureInspector() {
+    resetInspector();
+    hide("inspector-empty", true); hide("architecture-inspector", false);
+    document.body.classList.add("architecture-inspector-active");
+    if (get("inspector-clear")) get("inspector-clear").disabled = false;
+    drawer("inspector", true);
+  }
+  function setViewCallback(callback) { viewCallback = callback; }
   function setInspectorClearCallback(callback) {
     inspectorClearCallback = typeof callback === "function" ? callback : null;
   }
@@ -71,15 +93,17 @@
     if (!Object.hasOwn(views, name)) return;
     if (document.body.classList.contains("files-section")) showDiagrams();
     activeView = name;
+    hide("diagram-metrics", name === "architecture");
     document.body.classList.toggle("classes-view", name === "classes");
     window.TrellisClasses?.closeContextMenu?.();
-    if (name === "sequence" || name === "classes") drawer("explorer", false);
+    if (name === "sequence" || name === "classes" || name === "architecture") drawer("explorer", false);
     for (const [key, panel] of Object.entries(views)) {
       hide(panel, key !== name);
       const tab = get(`view-${key}`);
       tab?.setAttribute("aria-selected", String(key === name));
       if (tab) tab.tabIndex = key === name ? 0 : -1;
     }
+    viewCallback?.(name);
   }
   function showSource(name) {
     if (!["workspace", "library"].includes(name)) return;
@@ -123,6 +147,7 @@
     });
   }
   function resetInspector() {
+    clearArchitectureInspector();
     clearMetricInspector();
     openSource = null;
     drawer("inspector", false);
@@ -237,6 +262,6 @@
     else if (mobile && document.body.classList.contains("explorer-open")) { drawer("explorer", false); get("explorer-toggle")?.focus(); }
     else if (get("source-dock") && !get("source-dock").hidden) closeSource();
   });
-  window.TrellisShell = {setSection, setSectionCallback, setConnected, updateCheckout, formatGit, updateWorkspace, showView, showSource, closeSource, showFiles, showDiagrams, showMetricInspector, clearMetricInspector, setInspectorClearCallback, selectStep, resetInspector, reset};
+  window.TrellisShell = {showArchitectureInspector, clearArchitectureInspector, setViewCallback, setSection, setSectionCallback, setConnected, updateCheckout, formatGit, updateWorkspace, showView, showSource, closeSource, showFiles, showDiagrams, showMetricInspector, clearMetricInspector, setInspectorClearCallback, selectStep, resetInspector, reset};
   reset();
 })();

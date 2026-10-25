@@ -43,9 +43,23 @@ const view=(steps=[])=>({revision:{indexGeneration:'12345678-1234-4123-8123-1234
 const response=data=>({ok:true,status:200,json:async()=>data});
 const key=(element,value)=>{let prevented=false;element.listeners.keydown({key:value,preventDefault(){prevented=true;}});return prevented;};
 
-test("three workspace tabs have roving keyboard focus and never request source",()=>{
+test("Architecture owns its metric controls across view and Files transitions", () => {
+  const h = harness();
+  h.shell.showView("architecture");
+  assert.equal(h.get("diagram-metrics").hidden, true);
+  h.shell.setSection("files");
+  h.shell.setSection("diagrams");
+  assert.equal(h.get("diagram-metrics").hidden, true);
+  h.shell.showView("sequence");
+  assert.equal(h.get("diagram-metrics").hidden, false);
+  h.shell.showView("classes");
+  assert.equal(h.get("diagram-metrics").hidden, false);
+  assert.deepEqual(h.requests, []);
+});
+
+test("four workspace tabs have roving keyboard focus and never request source",()=>{
   const h=harness();
-  assert.equal(h.get("sequence-panel").hidden,false);assert.equal(h.get("dependency-library").hidden,true);
+  assert.equal(h.get("sequence-panel").hidden,false);assert.equal(h.get("dependency-library").hidden,true);assert.equal(h.get("architecture-panel").hidden,true);
   assert.equal(key(h.get("view-sequence"),"ArrowRight"),true);
   assert.equal(h.get("view-classes").attrs["aria-selected"],"true");
   assert.equal(h.get("classes-panel").hidden,false);
@@ -54,21 +68,22 @@ test("three workspace tabs have roving keyboard focus and never request source",
   assert.equal(h.get("view-libraries").attrs["aria-selected"],"true");assert.equal(h.get("view-libraries").tabIndex,0);assert.equal(h.get("view-sequence").tabIndex,-1);
   assert.equal(h.get("dependency-library").hidden,false);assert.ok(h.get("view-libraries").focused);
   key(h.get("view-classes"),"End");assert.equal(h.get("dependency-library").hidden,false);
-  key(h.get("view-libraries"),"ArrowRight");assert.equal(h.get("sequence-panel").hidden,false);
-  key(h.get("view-sequence"),"ArrowLeft");assert.equal(h.get("dependency-library").hidden,false);
-  key(h.get("view-libraries"),"Home");assert.equal(h.get("sequence-panel").hidden,false);
+  key(h.get("view-libraries"),"ArrowRight");assert.equal(h.get("architecture-panel").hidden,false);assert.ok(h.get("view-architecture").focused);
+  key(h.get("view-architecture"),"ArrowRight");assert.equal(h.get("sequence-panel").hidden,false);
+  key(h.get("view-sequence"),"ArrowLeft");assert.equal(h.get("architecture-panel").hidden,false);
+  key(h.get("view-libraries"),"Home");assert.equal(h.get("architecture-panel").hidden,false);
   for (const name of ["tools", "terminal"]) h.shell.showView(name);
-  assert.equal(h.get("sequence-panel").hidden,false);
-  for (const name of ["sequence", "classes", "libraries"]) {
-    assert.equal(h.get(`view-${name}`).attrs["aria-selected"],String(name === "sequence"));
-    assert.equal(h.get(`view-${name}`).tabIndex,name === "sequence" ? 0 : -1);
+  assert.equal(h.get("architecture-panel").hidden,false);
+  for (const name of ["architecture", "sequence", "classes", "libraries"]) {
+    assert.equal(h.get(`view-${name}`).attrs["aria-selected"],String(name === "architecture"));
+    assert.equal(h.get(`view-${name}`).tabIndex,name === "architecture" ? 0 : -1);
   }
   assert.deepEqual(h.requests,[]);
 });
-test("workspace tabs have exactly three valid ARIA panel relationships",()=>{
+test("workspace tabs have exactly four valid ARIA panel relationships",()=>{
   const html=fs.readFileSync(path.join(__dirname,"../web/index.html"),"utf8");
   const tabs=[...html.matchAll(/<button id="view-([^"]+)" role="tab"[^>]*aria-controls="([^"]+)"/g)];
-  assert.deepEqual(tabs.map(match=>match[1]),["sequence","classes","libraries"]);
+  assert.deepEqual(tabs.map(match=>match[1]),["architecture","sequence","classes","libraries"]);
   for(const [,name,panel] of tabs) {
     assert.match(html,new RegExp(`<section id="${panel}"[^>]*role="tabpanel"[^>]*aria-labelledby="view-${name}"`));
   }

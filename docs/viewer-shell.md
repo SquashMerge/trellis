@@ -1,7 +1,9 @@
 # Viewer shell
 
 The Viewer has Diagrams and Files sections within one checkout/session frame. Diagrams keeps
-Sequence, Classes and Libraries and its collapsible source dock. Files is a primary cached-source
+Sequence, Architecture, Classes and Libraries and its collapsible source dock. Architecture shows
+authored layer bands over pinned structural-reference evidence; see the
+[Architecture contract](architecture-view.md) for counts, stored roles, metrics and limits. Files is a primary cached-source
 surface with a pinned indexed-file catalog, all-symbol outline and declaration evidence, as
 specified in the [Files contract](files-view.md). Section switching alone never chooses a file,
 reads source or starts indexing. Explicit indexed source reads remain cached and revision-bound.
