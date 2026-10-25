@@ -346,3 +346,981 @@ fn reference_and_call_roles_are_not_authorized_by_native_shape_alone() {
         assert_eq!(join.anchor.document.language, "javascript");
     }
 }
+
+type ScipSymbolFixture<'a> = (&'a str, i32, Vec<(&'a str, bool, bool)>);
+
+fn admitted_case(
+    language: &str,
+    source: &str,
+    occurrences: Vec<(usize, usize, &str, i32)>,
+    symbols: Vec<ScipSymbolFixture<'_>>,
+) -> (
+    tempfile::TempDir,
+    native::Artifact,
+    BTreeMap<native::DocumentKey, Vec<u8>>,
+    CapturedScipInventory,
+) {
+    admitted_case_with_calls(language, source, occurrences, symbols, &[])
+}
+fn admitted_case_with_calls(
+    language: &str,
+    source: &str,
+    occurrences: Vec<(usize, usize, &str, i32)>,
+    symbols: Vec<ScipSymbolFixture<'_>>,
+    semantic_calls: &[usize],
+) -> (
+    tempfile::TempDir,
+    native::Artifact,
+    BTreeMap<native::DocumentKey, Vec<u8>>,
+    CapturedScipInventory,
+) {
+    use protobuf::{EnumOrUnknown, Message};
+    use scip::types::{self};
+    let root = tempfile::tempdir().unwrap();
+    let physical = fs::canonicalize(root.path()).unwrap();
+    fs::create_dir(physical.join("src")).unwrap();
+    let (path, producer_name, encoding) = match language {
+        "java" => ("src/A.java", "scip-java", 2),
+        "javascript" => ("src/A.js", "scip-typescript", 2),
+        "python" => ("src/A.py", "scip-python", 2),
+        "rust" => ("src/A.rs", "rust-analyzer", 1),
+        _ => panic!("unsupported test language"),
+    };
+    fs::write(physical.join(path), source).unwrap();
+    let mut index = types::Index::new();
+    let mut document = types::Document::new();
+    document.language = language.into();
+    document.relative_path = path.into();
+    document.position_encoding = EnumOrUnknown::from_i32(encoding);
+    for (start, end, symbol, roles) in occurrences {
+        let mut occurrence = types::Occurrence::new();
+        let prefix = &source[..start];
+        let line = prefix.bytes().filter(|c| *c == b'\n').count();
+        let col = prefix.rsplit('\n').next().unwrap().encode_utf16().count();
+        let width = source[start..end].encode_utf16().count();
+        let col = if encoding == 1 {
+            prefix.rsplit('\n').next().unwrap().len()
+        } else {
+            col
+        };
+        let width = if encoding == 1 { end - start } else { width };
+        occurrence.range = vec![line as i32, col as i32, (col + width) as i32];
+        occurrence.symbol = symbol.into();
+        occurrence.symbol_roles = roles;
+        if semantic_calls.contains(&start) {
+            let close = source[end..].find(')').unwrap() + end + 1;
+            let enclosing_width = if encoding == 1 {
+                close - start
+            } else {
+                source[start..close].encode_utf16().count()
+            };
+            occurrence.enclosing_range =
+                vec![line as i32, col as i32, (col + enclosing_width) as i32];
+        }
+        occurrence.syntax_kind = EnumOrUnknown::from_i32(0);
+        document.occurrences.push(occurrence);
+    }
+    for (symbol, kind, relationships) in symbols {
+        let mut info = types::SymbolInformation::new();
+        info.symbol = symbol.into();
+        info.kind = EnumOrUnknown::from_i32(kind);
+        info.display_name = symbol.into();
+        for (other, reference, implementation) in relationships {
+            let mut edge = types::Relationship::new();
+            edge.symbol = other.into();
+            edge.is_reference = reference;
+            edge.is_implementation = implementation;
+            info.relationships.push(edge);
+        }
+        document.symbols.push(info);
+    }
+    index.documents.push(document);
+    let bytes = index.write_to_bytes().unwrap();
+    fs::write(physical.join("artifact.scip"), &bytes).unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let mut options = IndexOptions::new(physical.clone());
+    options.scip_path = Some(physical.join("artifact.scip"));
+    options.manifest_path = Some(physical.join("manifest.json"));
+    let first = Capture::admit(&options, &cancel, &|_| {}).unwrap();
+    let identity =
+        trellis::store::topology::WorkspaceIdentity::discover(Some(&physical), &physical).unwrap();
+    let first_native =
+        native::from_capture(&first, &physical, &identity.record_id, &cancel).unwrap();
+    let set = &first_native.source_set;
+    let rev = &first_native.revision;
+    let f = &first.files[0];
+    let doc = json!({"language":language,"relativePath":path,"contentHash":f.hash});
+    let manifest_hash = native_ids::digest(
+        b"",
+        &native_ids::canonical(
+            &json!([{"document":{"sourceSetId":set.id,"language":language,"path":path},"contentHash":f.hash}]),
+        ),
+    );
+    let profile: serde_json::Value = serde_json::from_str(include_str!(
+        "../docs/semantic-evidence/hardware/mac-mini-m5-pro-v1.json"
+    ))
+    .unwrap();
+    let producer = profile["semanticProducers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == producer_name)
+        .unwrap();
+    let manifest = json!({"formatVersion":1,"trustOrigin":"referenceProfile","completion":"complete","decoderVersion":"scip-0.10.0/CapturedScipFactV1/1","profileId":profile["profileId"],
+        "producer":{"name":producer["name"],"version":producer["version"],"executableHash":producer["executableHash"],"positionEncoding":encoding},
+        "sourceSet":{"id":set.id,"rootId":set.root_id,"languages":set.languages,"dependencies":set.dependencies},
+        "sourceRevision":rev.id,"sourceManifestHash":manifest_hash,
+        "components":{"toolchainHash":rev.toolchain_hash,"configHash":rev.config_hash,"dependencyHash":rev.dependency_hash},
+        "metadata":{"protocolVersion":0,"projectRoot":format!("file://{}",physical.display()),"textDocumentEncoding":1},
+        "sourceDocuments":[doc],"documents":[doc],"exclusions":[],
+        "artifacts":[{"kind":"scipBinary","path":"artifact.scip","hash":native_ids::digest(b"",&bytes),"language":language,"documents":[path]}]});
+    let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+    fs::write(physical.join("manifest.json"), &manifest_bytes).unwrap();
+    let capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
+    let selection = TrustedSelection {
+        expected_manifest_hash: native_ids::digest(b"", &manifest_bytes),
+        profile_id: "mac-mini-m5-pro-v1".into(),
+        producer_name: producer_name.into(),
+    };
+    let admission =
+        ReferenceProfileAdmission::from_trusted_selection(&capture, &selection, &cancel).unwrap();
+    let inventory = decode_reference_profile(&admission, &cancel).unwrap();
+    let native = native::from_capture(&capture, &physical, &identity.record_id, &cancel).unwrap();
+    let sources = capture
+        .files
+        .iter()
+        .map(|f| {
+            (
+                native::DocumentKey {
+                    source_set_id: native.revision.source_set_id.clone(),
+                    language: f.language.clone(),
+                    path: f.path.clone(),
+                },
+                f.text.as_bytes().to_vec(),
+            )
+        })
+        .collect();
+    (root, native, sources, inventory)
+}
+
+#[test]
+fn four_real_admitted_languages_measure_all_anchor_families() {
+    for (language, source, name) in [
+        ("java", "class A { void f() { f(); } }", "f"),
+        ("javascript", "function f(){ f(); }", "f"),
+        ("python", "def f():\n    f()\n", "f"),
+        ("rust", "fn f(){ f(); }", "f"),
+    ] {
+        let occurrence = source.rfind(name).unwrap();
+        let (_root, native, sources, inventory) = admitted_case(
+            language,
+            source,
+            vec![(occurrence, occurrence + 1, "external pkg f.", 0)],
+            vec![],
+        );
+        let key = native.revision.documents[0].key.clone();
+        let measured = MeasuredFacts::new(&native, &sources).unwrap();
+        assert!(
+            native.declarations.iter().any(|d| d.name_range.is_some()),
+            "{language}"
+        );
+        for declaration in native
+            .declarations
+            .iter()
+            .filter(|d| d.name_range.is_some())
+        {
+            let join = measured
+                .join(
+                    &key,
+                    declaration.name_range.clone().unwrap(),
+                    semantic::JoinKind::DeclarationName,
+                )
+                .unwrap();
+            assert!(
+                join.candidate_ids.contains(&declaration.syntax_id),
+                "{language}"
+            );
+        }
+        assert!(!native.calls.is_empty(), "{language}");
+        for call in &native.calls {
+            assert!(
+                measured
+                    .join(&key, call.range.clone(), semantic::JoinKind::Invocation)
+                    .unwrap()
+                    .candidate_ids
+                    .contains(&call.id),
+                "{language}"
+            );
+            if let Some(range) = &call.callee_range {
+                assert!(
+                    measured
+                        .join(&key, range.clone(), semantic::JoinKind::Callee)
+                        .unwrap()
+                        .candidate_ids
+                        .contains(&call.id),
+                    "{language}"
+                );
+            }
+        }
+        for reference in &native.references {
+            assert!(
+                measured
+                    .join(&key, reference.range.clone(), semantic::JoinKind::Reference)
+                    .unwrap()
+                    .candidate_ids
+                    .contains(&reference.id),
+                "{language}"
+            );
+        }
+        let output = join_inventory(
+            &inventory,
+            &native,
+            &sources,
+            if language == "rust" { 1 } else { 2 },
+        )
+        .unwrap();
+        assert!(
+            output
+                .joins
+                .iter()
+                .any(|(_, j)| j.anchor.kind == semantic::JoinKind::Reference
+                    && j.status == semantic::JoinStatus::Exact),
+            "{language}"
+        );
+        let reference = output
+            .references
+            .iter()
+            .find(|r| r.range.start == occurrence)
+            .expect("actual semantic reference");
+        let actual = native
+            .references
+            .iter()
+            .find(|r| r.id == reference.id)
+            .unwrap();
+        assert_eq!(
+            (
+                &reference.owner_syntax_id,
+                reference.ordinal,
+                &reference.spelling,
+                &reference.range
+            ),
+            (
+                &actual.owner_syntax_id,
+                actual.ordinal,
+                &actual.spelling,
+                &actual.range
+            ),
+            "{language} native identity"
+        );
+        assert_eq!(
+            reference.resolution,
+            semantic::Resolution::External,
+            "{language} explicit global target"
+        );
+        assert!(
+            !reference.roles.contains(&semantic::Role::Call),
+            "{language} no raw call assertion"
+        );
+    }
+}
+
+#[test]
+fn two_distinct_native_ids_are_ambiguous_but_repeated_raw_proof_is_not() {
+    let source = "function f(){ f(); }";
+    let offset = source.rfind('f').unwrap();
+    let (_root, mut native, sources, inventory) = admitted_case(
+        "javascript",
+        source,
+        vec![(offset, offset + 1, "external pkg f.", 0)],
+        vec![],
+    );
+    let doc = native.revision.documents[0].key.clone();
+    let r = native
+        .references
+        .iter()
+        .find(|r| r.range.start == offset)
+        .unwrap()
+        .clone();
+    let actual = MeasuredFacts::new(&native, &sources)
+        .unwrap()
+        .join(&doc, r.range.clone(), semantic::JoinKind::Reference)
+        .unwrap();
+    assert_eq!(actual.status, semantic::JoinStatus::Exact);
+    let mut other = r.clone();
+    other.id = native.calls[0].id.clone();
+    native.references.push(other);
+    let joined = MeasuredFacts::new(&native, &sources)
+        .unwrap()
+        .join(&doc, r.range.clone(), semantic::JoinKind::Reference)
+        .unwrap();
+    assert_eq!(joined.status, semantic::JoinStatus::Ambiguous);
+    assert_eq!(joined.candidate_ids.len(), 2);
+    let output = join_inventory(&inventory, &native, &sources, 2).unwrap();
+    assert!(
+        output.references.is_empty(),
+        "ambiguous source candidate cannot enrich reference"
+    );
+    assert!(
+        output
+            .joins
+            .iter()
+            .any(|(_, j)| j.anchor.kind == semantic::JoinKind::Reference
+                && j.status == semantic::JoinStatus::Ambiguous)
+    );
+}
+
+#[test]
+fn distinct_admitted_proofs_on_one_anchor_preserve_joins_and_ambiguity() {
+    let source = "function useIt(){ value; }";
+    let offset = source.find("value").unwrap();
+    let (_root, native, sources, inventory) = admitted_case(
+        "javascript",
+        source,
+        vec![
+            (offset, offset + 5, "external pkg A#", 0),
+            (offset, offset + 5, "external pkg B#", 0),
+        ],
+        vec![],
+    );
+    assert_eq!(
+        inventory
+            .claims
+            .iter()
+            .filter(|c| c.envelope.record_kind == "occurrence")
+            .count(),
+        2
+    );
+    let output = join_inventory(&inventory, &native, &sources, 2).unwrap();
+    let proofs: std::collections::BTreeSet<_> = output
+        .joins
+        .iter()
+        .filter(|(_, j)| {
+            j.anchor.kind == semantic::JoinKind::Reference
+                && j.status == semantic::JoinStatus::Exact
+        })
+        .map(|(p, _)| p.as_str())
+        .collect();
+    assert_eq!(
+        proofs.len(),
+        2,
+        "each distinct authenticated raw proof retains its own join"
+    );
+    assert_eq!(
+        output.references.len(),
+        1,
+        "one native reference identity selects one valid fact"
+    );
+    assert_eq!(
+        output.references[0].resolution,
+        semantic::Resolution::Ambiguous
+    );
+    assert_eq!(output.references[0].candidates.len(), 2);
+    assert!(proofs.contains(output.references[0].provenance_id.as_str()));
+}
+
+#[test]
+fn admitted_semantic_call_witness_controls_binding_and_role() {
+    let source = "function f(){ f(); }";
+    let offset = source.rfind('f').unwrap();
+    let (_root, native, sources, inventory) = admitted_case(
+        "javascript",
+        source,
+        vec![(offset, offset + 1, "external pkg f.", 0)],
+        vec![],
+    );
+    let output = join_inventory(&inventory, &native, &sources, 2).unwrap();
+    assert!(
+        output.call_bindings.is_empty(),
+        "plain reference is not semantic call"
+    );
+    assert!(
+        output
+            .references
+            .iter()
+            .all(|r| !r.roles.contains(&semantic::Role::Call))
+    );
+    let (_root, native, sources, inventory) = admitted_case_with_calls(
+        "javascript",
+        source,
+        vec![(offset, offset + 1, "external pkg f.", 8)],
+        vec![],
+        &[offset],
+    );
+    let output = join_inventory(&inventory, &native, &sources, 2).unwrap();
+    assert_eq!(
+        output.call_bindings.len(),
+        1,
+        "authenticated semantic call should bind exact native callee"
+    );
+    assert!(output.references[0].roles.contains(&semantic::Role::Call));
+}
+
+#[test]
+fn admitted_java_direct_class_and_external_type_are_source_backed() {
+    let source = "class Base {} class Child extends Base {} class Cat implements java.lang.Comparable<Cat> {}";
+    let at = |text: &str| {
+        let i = source.find(text).unwrap();
+        (i, i + text.len())
+    };
+    let child = at("Child");
+    let base_decl = at("Base");
+    let base_use = {
+        let i = source.rfind("Base").unwrap();
+        (i, i + 4)
+    };
+    let cat = at("Cat");
+    let comparable = at("Comparable");
+    let (_root, native, sources, inventory) = admitted_case(
+        "java",
+        source,
+        vec![
+            (base_decl.0, base_decl.1, "scip-java pkg Base#", 1),
+            (child.0, child.1, "scip-java pkg Child#", 1),
+            (base_use.0, base_use.1, "scip-java pkg Base#", 8),
+            (cat.0, cat.1, "scip-java pkg Cat#", 1),
+            (
+                comparable.0,
+                comparable.1,
+                "scip-java java/lang/ Comparable#",
+                8,
+            ),
+        ],
+        vec![
+            ("scip-java pkg Base#", 7, vec![]),
+            (
+                "scip-java pkg Child#",
+                7,
+                vec![("scip-java pkg Base#", true, false)],
+            ),
+            (
+                "scip-java pkg Cat#",
+                7,
+                vec![("scip-java java/lang/ Comparable#", true, true)],
+            ),
+        ],
+    );
+    let output = join_inventory(&inventory, &native, &sources, 2).unwrap();
+    assert!(
+        output
+            .type_relationships
+            .iter()
+            .any(|r| r.kind == semantic::RelationshipKind::Extends
+                && matches!(r.target, semantic::Target::Internal { .. })),
+        "local direct extends: {:#?}",
+        output.type_relationships
+    );
+    assert!(
+        output
+            .type_relationships
+            .iter()
+            .any(|r| r.kind == semantic::RelationshipKind::Implements
+                && matches!(r.target, semantic::Target::External { .. })),
+        "external direct implements: {:#?}",
+        output.type_relationships
+    );
+}
+
+#[test]
+fn admitted_java_direct_interface_enum_record_and_transitive_negative() {
+    let source = "interface I {} interface J extends I {} enum E implements I { A } record R() implements I {} class Base {} class Mid extends Base {} class Leaf extends Mid {}";
+    let mut occ = Vec::new();
+    for (name, symbol) in [
+        ("I", "scip-java pkg I#"),
+        ("J", "scip-java pkg J#"),
+        ("E", "scip-java pkg E#"),
+        ("R", "scip-java pkg R#"),
+        ("Base", "scip-java pkg Base#"),
+        ("Mid", "scip-java pkg Mid#"),
+        ("Leaf", "scip-java pkg Leaf#"),
+    ] {
+        let first = source
+            .find(&format!("{name} "))
+            .or_else(|| source.find(&format!("{name}()")))
+            .unwrap();
+        occ.push((first, first + name.len(), symbol, 1));
+    }
+    for (needle, symbol) in [
+        ("extends I", "scip-java pkg I#"),
+        ("implements I", "scip-java pkg I#"),
+        ("extends Base", "scip-java pkg Base#"),
+        ("extends Mid", "scip-java pkg Mid#"),
+    ] {
+        let mut start = 0;
+        while let Some(pos) = source[start..].find(needle) {
+            let at = start + pos + needle.len()
+                - symbol
+                    .rsplit(' ')
+                    .next()
+                    .unwrap()
+                    .trim_end_matches('#')
+                    .len();
+            let len = needle.rsplit(' ').next().unwrap().len();
+            occ.push((at, at + len, symbol, 8));
+            start = start + pos + needle.len();
+        }
+    }
+    let symbols = vec![
+        ("scip-java pkg I#", 21, vec![]),
+        (
+            "scip-java pkg J#",
+            21,
+            vec![("scip-java pkg I#", true, false)],
+        ),
+        (
+            "scip-java pkg E#",
+            11,
+            vec![
+                ("scip-java pkg I#", true, true),
+                ("scip-java java/lang/Enum#", true, false),
+            ],
+        ),
+        (
+            "scip-java pkg R#",
+            7,
+            vec![("scip-java pkg I#", true, true)],
+        ),
+        ("scip-java pkg Base#", 7, vec![]),
+        (
+            "scip-java pkg Mid#",
+            7,
+            vec![("scip-java pkg Base#", true, false)],
+        ),
+        (
+            "scip-java pkg Leaf#",
+            7,
+            vec![
+                ("scip-java pkg Mid#", true, false),
+                ("scip-java pkg Base#", true, false),
+            ],
+        ),
+    ];
+    let (_root, native, sources, inventory) = admitted_case("java", source, occ, symbols);
+    let output = join_inventory(&inventory, &native, &sources, 2).unwrap();
+    let names: Vec<_> = output
+        .type_relationships
+        .iter()
+        .map(|r| (r.kind, r.provenance_id.as_str()))
+        .collect();
+    assert_eq!(
+        names.len(),
+        6,
+        "direct J->I, E->I, E->Enum, R->I, Mid->Base and Leaf->Mid only: {names:?}"
+    );
+    assert_eq!(
+        names
+            .iter()
+            .filter(|(kind, _)| *kind == semantic::RelationshipKind::Implements)
+            .count(),
+        2
+    );
+    assert_eq!(
+        names
+            .iter()
+            .filter(|(kind, _)| *kind == semantic::RelationshipKind::Extends)
+            .count(),
+        4
+    );
+}
+
+#[test]
+fn admitted_java_local_forward_override_keeps_full_opaque_overload() {
+    let source = "class Base { void f(int x) {} void f(String x) {} } class Child extends Base { @Override void f(int x) {} }";
+    let at = |needle: &str| source.find(needle).unwrap();
+    let base = at("Base");
+    let child = at("Child");
+    let base_use = source.rfind("Base").unwrap();
+    let f1 = at("f(int");
+    let f2 = at("f(String");
+    let f3 = source.rfind("f(int").unwrap();
+    let b = "scip-java pkg Base#";
+    let c = "scip-java pkg Child#";
+    let first = "scip-java pkg Base#f(I).";
+    let other = "scip-java pkg Base#f(Ljava/lang/String;).";
+    let derived = "scip-java pkg Child#f(I).";
+    let (_root, native, sources, inventory) = admitted_case(
+        "java",
+        source,
+        vec![
+            (base, base + 4, b, 1),
+            (child, child + 5, c, 1),
+            (base_use, base_use + 4, b, 8),
+            (f1, f1 + 1, first, 1),
+            (f2, f2 + 1, other, 1),
+            (f3, f3 + 1, derived, 1),
+        ],
+        vec![
+            (b, 7, vec![]),
+            (c, 7, vec![(b, true, false)]),
+            (first, 26, vec![]),
+            (other, 26, vec![]),
+            (derived, 26, vec![(first, true, true), (other, true, true)]),
+        ],
+    );
+    let output = join_inventory(&inventory, &native, &sources, 2).unwrap();
+    let methods: Vec<_> = output
+        .type_relationships
+        .iter()
+        .filter(|r| r.kind == semantic::RelationshipKind::Overrides)
+        .collect();
+    assert_eq!(
+        methods.len(),
+        1,
+        "forward only, identical overload: {:?}; diagnostics {:?}",
+        methods,
+        output.diagnostics
+    );
+    assert!(matches!(
+        methods[0].target,
+        semantic::Target::Internal { .. }
+    ));
+}
+
+#[test]
+fn admitted_java_comparable_positive_and_implicit_object_partial() {
+    let source = "class Cat implements Comparable<Cat> { public int compareTo(Cat other) { return 0; } public String toString(){ return null; } }";
+    let at = |needle: &str| source.find(needle).unwrap();
+    let cat = at("Cat");
+    let comparable = at("Comparable");
+    let compare = at("compareTo");
+    let string = at("toString");
+    let cat_sym = "scip-java pkg Cat#";
+    let compare_sym = "scip-java pkg Cat#compareTo(Lpkg/Cat;).";
+    let comparable_sym = "scip-java java/lang/Comparable#";
+    let external_compare = "scip-java java/lang/Comparable#compareTo().";
+    let object_string = "scip-java java/lang/Object#toString().";
+    let (_root, native, sources, inventory) = admitted_case(
+        "java",
+        source,
+        vec![
+            (cat, cat + 3, cat_sym, 1),
+            (comparable, comparable + 10, comparable_sym, 8),
+            (compare, compare + 9, compare_sym, 1),
+            (string, string + 8, "scip-java pkg Cat#toString().", 1),
+        ],
+        vec![
+            (cat_sym, 7, vec![(comparable_sym, true, true)]),
+            (compare_sym, 26, vec![(external_compare, true, true)]),
+            (
+                "scip-java pkg Cat#toString().",
+                26,
+                vec![(object_string, true, true)],
+            ),
+        ],
+    );
+    let output = join_inventory(&inventory, &native, &sources, 2).unwrap();
+    let overrides: Vec<_> = output
+        .type_relationships
+        .iter()
+        .filter(|r| r.kind == semantic::RelationshipKind::Overrides)
+        .collect();
+    assert_eq!(
+        overrides.len(),
+        1,
+        "Comparable positive, Object not measurable: {:?}",
+        overrides
+    );
+    assert!(matches!(
+        overrides[0].target,
+        semantic::Target::External { .. }
+    ));
+    assert!(
+        output
+            .diagnostics
+            .values()
+            .any(|d| d.contains("unmeasurable_override_endpoint")),
+        "Object missing endpoint is partial"
+    );
+}
+
+#[test]
+fn admitted_script_direct_local_external_and_reverse_transitive_exclusion() {
+    for (language, source, classes, occ, edges) in [
+        (
+            "javascript",
+            "class Base {} class Mid extends Base {} class Leaf extends Mid {} class X extends Outside {}",
+            vec![
+                ("Base", "typescript pkg Base#"),
+                ("Mid", "typescript pkg Mid#"),
+                ("Leaf", "typescript pkg Leaf#"),
+                ("X", "typescript pkg X#"),
+            ],
+            vec![
+                ("Base", "typescript pkg Base#"),
+                ("Mid", "typescript pkg Mid#"),
+                ("Outside", "typescript ext Outside#"),
+            ],
+            vec![
+                ("typescript pkg Mid#", "typescript pkg Base#"),
+                ("typescript pkg Leaf#", "typescript pkg Mid#"),
+                ("typescript pkg Leaf#", "typescript pkg Base#"),
+                ("typescript pkg X#", "typescript ext Outside#"),
+            ],
+        ),
+        (
+            "python",
+            "class Base: pass\nclass Mid(Base): pass\nclass Leaf(Mid): pass\nclass X(Outside): pass\n",
+            vec![
+                ("Base", "python pkg Base#"),
+                ("Mid", "python pkg Mid#"),
+                ("Leaf", "python pkg Leaf#"),
+                ("X", "python pkg X#"),
+            ],
+            vec![
+                ("Base", "python pkg Base#"),
+                ("Mid", "python pkg Mid#"),
+                ("Outside", "python ext Outside#"),
+            ],
+            vec![
+                ("python pkg Mid#", "python pkg Base#"),
+                ("python pkg Leaf#", "python pkg Mid#"),
+                ("python pkg Leaf#", "python pkg Base#"),
+                ("python pkg X#", "python ext Outside#"),
+            ],
+        ),
+    ] {
+        let mut occurrences = Vec::new();
+        let mut symbols = Vec::new();
+        for (name, symbol) in classes {
+            let declaration = source.find(&format!("class {name}")).unwrap() + 6;
+            occurrences.push((declaration, declaration + name.len(), symbol, 1));
+            let relationships = edges
+                .iter()
+                .filter(|(a, _)| a == &symbol)
+                .map(|(_, b)| (*b, true, false))
+                .collect();
+            symbols.push((symbol, 7, relationships));
+        }
+        for (name, symbol) in occ {
+            let use_offset = source.rfind(name).unwrap();
+            occurrences.push((use_offset, use_offset + name.len(), symbol, 8));
+        }
+        let (_root, native, sources, inventory) =
+            admitted_case(language, source, occurrences, symbols);
+        let output = join_inventory(&inventory, &native, &sources, 2).unwrap();
+        assert_eq!(
+            output.type_relationships.len(),
+            3,
+            "{language} direct only: {:?}",
+            output.type_relationships
+        );
+        assert_eq!(
+            output
+                .type_relationships
+                .iter()
+                .filter(|r| matches!(r.target, semantic::Target::External { .. }))
+                .count(),
+            1,
+            "{language} external"
+        );
+    }
+}
+
+#[test]
+fn admitted_rust_impl_and_supertrait_without_raw_edges_never_fabricate() {
+    let source = "trait Parent {} trait Child: Parent {} struct S; impl Child for S {}";
+    let (_root, native, sources, inventory) = admitted_case("rust", source, vec![], vec![]);
+    assert!(
+        inventory
+            .claims
+            .iter()
+            .all(|c| c.envelope.record_kind != "relationship")
+    );
+    let output = join_inventory(&inventory, &native, &sources, 1).unwrap();
+    assert!(output.type_relationships.is_empty());
+}
+
+#[test]
+fn admitted_declaration_roles_and_local_unresolved_external_targets() {
+    let source = "class Local {} function useIt(){ Local; missing; }";
+    let declare = source.find("Local").unwrap();
+    let use_local = source.rfind("Local").unwrap();
+    let missing = source.find("missing").unwrap();
+    let (_root, native, sources, inventory) = admitted_case(
+        "javascript",
+        source,
+        vec![
+            (declare, declare + 5, "local 1", 1),
+            (use_local, use_local + 5, "local 1", 8),
+            (missing, missing + 7, "external pkg Missing#", 8),
+        ],
+        vec![("local 1", 7, vec![])],
+    );
+    let output = join_inventory(&inventory, &native, &sources, 2).unwrap();
+    let local = output
+        .references
+        .iter()
+        .find(|r| r.range.start == use_local)
+        .unwrap();
+    assert_eq!(local.resolution, semantic::Resolution::Resolved);
+    let external = output
+        .references
+        .iter()
+        .find(|r| r.range.start == missing)
+        .unwrap();
+    assert_eq!(external.resolution, semantic::Resolution::External);
+    assert!(
+        output
+            .references
+            .iter()
+            .any(|r| r.range.start == declare && r.roles.contains(&semantic::Role::Definition))
+    );
+}
+
+#[test]
+fn admitted_unresolved_local_reference_and_noncall_method_value() {
+    let source = "function f(){ f; missing; }";
+    let f_use = source.rfind('f').unwrap();
+    let missing = source.find("missing").unwrap();
+    let (_root, native, sources, inventory) = admitted_case(
+        "javascript",
+        source,
+        vec![
+            (f_use, f_use + 1, "local absent", 8),
+            (missing, missing + 7, "local absent2", 8),
+        ],
+        vec![],
+    );
+    let output = join_inventory(&inventory, &native, &sources, 2).unwrap();
+    assert!(
+        output
+            .references
+            .iter()
+            .all(|r| r.resolution == semantic::Resolution::Unresolved)
+    );
+    assert!(output.call_bindings.is_empty());
+    assert!(
+        output
+            .references
+            .iter()
+            .all(|r| !r.roles.contains(&semantic::Role::Call))
+    );
+}
+
+#[test]
+fn invocation_only_exact_join_can_bind_without_exact_callee() {
+    let source = "function f(){ f(); }";
+    let at = source.rfind('f').unwrap();
+    let (_root, mut native, sources, inventory) = admitted_case_with_calls(
+        "javascript",
+        source,
+        vec![(at, at + 1, "external pkg f.", 8)],
+        vec![],
+        &[at],
+    );
+    let call = native
+        .calls
+        .iter_mut()
+        .find(|c| c.callee_range.as_ref().is_some_and(|r| r.start == at))
+        .unwrap();
+    call.callee_range = None;
+    let call_id = call.id.clone();
+    let output = join_inventory(&inventory, &native, &sources, 2).unwrap();
+    assert!(
+        output
+            .joins
+            .iter()
+            .any(|(_, j)| j.anchor.kind == semantic::JoinKind::Invocation
+                && j.status == semantic::JoinStatus::Exact)
+    );
+    assert!(
+        output
+            .call_bindings
+            .iter()
+            .any(
+                |binding| binding.join.anchor.kind == semantic::JoinKind::Invocation
+                    && binding.call_id.as_ref() == Some(&call_id)
+            )
+    );
+}
+
+#[test]
+fn published_native_v9_capability_families_authorize_only_available_measurements() {
+    for (language, source) in [
+        ("java", "class A {}"),
+        ("javascript", "class A {}"),
+        ("python", "class A: pass\n"),
+        ("rust", "struct A;"),
+    ] {
+        let (_root, native, sources, _inventory) = admitted_case(language, source, vec![], vec![]);
+        let key = native.revision.documents[0].key.clone();
+        let report = native
+            .capability_reports
+            .iter()
+            .find(|r| r.document == key)
+            .unwrap();
+        for family in &report.families {
+            let measured = MeasuredFacts::new(&native, &sources).unwrap();
+            let probe = native::Range { start: 0, end: 1 };
+            let kind = match family.kind {
+                native::MeasurementKind::DeclarationName => semantic::JoinKind::DeclarationName,
+                native::MeasurementKind::Callee => semantic::JoinKind::Callee,
+                native::MeasurementKind::Invocation => semantic::JoinKind::Invocation,
+                native::MeasurementKind::Reference => semantic::JoinKind::Reference,
+            };
+            let result = measured.join(&key, probe, kind).unwrap();
+            assert_eq!(
+                result.status,
+                if family.available {
+                    semantic::JoinStatus::Unmatched
+                } else {
+                    semantic::JoinStatus::Unsupported
+                },
+                "{language}: {:?}",
+                family.kind
+            );
+        }
+    }
+}
+
+#[test]
+fn invocation_without_matching_reference_never_enriches_call() {
+    let source = "function f(){ f(); }";
+    let at = source.rfind('f').unwrap();
+    let (_root, mut native, sources, inventory) = admitted_case_with_calls(
+        "javascript",
+        source,
+        vec![(at, at + 1, "external pkg f.", 8)],
+        vec![],
+        &[at],
+    );
+    native.references.retain(|r| r.range.start != at);
+    let output = join_inventory(&inventory, &native, &sources, 2).unwrap();
+    assert!(output.call_bindings.is_empty());
+    assert!(output.references.is_empty());
+    assert!(
+        output
+            .joins
+            .iter()
+            .any(|(_, j)| j.anchor.kind == semantic::JoinKind::Invocation
+                && j.status == semantic::JoinStatus::Exact)
+    );
+}
+
+#[test]
+fn admitted_distinct_call_claims_reconcile_ambiguous_targets() {
+    let source = "function f(){ f(); }";
+    let at = source.rfind('f').unwrap();
+    let (_root, native, sources, inventory) = admitted_case_with_calls(
+        "javascript",
+        source,
+        vec![
+            (at, at + 1, "external pkg A.", 8),
+            (at, at + 1, "external pkg B.", 8),
+        ],
+        vec![],
+        &[at],
+    );
+    let output = join_inventory(&inventory, &native, &sources, 2).unwrap();
+    assert_eq!(output.call_bindings.len(), 2);
+    assert!(
+        output
+            .call_bindings
+            .iter()
+            .all(|b| b.resolution == semantic::Resolution::Ambiguous && b.candidates.len() == 2)
+    );
+    assert_eq!(output.references.len(), 1);
+    assert_eq!(
+        output.references[0].resolution,
+        semantic::Resolution::Ambiguous
+    );
+}

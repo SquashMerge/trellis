@@ -971,7 +971,12 @@ pub fn validate_evidence(
             ensure!(
                 native.calls.iter().any(|call| call.document == r.document
                     && call.owner_syntax_id == r.owner_syntax_id
-                    && call.callee_range.as_ref() == Some(&r.range)
+                    && call.range.start <= r.range.start
+                    && r.range.end <= call.range.end
+                    && call
+                        .callee_range
+                        .as_ref()
+                        .is_none_or(|callee| callee == &r.range)
                     && call.spelling.as_deref() == Some(&r.spelling)),
                 "call role without measured invocation"
             );

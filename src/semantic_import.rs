@@ -336,7 +336,6 @@ pub fn join_inventory(
     let mut type_uses: BTreeMap<(native::DocumentKey, usize, usize), BTreeSet<String>> =
         BTreeMap::new();
     let mut occurrences = Vec::new();
-    let mut occurrence_symbols = BTreeSet::new();
     for claim in &inventory.claims {
         inventory.lookup(
             &claim.captured_proof_id,
@@ -356,7 +355,6 @@ pub fn join_inventory(
                 .as_str()
                 .filter(|s| !s.is_empty())
                 .context("missing occurrence symbol")?;
-            occurrence_symbols.insert(scoped_key(symbol, &doc));
             let range = occurrence_range(claim, source, admitted_encoding)?;
             let roles = claim.envelope.raw["symbolRoles"]
                 .as_u64()
@@ -383,10 +381,7 @@ pub fn join_inventory(
                 let compatible = symbol_info
                     .and_then(|c| c.envelope.raw["kind"].as_i64())
                     .is_some_and(|kind| match candidate.kind.as_str() {
-                        "class" => kind == 7,
-                        "interface" => kind == 21,
-                        "enum" => kind == 11,
-                        "record" => kind == 7,
+                        "type" => matches!(kind, 7 | 11 | 21),
                         "method" => kind == 26,
                         _ => true,
                     });
@@ -454,12 +449,20 @@ pub fn join_inventory(
             provenance_id: claim.captured_proof_id.clone(),
         });
     }
+    let mut reference_claims: BTreeMap<String, Vec<(String, semantic::Target)>> = BTreeMap::new();
+    let mut call_reference_ids: BTreeMap<String, String> = BTreeMap::new();
     for (claim, doc, symbol, roles, binding, reference, call) in occurrences {
         let key = symbol_key(&symbol, &doc);
         let mut asserted = targets(&doc, &symbol);
         if asserted.is_empty()
             && key.scope == semantic::SymbolScope::Global
-            && !occurrence_symbols.contains(&scoped_key(&symbol, &doc))
+            && !inventory.claims.iter().any(|c| {
+                c.envelope.record_kind == "occurrence"
+                    && c.envelope.raw["symbol"].as_str() == Some(&symbol)
+                    && c.envelope.raw["symbolRoles"]
+                        .as_u64()
+                        .is_some_and(|roles| roles & 1 != 0)
+            })
             && !inventory.claims.iter().any(|c| {
                 c.envelope.record_kind == "symbolInformation"
                     && c.envelope.raw["symbol"].as_str() == Some(&symbol)
@@ -516,13 +519,18 @@ pub fn join_inventory(
                         && d.name.as_deref() == Some(&r.spelling)
                 });
             let is_call = roles & 1 == 0
+                && !claim.envelope.raw["enclosingRange"].is_null()
                 && native.calls.iter().any(|c| {
                     c.document == doc
                         && c.owner_syntax_id == r.owner_syntax_id
-                        && c.callee_range.as_ref() == Some(&r.range)
+                        && c.range.start <= r.range.start
+                        && r.range.end <= c.range.end
                         && c.spelling.as_deref() == Some(&r.spelling)
+                        && c.callee_range
+                            .as_ref()
+                            .is_none_or(|callee| callee == &r.range)
                 })
-                && call.status == semantic::JoinStatus::Exact;
+                && reference.status == semantic::JoinStatus::Exact;
             let mut assigned = BTreeSet::new();
             if declaration_site {
                 assigned.insert(semantic::Role::Definition);
@@ -541,6 +549,14 @@ pub fn join_inventory(
             }
             if declaration_site && roles & 2 != 0 && doc.language == "python" {
                 assigned.insert(semantic::Role::Alias);
+            }
+            if !assigned.is_empty() {
+                for target in resolved.iter().chain(candidates.iter()) {
+                    reference_claims
+                        .entry(r.id.clone())
+                        .or_default()
+                        .push((claim.captured_proof_id.clone(), target.clone()));
+                }
             }
             if !assigned.is_empty() && !out.references.iter().any(|prior| prior.id == r.id) {
                 out.references.push(semantic::Reference {
@@ -586,29 +602,42 @@ pub fn join_inventory(
                 .as_ref()
                 .is_some_and(|j| j.status == semantic::JoinStatus::Exact)
             {
-                invocation.unwrap()
+                invocation.as_ref().expect("exact invocation").clone()
             } else {
                 call.clone()
             };
             out.joins.push((claim.captured_proof_id.clone(), call));
             if candidate.status == semantic::JoinStatus::Exact
                 && reference.status == semantic::JoinStatus::Exact
+                && invocation.as_ref().is_some_and(|j| {
+                    j.status == semantic::JoinStatus::Exact
+                        && j.candidate_ids == candidate.candidate_ids
+                })
             {
                 let actual = native
                     .calls
                     .iter()
                     .find(|c| c.id == candidate.candidate_ids[0]);
                 if actual.is_some_and(|c| {
-                    c.callee_range.as_ref().is_some_and(|r| {
-                        let primary = &reference.anchor.range;
-                        r == primary
-                            && c.spelling.as_deref()
-                                == source
-                                    .get(r.start..r.end)
-                                    .and_then(|b| std::str::from_utf8(b).ok())
-                    })
-                }) && candidate.anchor.kind == semantic::JoinKind::Callee
-                {
+                    let primary = &reference.anchor.range;
+                    c.document == doc
+                        && c.range.start <= primary.start
+                        && primary.end <= c.range.end
+                        && c.callee_range.as_ref().is_none_or(|r| r == primary)
+                        && c.spelling.as_deref()
+                            == source
+                                .get(primary.start..primary.end)
+                                .and_then(|b| std::str::from_utf8(b).ok())
+                        && native.references.iter().any(|r| {
+                            r.id == reference.candidate_ids[0]
+                                && r.owner_syntax_id == c.owner_syntax_id
+                                && r.range == *primary
+                        })
+                }) {
+                    call_reference_ids.insert(
+                        claim.captured_proof_id.clone(),
+                        reference.candidate_ids[0].clone(),
+                    );
                     out.call_bindings.push(semantic::CallBinding {
                         call_id: Some(candidate.candidate_ids[0].clone()),
                         join: candidate,
@@ -625,6 +654,45 @@ pub fn join_inventory(
                     });
                 }
             }
+        }
+    }
+    for reference in &mut out.references {
+        let mut claims = reference_claims.remove(&reference.id).unwrap_or_default();
+        claims.sort_by(|a, b| a.0.cmp(&b.0));
+        if let Some((proof, _)) = claims.first() {
+            reference.provenance_id = proof.clone();
+        }
+        let mut targets: Vec<_> = claims.into_iter().map(|(_, target)| target).collect();
+        targets.sort_by_key(|target| {
+            native_ids::canonical(&serde_json::to_value(target).expect("serializable target"))
+        });
+        targets.dedup();
+        if targets.len() > 1 {
+            reference.resolution = semantic::Resolution::Ambiguous;
+            reference.declared_target = None;
+            reference.candidates = targets;
+        } else if let Some(target) = targets.pop() {
+            reference.resolution = if matches!(target, semantic::Target::Internal { .. }) {
+                semantic::Resolution::Resolved
+            } else {
+                semantic::Resolution::External
+            };
+            reference.declared_target = Some(target);
+            reference.candidates.clear();
+        }
+    }
+    for binding in &mut out.call_bindings {
+        if let Some(reference) = call_reference_ids
+            .get(&binding.provenance_id)
+            .and_then(|id| out.references.iter().find(|r| &r.id == id))
+        {
+            binding.resolution = reference.resolution;
+            binding.declared_target = reference.declared_target.clone();
+            binding.candidates = reference.candidates.clone();
+            binding.stale_target = reference
+                .declared_target
+                .as_ref()
+                .and_then(|t| matches!(t, semantic::Target::Internal { .. }).then_some(false));
         }
     }
     for (doc, bytes) in sources {
@@ -710,50 +778,72 @@ pub fn join_inventory(
                 else {
                     continue;
                 };
-                let source_type = native.declarations.iter().find(|d| {
-                    d.document == *doc
-                        && d.kind == "method"
-                        && d.name_range.is_some()
-                        && type_uses
-                            .get(&(
-                                doc.clone(),
-                                d.name_range.as_ref().unwrap().start,
-                                d.name_range.as_ref().unwrap().end,
-                            ))
-                            .is_some_and(|keys| keys.contains(source_symbol))
-                });
-                let Some(source_method) = source_type else {
+                let source_methods: Vec<_> = native
+                    .declarations
+                    .iter()
+                    .filter(|d| {
+                        d.document == *doc
+                            && d.kind == "method"
+                            && d.name_range.is_some()
+                            && type_uses
+                                .get(&(
+                                    doc.clone(),
+                                    d.name_range.as_ref().unwrap().start,
+                                    d.name_range.as_ref().unwrap().end,
+                                ))
+                                .is_some_and(|keys| keys.contains(source_symbol))
+                    })
+                    .collect();
+                let [source_method] = source_methods.as_slice() else {
+                    out.diagnostics
+                        .entry(doc.clone())
+                        .or_default()
+                        .insert("unmeasurable_override_endpoint".into());
                     continue;
                 };
                 let Some(source_target) = target(doc, source_symbol) else {
                     continue;
                 };
-                let target_method = native.declarations.iter().find(|d| {
-                    d.kind == "method"
-                        && d.name_range.is_some()
-                        && d.document.source_set_id == doc.source_set_id
-                        && type_uses
-                            .get(&(
-                                d.document.clone(),
-                                d.name_range.as_ref().unwrap().start,
-                                d.name_range.as_ref().unwrap().end,
-                            ))
-                            .is_some_and(|keys| keys.contains(target_symbol))
-                });
-                let source_owner = &source_method.ancestors;
-                let target_owner = target_method.map(|d| &d.ancestors);
-                let direct_owner = source_owner
-                    .last()
-                    .and_then(|key| key.name.as_ref())
-                    .and_then(|name| {
-                        native.declarations.iter().find(|d| {
-                            d.document == *doc && d.name.as_ref() == Some(name) && d.kind == "class"
-                        })
-                    });
-                let direct_identity =
-                    direct_owner.and_then(|owner| owner.name_range.as_ref().map(|r| (owner, r)));
-                let direct_base = direct_identity
-                    .and_then(|(_, r)| {
+                let target_methods: Vec<_> = native
+                    .declarations
+                    .iter()
+                    .filter(|d| {
+                        d.kind == "method"
+                            && d.name_range.is_some()
+                            && d.document.source_set_id == doc.source_set_id
+                            && type_uses
+                                .get(&(
+                                    d.document.clone(),
+                                    d.name_range.as_ref().unwrap().start,
+                                    d.name_range.as_ref().unwrap().end,
+                                ))
+                                .is_some_and(|keys| keys.contains(target_symbol))
+                    })
+                    .collect();
+                if target_methods.len() > 1 {
+                    out.diagnostics
+                        .entry(doc.clone())
+                        .or_default()
+                        .insert("unmeasurable_override_endpoint".into());
+                    continue;
+                }
+                let target_method = target_methods.first().copied();
+                let source_owner = source_method.ancestors.last();
+                let owner_declarations: Vec<_> = native
+                    .declarations
+                    .iter()
+                    .filter(|d| {
+                        d.document == *doc
+                            && d.kind == "type"
+                            && source_owner == Some(&d.key)
+                            && d.range.start <= source_method.range.start
+                            && source_method.range.end <= d.range.end
+                    })
+                    .collect();
+                let direct_base = (owner_declarations.len() == 1)
+                    .then(|| owner_declarations[0])
+                    .and_then(|owner| owner.name_range.as_ref())
+                    .and_then(|r| {
                         direct_java_types(bytes)
                             .ok()
                             .and_then(|rows| rows.into_iter().find(|(range, _, _)| range == r))
@@ -764,18 +854,41 @@ pub fn join_inventory(
                 let target_owner_key = target_symbol
                     .rsplit_once('#')
                     .map(|(owner, _)| format!("{owner}#"));
+                let method_descriptor_matches =
+                    target_symbol.rsplit_once('#').is_some_and(|(_, suffix)| {
+                        source_symbol
+                            .rsplit_once('#')
+                            .is_some_and(|(_, source_suffix)| {
+                                target_method.is_none() || suffix == source_suffix
+                            })
+                    });
+                let target_owner_matches = target_method.is_none_or(|method| {
+                    target_owner_key.as_ref().is_some_and(|owner_key| {
+                        native
+                            .declarations
+                            .iter()
+                            .filter(|owner| {
+                                owner.document == method.document
+                                    && owner.kind == "type"
+                                    && method.ancestors.last() == Some(&owner.key)
+                                    && owner.range.start <= method.range.start
+                                    && method.range.end <= owner.range.end
+                                    && owner.name_range.as_ref().is_some_and(|r| {
+                                        type_uses
+                                            .get(&(owner.document.clone(), r.start, r.end))
+                                            .is_some_and(|keys| {
+                                                keys.len() == 1 && keys.contains(owner_key)
+                                            })
+                                    })
+                            })
+                            .count()
+                            == 1
+                    })
+                });
                 let owner_matches = direct_base
                     .is_some_and(|base| Some(base) == target_owner_key.as_ref())
-                    && (target_method.is_none()
-                        || target_owner.is_some_and(|ancestors| {
-                            ancestors
-                                .last()
-                                .and_then(|key| key.name.as_ref())
-                                .is_some_and(|name| {
-                                    direct_base
-                                        .is_some_and(|base| base.ends_with(&format!("{name}#")))
-                                })
-                        }));
+                    && method_descriptor_matches
+                    && target_owner_matches;
                 if !owner_matches {
                     out.diagnostics
                         .entry(doc.clone())
@@ -797,11 +910,17 @@ pub fn join_inventory(
                     });
                 }
             }
-            for declaration in native
-                .declarations
-                .iter()
-                .filter(|d| d.document == *doc && d.kind == "enum")
-            {
+            for declaration in native.declarations.iter().filter(|d| {
+                d.document == *doc
+                    && d.kind == "type"
+                    && std::str::from_utf8(bytes).ok().is_some_and(|source| {
+                        d.name_range
+                            .as_ref()
+                            .and_then(|r| source.get(..r.start))
+                            .and_then(|prefix| prefix.rsplit(['{', '}', ';']).next())
+                            .is_some_and(|prefix| prefix.split_whitespace().last() == Some("enum"))
+                    })
+            }) {
                 let Some(name) = &declaration.name_range else {
                     continue;
                 };
@@ -892,7 +1011,10 @@ fn direct_java_types(
             for (clause, relationship) in clauses {
                 let mut todo = vec![clause];
                 while let Some(item) = todo.pop() {
-                    if item.kind() == "type_list" {
+                    if matches!(
+                        item.kind(),
+                        "type_list" | "super_interfaces" | "interface_type_list"
+                    ) {
                         let mut cursor = item.walk();
                         todo.extend(item.named_children(&mut cursor));
                     } else if item.kind() == "type_identifier" {
@@ -906,7 +1028,21 @@ fn direct_java_types(
                         ));
                     } else if matches!(item.kind(), "generic_type" | "scoped_type_identifier") {
                         // Only the outermost base type, never a generic argument.
-                        if let Some(base) = item.child_by_field_name("name") {
+                        let mut outer = item;
+                        let mut base = None;
+                        while matches!(outer.kind(), "generic_type" | "scoped_type_identifier") {
+                            let mut cursor = outer.walk();
+                            let children: Vec<_> = outer.named_children(&mut cursor).collect();
+                            let next = if outer.kind() == "generic_type" {
+                                children.first()
+                            } else {
+                                children.last()
+                            };
+                            let Some(child) = next else { break };
+                            outer = *child;
+                            base = Some(outer);
+                        }
+                        if let Some(base) = base {
                             result.push((
                                 owner.clone(),
                                 native::Range {
@@ -915,18 +1051,6 @@ fn direct_java_types(
                                 },
                                 relationship,
                             ));
-                        } else {
-                            let mut cursor = item.walk();
-                            if let Some(base) = item.named_children(&mut cursor).next() {
-                                result.push((
-                                    owner.clone(),
-                                    native::Range {
-                                        start: base.start_byte(),
-                                        end: base.end_byte(),
-                                    },
-                                    relationship,
-                                ));
-                            }
                         }
                     } else {
                         let mut cursor = item.walk();
