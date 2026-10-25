@@ -623,7 +623,7 @@ fn full_reconcile_replaces_persisted_source_and_input_inventory() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        17
+        19
     );
     let files = db
         .prepare("SELECT path FROM revision_documents WHERE revision_id=?1 ORDER BY path")
@@ -739,12 +739,12 @@ fn sqlite_snapshot(
         .unwrap()
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
-    // Schema 17 keeps the derived graph and labels, and compacts native IDs
+    // Schema 19 keeps the derived graph and labels, and compacts native IDs
     // and document/projection references into BLOB keys and surrogates.
     // Supersession state and the paired producer bindings are additive.
     // Check exact names, not just a count: an unknown table must not escape the
     // independent cold-source comparison.
-    const REQUIRED_V17_TABLES: [&str; 57] = [
+    const REQUIRED_V19_TABLES: [&str; 57] = [
         "native_producers",
         "native_producer_languages",
         "native_producer_inputs",
@@ -803,7 +803,7 @@ fn sqlite_snapshot(
         "semantic_call_join_candidates",
         "semantic_type_relationships",
     ];
-    let required: std::collections::BTreeSet<_> = REQUIRED_V17_TABLES.into_iter().collect();
+    let required: std::collections::BTreeSet<_> = REQUIRED_V19_TABLES.into_iter().collect();
     let actual: std::collections::BTreeSet<_> = tables.iter().map(String::as_str).collect();
     let optional = [
         "native_revision_supersessions",

@@ -2,7 +2,7 @@
 use crate::{
     capture::Capture,
     model::{CancelFlag, Diagnostic, IndexProgress, IndexStats, SourceFile},
-    native_ids::{IdentityRegistry, canonical, digest, extraction_context},
+    native_ids::{IdentityRegistry, OccurrenceInputRef, canonical, digest, extraction_context},
 };
 use anyhow::{Context, Result, ensure};
 use icu_normalizer::ComposingNormalizerBorrowed;
@@ -1114,6 +1114,102 @@ fn build_native_with(
     Ok(artifact)
 }
 
+// The private spool omits only reference fields shared by its validated document.
+// Public Artifact/Reference JSON remains unchanged.
+#[derive(Serialize)]
+struct SpoolFactsRef<'a> {
+    artifact: &'a Artifact,
+    references: SpoolReferencesRef<'a>,
+}
+
+struct SpoolReferencesRef<'a>(&'a [Reference]);
+impl Serialize for SpoolReferencesRef<'_> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for reference in self.0 {
+            let lookup_override = (reference.lookup_key != reference.spelling)
+                .then_some(reference.lookup_key.as_str());
+            sequence.serialize_element(&(
+                reference.id.as_str(),
+                reference.owner_syntax_id.as_str(),
+                reference.ordinal,
+                reference.range.start,
+                reference.range.end,
+                reference.spelling.as_str(),
+                lookup_override,
+            ))?;
+        }
+        sequence.end()
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SpoolFacts {
+    artifact: Artifact,
+    references: Vec<SpoolReference>,
+}
+
+#[derive(Deserialize)]
+struct SpoolReference(String, String, usize, usize, usize, String, Option<String>);
+
+fn spool_proof<'a>(artifact: &'a Artifact, document: &Document) -> Result<&'a str> {
+    ensure!(
+        artifact.provenance.len() == 1,
+        "native spool proof cardinality"
+    );
+    let proof = &artifact.provenance[0];
+    let expected = format!(
+        "native-proof:v1:{}",
+        digest(
+            b"trellis.native-proof.v1\0",
+            &canonical(
+                &json!({"producerId":PRODUCER,"document":document.key,"revisionId":artifact.revision.id})
+            )
+        )
+    );
+    ensure!(
+        proof.id == expected
+            && proof.producer_id == PRODUCER
+            && proof.document == document.key
+            && proof.revision_id == artifact.revision.id
+            && proof.content_hash == document.content_hash
+            && proof.evidence_kind == "measuredSyntax"
+            && proof.basis.is_none()
+            && proof.derived_from.is_none()
+            && proof.freshness == "fresh",
+        "native spool proof/document mismatch"
+    );
+    Ok(&proof.id)
+}
+
+fn encode_spool_facts(mut artifact: Artifact, document: &Document) -> Result<Vec<u8>> {
+    ensure!(
+        artifact.revision.documents.as_slice() == std::slice::from_ref(document),
+        "native spool facts/document mismatch"
+    );
+    let proof = spool_proof(&artifact, document)?;
+    ensure!(
+        artifact.references.iter().all(|reference| {
+            reference.document == document.key
+                && reference.revision_id == artifact.revision.id
+                && reference.provenance_id == proof
+        }),
+        "native spool reference context mismatch"
+    );
+    let references = std::mem::take(&mut artifact.references);
+    artifact.revision.documents.clear();
+    serde_json::to_vec(&SpoolFactsRef {
+        artifact: &artifact,
+        references: SpoolReferencesRef(&references),
+    })
+    .context("encode native spool facts")
+}
+
 /// Disposable, disk-backed full extraction. Only the captured header and aggregate
 /// counters remain in memory; each measured document is serialized before the next
 /// batch is measured. The file is private to this process and removed on drop.
@@ -1162,9 +1258,13 @@ impl FullDocumentSpool {
             rusqlite::params![i64::try_from(index)?],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        let mut artifact: Artifact = serde_json::from_slice(&facts)?;
+        let SpoolFacts {
+            mut artifact,
+            references,
+        } = serde_json::from_slice(&facts)?;
         ensure!(
-            artifact.revision.documents.is_empty()
+            artifact.references.is_empty()
+                && artifact.revision.documents.is_empty()
                 && artifact.producer == self.header.producer
                 && artifact.source_set == self.header.source_set
                 && artifact.revision.id == self.header.revision.id
@@ -1172,6 +1272,33 @@ impl FullDocumentSpool {
                 && artifact.coverage[0].document_path == document.key.path,
             "native spool document/header mismatch"
         );
+        let proof_id = spool_proof(&artifact, document)?.to_owned();
+        artifact.references = references
+            .into_iter()
+            .map(
+                |SpoolReference(
+                    id,
+                    owner_syntax_id,
+                    ordinal,
+                    start,
+                    end,
+                    spelling,
+                    lookup_override,
+                )| {
+                    Reference {
+                        id,
+                        owner_syntax_id,
+                        ordinal,
+                        document: document.key.clone(),
+                        revision_id: artifact.revision.id.clone(),
+                        range: Range { start, end },
+                        lookup_key: lookup_override.unwrap_or_else(|| spelling.clone()),
+                        spelling,
+                        provenance_id: proof_id.clone(),
+                    }
+                },
+            )
+            .collect();
         artifact.revision.documents.push(document.clone());
         let graph: crate::model::Graph = serde_json::from_slice(&graph)?;
         ensure!(
@@ -1288,8 +1415,6 @@ fn prepare_spooled_document(
     before_validate: &(dyn Fn(&Document, &mut Artifact) -> Result<()> + Sync),
     after_class: &(dyn Fn(&Document, &crate::classes::FileExtraction) -> Result<()> + Sync),
 ) -> Result<PreparedSpoolDocument> {
-    // The spool keeps facts without their document row; read() restores it.
-    let encoded_facts = serde_json::to_vec(&facts)?;
     before_validate(document, &mut facts)?;
     validate_spooled_document(&mut facts, document, file)?;
     let graph = crate::indexer::project_native_spooled_document(
@@ -1328,7 +1453,7 @@ fn prepare_spooled_document(
         None
     };
     Ok(PreparedSpoolDocument {
-        facts: encoded_facts,
+        facts: encode_spool_facts(facts, document)?,
         graph: serde_json::to_vec(&graph)?,
         extraction,
         stats: graph.stats.clone(),
@@ -2516,15 +2641,23 @@ fn extract_known_with_witnesses(
 }
 /// Decision 0003 `occ:v2` input: document version, extraction context and native producer
 /// descriptor, never the containing revision.
-fn occurrence_input(
-    content_hash: &str,
-    extraction_context: &str,
-    producer: &Producer,
-    owner: &str,
-    kind: &str,
+fn occurrence_input<'a>(
+    content_hash: &'a str,
+    extraction_context: &'a str,
+    producer: &'a Producer,
+    owner: &'a str,
+    kind: &'a str,
     ordinal: usize,
-) -> Value {
-    json!({"contentHash":content_hash,"extractionContext":extraction_context,"nativeProducerId":producer.id,"nativeProducerVersion":producer.version,"ownerSyntaxId":owner,"kind":kind,"ordinal":ordinal})
+) -> OccurrenceInputRef<'a> {
+    OccurrenceInputRef {
+        content_hash,
+        extraction_context,
+        native_producer_id: &producer.id,
+        native_producer_version: &producer.version,
+        owner_syntax_id: owner,
+        kind,
+        ordinal: ordinal as u64,
+    }
 }
 struct ParserState<'a> {
     artifact: &'a mut Artifact,
@@ -2550,16 +2683,6 @@ struct ParserState<'a> {
     header_witness: &'a mut dyn FnMut(&str, String, Range),
 }
 impl ParserState<'_> {
-    fn occurrence_input(&self, owner: &str, kind: &str, ordinal: usize) -> Value {
-        occurrence_input(
-            &self.file.hash,
-            &self.extraction_context,
-            &self.artifact.producer,
-            owner,
-            kind,
-            ordinal,
-        )
-    }
     fn finish_occurrences(&mut self) -> Result<()> {
         let mut replacements = BTreeMap::new();
         let mut by_owner: BTreeMap<String, Vec<usize>> = BTreeMap::new();
@@ -2582,12 +2705,15 @@ impl ParserState<'_> {
                 (r.start, r.end)
             });
             for (ordinal, i) in indexes.iter().enumerate() {
-                let input = self.occurrence_input(
+                let input = occurrence_input(
+                    &self.file.hash,
+                    &self.extraction_context,
+                    &self.artifact.producer,
                     &self.artifact.control_regions[*i].owner_syntax_id,
                     "control",
                     ordinal,
                 );
-                let id = self.ids.occurrence(&input)?;
+                let id = self.ids.occurrence_ref(&input)?;
                 let region = &mut self.artifact.control_regions[*i];
                 replacements.insert(std::mem::replace(&mut region.id, id.clone()), id);
                 region.ordinal = ordinal;
@@ -2618,12 +2744,15 @@ impl ParserState<'_> {
                 (r.start, r.end)
             });
             for (ordinal, i) in indexes.iter().enumerate() {
-                let input = self.occurrence_input(
+                let input = occurrence_input(
+                    &self.file.hash,
+                    &self.extraction_context,
+                    &self.artifact.producer,
                     &self.artifact.calls[*i].owner_syntax_id,
                     "call",
                     ordinal,
                 );
-                let id = self.ids.occurrence(&input)?;
+                let id = self.ids.occurrence_ref(&input)?;
                 let call = &mut self.artifact.calls[*i];
                 call.ordinal = ordinal;
                 call.id = id;
@@ -2651,12 +2780,15 @@ impl ParserState<'_> {
                 (r.start, r.end)
             });
             for (ordinal, i) in indexes.iter().enumerate() {
-                let input = self.occurrence_input(
+                let input = occurrence_input(
+                    &self.file.hash,
+                    &self.extraction_context,
+                    &self.artifact.producer,
                     &self.artifact.references[*i].owner_syntax_id,
                     "reference",
                     ordinal,
                 );
-                let id = self.ids.occurrence(&input)?;
+                let id = self.ids.occurrence_ref(&input)?;
                 let reference = &mut self.artifact.references[*i];
                 reference.ordinal = ordinal;
                 reference.id = id;
@@ -3248,11 +3380,11 @@ impl Artifact {
                 }
             }
         }
-        let mut reference_ordinals: BTreeMap<(DocumentKey, String), Vec<&Reference>> =
+        let mut reference_ordinals: BTreeMap<(&DocumentKey, &str), Vec<&Reference>> =
             BTreeMap::new();
         for r in &self.references {
             reference_ordinals
-                .entry((r.document.clone(), r.owner_syntax_id.clone()))
+                .entry((&r.document, r.owner_syntax_id.as_str()))
                 .or_default()
                 .push(r);
         }
@@ -3288,15 +3420,29 @@ impl Artifact {
                 }
             }
         }
+        // Keep authentication results local to this producer/revision validation.
+        // Failures are surfaced at the existing occurrence-mint boundary.
+        let contexts: BTreeMap<_, _> = docs
+            .keys()
+            .map(|document| {
+                (
+                    document,
+                    native_extraction_context(&self.producer, &document.language, &self.revision),
+                )
+            })
+            .collect();
         let occurrence_of = |document: &DocumentKey, owner: &str, kind: &str, ordinal: usize| {
             let file = docs
                 .get(document)
                 .context("native occurrence dangling document")?;
-            let context =
-                native_extraction_context(&self.producer, &document.language, &self.revision)?;
-            crate::native_ids::mint_occurrence(&occurrence_input(
+            let context = contexts
+                .get(document)
+                .context("native occurrence dangling context")?
+                .as_ref()
+                .map_err(|error| anyhow::anyhow!("{error:#}"))?;
+            crate::native_ids::mint_occurrence_ref(&occurrence_input(
                 &file.hash,
-                &context,
+                context,
                 &self.producer,
                 owner,
                 kind,
@@ -3351,7 +3497,7 @@ impl Artifact {
                 );
             }
         }
-        let mut references = BTreeSet::new();
+        let mut references: BTreeSet<&str> = BTreeSet::new();
         for r in &self.references {
             let file = docs
                 .get(&r.document)
@@ -3363,7 +3509,7 @@ impl Artifact {
                 owner.document == r.document
                     && r.revision_id == self.revision.id
                     && proofs.contains(&r.provenance_id)
-                    && references.insert(r.id.clone()),
+                    && references.insert(r.id.as_str()),
                 "native reference ownership/duplicate"
             );
             span(&file.text, &r.range, false)?;
@@ -4497,15 +4643,30 @@ mod full_document_spool_tests {
         .unwrap();
         fs::write(
             workspace.path().join("c.js"),
-            "function café() { return café(); }\n",
+            "const café = 1; function use() { return caf\\u00e9 + café; }\n",
         )
         .unwrap();
+        fs::write(
+            workspace.path().join("d.rs"),
+            "fn f(r#type: i32) -> i32 { r#type }\n",
+        )
+        .unwrap();
+        fs::write(workspace.path().join("empty.js"), "").unwrap();
         let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
         let options = IndexOptions::new(workspace.path().to_owned());
         let root = fs::canonicalize(workspace.path()).unwrap();
         let cancel = Arc::new(AtomicBool::new(false));
         let baseline_capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
         let baseline = from_capture(&baseline_capture, &root, store.root_id(), &cancel).unwrap();
+        assert!(!baseline.references.is_empty());
+        assert!(baseline.references.iter().any(|reference| {
+            reference.spelling == "caf\\u00e9" && reference.lookup_key == "café"
+        }));
+        assert!(
+            baseline.references.iter().any(|reference| {
+                reference.spelling == "r#type" && reference.lookup_key == "type"
+            })
+        );
         let plain = crate::indexer::project_native(
             &options,
             &baseline_capture,
@@ -4562,6 +4723,50 @@ mod full_document_spool_tests {
             let path = &spool.header().revision.documents[index].key.path;
             let (native, graph) = spool.read(index).unwrap();
             assert_eq!(spool.read(index).unwrap(), (native.clone(), graph.clone()));
+            let expected_references: Vec<_> = baseline
+                .references
+                .iter()
+                .filter(|reference| &reference.document.path == path)
+                .cloned()
+                .collect();
+            assert_eq!(native.references, expected_references);
+            let selected = measure_captured_document(
+                &baseline_capture,
+                &root,
+                store.root_id(),
+                path,
+                &cancel,
+                |_| {},
+            )
+            .unwrap();
+            assert_eq!(native.references, selected.references);
+            let encoded: Vec<u8> = spool
+                .conn
+                .query_row(
+                    "SELECT facts FROM documents WHERE ordinal=?1",
+                    [i64::try_from(index).unwrap()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let encoded: Value = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(encoded["artifact"]["references"], json!([]));
+            let tuples = encoded["references"].as_array().unwrap();
+            assert_eq!(tuples.len(), expected_references.len());
+            for (tuple, reference) in tuples.iter().zip(&expected_references) {
+                assert_eq!(tuple.as_array().unwrap().len(), 7);
+                assert_eq!(tuple[5], json!(reference.spelling));
+                assert_eq!(
+                    tuple[6],
+                    if reference.lookup_key == reference.spelling {
+                        Value::Null
+                    } else {
+                        json!(reference.lookup_key)
+                    }
+                );
+            }
+            if path == "empty.js" {
+                assert!(native.references.is_empty());
+            }
             assert_eq!(
                 native.revision,
                 Revision {
@@ -4658,6 +4863,66 @@ mod full_document_spool_tests {
             .iter()
             .position(|document| document.key.path == "c.js")
             .unwrap();
+        let encoded: Vec<u8> = spool
+            .conn
+            .query_row(
+                "SELECT facts FROM documents WHERE ordinal=?1",
+                [i64::try_from(js).unwrap()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let payload: Value = serde_json::from_slice(&encoded).unwrap();
+        let replace_facts = |bytes: &[u8]| {
+            spool
+                .conn
+                .execute(
+                    "UPDATE documents SET facts=?1 WHERE ordinal=?2",
+                    rusqlite::params![bytes, i64::try_from(js).unwrap()],
+                )
+                .unwrap();
+        };
+        let (native, _) = spool.read(js).unwrap();
+        for (path, value) in [
+            ("/unexpected", json!(true)),
+            ("/references", json!([["truncated"]])),
+            ("/references/0/2", json!(-1)),
+            ("/references/0/6", json!(false)),
+            ("/artifact/references", json!([native.references[0]])),
+            (
+                "/artifact/revision/documents",
+                json!([native.revision.documents[0]]),
+            ),
+            ("/artifact/producer/id", json!("wrong")),
+            ("/artifact/coverage/0/documentPath", json!("wrong.js")),
+            ("/artifact/provenance", json!([])),
+            ("/artifact/provenance/0/id", json!("native-proof:v1:wrong")),
+            ("/artifact/provenance/0/document/path", json!("wrong.js")),
+            ("/artifact/provenance/0/revisionId", json!("wrong")),
+            ("/artifact/provenance/0/contentHash", json!("0".repeat(64))),
+        ] {
+            let mut corrupt = payload.clone();
+            if path == "/unexpected" {
+                corrupt["unexpected"] = value;
+            } else {
+                *corrupt.pointer_mut(path).unwrap() = value;
+            }
+            replace_facts(&serde_json::to_vec(&corrupt).unwrap());
+            assert!(spool.read(js).is_err(), "accepted corrupt spool {path}");
+        }
+        let mut extra_tuple_field = payload.clone();
+        extra_tuple_field["references"][0]
+            .as_array_mut()
+            .unwrap()
+            .push(Value::Null);
+        replace_facts(&serde_json::to_vec(&extra_tuple_field).unwrap());
+        assert!(
+            spool.read(js).is_err(),
+            "accepted oversized reference tuple"
+        );
+        replace_facts(&encoded[..encoded.len() - 1]);
+        assert!(spool.read(js).is_err(), "accepted truncated spool");
+        replace_facts(&encoded);
+        assert_eq!(spool.read(js).unwrap().0.references, native.references);
         spool.corrupt_graph_json_for_tests(js);
         assert!(spool.read(js).is_err(), "malformed scratch graph is typed");
         assert_eq!(spool._file.as_file().metadata().unwrap().nlink(), 0);
@@ -5184,6 +5449,78 @@ mod full_document_spool_tests {
     #[test]
     fn fallible_allocation_after_private_spool_write_preserves_prior_head() {
         private_spool_failure_preserves_prior_head(true);
+    }
+
+    #[test]
+    fn spool_packing_never_hides_corrupt_reference_fields() {
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("a.py"), "def f(x):\n    return x\n").unwrap();
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let options = IndexOptions::new(workspace.path().to_owned());
+        let root = fs::canonicalize(workspace.path()).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        for field in ["document", "revision", "proof", "range", "owner", "lookup"] {
+            let capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
+            let error = spool_full_capture_with(
+                &options,
+                &capture,
+                &root,
+                store.root_id(),
+                &cancel,
+                &|_| {},
+                |_, _| {},
+                ExtractionPlan {
+                    workers: 1,
+                    chunk: 1,
+                },
+                &|_, _| Ok(()),
+                &|_, artifact| {
+                    assert!(!artifact.references.is_empty());
+                    let reference = &mut artifact.references[0];
+                    match field {
+                        "document" => reference.document.path = "wrong.py".into(),
+                        "revision" => reference.revision_id = "wrong".into(),
+                        "proof" => reference.provenance_id = "wrong".into(),
+                        "range" => reference.range.end = usize::MAX,
+                        "owner" => reference.owner_syntax_id = "sid:v1:missing".into(),
+                        "lookup" => reference.lookup_key = "wrong".into(),
+                        _ => unreachable!(),
+                    }
+                    Ok(())
+                },
+                &|_, _, _| Ok(()),
+                &|_, _| Ok(()),
+                &store.native_spool_dir().unwrap(),
+            )
+            .err()
+            .unwrap_or_else(|| panic!("packing hid corrupt reference {field}"));
+            assert!(!error.to_string().is_empty());
+        }
+
+        let capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
+        let native = from_capture(&capture, &root, store.root_id(), &cancel).unwrap();
+        for fault in [
+            ExtractionAuthFault::Undeclared,
+            ExtractionAuthFault::Mismatched,
+        ] {
+            let _guard = inject_extraction_auth_fault(&native.revision.id, "python", fault);
+            assert!(native.validate_structure(&capture.files).is_err());
+        }
+        let document = &native.revision.documents[0];
+        for field in ["document", "revision", "proof"] {
+            let mut corrupt = native.clone();
+            match field {
+                "document" => corrupt.references[0].document.path = "wrong.py".into(),
+                "revision" => corrupt.references[0].revision_id = "wrong".into(),
+                "proof" => corrupt.references[0].provenance_id = "wrong".into(),
+                _ => unreachable!(),
+            }
+            assert!(
+                encode_spool_facts(corrupt, document).is_err(),
+                "encoder elided corrupt reference {field}"
+            );
+        }
     }
 
     #[test]

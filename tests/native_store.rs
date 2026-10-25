@@ -240,7 +240,7 @@ fn four_languages_normalized_rows_and_pinned_bytes_are_coherent() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        17
+        19
     );
     let count: i64 = db
         .query_row(
@@ -787,7 +787,7 @@ fn physical_v8_native_v4_index_recreates_before_role_column_read() {
         rebuilt
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        17
+        19
     );
     let stamp: String = rebuilt
         .query_row("SELECT extractor_version FROM index_metadata", [], |row| {
@@ -3026,7 +3026,7 @@ fn schema16_index_recreates_exclusively_without_migration_and_preserves_queue() 
         rebuilt
             .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        17
+        19
     );
     for table in [
         "native_version_references",
@@ -3071,7 +3071,7 @@ fn newer_disposable_schema_is_refused_without_rebuild_or_deletion() {
         .join(identity.root_key)
         .join("index.db");
     let db = Connection::open(&path).unwrap();
-    db.execute_batch("PRAGMA user_version=18").unwrap();
+    db.execute_batch("PRAGMA user_version=20").unwrap();
     drop(db);
     let inode = fs::metadata(&path).unwrap().ino();
     let error = Store::open_for_tests(state.path(), root.path()).unwrap_err();
@@ -3091,13 +3091,13 @@ fn newer_disposable_schema_is_refused_without_rebuild_or_deletion() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(version, 18);
+    assert_eq!(version, 20);
     let metadata_version: i64 = db
         .query_row("SELECT schema_version FROM index_metadata", [], |r| {
             r.get(0)
         })
         .unwrap();
-    assert_eq!(metadata_version, 17);
+    assert_eq!(metadata_version, 19);
     assert_eq!(generation, old.index_generation.to_string());
 }
 
@@ -4322,6 +4322,188 @@ fn native_reference_and_gap_rows_survive_stream_reuse_and_retained_pins() {
     let reopened = Store::open_for_tests(state.path(), root.path()).unwrap();
     assert_retained_native_family_parity(&reopened, first, &first_native);
     assert_retained_native_family_parity(&reopened, second, &second_native);
+}
+
+#[test]
+#[cfg(feature = "test-support")]
+fn reference_lookup_overrides_roundtrip_after_reopen() {
+    let (state, root, store, cancel) = fixture();
+    for (path, source) in [
+        (
+            "flow.rs",
+            "fn main() { let r#type = 1; let e\u{301} = r#type; }\n",
+        ),
+        ("flow.py", "def go():\n    Ａ = 1\n    return Ａ\n"),
+        (
+            "flow.js",
+            "function first() { let \\u0061 = 1; return a(); } function second() { return first; }\n",
+        ),
+    ] {
+        fs::write(root.path().join(path), source).unwrap();
+    }
+    let options = IndexOptions::new(root.path().to_owned());
+    let (_, measured, _) =
+        index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+    let (pin, owner) =
+        trellis::index_coordinator::reconcile_workspace(&store, &options, &cancel, |_| {}).unwrap();
+    assert_retained_native_family_parity(&store, pin, &measured);
+    let db = Connection::open(published_db(state.path(), root.path())).unwrap();
+    let mut overrides = 0;
+    let mut equal = 0;
+    for reference in &measured.references {
+        let stored: Option<String> = db
+            .query_row(
+                "SELECT lookup_key FROM native_version_references WHERE vid=?1 AND owner_syntax_id=?2 AND ordinal=?3",
+                rusqlite::params![
+                    live_document_version(&db, &reference.document.path),
+                    hex::decode(reference.owner_syntax_id.strip_prefix("sid:v1:").unwrap()).unwrap(),
+                    reference.ordinal as i64
+                ],
+                |row| row.get(0),
+            )
+            .unwrap();
+        if reference.spelling == reference.lookup_key {
+            equal += 1;
+            assert_eq!(stored, None);
+        } else {
+            overrides += 1;
+            assert_eq!(stored.as_deref(), Some(reference.lookup_key.as_str()));
+        }
+    }
+    assert!(equal > 0 && overrides > 0);
+    for language in ["rust", "python", "javascript"] {
+        assert!(
+            measured.references.iter().any(|reference| {
+                reference.document.language == language
+                    && reference.spelling != reference.lookup_key
+            }),
+            "missing normalized reference for {language}"
+        );
+    }
+    drop(db);
+    drop(owner);
+    drop(store);
+    let reopened = Store::open_for_tests(state.path(), root.path()).unwrap();
+    assert_retained_native_family_parity(&reopened, pin, &measured);
+}
+
+#[test]
+#[cfg(feature = "test-support")]
+fn duplicate_reference_artifact_does_not_publish() {
+    let (_state, root, store, cancel) = fixture();
+    let leader = store.publication_for_tests().unwrap();
+    let pin = publish(
+        &store,
+        root.path(),
+        &cancel,
+        store.index_baseline().unwrap(),
+        &leader,
+    )
+    .unwrap();
+    let graph_before = store.graph_at(Some(pin)).unwrap();
+    let (graph, mut native, capture) = index_workspace_bundle(
+        &IndexOptions::new(root.path().to_owned()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    native.references.push(native.references[0].clone());
+    assert!(
+        store
+            .publish_native(&graph, &capture, &native, &leader, pin, &cancel)
+            .is_err()
+    );
+    assert_eq!(store.status().unwrap().revision, pin);
+    assert_eq!(store.graph_at(Some(pin)).unwrap(), graph_before);
+}
+
+#[test]
+#[cfg(feature = "test-support")]
+fn reference_release_resumes_after_primary_key_batch_and_reopen() {
+    let (state, root, store, cancel) = fixture();
+    let source = format!("function many() {{ {} }}\n", "value;".repeat(300));
+    fs::write(root.path().join("flow.js"), source).unwrap();
+    store.set_retention_clock_for_tests(1_000, 0);
+    let leader = store.publication_for_tests().unwrap();
+    let old = publish(
+        &store,
+        root.path(),
+        &cancel,
+        store.index_baseline().unwrap(),
+        &leader,
+    )
+    .unwrap();
+    let path = published_db(state.path(), root.path());
+    let db = Connection::open(&path).unwrap();
+    let retired = live_document_version(&db, "flow.js");
+    let shared = live_document_version(&db, "flow.java");
+    let count = |db: &Connection, vid: i64| -> i64 {
+        db.query_row(
+            "SELECT count(*) FROM native_version_references WHERE vid=?1",
+            [vid],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    let original = count(&db, retired);
+    let shared_count = count(&db, shared);
+    assert!(original > 256);
+    drop(db);
+    fs::write(
+        root.path().join("flow.js"),
+        "function current() { newest(); }\n",
+    )
+    .unwrap();
+    store.set_retention_clock_for_tests(1_001, 1);
+    let head = publish(&store, root.path(), &cancel, old, &leader).unwrap();
+    store.set_retention_clock_for_tests(1_901, 901);
+    let db = Connection::open(&path).unwrap();
+    for _ in 0..16 {
+        assert!(store.maintain_one_revision_step_for_tests(&leader).unwrap());
+        if count(&db, retired) < original {
+            break;
+        }
+    }
+    assert_eq!(count(&db, retired), original - 256);
+    assert_eq!(count(&db, shared), shared_count);
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| r
+            .get::<_, i64>(
+            0
+        ))
+        .unwrap(),
+        0
+    );
+    assert!(store.graph_at(Some(head)).is_ok());
+    drop(db);
+    drop(leader);
+    drop(store);
+    let reopened = Store::open_for_tests(state.path(), root.path()).unwrap();
+    reopened.set_retention_clock_for_tests(1_901, 0);
+    let leader = reopened.publication_for_tests().unwrap();
+    let next = publish(&reopened, root.path(), &cancel, head, &leader).unwrap();
+    reopened.maintain_revisions(&leader).unwrap();
+    let db = Connection::open(&path).unwrap();
+    assert_eq!(count(&db, retired), 0);
+    assert_eq!(count(&db, shared), shared_count);
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| r
+            .get::<_, i64>(
+            0
+        ))
+        .unwrap(),
+        0
+    );
+    assert!(reopened.graph_at(Some(next)).is_ok());
+    assert!(reopened.graph_at(Some(head)).is_ok());
+    assert!(
+        reopened
+            .graph_at(Some(old))
+            .unwrap_err()
+            .downcast_ref::<trellis::store::PinExpired>()
+            .is_some()
+    );
 }
 
 #[test]
