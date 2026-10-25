@@ -171,6 +171,7 @@ impl CheckoutMetadata {
 struct BrowserCheckoutEntry {
     identity: CheckoutMetadata,
     active: bool,
+    runtime: Option<Arc<CheckoutRuntime>>,
     replacement_idle: bool,
     lost_reads: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
@@ -183,6 +184,7 @@ pub struct BrowserCheckoutsProbe {
 impl BrowserCheckoutsProbe {
     pub fn check(self) -> Vec<serde_json::Value> {
         let mut rows = std::collections::BTreeMap::new();
+        let mut replacements = HashSet::new();
         let roots = self
             .roots
             .clone()
@@ -221,9 +223,12 @@ impl BrowserCheckoutsProbe {
                             })
                 });
             let state = if replaced_available {
+                replacements.insert(key.clone());
                 "available"
             } else if !old_verified {
                 "unavailable"
+            } else if entry.runtime.is_some() {
+                "available"
             } else if index.as_ref().is_some_and(|index| index.is_file()) {
                 roots
                     .as_ref()
@@ -242,7 +247,7 @@ impl BrowserCheckoutsProbe {
                 }),
             );
         }
-        if let Ok(roots) = roots
+        if let Ok(roots) = &roots
             && let Ok(indexes) = fs::read_dir(roots.cache.join("indexes"))
         {
             for candidate in indexes.flatten() {
@@ -255,7 +260,7 @@ impl BrowserCheckoutsProbe {
                 {
                     continue;
                 }
-                let row = match Store::browser_index_root_existing(&roots, &key) {
+                let row = match Store::browser_index_root_existing(roots, &key) {
                     Ok(spelling)
                         if WorkspaceIdentity::discover_unattached(
                             Some(Path::new(&spelling)),
@@ -276,8 +281,96 @@ impl BrowserCheckoutsProbe {
                 rows.insert(key, row);
             }
         }
+        for (key, row) in &mut rows {
+            row["revision"] = serde_json::Value::Null;
+            row["catchingUp"] = serde_json::Value::Null;
+            row["indexError"] = serde_json::Value::Null;
+            if row["state"] != "available" {
+                row["indexError"] = row["state"].clone();
+                continue;
+            }
+            let entry = self.entries.get(key);
+            // A selectable replacement has no claim on its predecessor's pin.
+            if replacements.contains(key) {
+                row["indexError"] = serde_json::json!("index_not_ready");
+                continue;
+            }
+            let runtime = entry.and_then(|entry| entry.runtime.as_ref());
+            let observation = (|| {
+                if let Some(entry) = entry {
+                    entry.identity.rediscover()?;
+                }
+                if let Some(runtime) = runtime {
+                    let (response, catching_up) = runtime.evidence_response()?;
+                    let revision = response.status()?.revision;
+                    response.finish((revision, Some(catching_up)))
+                } else {
+                    let roots = roots
+                        .as_ref()
+                        .map_err(|_| anyhow::anyhow!("unavailable: topology roots unavailable"))?;
+                    let spelling = row["workspaceRoot"]
+                        .as_str()
+                        .ok_or_else(|| anyhow::anyhow!("unavailable: checkout root unavailable"))?;
+                    let root = Path::new(spelling);
+                    let identity = WorkspaceIdentity::discover_unattached(Some(root), root)?
+                        .attach_existing_marker_readonly()?;
+                    anyhow::ensure!(
+                        identity.root_key == *key,
+                        "root_changed: checkout key changed"
+                    );
+                    let status = Store::status_existing_readonly(roots.clone(), identity)?;
+                    Ok((status.revision, None))
+                }
+            })();
+            match observation {
+                Ok((revision, catching_up)) => {
+                    row["revision"] = serde_json::json!(revision);
+                    row["catchingUp"] = serde_json::json!(catching_up);
+                }
+                Err(error) => {
+                    let code = browser_index_error(&error);
+                    row["indexError"] = serde_json::json!(code);
+                    if code == "index_not_ready" {
+                        row["catchingUp"] =
+                            serde_json::json!(runtime.map(|runtime| runtime.catching_up()));
+                    } else {
+                        row["state"] = serde_json::json!(match code {
+                            "storage_busy" => "storage_busy",
+                            "corrupt" => "corrupt",
+                            _ => "unavailable",
+                        });
+                    }
+                }
+            }
+        }
         rows.into_values().collect()
     }
+}
+
+fn browser_index_error(error: &anyhow::Error) -> &'static str {
+    if crate::store::transient_storage_contention(error) {
+        return "storage_busy";
+    }
+    for cause in error.chain() {
+        let text = cause.to_string();
+        for code in [
+            "root_changed",
+            "root_key_collision",
+            "workspace_id_changed",
+            "index_not_ready",
+        ] {
+            if text.starts_with(code) {
+                return code;
+            }
+        }
+        if text.starts_with("incompatible_index")
+            || text.starts_with("corrupt")
+            || text.starts_with("recovery_required: exceptional index format")
+        {
+            return "corrupt";
+        }
+    }
+    "unavailable"
 }
 
 /// Captured registry incarnations; preparation performs no registry mutation.
@@ -746,6 +839,7 @@ impl CheckoutRegistry {
                         BrowserCheckoutEntry {
                             identity: entry.identity.clone(),
                             active: self.runtimes.contains_key(key),
+                            runtime: self.runtimes.get(key).cloned(),
                             replacement_idle: entry.released
                                 && !self.runtimes.contains_key(key)
                                 && entry.sessions.is_empty()

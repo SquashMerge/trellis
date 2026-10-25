@@ -95,6 +95,168 @@ async fn registration_does_not_open_a_store_and_active_checkouts_are_isolated() 
     response.finish(()).unwrap();
 }
 
+#[test]
+fn browser_listing_without_an_index_does_not_activate_or_create_state() {
+    let base = tempfile::tempdir().unwrap();
+    let checkout = base.path().join("work");
+    fs::create_dir(&checkout).unwrap();
+    let id = identity(&checkout);
+    let topology = roots(base.path());
+    let mut registry = CheckoutRegistry::with_roots(topology.clone());
+    registry
+        .register(&id, CheckoutOptions(serde_json::json!({})))
+        .unwrap();
+    let listed = registry.browser_checkouts();
+    let row = listed
+        .iter()
+        .find(|row| row["rootKey"] == id.root_key)
+        .unwrap();
+    assert_eq!(row["state"], "available");
+    assert_eq!(row["active"], false);
+    assert!(row["revision"].is_null());
+    assert!(row["catchingUp"].is_null());
+    assert_eq!(row["indexError"], "index_not_ready");
+    assert!(registry.runtime(&id.root_key).is_none());
+    assert!(!topology.cache.exists());
+}
+
+#[test]
+fn browser_listing_cold_index_reports_pin_without_claiming_freshness() {
+    let base = tempfile::tempdir().unwrap();
+    let checkout = base.path().join("work");
+    fs::create_dir(&checkout).unwrap();
+    fs::write(checkout.join("a.js"), "function coldHead() {}\n").unwrap();
+    let id = identity(&checkout);
+    let topology = roots(base.path());
+    let store = Store::open(topology.clone(), identity(&checkout)).unwrap();
+    let owner = trellis::index_coordinator::establish_serving_session(
+        &store,
+        None,
+        &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .unwrap();
+    let first = store.status().unwrap().revision;
+    drop(owner);
+    drop(store);
+    // A cold head does not establish equality with the current disk.
+    fs::write(checkout.join("a.js"), "function newerDisk() {}\n").unwrap();
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry
+        .register(&id, CheckoutOptions(serde_json::json!({})))
+        .unwrap();
+    let listed = registry.browser_checkouts();
+    let row = listed
+        .iter()
+        .find(|row| row["rootKey"] == id.root_key)
+        .unwrap();
+    assert_eq!(row["state"], "available");
+    assert_eq!(row["revision"], serde_json::json!(first));
+    assert!(row["catchingUp"].is_null());
+    assert!(row["indexError"].is_null());
+    assert!(registry.runtime(&id.root_key).is_none());
+    assert_eq!(
+        file_descriptors(
+            &base
+                .path()
+                .join("cache/indexes")
+                .join(&id.root_key)
+                .join("index.db")
+        ),
+        0
+    );
+}
+
+#[test]
+fn browser_listing_cold_index_distinguishes_busy_and_corrupt_from_no_head() {
+    let base = tempfile::tempdir().unwrap();
+    let checkout = base.path().join("work");
+    fs::create_dir(&checkout).unwrap();
+    fs::write(checkout.join("a.js"), "function coldHead() {}\n").unwrap();
+    let id = identity(&checkout);
+    let topology = roots(base.path());
+    let store = Store::open(topology.clone(), identity(&checkout)).unwrap();
+    let owner = trellis::index_coordinator::establish_serving_session(
+        &store,
+        None,
+        &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .unwrap();
+    drop(owner);
+    drop(store);
+    let index = topology.index_db(&id);
+    let journal = index.with_file_name("index.db-journal");
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry
+        .register(&id, CheckoutOptions(serde_json::json!({})))
+        .unwrap();
+    fs::write(&journal, []).unwrap();
+    let listed = registry.browser_checkouts();
+    let row = listed
+        .iter()
+        .find(|row| row["rootKey"] == id.root_key)
+        .unwrap();
+    assert_eq!(row["state"], "storage_busy");
+    assert_eq!(row["indexError"], "storage_busy");
+    assert!(row["revision"].is_null());
+    assert!(row["catchingUp"].is_null());
+    fs::remove_file(journal).unwrap();
+    let db = rusqlite::Connection::open(&index).unwrap();
+    db.execute(
+        "UPDATE index_metadata SET index_generation='invalid' WHERE singleton=1",
+        [],
+    )
+    .unwrap();
+    drop(db);
+    let listed = registry.browser_checkouts();
+    let row = listed
+        .iter()
+        .find(|row| row["rootKey"] == id.root_key)
+        .unwrap();
+    assert_eq!(row["state"], "corrupt");
+    assert_eq!(row["indexError"], "corrupt");
+    assert!(row["revision"].is_null());
+    assert!(row["catchingUp"].is_null());
+    assert!(registry.runtime(&id.root_key).is_none());
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn browser_listing_active_without_a_head_reports_catching_up() {
+    let base = tempfile::tempdir().unwrap();
+    let checkout = base.path().join("work");
+    fs::create_dir(&checkout).unwrap();
+    fs::write(checkout.join("a.js"), "function firstHead() {}\n").unwrap();
+    let id = identity(&checkout);
+    let mut registry = CheckoutRegistry::with_roots(roots(base.path()));
+    registry.attach_launch(1, &id).unwrap();
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+    let resume_rx = std::sync::Mutex::new(resume_rx);
+    registry.set_next_startup_hook_for_tests(std::sync::Arc::new(move || {
+        entered_tx.send(()).unwrap();
+        resume_rx.lock().unwrap().recv().unwrap();
+    }));
+    let runtime = registry.activate(&id.root_key).unwrap();
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        while entered_rx.try_recv().is_err() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let listed = registry.browser_checkouts();
+    let row = listed
+        .iter()
+        .find(|row| row["rootKey"] == id.root_key)
+        .unwrap();
+    assert_eq!(row["state"], "available");
+    assert!(row["revision"].is_null());
+    assert_eq!(row["catchingUp"], true);
+    assert_eq!(row["indexError"], "index_not_ready");
+    resume_tx.send(()).unwrap();
+    ready(&runtime).await;
+}
+
 #[tokio::test]
 async fn separate_store_writer_does_not_downgrade_daemon_read() {
     let base = tempfile::tempdir().unwrap();
@@ -188,6 +350,15 @@ async fn reattach_reports_catching_up_and_keeps_complete_head_until_startup() {
     assert!(old_source.text.contains("oldHead"));
     prior.finish(()).unwrap();
     drop(prior);
+    let listed = registry.browser_checkouts();
+    let row = listed
+        .iter()
+        .find(|row| row["rootKey"] == id.root_key)
+        .unwrap();
+    assert_eq!(row["revision"], serde_json::json!(first));
+    assert_eq!(row["catchingUp"], true);
+    assert!(row["indexError"].is_null());
+    assert!(row.get("pendingFileCount").is_none());
     resume_tx.send(()).unwrap();
     ready(&resumed).await;
     let (current, catching_up) = resumed.evidence_response().unwrap();
@@ -195,6 +366,13 @@ async fn reattach_reports_catching_up_and_keeps_complete_head_until_startup() {
     let new_revision = current.status().unwrap().revision;
     assert!(new_revision.index_revision > first.index_revision);
     current.finish(()).unwrap();
+    let listed = registry.browser_checkouts();
+    let row = listed
+        .iter()
+        .find(|row| row["rootKey"] == id.root_key)
+        .unwrap();
+    assert_eq!(row["revision"], serde_json::json!(new_revision));
+    assert_eq!(row["catchingUp"], false);
 }
 
 #[cfg(feature = "test-support")]
@@ -1501,6 +1679,12 @@ async fn browser_identity_retires_replaced_root_after_lease_and_reads_finish() {
         row["active"], false,
         "old index is not an active new checkout"
     );
+    assert!(
+        row["revision"].is_null(),
+        "replacement must not inherit old pin"
+    );
+    assert!(row["catchingUp"].is_null());
+    assert_eq!(row["indexError"], "index_not_ready");
     assert_eq!(
         row["workspaceRoot"],
         new_id.root.to_string_lossy().to_string()

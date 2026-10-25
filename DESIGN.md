@@ -14,9 +14,12 @@ that imply those capabilities already work.
 ## Product frame
 
 - Compact explorer on the left; files expand to methods.
-- Main tabbed workspace: Sequence, Classes, Libraries, Tools. No placeholder capability tabs.
-- Classes uses the full canvas without the call inspector; class menus expose related classes and cached source.
-- Selected-call inspector on the right. Move full source/provenance/control descriptions here.
+- Main tabbed workspace: Sequence, Classes, Libraries. No placeholder capability tabs.
+- Diagrams/Files header actions focus the diagram or existing file browser; Files is not a separate source page.
+- The left pane lists local checkouts and their observed index state above the filtered file tree.
+- Classes uses the full canvas without the call inspector; explicit file/directory metric selection may show the metric inspector. Class menus expose related classes and cached source.
+- The right inspector shows the selected source step or pinned file/directory metrics, never both.
+  See the [Viewer shell contract](docs/viewer-shell.md) for freshness, heat and metric scope.
 - Explicit source reads open a collapsible source dock without losing the selected method.
 - Source lines and class members expose revision-bound navigation menus. Use measured declarations
   and scoped type candidates, not global-name guesses. Source navigation is explicitly line-based.

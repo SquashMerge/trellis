@@ -14,7 +14,7 @@ function deferred() {
 }
 const ROOT = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const SCOPED = `/api/checkouts/${ROOT}`;
-function harness(windowOptions = {}) {
+function harness(windowOptions = {}, withMetrics = false) {
   const elements = new Map(), blobs = [], downloads = [], timers = new Map();
   let nextTimer = 0;
   function node(tagName) {
@@ -28,13 +28,14 @@ function harness(windowOptions = {}) {
       click() { downloads.push(this.download); }};
   }
   function get(id) { if (!elements.has(id)) elements.set(id, node()); return elements.get(id); }
-  const context = vm.createContext({console, TextEncoder, DOMException, Blob, AbortController,
+  const context = vm.createContext({console, TextEncoder, DOMException, Blob, AbortController, URLSearchParams,
     setTimeout(callback, delay) { const id = ++nextTimer; timers.set(id, {callback, delay}); return id; }, clearTimeout(id) { timers.delete(id); },
     window: {confirm: () => true, ...windowOptions},
     URL: {createObjectURL(blob) { blobs.push(blob); return "blob:synthetic"; }, revokeObjectURL() {}},
     document: {addEventListener() {}, getElementById: get, createElement: node, createElementNS: (ns, tag) => node(tag), createDocumentFragment: node, createTextNode: text => ({textContent:text}), body: node()},
     fetch() { throw new Error("Unexpected request"); }});
   const run = code => vm.runInContext(code, context);
+  if (withMetrics) run(fs.readFileSync(path.join(__dirname, "../web/viewer-metrics.js"), "utf8"));
   run(source);
   run(`token = 'synthetic'; selectedRootKey = '${ROOT}'; checkouts = [{rootKey:'${ROOT}',workspaceRoot:'/synthetic',state:'available',active:false}]; status = {revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1}};`);
   // The app receives the production scoped URL; legacy suffixes below remain the
@@ -457,10 +458,11 @@ test("successful reconnect clears an earlier authentication error", async () => 
   assert.equal(h.get('workspace').hidden,false);
 });
 
-test("file browser puts optional controls behind collapsed details and reserves mobile tree space", () => {
+test("file browser keeps filtering visible, display options collapsed and mobile tree space reserved", () => {
   const html = fs.readFileSync(path.join(__dirname, '../web/index.html'),'utf8');
   const css = fs.readFileSync(path.join(__dirname, '../web/style.css'),'utf8');
-  assert.match(html, /<details class="browse-options"><summary>Filter &amp; display options<\/summary><label for="file-filter">/);
+  assert.match(html, /<label class="file-filter-label" for="file-filter">Filter loaded entries<\/label><input id="file-filter"/);
+  assert.match(html, /<details class="browse-options"><summary>Display options<\/summary>/);
   assert.doesNotMatch(html, /<details class="browse-options" open/);
   assert.match(css, /@media\s*\(max-width:\s*900px\)/);
   assert.match(css, /\.file-browser,\s*\.call-inspector\s*\{[^}]*position:\s*absolute;[^}]*top:\s*0;[^}]*bottom:\s*0;[^}]*width:\s*min\(310px,\s*88%\)/);
@@ -864,4 +866,138 @@ test("shared source rejects missing, empty, inverted and noninteger witnessed ra
    await assert.rejects(h.run("showSource(item,status.revision)"),/Measured source path and range unavailable/);
  }
  assert.equal(requests.length,0);
+});
+
+const metricPin = {indexGeneration:"12345678-1234-4123-8123-123456789abc",indexRevision:1};
+const metricFile = {path:"src/a.js",sourceSetId:"main",language:"javascript",declarationCount:1,metrics:{cognitive:7}};
+const metricsResponse = (scope, {files = [metricFile], directories = [], pin = metricPin} = {}) => response({payload:{...pin,metricsVersion:"metrics:v1",scope,aggregate:"max",files,directories,topCognitive:[]},catchingUp:false});
+
+test("selecting a sequence step fences an already pending file metrics inspection", async () => {
+  const h = harness({}, true), pending = deferred();
+  const step = {id:"selected-call",kind:"call",label:"Selected call",path:"src/a.js",range:{startLine:2,endLine:2},target:"unknown",children:[],alternate:[]};
+  const data = {...view("root"),steps:[step]};
+  h.context.fetch = async request => {
+    if (request === "/api/sequence") return response(data);
+    if (request.startsWith("/api/metrics?")) return new URL(request,"http://test").searchParams.get("scope") === "revision" ? metricsResponse("revision") : pending.promise;
+    if (request.startsWith("/api/methods?")) return response({...metricPin,revision:metricPin,items:[],truncated:false});
+    throw new Error("Unexpected " + request);
+  };
+  await h.run(`selectMethod(${JSON.stringify(symbol("root"))})`);
+  await h.run("viewerMetrics.refresh()");
+  h.run("files=[{path:'src/a.js',methodCount:1}]; renderFiles()");
+  const file = descendants(h.get("file-tree")).find(node => node.tagName === "button" && node.title === "src/a.js");
+  await file.listeners.click();
+  assert.equal(h.get("metric-inspector").hidden, false);
+  const pick = descendants(h.get("sequence-diagram")).find(node => node.attrs?.class?.split(" ").includes("sequence-source"));
+  pick.listeners.click();
+  assert.equal(h.get("inspector-title").textContent, "Selected call");
+  assert.equal(h.get("metric-inspector").hidden, true);
+  pending.resolve(metricsResponse("file"));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.get("metric-inspector").hidden, true);
+  assert.equal(h.get("metric-inspector-values").children.length, 0);
+  assert.equal(h.get("inspector-title").textContent, "Selected call");
+  assert.equal(h.get("inspector-open-source").disabled, false);
+  assert.equal(h.networkUrls.some(url => /\/source\?/.test(url)), false);
+});
+
+test("cwd compact directory metrics use the terminal indexed-relative path, never an outside prefix", async () => {
+  const h = harness({}, true), inspections = [];
+  const rows = ["", "src"].map(path => ({path,sourceSetId:"main",declarationCount:1,metrics:{cognitive:path ? 8 : 2}}));
+  h.context.fetch = async request => {
+    const query = new URL(request,"http://test").searchParams;
+    if (request.startsWith("/api/metrics?")) {
+      if (query.get("scope") !== "revision") inspections.push(query.get("path"));
+      return metricsResponse(query.get("scope"),{files:[],directories:rows.filter(row => query.get("scope") === "revision" || row.path === query.get("path"))});
+    }
+    throw new Error("Unexpected " + request);
+  };
+  h.run(`treeMode=true; treeRoot='/cwd'; indexedWorkspace='/cwd/sample';
+    directories.set('',{open:true,items:${JSON.stringify([folder('sample'),folder('sample-old')])},nextOffset:null,truncated:false});
+    directories.set('sample',{open:false,items:${JSON.stringify([folder('sample/src')])},nextOffset:null,truncated:false});
+    directories.set('sample/src',{open:false,items:[],nextOffset:null,truncated:false});
+    directories.set('sample-old',{open:false,items:[],nextOffset:null,truncated:false});`);
+  await h.run("viewerMetrics.refresh()");
+  const compact = descendants(h.get("file-tree")).find(node => node.title === "sample/src/");
+  assert.ok(compact);
+  assert.match(text(compact), /8/);
+  await compact.listeners.click(); await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(inspections, ["src"]);
+  assert.equal(h.get("metric-inspector-title").textContent, "src");
+  const outside = descendants(h.get("file-tree")).find(node => node.title === "sample-old/");
+  await outside.listeners.click(); await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(inspections, ["src"]);
+  assert.equal(h.get("metric-inspector").hidden, true);
+  assert.equal(h.run("metricDirectorySelection('sample').path"), "");
+  assert.equal(h.run("metricDirectorySelection('')"), null);
+  assert.equal(h.run("metricDirectorySelection('sample-old')"), null);
+});
+
+for (const transition of ["root", "session", "generation"]) test(`${transition} change clears metrics projection, selection and pending inspection`, async () => {
+  const h = harness({}, true), pending = deferred();
+  const changedPin = {...metricPin,indexGeneration:"87654321-4321-4321-8321-cba987654321"};
+  h.context.fetch = async request => {
+    if (request.startsWith("/api/metrics?")) {
+      const query = new URL(request,"http://test").searchParams;
+      return query.get("scope") !== "revision" ? pending.promise : query.get("indexGeneration") === changedPin.indexGeneration
+        ? metricsResponse("revision",{pin:changedPin,files:[]}) : metricsResponse("revision");
+    }
+    if (request === "/api/status") return response({workspaceRoot:"/synthetic",revision:changedPin,stats:{}});
+    if (request.startsWith("/api/tree?")) return response({...treePage("",[]),root:"/synthetic",indexedWorkspace:"/synthetic",revision:changedPin});
+    if (request === "/api/dependencies") return response({state:"disabled",workspaceRevision:changedPin,catalogId:null,packages:[],warnings:[]});
+    throw new Error("Unexpected " + request);
+  };
+  await h.run("viewerMetrics.refresh()");
+  h.run("files=[{path:'src/a.js',methodCount:1}]; renderFiles()");
+  assert.match(text(h.get("metric-legend")), /Displayed/);
+  const inspection = h.run("viewerMetrics.inspect({scope:'file',path:'src/a.js'})");
+  assert.equal(h.get("metric-inspector").hidden, false);
+  if (transition === "root") h.run("resetCheckout()");
+  if (transition === "session") h.get("logout").listeners.click();
+  if (transition === "generation") await h.run("refreshStatus()");
+  pending.resolve(metricsResponse("file")); await inspection;
+  assert.equal(h.get("metric-inspector").hidden, true);
+  assert.equal(h.get("metric-inspector-values").children.length, 0);
+  assert.equal(h.get("metric-inspector-top").children.length, 0);
+  assert.doesNotMatch(text(h.get("metric-legend")), /Displayed/);
+  assert.equal(h.run("viewerMetrics.decorate(document.createElement('button'),{scope:'file',path:'src/a.js'}).value"), undefined);
+});
+
+test("a listed generation-only snapshot change clears derived UI before awaiting status rebind", async () => {
+  const h = harness({}, true), statusReply = deferred();
+  const nextPin = {...metricPin,indexGeneration:"87654321-4321-4321-8321-cba987654321"};
+  h.context.fetch = async request => {
+    if (request === "/api/checkouts") return response({checkouts:[{rootKey:ROOT,workspaceRoot:"/synthetic",state:"available",revision:nextPin,catchingUp:false}]});
+    if (request === "/api/status") return statusReply.promise;
+    if (request.startsWith("/api/metrics?")) {
+      const query = new URL(request,"http://test").searchParams;
+      return metricsResponse(query.get("scope"),query.get("indexGeneration") === nextPin.indexGeneration ? {pin:nextPin,files:[]} : {});
+    }
+    if (request.startsWith("/api/tree?")) return response({...treePage("",[]),root:"/synthetic",indexedWorkspace:"/synthetic",revision:nextPin});
+    if (request === "/api/dependencies") return response({state:"disabled",workspaceRevision:nextPin,catalogId:null,packages:[],warnings:[]});
+    throw new Error("Unexpected " + request);
+  };
+  h.run("selectedWorkspaceRoot='/synthetic'; files=[{path:'src/a.js',methodCount:1}]");
+  await h.run("viewerMetrics.refresh()");
+  await h.run("viewerMetrics.inspect({scope:'file',path:'src/a.js'})");
+  h.run("selectedMethod={id:'old'}; sourceCache.set('old',{text:'old'}); $('source').append(document.createTextNode('old source')); window.TrellisShell.showSource('workspace')");
+  assert.match(text(h.get("metric-legend")),/Displayed/);
+  let settled = false;
+  const listed = h.run("loadCheckouts()").then(value => { settled = true; return value; });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.networkUrls.filter(url => url.endsWith("/status")).length,1);
+  assert.equal(settled,false,"list refresh must await the selected checkout's status rebind");
+  assert.equal(h.run("selectedMethod"),null);
+  assert.equal(h.run("sourceCache.size"),0);
+  assert.equal(h.get("source").children.length,0);
+  assert.equal(h.get("source-dock").hidden,true);
+  assert.equal(h.get("file-tree").children.length,0);
+  assert.equal(h.get("metric-inspector").hidden,true);
+  assert.equal(h.get("metric-inspector-values").children.length,0);
+  assert.doesNotMatch(text(h.get("metric-legend")),/Displayed/);
+  statusReply.resolve(response({workspaceRoot:"/synthetic",revision:nextPin,catchingUp:false,stats:{}}));
+  assert.equal(await listed,true);
+  assert.equal(h.run("selectedRootKey"),ROOT);
+  assert.deepEqual(JSON.parse(JSON.stringify(h.run("status.revision"))),nextPin);
+  assert.equal(h.get("error").hidden,true);
 });

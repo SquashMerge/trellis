@@ -52,9 +52,25 @@ async fn fixture_with_startup_hook(
     ProvisionedBrowser,
     String,
 ) {
+    fixture_with_identity(startup_hook, wait_ready, parser_fixture, false).await
+}
+async fn fixture_with_identity(
+    startup_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    wait_ready: bool,
+    parser_fixture: bool,
+    git: bool,
+) -> (
+    tempfile::TempDir,
+    Arc<trellis::daemon::registry::CheckoutRuntime>,
+    ProvisionedBrowser,
+    String,
+) {
     let base = tempfile::tempdir().unwrap();
     let root = base.path().join("checkout");
     fs::create_dir(&root).unwrap();
+    if git {
+        fs::create_dir(root.join(".git")).unwrap();
+    }
     fs::write(root.join("sample.js"), "function sample(x) { return x; }\n").unwrap();
     fs::create_dir(root.join("deep")).unwrap();
     fs::write(
@@ -131,6 +147,113 @@ async fn fixture_with_startup_hook(
     let key = identity.root_key;
     (base, runtime, browser, key)
 }
+#[tokio::test]
+async fn selected_metrics_top_cognitive_validation_and_git_identity() {
+    for git in [false, true] {
+        let (_base, _runtime, browser, key) = fixture_with_identity(None, true, false, git).await;
+        let app = browser.clone().router();
+        let (status, ordinary) = request(app.clone(), &key, "").await;
+        assert_eq!(status, StatusCode::OK, "{ordinary}");
+        assert!(ordinary["payload"].get("topCognitive").is_none());
+        let payload = &ordinary["payload"];
+        let source = payload["files"][0]["sourceSetId"].as_str().unwrap();
+        if git {
+            let identity = source.strip_prefix("source-set:v1:").unwrap();
+            assert_eq!(
+                uuid::Uuid::parse_str(identity).unwrap().to_string(),
+                identity
+            );
+        } else {
+            assert!(source.starts_with("source-set:v1:path-"));
+        }
+        let generation = payload["indexGeneration"].as_str().unwrap();
+        let revision = payload["indexRevision"].as_u64().unwrap();
+        let pin = format!("indexGeneration={generation}&indexRevision={revision}");
+        let query = format!(
+            "?scope=directory&sourceSetId={source}&path=&aggregate=mean&metrics=loc&topCognitive=1&{pin}"
+        );
+        let (status, directory) = request(app.clone(), &key, &query).await;
+        assert_eq!(status, StatusCode::OK, "{directory}");
+        assert_eq!(directory["payload"]["declarations"], serde_json::json!([]));
+        let top = &directory["payload"]["topCognitive"];
+        assert_eq!(top.as_array().unwrap().len(), 1);
+        assert_eq!(top[0]["name"], "extra");
+        assert_eq!(top[0]["kind"], "function");
+        assert_eq!(top[0]["path"], "deep/extra.js");
+        assert_eq!(top[0]["sourceSetId"], source);
+        assert_eq!(
+            top[0]["metrics"],
+            serde_json::json!({"cognitive":0,"cyclomatic":1,"maxNesting":0})
+        );
+        browser.set_metrics_controls_for_tests(
+            serde_json::to_vec(&directory).unwrap().len() - 1,
+            None,
+            false,
+        );
+        let (status, oversized) = request(app.clone(), &key, &query).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{oversized}");
+        assert_eq!(oversized["error"]["code"], "response_too_large");
+        browser.set_metrics_controls_for_tests(64 * 1024 * 1024, None, true);
+        let (status, cancelled) = request(app.clone(), &key, &query).await;
+        assert_eq!(status, StatusCode::REQUEST_TIMEOUT, "{cancelled}");
+        assert_eq!(cancelled["error"]["code"], "cancelled");
+        browser.set_metrics_controls_for_tests(64 * 1024 * 1024, None, false);
+        let (status, file) = request(app.clone(), &key, &format!("?scope=file&sourceSetId={source}&language=javascript&path=sample.js&topCognitive=10&{pin}")).await;
+        assert_eq!(status, StatusCode::OK, "{file}");
+        assert_eq!(file["payload"]["topCognitive"][0]["name"], "sample");
+        assert_eq!(
+            file["payload"]["topCognitive"][0]["sid"],
+            file["payload"]["declarations"][0]["sid"]
+        );
+        assert_eq!(
+            file["payload"]["topCognitive"][0]["range"],
+            file["payload"]["declarations"][0]["range"]
+        );
+        assert!(file["payload"]["declarations"][0].get("name").is_none());
+        let (status, wrong_pin) = request(
+            app.clone(),
+            &key,
+            &format!(
+                "?topCognitive=3&indexGeneration={generation}&indexRevision={}",
+                revision + 1
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{wrong_pin}");
+        assert_eq!(wrong_pin["error"]["code"], "revision_conflict");
+        for count in [
+            "",
+            "0",
+            "11",
+            "-1",
+            "1.0",
+            "%2B1",
+            "99999999999999999999999999",
+        ] {
+            let (status, error) =
+                request(app.clone(), &key, &format!("?topCognitive={count}")).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+            assert_eq!(error["error"]["code"], "invalid_request");
+        }
+        let (status, _) = request(app.clone(), &key, "?topCognitive=1&topCognitive=2").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        for identity in [
+            "SOURCE-SET:v1:path-0000000000000000000000000000000000000000000000000000000000000000",
+            "source-set:v1:550E8400-E29B-41D4-A716-446655440000",
+            "source-set:v1:550e8400e29b41d4a716446655440000",
+            "source-set:v1:not-a-uuid",
+        ] {
+            let (status, _) = request(
+                app.clone(),
+                &key,
+                &format!("?scope=directory&sourceSetId={identity}&path="),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{identity}");
+        }
+    }
+}
+
 #[tokio::test]
 async fn selected_metrics_projection_and_validation() {
     let (_base, _runtime, browser, key) = fixture().await;

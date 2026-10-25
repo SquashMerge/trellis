@@ -1886,6 +1886,15 @@ pub fn router(state: Arc<DaemonState>) -> Router {
             }),
         )
         .route(
+            "/viewer-metrics.js",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                    include_str!("../web/viewer-metrics.js"),
+                )
+            }),
+        )
+        .route(
             "/shell.js",
             get(|| async {
                 (
@@ -3038,6 +3047,15 @@ impl ProvisionedBrowser {
                 }),
             )
             .route(
+                "/viewer-metrics.js",
+                get(|| async {
+                    (
+                        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                        include_str!("../web/viewer-metrics.js"),
+                    )
+                }),
+            )
+            .route(
                 "/shell.js",
                 get(|| async {
                     (
@@ -3773,6 +3791,7 @@ fn metrics_query(uri: &axum::http::Uri) -> Result<crate::store::MetricsOptions, 
                     | "indexRevision"
                     | "aggregate"
                     | "metrics"
+                    | "topCognitive"
             ) || fields.insert(name, decode(value)?).is_some()
             {
                 return Err(invalid());
@@ -3789,6 +3808,12 @@ fn metrics_query(uri: &axum::http::Uri) -> Result<crate::store::MetricsOptions, 
     options.sid = fields.remove("sid");
     if let Some(value) = fields.remove("aggregate") {
         options.aggregate = value;
+    }
+    if let Some(value) = fields.remove("topCognitive") {
+        if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(invalid());
+        }
+        options.top_cognitive = Some(value.parse().map_err(|_| invalid())?);
     }
     let generation = fields.remove("indexGeneration");
     let revision = fields.remove("indexRevision");
@@ -3824,11 +3849,16 @@ fn metrics_query(uri: &axum::http::Uri) -> Result<crate::store::MetricsOptions, 
         }
     }
     if options.source_set_id.as_ref().is_some_and(|id| {
-        !id.starts_with("source-set:v1:path-")
-            || id.len() != "source-set:v1:path-".len() + 64
-            || !id["source-set:v1:path-".len()..]
-                .bytes()
-                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        let Some(identity) = id.strip_prefix("source-set:v1:") else {
+            return true;
+        };
+        if let Some(hash) = identity.strip_prefix("path-") {
+            return hash.len() != 64
+                || !hash
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase());
+        }
+        !uuid::Uuid::parse_str(identity).is_ok_and(|uuid| uuid.to_string() == identity)
     }) || options.path.as_ref().is_some_and(|path| path.contains(':'))
         || options.sid.as_ref().is_some_and(|v| {
             v.len() != 39

@@ -1,0 +1,64 @@
+# Diagrams-only Viewer shell
+
+The Viewer keeps Sequence, Classes and Libraries. The header's Diagrams and Files actions
+focus the existing canvas or file browser. Files does not introduce a new source page or
+read working-tree contents. Source reads remain explicit, cached and revision-bound.
+There are no remote-machine groups, future diagram tabs, agent/terminal controls or gated actions.
+The existing Git summary remains independent of index freshness; upstream counts are as of last fetch.
+
+## Checkout observation
+
+`GET /api/checkouts` remains observational. Existing `rootKey`, `workspaceRoot`, `state`,
+`active` and `git` retain their meanings. Each row additionally carries:
+
+- `revision`: the complete `{indexGeneration,indexRevision}` pair, or null without an admitted head.
+- `catchingUp`: an active runtime's admitted observation, or null when no watcher owns the checkout.
+- `indexError`: null on success, otherwise a typed observation failure such as `index_not_ready`,
+  `storage_busy`, `corrupt` or `unavailable`. Selection availability is not freshness.
+
+Runtime references are captured under the registry lock and read outside it. Listing never
+activates a checkout or starts indexing. Cold published indexes are observed through the existing
+read-only identity/status path; their pin is shown as **Indexed · idle**, not Fresh. An active
+`catchingUp:false` means **Fresh at read admission**, not proof that disk cannot change or that
+watcher delivery is complete. True is **Catching up**. Failures and missing heads stay explicit.
+The watcher does not publish a pending-file count, so no count is guessed from dirty generations,
+SCIP drift, modified Git paths or private watcher batches.
+
+Both checkout entry buttons and the native header selector use the same explicit selection path.
+Connecting never picks a checkout. Checkout, session or full pin changes clear metrics, tree,
+source callbacks and open views before rebinding; equal revision numbers in different generations
+are not equal pins. Existing busy/replacement and authentication semantics remain intact.
+
+## Metric tree and inspector
+
+Use [`metrics:v1`](metrics.md), scoped to **all indexed callables**. Default color is cognitive
+complexity and default aggregate is max. Max, sum and mean are server projections over declaration
+scores, never client folds of file aggregates. One revision projection supplies file and directory
+swatches; one selected-scope request supplies the inspector and `topCognitive=3`.
+
+The tree remains live filesystem metadata. Only `indexedPath` joins file evidence. Directory
+paths must map inside the verified indexed workspace; outside paths, symlinks, nonindexed files
+and ambiguous source-set/language matches have no metric evidence. Expanding a path for metrics
+never reads source, starts indexing or calls a provider. Compacted directory chains inspect their
+terminal displayed directory. Filtering still searches loaded entries only.
+
+The inspector shows every metric leaf at the named aggregate. Null stays `—`; explicit unavailable
+reasons, including fan-in, stay visible. Highest-cognitive rows use raw callable scores and native
+nullable names, kinds and byte ranges. Anonymous functions are not assigned invented names.
+These rows are informational, not guessed native-SID-to-source links.
+
+Heat cut values are quartiles of finite metric values on the **currently displayed file/directory
+rows**, after loaded-entry filtering, expansion and pagination. Sort values ascending; for n values
+choose cuts at `min(n-1,floor(n*p))` for p=0.25,0.5,0.75. The band is the number of cuts strictly
+less than the value, so ties remain together and repeated cuts may leave empty bands. The legend
+shows the actual cuts (`≤a`, `>a–b`, `>b–c`, `>c`); an empty sample has no invented zero cuts.
+Maintainability reverses color severity only, retaining the original values and higher-is-better label.
+Color selection does not fetch; aggregation refreshes the pinned projection. Failures clear stale
+metric values and show an actionable error. The existing 15-second browser request timeout remains;
+a timeout is not evidence that the server finished or that values are zero.
+
+Only one inspector selection is displayed: a source step or file/directory metrics. Classes keeps
+its full canvas unless a file/directory metric inspector was explicitly selected. Clearing it
+restores that layout. Desktop panes scroll independently; at 900px and below, Explorer and
+Inspector use the existing mutually exclusive drawers. Files opens/focuses the Explorer, not source.
+All repository text is written with `textContent` under the existing CSP and local assets.

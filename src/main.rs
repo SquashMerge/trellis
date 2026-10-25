@@ -1718,6 +1718,7 @@ fn metrics_options_from_request(
             vec![]
         },
         pin: field(args, "pin")?,
+        top_cognitive: None,
     };
     options
         .validate()

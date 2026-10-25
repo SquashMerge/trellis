@@ -50,8 +50,8 @@ function selectedUrl(path, method, root) {
   }
   const suffix = path.startsWith("/api/") ? path.slice(5) : "";
   const route = suffix.split("?", 1)[0];
-  const simple = new Set(["status", "git", "index", "tree", "files", "methods", "sequence", "classes", "class-diagram", "navigation", "source", "jobs/current", "dependencies", "dependencies/refresh", "dependencies/symbols", "dependencies/source", "rust-sources", "rust-sources/tree", "rust-sources/file"]);
-  if (route === "git" && method !== "GET") throw new Error("Git API requests must be GET.");
+  const simple = new Set(["status", "git", "metrics", "index", "tree", "files", "methods", "sequence", "classes", "class-diagram", "navigation", "source", "jobs/current", "dependencies", "dependencies/refresh", "dependencies/symbols", "dependencies/source", "rust-sources", "rust-sources/tree", "rust-sources/file"]);
+  if (["git", "metrics"].includes(route) && method !== "GET") throw new Error("Read-only API requests must be GET.");
   const item = /^jobs\/[^/?]+(?:\/cancel)?$/.test(route);
   if (!simple.has(route) && !item || /[#\s]/.test(suffix) || suffix.includes("//")) throw new Error("Unknown checkout API route.");
   if (!root || !uniqueSelectableRoot(root)) throw new Error("Choose an available checkout first.");
@@ -151,6 +151,7 @@ async function refreshStatus(followup = false) {
       $("checkout-root").textContent = workspaceRoot || "Selected checkout · verified root unavailable until status responds";
       $("workspace").hidden = false; $("refresh").disabled = false; $("index").disabled = false;
       window.TrellisShell?.setConnected(true);
+      showCheckoutIndexState(checkouts.find(row => row.rootKey === root));
       $("status").textContent = "No validated index head is available yet.";
       $("checkout-state").textContent = "Index not ready. Retry status after indexing starts.";
       stale("Index not ready. Retry status after indexing starts.");
@@ -167,9 +168,12 @@ async function refreshStatus(followup = false) {
   if (browseChanged) clearDependencyCatalog();
   status = {...data, revision:nextPin};
   data = status;
+  const listed = checkouts.find(row => row.rootKey === selectedRootKey);
+  if (listed) Object.assign(listed, {revision:nextPin, catchingUp:data.catchingUp, indexError:nextPin ? null : "index_not_ready"});
   window.TrellisShell?.updateWorkspace(nextPin ? status : null);
   $("catching-up").hidden = data.catchingUp !== true || !nextPin;
-  if (browseChanged && nextPin) await loadTreeRoot();
+  renderCheckoutList();
+  if (browseChanged && nextPin) { void viewerMetrics?.refresh(); await loadTreeRoot(); }
   if (serial !== statusSerial || session !== epoch || status !== data) return;
   const stats = status.stats || {};
   $("status").textContent = `${status.workspaceRoot} · ${status.revision ? `Revision ${IndexPin.label(status.revision)}` : "Index not ready"} · ${stats.files ?? 0} files · ${stats.symbols ?? 0} symbols · ${stats.calls ?? 0} calls · Semantic proof unavailable · SCIP (if present): display only · Indexed: ${status.indexedAt ? new Date(Number(status.indexedAt)).toLocaleString() : "not yet"}`;
@@ -257,10 +261,11 @@ function resetCheckout() {
   $("checkout-root").textContent = "No checkout selected";
   $("workspace").hidden = true; $("index").disabled = true; $("cancel").hidden = true;
   window.TrellisShell?.setConnected(false);
+  renderCheckoutList();
 }
 function disconnect(message) {
   tokenFileSerial++; tokenSaveFailed = false; const forgotten = forgetStoredToken();
-  resetCheckout(); checkouts = []; token = "";
+  resetCheckout(); checkouts = []; renderCheckoutList(); token = "";
   $("remember-token").checked = false; $("token-file").value = ""; $("token").value = "";
   $("checkout-picker").hidden = true; $("checkout-select").replaceChildren(checkoutOption("Choose a checkout", ""));
   $("logout").hidden = true; $("connect-form").hidden = false;
@@ -282,6 +287,41 @@ function selectable(row) {
 function uniqueSelectableRoot(key) {
   const matches = checkouts.filter(row => row.rootKey === key);
   return matches.length === 1 && selectable(matches[0]);
+}
+function checkoutIndexLabel(row) {
+  if (!row || row.state !== "available") return {text: row?.state === "storage_busy" ? "Busy" : "Failed", state:"failed", shape:"□"};
+  const pin = row.revision, catchingUp = row.catchingUp;
+  if (row.indexError && row.indexError !== "index_not_ready") return {text:`Index unavailable · ${row.indexError}`, state:"failed", shape:"□"};
+  if (!pin) return catchingUp === true ? {text:"Catching up", state:"catching-up", shape:"◐"}
+    : {text:"Not indexed", state:"unknown", shape:"◇"};
+  let label;
+  try { label = IndexPin.label(pin); } catch (_) { return {text:"Index status unavailable", state:"unknown", shape:"◇"}; }
+  return catchingUp === true ? {text:`Catching up · rev ${label}`, state:"catching-up", shape:"◐"}
+    : catchingUp === false ? {text:`Fresh · rev ${label}`, state:"fresh", shape:"○"}
+    : {text:`Indexed · idle · rev ${label}`, state:"unknown", shape:"◇"};
+}
+function showCheckoutIndexState(row) {
+  const state = checkoutIndexLabel(row);
+  $("workspace-index-state")?.setAttribute("data-state", state.state);
+  if ($("workspace-index-label")) $("workspace-index-label").textContent = state.text;
+}
+function renderCheckoutList() {
+  const list = $("indexed-checkouts");
+  if (!list) return;
+  list.replaceChildren();
+  for (const row of checkouts) {
+    const li = element("li"), state = checkoutIndexLabel(row);
+    const name = row.workspaceRoot?.split("/").filter(Boolean).at(-1) || row.rootKey;
+    const pick = button(name, () => selectCheckout(row.rootKey));
+    pick.className = "checkout-pick"; pick.disabled = !selectable(row);
+    pick.title = row.workspaceRoot || row.rootKey;
+    pick.setAttribute("aria-pressed", String(row.rootKey === selectedRootKey));
+    pick.append(element("span", window.TrellisShell?.formatGit(row.git) || "Git unavailable", "checkout-git"));
+    const freshness = element("span", `${state.shape} ${state.text}`, "checkout-freshness");
+    freshness.setAttribute("data-state", state.state); pick.append(freshness);
+    li.append(pick); list.append(li);
+  }
+  if (!checkouts.length) list.append(element("li", "No indexed checkouts listed.", "detail"));
 }
 async function loadCheckouts() {
   const session = epoch, gitAtStart = gitSerial;
@@ -310,6 +350,7 @@ async function loadCheckouts() {
       $("checkout-root").textContent = verifiedRoot;
     }
     checkouts = next;
+    renderCheckoutList();
     if (selectedRootKey && (!sameRoot || (!busy && !selectable(selected)))) {
       invalidateSelection("Selected checkout is no longer available. Choose again."); return;
     }
@@ -327,12 +368,17 @@ async function loadCheckouts() {
       : !checkouts.some(selectable) ? "No available checkouts. Unavailable or corrupt entries cannot be selected. Retry the list."
       : choice ? "Checkout selected." : "Choose a checkout to inspect. No checkout is selected automatically.";
     $("checkout-retry").hidden = !busy && checkouts.length > 0 && checkouts.every(selectable);
+    if (choice && !busy) showCheckoutIndexState(selected);
     if (recovering) await selectCheckout(choice);
+    else if (choice && !busy && status?.revision && Object.hasOwn(selected, "revision") && !IndexPin.equal(selected.revision, status.revision)) {
+      clearBrowse("Index changed. Rebinding the selected checkout."); clearSource(); sourceCache.clear(); clearDependencyCatalog();
+      await refreshStatus();
+    }
     return true;
   } catch (error) {
     if (session !== epoch || error.name === "AbortError") return;
     if (selectedRootKey) resetCheckout();
-    checkouts = []; $("checkout-select").replaceChildren(checkoutOption("Choose a checkout", ""));
+    checkouts = []; renderCheckoutList(); $("checkout-select").replaceChildren(checkoutOption("Choose a checkout", ""));
     $("checkout-select").disabled = true; $("checkout-retry").hidden = false;
     $("checkout-state").textContent = `Checkout list unavailable: ${error.message} Retry the list.`;
     return false;
@@ -354,7 +400,9 @@ async function selectCheckout(key) {
   selectedRootKey = key;
   const selected = checkouts.find(row => row.rootKey === key);
   selectedWorkspaceRoot = selected.workspaceRoot;
+  renderCheckoutList();
   showSelectedGit(selected.git);
+  showCheckoutIndexState(selected);
   $("error").hidden = true; $("error").textContent = "";
   $("checkout-root").textContent = "Verifying selected checkout…";
   $("checkout-state").textContent = "Loading selected checkout…";
@@ -374,6 +422,7 @@ async function selectCheckout(key) {
   } catch (error) {
     if (session !== epoch || error.name === "AbortError") return;
     const cold = error.code === "index_not_ready";
+    showCheckoutIndexState(cold ? checkouts.find(row => row.rootKey === key) : {state:"unavailable"});
     $("checkout-root").textContent = error.workspaceRoot || status?.workspaceRoot || "Selected checkout · verified root unavailable until status responds";
     $("checkout-state").textContent = cold ? "Index not ready. Retry status after indexing starts." : `Checkout unavailable: ${error.message} Retry status; your selection is unchanged.`;
     $("status").textContent = cold ? "No validated index head is available yet." : "Selected checkout status unavailable.";
@@ -455,7 +504,7 @@ async function showSource(item, revision) {
     highlight.scrollIntoView?.({block:"start", inline:"nearest"});
   }
 }
-$("refresh").addEventListener("click", () => perform(async () => { clearSource(); const revision = status?.revision, session = epoch, root = selectedRootKey; await refreshGit(); if (session !== epoch || root !== selectedRootKey) return; await refreshStatus(); if (IndexPin.equal(revision, status?.revision)) await refreshTree(); if (selectedMethod) await loadSequence(); schedulePoll(); }, $("refresh")));
+$("refresh").addEventListener("click", () => perform(async () => { clearSource(); const revision = status?.revision, session = epoch, root = selectedRootKey; await refreshGit(); if (session !== epoch || root !== selectedRootKey) return; await refreshStatus(); if (IndexPin.equal(revision, status?.revision)) { void viewerMetrics?.refresh(); await refreshTree(); } if (selectedMethod) await loadSequence(); schedulePoll(); }, $("refresh")));
 function activeJob(value) { return ["queued", "running"].includes(value.state); }
 function showJob() {
   if (!job) { $("job").textContent = ""; $("cancel").hidden = true; $("index").disabled = false; return; }
@@ -474,7 +523,7 @@ function schedulePoll() {
 }
 $("index").addEventListener("click", () => perform(async () => {
   window.TrellisClasses?.reset();
-  diagramSerial++; window.TrellisShell?.resetInspector(); clearSource();
+  diagramSerial++; viewerMetrics?.clearInspection(); window.TrellisShell?.resetInspector(); clearSource();
   job = await api("/api/index", "POST", {}); waitingForJob = true; showJob(); schedulePoll();
 }, $("index")).then(() => { if (job) showJob(); }));
 $("cancel").addEventListener("click", () => {
@@ -493,6 +542,7 @@ function clearBrowse(message = "Expand a file and select a method.") {
   if ($("method-class")) $("method-class").disabled = true;
   window.TrellisShell?.resetInspector();
   if ($("sequence-warning-count")) $("sequence-warning-count").textContent = "0";
+  viewerMetrics?.reset();
   browseSerial++; diagramSerial++; catalogSerial++; directoryRefreshSerial++; files = []; nextFileOffset = null; selectedMethod = null;
   directories.clear(); treeMode = false; treeRoot = null; indexedWorkspace = "";
   $("index").textContent = "Index workspace";
@@ -539,6 +589,7 @@ function renderFiles() {
   const tree = $("file-tree"); tree.replaceChildren();
   const filter = $("file-filter").value.toLowerCase();
   const visible = files.filter(f => f.path.toLowerCase().includes(filter));
+  const metricRows = [];
   const dirs = new Map([["", tree]]);
   for (const file of visible) {
     const parts = file.path.split("/"); let parent = tree, key = "";
@@ -560,13 +611,16 @@ function renderFiles() {
       parent = dirs.get(key);
     }
     const state = fileStates.get(file.path), li = element("li");
-    const pick = button(`${state?.open ? "▾" : "▸"} ${parts.at(-1)} · ${file.methodCount}`, () => toggleFile(file));
+    const selection = {scope:"file", path:file.path};
+    const pick = button(`${state?.open ? "▾" : "▸"} ${parts.at(-1)} · ${file.methodCount}`, () => { inspectTreeSelection(selection); return toggleFile(file); });
     pick.className = "file-pick"; pick.title = file.path;
     attachClassMenu(pick, {path:file.path});
-    pick.setAttribute("aria-expanded", String(!!state?.open)); li.append(pick);
+    pick.setAttribute("aria-expanded", String(!!state?.open));
+    metricRows.push(viewerMetrics?.decorate(pick, selection)); li.append(pick);
     appendMethods(li, file);
     parent.append(li);
   }
+  viewerMetrics?.renderLegend(metricRows.filter(Boolean));
   $("browse-root").textContent = status?.workspaceRoot || "Indexed workspace";
   $("reveal-method").hidden = !selectedMethod;
   if (!visible.length) tree.append(element("li", files.length ? "No loaded paths match. Clear the filter or load more files." : "No indexed files yet. Use Index workspace above, then browse the tree.", "detail"));
@@ -593,14 +647,16 @@ async function toggleFile(file) {
   } finally { if (current()) { state.loading = false; renderFiles(); } }
 }
 async function selectMethod(symbol) {
+  viewerMetrics?.clearInspection();
   window.TrellisShell?.showView("sequence");
   if ($("method-class")) $("method-class").disabled = !classLanguage(symbol.path);
   selectedMethod = symbol; $("method-source").disabled = false;
   clearSource(); renderFiles();
   await loadSequence();
-  if (selectedMethod === symbol && window.matchMedia?.("(max-width: 850px)").matches) $("sequence-title").scrollIntoView?.({block:"start"});
+  if (selectedMethod === symbol && window.matchMedia?.("(max-width: 900px)").matches) $("sequence-title").scrollIntoView?.({block:"start"});
 }
 async function loadSequence() {
+  viewerMetrics?.clearInspection();
   window.TrellisShell?.resetInspector();
   if ($("sequence-warning-count")) $("sequence-warning-count").textContent = "0";
   if (!selectedMethod || !status) return;
@@ -623,7 +679,7 @@ async function loadSequence() {
       $("sequence-state").textContent = $("sequence-state").textContent.replace(/ · Pele rendered$/, ` · Pele fell back: ${reason}`);
     };
     if (window.TrellisShell) options.onSelect = step => {
-      if (current()) window.TrellisShell?.selectStep(step, data, () => readSource(step));
+      if (current()) { viewerMetrics?.clearInspection(); window.TrellisShell?.selectStep(step, data, () => readSource(step)); }
     };
     const diagram = $("sequence-diagram");
     const expanded = new Set();
@@ -729,6 +785,24 @@ async function refreshTree() {
   }
 }
 const compactDirectoryDepth = 32;
+const viewerMetrics = window.TrellisMetrics?.create({
+  request: path => api(path),
+  context: () => ({rootKey:selectedRootKey, session:epoch, pin:status?.revision, treeRoot, indexedWorkspace}),
+  onConflict: pin => unexpectedPair("Index changed. Refresh status before inspecting metrics.", pin),
+  onChange: () => { if (treeMode) renderDirectoryTree(); else renderFiles(); },
+});
+window.TrellisShell?.setInspectorClearCallback?.(() => viewerMetrics?.clearInspection());
+function metricDirectorySelection(path) {
+  if (!treeRoot || !indexedWorkspace) return null;
+  const absolute = `${treeRoot.replace(/\/$/, "")}${path ? "/" + path : ""}`;
+  const base = indexedWorkspace.replace(/\/$/, "");
+  const relative = absolute === base ? "" : absolute.startsWith(base + "/") ? absolute.slice(base.length + 1) : null;
+  return relative == null ? null : {scope:"directory", path:relative};
+}
+function inspectTreeSelection(selection) {
+  if (selection) void viewerMetrics?.inspect(selection);
+  else viewerMetrics?.clearInspection();
+}
 function directoryState(path, open = false) {
   let state = directories.get(path);
   if (!state) { state = {open, items:null, serial:0, expansionSerial:0}; directories.set(path, state); }
@@ -845,6 +919,7 @@ function renderDirectoryTree() {
       (item.kind === "directory" && directories.get(item.path)?.items?.some(matches));
   }
   let count = 0;
+  const metricRows = [];
   function rows(path, list, anchorPath = path) {
     const state = directories.get(path);
     if (!state) return;
@@ -857,19 +932,24 @@ function renderDirectoryTree() {
         const open = !!child?.open || (!!filter && !!terminal?.items);
         const label = compact.items.map(entry => entry.name).join("/") + "/";
         const fullPath = compact.last.path + "/";
-        const pick = button(`${open ? "▾" : "▸"} ${label}`, () => toggleDirectory(item.path));
+        const selection = metricDirectorySelection(compact.last.path);
+        const pick = button(`${open ? "▾" : "▸"} ${label}`, () => { inspectTreeSelection(selection); return toggleDirectory(item.path); });
         pick.className = "file-pick directory-pick"; pick.title = fullPath;
         pick.setAttribute("aria-label", `${open ? "Collapse" : "Expand"} folder ${fullPath}`);
         pick.setAttribute("aria-expanded", String(open));
+        metricRows.push(viewerMetrics?.decorate(pick, selection));
         row.append(pick);
         if (open) { const children = element("ul"); rows(compact.last.path, children, item.path); row.append(children); }
       } else if (item.kind === "file" && item.indexedPath != null) {
         const file = {path:item.indexedPath, methodCount:item.methodCount};
         const open = !!fileStates.get(file.path)?.open;
-        const pick = button(`${open ? "▾" : "▸"} ${item.name} · ${item.methodCount ?? 0}`, () => toggleFile(file));
+        const selection = {scope:"file", path:item.indexedPath};
+        const pick = button(`${open ? "▾" : "▸"} ${item.name} · ${item.methodCount ?? 0}`, () => { inspectTreeSelection(selection); return toggleFile(file); });
         pick.className = "file-pick"; pick.title = item.path;
         attachClassMenu(pick, {path:file.path});
-        pick.setAttribute("aria-expanded", String(open)); row.append(pick); appendMethods(row, file);
+        pick.setAttribute("aria-expanded", String(open));
+        metricRows.push(viewerMetrics?.decorate(pick, selection));
+        row.append(pick); appendMethods(row, file);
       } else {
         row.append(element("span", item.name, "unindexed-file"), element("span",
           item.kind === "symlink" ? "Symbolic link · not followed" : item.kind === "file" ? (item.unindexedReason || "Not indexed in current workspace") : "Special entry · metadata only", "detail"));
@@ -889,6 +969,7 @@ function renderDirectoryTree() {
     if (state.truncated) list.append(element("li", "Directory scan limit reached. Some entries are omitted.", "warning"));
   }
   rows("", tree);
+  viewerMetrics?.renderLegend(metricRows.filter(Boolean));
   $("files-state").textContent = filter ? `${count} matching loaded entries · unopened folders are not searched` : "Expand folders to browse. Choose an indexed file to see methods.";
   if (filter && !count) tree.append(element("li", "No loaded entries match. Clear the filter to browse folders.", "detail"));
 }
@@ -1208,6 +1289,7 @@ $("dependency-next")?.addEventListener("click", () => { if (!$("dependency-next"
 function classLanguage(path) { return /\.(?:java|py)$/i.test(path || ""); }
 async function openClasses(options = {}) {
   if (!token || !status || !window.TrellisClasses) return;
+  viewerMetrics?.clearInspection();
   clearSource(); window.TrellisShell?.resetInspector();
   window.TrellisShell?.showView("classes");
   return window.TrellisClasses.open(options.seed ? {seed:options.seed} : options);
@@ -1244,7 +1326,7 @@ function initClassView() {
     onStale: unexpectedPair,
     currentRevision: () => status?.revision,
     currentSession: () => `${epoch}:${status?.workspaceRoot || ""}`,
-    onChange: () => { clearSource(); window.TrellisShell?.resetInspector(); },
+    onChange: () => { viewerMetrics?.clearInspection(); clearSource(); window.TrellisShell?.resetInspector(); },
     readSource: (item, revision) => perform(() => showSource(item, revision)),
     selectMethod: symbol => perform(() => selectMethod(symbol)),
     navigateMember: (event, selector, options) => window.TrellisNavigation?.open(event, selector, options),

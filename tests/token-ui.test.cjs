@@ -715,3 +715,79 @@ test("Disconnect clears selected Git and rejects an in-flight Git read",async()=
   assert.equal(h.run("selectedGit"),null);
   assert.equal(h.run("selectedRootKey"),null);
 });
+
+const checkoutNodes = node => [node,...node.children.flatMap(checkoutNodes)];
+test("checkout list shows measured freshness and shares explicit selection with the picker", async () => {
+  const pin = {indexGeneration:"12345678-1234-4123-8123-123456789abc",indexRevision:1};
+  const rows = [
+    {rootKey:ROOT,workspaceRoot:"/synthetic",state:"available",revision:pin,catchingUp:false},
+    {rootKey:"b".repeat(64),workspaceRoot:"/catching-up",state:"available",revision:pin,catchingUp:true},
+    {rootKey:"c".repeat(64),workspaceRoot:"/idle",state:"available",revision:pin,catchingUp:null},
+    {rootKey:"d".repeat(64),workspaceRoot:"/cold",state:"available",revision:null,catchingUp:null,indexError:"index_not_ready"},
+    {rootKey:"e".repeat(64),workspaceRoot:"/failed",state:"unavailable",revision:null}
+  ];
+  const h = harness({routes:url => {
+    if (url === "/api/checkouts") return response({checkouts:rows});
+    if (url === "/api/daemon/status") return response({activeCheckouts:0});
+    if (url === `${SCOPED}/status`) return response({workspaceRoot:"/synthetic",revision:pin,catchingUp:false,stats:{}});
+    if (url.startsWith(`${SCOPED}/tree?`)) return response({revision:pin,path:"",root:"/synthetic",indexedWorkspace:"/synthetic",items:[],nextOffset:null});
+    if (url === `${SCOPED}/dependencies`) return response({state:"disabled",workspaceRevision:pin,catalogId:null,packages:[],warnings:[]});
+    if (url === `${SCOPED}/jobs/current`) return response(null);
+    throw new Error("Unexpected " + url);
+  }});
+  await h.connect("synthetic",false,false);
+  const nodes = checkoutNodes(h.get("indexed-checkouts"));
+  const labels = nodes.filter(node => node.className === "checkout-freshness");
+  assert.deepEqual(labels.map(node => node.attrs["data-state"]),["fresh","catching-up","unknown","unknown","failed"]);
+  assert.match(labels[0].textContent,/Fresh.*12345678:1/);
+  assert.match(labels[1].textContent,/Catching up.*12345678:1/);
+  assert.match(labels[2].textContent,/Indexed · idle/);
+  assert.match(labels[3].textContent,/Not indexed/);
+  assert.match(labels[4].textContent,/Failed/);
+  const picks = nodes.filter(node => node.className === "checkout-pick");
+  assert.equal(picks[4].disabled,true);
+  assert.ok(picks.slice(0,4).every(node => !node.disabled));
+  assert.equal(h.run("selectedRootKey"),null);
+  assert.deepEqual(h.requests.map(request => request.url),["/api/checkouts","/api/daemon/status"]);
+  const before = h.requests.length;
+  await picks[0].listeners.click(); await flush();
+  const listRequests = h.requests.slice(before).map(request => request.url);
+  assert.equal(h.run("selectedRootKey"),ROOT);
+  assert.equal(h.get("checkout-select").value,ROOT);
+  assert.equal(h.get("checkout-state").textContent,"Checkout ready.");
+  h.run("resetCheckout()");
+  const pickerStart = h.requests.length;
+  h.get("checkout-select").value=ROOT;
+  h.get("checkout-select").listeners.change({target:h.get("checkout-select")}); await flush();
+  assert.deepEqual(h.requests.slice(pickerStart).map(request => request.url),listRequests);
+  assert.equal(h.run("selectedRootKey"),ROOT);
+  assert.equal(h.get("checkout-state").textContent,"Checkout ready.");
+});
+
+test("newer checkout list freshness updates the selected card and header at the same snapshot pin", async () => {
+  const pin = {indexGeneration:"12345678-1234-4123-8123-123456789abc",indexRevision:1};
+  let listedCatchingUp = false;
+  const h = harness({routes:url => {
+    if (url === "/api/checkouts") return response({checkouts:[{rootKey:ROOT,workspaceRoot:"/synthetic",state:"available",revision:{...pin},catchingUp:listedCatchingUp}]});
+    if (url === "/api/daemon/status") return response({activeCheckouts:0});
+    if (url === `${SCOPED}/status`) return response({workspaceRoot:"/synthetic",revision:pin,catchingUp:false,stats:{}});
+    if (url.startsWith(`${SCOPED}/tree?`)) return response({revision:pin,path:"",root:"/synthetic",indexedWorkspace:"/synthetic",items:[],nextOffset:null});
+    if (url === `${SCOPED}/dependencies`) return response({state:"disabled",workspaceRevision:pin,catalogId:null,packages:[],warnings:[]});
+    if (url === `${SCOPED}/jobs/current`) return response(null);
+    throw new Error("Unexpected " + url);
+  }});
+  await h.connect("synthetic",false);
+  assert.equal(h.run("status.catchingUp"),false);
+  assert.equal(h.get("workspace-index-state").attrs["data-state"],"fresh");
+  listedCatchingUp = true;
+  const before = h.requests.length;
+  await h.run("loadCheckouts()");
+  const label = checkoutNodes(h.get("indexed-checkouts")).find(node => node.className === "checkout-freshness");
+  assert.equal(label.attrs["data-state"],"catching-up");
+  assert.match(label.textContent,/Catching up/);
+  assert.equal(h.get("workspace-index-state").attrs["data-state"],"catching-up");
+  assert.match(h.get("workspace-index-label").textContent,/Catching up/);
+  assert.equal(h.run("status.catchingUp"),false,"cached status must not override the newer list observation");
+  assert.deepEqual(h.requests.slice(before).map(request => request.url),["/api/checkouts"]);
+  assert.deepEqual(JSON.parse(JSON.stringify(h.run("status.revision"))),pin);
+});

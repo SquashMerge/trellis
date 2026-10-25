@@ -14,6 +14,7 @@
   <script src="/shell.js" defer></script>
   <script src="/classes.js" defer></script>
   <script src="/navigation.js" defer></script>
+  <script src="/viewer-metrics.js" defer></script>
   <script src="/app.js" defer></script>
 </head>
 <body>
@@ -22,7 +23,20 @@
       <img class="brand-mark" src="/brand/trellis-mark-transparent-v1.png" width="24" height="30" alt="">
       <h1>Trellis <span class="brand-byline">by SquashMerge</span></h1>
     </a>
-    <div class="workspace-identity"><strong id="workspace-name">Code inspection</strong><span id="workspace-meta">Local workspace</span><span id="workspace-git" hidden></span></div>
+    <nav class="section-nav" aria-label="App sections">
+      <button id="section-diagrams" type="button" aria-controls="workspace" disabled>Diagrams</button>
+      <button id="section-files" type="button" aria-controls="explorer-panel" disabled>Files</button>
+    </nav>
+    <section id="checkout-picker" class="checkout-picker" aria-label="Checkout selection" hidden>
+      <label for="checkout-select">Checkout</label>
+      <select id="checkout-select" data-testid="checkout-select" disabled><option value="">Choose a checkout</option></select>
+      <button id="checkout-retry" type="button" hidden>Retry checkout list</button>
+      <span id="checkout-state" role="status" aria-live="polite">Loading checkouts…</span>
+      <span id="checkout-root" class="checkout-root" data-testid="checkout-root">No checkout selected</span>
+      <span id="catching-up" class="warning" role="status" aria-live="polite" hidden>Catching up — evidence may be stale</span>
+      <span id="daemon-state" class="detail" role="status"></span>
+    </section>
+    <div class="workspace-identity"><strong id="workspace-name">Code inspection</strong><span id="workspace-meta">Local workspace</span><span id="workspace-git" hidden></span><span id="workspace-index-state" class="index-state" data-state="unknown" role="status"><span class="state-shape" aria-hidden="true"></span><span id="workspace-index-label">Index status unavailable</span></span></div>
     <div class="header-actions">
       <button id="explorer-toggle" class="mobile-toggle" type="button" aria-controls="explorer-panel" aria-expanded="false">Explorer</button>
       <button id="inspector-toggle" class="mobile-toggle" type="button" aria-controls="call-inspector" aria-expanded="false">Inspector</button>
@@ -52,15 +66,6 @@
     </div>
     <p id="error" role="alert" hidden></p>
     <p id="notice" role="status" aria-live="polite">Connect to inspect a checkout. Indexing starts only when you request it.</p>
-    <section id="checkout-picker" class="checkout-picker" aria-label="Checkout selection" hidden>
-      <label for="checkout-select">Checkout</label>
-      <select id="checkout-select" data-testid="checkout-select" disabled><option value="">Choose a checkout</option></select>
-      <button id="checkout-retry" type="button" hidden>Retry checkout list</button>
-      <span id="checkout-state" role="status" aria-live="polite">Loading checkouts…</span>
-      <span id="checkout-root" class="checkout-root" data-testid="checkout-root">No checkout selected</span>
-      <span id="catching-up" class="warning" role="status" aria-live="polite" hidden>Catching up — evidence may be stale</span>
-      <span id="daemon-state" class="detail" role="status"></span>
-    </section>
     <div id="workspace" hidden>
       <section class="workspace-toolbar" aria-labelledby="status-title">
         <div class="bar workspace-actions"><h2 id="status-title">Workspace</h2><button id="refresh" type="button">Refresh status &amp; view</button><button id="index" type="button">Index workspace</button><button id="cancel" type="button" hidden>Stop waiting</button>
@@ -69,13 +74,35 @@
         <p id="job" role="status"></p><p id="stale" class="warning" hidden></p>
       </section>
       <div class="workspace-frame">
-        <aside id="explorer-panel" aria-labelledby="files-title" class="file-browser"><h2 id="files-title">Explorer</h2><p class="browse-root" id="browse-root"></p><details class="browse-scope"><summary>Index scope &amp; file access</summary><p class="detail" id="browse-scope">Working directory files · indexed files have methods</p></details><details class="browse-options"><summary>Filter &amp; display options</summary><label for="file-filter">Filter loaded entries</label><input id="file-filter" placeholder="Path contains…" type="search"/><p><label><input id="all-methods" type="checkbox"/> Show all methods</label></p></details><div class="bar"><button hidden="" id="reveal-method">Reveal selected method</button><button hidden="" id="retry-files">Retry file list</button></div><p id="files-state" role="status"></p><ul class="file-tree plain" id="file-tree"></ul><button hidden="" id="more-files">Load more files</button></aside>
+        <aside id="explorer-panel" aria-labelledby="files-title" class="file-browser">
+          <section class="indexed-checkouts-section" aria-labelledby="indexed-checkouts-title">
+            <h2 id="indexed-checkouts-title">Indexed checkouts</h2>
+            <ul id="indexed-checkouts" class="plain" aria-label="Indexed checkouts"></ul>
+            <p class="detail">Agents can use these indexes through <code>trellis mcp</code>.</p>
+          </section>
+          <h2 id="files-title">Files</h2><p class="browse-root" id="browse-root"></p><details class="browse-scope"><summary>Index scope &amp; file access</summary><p class="detail" id="browse-scope">Working directory files · indexed files have methods</p></details><label class="file-filter-label" for="file-filter">Filter loaded entries</label><input id="file-filter" placeholder="Path contains…" type="search"/><details class="browse-options"><summary>Display options</summary><p><label><input id="all-methods" type="checkbox"/> Show all methods</label></p></details><div class="bar"><button hidden="" id="reveal-method">Reveal selected method</button><button hidden="" id="retry-files">Retry file list</button></div><p id="files-state" role="status"></p><ul class="file-tree plain" id="file-tree"></ul><button hidden="" id="more-files">Load more files</button></aside>
         <div class="canvas-area">
           <nav class="view-tabs" aria-label="Workspace views" role="tablist">
             <button id="view-sequence" role="tab" type="button" aria-selected="true" aria-controls="sequence-panel">Sequence</button>
             <button id="view-classes" role="tab" type="button" aria-selected="false" aria-controls="classes-panel" tabindex="-1">Classes</button>
             <button id="view-libraries" role="tab" type="button" aria-selected="false" aria-controls="dependency-library" tabindex="-1">Libraries</button>
           </nav>
+          <div class="metric-controls" role="group" aria-label="File tree metrics">
+            <label for="metric-color">Color by</label>
+            <select id="metric-color">
+              <option value="cognitive">Cognitive</option>
+              <option value="cyclomatic">Cyclomatic</option>
+              <option value="maxNesting">Max nesting</option>
+              <option value="maintainabilityIndex">Maintainability</option>
+              <option value="halstead.volume">Halstead volume</option>
+              <option value="fanOut">Fan-out</option>
+              <option value="none">None</option>
+            </select>
+            <label for="metric-aggregate">Aggregation</label>
+            <select id="metric-aggregate"><option value="max">max</option><option value="sum">sum</option><option value="mean">mean</option></select>
+            <div id="metric-legend" class="metric-legend" aria-label="Metric heat legend"></div>
+            <p id="metrics-state" role="status" aria-live="polite"></p>
+          </div>
           <section id="sequence-panel" class="view-panel" role="tabpanel" aria-labelledby="view-sequence">
             <div class="sequence-toolbar"><h2 id="sequence-title">Method sequence</h2><div class="bar"><button id="method-class" type="button" disabled>Class diagram</button><button id="method-source" type="button" disabled>Read method source</button><label><input id="all-steps" type="checkbox"> Show all steps</label></div></div>
             <div class="sequence-context"><span class="badge">Measured source steps</span><span>Not a runtime trace</span></div>
@@ -107,6 +134,14 @@
             <button id="inspector-open-source" type="button" disabled>Open call site</button>
             <h4>Measured syntax details</h4><div id="inspector-detail"></div>
           </div>
+          <section id="metric-inspector" aria-labelledby="metric-inspector-title" hidden>
+            <h3 id="metric-inspector-title"></h3>
+            <p id="metric-inspector-scope" class="detail"></p>
+            <p id="metric-inspector-state" role="status" aria-live="polite"></p>
+            <dl id="metric-inspector-values" class="metric-inspector-values"></dl>
+            <h4>Highest cognitive complexity</h4>
+            <ul id="metric-inspector-top" class="plain"></ul>
+          </section>
           <p class="inspector-footnote">Only measured source opens at a matched snapshot. Candidate types and calls do not prove dispatch.</p>
         </aside>
       </div>
