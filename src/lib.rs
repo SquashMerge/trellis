@@ -39,6 +39,7 @@ mod rust_sources;
 pub mod scip_admission;
 mod scip_raw;
 pub mod semantic_evidence;
+pub mod semantic_import;
 pub mod store;
 #[doc(hidden)]
 pub mod testing;

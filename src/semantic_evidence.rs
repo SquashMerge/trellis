@@ -317,7 +317,18 @@ fn validate_join(
                 }
             }
         }
-        _ => anyhow::bail!("unsupported join family"),
+        JoinKind::Reference => {
+            for reference in &native.references {
+                if reference.document == a.document
+                    && reference.range == a.range
+                    && reference.spelling == slice
+                    && native::lookup(&a.document.language, slice)? == reference.lookup_key
+                {
+                    candidates.insert(reference.id.clone());
+                }
+            }
+        }
+        JoinKind::Invocation => anyhow::bail!("invocation is a call anchor, not a fact family"),
     }
     let kind = match a.kind {
         JoinKind::DeclarationName => native::MeasurementKind::DeclarationName,
@@ -960,7 +971,12 @@ pub fn validate_evidence(
             ensure!(
                 native.calls.iter().any(|call| call.document == r.document
                     && call.owner_syntax_id == r.owner_syntax_id
-                    && call.callee_range.as_ref() == Some(&r.range)
+                    && call.range.start <= r.range.start
+                    && r.range.end <= call.range.end
+                    && call
+                        .callee_range
+                        .as_ref()
+                        .is_none_or(|callee| callee == &r.range)
                     && call.spelling.as_deref() == Some(&r.spelling)),
                 "call role without measured invocation"
             );

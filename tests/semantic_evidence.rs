@@ -1213,3 +1213,16 @@ fn semantic_reference_tuple_must_match_a_complete_native_candidate() {
             .contains("native reference candidate")
     );
 }
+
+#[test]
+fn call_role_requires_exact_native_identity_and_matching_reference() {
+    let (mut semantic, native, bytes) = fixture();
+    semantic.references[0].roles = vec![s::Role::Read, s::Role::Call];
+    s::validate_evidence(&semantic, &native, &bytes).unwrap();
+    let mut wrong = native.clone();
+    wrong.calls[0].owner_syntax_id = "sid:v1:wrong".into();
+    assert!(s::validate_evidence(&semantic, &wrong, &bytes).is_err());
+    let mut wrong = native.clone();
+    wrong.calls[0].spelling = Some("other".into());
+    assert!(s::validate_evidence(&semantic, &wrong, &bytes).is_err());
+}
