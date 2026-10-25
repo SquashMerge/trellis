@@ -26,12 +26,32 @@ that imply those capabilities already work.
 
 ## Visual tokens
 
-Warm charcoal: page `#0E0D0C`, rail `#111010`, panel `#131211`, card `#161513`, node `#1A1816`.
-Borders `#2E2A26` and `#3A3632`. Text `#EDE9E3`, secondary `#A79F95`, muted `#8C847B`.
-Flame orange `#F0913C` is the single action/selection accent. Verify contrast on actual surfaces.
-Use locally served Space Grotesk for interface text and JetBrains Mono for identifiers/source.
-Body 13–14px; code labels 12–13px where practical. Keep focus, disabled and loading states visible.
-The lowercase `trellis` wordmark and flame-eye mark follow the reference.
+The owner-approved SquashMerge brand replaces the reference's palette and typography, not its
+layout or interactions. Use these dark-theme tokens:
+
+- Surfaces: ink `#0B0C10` (page), surface `#14151D` (panels/cards), raised `#1D1E2A` (hover/quiet emphasis).
+- Lines: line `#343644` for decorative dividers; control `#777A8E` for meaningful control boundaries.
+- Text: white `#F7F7FB` primary and muted `#B8BAC8` secondary. Never use the control color for text.
+- Warm colors: gold `#FFC20A`, amber `#FFAA10`, orange `#FF7A00`. Primary actions use amber fill
+  with ink text. Heat uses line → gold → amber → orange, with ink text on warm fills and a legend;
+  reverse the ramp for Maintainability. This does not add a metric view or decide its thresholds.
+- Cool colors: lavender `#ABA5FF`, purple `#7770DC`, deep purple `#5D55C8`.
+  Selection uses purple fill with ink text. Links are lavender and underlined.
+  Keyboard focus uses a 2px lavender outline with a 3px offset.
+- Status: success `#57D6A0`, error `#FF8E9A`, info `#85C7FF`; caution uses gold.
+  Always pair status with a word and a shape, never color alone. Where diff markers exist,
+  added uses success with `+`, removed uses error with `−`, and changed uses gold with `~`.
+
+Use locally served Manrope for headings, Inter for body/interface text, and JetBrains Mono for
+identifiers/source. Retain the compact body size of 13–14px and code labels of 12–13px where practical;
+this brand amendment does not adopt the packet's larger layout or type scale. Primary action
+buttons use a 44px minimum height and 8px radius; keep the surrounding panes compact.
+Keep focus, disabled and loading states visible. Verify contrast on actual surfaces.
+
+The full logo lockup appears only on Connect, with clear space. App headers use the provisional
+symbol plus “Trellis by SquashMerge”. The symbol is unreviewed and awaits an official compact mark;
+do not add a favicon until a reviewed compact mark exists. The design packet is a visual source,
+not authorization to retire Tools, add unshipped tabs or expose gated capabilities.
 
 ## Diagram simplification, not semantic loss
 

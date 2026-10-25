@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#0E0D0C">
+  <meta name="theme-color" content="#0B0C10">
   <title>Trellis · Code inspection</title>
   <link rel="stylesheet" href="/style.css">
   <link rel="stylesheet" href="/classes.css">
@@ -19,8 +19,8 @@
 <body>
   <header class="app-header">
     <a class="brand" href="/" aria-label="Trellis home">
-      <svg class="brand-mark" viewBox="0 0 32 32" width="28" height="28" aria-hidden="true"><path d="M16 2c2 6 8 8 8 15a8 8 0 0 1-16 0c0-4 3-7 5-9 0 4 1 5 2 5 2-3 2-6 1-11Z" fill="currentColor"/><path d="M10 19s2-3 6-3 6 3 6 3-2 3-6 3-6-3-6-3Z" fill="#131211"/><circle cx="16" cy="19" r="2" fill="currentColor"/></svg>
-      <h1>trellis</h1>
+      <img class="brand-mark" src="/brand/trellis-mark-transparent-v1.png" width="24" height="30" alt="">
+      <h1>Trellis <span class="brand-byline">by SquashMerge</span></h1>
     </a>
     <div class="workspace-identity"><strong id="workspace-name">Code inspection</strong><span id="workspace-meta">Local workspace</span></div>
     <div class="header-actions">
@@ -30,7 +30,7 @@
     </div>
   </header>
   <main>
-    <div class="connection-area"><form class="bar" id="connect-form"><label for="token">Daemon token</label><input autocomplete="off" id="token" placeholder="Paste from the token file" required="" spellcheck="false" type="password"/><button>Connect</button><label><input id="remember-token" type="checkbox"/> Remember token on this browser</label><label for="token-file">Load token file instead</label><input id="token-file" type="file"/><span class="muted">Remembering stores this credential in this browser for this address. Use only on a trusted device. Disconnect forgets it.</span></form></div>
+    <div class="connection-area"><img class="connection-logo" src="/brand/trellis-logo-dark-v1.webp" width="280" height="364" alt="Trellis by SquashMerge"><form class="bar" id="connect-form"><label for="token">Daemon token</label><input autocomplete="off" id="token" placeholder="Paste from the token file" required="" spellcheck="false" type="password"/><button>Connect</button><label><input id="remember-token" type="checkbox"/> Remember token on this browser</label><label for="token-file">Load token file instead</label><input id="token-file" type="file"/><span class="muted">Remembering stores this credential in this browser for this address. Use only on a trusted device. Disconnect forgets it.</span></form></div>
     <p id="error" role="alert" hidden></p>
     <p id="notice" role="status" aria-live="polite">Connect to inspect a checkout. Indexing starts only when you request it.</p>
     <section id="checkout-picker" class="checkout-picker" aria-label="Checkout selection" hidden>

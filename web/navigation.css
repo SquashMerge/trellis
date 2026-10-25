@@ -2,12 +2,13 @@
 .source-navigation { position: sticky; top: 0; left: 0; z-index: 1; display: flex; flex: none; flex-wrap: wrap; align-items: center; gap: 6px 12px; padding: 6px 12px; border-bottom: 1px solid var(--line); background: var(--surface); color: var(--ink); }
 .source-navigation-action { min-height: 36px; flex: none; }
 .source-navigation-status { color: var(--secondary); font-size: 12px; overflow-wrap: anywhere; }
-.source-navigation-action:focus-visible, .source-navigation + :focus-visible { outline: 2px solid var(--primary); outline-offset: -2px; }
+.source-navigation-action:focus-visible, .source-navigation + :focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; }
 /* Keep line reveal below the local sticky control layer, including its wrapped hint. */
 .source-navigation + pre .source-line { scroll-margin-top: 4rem; }
 @media (max-width: 600px), (pointer: coarse) {
   .source-navigation + pre .source-line { scroll-margin-top: 7rem; }
 }
-.source-line.navigation-active-line { outline: 1px solid var(--primary); outline-offset: -1px; }
-.source-line.navigation-active-line .line-number { color: var(--primary); }
+.source-line.navigation-active-line { outline: 1px solid var(--focus); outline-offset: -1px; }
+.source-line.navigation-active-line .line-number { color: var(--link); }
+.source-line.navigation-active-line.highlight .line-number { color: var(--on-selected); }
 @media (pointer: coarse) { .source-navigation-action { min-height: 44px; } }

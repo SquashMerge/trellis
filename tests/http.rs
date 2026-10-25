@@ -64,9 +64,7 @@ async fn call(app: &Router, method: &str, path: &str, body: Value) -> (StatusCod
         .unwrap();
     let response = app.clone().oneshot(req).await.unwrap();
     let code = response.status();
-    let bytes = to_bytes(response.into_body(), 2 * 1024 * 1024)
-        .await
-        .unwrap();
+    let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
     (code, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
 }
 #[tokio::test]
@@ -497,9 +495,13 @@ async fn local_design_assets_preserve_same_origin_guards() {
     for (path, mime) in [
         ("/shell.js", "text/javascript; charset=utf-8"),
         ("/fonts/jetbrains-mono-latin.woff2", "font/woff2"),
-        ("/fonts/space-grotesk-latin.woff2", "font/woff2"),
+        ("/fonts/inter-variable.woff2", "font/woff2"),
+        ("/fonts/manrope-variable.woff2", "font/woff2"),
         ("/fonts/JetBrainsMono-OFL.txt", "text/plain; charset=utf-8"),
-        ("/fonts/SpaceGrotesk-OFL.txt", "text/plain; charset=utf-8"),
+        ("/fonts/Inter-OFL.txt", "text/plain; charset=utf-8"),
+        ("/fonts/Manrope-OFL.txt", "text/plain; charset=utf-8"),
+        ("/brand/trellis-mark-transparent-v1.png", "image/png"),
+        ("/brand/trellis-logo-dark-v1.webp", "image/webp"),
     ] {
         let response = app
             .clone()
@@ -519,13 +521,31 @@ async fn local_design_assets_preserve_same_origin_guards() {
             .to_str()
             .unwrap();
         assert!(csp.contains("font-src 'self'"));
+        assert!(csp.contains("img-src 'self' data:"));
         assert!(!csp.contains("unsafe-inline"));
         let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
         if mime == "font/woff2" {
             assert_eq!(&bytes[..4], b"wOF2");
+        } else if mime == "image/png" {
+            assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
+        } else if mime == "image/webp" {
+            assert_eq!(&bytes[..4], b"RIFF");
+            assert_eq!(&bytes[8..12], b"WEBP");
         } else if path.ends_with("OFL.txt") {
             assert!(String::from_utf8_lossy(&bytes).contains("SIL OPEN FONT LICENSE"));
         }
+        let bad_host = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .header("host", "evil.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bad_host.status(), 403);
         let bad = app
             .clone()
             .oneshot(
@@ -540,12 +560,16 @@ async fn local_design_assets_preserve_same_origin_guards() {
             .unwrap();
         assert_eq!(bad.status(), 403);
     }
-    assert_eq!(
-        call(&app, "GET", "/fonts/missing.woff2", Value::Null)
-            .await
-            .0,
-        404
-    );
+    for path in [
+        "/fonts/missing.woff2",
+        "/fonts/inter-latin.woff2",
+        "/fonts/manrope-latin.woff2",
+        "/fonts/space-grotesk-latin.woff2",
+        "/fonts/SpaceGrotesk-OFL.txt",
+        "/brand/missing.png",
+    ] {
+        assert_eq!(call(&app, "GET", path, Value::Null).await.0, 404);
+    }
 }
 
 #[tokio::test]
