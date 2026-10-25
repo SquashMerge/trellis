@@ -823,7 +823,6 @@ fn take_selected_read_counts() -> SelectedReadCounts {
 struct SelectedHeader {
     path: String,
     language: String,
-    gid: i64,
     hash: String,
     bytes: i64,
     scope: V8NativeScope,
@@ -832,7 +831,7 @@ struct SelectedHeader {
     stored_bytes: u64,
 }
 
-/// One selected document's stored source, native rows and display labels,
+/// One selected document's stored source and native rows,
 /// read from one snapshot. The indexer validated them before publishing, so
 /// reads trust them (owner ruling 2026-10-23, #261).
 struct FetchedDocument {
@@ -840,7 +839,6 @@ struct FetchedDocument {
     declarations: Vec<crate::native_evidence::Declaration>,
     calls: Vec<crate::native_evidence::Call>,
     regions: Vec<crate::native_evidence::ControlRegion>,
-    labels: BTreeMap<String, String>,
     stored_bytes: u64,
 }
 
@@ -4434,13 +4432,6 @@ fn write_graph_document(
             "INSERT INTO graph_nodes VALUES(?1,?2,?3,?4)",
             params![gid, stored_sid(&n.id)?, n.name, kind],
         )?;
-        if let Some(label) = &n.display_label {
-            immutable.insert(
-                db,
-                "INSERT INTO graph_display_labels VALUES(?1,?2,?3)",
-                params![gid, stored_sid(&n.id)?, label],
-            )?;
-        }
     }
     for class in &grouped.classes {
         if reused.class {
@@ -8049,7 +8040,7 @@ fn validate_reconcile_inventory(db: &Connection) -> Result<()> {
         .context("incompatible_index: invalid reconcile options")?;
     control_ensure!(
         json(&decoded_options)? == options
-            && decoded_options.version == 1
+            && decoded_options.version == 2
             && decoded_options.max_file_bytes > 0
             && decoded_options.max_file_bytes <= 256 * 1024 * 1024,
         "incompatible_index: unsupported reconcile options"
@@ -8128,8 +8119,6 @@ fn validate_reconcile_inventory(db: &Connection) -> Result<()> {
                 if key.starts_with("config:")
                     || key.starts_with("toolchain:")
                     || key.starts_with("ignore:")
-                    || key.starts_with("presentation-scip:")
-                    || key.starts_with("presentation-manifest:")
                     || key.starts_with("executable:") =>
             {
                 validate_capture_stat(stat, "file")?;
@@ -8161,9 +8150,7 @@ fn validate_reconcile_inventory(db: &Connection) -> Result<()> {
             (key, crate::capture::CaptureInputObservation::Absent)
                 if key.starts_with("config:")
                     || key.starts_with("toolchain:")
-                    || key.starts_with("ignore:")
-                    || key.starts_with("presentation-scip:")
-                    || key.starts_with("presentation-manifest:") => {}
+                    || key.starts_with("ignore:") => {}
             _ => {
                 return Err(ControlIntegrity(
                     "incompatible_index: capture input role mismatch".into(),
@@ -8215,33 +8202,6 @@ fn validate_reconcile_inventory(db: &Connection) -> Result<()> {
             ControlIntegrity("incompatible_index: missing executable input".into())
         })?,
     );
-    match &decoded_options.scip_path {
-        Some(path) => {
-            control_ensure!(!path.is_empty(), "incompatible_index: empty SCIP option");
-            expected.insert(format!("presentation-scip:{path}"));
-        }
-        None => control_ensure!(
-            !actual
-                .iter()
-                .any(|key| key.starts_with("presentation-scip:")),
-            "incompatible_index: unconfigured SCIP input"
-        ),
-    }
-    match &decoded_options.manifest_path {
-        Some(path) => {
-            control_ensure!(
-                !path.is_empty(),
-                "incompatible_index: empty manifest option"
-            );
-            expected.insert(format!("presentation-manifest:{path}"));
-        }
-        None => control_ensure!(
-            !actual
-                .iter()
-                .any(|key| key.starts_with("presentation-manifest:")),
-            "incompatible_index: unconfigured manifest input"
-        ),
-    }
     // Revisions published before the extractor producer hash lack it; they
     // stay readable and simply never qualify for rebuilt-executable reuse.
     if actual.contains(crate::capture::EXTRACTOR_INPUT_KEY) {
@@ -9433,12 +9393,9 @@ impl Store {
             ))
             .context("incompatible_index: invalid reconcile options")?;
         ensure!(
-            json(&options)? == raw_options && options.version == 1,
+            json(&options)? == raw_options && options.version == 2,
             "incompatible_index: unsupported reconcile options"
         );
-        options.require_absolute_optional_inputs().context(
-            "recovery_required: recorded relative index input; run explicit trellis index",
-        )?;
         let status = store.read_status(&db)?;
         store.identity.verify_readonly()?;
         guard.verify()?;
@@ -10811,17 +10768,12 @@ impl Store {
                 ))
                 .context("incompatible_index: invalid reconcile options")?;
             selected_ensure!(
-                json(&options)? == payload && options.version == 1,
+                json(&options)? == payload && options.version == 2,
                 "incompatible_index: unsupported reconcile options"
             );
-            options.require_absolute_optional_inputs().context(
-                "recovery_required: recorded relative index input; run explicit trellis index",
-            )?;
             let mut result =
                 crate::indexer::IndexOptions::new(Path::new(&self.workspace_root).to_owned());
             result.max_file_bytes = options.max_file_bytes;
-            result.scip_path = options.scip_path.map(Into::into);
-            result.manifest_path = options.manifest_path.map(Into::into);
             Ok(Some(result))
         })()
         .map_err(|error| self.report_index_failure(error))
@@ -11610,9 +11562,6 @@ impl Store {
                         && counts.hashes == 1),
             "native_evidence_required: each source must open, read, and hash once"
         );
-        capture
-            .reconcile_options()
-            .require_absolute_optional_inputs()?;
         ensure!(
             spool.len() == spool.header().revision.documents.len()
                 && spool.len() == capture.files.len(),
@@ -12167,11 +12116,7 @@ impl Store {
             "native_evidence_required: each source must open, read, and hash once"
         );
         crate::indexer::validate_native_graph(graph, capture, native, cancel)?;
-        // A capture from a direct library caller must not persist cwd-relative
-        // presentation identities even if it bypassed the explicit CLI ingress.
-        capture
-            .reconcile_options()
-            .require_absolute_optional_inputs()
+        Ok(())
     }
     /// Publish to an unpublished private bootstrap while the caller retains EX use.
     /// This stages the full pair without admitting evidence from the corrupt live DB.
@@ -15771,7 +15716,6 @@ impl Store {
         Ok(SelectedHeader {
             path: path.to_owned(),
             language,
-            gid,
             hash,
             bytes,
             scope,
@@ -15788,7 +15732,6 @@ impl Store {
         let SelectedHeader {
             path,
             language,
-            gid,
             hash,
             bytes,
             scope,
@@ -15814,23 +15757,11 @@ impl Store {
         let calls = read_native_calls_v8_inner(db, &scope, None, progress)?;
         optional_hint_check(progress)?;
         let regions = read_native_control_regions_v8_inner(db, &scope, None, progress)?;
-        let mut labels = BTreeMap::new();
-        for row in db
-            .prepare_cached("SELECT id,label FROM graph_display_labels WHERE gid=?1 ORDER BY id")?
-            .query_map([gid], |r| {
-                Ok((stored_id_row(r, 0, false)?, r.get::<_, String>(1)?))
-            })?
-        {
-            optional_hint_check(progress)?;
-            let (id, label) = row?;
-            labels.insert(id, label);
-        }
         Ok(FetchedDocument {
             file,
             declarations,
             calls,
             regions,
-            labels,
             stored_bytes,
         })
     }
@@ -15843,7 +15774,6 @@ impl Store {
             declarations,
             calls,
             regions,
-            labels,
             stored_bytes: _,
         } = fetched;
         let (nodes, graph_calls, graph_regions) = crate::indexer::project_document(
@@ -15854,7 +15784,6 @@ impl Store {
                 calls: calls.iter().collect(),
                 control_regions: regions.iter().collect(),
             },
-            &labels,
         )
         .context(SelectedIntegrity(
             "incompatible_index: selected graph derivation failed".into(),

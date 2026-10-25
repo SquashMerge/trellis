@@ -928,7 +928,7 @@ fn ingress_filters_only_certain_excluded_noise_before_debounce() {
     for path in &noise {
         fs::write(path, "noise").unwrap();
     }
-    let mut watch = WatchSignals::new(root.to_owned(), None, None);
+    let mut watch = WatchSignals::new(root.to_owned());
     // This fixture drives the bounded synthetic ingress only. Do not let a
     // live notify callback race the exact generation being acknowledged.
     watch.disable_native_watcher_for_tests();
@@ -980,7 +980,7 @@ fn ingress_filters_only_certain_excluded_noise_before_debounce() {
 }
 
 #[test]
-fn selected_input_inside_excluded_subtree_is_accepted() {
+fn excluded_unselected_artifact_does_not_schedule_native_work() {
     use notify::{
         Event, EventKind,
         event::{DataChange, ModifyKind},
@@ -989,17 +989,16 @@ fn selected_input_inside_excluded_subtree_is_accepted() {
     let workspace = tempfile::tempdir().unwrap();
     let root = workspace.path();
     fs::create_dir(root.join("target")).unwrap();
-    let selected = root.join("target/index.scip");
-    fs::write(&selected, "selected input").unwrap();
-    let mut watch = WatchSignals::new(root.to_owned(), Some(selected.clone()), None);
+    let artifact = root.join("target/index.scip");
+    fs::write(&artifact, "unselected input").unwrap();
+    let mut watch = WatchSignals::new(root.to_owned());
     let initial = watch.drain();
     assert!(watch.acknowledge(&initial));
     watch.submit_event(Ok(Event::new(EventKind::Modify(ModifyKind::Data(
         DataChange::Content,
     )))
-    .add_path(selected)));
-    assert!(watch.accepted_unacked());
-    assert!(watch.drain().full);
+    .add_path(artifact)));
+    assert!(!watch.accepted_unacked());
 }
 
 #[test]

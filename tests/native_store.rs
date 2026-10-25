@@ -870,36 +870,10 @@ fn selected_class_payload_oversize_refuses_before_json_decode() {
 #[test]
 #[cfg(feature = "test-support")]
 fn every_encoded_selected_id_rejects_wrong_length_blob() {
-    use protobuf::Message;
-    use sha2::{Digest, Sha256};
     let (state, root, store, cancel) = fixture();
     let java = "class Base {}\nclass Demo<T> extends Base {\n  <U> U map(U input) { if (input != null) { if (input.hashCode() > 0) { helper(); } } return input; }\n  void helper() {}\n}\n";
     fs::write(root.path().join("flow.java"), java).unwrap();
-    let scip_path = state.path().join("labels.scip");
-    let manifest_path = state.path().join("labels.json");
-    let mut index = scip::types::Index::new();
-    let mut document = scip::types::Document::new();
-    document.relative_path = "flow.java".into();
-    document.position_encoding =
-        scip::types::PositionEncoding::UTF16CodeUnitOffsetFromLineStart.into();
-    let mut occurrence = scip::types::Occurrence::new();
-    occurrence.range = vec![1, 6, 10];
-    occurrence.symbol_roles = 1;
-    occurrence.symbol = "scip test Demo".into();
-    document.occurrences.push(occurrence);
-    index.documents.push(document);
-    fs::write(&scip_path, index.write_to_bytes().unwrap()).unwrap();
-    fs::write(
-        &manifest_path,
-        serde_json::to_vec(&serde_json::json!({
-            "flow.java": hex::encode(Sha256::digest(java.as_bytes()))
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-    let mut options = IndexOptions::new(root.path().to_owned());
-    options.scip_path = Some(scip_path);
-    options.manifest_path = Some(manifest_path);
+    let options = IndexOptions::new(root.path().to_owned());
     let (graph, native, capture) =
         index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
     let leader = store.publication_for_tests().unwrap();
@@ -923,7 +897,6 @@ fn every_encoded_selected_id_rejects_wrong_length_blob() {
     // Reads trust the published index (#261), but a row that will not decode
     // is corruption: it fails typed and schedules a re-index.
     let cases = [
-        ("graph_display_labels", "id", "gid"),
         ("native_version_declarations", "syntax_id", "vid"),
         ("native_version_declarations", "owner_syntax_id", "vid"),
         ("native_version_declaration_ancestors", "syntax_id", "vid"),

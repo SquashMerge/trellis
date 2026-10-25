@@ -31,9 +31,7 @@ fn fixture() -> (
     fs::write(physical.join("src/A.js"), text).unwrap();
     fs::write(physical.join("artifact.scip"), hex::decode(WIRE).unwrap()).unwrap();
     let cancel = Arc::new(AtomicBool::new(false));
-    let mut options = IndexOptions::new(physical.clone());
-    options.scip_path = Some(physical.join("artifact.scip"));
-    options.manifest_path = Some(physical.join("manifest.json"));
+    let options = IndexOptions::new(physical.clone());
     let first = Capture::admit(&options, &cancel, &|_| {}).unwrap();
     let identity =
         trellis::store::topology::WorkspaceIdentity::discover(Some(&physical), &physical).unwrap();
@@ -76,8 +74,16 @@ fn fixture() -> (
         profile_id: "mac-mini-m5-pro-v1".into(),
         producer_name: "scip-typescript".into(),
     };
-    let admission =
-        ReferenceProfileAdmission::from_trusted_selection(&capture, &selection, &cancel).unwrap();
+    let admission = ReferenceProfileAdmission::from_trusted_selection(
+        &capture,
+        &physical.join("artifact.scip"),
+        &bytes,
+        &physical.join("manifest.json"),
+        &manifest_bytes,
+        &selection,
+        &cancel,
+    )
+    .unwrap();
     let inventory = decode_reference_profile(&admission, &cancel).unwrap();
     let native = native::from_capture(&capture, &physical, &identity.record_id, &cancel).unwrap();
     let sources = capture
@@ -438,9 +444,7 @@ fn admitted_case_with_calls(
     let bytes = index.write_to_bytes().unwrap();
     fs::write(physical.join("artifact.scip"), &bytes).unwrap();
     let cancel = Arc::new(AtomicBool::new(false));
-    let mut options = IndexOptions::new(physical.clone());
-    options.scip_path = Some(physical.join("artifact.scip"));
-    options.manifest_path = Some(physical.join("manifest.json"));
+    let options = IndexOptions::new(physical.clone());
     let first = Capture::admit(&options, &cancel, &|_| {}).unwrap();
     let identity =
         trellis::store::topology::WorkspaceIdentity::discover(Some(&physical), &physical).unwrap();
@@ -482,8 +486,16 @@ fn admitted_case_with_calls(
         profile_id: "mac-mini-m5-pro-v1".into(),
         producer_name: producer_name.into(),
     };
-    let admission =
-        ReferenceProfileAdmission::from_trusted_selection(&capture, &selection, &cancel).unwrap();
+    let admission = ReferenceProfileAdmission::from_trusted_selection(
+        &capture,
+        &physical.join("artifact.scip"),
+        &bytes,
+        &physical.join("manifest.json"),
+        &manifest_bytes,
+        &selection,
+        &cancel,
+    )
+    .unwrap();
     let inventory = decode_reference_profile(&admission, &cancel).unwrap();
     let native = native::from_capture(&capture, &physical, &identity.record_id, &cancel).unwrap();
     let sources = capture

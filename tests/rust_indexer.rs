@@ -167,9 +167,7 @@ fn cargo_hash_inputs_and_fresh_scip_do_not_resolve_rust() {
         serde_json::to_vec(&hashes).unwrap(),
     )
     .unwrap();
-    let mut o = IndexOptions::new(d.path().to_owned());
-    o.scip_path = Some(d.path().join("index.scip"));
-    o.manifest_path = Some(d.path().join("manifest.json"));
+    let o = IndexOptions::new(d.path().to_owned());
     let g = run(&o);
     assert_eq!(g.stats.semantic_state, SemanticState::Unavailable);
     assert!(

@@ -210,7 +210,7 @@ fn private_stage_fault_before_publish_leaves_main_absent_and_retries() {
                     Connection::open_with_flags(stage, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
                 assert_eq!(
                     db.pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))?,
-                    1
+                    2
                 );
                 assert!(!path.exists());
                 stage_path = Some(stage.to_owned());
@@ -272,7 +272,7 @@ fn crashed_stage_orphan_sibling_does_not_change_candidate_gc_inventory() {
 }
 
 #[test]
-fn publish_between_dir_syncs_reopens_v1_without_losing_witness_gate() {
+fn publish_between_dir_syncs_reopens_v2_without_losing_witness_gate() {
     let state = tempfile::tempdir().unwrap();
     let root = tempfile::tempdir().unwrap();
     let store = Store::open_for_tests(state.path(), root.path()).unwrap();
@@ -593,4 +593,209 @@ fn missing_virgin_queue_bootstraps_empty_queue_before_first_startup() {
     assert_eq!(store.settle_foreign_root_requests().unwrap(), 0);
     assert!(store.request_db_path().exists());
     assert!(store.current_request().unwrap().is_none());
+}
+
+#[test]
+fn v1_accepted_and_terminal_rows_migrate_atomically_without_optional_inputs() {
+    let state = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("a.js"), "function a() {}\n").unwrap();
+    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    let path = store.request_db_path();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let db = Connection::open(&path).unwrap();
+    db.execute_batch(V1_SCHEMA).unwrap();
+    db.execute(
+        "INSERT INTO queue_identity VALUES (1,?1,?2)",
+        params![store.workspace_root, store.identity.root_key],
+    )
+    .unwrap();
+    let generation = Uuid::new_v4().to_string();
+    let ids: Vec<_> = (0..4).map(|_| Uuid::new_v4().to_string()).collect();
+    let old_options = serde_json::json!({"version":1,"maxFileBytes":8192,"scipPath":"/missing/old.scip","manifestPath":"/missing/old.json"}).to_string();
+    for (i, id) in ids.iter().enumerate() {
+        let (status, claim, result, err, started, finished) = match i {
+            0 => ("queued", None, None, None, None, None),
+            1 => ("running", Some("prior"), None, None, Some("102"), None),
+            2 => (
+                "done",
+                Some("prior"),
+                Some(9),
+                None,
+                Some("103"),
+                Some("104"),
+            ),
+            _ => (
+                "failed",
+                Some("prior"),
+                None,
+                Some("index_failed"),
+                Some("105"),
+                Some("106"),
+            ),
+        };
+        db.execute("INSERT INTO requests(seq,id,root_device,root_inode,options_json,expected_generation,expected_revision,state,claim_incarnation,result_generation,result_revision,error_code,submitted_at,started_at,finished_at) VALUES (?1,?2,?3,?4,?5,?6,7,?7,?8,?9,?10,?11,?12,?13,?14)", params![i as i64+1,id,store.identity.device.to_string(),store.identity.inode.to_string(),old_options,generation,status,claim,result.map(|_| generation.clone()),result,err,format!("10{i}"),started,finished]).unwrap();
+    }
+    drop(db);
+    std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+    let queued = store.earliest_unfinished_request().unwrap().unwrap();
+    assert_eq!(queued.id, ids[0]);
+    assert_eq!(queued.options(root.path()).unwrap().max_file_bytes, 8192);
+    let db = Connection::open(&path).unwrap();
+    let version: i64 = db
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 2);
+    validate_gc_queue(&db, &store.workspace_root, &store.identity.root_key).unwrap();
+    for (i, id) in ids.iter().enumerate() {
+        let row = db
+            .query_row(
+                &format!("SELECT {COLUMNS} FROM requests WHERE id=?1"),
+                [id],
+                read,
+            )
+            .unwrap();
+        assert_eq!(row.seq, i as i64 + 1);
+        assert_eq!(row.id, *id);
+        assert_eq!(row.root_device, store.identity.device.to_string());
+        assert_eq!(row.root_inode, store.identity.inode.to_string());
+        assert_eq!(
+            row.expected.unwrap().index_generation.to_string(),
+            generation
+        );
+        assert_eq!(row.expected.unwrap().index_revision, 7);
+        assert_eq!(row.submitted_at, format!("10{i}"));
+        assert_eq!(row.request_kind, RequestKind::Index);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&row.options_json).unwrap(),
+            serde_json::json!({"version":2,"maxFileBytes":8192})
+        );
+        assert_eq!(row.state, ["queued", "running", "done", "failed"][i]);
+        assert_eq!(
+            row.claim_incarnation.as_deref(),
+            [None, Some("prior"), Some("prior"), Some("prior")][i]
+        );
+        assert_eq!(
+            row.started_at.as_deref(),
+            [None, Some("102"), Some("103"), Some("105")][i]
+        );
+        assert_eq!(
+            row.finished_at.as_deref(),
+            [None, None, Some("104"), Some("106")][i]
+        );
+        assert_eq!(
+            row.error_code.as_deref(),
+            if i == 3 { Some("index_failed") } else { None }
+        );
+        assert_eq!(
+            row.revision.map(|p| p.index_revision),
+            if i == 2 { Some(9) } else { None }
+        );
+        assert_eq!(
+            row.revision.map(|p| p.index_generation.to_string()),
+            if i == 2 {
+                Some(generation.clone())
+            } else {
+                None
+            }
+        );
+    }
+    drop(db);
+}
+
+#[test]
+fn malformed_v1_row_does_not_partially_migrate_queue() {
+    let state = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    let path = store.request_db_path();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let db = Connection::open(&path).unwrap();
+    db.execute_batch(V1_SCHEMA).unwrap();
+    db.execute(
+        "INSERT INTO queue_identity VALUES (1,?1,?2)",
+        params![store.workspace_root, store.identity.root_key],
+    )
+    .unwrap();
+    for (i, options) in [
+        r#"{"version":1,"maxFileBytes":1024,"scipPath":"/old","manifestPath":null}"#,
+        r#"{"version":1,"maxFileBytes":1024,"unexpected":true}"#,
+    ]
+    .iter()
+    .enumerate()
+    {
+        db.execute("INSERT INTO requests(id,root_device,root_inode,options_json,state,submitted_at) VALUES (?1,?2,?3,?4,'queued','100')",params![Uuid::new_v4().to_string(),store.identity.device.to_string(),store.identity.inode.to_string(),options]).unwrap();
+        assert_eq!(
+            i as i64 + 1,
+            db.query_row("SELECT count(*) FROM requests", [], |r| r.get::<_, i64>(0))
+                .unwrap()
+        );
+    }
+    drop(db);
+    std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+    assert!(
+        store
+            .earliest_unfinished_request()
+            .unwrap_err()
+            .to_string()
+            .contains("incompatible_queue")
+    );
+    let db = Connection::open(&path).unwrap();
+    assert_eq!(
+        db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM requests", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+    assert!(!db.prepare("SELECT request_kind FROM requests").is_ok());
+}
+
+#[test]
+fn migrated_v1_native_fifo_executes_without_old_artifact_paths() {
+    let state = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("a.js"), "function a() {}\n").unwrap();
+    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    let path = store.request_db_path();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let db = Connection::open(&path).unwrap();
+    db.execute_batch(V1_SCHEMA).unwrap();
+    db.execute(
+        "INSERT INTO queue_identity VALUES (1,?1,?2)",
+        params![store.workspace_root, store.identity.root_key],
+    )
+    .unwrap();
+    let ids = [Uuid::new_v4().to_string(), Uuid::new_v4().to_string()];
+    for id in &ids {
+        db.execute("INSERT INTO requests(id,root_device,root_inode,options_json,state,submitted_at) VALUES (?1,?2,?3,?4,'queued','100')",params![id,store.identity.device.to_string(),store.identity.inode.to_string(),serde_json::json!({"version":1,"maxFileBytes":8192,"scipPath":"/does-not-exist/old.scip","manifestPath":"/does-not-exist/old.json"}).to_string()]).unwrap();
+    }
+    drop(db);
+    std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+    let options = IndexOptions::new(root.path().to_owned());
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (_, owner) =
+        crate::index_coordinator::reconcile_workspace(&store, &options, &cancel, |_| {}).unwrap();
+    assert_eq!(
+        crate::index_coordinator::drain_requests(&store, &owner).unwrap(),
+        2
+    );
+    for id in ids {
+        let row = store.request_by_id(&id).unwrap().unwrap();
+        assert_eq!(row.state, "done");
+        assert_eq!(row.options(root.path()).unwrap().max_file_bytes, 8192);
+    }
+    assert_eq!(
+        store
+            .graph_at(None)
+            .unwrap()
+            .nodes
+            .iter()
+            .filter(|n| n.name == "a")
+            .count(),
+        1
+    );
 }
