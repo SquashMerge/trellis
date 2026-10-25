@@ -40,7 +40,9 @@ test("real Connect preserves explicit token opt-in, file loading, restore, typed
     browser = await chromium.launch();
     context = await browser.newContext({viewport:{width:1440,height:900}});
     const page = await context.newPage();
-    const apiRequests = [], pageErrors = [];
+    const apiRequests = [], pageErrors = [], fileChoosers = [];
+    // Enable Chromium chooser interception before navigation, not alongside the key press.
+    page.on("filechooser", chooser => fileChoosers.push(chooser));
     page.on("pageerror", error => pageErrors.push(error.message));
     page.on("request", request => {
       const url = new URL(request.url());
@@ -77,19 +79,25 @@ test("real Connect preserves explicit token opt-in, file loading, restore, typed
     }
     await page.setViewportSize({width:1440, height:900});
 
-    // The visible file action opens Chromium's real chooser from the keyboard.
-    await page.locator("#token").focus();
-    await page.keyboard.press("Tab");
-    assert.equal(await page.locator("#load-token-file").evaluate(node => document.activeElement === node && node.matches(":focus-visible") && getComputedStyle(node).outlineStyle !== "none" && parseFloat(getComputedStyle(node).outlineWidth) > 0), true, "file action has visible keyboard focus");
-    const choosing = page.waitForEvent("filechooser");
-    await page.keyboard.press("Enter");
-    await (await choosing).setFiles(paths.tokenFile);
-    await page.waitForFunction(() => document.querySelector("#notice")?.textContent.includes("Token file loaded locally"));
-    assert.ok(await page.locator("#token").evaluate((input, secret) => input.value === secret, paths.token), "local file fills the password field");
-    assert.ok(await page.locator("#token-file").evaluate(input => input.value === ""), "file selection resets after loading");
-    assert.equal(await page.locator("#remember-token").isChecked(), false);
-    assert.equal(await hasNoSavedToken(page), true);
-    assert.deepEqual(apiRequests, [], "file selection does not connect or persist");
+    // Both native keyboard activation paths must open the hidden input's real chooser.
+    for (const key of ["Enter", "Space"]) {
+      await page.locator("#token").focus();
+      await page.keyboard.press("Tab");
+      const action = page.locator("#load-token-file");
+      assert.equal(await action.evaluate(node => document.activeElement === node && node.matches(":focus-visible") && getComputedStyle(node).outlineStyle !== "none" && parseFloat(getComputedStyle(node).outlineWidth) > 0), true, "file action has visible keyboard focus");
+      const [chooser] = await Promise.all([
+        page.waitForEvent("filechooser"),
+        action.press(key),
+      ]);
+      assert.equal(await chooser.element().getAttribute("id"), "token-file");
+      assert.equal(fileChoosers.length, key === "Enter" ? 1 : 2, "one chooser per activation");
+      await chooser.setFiles(paths.tokenFile);
+      await page.waitForFunction(() => document.querySelector("#token-file").value === "" && document.querySelector("#notice")?.textContent.includes("Token file loaded locally"));
+      assert.ok(await page.locator("#token").evaluate((input, secret) => input.value === secret, paths.token), "local file fills the password field");
+      assert.equal(await page.locator("#remember-token").isChecked(), false);
+      assert.equal(await hasNoSavedToken(page), true);
+      assert.deepEqual(apiRequests, [], "file selection does not connect or persist");
+    }
 
     // Continue in form order and submit without a pointer.
     await page.locator("#load-token-file").focus();
