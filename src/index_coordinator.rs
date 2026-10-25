@@ -1376,7 +1376,6 @@ fn drain_requests_observed_with_cancel(
                             &cert.options,
                             &request.root_device,
                             &request.root_inode,
-                            cancel,
                         );
                     }
                 },

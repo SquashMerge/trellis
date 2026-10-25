@@ -7447,14 +7447,15 @@ fn compare_capture_snapshot(
     compare_capture_snapshot_with(db, capture, true)
 }
 
-/// The selected-reuse comparison: the executable observation is left out, so
-/// an executable rebuild alone is no change. Native reuse is decided by the
-/// recorded extractor producer hash, which is compared (Decision 0005).
-fn compare_capture_snapshot_for_reuse(
+/// UNCHANGED trusts the indexer's published source hashes and projection links.
+/// Fresh Capture hashes are still compared; stored source BLOBs are not read.
+fn compare_capture_snapshot_for_unchanged(
     db: &Connection,
     capture: &crate::capture::Capture,
+    include_executable: bool,
+    cancel: &CancelFlag,
 ) -> Result<ScanComparison> {
-    compare_capture_snapshot_with(db, capture, false)
+    compare_capture_snapshot_inner(db, capture, include_executable, Some(cancel))
 }
 
 fn compare_capture_snapshot_with(
@@ -7462,20 +7463,59 @@ fn compare_capture_snapshot_with(
     capture: &crate::capture::Capture,
     include_executable: bool,
 ) -> Result<ScanComparison> {
+    compare_capture_snapshot_inner(db, capture, include_executable, None)
+}
+
+fn compare_capture_snapshot_inner(
+    db: &Connection,
+    capture: &crate::capture::Capture,
+    include_executable: bool,
+    unchanged: Option<&CancelFlag>,
+) -> Result<ScanComparison> {
     let mut previous_sources = BTreeMap::new();
-    let mut statement = db.prepare(SELECTED_CAPTURE_SNAPSHOT_SQL)?;
-    let rows = statement.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-        ))
-    })?;
-    for row in rows {
-        let (path, hash, stat) = row?;
+    let sql = if unchanged.is_some() {
+        "SELECT d.path,v.content_hash,d.capture_stat,v.language,v.path,v.byte_length,
+            g.state,c.state,v.extraction_context,v.producer_id,v.producer_version
+         FROM revision_documents d
+         LEFT JOIN document_versions v ON v.vid=d.vid AND v.language=d.language AND v.path=d.path
+         LEFT JOIN graph_projections g ON g.gid=d.gid AND g.vid=d.vid AND g.language=d.language
+         LEFT JOIN class_projections c ON c.cid=d.cid AND c.gid=d.gid
+         WHERE d.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision
+             FROM index_metadata WHERE singleton=1) ORDER BY d.path"
+    } else {
+        SELECTED_CAPTURE_SNAPSHOT_SQL
+    };
+    let mut statement = db.prepare(sql)?;
+    let mut rows = statement.query([])?;
+    let mut reuse_metadata = BTreeMap::new();
+    while let Some(row) = rows.next()? {
+        if let Some(cancel) = unchanged {
+            check_cancel(cancel)?;
+        }
+        let path: String = row.get(0)?;
+        let hash: Option<String> = row.get(1)?;
+        let hash = hash.ok_or_else(|| {
+            SelectedIntegrity("incompatible_index: selected reused source missing".into())
+        })?;
+        let stat: String = row.get(2)?;
         let stat: crate::capture::CaptureStat = serde_json::from_str(&stat).context(
             SelectedIntegrity("incompatible_index: stored JSON decode failed".into()),
         )?;
+        if unchanged.is_some() {
+            reuse_metadata.insert(
+                path.clone(),
+                (
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, String>(10)?,
+                ),
+            );
+        }
         selected_ensure!(
             previous_sources.insert(path, (hash, stat)).is_none(),
             "incompatible_index: duplicate captured source observation"
@@ -7511,12 +7551,43 @@ fn compare_capture_snapshot_with(
         previous_inputs.retain(|key: &String, _| !key.starts_with("executable:"));
         current_inputs.retain(|key, _| !key.starts_with("executable:"));
     }
-    Ok(compare_capture_observations(
+    let comparison = compare_capture_observations(
         &previous_sources,
         &current_sources,
         &previous_inputs,
         &current_inputs,
-    ))
+    );
+    if !comparison.changed()
+        && let Some(cancel) = unchanged
+    {
+        for source in &capture.files {
+            check_cancel(cancel)?;
+            let (language, path, length, graph, class, context, producer, version) =
+                reuse_metadata.get(&source.path).ok_or_else(|| {
+                    SelectedIntegrity("incompatible_index: selected reused source missing".into())
+                })?;
+            selected_ensure!(
+                language == &source.language
+                    && path == &source.path
+                    && usize::try_from(*length).ok() == Some(source.text.len()),
+                "incompatible_index: selected reused source metadata differs"
+            );
+            selected_ensure!(
+                graph.as_deref() == Some("ready")
+                    && class.as_deref() == Some("ready")
+                    && producer == crate::native_evidence::PRODUCER
+                    && version == crate::native_evidence::NATIVE_VERSION
+                    && context
+                        == &crate::native_evidence::declared_selected_extraction_context(
+                            producer,
+                            version,
+                            &source.language,
+                        )?,
+                "incompatible_index: selected reusable projection link or extraction context invalid"
+            );
+        }
+    }
+    Ok(comparison)
 }
 
 fn validate_capture_stat(stat: &crate::capture::CaptureStat, expected_kind: &str) -> Result<()> {
@@ -11924,8 +11995,8 @@ impl Store {
     /// A leader Serve can advance an unchanged, already-validated head without
     /// re-extracting native facts. This is deliberately stricter than stat
     /// equality: Capture::admit has freshly read and SHA-256 hashed every source,
-    /// and selected_source_row_for authenticates the saved bytes of every reused
-    /// version before any metadata-only writer transaction starts.
+    /// and the indexer's saved content hashes identify the validated versions.
+    /// Stored source bytes are not re-attested by these UNCHANGED writer paths.
     /// A leader's final full inventory may avoid a redundant publication only
     /// when the freshly hashed capture is still exactly the selected head.
     /// This read-only guard is not an explicit-request completion path.
@@ -11983,60 +12054,9 @@ impl Store {
         if prior_options != json(capture.reconcile_options())? {
             return Ok(false);
         }
-        let comparison = compare_capture_snapshot(&db, capture)?;
+        let comparison = compare_capture_snapshot_for_unchanged(&db, capture, true, cancel)?;
         if comparison.examined == 0 || comparison.changed() {
             return Ok(false);
-        }
-        for source in &capture.files {
-            check_cancel(cancel)?;
-            let stored = self
-                .selected_source_row_for(&db, &source.path, &selected)?
-                .ok_or_else(|| {
-                    SelectedIntegrity(
-                        "incompatible_index: selected final inventory source missing".into(),
-                    )
-                })?;
-            selected_ensure!(
-                stored == *source,
-                "incompatible_index: selected final inventory source differs"
-            );
-            let linked: Option<(String, String, String, String, String)> = db
-                .prepare_cached(
-                    "SELECT g.state,c.state,v.extraction_context,v.producer_id,v.producer_version
-                 FROM revision_documents m
-                 JOIN document_versions v ON v.vid=m.vid AND v.language=m.language AND v.path=m.path
-                 JOIN graph_projections g ON g.gid=m.gid AND g.vid=m.vid AND g.language=m.language
-                 JOIN class_projections c ON c.cid=m.cid AND c.gid=m.gid
-                 WHERE m.revision_id=?1 AND m.path=?2",
-                )?
-                .query_row(params![selected.key, source.path], |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                    ))
-                })
-                .optional()?;
-            let (graph, class, context, producer, version) = linked.ok_or_else(|| {
-                SelectedIntegrity(
-                    "incompatible_index: selected final inventory projection missing".into(),
-                )
-            })?;
-            selected_ensure!(
-                graph == "ready"
-                    && class == "ready"
-                    && producer == crate::native_evidence::PRODUCER
-                    && version == crate::native_evidence::NATIVE_VERSION
-                    && context
-                        == crate::native_evidence::declared_selected_extraction_context(
-                            &producer,
-                            &version,
-                            &source.language
-                        )?,
-                "incompatible_index: selected final inventory producer or projection drift"
-            );
         }
         capture.verify(cancel)?;
         leader.verify()?;
@@ -12120,7 +12140,7 @@ impl Store {
         if prior_options != json(capture.reconcile_options())? {
             return Ok(None);
         }
-        let comparison = compare_capture_snapshot_for_reuse(&db, capture)?;
+        let comparison = compare_capture_snapshot_for_unchanged(&db, capture, false, cancel)?;
         if comparison.changed() || comparison.examined == 0 {
             // This compares the freshly hashed source content AND the captured
             // root, directory, config, selector, presentation and extractor
@@ -12158,62 +12178,6 @@ impl Store {
         } else {
             None
         };
-        for source in &capture.files {
-            check_cancel(cancel)?;
-            let stored = self
-                .selected_source_row_for(&db, &source.path, &selected)?
-                .ok_or_else(|| {
-                    SelectedIntegrity("incompatible_index: selected reused source missing".into())
-                })?;
-            selected_ensure!(
-                stored == *source,
-                "incompatible_index: selected reused source bytes differ"
-            );
-            // The prior head has already validated these immutable versions.
-            // Check their indexed version/projection links without re-parsing
-            // millions of native and graph facts.
-            let linked: Option<(String, String, String, String, String)> = db
-                .prepare_cached(
-                    "SELECT g.state,c.state,v.extraction_context,v.producer_id,v.producer_version
-                 FROM revision_documents m
-                 JOIN document_versions v ON v.vid=m.vid
-                   AND v.language=m.language AND v.path=m.path
-                 JOIN graph_projections g ON g.gid=m.gid
-                   AND g.vid=m.vid AND g.language=m.language
-                 JOIN class_projections c ON c.cid=m.cid
-                   AND c.gid=m.gid
-                 WHERE m.revision_id=?1 AND m.path=?2",
-                )?
-                .query_row(params![selected.key, source.path], |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                    ))
-                })
-                .optional()?;
-            let (graph_state, class_state, context, producer_id, producer_version) = linked
-                .ok_or_else(|| {
-                    SelectedIntegrity(
-                        "incompatible_index: selected reusable projection link missing".into(),
-                    )
-                })?;
-            selected_ensure!(
-                graph_state == "ready"
-                    && class_state == "ready"
-                    && producer_id == crate::native_evidence::PRODUCER
-                    && producer_version == crate::native_evidence::NATIVE_VERSION
-                    && context
-                        == crate::native_evidence::declared_selected_extraction_context(
-                            &producer_id,
-                            &producer_version,
-                            &source.language,
-                        )?,
-                "incompatible_index: selected reusable projection link or extraction context invalid"
-            );
-        }
         // The same connection fences the authenticated preflight against a
         // concurrent direct SQL rewrite. The leader/use guards exclude normal
         // writers, while the metadata CAS excludes stale in-process requests.
@@ -12223,7 +12187,7 @@ impl Store {
             after_preflight == admitted_version,
             "incompatible_index: index changed during unchanged preflight"
         );
-        capture.verify(cancel)?;
+        check_cancel(cancel)?;
         leader.verify()?;
         self.identity.verify()?;
         // Decision 0006 §3 (amended 2026-10-20): an unchanged capture publishes
@@ -12242,8 +12206,13 @@ impl Store {
             "revision conflict: unchanged baseline changed"
         );
         let Some(header) = fresh_header else {
+            // Capture::admit already verified this fresh inventory. UNCHANGED
+            // publishes nothing, so it needs no second full filesystem walk.
             return Ok(Some(selected.pin));
         };
+        capture.verify(cancel)?;
+        leader.verify()?;
+        self.identity.verify()?;
         // Decision 0005 (2026-10 amendment): a rebuilt executable with an
         // unchanged extractor producer hash keeps every selected fact, but
         // the head must carry this executable's provenance and binding. Publish
@@ -17051,3 +17020,5 @@ mod sqlite_deleted_witness_tests;
 mod catalog_summary_tests;
 #[cfg(test)]
 mod preflight_hash_reuse_tests;
+#[cfg(test)]
+mod unchanged_trust_tests;

@@ -1163,8 +1163,8 @@ fn claimed_unchanged_guard_failure_never_acks_or_changes_selected_pair() {
     let db =
         rusqlite::Connection::open(store.request_db_path().with_file_name("index.db")).unwrap();
     db.execute(
-        "UPDATE document_versions SET source_bytes=?1 WHERE path='a.js'",
-        [b"function b() {}\n".as_slice()],
+        "UPDATE document_versions SET extraction_context=printf('%064d',0) WHERE path='a.js'",
+        [],
     )
     .unwrap();
     drop(db);
