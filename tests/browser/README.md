@@ -80,3 +80,18 @@ IPC readiness hook after real daemon election and serve attachment, interrupts
 that child suite, and checks both owned PIDs are gone. A daemon using another
 suite binary must survive. SIGKILL cannot run JavaScript cleanup. Production
 15-minute checkout/browser and 30-minute daemon idle policy is unchanged.
+
+## Files acceptance
+
+`files.test.cjs` uses the real daemon and published cached index to exercise Files on desktop
+and mobile. It checks the all-symbol outline, indexed source and syntax-match evidence labels,
+callable mini-sequence/Open full, and the existing per-file net HEAD-to-working-tree Git diff.
+Working-tree fixtures are staged and edited before indexing and startup so assertions do not
+race the watcher. Deterministic cached-vs-live divergence belongs to the offline Store/HTTP
+regressions, not timing-based browser edits. Git diff coordinates never become indexed
+navigation targets. No-Git and repository text remain explicit and safe.
+
+The suite runs in the canonical `./tools/verify` browser lane. For a focused run after normal
+setup and build, set `TRELLIS_SUITE_BINARY` to the absolute built binary and run
+`node --test --test-concurrency=1 tests/browser/files.test.cjs` with the same external
+`PLAYWRIGHT_BROWSERS_PATH`.

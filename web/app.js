@@ -26,6 +26,11 @@ const IndexPin = Object.freeze({
 window.TrellisIndexPin = IndexPin;
 const objectValue = value => !!value && typeof value === "object" && !Array.isArray(value);
 const sourceCache = new Map();
+let section = "diagrams", sectionSerial = 0, filesSerial = 0, filesDiffSerial = 0, filesMatchesSerial = 0;
+let filesFile = null, filesSymbol = null, filesBasis = "indexed", filesMini = null, filesMatches = null;
+let filesGitStatus = null, filesDiff = null, filesCatalogLoaded = false;
+let diagramSequence = null;
+
 function element(tag, text, className) {
   const node = document.createElement(tag);
   if (text !== undefined) node.textContent = text;
@@ -50,19 +55,20 @@ function selectedUrl(path, method, root) {
   }
   const suffix = path.startsWith("/api/") ? path.slice(5) : "";
   const route = suffix.split("?", 1)[0];
-  const simple = new Set(["status", "git", "metrics", "index", "tree", "files", "methods", "sequence", "classes", "class-diagram", "navigation", "source", "jobs/current", "dependencies", "dependencies/refresh", "dependencies/symbols", "dependencies/source", "rust-sources", "rust-sources/tree", "rust-sources/file"]);
-  if (["git", "metrics"].includes(route) && method !== "GET") throw new Error("Read-only API requests must be GET.");
+  const simple = new Set(["status", "git", "git/diff", "metrics", "index", "tree", "files", "methods", "symbols", "syntax-matches", "sequence", "classes", "class-diagram", "navigation", "source", "jobs/current", "dependencies", "dependencies/refresh", "dependencies/symbols", "dependencies/source", "rust-sources", "rust-sources/tree", "rust-sources/file"]);
+  if (route === "syntax-matches" && method !== "POST") throw new Error("Syntax match requests must be POST.");
+  if (["git", "git/diff", "metrics", "symbols"].includes(route) && method !== "GET") throw new Error("Read-only API requests must be GET.");
   const item = /^jobs\/[^/?]+(?:\/cancel)?$/.test(route);
   if (!simple.has(route) && !item || /[#\s]/.test(suffix) || suffix.includes("//")) throw new Error("Unknown checkout API route.");
   if (!root || !uniqueSelectableRoot(root)) throw new Error("Choose an available checkout first.");
   return `/api/checkouts/${encodeURIComponent(root)}/${suffix}`;
 }
-async function api(path, method = "GET", body) {
+async function api(path, method = "GET", body, callerCurrent = () => true) {
   const session = epoch, root = selectedRootKey, sourceAtStart = sourceSerial;
   const url = selectedUrl(path, method, root);
   const guarded = path.startsWith("/api/source?");
   const operationCurrent = operationGuard();
-  const current = () => session === epoch && root === selectedRootKey && (!guarded || (operationCurrent() && sourceAtStart === sourceSerial));
+  const current = () => callerCurrent() && session === epoch && root === selectedRootKey && (!guarded || (operationCurrent() && sourceAtStart === sourceSerial));
   let response, data, timer;
   const controller = new AbortController(); pendingRequests.add(controller);
   const timeoutError = new Error("Request timed out. No automatic retry was made. Refresh status before trying again.");
@@ -115,23 +121,25 @@ function form(id, action) {
 }
 function stale(message) { $("stale").textContent = message; $("stale").hidden = false; }
 function clearSource() {
-  sourceSerial++; window.TrellisNavigation?.reset(); $("source").replaceChildren();
+  sourceSerial++; workspaceSource = null; window.TrellisNavigation?.reset(); $("source").replaceChildren();
   $("source-path").textContent = "Choose a call to read its cached source snapshot.";
   if (!$("source-dock")?.hidden) window.TrellisShell?.closeSource?.();
 }
 function changedCount(value) { return Array.isArray(value) ? value.length : Number(value || 0); }
 function showSelectedGit(git) {
   selectedGit = git || null;
+  updateFilesBasis();
   window.TrellisShell?.updateCheckout(selectedWorkspaceRoot, selectedGit);
   if (!status) window.TrellisShell?.updateWorkspace(null);
 }
 async function refreshGit() {
   const serial = ++gitSerial, session = epoch, root = selectedRootKey;
+  filesDiffSerial++; filesDiff = null; $("files-diff")?.replaceChildren();
   try {
     const data = await api("/api/git");
-    if (serial === gitSerial && session === epoch && root === selectedRootKey) showSelectedGit(data?.git);
+    if (serial === gitSerial && session === epoch && root === selectedRootKey) { filesGitStatus = data; showSelectedGit(data?.git); updateFilesBasis(); if (section === "files") renderFiles(); }
   } catch (error) {
-    if (serial === gitSerial && session === epoch && root === selectedRootKey && error.name !== "AbortError") showSelectedGit(null);
+    if (serial === gitSerial && session === epoch && root === selectedRootKey && error.name !== "AbortError") { filesGitStatus = null; showSelectedGit(null); updateFilesBasis(); }
   }
 }
 async function refreshStatus(followup = false) {
@@ -168,6 +176,7 @@ async function refreshStatus(followup = false) {
   if (browseChanged) clearDependencyCatalog();
   status = {...data, revision:nextPin};
   data = status;
+  updateFilesBasis();
   const listed = checkouts.find(row => row.rootKey === selectedRootKey);
   if (listed) Object.assign(listed, {revision:nextPin, catchingUp:data.catchingUp, indexError:nextPin ? null : "index_not_ready"});
   window.TrellisShell?.updateWorkspace(nextPin ? status : null);
@@ -249,7 +258,7 @@ const validRootKey = key => typeof key === "string" && /^[0-9a-f]{64}$/.test(key
 function checkoutOption(label, value) { const option = element("option", label); option.value = value; return option; }
 function resetCheckout() {
   // Advance the generation before aborting or awaiting any request. Equal revision pairs are not identity.
-  epoch++; gitSerial++; selectedRootKey = null; selectedWorkspaceRoot = null; selectedGit = null; checkoutBusy = false;
+  epoch++; gitSerial++; section = "diagrams"; sectionSerial++; filesGitStatus = null; selectedRootKey = null; selectedWorkspaceRoot = null; selectedGit = null; checkoutBusy = false;
   for (const controller of pendingRequests) controller.abort();
   clearTimeout(pollTimer); pollTimer = null; statusSerial++;
   pairRefreshPending = false; pairRefreshQueued = null;
@@ -471,40 +480,70 @@ function sourceWitness(item) {
     (r.endByte == null || (Number.isSafeInteger(r.endByte) && r.endByte > (r.startByte ?? -1)));
 }
 async function showSource(item, revision) {
-  IndexPin.copy(revision);
   if (!sourceWitness(item)) throw new Error("Measured source path and range unavailable.");
-  if (!status?.revision || !IndexPin.equal(revision, status.revision)) throw new Error("This source has no current paired snapshot. Refresh the view first.");
-  const serial = ++sourceSerial; const key = `${IndexPin.key(revision)}:${item.path}`;
-  window.TrellisNavigation?.reset();
-  $("source-path").textContent = `Loading ${item.path}…`; $("source").replaceChildren();
-  const data = sourceCache.get(key) || await api(`/api/source?path=${encodeURIComponent(item.path)}&${IndexPin.query(revision)}`);
-  if (serial !== sourceSerial || !IndexPin.equal(status?.revision, revision)) return;
-  if (!IndexPin.equal(data.revision, revision) || !IndexPin.equal(status?.revision, revision)) { unexpectedPair("Source snapshot changed. Refresh status.", data.revision); throw new Error("Source snapshot changed. Refresh status."); }
-  sourceCache.set(key, data);
-  $("source-path").textContent = `${data.file.path} · revision ${IndexPin.label(data.revision)} · cached snapshot`;
+  return showCachedSource(item.path, item.range, revision);
+}
+let workspaceSource = null;
+function paintCachedSource(data, range, current) {
+  workspaceSource = {data, range};
+  $("source-path").textContent = `${data.file.path} · ${data.file.language} · ${data.file.text.split("\n").length} lines · revision ${IndexPin.label(data.revision)} · cached snapshot`;
   const fragment = document.createDocumentFragment();
+  const lastLine = range && range.endLine > range.startLine && range.endColumn === 1 ? range.endLine - 1 : range?.endLine;
   data.file.text.split("\n").forEach((text, index) => {
-    const number = index + 1; const line = element("span", undefined, "source-line");
-    if (number >= item.range.startLine && number <= item.range.endLine) line.classList.add("highlight");
+    const number = index + 1, line = element("span", undefined, "source-line");
+    if (range && number >= range.startLine && number <= lastLine) line.classList.add("highlight");
     line.append(element("span", String(number), "line-number"), document.createTextNode(text)); fragment.append(line);
   });
-  $("source").replaceChildren(fragment);
+  $("source").replaceChildren(fragment); $("source").hidden = false;
   window.TrellisShell?.showSource("workspace");
   window.TrellisNavigation?.attachSource($("source"), {
-    path:data.file.path, revision:data.revision, startLine:item.range.startLine,
-    isCurrent: () => serial === sourceSerial && !!token && IndexPin.equal(status?.revision, revision) &&
-      !$("source-dock")?.hidden && !$("workspace-source-panel")?.hidden,
+    path:data.file.path, revision:data.revision, startLine:range?.startLine || 1,
+    isCurrent: () => current() && !!token && IndexPin.equal(status?.revision, data.revision) &&
+      !(section === "files" && filesBasis !== "indexed") && !$("source-dock")?.hidden && !$("workspace-source-panel")?.hidden,
   });
+}
+async function showCachedSource(path, range, revision, callerCurrent = () => true) {
+  IndexPin.copy(revision);
+  if (!status?.revision || !IndexPin.equal(revision, status.revision)) throw new Error("This source has no current paired snapshot. Refresh the view first.");
+  const serial = ++sourceSerial, session = epoch, root = selectedRootKey;
+  const current = () => callerCurrent() && serial === sourceSerial && session === epoch && root === selectedRootKey && IndexPin.equal(status?.revision, revision);
+  const key = `${IndexPin.key(revision)}:${path}`;
+  window.TrellisNavigation?.reset(); workspaceSource = null;
+  $("source-path").textContent = `Loading ${path}…`; $("source").replaceChildren();
+  const data = sourceCache.get(key) || await api(`/api/source?path=${encodeURIComponent(path)}&${IndexPin.query(revision)}`, "GET", undefined, current);
+  if (!current()) return;
+  if (!IndexPin.equal(data.revision, revision)) { unexpectedPair("Source snapshot changed. Refresh status.", data.revision); return; }
+  if (data.file.path !== path) throw new Error("Source path mismatch. Nothing displayed.");
+  sourceCache.set(key, data);
+  if (section === "diagrams") {
+    // An explicit diagram source read replaces the shared source selection.
+    filesSerial++; filesDiffSerial++; clearFilesInspector();
+    filesFile = files.find(file => file.path === path) || {path}; filesBasis = "indexed"; filesDiff = null;
+  }
+  paintCachedSource(data, range, current);
   $("source").focus({preventScroll:true});
-  $("source").scrollIntoView?.({block:"nearest"});
   const highlight = $("source").querySelector(".highlight");
   if (highlight) {
     $("source").scrollTop = highlight.offsetTop - $("source").offsetTop - 80;
-    // The workbench's source panel can own vertical scrolling, not the pre.
     highlight.scrollIntoView?.({block:"start", inline:"nearest"});
   }
 }
-$("refresh").addEventListener("click", () => perform(async () => { clearSource(); const revision = status?.revision, session = epoch, root = selectedRootKey; await refreshGit(); if (session !== epoch || root !== selectedRootKey) return; await refreshStatus(); if (IndexPin.equal(revision, status?.revision)) { void viewerMetrics?.refresh(); await refreshTree(); } if (selectedMethod) await loadSequence(); schedulePoll(); }, $("refresh")));
+$("refresh").addEventListener("click", () => perform(async () => {
+  const revision = status?.revision, session = epoch, root = selectedRootKey;
+  const file = filesFile, basis = filesBasis;
+  clearSource(); filesDiffSerial++; filesDiff = null; $("files-diff")?.replaceChildren();
+  await refreshGit(); if (session !== epoch || root !== selectedRootKey) return;
+  await refreshStatus();
+  if (IndexPin.equal(revision, status?.revision)) {
+    void viewerMetrics?.refresh(); await refreshTree();
+    if (section === "files" && file) {
+      if (file.changeOnly) { filesFile = file; await setFilesBasis("working"); }
+      else { await selectFilesFile(file); if (basis === "working") await setFilesBasis("working"); }
+    }
+  }
+  if (section !== "files" && selectedMethod) await loadSequence();
+  schedulePoll();
+}, $("refresh")));
 function activeJob(value) { return ["queued", "running"].includes(value.state); }
 function showJob() {
   if (!job) { $("job").textContent = ""; $("cancel").hidden = true; $("index").disabled = false; return; }
@@ -531,6 +570,268 @@ $("cancel").addEventListener("click", () => {
   clearTimeout(pollTimer); waitingForJob = false; showJob();
 });
 
+
+// Files uses the existing checkout/session owner, source cache and tree DOM.
+function filesGuard({symbol = false, basis = false} = {}) {
+  const session = epoch, root = selectedRootKey, pin = status?.revision, generation = filesSerial;
+  const surface = sectionSerial, file = filesFile, selected = filesSymbol, sourceBasis = filesBasis;
+  return () => session === epoch && root === selectedRootKey && IndexPin.equal(pin, status?.revision) &&
+    section === "files" && surface === sectionSerial && file === filesFile &&
+    (!symbol || (generation === filesSerial && selected === filesSymbol)) && (!basis || sourceBasis === filesBasis);
+}
+function clearFilesInspector() {
+  filesMatchesSerial++; filesSymbol = null; filesMini = null; filesMatches = null;
+  for (const id of ["files-symbol-location", "files-symbol-header", "files-symbol-return", "files-mini-sequence", "files-matches", "files-matches-state"]) $(id)?.replaceChildren();
+  if ($("files-symbol-title")) $("files-symbol-title").textContent = "Choose a symbol";
+  if ($("files-symbol-kind")) $("files-symbol-kind").textContent = "Indexed symbol";
+  if ($("files-mini-state")) $("files-mini-state").textContent = "Select a callable to preview its measured sequence.";
+  if ($("files-open-full")) $("files-open-full").disabled = true;
+  for (const id of ["files-matches-more", "files-matches-retry"]) if ($(id)) $(id).hidden = true;
+}
+function clearFilesEvidence() {
+  filesSerial++; filesDiffSerial++; filesFile = null; filesBasis = "indexed"; filesDiff = null; filesCatalogLoaded = false;
+  clearFilesInspector(); $("files-diff")?.replaceChildren();
+  if ($("files-empty")) $("files-empty").hidden = false;
+  updateFilesBasis();
+}
+function filesFailure(error, target, current) {
+  if (!current() || error.name === "AbortError") return;
+  if (["revision_conflict", "pin_expired", "root_changed"].includes(error.code)) { unexpectedPair("Indexed evidence is stale. Refresh status before selecting again."); return; }
+  if ($(target)) $(target).textContent = error.message;
+}
+async function setSection(name) {
+  if (!["files", "diagrams"].includes(name) || !selectedRootKey) return;
+  if (section === name) {
+    const target = name === "files" ? filesBasis === "working" ? $("files-diff") : workspaceSource ? $("source") : $("file-filter") : $("view-sequence");
+    target?.focus(); return;
+  }
+  section = name; sectionSerial++; sourceSerial++; filesDiffSerial++;
+  for (const state of fileStates.values()) if (state.outlineLoading) {
+    state.serial++; state.outlineLoading = false; state.outlineError = "Symbol read interrupted. Retry to read this indexed outline.";
+  }
+  window.TrellisNavigation?.reset(); window.TrellisClasses?.closeContextMenu?.();
+  window.TrellisShell?.setSection(name);
+  if (name !== "files") {
+    $("source").hidden = false; $("files-diff").hidden = true;
+    if (!workspaceSource) window.TrellisShell?.closeSource();
+    renderFiles();
+    const cached = workspaceSource, surface = sectionSerial, session = epoch, root = selectedRootKey, sourceAtStart = sourceSerial;
+    const current = () => section === "diagrams" && surface === sectionSerial && session === epoch && root === selectedRootKey && sourceAtStart === sourceSerial && IndexPin.equal(cached?.data.revision, status?.revision);
+    if (diagramSequence && selectedMethod?.id === diagramSequence.seed.id) await loadSequence(diagramSequence, true);
+    if (cached && current()) paintCachedSource(cached.data, cached.range, current);
+    return;
+  }
+  viewerMetrics?.clearInspection();
+  // Section changes keep validated evidence but never choose or read a file.
+  updateFilesBasis(); renderFiles();
+  if (!workspaceSource && filesFile && !filesFile.changeOnly && status?.revision) {
+    const cached = sourceCache.get(`${IndexPin.key(status.revision)}:${filesFile.path}`);
+    if (cached) workspaceSource = {data:cached, range:filesSymbol?.symbol.range || null};
+  }
+  if (workspaceSource && filesBasis === "indexed") {
+    const source = workspaceSource;
+    paintCachedSource(source.data, source.range, filesGuard({basis:true}));
+  }
+  if (filesSymbol) {
+    const current = filesGuard({symbol:true});
+    if (filesMatches) renderFilesMatches(); else void loadFilesMatches();
+    if (filesMini) await renderFilesMini(current);
+    else if (["function", "method"].includes(filesSymbol.symbol.kind)) void loadFilesMini(current);
+  }
+  if (!workspaceSource && filesFile && filesBasis === "indexed") $("source-path").textContent = "Source read interrupted. Select the file again to read its cached snapshot.";
+  if (filesBasis === "working") {
+    if (filesDiff) window.TrellisFiles?.diff($("files-diff"), filesDiff);
+    else $("files-diff").textContent = "Diff read interrupted. Select Working tree again to measure it.";
+  }
+  if (!filesCatalogLoaded && status?.revision) await loadFiles(true);
+  if (!filesGitStatus) await refreshGit();
+}
+window.TrellisShell?.setSectionCallback?.(name => { void setSection(name); });
+function appendFilesOutline(li, file) {
+  const state = fileStates.get(file.path);
+  if (!state?.outlineOpen) return;
+  const list = element("ul"); li.append(list);
+  const guard = filesGuard(), serial = state.serial;
+  const current = () => guard() && fileStates.get(file.path) === state && serial === state.serial;
+  if (state.outlineLoading) list.append(element("li", "Loading symbols…", "detail"));
+  else if (state.outlineError) list.append(button(`Retry symbols · ${state.outlineError}`, () => { if (current()) return loadFilesOutline(file, 0); }));
+  else {
+    window.TrellisFiles?.outline(list, state.outlineItems || [], filesSymbol, selectFilesSymbol, current);
+    if (!state.outlineItems?.length) list.append(element("li", "No measured symbols. Cached source remains readable.", "detail"));
+    if (state.outlineNext != null) { const next = state.outlineNext; list.append(button("More symbols", () => { if (current()) return loadFilesOutline(file, next); })); }
+    for (const warning of state.outlineWarnings || []) list.append(element("li", warning, "warning"));
+    if (state.outlineTruncated) list.append(element("li", "Outline continues on the next page.", "detail"));
+  }
+}
+async function loadFilesOutline(file, offset = 0) {
+  if (!status?.revision || filesFile?.path !== file.path) return;
+  let state = fileStates.get(file.path);
+  if (!state) { state = {open:false, serial:0}; fileStates.set(file.path, state); }
+  const current = filesGuard(), serial = ++state.serial, pin = IndexPin.copy(status.revision);
+  const active = () => current() && fileStates.get(file.path) === state && serial === state.serial;
+  state.outlineOpen = true; state.outlineLoading = true; state.outlineError = null; renderFiles();
+  try {
+    const data = await api(`/api/symbols?path=${encodeURIComponent(file.path)}&${IndexPin.query(pin)}&offset=${offset}&limit=200`, "GET", undefined, active);
+    if (!active()) return;
+    if (!IndexPin.equal(data.revision, pin)) { unexpectedPair(undefined, data.revision); return; }
+    if (data.path !== file.path || data.items.some(item => item.symbol.path !== file.path)) throw new Error("Outline path mismatch. Nothing displayed.");
+    state.outlineItems = offset ? [...(state.outlineItems || []), ...data.items] : data.items;
+    state.outlineNext = data.nextOffset; state.outlineWarnings = data.warnings; state.outlineTruncated = data.truncated;
+  } catch (error) { if (active()) state.outlineError = error.message; filesFailure(error, "files-state", active); }
+  finally { if (active()) { state.outlineLoading = false; renderFiles(); } }
+}
+async function selectFilesFile(file) {
+  if (section !== "files" || !status?.revision) return;
+  for (const [path, state] of fileStates) if (path !== file.path) state.outlineOpen = false;
+  filesSerial++; filesDiffSerial++; filesFile = {...file}; filesBasis = "indexed"; filesDiff = null; clearFilesInspector();
+  $("files-diff").replaceChildren(); $("files-empty").hidden = true; updateFilesBasis();
+  const current = filesGuard({symbol:true, basis:true}), pin = IndexPin.copy(status.revision);
+  await Promise.all([
+    showCachedSource(file.path, null, pin, current).catch(error => filesFailure(error, "source-path", current)),
+    loadFilesOutline(file),
+  ]);
+}
+async function selectFilesSymbol(item) {
+  if (section !== "files") return;
+  if (item.symbol.path !== filesFile?.path) {
+    filesFile = files.find(file => file.path === item.symbol.path) || {path:item.symbol.path};
+    for (const [path, state] of fileStates) if (path !== item.symbol.path) state.outlineOpen = false;
+  }
+  filesSerial++; filesDiffSerial++; clearFilesInspector(); filesSymbol = item; filesBasis = "indexed"; filesDiff = null;
+  const symbol = item.symbol, pin = IndexPin.copy(status.revision), current = filesGuard({symbol:true});
+  $("files-symbol-title").textContent = symbol.qualifiedName || symbol.name;
+  $("files-symbol-kind").textContent = item.nativeKind;
+  $("files-symbol-location").textContent = `${symbol.path}:${symbol.range.startLine}–${symbol.range.endLine} · indexed revision ${IndexPin.label(pin)}`;
+  $("files-symbol-header").textContent = window.TrellisFiles?.headerText(item.header) || "Measured header unavailable";
+  $("files-symbol-return").textContent = item.header?.resultType ? `Return type · ${item.header.resultType}` : "Return type not recorded";
+  updateFilesBasis(); renderFiles();
+  const callable = ["function", "method"].includes(symbol.kind);
+  $("files-mini-state").textContent = callable ? "Loading measured sequence…" : "Sequence not applicable to this noncallable symbol.";
+  await Promise.all([
+    showCachedSource(symbol.path, symbol.range, pin, filesGuard({symbol:true, basis:true})).catch(error => filesFailure(error, "source-path", current)),
+    loadFilesMatches(),
+    callable ? loadFilesMini(current) : Promise.resolve(),
+  ]);
+}
+async function loadFilesMatches(continuation = null) {
+  if (!filesSymbol) return;
+  const item = filesSymbol, pin = IndexPin.copy(status.revision), guard = filesGuard({symbol:true}), serial = ++filesMatchesSerial;
+  const current = () => guard() && serial === filesMatchesSerial;
+  $("files-matches-state").textContent = "Loading syntax matches…"; $("files-matches-more").hidden = true; $("files-matches-retry").hidden = true;
+  try {
+    const data = await api("/api/syntax-matches", "POST", {expectedRevision:pin, symbolId:item.symbol.id, ...(continuation ? {continuation} : {})}, current);
+    if (!current()) return;
+    if (!IndexPin.equal(data.revision, pin)) { unexpectedPair(undefined, data.revision); return; }
+    if (data.symbolId !== item.symbol.id || data.evidenceKind !== "syntaxMatches") throw new Error("Syntax match provenance mismatch. Nothing displayed.");
+    filesMatches = {...data, items:continuation ? [...(filesMatches?.items || []), ...data.items] : data.items}; renderFilesMatches();
+  } catch (error) { filesFailure(error, "files-matches-state", current); if (current()) $("files-matches-retry").hidden = false; }
+}
+function renderFilesMatches() {
+  $("files-matches").replaceChildren();
+  if (!filesMatches || !filesSymbol) return;
+  const data = filesMatches, pin = IndexPin.copy(data.revision), current = filesGuard({symbol:true});
+  window.TrellisFiles?.matches($("files-matches"), data.items, item => openFilesLocation(item, pin), current);
+  $("files-matches-state").textContent = `${data.items.length} shown · ${data.scope?.language || "language unavailable"} · source set ${data.scope?.sourceSetId || "unavailable"}${data.scope?.spelling ? " · " + data.scope.spelling : " · spelling unavailable"}${data.partial ? " · Incomplete coverage (skipped files or work budget)" : ""}${data.truncated ? " · more available" : ""}${!data.items.length ? " · No matches returned in the scanned scope; not proof of no references." : ""}${data.warnings?.length ? " · " + data.warnings.join(" · ") : ""}`;
+  $("files-matches-more").hidden = data.continuation == null;
+}
+async function openFilesLocation(item, pin) {
+  if (!IndexPin.equal(pin, status?.revision) || section !== "files") return;
+  filesSerial++; filesDiffSerial++; clearFilesInspector(); filesFile = files.find(file => file.path === item.path) || {path:item.path}; filesBasis = "indexed"; filesDiff = null;
+  $("files-empty").hidden = true; $("files-symbol-title").textContent = "Pinned source location";
+  $("files-symbol-location").textContent = `${item.path}:${item.range.startLine} · indexed revision ${IndexPin.label(pin)}`;
+  updateFilesBasis(); renderFiles();
+  const current = filesGuard({symbol:true, basis:true});
+  await showCachedSource(item.path, item.range, pin, current).catch(error => filesFailure(error, "source-path", current));
+}
+async function loadFilesMini(current) {
+  const symbol = filesSymbol.symbol, pin = IndexPin.copy(status.revision);
+  try {
+    const data = await api("/api/sequence", "POST", {seed:symbol.id, expectedRevision:pin, showAll:false}, current);
+    if (!current()) return;
+    if (!IndexPin.equal(data.revision, pin)) { unexpectedPair(undefined, data.revision); return; }
+    if (data.seed.id !== symbol.id) throw new Error("Sequence provenance mismatch. Nothing displayed.");
+    filesMini = data; await renderFilesMini(current);
+  } catch (error) { filesFailure(error, "files-mini-state", current); }
+}
+async function renderFilesMini(current) {
+  if (!filesMini || !filesSymbol) return;
+  const data = filesMini, revision = data.revision, expanded = new Set(), container = $("files-mini-sequence");
+  const readSource = step => { if (current()) return openFilesLocation(step, revision); };
+  const options = {showDetails:false, isCurrent:current};
+  options.onUnsupported = reason => { if (current()) { window.TrellisSequence.render(container, data, readSource, expanded, options); $("files-mini-state").textContent += ` · Pele fell back: ${reason}`; } };
+  const outcome = window.TrellisPeleSequence ? await window.TrellisPeleSequence.render(container, data, readSource, expanded, options) : {status:"unsupported", reason:"Pele asset unavailable"};
+  if (!current() || outcome.status === "stale") return;
+  if (outcome.status !== "rendered") window.TrellisSequence.render(container, data, readSource, expanded, options);
+  $("files-mini-state").textContent = `Indexed revision ${IndexPin.label(revision)} · ${data.hiddenSteps} incidental steps hidden${data.truncated ? " · truncated" : ""}${!data.steps.length ? " · No visible behavior steps" : ""}${data.warnings?.length ? " · " + data.warnings.join(" · ") : ""}${outcome.status !== "rendered" ? " · Pele fell back: " + outcome.reason : ""}`;
+  $("files-open-full").disabled = false;
+}
+async function openFilesFull() {
+  if (section !== "files" || !filesMini || !filesSymbol || !IndexPin.equal(filesMini.revision, status?.revision)) return;
+  const data = filesMini, symbol = filesSymbol.symbol;
+  await setSection("diagrams"); selectedMethod = symbol; $("all-steps").checked = false;
+  $("method-source").disabled = false; if ($("method-class")) $("method-class").disabled = !classLanguage(symbol.path);
+  window.TrellisShell?.showView("sequence"); renderFiles(); await loadSequence(data);
+}
+function updateFilesBasis() {
+  if (!$("files-working")) return;
+  const available = selectedGit?.state === "available", working = filesBasis === "working";
+  $("files-working").hidden = !available; $("files-working").disabled = !filesFile;
+  $("files-indexed").disabled = !filesFile || filesFile.changeOnly === true;
+  $("files-indexed").setAttribute("aria-pressed", String(!working)); $("files-working").setAttribute("aria-pressed", String(working));
+  $("files-git-state").textContent = available ? "" : `Working tree unavailable · ${selectedGit?.reason || "Git status unavailable"}`;
+  $("files-basis-note").textContent = status?.revision ? working ? `Uncommitted vs HEAD · Not indexed. Navigation and diagrams use indexed revision ${IndexPin.label(status.revision)}.` : `Cached source · indexed revision ${IndexPin.label(status.revision)}. Navigation and diagrams use this basis.` : "Select an indexed checkout to read cached source.";
+  $("files-diff").hidden = !working; $("source").hidden = working;
+  if ($("files-empty")) $("files-empty").hidden = !!filesFile || !!workspaceSource;
+}
+async function setFilesBasis(basis) {
+  if (section !== "files" || !filesFile || !["indexed", "working"].includes(basis) || (basis === "indexed" && filesFile.changeOnly)) return;
+  if (basis === "working" && selectedGit?.state !== "available") return;
+  filesBasis = basis; const serial = ++filesDiffSerial;
+  window.TrellisNavigation?.reset(); filesDiff = null; $("files-diff").replaceChildren(); updateFilesBasis();
+  if (basis === "indexed") {
+    const current = filesGuard({basis:true});
+    if (workspaceSource?.data.file.path === filesFile.path) paintCachedSource(workspaceSource.data, workspaceSource.range, current);
+    else await showCachedSource(filesFile.path, filesSymbol?.symbol.range || null, status.revision, current).catch(error => filesFailure(error, "source-path", current));
+    return;
+  }
+  const path = filesFile.path, guard = filesGuard({basis:true}), observation = ++gitSerial;
+  const current = () => guard() && serial === filesDiffSerial && observation === gitSerial;
+  $("files-diff").append(element("p", "Measuring uncommitted changes against HEAD…"));
+  try {
+    const statusData = await api("/api/git", "GET", undefined, current);
+    if (!current()) return;
+    filesGitStatus = statusData; showSelectedGit(statusData.git);
+    if (statusData.git.state !== "available") { window.TrellisFiles?.diff($("files-diff"), {git:statusData.git, file:null}); return; }
+    if (!statusData.changes?.some(change => change.path === path)) { window.TrellisFiles?.diff($("files-diff"), {git:statusData.git, file:null}); return; }
+    const data = await api(`/api/git/diff?path=${encodeURIComponent(path)}`, "GET", undefined, current);
+    if (!current()) return;
+    if (data.file && data.file.path !== path) throw new Error("Git diff path changed. Refresh to measure again.");
+    filesDiff = data; showSelectedGit(data.git); window.TrellisFiles?.diff($("files-diff"), data); renderFiles();
+  } catch (error) { if (current()) $("files-diff").replaceChildren(); filesFailure(error, "files-diff", current); }
+}
+function appendChangedOnlyPaths(tree, filter) {
+  const indexed = new Set(files.map(file => file.path));
+  const changes = filesGitStatus?.changes?.filter(change => !indexed.has(change.path) && change.path.toLowerCase().includes(filter)) || [];
+  if (!changes.length) return;
+  const group = element("li", "Uncommitted paths · not indexed"), list = element("ul"); group.append(list); tree.append(group);
+  const session = epoch, root = selectedRootKey, surface = sectionSerial, pin = status?.revision && IndexPin.copy(status.revision);
+  const current = () => session === epoch && root === selectedRootKey && surface === sectionSerial && section === "files" && IndexPin.equal(pin, status?.revision);
+  for (const change of changes) {
+    const row = element("li"), pick = button(`${change.status} · ${change.path}`, async () => {
+      if (!current()) return;
+      filesSerial++; filesDiffSerial++; clearFilesInspector(); clearSource(); filesFile = {path:change.path, changeOnly:true};
+      $("source-path").textContent = `${change.path} · not in the loaded indexed catalog; no indexed outline or navigation`;
+      await setFilesBasis("working");
+    });
+    pick.className = "files-change-pick"; pick.setAttribute("data-path", change.path); row.append(pick); list.append(row);
+  }
+}
+$("files-indexed")?.addEventListener("click", () => setFilesBasis("indexed"));
+$("files-working")?.addEventListener("click", () => setFilesBasis("working"));
+$("files-open-full")?.addEventListener("click", openFilesFull);
+$("files-matches-more")?.addEventListener("click", () => { if (filesMatches?.continuation) return loadFilesMatches(filesMatches.continuation); });
+$("files-matches-retry")?.addEventListener("click", () => loadFilesMatches());
+
 // File browser has independent request generations, including failures.
 let browseSerial = 0, diagramSerial = 0, files = [], nextFileOffset = null;
 let selectedMethod = null, catalogSerial = 0, treeSerial = 0, directoryRefreshSerial = 0, retryCatalogReset = true;
@@ -538,11 +839,13 @@ const fileStates = new Map(), closedDirectories = new Set();
 let treeMode = false, treeRoot = null, indexedWorkspace = "";
 const directories = new Map();
 function clearBrowse(message = "Expand a file and select a method.") {
+  clearFilesEvidence();
   window.TrellisClasses?.reset();
   if ($("method-class")) $("method-class").disabled = true;
   window.TrellisShell?.resetInspector();
   if ($("sequence-warning-count")) $("sequence-warning-count").textContent = "0";
   viewerMetrics?.reset();
+  diagramSequence = null;
   browseSerial++; diagramSerial++; catalogSerial++; directoryRefreshSerial++; files = []; nextFileOffset = null; selectedMethod = null;
   directories.clear(); treeMode = false; treeRoot = null; indexedWorkspace = "";
   $("index").textContent = "Index workspace";
@@ -565,26 +868,27 @@ async function browseRequest(action, current, state) {
 }
 async function loadFiles(reset = false) {
   if (!status) return;
-  const serial = ++catalogSerial, guard = browseGuard();
-  const current = () => guard() && serial === catalogSerial;
+  const serial = ++catalogSerial, guard = browseGuard(), surface = sectionSerial;
+  const current = () => guard() && serial === catalogSerial && surface === sectionSerial;
   const revision = IndexPin.copy(status.revision), offset = reset ? 0 : nextFileOffset;
   if (offset == null) return;
   $("files-state").textContent = "Loading indexed files…"; $("retry-files").hidden = true;
   let loaded = false; retryCatalogReset = reset;
   await browseRequest(async () => {
-    const data = await api(`/api/files?${IndexPin.query(revision)}&offset=${offset}&limit=200`);
+    const data = await api(`/api/files?${IndexPin.query(revision)}&offset=${offset}&limit=200`, "GET", undefined, current);
     if (!current()) return;
     if (!IndexPin.equal(data.revision, revision)) { unexpectedPair(undefined, data.revision); throw new Error("File catalog revision does not match. Refresh status."); }
+    if (reset && section === "files") files = [];
     const hadFiles = files.length > 0;
     const known = new Set(files.map(f => f.path));
     files.push(...data.items.filter(f => !known.has(f.path)));
     if (!reset || !hadFiles) nextFileOffset = data.nextOffset;
-    renderFiles(); loaded = true;
+    filesCatalogLoaded = true; renderFiles(); loaded = true;
   }, current, "files-state");
   if (current()) $("retry-files").hidden = loaded;
 }
 function renderFiles() {
-  if (treeMode) { renderDirectoryTree(); return; }
+  if (section !== "files" && treeMode) { renderDirectoryTree(); return; }
   const generation = ++treeSerial;
   const tree = $("file-tree"); tree.replaceChildren();
   const filter = $("file-filter").value.toLowerCase();
@@ -611,13 +915,14 @@ function renderFiles() {
       parent = dirs.get(key);
     }
     const state = fileStates.get(file.path), li = element("li");
+    const fileCurrent = browseGuard(), fileSurface = sectionSerial;
     const selection = {scope:"file", path:file.path};
-    const pick = button(`${state?.open ? "▾" : "▸"} ${parts.at(-1)} · ${file.methodCount}`, () => { inspectTreeSelection(selection); return toggleFile(file); });
+    const pick = button(`${state?.open ? "▾" : "▸"} ${parts.at(-1)}${section === "files" ? "" : " · " + file.methodCount}`, () => { if (!fileCurrent() || fileSurface !== sectionSerial) return; if (section === "files") return selectFilesFile(file); inspectTreeSelection(selection); return toggleFile(file); });
     pick.className = "file-pick"; pick.title = file.path;
-    attachClassMenu(pick, {path:file.path});
-    pick.setAttribute("aria-expanded", String(!!state?.open));
-    metricRows.push(viewerMetrics?.decorate(pick, selection)); li.append(pick);
-    appendMethods(li, file);
+    if (section !== "files") attachClassMenu(pick, {path:file.path});
+    pick.setAttribute("aria-expanded", String(section === "files" ? !!state?.outlineOpen : !!state?.open));
+    if (section !== "files") metricRows.push(viewerMetrics?.decorate(pick, selection)); li.append(pick);
+    if (section === "files") appendFilesOutline(li, file); else appendMethods(li, file);
     parent.append(li);
   }
   viewerMetrics?.renderLegend(metricRows.filter(Boolean));
@@ -626,6 +931,7 @@ function renderFiles() {
   if (!visible.length) tree.append(element("li", files.length ? "No loaded paths match. Clear the filter or load more files." : "No indexed files yet. Use Index workspace above, then browse the tree.", "detail"));
   $("files-state").textContent = `${visible.length} of ${files.length} loaded files${nextFileOffset != null ? " · more available" : ""}`;
   $("more-files").hidden = nextFileOffset == null;
+  if (section === "files") appendChangedOnlyPaths(tree, filter);
 }
 async function toggleFile(file) {
   let state = fileStates.get(file.path);
@@ -655,20 +961,23 @@ async function selectMethod(symbol) {
   await loadSequence();
   if (selectedMethod === symbol && window.matchMedia?.("(max-width: 900px)").matches) $("sequence-title").scrollIntoView?.({block:"start"});
 }
-async function loadSequence() {
+async function loadSequence(admitted = null, preserveSource = false) {
   viewerMetrics?.clearInspection();
   window.TrellisShell?.resetInspector();
   if ($("sequence-warning-count")) $("sequence-warning-count").textContent = "0";
   if (!selectedMethod || !status) return;
   const serial = ++diagramSerial, guard = browseGuard(), symbol = selectedMethod, revision = IndexPin.copy(status.revision);
-  const current = () => guard() && serial === diagramSerial && selectedMethod === symbol;
-  clearSource(); $("sequence-diagram").replaceChildren(); $("sequence-warnings").replaceChildren();
+  const surface = sectionSerial;
+  const current = () => guard() && section === "diagrams" && surface === sectionSerial && serial === diagramSerial && selectedMethod === symbol;
+  if (!preserveSource) clearSource();
+  $("sequence-diagram").replaceChildren(); $("sequence-warnings").replaceChildren();
   $("sequence-state").textContent = `Loading ${symbol.name}…`;
   await browseRequest(async () => {
-    const data = await api("/api/sequence", "POST", {seed:symbol.id, expectedRevision:revision, showAll:!!$("all-steps").checked});
+    const data = admitted || await api("/api/sequence", "POST", {seed:symbol.id, expectedRevision:revision, showAll:!!$("all-steps").checked});
     if (!current()) return;
     if (!IndexPin.equal(data.revision, revision)) { unexpectedPair(undefined, data.revision); throw new Error("Sequence provenance mismatch. Nothing displayed."); }
     if (data.seed.id !== symbol.id) throw new Error("Sequence provenance mismatch. Nothing displayed.");
+    diagramSequence = data;
     const readSource = step => { if (current()) return perform(() => showSource(step, revision)); };
     const options = {showDetails: !!$("all-steps").checked, isCurrent: () => current() && IndexPin.equal(status?.revision, revision)};
     // A later group redraw can fail after the initial load succeeded. Preserve
@@ -756,6 +1065,7 @@ function appendMethods(li, file) {
 
 // Filesystem metadata is separate from the immutable indexed source catalog.
 async function loadTreeRoot() {
+  if (section === "files") return loadFiles(true);
   treeMode = true;
   await loadDirectory("", true);
 }
@@ -773,6 +1083,7 @@ function openDirectoryAnchors(path = "", found = [], visited = new Set()) {
   return found;
 }
 async function refreshTree() {
+  if (section === "files") return loadFiles(true);
   if (!treeMode) return loadTreeRoot();
   const serial = ++directoryRefreshSerial, guard = browseGuard();
   const anchors = openDirectoryAnchors();
@@ -789,7 +1100,7 @@ const viewerMetrics = window.TrellisMetrics?.create({
   request: path => api(path),
   context: () => ({rootKey:selectedRootKey, session:epoch, pin:status?.revision, treeRoot, indexedWorkspace}),
   onConflict: pin => unexpectedPair("Index changed. Refresh status before inspecting metrics.", pin),
-  onChange: () => { if (treeMode) renderDirectoryTree(); else renderFiles(); },
+  onChange: () => renderFiles(),
 });
 window.TrellisShell?.setInspectorClearCallback?.(() => viewerMetrics?.clearInspection());
 function metricDirectorySelection(path) {
@@ -1317,7 +1628,7 @@ window.TrellisNavigation?.init({
   currentSession: () => `${epoch}:${status?.workspaceRoot || ""}`,
   openClass: symbol => perform(() => openClasses({seed:symbol.id})),
   selectMethod: symbol => perform(() => selectMethod(symbol)),
-  openSource: (symbol, revision) => perform(() => showSource(symbol, revision)),
+  openSource: (symbol, revision) => perform(() => section === "files" ? openFilesLocation(symbol, revision) : showSource(symbol, revision)),
   showMenu: (event, actions, options) => window.TrellisClasses?.showContextMenu(event, actions, options),
 });
 function initClassView() {

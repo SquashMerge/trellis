@@ -54,6 +54,7 @@ const VIEW_TIME_PARSERS: &[(&str, &str)] = &[
         "dependency source browsing, outside the workspace index",
     ),
     ("src/metrics.rs", "read-time code metrics"),
+    ("src/files_view.rs", "read-time cached syntax matches"),
 ];
 
 fn root() -> &'static Path {

@@ -682,9 +682,14 @@ receives an inbox event/deep link; publication must not steal focus, run a provi
 
 ## 9. Rendering
 
-The current diagrams-only browser frame follows the [Viewer shell contract](docs/viewer-shell.md).
-It keeps Sequence, Classes and Libraries, with observed per-checkout freshness and pinned metric
-file/directory inspection. Files focuses the existing browser, not a separate source page.
+The browser frame follows the [Viewer shell contract](docs/viewer-shell.md). Diagrams keeps
+Sequence, Classes and Libraries, with observed per-checkout freshness and pinned metric
+file/directory inspection. The [Files section](docs/files-view.md) shares its checkout/session
+and cached-source owner, with a pinned indexed-file catalog, all-symbol outline, explicit cached
+source selection, same-spelling syntax matches and faithful callable mini-sequences. Section
+switches never choose a file or start indexing. Files may separately display the existing net
+HEAD-to-working-tree staged+unstaged Git diff, labelled uncommitted and not indexed; indexed
+navigation and diagrams retain their complete `{indexGeneration,indexRevision}` basis.
 
 **Target: generate Mermaid from the revision-bound structure model and render it with a
 locally served, exact-version-pinned Pele asset.** Mermaid is both the rendered source

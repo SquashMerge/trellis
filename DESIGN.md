@@ -13,14 +13,15 @@ that imply those capabilities already work.
 
 ## Product frame
 
-- Compact explorer on the left; files expand to methods.
-- Main tabbed workspace: Sequence, Classes, Libraries. No placeholder capability tabs.
-- Diagrams/Files header actions focus the diagram or existing file browser; Files is not a separate source page.
+- Compact explorer on the left; Diagrams files expand to methods. Files uses a pinned indexed-file catalog and an all-symbol outline, including noncallables.
+- Diagrams keeps Sequence, Classes and Libraries. Files is a real section of the same checkout/session frame, not another application. No placeholder capability tabs.
+- Section switching alone never selects a file, reads source or starts indexing. Explicit Files selection opens cached indexed source; cached files remain reachable after live deletion.
 - The left pane lists local checkouts and their observed index state above the filtered file tree.
 - Classes uses the full canvas without the call inspector; explicit file/directory metric selection may show the metric inspector. Class menus expose related classes and cached source.
-- The right inspector shows the selected source step or pinned file/directory metrics, never both.
-  See the [Viewer shell contract](docs/viewer-shell.md) for freshness, heat and metric scope.
-- Explicit source reads open a collapsible source dock without losing the selected method.
+- Diagrams shows the selected source step or pinned file/directory metrics, never both. Files shows the selected declaration's pinned evidence, honestly labelled same-spelling syntax matches and a faithful callable mini-sequence.
+  See the [Viewer shell contract](docs/viewer-shell.md) for freshness, heat and metric scope, and the [Files contract](docs/files-view.md) for source and evidence boundaries.
+- Explicit Diagrams source reads open a collapsible source dock without losing the selected method. Files reuses that cached-source/navigation owner as its primary source surface.
+- Files may separately show the existing net HEAD-to-working-tree Git diff, including staged and unstaged changes. It is uncommitted and not indexed; it never replaces cached source or supplies navigation/diagram evidence.
 - Source lines and class members expose revision-bound navigation menus. Use measured declarations
   and scoped type candidates, not global-name guesses. Source navigation is explicitly line-based.
 - Workspace, revision, syntax/semantic state, indexing progress and failures remain discoverable.

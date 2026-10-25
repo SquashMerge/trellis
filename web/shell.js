@@ -7,25 +7,47 @@
   const make = (tag, value) => { const node = document.createElement(tag); if (value !== undefined) node.textContent = value; return node; };
   const describe = value => typeof value === "string" ? value : JSON.stringify(value, null, 2);
   const views = {sequence:"sequence-panel", classes:"classes-panel", libraries:"dependency-library"};
-  let openSource = null, sourceReturnFocus = null, activeView = "sequence", inspectorClearCallback = null;
+  let openSource = null, sourceReturnFocus = null, activeView = "sequence", inspectorClearCallback = null, sectionCallback = null;
+  function setSection(name) {
+    const files = name === "files";
+    window.TrellisNavigation?.reset(); window.TrellisClasses?.closeContextMenu?.();
+    document.body.classList.toggle("files-section", files);
+    document.body.classList.toggle("classes-view", !files && activeView === "classes");
+    drawer("explorer", false); drawer("inspector", false);
+    get("section-files")?.setAttribute("aria-current", files ? "page" : "false");
+    get("section-diagrams")?.setAttribute("aria-current", files ? "false" : "page");
+    for (const id of ["diagram-tabs", "diagram-metrics"]) hide(id, files);
+    for (const [key, panel] of Object.entries(views)) hide(panel, files || key !== activeView);
+    hide("files-inspector", !files); hide("files-source-toolbar", !files);
+    for (const id of ["inspector-empty", "inspector-content", "metric-inspector"]) {
+      if (files) hide(id, true);
+    }
+    hide("inspector-clear", files);
+    if (files) {
+      hide("source-dock", false); hide("workspace-source-panel", false); hide("library-source-panel", true);
+      get("file-filter")?.focus();
+    } else {
+      hide("inspector-empty", !get("inspector-content")?.hidden || !get("metric-inspector")?.hidden);
+      get(`view-${activeView}`)?.focus();
+    }
+  }
+  function setSectionCallback(callback) { sectionCallback = callback; }
   function showFiles() {
     if (get("workspace")?.hidden) return;
-    if (!get("source-dock")?.hidden) get("source-dock")?.scrollIntoView?.({block:"nearest"});
-    drawer("explorer", true);
-    get("file-filter")?.focus();
+    if (sectionCallback) return sectionCallback("files");
+    setSection("files");
   }
   function showDiagrams() {
     if (get("workspace")?.hidden) return;
-    drawer("explorer", false);
-    drawer("inspector", false);
-    get(`view-${activeView}`)?.focus();
+    if (sectionCallback) return sectionCallback("diagrams");
+    setSection("diagrams");
   }
   function clearMetricInspector() {
     hide("metric-inspector", true);
     document.body.classList.remove("metric-inspector-active");
     drawer("inspector", false);
     for (const id of ["metric-inspector-title", "metric-inspector-scope", "metric-inspector-values", "metric-inspector-top", "metric-inspector-state"]) get(id)?.replaceChildren();
-    hide("inspector-empty", !get("inspector-content")?.hidden);
+    hide("inspector-empty", document.body.classList.contains("files-section") || !get("inspector-content")?.hidden);
     if (get("inspector-clear")) get("inspector-clear").disabled = !!get("inspector-content")?.hidden;
   }
   function showMetricInspector() {
@@ -47,6 +69,7 @@
   }
   function showView(name) {
     if (!Object.hasOwn(views, name)) return;
+    if (document.body.classList.contains("files-section")) showDiagrams();
     activeView = name;
     document.body.classList.toggle("classes-view", name === "classes");
     window.TrellisClasses?.closeContextMenu?.();
@@ -60,7 +83,8 @@
   }
   function showSource(name) {
     if (!["workspace", "library"].includes(name)) return;
-    if (!get("source-dock")?.contains?.(document.activeElement)) sourceReturnFocus = document.activeElement;
+    if (name === "library" && document.body.classList.contains("files-section")) showDiagrams();
+    if (!document.body.classList.contains("files-section") && !get("source-dock")?.contains?.(document.activeElement)) sourceReturnFocus = document.activeElement;
     hide("source-dock", false);
     for (const key of ["workspace", "library"]) {
       hide(`${key}-source-panel`, key !== name);
@@ -71,13 +95,14 @@
     // place an old inspector/explorer over the open source dock.
     drawer("explorer", false); drawer("inspector", false);
     if (window.matchMedia?.("(max-width: 900px)").matches) {
-      get(`dock-${name}`)?.focus();
+      (document.body.classList.contains("files-section") ? get("source") : get(`dock-${name}`))?.focus();
     }
   }
   function visibleControl(node) {
     return node && !node.disabled && !node.hidden && !node.closest?.("[hidden]") && (!node.getClientRects || node.getClientRects().length > 0);
   }
   function closeSource() {
+    if (document.body.classList.contains("files-section")) return;
     hide("source-dock", true);
     const target = visibleControl(sourceReturnFocus) ? sourceReturnFocus : get(`view-${activeView}`);
     target?.focus(); sourceReturnFocus = null;
@@ -101,7 +126,7 @@
     clearMetricInspector();
     openSource = null;
     drawer("inspector", false);
-    hide("inspector-empty", false); hide("inspector-content", true);
+    hide("inspector-empty", document.body.classList.contains("files-section")); hide("inspector-content", true);
     for (const id of ["inspector-title", "inspector-kind", "inspector-target", "inspector-location", "inspector-evidence", "inspector-detail"]) get(id)?.replaceChildren();
     if (get("inspector-open-source")) get("inspector-open-source").disabled = true;
     if (get("inspector-clear")) get("inspector-clear").disabled = true;
@@ -189,7 +214,7 @@
     text("workspace-index-label", status ? `${status.catchingUp === true ? "Catching up" : "Fresh"} · revision ${status.revision.indexGeneration.slice(0, 8)}:${status.revision.indexRevision}` : checkoutRoot ? "Index status unavailable" : "No checkout selected");
   }
   function reset() {
-    resetInspector(); showView("sequence"); hide("source-dock", true); sourceReturnFocus = null;
+    setSection("diagrams"); resetInspector(); showView("sequence"); hide("source-dock", true); sourceReturnFocus = null;
     drawer("explorer", false); drawer("inspector", false); updateCheckout(null, null); updateWorkspace(null);
   }
   function setConnected(connected) {
@@ -212,6 +237,6 @@
     else if (mobile && document.body.classList.contains("explorer-open")) { drawer("explorer", false); get("explorer-toggle")?.focus(); }
     else if (get("source-dock") && !get("source-dock").hidden) closeSource();
   });
-  window.TrellisShell = {setConnected, updateCheckout, formatGit, updateWorkspace, showView, showSource, closeSource, showFiles, showDiagrams, showMetricInspector, clearMetricInspector, setInspectorClearCallback, selectStep, resetInspector, reset};
+  window.TrellisShell = {setSection, setSectionCallback, setConnected, updateCheckout, formatGit, updateWorkspace, showView, showSource, closeSource, showFiles, showDiagrams, showMetricInspector, clearMetricInspector, setInspectorClearCallback, selectStep, resetInspector, reset};
   reset();
 })();

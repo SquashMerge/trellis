@@ -1669,6 +1669,11 @@ impl From<anyhow::Error> for ApiError {
                 "invalid_navigation_request",
                 invalid.0,
             )
+        } else if e
+            .downcast_ref::<crate::files_view::InvalidRequest>()
+            .is_some()
+        {
+            invalid()
         } else if let Some(invalid) = e.downcast_ref::<crate::class_diagram::InvalidRequest>() {
             Self(StatusCode::BAD_REQUEST, "invalid_class_request", invalid.0)
         } else if e
@@ -1895,6 +1900,24 @@ pub fn router(state: Arc<DaemonState>) -> Router {
             }),
         )
         .route(
+            "/files.js",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                    include_str!("../web/files.js"),
+                )
+            }),
+        )
+        .route(
+            "/files.css",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+                    include_str!("../web/files.css"),
+                )
+            }),
+        )
+        .route(
             "/shell.js",
             get(|| async {
                 (
@@ -2004,6 +2027,8 @@ pub fn router(state: Arc<DaemonState>) -> Router {
         .route("/api/tree", get(tree))
         .route("/api/files", get(files))
         .route("/api/methods", get(methods))
+        .route("/api/symbols", get(file_symbols))
+        .route("/api/syntax-matches", post(syntax_matches))
         .route("/api/sequence", post(sequence))
         .route("/api/classes", get(classes))
         .route("/api/class-diagram", post(class_diagram))
@@ -2091,6 +2116,8 @@ fn native_response_route(path: &str) -> bool {
             | "/api/tree"
             | "/api/files"
             | "/api/methods"
+            | "/api/symbols"
+            | "/api/syntax-matches"
             | "/api/sequence"
             | "/api/classes"
             | "/api/class-diagram"
@@ -2604,6 +2631,57 @@ struct FilesQuery {
     #[serde(default = "file_limit")]
     limit: usize,
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileSymbolsQuery {
+    path: String,
+    #[serde(flatten)]
+    pin: PinQuery,
+    #[serde(default)]
+    offset: usize,
+    #[serde(default = "file_limit")]
+    limit: usize,
+}
+impl FileSymbolsQuery {
+    fn validate(&self) -> Result<IndexPin, ApiError> {
+        if !crate::files_view::valid_path(&self.path)
+            || !(1..=200).contains(&self.limit)
+            || self.offset > i64::MAX as usize
+        {
+            return Err(invalid());
+        }
+        self.pin.pin()?.ok_or_else(invalid)
+    }
+}
+#[cfg(feature = "test-support")]
+async fn file_symbols(
+    State(s): State<Arc<DaemonState>>,
+    query: Result<Query<FileSymbolsQuery>, axum::extract::rejection::QueryRejection>,
+) -> Result<Json<crate::files_view::Outline>, ApiError> {
+    let Query(q) = query.map_err(|_| invalid())?;
+    let pin = q.validate()?;
+    Ok(Json(
+        db(s, move |s| {
+            s.file_symbols_at(&q.path, pin, q.offset, q.limit)
+        })
+        .await?
+        .ok_or_else(missing)?,
+    ))
+}
+#[cfg(feature = "test-support")]
+async fn syntax_matches(
+    State(s): State<Arc<DaemonState>>,
+    body: Bytes,
+) -> Result<Json<crate::files_view::SyntaxMatches>, ApiError> {
+    let q: crate::files_view::SyntaxMatchesRequest =
+        serde_json::from_slice(&body).map_err(|_| invalid())?;
+    q.validate()?;
+    Ok(Json(
+        db(s, move |s| s.syntax_matches_at(&q))
+            .await?
+            .ok_or_else(missing)?,
+    ))
+}
 fn file_limit() -> usize {
     200
 }
@@ -3056,6 +3134,24 @@ impl ProvisionedBrowser {
                 }),
             )
             .route(
+                "/files.js",
+                get(|| async {
+                    (
+                        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                        include_str!("../web/files.js"),
+                    )
+                }),
+            )
+            .route(
+                "/files.css",
+                get(|| async {
+                    (
+                        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+                        include_str!("../web/files.css"),
+                    )
+                }),
+            )
+            .route(
                 "/shell.js",
                 get(|| async {
                     (
@@ -3389,6 +3485,8 @@ enum BrowserCoreRoute {
     Tree,
     Files,
     Methods,
+    FileSymbols,
+    SyntaxMatches,
     Classes,
     Sequence,
     ClassDiagram,
@@ -3417,6 +3515,8 @@ impl BrowserCoreRoute {
             (&Method::GET, "tree") => Some(Self::Tree),
             (&Method::GET, "files") => Some(Self::Files),
             (&Method::GET, "methods") => Some(Self::Methods),
+            (&Method::GET, "symbols") => Some(Self::FileSymbols),
+            (&Method::POST, "syntax-matches") => Some(Self::SyntaxMatches),
             (&Method::GET, "classes") => Some(Self::Classes),
             (&Method::POST, "sequence") => Some(Self::Sequence),
             (&Method::POST, "class-diagram") => Some(Self::ClassDiagram),
@@ -4329,6 +4429,29 @@ async fn provisioned_core_answer(
                 selected_evidence(runtime, hook, move |r| r.files_at(pin, q.offset, q.limit))
                     .await?;
             Ok((Json(value).into_response(), catching_up))
+        }
+        BrowserCoreRoute::FileSymbols => {
+            let Query(q) = Query::<FileSymbolsQuery>::try_from_uri(uri).map_err(|_| invalid())?;
+            let pin = q.validate()?;
+            let (value, catching_up) = selected_evidence(runtime, hook, move |r| {
+                r.file_symbols_at(&q.path, pin, q.offset, q.limit)
+            })
+            .await?;
+            Ok((
+                Json(value.ok_or_else(missing)?).into_response(),
+                catching_up,
+            ))
+        }
+        BrowserCoreRoute::SyntaxMatches => {
+            let q: crate::files_view::SyntaxMatchesRequest =
+                serde_json::from_slice(&body).map_err(|_| invalid())?;
+            q.validate()?;
+            let (value, catching_up) =
+                selected_evidence(runtime, hook, move |r| r.syntax_matches_at(&q)).await?;
+            Ok((
+                Json(value.ok_or_else(missing)?).into_response(),
+                catching_up,
+            ))
         }
         BrowserCoreRoute::Methods => {
             let Query(q) = Query::<SourceQuery>::try_from_uri(uri).map_err(|_| browse_invalid())?;

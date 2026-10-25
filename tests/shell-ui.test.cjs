@@ -24,7 +24,7 @@ function harness(withApp = false) {
   const run = code => vm.runInContext(code,context);
   if(withApp)run(fs.readFileSync("web/sequence.js","utf8"));
   run(fs.readFileSync("web/shell.js","utf8"));
-  if(withApp){run(fs.readFileSync("web/app.js","utf8"));run(`token="synthetic";selectedRootKey="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";checkouts=[{rootKey:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",workspaceRoot:"/repo",state:"available"}];status={revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},workspaceRoot:"/repo"};`);}
+  if(withApp){run(fs.readFileSync("web/files.js","utf8"));run(fs.readFileSync("web/app.js","utf8"));run(`token="synthetic";selectedRootKey="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";checkouts=[{rootKey:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",workspaceRoot:"/repo",state:"available"}];status={revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},workspaceRoot:"/repo"};`);}
   if (withApp) {
     let handler = context.fetch;
     Object.defineProperty(context,"fetch",{configurable:true,get:()=>request,set(fn){handler=fn;}});
@@ -137,7 +137,7 @@ test("app row selection inspects without fetch; explicit Open call site reads gu
 for(const change of ["method","revision","disconnect","index"] ) test(`app invalidates inspector callbacks after ${change}`,async()=>{
   const h=await selectedHarness(),open=h.get("inspector-open-source").listeners.click;
   if(change==="method")await h.run(`selectMethod({id:"new",name:"new",path:"main.rs",range:{startLine:1,endLine:1}})`);
-  if(change==="revision")h.run(`status.revision=2;clearBrowse();`);
+  if(change==="revision")h.run(`status.revision={...status.revision,indexRevision:2};clearBrowse();`);
   if(change==="disconnect")h.get("logout").listeners.click();
   if(change==="index") {h.context.fetch=async()=>response({id:"job",state:"running"});await h.get("index").listeners.click();}
   await open();assert.equal(h.requests.some(p=>p.startsWith("/api/source?")),false);
@@ -265,18 +265,32 @@ test("Git header shows measured branch, last-fetch counts, detached HEAD and una
   assert.deepEqual(h.requests,[]);
 });
 
-test("Files action focuses browsing and opens only its drawer without changing view or requesting data", () => {
+test("Files is a primary source section without automatic reads or drawers and preserves the diagram view", () => {
   const h = harness();
   h.context.window.matchMedia = () => ({matches:true});
   h.shell.showView("libraries");
   h.shell.showMetricInspector();
   h.get("section-files").listeners.click();
   assert.equal(h.get("file-filter").focused,true);
-  assert.equal(h.document.body.classList.contains("explorer-open"),true);
+  assert.equal(h.document.body.classList.contains("files-section"),true);
+  assert.equal(h.document.body.classList.contains("explorer-open"),false);
   assert.equal(h.document.body.classList.contains("inspector-open"),false);
+  assert.equal(h.get("section-files").attrs["aria-current"],"page");
+  for (const id of ["diagram-tabs", "diagram-metrics", "sequence-panel", "classes-panel", "dependency-library", "metric-inspector"]) {
+    assert.equal(h.get(id).hidden,true,`${id} is not shown over Files`);
+  }
+  assert.equal(h.get("source-dock").hidden,false);
+  assert.equal(h.get("workspace-source-panel").hidden,false);
+  assert.equal(h.get("library-source-panel").hidden,true);
+  assert.equal(h.get("files-inspector").hidden,false);
+  h.document.listeners.keydown({key:"Escape"});
+  assert.equal(h.get("source-dock").hidden,false,"Escape does not close primary Files source");
+  h.get("section-diagrams").listeners.click();
+  assert.equal(h.document.body.classList.contains("files-section"),false);
+  assert.equal(h.get("section-diagrams").attrs["aria-current"],"page");
   assert.equal(h.get("dependency-library").hidden,false);
-  assert.equal(h.get("source-dock").hidden,true);
-  assert.equal(h.get("metric-inspector").hidden,false,"opening files does not discard the inspection");
+  assert.equal(h.get("view-libraries").focused,true);
+  assert.equal(h.get("files-inspector").hidden,true);
   assert.deepEqual(h.requests,[]);
 });
 

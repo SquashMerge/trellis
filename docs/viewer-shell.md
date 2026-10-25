@@ -1,8 +1,12 @@
-# Diagrams-only Viewer shell
+# Viewer shell
 
-The Viewer keeps Sequence, Classes and Libraries. The header's Diagrams and Files actions
-focus the existing canvas or file browser. Files does not introduce a new source page or
-read working-tree contents. Source reads remain explicit, cached and revision-bound.
+The Viewer has Diagrams and Files sections within one checkout/session frame. Diagrams keeps
+Sequence, Classes and Libraries and its collapsible source dock. Files is a primary cached-source
+surface with a pinned indexed-file catalog, all-symbol outline and declaration evidence, as
+specified in the [Files contract](files-view.md). Section switching alone never chooses a file,
+reads source or starts indexing. Explicit indexed source reads remain cached and revision-bound.
+Files may separately show the existing net HEAD-to-working-tree Git diff; it is uncommitted and
+not indexed, never a replacement for cached source or its navigation basis.
 There are no remote-machine groups, future diagram tabs, agent/terminal controls or gated actions.
 The existing Git summary remains independent of index freshness; upstream counts are as of last fetch.
 
@@ -36,11 +40,13 @@ complexity and default aggregate is max. Max, sum and mean are server projection
 scores, never client folds of file aggregates. One revision projection supplies file and directory
 swatches; one selected-scope request supplies the inspector and `topCognitive=3`.
 
-The tree remains live filesystem metadata. Only `indexedPath` joins file evidence. Directory
-paths must map inside the verified indexed workspace; outside paths, symlinks, nonindexed files
-and ambiguous source-set/language matches have no metric evidence. Expanding a path for metrics
-never reads source, starts indexing or calls a provider. Compacted directory chains inspect their
-terminal displayed directory. Filtering still searches loaded entries only.
+The Diagrams Explorer remains live filesystem metadata. Only `indexedPath` joins file evidence.
+Directory paths must map inside the verified indexed workspace; outside paths, symlinks, nonindexed
+files and ambiguous source-set/language matches have no metric evidence. Expanding a path for
+metrics never reads source, starts indexing or calls a provider. Compacted directory chains inspect
+their terminal displayed directory. Filtering still searches loaded entries only. Files instead
+uses the pinned indexed-file catalog: its cached source must remain reachable when a live file
+has been deleted. That catalog is not a claim about the current filesystem or Git changed set.
 
 The inspector shows every metric leaf at the named aggregate. Null stays `—`; explicit unavailable
 reasons, including fan-in, stay visible. Highest-cognitive rows use raw callable scores and native
@@ -57,8 +63,13 @@ Color selection does not fetch; aggregation refreshes the pinned projection. Fai
 metric values and show an actionable error. The existing 15-second browser request timeout remains;
 a timeout is not evidence that the server finished or that values are zero.
 
-Only one inspector selection is displayed: a source step or file/directory metrics. Classes keeps
-its full canvas unless a file/directory metric inspector was explicitly selected. Clearing it
-restores that layout. Desktop panes scroll independently; at 900px and below, Explorer and
-Inspector use the existing mutually exclusive drawers. Files opens/focuses the Explorer, not source.
-All repository text is written with `textContent` under the existing CSP and local assets.
+Within Diagrams, only one inspector selection is displayed: a source step or file/directory
+metrics. Classes keeps its full canvas unless a file/directory metric inspector was explicitly
+selected. Clearing it restores that layout. Files replaces that inspector with the explicitly
+selected declaration's evidence; source locations, syntax matches and mini-sequences remain on
+the shown full pin. Full-pin, checkout and session changes clear derived evidence before rebinding.
+Desktop panes scroll independently; at 900px and below, Explorer and Inspector use the existing
+mutually exclusive drawers. Files source is primary, not an Escape-dismissable secondary dock.
+Source navigation retains its shared keyboard/menu behavior; Git diff rows never become indexed
+navigation targets. All repository text is written with `textContent` under the existing CSP and
+local assets. Existing authentication, Host/Origin checks and token behavior remain unchanged.

@@ -57,7 +57,6 @@ async fn unknown_checkout_routes_do_not_attach_activate_or_renew() {
         (Method::POST, "questions/a/extra/jev-run"),
         (Method::POST, "jobs/a/extra/cancel"),
         (Method::POST, "jobs//cancel"),
-        (Method::GET, "symbols"),
         (Method::GET, "symbol"),
         (Method::POST, "query"),
         (Method::GET, "views"),

@@ -244,7 +244,7 @@ test("real indexed viewer exposes snapshot metrics, numeric heat legend, raw top
   assert.ok(explorer.x + explorer.width <= canvas.x && canvas.x + canvas.width <= inspector.x, "desktop keeps separate explorer, canvas and inspector columns");
 }));
 
-test("390px drawers and keyboard Files retain selected evidence without fetching source or parsing filenames as HTML", {timeout:240000}, async () => published(async ({page, requests}) => {
+test("390px drawers and explicit Files section retain selected evidence without fetching source or parsing filenames as HTML", {timeout:240000}, async () => published(async ({page, requests}) => {
   await expandSources(page);
   await page.locator('.file-pick[title="src/flow.js"]').click();
   const method = page.locator(".method-pick").filter({hasText:"measured"});
@@ -268,12 +268,17 @@ test("390px drawers and keyboard Files retain selected evidence without fetching
   for (const width of [1440, 390]) {
     await page.setViewportSize({width, height:width === 390 ? 844 : 900});
     await page.locator("#section-files").focus(); await page.keyboard.press("Enter");
-    assert.equal(await page.locator("#file-filter").evaluate(node => document.activeElement === node), true, "Files moves keyboard focus to browsing");
-    assert.equal(await page.locator("#source-dock").isVisible(), true);
+    assert.equal(await page.locator("body").evaluate(node => node.classList.contains("files-section")), true, "Files is a source section, not merely Explorer focus");
+    assert.equal(await page.locator("#source").isVisible(), true);
     assert.equal(await page.locator("#source").textContent(), source);
-    assert.equal(sourceCount(), before, "Files is navigation, not a source request");
+    assert.equal(sourceCount(), before, "switching to Files does not select or read a file");
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true, `${width}px Files has no page overflow`);
+    await page.locator("#section-diagrams").click();
+    assert.equal(await page.locator("#sequence-diagram").textContent(), diagram);
+    assert.equal(await page.locator("#source").textContent(), source);
     await noOverflow(page, width);
   }
+  await page.locator("#explorer-toggle").click();
   assert.equal(await page.locator("#explorer-toggle").getAttribute("aria-expanded"), "true");
   const explorer = await page.locator("#explorer-panel").boundingBox();
   assert.ok(explorer && explorer.x >= 0 && explorer.x + explorer.width <= 390);
@@ -287,7 +292,7 @@ test("390px drawers and keyboard Files retain selected evidence without fetching
   await page.keyboard.press("Escape");
   assert.equal(await page.locator("#inspector-toggle").evaluate(node => document.activeElement === node), true);
   assert.equal(await page.locator("#call-inspector").isVisible(), false);
-  await page.locator("#section-files").focus(); await page.keyboard.press("Enter");
+  await page.locator("#explorer-toggle").click();
   const malicious = page.locator("#file-tree .file-pick").filter({hasText:maliciousName});
   assert.equal(await malicious.count(), 1);
   assert.equal(await malicious.getAttribute("title"), maliciousName);

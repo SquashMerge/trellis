@@ -81,13 +81,30 @@ test("checkout selection and refresh load only retained services and keep curren
 test("retired checkout routes are rejected before a browser request",async()=>{
   const h=harness();await h.connect("synthetic",false);
   const before=h.requests.length;
-  for(const route of ["symbols?q=x","symbol?id=x","query","views","views/item","annotations","annotations/item",
+  for(const route of ["symbol?id=x","query","views","views/item","annotations","annotations/item",
     "questions/preview","questions/packet/jev-request","questions/packet/jev-response","questions/packet/selection",
     "questions/packet/jev-run","questions/packet/acp-answer","jev/status","acp/status"]) {
     h.context.retiredPath=`/api/${route}`;
     await assert.rejects(h.run("api(retiredPath)"),/Unknown checkout API route/);
   }
   assert.equal(h.requests.length,before);
+});
+
+test("Files reads use the selected checkout adapter without reviving retired symbol detail",async()=>{
+  const h=harness();await h.connect("synthetic",false);
+  const routes=[
+    ["symbols?path=a.js&indexGeneration=12345678-1234-4123-8123-123456789abc&indexRevision=1","GET",undefined],
+    ["syntax-matches","POST",{expectedRevision:{indexGeneration:"12345678-1234-4123-8123-123456789abc",indexRevision:1},symbolId:"measured"}],
+    ["git/diff?path=a.js","GET",undefined]
+  ];
+  h.context.fetch=async(url,options)=>{h.requests.push({url,options});return response({});};
+  for(const [suffix,method,body] of routes){
+    h.context.filesPath=`/api/${suffix}`;h.context.filesMethod=method;h.context.filesBody=body;
+    await h.run("api(filesPath,filesMethod,filesBody)");
+    const request=h.requests.at(-1);
+    assert.equal(request.url,`${SCOPED}/${suffix}`);assert.equal(request.options.method,method);
+    if(body)assert.deepEqual(JSON.parse(request.options.body),body);
+  }
 });
 
 test("Connect enters the shell directly and reports the measured daemon address", async () => {
