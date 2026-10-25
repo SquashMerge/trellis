@@ -45,6 +45,11 @@ async fn unknown_checkout_routes_do_not_attach_activate_or_renew() {
     assert_eq!(registry.lock().await.active_count(), 0);
     let invalid = [
         (Method::GET, "unknown"),
+        (Method::POST, "git"),
+        (Method::PUT, "git/diff"),
+        (Method::DELETE, "git"),
+        (Method::GET, "git/extra"),
+        (Method::GET, "git/diff/extra"),
         (Method::POST, "status"),
         (Method::GET, "views/a/extra"),
         (Method::GET, "annotations/a"),

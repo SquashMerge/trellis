@@ -127,15 +127,34 @@
     if (get("inspector-open-source")) get("inspector-open-source").disabled = !openSource;
     drawer("inspector", true);
   }
+  let checkoutRoot = "";
+  function formatGit(git) {
+    if (git?.state !== "available") return "Git unavailable";
+    const head = git.head?.kind === "branch" ? git.head.name
+      : git.head?.kind === "detached" && git.head.shortCommit ? `Detached HEAD ${git.head.shortCommit}` : null;
+    if (!head) return "Git unavailable";
+    return git.upstream
+      ? `${head} · ${git.upstream.name} ↑${git.upstream.ahead} ↓${git.upstream.behind} · As of last fetch`
+      : `${head} · No upstream`;
+  }
+  function updateCheckout(root, git) {
+    checkoutRoot = root || "";
+    const label = checkoutRoot ? formatGit(git) : "";
+    text("workspace-git", label);
+    hide("workspace-git", !checkoutRoot);
+    if (get("workspace-git")) get("workspace-git").title = label;
+    text("workspace-name", checkoutRoot.split(/[\\/]/).filter(Boolean).at(-1) || "No workspace");
+    if (get("workspace-name")) get("workspace-name").title = checkoutRoot;
+  }
   function updateWorkspace(status) {
-    const root = status?.workspaceRoot || "";
+    const root = status?.workspaceRoot || checkoutRoot;
     text("workspace-name", root.split(/[\\/]/).filter(Boolean).at(-1) || "No workspace");
-    text("workspace-meta", status ? `Revision ${status.revision.indexGeneration.slice(0, 8)}:${status.revision.indexRevision} · ${status.stats?.files ?? 0} files · ${"Syntax only · SCIP display metadata is not proof"}` : "Connect to a local daemon");
+    text("workspace-meta", status ? `Revision ${status.revision.indexGeneration.slice(0, 8)}:${status.revision.indexRevision} · ${status.stats?.files ?? 0} files · ${"Syntax only · SCIP display metadata is not proof"}` : checkoutRoot ? "Index status unavailable" : "Connect to a local daemon");
     if (get("workspace-name")) get("workspace-name").title = root;
   }
   function reset() {
     resetInspector(); showView("sequence"); hide("source-dock", true); sourceReturnFocus = null;
-    drawer("explorer", false); drawer("inspector", false); updateWorkspace(null);
+    drawer("explorer", false); drawer("inspector", false); updateCheckout(null, null); updateWorkspace(null);
   }
   function setConnected(connected) {
     document.body.classList.toggle("connected", !!connected);
@@ -154,6 +173,6 @@
     else if (mobile && document.body.classList.contains("explorer-open")) { drawer("explorer", false); get("explorer-toggle")?.focus(); }
     else if (get("source-dock") && !get("source-dock").hidden) closeSource();
   });
-  window.TrellisShell = {setConnected, updateWorkspace, showView, showSource, closeSource, selectStep, resetInspector, reset};
+  window.TrellisShell = {setConnected, updateCheckout, formatGit, updateWorkspace, showView, showSource, closeSource, selectStep, resetInspector, reset};
   reset();
 })();

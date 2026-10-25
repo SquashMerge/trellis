@@ -3909,7 +3909,7 @@ impl ProvisionedBrowser {
                 "/api/checkouts",
                 get(|State(state): State<Arc<Self>>| async move {
                     let probe = state.registry.lock().await.browser_checkouts_probe();
-                    let checkouts = tokio::task::spawn_blocking(move || probe.check())
+                    let mut checkouts = tokio::task::spawn_blocking(move || probe.check())
                         .await
                         .map_err(|_| {
                             ApiError(
@@ -3918,7 +3918,8 @@ impl ProvisionedBrowser {
                                 "Operation failed",
                             )
                         })?;
-                    Ok::<_, ApiError>(Json(json!({"checkouts": checkouts})))
+                    enrich_checkout_git(&mut checkouts).await;
+                    checkout_list_response(checkouts)
                 }),
             )
             .route(
@@ -3951,8 +3952,123 @@ async fn provision_guard(
     guard_common(&state.token, &state.hosts, &state.origins, req, next).await
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GitDiffQuery {
+    path: String,
+}
+
+fn git_query(route: BrowserCoreRoute, uri: &axum::http::Uri) -> Result<Option<String>, ApiError> {
+    if matches!(route, BrowserCoreRoute::GitStatus) {
+        return if uri.query().is_none() {
+            Ok(None)
+        } else {
+            Err(invalid())
+        };
+    }
+    let Query(query) = Query::<GitDiffQuery>::try_from_uri(uri).map_err(|_| invalid())?;
+    crate::git_status::validate_path(&query.path).map_err(git_request_error)?;
+    Ok(Some(query.path))
+}
+
+fn git_request_error(error: crate::git_status::GitRequestError) -> ApiError {
+    match error {
+        crate::git_status::GitRequestError::InvalidPath => ApiError(
+            StatusCode::BAD_REQUEST,
+            "invalid_git_path",
+            "Invalid Git path",
+        ),
+        crate::git_status::GitRequestError::NotFound => missing(),
+    }
+}
+
+async fn git_answer(root: &std::path::Path, path: Option<&str>) -> Result<Response, ApiError> {
+    match path {
+        Some(path) => Ok(Json(
+            crate::git_status::diff(root, path)
+                .await
+                .map_err(git_request_error)?,
+        )
+        .into_response()),
+        None => Ok(Json(crate::git_status::status(root).await).into_response()),
+    }
+}
+
+async fn enrich_checkout_git(checkouts: &mut [Value]) {
+    use crate::{
+        git_status::{GitReason, GitSummary},
+        store::topology::WorkspaceIdentity,
+    };
+    let deadline = tokio::time::Instant::now() + crate::git_status::READ_DEADLINE;
+    for row in checkouts {
+        if tokio::time::Instant::now() >= deadline {
+            row["git"] = json!(GitSummary::Unavailable {
+                reason: GitReason::DeadlineExceeded
+            });
+            continue;
+        }
+        let identity = row["workspaceRoot"]
+            .as_str()
+            .filter(|_| row["state"] != "unavailable")
+            .and_then(|root| {
+                let root = std::path::Path::new(root);
+                WorkspaceIdentity::discover_unattached(Some(root), root)
+                    .and_then(WorkspaceIdentity::attach_existing_marker_readonly)
+                    .ok()
+            })
+            .filter(|identity| row["rootKey"].as_str() == Some(identity.root_key.as_str()));
+        let git = match identity {
+            None => GitSummary::Unavailable {
+                reason: GitReason::Unreadable,
+            },
+            Some(identity) => {
+                let result =
+                    tokio::time::timeout_at(deadline, crate::git_status::summary(&identity.root))
+                        .await;
+                if identity.verify_readonly().is_err() {
+                    GitSummary::Unavailable {
+                        reason: GitReason::Unreadable,
+                    }
+                } else {
+                    result.unwrap_or(GitSummary::Unavailable {
+                        reason: GitReason::DeadlineExceeded,
+                    })
+                }
+            }
+        };
+        row["git"] = json!(git);
+    }
+}
+
+fn checkout_list_response(checkouts: Vec<Value>) -> Result<Response, ApiError> {
+    struct Bounded(Vec<u8>);
+    impl std::io::Write for Bounded {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > crate::git_status::RESPONSE_LIMIT.saturating_sub(self.0.len()) {
+                return Err(std::io::Error::other("response_too_large"));
+            }
+            self.0.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut writer = Bounded(Vec::new());
+    serde_json::to_writer(&mut writer, &json!({"checkouts": checkouts})).map_err(|_| {
+        ApiError(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "response_too_large",
+            "Response is too large",
+        )
+    })?;
+    Ok(([(header::CONTENT_TYPE, "application/json")], writer.0).into_response())
+}
+
 #[derive(Clone, Copy)]
 enum BrowserCoreRoute {
+    GitStatus,
+    GitDiff,
     Metrics,
     RefreshDependencies,
     JevStatus,
@@ -3991,6 +4107,8 @@ impl BrowserCoreRoute {
     fn parse(method: &axum::http::Method, suffix: &str) -> Option<Self> {
         use axum::http::Method;
         match (method, suffix) {
+            (&Method::GET, "git") => Some(Self::GitStatus),
+            (&Method::GET, "git/diff") => Some(Self::GitDiff),
             (&Method::GET, "metrics") => Some(Self::Metrics),
             (&Method::POST, "dependencies/refresh") => Some(Self::RefreshDependencies),
             (&Method::GET, "jev/status") => Some(Self::JevStatus),
@@ -4069,6 +4187,18 @@ async fn provisioned_core(
     let Some(route) = BrowserCoreRoute::parse(&method, &suffix) else {
         return missing().into_response();
     };
+    let is_git = matches!(
+        route,
+        BrowserCoreRoute::GitStatus | BrowserCoreRoute::GitDiff
+    );
+    let git_path = if is_git {
+        match git_query(route, &uri) {
+            Ok(path) => path,
+            Err(error) => return error.into_response(),
+        }
+    } else {
+        None
+    };
     let identity = {
         let mut registry = browser.registry.lock().await;
         match registry.browser_identity(&root_key) {
@@ -4079,62 +4209,83 @@ async fn provisioned_core(
         }
     };
     let root = identity.root.to_string_lossy().to_string();
-    let runtime = {
-        let mut registry = browser.registry.lock().await;
-        match registry.browser_request_at(&identity, Instant::now()) {
-            Ok(_) => registry.activate(&root_key).map_err(|error| {
-                if crate::store::transient_storage_contention(&error) {
-                    ApiError::from(error)
-                } else {
-                    ApiError(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "store_unavailable",
-                        "Storage is unavailable",
-                    )
-                }
-            }),
-            Err(SelectionError::CheckoutCapacity) => Err(ApiError(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "checkout_capacity",
-                "Checkout capacity reached",
-            )),
-            Err(error) => Err(ApiError::from(anyhow::anyhow!("{}", error.reason()))),
+    // Git reads are observational: they neither attach a browser lifetime nor
+    // activate an index runtime. The common selected-root fence still applies.
+    let answer: Result<(Response, bool), ApiError> = if is_git {
+        let result = if identity.verify_readonly().is_err() {
+            Err(ApiError::from(anyhow::anyhow!("root_changed")))
+        } else {
+            git_answer(&identity.root, git_path.as_deref()).await
+        };
+        let hook = browser.response_hook.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook("after_handler");
         }
-    };
-    let answer: Result<(Response, bool), ApiError> = match runtime {
-        Err(error) => Err(error),
-        Ok(runtime) => {
-            let hook = browser.response_hook.lock().unwrap().clone();
-            #[cfg(feature = "test-support")]
-            let frozen_now = *browser.metrics_clock.lock().unwrap();
-            let result = provisioned_core_answer(
-                &runtime,
-                BrowserCoreRequest {
-                    route,
-                    method: &method,
-                    suffix: &suffix,
-                    uri: &uri,
-                    body,
-                },
-                hook.clone(),
-                MetricsHttpControls {
-                    limit: browser
-                        .metrics_limit
-                        .load(std::sync::atomic::Ordering::Relaxed),
-                    deadline_ms: browser
-                        .metrics_deadline_ms
-                        .load(std::sync::atomic::Ordering::Relaxed),
-                    test_cancel: browser.metrics_test_cancel.clone(),
-                    clock_skew_ms: browser.metrics_clock_skew_ms.clone(),
-                    #[cfg(feature = "test-support")]
-                    frozen_now,
-                },
-            )
-            .await;
-            if let Some(hook) = hook {
-                hook("after_handler");
+        let catching_up = browser
+            .registry
+            .lock()
+            .await
+            .runtime(&root_key)
+            .is_some_and(|runtime| runtime.catching_up());
+        result.map(|response| (response, catching_up))
+    } else {
+        let runtime = {
+            let mut registry = browser.registry.lock().await;
+            match registry.browser_request_at(&identity, Instant::now()) {
+                Ok(_) => registry.activate(&root_key).map_err(|error| {
+                    if crate::store::transient_storage_contention(&error) {
+                        ApiError::from(error)
+                    } else {
+                        ApiError(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "store_unavailable",
+                            "Storage is unavailable",
+                        )
+                    }
+                }),
+                Err(SelectionError::CheckoutCapacity) => Err(ApiError(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "checkout_capacity",
+                    "Checkout capacity reached",
+                )),
+                Err(error) => Err(ApiError::from(anyhow::anyhow!("{}", error.reason()))),
             }
-            result
+        };
+        match runtime {
+            Err(error) => Err(error),
+            Ok(runtime) => {
+                let hook = browser.response_hook.lock().unwrap().clone();
+                #[cfg(feature = "test-support")]
+                let frozen_now = *browser.metrics_clock.lock().unwrap();
+                let result = provisioned_core_answer(
+                    &runtime,
+                    BrowserCoreRequest {
+                        route,
+                        method: &method,
+                        suffix: &suffix,
+                        uri: &uri,
+                        body,
+                    },
+                    hook.clone(),
+                    MetricsHttpControls {
+                        limit: browser
+                            .metrics_limit
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                        deadline_ms: browser
+                            .metrics_deadline_ms
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                        test_cancel: browser.metrics_test_cancel.clone(),
+                        clock_skew_ms: browser.metrics_clock_skew_ms.clone(),
+                        #[cfg(feature = "test-support")]
+                        frozen_now,
+                    },
+                )
+                .await;
+                if let Some(hook) = hook {
+                    hook("after_handler");
+                }
+                result
+            }
         }
     };
     let (mut response, catching_up) = match answer {
@@ -4145,7 +4296,7 @@ async fn provisioned_core(
                 .lock()
                 .await
                 .runtime(&root_key)
-                .is_none_or(|runtime| runtime.catching_up());
+                .map_or(!is_git, |runtime| runtime.catching_up());
             (error.into_response(), catching_up)
         }
     };
@@ -4597,6 +4748,9 @@ async fn provisioned_core_answer(
         body,
     } = request;
     match route {
+        BrowserCoreRoute::GitStatus | BrowserCoreRoute::GitDiff => {
+            unreachable!("Git reads bypass index activation")
+        }
         BrowserCoreRoute::Metrics => {
             let options = metrics_query(uri)?;
             let runtime = runtime.clone();
@@ -5514,8 +5668,19 @@ mod browser_core_route_tests {
     use axum::http::Method;
 
     #[test]
+    fn git_checkout_list_refuses_an_oversized_complete_envelope() {
+        let row =
+            serde_json::json!({"workspaceRoot": "x".repeat(crate::git_status::RESPONSE_LIMIT)});
+        let error = super::checkout_list_response(vec![row]).unwrap_err();
+        assert_eq!(error.0, axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(error.1, "response_too_large");
+    }
+
+    #[test]
     fn dynamic_routes_match_only_their_supported_method_and_shape() {
         for (method, suffix) in [
+            (Method::GET, "git"),
+            (Method::GET, "git/diff"),
             (Method::GET, "views/id"),
             (Method::PUT, "views/id"),
             (Method::DELETE, "views/id"),

@@ -224,3 +224,28 @@ test("inspector refuses source callback for malformed ranges or missing paired s
  assert.equal(h.get("inspector-open-source").disabled,true);
  assert.equal(opened,0);
 });
+
+const branchGit = (upstream = null) => ({state:"available",head:{kind:"branch",name:"feature/<script>",commit:"abcdef123456",shortCommit:"abcdef1"},upstream});
+test("Git header shows measured branch, last-fetch counts, detached HEAD and unavailable without inventing a branch",()=>{
+  const h=harness();
+  for (const [git,expected] of [
+    [branchGit({name:"origin/main",ahead:2,behind:3,basis:"last_fetch"}),"feature/<script> · origin/main ↑2 ↓3 · As of last fetch"],
+    [branchGit(),"feature/<script> · No upstream"],
+    [{state:"available",head:{kind:"detached",name:null,commit:"abcdef123456",shortCommit:"abcdef1"},upstream:null},"Detached HEAD abcdef1 · No upstream"],
+    [{state:"unavailable",reason:"not_repository"},"Git unavailable"],
+    [undefined,"Git unavailable"]
+  ]) {
+    h.shell.updateCheckout("/a/repo",git);
+    assert.equal(h.get("workspace-git").textContent,expected);
+    assert.equal(h.get("workspace-git").title,expected);
+    assert.equal(h.get("workspace-git").hidden,false);
+    assert.equal(all(h.get("workspace-git")).some(n=>n.tagName==="script"),false);
+    h.shell.updateWorkspace(null);
+    assert.equal(h.get("workspace-git").textContent,expected,"cold index must not erase independent Git");
+    assert.equal(h.get("workspace-name").textContent,"repo");
+  }
+  h.shell.setConnected(false);
+  assert.equal(h.get("workspace-git").textContent,"");
+  assert.equal(h.get("workspace-git").hidden,true);
+  assert.deepEqual(h.requests,[]);
+});
