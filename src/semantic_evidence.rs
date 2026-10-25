@@ -483,6 +483,35 @@ pub fn validate_evidence(
     native: &native::Artifact,
     captured: &CapturedComponents,
 ) -> Result<()> {
+    validate_evidence_with_raw(semantic, native, captured, None)
+}
+
+pub fn validate_evidence_with_raw(
+    semantic: &SemanticPublication,
+    native: &native::Artifact,
+    captured: &CapturedComponents,
+    raw: Option<&crate::store::SemanticRawCapture>,
+) -> Result<()> {
+    validate_evidence_inner(semantic, native, captured, raw, None)
+}
+
+pub(crate) fn validate_evidence_with_attested_raw(
+    semantic: &SemanticPublication,
+    native: &native::Artifact,
+    captured: &CapturedComponents,
+    raw: &crate::store::SemanticRawCapture,
+    attested: &crate::store::AttestedProfileProducer,
+) -> Result<()> {
+    validate_evidence_inner(semantic, native, captured, Some(raw), Some(attested))
+}
+
+fn validate_evidence_inner(
+    semantic: &SemanticPublication,
+    native: &native::Artifact,
+    captured: &CapturedComponents,
+    raw: Option<&crate::store::SemanticRawCapture>,
+    attested: Option<&crate::store::AttestedProfileProducer>,
+) -> Result<()> {
     ensure!(
         captured.native_extraction_components.is_empty(),
         "undeclared native extraction components"
@@ -578,24 +607,36 @@ pub fn validate_evidence(
         hash(&p.executable_hash)?;
         ordered(&p.languages)?;
         ensure!(!p.languages.is_empty(), "empty producer languages");
-        ensure!(
-            p.executable_hash
-                == native_ids::digest(
-                    b"",
-                    captured
-                        .producer_executables
-                        .get(&p.id)
-                        .context("missing semantic executable")?
-                ),
-            "semantic executable mismatch"
-        );
+        if let Some(attested) = attested {
+            ensure!(
+                attested.matches(p),
+                "authenticated profile producer mismatch"
+            );
+        } else {
+            ensure!(
+                p.executable_hash
+                    == native_ids::digest(
+                        b"",
+                        captured
+                            .producer_executables
+                            .get(&p.id)
+                            .context("missing semantic executable")?
+                    ),
+                "semantic executable mismatch"
+            );
+        }
         ensure!(
             producers.insert(p.id.as_str(), p).is_none(),
             "duplicate semantic producer"
         );
     }
     ensure!(
-        captured.producer_executables.len() == producers.len()
+        captured.producer_executables.len()
+            == if attested.is_some() {
+                0
+            } else {
+                producers.len()
+            }
             && captured.artifacts.len() == producers.len(),
         "unclaimed semantic bytes"
     );
@@ -718,14 +759,33 @@ pub fn validate_evidence(
         text(&p.id)?;
         key(&p.document, revision)?;
         hash(&p.content_hash)?;
-        ensure!(
-            p.revision_id == captured.captured_revision.id,
-            "captured proof revision mismatch"
-        );
-        ensure!(
-            p.derived_from.is_none(),
-            "derived provenance is not admitted in this stage"
-        );
+        if let Some(derived) = &p.derived_from {
+            ensure!(
+                p.revision_id == revision.id,
+                "derived proof revision mismatch"
+            );
+            let raw = raw.context("derived provenance requires authenticated raw inventory")?;
+            let kind = serde_json::to_value(derived.record_kind)?;
+            let claim = raw.inventory.lookup(
+                &derived.provenance_id,
+                kind.as_str().context("invalid raw record kind")?,
+                &derived.fact_digest,
+            )?;
+            ensure!(
+                p.producer_id == raw.producer_id
+                    && p.document.source_set_id == raw.source_set_id
+                    && p.document.language == claim.language
+                    && p.document.path == claim.envelope.relative_path
+                    && raw.captured_revision == captured.captured_revision.id
+                    && raw.inventory.artifact_hash == native_ids::digest(b"", &raw.binary_bytes),
+                "derived provenance raw capture identity mismatch"
+            );
+        } else {
+            ensure!(
+                p.revision_id == captured.captured_revision.id,
+                "captured proof revision mismatch"
+            );
+        }
         let row = coverage
             .get(&(
                 p.producer_id.as_str(),

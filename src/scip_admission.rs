@@ -108,6 +108,19 @@ struct HardwareProducer {
     #[serde(rename = "positionEncoding")]
     position_encoding: Option<String>,
 }
+fn parse_manifest(bytes: &[u8]) -> Result<Manifest, ScipCaptureError> {
+    serde_json::from_slice(bytes).map_err(|_| admission("closed manifest"))
+}
+
+/// Apply the exact reference-profile manifest grammar to retained bytes before
+/// Store interprets their authenticated fields.
+pub(crate) fn validate_closed_manifest(bytes: &[u8]) -> Result<(), ScipCaptureError> {
+    if bytes.len() > 1024 * 1024 {
+        return Err(ScipCaptureError::LimitExceeded("admitted bytes".into()));
+    }
+    parse_manifest(bytes).map(|_| ())
+}
+
 fn admission(s: &str) -> ScipCaptureError {
     ScipCaptureError::InvalidAdmission(s.into())
 }
@@ -209,8 +222,7 @@ impl<'a> ReferenceProfileAdmission<'a> {
         {
             return Err(admission("expected manifest digest"));
         }
-        let manifest: Manifest =
-            serde_json::from_slice(manifest_bytes).map_err(|_| admission("closed manifest"))?;
+        let manifest = parse_manifest(manifest_bytes)?;
         let artifact_relative = relative(root, artifact_path)?;
         let _ = relative(root, manifest_path)?;
         if manifest.format_version != 1
