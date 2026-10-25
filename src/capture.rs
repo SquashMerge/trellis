@@ -725,20 +725,6 @@ impl Capture {
             hash(executable_bytes.as_ref().unwrap())
         };
         check(cancel)?;
-        for path in [options.scip_path.as_ref(), options.manifest_path.as_ref()]
-            .into_iter()
-            .flatten()
-        {
-            admit_input(
-                path.clone(),
-                256 * 1024 * 1024,
-                cancel,
-                &source_identities,
-                &mut input_identities,
-                &mut inputs,
-                &mut input_bytes,
-            )?;
-        }
         let mut files = Vec::new();
         let mut hashes = BTreeMap::new();
         let mut source_operations = BTreeMap::new();
@@ -888,25 +874,12 @@ impl Capture {
     fn input_cap(&self, path: &Path) -> u64 {
         if path == self.executable_path {
             512 * 1024 * 1024
-        } else if self.reconcile_options.scip_path.as_deref() == path.to_str()
-            || self.reconcile_options.manifest_path.as_deref() == path.to_str()
-        {
-            256 * 1024 * 1024
         } else {
             16 * 1024 * 1024
         }
     }
     pub(crate) fn physical_root(&self) -> &Path {
         &self.root
-    }
-    pub(crate) fn selected_scip_inputs(&self) -> Option<(&Path, &Path)> {
-        let artifact = Path::new(self.reconcile_options.scip_path.as_deref()?);
-        let manifest = Path::new(self.reconcile_options.manifest_path.as_deref()?);
-        if artifact == manifest || self.bytes(artifact).is_none() || self.bytes(manifest).is_none()
-        {
-            return None;
-        }
-        Some((artifact, manifest))
     }
     pub fn bytes(&self, path: &Path) -> Option<&[u8]> {
         self.input_bytes.get(path).and_then(|b| b.as_deref())
@@ -935,10 +908,8 @@ impl Capture {
         };
         admitted.then_some(self.executable_digest.as_str())
     }
-    /// Compare the native roles of admitted inputs, not presentation pathnames. A single
-    /// optional SCIP/manifest pathname can also be a root config, nested ignore file,
-    /// toolchain selector, or this executable. Its native role must never be filtered.
-    /// The executable uses its admitted Arc digest; do not rehash its bytes.
+    /// Fingerprint native inputs by their admitted roles. The executable uses
+    /// its admitted Arc digest; do not rehash its bytes.
     pub(crate) fn native_input_fingerprints(&self) -> Result<BTreeMap<String, Option<String>>> {
         let mut result = BTreeMap::new();
         for (path, expected) in &self.inputs {
@@ -1068,12 +1039,6 @@ impl Capture {
             let mut roles = Vec::new();
             if path == &self.executable_path {
                 roles.push(format!("executable:{}", path.to_string_lossy()));
-            }
-            if self.reconcile_options.scip_path.as_deref() == path.to_str() {
-                roles.push(format!("presentation-scip:{}", path.to_string_lossy()));
-            }
-            if self.reconcile_options.manifest_path.as_deref() == path.to_str() {
-                roles.push(format!("presentation-manifest:{}", path.to_string_lossy()));
             }
             if path.starts_with(&self.root) {
                 let rel = relative(&self.root, path)?;

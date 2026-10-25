@@ -78,8 +78,6 @@ pub struct CheckoutOptions(pub serde_json::Value);
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct BrowserOptions {
     pub browse_root: Option<PathBuf>,
-    pub scip: Option<PathBuf>,
-    pub manifest: Option<PathBuf>,
     pub max_file_bytes: u64,
     pub rust_source_roots: Vec<(String, PathBuf)>,
     pub rust_library: Option<PathBuf>,
@@ -96,8 +94,6 @@ impl Default for BrowserOptions {
     fn default() -> Self {
         Self {
             browse_root: None,
-            scip: None,
-            manifest: None,
             max_file_bytes: 2_097_152,
             rust_source_roots: Vec::new(),
             rust_library: None,
@@ -589,17 +585,9 @@ impl CheckoutRegistry {
             .transpose()?
             .unwrap_or_default();
         let mut options = IndexOptions::new(root.to_owned());
-        options.scip_path = config.scip;
-        options.manifest_path = config.manifest;
         options.max_file_bytes = config.max_file_bytes;
-        // The raw registration preserves option presence. A supplied default
-        // value (or an explicit null for an optional input) is still explicit;
-        // comparing values would silently reuse an earlier checkout's inputs.
-        let explicit_options = registration.is_some_and(|registered| {
-            ["scip", "manifest", "maxFileBytes"]
-                .iter()
-                .any(|key| registered.0.get(*key).is_some())
-        });
+        let explicit_options =
+            registration.is_some_and(|registered| registered.0.get("maxFileBytes").is_some());
         let provider = match (config.jev_budget_dir, config.jev_budget_cents) {
             (Some(dir), Some(cap)) => {
                 let key = config
@@ -841,10 +829,7 @@ impl CheckoutRegistry {
             .map_err(|_| SelectionError::IdentityChanged)?;
         let config: BrowserOptions =
             serde_json::from_value(options.0.clone()).map_err(|_| SelectionError::Unavailable)?;
-        if config.max_file_bytes == 0
-            || config.max_file_bytes > 16_777_216
-            || config.manifest.is_some() && config.scip.is_none()
-        {
+        if config.max_file_bytes == 0 || config.max_file_bytes > 16_777_216 {
             return Err(SelectionError::Unavailable);
         }
         let browse = config.browse_root.as_deref().unwrap_or(&identity.root);
@@ -961,8 +946,6 @@ impl CheckoutRegistry {
             return Err(SelectionError::Unavailable);
         }
         for path in [
-            config.scip,
-            config.manifest,
             config.rust_library,
             config.trusted_rustc,
             config.cargo_home,

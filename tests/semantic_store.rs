@@ -2116,9 +2116,7 @@ fn admitted_raw_fixture() -> (
     fs::write(physical.join("src/A.js"), text).unwrap();
     fs::write(physical.join("artifact.scip"), hex::decode(WIRE).unwrap()).unwrap();
     let cancel = Arc::new(AtomicBool::new(false));
-    let mut options = IndexOptions::new(physical.clone());
-    options.scip_path = Some(physical.join("artifact.scip"));
-    options.manifest_path = Some(physical.join("manifest.json"));
+    let options = IndexOptions::new(physical.clone());
     let first = trellis::capture::Capture::admit(&options, &cancel, &|_| {}).unwrap();
     let identity =
         trellis::store::topology::WorkspaceIdentity::discover(Some(&physical), &physical).unwrap();
@@ -2161,7 +2159,13 @@ fn admitted_raw_fixture() -> (
         producer_name: "scip-typescript".into(),
     };
     let admission = trellis::scip_admission::ReferenceProfileAdmission::from_trusted_selection(
-        &capture, &selection, &cancel,
+        &capture,
+        &physical.join("artifact.scip"),
+        &bytes,
+        &physical.join("manifest.json"),
+        &manifest_bytes,
+        &selection,
+        &cancel,
     )
     .unwrap();
     let inventory = trellis::scip_admission::decode_reference_profile(&admission, &cancel).unwrap();
@@ -2212,9 +2216,7 @@ fn conflicting_plain_reference_fixture() -> (
     let wire = binary.write_to_bytes().unwrap();
     fs::write(physical.join("artifact.scip"), &wire).unwrap();
     let cancel = Arc::new(AtomicBool::new(false));
-    let mut options = IndexOptions::new(physical.clone());
-    options.scip_path = Some(physical.join("artifact.scip"));
-    options.manifest_path = Some(physical.join("manifest.json"));
+    let options = IndexOptions::new(physical.clone());
     let first = trellis::capture::Capture::admit(&options, &cancel, &|_| {}).unwrap();
     let identity =
         trellis::store::topology::WorkspaceIdentity::discover(Some(&physical), &physical).unwrap();
@@ -2257,7 +2259,13 @@ fn conflicting_plain_reference_fixture() -> (
         producer_name: "scip-typescript".into(),
     };
     let admission = trellis::scip_admission::ReferenceProfileAdmission::from_trusted_selection(
-        &capture, &selection, &cancel,
+        &capture,
+        &physical.join("artifact.scip"),
+        &bytes,
+        &physical.join("manifest.json"),
+        &manifest_bytes,
+        &selection,
+        &cancel,
     )
     .unwrap();
     let inventory = trellis::scip_admission::decode_reference_profile(&admission, &cancel).unwrap();
@@ -2286,9 +2294,7 @@ fn contradictory_plain_reference_proofs_survive_store_selected_roundtrip() {
     let store = Store::open_for_tests(state.path(), root.path()).unwrap();
     let cancel = Arc::new(AtomicBool::new(false));
     let physical = fs::canonicalize(root.path()).unwrap();
-    let mut options = IndexOptions::new(physical.clone());
-    options.scip_path = Some(physical.join("artifact.scip"));
-    options.manifest_path = Some(physical.join("manifest.json"));
+    let options = IndexOptions::new(physical.clone());
     let (graph, native, capture) =
         index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
     let leader = store.publication_for_tests().unwrap();
@@ -2452,9 +2458,7 @@ fn raw_proof_import_cas_and_selected_read_are_atomic() {
     let state = tempfile::tempdir().unwrap();
     let store = Store::open_for_tests(state.path(), root.path()).unwrap();
     let cancel = Arc::new(AtomicBool::new(false));
-    let mut options = IndexOptions::new(root.path().to_owned());
-    options.scip_path = Some(root.path().join("artifact.scip"));
-    options.manifest_path = Some(root.path().join("manifest.json"));
+    let options = IndexOptions::new(root.path().to_owned());
     let (graph, native, capture) =
         index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
     let leader = store.publication_for_tests().unwrap();

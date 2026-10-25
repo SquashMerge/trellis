@@ -91,12 +91,6 @@ struct WorkspaceArgs {
 struct IndexArgs {
     #[command(flatten)]
     workspace: WorkspaceArgs,
-    /// Existing binary SCIP artifact. No semantic indexer is executed.
-    #[arg(long)]
-    scip: Option<PathBuf>,
-    /// Paired flat JSON map of relative input paths to SHA-256 hashes.
-    #[arg(long, requires = "scip")]
-    manifest: Option<PathBuf>,
     /// Larger files are skipped with a diagnostic; valid range 1..16777216.
     #[arg(long)]
     max_file_bytes: Option<u64>,
@@ -749,7 +743,6 @@ fn dispatch_cli(command: &Command) -> Result<()> {
             "index",
             &args.workspace,
             serde_json::json!({
-                "scip": args.scip, "manifest": args.manifest,
                 "maxFileBytes": args.max_file_bytes
             }),
             false,
@@ -770,12 +763,6 @@ fn dispatch_cli(command: &Command) -> Result<()> {
             (1..=16_777_216).contains(&args.max_file_bytes.unwrap_or(2_097_152)),
             "max-file-bytes must be 1..16777216"
         );
-        let mut options = IndexOptions::new(identity.root.clone());
-        options.scip_path = args.scip.clone();
-        options.manifest_path = args.manifest.clone();
-        options.anchor_optional_inputs(&std::env::current_dir()?)?;
-        payload["scip"] = serde_json::to_value(options.scip_path)?;
-        payload["manifest"] = serde_json::to_value(options.manifest_path)?;
         if args.max_file_bytes.is_none() {
             payload
                 .as_object_mut()
@@ -862,14 +849,11 @@ async fn serve_via_daemon(args: &ServeArgs) -> Result<()> {
             .context("serve token file needs a name")?,
     );
     let mut index_options = IndexOptions::new(identity.root.clone());
-    index_options.scip_path = args.index.scip.clone();
-    index_options.manifest_path = args.index.manifest.clone();
     index_options.max_file_bytes = args.index.max_file_bytes.unwrap_or(2_097_152);
     ensure!(
         (1..=16_777_216).contains(&index_options.max_file_bytes),
         "max-file-bytes must be 1..16777216"
     );
-    index_options.anchor_optional_inputs(&std::env::current_dir()?)?;
     let rust_library = if let Some(path) = args
         .rust_library
         .clone()
@@ -886,8 +870,6 @@ async fn serve_via_daemon(args: &ServeArgs) -> Result<()> {
             &index_options,
             args.browse_root.clone(),
         )),
-        scip: index_options.scip_path,
-        manifest: index_options.manifest_path,
         max_file_bytes: index_options.max_file_bytes,
         rust_source_roots: args.rust_source_roots.clone(),
         rust_library,
@@ -914,12 +896,6 @@ async fn serve_via_daemon(args: &ServeArgs) -> Result<()> {
         .expect("browser options object");
     // Only index options actually supplied by this caller can supersede a
     // durable option. Other BrowserOptions fields retain their normal shape.
-    if args.index.scip.is_none() {
-        fields.remove("scip");
-    }
-    if args.index.manifest.is_none() {
-        fields.remove("manifest");
-    }
     if args.index.max_file_bytes.is_none() {
         fields.remove("maxFileBytes");
     }
@@ -1114,17 +1090,13 @@ mod serve_option_transport_tests {
     fn daemon_receipt_keeps_omitted_and_explicit_default_distinct() {
         let options = serde_json::to_value(registry::BrowserOptions::default()).unwrap();
         let mut omitted = options.clone();
-        for key in ["scip", "manifest", "maxFileBytes"] {
-            omitted.as_object_mut().unwrap().remove(key);
-        }
+        omitted.as_object_mut().unwrap().remove("maxFileBytes");
         let absent = checked_serve_options(omitted).unwrap();
         let explicit = checked_serve_options(options).unwrap();
-        for key in ["scip", "manifest", "maxFileBytes"] {
-            assert!(absent.0.get(key).is_none(), "{}", absent.0);
-        }
+        assert!(absent.0.get("maxFileBytes").is_none());
         assert_eq!(explicit.0["maxFileBytes"], 2_097_152);
-        assert_eq!(explicit.0.get("scip"), Some(&serde_json::Value::Null));
-        assert_eq!(explicit.0.get("manifest"), Some(&serde_json::Value::Null));
+        assert!(explicit.0.get("scip").is_none());
+        assert!(explicit.0.get("manifest").is_none());
     }
 }
 
@@ -1577,9 +1549,13 @@ fn dispatch_connection(
                     Ok(value)
                 }
                 "index" => {
+                    ensure!(
+                        args.as_object().is_some_and(|values| values
+                            .keys()
+                            .all(|key| matches!(key.as_str(), "workspace" | "maxFileBytes"))),
+                        "invalid_request: unknown index option"
+                    );
                     let mut options = IndexOptions::new(identity.root.clone());
-                    options.scip_path = serde_json::from_value(args["scip"].clone())?;
-                    options.manifest_path = serde_json::from_value(args["manifest"].clone())?;
                     if let Some(value) = args.get("maxFileBytes") {
                         options.max_file_bytes = value.as_u64().context("invalid maxFileBytes")?;
                     }
@@ -1587,7 +1563,6 @@ fn dispatch_connection(
                         (1..=16_777_216).contains(&options.max_file_bytes),
                         "max-file-bytes must be 1..16777216"
                     );
-                    options.anchor_optional_inputs(&std::env::current_dir()?)?;
                     checkout.cli_index(&options)
                 }
                 _ => anyhow::bail!("unknown daemon operation"),

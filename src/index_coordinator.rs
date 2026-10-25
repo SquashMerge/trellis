@@ -524,12 +524,8 @@ impl WatcherWork {
         health: Arc<crate::watch::WatcherHealth>,
     ) -> Result<Self> {
         store.verify_writer_session(session)?;
-        let watch = crate::watch::WatchSignals::publishing(
-            options.workspace_root.clone(),
-            options.scip_path.clone(),
-            options.manifest_path.clone(),
-            health.clone(),
-        );
+        let watch =
+            crate::watch::WatchSignals::publishing(options.workspace_root.clone(), health.clone());
         Ok(Self {
             health,
             watch,
@@ -611,8 +607,6 @@ impl WatcherWork {
         (self.options.workspace_root != options.workspace_root
             && std::fs::canonicalize(&self.options.workspace_root).ok()
                 != std::fs::canonicalize(&options.workspace_root).ok())
-            || self.options.scip_path != options.scip_path
-            || self.options.manifest_path != options.manifest_path
             || self.options.max_file_bytes != options.max_file_bytes
     }
 
@@ -814,12 +808,7 @@ impl WatcherWork {
     #[doc(hidden)]
     pub fn suppress_watch_signals_for_tests(&mut self, absent_watch_root: std::path::PathBuf) {
         assert!(!absent_watch_root.exists());
-        self.watch = crate::watch::WatchSignals::publishing(
-            absent_watch_root,
-            None,
-            None,
-            self.health.clone(),
-        );
+        self.watch = crate::watch::WatchSignals::publishing(absent_watch_root, self.health.clone());
         assert!(self.watch.degraded());
         self.last_accounted_generation = Some(self.watch.drain().generation);
     }
@@ -972,8 +961,6 @@ impl WatcherWork {
         if self.options_differ(options) {
             let next = crate::watch::WatchSignals::publishing(
                 options.workspace_root.clone(),
-                options.scip_path.clone(),
-                options.manifest_path.clone(),
                 self.health.clone(),
             );
             if let Some(waker) = &self.waker {

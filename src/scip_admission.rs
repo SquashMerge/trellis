@@ -198,6 +198,10 @@ fn checked_docs(rows: &[Doc]) -> Result<(), ScipCaptureError> {
 impl<'a> ReferenceProfileAdmission<'a> {
     pub fn from_trusted_selection(
         capture: &'a Capture,
+        artifact_path: &Path,
+        artifact_bytes: &'a [u8],
+        manifest_path: &Path,
+        manifest_bytes: &'a [u8],
         selection: &TrustedSelection,
         cancel: &CancelFlag,
     ) -> Result<Self, ScipCaptureError> {
@@ -205,15 +209,6 @@ impl<'a> ReferenceProfileAdmission<'a> {
             return Err(ScipCaptureError::Cancelled);
         }
         let root = capture.physical_root();
-        let (artifact_path, manifest_path) = capture
-            .selected_scip_inputs()
-            .ok_or_else(|| admission("SCIP roles"))?;
-        let artifact_bytes = capture
-            .bytes(artifact_path)
-            .ok_or_else(|| admission("artifact role"))?;
-        let manifest_bytes = capture
-            .bytes(manifest_path)
-            .ok_or_else(|| admission("manifest role"))?;
         if manifest_bytes.len() > 1024 * 1024 || artifact_bytes.len() > 64 * 1024 * 1024 {
             return Err(ScipCaptureError::LimitExceeded("admitted bytes".into()));
         }
@@ -469,6 +464,39 @@ mod tests {
         fs,
         sync::{Arc, atomic::AtomicBool},
     };
+    struct RawInputs {
+        artifact_path: std::path::PathBuf,
+        manifest_path: std::path::PathBuf,
+        artifact: Vec<u8>,
+        manifest: Vec<u8>,
+    }
+    impl RawInputs {
+        fn load(root: &Path, artifact: &Path) -> Self {
+            let manifest_path = root.join("manifest.json");
+            Self {
+                artifact_path: artifact.to_owned(),
+                manifest_path: manifest_path.clone(),
+                artifact: fs::read(artifact).unwrap(),
+                manifest: fs::read(manifest_path).unwrap(),
+            }
+        }
+        fn admit<'a>(
+            &'a self,
+            capture: &'a Capture,
+            selection: &TrustedSelection,
+            cancel: &CancelFlag,
+        ) -> Result<ReferenceProfileAdmission<'a>, ScipCaptureError> {
+            ReferenceProfileAdmission::from_trusted_selection(
+                capture,
+                &self.artifact_path,
+                &self.artifact,
+                &self.manifest_path,
+                &self.manifest,
+                selection,
+                cancel,
+            )
+        }
+    }
     const WIRE: &str = "122e0a087372632f412e6a73220a6a617661736372697074120b0a0300090a1202412318011a090a0241232811320166";
     fn fixture() -> (
         tempfile::TempDir,
@@ -484,9 +512,7 @@ mod tests {
         fs::write(root.join("src/A.js"), "function f(){g();}\n").unwrap();
         fs::write(root.join("artifact.scip"), hex::decode(WIRE).unwrap()).unwrap();
         let cancel = Arc::new(AtomicBool::new(false));
-        let mut options = IndexOptions::new(root.to_owned());
-        options.scip_path = Some(root.join("artifact.scip"));
-        options.manifest_path = Some(root.join("manifest.json"));
+        let options = IndexOptions::new(root.to_owned());
         let initial = Capture::admit(&options, &cancel, &|_| {}).unwrap();
         let identity = crate::store::topology::WorkspaceIdentity::discover(
             Some(initial.physical_root()),
@@ -531,9 +557,11 @@ mod tests {
     #[test]
     fn scip_trusted_capture_and_unattested_changes() {
         let (root, capture, selection, manifest, cancel) = fixture();
-        let admitted =
-            ReferenceProfileAdmission::from_trusted_selection(&capture, &selection, &cancel)
-                .unwrap();
+        let raw = RawInputs::load(
+            capture.physical_root(),
+            &capture.physical_root().join("artifact.scip"),
+        );
+        let admitted = raw.admit(&capture, &selection, &cancel).unwrap();
         let inventory = decode_reference_profile(&admitted, &cancel).unwrap();
         assert_eq!(inventory.claims.len(), 2);
         assert_eq!(
@@ -543,14 +571,12 @@ mod tests {
         let mut wrong = selection.clone();
         wrong.expected_manifest_hash = "0".repeat(64);
         assert!(matches!(
-            ReferenceProfileAdmission::from_trusted_selection(&capture, &wrong, &cancel),
+            raw.admit(&capture, &wrong, &cancel),
             Err(ScipCaptureError::InvalidAdmission(_))
         ));
         wrong = selection.clone();
         wrong.producer_name = "rust-analyzer".into();
-        assert!(
-            ReferenceProfileAdmission::from_trusted_selection(&capture, &wrong, &cancel).is_err()
-        );
+        assert!(raw.admit(&capture, &wrong, &cancel).is_err());
         for (pointer, value) in [
             ("/producer/executableHash", json!("0".repeat(64))),
             ("/sourceDocuments/0/contentHash", json!("1".repeat(64))),
@@ -580,13 +606,10 @@ mod tests {
                 expected_manifest_hash: scip_raw::sha(&bytes),
                 ..selection.clone()
             };
+            let mutated = RawInputs::load(root.path(), &root.path().join("artifact.scip"));
             let recaptured = Capture::admit(
                 &IndexOptions {
                     workspace_root: fs::canonicalize(root.path()).unwrap(),
-                    scip_path: Some(fs::canonicalize(root.path()).unwrap().join("artifact.scip")),
-                    manifest_path: Some(
-                        fs::canonicalize(root.path()).unwrap().join("manifest.json"),
-                    ),
                     max_file_bytes: 2 * 1024 * 1024,
                 },
                 &cancel,
@@ -594,19 +617,17 @@ mod tests {
             )
             .unwrap();
             assert!(
-                ReferenceProfileAdmission::from_trusted_selection(&recaptured, &expected, &cancel)
-                    .is_err(),
+                mutated.admit(&recaptured, &expected, &cancel).is_err(),
                 "unexpected admitted mutated {pointer}"
             );
             assert!(
-                ReferenceProfileAdmission::from_trusted_selection(&recaptured, &selection, &cancel)
-                    .is_err(),
+                mutated.admit(&recaptured, &selection, &cancel).is_err(),
                 "unattested mutated {pointer}"
             );
         }
         cancel.store(true, Ordering::Relaxed);
         assert!(matches!(
-            ReferenceProfileAdmission::from_trusted_selection(&capture, &selection, &cancel),
+            raw.admit(&capture, &selection, &cancel),
             Err(ScipCaptureError::Cancelled)
         ));
         assert!(matches!(
@@ -642,22 +663,19 @@ mod tests {
         let capture = Capture::admit(
             &IndexOptions {
                 workspace_root: physical.clone(),
-                scip_path: Some(physical.join("artifact.scip")),
-                manifest_path: Some(physical.join("manifest.json")),
                 max_file_bytes: 2 * 1024 * 1024,
             },
             &cancel,
             &|_| {},
         )
         .unwrap();
+        let raw = RawInputs::load(&physical, &physical.join("artifact.scip"));
         let selected = TrustedSelection {
             expected_manifest_hash: scip_raw::sha(&bytes),
             ..selection
         };
-        assert!(
-            matches!(ReferenceProfileAdmission::from_trusted_selection(&capture, &selected, &cancel),
-            Err(ScipCaptureError::InvalidAdmission(reason)) if reason == "producer profile pin")
-        );
+        assert!(matches!(raw.admit(&capture, &selected, &cancel),
+            Err(ScipCaptureError::InvalidAdmission(reason)) if reason == "producer profile pin"));
     }
     #[test]
     fn scip_path_and_uri_reject_escapes() {
@@ -679,12 +697,11 @@ mod tests {
             vec![b' '; 1024 * 1024 + 1],
         )
         .unwrap();
-        let mut options = IndexOptions::new(root.path().to_owned());
-        options.scip_path = Some(root.path().join("artifact.scip"));
-        options.manifest_path = Some(root.path().join("manifest.json"));
+        let options = IndexOptions::new(root.path().to_owned());
         let capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
+        let raw = RawInputs::load(root.path(), &root.path().join("artifact.scip"));
         assert!(matches!(
-            ReferenceProfileAdmission::from_trusted_selection(&capture, &selection, &cancel),
+            raw.admit(&capture, &selection, &cancel),
             Err(ScipCaptureError::LimitExceeded(_))
         ));
     }
@@ -701,8 +718,6 @@ mod tests {
         selection.expected_manifest_hash = scip_raw::sha(&bytes);
         let options = IndexOptions {
             workspace_root: physical.clone(),
-            scip_path: Some(linked.join("artifact.scip")),
-            manifest_path: Some(physical.join("manifest.json")),
             max_file_bytes: 2 * 1024 * 1024,
         };
         let baseline = Capture::admit(&options, &cancel, &|_| {}).unwrap();
@@ -721,9 +736,8 @@ mod tests {
         fs::write(physical.join("manifest.json"), &bytes).unwrap();
         selection.expected_manifest_hash = scip_raw::sha(&bytes);
         let baseline = Capture::admit(&options, &cancel, &|_| {}).unwrap();
-        let admitted =
-            ReferenceProfileAdmission::from_trusted_selection(&baseline, &selection, &cancel)
-                .unwrap();
+        let raw = RawInputs::load(&physical, &linked.join("artifact.scip"));
+        let admitted = raw.admit(&baseline, &selection, &cancel).unwrap();
         assert_eq!(
             decode_reference_profile(&admitted, &cancel)
                 .unwrap()
@@ -741,26 +755,23 @@ mod tests {
         fs::remove_dir_all(&linked).unwrap();
         std::os::unix::fs::symlink(outside.path(), &linked).unwrap();
         let capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
-        assert!(
-            capture.selected_scip_inputs().is_some(),
-            "ancestor leaf bytes were captured"
-        );
+        let linked_raw = RawInputs::load(&physical, &linked.join("artifact.scip"));
         assert!(matches!(
-            ReferenceProfileAdmission::from_trusted_selection(&capture, &selection, &cancel),
+            linked_raw.admit(&capture, &selection, &cancel),
             Err(ScipCaptureError::InvalidAdmission(message)) if message == "symlinked selected role"
         ));
     }
     #[test]
-    fn scip_capture_rejects_symlinked_role_and_missing_pair() {
-        let (root, _, _, _, cancel) = fixture();
+    fn explicit_inputs_reject_symlinked_role() {
+        let (root, capture, selection, _, cancel) = fixture();
         let link = root.path().join("symlink.scip");
         std::os::unix::fs::symlink(root.path().join("artifact.scip"), &link).unwrap();
-        let mut options = IndexOptions::new(root.path().to_owned());
-        options.scip_path = Some(link);
-        options.manifest_path = Some(root.path().join("manifest.json"));
-        assert!(Capture::admit(&options, &cancel, &|_| {}).is_err());
-        options.scip_path = None;
-        let without = Capture::admit(&options, &cancel, &|_| {}).unwrap();
-        assert!(without.selected_scip_inputs().is_none());
+        let raw = RawInputs::load(
+            capture.physical_root(),
+            &capture.physical_root().join("symlink.scip"),
+        );
+        assert!(
+            matches!(raw.admit(&capture, &selection, &cancel), Err(ScipCaptureError::InvalidAdmission(message)) if message == "symlinked selected role")
+        );
     }
 }

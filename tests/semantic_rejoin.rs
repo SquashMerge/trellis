@@ -31,9 +31,7 @@ fn fixture() -> (
     fs::write(physical.join("src/A.js"), text).unwrap();
     fs::write(physical.join("artifact.scip"), hex::decode(WIRE).unwrap()).unwrap();
     let cancel = Arc::new(AtomicBool::new(false));
-    let mut options = IndexOptions::new(physical.clone());
-    options.scip_path = Some(physical.join("artifact.scip"));
-    options.manifest_path = Some(physical.join("manifest.json"));
+    let options = IndexOptions::new(physical.clone());
     let first = Capture::admit(&options, &cancel, &|_| {}).unwrap();
     let identity =
         trellis::store::topology::WorkspaceIdentity::discover(Some(&physical), &physical).unwrap();
@@ -76,8 +74,16 @@ fn fixture() -> (
         profile_id: "mac-mini-m5-pro-v1".into(),
         producer_name: "scip-typescript".into(),
     };
-    let admission =
-        ReferenceProfileAdmission::from_trusted_selection(&capture, &selection, &cancel).unwrap();
+    let admission = ReferenceProfileAdmission::from_trusted_selection(
+        &capture,
+        &physical.join("artifact.scip"),
+        &bytes,
+        &physical.join("manifest.json"),
+        &manifest_bytes,
+        &selection,
+        &cancel,
+    )
+    .unwrap();
     let inventory = decode_reference_profile(&admission, &cancel).unwrap();
     let native = native::from_capture(&capture, &physical, &identity.record_id, &cancel).unwrap();
     let sources = capture
@@ -165,9 +171,7 @@ fn two_document_fixture(
     let bytes = binary.write_to_bytes().unwrap();
     fs::write(physical.join("artifact.scip"), &bytes).unwrap();
     let cancel = Arc::new(AtomicBool::new(false));
-    let mut options = IndexOptions::new(physical.clone());
-    options.scip_path = Some(physical.join("artifact.scip"));
-    options.manifest_path = Some(physical.join("manifest.json"));
+    let options = IndexOptions::new(physical.clone());
     let capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
     let identity =
         trellis::store::topology::WorkspaceIdentity::discover(Some(&physical), &physical).unwrap();
@@ -211,6 +215,10 @@ fn two_document_fixture(
     let capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
     let admission = ReferenceProfileAdmission::from_trusted_selection(
         &capture,
+        &physical.join("artifact.scip"),
+        &bytes,
+        &physical.join("manifest.json"),
+        &manifest_bytes,
         &TrustedSelection {
             expected_manifest_hash: native_ids::digest(b"", &manifest_bytes),
             profile_id: "mac-mini-m5-pro-v1".into(),
@@ -361,16 +369,19 @@ fn two_distinct_raw_claims_on_one_declaration_rejoin_as_separate_proofs() {
     let mut manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
     manifest["artifacts"][0]["hash"] = json!(native_ids::digest(b"", &bytes));
-    fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+    fs::write(&manifest_path, &manifest_bytes).unwrap();
     let cancel = Arc::new(AtomicBool::new(false));
-    let mut options = IndexOptions::new(physical);
-    options.scip_path = Some(artifact_path);
-    options.manifest_path = Some(manifest_path.clone());
+    let options = IndexOptions::new(physical.clone());
     let capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
     let admission = ReferenceProfileAdmission::from_trusted_selection(
         &capture,
+        &physical.join("artifact.scip"),
+        &bytes,
+        &physical.join("manifest.json"),
+        &manifest_bytes,
         &TrustedSelection {
-            expected_manifest_hash: native_ids::digest(b"", &fs::read(&manifest_path).unwrap()),
+            expected_manifest_hash: native_ids::digest(b"", &manifest_bytes),
             profile_id: "mac-mini-m5-pro-v1".into(),
             producer_name: "scip-typescript".into(),
         },
