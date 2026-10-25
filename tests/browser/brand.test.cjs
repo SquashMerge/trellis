@@ -87,12 +87,13 @@ test("real shell loads local brand fonts, preserves Connect and source, and rend
       assert.equal(await page.locator(selector).evaluate(img => img.complete && img.naturalWidth > 0),true,`${selector} loaded from daemon`);
     }
     assert.equal(await page.locator(".brand").getAttribute("aria-label"),"Trellis home");
-    for (const selector of ["#token","#remember-token","#token-file","#connect-form button"]) assert.equal(await page.locator(selector).isVisible(),true,selector);
+    for (const selector of ["#token","#remember-token","#load-token-file","#connect-form button[type=submit]"]) assert.equal(await page.locator(selector).isVisible(),true,selector);
+    assert.equal(await page.locator("#token-file").getAttribute("type"),"file");
     assert.match(await page.locator("body").evaluate(node => getComputedStyle(node).fontFamily),/^Inter(?:,|$)/);
-    assert.match(await page.locator("h1").evaluate(node => getComputedStyle(node).fontFamily),/^Manrope(?:,|$)/);
+    assert.match(await page.locator("#connect-heading").evaluate(node => getComputedStyle(node).fontFamily),/^Manrope(?:,|$)/);
     await page.keyboard.press("Tab");
     await focusRing(page,"#token");
-    for (const selector of ["#connect-form button", "#connect-form label", "#connect-form .muted", "#notice"]) await readable(page,selector);
+    for (const selector of ["#load-token-file", "#connect-form button[type=submit]", "#connect-form label", "#connect-form .muted", "#notice"]) await readable(page,selector);
     const border = await contrast(page,"#token",{border:true});
     assert.ok(border.ratio >= 3 && border.outsideRatio >= 3,`input boundary contrast ${JSON.stringify(border)}`);
     measurements.push({kind:"control-boundary",selector:"#token",...border});
@@ -100,7 +101,7 @@ test("real shell loads local brand fonts, preserves Connect and source, and rend
     await page.setViewportSize({width:390,height:844});
     const bounds = await page.locator("#token").boundingBox();
     assert.ok(bounds && bounds.x >= 0 && bounds.x + bounds.width <= 390,"mobile token input remains in viewport");
-    assert.equal(await page.locator("#connect-form button").isVisible(),true);
+    assert.equal(await page.locator("#connect-form button[type=submit]").isVisible(),true);
     await page.setViewportSize({width:1440,height:900});
     const checkoutRequests=[];
     page.on("request",request=>{

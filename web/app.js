@@ -89,7 +89,7 @@ async function api(path, method = "GET", body) {
     error.code = data?.error?.code;
     error.reason = data?.error?.reason;
     error.workspaceRoot = response.headers?.get?.("X-Trellis-Workspace") || null;
-    if (error.status === 401 || error.status === 403) disconnect("Authentication failed. Connect with a daemon token again.");
+    if (error.status === 401 || error.status === 403) disconnect(`Authentication failed (${error.code || error.status}). Connect with a daemon token again.`);
     else if (root && error.code === "workspace_selection_failed") invalidateSelection("Checkout identity changed. Choose an available checkout again.");
     throw error;
   }
@@ -111,7 +111,7 @@ async function perform(action, control) {
   finally { if (control) control.disabled = false; }
 }
 function form(id, action) {
-  $(id).addEventListener("submit", event => { event.preventDefault(); perform(action, $(id).querySelector("button")); });
+  $(id).addEventListener("submit", event => { event.preventDefault(); perform(action, $(id).querySelector("button[type=submit]")); });
 }
 function stale(message) { $("stale").textContent = message; $("stale").hidden = false; }
 function clearSource() {
@@ -222,6 +222,7 @@ try {
     $("notice").textContent = "Saved token loaded. Select Connect to browse.";
   }
 } catch (_) { /* Normal in-memory authentication still works. */ }
+$("load-token-file").addEventListener("click", () => $("token-file").click());
 $("remember-token").addEventListener("change", () => {
   if (!$("remember-token").checked) { tokenSaveFailed = false; forgetStoredToken(); }
 });
@@ -263,6 +264,7 @@ function disconnect(message) {
   $("remember-token").checked = false; $("token-file").value = ""; $("token").value = "";
   $("checkout-picker").hidden = true; $("checkout-select").replaceChildren(checkoutOption("Choose a checkout", ""));
   $("logout").hidden = true; $("connect-form").hidden = false;
+  document.body.classList.toggle("daemon-connected", false);
   $("error").hidden = !message; $("error").textContent = message || "";
   $("notice").textContent = message || (forgotten ? "Disconnected. Saved token and cached source cleared." : "Disconnected. Browser storage could not be cleared; clear this address’s site data to forget any saved token.");
   $("token").focus();
@@ -390,9 +392,10 @@ $("checkout-retry").addEventListener("click", async () => {
 form("connect-form", async () => {
   const supplied = $("token").value.trim();
   if (!safeTokenText(supplied)) throw new Error("Paste a daemon token or load daemon.token first.");
-  tokenFileSerial++; tokenSaveFailed = false; token = supplied; $("token").value = "";
+  tokenFileSerial++; tokenSaveFailed = false; token = supplied; $("token").value = ""; $("token-file").value = "";
   $("error").hidden = true; $("error").textContent = "";
   $("checkout-picker").hidden = false; $("connect-form").hidden = true; $("logout").hidden = false;
+  document.body.classList.toggle("daemon-connected", true);
   const [listed] = await Promise.all([loadCheckouts(), loadDaemonStatus()]);
   if (!token) return;
   let remembered = false;
@@ -400,7 +403,7 @@ form("connect-form", async () => {
     try { localStorage.setItem(tokenStorageKey, token); remembered = true; }
     catch (_) { tokenSaveFailed = true; }
   } else if (listed) forgetStoredToken();
-  $("notice").textContent = listed ? "Connected. Choose a checkout before browsing."
+  $("notice").textContent = listed ? `Connected to the daemon on ${window.location?.host || "this address"}. Choose a checkout before browsing.`
     + (remembered ? " Token saved on this browser." : tokenSaveFailed ? " Browser storage is unavailable; token was not saved." : "")
     : "Checkout list unavailable. Retry the list; no checkout has been selected.";
   $("checkout-select").focus();

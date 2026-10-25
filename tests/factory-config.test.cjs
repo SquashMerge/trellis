@@ -220,7 +220,7 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
         ["cargo", "clippy", "--locked", "--all-targets", "--", "-D", "warnings"],
         ["cargo", "clippy", "--locked", "--all-targets", "--features", "test-support", "--", "-D", "warnings"],
         ["cargo", "build", "--locked", "--bin", "trellis"],
-        ["node", "--test", "--test-concurrency=1", "tests/browser/sequence-harness.test.cjs", "tests/browser/sequence-pele.test.cjs", "tests/browser/sequence.test.cjs", "tests/browser/sequence-cost.test.cjs", "tests/browser/brand.test.cjs"],
+        ["node", "--test", "--test-concurrency=1", "tests/browser/sequence-harness.test.cjs", "tests/browser/sequence-pele.test.cjs", "tests/browser/sequence.test.cjs", "tests/browser/sequence-cost.test.cjs", "tests/browser/brand.test.cjs", "tests/browser/connect.test.cjs"],
       ],
       tests: [
         ["cargo", "nextest", "--version"],

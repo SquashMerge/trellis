@@ -19,7 +19,7 @@ function harness() {
   let nextTimer = 0;
   function node(tagName) {
     const classes = new Set();
-    return {tagName, classList: {add(value) { classes.add(value); }, contains(value) { return classes.has(value); }}, focus() {}, hidden: true, disabled: false, value: "", textContent: "", children: [], listeners: {},
+    return {tagName, classList: {add(value) { classes.add(value); }, contains(value) { return classes.has(value); }, toggle(value, force) { const on = force ?? !classes.has(value); if (on) classes.add(value); else classes.delete(value); return on; }}, focus() {}, hidden: true, disabled: false, value: "", textContent: "", children: [], listeners: {},
       addEventListener(type, handler) { this.listeners[type] = handler; },
       replaceChildren(...items) { this.children = items; },
       append(...items) { this.children.push(...items); },
