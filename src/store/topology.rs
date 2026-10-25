@@ -2476,7 +2476,7 @@ mod gc_schema_race_tests {
         assert_eq!(
             (schema, marker.as_str(), generation, revision),
             (
-                20,
+                21,
                 "native-v6-delta-v1",
                 pin.index_generation.to_string(),
                 pin.index_revision as i64
@@ -2724,7 +2724,7 @@ mod gc_schema_race_tests {
         assert_eq!(
             (schema, marker.as_str(), generation, revision),
             (
-                20,
+                21,
                 "native-v4",
                 pin.index_generation.to_string(),
                 pin.index_revision as i64
@@ -2878,7 +2878,7 @@ mod gc_final_witness_tests {
         assert_eq!(
             db.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            20
+            21
         );
         drop(live);
         assert!(roots.index_use_lock(&candidate).exists());

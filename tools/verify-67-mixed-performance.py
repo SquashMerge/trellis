@@ -250,8 +250,8 @@ def db_for(home):
 
 
 def published(db, output, size):
-    require(db.execute("PRAGMA user_version").fetchone()[0] == 20,
-            "merged native-v9 gate requires owner-directed schema20")
+    require(db.execute("PRAGMA user_version").fetchone()[0] == 21,
+            "merged native-v9 gate requires owner-directed schema21")
     index_result = json.loads(output)
     pin = index_result["publishedRevision"]
     revision = f"pin:v1:{pin['indexGeneration']}:{pin['indexRevision']}"
@@ -595,7 +595,7 @@ def class_output(db, revision, path):
 
 
 # Port of tests/index_atomic.rs::sqlite_snapshot: all selected evidence columns,
-# 57 native-v9/schema20 tables, immutable surrogate keys, and current pin normalization.
+# 57 native-v9/schema21 tables, immutable surrogate keys, and current pin normalization.
 REQUIRED_TABLES = set("""
 native_producers native_producer_languages native_producer_inputs
 native_source_sets native_source_set_languages native_source_set_dependencies
@@ -623,8 +623,8 @@ DEBT_TABLES = {"native_revision_release_debt", "native_release_candidate_version
 
 
 def parity_digest(db, revision):
-    require(db.execute("PRAGMA user_version").fetchone()[0] == 20,
-            "independent merged native-v9 parity requires schema20")
+    require(db.execute("PRAGMA user_version").fetchone()[0] == 21,
+            "independent merged native-v9 parity requires schema21")
     generation, number = revision.removeprefix("pin:v1:").rsplit(":", 1)
     require(db.execute("SELECT index_generation,index_revision FROM index_metadata WHERE singleton=1").fetchone()
             == (generation, int(number)), "parity pin is not frozen head")
