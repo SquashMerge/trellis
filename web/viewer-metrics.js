@@ -28,18 +28,20 @@
     cognitive:"Cognitive", cyclomatic:"Cyclomatic", maxNesting:"Max nesting", maintainabilityIndex:"Maintainability (higher is better)",
     halstead:"Halstead", fanIn:"Fan-in", fanOut:"Fan-out (call sites)", parameters:"Parameters", exits:"Exits"};
   function create({request, context, onConflict = () => {}, onChange = () => {}}) {
-    let metric = "cognitive", aggregate = "max", epoch = 0, refreshSerial = 0, inspectionSerial = 0;
+    let metric = "cognitive", aggregate = "max", role = "production", epoch = 0, refreshSerial = 0, inspectionSerial = 0;
     let projection = null, projectionGuard = null, selected = null, loading = false;
     let decorations = [];
+    const callables = () => role === "all" ? "indexed callables" : "production callables";
+    const population = () => role === "all" ? "all indexed callables" : callables();
     const text = (id, value) => { if (get(id)) get(id).textContent = value; };
     function capture() {
       const now = context();
-      return {rootKey:now.rootKey, session:now.session, pin:pair(now.pin), aggregate, epoch};
+      return {rootKey:now.rootKey, session:now.session, pin:pair(now.pin), aggregate, role, epoch};
     }
     function current(guard) {
       const now = context();
       return guard.epoch === epoch && guard.rootKey === now.rootKey && guard.session === now.session &&
-        guard.aggregate === aggregate && equalPair(guard.pin, pair(now.pin));
+        guard.aggregate === aggregate && guard.role === role && equalPair(guard.pin, pair(now.pin));
     }
     const usable = () => projection && projectionGuard && current(projectionGuard);
     function clearDecorations() {
@@ -70,7 +72,7 @@
       return candidates.length === 1 ? candidates[0] : null;
     }
     function url(scope, guard, row) {
-      const query = new URLSearchParams({scope, aggregate:guard.aggregate,
+      const query = new URLSearchParams({scope, aggregate:guard.aggregate, role:guard.role,
         indexGeneration:guard.pin.indexGeneration, indexRevision:String(guard.pin.indexRevision)});
       if (row) {
         query.set("path", row.path); query.set("sourceSetId", row.sourceSetId);
@@ -86,7 +88,7 @@
         const error = new Error("Indexed snapshot changed. Refresh status.");
         error.code = "revision_conflict"; error.status = 409; throw error;
       }
-      if (payload.metricsVersion !== "metrics:v1" || payload.aggregate !== guard.aggregate || payload.scope !== scope ||
+      if (payload.metricsVersion !== "metrics:v1" || payload.aggregate !== guard.aggregate || payload.role !== guard.role || payload.scope !== scope ||
           !Array.isArray(payload.files) || !Array.isArray(payload.directories)) throw new Error("Invalid metrics response.");
       return payload;
     }
@@ -108,7 +110,7 @@
         const data = await request(url("revision", guard));
         if (!current(guard) || serial !== refreshSerial) return;
         projection = payloadOf(data, guard, "revision"); projectionGuard = guard; loading = false;
-        text("metrics-state", `Indexed snapshot · ${aggregate} · all indexed callables${data.catchingUp ? " · index catching up" : ""}`);
+        text("metrics-state", `Indexed snapshot · ${aggregate} · ${population()}${data.catchingUp ? " · index catching up" : ""}`);
         onChange();
         if (selected) await inspect(selected);
       } catch (error) {
@@ -121,7 +123,7 @@
     function inspectionState(selection, message) {
       window.TrellisShell?.showMetricInspector();
       text("metric-inspector-title", selection.path || "Indexed workspace");
-      text("metric-inspector-scope", `${selection.scope} · ${aggregate} · indexed snapshot · all indexed callables`);
+      text("metric-inspector-scope", `${selection.scope} · ${aggregate} · indexed snapshot · ${population()}`);
       text("metric-inspector-state", message);
       get("metric-inspector-values")?.replaceChildren(); get("metric-inspector-top")?.replaceChildren();
     }
@@ -141,12 +143,12 @@
     }
     function renderTop(top) {
       const target = get("metric-inspector-top");
-      target?.append(make("li", "Highest cognitive complexity · raw callable scores"));
-      if (!top?.length) { target?.append(make("li", "No indexed callables.")); return; }
+      target?.append(make("li", `Highest cognitive complexity · ${population()} · raw callable scores`));
+      if (!top?.length) { target?.append(make("li", `No ${callables()}.`)); return; }
       for (const row of top) {
         const item = make("li");
         item.append(make("strong", row.name ?? "Anonymous function"),
-          make("span", ` · ${row.kind} · ${row.sourceSetId} · ${row.language} · ${row.path} · UTF-8 bytes [${row.range?.start}, ${row.range?.end})`),
+          make("span", ` · ${row.role} · ${row.kind} · ${row.sourceSetId} · ${row.language} · ${row.path} · UTF-8 bytes [${row.range?.start}, ${row.range?.end})`),
           make("span", ` · Cognitive ${display(row.metrics?.cognitive)} · Cyclomatic ${display(row.metrics?.cyclomatic)} · Max nesting ${display(row.metrics?.maxNesting)}`));
         target?.append(item);
       }
@@ -168,8 +170,8 @@
           (choice.scope !== "file" || candidate.language === row.language));
         if (candidates.length !== 1) throw new Error("Metrics unavailable: selected indexed scope was not returned.");
         const result = candidates[0];
-        text("metric-inspector-state", result.declarationCount === 0 ? "No indexed callables. Numeric aggregates are unavailable, not zero." :
-          `${result.declarationCount} indexed callables${data.catchingUp ? " · index catching up" : ""}`);
+        text("metric-inspector-state", result.declarationCount === 0 ? `No ${callables()}. Numeric aggregates are unavailable, not zero.` :
+          `${result.declarationCount} ${callables()}${data.catchingUp ? " · index catching up" : ""}`);
         renderValues(result.metrics); renderTop(payload.topCognitive);
       } catch (error) {
         if (!current(guard) || serial !== inspectionSerial) return;
@@ -185,7 +187,7 @@
       const node = make("span", undefined, "metric-value");
       const swatch = make("span", undefined, "metric-swatch"); swatch.setAttribute("aria-hidden", "true");
       node.append(swatch, make("span", display(value)));
-      node.title = row ? `${metric} · ${aggregate} · indexed snapshot: ${display(value)}` : "Unavailable: no unique indexed metric for this path.";
+      node.title = row ? `${metric} · ${aggregate} · ${population()} · indexed snapshot: ${display(value)}` : "Unavailable: no unique indexed metric for this path.";
       pick.append(node);
       const decoration = {pick, selection, node, swatch, value, guard:projectionGuard};
       decorations.push(decoration);
@@ -203,8 +205,8 @@
         const color = item.guard && current(item.guard) ? band(item.value, cuts, metric) : null;
         item.swatch.className = `metric-swatch${color === null ? " neutral" : ` heat-${color}`}`;
       }
-      if (!cuts.length) { target?.append(make("span", "No measured values")); return; }
-      target?.append(make("span", `Displayed file/directory rows · ${aggregate}${metric === "maintainabilityIndex" ? " · higher is better" : ""}`));
+      if (!cuts.length) { target?.append(make("span", `No measured values · ${population()} · — unavailable, not zero`)); return; }
+      target?.append(make("span", `Displayed file/directory rows · ${aggregate} · ${population()}${metric === "maintainabilityIndex" ? " · higher is better" : ""}`));
       const ranges = [`≤${cuts[0]}`, `>${cuts[0]}–${cuts[1]}`, `>${cuts[1]}–${cuts[2]}`, `>${cuts[2]}`];
       ranges.forEach((range, rank) => {
         const entry = make("span", undefined, "metric-legend-entry");
@@ -214,6 +216,12 @@
     }
     if (get("metric-color")) get("metric-color").value = metric;
     if (get("metric-aggregate")) get("metric-aggregate").value = aggregate;
+    if (get("metric-include-tests")) get("metric-include-tests").checked = false;
+    get("metric-include-tests")?.addEventListener("change", event => {
+      const next = event.target.checked ? "all" : "production";
+      if (next === role) return;
+      role = next; clearInspection(); void refresh();
+    });
     get("metric-color")?.addEventListener("change", event => {
       metric = event.target.value; clearDecorations(); onChange();
     });

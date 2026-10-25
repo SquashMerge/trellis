@@ -869,8 +869,8 @@ test("shared source rejects missing, empty, inverted and noninteger witnessed ra
 });
 
 const metricPin = {indexGeneration:"12345678-1234-4123-8123-123456789abc",indexRevision:1};
-const metricFile = {path:"src/a.js",sourceSetId:"main",language:"javascript",declarationCount:1,metrics:{cognitive:7}};
-const metricsResponse = (scope, {files = [metricFile], directories = [], pin = metricPin} = {}) => response({payload:{...pin,metricsVersion:"metrics:v1",scope,aggregate:"max",files,directories,topCognitive:[]},catchingUp:false});
+const metricFile = {path:"src/a.js",sourceSetId:"main",language:"javascript",declarationCount:1,roleCounts:{production:1,test:0},metrics:{cognitive:7}};
+const metricsResponse = (scope, {files = [metricFile], directories = [], pin = metricPin} = {}) => response({payload:{...pin,metricsVersion:"metrics:v1",scope,aggregate:"max",role:"production",files,directories,topCognitive:[]},catchingUp:false});
 
 test("selecting a sequence step fences an already pending file metrics inspection", async () => {
   const h = harness({}, true), pending = deferred();

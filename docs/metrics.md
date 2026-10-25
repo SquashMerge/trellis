@@ -2,9 +2,31 @@
 
 `metricsVersion` is `metrics:v1`, independent of the native evidence version. Metrics are computed from selected pinned source and native facts, not persisted. A supplied pin is the complete `(indexGeneration,indexRevision)` pair; missing means the admitted current head. A stale, incomplete or wrong-generation pin never falls back to head. Invalid selected source/facts abort the whole result.
 
+## Callable role selection
+
+Metrics options accept exactly `role=production|all|test`; CLI uses `--role`. Omitted API/CLI
+options default to `all`. The Viewer and Architecture explicitly request `production` by default;
+their unchecked **Include tests in metrics** controls select `all` when checked. Test-only
+selection is available through API/CLI, not a third browser control. The payload echoes `role`.
+
+Role comes directly from each pinned native `Declaration.role` under
+[Decision 0011](semantic-evidence/decisions/0011-test-production-declaration-role.md), for Rust,
+Java, Python and JavaScript. It is syntax/convention classification, not test-runner discovery.
+Rust inline `#[cfg(test)]` callables inherit test; `#[cfg(feature = "test-support")]` by itself
+remains production. Browsers do not classify filenames or source text. Missing or invalid stored
+roles are typed index corruption, not silently production or partial results.
+
+Scoring and binding use the same selected pinned source/native rows before role filtering. The
+selected callable population supplies every aggregate, declaration output and highest-cognitive
+ranking. Source-only memo entries remain role-independent and bind current stored roles on reuse.
+Each file row also carries `roleCounts: {production, test}` for all measured callables at that pin,
+independent of the role selection; `declarationCount` is the selected count. Manifest-selected
+file/directory rows remain present with count zero and null numeric aggregates when the selected
+population is empty. A declaration selector excluded by role returns `not_found`.
+
 ## Declaration boundary and lines
 
-Rows represent native callable declarations (`function`, `method`, `constructor`, `anonymousFunction`) and retain native `syntax_id` as `sid` and the native half-open byte `range`. Types, modules and fields are not callable rows. Exclude represented nested callables' tokens, branches and calls from their enclosing callable. An unrepresented nested callable remains in its nearest represented parent. Physical lines may overlap and aggregate counts intentionally double-count them. `loc` counts physical lines intersecting a nonempty half-open byte interval: LF and CRLF each end a line, and a final terminator does not invent an empty line. `sloc` counts intersecting lines with non-comment, non-whitespace tree-sitter tokens. `commentLines` counts each intersecting line containing comment syntax, including mixed code/comment lines and block-comment continuation. Text that looks like a comment inside a string is not a comment. An empty interval gives zero for all three.
+Rows represent native callable declarations (`function`, `method`, `constructor`, `anonymousFunction`) and retain native `syntax_id` as `sid` and the native half-open byte `range`. Types, modules and fields are not callable rows. Exclude represented nested callables' tokens, branches and calls from their enclosing callable. An unrepresented nested callable remains in its nearest represented parent. Physical lines may overlap and aggregate counts intentionally double-count them. Production-selected callable-range LOC/SLOC sums are not production physical file lines; this API does not measure physical production LOC. `loc` counts physical lines intersecting a nonempty half-open byte interval: LF and CRLF each end a line, and a final terminator does not invent an empty line. `sloc` counts intersecting lines with non-comment, non-whitespace tree-sitter tokens. `commentLines` counts each intersecting line containing comment syntax, including mixed code/comment lines and block-comment continuation. Text that looks like a comment inside a string is not a comment. An empty interval gives zero for all three.
 
 ## Complexity and size
 
@@ -46,7 +68,7 @@ Select from canonical order `loc,sloc,commentLines,cyclomatic,cognitive,maxNesti
 ## Browser transport and highest cognitive callables
 
 `GET /api/checkouts/{rootKey}/metrics` returns `{catchingUp,payload}`. The payload carries
-`metricsVersion,indexGeneration,indexRevision,scope,aggregate,selectedMetrics,declarations,files,directories`.
+`metricsVersion,indexGeneration,indexRevision,scope,aggregate,role,selectedMetrics,declarations,files,directories`.
 The optional paired pin is supplied as `indexGeneration` and `indexRevision`. File selectors require
 `sourceSetId,language,path`; directory selectors require `sourceSetId,path` (empty path means the
 source-set root); declaration selectors require `sourceSetId,path,sid` and no language. Source-set IDs
@@ -56,7 +78,7 @@ accept the emitted canonical `source-set:v1:path-<64 lowercase hex>` and
 The optional `topCognitive=1..10` query adds `payload.topCognitive`; absent means this field is omitted.
 It contains at most the requested count of callable rows from the selected scope, ordered by raw
 `cognitive` descending, then byte ordering of `(sourceSetId,language,path,range.start,range.end,sid)`.
-Each row has `sourceSetId,language,path,sid,range,name,kind,metrics`, where `name` is the native nullable
+Each row has `sourceSetId,language,path,sid,range,name,kind,role,metrics`, where `name` is the native nullable
 name, `kind` is the native callable kind, and `metrics` contains raw `cognitive,cyclomatic,maxNesting`.
 Ranges remain half-open byte intervals. Anonymous names remain null, not invented labels. These three
 raw scores are independent of `aggregate` and `selectedMetrics`; requesting `metrics=loc` does not
@@ -66,8 +88,9 @@ callable. Existing declaration arrays and all fields when the option is absent r
 Candidates are selected during the same pinned source computation and declaration fold, with only a
 bounded top list retained, not additional per-file requests or a methods/name join. The existing
 complete-envelope response bound, cancellation, deadline and final snapshot fence cover this list.
-Metrics currently include **all indexed callable roles**, not a production-only subset. A browser must
-not infer production status from filenames or treat the live filesystem tree as indexed evidence.
+The role filter applies to the highest-cognitive list as well as declaration output and all
+aggregates. A browser must not infer production status from filenames or treat the live filesystem
+tree as indexed evidence.
 
 ## Hand-checked control-flow expectations
 

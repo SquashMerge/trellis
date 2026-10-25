@@ -1780,6 +1780,7 @@ fn metrics_cli_reports_pinned_envelope_and_typed_selectors() {
     assert!(envelope["catchingUp"].is_boolean());
     assert_eq!(envelope["payload"]["metricsVersion"], "metrics:v1");
     assert_eq!(envelope["payload"]["scope"], "revision");
+    assert_eq!(envelope["payload"]["role"], "all");
     assert_eq!(envelope["payload"]["declarations"], serde_json::json!([]));
     assert!(!envelope["payload"]["files"].as_array().unwrap().is_empty());
     let generation = envelope["payload"]["indexGeneration"].as_str().unwrap();
@@ -1842,6 +1843,25 @@ fn metrics_cli_reports_pinned_envelope_and_typed_selectors() {
         .unwrap();
     assert!(!pin_error.status.success());
     assert!(String::from_utf8_lossy(&pin_error.stderr).contains("invalid_argument"));
+    for role in ["", "unknown", "Production"] {
+        let bad = cli(&home)
+            .args(["metrics", "--json", "--workspace"])
+            .arg(&root)
+            .args(["--role", role])
+            .output()
+            .unwrap();
+        assert!(!bad.status.success(), "{role}");
+        assert!(bad.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&bad.stderr).contains("invalid_argument"));
+    }
+    let duplicate = cli(&home)
+        .args(["metrics", "--workspace"])
+        .arg(&root)
+        .args(["--role", "all", "--role", "test"])
+        .output()
+        .unwrap();
+    assert!(!duplicate.status.success());
+    assert!(duplicate.stdout.is_empty());
 }
 
 #[test]
@@ -2123,6 +2143,20 @@ async fn metrics_cli_json_matches_authenticated_selected_http_envelope() {
     let home = temp.path().join("home");
     fs::create_dir(&home).unwrap();
     let root = checkout(temp.path(), "metricshttp");
+    fs::write(
+        root.join("roles.rs"),
+        r#"fn production() -> usize { 1 }
+#[cfg(feature = "test-support")] fn support() -> usize { 2 }
+#[cfg(test)] mod tests { fn check(x: bool) -> bool { if x { true } else { false } } }
+"#,
+    )
+    .unwrap();
+    fs::create_dir(root.join("tests")).unwrap();
+    fs::write(
+        root.join("tests/only.js"),
+        "function only() { return 1; }\n",
+    )
+    .unwrap();
     fs::create_dir(root.join("src")).unwrap();
     let source = root.join("src/math.js");
     fs::write(
@@ -2158,7 +2192,40 @@ async fn metrics_cli_json_matches_authenticated_selected_http_envelope() {
     );
     let initial: Value = serde_json::from_slice(&initial.stdout).unwrap();
     assert_eq!(initial["payload"], http["payload"]);
+    assert_eq!(initial["payload"]["role"], "all");
     assert!(initial["catchingUp"].is_boolean());
+    for (role, count, cyclomatic) in [("production", 2, 2), ("all", 3, 4), ("test", 1, 2)] {
+        let query = format!(
+            "?role={role}&aggregate=sum&indexGeneration={generation}&indexRevision={revision}"
+        );
+        let http_selected = http_metrics(&client, address, &key, token, &query).await;
+        let cli_selected = cli(&home)
+            .args(["metrics", "--json", "--workspace"])
+            .arg(&root)
+            .args(["--pin", &pin, "--role", role, "--aggregate", "sum"])
+            .output()
+            .unwrap();
+        assert!(
+            cli_selected.status.success(),
+            "{}",
+            String::from_utf8_lossy(&cli_selected.stderr)
+        );
+        let cli_selected: Value = serde_json::from_slice(&cli_selected.stdout).unwrap();
+        assert_eq!(cli_selected["payload"], http_selected["payload"]);
+        assert_eq!(cli_selected["payload"]["role"], role);
+        let mixed = cli_selected["payload"]["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["path"] == "roles.rs")
+            .unwrap();
+        assert_eq!(mixed["declarationCount"], count);
+        assert_eq!(mixed["metrics"]["cyclomatic"], cyclomatic);
+        assert_eq!(
+            mixed["roleCounts"],
+            serde_json::json!({"production":2,"test":1})
+        );
+    }
     let file = http["payload"]["files"]
         .as_array()
         .unwrap()
@@ -2172,7 +2239,7 @@ async fn metrics_cli_json_matches_authenticated_selected_http_envelope() {
     fs::write(&source, "function newer() { return 99; }\n").unwrap();
     run(&home, "index", &root);
     let file_query = format!(
-        "?scope=file&sourceSetId={source_set}&language=javascript&path=src/math.js&aggregate=mean&metrics=loc,cyclomatic,fanIn"
+        "?role=production&scope=file&sourceSetId={source_set}&language=javascript&path=src/math.js&aggregate=mean&metrics=loc,cyclomatic,fanIn"
     );
     let pinned_file_query =
         format!("{file_query}&indexGeneration={generation}&indexRevision={revision}");
@@ -2184,6 +2251,8 @@ async fn metrics_cli_json_matches_authenticated_selected_http_envelope() {
         .args(["metrics", "--json", "--workspace"])
         .arg(&root)
         .args([
+            "--role",
+            "production",
             "--scope",
             "file",
             "--pin",
@@ -2246,13 +2315,15 @@ async fn metrics_cli_json_matches_authenticated_selected_http_envelope() {
     assert!(sid.starts_with("sid:v1:"));
 
     let directory_query = format!(
-        "?scope=directory&sourceSetId={source_set}&path=src&aggregate=mean&metrics=loc,cyclomatic,fanIn&indexGeneration={generation}&indexRevision={revision}"
+        "?role=production&scope=directory&sourceSetId={source_set}&path=src&aggregate=mean&metrics=loc,cyclomatic,fanIn&indexGeneration={generation}&indexRevision={revision}"
     );
     let http_directory = http_metrics(&client, address, &key, token, &directory_query).await;
     let directory = cli(&home)
         .args(["metrics", "--json", "--workspace"])
         .arg(&root)
         .args([
+            "--role",
+            "production",
             "--scope",
             "directory",
             "--pin",
@@ -2289,13 +2360,15 @@ async fn metrics_cli_json_matches_authenticated_selected_http_envelope() {
     assert_eq!(directory["payload"]["declarations"], serde_json::json!([]));
 
     let declaration_query = format!(
-        "?scope=declaration&sourceSetId={source_set}&path=src/math.js&sid={sid}&aggregate=mean&metrics=loc,cyclomatic,fanIn&indexGeneration={generation}&indexRevision={revision}"
+        "?role=production&scope=declaration&sourceSetId={source_set}&path=src/math.js&sid={sid}&aggregate=mean&metrics=loc,cyclomatic,fanIn&indexGeneration={generation}&indexRevision={revision}"
     );
     let http_declaration = http_metrics(&client, address, &key, token, &declaration_query).await;
     let declaration = cli(&home)
         .args(["metrics", "--json", "--workspace"])
         .arg(&root)
         .args([
+            "--role",
+            "production",
             "--scope",
             "declaration",
             "--pin",
@@ -2335,6 +2408,8 @@ async fn metrics_cli_json_matches_authenticated_selected_http_envelope() {
         .args(["metrics", "--workspace"])
         .arg(&root)
         .args([
+            "--role",
+            "production",
             "--scope",
             "file",
             "--pin",

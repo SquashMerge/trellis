@@ -3902,11 +3902,14 @@ fn selected_mutation_error(error: ApiError, outcome: &str) -> Response {
 fn architecture_query(uri: &axum::http::Uri) -> Result<crate::store::MetricsOptions, ApiError> {
     let mut options = metrics_query(uri)?;
     // metrics_query already decodes and rejects duplicate/unknown fields. Architecture
-    // accepts only the complete pin and aggregation, not metrics selectors.
+    // accepts only the complete pin, aggregation and role, not metrics selectors.
     if let Some(query) = uri.query() {
         for pair in query.split('&') {
             let name = pair.split_once('=').ok_or_else(invalid)?.0;
-            if !matches!(name, "indexGeneration" | "indexRevision" | "aggregate") {
+            if !matches!(
+                name,
+                "indexGeneration" | "indexRevision" | "aggregate" | "role"
+            ) {
                 return Err(invalid());
             }
         }
@@ -3967,6 +3970,7 @@ fn metrics_query(uri: &axum::http::Uri) -> Result<crate::store::MetricsOptions, 
                     | "indexGeneration"
                     | "indexRevision"
                     | "aggregate"
+                    | "role"
                     | "metrics"
                     | "topCognitive"
             ) || fields.insert(name, decode(value)?).is_some()
@@ -3985,6 +3989,9 @@ fn metrics_query(uri: &axum::http::Uri) -> Result<crate::store::MetricsOptions, 
     options.sid = fields.remove("sid");
     if let Some(value) = fields.remove("aggregate") {
         options.aggregate = value;
+    }
+    if let Some(value) = fields.remove("role") {
+        options.role = value;
     }
     if let Some(value) = fields.remove("topCognitive") {
         if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {

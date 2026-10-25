@@ -76,7 +76,8 @@ fn architecture_exact_counts_roles_policy_samples_and_full_identity_metrics() {
     assert_eq!(data["state"], "ready");
     assert_eq!(data["indexGeneration"], pin.index_generation.to_string());
     assert_eq!(data["indexRevision"], pin.index_revision);
-    assert_eq!(data["metricsScope"], "all-indexed-callables");
+    assert_eq!(data["role"], "all");
+    assert!(data.get("metricsScope").is_none());
     assert_eq!(data["semanticComplete"], false);
     let edge = |source: &str, destination: &str, role: &str| {
         data["edges"]
@@ -129,6 +130,10 @@ fn architecture_exact_counts_roles_policy_samples_and_full_identity_metrics() {
                 .unwrap();
             assert_eq!(module["metrics"], file.metrics);
             assert_eq!(module["declarationCount"], file.declaration_count);
+            assert_eq!(
+                module["roleCounts"],
+                serde_json::to_value(&file.role_counts).unwrap()
+            );
             assert!(identity["sid"].as_str().unwrap().starts_with("sid:v1:"));
         }
         let store_module = projected["modules"]
@@ -332,4 +337,67 @@ fn architecture_exceptions_preserve_unexcepted_deviations_and_unknown_evidence()
             .sum();
         assert_eq!(assigned, summarized);
     }
+}
+
+#[test]
+fn architecture_metric_roles_leave_reference_roles_and_physical_lines_unchanged() {
+    let (_state, root, store, pin) = fixture();
+    rules(root.path(), RULES);
+    let response = store.evidence_response().unwrap();
+    let all = response
+        .architecture_view(&options(pin, "sum"), &mut || Ok(()))
+        .unwrap();
+    for (role, count) in [("production", 2), ("all", 3), ("test", 1)] {
+        let selected = MetricsOptions {
+            role: role.into(),
+            ..options(pin, "sum")
+        };
+        let data = response
+            .architecture_view(&selected, &mut || Ok(()))
+            .unwrap();
+        let measured = response.metrics_at(&selected, &mut || Ok(())).unwrap();
+        assert_eq!(data["role"], role);
+        assert!(data.get("metricsScope").is_none());
+        assert_eq!(data["references"], all["references"]);
+        assert_eq!(data["edges"], all["edges"]);
+        assert_eq!(data["rules"], all["rules"]);
+        for module in data["modules"].as_array().unwrap() {
+            let file = measured
+                .files
+                .iter()
+                .find(|file| {
+                    module["identity"]["sourceSetId"] == file.source_set_id
+                        && module["identity"]["language"] == file.language
+                        && module["identity"]["path"] == file.path
+                })
+                .unwrap();
+            assert_eq!(module["metrics"], file.metrics);
+            assert_eq!(module["declarationCount"], file.declaration_count);
+            assert_eq!(
+                module["roleCounts"],
+                serde_json::to_value(&file.role_counts).unwrap()
+            );
+        }
+        let mixed = data["modules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|module| module["identity"]["path"] == "src/store.rs")
+            .unwrap();
+        assert_eq!(mixed["declarationCount"], count);
+        assert_eq!(mixed["roleCounts"], json!({"production": 2, "test": 1}));
+        assert_eq!(mixed["metrics"]["cyclomatic"], count);
+        assert_eq!(mixed["physicalLines"], 3);
+        let production_only = data["modules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|module| module["identity"]["path"] == "src/entry.rs")
+            .unwrap();
+        if role == "test" {
+            assert_eq!(production_only["declarationCount"], 0);
+            assert!(production_only["metrics"]["cyclomatic"].is_null());
+        }
+    }
+    response.finish(()).unwrap();
 }

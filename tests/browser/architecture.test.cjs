@@ -9,7 +9,7 @@ const H = require("./sequence-harness.cjs");
 const hostileLayer = '<img src=x onerror="globalThis.architectureExecuted=true">';
 const lowSource = `pub fn low() { crate::top::target(); external::unknown(); }
 #[cfg(test)] mod tests {
-    fn first() { crate::top::target(); }
+    fn first() { if true { if true { crate::top::target(); } } }
     fn second() { crate::top::target(); }
 }
 #[cfg(feature = "test-support")]
@@ -22,6 +22,7 @@ const sources = new Map([
   ["src/low.rs", lowSource],
   ["src/shared.rs", "pub fn target() { crate::mid::target(); }\n"],
   ["src/unassigned.rs", "pub fn unknown_layer() { crate::top::target(); }\n"],
+  ["src/only.rs", "#![cfg(test)]\nfn only(value: i32) -> i32 { if value > 0 { return value; } 0 }\n"],
 ]);
 // Normal-sized layout: native files, not authored package/group nodes.
 for (let i = 0; i < 33; i++) sources.set(`src/leaf_${i}.rs`, `pub fn leaf_${i}(value: i32) -> i32 { ${i % 3 ? "value + 1" : "if value > 0 { value } else { 0 }"} }\n`);
@@ -48,6 +49,12 @@ shared = true
 paths = ["src/no-match.rs"]
 `;
 
+async function capture(page, name) {
+  const directory = process.env.TRELLIS_BROWSER_SCREENSHOTS;
+  if (!directory) return;
+  mkdirSync(directory, {recursive:true});
+  await page.screenshot({path:join(directory, `${name}.png`), fullPage:true});
+}
 test.before(async () => H.setup(), {timeout:960000});
 test.after(async () => H.cleanup());
 
@@ -84,6 +91,8 @@ async function published(config, callback) {
     assert.deepEqual(errors, [], "real local assets and repository text obey the unchanged CSP");
     assert.equal(requests.some(row => row.method === "POST" && row.url.pathname.endsWith("/index")), false, "browsing does not index");
     for (const row of requests.filter(row => row.url.pathname.endsWith("/architecture"))) {
+      assert.equal(row.method, "GET");
+      assert.ok(["production", "all"].includes(row.url.searchParams.get("role")), "browser explicitly selects its metric population");
       assert.equal(row.url.searchParams.get("indexGeneration"), pin.indexGeneration);
       assert.equal(row.url.searchParams.get("indexRevision"), String(pin.indexRevision));
       assert.ok(row.url.pathname.startsWith(`/api/checkouts/${server.rootKey}/`));
@@ -97,8 +106,8 @@ async function published(config, callback) {
     rmSync(paths.temp, {recursive:true, force:true, maxRetries:10, retryDelay:100});
   }
 }
-async function architecture(selected, aggregate = "max") {
-  const query = new URLSearchParams({aggregate, indexGeneration:selected.pin.indexGeneration, indexRevision:selected.pin.indexRevision});
+async function architecture(selected, aggregate = "max", role = "production") {
+  const query = new URLSearchParams({aggregate, role, indexGeneration:selected.pin.indexGeneration, indexRevision:selected.pin.indexRevision});
   return H.api(selected.server.base, selected.paths.token, "GET", H.scoped(selected.server.rootKey, `architecture?${query}`));
 }
 const identityKey = identity => JSON.stringify([identity.sourceSetId, identity.language, identity.path, identity.sid]);
@@ -119,7 +128,8 @@ test("Architecture uses real pinned structural sites, authored native-file layer
   const dto = result.data.payload;
   assert.equal(dto.indexGeneration, pin.indexGeneration); assert.equal(dto.indexRevision, pin.indexRevision);
   assert.equal(dto.state, "ready"); assert.equal(dto.evidenceTier, "syntax"); assert.equal(dto.semanticComplete, false);
-  assert.equal(dto.metricsScope, "all-indexed-callables"); assert.equal(dto.modules.length, 40);
+  assert.equal(dto.role, "production");
+  assert.equal(dto.modules.length, 41);
   assert.equal(new Set(dto.modules.map(module => identityKey(module.identity))).size, dto.modules.length);
   const cli = await H.run(H.binary, ["references", "--workspace", paths.workspace, "--pin", `${pin.indexGeneration}:${pin.indexRevision}`, "--limit", "5"], {env:paths.env});
   const references = JSON.parse(cli.stdout).payload;
@@ -162,7 +172,9 @@ test("Architecture uses real pinned structural sites, authored native-file layer
   assert.equal(await page.locator("#architecture-diagram [data-trellis-module-id]").count(), dto.modules.length, "returning from Files restores a rendered Architecture, not an empty stale tab");
   assert.ok((await page.locator("#architecture-diagram [data-trellis-module-id]").allTextContents()).some(text => text.includes("Unavailable")), "numeric mode keeps null metrics explicitly unavailable");
   assert.match(await page.locator("#architecture-panel").textContent(), /structural references.*syntax evidence/is);
-  assert.match(await page.locator("#architecture-panel").textContent(), /all indexed callable|all-indexed-callable/i);
+  assert.equal(await page.locator("#architecture-metric-tests").isChecked(), false);
+  assert.match(await page.locator("#architecture-panel").textContent(), /production callables/i);
+  assert.ok(selected.requests.filter(row => row.url.pathname.endsWith("/architecture")).every(row => row.url.searchParams.get("role") === "production"));
   assert.match(await page.locator("#architecture-panel").textContent(), /Unassigned|unknown/i);
   assert.ok((await page.locator("#architecture-diagram [role=button]").evaluateAll(nodes => nodes.map(node => node.getAttribute("aria-label")))).some(label => label.includes(hostileLayer)), "clipped labels retain their complete accessible text");
   assert.equal(await page.locator("#architecture-diagram img, #architecture-diagram script, #architecture-diagram foreignObject").count(), 0);
@@ -185,7 +197,9 @@ test("Architecture uses real pinned structural sites, authored native-file layer
   const low = dto.modules.find(row => row.identity.path === "src/low.rs");
   const detail = await page.locator("#architecture-inspector-content").textContent();
   assert.ok(detail.includes(`${low.physicalLines} physical file lines`));
-  assert.ok(detail.includes(`${low.declarationCount} indexed callables`));
+  assert.equal(low.declarationCount, 2);
+  assert.equal(low.metrics.cognitive, 0, "both production low and feature test-support have no decisions");
+  assert.ok(detail.includes(`${low.declarationCount} production callables`));
   for (const value of Object.values(low.identity)) assert.ok(detail.includes(value), "inspector retains complete native identity");
   for (const label of ["Cognitive", "Cyclomatic", "Max nesting", "Maintainability", "Halstead", "Fan-in", "Fan-out"]) assert.ok(detail.includes(label), label);
   assert.match(detail, /—/, "unavailable values remain null, not zero");
@@ -211,6 +225,63 @@ test("Architecture uses real pinned structural sites, authored native-file layer
   assert.deepEqual(await page.locator("#architecture-diagram [data-trellis-edge-id]").evaluateAll(nodes => nodes.map(node => node.getAttribute("data-trellis-edge-id")).sort()), dto.edges.map(summaryKey).sort(), "test toggle preserves complete exact summary mapping");
   assert.equal(await module.locator("rect").first().getAttribute("fill"), heat);
   assert.equal(await page.locator("#architecture-legend").textContent(), legend, "hiding/showing tests does not reclassify metric population");
+  const only = dto.modules.find(row => row.identity.path === "src/only.rs");
+  assert.equal(only.declarationCount, 0);
+  assert.equal(only.metrics.cognitive, null, "a test-only file has unavailable production heat, never zero");
+  const onlyModule = page.locator("#architecture-diagram").getByRole("button", {name:/^src\/only\.rs(?:\s|$)/});
+  assert.match(await onlyModule.textContent(), /Unavailable/);
+  await onlyModule.click();
+  assert.match(await page.locator("#architecture-inspector-content").textContent(), /No production callables/);
+  await module.click();
+  await capture(page, "architecture-production-desktop");
+  await page.setViewportSize({width:390, height:844});
+  if (await page.locator("#inspector-toggle").getAttribute("aria-expanded") === "true") await page.locator("#inspector-toggle").click();
+  assert.equal(await page.locator("#architecture-metric-tests").isVisible(), true);
+  await capture(page, "architecture-production-mobile");
+  await page.locator("#inspector-toggle").click();
+  await capture(page, "architecture-production-mobile-inspector");
+  await page.setViewportSize({width:1440, height:1000});
+  const withTests = await architecture(selected, "max", "all");
+  assert.equal(withTests.status, 200, JSON.stringify(withTests.data));
+  const all = withTests.data.payload;
+  assert.equal(all.role, "all");
+  assert.equal(all.indexGeneration, pin.indexGeneration); assert.equal(all.indexRevision, pin.indexRevision);
+  const allLow = all.modules.find(row => row.identity.path === "src/low.rs");
+  assert.equal(allLow.declarationCount, 4);
+  assert.equal(allLow.metrics.cognitive, 3, "two nested test ifs contribute 1 + 2, while low and test-support stay production");
+  assert.deepEqual(all.edges, dto.edges, "metric population cannot change reference roles, counts or policy");
+  assert.equal(all.modules.find(row => row.identity.path === "src/only.rs").metrics.cognitive, 1);
+  await page.locator("#architecture-metric-tests").check();
+  await page.waitForFunction(() => document.querySelector("#architecture-state")?.textContent.includes("Metrics: max, all indexed callables"));
+  await ready(page);
+  assert.equal(await page.locator("#architecture-tests").isChecked(), true, "metric inclusion does not alter the independent reference overlay");
+  assert.deepEqual(await page.locator("#architecture-diagram [data-trellis-edge-id]").evaluateAll(nodes => nodes.map(node => node.getAttribute("data-trellis-edge-id")).sort()), dto.edges.map(summaryKey).sort());
+  assert.notEqual(await module.locator("rect").first().getAttribute("fill"), heat, "real higher-complexity tests visibly change the low module's heat");
+  assert.match(await page.locator("#architecture-legend").textContent(), /all indexed callables/);
+  assert.doesNotMatch(await onlyModule.textContent(), /Unavailable/, "test-only module becomes measured only when tests are included");
+  await module.click();
+  assert.match(await page.locator("#architecture-inspector-content").textContent(), /4 indexed callables.*all indexed callables/is);
+  await capture(page, "architecture-all-desktop");
+  await page.setViewportSize({width:390, height:844});
+  if (await page.locator("#inspector-toggle").getAttribute("aria-expanded") === "true") await page.locator("#inspector-toggle").click();
+  assert.equal(await page.locator("#architecture-metric-tests").isVisible(), true);
+  await capture(page, "architecture-all-mobile");
+  await page.locator("#inspector-toggle").click();
+  await capture(page, "architecture-all-mobile-inspector");
+  await page.setViewportSize({width:1440, height:1000});
+  const allHeat = await module.locator("rect").first().getAttribute("fill"), allLegend = await page.locator("#architecture-legend").textContent();
+  await page.locator("#architecture-tests").uncheck();
+  await page.waitForFunction(() => ![...document.querySelectorAll('#architecture-diagram [role=button]')].some(node => node.getAttribute("aria-label")?.includes("test sites")));
+  assert.equal(await page.locator("#architecture-metric-tests").isChecked(), true);
+  assert.equal(await module.locator("rect").first().getAttribute("fill"), allHeat);
+  assert.equal(await page.locator("#architecture-legend").textContent(), allLegend);
+  await page.locator("#architecture-tests").check();
+  await ready(page);
+  await page.locator("#architecture-metric-tests").uncheck();
+  await page.waitForFunction(() => document.querySelector("#architecture-state")?.textContent.includes("Metrics: max, production callables"));
+  await ready(page);
+  assert.equal(await page.locator("#architecture-tests").isChecked(), true);
+  assert.equal(await module.locator("rect").first().getAttribute("fill"), heat);
   const testEdge = page.locator("#architecture-diagram").getByRole("button", {name:/^2 test sites\s+deviation$/});
   await testEdge.focus(); await page.keyboard.press("Enter");
   assert.equal(await page.locator("#architecture-inspector-title").textContent(), "low → top");
@@ -253,6 +324,57 @@ test("Architecture uses real pinned structural sites, authored native-file layer
   assert.equal(await page.locator("#architecture-inspector-title").textContent(), "src/low.rs");
   assert.equal(await page.locator("#architecture-inspector").isVisible(), true);
   await noOverflow(page);
+}));
+
+test("Architecture rejects a route-gated production response after all-callable heat wins", {timeout:240000}, async () => published(rules, async selected => {
+  const {page} = selected;
+  await ready(page);
+  const production = await architecture(selected);
+  assert.equal(production.status, 200, JSON.stringify(production.data));
+  let entered, release;
+  const seen = new Promise(resolve => { entered = resolve; });
+  const gate = new Promise(resolve => { release = resolve; });
+  const pattern = "**/api/checkouts/*/architecture?*";
+  const respond = async route => {
+    const url = new URL(route.request().url());
+    if (url.searchParams.get("role") !== "production") return route.continue();
+    entered(); await gate;
+    await route.fulfill({status:200, contentType:"application/json", body:JSON.stringify(production.data)});
+  };
+  await page.evaluate(() => {
+    const original = window.fetch;
+    window.__architectureRoleFetch = original;
+    window.fetch = async (...args) => {
+      const response = await original(...args), url = new URL(args[0], location.href);
+      if (url.pathname.endsWith("/architecture") && url.searchParams.get("role") === "production") window.__lateArchitectureDelivered = true;
+      return response;
+    };
+  });
+  try {
+    await page.locator("#architecture-metric-tests").check();
+    await page.waitForFunction(() => document.querySelector("#architecture-state")?.textContent.includes("Metrics: max, all indexed callables"));
+    await ready(page);
+    await page.locator("#architecture-diagram").getByRole("button", {name:/^src\/low\.rs(?:\s|$)/}).click();
+    assert.match(await page.locator("#architecture-inspector-content").textContent(), /4 indexed callables/);
+    await page.route(pattern, respond);
+    await page.locator("#architecture-metric-tests").uncheck();
+    await seen;
+    assert.equal(await page.locator("#architecture-diagram svg").count(), 0, "changing role removes old heat before the blocked read");
+    assert.equal(await page.locator("#architecture-inspector-content").textContent(), "");
+    await page.locator("#architecture-metric-tests").check();
+    await page.waitForFunction(() => document.querySelector("#architecture-state")?.textContent.includes("Metrics: max, all indexed callables"));
+    await ready(page);
+    const allCanvas = await page.locator("#architecture-diagram").textContent();
+    release();
+    await page.waitForFunction(() => window.__lateArchitectureDelivered === true);
+    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+    assert.match(await page.locator("#architecture-state").textContent(), /all indexed callables/);
+    assert.equal(await page.locator("#architecture-metric-tests").isChecked(), true);
+    assert.equal(await page.locator("#architecture-diagram").textContent(), allCanvas, "old delivered response cannot replace newer heat");
+  } finally {
+    release(); await page.unroute(pattern, respond);
+    await page.evaluate(() => { window.fetch = window.__architectureRoleFetch; delete window.__architectureRoleFetch; delete window.__lateArchitectureDelivered; });
+  }
 }));
 
 // Setup/error states use separate pre-start configurations, never racing live edits.

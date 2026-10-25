@@ -106,6 +106,7 @@
             </select>
             <label for="metric-aggregate">Aggregation</label>
             <select id="metric-aggregate"><option value="max">max</option><option value="sum">sum</option><option value="mean">mean</option></select>
+            <label><input id="metric-include-tests" type="checkbox"> Include tests in metrics</label>
             <div id="metric-legend" class="metric-legend" aria-label="Metric heat legend"></div>
             <p id="metrics-state" role="status" aria-live="polite"></p>
           </div>
@@ -114,9 +115,10 @@
             <div class="architecture-controls">
               <label for="architecture-color">Color by</label><select id="architecture-color"><option value="layer">Layer</option><option value="cyclomatic">Cyclomatic</option><option value="cognitive" selected>Cognitive</option><option value="maxNesting">Max nesting</option><option value="maintainabilityIndex">Maintainability (inverted heat)</option><option value="halstead.volume">Halstead volume</option><option value="fanOut">Fan-out</option></select>
               <label for="architecture-aggregate">Aggregation</label><select id="architecture-aggregate"><option value="max">max</option><option value="sum">sum</option><option value="mean">mean</option></select>
+              <label><input id="architecture-metric-tests" type="checkbox"> Include tests in metrics</label>
               <label><input id="architecture-tests" type="checkbox"> Test-only edges</label>
             </div>
-            <p class="architecture-basis">Authored layers · structural references · syntax evidence, not resolved calls. Metrics: all indexed callables.</p>
+            <p class="architecture-basis">Authored layers · structural references · syntax evidence, not resolved calls. Metrics default to production callables; test-only edges are independent.</p>
             <p id="architecture-state" role="status" aria-live="polite">Open Architecture to read the indexed snapshot and reviewed rules.</p>
             <div id="architecture-legend" class="metric-legend" aria-label="Architecture metric heat legend"></div>
             <div id="architecture-diagram" tabindex="0" aria-label="Authored layer architecture. Scroll to explore; select a module or summary for evidence."></div>

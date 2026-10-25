@@ -663,3 +663,348 @@ fn source_only_memo_rebinds_native_calls_for_new_path_and_pin() {
         unavailable_fan_in()
     );
 }
+
+#[test]
+fn role_selection_folds_raw_callables_at_one_pin_and_preserves_empty_files() {
+    use trellis::native_evidence::DeclarationRole;
+
+    const SOURCE: &str = "pub fn production(x: bool) { if x {} }\n#[cfg(feature = \"test-support\")]\npub fn seam() {}\n#[cfg(test)]\nmod tests {\n    fn check(x: bool) { if x { if x {} } }\n}\n";
+    let (_state, _root, store, pin) = fixture_with_sources(&[
+        ("src/mixed.rs", SOURCE),
+        ("src/tests/only.rs", "fn helper() {}\n"),
+        ("src/empty.rs", "// no callables\n"),
+    ]);
+    let response = store.evidence_response().unwrap();
+    let manifest = response
+        .metrics_at(
+            &MetricsOptions {
+                pin: Some(pin),
+                ..Default::default()
+            },
+            &mut || Ok(()),
+        )
+        .unwrap();
+    let source_set = manifest.files[0].source_set_id.clone();
+    let mut file = MetricsOptions {
+        pin: Some(pin),
+        scope: "file".into(),
+        source_set_id: Some(source_set.clone()),
+        language: Some("rust".into()),
+        path: Some("src/mixed.rs".into()),
+        top_cognitive: Some(10),
+        ..Default::default()
+    };
+    let all = response.metrics_at(&file, &mut || Ok(())).unwrap();
+    let source_set = all.files[0].source_set_id.clone();
+    file.source_set_id = Some(source_set.clone());
+    let expected = [
+        ("production", DeclarationRole::Production, 2, 1),
+        ("seam", DeclarationRole::Production, 1, 0),
+        ("check", DeclarationRole::Test, 3, 3),
+    ];
+    for (name, role, cyclomatic, cognitive) in expected {
+        let top = all
+            .top_cognitive
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|row| row.name.as_deref() == Some(name))
+            .unwrap();
+        let row = all
+            .declarations
+            .iter()
+            .find(|row| row.sid == top.sid)
+            .unwrap();
+        assert_eq!(row.role, role, "{name}");
+        assert_eq!(row.metrics["cyclomatic"], cyclomatic, "{name}");
+        assert_eq!(row.metrics["cognitive"], cognitive, "{name}");
+    }
+    let test_sid = all
+        .declarations
+        .iter()
+        .find(|row| row.role == DeclarationRole::Test)
+        .unwrap()
+        .sid
+        .clone();
+    for (role, mixed_count, total_count, sums, maxima, means, top_name) in [
+        (
+            "production",
+            2,
+            2,
+            (3.0, 3.0),
+            (2.0, 2.0),
+            (1.5, 1.5),
+            "production",
+        ),
+        ("all", 3, 4, (6.0, 7.0), (3.0, 3.0), (2.0, 1.75), "check"),
+        ("test", 1, 2, (3.0, 4.0), (3.0, 3.0), (3.0, 2.0), "check"),
+    ] {
+        for (aggregate, (mixed_value, total_value)) in
+            [("sum", sums), ("max", maxima), ("mean", means)]
+        {
+            file.role = role.into();
+            file.aggregate = aggregate.into();
+            let measured = response.metrics_at(&file, &mut || Ok(())).unwrap();
+            assert_eq!(measured.role, role);
+            assert_eq!(measured.index_generation, pin.index_generation.to_string());
+            assert_eq!(measured.index_revision, pin.index_revision);
+            assert_eq!(measured.declarations.len(), mixed_count);
+            assert_eq!(measured.files[0].declaration_count, mixed_count);
+            assert_eq!(measured.files[0].role_counts.production, 2);
+            assert_eq!(measured.files[0].role_counts.test, 1);
+            let serialized = serde_json::to_value(&measured).unwrap();
+            assert_eq!(serialized["role"], role);
+            assert_eq!(
+                serialized["files"][0]["roleCounts"],
+                serde_json::json!({"production": 2, "test": 1})
+            );
+            assert_eq!(
+                measured.files[0].metrics["cyclomatic"].as_f64(),
+                Some(mixed_value)
+            );
+            let top = measured.top_cognitive.as_ref().unwrap();
+            assert_eq!(top[0].name.as_deref(), Some(top_name));
+            assert!(top.iter().all(|row| role == "all"
+                || match row.role {
+                    DeclarationRole::Production => role == "production",
+                    DeclarationRole::Test => role == "test",
+                }));
+            let revision_options = MetricsOptions {
+                pin: Some(pin),
+                role: role.into(),
+                aggregate: aggregate.into(),
+                top_cognitive: Some(10),
+                ..Default::default()
+            };
+            let revision = response
+                .metrics_at(&revision_options, &mut || Ok(()))
+                .unwrap();
+            let directory = response
+                .metrics_at(
+                    &MetricsOptions {
+                        scope: "directory".into(),
+                        source_set_id: Some(source_set.clone()),
+                        path: Some("src".into()),
+                        ..revision_options
+                    },
+                    &mut || Ok(()),
+                )
+                .unwrap();
+            for payload in [&revision, &directory] {
+                assert_eq!(payload.files.len(), 3);
+                let fold = payload
+                    .directories
+                    .iter()
+                    .find(|row| row.path == "src")
+                    .unwrap();
+                assert_eq!(fold.declaration_count, total_count);
+                assert_eq!(fold.metrics["cyclomatic"].as_f64(), Some(total_value));
+                assert_eq!(
+                    payload.top_cognitive.as_ref().unwrap()[0].name.as_deref(),
+                    Some(top_name)
+                );
+                let mixed = payload
+                    .files
+                    .iter()
+                    .find(|row| row.path == "src/mixed.rs")
+                    .unwrap();
+                assert_eq!(mixed.metrics, measured.files[0].metrics);
+                let empty = payload
+                    .files
+                    .iter()
+                    .find(|row| row.path == "src/empty.rs")
+                    .unwrap();
+                assert_eq!(empty.declaration_count, 0);
+                assert_eq!(
+                    (empty.role_counts.production, empty.role_counts.test),
+                    (0, 0)
+                );
+                assert!(empty.metrics["cyclomatic"].is_null());
+                let test_only = payload
+                    .files
+                    .iter()
+                    .find(|row| row.path == "src/tests/only.rs")
+                    .unwrap();
+                assert_eq!(
+                    (test_only.role_counts.production, test_only.role_counts.test),
+                    (0, 1)
+                );
+                if role == "production" {
+                    assert_eq!(test_only.declaration_count, 0);
+                    assert!(test_only.metrics["cyclomatic"].is_null());
+                    let empty_directory = payload
+                        .directories
+                        .iter()
+                        .find(|row| row.path == "src/tests")
+                        .unwrap();
+                    assert_eq!(empty_directory.declaration_count, 0);
+                    assert!(empty_directory.metrics["cyclomatic"].is_null());
+                }
+            }
+            let root_fold = revision
+                .directories
+                .iter()
+                .find(|row| row.path.is_empty())
+                .unwrap();
+            assert_eq!(root_fold.declaration_count, total_count);
+            assert_eq!(root_fold.metrics["cyclomatic"].as_f64(), Some(total_value));
+        }
+    }
+    let mut declaration = MetricsOptions {
+        pin: Some(pin),
+        scope: "declaration".into(),
+        source_set_id: Some(source_set),
+        path: Some("src/mixed.rs".into()),
+        sid: Some(test_sid),
+        role: "production".into(),
+        ..Default::default()
+    };
+    assert!(
+        response
+            .metrics_at(&declaration, &mut || Ok(()))
+            .unwrap_err()
+            .to_string()
+            .starts_with("not_found:")
+    );
+    declaration.role = "test".into();
+    let selected = response.metrics_at(&declaration, &mut || Ok(())).unwrap();
+    assert_eq!(selected.declarations.len(), 1);
+    assert_eq!(selected.declarations[0].role, DeclarationRole::Test);
+    file.path = Some("src/tests/only.rs".into());
+    file.role = "production".into();
+    let empty = response.metrics_at(&file, &mut || Ok(())).unwrap();
+    assert!(empty.declarations.is_empty());
+    assert!(empty.top_cognitive.unwrap().is_empty());
+    assert!(empty.files[0].metrics["cyclomatic"].is_null());
+    response.finish(()).unwrap();
+}
+
+#[test]
+fn stored_roles_cover_four_languages_and_warm_source_memo_is_role_independent() {
+    use trellis::native_evidence::DeclarationRole;
+
+    let (_state, _root, store, pin) = fixture_with_sources(&[
+        ("src/Example.java", "class Example { void calc() {} }\n"),
+        ("tests/Example.java", "class Example { void calc() {} }\n"),
+        ("src/example.py", "def calc():\n    return 1\n"),
+        ("tests/example.py", "def calc():\n    return 1\n"),
+        ("src/example.js", "function calc() { return 1; }\n"),
+        ("tests/example.js", "function calc() { return 1; }\n"),
+        ("src/example.rs", "fn calc() {}\n"),
+        ("tests/example.rs", "fn calc() {}\n"),
+    ]);
+    let response = store.evidence_response().unwrap();
+    let manifest = response
+        .metrics_at(
+            &MetricsOptions {
+                pin: Some(pin),
+                ..Default::default()
+            },
+            &mut || Ok(()),
+        )
+        .unwrap();
+    let source_set = manifest.files[0].source_set_id.clone();
+    for (language, name) in [
+        ("java", "Example.java"),
+        ("python", "example.py"),
+        ("javascript", "example.js"),
+        ("rust", "example.rs"),
+    ] {
+        let mut selected = MetricsOptions {
+            pin: Some(pin),
+            scope: "file".into(),
+            source_set_id: Some(source_set.clone()),
+            language: Some(language.into()),
+            path: Some(format!("src/{name}")),
+            top_cognitive: Some(1),
+            ..Default::default()
+        };
+        let production = response.metrics_at(&selected, &mut || Ok(())).unwrap();
+        assert_eq!(production.declarations.len(), 1, "{language}");
+        assert_eq!(production.declarations[0].role, DeclarationRole::Production);
+        let memo_entries = store.metrics_memo_entries_for_tests();
+        selected.path = Some(format!("tests/{name}"));
+        let tests = response.metrics_at(&selected, &mut || Ok(())).unwrap();
+        assert_eq!(
+            store.metrics_memo_entries_for_tests(),
+            memo_entries,
+            "{language}"
+        );
+        assert_eq!(tests.declarations.len(), 1, "{language}");
+        assert_eq!(tests.declarations[0].role, DeclarationRole::Test);
+        assert_eq!(
+            tests.top_cognitive.as_ref().unwrap()[0].role,
+            DeclarationRole::Test
+        );
+        assert_eq!(
+            production.declarations[0].metrics,
+            tests.declarations[0].metrics
+        );
+        assert_ne!(production.declarations[0].sid, tests.declarations[0].sid);
+        selected.role = "production".into();
+        let excluded = response.metrics_at(&selected, &mut || Ok(())).unwrap();
+        assert_eq!(excluded.files[0].declaration_count, 0);
+        assert!(excluded.files[0].metrics["cyclomatic"].is_null());
+        assert_eq!(excluded.files[0].role_counts.test, 1);
+        assert_eq!(excluded.files[0].role_counts.production, 0);
+        selected.role = "test".into();
+        let included = response.metrics_at(&selected, &mut || Ok(())).unwrap();
+        assert_eq!(included.declarations[0].role, DeclarationRole::Test);
+        assert_eq!(included.files[0].metrics, tests.files[0].metrics);
+    }
+    response.finish(()).unwrap();
+}
+
+#[test]
+fn metrics_role_selection_is_closed_and_defaults_to_all() {
+    assert_eq!(MetricsOptions::default().role, "all");
+    for role in ["production", "all", "test"] {
+        assert!(
+            MetricsOptions {
+                role: role.into(),
+                ..Default::default()
+            }
+            .validate()
+            .is_ok()
+        );
+    }
+    for role in ["", "tests", "Production", "production,test"] {
+        assert!(
+            MetricsOptions {
+                role: role.into(),
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn invalid_stored_role_is_corruption_even_when_role_selection_would_exclude_the_file() {
+    let (state, _root, store, pin) =
+        fixture_with_sources(&[("tests/example.js", "function calc() { return 1; }\n")]);
+    let db = rusqlite::Connection::open(index_path(state.path())).unwrap();
+    db.execute_batch("PRAGMA ignore_check_constraints=ON")
+        .unwrap();
+    db.execute("UPDATE native_version_declarations SET role='unknown'", [])
+        .unwrap();
+    drop(db);
+    let response = store.evidence_response().unwrap();
+    let error = response
+        .metrics_at(
+            &MetricsOptions {
+                pin: Some(pin),
+                role: "production".into(),
+                ..Default::default()
+            },
+            &mut || Ok(()),
+        )
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("invalid declaration role"),
+        "{error:#}"
+    );
+    assert!(store.recovery_pending_for_tests());
+    assert!(response.finish(()).is_err());
+}

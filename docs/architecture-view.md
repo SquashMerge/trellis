@@ -21,8 +21,9 @@ fixed path, line and column, without a partial diagram.
 Layer edges count reference **sites**, not module pairs or rule-check instances.
 Production references are solid. Test references are dashed and toggleable. Stored
 roles determine this split: `cfg(test)` is test, while `cfg(feature="test-support")`
-remains production under Decision 0011. Hiding tests does not change production totals,
-policy or metric heat.
+remains production under Decision 0011. The **Test-only edges** overlay does not change production reference totals,
+policy or metric role selection. The separate **Include tests in metrics** checkbox changes heat
+without changing which reference edges are shown.
 
 Downward references, including skipped orders, conform. Upward references deviate.
 Cross-peer and shared-to-ordered references deviate by default; the independent
@@ -44,10 +45,18 @@ the displayed revision. They never fall back to the live file.
 The color choices are Layer, Cyclomatic, Cognitive, Max nesting, Maintainability,
 Halstead volume and Fan-out. Layer mode uses neutral module chips and explicit
 membership, not an invented numeric metric. Numeric aggregates are max (default), sum
-and mean over raw [`metrics:v1`](metrics.md) callable scores. Metrics include **all
-indexed callable roles**, including tests. Fan-out is the measured callable metric,
+and mean over raw [`metrics:v1`](metrics.md) callable scores. Heat explicitly starts with
+`role=production`; the unchecked **Include tests in metrics** checkbox requests `all` when checked.
+Omitted API/CLI role remains `all`; `test` is available through those transports. The Architecture
+payload echoes `role` (rather than `metricsScope`). Stored native declaration roles are authoritative
+for Rust, Java, Python and JavaScript under Decision 0011, not browser path heuristics or runner
+discovery. Inline Rust `cfg(test)` callables are test; feature-only `test-support` remains production.
+Each module carries per-file `roleCounts: {production, test}` independent of the selected role;
+its `declarationCount` and metrics describe the selected population. Fan-out is the measured callable metric,
 not structural dependency degree. Null values stay unavailable, with reasons; they
-never become zero. Callable-line aggregates are not physical-file LOC.
+never become zero. Test-only files have unavailable production heat, not a fabricated zero.
+Callable-range LOC/SLOC can overlap and are not physical production file lines; no physical
+production-LOC measurement is claimed.
 
 Band headers show the maximum available displayed module value at the chosen
 aggregate, not a mean of file means. Heat uses the Viewer shell's deterministic
@@ -60,7 +69,10 @@ One admitted snapshot supplies code evidence, assignments and metrics. The view 
 the full `{indexGeneration,indexRevision}` pin and the separate rules content hash:
 indexed code does not pin live configuration. Evidence actions retain both. Changed
 rules require refresh rather than explaining an old diagram using new rules. Checkout,
-session and full-pin changes clear pending evidence and selection before rebinding.
+session and full-pin changes clear pending evidence and selection before rebinding. Metric-role
+changes also clear old heat and inspection before fetching. Role participates in query, response
+validation and currentness alongside the aggregate, root/session, full pin and request serial,
+including async Pele completion and indexed-source callbacks.
 Browsing does not index, execute repository code or contact providers.
 
 Patched Pele 1.10.0 renders app-generated `block-beta` layer summaries. App-owned opaque

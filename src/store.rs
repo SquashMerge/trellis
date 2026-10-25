@@ -6,6 +6,7 @@ pub mod requests;
 pub(crate) mod symbol_trigrams;
 pub mod topology;
 use crate::model::*;
+use crate::native_evidence::DeclarationRole;
 use anyhow::{Context, Result, ensure};
 pub use requests::{MaintenanceQueueProbe, MaintenanceQueueState, QueueProbeAdmission};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
@@ -889,6 +890,7 @@ impl ReadRevision {
 #[derive(Debug, Clone)]
 pub struct MetricsOptions {
     pub pin: Option<IndexPin>,
+    pub role: String,
     pub scope: String,
     pub source_set_id: Option<String>,
     pub language: Option<String>,
@@ -904,6 +906,7 @@ impl Default for MetricsOptions {
         Self {
             pin: None,
             scope: "revision".into(),
+            role: "all".into(),
             source_set_id: None,
             language: None,
             path: None,
@@ -916,6 +919,10 @@ impl Default for MetricsOptions {
 }
 impl MetricsOptions {
     pub fn validate(&self) -> Result<()> {
+        ensure!(
+            matches!(self.role.as_str(), "production" | "all" | "test"),
+            "invalid role"
+        );
         ensure!(
             matches!(
                 self.scope.as_str(),
@@ -971,8 +978,15 @@ pub struct MetricsFileRow {
     pub source_set_id: String,
     pub language: String,
     pub path: String,
+    pub role_counts: MetricsRoleCounts,
     pub declaration_count: usize,
     pub metrics: serde_json::Value,
+}
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MetricsRoleCounts {
+    pub production: usize,
+    pub test: usize,
 }
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -985,6 +999,7 @@ pub struct MetricsDirectoryRow {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MetricsDeclarationRow {
+    pub role: DeclarationRole,
     pub source_set_id: String,
     pub language: String,
     pub path: String,
@@ -995,6 +1010,7 @@ pub struct MetricsDeclarationRow {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MetricsTopCognitiveRow {
+    pub role: DeclarationRole,
     pub source_set_id: String,
     pub language: String,
     pub path: String,
@@ -1015,6 +1031,7 @@ pub struct MetricsTopCognitiveScore {
 #[serde(rename_all = "camelCase")]
 pub struct MetricsPayload {
     pub metrics_version: &'static str,
+    pub role: String,
     pub index_generation: String,
     pub index_revision: u64,
     pub scope: String,
@@ -1324,7 +1341,7 @@ impl EvidenceResponse {
             "state": if config.is_none() { "missing_rules" } else if layers.is_empty() { "no_layers" } else { "ready" },
             "rulesFile": config.as_ref().map(crate::rules::descriptor),
             "aggregate": options.aggregate, "metricsVersion": "metrics:v1",
-            "metricsScope": "all-indexed-callables", "evidenceTier": "syntax", "semanticComplete": false,
+            "role": options.role, "evidenceTier": "syntax", "semanticComplete": false,
             "layers": layers, "modules": [], "edges": [], "references": null, "rules": null
         });
         if payload["state"] != "ready" {
@@ -1340,6 +1357,7 @@ impl EvidenceResponse {
         let metrics = self.metrics_at(
             &MetricsOptions {
                 pin: Some(snapshot.pin),
+                role: options.role.clone(),
                 aggregate: options.aggregate.clone(),
                 ..MetricsOptions::default()
             },
@@ -1401,6 +1419,7 @@ impl EvidenceResponse {
             row["layer"] = serde_json::json!(crate::rules::layer_for(config, key.2)?);
             row["physicalLines"] = serde_json::json!(doc.file.text.lines().count());
             row["declarationCount"] = serde_json::json!(file.declaration_count);
+            row["roleCounts"] = serde_json::json!(file.role_counts);
             row["metrics"] = file.metrics.clone();
             modules.push(row);
         }
@@ -1735,13 +1754,25 @@ impl EvidenceResponse {
                     return progress.result(Err(anyhow::anyhow!("cancelled")));
                 }
             };
-            let rows = computed.commit(
+            let mut rows = computed.commit(
                 &mut self
                     .store
                     .metrics_memo
                     .lock()
                     .unwrap_or_else(|e| e.into_inner()),
             )?;
+            let mut role_counts = MetricsRoleCounts {
+                production: 0,
+                test: 0,
+            };
+            for row in &rows {
+                progress.check()?;
+                match row.role {
+                    DeclarationRole::Production => role_counts.production += 1,
+                    DeclarationRole::Test => role_counts.test += 1,
+                }
+            }
+            rows.retain(|row| options.role == "all" || options.role == row.role.as_str());
             let mut file_fold = crate::metrics::Accumulator::default();
             let mut parents = vec![String::new()];
             let mut directory = String::new();
@@ -1789,6 +1820,7 @@ impl EvidenceResponse {
                     && let (Some(count), Some(top)) = (options.top_cognitive, &mut top_cognitive)
                 {
                     top.push(MetricsTopCognitiveRow {
+                        role: row.role,
                         source_set_id: row.source_set_id.clone(),
                         language: row.language.clone(),
                         path: row.path.clone(),
@@ -1832,6 +1864,7 @@ impl EvidenceResponse {
                         .expect("metric score object")
                         .retain(|name, _| selected_metrics.iter().any(|selected| selected == name));
                     declarations.push(MetricsDeclarationRow {
+                        role: row.role,
                         source_set_id: row.source_set_id,
                         language: row.language,
                         path: row.path,
@@ -1846,6 +1879,7 @@ impl EvidenceResponse {
                     source_set_id: key.source_set_id.clone(),
                     language: key.language.clone(),
                     path: key.path.clone(),
+                    role_counts,
                     declaration_count: file_fold.count(),
                     metrics: file_fold.project(&options.aggregate, &names)?,
                 });
@@ -2053,6 +2087,7 @@ impl EvidenceResponse {
         progress.check()?;
         Ok(MetricsPayload {
             metrics_version: crate::metrics::VERSION,
+            role: options.role.clone(),
             index_generation: selected.pin.index_generation.to_string(),
             index_revision: selected.pin.index_revision,
             scope: options.scope.clone(),

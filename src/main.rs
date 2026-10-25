@@ -213,6 +213,8 @@ struct MetricsArgs {
     sid: Option<String>,
     #[arg(long, default_value = "sum")]
     aggregate: String,
+    #[arg(long, default_value = "all")]
+    role: String,
     #[arg(long)]
     metrics: Option<String>,
 }
@@ -679,6 +681,7 @@ fn dispatch_cli(command: &Command) -> Result<()> {
                 path: args.path.clone(),
                 sid: args.sid.clone(),
                 aggregate: args.aggregate.clone(),
+                role: args.role.clone(),
                 ..Default::default()
             };
             if let Some(names) = &args.metrics {
@@ -749,7 +752,7 @@ fn dispatch_cli(command: &Command) -> Result<()> {
                 serde_json::json!({
                     "scope": options.scope, "sourceSetId": options.source_set_id,
                     "language": options.language, "path": options.path,
-                    "sid": options.sid, "aggregate": options.aggregate,
+                    "sid": options.sid, "aggregate": options.aggregate, "role": options.role,
                     "metrics": options.metrics, "pin": options.pin
                 }),
                 true,
@@ -806,11 +809,12 @@ fn dispatch_cli(command: &Command) -> Result<()> {
         } else {
             let payload = &value["payload"];
             println!(
-                "metrics {}:{} ({}, {}, catchingUp={})",
+                "metrics {}:{} ({}, {}, role={}, catchingUp={})",
                 payload["indexGeneration"].as_str().unwrap_or("?"),
                 payload["indexRevision"],
                 payload["scope"].as_str().unwrap_or("?"),
                 payload["aggregate"].as_str().unwrap_or("?"),
+                payload["role"].as_str().unwrap_or("?"),
                 value["catchingUp"]
             );
             for kind in ["declarations", "files", "directories"] {
@@ -1824,7 +1828,15 @@ fn metrics_options_from_request(
     ensure!(
         fields.keys().all(|key| matches!(
             key.as_str(),
-            "scope" | "aggregate" | "sourceSetId" | "language" | "path" | "sid" | "metrics" | "pin"
+            "scope"
+                | "aggregate"
+                | "role"
+                | "sourceSetId"
+                | "language"
+                | "path"
+                | "sid"
+                | "metrics"
+                | "pin"
         )),
         "invalid_argument: unknown metrics option"
     );
@@ -1843,6 +1855,11 @@ fn metrics_options_from_request(
             .as_str()
             .context("invalid_argument: aggregate")?
             .to_owned(),
+        role: if fields.contains_key("role") {
+            field(args, "role")?
+        } else {
+            "all".into()
+        },
         source_set_id: field(args, "sourceSetId")?,
         language: field(args, "language")?,
         path: field(args, "path")?,
@@ -1989,4 +2006,42 @@ fn write_daemon_reply_until(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod metrics_request_tests {
+    use super::metrics_options_from_request;
+    use serde_json::json;
+
+    #[test]
+    fn role_selection_defaults_and_strict_daemon_option_validation() {
+        let args = json!({"scope": "revision", "aggregate": "sum"});
+        assert_eq!(metrics_options_from_request(&args).unwrap().role, "all");
+        for role in ["production", "all", "test"] {
+            let mut selected = args.clone();
+            selected["role"] = json!(role);
+            assert_eq!(metrics_options_from_request(&selected).unwrap().role, role);
+        }
+        for role in [
+            json!(""),
+            json!("unknown"),
+            json!("Production"),
+            json!(null),
+            json!(true),
+            json!(["all"]),
+        ] {
+            let mut invalid = args.clone();
+            invalid["role"] = role;
+            let error = metrics_options_from_request(&invalid).unwrap_err();
+            assert!(error.to_string().contains("invalid_argument"), "{error}");
+        }
+        let mut unknown = args;
+        unknown["roles"] = json!("production");
+        assert!(
+            metrics_options_from_request(&unknown)
+                .unwrap_err()
+                .to_string()
+                .contains("unknown metrics option")
+        );
+    }
 }

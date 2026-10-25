@@ -40,6 +40,16 @@ async fn fixture() -> (
     ProvisionedBrowser,
     String,
 ) {
+    fixture_with_roles(false).await
+}
+async fn fixture_with_roles(
+    role_fixture: bool,
+) -> (
+    tempfile::TempDir,
+    Arc<trellis::daemon::registry::CheckoutRuntime>,
+    ProvisionedBrowser,
+    String,
+) {
     let base = tempfile::tempdir().unwrap();
     let root = base.path().join("checkout");
     fs::create_dir(&root).unwrap();
@@ -53,6 +63,24 @@ async fn fixture() -> (
     fs::write(root.join("empty.js"), "// no callable\n").unwrap();
     fs::create_dir(root.join("zero")).unwrap();
     fs::write(root.join("zero/empty.js"), "// zero-callable directory\n").unwrap();
+    if role_fixture {
+        fs::create_dir(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/roles.rs"),
+            r#"fn production() { crate::target::run(); }
+#[cfg(feature = "test-support")] fn support() { crate::target::run(); }
+#[cfg(test)] mod tests { fn check() { crate::target::run(); } }
+"#,
+        )
+        .unwrap();
+        fs::write(root.join("src/target.rs"), "pub fn run() {}\n").unwrap();
+        fs::create_dir(root.join("tests")).unwrap();
+        fs::write(
+            root.join("tests/only.rs"),
+            "fn only() { crate::target::run(); }\n",
+        )
+        .unwrap();
+    }
     let identity = WorkspaceIdentity::discover(Some(&root), &root)
         .unwrap()
         .attach_marker()
@@ -123,6 +151,8 @@ async fn architecture_route_pin_aggregate_setup_and_located_diagnostics() {
     assert_eq!(status, StatusCode::OK, "{missing}");
     assert_eq!(missing["payload"]["state"], "missing_rules");
     assert_eq!(missing["payload"]["aggregate"], "max");
+    assert_eq!(missing["payload"]["role"], "all");
+    assert!(missing["payload"].get("metricsScope").is_none());
     let generation = missing["payload"]["indexGeneration"].as_str().unwrap();
     let revision = missing["payload"]["indexRevision"].as_u64().unwrap();
     write_rules(&base, RULES);
@@ -140,6 +170,11 @@ async fn architecture_route_pin_aggregate_setup_and_located_diagnostics() {
         format!("?indexRevision={revision}"),
         "?aggregate=avg".into(),
         "?aggregate=sum&aggregate=max".into(),
+        "?role=".into(),
+        "?role=unknown".into(),
+        "?role=Production".into(),
+        "?role=all&role=test".into(),
+        "?role=all&%72ole=production".into(),
         "?scope=revision".into(),
         "?metrics=cyclomatic".into(),
         "?unexpected=x".into(),
@@ -174,6 +209,117 @@ async fn architecture_route_pin_aggregate_setup_and_located_diagnostics() {
     }
     assert!(invalid.get("payload").is_none());
 }
+#[tokio::test]
+async fn architecture_role_filters_metrics_without_changing_reference_evidence() {
+    let (base, _runtime, browser, key) = fixture_with_roles(true).await;
+    write_rules(
+        &base,
+        "version=1\n[layers.app]\norder=2\npaths=['src/roles.rs','tests/**']\n[layers.target]\norder=1\npaths=['src/target.rs']",
+    );
+    let app = browser.router();
+    let (status, omitted) = request(app.clone(), &key, "").await;
+    assert_eq!(status, StatusCode::OK, "{omitted}");
+    let baseline = &omitted["payload"];
+    assert_eq!(baseline["role"], "all");
+    assert!(
+        !baseline["references"]["production"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        !baseline["references"]["tests"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let generation = baseline["indexGeneration"].as_str().unwrap();
+    let revision = baseline["indexRevision"].as_u64().unwrap();
+    let pin = format!("indexGeneration={generation}&indexRevision={revision}");
+    for (role, count) in [("production", 2), ("all", 3), ("test", 1)] {
+        let (status, selected) = request(app.clone(), &key, &format!("?role={role}&{pin}")).await;
+        assert_eq!(status, StatusCode::OK, "{selected}");
+        let payload = &selected["payload"];
+        assert_eq!(payload["role"], role);
+        assert!(payload.get("metricsScope").is_none());
+        for field in [
+            "indexGeneration",
+            "indexRevision",
+            "aggregate",
+            "references",
+            "edges",
+            "rules",
+            "layers",
+        ] {
+            assert_eq!(payload[field], baseline[field], "{role}: {field}");
+        }
+        assert_eq!(
+            payload["modules"].as_array().unwrap().len(),
+            baseline["modules"].as_array().unwrap().len()
+        );
+        let mixed = payload["modules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["identity"]["path"] == "src/roles.rs")
+            .unwrap();
+        assert_eq!(mixed["declarationCount"], count);
+        assert_eq!(
+            mixed["roleCounts"],
+            serde_json::json!({"production":2,"test":1})
+        );
+        assert_eq!(mixed["physicalLines"], 3);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/checkouts/{key}/metrics?role={role}&aggregate=max&{pin}"
+                    ))
+                    .header("host", "127.0.0.1:7331")
+                    .header("authorization", format!("Bearer {TOKEN}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 64 * 1024 * 1024)
+            .await
+            .unwrap();
+        let metrics: Value = serde_json::from_slice(&bytes).unwrap();
+        for module in payload["modules"].as_array().unwrap() {
+            let file = metrics["payload"]["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| {
+                    row["sourceSetId"] == module["identity"]["sourceSetId"]
+                        && row["language"] == module["identity"]["language"]
+                        && row["path"] == module["identity"]["path"]
+                })
+                .unwrap();
+            for field in ["metrics", "declarationCount", "roleCounts"] {
+                assert_eq!(module[field], file[field], "{role}: {field}");
+            }
+        }
+        if role == "production" {
+            let test_only = payload["modules"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["identity"]["path"] == "tests/only.rs")
+                .unwrap();
+            assert_eq!(test_only["declarationCount"], 0);
+            assert_eq!(
+                test_only["roleCounts"],
+                serde_json::json!({"production":0,"test":1})
+            );
+            assert!(test_only["metrics"]["cyclomatic"].is_null());
+        }
+    }
+}
+
 #[tokio::test]
 async fn architecture_bounds_cancellation_deadline_and_final_root_fences() {
     let (base, _runtime, browser, key) = fixture().await;
