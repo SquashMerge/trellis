@@ -183,3 +183,166 @@ fn admitted_raw_coordinates_reject_split_utf16_scalar_and_crlf() {
         native::Range { start: 0, end: 4 }
     );
 }
+
+#[test]
+fn four_measured_families_retain_exact_native_identity_and_capability_authority() {
+    let (_root, native, sources, _inventory) = fixture();
+    let doc = native.revision.documents[0].key.clone();
+    let measured = MeasuredFacts::new(&native, &sources).unwrap();
+    for d in native
+        .declarations
+        .iter()
+        .filter(|d| d.document == doc && d.name_range.is_some())
+    {
+        let join = measured
+            .join(
+                &doc,
+                d.name_range.clone().unwrap(),
+                semantic::JoinKind::DeclarationName,
+            )
+            .unwrap();
+        assert_eq!(join.status, semantic::JoinStatus::Exact);
+        assert_eq!(join.candidate_ids, vec![d.syntax_id.clone()]);
+    }
+    for call in native.calls.iter().filter(|c| c.document == doc) {
+        let invocation = measured
+            .join(&doc, call.range.clone(), semantic::JoinKind::Invocation)
+            .unwrap();
+        assert_eq!(invocation.candidate_ids, vec![call.id.clone()]);
+        if let Some(callee) = &call.callee_range {
+            let join = measured
+                .join(&doc, callee.clone(), semantic::JoinKind::Callee)
+                .unwrap();
+            assert_eq!(join.candidate_ids, vec![call.id.clone()]);
+        }
+    }
+    for reference in native.references.iter().filter(|r| r.document == doc) {
+        let join = measured
+            .join(&doc, reference.range.clone(), semantic::JoinKind::Reference)
+            .unwrap();
+        assert_eq!(join.candidate_ids, vec![reference.id.clone()]);
+    }
+    let absent = native::Range { start: 0, end: 8 };
+    assert_eq!(
+        measured
+            .join(&doc, absent.clone(), semantic::JoinKind::Callee)
+            .unwrap()
+            .status,
+        semantic::JoinStatus::Unmatched
+    );
+    let mut gap = native.clone();
+    let support = gap.capability_reports[0]
+        .families
+        .iter_mut()
+        .find(|f| f.kind == native::MeasurementKind::Callee)
+        .unwrap();
+    support.gaps.push(native::MeasurementGap {
+        range: absent.clone(),
+        diagnostic: "opaque_native_construct".into(),
+    });
+    assert_eq!(
+        MeasuredFacts::new(&gap, &sources)
+            .unwrap()
+            .join(&doc, absent.clone(), semantic::JoinKind::Callee)
+            .unwrap()
+            .status,
+        semantic::JoinStatus::Unsupported
+    );
+    assert_eq!(
+        MeasuredFacts::new(&gap, &sources)
+            .unwrap()
+            .join(
+                &doc,
+                native::Range { start: 0, end: 9 },
+                semantic::JoinKind::Callee
+            )
+            .unwrap()
+            .status,
+        semantic::JoinStatus::Unmatched
+    );
+    let support = gap.capability_reports[0]
+        .families
+        .iter_mut()
+        .find(|f| f.kind == native::MeasurementKind::Callee)
+        .unwrap();
+    support.gaps.clear();
+    support.available = false;
+    support.diagnostic = Some("no_native_convention".into());
+    assert_eq!(
+        MeasuredFacts::new(&gap, &sources)
+            .unwrap()
+            .join(&doc, absent, semantic::JoinKind::Callee)
+            .unwrap()
+            .diagnostic
+            .as_deref(),
+        Some("no_native_convention")
+    );
+}
+
+#[test]
+fn duplicate_and_conflicting_authenticated_claims_preserve_raw_proofs() {
+    let (_root, native, sources, inventory) = fixture();
+    let original = inventory
+        .claims
+        .iter()
+        .find(|c| c.envelope.record_kind == "occurrence")
+        .unwrap()
+        .clone();
+    let mut same = inventory.clone();
+    same.claims.push(original.clone());
+    assert!(
+        join_inventory(&same, &native, &sources, 2).is_err(),
+        "duplicate raw proof must fail closed"
+    );
+    let mut competing = inventory.clone();
+    let mut other = original.clone();
+    other.envelope.raw["symbol"] = json!("external pkg Other#");
+    other.canonical_bytes = native_ids::canonical(
+        &json!({"formatVersion":1,"recordKind":"occurrence","relativePath":other.envelope.relative_path,
+        "positionEncoding":other.envelope.position_encoding,"raw":other.envelope.raw}),
+    );
+    other.fact_digest = native_ids::digest(b"trellis.semantic-fact.v1\0", &other.canonical_bytes);
+    other.captured_proof_id = native_ids::digest(
+        b"trellis.capture-proof.v1\0",
+        &native_ids::canonical(&json!({
+        "producerId":"scip-typescript","artifactHash":inventory.artifact_hash,"sourceSetId":native.source_set.id,
+        "sourceRevision":native.revision.id,"language":other.language,"relativePath":other.envelope.relative_path,
+        "factDigest":other.fact_digest})),
+    );
+    let other_proof = other.captured_proof_id.clone();
+    competing.claims.push(other);
+    let output = join_inventory(&competing, &native, &sources, 2).unwrap();
+    let ids: Vec<_> = output
+        .joins
+        .iter()
+        .filter(|(_, j)| j.anchor.kind == semantic::JoinKind::DeclarationName)
+        .map(|(proof, j)| (proof.as_str(), j.status))
+        .collect();
+    assert!(ids.iter().any(|(id, _)| *id == original.captured_proof_id));
+    assert!(ids.iter().any(|(id, _)| *id == other_proof));
+}
+
+#[test]
+fn reference_and_call_roles_are_not_authorized_by_native_shape_alone() {
+    let (_root, native, sources, inventory) = fixture();
+    let facts = join_inventory(&inventory, &native, &sources, 2).unwrap();
+    assert!(
+        facts.call_bindings.is_empty(),
+        "no authenticated call occurrence in pinned fixture"
+    );
+    assert!(
+        facts
+            .references
+            .iter()
+            .all(|r| !r.roles.contains(&semantic::Role::Call))
+    );
+    for (proof, join) in &facts.joins {
+        let claim = inventory
+            .claims
+            .iter()
+            .find(|c| &c.captured_proof_id == proof)
+            .unwrap();
+        assert_eq!(claim.envelope.record_kind, "occurrence");
+        assert_eq!(join.anchor.document.language, "javascript");
+    }
+}

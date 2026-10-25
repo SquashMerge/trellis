@@ -40,10 +40,9 @@ const NON_EXTRACTION_ITEMS: &[(&str, &str)] = &[
     ),
 ];
 
-/// Modules outside the list that parse source themselves. Each computes a
-/// read-time view from served facts and source and never writes a native
-/// fact, graph or class projection.
-const VIEW_TIME_PARSERS: &[(&str, &str)] = &[
+/// Modules outside native extraction that parse source. They compute read-time
+/// views or post-native semantic evidence, never native facts, graph or class projections.
+const NON_NATIVE_SOURCE_PARSERS: &[(&str, &str)] = &[
     ("src/behavior_bindings.rs", "read-time sequence views"),
     ("src/behavior_java.rs", "read-time sequence views"),
     ("src/behavior_js.rs", "read-time sequence views"),
@@ -54,6 +53,10 @@ const VIEW_TIME_PARSERS: &[(&str, &str)] = &[
         "dependency source browsing, outside the workspace index",
     ),
     ("src/metrics.rs", "read-time code metrics"),
+    (
+        "src/semantic_import.rs",
+        "post-native semantic relationships from authenticated source",
+    ),
 ];
 
 fn root() -> &'static Path {
@@ -384,7 +387,7 @@ fn the_module_guard_catches_extraction_code_in_an_unlisted_module() {
 }
 
 #[test]
-fn source_parsers_outside_the_list_are_declared_view_time() {
+fn source_parsers_outside_native_extraction_are_declared() {
     fn walk(dir: &Path, out: &mut Vec<String>) {
         for entry in std::fs::read_dir(dir).unwrap() {
             let path = entry.unwrap().path();
@@ -404,7 +407,9 @@ fn source_parsers_outside_the_list_are_declared_view_time() {
         let parses = code.contains("tree_sitter") || code.contains("icu_normalizer");
         if parses
             && !extraction_modules(true).any(|listed| listed == path)
-            && !VIEW_TIME_PARSERS.iter().any(|(file, _)| *file == path)
+            && !NON_NATIVE_SOURCE_PARSERS
+                .iter()
+                .any(|(file, _)| *file == path)
         {
             undeclared.push(path);
         }
@@ -412,6 +417,6 @@ fn source_parsers_outside_the_list_are_declared_view_time() {
     assert!(
         undeclared.is_empty(),
         "these modules parse source but are neither hashed extraction modules nor \
-         declared read-time views: {undeclared:?}"
+         declared non-native parsers: {undeclared:?}"
     );
 }
