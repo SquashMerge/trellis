@@ -160,7 +160,7 @@ const pinSections = {
   executable: ["semanticProducers", "executableHash"],
   toolchain: ["toolchains", "toolchainHash"],
 };
-async function verifyPin(repository, capture, producer) {
+async function verifyPin(repository, capture, producers) {
   const [path, name, extra] = capture.pinned.split("#");
   if (
     !name ||
@@ -180,10 +180,11 @@ async function verifyPin(repository, capture, producer) {
       capture.pinned,
       `pinned digest differs: expected ${capture.hash}, profile ${entry[field]}`,
     );
-  if (capture.kind === "executable" && producer?.kind === "semantic" &&
-      (!Object.hasOwn(entry, "positionEncoding") ||
-        !["utf8", "utf16", "unicodeScalar"].includes(entry.positionEncoding) ||
-        entry.positionEncoding !== producer.positionEncoding))
+  if (capture.kind === "executable" && producers.some((producer) =>
+    producer.kind === "semantic" && producer.executableHash === capture.hash &&
+    (!Object.hasOwn(entry, "positionEncoding") ||
+      !["utf8", "utf16", "unicodeScalar"].includes(entry.positionEncoding) ||
+      entry.positionEncoding !== producer.positionEncoding)))
     reject("IDENTITY.PRODUCER", capture.pinned, "pinned position encoding differs");
 }
 export async function loadFixture(root, { repository = repositoryRoot } = {}) {
@@ -378,8 +379,7 @@ export async function loadFixture(root, { repository = repositoryRoot } = {}) {
     captures.set(capture.ref, capture);
     if (capture.pinned !== undefined) {
       await verifyPin(repository, capture,
-        fixture.producers.find((producer) =>
-          producer.executableHash === capture.hash && producer.kind === "semantic"));
+        [...fixture.producers, ...fixture.comparison.producers]);
       continue;
     }
     const bytes = await confinedFile(root, capture.file);

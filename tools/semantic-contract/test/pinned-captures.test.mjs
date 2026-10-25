@@ -80,6 +80,29 @@ test("PIN.ENCODING rejects a pinned producer convention mismatch", async (t) => 
     message: /pinned position encoding differs/,
   });
 });
+test("PIN.ENCODING checks comparison-only producers using pinned executable bytes", async (t) => {
+  const load = await pinnedExample(t, (fixture) => {
+    fixture.comparison.producers.push({
+      ...fixture.comparison.producers.find((producer) => producer.id === "P"),
+      id: "comparison-only",
+      positionEncoding: "utf16",
+    });
+  });
+  await assert.rejects(load(), {
+    assertion: "IDENTITY.PRODUCER",
+    message: /pinned position encoding differs/,
+  });
+});
+test("PIN.ENCODING checks every producer sharing the pinned executable hash", async (t) => {
+  const load = await pinnedExample(t, (fixture) => {
+    fixture.producers.find((producer) => producer.id === "Q").executableHash = hashOf("P");
+    fixture.producers.find((producer) => producer.id === "Q").positionEncoding = "utf16";
+  });
+  await assert.rejects(load(), {
+    assertion: "IDENTITY.PRODUCER",
+    message: /pinned position encoding differs/,
+  });
+});
 test("PIN.ENTRY rejects a pin naming a missing profile entry or profile", async (t) => {
   const missingEntry = await pinnedExample(t, (fixture) => {
     capture(fixture, "P").pinned = `${profilePath}#scip-nothing`;
