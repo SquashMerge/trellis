@@ -620,7 +620,7 @@ fn every_nullable_native_field_requires_presence_even_when_null() {
 }
 
 #[test]
-fn every_native_kind_rejects_well_shaped_forgery_against_immutable_capture() {
+fn native_validation_rejects_invalid_structure_against_immutable_capture() {
     use std::{
         fs,
         sync::{Arc, atomic::AtomicBool},
@@ -720,24 +720,6 @@ fn every_native_kind_rejects_well_shaped_forgery_against_immutable_capture() {
             Box::new(|a| a.revision.documents.swap(0, 1)),
         ),
         (
-            "coverage complete roles",
-            Box::new(|a| a.coverage[0].observed_roles.clear()),
-        ),
-        (
-            "coverage failed with diagnostic",
-            Box::new(|a| {
-                a.coverage[0].state = "failed".into();
-                a.coverage[0].diagnostic = Some("failed".into());
-            }),
-        ),
-        (
-            "coverage partial with diagnostic",
-            Box::new(|a| {
-                a.coverage[0].state = "partial".into();
-                a.coverage[0].diagnostic = Some("partial".into());
-            }),
-        ),
-        (
             "provenance proof document",
             Box::new(|a| a.provenance[0].document = a.provenance[1].document.clone()),
         ),
@@ -751,29 +733,6 @@ fn every_native_kind_rejects_well_shaped_forgery_against_immutable_capture() {
         (
             "provenance basis",
             Box::new(|a| a.provenance[0].basis = Some(serde_json::json!({}))),
-        ),
-        (
-            "declaration modifier",
-            Box::new(|a| {
-                a.declarations
-                    .iter_mut()
-                    .find(|d| d.name.as_deref() == Some("go"))
-                    .unwrap()
-                    .header
-                    .modifiers
-                    .push("public".into())
-            }),
-        ),
-        (
-            "declaration result type",
-            Box::new(|a| {
-                a.declarations
-                    .iter_mut()
-                    .find(|d| d.document.language == "java" && d.name.as_deref() == Some("go"))
-                    .unwrap()
-                    .header
-                    .result_type = Some("String".into())
-            }),
         ),
         (
             "declaration signature",
@@ -813,37 +772,15 @@ fn every_native_kind_rejects_well_shaped_forgery_against_immutable_capture() {
                     .start += 1
             }),
         ),
+        ("call ordinal", Box::new(|a| a.calls[0].ordinal += 1)),
         (
-            "declaration source range",
-            Box::new(|a| {
-                a.declarations
-                    .iter_mut()
-                    .find(|d| d.name.as_deref() == Some("go"))
-                    .unwrap()
-                    .range
-                    .end -= 1
-            }),
+            "call region",
+            Box::new(|a| a.calls[0].region_ids.push("not-a-region".into())),
         ),
         (
-            "call unverified spelling",
+            "control owner",
             Box::new(|a| {
-                let c = a
-                    .calls
-                    .iter_mut()
-                    .find(|c| c.document.language == "javascript")
-                    .unwrap();
-                c.spelling = Some("guessed".into());
-                c.callee_range = None;
-            }),
-        ),
-        (
-            "call proof from other document",
-            Box::new(|a| {
-                a.calls
-                    .iter_mut()
-                    .find(|c| c.document.language == "javascript")
-                    .unwrap()
-                    .provenance_id = a.provenance[0].id.clone()
+                a.control_regions[0].owner_syntax_id = a.declarations[0].syntax_id.clone()
             }),
         ),
         (
@@ -895,29 +832,6 @@ fn every_native_kind_rejects_well_shaped_forgery_against_immutable_capture() {
                 });
             }),
         ),
-        ("call ordinal", Box::new(|a| a.calls[0].ordinal += 1)),
-        (
-            "call region",
-            Box::new(|a| a.calls[0].region_ids.push("not-a-region".into())),
-        ),
-        (
-            "control kind",
-            Box::new(|a| a.control_regions[0].kind = "for_statement".into()),
-        ),
-        (
-            "control arm",
-            Box::new(|a| a.control_regions[0].arm = Some("fabricated".into())),
-        ),
-        (
-            "control owner",
-            Box::new(|a| {
-                a.control_regions[0].owner_syntax_id = a.declarations[0].syntax_id.clone()
-            }),
-        ),
-        (
-            "control range",
-            Box::new(|a| a.control_regions[0].range.end += 1),
-        ),
     ];
     for (label, mutator) in mutations.drain(..) {
         let mut changed = artifact.clone();
@@ -929,11 +843,177 @@ fn every_native_kind_rejects_well_shaped_forgery_against_immutable_capture() {
             "forged {label} accepted"
         );
     }
+    // #225 keeps structural validation, not a second extraction to compare facts.
+    // These edits remain structurally valid and no longer require re-derivation.
+    let accepted: Vec<Mutation> = vec![
+        (
+            "coverage complete roles",
+            Box::new(|a| a.coverage[0].observed_roles.clear()),
+        ),
+        (
+            "coverage failed with diagnostic",
+            Box::new(|a| {
+                a.coverage[0].state = "failed".into();
+                a.coverage[0].diagnostic = Some("failed".into());
+            }),
+        ),
+        (
+            "coverage partial with diagnostic",
+            Box::new(|a| {
+                a.coverage[0].state = "partial".into();
+                a.coverage[0].diagnostic = Some("partial".into());
+            }),
+        ),
+        (
+            "declaration modifier",
+            Box::new(|a| {
+                a.declarations
+                    .iter_mut()
+                    .find(|d| d.name.as_deref() == Some("go"))
+                    .unwrap()
+                    .header
+                    .modifiers
+                    .push("public".into())
+            }),
+        ),
+        (
+            "declaration result type",
+            Box::new(|a| {
+                a.declarations
+                    .iter_mut()
+                    .find(|d| d.document.language == "java" && d.name.as_deref() == Some("go"))
+                    .unwrap()
+                    .header
+                    .result_type = Some("String".into())
+            }),
+        ),
+        (
+            "declaration source range",
+            Box::new(|a| {
+                a.declarations
+                    .iter_mut()
+                    .find(|d| d.name.as_deref() == Some("go"))
+                    .unwrap()
+                    .range
+                    .end -= 1
+            }),
+        ),
+        (
+            "call unverified spelling",
+            Box::new(|a| {
+                let c = a
+                    .calls
+                    .iter_mut()
+                    .find(|c| c.document.language == "javascript")
+                    .unwrap();
+                c.spelling = Some("guessed".into());
+                c.callee_range = None;
+            }),
+        ),
+        (
+            "control kind",
+            Box::new(|a| a.control_regions[0].kind = "for_statement".into()),
+        ),
+        (
+            "control arm",
+            Box::new(|a| a.control_regions[0].arm = Some("fabricated".into())),
+        ),
+        (
+            "control range",
+            Box::new(|a| a.control_regions[0].range.end += 1),
+        ),
+    ];
+    for (label, mutator) in accepted {
+        let mut changed = artifact.clone();
+        mutator(&mut changed);
+        changed
+            .validate(&capture, root.path(), &id.record_id, &cancel)
+            .unwrap_or_else(|error| panic!("structurally valid {label} refused: {error:#}"));
+    }
     artifact
         .validate(&capture, root.path(), &id.record_id, &cancel)
         .unwrap();
     for ops in capture.source_operations.values() {
         assert_eq!((ops.opens, ops.complete_reads, ops.hashes), (1, 1, 1));
+    }
+}
+
+#[test]
+fn native_validation_rejects_cross_document_proof_for_every_fact_family() {
+    use std::{
+        fs,
+        sync::{Arc, atomic::AtomicBool},
+    };
+    use trellis::{
+        capture::Capture,
+        indexer::IndexOptions,
+        model::CancelFlag,
+        native_evidence::{Artifact, from_capture},
+    };
+    let root = tempfile::tempdir().unwrap();
+    for (path, source) in [
+        ("a.js", "function first(value) { if (value) { one(); } }"),
+        ("b.js", "function second(value) { if (value) { two(); } }"),
+    ] {
+        fs::write(root.path().join(path), source).unwrap();
+    }
+    let identity =
+        trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+            .unwrap();
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let capture = Capture::admit(&IndexOptions::new(root.path().into()), &cancel, &|_| {}).unwrap();
+    let artifact = from_capture(&capture, root.path(), &identity.record_id, &cancel).unwrap();
+    artifact
+        .validate(&capture, root.path(), &identity.record_id, &cancel)
+        .unwrap();
+    type Mutation = (&'static str, fn(&mut Artifact));
+    let mutations: [Mutation; 4] = [
+        ("declaration", |a| {
+            a.declarations[0].provenance_id = a
+                .provenance
+                .iter()
+                .find(|p| p.document != a.declarations[0].document)
+                .unwrap()
+                .id
+                .clone();
+        }),
+        ("call", |a| {
+            a.calls[0].provenance_id = a
+                .provenance
+                .iter()
+                .find(|p| p.document != a.calls[0].document)
+                .unwrap()
+                .id
+                .clone();
+        }),
+        ("reference", |a| {
+            a.references[0].provenance_id = a
+                .provenance
+                .iter()
+                .find(|p| p.document != a.references[0].document)
+                .unwrap()
+                .id
+                .clone();
+        }),
+        ("control region", |a| {
+            a.control_regions[0].provenance_id = a
+                .provenance
+                .iter()
+                .find(|p| p.document != a.control_regions[0].document)
+                .unwrap()
+                .id
+                .clone();
+        }),
+    ];
+    for (family, mutate) in mutations {
+        let mut changed = artifact.clone();
+        mutate(&mut changed);
+        assert!(
+            changed
+                .validate(&capture, root.path(), &identity.record_id, &cancel)
+                .is_err(),
+            "{family} accepted a proof belonging to another document"
+        );
     }
 }
 
@@ -957,8 +1037,8 @@ fn parser_recovery_reports_partial_not_false_complete() {
     assert_eq!(artifact.coverage[0].state, "partial");
     assert!(artifact.coverage[0].diagnostic.is_some());
     let mut forged = artifact.clone();
+    // A complete coverage row cannot retain the partial diagnostic.
     forged.coverage[0].state = "complete".into();
-    forged.coverage[0].diagnostic = None;
     assert!(
         forged
             .validate(&capture, root.path(), &id.record_id, &cancel)
@@ -1725,7 +1805,7 @@ fn assert_javascript_declaration_lookup(source: &str, name: &str, key: &str) {
     let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
     let capture = Capture::admit(&IndexOptions::new(root.path().into()), &cancel, &|_| {}).unwrap();
     // from_capture structurally validates its own build. Store publication
-    // (with the full rebuild) and incoming reads are exercised separately.
+    // and incoming reads are exercised separately.
     let artifact = from_capture(&capture, root.path(), &identity.record_id, &cancel).unwrap();
     let declaration = artifact
         .declarations

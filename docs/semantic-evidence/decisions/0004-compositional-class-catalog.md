@@ -73,6 +73,15 @@ The catalog is built in two steps. Every limit is read from one `Limits` value. 
 
 `Catalog::build(files, nodes, cancel)` is defined as `compose(extract_file(f) for every file)` with production limits. #67's full-snapshot parity for classes is measured against that definition, not against the current one-pass output.
 
+### Equivalent composition from compact summaries (#300)
+
+Composition need not decode every stored `F` when compact per-file summaries prove that no workspace-wide cap is reached. Each summary records the effective source, registry, declaration, record and detail-text charges, intrinsic flags and ordered warnings. Invisible detail-text items still charge their budgets. Summary composition must reproduce the full composition's warnings, warning order, deduplication and flags exactly.
+
+The selected manifest records whether each class projection contains the complete per-file output of `F`, including intrinsic class flags. This is selection admission state, not `!F.truncated`. When all global budgets fit, an unchanged complete projection may be reused by CID without rebuilding its DTOs or hash. A previously incomplete selection must recover its full per-file rows from the immutable `F` before publication. Thus falling below a cap immediately restores previously excluded output; truncation is not sticky.
+
+The first #300 implementation retains the existing full composition path whenever a global cap may be reached. Its cutoffs and warning rules above are unchanged. Compact summaries are stored with the immutable graph projection; they do not replace `F` as the recovery input or add a second cache.
+
+
 ## Alternatives rejected
 
 - **Keep the one-pass output exactly, and replay or re-parse to reproduce it.** Reproducing today's mid-class budget cutoffs and warning order on a delta needs every earlier file's extraction state. In practice that means re-parsing every Java/Python file, or replaying stored per-file extraction traces, on every publication. That is O(workspace) work per edit, against a p95 that includes class projection.

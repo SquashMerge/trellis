@@ -361,19 +361,14 @@ fn invalid_native_and_conflict_never_change_published_pair() {
     }
 }
 
-/// #199 I-4b: only the coordinator's own fresh build skips the rebuild and
-/// comparison. An artifact handed to `publish_native` is caller input, so a
-/// structurally valid forgery is still refused by the full re-derivation,
-/// before any write.
+/// #225: plain caller-supplied artifacts get the same structural validation
+/// without a determinism rebuild. Publication still checks graph consistency.
 #[test]
 #[cfg(feature = "test-support")]
-fn caller_supplied_native_artifact_still_runs_the_full_rebuild() {
-    let (state, root, store, cancel) = fixture();
+fn caller_supplied_native_artifact_uses_structural_validation() {
+    let (_state, root, store, cancel) = fixture();
     let baseline = store.index_baseline().unwrap();
     let leader = store.publication_for_tests().unwrap();
-    let pin = publish(&store, root.path(), &cancel, baseline, &leader).unwrap();
-    let path = published_db(state.path(), root.path());
-    let before = fs::read(&path).unwrap();
     let (graph, mut native, capture) = index_workspace_bundle(
         &IndexOptions::new(root.path().to_owned()),
         store.root_id(),
@@ -381,8 +376,7 @@ fn caller_supplied_native_artifact_still_runs_the_full_rebuild() {
         |_| {},
     )
     .unwrap();
-    // Well-shaped: it passes every structural check, and the graph projection
-    // does not carry modifiers, so only the comparison sees it.
+    // Modifiers are structurally valid and not carried in the graph projection.
     native
         .declarations
         .iter_mut()
@@ -391,15 +385,70 @@ fn caller_supplied_native_artifact_still_runs_the_full_rebuild() {
         .header
         .modifiers
         .push("public".into());
-    let error = store
-        .publish_native(&graph, &capture, &native, &leader, pin, &cancel)
-        .unwrap_err();
+    let next = store
+        .publish_native(&graph, &capture, &native, &leader, baseline, &cancel)
+        .unwrap();
+    assert_eq!(store.status().unwrap().revision, next);
+    assert_eq!(store.graph().unwrap(), graph);
+}
+
+#[test]
+#[cfg(feature = "test-support")]
+fn caller_supplied_cross_document_proof_does_not_publish_or_change_head() {
+    let (_state, root, store, cancel) = fixture();
+    let leader = store.publication_for_tests().unwrap();
+    let pin = publish(
+        &store,
+        root.path(),
+        &cancel,
+        store.index_baseline().unwrap(),
+        &leader,
+    )
+    .unwrap();
+    let prior_graph = store.graph().unwrap();
+    let prior_source = store.source_at("flow.js", Some(pin)).unwrap().unwrap();
+    fs::write(
+        root.path().join("flow.js"),
+        "function updated(value) { if (value) { obj.changed(); } }\n",
+    )
+    .unwrap();
+    let (graph, mut native, capture) = index_workspace_bundle(
+        &IndexOptions::new(root.path().to_owned()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    let canonical_root = fs::canonicalize(root.path()).unwrap();
+    native
+        .validate(&capture, &canonical_root, store.root_id(), &cancel)
+        .unwrap();
+    assert_ne!(graph, prior_graph);
+    let call = native
+        .calls
+        .iter_mut()
+        .find(|call| call.document.path == "flow.js")
+        .unwrap();
+    call.provenance_id = native
+        .provenance
+        .iter()
+        .find(|proof| proof.document != call.document)
+        .unwrap()
+        .id
+        .clone();
     assert!(
-        format!("{error:#}").contains("native evidence differs from captured source or inputs"),
-        "{error:#}"
+        store
+            .publish_native(&graph, &capture, &native, &leader, pin, &cancel)
+            .is_err(),
+        "caller-supplied call accepted a proof belonging to another document"
     );
-    assert_eq!(fs::read(&path).unwrap(), before);
+    assert_eq!(store.index_baseline().unwrap(), pin);
     assert_eq!(store.status().unwrap().revision, pin);
+    assert_eq!(store.graph().unwrap(), prior_graph);
+    assert_eq!(
+        store.source_at("flow.js", Some(pin)).unwrap().unwrap(),
+        prior_source
+    );
 }
 
 #[test]
@@ -2935,90 +2984,108 @@ fn compatible_pending_debt_replays_after_verified_leader_restart_in_same_generat
 
 #[test]
 #[cfg(feature = "test-support")]
-fn schema16_index_recreates_exclusively_without_migration_and_preserves_queue() {
+fn schemas16_and19_recreate_exclusively_without_migration_and_preserve_queue() {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    let (state, root, prior, cancel) = fixture();
-    let queued = prior
-        .enqueue_request(&IndexOptions::new(root.path().to_owned()), None)
-        .unwrap();
-    let path = published_db(state.path(), root.path());
-    drop(prior);
-    fs::remove_file(&path).unwrap();
-    let identity =
-        trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+    for old_version in [16, 19] {
+        let (state, root, prior, cancel) = fixture();
+        let queued = prior
+            .enqueue_request(&IndexOptions::new(root.path().to_owned()), None)
             .unwrap();
-    let old_generation = uuid::Uuid::new_v4();
-    let db = Connection::open(&path).unwrap();
-    db.execute_batch(include_str!("fixtures/gc-legacy/v16-current.sql"))
+        let path = published_db(state.path(), root.path());
+        let old_generation = prior.index_baseline().unwrap().index_generation;
+        drop(prior);
+        if old_version == 16 {
+            fs::remove_file(&path).unwrap();
+            let identity = trellis::store::topology::WorkspaceIdentity::discover(
+                Some(root.path()),
+                root.path(),
+            )
+            .unwrap();
+            let db = Connection::open(&path).unwrap();
+            db.execute_batch(include_str!("fixtures/gc-legacy/v16-current.sql"))
+                .unwrap();
+            db.pragma_update(None, "user_version", 16).unwrap();
+            db.execute("INSERT INTO index_metadata VALUES(1,16,'native-v6-delta-v1',?1,?2,?3,?4,0,0,'','{}','[]',NULL)",
+                rusqlite::params![identity.root.to_str().unwrap(),identity.device.to_string(),identity.inode.to_string(),old_generation.to_string()]).unwrap();
+        } else {
+            // Exercise paired obsolete markers, not a historical schema19 layout.
+            let db = Connection::open(&path).unwrap();
+            db.execute_batch(
+                "PRAGMA ignore_check_constraints=ON; UPDATE index_metadata SET schema_version=19; PRAGMA user_version=19;",
+            )
+            .unwrap();
+        }
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let old_inode = fs::metadata(&path).unwrap().ino();
+        let old_bytes = fs::read(&path).unwrap();
+        let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().ino(), old_inode);
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            old_bytes,
+            "opening must defer obsolete-index replacement"
+        );
+        let error = store.status().unwrap_err();
+        assert!(
+            error.to_string().contains("recovery_required"),
+            "schema{old_version}: {error:#}"
+        );
+        let (pin, _owner) = trellis::index_coordinator::reconcile_workspace(
+            &store,
+            &IndexOptions::new(root.path().to_owned()),
+            &cancel,
+            |_| {},
+        )
         .unwrap();
-    db.pragma_update(None, "user_version", 16).unwrap();
-    db.execute("INSERT INTO index_metadata VALUES(1,16,'native-v6-delta-v1',?1,?2,?3,?4,0,0,'','{}','[]',NULL)",
-        rusqlite::params![identity.root.to_str().unwrap(),identity.device.to_string(),identity.inode.to_string(),old_generation.to_string()]).unwrap();
-    drop(db);
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-    let old_inode = fs::metadata(&path).unwrap().ino();
-    let old_bytes = fs::read(&path).unwrap();
-    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
-    assert_eq!(fs::metadata(&path).unwrap().ino(), old_inode);
-    assert_eq!(
-        fs::read(&path).unwrap(),
-        old_bytes,
-        "opening must defer obsolete-index replacement"
-    );
-    assert!(
-        store
-            .status()
-            .unwrap_err()
-            .to_string()
-            .contains("recovery_required")
-    );
-    let (pin, _owner) = trellis::index_coordinator::reconcile_workspace(
-        &store,
-        &IndexOptions::new(root.path().to_owned()),
-        &cancel,
-        |_| {},
-    )
-    .unwrap();
-    assert_ne!(pin.index_generation, old_generation);
-    assert_eq!(pin.index_revision, 1);
-    assert_ne!(
-        fs::metadata(&path).unwrap().ino(),
-        old_inode,
-        "disposable schema16 must recreate, never migrate"
-    );
-    assert_eq!(
-        store.request_by_id(&queued.id).unwrap().unwrap().seq,
-        queued.seq
-    );
-    assert_eq!(
-        store.request_by_id(&queued.id).unwrap().unwrap().state,
-        "queued"
-    );
-    let rebuilt = Connection::open(&path).unwrap();
-    assert_eq!(
-        rebuilt
-            .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
-            .unwrap(),
-        22
-    );
-    for table in [
-        "native_version_references",
-        "native_version_capability_families",
-        "native_version_capability_gaps",
-    ] {
+        assert_ne!(pin.index_generation, old_generation);
+        assert_eq!(pin.index_revision, 1);
+        assert_ne!(
+            fs::metadata(&path).unwrap().ino(),
+            old_inode,
+            "disposable schema{old_version} must recreate, never migrate"
+        );
+        assert_eq!(
+            store.request_by_id(&queued.id).unwrap().unwrap().seq,
+            queued.seq
+        );
+        assert_eq!(
+            store.request_by_id(&queued.id).unwrap().unwrap().state,
+            "queued"
+        );
+        let rebuilt = Connection::open(&path).unwrap();
         assert_eq!(
             rebuilt
-                .query_row(
-                    "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
-                    [table],
-                    |r| r.get::<_, i64>(0)
-                )
+                .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
                 .unwrap(),
-            1
+            22
         );
+        assert_eq!(
+            rebuilt
+                .query_row("SELECT schema_version FROM index_metadata", [], |row| row
+                    .get::<_, i64>(
+                    0
+                ))
+                .unwrap(),
+            22
+        );
+        for table in [
+            "native_version_references",
+            "native_version_capability_families",
+            "native_version_capability_gaps",
+        ] {
+            assert_eq!(
+                rebuilt
+                    .query_row(
+                        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                        [table],
+                        |r| r.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                1
+            );
+        }
     }
 }
-
 #[test]
 #[cfg(feature = "test-support")]
 fn newer_disposable_schema_is_refused_without_rebuild_or_deletion() {
@@ -4295,6 +4362,188 @@ fn native_reference_and_gap_rows_survive_stream_reuse_and_retained_pins() {
     let reopened = Store::open_for_tests(state.path(), root.path()).unwrap();
     assert_retained_native_family_parity(&reopened, first, &first_native);
     assert_retained_native_family_parity(&reopened, second, &second_native);
+}
+
+#[test]
+#[cfg(feature = "test-support")]
+fn reference_lookup_overrides_roundtrip_after_reopen() {
+    let (state, root, store, cancel) = fixture();
+    for (path, source) in [
+        (
+            "flow.rs",
+            "fn main() { let r#type = 1; let e\u{301} = r#type; }\n",
+        ),
+        ("flow.py", "def go():\n    Ａ = 1\n    return Ａ\n"),
+        (
+            "flow.js",
+            "function first() { let \\u0061 = 1; return a(); } function second() { return first; }\n",
+        ),
+    ] {
+        fs::write(root.path().join(path), source).unwrap();
+    }
+    let options = IndexOptions::new(root.path().to_owned());
+    let (_, measured, _) =
+        index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+    let (pin, owner) =
+        trellis::index_coordinator::reconcile_workspace(&store, &options, &cancel, |_| {}).unwrap();
+    assert_retained_native_family_parity(&store, pin, &measured);
+    let db = Connection::open(published_db(state.path(), root.path())).unwrap();
+    let mut overrides = 0;
+    let mut equal = 0;
+    for reference in &measured.references {
+        let stored: Option<String> = db
+            .query_row(
+                "SELECT lookup_key FROM native_version_references WHERE vid=?1 AND owner_syntax_id=?2 AND ordinal=?3",
+                rusqlite::params![
+                    live_document_version(&db, &reference.document.path),
+                    hex::decode(reference.owner_syntax_id.strip_prefix("sid:v1:").unwrap()).unwrap(),
+                    reference.ordinal as i64
+                ],
+                |row| row.get(0),
+            )
+            .unwrap();
+        if reference.spelling == reference.lookup_key {
+            equal += 1;
+            assert_eq!(stored, None);
+        } else {
+            overrides += 1;
+            assert_eq!(stored.as_deref(), Some(reference.lookup_key.as_str()));
+        }
+    }
+    assert!(equal > 0 && overrides > 0);
+    for language in ["rust", "python", "javascript"] {
+        assert!(
+            measured.references.iter().any(|reference| {
+                reference.document.language == language
+                    && reference.spelling != reference.lookup_key
+            }),
+            "missing normalized reference for {language}"
+        );
+    }
+    drop(db);
+    drop(owner);
+    drop(store);
+    let reopened = Store::open_for_tests(state.path(), root.path()).unwrap();
+    assert_retained_native_family_parity(&reopened, pin, &measured);
+}
+
+#[test]
+#[cfg(feature = "test-support")]
+fn duplicate_reference_artifact_does_not_publish() {
+    let (_state, root, store, cancel) = fixture();
+    let leader = store.publication_for_tests().unwrap();
+    let pin = publish(
+        &store,
+        root.path(),
+        &cancel,
+        store.index_baseline().unwrap(),
+        &leader,
+    )
+    .unwrap();
+    let graph_before = store.graph_at(Some(pin)).unwrap();
+    let (graph, mut native, capture) = index_workspace_bundle(
+        &IndexOptions::new(root.path().to_owned()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    native.references.push(native.references[0].clone());
+    assert!(
+        store
+            .publish_native(&graph, &capture, &native, &leader, pin, &cancel)
+            .is_err()
+    );
+    assert_eq!(store.status().unwrap().revision, pin);
+    assert_eq!(store.graph_at(Some(pin)).unwrap(), graph_before);
+}
+
+#[test]
+#[cfg(feature = "test-support")]
+fn reference_release_resumes_after_primary_key_batch_and_reopen() {
+    let (state, root, store, cancel) = fixture();
+    let source = format!("function many() {{ {} }}\n", "value;".repeat(300));
+    fs::write(root.path().join("flow.js"), source).unwrap();
+    store.set_retention_clock_for_tests(1_000, 0);
+    let leader = store.publication_for_tests().unwrap();
+    let old = publish(
+        &store,
+        root.path(),
+        &cancel,
+        store.index_baseline().unwrap(),
+        &leader,
+    )
+    .unwrap();
+    let path = published_db(state.path(), root.path());
+    let db = Connection::open(&path).unwrap();
+    let retired = live_document_version(&db, "flow.js");
+    let shared = live_document_version(&db, "flow.java");
+    let count = |db: &Connection, vid: i64| -> i64 {
+        db.query_row(
+            "SELECT count(*) FROM native_version_references WHERE vid=?1",
+            [vid],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    let original = count(&db, retired);
+    let shared_count = count(&db, shared);
+    assert!(original > 256);
+    drop(db);
+    fs::write(
+        root.path().join("flow.js"),
+        "function current() { newest(); }\n",
+    )
+    .unwrap();
+    store.set_retention_clock_for_tests(1_001, 1);
+    let head = publish(&store, root.path(), &cancel, old, &leader).unwrap();
+    store.set_retention_clock_for_tests(1_901, 901);
+    let db = Connection::open(&path).unwrap();
+    for _ in 0..16 {
+        assert!(store.maintain_one_revision_step_for_tests(&leader).unwrap());
+        if count(&db, retired) < original {
+            break;
+        }
+    }
+    assert_eq!(count(&db, retired), original - 256);
+    assert_eq!(count(&db, shared), shared_count);
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| r
+            .get::<_, i64>(
+            0
+        ))
+        .unwrap(),
+        0
+    );
+    assert!(store.graph_at(Some(head)).is_ok());
+    drop(db);
+    drop(leader);
+    drop(store);
+    let reopened = Store::open_for_tests(state.path(), root.path()).unwrap();
+    reopened.set_retention_clock_for_tests(1_901, 0);
+    let leader = reopened.publication_for_tests().unwrap();
+    let next = publish(&reopened, root.path(), &cancel, head, &leader).unwrap();
+    reopened.maintain_revisions(&leader).unwrap();
+    let db = Connection::open(&path).unwrap();
+    assert_eq!(count(&db, retired), 0);
+    assert_eq!(count(&db, shared), shared_count);
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| r
+            .get::<_, i64>(
+            0
+        ))
+        .unwrap(),
+        0
+    );
+    assert!(reopened.graph_at(Some(next)).is_ok());
+    assert!(reopened.graph_at(Some(head)).is_ok());
+    assert!(
+        reopened
+            .graph_at(Some(old))
+            .unwrap_err()
+            .downcast_ref::<trellis::store::PinExpired>()
+            .is_some()
+    );
 }
 
 #[test]

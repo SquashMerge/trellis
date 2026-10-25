@@ -127,275 +127,79 @@ local+peer_value+revision+f0()
 pub fn f21(revision:i32)->i32{
 let local=f0();let peer_value=peer0();
 if revision>local{return peer_value+f0()+peer0();}
-if revision&1==0{return local+peer_value+f0()+peer0();}
 local+peer_value+revision+f0()
 }
 pub fn f22(revision:i32)->i32{
 let local=f0();let peer_value=peer0();
 if revision>local{return peer_value+f0()+peer0();}
-if revision&1==0{return local+peer_value+f0()+peer0();}
 local+peer_value+revision+f0()
 }
 pub fn f23(revision:i32)->i32{
 let local=f0();let peer_value=peer0();
 if revision>local{return peer_value+f0()+peer0();}
-if revision&1==0{return local+peer_value+f0()+peer0();}
 local+peer_value+revision+f0()
 }
 pub fn f24(revision:i32)->i32{
 let local=f0();let peer_value=peer0();
 if revision>local{return peer_value+f0()+peer0();}
-if revision&1==0{return local+peer_value+f0()+peer0();}
 local+peer_value+revision+f0()
 }
 pub fn f25(revision:i32)->i32{
 let local=f0();let peer_value=peer0();
 if revision>local{return peer_value+f0()+peer0();}
-if revision&1==0{return local+peer_value+f0()+peer0();}
 local+peer_value+revision+f0()
 }
 pub fn f26(revision:i32)->i32{
 let local=f0();let peer_value=peer0();
 if revision>local{return peer_value+f0()+peer0();}
-if revision&1==0{return local+peer_value+f0()+peer0();}
 local+peer_value+revision+f0()
 }
 pub fn f27(revision:i32)->i32{
 let local=f0();let peer_value=peer0();
 if revision>local{return peer_value+f0()+peer0();}
-if revision&1==0{return local+peer_value+f0()+peer0();}
 local+peer_value+revision+f0()
 }
 pub fn f28(revision:i32)->i32{
 let local=f0();let peer_value=peer0();
 if revision>local{return peer_value+f0()+peer0();}
-if revision&1==0{return local+peer_value+f0()+peer0();}
 local+peer_value+revision+f0()
 }
 pub fn f29(revision:i32)->i32{
 let local=f0();let peer_value=peer0();
 if revision>local{return peer_value+f0()+peer0();}
-if revision&1==0{return local+peer_value+f0()+peer0();}
 local+peer_value+revision+f0()
 }
 pub fn f30(revision:i32)->i32{
 let local=f0();let peer_value=peer0();
 if revision>local{return peer_value+f0()+peer0();}
-if revision&1==0{return local+peer_value+f0()+peer0();}
 local+peer_value+revision+f0()
 }
 pub fn f31(revision:i32)->i32{
 let local=f0();let peer_value=peer0();
 if revision>local{return peer_value+f0()+peer0();}
-if revision&1==0{return local+peer_value+f0()+peer0();}
 local+peer_value+revision+f0()
 }
 pub fn f32(revision:i32)->i32{
 let local=f0();let peer_value=peer0();
 if revision>local{return peer_value+f0()+peer0();}
-if revision&1==0{return local+peer_value+f0()+peer0();}
 local+peer_value+revision+f0()
 }
 pub fn f33(revision:i32)->i32{
 let local=f0();let peer_value=peer0();
 if revision>local{return peer_value+f0()+peer0();}
-if revision&1==0{return local+peer_value+f0()+peer0();}
 local+peer_value+revision+f0()
 }
 pub fn f34(revision:i32)->i32{
 let local=f0();let peer_value=peer0();
 if revision>local{return peer_value+f0()+peer0();}
-if revision&1==0{return local+peer_value+f0()+peer0();}
 local+peer_value+revision+f0()
 }
 pub fn f35(revision:i32)->i32{
 let local=f0();let peer_value=peer0();
 if revision>local{return peer_value+f0()+peer0();}
-if revision&1==0{return local+peer_value+f0()+peer0();}
 local+peer_value+revision+f0()
 }
 pub fn f36(revision:i32)->i32{
-let local=f0();let peer_value=peer0();
-if revision>local{return peer_value+f0()+peer0();}
-if revision&1==0{return local+peer_value+f0()+peer0();}
-local+peer_value+revision+f0()
-}
-pub fn f37(revision:i32)->i32{
-let local=f0();let peer_value=peer0();
-if revision>local{return peer_value+f0()+peer0();}
-if revision&1==0{return local+peer_value+f0()+peer0();}
-local+peer_value+revision+f0()
-}
-pub fn f38(revision:i32)->i32{
-let local=f0();let peer_value=peer0();
-if revision>local{return peer_value+f0()+peer0();}
-if revision&1==0{return local+peer_value+f0()+peer0();}
-local+peer_value+revision+f0()
-}
-pub fn f39(revision:i32)->i32{
-let local=f0();let peer_value=peer0();
-if revision>local{return peer_value+f0()+peer0();}
-if revision&1==0{return local+peer_value+f0()+peer0();}
-local+peer_value+revision+f0()
-}
-pub fn f40(revision:i32)->i32{
-let local=f0();let peer_value=peer0();
-if revision>local{return peer_value+f0()+peer0();}
-if revision&1==0{return local+peer_value+f0()+peer0();}
-local+peer_value+revision+f0()
-}
-pub fn f41(revision:i32)->i32{
-let local=f0();let peer_value=peer0();
-if revision>local{return peer_value+f0()+peer0();}
-if revision&1==0{return local+peer_value+f0()+peer0();}
-local+peer_value+revision+f0()
-}
-pub fn f42(revision:i32)->i32{
-let local=f0();let peer_value=peer0();
-if revision>local{return peer_value+f0()+peer0();}
-local+peer_value+revision+f0()
-}
-pub fn f43(revision:i32)->i32{
-let local=f0();let peer_value=peer0();
-if revision>local{return peer_value+f0()+peer0();}
-local+peer_value+revision+f0()
-}
-pub fn f44(revision:i32)->i32{
-let local=f0();let peer_value=peer0();
-if revision>local{return peer_value+f0()+peer0();}
-local+peer_value+revision+f0()
-}
-pub fn f45(revision:i32)->i32{
-let local=f0();let peer_value=peer0();
-if revision>local{return peer_value+f0()+peer0();}
-local+peer_value+revision+f0()
-}
-pub fn f46(revision:i32)->i32{
-let local=f0();let peer_value=peer0();
-if revision>local{return peer_value+f0()+peer0();}
-local+peer_value+revision+f0()
-}
-pub fn f47(revision:i32)->i32{
-let local=f0();let peer_value=peer0();
-if revision>local{return peer_value+f0()+peer0();}
-local+peer_value+revision+f0()
-}
-pub fn f48(revision:i32)->i32{
-let local=f0();let peer_value=peer0();
-if revision>local{return peer_value+f0()+peer0();}
-local+peer_value+revision+f0()
-}
-pub fn f49(revision:i32)->i32{
-let local=f0();let peer_value=peer0();
-if revision>local{return peer_value+f0()+peer0();}
-local+peer_value+revision+f0()
-}
-pub fn f50(revision:i32)->i32{
-let local=f0();let peer_value=peer0();
-if revision>local{return peer_value+f0()+peer0();}
-local+peer_value+revision+f0()
-}
-pub fn f51(revision:i32)->i32{
-let local=f0();let peer_value=peer0();
-if revision>local{return peer_value+f0()+peer0();}
-local+peer_value+revision+f0()
-}
-pub fn f52(revision:i32)->i32{
-let local=f0();let peer_value=peer0();
-if revision>local{return peer_value+f0()+peer0();}
-local+peer_value+revision+f0()
-}
-pub fn f53(revision:i32)->i32{
-let local=f0();let peer_value=peer0();
-if revision>local{return peer_value+f0()+peer0();}
-local+peer_value+revision+f0()
-}
-pub fn f54(revision:i32)->i32{
-let local=f0();let peer_value=peer0();
-if revision>local{return peer_value+f0()+peer0();}
-local+peer_value+revision+f0()
-}
-pub fn f55(revision:i32)->i32{
-let local=f0();let peer_value=peer0();
-if revision>local{return peer_value+f0()+peer0();}
-local+peer_value+revision+f0()
-}
-pub fn f56(revision:i32)->i32{
-let local=f0();let peer_value=peer0();
-if revision>local{return peer_value+f0()+peer0();}
-local+peer_value+revision+f0()
-}
-pub fn f57(revision:i32)->i32{
-let local=f0();let peer_value=peer0();
-if revision>local{return peer_value+f0()+peer0();}
-local+peer_value+revision+f0()
-}
-pub fn f58(revision:i32)->i32{
-let local=f0();let peer_value=peer0();
-if revision>local{return peer_value+f0()+peer0();}
-local+peer_value+revision+f0()
-}
-pub fn f59(revision:i32)->i32{
-let local=f0();let peer_value=peer0();
-if revision>local{return peer_value+f0()+peer0();}
-local+peer_value+revision+f0()
-}
-pub fn f60(revision:i32)->i32{
-let local=f0();let peer_value=peer0();
-if revision>local{return peer_value+f0()+peer0();}
-local+peer_value+revision+f0()
-}
-pub fn f61(revision:i32)->i32{
-let local=f0();let peer_value=peer0();
-if revision>local{return peer_value+f0()+peer0();}
-local+peer_value+revision+f0()
-}
-pub fn f62(revision:i32)->i32{
-let local=f0();let peer_value=peer0();
-if revision>local{return peer_value+f0()+peer0();}
-local+peer_value+revision+f0()
-}
-pub fn f63(revision:i32)->i32{
-let local=f0();let peer_value=peer0();
-if revision>local{return peer_value+f0()+peer0();}
-local+peer_value+revision+f0()
-}
-pub fn f64(revision:i32)->i32{
-let local=f0();let peer_value=peer0();
-if revision>local{return peer_value+f0()+peer0();}
-local+peer_value+revision+f0()
-}
-pub fn f65(revision:i32)->i32{
-let local=f0();let peer_value=peer0();
-if revision>local{return peer_value+f0()+peer0();}
-local+peer_value+revision+f0()
-}
-pub fn f66(revision:i32)->i32{
-let local=f0();let peer_value=peer0();
-if revision>local{return peer_value+f0()+peer0();}
-local+peer_value+revision+f0()
-}
-pub fn f67(revision:i32)->i32{
-let local=f0();let peer_value=peer0();
-if revision>local{return peer_value+f0()+peer0();}
-local+peer_value+revision+f0()
-}
-pub fn f68(revision:i32)->i32{
-let local=f0();let peer_value=peer0();
-if revision>local{return peer_value+f0()+peer0();}
-local+peer_value+revision+f0()
-}
-pub fn f69(revision:i32)->i32{
-let local=f0();let peer_value=peer0();
-if revision>local{return peer_value+f0()+peer0();}
-local+peer_value+revision+f0()
-}
-pub fn f70(revision:i32)->i32{
-let local=f0();let peer_value=peer0();
-if revision>local{return peer_value+f0()+peer0();}
-local+peer_value+revision+f0()
-}
-pub fn f71(revision:i32)->i32{
 let local=f0();let peer_value=peer0();
 if revision>local{return peer_value+f0()+peer0();}
 local+peer_value+revision+f0()

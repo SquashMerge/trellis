@@ -2592,7 +2592,7 @@ mod gc_schema_race_tests {
     }
 
     #[test]
-    fn exact_v17_gc_candidate_survives_unknown_busy_then_deletes_after_fences_clear() {
+    fn exact_v20_gc_candidate_survives_unknown_busy_then_deletes_after_fences_clear() {
         let state = tempfile::tempdir().unwrap();
         let candidate_root = tempfile::tempdir().unwrap();
         let current_root = tempfile::tempdir().unwrap();
@@ -2706,7 +2706,7 @@ mod gc_schema_race_tests {
         assert_eq!(
             inspect_index(&dir, &identity.root_key, now).unwrap(),
             ("unknown", "recent_open"),
-            "genuine current-v17 cache must pass GC admission"
+            "genuine current-v20 cache must pass GC admission"
         );
 
         let attacker = rusqlite::Connection::open(&path).unwrap();

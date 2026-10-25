@@ -516,6 +516,32 @@ fn admitted_case_with_calls(
 }
 
 #[test]
+fn same_target_reference_roles_union_only_validated_claim_roles() {
+    let source = "function useIt(){ value; }\n";
+    let start = source.find("value").unwrap();
+    let (_root, native, sources, inventory) = admitted_case(
+        "javascript",
+        source,
+        vec![
+            (start, start + 5, "external pkg value.", 0),
+            (start, start + 5, "external pkg value.", 4),
+            // An import flag at a non-import site must not add the Import role.
+            (start, start + 5, "external pkg value.", 2),
+        ],
+        vec![],
+    );
+    let joined = join_inventory(&inventory, &native, &sources, 2).unwrap();
+    assert_eq!(joined.references.len(), 1);
+    let reference = &joined.references[0];
+    assert_eq!(
+        reference.roles,
+        vec![semantic::Role::Read, semantic::Role::Write]
+    );
+    assert_eq!(reference.resolution, semantic::Resolution::External);
+    assert!(reference.candidates.is_empty());
+}
+
+#[test]
 fn four_real_admitted_languages_measure_all_anchor_families() {
     for (language, source, name) in [
         ("java", "class A { void f() { f(); } }", "f"),

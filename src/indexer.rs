@@ -5,7 +5,7 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::atomic::Ordering,
 };
@@ -514,11 +514,9 @@ pub(crate) fn measure_persisted_change(
     previous_options: &ReconcileOptions,
     previous_inputs: &BTreeMap<String, crate::capture::CaptureInputObservation>,
     current: &Capture,
-) -> Result<CapturedChange> {
+) -> Result<Option<BTreeSet<String>>> {
     if previous_options != current.reconcile_options() {
-        return Ok(CapturedChange::FullNative {
-            reason: "capture admission changed",
-        });
+        return Ok(None);
     }
     let current_inputs = current.persisted_inputs()?;
     let native_inputs = |inputs: &BTreeMap<String, crate::capture::CaptureInputObservation>| {
@@ -534,44 +532,20 @@ pub(crate) fn measure_persisted_change(
             .collect::<BTreeMap<_, _>>()
     };
     if native_inputs(previous_inputs) != native_inputs(&current_inputs) {
-        return Ok(CapturedChange::FullNative {
-            reason: "captured native input changed",
-        });
+        return Ok(None);
     }
     let before: BTreeMap<_, _> = previous.iter().map(|f| (f.path.as_str(), f)).collect();
     let after: BTreeMap<_, _> = current.files.iter().map(|f| (f.path.as_str(), f)).collect();
-    if before.keys().ne(after.keys()) {
-        return Ok(CapturedChange::FullNative {
-            reason: "source inventory changed (add/delete/rename)",
-        });
-    }
-    let mut changed = None;
-    for (path, old) in before {
-        let new = after[path];
-        if old.language != new.language {
-            return Ok(CapturedChange::FullNative {
-                reason: "source language changed",
-            });
-        }
-        if old.hash == new.hash {
-            continue;
-        }
-        if changed.is_some() {
-            return Ok(CapturedChange::FullNative {
-                reason: "multiple source documents changed",
-            });
-        }
-        changed = Some((path, old, new));
-    }
-    Ok(match changed {
-        None => CapturedChange::Unchanged,
-        Some((path, old, new)) if proved_body_only(old, new) => CapturedChange::DocumentLocal {
-            path: path.to_owned(),
-        },
-        Some(_) => CapturedChange::FullNative {
-            reason: "cross-file effect not proved local",
-        },
-    })
+    let changed = before
+        .keys()
+        .chain(after.keys())
+        .filter(|path| match (before.get(**path), after.get(**path)) {
+            (Some(old), Some(new)) => old.language != new.language || old.hash != new.hash,
+            _ => true,
+        })
+        .map(|path| (*path).to_owned())
+        .collect();
+    Ok(Some(changed))
 }
 
 /// A diagnostic selected-document measurement for two caller-supplied captures.
@@ -755,7 +729,25 @@ pub(crate) fn project_native_document(
             && native.coverage[0].document_path == path,
         "selected native projection contains another document"
     );
-    project_native_selected(options, capture, native, cancel, progress, Some(path))
+    project_native_selected(
+        options,
+        capture,
+        native,
+        cancel,
+        progress,
+        Some(&BTreeSet::from([path.to_owned()])),
+    )
+}
+
+pub(crate) fn project_native_documents(
+    options: &IndexOptions,
+    capture: &Capture,
+    native: &native_evidence::Artifact,
+    paths: &BTreeSet<String>,
+    cancel: &CancelFlag,
+    progress: &impl Fn(IndexProgress),
+) -> Result<Graph> {
+    project_native_selected(options, capture, native, cancel, progress, Some(paths))
 }
 
 /// Borrowed facts for exactly one document. Group the writer's full artifact by
@@ -898,7 +890,7 @@ fn project_native_selected(
     native: &native_evidence::Artifact,
     cancel: &CancelFlag,
     progress: &impl Fn(IndexProgress),
-    selected: Option<&str>,
+    selected: Option<&BTreeSet<String>>,
 ) -> Result<Graph> {
     ensure!(!cancel.load(Ordering::Relaxed), "indexing cancelled");
     if selected.is_none() {
@@ -907,11 +899,11 @@ fn project_native_selected(
     let selected_files: Vec<_> = capture
         .files
         .iter()
-        .filter(|f| selected.is_none_or(|path| f.path == path))
+        .filter(|f| selected.is_none_or(|paths| paths.contains(&f.path)))
         .cloned()
         .collect();
     ensure!(
-        selected.is_none() || selected_files.len() == 1,
+        selected.is_none_or(|paths| selected_files.len() == paths.len()),
         "selected graph source is missing or ambiguous"
     );
     let mut graph = Graph {
@@ -1422,7 +1414,7 @@ mod local_classification_tests {
                 "{:x}",
                 Sha256::digest(fs::read(corpus.join("manifest.json")).unwrap())
             ),
-            "03faaaa04c61ba7c18051e12386201898cd31625758c36a0202ff8da65da8882"
+            "ab4a058fac22dd9f324a476990755a3af07ab32f977f32c977d6eeea79627259"
         );
         let mut paths = 0;
         for size in ["medium", "large"] {

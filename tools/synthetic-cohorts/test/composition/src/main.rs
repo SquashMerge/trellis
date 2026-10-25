@@ -366,12 +366,20 @@ fn inspect(root: &Path, rel: &str) -> Fact {
             bytes: bytes.len(),
         };
     }
+    let (minimum_bodies, maximum_bodies, maximum_java_methods) = if size == "large" {
+        (38, 40, 40)
+    } else {
+        (MIN_BODIES, MAX_BODIES, 72)
+    };
     assert!(
-        (MIN_BODIES..=MAX_BODIES).contains(&bodies.len()),
+        (minimum_bodies..=maximum_bodies).contains(&bodies.len()),
         "{rel}: callable bodies {}",
         bodies.len()
     );
-    assert!(methods <= 72, "{rel}: Java method signatures {methods}");
+    assert!(
+        methods <= maximum_java_methods,
+        "{rel}: Java method signatures {methods}"
+    );
     assert_eq!(imports.len(), 2, "{rel}: exact two AST peer imports");
     assert_ne!(imports[0].path, imports[1].path, "{rel}: distinct peers");
     assert!(

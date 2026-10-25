@@ -409,10 +409,19 @@ fn position_walk_hook(flag: &CancelFlag) {
         }
     });
 }
+#[cfg(test)]
+thread_local! { static POSITION_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+#[cfg(test)]
+pub(crate) fn take_position_work() -> usize {
+    POSITION_WORK.with(|work| work.replace(0))
+}
 fn next_newline(bytes: &[u8], flag: &CancelFlag) -> Result<Option<usize>, ScipCaptureError> {
     for (chunk_index, chunk) in bytes.chunks(65536).enumerate() {
         cancelled(flag)?;
-        if let Some(at) = chunk.iter().position(|b| *b == b'\n') {
+        let newline = chunk.iter().position(|b| *b == b'\n');
+        #[cfg(test)]
+        POSITION_WORK.with(|work| work.set(work.get() + newline.map_or(chunk.len(), |at| at + 1)));
+        if let Some(at) = newline {
             return Ok(Some(chunk_index * 65536 + at));
         }
     }
@@ -472,6 +481,8 @@ pub(crate) fn source_byte_offsets(
                 .next()
                 .ok_or_else(|| invalid("range column outside source"))?;
             steps += 1;
+            #[cfg(test)]
+            POSITION_WORK.with(|work| work.set(work.get() + c.len_utf8()));
             if steps.is_multiple_of(1024) {
                 #[cfg(test)]
                 position_walk_hook(flag);

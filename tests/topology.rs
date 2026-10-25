@@ -1906,7 +1906,7 @@ fn gc_classifies_current_schema22_but_refuses_spoofed_shapes() {
     db.execute_batch("DROP TRIGGER unapproved_trigger").unwrap();
     assert_eq!(inspect(), ("unknown", "recent_open"));
     // Any earlier schema is collectable whatever its layout, root or age (#253).
-    for version in [1, 7, 9, 13, 14, 15] {
+    for version in [1, 7, 9, 13, 14, 15, 17, 18, 19, 20] {
         db.pragma_update(None, "user_version", version).unwrap();
         assert_eq!(inspect(), ("eligible", "old_schema"), "v{version}");
     }

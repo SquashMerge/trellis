@@ -1115,7 +1115,7 @@ fn pin_taken_before_noop_request_still_reads_and_cas_holds() {
 }
 
 #[test]
-fn changed_claimed_source_uses_native_fallback_not_unchanged() {
+fn changed_claimed_source_uses_local_publication_not_unchanged() {
     use std::sync::{Arc, Mutex, atomic::AtomicBool};
     use trellis::index_coordinator::{drain_requests_observed, reconcile_workspace};
     let state = tempfile::tempdir().unwrap();
@@ -1139,8 +1139,8 @@ fn changed_claimed_source_uses_native_fallback_not_unchanged() {
     );
     assert_eq!(
         modes.into_inner().unwrap(),
-        vec!["mode:full"],
-        "declaration change is not #67 local"
+        vec!["mode:local"],
+        "#225 declaration changes publish locally, not as unchanged work"
     );
     assert_eq!(
         store.request_by_id(&request.id).unwrap().unwrap().state,
@@ -1163,8 +1163,8 @@ fn claimed_unchanged_guard_failure_never_acks_or_changes_selected_pair() {
     let db =
         rusqlite::Connection::open(store.request_db_path().with_file_name("index.db")).unwrap();
     db.execute(
-        "UPDATE document_versions SET source_bytes=?1 WHERE path='a.js'",
-        [b"function b() {}\n".as_slice()],
+        "UPDATE document_versions SET extraction_context=printf('%064d',0) WHERE path='a.js'",
+        [],
     )
     .unwrap();
     drop(db);

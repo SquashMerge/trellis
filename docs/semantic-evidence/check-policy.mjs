@@ -218,7 +218,10 @@ const EXPECTED = {
   "synthetic": {
     "small": {"files": 100, "sourceBytes": 1677722, "minimumNormalizedFacts": 5000, "factsScope": "perLanguage"},
     "medium": {"files": 1000, "sourceMiB": 16, "minimumNormalizedFacts": 50000, "factsScope": "perLanguage"},
-    "large": {"files": 10000, "sourceMiB": 128, "minimumNormalizedFacts": 500000, "factsScope": "overall"},
+    "large": {"files": 10000, "sourceMiB": 128, "minimumNormalizedFacts": 500000, "factsScope": "overall",
+      "minimumGraphSymbolsPerFile": 115,
+      "maximumGraphSymbolsPerFile": 120
+    },
     "atCap": {"files": 100000, "sourceMiB": 256, "purpose": "boundedFailureSafetyLimits", "sloApplies": false},
     "minimumComposition": {
       "minimumCallableBodiesPerOrdinaryFile": 64,
@@ -246,8 +249,13 @@ const EXPECTED = {
         "medium": 5,
         "large": 40
       },
-      "maximumLargeIndexedDeclarationNodes": 900000,
-      "maximumClassDetailRecordsAtLargestIndexScope": 225000
+      "maximumLargeIndexedDeclarationNodes": 1200000,
+      "maximumClassDetailRecordsAtLargestIndexScope": 225000,
+      "largeOrdinaryFileOverrides": {
+        "minimumCallableBodiesPerOrdinaryFile": 38,
+        "maximumCallableBodiesPerOrdinaryFile": 40,
+        "maximumJavaMethodsPerFile": 40
+      }
     }
   }
 },

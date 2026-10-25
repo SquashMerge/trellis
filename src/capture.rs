@@ -795,14 +795,14 @@ impl Capture {
         capture.verify(cancel)?;
         Ok(capture)
     }
-    /// Confirm that the complete captured walk and selected inputs belong to
-    /// these effective watcher options and this accepted request root.
+    /// Match an already verified capture to the watcher options and request root.
+    /// The coordinator supplies its fresh admission or verified publication capture;
+    /// this identity check must not repeat the capture's full inventory verification.
     pub(crate) fn covers_watcher_request(
         &self,
         options: &IndexOptions,
         root_device: &str,
         root_inode: &str,
-        cancel: &CancelFlag,
     ) -> bool {
         #[cfg(unix)]
         if self.root_stamp.dev.to_string() != root_device
@@ -815,7 +815,6 @@ impl Capture {
         (self.admission_root == options.workspace_root
             || std::fs::canonicalize(&options.workspace_root).ok() == Some(self.root.clone()))
             && self.reconcile_options == crate::indexer::ReconcileOptions::from(options)
-            && self.verify(cancel).is_ok()
     }
 
     /// A capture may feed exactly one graph projection. Cross-link validation is not projection.
@@ -1095,6 +1094,40 @@ impl Capture {
 mod tests {
     use super::*;
     use std::sync::{Arc, atomic::AtomicBool};
+
+    #[test]
+    fn verified_capture_matches_only_its_watcher_options_and_request_root() {
+        let workspace = tempfile::tempdir().unwrap();
+        let exe = tempfile::tempdir().unwrap();
+        let binary = exe.path().join("extractor");
+        fs::write(&binary, b"binary").unwrap();
+        fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
+        let options = IndexOptions::new(workspace.path().to_owned());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let capture = Capture::admit_with_executable(&options, &cancel, &|_| {}, binary).unwrap();
+        #[cfg(unix)]
+        let (device, inode) = (
+            capture.root_stamp.dev.to_string(),
+            capture.root_stamp.ino.to_string(),
+        );
+        #[cfg(not(unix))]
+        let (device, inode) = (String::new(), String::new());
+
+        assert!(capture.covers_watcher_request(&options, &device, &inode));
+        let mut different = options.clone();
+        different.max_file_bytes /= 2;
+        assert!(!capture.covers_watcher_request(&different, &device, &inode));
+        let other_root = tempfile::tempdir().unwrap();
+        different = options.clone();
+        different.workspace_root = other_root.path().to_owned();
+        assert!(!capture.covers_watcher_request(&different, &device, &inode));
+        #[cfg(unix)]
+        {
+            assert!(!capture.covers_watcher_request(&options, "different", &inode));
+            assert!(!capture.covers_watcher_request(&options, &device, "different"));
+        }
+    }
+
     #[test]
     fn input_inventory_drift_is_typed_without_source_inventory_change() {
         let workspace = tempfile::tempdir().unwrap();

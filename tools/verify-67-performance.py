@@ -20,7 +20,7 @@ import tempfile
 import time
 
 REPO = Path(__file__).resolve().parents[1]
-PINNED = REPO / "tools/synthetic-cohorts/manifest-v1.json"
+PINNED = REPO / "tools/synthetic-cohorts/manifest-v2.json"
 GENERATOR = REPO / "tools/synthetic-cohorts/generate.mjs"
 TARGET_DIR = Path(os.environ.get("CARGO_TARGET_DIR", REPO / "target"))
 if not TARGET_DIR.is_absolute():
@@ -205,7 +205,7 @@ def main():
     require(model == "Mac17,16", f"wrong reference host: {model}")
     pinned = PINNED.read_bytes()
     parsed = json.loads(pinned)
-    require(parsed["version"] == 1 and parsed["seed"] == "trellis-synthetic-cohorts-v1", "unknown manifest")
+    require(parsed["version"] == 2 and parsed["seed"] == "trellis-synthetic-cohorts-v1", "unknown manifest")
     command(["cargo", "build", "--locked", "--release"])
     with tempfile.TemporaryDirectory(prefix="trellis-67-reference-") as scratch:
         scratch = Path(scratch)

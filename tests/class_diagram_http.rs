@@ -359,7 +359,7 @@ fn selected_class_pages_medium_release_latency() {
         std::fs::read(canonical.join("manifest.json")).unwrap(),
         std::fs::read(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("tools/synthetic-cohorts/manifest-v1.json")
+                .join("tools/synthetic-cohorts/manifest-v2.json")
         )
         .unwrap()
     );
