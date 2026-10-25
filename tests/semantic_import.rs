@@ -1817,23 +1817,23 @@ fn type_role_marks_field_type_not_value_with_same_symbol() {
         ],
     );
     let output = join_inventory(&inventory, &native, &sources, 2).unwrap();
+    for at in [base, field] {
+        let reference = output
+            .references
+            .iter()
+            .find(|r| r.range.start == at)
+            .expect("measured Java type reference");
+        assert_eq!(
+            reference.roles,
+            vec![semantic::Role::Type],
+            "Java type-only site {at}"
+        );
+    }
     assert!(
         output
             .references
             .iter()
-            .any(|r| r.range.start == base && r.roles.contains(&semantic::Role::Type))
-    );
-    assert!(
-        output
-            .references
-            .iter()
-            .any(|r| r.range.start == field && r.roles.contains(&semantic::Role::Type))
-    );
-    assert!(
-        output
-            .references
-            .iter()
-            .any(|r| r.range.start == value && !r.roles.contains(&semantic::Role::Type))
+            .any(|r| r.range.start == value && r.roles == vec![semantic::Role::Read])
     );
 }
 
@@ -1998,9 +1998,72 @@ fn annotation_and_explicit_type_contexts_are_not_heritage_only() {
             output
                 .references
                 .iter()
-                .any(|r| r.range.start == at && r.roles.contains(&semantic::Role::Type)),
-            "{language} explicit type context: {:?}",
+                .any(|r| r.range.start == at && r.roles == vec![semantic::Role::Type]),
+            "{language} explicit type-only context: {:?}",
             output.references
         );
     }
+}
+
+#[test]
+fn nested_javascript_runtime_values_inside_type_expression_are_not_types() {
+    for source in [
+        "class Base {} function getConstructor(arg){ return Base; } function use(value,arg){ return value instanceof getConstructor(arg); }",
+        "class Base {} function mixin(value){ return Base; } class Child extends mixin(value) {}",
+    ] {
+        let direct = source.find("class Base").unwrap() + 6;
+        let nested = source
+            .rfind("(arg)")
+            .or_else(|| source.rfind("(value)"))
+            .unwrap()
+            + 1;
+        let nested_len = if &source[nested..nested + 3] == "arg" {
+            3
+        } else {
+            5
+        };
+        let mut claims = vec![
+            (direct, direct + 4, "typescript pkg Base#", 1),
+            (nested, nested + nested_len, "external pkg value.", 8),
+        ];
+        if source.contains("class Child") {
+            let child = source.find("class Child").unwrap() + 6;
+            claims.push((child, child + 5, "typescript pkg Child#", 1));
+        }
+        let (_root, native, sources, inventory) = admitted_case(
+            "javascript",
+            source,
+            claims,
+            vec![("typescript pkg Base#", 7, vec![])],
+        );
+        let output = join_inventory(&inventory, &native, &sources, 2).unwrap();
+        let reference = output
+            .references
+            .iter()
+            .find(|r| r.range.start == nested)
+            .expect("native measured nested value reference");
+        assert_eq!(
+            reference.roles,
+            vec![semantic::Role::Read],
+            "nested runtime argument remains a value"
+        );
+    }
+    let source = "class Base {} function use(value){ return value instanceof Base; }";
+    let at = source.rfind("Base").unwrap();
+    let (_root, native, sources, inventory) = admitted_case(
+        "javascript",
+        source,
+        vec![(at, at + 4, "typescript pkg Base#", 8)],
+        vec![],
+    );
+    let output = join_inventory(&inventory, &native, &sources, 2).unwrap();
+    let reference = output
+        .references
+        .iter()
+        .find(|r| r.range.start == at)
+        .expect("native direct class value");
+    assert_eq!(
+        reference.roles,
+        vec![semantic::Role::Read, semantic::Role::Type]
+    );
 }

@@ -580,7 +580,11 @@ pub fn join_inventory(
             if is_call {
                 assigned.insert(semantic::Role::Call);
             }
-            if !declaration_site && roles & 4 == 0 && roles & 2 == 0 {
+            if !declaration_site
+                && roles & 4 == 0
+                && roles & 2 == 0
+                && (!assigned.contains(&semantic::Role::Type) || doc.language == "javascript")
+            {
                 assigned.insert(semantic::Role::Read);
             }
             if declaration_site
@@ -1210,7 +1214,10 @@ fn source_role_sites(language: &str, source: &[u8]) -> Result<RoleSites> {
             collect_role_leaf_spans(node, language, &mut sites.types);
         }
         if language == "javascript" && kind == "class_heritage" {
-            collect_role_leaf_spans(node, language, &mut sites.types);
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                js_direct_class_span(child, &mut sites.types);
+            }
         }
         if language == "python" && kind == "class_definition" {
             let mut cursor = node.walk();
@@ -1229,7 +1236,7 @@ fn source_role_sites(language: &str, source: &[u8]) -> Result<RoleSites> {
             )
             && source.get(operator.byte_range()) == Some(b"instanceof".as_slice())
         {
-            collect_role_leaf_spans(right, language, &mut sites.types);
+            js_direct_class_span(right, &mut sites.types);
         }
         let import_root = match language {
             "java" => kind == "import_declaration",
@@ -1254,6 +1261,20 @@ fn source_role_sites(language: &str, source: &[u8]) -> Result<RoleSites> {
         stack.extend(node.named_children(&mut cursor));
     }
     Ok(sites)
+}
+
+fn js_direct_class_span(node: tree_sitter::Node<'_>, spans: &mut BTreeSet<(usize, usize)>) {
+    match node.kind() {
+        "identifier" => {
+            spans.insert((node.start_byte(), node.end_byte()));
+        }
+        "member_expression" => {
+            if let Some(property) = node.child_by_field_name("property") {
+                spans.insert((property.start_byte(), property.end_byte()));
+            }
+        }
+        _ => {}
+    }
 }
 
 fn collect_role_leaf_spans(
