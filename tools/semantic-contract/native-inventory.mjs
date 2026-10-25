@@ -8,9 +8,9 @@
 // under an existing version.
 const INVENTORIES = new Map([
   // Current production extractor. Its compiled grammars and normalization tables are
-  // versioned by native-v8; no external capture affects per-document measurement.
+  // versioned by native-v8.1; no external capture affects per-document measurement.
   [
-    "trellis.native.syntax\u0000native-v8",
+    "trellis.native.syntax\u0000native-v8.1",
     { java: [], rust: [], python: [], javascript: [] },
   ],
   // Conformance producer used by the example fixture and the toolkit tests. Like the Rust
