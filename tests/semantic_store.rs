@@ -2196,10 +2196,20 @@ fn raw_proof_import_cas_and_selected_read_are_atomic() {
         index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
     let leader = store.publication_for_tests().unwrap();
     let document = &native.revision.documents[0];
+    let profile: serde_json::Value = serde_json::from_str(include_str!(
+        "../docs/semantic-evidence/hardware/mac-mini-m5-pro-v1.json"
+    ))
+    .unwrap();
+    let pinned = profile["semanticProducers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "scip-typescript")
+        .unwrap();
     let producer = s::Producer {
-        id: "scip-typescript".into(),
-        version: "v1".into(),
-        executable_hash: native_ids::digest(b"", b"exe"),
+        id: pinned["name"].as_str().unwrap().into(),
+        version: pinned["version"].as_str().unwrap().into(),
+        executable_hash: pinned["executableHash"].as_str().unwrap().into(),
         kind: s::SemanticKind::Semantic,
         languages: vec![s::Language::Javascript],
         position_encoding: s::PositionEncoding::Utf16,
@@ -2337,7 +2347,7 @@ fn raw_proof_import_cas_and_selected_read_are_atomic() {
         "dependency"
     );
     let captured = s::CapturedComponents {
-        producer_executables: BTreeMap::from([(producer.id.clone(), b"exe".to_vec())]),
+        producer_executables: BTreeMap::new(),
         artifacts: BTreeMap::from([(producer.id.clone(), raw.binary_bytes.clone())]),
         sources: BTreeMap::from([(
             document.key.clone(),
@@ -2355,10 +2365,13 @@ fn raw_proof_import_cas_and_selected_read_are_atomic() {
     };
     let mut other = semantic.clone();
     other.producers[0].id = "other.semantic".into();
+    other.producers[0].executable_hash = native_ids::digest(b"", b"exe");
     other.coverage[0].producer_id = "other.semantic".into();
     other.provenance[0].producer_id = "other.semantic".into();
     other.provenance[0].derived_from = None;
     other.provenance[0].basis.as_mut().unwrap().producer_id = "other.semantic".into();
+    other.provenance[0].basis.as_mut().unwrap().producer_hash =
+        other.producers[0].executable_hash.clone();
     let mut other_captured = captured.clone();
     other_captured.producer_executables =
         BTreeMap::from([("other.semantic".into(), b"exe".to_vec())]);
@@ -2398,6 +2411,77 @@ fn raw_proof_import_cas_and_selected_read_are_atomic() {
         document.content_hash.clone(),
     )]);
     let report = json!({"requested":1,"matched":1});
+    assert!(
+        s::validate_evidence_with_raw(&semantic, &native, &captured, Some(&raw)).is_err(),
+        "caller-owned raw inventory must not bypass executable bytes"
+    );
+    let mut synthetic_wrong_bytes = other_captured.clone();
+    synthetic_wrong_bytes
+        .producer_executables
+        .insert("other.semantic".into(), b"wrong".to_vec());
+    assert!(
+        s::validate_evidence(&other, &native, &synthetic_wrong_bytes).is_err(),
+        "ordinary synthetic publication keeps executable-byte authentication"
+    );
+    for mutation in ["version", "hash"] {
+        let mut wrong = semantic.clone();
+        if mutation == "version" {
+            wrong.producers[0].version = "unreviewed".into();
+        } else {
+            wrong.producers[0].executable_hash = native_ids::digest(b"", b"unreviewed");
+        }
+        assert!(
+            store
+                .publish_semantic_import(
+                    first, &docs, &wrong, &captured, &native, &raw, &report, &leader, &cancel
+                )
+                .is_err(),
+            "{mutation}"
+        );
+    }
+    let mut wrong_requested = captured.clone();
+    wrong_requested.requested_producers[0].version = "unreviewed".into();
+    assert!(
+        store
+            .publish_semantic_import(
+                first,
+                &docs,
+                &semantic,
+                &wrong_requested,
+                &native,
+                &raw,
+                &report,
+                &leader,
+                &cancel
+            )
+            .is_err()
+    );
+    for field in [
+        "futureTopLevel",
+        "futureProducer",
+        "futureDocument",
+        "futureArtifact",
+    ] {
+        let mut extra = raw.clone();
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&extra.manifest_bytes).unwrap();
+        match field {
+            "futureTopLevel" => manifest[field] = json!(true),
+            "futureProducer" => manifest["producer"][field] = json!(true),
+            "futureDocument" => manifest["sourceDocuments"][0][field] = json!(true),
+            "futureArtifact" => manifest["artifacts"][0][field] = json!(true),
+            _ => unreachable!(),
+        }
+        extra.manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        assert!(
+            store
+                .publish_semantic_import(
+                    first, &docs, &semantic, &captured, &native, &extra, &report, &leader, &cancel
+                )
+                .is_err(),
+            "{field}"
+        );
+    }
     assert!(
         raw.inventory.claims.len() >= 2,
         "fixture must decode distinct raw proofs"

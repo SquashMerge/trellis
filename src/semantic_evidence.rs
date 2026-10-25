@@ -492,6 +492,26 @@ pub fn validate_evidence_with_raw(
     captured: &CapturedComponents,
     raw: Option<&crate::store::SemanticRawCapture>,
 ) -> Result<()> {
+    validate_evidence_inner(semantic, native, captured, raw, None)
+}
+
+pub(crate) fn validate_evidence_with_attested_raw(
+    semantic: &SemanticPublication,
+    native: &native::Artifact,
+    captured: &CapturedComponents,
+    raw: &crate::store::SemanticRawCapture,
+    attested: &crate::store::AttestedProfileProducer,
+) -> Result<()> {
+    validate_evidence_inner(semantic, native, captured, Some(raw), Some(attested))
+}
+
+fn validate_evidence_inner(
+    semantic: &SemanticPublication,
+    native: &native::Artifact,
+    captured: &CapturedComponents,
+    raw: Option<&crate::store::SemanticRawCapture>,
+    attested: Option<&crate::store::AttestedProfileProducer>,
+) -> Result<()> {
     ensure!(
         captured.native_extraction_components.is_empty(),
         "undeclared native extraction components"
@@ -587,24 +607,36 @@ pub fn validate_evidence_with_raw(
         hash(&p.executable_hash)?;
         ordered(&p.languages)?;
         ensure!(!p.languages.is_empty(), "empty producer languages");
-        ensure!(
-            p.executable_hash
-                == native_ids::digest(
-                    b"",
-                    captured
-                        .producer_executables
-                        .get(&p.id)
-                        .context("missing semantic executable")?
-                ),
-            "semantic executable mismatch"
-        );
+        if let Some(attested) = attested {
+            ensure!(
+                attested.matches(p),
+                "authenticated profile producer mismatch"
+            );
+        } else {
+            ensure!(
+                p.executable_hash
+                    == native_ids::digest(
+                        b"",
+                        captured
+                            .producer_executables
+                            .get(&p.id)
+                            .context("missing semantic executable")?
+                    ),
+                "semantic executable mismatch"
+            );
+        }
         ensure!(
             producers.insert(p.id.as_str(), p).is_none(),
             "duplicate semantic producer"
         );
     }
     ensure!(
-        captured.producer_executables.len() == producers.len()
+        captured.producer_executables.len()
+            == if attested.is_some() {
+                0
+            } else {
+                producers.len()
+            }
             && captured.artifacts.len() == producers.len(),
         "unclaimed semantic bytes"
     );

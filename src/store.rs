@@ -4620,6 +4620,25 @@ pub struct SemanticRawCapture {
     pub inventory: crate::scip_raw::CapturedScipInventory,
 }
 
+pub(crate) struct AttestedProfileProducer {
+    id: String,
+    version: String,
+    executable_hash: String,
+    position_encoding: crate::semantic_evidence::PositionEncoding,
+    language: crate::semantic_evidence::Language,
+}
+
+impl AttestedProfileProducer {
+    pub(crate) fn matches(&self, producer: &crate::semantic_evidence::Producer) -> bool {
+        producer.id == self.id
+            && producer.version == self.version
+            && producer.executable_hash == self.executable_hash
+            && producer.position_encoding == self.position_encoding
+            && producer.kind == crate::semantic_evidence::SemanticKind::Semantic
+            && producer.languages == [self.language]
+    }
+}
+
 fn same_measured_native(
     supplied: &crate::native_evidence::Artifact,
     selected: &crate::native_evidence::Artifact,
@@ -4653,9 +4672,11 @@ fn authenticate_import_raw(
     sources: &BTreeMap<crate::native_evidence::DocumentKey, Vec<u8>>,
     root: &std::path::Path,
     cancel: &CancelFlag,
-) -> Result<()> {
+) -> Result<AttestedProfileProducer> {
     use crate::native_ids::{canonical, digest};
     use crate::scip_raw::{self, AuthenticatedScipDocument, AuthenticatedScipInput};
+    crate::scip_admission::validate_closed_manifest(&raw.manifest_bytes)
+        .context("invalid closed raw manifest")?;
     let manifest: serde_json::Value =
         serde_json::from_slice(&raw.manifest_bytes).context("invalid raw manifest")?;
     let profile: serde_json::Value = serde_json::from_str(include_str!(
@@ -4811,7 +4832,23 @@ fn authenticate_import_raw(
             && admitted.claims == raw.inventory.claims,
         "raw inventory differs from authenticated binary"
     );
-    Ok(())
+    Ok(AttestedProfileProducer {
+        id: raw.producer_id.clone(),
+        version: pinned["version"]
+            .as_str()
+            .context("producer version")?
+            .to_owned(),
+        executable_hash: pinned["executableHash"]
+            .as_str()
+            .context("producer executable hash")?
+            .to_owned(),
+        position_encoding: serde_json::from_value(serde_json::json!(match encoding {
+            1 => "utf8",
+            2 => "utf16",
+            _ => "unicodeScalar",
+        }))?,
+        language: serde_json::from_value(serde_json::json!(language))?,
+    })
 }
 
 fn write_raw_capture(db: &Connection, raw: &SemanticRawCapture) -> Result<i64> {
@@ -11196,7 +11233,7 @@ impl Store {
         cancel: &CancelFlag,
         mut hook: impl FnMut(&Connection) -> Result<()>,
     ) -> Result<IndexPin> {
-        use crate::semantic_evidence::validate_evidence_with_raw;
+        use crate::semantic_evidence::validate_evidence_with_attested_raw;
         ensure!(
             publication.producers.len() == 1 && publication.producers[0].id == raw.producer_id,
             "semantic import requires one authenticated producer"
@@ -11221,7 +11258,7 @@ impl Store {
             Ok(IndexPin { index_generation:expected.index_generation,index_revision:u64::try_from(revision)? })
         })?;
         let (captured_native, captured_sources) = self.retained_native_snapshot_at(captured_pin)?;
-        authenticate_import_raw(
+        let attested = authenticate_import_raw(
             raw,
             captured,
             &captured_native,
@@ -11229,7 +11266,23 @@ impl Store {
             &self.identity.root,
             cancel,
         )?;
-        validate_evidence_with_raw(publication, &selected_native, captured, Some(raw))?;
+        ensure!(
+            publication.producers.len() == 1
+                && attested.matches(&publication.producers[0])
+                && captured.requested_producers.len() == 1
+                && attested.matches(&captured.requested_producers[0])
+                && captured.artifacts.len() == 1
+                && captured.artifacts.get(&raw.producer_id) == Some(&raw.binary_bytes)
+                && captured.producer_executables.is_empty(),
+            "authenticated semantic producer identity differs"
+        );
+        validate_evidence_with_attested_raw(
+            publication,
+            &selected_native,
+            captured,
+            raw,
+            &attested,
+        )?;
         leader.belongs_to(&self.identity)?;
         self.identity.verify()?;
         let mut db = self.cache_write()?;
