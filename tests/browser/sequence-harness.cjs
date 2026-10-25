@@ -278,7 +278,7 @@ async function connect(page, server, token) {
   page.serveLog = () => server.stderr().replaceAll(token,"[redacted]").slice(-4000);
   await page.goto(`${base}/`,{waitUntil:"domcontentloaded"});
   await page.locator("#token").fill(token);
-  await page.locator("#connect-form button").click();
+  await page.locator("#connect-form button[type=submit]").click();
   await page.locator("#checkout-select").waitFor({state:"visible",timeout:15000});
   await page.locator("#checkout-select").selectOption(rootKey);
   await page.locator("#workspace").waitFor({state:"visible",timeout:15000});

@@ -30,7 +30,26 @@
     </div>
   </header>
   <main>
-    <div class="connection-area"><img class="connection-logo" src="/brand/trellis-logo-dark-v1.webp" width="280" height="364" alt="Trellis by SquashMerge"><form class="bar" id="connect-form"><label for="token">Daemon token</label><input autocomplete="off" id="token" placeholder="Paste from the token file" required="" spellcheck="false" type="password"/><button>Connect</button><label><input id="remember-token" type="checkbox"/> Remember token on this browser</label><label for="token-file">Load token file instead</label><input id="token-file" type="file"/><span class="muted">Remembering stores this credential in this browser for this address. Use only on a trusted device. Disconnect forgets it.</span></form></div>
+    <div class="connection-area">
+      <div class="connection-brand"><img class="connection-logo" src="/brand/trellis-logo-dark-v1.webp" width="280" height="364" alt="Trellis by SquashMerge"></div>
+      <section class="connection-content" aria-labelledby="connect-heading">
+        <div class="connection-intro">
+          <h1 id="connect-heading">Connect to Trellis</h1>
+          <p>Trellis reads the indexes on this machine. Connecting sends nothing to a model provider and starts no agent.</p>
+        </div>
+        <form id="connect-form">
+          <div class="token-field">
+            <label for="token">Daemon token</label>
+            <input autocomplete="off" id="token" placeholder="Paste from the token file" required spellcheck="false" type="password" aria-describedby="token-file-hint">
+            <span id="token-file-hint" class="muted">Select the token file configured for the running daemon. Loading it fills this field without connecting.</span>
+          </div>
+          <button id="load-token-file" type="button">Load token file instead</button>
+          <input id="token-file" type="file" aria-label="Daemon token file" hidden>
+          <label class="remember-token-option"><input id="remember-token" type="checkbox" aria-describedby="remember-token-warning"><span>Remember token on this browser<span id="remember-token-warning" class="muted">Remembering stores this credential in this browser for this address. Use only on a trusted device. Disconnect forgets it.</span></span></label>
+          <button type="submit">Connect</button>
+        </form>
+      </section>
+    </div>
     <p id="error" role="alert" hidden></p>
     <p id="notice" role="status" aria-live="polite">Connect to inspect a checkout. Indexing starts only when you request it.</p>
     <section id="checkout-picker" class="checkout-picker" aria-label="Checkout selection" hidden>
@@ -93,6 +112,6 @@
       </div>
     </div>
   </main>
-  <footer><span class="local-indicator">Local inspection</span><details><summary>Privacy &amp; evidence limits</summary><p>Local code inspection. Measured syntax is not a runtime trace or semantic proof. Candidate and callback relationships cannot be traversed.</p></details></footer>
+  <footer><span class="local-indicator">Local inspection</span><span class="connection-footer-brand">Trellis by SquashMerge · local inspection</span><span class="connection-footer-topology">Loopback only · bearer token · no automatic indexing</span><details><summary>Privacy &amp; evidence limits</summary><p>Local code inspection. Measured syntax is not a runtime trace or semantic proof. Candidate and callback relationships cannot be traversed.</p></details></footer>
 </body>
 </html>

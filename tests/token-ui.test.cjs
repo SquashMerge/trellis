@@ -29,7 +29,7 @@ function harness({saved, blocked = false, routes} = {}) {
     removeItem(key) { if (blocked) throw new Error("Storage blocked"); stored.delete(key); }
   };
   const context = vm.createContext({console, TextEncoder, DOMException, Blob, AbortController,
-    setTimeout() { return 1; }, clearTimeout() {}, localStorage:storage, window:{localStorage:storage, confirm:() => true},
+    setTimeout() { return 1; }, clearTimeout() {}, localStorage:storage, window:{localStorage:storage, location:{host:"127.0.0.1:43127"}, confirm:() => true},
     document:{addEventListener() {}, getElementById:get, createElement:node, createElementNS:(_,tag) => node(tag), createDocumentFragment:node, createTextNode:text => ({textContent:text}), body:node()},
     fetch:async (url, options) => {
       requests.push({url,options});
@@ -88,6 +88,30 @@ test("retired checkout routes are rejected before a browser request",async()=>{
     await assert.rejects(h.run("api(retiredPath)"),/Unknown checkout API route/);
   }
   assert.equal(h.requests.length,before);
+});
+
+test("Connect enters the shell directly and reports the measured daemon address", async () => {
+  const h = harness();
+  await h.connect("synthetic",false,false);
+  assert.equal(h.run('document.body.classList.contains("daemon-connected")'),true);
+  assert.equal(h.get("connect-form").hidden,true);
+  assert.equal(h.get("logout").hidden,false);
+  assert.equal(h.get("token").value,"");
+  assert.match(h.get("notice").textContent,/Connected to the daemon on 127\.0\.0\.1:43127/);
+  assert.equal(h.run("selectedRootKey"),null);
+  assert.deepEqual(h.requests.map(r=>r.url),["/api/checkouts","/api/daemon/status"]);
+  h.get("logout").listeners.click();
+  assert.equal(h.run('document.body.classList.contains("daemon-connected")'),false);
+  assert.equal(h.get("connect-form").hidden,false);
+});
+test("authentication rejection shows its type as text without echoing the credential", async () => {
+  const h = harness({saved:"synthetic-old",routes:async()=>({ok:false,status:401,json:async()=>({error:{code:"unauthorized",message:"Synthetic rejection"}})})});
+  await h.connect("synthetic-rejected",true,false);
+  assert.match(h.get("error").textContent,/Authentication failed \(unauthorized\)/);
+  assert.doesNotMatch(h.get("error").textContent,/synthetic-rejected/);
+  assert.equal(h.run('document.body.classList.contains("daemon-connected")'),false);
+  assert.equal(h.get("token").value,"");
+  assert.equal(h.stored.has(KEY),false);
 });
 
 test("saved token is loaded with opt-in checked but makes no startup request", () => {
@@ -210,6 +234,20 @@ test("older file read cannot overwrite newer selection", async () => {
   await h.file("synthetic-newer"); finish("synthetic-older"); await pending;
   assert.equal(h.get("token").value, "synthetic-newer"); assert.equal(h.requests.length, 0);
 });
+test("Connect clears a pending native file selection and ignores its late contents", async () => {
+  const h = harness(); let finish;
+  h.get("token-file").value = "synthetic-selection";
+  h.get("token-file").files = [{size:10,text:() => new Promise(resolve => { finish = resolve; })}];
+  const pending = h.get("token-file").listeners.change();
+  await h.connect("synthetic-pasted",false,false);
+  assert.equal(h.get("token-file").value,"");
+  assert.equal(h.get("token").value,"");
+  finish("synthetic-file"); await pending;
+  assert.equal(h.get("token").value,"");
+  assert.equal(h.run("token"),"synthetic-pasted");
+  assert.equal(h.get("connect-form").hidden,true);
+});
+
 test("pending file read cannot restore credentials after Disconnect", async () => {
   const h = harness(); let finish;
   h.get("token-file").files = [{size:10,text:() => new Promise(resolve => { finish = resolve; })}];

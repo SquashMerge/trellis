@@ -85,7 +85,7 @@ rust() {
   cargo clippy --locked --all-targets --features test-support -- -D warnings
   cargo build --locked --bin trellis
   browser_system_deps
-  TRELLIS_SUITE_BINARY="$target_dir/debug/trellis" node --test --test-concurrency=1 tests/browser/sequence-harness.test.cjs tests/browser/sequence-pele.test.cjs tests/browser/sequence.test.cjs tests/browser/sequence-cost.test.cjs tests/browser/brand.test.cjs
+  TRELLIS_SUITE_BINARY="$target_dir/debug/trellis" node --test --test-concurrency=1 tests/browser/sequence-harness.test.cjs tests/browser/sequence-pele.test.cjs tests/browser/sequence.test.cjs tests/browser/sequence-cost.test.cjs tests/browser/brand.test.cjs tests/browser/connect.test.cjs
 }
 tests() {
   if ! cargo nextest --version >/dev/null 2>&1; then
