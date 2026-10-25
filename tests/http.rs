@@ -1235,8 +1235,8 @@ async fn pele_assets_are_local_and_keep_csp() {
             include_bytes!("../web/sequence-pele.js").as_slice(),
         ),
         (
-            "/vendor/pele-1.6.0.js",
-            include_bytes!("../web/vendor/pele-1.6.0.js").as_slice(),
+            "/vendor/pele-1.10.0-trellis.1.js",
+            include_bytes!("../web/vendor/pele-1.10.0-trellis.1.js").as_slice(),
         ),
     ] {
         let req = Request::builder()
@@ -1267,8 +1267,8 @@ async fn pele_assets_are_local_and_keep_csp() {
     assert_eq!(
         format!(
             "{:x}",
-            Sha256::digest(include_bytes!("../web/vendor/pele-1.6.0.js"))
+            Sha256::digest(include_bytes!("../web/vendor/pele-1.10.0-trellis.1.js"))
         ),
-        "b82d1bcd435302779a945e1e0f4a54ea56fb26e010ce3f2122f4216fcfc095d7"
+        "3749dd9b9f97d6b239eedc0017a97a913c98dc270ad3ce059b3c96933effa072"
     );
 }

@@ -525,7 +525,7 @@ async fn provisioned_page_serves_all_referenced_assets() {
             }
         );
     }
-    for asset in ["sequence-pele.js", "vendor/pele-1.6.0.js"] {
+    for asset in ["sequence-pele.js", "vendor/pele-1.10.0-trellis.1.js"] {
         let reply = response(
             browser.router().unwrap(),
             address,
