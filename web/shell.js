@@ -6,7 +6,7 @@
   const hide = (id, value) => { if (get(id)) get(id).hidden = value; };
   const make = (tag, value) => { const node = document.createElement(tag); if (value !== undefined) node.textContent = value; return node; };
   const describe = value => typeof value === "string" ? value : JSON.stringify(value, null, 2);
-  const views = {architecture:"architecture-panel", sequence:"sequence-panel", classes:"classes-panel", libraries:"dependency-library"};
+  const views = {architecture:"architecture-panel", treemap:"treemap-panel", sequence:"sequence-panel", classes:"classes-panel", libraries:"dependency-library"};
   let openSource = null, sourceReturnFocus = null, activeView = "sequence", inspectorClearCallback = null, sectionCallback = null, viewCallback = null;
   function setSection(name) {
     const files = name === "files";
@@ -17,10 +17,10 @@
     get("section-files")?.setAttribute("aria-current", files ? "page" : "false");
     get("section-diagrams")?.setAttribute("aria-current", files ? "false" : "page");
     hide("diagram-tabs", files);
-    hide("diagram-metrics", files || activeView === "architecture");
+    hide("diagram-metrics", files || ["architecture", "treemap"].includes(activeView));
     for (const [key, panel] of Object.entries(views)) hide(panel, files || key !== activeView);
     hide("files-inspector", !files); hide("files-source-toolbar", !files);
-    for (const id of ["inspector-empty", "inspector-content", "metric-inspector", "architecture-inspector"]) {
+    for (const id of ["inspector-empty", "inspector-content", "metric-inspector", "architecture-inspector", "treemap-inspector"]) {
       if (files) hide(id, true);
     }
     hide("inspector-clear", files);
@@ -28,7 +28,7 @@
       hide("source-dock", false); hide("workspace-source-panel", false); hide("library-source-panel", true);
       get("file-filter")?.focus();
     } else {
-      hide("inspector-empty", !get("inspector-content")?.hidden || !get("metric-inspector")?.hidden || !get("architecture-inspector")?.hidden);
+      hide("inspector-empty", !get("inspector-content")?.hidden || !get("metric-inspector")?.hidden || !get("architecture-inspector")?.hidden || !get("treemap-inspector")?.hidden);
       get(`view-${activeView}`)?.focus();
     }
   }
@@ -52,6 +52,7 @@
     if (get("inspector-clear")) get("inspector-clear").disabled = !!get("inspector-content")?.hidden;
   }
   function showMetricInspector() {
+    clearTreemapInspector();
     clearArchitectureInspector();
     openSource = null;
     hide("inspector-empty", true); hide("inspector-content", true);
@@ -80,6 +81,23 @@
     if (get("inspector-clear")) get("inspector-clear").disabled = false;
     drawer("inspector", true);
   }
+  function clearTreemapInspector() {
+    const wasOpen = get("treemap-inspector") && !get("treemap-inspector").hidden;
+    hide("treemap-inspector", true);
+    if (wasOpen) {
+      drawer("inspector", false);
+      hide("inspector-empty", document.body.classList.contains("files-section"));
+      if (get("inspector-clear")) get("inspector-clear").disabled = true;
+    }
+    get("treemap-inspector-title")?.replaceChildren();
+    get("treemap-inspector-content")?.replaceChildren();
+  }
+  function showTreemapInspector() {
+    resetInspector();
+    hide("inspector-empty", true); hide("treemap-inspector", false);
+    if (get("inspector-clear")) get("inspector-clear").disabled = false;
+    drawer("inspector", true);
+  }
   function setViewCallback(callback) { viewCallback = callback; }
   function setInspectorClearCallback(callback) {
     inspectorClearCallback = typeof callback === "function" ? callback : null;
@@ -93,10 +111,10 @@
     if (!Object.hasOwn(views, name)) return;
     if (document.body.classList.contains("files-section")) showDiagrams();
     activeView = name;
-    hide("diagram-metrics", name === "architecture");
+    hide("diagram-metrics", ["architecture", "treemap"].includes(name));
     document.body.classList.toggle("classes-view", name === "classes");
     window.TrellisClasses?.closeContextMenu?.();
-    if (name === "sequence" || name === "classes" || name === "architecture") drawer("explorer", false);
+    if (name === "sequence" || name === "classes" || ["architecture", "treemap"].includes(name)) drawer("explorer", false);
     for (const [key, panel] of Object.entries(views)) {
       hide(panel, key !== name);
       const tab = get(`view-${key}`);
@@ -147,6 +165,7 @@
     });
   }
   function resetInspector() {
+    clearTreemapInspector();
     clearArchitectureInspector();
     clearMetricInspector();
     openSource = null;
@@ -262,6 +281,6 @@
     else if (mobile && document.body.classList.contains("explorer-open")) { drawer("explorer", false); get("explorer-toggle")?.focus(); }
     else if (get("source-dock") && !get("source-dock").hidden) closeSource();
   });
-  window.TrellisShell = {showArchitectureInspector, clearArchitectureInspector, setViewCallback, setSection, setSectionCallback, setConnected, updateCheckout, formatGit, updateWorkspace, showView, showSource, closeSource, showFiles, showDiagrams, showMetricInspector, clearMetricInspector, setInspectorClearCallback, selectStep, resetInspector, reset};
+  window.TrellisShell = {showTreemapInspector, clearTreemapInspector,showArchitectureInspector, clearArchitectureInspector, setViewCallback, setSection, setSectionCallback, setConnected, updateCheckout, formatGit, updateWorkspace, showView, showSource, closeSource, showFiles, showDiagrams, showMetricInspector, clearMetricInspector, setInspectorClearCallback, selectStep, resetInspector, reset};
   reset();
 })();

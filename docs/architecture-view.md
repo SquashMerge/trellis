@@ -86,6 +86,6 @@ Desktop panes scroll independently; narrow screens reuse Explorer/Inspector draw
 Architecture remains syntax-tier evidence with `semanticComplete:false`. Coverage and
 limitations are visible; missing references do not prove there is no dependency.
 Module-level Flow is deferred to [#324](https://github.com/SquashMerge/trellis/issues/324).
-The requested module-to-treemap action depends on
-[#121](https://github.com/SquashMerge/trellis/issues/121); no dead link or Files substitute
-claims that acceptance complete.
+The module inspector's **Open in Treemap** action opens the exact source-set/language/path
+file at the same full pin. [Treemap](treemap.md) uses physical file lines (including
+inline test lines) for area; its production heat and file visibility are independent.

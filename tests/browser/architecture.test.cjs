@@ -179,7 +179,7 @@ test("Architecture uses real pinned structural sites, authored native-file layer
   assert.ok((await page.locator("#architecture-diagram [role=button]").evaluateAll(nodes => nodes.map(node => node.getAttribute("aria-label")))).some(label => label.includes(hostileLayer)), "clipped labels retain their complete accessible text");
   assert.equal(await page.locator("#architecture-diagram img, #architecture-diagram script, #architecture-diagram foreignObject").count(), 0);
   assert.equal(await page.evaluate(() => globalThis.architectureExecuted), undefined);
-  assert.equal(await page.locator("#architecture-inspector a").filter({hasText:/treemap/i}).count(), 0, "#121 has no placeholder action");
+  assert.equal(await page.getByRole("button", {name:"Open in Treemap", exact:true}).count(), 0, "Treemap navigation is only offered for a selected module");
 
   await page.locator("#architecture-notices > summary").click();
   await page.getByRole("button", {name:"Inspect unresolved sites", exact:true}).click();
@@ -194,6 +194,7 @@ test("Architecture uses real pinned structural sites, authored native-file layer
   assert.deepEqual(await page.locator("#architecture-diagram [data-trellis-edge-id]").evaluateAll(nodes => nodes.map(node => node.getAttribute("data-trellis-edge-id")).sort()), dto.edges.filter(row => row.role === "production").map(summaryKey).sort(), "summary identity includes direction, role, policy and exception");
   await module.click();
   await page.waitForFunction(() => document.querySelector("#architecture-inspector-title")?.textContent === "src/low.rs");
+  assert.equal(await page.getByRole("button", {name:"Open in Treemap", exact:true}).count(), 1);
   const low = dto.modules.find(row => row.identity.path === "src/low.rs");
   const detail = await page.locator("#architecture-inspector-content").textContent();
   assert.ok(detail.includes(`${low.physicalLines} physical file lines`));
@@ -301,7 +302,7 @@ test("Architecture uses real pinned structural sites, authored native-file layer
   await sample.getByRole("button", {name:"Read indexed reference source"}).click();
   await page.waitForFunction(() => document.querySelector("#source .source-line.highlight"));
   assert.equal(await page.locator("#source .source-line.highlight .line-number").first().textContent(), String(reverse.sites[0].lines.start));
-  assert.equal(await page.locator("#architecture-inspector a").filter({hasText:/treemap/i}).count(), 0);
+  assert.equal(await page.getByRole("button", {name:"Open in Treemap", exact:true}).count(), 0, "An edge/source selection is not a module identity");
   await page.locator("#architecture-color").selectOption("layer");
   await page.waitForFunction(() => document.querySelector("#architecture-legend")?.textContent.includes("neutral chips"));
   await ready(page);

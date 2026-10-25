@@ -24,7 +24,7 @@
   const labels = {loc:"LOC (callable ranges)", sloc:"SLOC (callable ranges)", commentLines:"Comment lines (callable ranges)",
     cognitive:"Cognitive", cyclomatic:"Cyclomatic", maxNesting:"Max nesting", maintainabilityIndex:"Maintainability (higher is better)",
     fanOut:"Fan-out (call sites)", fanIn:"Fan-in", halstead:"Halstead", parameters:"Parameters", exits:"Exits"};
-  function create({request, context, readSource, onConflict = () => {}, onInspect = () => {}}) {
+  function create({request, context, readSource, openTreemap, onConflict = () => {}, onInspect = () => {}}) {
     let serial = 0, renderSerial = 0, selectionSerial = 0, view = null, basis = null;
     let metric = "cognitive", aggregate = "max", role = "production", showTests = false;
     const callables = () => role === "all" ? "indexed callables" : "production callables";
@@ -216,6 +216,10 @@
         if (record.physicalLines > 0) {
           const button = make("button", "Read indexed file source"); button.type = "button";
           button.addEventListener("click", () => { if (active()) return readSource({path:record.identity.path, range:{startLine:1,endLine:record.physicalLines}}, c.pin, active); }); target.append(button);
+        }
+        if (typeof openTreemap === "function") {
+          const button = make("button", "Open in Treemap"); button.type = "button";
+          button.addEventListener("click", () => { if (active()) openTreemap(record.identity, c.pin); }); target.append(button);
         }
         pairs(target, [...references.production, ...references.tests].filter(pair => same(pair.source, record.identity) || same(pair.target, record.identity)), active);
         disclosure(target, "Owned rule evaluation (including exceptions and test-only outcomes)", payload.rules);

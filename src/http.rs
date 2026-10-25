@@ -1909,6 +1909,33 @@ pub fn router(state: Arc<DaemonState>) -> Router {
             }),
         )
         .route(
+            "/treemap.js",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                    include_str!("../web/treemap.js"),
+                )
+            }),
+        )
+        .route(
+            "/treemap-pele.js",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                    include_str!("../web/treemap-pele.js"),
+                )
+            }),
+        )
+        .route(
+            "/treemap.css",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+                    include_str!("../web/treemap.css"),
+                )
+            }),
+        )
+        .route(
             "/architecture.js",
             get(|| async {
                 (
@@ -3166,6 +3193,33 @@ impl ProvisionedBrowser {
                     (
                         [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
                         include_str!("../web/files.js"),
+                    )
+                }),
+            )
+            .route(
+                "/treemap.js",
+                get(|| async {
+                    (
+                        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                        include_str!("../web/treemap.js"),
+                    )
+                }),
+            )
+            .route(
+                "/treemap-pele.js",
+                get(|| async {
+                    (
+                        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                        include_str!("../web/treemap-pele.js"),
+                    )
+                }),
+            )
+            .route(
+                "/treemap.css",
+                get(|| async {
+                    (
+                        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+                        include_str!("../web/treemap.css"),
                     )
                 }),
             )

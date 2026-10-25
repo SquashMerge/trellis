@@ -978,6 +978,8 @@ pub struct MetricsFileRow {
     pub source_set_id: String,
     pub language: String,
     pub path: String,
+    pub physical_lines: usize,
+    pub file_role: DeclarationRole,
     pub role_counts: MetricsRoleCounts,
     pub declaration_count: usize,
     pub metrics: serde_json::Value,
@@ -1170,6 +1172,13 @@ impl MetricsReadCheck<'_> {
         }
         result
     }
+}
+
+/// Metrics and file metadata from one fetched indexed document.
+struct MetricsComputedDocument {
+    computed: crate::metrics::Computed,
+    physical_lines: usize,
+    file_role: DeclarationRole,
 }
 
 /// Why one revision document did not produce metrics.
@@ -1690,7 +1699,7 @@ impl EvidenceResponse {
         let compute_document =
             |fetched: FetchedDocument,
              key: &DocumentKey|
-             -> std::result::Result<crate::metrics::Computed, MetricsDocumentFailure> {
+             -> std::result::Result<MetricsComputedDocument, MetricsDocumentFailure> {
                 let calls = std::cell::Cell::new(0);
                 let expired = || progress.expired_every(&calls, check_every);
                 // Metrics use the stored source and native rows as fetched.
@@ -1703,6 +1712,17 @@ impl EvidenceResponse {
                 if expired() {
                     return Err(MetricsDocumentFailure::Stopped);
                 }
+                let mut roots = fetched
+                    .declarations
+                    .iter()
+                    .filter(|row| row.kind == "module" && row.ancestors.is_empty());
+                let file_role = roots.next().map(|row| row.role);
+                let Some(file_role) = file_role.filter(|_| roots.next().is_none()) else {
+                    return Err(MetricsDocumentFailure::Read(
+                        SelectedIntegrity("incompatible_index: metrics file module".into()).into(),
+                    ));
+                };
+                let physical_lines = fetched.file.text.lines().count();
                 let source = crate::metrics::SourceInput {
                     language: &key.language,
                     content_hash: &fetched.file.hash,
@@ -1726,6 +1746,11 @@ impl EvidenceResponse {
                         Ok(())
                     },
                 )
+                .map(|computed| MetricsComputedDocument {
+                    computed,
+                    physical_lines,
+                    file_role,
+                })
                 .map_err(MetricsDocumentFailure::Other)
             };
         let compute = |fetched: FetchedDocument, key: &DocumentKey| {
@@ -1738,10 +1763,14 @@ impl EvidenceResponse {
         };
         let mut accept = |key: &DocumentKey,
                           outcome: Option<
-            std::result::Result<crate::metrics::Computed, MetricsDocumentFailure>,
+            std::result::Result<MetricsComputedDocument, MetricsDocumentFailure>,
         >|
          -> Result<()> {
-            let computed = match outcome {
+            let MetricsComputedDocument {
+                computed,
+                physical_lines,
+                file_role,
+            } = match outcome {
                 Some(Ok(computed)) => computed,
                 Some(Err(MetricsDocumentFailure::Read(error))) => {
                     return progress.result(Err(self.store.report_index_failure(error)));
@@ -1879,6 +1908,8 @@ impl EvidenceResponse {
                     source_set_id: key.source_set_id.clone(),
                     language: key.language.clone(),
                     path: key.path.clone(),
+                    physical_lines,
+                    file_role,
                     role_counts,
                     declaration_count: file_fold.count(),
                     metrics: file_fold.project(&options.aggregate, &names)?,

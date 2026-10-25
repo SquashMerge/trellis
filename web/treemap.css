@@ -1,0 +1,22 @@
+/* Native Pele geometry stays at natural size. Small tiles also have a file list. */
+#treemap-panel { display: flex; flex-direction: column; min-height: 0; overflow: auto; }
+.treemap-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; padding: 8px 16px; }
+.treemap-controls label { font-size: 12px; }
+.treemap-controls input[type="search"] { width: 180px; min-width: 0; }
+.treemap-basis, #treemap-state, #treemap-legend, #treemap-breadcrumbs { margin: 4px 16px 8px; font-size: 12px; }
+#treemap-breadcrumbs { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+#treemap-diagram { overflow: auto; flex: 1 0 300px; min-height: 260px; max-height: 70vh; padding: 8px; }
+#treemap-diagram svg { display: block; max-width: none; flex: none; font-family: var(--sans); }
+#treemap-diagram [role="button"] { cursor: pointer; }
+#treemap-diagram [role="button"]:is(:hover, :focus-visible, [aria-pressed="true"]) > rect { stroke: var(--sm-lavender); stroke-width: 3px; }
+#treemap-diagram [role="button"]:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.treemap-file-list { padding: 10px 16px; font-size: 12px; border-top: 1px solid var(--line); }
+#treemap-files { display: flex; flex-direction: column; align-items: stretch; gap: 4px; padding-top: 8px; }
+#treemap-files button { text-align: left; overflow-wrap: anywhere; }
+#treemap-inspector-content { overflow-wrap: anywhere; }
+#treemap-inspector-content pre { white-space: pre-wrap; }
+@media (max-width: 600px) { .treemap-controls { padding: 8px 12px; gap: 8px; } #treemap-diagram { padding: 4px; } }
+#treemap-inspector { padding-top: 14px; font-size: 12px; }
+#treemap-inspector-title { margin-top: 0; font: 13px/1.6 var(--mono); }
+#treemap-inspector-content button { font-size: 12px; min-height: 34px; }
+#treemap-state[data-state="error"] { color: var(--error); }
