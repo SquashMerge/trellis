@@ -3778,31 +3778,58 @@ fn publication_native_witness(
         document,
         producer,
         coverage,
-        &grouped
-            .native_declarations
-            .iter()
-            .map(|d| (*d).clone())
-            .collect::<Vec<_>>(),
-        &grouped
-            .native_calls
-            .iter()
-            .map(|c| (*c).clone())
-            .collect::<Vec<_>>(),
-        &grouped
-            .native_regions
-            .iter()
-            .map(|r| (*r).clone())
-            .collect::<Vec<_>>(),
-        &grouped
-            .native_references
-            .iter()
-            .map(|r| (*r).clone())
-            .collect::<Vec<_>>(),
+        grouped.native_declarations.iter().copied(),
+        grouped.native_calls.iter().copied(),
+        grouped.native_regions.iter().copied(),
+        grouped.native_references.iter().copied(),
         grouped
             .capability_report
             .context("native capability report missing")?,
     )
 }
+
+#[cfg(test)]
+#[test]
+fn publication_witness_requires_capability_report() {
+    use crate::native_evidence::{Coverage, Document, DocumentKey, Producer};
+
+    let document = Document {
+        key: DocumentKey {
+            source_set_id: "source-set".into(),
+            language: "javascript".into(),
+            path: "a.js".into(),
+        },
+        revision_id: "revision".into(),
+        content_hash: "a".repeat(64),
+        byte_length: 0,
+    };
+    let producer = Producer {
+        id: crate::native_evidence::PRODUCER.into(),
+        version: crate::native_evidence::NATIVE_VERSION.into(),
+        executable_hash: "e".repeat(64),
+        kind: "native".into(),
+        languages: vec!["javascript".into()],
+        position_encoding: "utf8".into(),
+    };
+    let coverage = Coverage {
+        producer_id: producer.id.clone(),
+        language: document.key.language.clone(),
+        source_set_id: document.key.source_set_id.clone(),
+        document_path: document.key.path.clone(),
+        revision_id: document.revision_id.clone(),
+        requested: true,
+        selected: true,
+        state: "complete".into(),
+        supported_roles: Vec::new(),
+        observed_roles: Vec::new(),
+        diagnostic: None,
+    };
+    let error =
+        publication_native_witness(&document, &producer, &coverage, &PublicationRows::default())
+            .unwrap_err();
+    assert_eq!(error.to_string(), "native capability report missing");
+}
+
 fn publication_rows<'a>(
     graph: &'a Graph,
     native: &'a crate::native_evidence::Artifact,
