@@ -2029,11 +2029,20 @@ pub fn router(state: Arc<DaemonState>) -> Router {
             }),
         )
         .route(
-            "/fonts/space-grotesk-latin.woff2",
+            "/fonts/inter-latin.woff2",
             get(|| async {
                 (
                     [(header::CONTENT_TYPE, "font/woff2")],
-                    &include_bytes!("../web/fonts/space-grotesk-latin.woff2")[..],
+                    &include_bytes!("../web/fonts/inter-latin.woff2")[..],
+                )
+            }),
+        )
+        .route(
+            "/fonts/manrope-latin.woff2",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "font/woff2")],
+                    &include_bytes!("../web/fonts/manrope-latin.woff2")[..],
                 )
             }),
         )
@@ -2047,11 +2056,38 @@ pub fn router(state: Arc<DaemonState>) -> Router {
             }),
         )
         .route(
-            "/fonts/SpaceGrotesk-OFL.txt",
+            "/fonts/Inter-OFL.txt",
             get(|| async {
                 (
                     [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-                    include_str!("../web/fonts/SpaceGrotesk-OFL.txt"),
+                    include_str!("../web/fonts/Inter-OFL.txt"),
+                )
+            }),
+        )
+        .route(
+            "/fonts/Manrope-OFL.txt",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                    include_str!("../web/fonts/Manrope-OFL.txt"),
+                )
+            }),
+        )
+        .route(
+            "/brand/trellis-mark-transparent-v1.png",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "image/png")],
+                    &include_bytes!("../web/brand/trellis-mark-transparent-v1.png")[..],
+                )
+            }),
+        )
+        .route(
+            "/brand/trellis-logo-dark-v1.png",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "image/png")],
+                    &include_bytes!("../web/brand/trellis-logo-dark-v1.png")[..],
                 )
             }),
         )
@@ -3802,11 +3838,20 @@ impl ProvisionedBrowser {
                 }),
             )
             .route(
-                "/fonts/space-grotesk-latin.woff2",
+                "/fonts/inter-latin.woff2",
                 get(|| async {
                     (
                         [(header::CONTENT_TYPE, "font/woff2")],
-                        &include_bytes!("../web/fonts/space-grotesk-latin.woff2")[..],
+                        &include_bytes!("../web/fonts/inter-latin.woff2")[..],
+                    )
+                }),
+            )
+            .route(
+                "/fonts/manrope-latin.woff2",
+                get(|| async {
+                    (
+                        [(header::CONTENT_TYPE, "font/woff2")],
+                        &include_bytes!("../web/fonts/manrope-latin.woff2")[..],
                     )
                 }),
             )
@@ -3820,11 +3865,38 @@ impl ProvisionedBrowser {
                 }),
             )
             .route(
-                "/fonts/SpaceGrotesk-OFL.txt",
+                "/fonts/Inter-OFL.txt",
                 get(|| async {
                     (
                         [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-                        include_str!("../web/fonts/SpaceGrotesk-OFL.txt"),
+                        include_str!("../web/fonts/Inter-OFL.txt"),
+                    )
+                }),
+            )
+            .route(
+                "/fonts/Manrope-OFL.txt",
+                get(|| async {
+                    (
+                        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                        include_str!("../web/fonts/Manrope-OFL.txt"),
+                    )
+                }),
+            )
+            .route(
+                "/brand/trellis-mark-transparent-v1.png",
+                get(|| async {
+                    (
+                        [(header::CONTENT_TYPE, "image/png")],
+                        &include_bytes!("../web/brand/trellis-mark-transparent-v1.png")[..],
+                    )
+                }),
+            )
+            .route(
+                "/brand/trellis-logo-dark-v1.png",
+                get(|| async {
+                    (
+                        [(header::CONTENT_TYPE, "image/png")],
+                        &include_bytes!("../web/brand/trellis-logo-dark-v1.png")[..],
                     )
                 }),
             )

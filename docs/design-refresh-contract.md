@@ -2,9 +2,22 @@
 
 ## Layout and assets
 
-The approved reference is the user-provided UI reference. The implementation uses its
-warm charcoal/flame-orange palette and locally served Space Grotesk/JetBrains Mono fonts.
-It does not copy fictional compiler, class-diagram, agent or terminal capabilities.
+The approved layout and interaction reference is the user-provided UI reference. The owner-approved
+SquashMerge brand supersedes only its palette, typography and logo treatment, as specified in
+[DESIGN.md](../DESIGN.md#visual-tokens). Use ink/surface/raised backgrounds, decorative line and
+meaningful control boundaries, and white/muted text. Primary actions use amber fill with ink text;
+selection uses purple fill with ink text. Links are lavender and underlined; keyboard focus is a
+2px lavender outline with a 3px offset. Status always combines a word and a shape with its color.
+Heat uses line → gold → amber → orange, with a legend and ink text on warm fills, reversed for
+Maintainability; this amendment adds no metric view or threshold policy.
+
+Serve Manrope headings, Inter body/interface text and JetBrains Mono identifiers/source locally.
+Retain the compact 13–14px body and existing pane layout, not the packet's larger layout or type
+scale. Primary action buttons use a 44px minimum height and 8px radius.
+The full logo lockup is Connect-only, with clear space. App headers use the provisional, unreviewed
+symbol plus “Trellis by SquashMerge”; no favicon ships before a reviewed compact mark exists.
+This amendment does not retire Tools, add unshipped tabs, or authorize fictional compiler,
+class-diagram, agent or terminal capabilities. Gated capabilities remain hidden until accepted.
 
 The explorer stays beside the sequence canvas on desktop. Libraries and Tools have their
 own tabs. Selected calls and controls populate the inspector. Explicit source actions open

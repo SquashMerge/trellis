@@ -1,0 +1,310 @@
+{
+  "revision": {
+    "indexGeneration": "1274a93a-9fc7-4f3d-bf83-23a5f5cacbdf",
+    "indexRevision": 1
+  },
+  "fontResponses": [
+    {
+      "url": "http://127.0.0.1:52940/fonts/manrope-latin.woff2",
+      "status": 200
+    },
+    {
+      "url": "http://127.0.0.1:52940/fonts/inter-latin.woff2",
+      "status": 200
+    },
+    {
+      "url": "http://127.0.0.1:52940/fonts/jetbrains-mono-latin.woff2",
+      "status": 200
+    },
+    {
+      "url": "http://127.0.0.1:52940/fonts/manrope-latin.woff2",
+      "status": 200
+    },
+    {
+      "url": "http://127.0.0.1:52940/fonts/inter-latin.woff2",
+      "status": 200
+    },
+    {
+      "url": "http://127.0.0.1:52940/fonts/jetbrains-mono-latin.woff2",
+      "status": 200
+    }
+  ],
+  "measurements": [
+    {
+      "kind": "text",
+      "selector": "#connect-form button",
+      "foreground": [
+        11,
+        12,
+        16,
+        1
+      ],
+      "background": [
+        255,
+        170,
+        16,
+        1
+      ],
+      "ratio": 10.247946363963722
+    },
+    {
+      "kind": "text",
+      "selector": "#connect-form label",
+      "foreground": [
+        247,
+        247,
+        251,
+        1
+      ],
+      "background": [
+        11,
+        12,
+        16,
+        1
+      ],
+      "ratio": 18.292970113558468
+    },
+    {
+      "kind": "text",
+      "selector": "#connect-form .muted",
+      "foreground": [
+        184,
+        186,
+        200,
+        1
+      ],
+      "background": [
+        11,
+        12,
+        16,
+        1
+      ],
+      "ratio": 10.142096577125866
+    },
+    {
+      "kind": "text",
+      "selector": "#notice",
+      "foreground": [
+        184,
+        186,
+        200,
+        1
+      ],
+      "background": [
+        11,
+        12,
+        16,
+        1
+      ],
+      "ratio": 10.142096577125866
+    },
+    {
+      "kind": "control-boundary",
+      "selector": "#token",
+      "foreground": [
+        119,
+        122,
+        142,
+        1
+      ],
+      "background": [
+        29,
+        30,
+        42,
+        1
+      ],
+      "ratio": 3.9003136802651883,
+      "outsideRatio": 4.615841347581189
+    },
+    {
+      "kind": "text",
+      "selector": "#checkout-select",
+      "foreground": [
+        247,
+        247,
+        251,
+        1
+      ],
+      "background": [
+        29,
+        30,
+        42,
+        1
+      ],
+      "ratio": 15.457273379636966
+    },
+    {
+      "kind": "control-boundary",
+      "selector": "#checkout-select",
+      "foreground": [
+        119,
+        122,
+        142,
+        1
+      ],
+      "background": [
+        29,
+        30,
+        42,
+        1
+      ],
+      "ratio": 3.9003136802651883,
+      "outsideRatio": 4.29425411383822
+    },
+    {
+      "kind": "text",
+      "selector": "#refresh",
+      "foreground": [
+        247,
+        247,
+        251,
+        1
+      ],
+      "background": [
+        29,
+        30,
+        42,
+        1
+      ],
+      "ratio": 15.457273379636966
+    },
+    {
+      "kind": "control-boundary",
+      "selector": "#refresh",
+      "foreground": [
+        119,
+        122,
+        142,
+        1
+      ],
+      "background": [
+        29,
+        30,
+        42,
+        1
+      ],
+      "ratio": 3.9003136802651883,
+      "outsideRatio": 4.29425411383822
+    },
+    {
+      "kind": "text",
+      "selector": ".method-pick.selected",
+      "foreground": [
+        11,
+        12,
+        16,
+        1
+      ],
+      "background": [
+        119,
+        112,
+        220,
+        1
+      ],
+      "ratio": 4.780336638402613
+    },
+    {
+      "kind": "text",
+      "selector": "#view-sequence",
+      "foreground": [
+        11,
+        12,
+        16,
+        1
+      ],
+      "background": [
+        119,
+        112,
+        220,
+        1
+      ],
+      "ratio": 4.780336638402613
+    },
+    {
+      "kind": "text",
+      "selector": "#inspector-target",
+      "foreground": [
+        184,
+        186,
+        200,
+        1
+      ],
+      "background": [
+        20,
+        21,
+        29,
+        1
+      ],
+      "ratio": 9.43549326540219
+    },
+    {
+      "kind": "text",
+      "selector": "#inspector-open-source",
+      "foreground": [
+        171,
+        165,
+        255,
+        1
+      ],
+      "background": [
+        29,
+        30,
+        42,
+        1
+      ],
+      "ratio": 7.517502181377918
+    },
+    {
+      "kind": "text",
+      "selector": "#sequence-state",
+      "foreground": [
+        184,
+        186,
+        200,
+        1
+      ],
+      "background": [
+        11,
+        12,
+        16,
+        1
+      ],
+      "ratio": 10.142096577125866
+    },
+    {
+      "kind": "text",
+      "selector": ".pele-note[aria-pressed=true] text",
+      "foreground": [
+        11,
+        12,
+        16,
+        1
+      ],
+      "background": [
+        119,
+        112,
+        220,
+        1
+      ],
+      "ratio": 4.780336638402613
+    },
+    {
+      "kind": "text",
+      "selector": "#source .source-line.highlight",
+      "foreground": [
+        11,
+        12,
+        16,
+        1
+      ],
+      "background": [
+        119,
+        112,
+        220,
+        1
+      ],
+      "ratio": 4.780336638402613
+    }
+  ],
+  "errors": []
+}
