@@ -150,9 +150,10 @@ pre { font: 12px/1.7 var(--mono); overflow: auto; background: var(--rail); paddi
 .brand-mark { display: block; width: 24px; height: 30px; object-fit: contain; }
 .brand h1 { line-height: 1.1; white-space: nowrap; }
 .brand-byline { display: block; margin-top: 3px; font: 11px/1.2 var(--sans); color: var(--secondary); letter-spacing: normal; }
-.workspace-identity { display: flex; align-items: baseline; gap: 12px; padding-left: 24px; border-left: 1px solid var(--line); min-width: 0; }
+.workspace-identity { display: grid; grid-template-columns: minmax(0, auto) minmax(0, 1fr); align-items: baseline; gap: 2px 12px; padding-left: 24px; border-left: 1px solid var(--line); min-width: 0; flex: 1; }
 .workspace-identity strong { font-size: 13px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #workspace-meta { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#workspace-git { grid-column: 1 / -1; color: var(--secondary); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .header-actions { display: flex; gap: 8px; margin-left: auto; flex: none; }
 #logout { color: var(--secondary); background: var(--clear); border-color: var(--clear); }
 .mobile-toggle { display: none; }
@@ -375,7 +376,7 @@ footer details > p { position: absolute; bottom: 30px; right: 12px; width: min(5
   .brand { gap: 5px; }
   .brand-mark { width: 23px; height: 23px; }
   h1 { font-size: 19px; }
-  .workspace-identity { display: flex; flex: 1; padding-left: 0; border: 0; font-size: 12px; }
+  .workspace-identity { grid-template-columns: minmax(0, 1fr); padding-left: 0; border: 0; font-size: 12px; }
   .workspace-identity #workspace-meta { display: none; }
   .checkout-picker { align-items: flex-start; }
   .checkout-root { flex-basis: 100%; }

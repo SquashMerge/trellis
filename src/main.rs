@@ -27,6 +27,8 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
+    #[command(hide = true)]
+    GitRead(GitReadArgs),
     /// Export fixture snapshots through the real native extractor (test-support build only).
     #[cfg(feature = "test-support")]
     NativeCapture(NativeCaptureArgs),
@@ -67,6 +69,15 @@ struct NativeCaptureArgs {
     source_set: Option<String>,
     #[arg(long)]
     revision: Option<String>,
+}
+#[derive(Args)]
+struct GitReadArgs {
+    #[arg(long)]
+    root: PathBuf,
+    #[arg(long, value_parser = ["summary", "status", "diff"])]
+    mode: String,
+    #[arg(long)]
+    path: Option<String>,
 }
 #[derive(Args)]
 struct ForgetArgs {
@@ -215,6 +226,10 @@ const CLI_READ_WAIT: Duration = Duration::from_secs(5);
 #[tokio::main]
 async fn main() -> Result<()> {
     let command = Cli::parse().command;
+    if let Command::GitRead(args) = &command {
+        trellis::git_status::write_child_response(&args.root, &args.mode, args.path.as_deref())?;
+        return Ok(());
+    }
     if matches!(&command, Command::Index(_) | Command::Serve(_)) {
         trellis::capture::pin_running_executable()?;
     }
@@ -245,7 +260,7 @@ async fn main() -> Result<()> {
                 )?;
             }
         }
-        Command::Daemon | Command::Serve(_) => unreachable!(),
+        Command::Daemon | Command::Serve(_) | Command::GitRead(_) => unreachable!(),
         Command::Mcp(args) => {
             let (_, identity) = args.resolve_unattached()?;
             let socket = socket_path()?;

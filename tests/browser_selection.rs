@@ -194,6 +194,287 @@ impl Drop for Server {
 }
 
 #[tokio::test]
+async fn git_reads_do_not_activate_or_renew_and_keep_the_final_identity_fence() {
+    use std::sync::Arc;
+    use trellis::{
+        daemon::registry::{
+            BROWSER_IDLE_DELAY, CHECKOUT_RELEASE_DELAY, CheckoutOptions, CheckoutRegistry,
+        },
+        http::ProvisionedBrowser,
+        store::topology::TopologyRoots,
+    };
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("checkout");
+    fs::create_dir(&root).unwrap();
+    let root = root.canonicalize().unwrap();
+    let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+    let roots =
+        TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+    let index = roots.index_db(&identity);
+    let now = std::time::Instant::now();
+    let mut registry = CheckoutRegistry::with_roots_at(roots, now);
+    registry
+        .register(&identity, CheckoutOptions(serde_json::json!({})))
+        .unwrap();
+    let registry = Arc::new(tokio::sync::Mutex::new(registry));
+    let browser = ProvisionedBrowser::new(
+        registry.clone(),
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+        "127.0.0.1:7331".parse().unwrap(),
+    )
+    .unwrap();
+    let app = browser.clone().router();
+    let path = format!("/api/checkouts/{}/git", identity.root_key);
+    for active in [false, true] {
+        if active {
+            registry
+                .lock()
+                .await
+                .browser_request_at(&identity, now)
+                .unwrap();
+        }
+        let (status, headers, body) = selected_json(app.clone(), "GET", &path, Value::Null).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        assert_eq!(body["git"]["state"], "unavailable");
+        assert!(body["changes"].is_null());
+        assert_eq!(headers["x-trellis-workspace"], root.to_str().unwrap());
+        assert_eq!(headers["x-trellis-catching-up"], "false");
+        assert!(registry.lock().await.runtime(&identity.root_key).is_none());
+        assert_eq!(registry.lock().await.active_count(), usize::from(active));
+        assert!(!index.exists());
+    }
+    let tick = registry
+        .lock()
+        .await
+        .advance(now + BROWSER_IDLE_DELAY + CHECKOUT_RELEASE_DELAY)
+        .unwrap();
+    assert_eq!(tick.released, vec![identity.root_key.clone()]);
+    let moved = root.with_file_name("moved");
+    let changed_root = root.clone();
+    browser.set_selected_response_hook_for_tests(Arc::new(move |stage| {
+        if stage == "after_handler" {
+            fs::rename(&changed_root, &moved).unwrap();
+        }
+    }));
+    let (status, headers, body) = selected_json(app, "GET", &path, Value::Null).await;
+    assert_eq!(status, axum::http::StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "root_changed");
+    assert_eq!(headers["x-trellis-workspace"], root.to_str().unwrap());
+    assert_eq!(headers["x-trellis-catching-up"], "false");
+    assert!(registry.lock().await.runtime(&identity.root_key).is_none());
+}
+
+#[tokio::test]
+async fn production_git_routes_read_cold_checkout_and_enrich_discovered_rows() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let _daemon = FixtureDaemon::new(&home);
+    let cold = temp.path().join("cold");
+    let discovered = temp.path().join("discovered");
+    for root in [&cold, &discovered] {
+        fs::create_dir(root).unwrap();
+        git(root, &["init", "-qb", "main"]);
+        git(root, &["config", "user.email", "test@example.invalid"]);
+        git(root, &["config", "user.name", "Test"]);
+        fs::write(root.join("core.js"), "function original() { return 1; }\n").unwrap();
+        git(root, &["add", "core.js"]);
+        git(root, &["commit", "-qm", "base"]);
+    }
+    let indexed = command(&home)
+        .arg("index")
+        .arg("--workspace")
+        .arg(&discovered)
+        .output()
+        .unwrap();
+    assert!(
+        indexed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+    drop(FixtureDaemon::new(&home));
+    let cold = cold.canonicalize().unwrap();
+    let cold_key = WorkspaceIdentity::discover(Some(&cold), &cold)
+        .unwrap()
+        .root_key;
+    let discovered_key = WorkspaceIdentity::discover(Some(&discovered), &discovered)
+        .unwrap()
+        .root_key;
+    fs::write(cold.join("core.js"), "function changed() { return 2; }\n").unwrap();
+    let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let token_file = home.join("token");
+    fs::write(&token_file, token).unwrap();
+    fs::set_permissions(&token_file, fs::Permissions::from_mode(0o600)).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let log = temp.path().join("git-serve-stderr");
+    let child = command(&home)
+        .arg("serve")
+        .arg("--workspace")
+        .arg(&cold)
+        .arg("--bind")
+        .arg(format!("127.0.0.1:{port}"))
+        .arg("--token-file")
+        .arg(token_file)
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(fs::File::create(&log).unwrap()))
+        .spawn()
+        .unwrap();
+    let mut server = Server(child);
+    let client = reqwest::Client::new();
+    let base = format!("http://127.0.0.1:{port}");
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        loop {
+            if client
+                .get(format!("{base}/healthz"))
+                .send()
+                .await
+                .is_ok_and(|r| r.status().is_success())
+            {
+                break;
+            }
+            assert!(
+                server.0.try_wait().unwrap().is_none(),
+                "{}",
+                fs::read_to_string(&log).unwrap()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let listing: Value = client
+        .get(format!("{base}/api/checkouts"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    for key in [&cold_key, &discovered_key] {
+        let row = listing["checkouts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["rootKey"] == *key)
+            .unwrap();
+        assert_eq!(row["git"]["state"], "available", "{listing}");
+        assert_eq!(row["git"]["head"]["name"], "main");
+        assert!(!row.as_object().unwrap().contains_key("changes"));
+        assert_eq!(row["active"], false);
+    }
+    let prefix = format!("{base}/api/checkouts/{cold_key}/git");
+    for suffix in ["", "/diff?path=core.js"] {
+        let response = client
+            .get(format!("{prefix}{suffix}"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            response.headers()["x-trellis-workspace"],
+            cold.to_str().unwrap()
+        );
+        assert_eq!(response.headers()["x-trellis-catching-up"], "false");
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        assert!(response.headers().contains_key("content-security-policy"));
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["git"]["state"], "available", "{body}");
+        if suffix.is_empty() {
+            assert!(
+                body["changes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|change| change["path"] == "core.js" && change["status"] == "modified")
+            );
+        } else {
+            assert_eq!(body["file"]["path"], "core.js");
+            assert!(!body["file"]["hunks"].as_array().unwrap().is_empty());
+        }
+    }
+    for suffix in [
+        "?unknown=1",
+        "/diff",
+        "/diff?path=core.js&path=core.js",
+        "/diff?path=core.js&extra=1",
+        "/diff?path=../core.js",
+        "/diff?path=/core.js",
+        "/diff?path=",
+    ] {
+        let response = client
+            .get(format!("{prefix}{suffix}"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "{suffix}"
+        );
+    }
+    let response = client
+        .get(format!("{prefix}/diff?path=missing.js"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+    for (header, value, expected) in [
+        (
+            "authorization",
+            "Bearer invalid",
+            reqwest::StatusCode::UNAUTHORIZED,
+        ),
+        ("host", "not-local:1", reqwest::StatusCode::FORBIDDEN),
+        (
+            "origin",
+            "http://not-local:1",
+            reqwest::StatusCode::FORBIDDEN,
+        ),
+    ] {
+        let response = client
+            .get(&prefix)
+            .bearer_auth(token)
+            .header(header, value)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected, "{header}");
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        assert!(!response.headers().contains_key("x-trellis-workspace"));
+    }
+    let state: Value = client
+        .get(format!("{base}/api/daemon/status"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(state["activeCheckouts"], 0);
+    let cache = if cfg!(target_os = "macos") {
+        home.join("Library/Caches/dev.squashmerge.trellis")
+    } else {
+        home.join(".cache/trellis")
+    };
+    assert!(
+        !cache
+            .join("indexes")
+            .join(&cold_key)
+            .join("index.db")
+            .exists()
+    );
+}
+
+#[tokio::test]
 async fn production_browser_selects_two_real_worktrees_without_global_attachment() {
     let temp = TempDir::new().unwrap();
     let home = temp.path().join("home");
@@ -2936,6 +3217,8 @@ async fn production_browser_rejects_every_selector_free_checkout_route_without_a
     // implicit default is allowed merely because selection is unambiguous.
     let old_routes = [
         ("GET", "/api/status"),
+        ("GET", "/api/git"),
+        ("GET", "/api/git/diff?path=core.js"),
         ("GET", "/api/tree"),
         ("GET", "/api/files"),
         ("GET", "/api/methods"),

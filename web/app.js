@@ -1,6 +1,6 @@
 "use strict";
 const $ = id => document.getElementById(id);
-let token = "", epoch = 0, selectedRootKey = null, selectedWorkspaceRoot = null, checkoutBusy = false, checkouts = [], querySerial = 0, sourceSerial = 0, searchSerial = 0;
+let token = "", epoch = 0, selectedRootKey = null, selectedWorkspaceRoot = null, selectedGit = null, gitSerial = 0, checkoutBusy = false, checkouts = [], querySerial = 0, sourceSerial = 0, searchSerial = 0;
 const pendingRequests = new Set();
 let status = null, result = null, seed = null, views = [], annotations = [], editingView = null, editingNote = null;
 let statusSerial = 0, savedSerial = 0, statusRefreshDepth = 0, pairRefreshPending = false, pairRefreshObserved = null;
@@ -133,7 +133,8 @@ function selectedUrl(path, method, root) {
   }
   const suffix = path.startsWith("/api/") ? path.slice(5) : "";
   const route = suffix.split("?", 1)[0];
-  const simple = new Set(["status", "index", "tree", "files", "methods", "sequence", "classes", "class-diagram", "navigation", "symbols", "symbol", "source", "query", "views", "annotations", "jobs/current", "jev/status", "acp/status", "questions/preview", "dependencies", "dependencies/refresh", "dependencies/symbols", "dependencies/source", "rust-sources", "rust-sources/tree", "rust-sources/file"]);
+  const simple = new Set(["status", "git", "index", "tree", "files", "methods", "sequence", "classes", "class-diagram", "navigation", "symbols", "symbol", "source", "query", "views", "annotations", "jobs/current", "jev/status", "acp/status", "questions/preview", "dependencies", "dependencies/refresh", "dependencies/symbols", "dependencies/source", "rust-sources", "rust-sources/tree", "rust-sources/file"]);
+  if (route === "git" && method !== "GET") throw new Error("Git API requests must be GET.");
   const item = /^jobs\/[^/?]+(?:\/cancel)?$/.test(route) || /^(?:views|annotations)\/[^/?]+$/.test(route) || /^questions\/[^/?]+\/(?:jev-request|jev-response|jev-run|acp-answer|selection)$/.test(route);
   if (!simple.has(route) && !item || /[#\s]/.test(suffix) || suffix.includes("//")) throw new Error("Unknown checkout API route.");
   if (!root || !uniqueSelectableRoot(root)) throw new Error("Choose an available checkout first.");
@@ -202,6 +203,20 @@ function clearSource() {
   if (!$("source-dock")?.hidden) window.TrellisShell?.closeSource?.();
 }
 function changedCount(value) { return Array.isArray(value) ? value.length : Number(value || 0); }
+function showSelectedGit(git) {
+  selectedGit = git || null;
+  window.TrellisShell?.updateCheckout(selectedWorkspaceRoot, selectedGit);
+  if (!status) window.TrellisShell?.updateWorkspace(null);
+}
+async function refreshGit() {
+  const serial = ++gitSerial, session = epoch, root = selectedRootKey;
+  try {
+    const data = await api("/api/git");
+    if (serial === gitSerial && session === epoch && root === selectedRootKey) showSelectedGit(data?.git);
+  } catch (error) {
+    if (serial === gitSerial && session === epoch && root === selectedRootKey && error.name !== "AbortError") showSelectedGit(null);
+  }
+}
 async function refreshStatus(followup = false) {
   statusRefreshDepth++;
   try {
@@ -211,9 +226,10 @@ async function refreshStatus(followup = false) {
   catch (error) {
     if (error.code === "index_not_ready" && serial === statusSerial && session === epoch && selectedRootKey) {
       const root = selectedRootKey, workspaceRoot = error.workspaceRoot || status?.workspaceRoot;
-      const listedRoot = selectedWorkspaceRoot;
+      const listedRoot = selectedWorkspaceRoot, git = selectedGit;
       resetCheckout();
       selectedRootKey = root; selectedWorkspaceRoot = listedRoot;
+      showSelectedGit(git);
       $("checkout-select").value = root;
       $("checkout-root").textContent = workspaceRoot || "Selected checkout · verified root unavailable until status responds";
       $("workspace").hidden = false; $("refresh").disabled = false; $("index").disabled = false;
@@ -349,7 +365,7 @@ const validRootKey = key => typeof key === "string" && /^[0-9a-f]{64}$/.test(key
 function checkoutOption(label, value) { const option = element("option", label); option.value = value; return option; }
 function resetCheckout() {
   // Advance the generation before aborting or awaiting any request. Equal revision pairs are not identity.
-  epoch++; selectedRootKey = null; selectedWorkspaceRoot = null; checkoutBusy = false;
+  epoch++; gitSerial++; selectedRootKey = null; selectedWorkspaceRoot = null; selectedGit = null; checkoutBusy = false;
   for (const controller of pendingRequests) controller.abort();
   clearTimeout(pollTimer); pollTimer = null; statusSerial++; savedSerial++; querySerial++; searchSerial++;
   pairRefreshPending = false; pairRefreshQueued = null;
@@ -392,7 +408,7 @@ function uniqueSelectableRoot(key) {
   return matches.length === 1 && selectable(matches[0]);
 }
 async function loadCheckouts() {
-  const session = epoch;
+  const session = epoch, gitAtStart = gitSerial;
   $("checkout-state").textContent = "Loading checkouts…";
   $("checkout-select").disabled = true; $("checkout-retry").hidden = true;
   try {
@@ -410,9 +426,10 @@ async function loadCheckouts() {
     const busy = sameRoot && selected.state === "storage_busy";
     const recovering = checkoutBusy && sameRoot && selectable(selected);
     if (busy && !checkoutBusy) {
-      const key = selectedRootKey;
+      const key = selectedRootKey, git = selectedGit;
       resetCheckout();
       selectedRootKey = key; selectedWorkspaceRoot = verifiedRoot;
+      showSelectedGit(git);
       checkoutBusy = true;
       $("checkout-root").textContent = verifiedRoot;
     }
@@ -423,10 +440,11 @@ async function loadCheckouts() {
     const select = $("checkout-select"), choice = selectedRootKey || "";
     select.replaceChildren(checkoutOption("Choose a checkout", ""));
     for (const row of checkouts) {
-      const option = checkoutOption(`${row.workspaceRoot || row.rootKey} · ${row.state}`, row.rootKey);
+      const option = checkoutOption(`${row.workspaceRoot || row.rootKey} · ${row.state} · ${window.TrellisShell.formatGit(row.git)}`, row.rootKey);
       option.disabled = !selectable(row); select.append(option);
     }
     select.value = choice;
+    if (choice && !busy && gitAtStart === gitSerial) { gitSerial++; showSelectedGit(selected.git); }
     select.disabled = !checkouts.some(selectable);
     $("checkout-state").textContent = busy ? "Selected checkout is temporarily busy. Retry the checkout list."
       : !checkouts.length ? "No checkouts found. Register a checkout, then retry."
@@ -458,7 +476,9 @@ async function selectCheckout(key) {
     $("checkout-select").value = ""; $("checkout-state").textContent = "Choose an available checkout."; return;
   }
   selectedRootKey = key;
-  selectedWorkspaceRoot = checkouts.find(row => row.rootKey === key).workspaceRoot;
+  const selected = checkouts.find(row => row.rootKey === key);
+  selectedWorkspaceRoot = selected.workspaceRoot;
+  showSelectedGit(selected.git);
   $("error").hidden = true; $("error").textContent = "";
   $("checkout-root").textContent = "Verifying selected checkout…";
   $("checkout-state").textContent = "Loading selected checkout…";
@@ -670,7 +690,7 @@ async function showSource(item, revision) {
     highlight.scrollIntoView?.({block:"start", inline:"nearest"});
   }
 }
-$("refresh").addEventListener("click", () => perform(async () => { clearSource(); const revision = status?.revision; await refreshStatus(); if (IndexPin.equal(revision, status?.revision)) await refreshTree(); if (selectedMethod) await loadSequence(); else if (seed) await runQuery(); await loadSaved(); await refreshJevStatus(); await refreshAcpStatus(); schedulePoll(); }, $("refresh")));
+$("refresh").addEventListener("click", () => perform(async () => { clearSource(); const revision = status?.revision, session = epoch, root = selectedRootKey; await refreshGit(); if (session !== epoch || root !== selectedRootKey) return; await refreshStatus(); if (IndexPin.equal(revision, status?.revision)) await refreshTree(); if (selectedMethod) await loadSequence(); else if (seed) await runQuery(); await loadSaved(); await refreshJevStatus(); await refreshAcpStatus(); schedulePoll(); }, $("refresh")));
 function savedButton(text, action, kind, id, actionName) {
   const control = button(text, action);
   control.setAttribute("data-saved-kind", kind);

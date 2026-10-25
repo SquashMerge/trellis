@@ -5,7 +5,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
-const source = fs.readFileSync(path.join(__dirname, "../web/sequence.js"), "utf8") + "\n" + fs.readFileSync(path.join(__dirname, "../web/app.js"), "utf8");
+const source = ["sequence.js", "shell.js", "app.js"].map(file => fs.readFileSync(path.join(__dirname, "../web", file), "utf8")).join("\n");
 
 function deferred() {
   let resolve, reject;
@@ -19,7 +19,7 @@ function harness() {
   let nextTimer = 0;
   function node(tagName) {
     const classes = new Set();
-    return {tagName, classList: {add(value) { classes.add(value); }, contains(value) { return classes.has(value); }}, focus() {}, hidden: true, disabled: false, value: "", textContent: "", children: [], listeners: {},
+    return {tagName, classList: {add(value) { classes.add(value); }, remove(value) { classes.delete(value); }, contains(value) { return classes.has(value); }, toggle(value, force) { const on = force ?? !classes.has(value); if (on) classes.add(value); else classes.delete(value); return on; }}, focus() {}, hidden: true, disabled: false, value: "", textContent: "", children: [], listeners: {},
       addEventListener(type, handler) { this.listeners[type] = handler; },
       replaceChildren(...items) { this.children = items; },
       append(...items) { this.children.push(...items); },
@@ -32,7 +32,7 @@ function harness() {
     setTimeout(callback, delay) { const id = ++nextTimer; timers.set(id, {callback, delay}); return id; }, clearTimeout(id) { timers.delete(id); },
     window: {confirm: () => true},
     URL: {createObjectURL(blob) { blobs.push(blob); return "blob:synthetic"; }, revokeObjectURL() {}},
-    document: {getElementById: get, createElement: node, createElementNS: (ns, tag) => node(tag), createDocumentFragment: node, createTextNode: text => ({textContent:text}), body: node()},
+    document: {addEventListener() {}, getElementById: get, createElement: node, createElementNS: (ns, tag) => node(tag), createDocumentFragment: node, createTextNode: text => ({textContent:text}), body: node()},
     fetch() { throw new Error("Unexpected request"); }});
   const run = code => vm.runInContext(code, context);
   run(source);

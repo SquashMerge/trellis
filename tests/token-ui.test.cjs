@@ -5,7 +5,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
-const source = fs.readFileSync(path.join(__dirname, "../web/sequence.js"), "utf8") + "\n" + fs.readFileSync(path.join(__dirname, "../web/app.js"), "utf8");
+const source = ["sequence.js", "shell.js", "app.js"].map(file => fs.readFileSync(path.join(__dirname, "../web", file), "utf8")).join("\n");
 const KEY = "trellis.daemonToken.v1";
 const ROOT = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const SCOPED = `/api/checkouts/${ROOT}`;
@@ -16,7 +16,7 @@ function harness({saved, blocked = false, routes} = {}) {
   function node(tagName) {
     const classes = new Set();
     return {tagName, hidden:true, disabled:false, checked:false, value:"", textContent:"", children:[], listeners:{}, attrs:{},
-      classList:{add(value) { classes.add(value); }, contains(value) { return classes.has(value); }},
+      classList:{add(value) { classes.add(value); }, remove(value) { classes.delete(value); }, contains(value) { return classes.has(value); }, toggle(value, force) { const on = force ?? !classes.has(value); if (on) classes.add(value); else classes.delete(value); return on; }},
       focus() {}, addEventListener(type, handler) { this.listeners[type] = handler; },
       replaceChildren(...items) { this.children = items; }, append(...items) { this.children.push(...items); },
       querySelector() { return null; }, setAttribute(key, value) { this.attrs[key] = String(value); }, remove() {}, click() {}};
@@ -30,7 +30,7 @@ function harness({saved, blocked = false, routes} = {}) {
   };
   const context = vm.createContext({console, TextEncoder, DOMException, Blob, AbortController,
     setTimeout() { return 1; }, clearTimeout() {}, localStorage:storage, window:{localStorage:storage, confirm:() => true},
-    document:{getElementById:get, createElement:node, createElementNS:(_,tag) => node(tag), createDocumentFragment:node, createTextNode:text => ({textContent:text}), body:node()},
+    document:{addEventListener() {}, getElementById:get, createElement:node, createElementNS:(_,tag) => node(tag), createDocumentFragment:node, createTextNode:text => ({textContent:text}), body:node()},
     fetch:async (url, options) => {
       requests.push({url,options});
       if (routes) return routes(url, options);
@@ -552,3 +552,130 @@ for(const unavailable of ["unavailable","corrupt","missing","changed","duplicate
     assert.equal(h.get("workspace").hidden,true);
     assert.ok(h.requests.slice(at).every(({url})=>url==="/api/checkouts"));
   });
+
+const gitBranch = (name, upstream = null) => ({state:"available",head:{kind:"branch",name,commit:"abcdef123456",shortCommit:"abcdef1"},upstream});
+const coldStatus = () => ({ok:false,status:503,json:async()=>({error:{code:"index_not_ready",message:"No admitted head"}})});
+
+test("checkout options and cold header share measured Git labels without extra requests on connect or selection",async()=>{
+  const rows=[
+    {rootKey:ROOT,workspaceRoot:"/repo/branch",state:"available",git:gitBranch("feature/<script>",{name:"origin/main",ahead:2,behind:1,basis:"last_fetch"})},
+    {rootKey:"b".repeat(64),workspaceRoot:"/repo/no-upstream",state:"available",git:gitBranch("local")},
+    {rootKey:"c".repeat(64),workspaceRoot:"/repo/detached",state:"available",git:{state:"available",head:{kind:"detached",name:null,commit:"abcdef123456",shortCommit:"abcdef1"},upstream:null}},
+    {rootKey:"d".repeat(64),workspaceRoot:"/repo/non-git",state:"available",git:{state:"unavailable",reason:"not_repository"}},
+    {rootKey:"e".repeat(64),workspaceRoot:"/repo/missing-git",state:"available"}
+  ];
+  const labels=["feature/<script> · origin/main ↑2 ↓1 · As of last fetch","local · No upstream","Detached HEAD abcdef1 · No upstream","Git unavailable","Git unavailable"];
+  const h=harness({routes:url=>{
+    if(url==="/api/checkouts")return response({checkouts:rows});
+    if(url==="/api/daemon/status")return response({activeCheckouts:0});
+    if(rows.some(row=>url===`/api/checkouts/${row.rootKey}/status`))return coldStatus();
+    throw new Error(`Unexpected Git or provider request: ${url}`);
+  }});
+  assert.equal(h.requests.length,0);
+  await h.connect("synthetic",false,false);
+  assert.deepEqual(h.requests.map(r=>r.url),["/api/checkouts","/api/daemon/status"]);
+  for(const [i,row] of rows.entries()) {
+    const option=h.get("checkout-select").children[i+1];
+    assert.equal(option.textContent,`${row.workspaceRoot} · available · ${labels[i]}`);
+    assert.equal(option.children.length,0,"repository labels stay text, not markup");
+    await h.run(`selectCheckout(${JSON.stringify(row.rootKey)})`);
+    assert.equal(h.get("workspace-git").textContent,labels[i]);
+    assert.equal(h.get("workspace-git").hidden,false);
+    assert.equal(h.run("status"),null);
+    assert.equal(h.run("selectedRootKey"),row.rootKey);
+    h.context.window.TrellisShell.updateWorkspace(null);
+    assert.equal(h.get("workspace-git").textContent,labels[i]);
+  }
+  assert.equal(h.requests.length,2+rows.length);
+  h.get("logout").listeners.click();
+  assert.equal(h.get("workspace-git").textContent,"");
+  assert.equal(h.get("workspace-git").hidden,true);
+});
+
+test("explicit status refresh reads Git even with a cold index; list refresh and read failure update only Git",async()=>{
+  let git=gitBranch("before"),fail=false;
+  const h=harness({routes:(url,options)=>{
+    assert.equal(options.method,"GET");
+    if(url==="/api/checkouts")return response({checkouts:[{rootKey:ROOT,workspaceRoot:"/repo",state:"available",git}]});
+    if(url==="/api/daemon/status")return response({activeCheckouts:0});
+    if(url===`${SCOPED}/status`)return coldStatus();
+    if(url===`${SCOPED}/git`)return fail ? {ok:false,status:503,json:async()=>({error:{message:"Read unavailable"}})} : response({git,changes:[]});
+    throw new Error(`Unexpected request: ${url}`);
+  }});
+  await h.connect("synthetic",false,false);await h.run(`selectCheckout('${ROOT}')`);
+  git=gitBranch("after",{name:"origin/after",ahead:0,behind:4,basis:"last_fetch"});
+  const before=h.requests.length;
+  await h.get("refresh").listeners.click();
+  assert.deepEqual(h.requests.slice(before).map(r=>r.url),[`${SCOPED}/git`,`${SCOPED}/status`]);
+  assert.equal(h.get("workspace-git").textContent,"after · origin/after ↑0 ↓4 · As of last fetch");
+  assert.equal(h.run("status"),null);
+  git=gitBranch("from-list");await h.run("loadCheckouts()");
+  assert.equal(h.get("workspace-git").textContent,"from-list · No upstream");
+  fail=true;await h.run("refreshGit()");
+  assert.equal(h.get("workspace-git").textContent,"Git unavailable");
+  assert.equal(h.run("selectedRootKey"),ROOT);
+  const requests=h.requests.length;
+  await assert.rejects(h.run("api('/api/git','POST',{})"),/must be GET/);
+  assert.equal(h.requests.length,requests);
+});
+
+test("late Git success or authentication failure from A cannot overwrite B or disconnect it",async()=>{
+  for(const lateAuth of [false,true]) {
+    const B="b".repeat(64);let finish;
+    const rows=[ROOT,B].map((rootKey,i)=>({rootKey,workspaceRoot:i?"/B":"/A",state:"available",git:gitBranch(i?"branch-B":"branch-A")}));
+    const h=harness({routes:url=>{
+      if(url==="/api/checkouts")return response({checkouts:rows});
+      if(url==="/api/daemon/status")return response({activeCheckouts:0});
+      if(url.endsWith("/status"))return coldStatus();
+      if(url===`${SCOPED}/git`)return new Promise(resolve=>{finish=resolve;});
+      throw new Error(`Wrong-root Git request: ${url}`);
+    }});
+    await h.connect("synthetic",false,false);await h.run(`selectCheckout('${ROOT}')`);
+    const pending=h.run("refreshGit()");
+    assert.ok(finish);
+    await h.run(`selectCheckout('${B}')`);
+    finish(lateAuth?{ok:false,status:401,json:async()=>({error:{message:"obsolete authentication"}})}:response({git:gitBranch("obsolete-A"),changes:[]}));
+    await pending;
+    assert.equal(h.run("selectedRootKey"),B);
+    assert.equal(h.get("workspace-git").textContent,"branch-B · No upstream");
+    assert.equal(h.get("connect-form").hidden,true);
+    assert.equal(h.get("error").hidden,true);
+  }
+});
+
+test("newer selected Git read wins over an older read and an in-flight list summary",async()=>{
+  let holdList=false,finishList;const reads=[];
+  const row=git=>({rootKey:ROOT,workspaceRoot:"/repo",state:"available",git});
+  const h=harness({routes:url=>{
+    if(url==="/api/checkouts")return holdList?new Promise(resolve=>{finishList=resolve;}):response({checkouts:[row(gitBranch("initial"))]});
+    if(url==="/api/daemon/status")return response({activeCheckouts:0});
+    if(url===`${SCOPED}/status`)return coldStatus();
+    if(url===`${SCOPED}/git`)return new Promise(resolve=>reads.push(resolve));
+    throw new Error(`Unexpected request: ${url}`);
+  }});
+  await h.connect("synthetic",false,false);await h.run(`selectCheckout('${ROOT}')`);
+  holdList=true;const listed=h.run("loadCheckouts()"),older=h.run("refreshGit()"),newer=h.run("refreshGit()");
+  reads[1](response({git:gitBranch("newest"),changes:[]}));await newer;
+  reads[0](response({git:gitBranch("older"),changes:[]}));await older;
+  finishList(response({checkouts:[row(gitBranch("older-list"))]}));await listed;
+  assert.equal(h.get("workspace-git").textContent,"newest · No upstream");
+});
+
+test("Disconnect clears selected Git and rejects an in-flight Git read",async()=>{
+  let finish;
+  const h=harness({routes:url=>{
+    if(url==="/api/checkouts")return response({checkouts:[{rootKey:ROOT,workspaceRoot:"/repo",state:"available",git:gitBranch("selected")}]});
+    if(url==="/api/daemon/status")return response({activeCheckouts:0});
+    if(url===`${SCOPED}/status`)return coldStatus();
+    if(url===`${SCOPED}/git`)return new Promise(resolve=>{finish=resolve;});
+    throw new Error(`Unexpected request: ${url}`);
+  }});
+  await h.connect("synthetic",false,false);await h.run(`selectCheckout('${ROOT}')`);
+  const pending=h.run("refreshGit()");
+  h.get("logout").listeners.click();
+  finish(response({git:gitBranch("obsolete"),changes:[]}));await pending;
+  assert.equal(h.get("workspace-git").textContent,"");
+  assert.equal(h.get("workspace-git").hidden,true);
+  assert.equal(h.run("selectedGit"),null);
+  assert.equal(h.run("selectedRootKey"),null);
+});
