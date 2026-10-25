@@ -206,13 +206,49 @@ fn two_document_case(change_b: &str) {
                 .collect::<Vec<_>>()
         )),
     );
-    let manifest = json!({"formatVersion":1,"trustOrigin":"referenceProfile","completion":"complete","decoderVersion":"scip-0.10.0/CapturedScipFactV1/1","profileId":profile["profileId"],
+    let exclusion_reason = match change_b {
+        "partial_empty_covered" => Some("notRequested"),
+        "partial_not_requested" => Some("notRequested"),
+        "partial_unsupported" => Some("unsupported"),
+        "partial_failed" => Some("failed"),
+        _ => None,
+    };
+    let partial = exclusion_reason.is_some();
+    if partial {
+        binary.documents.retain(|d| d.relative_path == "src/A.js");
+        if change_b == "partial_empty_covered" {
+            binary.documents[0].occurrences.clear();
+            binary.documents[0].symbols.clear();
+        }
+        fs::write(root.join("artifact.scip"), binary.write_to_bytes().unwrap()).unwrap();
+    }
+    let bytes = fs::read(root.join("artifact.scip")).unwrap();
+    let covered_documents: Vec<_> = if partial {
+        documents
+            .iter()
+            .filter(|d| d["relativePath"] == "src/A.js")
+            .cloned()
+            .collect()
+    } else {
+        documents.clone()
+    };
+    let artifact_documents = if partial {
+        vec!["src/A.js"]
+    } else {
+        vec!["src/A.js", "src/B.js"]
+    };
+    let exclusions = exclusion_reason
+        .map(|reason| {
+            vec![json!({"language":"javascript","relativePath":"src/B.js","reason":reason})]
+        })
+        .unwrap_or_default();
+    let manifest = json!({"formatVersion":1,"trustOrigin":"referenceProfile","completion":if partial {"partial"} else {"complete"},"decoderVersion":"scip-0.10.0/CapturedScipFactV1/1","profileId":profile["profileId"],
       "producer":{"name":producer["name"],"version":producer["version"],"executableHash":producer["executableHash"],"positionEncoding":2},
       "sourceSet":native.source_set,"sourceRevision":native.revision.id,"sourceManifestHash":manifest_hash,
       "components":{"toolchainHash":native.revision.toolchain_hash,"configHash":native.revision.config_hash,"dependencyHash":native.revision.dependency_hash},
       "metadata":{"protocolVersion":0,"projectRoot":format!("file://{}",root.display()),"textDocumentEncoding":1},
-      "sourceDocuments":documents,"documents":documents,"exclusions":[],
-      "artifacts":[{"kind":"scipBinary","path":"artifact.scip","hash":native_ids::digest(b"",&bytes),"language":"javascript","documents":["src/A.js","src/B.js"]}]});
+      "sourceDocuments":documents,"documents":covered_documents,"exclusions":exclusions,
+      "artifacts":[{"kind":"scipBinary","path":"artifact.scip","hash":native_ids::digest(b"",&bytes),"language":"javascript","documents":artifact_documents}]});
     let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
     fs::write(root.join("manifest.json"), &manifest_bytes).unwrap();
     let digest = native_ids::digest(b"", &manifest_bytes);
@@ -554,6 +590,71 @@ fn two_document_case(change_b: &str) {
     let captured_pin: trellis::model::IndexPin =
         serde_json::from_value(captured["publishedRevision"].clone()).unwrap();
     let captured_semantic = store.semantic_at(captured_pin).unwrap();
+    if partial {
+        if change_b == "partial_empty_covered" {
+            let a = captured_semantic
+                .coverage
+                .iter()
+                .find(|row| row.document_path == "src/A.js")
+                .unwrap();
+            assert_eq!(a.state, trellis::semantic_evidence::CoverageState::Complete);
+            assert!(a.requested && a.selected);
+            assert!(a.diagnostic.is_none());
+            assert_eq!(captured["report"]["documents"][0]["requested"], 0);
+        }
+        let b = captured_semantic
+            .coverage
+            .iter()
+            .find(|row| row.document_path == "src/B.js")
+            .unwrap();
+        let (state, requested, selected, diagnostic) = match exclusion_reason.unwrap() {
+            "notRequested" => (
+                trellis::semantic_evidence::CoverageState::NotRequested,
+                false,
+                false,
+                None,
+            ),
+            "unsupported" => (
+                trellis::semantic_evidence::CoverageState::Omitted,
+                true,
+                false,
+                Some("excluded_by_producer"),
+            ),
+            "failed" => (
+                trellis::semantic_evidence::CoverageState::Failed,
+                true,
+                true,
+                Some("excluded_failed_by_producer"),
+            ),
+            _ => unreachable!(),
+        };
+        assert_eq!(b.state, state);
+        assert_eq!((b.requested, b.selected), (requested, selected));
+        assert_eq!(b.diagnostic.as_deref(), diagnostic);
+        assert!(
+            !captured_semantic
+                .provenance
+                .iter()
+                .any(|row| row.document.path == "src/B.js")
+        );
+        let report = captured["report"]["documents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["path"] == "src/B.js")
+            .unwrap();
+        assert_eq!(report["state"], serde_json::to_value(state).unwrap());
+        for key in [
+            "requested",
+            "matched",
+            "skipped",
+            "ambiguous",
+            "unsupported",
+        ] {
+            assert_eq!(report[key], 0, "{key}");
+        }
+        return;
+    }
     assert!(
         captured_semantic
             .provenance
@@ -876,6 +977,22 @@ fn two_document_case(change_b: &str) {
 }
 
 #[test]
+fn partial_manifest_excluded_b_is_not_requested_in_selected_store_and_report() {
+    two_document_case("partial_not_requested");
+}
+#[test]
+fn partial_manifest_excluded_unsupported_is_omitted_not_native_capability() {
+    two_document_case("partial_unsupported");
+}
+#[test]
+fn partial_manifest_empty_covered_a_remains_complete_without_claims() {
+    two_document_case("partial_empty_covered");
+}
+#[test]
+fn partial_manifest_excluded_failed_is_not_complete() {
+    two_document_case("partial_failed");
+}
+#[test]
 fn unchanged_a_rejoins_after_native_r2_with_new_proof_and_equal_id() {
     two_document_case("same");
 }
@@ -1021,6 +1138,121 @@ fn explicit_import_publishes_a_committed_report_through_daemon() {
     let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
     fs::write(root.join("manifest.json"), &manifest_bytes).unwrap();
     let digest = native_ids::digest(b"", &manifest_bytes);
+    // Start the daemon through the real CLI, then issue closed version-1 frames directly.
+    let started = run(&home, &["status", "--workspace", root_string]);
+    assert!(started.is_object());
+    let socket = trellis::daemon::SocketPaths::new(&if cfg!(target_os = "macos") {
+        home.join("Library/Application Support/dev.squashmerge.trellis")
+    } else {
+        home.join(".local/share/trellis")
+    })
+    .socket;
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(root.join("artifact.scip"), root.join("linked.scip")).unwrap();
+    let invalid = [
+        (
+            "relative.scip".to_owned(),
+            root.join("manifest.json").display().to_string(),
+        ),
+        (
+            temp.path().join("outside.scip").display().to_string(),
+            root.join("manifest.json").display().to_string(),
+        ),
+        (
+            root.join("linked.scip").display().to_string(),
+            root.join("manifest.json").display().to_string(),
+        ),
+    ];
+    fs::write(temp.path().join("outside.scip"), b"untouched outside").unwrap();
+    let queue_rows = || -> Vec<(String, String)> {
+        let db = rusqlite::Connection::open_with_flags(
+            store.request_db_path(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        db.prepare("SELECT id,state FROM requests ORDER BY seq")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    for (selected_scip, selected_manifest) in invalid {
+        let prior_rows = queue_rows();
+        use std::os::unix::net::UnixStream;
+        use trellis::daemon::protocol;
+        let mut stream = UnixStream::connect(&socket).unwrap();
+        protocol::write_frame(
+            &mut stream,
+            &protocol::Request {
+                id: 881,
+                operation: "semantic_import".into(),
+                payload: json!({"workspace":root,"args":{"version":1,"scip":selected_scip,
+                "manifest":selected_manifest,"profileId":"mac-mini-m5-pro-v1",
+                "producerName":"scip-typescript","manifestSha256":digest}}),
+            },
+        )
+        .unwrap();
+        let reply: protocol::Reply = protocol::read_frame(&mut stream).unwrap();
+        assert!(
+            reply.payload["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("invalid_request")),
+            "{reply:?}"
+        );
+        assert_eq!(
+            queue_rows(),
+            prior_rows,
+            "invalid direct request must not create a durable row"
+        );
+        assert!(store.earliest_unfinished_request().unwrap().is_none());
+    }
+    // A normal-size manifest above the existing 1 MiB cap must fail after FIFO acceptance.
+    let oversized_path = root.join("oversized-manifest.json");
+    fs::write(&oversized_path, vec![b' '; 1024 * 1024 + 1]).unwrap();
+    let prior_rows = queue_rows();
+    let oversized = cli(&home)
+        .args([
+            "semantic",
+            "import",
+            "--workspace",
+            root_string,
+            "--scip",
+            root.join("artifact.scip").to_str().unwrap(),
+            "--manifest",
+            oversized_path.to_str().unwrap(),
+            "--profile",
+            "mac-mini-m5-pro-v1",
+            "--producer",
+            "scip-typescript",
+            "--manifest-sha256",
+            &digest,
+        ])
+        .output()
+        .unwrap();
+    assert!(!oversized.status.success());
+    assert!(String::from_utf8_lossy(&oversized.stderr).contains("index_failed"));
+    let after_rows = queue_rows();
+    assert_eq!(
+        after_rows.len(),
+        prior_rows.len() + 1,
+        "oversize request must have been accepted"
+    );
+    assert_eq!(after_rows.last().unwrap().1, "failed");
+    let failed_row = store
+        .request_by_id(&after_rows.last().unwrap().0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(failed_row.error_code.as_deref(), Some("index_failed"));
+    assert!(store.earliest_unfinished_request().unwrap().is_none());
+    let baseline = store.index_baseline().unwrap();
+    assert!(store.semantic_at(baseline).unwrap().provenance.is_empty());
+    assert!(
+        store
+            .semantic_import_report_at(baseline, "scip-typescript")
+            .unwrap()
+            .is_none()
+    );
     let original_components = store.retained_native_components_at(pin).unwrap();
     fs::write(root.join("package.json"), "{\"changed\":true}\n").unwrap();
     let retained_components = store.retained_native_components_at(pin).unwrap();
@@ -1891,10 +2123,12 @@ fn replaced_root_fails_old_accepted_semantic_row_before_new_root_claim() {
     let old_identity =
         trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root).unwrap();
     let old = trellis::store::Store::open(roots.clone(), old_identity).unwrap();
+    fs::write(root.join("artifact.scip"), b"queued artifact").unwrap();
+    fs::write(root.join("manifest.json"), b"queued manifest").unwrap();
     let options = SemanticImportOptions {
         version: 1,
-        scip: "artifact.scip".into(),
-        manifest: "manifest.json".into(),
+        scip: root.join("artifact.scip").display().to_string(),
+        manifest: root.join("manifest.json").display().to_string(),
         profile_id: "mac-mini-m5-pro-v1".into(),
         producer_name: "scip-typescript".into(),
         manifest_sha256: "a".repeat(64),
@@ -1904,6 +2138,8 @@ fn replaced_root_fails_old_accepted_semantic_row_before_new_root_claim() {
     fs::rename(&root, temp.path().join("old-checkout")).unwrap();
     fs::create_dir(&root).unwrap();
     fs::write(root.join("A.js"), "function g(){}\n").unwrap();
+    fs::write(root.join("artifact.scip"), b"new root artifact").unwrap();
+    fs::write(root.join("manifest.json"), b"new root manifest").unwrap();
     assert_eq!(old.fail_changed_root_requests().unwrap(), 1);
     let fresh_identity =
         trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root).unwrap();

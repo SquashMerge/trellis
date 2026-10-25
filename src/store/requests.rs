@@ -1248,6 +1248,10 @@ impl Store {
                     .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
             "invalid_request: semantic import options"
         );
+        crate::scip_admission::validate_selected_role(root, Path::new(&options.scip))
+            .map_err(|error| anyhow::anyhow!("invalid_request: {error}"))?;
+        crate::scip_admission::validate_selected_role(root, Path::new(&options.manifest))
+            .map_err(|error| anyhow::anyhow!("invalid_request: {error}"))?;
         self.enqueue_typed_request(
             root,
             options,

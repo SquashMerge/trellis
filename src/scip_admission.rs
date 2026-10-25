@@ -162,6 +162,12 @@ fn path(s: &str) -> bool {
         && !s.contains(['\\', '\0'])
         && s.split('/').all(|p| !p.is_empty() && p != "." && p != "..")
 }
+pub(crate) fn validate_selected_role(root: &Path, p: &Path) -> Result<String, ScipCaptureError> {
+    if !p.is_absolute() {
+        return Err(admission("selected role is not absolute"));
+    }
+    relative(root, p)
+}
 fn relative(root: &Path, p: &Path) -> Result<String, ScipCaptureError> {
     let r = p
         .strip_prefix(root)

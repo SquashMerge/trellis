@@ -1464,6 +1464,55 @@ fn drain_requests_observed_with_cancel(
     Ok(completed)
 }
 
+fn read_semantic_input(
+    root: &std::path::Path,
+    path: &std::path::Path,
+    max: u64,
+) -> Result<Vec<u8>> {
+    use std::io::Read;
+    crate::scip_admission::validate_selected_role(root, path)
+        .map_err(|error| anyhow::anyhow!("invalid_request: {error}"))?;
+    let metadata = std::fs::symlink_metadata(path)?;
+    ensure!(
+        metadata.is_file(),
+        "invalid_request: semantic input must be a regular file"
+    );
+    ensure!(
+        metadata.len() <= max,
+        "invalid_request: semantic import input bound"
+    );
+    let file = std::fs::File::open(path)?;
+    ensure!(
+        file.metadata()?.is_file(),
+        "invalid_request: semantic input must be a regular file"
+    );
+    let mut bytes = Vec::new();
+    file.take(max + 1).read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() as u64 <= max,
+        "invalid_request: semantic import input bound"
+    );
+    Ok(bytes)
+}
+
+#[cfg(test)]
+mod semantic_input_tests {
+    use super::read_semantic_input;
+
+    #[test]
+    fn bounded_regular_input_accepts_limit_and_rejects_limit_plus_one() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("selected.scip");
+        std::fs::write(&path, b"abc").unwrap();
+        assert_eq!(read_semantic_input(root.path(), &path, 3).unwrap(), b"abc");
+        assert!(read_semantic_input(root.path(), &path, 2).is_err());
+        let fifo = root.path().join("pipe.scip");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        assert!(read_semantic_input(root.path(), &fifo, 3).is_err());
+    }
+}
+
 fn run_semantic_request(
     store: &Store,
     session: &Arc<WriterSession>,
@@ -1479,12 +1528,8 @@ fn run_semantic_request(
     use std::{collections::BTreeMap, path::Path};
     let options = request.semantic_options()?;
     let root = Path::new(store.workspace_root());
-    let binary = std::fs::read(&options.scip)?;
-    let manifest = std::fs::read(&options.manifest)?;
-    ensure!(
-        binary.len() <= 64 * 1024 * 1024 && manifest.len() <= 1024 * 1024,
-        "invalid_request: semantic import input bound"
-    );
+    let binary = read_semantic_input(root, Path::new(&options.scip), 64 * 1024 * 1024)?;
+    let manifest = read_semantic_input(root, Path::new(&options.manifest), 1024 * 1024)?;
     let selection = TrustedSelection {
         expected_manifest_hash: options.manifest_sha256,
         profile_id: options.profile_id,

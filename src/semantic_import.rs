@@ -1381,12 +1381,33 @@ pub fn rejoin_inventory(
     let mut unsupported_documents = BTreeSet::new();
     let mut failed = BTreeSet::new();
     let mut requested = BTreeSet::new();
+    let exclusions: BTreeMap<_, _> = inventory
+        .exclusions
+        .iter()
+        .map(|exclusion| {
+            (
+                (
+                    exclusion.language.as_str(),
+                    exclusion.relative_path.as_str(),
+                ),
+                exclusion.reason.as_str(),
+            )
+        })
+        .collect();
     for document in &captured_native.revision.documents {
         let language: semantic::Language =
             serde_json::from_value(serde_json::json!(document.key.language))?;
         if producer.languages.contains(&language) {
-            requested.insert(document.key.clone());
-            if destination_sources.get(&document.key) != captured_sources.get(&document.key) {
+            let reason =
+                exclusions.get(&(document.key.language.as_str(), document.key.path.as_str()));
+            if reason != Some(&"notRequested") {
+                requested.insert(document.key.clone());
+            }
+            if reason == Some(&"failed")
+                || (reason != Some(&"notRequested")
+                    && destination_sources.get(&document.key)
+                        != captured_sources.get(&document.key))
+            {
                 failed.insert(document.key.clone());
             }
         }
@@ -1982,13 +2003,17 @@ pub fn rejoin_inventory(
         }
         let requested = requested.contains(&doc.key);
         let failed = failed.contains(&doc.key);
-        let partial = unsupported_documents.contains(&doc.key)
+        let excluded = exclusions.get(&(doc.key.language.as_str(), doc.key.path.as_str()));
+        let partial = excluded == Some(&"unsupported")
+            || unsupported_documents.contains(&doc.key)
             || omitted.contains(&Some(doc.key.clone()))
             || facts.diagnostics.contains_key(&doc.key);
         let state = if !requested {
             semantic::CoverageState::NotRequested
         } else if failed {
             semantic::CoverageState::Failed
+        } else if excluded == Some(&"unsupported") {
+            semantic::CoverageState::Omitted
         } else if partial {
             semantic::CoverageState::Partial
         } else {
@@ -2033,12 +2058,21 @@ pub fn rejoin_inventory(
             document_path: doc.key.path.clone(),
             revision_id: destination_native.revision.id.clone(),
             requested,
-            selected: requested,
+            selected: requested && state != semantic::CoverageState::Omitted,
             state,
             supported_roles,
             observed_roles: observed.into_iter().collect(),
             diagnostic: if failed {
-                Some("unmeasurable_source_anchor".into())
+                Some(
+                    if excluded == Some(&"failed") {
+                        "excluded_failed_by_producer"
+                    } else {
+                        "unmeasurable_source_anchor"
+                    }
+                    .into(),
+                )
+            } else if excluded == Some(&"unsupported") {
+                Some("excluded_by_producer".into())
             } else if unsupported_documents.contains(&doc.key) {
                 Some("unsupported_native_gap".into())
             } else if partial {
