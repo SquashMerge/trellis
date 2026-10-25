@@ -946,6 +946,13 @@ fn cancelled_full_document_stream_never_changes_selected_pin() {
         "def after():\n    return 2\n",
     )
     .unwrap();
+    // Multi-document edits can publish locally; changed native configuration
+    // keeps cancellation inside full-stream document validation.
+    fs::write(
+        workspace.path().join("package.json"),
+        r#"{"type":"module"}"#,
+    )
+    .unwrap();
     let mut coordinator = IndexJobCoordinator::prepare(&store, Some(prior)).unwrap();
     let observed = AtomicBool::new(false);
     let attempt = coordinator.run_with_capture(

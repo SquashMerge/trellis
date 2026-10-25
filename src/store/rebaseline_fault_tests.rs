@@ -74,8 +74,8 @@ fn a_local_edit_does_not_reread_unchanged_prior_documents() {
     assert_eq!(
         prepared
             .expect("the one-file edit stays local")
-            .changed_path,
-        "local.js"
+            .changed_paths,
+        BTreeSet::from(["local.js".to_owned()])
     );
 }
 
@@ -141,7 +141,7 @@ fn selective_publication_faults_rollback_and_retry_same_expected_pin() {
             crate::native_evidence::ExtractionAuthFault::Mismatched,
         );
         let mismatch = store
-            .preflight_local_reuse(&graph, &prepared)
+            .preflight_local_reuse(&graph, &prepared, &BTreeMap::new())
             .err()
             .expect("synthetic mismatched declared component must refuse local reuse");
         assert!(
@@ -241,23 +241,23 @@ fn selective_publication_faults_rollback_and_retry_same_expected_pin() {
 }
 
 #[test]
-fn persisted_local_classifier_falls_back_on_affected_uncertainty_not_unrelated_ambiguity() {
+fn persisted_local_classifier_accepts_inventory_partial_and_surface_changes() {
     use crate::{capture::Capture, index_coordinator::IndexJobCoordinator};
     let cases = [
         ("unrelated lexical duplicate", "body", true),
-        ("added source", "add", false),
-        ("deleted source", "delete", false),
-        ("renamed path", "rename", false),
-        ("parser recovery", "parse", false),
-        ("changed scope", "scope", false),
-        ("changed import", "import", false),
-        ("changed reexport", "export", false),
-        ("changed supertype", "supertype", false),
-        ("affected unproved lookup", "lookup", false),
+        ("added source", "add", true),
+        ("deleted source", "delete", true),
+        ("renamed path", "rename", true),
+        ("parser recovery", "parse", true),
+        ("changed scope", "scope", true),
+        ("changed import", "import", true),
+        ("changed reexport", "export", true),
+        ("changed supertype", "supertype", true),
+        ("affected unproved lookup", "lookup", true),
         (
             "affected lexical duplicate candidate",
             "ambiguous_lookup",
-            false,
+            true,
         ),
     ];
     for (label, change, local) in cases {
@@ -596,6 +596,56 @@ fn local_class_catalog_cap_uses_selected_full_revision_symbol_summary() {
     assert!(actual.truncated && full.truncated);
     assert_ne!(actual.warnings, incorrect_changed_only.warnings);
     assert!(!incorrect_changed_only.truncated);
+}
+
+#[test]
+fn local_class_projection_refreshes_unchanged_file_when_cap_moves() {
+    let state = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    fs::write(work.path().join("a.py"), "class A: pass\n").unwrap();
+    fs::write(
+        work.path().join("z.py"),
+        "class Z: pass\nclass Last: pass\n",
+    )
+    .unwrap();
+    let options = IndexOptions::new(work.path().to_owned());
+    let cancel = Arc::new(AtomicBool::new(false));
+    let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+    let (before, before_native, _) =
+        index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+    fs::write(
+        work.path().join("a.py"),
+        "class A: pass\nclass Added: pass\n",
+    )
+    .unwrap();
+    let (after, after_native, _) =
+        index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+    let limits = crate::classes::Limits {
+        classes: 2,
+        ..crate::classes::Limits::default()
+    };
+    let old_catalog =
+        crate::classes::Catalog::build_with_limits(&before.files, &before.nodes, &cancel, limits)
+            .unwrap();
+    let new_catalog =
+        crate::classes::Catalog::build_with_limits(&after.files, &after.nodes, &cancel, limits)
+            .unwrap();
+    assert_eq!(old_catalog.warnings, new_catalog.warnings);
+    assert_eq!(old_catalog.truncated, new_catalog.truncated);
+    let old_rows = publication_rows(&before, &before_native, &old_catalog).unwrap();
+    let new_rows = publication_rows(&after, &after_native, &new_catalog).unwrap();
+    let file = before
+        .files
+        .iter()
+        .find(|file| file.path == "z.py")
+        .unwrap();
+    let old = v8_document_projection(file, &before_native, &old_rows["z.py"]).unwrap();
+    let full = v8_document_projection(file, &after_native, &new_rows["z.py"]).unwrap();
+    let refreshed = v8_class_projection(&old.graph_id, &new_rows["z.py"]);
+    assert_eq!(old.version_id, full.version_id);
+    assert_eq!(old.graph_id, full.graph_id);
+    assert_ne!(old.class_id, full.class_id);
+    assert_eq!(refreshed, (full.class_id, full.class_hash));
 }
 
 #[test]
@@ -1948,5 +1998,246 @@ fn real_source_above_injected_ancillary_cap_keeps_selected_source_available() {
             .1
             .text,
         source
+    );
+}
+
+#[test]
+fn local_composition_preserves_prior_stats_metadata() {
+    use crate::{capture::Capture, model::SemanticState};
+    let (_state, work, store, options, _pin) = local_edit_fixture();
+    let cancel = Arc::new(AtomicBool::new(false));
+    fs::write(
+        work.path().join("local.js"),
+        "function local(){if (ready()) { return next(); } return 2;}\nfunction added(){return local();}\n",
+    )
+    .unwrap();
+    let capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
+    let expected = store.recovery_index_baseline().unwrap();
+    let mut prepared = store
+        .prepare_local_revision(&capture, &expected, &cancel)
+        .unwrap()
+        .expect("the JavaScript edit uses local composition");
+    prepared.old_stats.semantic_state = SemanticState::Stale;
+    prepared.old_stats.changed_files = vec!["prior-change.js".into()];
+    prepared.old_stats.internal = 3;
+    prepared.old_stats.external = 4;
+    prepared.old_stats.ambiguous = 5;
+    let changed = crate::indexer::project_native_documents(
+        &options,
+        &capture,
+        &prepared.native,
+        &prepared.changed_paths,
+        &cancel,
+        &|_| {},
+    )
+    .unwrap();
+    let graph = store
+        .compose_local_revision(&capture, &prepared, changed, &cancel)
+        .unwrap();
+    let (full, _, _) = index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+    let mut expected_stats = full.stats;
+    expected_stats.semantic_state = prepared.old_stats.semantic_state;
+    expected_stats.changed_files = prepared.old_stats.changed_files.clone();
+    expected_stats.internal = prepared.old_stats.internal;
+    expected_stats.external = prepared.old_stats.external;
+    expected_stats.ambiguous = prepared.old_stats.ambiguous;
+    assert_eq!(graph.stats, expected_stats);
+}
+
+#[test]
+fn local_class_only_refresh_writes_new_class_rows_and_rolls_back_atomically() {
+    use crate::{capture::Capture, index_coordinator::IndexJobCoordinator};
+    let state = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    fs::write(
+        work.path().join("a.py"),
+        "class A:\n    def a(self): return 1\n",
+    )
+    .unwrap();
+    fs::write(
+        work.path().join("z.py"),
+        "class Z:\n    def z(self): return 2\n",
+    )
+    .unwrap();
+    let options = IndexOptions::new(work.path().to_owned());
+    let cancel = Arc::new(AtomicBool::new(false));
+    let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+    let job = IndexJobCoordinator::prepare(&store, None).unwrap();
+    let first = job.run(&options, &cancel, |_| {}).unwrap();
+    let old_graph = store.graph_at(Some(first)).unwrap();
+    fs::write(
+        work.path().join("a.py"),
+        "class A:\n    def a(self): return 1\n    def added(self): return 3\n",
+    )
+    .unwrap();
+    let capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
+    let expected = store.recovery_index_baseline().unwrap();
+    let prepared = store
+        .prepare_local_revision(&capture, &expected, &cancel)
+        .unwrap()
+        .unwrap();
+    let changed = crate::indexer::project_native_documents(
+        &options,
+        &capture,
+        &prepared.native,
+        &prepared.changed_paths,
+        &cancel,
+        &|_| {},
+    )
+    .unwrap();
+    let graph = store
+        .compose_local_revision(&capture, &prepared, changed, &cancel)
+        .unwrap();
+    assert!(graph.nodes.iter().all(|node| node.path == "a.py"));
+    let mut extractions = prepared.prior_extractions.clone();
+    let changed_file = graph.files.iter().find(|file| file.path == "a.py").unwrap();
+    extractions.insert(
+        "a.py".into(),
+        crate::classes::FileExtraction::extract_file(
+            changed_file,
+            &graph.nodes,
+            &cancel,
+            crate::classes::Limits::default(),
+        )
+        .unwrap(),
+    );
+    let catalog = Store::compose_selected_class_catalog(
+        &graph,
+        &extractions,
+        crate::classes::Limits {
+            records: 1,
+            ..crate::classes::Limits::default()
+        },
+    )
+    .unwrap();
+    assert!(catalog.truncated);
+    assert!(
+        catalog
+            .classes
+            .iter()
+            .find(|class| class.symbol.path == "z.py")
+            .unwrap()
+            .truncated
+    );
+    let mut native = prepared.native.clone();
+    let mut coverage = prepared.prior_coverage["z.py"].clone();
+    coverage.revision_id.clone_from(&native.revision.id);
+    native.coverage.push(coverage);
+    let rows = publication_rows(&graph, &native, &catalog).unwrap();
+    let reuse = store
+        .preflight_local_reuse(&graph, &prepared, &rows)
+        .unwrap();
+    let families = reuse.for_path("z.py");
+    assert!(families.native && families.graph && !families.class);
+    let old_ids = &prepared.prior_ids["z.py"];
+    let next_ids = &reuse.existing_ids["z.py"];
+    assert_eq!(next_ids.version_id, old_ids.version_id);
+    assert_eq!(next_ids.graph_id, old_ids.graph_id);
+    assert_ne!(next_ids.class_id, old_ids.class_id);
+    let mut db = store.cache_write().unwrap();
+    let prior_key = format!("pin:v1:{}:{}", first.index_generation, first.index_revision);
+    let old_storage: (i64, i64, i64) = db
+        .query_row(
+            "SELECT vid,gid,cid FROM revision_documents WHERE revision_id=?1 AND path='z.py'",
+            [&prior_key],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    let next = IndexPin {
+        index_generation: first.index_generation,
+        index_revision: first.index_revision + 1,
+    };
+    let next_key = format!("pin:v1:{}:{}", next.index_generation, next.index_revision);
+    let tx = db
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .unwrap();
+    let mut immutable = ImmutableAppend::default();
+    let written = write_native(
+        &tx,
+        (&native, &capture, &graph, &catalog, &extractions),
+        next,
+        &graph.stats,
+        &cancel,
+        &mut immutable,
+        &reuse,
+        &rows,
+        &graph.diagnostics,
+        NativeWrite::Header { ordinal_start: 0 },
+    )
+    .unwrap();
+    // Observe the unchanged file's class-only write separately from changed facts.
+    let before_class = immutable.counters.class.rows;
+    let before_native = immutable.counters.native;
+    let before_graph = immutable.counters.graph;
+    write_graph_document(
+        &tx,
+        &rows["z.py"],
+        &written["z.py"],
+        families,
+        &mut immutable,
+    )
+    .unwrap();
+    assert_eq!(immutable.counters.native, before_native);
+    assert_eq!(immutable.counters.graph, before_graph);
+    assert!(immutable.counters.class.rows > before_class);
+    write_graph_document(
+        &tx,
+        &rows["a.py"],
+        &written["a.py"],
+        reuse.for_path("a.py"),
+        &mut immutable,
+    )
+    .unwrap();
+    immutable.finish(&tx).unwrap();
+    let new_storage: (i64, i64, i64) = tx
+        .query_row(
+            "SELECT vid,gid,cid FROM revision_documents WHERE revision_id=?1 AND path='z.py'",
+            [&next_key],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (new_storage.0, new_storage.1),
+        (old_storage.0, old_storage.1)
+    );
+    assert_ne!(new_storage.2, old_storage.2);
+    assert_eq!(
+        tx.query_row(
+            "SELECT content_hash FROM class_projections WHERE cid=?1",
+            [new_storage.2],
+            |row| row.get::<_, String>(0)
+        )
+        .unwrap(),
+        next_ids.class_hash
+    );
+    assert_eq!(
+        tx.query_row(
+            "SELECT count(*) FROM classes WHERE cid=?1",
+            [new_storage.2],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    assert!(immutable.counters.class.rows > 0);
+    assert_eq!(immutable.counters.reused_occurrence_reads, 0);
+    tx.rollback().unwrap();
+    drop(db);
+    assert_eq!(
+        ReadRevision::current(&store.cache().unwrap()).unwrap().pin,
+        first
+    );
+    assert_eq!(store.graph_at(Some(first)).unwrap(), old_graph);
+    assert_eq!(
+        store
+            .cache()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM native_revisions WHERE id=?1",
+                [&next_key],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
     );
 }

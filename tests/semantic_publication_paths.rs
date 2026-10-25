@@ -535,8 +535,17 @@ fn private_stage_admits_typed_evidence_without_changing_live_head() {
 
 #[test]
 fn changed_local_semantics_bind_new_revision_and_keep_old_pin_isolated() {
-    let (_state, root, store, cancel, options) = setup();
-    fs::write(root.path().join("other.rs"), "fn hello() { hello(); }\n").unwrap();
+    let (state, root, store, cancel, options) = setup();
+    fs::write(
+        root.path().join("other.rs"),
+        "fn hello() { hello(); opaque!(hidden); }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.path().join("changed.rs"),
+        "fn hello() { hello(); } fn before() -> i32 { 1 }\n",
+    )
+    .unwrap();
     fs::write(
         root.path().join("hello.rs"),
         "fn hello() { hello(); } fn number() -> i32 { 1 }\n",
@@ -545,16 +554,47 @@ fn changed_local_semantics_bind_new_revision_and_keep_old_pin_isolated() {
     let (graph, native, capture) =
         index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
     let (mut semantic, captured) = evidence(&native, root.path());
-    let (other, _) = evidence_for(&native, root.path(), "other.rs");
-    semantic.coverage.extend(other.coverage);
-    semantic.provenance.extend(other.provenance);
-    semantic.symbols.extend(other.symbols);
-    semantic
-        .declaration_bindings
-        .extend(other.declaration_bindings);
-    semantic.references.extend(other.references);
-    semantic.call_bindings.extend(other.call_bindings);
-    semantic.type_relationships.extend(other.type_relationships);
+    assert!(!native.references.is_empty());
+    assert!(native.capability_reports.iter().any(|report| {
+        report.document.path == "other.rs"
+            && report.families.iter().any(|family| !family.gaps.is_empty())
+    }));
+    let assert_native_families = |pin, measured: &n::Artifact| {
+        for report in &measured.capability_reports {
+            assert_eq!(
+                store
+                    .native_capability_report_at(pin, &report.document)
+                    .unwrap()
+                    .as_ref(),
+                Some(report)
+            );
+        }
+        for declaration in &measured.declarations {
+            assert_eq!(
+                store
+                    .native_references_at(pin, &declaration.syntax_id)
+                    .unwrap(),
+                measured
+                    .references
+                    .iter()
+                    .filter(|reference| reference.owner_syntax_id == declaration.syntax_id)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            );
+        }
+    };
+    for path in ["changed.rs", "other.rs"] {
+        let (other, _) = evidence_for(&native, root.path(), path);
+        semantic.coverage.extend(other.coverage);
+        semantic.provenance.extend(other.provenance);
+        semantic.symbols.extend(other.symbols);
+        semantic
+            .declaration_bindings
+            .extend(other.declaration_bindings);
+        semantic.references.extend(other.references);
+        semantic.call_bindings.extend(other.call_bindings);
+        semantic.type_relationships.extend(other.type_relationships);
+    }
     let leader = store.publication_for_tests().unwrap();
     let first = store
         .publish_native_semantic(
@@ -568,9 +608,45 @@ fn changed_local_semantics_bind_new_revision_and_keep_old_pin_isolated() {
             &cancel,
         )
         .unwrap();
+    let identity =
+        trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+            .unwrap();
+    let unchanged_ids = |pin: trellis::model::IndexPin| -> (i64, i64) {
+        let db = rusqlite::Connection::open(
+            state
+                .path()
+                .join("cache/indexes")
+                .join(&identity.root_key)
+                .join("index.db"),
+        )
+        .unwrap();
+        db.query_row(
+            "SELECT vid,gid FROM revision_documents WHERE revision_id=?1 AND path='other.rs'",
+            [format!(
+                "pin:v1:{}:{}",
+                pin.index_generation, pin.index_revision
+            )],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
+    };
+    assert_native_families(first, &native);
+    let old_unchanged_ids = unchanged_ids(first);
+    let old_semantic = serde_json::to_value(store.semantic_at(first).unwrap()).unwrap();
+    let old_graph = store.graph_at(Some(first)).unwrap();
+    let old_changed_source = store
+        .source_at("changed.rs", Some(first))
+        .unwrap()
+        .unwrap()
+        .1;
     fs::write(
         root.path().join("hello.rs"),
-        "fn hello() { hello(); } fn number() -> i32 { 2 }\n",
+        "fn hello() { hello(); hello(); } fn number(value: i32) -> i32 { value }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.path().join("changed.rs"),
+        "pub fn hello() { hello(); } fn renamed(value: i32) -> i32 { value }\n",
     )
     .unwrap();
     let (new_graph, new_native, _) =
@@ -578,18 +654,20 @@ fn changed_local_semantics_bind_new_revision_and_keep_old_pin_isolated() {
     let new_capture = trellis::capture::Capture::admit(&options, &cancel, &|_| {}).unwrap();
     assert_ne!(native.revision.id, new_native.revision.id);
     let (mut new_semantic, new_components) = evidence(&new_native, root.path());
-    let (reused, _) = evidence_for(&new_native, root.path(), "other.rs");
-    new_semantic.coverage.extend(reused.coverage);
-    new_semantic.provenance.extend(reused.provenance);
-    new_semantic.symbols.extend(reused.symbols);
-    new_semantic
-        .declaration_bindings
-        .extend(reused.declaration_bindings);
-    new_semantic.references.extend(reused.references);
-    new_semantic.call_bindings.extend(reused.call_bindings);
-    new_semantic
-        .type_relationships
-        .extend(reused.type_relationships);
+    for path in ["changed.rs", "other.rs"] {
+        let (reused, _) = evidence_for(&new_native, root.path(), path);
+        new_semantic.coverage.extend(reused.coverage);
+        new_semantic.provenance.extend(reused.provenance);
+        new_semantic.symbols.extend(reused.symbols);
+        new_semantic
+            .declaration_bindings
+            .extend(reused.declaration_bindings);
+        new_semantic.references.extend(reused.references);
+        new_semantic.call_bindings.extend(reused.call_bindings);
+        new_semantic
+            .type_relationships
+            .extend(reused.type_relationships);
+    }
     let err = store
         .publish_local_semantic_for_tests(
             &options,
@@ -606,6 +684,11 @@ fn changed_local_semantics_bind_new_revision_and_keep_old_pin_isolated() {
         "{err:#}"
     );
     assert_eq!(store.status().unwrap().revision, first);
+    assert_eq!(store.graph_at(Some(first)).unwrap(), old_graph);
+    assert_eq!(
+        serde_json::to_value(store.semantic_at(first).unwrap()).unwrap(),
+        old_semantic
+    );
     assert_eq!(
         store.semantic_at(first).unwrap().references,
         semantic.references
@@ -623,6 +706,9 @@ fn changed_local_semantics_bind_new_revision_and_keep_old_pin_isolated() {
         )
         .unwrap();
     assert_ne!(first, second);
+    assert_eq!(unchanged_ids(second), old_unchanged_ids);
+    assert_native_families(second, &new_native);
+    assert_native_families(first, &native);
     assert_eq!(
         store.semantic_at(first).unwrap().references,
         semantic.references
@@ -632,7 +718,7 @@ fn changed_local_semantics_bind_new_revision_and_keep_old_pin_isolated() {
         new_semantic.references
     );
     let current = store.semantic_at(second).unwrap();
-    assert_eq!(current.coverage.len(), 2);
+    assert_eq!(current.coverage.len(), 3);
     assert!(
         current
             .coverage
@@ -692,6 +778,26 @@ fn changed_local_semantics_bind_new_revision_and_keep_old_pin_isolated() {
             .find(|r| r.document.path == "other.rs")
             .unwrap()
             .id
+    );
+    assert_eq!(store.graph_at(Some(first)).unwrap(), old_graph);
+    assert_eq!(
+        serde_json::to_value(store.semantic_at(first).unwrap()).unwrap(),
+        old_semantic
+    );
+    assert_eq!(
+        store
+            .source_at("changed.rs", Some(first))
+            .unwrap()
+            .unwrap()
+            .1,
+        old_changed_source
+    );
+    assert_eq!(store.graph_at(Some(second)).unwrap(), new_graph);
+    assert!(
+        current
+            .coverage
+            .iter()
+            .any(|coverage| coverage.document_path == "changed.rs")
     );
     assert_ne!(
         new_graph
