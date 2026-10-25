@@ -4620,6 +4620,200 @@ pub struct SemanticRawCapture {
     pub inventory: crate::scip_raw::CapturedScipInventory,
 }
 
+fn same_measured_native(
+    supplied: &crate::native_evidence::Artifact,
+    selected: &crate::native_evidence::Artifact,
+) -> Result<bool> {
+    fn rows<T: serde::Serialize>(items: &[T]) -> Result<Vec<Vec<u8>>> {
+        let mut bytes = items
+            .iter()
+            .map(|item| {
+                serde_json::to_value(item).map(|value| crate::native_ids::canonical(&value))
+            })
+            .collect::<serde_json::Result<Vec<_>>>()?;
+        bytes.sort();
+        Ok(bytes)
+    }
+    Ok(supplied.producer == selected.producer
+        && supplied.source_set == selected.source_set
+        && supplied.revision == selected.revision
+        && rows(&supplied.coverage)? == rows(&selected.coverage)?
+        && rows(&supplied.provenance)? == rows(&selected.provenance)?
+        && rows(&supplied.declarations)? == rows(&selected.declarations)?
+        && rows(&supplied.calls)? == rows(&selected.calls)?
+        && rows(&supplied.control_regions)? == rows(&selected.control_regions)?
+        && rows(&supplied.references)? == rows(&selected.references)?
+        && rows(&supplied.capability_reports)? == rows(&selected.capability_reports)?)
+}
+
+fn authenticate_import_raw(
+    raw: &SemanticRawCapture,
+    captured: &crate::semantic_evidence::CapturedComponents,
+    r1: &crate::native_evidence::Artifact,
+    sources: &BTreeMap<crate::native_evidence::DocumentKey, Vec<u8>>,
+    root: &std::path::Path,
+    cancel: &CancelFlag,
+) -> Result<()> {
+    use crate::native_ids::{canonical, digest};
+    use crate::scip_raw::{self, AuthenticatedScipDocument, AuthenticatedScipInput};
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&raw.manifest_bytes).context("invalid raw manifest")?;
+    let profile: serde_json::Value = serde_json::from_str(include_str!(
+        "../docs/semantic-evidence/hardware/mac-mini-m5-pro-v1.json"
+    ))?;
+    let pinned = profile["semanticProducers"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|p| p["name"] == raw.producer_id))
+        .context("raw producer not pinned")?;
+    let encoding = match pinned["positionEncoding"].as_str() {
+        Some("utf8") => 1,
+        Some("utf16") => 2,
+        Some("unicodeScalar") => 3,
+        _ => anyhow::bail!("raw producer encoding not pinned"),
+    };
+    let language = match raw.producer_id.as_str() {
+        "scip-java" => "java",
+        "scip-typescript" => "javascript",
+        "scip-python" => "python",
+        "rust-analyzer" => "rust",
+        _ => anyhow::bail!("raw producer not supported"),
+    };
+    let source_docs: Vec<_> = r1
+        .revision
+        .documents
+        .iter()
+        .map(|d| {
+            serde_json::json!({
+                "language":d.key.language,"relativePath":d.key.path,"contentHash":d.content_hash
+            })
+        })
+        .collect();
+    let covered: Vec<_> = manifest["documents"]
+        .as_array()
+        .context("raw covered documents absent")?
+        .iter()
+        .map(|d| {
+            (
+                d["language"].as_str(),
+                d["relativePath"].as_str(),
+                d["contentHash"].as_str(),
+            )
+        })
+        .collect();
+    ensure!(
+        !covered.is_empty() && covered.len() <= 1000,
+        "raw covered document count"
+    );
+    let mut docs = Vec::new();
+    for (lang, path, hash) in &covered {
+        let (lang, path, hash) = (
+            lang.context("raw document language")?,
+            path.context("raw document path")?,
+            hash.context("raw document hash")?,
+        );
+        let (key, bytes) = sources
+            .iter()
+            .find(|(k, _)| k.language == lang && k.path == path)
+            .context("raw retained document missing")?;
+        ensure!(
+            lang == language
+                && digest(b"", bytes) == hash
+                && r1
+                    .revision
+                    .documents
+                    .iter()
+                    .any(|d| d.key == *key && d.content_hash == hash),
+            "raw retained document differs"
+        );
+        docs.push(AuthenticatedScipDocument {
+            language: lang.to_owned(),
+            relative_path: path.to_owned(),
+            source_bytes: bytes,
+            content_hash: hash.to_owned(),
+        });
+    }
+    let mut uri = String::from("file://");
+    for b in root.to_str().context("non-UTF8 root")?.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~' | b'/') {
+            uri.push(char::from(b));
+        } else {
+            uri.push_str(&format!("%{b:02X}"));
+        }
+    }
+    let artifact_hash = digest(b"", &raw.binary_bytes);
+    let docs_list: Vec<_> = covered
+        .iter()
+        .map(|(_, p, _)| p.context("raw path").map(str::to_owned))
+        .collect::<Result<_>>()?;
+    let artifact = &manifest["artifacts"];
+    ensure!(manifest["formatVersion"] == 1
+        && manifest["trustOrigin"] == "referenceProfile"
+        && manifest["decoderVersion"] == scip_raw::DECODER_VERSION
+        && manifest["profileId"] == profile["profileId"]
+        && manifest["producer"] == serde_json::json!({"name":pinned["name"],"version":pinned["version"],"executableHash":pinned["executableHash"],"positionEncoding":encoding})
+        && manifest["sourceSet"] == serde_json::to_value(&r1.source_set)?
+        && manifest["sourceRevision"] == r1.revision.id
+        && manifest["sourceManifestHash"] == raw.inventory.source_manifest_hash
+        && manifest["sourceManifestHash"] == digest(b"",&canonical(&serde_json::json!(r1.revision.documents.iter().map(|d|serde_json::json!({"document":d.key,"contentHash":d.content_hash})).collect::<Vec<_>>())))
+        && manifest["components"] == serde_json::json!({"toolchainHash":r1.revision.toolchain_hash,"configHash":r1.revision.config_hash,"dependencyHash":r1.revision.dependency_hash})
+        && manifest["metadata"] == serde_json::json!({"protocolVersion":0,"projectRoot":uri,"textDocumentEncoding":1})
+        && manifest["sourceDocuments"] == serde_json::json!(source_docs)
+        && artifact.as_array().is_some_and(|list|list.len()==1)
+        && artifact[0]["kind"] == "scipBinary"
+        && artifact[0]["hash"] == artifact_hash
+        && artifact[0]["language"] == language
+        && artifact[0]["documents"] == serde_json::json!(docs_list)
+        && serde_json::from_value::<Vec<scip_raw::Exclusion>>(manifest["exclusions"].clone())? == raw.inventory.exclusions
+        && serde_json::from_value::<scip_raw::Completion>(manifest["completion"].clone())? == raw.inventory.completion,
+        "raw original manifest does not bind captured revision and producer");
+    ensure!(
+        raw.producer_id == pinned["name"]
+            && raw.source_set_id == r1.source_set.id
+            && raw.captured_revision == r1.revision.id
+            && captured.captured_revision == r1.revision
+            && captured.sources == *sources,
+        "raw captured native/source identity differs"
+    );
+    let admitted = scip_raw::decode_authenticated(
+        &AuthenticatedScipInput {
+            artifact_bytes: &raw.binary_bytes,
+            artifact_hash,
+            producer_id: raw.producer_id.clone(),
+            profile_id: profile["profileId"]
+                .as_str()
+                .context("profile id")?
+                .to_owned(),
+            source_set_id: raw.source_set_id.clone(),
+            source_revision: raw.captured_revision.clone(),
+            source_manifest_hash: raw.inventory.source_manifest_hash.clone(),
+            decoder_version: scip_raw::DECODER_VERSION,
+            completion: raw.inventory.completion,
+            exclusions: raw.inventory.exclusions.clone(),
+            project_root_uri: uri,
+            producer_version: pinned["version"]
+                .as_str()
+                .context("producer version")?
+                .to_owned(),
+            position_encoding: encoding,
+            protocol_version: 0,
+            text_document_encoding: 1,
+            documents: docs,
+        },
+        cancel,
+    )
+    .context("raw original binary admission")?;
+    ensure!(
+        admitted.artifact_hash == raw.inventory.artifact_hash
+            && admitted.decoder_version == raw.inventory.decoder_version
+            && admitted.source_manifest_hash == raw.inventory.source_manifest_hash
+            && admitted.completion == raw.inventory.completion
+            && admitted.exclusions == raw.inventory.exclusions
+            && admitted.claims == raw.inventory.claims,
+        "raw inventory differs from authenticated binary"
+    );
+    Ok(())
+}
+
 fn write_raw_capture(db: &Connection, raw: &SemanticRawCapture) -> Result<i64> {
     use crate::native_ids::{canonical, digest};
     ensure!(
@@ -10938,6 +11132,7 @@ impl Store {
     }
     /// Replace one semantic producer's selected overlay against the full native pin and document inventory.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn publish_semantic_import(
         &self,
         expected: IndexPin,
@@ -10949,6 +11144,57 @@ impl Store {
         report: &serde_json::Value,
         leader: &topology::WriterGuard,
         cancel: &CancelFlag,
+    ) -> Result<IndexPin> {
+        self.publish_semantic_import_inner(
+            expected,
+            expected_document_hashes,
+            publication,
+            captured,
+            native,
+            raw,
+            report,
+            leader,
+            cancel,
+            |_| Ok(()),
+        )
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn publish_semantic_import_with_fault_for_tests(
+        &self,
+        expected: IndexPin,
+        expected_document_hashes: &BTreeMap<(String, String), String>,
+        publication: &crate::semantic_evidence::SemanticPublication,
+        captured: &crate::semantic_evidence::CapturedComponents,
+        native: &crate::native_evidence::Artifact,
+        raw: &SemanticRawCapture,
+        report: &serde_json::Value,
+        leader: &topology::WriterGuard,
+        cancel: &CancelFlag,
+        precommit_cancel: bool,
+    ) -> Result<IndexPin> {
+        self.publish_semantic_import_inner(expected,expected_document_hashes,publication,captured,native,raw,report,leader,cancel,|db| {
+            if precommit_cancel { cancel.store(true,std::sync::atomic::Ordering::Relaxed); }
+            else { db.execute("INSERT INTO semantic_import_reports(revision_id) VALUES ('forced-sql-fault')",[])?; }
+            Ok(())
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn publish_semantic_import_inner(
+        &self,
+        expected: IndexPin,
+        expected_document_hashes: &BTreeMap<(String, String), String>,
+        publication: &crate::semantic_evidence::SemanticPublication,
+        captured: &crate::semantic_evidence::CapturedComponents,
+        native: &crate::native_evidence::Artifact,
+        raw: &SemanticRawCapture,
+        report: &serde_json::Value,
+        leader: &topology::WriterGuard,
+        cancel: &CancelFlag,
+        mut hook: impl FnMut(&Connection) -> Result<()>,
     ) -> Result<IndexPin> {
         use crate::semantic_evidence::validate_evidence_with_raw;
         ensure!(
@@ -10965,7 +11211,25 @@ impl Store {
             serde_json::to_vec(report)?.len() <= 1024 * 1024,
             "semantic import report exceeds response bound"
         );
-        validate_evidence_with_raw(publication, native, captured, Some(raw))?;
+        let (selected_native, _) = self.retained_native_snapshot_at(expected)?;
+        ensure!(
+            same_measured_native(native, &selected_native)?,
+            "revision conflict: semantic import measured native snapshot differs"
+        );
+        let captured_pin = self.with_evidence(|db| {
+            let revision: i64 = db.query_row("SELECT published_index_revision FROM native_revisions r WHERE native_revision_id=?1 AND source_set_id=?2 AND NOT EXISTS(SELECT 1 FROM revision_capture_inputs WHERE revision_id=r.id AND input_key IN ('__released:v1','__pending_release:v1')) ORDER BY published_index_revision DESC LIMIT 1",params![captured.captured_revision.id,raw.source_set_id],|r|r.get(0)).context("capture_unavailable: retained captured native revision missing")?;
+            Ok(IndexPin { index_generation:expected.index_generation,index_revision:u64::try_from(revision)? })
+        })?;
+        let (captured_native, captured_sources) = self.retained_native_snapshot_at(captured_pin)?;
+        authenticate_import_raw(
+            raw,
+            captured,
+            &captured_native,
+            &captured_sources,
+            &self.identity.root,
+            cancel,
+        )?;
+        validate_evidence_with_raw(publication, &selected_native, captured, Some(raw))?;
         leader.belongs_to(&self.identity)?;
         self.identity.verify()?;
         let mut db = self.cache_write()?;
@@ -11048,6 +11312,7 @@ impl Store {
         write_import_semantic(&tx, &next_key, publication, captured)?;
         tx.execute("INSERT INTO semantic_import_reports(revision_id,producer_id,report_json) VALUES(?1,?2,?3)",params![next_key,raw.producer_id,serde_json::to_string(report)?])?;
         tx.execute("INSERT INTO semantic_import_reports SELECT ?1,producer_id,report_json FROM semantic_import_reports WHERE revision_id=?2 AND producer_id<>?3",params![next_key,old_key,raw.producer_id])?;
+        hook(&tx)?;
         let published_at = self.retention_time()?;
         stamp_predecessor(&tx, &old_key, published_at.as_secs() as i64)?;
         tx.execute("UPDATE index_metadata SET index_revision=?1,indexed_at=?2 WHERE singleton=1 AND index_generation=?3 AND index_revision=?4", params![next.index_revision as i64,published_at.as_millis().to_string(),expected.index_generation.to_string(),expected.index_revision as i64])?;
@@ -14512,7 +14777,11 @@ impl Store {
         self.with_evidence(|db| {
             let row: Option<(String,String,String,String,Vec<u8>)> = db.query_row("SELECT p.record_kind,p.fact_digest,p.language,p.path,p.canonical_bytes FROM semantic_raw_captures c JOIN semantic_raw_proofs p ON p.capture_id=c.capture_id WHERE c.producer_id=?1 AND c.artifact_hash=?2 AND c.source_set_id=?3 AND c.captured_revision=?4 AND p.proof_id=?5",params![producer_id,artifact_hash,source_set_id,captured_revision,proof_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
             row.map(|(record_kind,fact_digest,language,path,canonical_bytes)| {
-                selected_ensure!(crate::native_ids::digest(b"trellis.semantic-fact.v1\0", &canonical_bytes) == fact_digest && crate::native_ids::digest(b"trellis.capture-proof.v1\0", &crate::native_ids::canonical(&serde_json::json!({"producerId":producer_id,"artifactHash":artifact_hash,"sourceSetId":source_set_id,"sourceRevision":captured_revision,"language":language,"relativePath":path,"factDigest":fact_digest}))) == proof_id,"incompatible_index: corrupt raw proof inventory");
+                let envelope: serde_json::Value = serde_json::from_slice(&canonical_bytes)
+                    .context(SelectedIntegrity("incompatible_index: corrupt raw proof envelope".into()))?;
+                selected_ensure!(envelope["recordKind"] == record_kind && envelope["relativePath"] == path
+                    && crate::native_ids::digest(b"trellis.semantic-fact.v1\0", &canonical_bytes) == fact_digest
+                    && crate::native_ids::digest(b"trellis.capture-proof.v1\0", &crate::native_ids::canonical(&serde_json::json!({"producerId":producer_id,"artifactHash":artifact_hash,"sourceSetId":source_set_id,"sourceRevision":captured_revision,"language":language,"relativePath":path,"factDigest":fact_digest}))) == proof_id,"incompatible_index: corrupt raw proof inventory");
                 Ok(StoredRawProof {record_kind,fact_digest,language,path,canonical_bytes})
             }).transpose()
         })
