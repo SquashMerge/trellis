@@ -2590,6 +2590,33 @@ fn raw_proof_import_cas_and_selected_read_are_atomic() {
         )
         .unwrap();
     assert_eq!(store.semantic_at(newer).unwrap().provenance.len(), 2);
+    let (r1_native, r1_sources) = store.retained_native_snapshot_at(first).unwrap();
+    let (r2_native, r2_sources) = store.retained_native_snapshot_at(newer).unwrap();
+    let engine = trellis::semantic_import::rejoin_inventory(
+        &raw.inventory,
+        &r1_native,
+        &r1_sources,
+        &r2_native,
+        &r2_sources,
+        semantic.producers[0].clone(),
+        &BTreeMap::from([(
+            document.key.clone(),
+            semantic.provenance[0].basis.clone().unwrap(),
+        )]),
+        2,
+    )
+    .unwrap();
+    assert!(
+        !engine.publication.provenance.is_empty(),
+        "production rejoin must author stored facts"
+    );
+    assert!(
+        engine
+            .publication
+            .provenance
+            .iter()
+            .all(|p| p.derived_from.is_some())
+    );
     assert!(
         store
             .semantic_at(newer)
@@ -2790,6 +2817,39 @@ fn raw_proof_import_cas_and_selected_read_are_atomic() {
         store.retained_native_snapshot_at(replaced).unwrap().0,
         selected_native
     );
+    let rejoined = store
+        .publish_semantic_import(
+            replaced,
+            &docs,
+            &engine.publication,
+            &captured,
+            &r2_native,
+            &raw,
+            &engine.report,
+            &leader,
+            &cancel,
+        )
+        .unwrap();
+    let selected_rejoin = store.semantic_at(rejoined).unwrap();
+    assert!(!selected_rejoin.provenance.is_empty());
+    for proof in selected_rejoin
+        .provenance
+        .iter()
+        .filter(|p| p.producer_id == raw.producer_id)
+    {
+        let derived = proof.derived_from.as_ref().unwrap();
+        let stored = store
+            .semantic_raw_proof_at(
+                &raw.producer_id,
+                &raw.inventory.artifact_hash,
+                &raw.source_set_id,
+                &raw.captured_revision,
+                &derived.provenance_id,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.fact_digest, derived.fact_digest);
+    }
     store.set_retention_clock_for_tests(1_901, 901);
     store.release_revision(first, &leader).unwrap();
     assert!(
@@ -2806,11 +2866,11 @@ fn raw_proof_import_cas_and_selected_read_are_atomic() {
     );
     assert_eq!(
         store
-            .semantic_at(replaced)
+            .semantic_at(rejoined)
             .unwrap()
             .declaration_bindings
             .len(),
-        2
+        other.declaration_bindings.len() + engine.publication.declaration_bindings.len()
     );
     let identity =
         trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())

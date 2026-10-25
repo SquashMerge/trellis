@@ -1361,3 +1361,671 @@ fn direct_script_types(
     }
     Ok(result)
 }
+
+/// Publication-time rejoin uses only retained, authenticated source and measured snapshots.
+/// The Store validates the returned publication and its raw links before its paired-pin CAS.
+#[derive(Debug)]
+pub struct RejoinResult {
+    pub publication: semantic::SemanticPublication,
+    pub report: serde_json::Value,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn rejoin_inventory(
+    inventory: &CapturedScipInventory,
+    captured_native: &native::Artifact,
+    captured_sources: &BTreeMap<native::DocumentKey, Vec<u8>>,
+    destination_native: &native::Artifact,
+    destination_sources: &BTreeMap<native::DocumentKey, Vec<u8>>,
+    producer: semantic::Producer,
+    basis: &BTreeMap<native::DocumentKey, semantic::SemanticBasis>,
+    admitted_encoding: u8,
+) -> Result<RejoinResult> {
+    ensure!(
+        inventory.source_manifest_hash == manifest_hash(&captured_native.revision)
+            && captured_native.revision.source_set_id == destination_native.revision.source_set_id,
+        "captured source manifest/source set mismatch"
+    );
+    let r1 = MeasuredFacts::new(captured_native, captured_sources)?;
+    let r2 = MeasuredFacts::new(destination_native, destination_sources)?;
+    let captured = join_inventory(
+        inventory,
+        captured_native,
+        captured_sources,
+        admitted_encoding,
+    )?;
+    let mut eligible = BTreeSet::new();
+    let mut failed = BTreeSet::new();
+    let mut requested = BTreeSet::new();
+    for document in &captured_native.revision.documents {
+        let language: semantic::Language =
+            serde_json::from_value(serde_json::json!(document.key.language))?;
+        if producer.languages.contains(&language) {
+            requested.insert(document.key.clone());
+            if destination_sources.get(&document.key) != captured_sources.get(&document.key) {
+                failed.insert(document.key.clone());
+            }
+        }
+    }
+    for claim in &inventory.claims {
+        inventory.lookup(
+            &claim.captured_proof_id,
+            &claim.envelope.record_kind,
+            &claim.fact_digest,
+        )?;
+        let doc = native::DocumentKey {
+            source_set_id: captured_native.revision.source_set_id.clone(),
+            language: claim.language.clone(),
+            path: claim.envelope.relative_path.clone(),
+        };
+        requested.insert(doc.clone());
+        let captured_document = captured_native
+            .revision
+            .documents
+            .iter()
+            .find(|d| d.key == doc)
+            .context("captured claim outside source manifest")?;
+        let bytes = captured_sources
+            .get(&doc)
+            .context("missing captured claim source")?;
+        ensure!(
+            native_ids::digest(b"", bytes) == captured_document.content_hash,
+            "captured source hash mismatch"
+        );
+        if destination_sources.get(&doc) != Some(bytes) {
+            failed.insert(doc);
+            continue;
+        }
+        if claim.envelope.record_kind == "occurrence" {
+            let range = occurrence_range(claim, bytes, admitted_encoding)?;
+            let roles = claim.envelope.raw["symbolRoles"]
+                .as_u64()
+                .context("invalid raw roles")?;
+            // Both revisions must measure A. Equal occurrence IDs alone never establish a join.
+            let primary = [
+                semantic::JoinKind::DeclarationName,
+                semantic::JoinKind::Reference,
+                semantic::JoinKind::Callee,
+            ]
+            .into_iter()
+            .filter(|kind| {
+                if roles & 1 != 0 {
+                    *kind == semantic::JoinKind::DeclarationName
+                } else {
+                    *kind != semantic::JoinKind::DeclarationName
+                }
+            })
+            .any(|kind| {
+                let first = r1.join(&doc, range.clone(), kind);
+                let second = r2.join(&doc, range.clone(), kind);
+                matches!((first, second), (Ok(a), Ok(b)) if a.status == semantic::JoinStatus::Exact
+                        && b.status == semantic::JoinStatus::Exact)
+            });
+            let call = if roles & 1 == 0 && !claim.envelope.raw["enclosingRange"].is_null() {
+                let mut enclosing = claim.clone();
+                enclosing.envelope.raw["range"] = claim.envelope.raw["enclosingRange"].clone();
+                let call_range = occurrence_range(&enclosing, bytes, admitted_encoding)?;
+                let first = r1.join(&doc, call_range.clone(), semantic::JoinKind::Invocation)?;
+                let second = r2.join(&doc, call_range, semantic::JoinKind::Invocation)?;
+                first.status == semantic::JoinStatus::Exact
+                    && second.status == semantic::JoinStatus::Exact
+            } else {
+                false
+            };
+            if primary || call {
+                eligible.insert(doc);
+            } else {
+                failed.insert(doc);
+            }
+        } else {
+            eligible.insert(doc);
+        }
+    }
+    eligible.retain(|doc| !failed.contains(doc));
+    let mut filtered = inventory.clone();
+    filtered.claims.retain(|claim| {
+        eligible
+            .iter()
+            .any(|doc| doc.language == claim.language && doc.path == claim.envelope.relative_path)
+    });
+    let destination = join_inventory(
+        &filtered,
+        destination_native,
+        destination_sources,
+        admitted_encoding,
+    )?;
+    let mut captured_targets: BTreeMap<(native::DocumentKey, String), Vec<semantic::Target>> =
+        BTreeMap::new();
+    for binding in &captured.declaration_bindings {
+        if let Some(syntax_id) = &binding.syntax_id {
+            for symbol in &binding.symbols {
+                captured_targets
+                    .entry((binding.join.anchor.document.clone(), symbol.symbol.clone()))
+                    .or_default()
+                    .push(semantic::Target::Internal {
+                        syntax_id: syntax_id.clone(),
+                        document: binding.join.anchor.document.clone(),
+                        revision_id: captured_native.revision.id.clone(),
+                    });
+            }
+        }
+    }
+    for targets in captured_targets.values_mut() {
+        targets.sort_by_key(|target| {
+            native_ids::canonical(&serde_json::to_value(target).expect("serializable target"))
+        });
+        targets.dedup();
+    }
+    let captured_declarations: BTreeMap<_, _> = captured
+        .declaration_bindings
+        .iter()
+        .filter_map(|b| {
+            b.syntax_id
+                .as_ref()
+                .map(|id| (b.provenance_id.clone(), id.clone()))
+        })
+        .collect();
+    let mut omitted = BTreeSet::new();
+    let retarget = |target: &mut semantic::Target| -> bool {
+        match target {
+            semantic::Target::External { symbol }
+                if captured_targets
+                    .iter()
+                    .any(|((_, key), targets)| key == &symbol.symbol && !targets.is_empty()) =>
+            {
+                false
+            }
+            semantic::Target::Internal {
+                syntax_id,
+                document,
+                revision_id,
+            } => {
+                if !captured_native.declarations.iter().any(|d| {
+                    d.syntax_id == *syntax_id && d.document == *document && d.name_range.is_some()
+                }) {
+                    return false;
+                }
+                let candidates: Vec<_> = destination_native
+                    .declarations
+                    .iter()
+                    .filter(|d| {
+                        d.syntax_id == *syntax_id
+                            && d.document == *document
+                            && d.name_range.is_some()
+                    })
+                    .collect();
+                if candidates.len() != 1 {
+                    return false;
+                }
+                let declaration = candidates[0];
+                let Some(bytes) = destination_sources.get(document) else {
+                    return false;
+                };
+                let Some(name) = declaration.name_range.as_ref() else {
+                    return false;
+                };
+                if std::str::from_utf8(bytes)
+                    .ok()
+                    .and_then(|s| s.get(name.start..name.end))
+                    != declaration.name.as_deref()
+                {
+                    return false;
+                }
+                *revision_id = destination_native.revision.id.clone();
+                true
+            }
+            _ => true,
+        }
+    };
+    let facts = destination;
+    let mut provenance_sources = BTreeSet::<(String, semantic::EvidenceKind)>::new();
+    let mut symbol_rows = Vec::new();
+    for mut symbol in facts.symbols {
+        let raw = filtered
+            .claims
+            .iter()
+            .find(|c| c.captured_proof_id == symbol.provenance_id);
+        if let Some(claim) = raw {
+            let doc = native::DocumentKey {
+                source_set_id: destination_native.revision.source_set_id.clone(),
+                language: claim.language.clone(),
+                path: claim.envelope.relative_path.clone(),
+            };
+            if let Some(targets) = captured_targets.get(&(doc, symbol.key.symbol.clone())) {
+                symbol.declarations = targets.clone();
+            }
+        }
+        if symbol.declarations.iter_mut().all(&retarget) {
+            provenance_sources.insert((
+                symbol.provenance_id.clone(),
+                semantic::EvidenceKind::DeclarationBinding,
+            ));
+            symbol_rows.push(symbol);
+        } else if let Some(claim) = filtered
+            .claims
+            .iter()
+            .find(|c| c.captured_proof_id == symbol.provenance_id)
+        {
+            omitted.insert(Some(native::DocumentKey {
+                source_set_id: destination_native.revision.source_set_id.clone(),
+                language: claim.language.clone(),
+                path: claim.envelope.relative_path.clone(),
+            }));
+        }
+    }
+    let mut bindings = Vec::new();
+    for binding in facts.declaration_bindings {
+        if binding.syntax_id.is_some()
+            && captured_declarations.get(&binding.provenance_id) == binding.syntax_id.as_ref()
+        {
+            provenance_sources.insert((
+                binding.provenance_id.clone(),
+                semantic::EvidenceKind::DeclarationBinding,
+            ));
+            bindings.push(binding);
+        }
+    }
+    let old_targets: BTreeMap<_, _> = captured
+        .call_bindings
+        .iter()
+        .map(|b| {
+            (
+                b.provenance_id.clone(),
+                (
+                    b.resolution,
+                    b.declared_target.clone(),
+                    b.candidates.clone(),
+                ),
+            )
+        })
+        .collect();
+    let mut calls = Vec::new();
+    for mut call in facts.call_bindings {
+        if let Some((resolution, target, candidates)) = old_targets.get(&call.provenance_id) {
+            call.resolution = *resolution;
+            call.declared_target = target.clone();
+            call.candidates = candidates.clone();
+        }
+        if call
+            .declared_target
+            .iter_mut()
+            .chain(call.candidates.iter_mut())
+            .all(&retarget)
+        {
+            call.stale_target = matches!(
+                call.declared_target,
+                Some(semantic::Target::Internal { .. })
+            )
+            .then_some(false);
+            provenance_sources.insert((
+                call.provenance_id.clone(),
+                semantic::EvidenceKind::SemanticReference,
+            ));
+            calls.push(call);
+        } else {
+            omitted.insert(Some(call.join.anchor.document.clone()));
+        }
+    }
+    let old_refs: BTreeMap<_, _> = captured
+        .references
+        .iter()
+        .map(|r| {
+            (
+                r.provenance_id.clone(),
+                (
+                    r.resolution,
+                    r.declared_target.clone(),
+                    r.candidates.clone(),
+                ),
+            )
+        })
+        .collect();
+    let mut references = Vec::new();
+    for mut reference in facts.references {
+        if let Some((resolution, target, candidates)) = old_refs.get(&reference.provenance_id) {
+            reference.resolution = *resolution;
+            reference.declared_target = target.clone();
+            reference.candidates = candidates.clone();
+        }
+        if reference
+            .declared_target
+            .iter_mut()
+            .chain(reference.candidates.iter_mut())
+            .all(&retarget)
+        {
+            provenance_sources.insert((
+                reference.provenance_id.clone(),
+                semantic::EvidenceKind::SemanticReference,
+            ));
+            references.push(reference);
+        } else {
+            omitted.insert(Some(reference.document.clone()));
+        }
+    }
+    let mut relationships = Vec::new();
+    for mut relationship in facts.type_relationships {
+        if retarget(&mut relationship.source) && retarget(&mut relationship.target) {
+            provenance_sources.insert((
+                relationship.provenance_id.clone(),
+                semantic::EvidenceKind::TypeRelationship,
+            ));
+            relationships.push(relationship);
+        } else if let Some(claim) = filtered
+            .claims
+            .iter()
+            .find(|c| c.captured_proof_id == relationship.provenance_id)
+        {
+            omitted.insert(Some(native::DocumentKey {
+                source_set_id: destination_native.revision.source_set_id.clone(),
+                language: claim.language.clone(),
+                path: claim.envelope.relative_path.clone(),
+            }));
+        }
+    }
+    let mut provenance = Vec::new();
+    let mut ids = BTreeMap::new();
+    for (raw_id, kind) in provenance_sources {
+        let claim = inventory
+            .claims
+            .iter()
+            .find(|c| c.captured_proof_id == raw_id)
+            .context("missing raw fact for joined provenance")?;
+        inventory.lookup(&raw_id, &claim.envelope.record_kind, &claim.fact_digest)?;
+        let doc = native::DocumentKey {
+            source_set_id: destination_native.revision.source_set_id.clone(),
+            language: claim.language.clone(),
+            path: claim.envelope.relative_path.clone(),
+        };
+        let captured_basis = basis
+            .get(&doc)
+            .context("missing immutable captured basis")?;
+        ensure!(
+            captured_basis.revision_id == captured_native.revision.id
+                && captured_basis.artifact_hash == inventory.artifact_hash
+                && captured_basis.source_manifest_hash == inventory.source_manifest_hash
+                && captured_basis.producer_id == producer.id
+                && captured_basis.language
+                    == serde_json::from_value::<semantic::Language>(serde_json::json!(
+                        doc.language
+                    ))?,
+            "captured semantic basis differs from authenticated inventory"
+        );
+        let dst = destination_native
+            .revision
+            .documents
+            .iter()
+            .find(|d| d.key == doc)
+            .context("missing destination document")?;
+        let freshness = if captured_native
+            .revision
+            .documents
+            .iter()
+            .find(|d| d.key == doc)
+            .is_none_or(|d| d.content_hash != dst.content_hash)
+        {
+            semantic::Freshness::Stale
+        } else if captured_basis.revision_id != destination_native.revision.id
+            || captured_basis.source_manifest_hash != manifest_hash(&destination_native.revision)
+            || captured_basis.toolchain_hash != destination_native.revision.toolchain_hash
+            || captured_basis.config_hash != destination_native.revision.config_hash
+            || captured_basis.dependency_hash != destination_native.revision.dependency_hash
+            || captured_basis.producer_version != producer.version
+            || captured_basis.producer_hash != producer.executable_hash
+            || !producer.languages.contains(&captured_basis.language)
+        {
+            semantic::Freshness::PossiblyStale
+        } else {
+            semantic::Freshness::Fresh
+        };
+        let id = native_ids::digest(
+            b"trellis.semantic-rejoin.v1\0",
+            &native_ids::canonical(
+                &serde_json::json!({"proof":raw_id,"revision":destination_native.revision.id,"kind":kind}),
+            ),
+        );
+        ids.insert((raw_id.clone(), kind), id.clone());
+        provenance.push(semantic::Provenance {
+            id,
+            producer_id: producer.id.clone(),
+            document: doc,
+            revision_id: destination_native.revision.id.clone(),
+            content_hash: dst.content_hash.clone(),
+            evidence_kind: kind,
+            basis: Some(captured_basis.clone()),
+            freshness,
+            derived_from: Some(semantic::DerivedFrom {
+                provenance_id: raw_id,
+                record_kind: serde_json::from_value(serde_json::json!(claim.envelope.record_kind))?,
+                fact_digest: claim.fact_digest.clone(),
+            }),
+        });
+    }
+    let mut outcomes = BTreeMap::<String, usize>::new();
+    for claim in inventory
+        .claims
+        .iter()
+        .filter(|c| c.envelope.record_kind != "symbolInformation")
+    {
+        outcomes.insert(claim.captured_proof_id.clone(), 2);
+    }
+    for row in &bindings {
+        if row.syntax_id.is_some() {
+            outcomes.insert(row.provenance_id.clone(), 1);
+        }
+    }
+    for row in &references {
+        outcomes.insert(
+            row.provenance_id.clone(),
+            if row.resolution == semantic::Resolution::Ambiguous {
+                3
+            } else {
+                1
+            },
+        );
+    }
+    for row in &calls {
+        outcomes.insert(
+            row.provenance_id.clone(),
+            if row.resolution == semantic::Resolution::Ambiguous {
+                3
+            } else {
+                1
+            },
+        );
+    }
+    for row in &relationships {
+        outcomes.insert(row.provenance_id.clone(), 1);
+    }
+    for row in &mut symbol_rows {
+        row.provenance_id = ids[&(
+            row.provenance_id.clone(),
+            semantic::EvidenceKind::DeclarationBinding,
+        )]
+            .clone();
+    }
+    for row in &mut bindings {
+        row.provenance_id = ids[&(
+            row.provenance_id.clone(),
+            semantic::EvidenceKind::DeclarationBinding,
+        )]
+            .clone();
+    }
+    for row in &mut references {
+        row.provenance_id = ids[&(
+            row.provenance_id.clone(),
+            semantic::EvidenceKind::SemanticReference,
+        )]
+            .clone();
+    }
+    for row in &mut calls {
+        row.provenance_id = ids[&(
+            row.provenance_id.clone(),
+            semantic::EvidenceKind::SemanticReference,
+        )]
+            .clone();
+    }
+    for row in &mut relationships {
+        row.provenance_id = ids[&(
+            row.provenance_id.clone(),
+            semantic::EvidenceKind::TypeRelationship,
+        )]
+            .clone();
+    }
+    let mut coverage = Vec::new();
+    for doc in &destination_native.revision.documents {
+        let language: semantic::Language =
+            serde_json::from_value(serde_json::json!(doc.key.language))?;
+        if !producer.languages.contains(&language) {
+            continue;
+        }
+        let requested = requested.contains(&doc.key);
+        let failed = failed.contains(&doc.key);
+        let partial =
+            omitted.contains(&Some(doc.key.clone())) || facts.diagnostics.contains_key(&doc.key);
+        let state = if !requested {
+            semantic::CoverageState::NotRequested
+        } else if failed {
+            semantic::CoverageState::Failed
+        } else if partial {
+            semantic::CoverageState::Partial
+        } else {
+            semantic::CoverageState::Complete
+        };
+        let mut observed = BTreeSet::new();
+        if bindings
+            .iter()
+            .any(|b| b.join.anchor.document == doc.key && b.syntax_id.is_some())
+        {
+            observed.insert(semantic::Role::Definition);
+        }
+        for row in references.iter().filter(|r| r.document == doc.key) {
+            observed.extend(row.roles.iter().copied());
+        }
+        if calls.iter().any(|b| b.join.anchor.document == doc.key) {
+            observed.insert(semantic::Role::Call);
+        }
+        if relationships.iter().any(|r| {
+            provenance
+                .iter()
+                .any(|p| p.id == r.provenance_id && p.document == doc.key)
+        }) {
+            observed.insert(semantic::Role::Type);
+        }
+        let supported_roles = [
+            semantic::Role::Definition,
+            semantic::Role::Read,
+            semantic::Role::Write,
+            semantic::Role::Call,
+            semantic::Role::Type,
+            semantic::Role::Import,
+            semantic::Role::Alias,
+        ]
+        .into_iter()
+        .filter(|r| language != semantic::Language::Java || *r != semantic::Role::Alias)
+        .collect();
+        coverage.push(semantic::Coverage {
+            producer_id: producer.id.clone(),
+            language,
+            source_set_id: doc.key.source_set_id.clone(),
+            document_path: doc.key.path.clone(),
+            revision_id: destination_native.revision.id.clone(),
+            requested,
+            selected: requested,
+            state,
+            supported_roles,
+            observed_roles: observed.into_iter().collect(),
+            diagnostic: if failed {
+                Some("unmeasurable_source_anchor".into())
+            } else if partial {
+                Some("unmeasurable_internal_target".into())
+            } else {
+                None
+            },
+        });
+    }
+    let mut document_counts = Vec::new();
+    let mut language_counts: BTreeMap<semantic::Language, [usize; 5]> = BTreeMap::new();
+    for row in &coverage {
+        let mut counts = [0usize; 5];
+        for claim in inventory.claims.iter().filter(|c| {
+            c.language
+                == serde_json::to_value(row.language)
+                    .ok()
+                    .and_then(|v| v.as_str().map(str::to_owned))
+                    .unwrap_or_default()
+                && c.envelope.relative_path == row.document_path
+                && c.envelope.record_kind != "symbolInformation"
+        }) {
+            counts[0] += 1;
+            let outcome = if row.state == semantic::CoverageState::Failed {
+                2
+            } else {
+                *outcomes
+                    .get(&claim.captured_proof_id)
+                    .context("missing rejoin claim outcome")?
+            };
+            counts[outcome] += 1;
+        }
+        ensure!(
+            counts[0] == counts[1] + counts[2] + counts[3] + counts[4],
+            "incomplete semantic import claim tally"
+        );
+        let aggregate = language_counts.entry(row.language).or_default();
+        for (total, count) in aggregate.iter_mut().zip(counts) {
+            *total += count;
+        }
+        document_counts.push((
+            row.language,
+            row.document_path.clone(),
+            serde_json::json!({
+                "language": row.language, "path": row.document_path, "state": row.state,
+                "supportedRoles": row.supported_roles, "observedRoles": row.observed_roles,
+                "diagnostic": row.diagnostic, "requested": counts[0], "matched": counts[1],
+                "skipped": counts[2], "ambiguous": counts[3], "unsupported": counts[4]
+            }),
+        ));
+    }
+    document_counts.sort_by(|a, b| (a.0, a.1.as_bytes()).cmp(&(b.0, b.1.as_bytes())));
+    let languages: Vec<_> = language_counts
+        .into_iter()
+        .map(|(language, counts)| {
+            serde_json::json!({
+                "language":language,"requested":counts[0],"matched":counts[1],"skipped":counts[2],
+                "ambiguous":counts[3],"unsupported":counts[4]
+            })
+        })
+        .collect();
+    let report = serde_json::json!({"producerId":producer.id,"sourceSetId":destination_native.revision.source_set_id,
+        "capturedRevision":captured_native.revision.id,"destinationRevision":destination_native.revision.id,
+        "languages":languages,"documents":document_counts.into_iter().map(|(_,_,row)|row).collect::<Vec<_>>()});
+    ensure!(
+        serde_json::to_vec(&report)?.len() <= 1024 * 1024,
+        "semantic import report exceeds response bound"
+    );
+    Ok(RejoinResult {
+        publication: semantic::SemanticPublication {
+            producers: vec![producer],
+            coverage,
+            provenance,
+            symbols: symbol_rows,
+            declaration_bindings: bindings,
+            references,
+            call_bindings: calls,
+            type_relationships: relationships,
+        },
+        report,
+    })
+}
+
+fn manifest_hash(revision: &native::Revision) -> String {
+    native_ids::digest(
+        b"",
+        &native_ids::canonical(&serde_json::json!(
+            revision
+                .documents
+                .iter()
+                .map(|d| serde_json::json!({"document":d.key,"contentHash":d.content_hash}))
+                .collect::<Vec<_>>()
+        )),
+    )
+}
