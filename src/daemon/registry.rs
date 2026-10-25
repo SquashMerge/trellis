@@ -72,8 +72,8 @@ impl SelectionError {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CheckoutOptions(pub serde_json::Value);
 
-/// Values are retained as data. No browser provider or checkout descriptor is
-/// opened by registration; activation uses only its selected checkout's values.
+/// Values are retained as data. No checkout descriptor is opened by
+/// registration; activation uses only its selected checkout's values.
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct BrowserOptions {
@@ -85,12 +85,6 @@ pub struct BrowserOptions {
     pub rust_library: Option<PathBuf>,
     pub trusted_rustc: Option<PathBuf>,
     pub cargo_home: Option<PathBuf>,
-    pub jev_budget_dir: Option<PathBuf>,
-    pub jev_budget_cents: Option<u64>,
-    pub jev_key: Option<String>,
-    pub acp_runner: Option<PathBuf>,
-    pub acp_state_dir: Option<PathBuf>,
-    pub acp_max_attempts: Option<u64>,
 }
 impl Default for BrowserOptions {
     fn default() -> Self {
@@ -103,12 +97,6 @@ impl Default for BrowserOptions {
             rust_library: None,
             trusted_rustc: None,
             cargo_home: None,
-            jev_budget_dir: None,
-            jev_budget_cents: None,
-            jev_key: None,
-            acp_runner: None,
-            acp_state_dir: None,
-            acp_max_attempts: None,
         }
     }
 }
@@ -391,8 +379,6 @@ pub struct CheckoutRegistry {
     test_after_due_release: Option<Box<dyn FnOnce() + Send>>,
     #[cfg(feature = "test-support")]
     test_next_startup_hook: Option<Arc<dyn Fn() + Send + Sync>>,
-    #[cfg(all(test, feature = "test-support"))]
-    test_jev_endpoint: Option<String>,
 }
 
 impl Default for CheckoutRegistry {
@@ -418,8 +404,6 @@ impl CheckoutRegistry {
             test_after_due_release: None,
             #[cfg(feature = "test-support")]
             test_next_startup_hook: None,
-            #[cfg(all(test, feature = "test-support"))]
-            test_jev_endpoint: None,
         }
     }
 
@@ -435,11 +419,6 @@ impl CheckoutRegistry {
     #[doc(hidden)]
     pub fn set_after_due_release_for_tests(&mut self, hook: impl FnOnce() + Send + 'static) {
         self.test_after_due_release = Some(Box::new(hook));
-    }
-
-    #[cfg(all(test, feature = "test-support"))]
-    pub(crate) fn set_jev_endpoint_for_tests(&mut self, endpoint: String) {
-        self.test_jev_endpoint = Some(endpoint);
     }
 
     /// Supply isolated roots in fixtures. The default uses the user's normal
@@ -600,38 +579,6 @@ impl CheckoutRegistry {
                 .iter()
                 .any(|key| registered.0.get(*key).is_some())
         });
-        let provider = match (config.jev_budget_dir, config.jev_budget_cents) {
-            (Some(dir), Some(cap)) => {
-                let key = config
-                    .jev_key
-                    .or_else(|| std::env::var("JEV_KEY").ok())
-                    .ok_or_else(|| anyhow::anyhow!("JEV_KEY must be configured"))?;
-                let live = crate::live_jev::LiveJev::open(&dir, key, cap, &options.workspace_root)?;
-                #[cfg(all(test, feature = "test-support"))]
-                let live = if let Some(endpoint) = &self.test_jev_endpoint {
-                    live.with_test_endpoint(endpoint.clone())
-                } else {
-                    live
-                };
-                Some(Arc::new(live))
-            }
-            _ => None,
-        };
-        let acp = match (
-            config.acp_runner,
-            config.acp_state_dir,
-            config.acp_max_attempts,
-        ) {
-            (Some(runner), Some(state_dir), Some(max_attempts)) => {
-                Some(Arc::new(crate::acp::Acp::open(crate::acp::AcpConfig {
-                    runner,
-                    state_dir,
-                    max_attempts,
-                    workspace: options.workspace_root.clone(),
-                })?))
-            }
-            _ => None,
-        };
         let browse_root = config
             .browse_root
             .unwrap_or_else(|| options.workspace_root.clone());
@@ -644,8 +591,6 @@ impl CheckoutRegistry {
                 cargo_home: config.cargo_home,
                 rust_library: config.rust_library,
             }),
-            provider,
-            acp,
         )
     }
 
@@ -851,18 +796,6 @@ impl CheckoutRegistry {
         if !browse.is_dir() || !browse.is_absolute() {
             return Err(SelectionError::Unavailable);
         }
-        if config.jev_budget_dir.is_some() != config.jev_budget_cents.is_some()
-            || config.acp_runner.is_some() != config.acp_state_dir.is_some()
-            || config.acp_runner.is_some() != config.acp_max_attempts.is_some()
-            || config
-                .jev_budget_cents
-                .is_some_and(|cap| !(10..=500).contains(&cap))
-            || config
-                .acp_max_attempts
-                .is_some_and(|cap| !(1..=20).contains(&cap))
-        {
-            return Err(SelectionError::Unavailable);
-        }
         if config.rust_source_roots.len() > 8 {
             return Err(SelectionError::Unavailable);
         }
@@ -878,76 +811,6 @@ impl CheckoutRegistry {
                 || !root.is_dir()
             {
                 return Err(SelectionError::Unavailable);
-            }
-        }
-        if let Some(dir) = &config.jev_budget_dir {
-            let environment_key = std::env::var("JEV_KEY").ok();
-            let key = config
-                .jev_key
-                .as_deref()
-                .or(environment_key.as_deref())
-                .ok_or(SelectionError::Unavailable)?;
-            if key.trim().is_empty()
-                || reqwest::header::HeaderValue::from_str(&format!("Bearer {key}")).is_err()
-            {
-                return Err(SelectionError::Unavailable);
-            }
-            match fs::symlink_metadata(dir) {
-                Ok(m) => {
-                    if !m.is_dir()
-                        || m.file_type().is_symlink()
-                        || m.uid() != unsafe { libc::geteuid() }
-                        || m.mode() & 0o777 != 0o700
-                    {
-                        return Err(SelectionError::Unavailable);
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(_) => return Err(SelectionError::Unavailable),
-            }
-        }
-        if let (Some(runner), Some(state)) = (&config.acp_runner, &config.acp_state_dir) {
-            let workspace = identity
-                .root
-                .canonicalize()
-                .map_err(|_| SelectionError::Unavailable)?;
-            let runner = runner
-                .canonicalize()
-                .map_err(|_| SelectionError::Unavailable)?;
-            if !runner.is_file()
-                || runner.starts_with(&workspace)
-                || state
-                    .components()
-                    .any(|c| matches!(c, Component::ParentDir))
-            {
-                return Err(SelectionError::Unavailable);
-            }
-            let mut ancestor = state.as_path();
-            while !ancestor
-                .try_exists()
-                .map_err(|_| SelectionError::Unavailable)?
-            {
-                ancestor = ancestor.parent().ok_or(SelectionError::Unavailable)?;
-            }
-            if ancestor
-                .canonicalize()
-                .map_err(|_| SelectionError::Unavailable)?
-                .starts_with(&workspace)
-            {
-                return Err(SelectionError::Unavailable);
-            }
-            match fs::symlink_metadata(state) {
-                Ok(m) => {
-                    if !m.is_dir()
-                        || m.file_type().is_symlink()
-                        || m.uid() != unsafe { libc::geteuid() }
-                        || m.mode() & 0o777 != 0o700
-                    {
-                        return Err(SelectionError::Unavailable);
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(_) => return Err(SelectionError::Unavailable),
             }
         }
         if let Some(compiler) = &config.trusted_rustc
@@ -966,9 +829,6 @@ impl CheckoutRegistry {
             config.rust_library,
             config.trusted_rustc,
             config.cargo_home,
-            config.jev_budget_dir,
-            config.acp_runner,
-            config.acp_state_dir,
         ]
         .into_iter()
         .flatten()

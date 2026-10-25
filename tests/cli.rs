@@ -1676,124 +1676,34 @@ fn cli_refuses_remote_bind_and_invalid_limits() {
 }
 
 #[test]
-fn live_jev_requires_paired_explicit_budget_flags() {
+fn removed_provider_flags_are_unknown_arguments_before_state_creation() {
     let temp = TempDir::new().unwrap();
     let source = temp.path().join("source");
+    let home = temp.path().join("home");
     fs::create_dir(&source).unwrap();
-    let state = temp.path().join("state");
-    for flags in [
-        vec!["--jev-budget-dir", "unused"],
-        vec!["--jev-budget-cents", "500"],
-        vec!["--jev-budget-dir", "unused", "--jev-budget-cents", "501"],
-        vec!["--jev-budget-dir", "unused", "--jev-budget-cents", "0"],
-    ] {
-        let output = command(&source, &state, "serve")
-            .args(flags)
-            .env_remove("JEV_KEY")
-            .output()
-            .unwrap();
-        assert!(!output.status.success());
-    }
-    assert!(
-        !state.exists(),
-        "invalid opt-in must fail before state creation"
-    );
-}
-
-#[test]
-fn live_jev_missing_key_fails_without_creating_budget() {
-    let temp = TempDir::new().unwrap();
-    let source = temp.path().join("source");
-    fs::create_dir(&source).unwrap();
-    let state = temp.path().join("state");
-    let budget = temp.path().join("budget");
-    let output = command(&source, &state, "serve")
-        .args([
-            "--bind",
-            "127.0.0.1:0",
-            "--jev-budget-cents",
-            "500",
-            "--jev-budget-dir",
-        ])
-        .arg(&budget)
-        .env_remove("JEV_KEY")
-        .output()
-        .unwrap();
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("JEV_KEY must be configured"));
-    assert!(!budget.exists());
-}
-
-#[cfg(unix)]
-#[test]
-fn malformed_jev_environment_never_echoes_credential_bytes() {
-    use std::os::unix::ffi::OsStringExt;
-    let temp = TempDir::new().unwrap();
-    let source = temp.path().join("source");
-    fs::create_dir(&source).unwrap();
-    let budget = temp.path().join("budget");
-    let output = command(&source, &temp.path().join("state"), "serve")
-        .args([
-            "--bind",
-            "127.0.0.1:0",
-            "--jev-budget-cents",
-            "500",
-            "--jev-budget-dir",
-        ])
-        .arg(&budget)
-        .env(
-            "JEV_KEY",
-            std::ffi::OsString::from_vec(b"SYNTHETIC_INVALID_CREDENTIAL_\xff".to_vec()),
-        )
-        .output()
-        .unwrap();
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("JEV_KEY must be configured"));
-    assert!(!stderr.contains("SYNTHETIC_INVALID_CREDENTIAL"));
-    assert!(!budget.exists());
-}
-
-#[test]
-fn acp_requires_complete_explicit_allowance_flags() {
-    let temp = TempDir::new().unwrap();
-    let source = temp.path().join("source");
-    fs::create_dir(&source).unwrap();
-    let state = temp.path().join("state");
-    for (case, flags) in [
-        vec!["--acp-runner", "unused"],
-        vec!["--acp-state-dir", "unused"],
-        vec!["--acp-max-attempts", "1"],
-        vec![
-            "--acp-runner",
-            "unused",
-            "--acp-state-dir",
-            "unused",
-            "--acp-max-attempts",
-            "0",
-        ],
-        vec![
-            "--acp-runner",
-            "unused",
-            "--acp-state-dir",
-            "unused",
-            "--acp-max-attempts",
-            "21",
-        ],
+    for (case, (flag, value)) in [
+        ("--jev-budget-dir", "unused"),
+        ("--jev-budget-cents", "500"),
+        ("--acp-runner", "unused"),
+        ("--acp-state-dir", "unused"),
+        ("--acp-max-attempts", "1"),
     ]
     .into_iter()
     .enumerate()
     {
         let output = bounded_invalid_cli(
             temp.path(),
-            &format!("acp-{case}"),
-            command(&source, &state, "serve").args(flags),
+            &format!("removed-provider-{case}"),
+            command(&source, &home, "serve").args([flag, value]),
         );
-        assert!(!output.status.success());
+        assert_eq!(output.status.code(), Some(2), "{flag}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("unexpected argument"), "{flag}: {stderr}");
+        assert!(stderr.contains(flag), "{flag}: {stderr}");
     }
     assert!(
-        !state.exists(),
-        "invalid opt-in must fail before state creation"
+        !home.exists(),
+        "removed flags must fail before state creation"
     );
 }
 
@@ -2225,7 +2135,7 @@ fn gc_report_without_workspace_does_not_create_state() {
     );
     let inventory: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(inventory["derived"], serde_json::json!([]));
-    assert_eq!(inventory["records"], serde_json::json!([]));
+    assert!(inventory.get("records").is_none());
     // The user-level daemon may create its private runtime socket, but GC
     // must not materialize any workspace index or saved record.
     assert!(
@@ -2311,107 +2221,22 @@ fn gc_cli_reports_multiple_indexes_in_sorted_order() {
 }
 
 #[test]
-fn forget_cli_requires_confirmation_and_preserves_unrelated_state() {
-    use trellis::{
-        model::SavedView,
-        store::topology::{DurableRecords, TopologyRoots, UseGuard, WorkspaceIdentity},
-    };
+fn removed_forget_is_an_unknown_subcommand_without_touching_state() {
     let temp = TempDir::new().unwrap();
     let home = temp.path().join("home");
-    let root = temp.path().join("work");
-    fs::create_dir(&root).unwrap();
-    let data = home.join(if cfg!(target_os = "macos") {
-        "Library/Application Support/dev.squashmerge.trellis"
-    } else {
-        ".local/share/trellis"
-    });
-    let roots = TopologyRoots::isolated_for_tests(home.join("cache"), data);
-    let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
-    let view: SavedView = serde_json::from_str(
-        r#"{"id":"view1","title":"A view","query":{"seed":"symbol"},"pins":{}}"#,
-    )
-    .unwrap();
-    let records = DurableRecords::new(&roots, &identity);
-    records.put_view(&view).unwrap();
-    let id = identity.record_id.as_str();
-    let run = |which: &str, yes: bool| {
-        let mut cmd = isolated_command(&home);
-        cmd.arg("forget").arg(which);
-        if yes {
-            cmd.arg("--yes");
-        }
-        cmd.output().unwrap()
-    };
-    assert!(!run("../work", true).status.success());
-    let denied = run(id, false);
-    assert!(!denied.status.success());
-    assert!(String::from_utf8_lossy(&denied.stderr).contains("terminal or --yes"));
-    assert!(roots.record_db(&identity).exists());
-    let shared =
-        UseGuard::acquire_existing(&roots.record_use_lock(&identity), false, true).unwrap();
-    assert!(!run(id, true).status.success());
-    drop(shared);
-    let other = home.join("untouched");
-    fs::write(&other, "still here").unwrap();
-    let result = run(id, true);
-    assert!(
-        result.status.success(),
-        "{}",
-        String::from_utf8_lossy(&result.stderr)
+    let output = bounded_invalid_cli(
+        temp.path(),
+        "removed-forget",
+        isolated_command(&home).args(["forget", "path-old-record", "--yes"]),
     );
-    let stderr = String::from_utf8_lossy(&result.stderr);
-    assert!(stderr.contains("every checkout sharing this UUID"));
-    assert!(stderr.contains("Saved views: 1; annotations: 0"));
-    assert!(stderr.contains(identity.root.to_str().unwrap()));
-    assert!(!roots.record_dir(&identity).exists());
-    assert!(!roots.record_use_lock(&identity).exists());
-    assert_eq!(fs::read_to_string(other).unwrap(), "still here");
-    assert!(!run(id, true).status.success());
-}
-
-#[test]
-fn forget_yes_refuses_unknown_sqlite_schema_without_removing_state() {
-    use trellis::{
-        model::SavedView,
-        store::topology::{DurableRecords, TopologyRoots, WorkspaceIdentity},
-    };
-    let temp = TempDir::new().unwrap();
-    let home = temp.path().join("home");
-    let work = temp.path().join("work");
-    fs::create_dir(&work).unwrap();
-    let data = home.join(if cfg!(target_os = "macos") {
-        "Library/Application Support/dev.squashmerge.trellis"
-    } else {
-        ".local/share/trellis"
-    });
-    let roots = TopologyRoots::isolated_for_tests(home.join("cache"), data);
-    let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
-    let view: SavedView = serde_json::from_str(
-        r#"{"id":"view1","title":"A view","query":{"seed":"symbol"},"pins":{}}"#,
-    )
-    .unwrap();
-    DurableRecords::new(&roots, &identity)
-        .put_view(&view)
-        .unwrap();
-    let path = roots.record_db(&identity);
-    let lock = roots.record_use_lock(&identity);
-    let db = rusqlite::Connection::open(&path).unwrap();
-    db.execute_batch("CREATE TABLE unknown(id INTEGER)")
-        .unwrap();
-    drop(db);
-    let before = fs::read(&path).unwrap();
-    let lock_before = fs::read(&lock).unwrap();
-    let unrelated = home.join("unrelated");
-    fs::write(&unrelated, "keep").unwrap();
-    let result = isolated_command(&home)
-        .args(["forget", &identity.record_id, "--yes"])
-        .output()
-        .unwrap();
-    assert!(!result.status.success());
-    assert!(String::from_utf8_lossy(&result.stderr).contains("unexpected SQLite schema"));
-    assert_eq!(fs::read(&path).unwrap(), before);
-    assert_eq!(fs::read(&lock).unwrap(), lock_before);
-    assert_eq!(fs::read(&unrelated).unwrap(), b"keep");
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unrecognized subcommand"), "{stderr}");
+    assert!(stderr.contains("forget"), "{stderr}");
+    assert!(
+        !home.exists(),
+        "removed command must fail before state creation"
+    );
 }
 
 // A test-process Store can prepare the index. Never open it beside the elected daemon.
@@ -2673,9 +2498,8 @@ fn same_bytes_evidence(snapshot: &Value) -> Value {
     evidence
 }
 
-// The provisioned browser serves global control-plane routes only. Keep the
-// selected-workspace API contract on the legacy router, backed by the very
-// same HOME topology as the executable fixtures above.
+// The recovery fixture uses a direct selected-workspace status router backed
+// by the same HOME topology as the executable fixtures above.
 #[derive(Clone)]
 struct LegacyClient {
     app: axum::Router,
@@ -2688,15 +2512,6 @@ impl Drop for LegacyClient {
     }
 }
 impl LegacyClient {
-    fn same_home(
-        root: &std::path::Path,
-        home: &std::path::Path,
-        token: &str,
-        url: &str,
-        max_file_bytes: u64,
-    ) -> Self {
-        Self::same_home_with_session(root, home, token, url, max_file_bytes, true)
-    }
     fn same_home_with_session(
         root: &std::path::Path,
         home: &std::path::Path,
@@ -2755,8 +2570,6 @@ impl LegacyClient {
             method,
             url,
             token: None,
-            origin: None,
-            body: None,
         }
     }
     fn get(&self, url: String) -> LegacyRequest {
@@ -2769,21 +2582,10 @@ struct LegacyRequest {
     method: reqwest::Method,
     url: String,
     token: Option<String>,
-    origin: Option<String>,
-    body: Option<Value>,
 }
 impl LegacyRequest {
-    fn header(mut self, name: &str, value: &str) -> Self {
-        assert!(name.eq_ignore_ascii_case("origin"));
-        self.origin = Some(value.to_owned());
-        self
-    }
     fn bearer_auth(mut self, token: &str) -> Self {
         self.token = Some(token.to_owned());
-        self
-    }
-    fn json(mut self, body: &Value) -> Self {
-        self.body = Some(body.clone());
         self
     }
     async fn send(self) -> anyhow::Result<LegacyResponse> {
@@ -2809,16 +2611,7 @@ impl LegacyRequest {
         if let Some(token) = self.token {
             request = request.header("authorization", format!("Bearer {token}"));
         }
-        if let Some(origin) = self.origin {
-            request = request.header("origin", origin);
-        }
-        let body = if let Some(value) = self.body {
-            request = request.header("content-type", "application/json");
-            Body::from(value.to_string())
-        } else {
-            Body::empty()
-        };
-        let response = self.app.oneshot(request.body(body)?).await?;
+        let response = self.app.oneshot(request.body(Body::empty())?).await?;
         let status = response.status();
         let bytes = to_bytes(response.into_body(), 8 * 1024 * 1024).await?;
         Ok(LegacyResponse { status, bytes })
@@ -2837,27 +2630,7 @@ impl LegacyResponse {
     }
 }
 
-async fn real_api(
-    client: &LegacyClient,
-    url: &str,
-    token: &str,
-    method: reqwest::Method,
-    route: &str,
-    body: Option<Value>,
-) -> (reqwest::StatusCode, Value) {
-    let mut request = client
-        .request(method, format!("{url}{route}"))
-        .header("Origin", url)
-        .bearer_auth(token);
-    if let Some(body) = body {
-        request = request.json(&body);
-    }
-    let response = request.send().await.unwrap();
-    let status = response.status();
-    (status, response.json().await.unwrap())
-}
-
-async fn saved_item_status(request: LegacyRequest, context: &str) -> anyhow::Result<Value> {
+async fn startup_status(request: LegacyRequest, context: &str) -> anyhow::Result<Value> {
     let mut attempts = 0;
     let mut last_observed = "no response".to_owned();
     tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
@@ -2900,7 +2673,7 @@ async fn saved_item_status(request: LegacyRequest, context: &str) -> anyhow::Res
     })?
 }
 
-fn saved_item_status_fixture(
+fn startup_status_fixture(
     responses: Vec<(reqwest::StatusCode, &'static str)>,
 ) -> (
     LegacyRequest,
@@ -2924,17 +2697,15 @@ fn saved_item_status_fixture(
             method: reqwest::Method::GET,
             url: "http://127.0.0.1:7331/api/status".to_owned(),
             token: None,
-            origin: None,
-            body: None,
         },
         attempts,
     )
 }
 
 #[tokio::test]
-async fn saved_item_status_retries_only_typed_startup_refusals() {
+async fn startup_status_retries_only_typed_startup_refusals() {
     use reqwest::StatusCode;
-    let (request, attempts) = saved_item_status_fixture(vec![
+    let (request, attempts) = startup_status_fixture(vec![
         (
             StatusCode::SERVICE_UNAVAILABLE,
             r#"{"error":{"code":"index_not_ready","message":"starting"}}"#,
@@ -2948,14 +2719,14 @@ async fn saved_item_status_retries_only_typed_startup_refusals() {
             r#"{"catchingUp":true,"revision":{"indexRevision":1}}"#,
         ),
     ]);
-    let body = saved_item_status(request, "initial").await.unwrap();
+    let body = startup_status(request, "initial").await.unwrap();
     assert_eq!(body["catchingUp"], true);
     assert_eq!(body["revision"]["indexRevision"], 1);
     assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
 }
 
 #[tokio::test]
-async fn saved_item_status_rejects_other_responses_with_the_body() {
+async fn startup_status_rejects_other_responses_with_the_body() {
     use reqwest::StatusCode;
     for (status, body) in [
         (
@@ -2968,8 +2739,8 @@ async fn saved_item_status_rejects_other_responses_with_the_body() {
         ),
         (StatusCode::SERVICE_UNAVAILABLE, "not JSON: unavailable"),
     ] {
-        let (request, attempts) = saved_item_status_fixture(vec![(status, body)]);
-        let error = saved_item_status(request, "reopened")
+        let (request, attempts) = startup_status_fixture(vec![(status, body)]);
+        let error = startup_status(request, "reopened")
             .await
             .unwrap_err()
             .to_string();
@@ -2999,241 +2770,6 @@ async fn real_selected_api(
     let response = request.send().await.unwrap();
     let status = response.status();
     (status, response.json().await.unwrap())
-}
-
-struct SavedItemServer;
-
-async fn start_saved_item_server(
-    _temp: &std::path::Path,
-    root: &std::path::Path,
-    home: &std::path::Path,
-    token: &str,
-) -> (SavedItemServer, LegacyClient, String) {
-    // The preceding CLI index elected a real daemon. End this fixture's
-    // writer before the direct router takes over the same HOME-backed Store.
-    let marker = home.join("auto-daemon.pid");
-    if marker.exists() {
-        // FixtureDaemon checks the live socket peer and exact executable
-        // before TERM; a numeric marker alone is not process ownership.
-        drop(FixtureDaemon::new(home));
-        let data = if cfg!(target_os = "macos") {
-            home.join("Library/Application Support/dev.squashmerge.trellis")
-        } else {
-            home.join(".local/share/trellis")
-        };
-        let socket = trellis::daemon::SocketPaths::new(&data).socket;
-        let deadline = std::time::Instant::now() + trellis::testing::HANG_BACKSTOP;
-        while std::os::unix::net::UnixStream::connect(&socket).is_ok() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "prior saved-item fixture daemon did not exit"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        assert!(!marker.exists(), "fixture daemon was not safely stopped");
-    }
-    let url = "http://127.0.0.1:7331".to_owned();
-    (
-        SavedItemServer,
-        LegacyClient::same_home(root, home, token, &url, 2_097_152),
-        url,
-    )
-}
-
-async fn real_index_job(
-    client: &LegacyClient,
-    url: &str,
-    token: &str,
-    expected: &Value,
-    changed_source: &str,
-) -> Value {
-    use std::time::Duration;
-    let (status, accepted) = real_api(
-        client,
-        url,
-        token,
-        reqwest::Method::POST,
-        "/api/index",
-        Some(serde_json::json!({"expectedRevision":expected})),
-    )
-    .await;
-    assert_eq!(status, reqwest::StatusCode::ACCEPTED, "{accepted}");
-    let id = accepted["id"].as_str().unwrap();
-    let completed = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
-        loop {
-            let (status, job) = real_api(
-                client,
-                url,
-                token,
-                reqwest::Method::GET,
-                &format!("/api/jobs/{id}"),
-                None,
-            )
-            .await;
-            assert_eq!(status, reqwest::StatusCode::OK, "{job}");
-            if !job["finishedAt"].is_null() {
-                break job;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("saved-item index job");
-    if completed["state"] == "done" {
-        let pin = completed["revision"].clone();
-        assert_eq!(pin["indexGeneration"], expected["indexGeneration"]);
-        assert!(
-            pin["indexRevision"].as_u64().unwrap() > expected["indexRevision"].as_u64().unwrap()
-        );
-        let (status, current) = real_api(
-            client,
-            url,
-            token,
-            reqwest::Method::GET,
-            "/api/status",
-            None,
-        )
-        .await;
-        assert_eq!(status, reqwest::StatusCode::OK, "{current}");
-        assert_eq!(
-            current["revision"], pin,
-            "completed job must select its returned pin"
-        );
-        return pin;
-    }
-    // The direct router's watcher can publish the edited source first. A stale
-    // explicit job must remain failed; prove that its replacement selected pin
-    // contains attested changed source bytes before using it below.
-    assert_eq!(
-        completed["error"]["code"], "revision_conflict",
-        "{completed}"
-    );
-    let (status, current) = real_api(
-        client,
-        url,
-        token,
-        reqwest::Method::GET,
-        "/api/status",
-        None,
-    )
-    .await;
-    assert_eq!(status, reqwest::StatusCode::OK, "{current}");
-    let revision = &current["revision"];
-    assert_eq!(revision["indexGeneration"], expected["indexGeneration"]);
-    assert!(
-        revision["indexRevision"].as_u64().unwrap() > expected["indexRevision"].as_u64().unwrap(),
-        "failed job without a newer selected head: {completed}; current={current}"
-    );
-    let route = saved_pin_route("/api/source?path=flow.rs", revision);
-    let (status, source) = real_api(client, url, token, reqwest::Method::GET, &route, None).await;
-    assert_eq!(status, reqwest::StatusCode::OK, "{source}");
-    assert_eq!(source["revision"], *revision);
-    assert_eq!(
-        source["file"]["text"], changed_source,
-        "attested changed source at selected pin"
-    );
-    revision.clone()
-}
-
-fn saved_pin_route(route: &str, pin: &Value) -> String {
-    let separator = if route.contains('?') { '&' } else { '?' };
-    format!(
-        "{route}{separator}indexGeneration={}&indexRevision={}",
-        pin["indexGeneration"].as_str().unwrap(),
-        pin["indexRevision"].as_u64().unwrap()
-    )
-}
-
-fn find_workspace_db(home: &std::path::Path) -> Option<std::path::PathBuf> {
-    fn find(dir: &std::path::Path) -> Option<std::path::PathBuf> {
-        for entry in fs::read_dir(dir).ok()?.flatten() {
-            let path = entry.path();
-            if path.file_name().is_some_and(|name| name == "workspace.db") {
-                return Some(path);
-            }
-            if path.is_dir()
-                && let Some(db) = find(&path)
-            {
-                return Some(db);
-            }
-        }
-        None
-    }
-    find(home)
-}
-
-fn stored_payload(db_path: &std::path::Path, table: &str, id: &str) -> String {
-    assert!(matches!(table, "views" | "annotations"));
-    let db = rusqlite::Connection::open(db_path).unwrap();
-    db.query_row(
-        &format!("SELECT payload FROM {table} WHERE id=?1"),
-        [id],
-        |row| row.get(0),
-    )
-    .unwrap()
-}
-
-fn raw_anchor(payload: &str) -> Option<String> {
-    #[derive(serde::Deserialize)]
-    struct Envelope {
-        #[serde(default)]
-        anchor: Option<Box<serde_json::value::RawValue>>,
-    }
-    serde_json::from_str::<Envelope>(payload)
-        .unwrap()
-        .anchor
-        .map(|raw| raw.get().to_owned())
-}
-
-// Reverse the lossless Jev table encoding to check the real cached export against
-// the separately read graph and preview, not only its HTTP status or packet ID.
-fn decoded_jev_rows(export: &Value, table: &str) -> Vec<Value> {
-    fn identity(cell: &Value, identities: &[Value]) -> Value {
-        match cell {
-            Value::Null => Value::Null,
-            Value::Number(n) => identities[n.as_u64().unwrap() as usize].clone(),
-            Value::Array(items) => {
-                Value::Array(items.iter().map(|v| identity(v, identities)).collect())
-            }
-            _ => panic!("unexpected Jev identity cell: {cell}"),
-        }
-    }
-    let state = &export["state"];
-    let encoded = &state["packet"]["context"][table];
-    let identities = state["identities"].as_array().unwrap();
-    let columns = encoded["columns"].as_array().unwrap();
-    let identity_columns = encoded["identityColumns"].as_array().unwrap();
-    let range_columns = state["rangeColumns"].as_array().unwrap();
-    encoded["rows"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|row| {
-            let cells = row.as_array().unwrap();
-            assert_eq!(cells.len(), columns.len());
-            let mut result = serde_json::Map::new();
-            for (column, cell) in columns.iter().zip(cells) {
-                let name = column.as_str().unwrap();
-                let decoded = if identity_columns.iter().any(|id| id.as_str() == Some(name)) {
-                    identity(cell, identities)
-                } else if name == "range" {
-                    let values = cell.as_array().unwrap();
-                    assert_eq!(values.len(), range_columns.len());
-                    Value::Object(
-                        range_columns
-                            .iter()
-                            .zip(values)
-                            .map(|(key, value)| (key.as_str().unwrap().to_owned(), value.clone()))
-                            .collect(),
-                    )
-                } else {
-                    cell.clone()
-                };
-                result.insert(name.to_owned(), decoded);
-            }
-            Value::Object(result)
-        })
-        .collect()
 }
 
 fn blob_id(blob: &Value, prefix: &str) -> String {
@@ -3592,9 +3128,8 @@ def sink():
             current["revision"], current_before["revision"],
             "{name}: rejected request changed job pin"
         );
-        // Cache a selected question and source at the committed head. The
-        // unchanged request publishes nothing, so the source stays readable.
-        let prior_selection = if file.is_empty() {
+        // Keep a pinned source read across an unchanged request, which publishes nothing.
+        let prior_source_route = if file.is_empty() {
             None
         } else {
             let source_route = format!(
@@ -3615,50 +3150,7 @@ def sink():
             assert_eq!(code, 200, "{name}: prior selected source: {source_at}");
             assert_eq!(source_at["revision"], post_start_pin, "{name}");
             assert_eq!(source_at["file"]["text"], source, "{name}");
-            let (code, symbols) = real_selected_api(
-                &client,
-                &url,
-                &origin,
-                token,
-                reqwest::Method::GET,
-                "/symbols?q=seed",
-                None,
-            )
-            .await;
-            assert_eq!(code, 200, "{name}: prior selected symbols: {symbols}");
-            assert_eq!(symbols["revision"], post_start_pin, "{name}");
-            let seed = symbols["items"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|item| item["name"] == "seed")
-                .expect("prior selected seed")["id"]
-                .as_str()
-                .unwrap();
-            let (code, preview) = real_selected_api(
-                &client, &url, &origin, token, reqwest::Method::POST, "/questions/preview",
-                Some(serde_json::json!({"seed":seed,"question":"what happens?","expectedRevision":post_start_pin}))
-            ).await;
-            assert_eq!(code, 200, "{name}: prior selected question: {preview}");
-            assert_eq!(preview["packet"]["revision"], post_start_pin, "{name}");
-            let packet = preview["packet"]["packetId"].as_str().unwrap();
-            let packet_route = format!("/questions/{packet}/jev-request");
-            let (code, packet_request) = real_selected_api(
-                &client,
-                &url,
-                &origin,
-                token,
-                reqwest::Method::GET,
-                &packet_route,
-                None,
-            )
-            .await;
-            assert_eq!(code, 200, "{name}: prior packet request: {packet_request}");
-            assert_eq!(
-                packet_request["state"]["packet"]["revision"], post_start_pin,
-                "{name}"
-            );
-            Some((source_route, packet_route))
+            Some(source_route)
         };
         let accepted = request().bearer_auth(token).send().await.unwrap();
         assert_eq!(accepted.status(), 202, "{name}");
@@ -3712,7 +3204,7 @@ def sink():
             usize::from(!file.is_empty()),
             "{name}"
         );
-        if let Some((source_route, packet_route)) = &prior_selection {
+        if let Some(source_route) = &prior_source_route {
             let (code, source_at) = real_selected_api(
                 &client,
                 &url,
@@ -3729,23 +3221,6 @@ def sink():
             );
             assert_eq!(source_at["revision"], post_start_pin, "{name}");
             assert_eq!(source_at["file"]["text"], source, "{name}");
-            // Every drained request resets the packet cache, even one that
-            // keeps the head, so the packet is evicted rather than stale.
-            let (code, evicted_packet) = real_selected_api(
-                &client,
-                &url,
-                &origin,
-                token,
-                reqwest::Method::GET,
-                packet_route,
-                None,
-            )
-            .await;
-            assert!(
-                code == reqwest::StatusCode::NOT_FOUND
-                    && evicted_packet["error"]["code"] == "not_found",
-                "{name}: evicted packet must be safely refused: {code} {evicted_packet}"
-            );
         }
         use sha2::{Digest, Sha256};
         // Collect every selected response against the same committed pin while
@@ -3775,18 +3250,14 @@ def sink():
                 classes.clone(),
                 fetch(reqwest::Method::GET, classes, None).await,
             );
-            let symbols = "/symbols?q=seed".to_owned();
-            let response = fetch(reqwest::Method::GET, symbols.clone(), None).await;
-            let seed = response.1["items"]
+            let seed = follower_symbols["items"]
                 .as_array()
                 .unwrap()
                 .iter()
                 .find(|item| item["name"] == "seed")
-                .expect("measured selected seed")["id"]
+                .expect("measured CLI seed")["id"]
                 .as_str()
-                .unwrap()
-                .to_owned();
-            captured.insert(symbols, response);
+                .unwrap();
             captured.insert(
                 "/navigation".into(),
                 fetch(
@@ -3805,17 +3276,6 @@ def sink():
                 )
                 .await,
             );
-            let preview = fetch(reqwest::Method::POST, "/questions/preview".into(),
-                Some(serde_json::json!({"seed":seed,"question":"what happens?","expectedRevision":pin}))).await;
-            let packet = preview.1["packet"]["packetId"]
-                .as_str()
-                .expect("selected question packet");
-            let export = format!("/questions/{packet}/jev-request");
-            captured.insert(
-                export.clone(),
-                fetch(reqwest::Method::GET, export, None).await,
-            );
-            captured.insert("/questions/preview".into(), preview);
         }
         // No revision was superseded, so CAS on a pin that is not the head.
         let not_head = serde_json::json!({
@@ -4019,18 +3479,13 @@ def sink():
                 "{name}"
             );
 
-            let (code, symbols) = captured
-                .get("/symbols?q=seed")
-                .expect("selected HTTP response")
-                .clone();
-            assert_eq!(code, 200, "{name}: {symbols}");
-            assert_eq!(symbols["revision"], pin, "{name}");
-            let seed = symbols["items"]
+            assert_eq!(follower_symbols["revision"], pin, "{name}");
+            let seed = follower_symbols["items"]
                 .as_array()
                 .unwrap()
                 .iter()
                 .find(|item| item["name"] == "seed")
-                .expect("measured seed declaration")["id"]
+                .expect("measured CLI seed declaration")["id"]
                 .as_str()
                 .unwrap();
             let measured_seed = measured.iter().find(|node| node["id"] == seed).unwrap();
@@ -4236,139 +3691,6 @@ def sink():
                 serde_json::to_value(&expected_sequence).unwrap(),
                 "{name}: complete sequence wire matches the captured source projection"
             );
-
-            let (code, preview) = captured
-                .get("/questions/preview")
-                .expect("selected HTTP response")
-                .clone();
-            assert_eq!(code, 200, "{name}: {preview}");
-            let preview_packet = &preview["packet"];
-            assert_eq!(preview_packet["revision"], pin, "{name}");
-            assert_eq!(preview_packet["request"]["expectedRevision"], pin, "{name}");
-            assert_eq!(preview_packet["request"]["seed"], seed, "{name}");
-            assert_eq!(preview_packet["context"]["revision"], pin, "{name}");
-            assert_eq!(preview_packet["context"]["query"]["seed"], seed, "{name}");
-            assert_eq!(
-                preview_packet["context"]["nodes"],
-                serde_json::json!([measured_seed]),
-                "{name}: packet must contain the exact selected graph/native seed"
-            );
-            assert_eq!(
-                preview_packet["sourceFiles"],
-                serde_json::json!([graph_files[0]]),
-                "{name}: packet must cite exact selected captured source"
-            );
-            let selected_calls = preview_packet["context"]["calls"].as_array().unwrap();
-            assert_eq!(
-                selected_calls.len(),
-                1,
-                "{name}: exactly one preview sink call"
-            );
-            assert_eq!(
-                selected_calls[0], *call,
-                "{name}: preview must cite the full measured native/graph call"
-            );
-            assert!(
-                graph_after["regions"].as_array().unwrap().is_empty(),
-                "{name}: simple seed-to-sink fixture has no control region"
-            );
-            assert_eq!(
-                preview_packet["context"]["regions"], graph_after["regions"],
-                "{name}: no fabricated preview control regions"
-            );
-            assert!(!preview.to_string().contains("lexical-guess"), "{name}");
-            let packet = preview_packet["packetId"].as_str().unwrap();
-
-            let (code, export) = captured
-                .get(&format!("/questions/{packet}/jev-request"))
-                .expect("selected HTTP response")
-                .clone();
-            assert_eq!(code, 200, "{name}: {export}");
-            assert_eq!(
-                export["state"]["identityPaths"],
-                serde_json::json!(["/request/seed", "/context/query/seed"]),
-                "{name}: canonical identity paths"
-            );
-            assert_eq!(
-                export["state"]["rangeColumns"],
-                serde_json::json!([
-                    "startByte",
-                    "endByte",
-                    "startLine",
-                    "startColumn",
-                    "endLine",
-                    "endColumn"
-                ]),
-                "{name}: canonical source range columns"
-            );
-            for (table, columns) in [
-                ("nodes", serde_json::json!(["id", "parent"])),
-                ("calls", serde_json::json!(["id", "caller", "regions"])),
-                ("regions", serde_json::json!(["id", "parent", "owner"])),
-            ] {
-                assert_eq!(
-                    export["state"]["packet"]["context"][table]["identityColumns"], columns,
-                    "{name}: canonical {table} identity columns"
-                );
-            }
-            let wire = &export["state"]["packet"];
-            assert_eq!(
-                wire["packetId"], packet,
-                "{name}: cached export packet identity"
-            );
-            assert_eq!(wire["revision"], pin, "{name}");
-            assert_eq!(wire["request"]["expectedRevision"], pin, "{name}");
-            assert_eq!(wire["context"]["revision"], pin, "{name}");
-            assert_eq!(
-                wire["sourceFiles"], preview_packet["sourceFiles"],
-                "{name}: cached source witness"
-            );
-            let identities = export["state"]["identities"].as_array().unwrap();
-            for index in [
-                wire["request"]["seed"].as_u64().unwrap(),
-                wire["context"]["query"]["seed"].as_u64().unwrap(),
-            ] {
-                assert_eq!(
-                    identities[index as usize], seed,
-                    "{name}: encoded seed identity"
-                );
-            }
-            let mut decoded = wire.clone();
-            decoded["request"]["seed"] = serde_json::json!(seed);
-            decoded["context"]["query"]["seed"] = serde_json::json!(seed);
-            for table in ["nodes", "calls", "regions"] {
-                let rows = decoded_jev_rows(&export, table);
-                if table == "nodes" || table == "calls" {
-                    assert!(
-                        !rows.is_empty(),
-                        "{name}: cached {table} witness cannot be empty"
-                    );
-                }
-                decoded["context"][table] = serde_json::json!(rows);
-            }
-            assert_eq!(
-                decoded, *preview_packet,
-                "{name}: lossless cached export must equal the entire selected measured packet"
-            );
-            let question_keys: Vec<_> = export["questions"]
-                .as_object()
-                .unwrap()
-                .keys()
-                .cloned()
-                .collect();
-            let mut expected_keys: Vec<_> = (0..selected_calls.len())
-                .map(|i| format!("c{i}_{packet}"))
-                .collect();
-            expected_keys.sort();
-            assert!(
-                !expected_keys.is_empty(),
-                "{name}: expected measured seed call questions"
-            );
-            assert_eq!(
-                question_keys, expected_keys,
-                "{name}: cached questions bind selected packet/calls"
-            );
-            assert!(!export.to_string().contains("lexical-guess"), "{name}");
         }
     }
 }
@@ -4554,576 +3876,6 @@ fn daemon_publication_is_independent_of_cli_output_file() {
         )
         .unwrap();
     assert_eq!((count, done), (1, 1), "one daemon-owned durable request");
-}
-
-#[tokio::test]
-async fn saved_items_real_index_matrix() {
-    const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    let temp = TempDir::new().unwrap();
-    let root = temp.path().join("workspace");
-    let home = temp.path().join("home");
-    fs::create_dir(&root).unwrap();
-    let source_path = root.join("flow.rs");
-    fs::write(
-        &source_path,
-        "fn seed(value: i32) { sink(); }\nfn sink() {}\nfn other() {}\n",
-    )
-    .unwrap();
-    let indexed = command(&root, &home, "index")
-        .env("TRELLIS_TEST_DAEMON_PID_FILE", home.join("auto-daemon.pid"))
-        .output()
-        .unwrap();
-    assert!(
-        indexed.status.success(),
-        "{}",
-        String::from_utf8_lossy(&indexed.stderr)
-    );
-    let indexed: Value = serde_json::from_slice(&indexed.stdout).unwrap();
-    let initial_pin = indexed["status"]["revision"].clone();
-    assert!(home.join("auto-daemon.pid").exists());
-    let (_server, client, url) = start_saved_item_server(temp.path(), &root, &home, TOKEN).await;
-    let serving_status = saved_item_status(
-        client
-            .get(format!("{url}/api/status"))
-            .header("Origin", &url)
-            .bearer_auth(TOKEN),
-        "initial",
-    )
-    .await
-    .unwrap();
-    let pin = serving_status["revision"].clone();
-    assert_eq!(pin["indexGeneration"], initial_pin["indexGeneration"]);
-    // The direct router may commit mandatory startup reconciliation after the daemon exits.
-    assert!(
-        pin["indexRevision"].as_u64().unwrap() >= initial_pin["indexRevision"].as_u64().unwrap()
-    );
-
-    for route in ["/api/views", "/api/views/absent", "/api/annotations"] {
-        let (status, response) =
-            real_api(&client, &url, TOKEN, reqwest::Method::GET, route, None).await;
-        if route.ends_with("absent") {
-            assert_eq!(status, reqwest::StatusCode::NOT_FOUND, "{response}");
-        } else {
-            assert_eq!(status, reqwest::StatusCode::OK, "{response}");
-            assert_eq!(response, serde_json::json!([]));
-        }
-    }
-    assert!(
-        find_workspace_db(&home).is_none(),
-        "saved reads before first write must not create workspace.db"
-    );
-
-    let (status, symbols) = real_api(
-        &client,
-        &url,
-        TOKEN,
-        reqwest::Method::GET,
-        "/api/symbols?q=",
-        None,
-    )
-    .await;
-    assert_eq!(status, reqwest::StatusCode::OK, "{symbols}");
-    let seed = symbols["items"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|symbol| symbol["name"] == "seed")
-        .unwrap()["id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    let other = symbols["items"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|symbol| symbol["name"] == "other")
-        .unwrap()["id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    let view_body = serde_json::json!({
-        "id":"real-view","title":"Original","query":{"seed":seed}
-    });
-    let (status, saved_view) = real_api(
-        &client,
-        &url,
-        TOKEN,
-        reqwest::Method::PUT,
-        &saved_pin_route("/api/views/real-view", &pin),
-        Some(view_body.clone()),
-    )
-    .await;
-    assert_eq!(status, reqwest::StatusCode::OK, "{saved_view}");
-    assert_eq!(saved_view["indexGeneration"], pin["indexGeneration"]);
-    assert_eq!(saved_view["indexRevision"], pin["indexRevision"]);
-    assert_eq!(saved_view["view"]["query"]["seed"], seed);
-    assert_eq!(saved_view["view"]["pins"], serde_json::json!({}));
-    assert_eq!(saved_view["view"]["hidden"], serde_json::json!([]));
-    assert_eq!(saved_view["attachment"]["availability"], "ready");
-    assert_eq!(saved_view["attachment"]["result"]["status"], "attached");
-    assert_eq!(saved_view["attachment"]["result"]["targetId"], seed);
-
-    let note_body = serde_json::json!({
-        "id":"real-note","nodeId":seed,"body":"First body","title":"First title"
-    });
-    let (status, saved_note) = real_api(
-        &client,
-        &url,
-        TOKEN,
-        reqwest::Method::PUT,
-        &saved_pin_route("/api/annotations/real-note", &pin),
-        Some(note_body.clone()),
-    )
-    .await;
-    assert_eq!(status, reqwest::StatusCode::OK, "{saved_note}");
-    assert_eq!(saved_note["indexGeneration"], pin["indexGeneration"]);
-    assert_eq!(saved_note["indexRevision"], pin["indexRevision"]);
-    assert_eq!(saved_note["annotation"]["nodeId"], seed);
-    assert_eq!(saved_note["annotation"]["title"], "First title");
-    assert_eq!(saved_note["attachment"]["availability"], "ready");
-    assert_eq!(saved_note["attachment"]["result"]["targetId"], seed);
-
-    let record_db = find_workspace_db(&home).expect("schema-1 saved record database");
-    let record = rusqlite::Connection::open(&record_db).unwrap();
-    let metadata: (i64, i64) = record
-        .query_row(
-            "SELECT schema_version,initialized FROM record_metadata WHERE singleton=1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .unwrap();
-    assert_eq!(metadata, (1, 1), "saved payload is schema 1");
-    let record_version: i64 = record
-        .pragma_query_value(None, "user_version", |row| row.get(0))
-        .unwrap();
-    assert_eq!(record_version, 1);
-    drop(record);
-    let original_view_payload = stored_payload(&record_db, "views", "real-view");
-    let original_note_payload = stored_payload(&record_db, "annotations", "real-note");
-    let original_view_anchor = raw_anchor(&original_view_payload).unwrap();
-    let original_note_anchor = raw_anchor(&original_note_payload).unwrap();
-    for (payload, target) in [
-        (&original_view_payload, &seed),
-        (&original_note_payload, &seed),
-    ] {
-        let value: Value = serde_json::from_str(payload).unwrap();
-        let fields = value["anchor"].as_object().unwrap();
-        let mut keys = fields.keys().map(String::as_str).collect::<Vec<_>>();
-        keys.sort_unstable();
-        assert_eq!(
-            keys,
-            [
-                "capturedRevisionId",
-                "document",
-                "headerHash",
-                "identicalHeaderCount",
-                "siblingCount",
-                "siblingGroupHash",
-                "syntaxId",
-            ]
-        );
-        assert_eq!(fields["syntaxId"], target.as_str());
-        assert_eq!(fields["headerHash"].as_str().unwrap().len(), 64);
-        assert_eq!(fields["siblingGroupHash"].as_str().unwrap().len(), 64);
-    }
-    let index_version: i64 = rusqlite::Connection::open(real_index_db(&home))
-        .unwrap()
-        .pragma_query_value(None, "user_version", |row| row.get(0))
-        .unwrap();
-    assert_eq!(
-        index_version, 14,
-        "derived v14 index inspection is separate"
-    );
-
-    let edited_view_body = serde_json::json!({
-        "id":"real-view","title":"Edited","query":{"seed":seed}
-    });
-    let (status, edited_view) = real_api(
-        &client,
-        &url,
-        TOKEN,
-        reqwest::Method::PUT,
-        &saved_pin_route("/api/views/real-view", &pin),
-        Some(edited_view_body.clone()),
-    )
-    .await;
-    assert_eq!(status, reqwest::StatusCode::OK, "{edited_view}");
-    assert_eq!(edited_view["view"]["anchor"], saved_view["view"]["anchor"]);
-    let edited_note_body = serde_json::json!({
-        "id":"real-note","nodeId":seed,"body":"Edited body"
-    });
-    let (status, edited_note) = real_api(
-        &client,
-        &url,
-        TOKEN,
-        reqwest::Method::PUT,
-        &saved_pin_route("/api/annotations/real-note", &pin),
-        Some(edited_note_body.clone()),
-    )
-    .await;
-    assert_eq!(status, reqwest::StatusCode::OK, "{edited_note}");
-    assert_eq!(edited_note["annotation"]["title"], "First title");
-    assert_eq!(
-        edited_note["annotation"]["anchor"],
-        saved_note["annotation"]["anchor"]
-    );
-    assert_eq!(
-        raw_anchor(&stored_payload(&record_db, "views", "real-view")).as_deref(),
-        Some(original_view_anchor.as_str())
-    );
-    assert_eq!(
-        raw_anchor(&stored_payload(&record_db, "annotations", "real-note")).as_deref(),
-        Some(original_note_anchor.as_str())
-    );
-
-    for (route, body) in [
-        (
-            saved_pin_route("/api/views/real-view", &pin),
-            serde_json::json!({
-                "id":"real-view","title":"Injected","query":{"seed":seed},
-                "anchor":saved_view["view"]["anchor"]
-            }),
-        ),
-        (
-            saved_pin_route("/api/annotations/real-note", &pin),
-            serde_json::json!({
-                "id":"real-note","nodeId":seed,"body":"Injected",
-                "attachment":saved_note["attachment"]
-            }),
-        ),
-        (
-            saved_pin_route("/api/views/real-view", &pin),
-            serde_json::json!({"id":"real-view","title":"Retarget","query":{"seed":other}}),
-        ),
-        (
-            saved_pin_route("/api/annotations/real-note", &pin),
-            serde_json::json!({"id":"real-note","nodeId":other,"body":"Retarget"}),
-        ),
-    ] {
-        let (status, error) = real_api(
-            &client,
-            &url,
-            TOKEN,
-            reqwest::Method::PUT,
-            &route,
-            Some(body),
-        )
-        .await;
-        assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{error}");
-    }
-    assert_eq!(
-        raw_anchor(&stored_payload(&record_db, "views", "real-view")).as_deref(),
-        Some(original_view_anchor.as_str())
-    );
-    assert_eq!(
-        raw_anchor(&stored_payload(&record_db, "annotations", "real-note")).as_deref(),
-        Some(original_note_anchor.as_str())
-    );
-
-    let changed_source = "fn seed(value: i64) { sink(); }\nfn sink() {}\nfn other() {}\n";
-    fs::write(&source_path, changed_source).unwrap();
-    let next = real_index_job(&client, &url, TOKEN, &pin, changed_source).await;
-    assert_eq!(next["indexGeneration"], pin["indexGeneration"]);
-    assert!(next["indexRevision"].as_u64().unwrap() > pin["indexRevision"].as_u64().unwrap());
-
-    let routes = [
-        saved_pin_route("/api/views/real-view", &next),
-        saved_pin_route("/api/views", &next),
-        saved_pin_route("/api/annotations", &next),
-    ];
-    for route in routes {
-        let (status, response) =
-            real_api(&client, &url, TOKEN, reqwest::Method::GET, &route, None).await;
-        assert_eq!(status, reqwest::StatusCode::OK, "{route}: {response}");
-        let state = if route.contains("/real-view") {
-            &response
-        } else if route.contains("annotations") {
-            &response[0]
-        } else {
-            response
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|state| state["view"]["id"] == "real-view")
-                .unwrap()
-        };
-        assert_eq!(state["indexGeneration"], next["indexGeneration"]);
-        assert_eq!(state["indexRevision"], next["indexRevision"]);
-        assert_eq!(state["attachment"]["availability"], "ready");
-        assert_eq!(state["attachment"]["result"]["status"], "orphaned");
-        assert_eq!(state["attachment"]["result"]["reason"], "headerMismatch");
-        assert!(state["attachment"]["result"]["targetId"].is_null());
-        if route.contains("annotations") {
-            assert_eq!(state["annotation"]["nodeId"], seed);
-            assert!(state["orphaned"].as_bool().unwrap());
-        } else {
-            assert_eq!(state["view"]["query"]["seed"], seed);
-            assert!(
-                state["orphanedIds"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|id| id == &serde_json::json!(seed))
-            );
-        }
-    }
-    assert_eq!(
-        raw_anchor(&stored_payload(&record_db, "views", "real-view")).as_deref(),
-        Some(original_view_anchor.as_str())
-    );
-    assert_eq!(
-        raw_anchor(&stored_payload(&record_db, "annotations", "real-note")).as_deref(),
-        Some(original_note_anchor.as_str())
-    );
-
-    for route in [
-        saved_pin_route("/api/views/real-view", &pin),
-        saved_pin_route("/api/views", &pin),
-        saved_pin_route("/api/annotations", &pin),
-    ] {
-        let (status, response) =
-            real_api(&client, &url, TOKEN, reqwest::Method::GET, &route, None).await;
-        assert_eq!(status, reqwest::StatusCode::OK, "{route}: {response}");
-        let selected = if route.contains("/real-view") {
-            &response
-        } else {
-            &response[0]
-        };
-        assert_eq!(selected["indexGeneration"], pin["indexGeneration"]);
-        assert_eq!(selected["indexRevision"], pin["indexRevision"]);
-        assert_eq!(selected["attachment"]["result"]["status"], "attached");
-        assert_eq!(selected["attachment"]["result"]["targetId"], seed);
-    }
-    for (route, body) in [
-        (
-            saved_pin_route("/api/views/real-view", &pin),
-            edited_view_body,
-        ),
-        (
-            saved_pin_route("/api/annotations/real-note", &pin),
-            edited_note_body,
-        ),
-    ] {
-        let (status, error) = real_api(
-            &client,
-            &url,
-            TOKEN,
-            reqwest::Method::PUT,
-            &route,
-            Some(body),
-        )
-        .await;
-        assert_eq!(status, reqwest::StatusCode::CONFLICT, "{error}");
-    }
-
-    let query = serde_json::json!({"seed":seed});
-    let (status, stale_query) = real_api(
-        &client,
-        &url,
-        TOKEN,
-        reqwest::Method::POST,
-        &saved_pin_route("/api/query", &pin),
-        Some(query.clone()),
-    )
-    .await;
-    assert_eq!(status, reqwest::StatusCode::OK, "{stale_query}");
-    assert_eq!(stale_query["revision"], pin, "retained query must select P");
-    let (status, current_query) = real_api(
-        &client,
-        &url,
-        TOKEN,
-        reqwest::Method::POST,
-        &saved_pin_route("/api/query", &next),
-        Some(query.clone()),
-    )
-    .await;
-    assert_eq!(status, reqwest::StatusCode::OK, "{current_query}");
-    assert_eq!(current_query["revision"], next);
-    assert_eq!(current_query["nodes"][0]["id"], seed);
-    let (status, ordinary_query) = real_api(
-        &client,
-        &url,
-        TOKEN,
-        reqwest::Method::POST,
-        "/api/query",
-        Some(query),
-    )
-    .await;
-    assert_eq!(status, reqwest::StatusCode::OK, "{ordinary_query}");
-    assert_eq!(ordinary_query["revision"], next);
-
-    let orphan_view_edit = serde_json::json!({
-        "id":"real-view","title":"Edited while orphaned","query":{"seed":seed}
-    });
-    let (status, orphan_view) = real_api(
-        &client,
-        &url,
-        TOKEN,
-        reqwest::Method::PUT,
-        &saved_pin_route("/api/views/real-view", &next),
-        Some(orphan_view_edit),
-    )
-    .await;
-    assert_eq!(status, reqwest::StatusCode::OK, "{orphan_view}");
-    assert_eq!(
-        orphan_view["attachment"]["result"]["reason"],
-        "headerMismatch"
-    );
-    let orphan_note_edit = serde_json::json!({
-        "id":"real-note","nodeId":seed,"body":"Edited while orphaned","title":"New title"
-    });
-    let (status, orphan_note) = real_api(
-        &client,
-        &url,
-        TOKEN,
-        reqwest::Method::PUT,
-        &saved_pin_route("/api/annotations/real-note", &next),
-        Some(orphan_note_edit),
-    )
-    .await;
-    assert_eq!(status, reqwest::StatusCode::OK, "{orphan_note}");
-    assert_eq!(
-        orphan_note["attachment"]["result"]["reason"],
-        "headerMismatch"
-    );
-    assert_eq!(
-        raw_anchor(&stored_payload(&record_db, "views", "real-view")).as_deref(),
-        Some(original_view_anchor.as_str())
-    );
-    assert_eq!(
-        raw_anchor(&stored_payload(&record_db, "annotations", "real-note")).as_deref(),
-        Some(original_note_anchor.as_str())
-    );
-
-    drop(client);
-    let db = rusqlite::Connection::open(&record_db).unwrap();
-    db.execute(
-        "INSERT INTO views(id,payload) VALUES(?1,?2)",
-        rusqlite::params![
-            "legacy-view",
-            serde_json::json!({
-                "id":"legacy-view","title":"Legacy","query":{"seed":seed},
-                "pins":{},"hidden":[]
-            })
-            .to_string()
-        ],
-    )
-    .unwrap();
-    db.execute(
-        "INSERT INTO annotations(id,node_id,payload) VALUES(?1,?2,?3)",
-        rusqlite::params![
-            "legacy-note",
-            seed,
-            serde_json::json!({"id":"legacy-note","nodeId":seed,"body":"Legacy body"}).to_string()
-        ],
-    )
-    .unwrap();
-    drop(db);
-
-    let (_server, client, url) = start_saved_item_server(temp.path(), &root, &home, TOKEN).await;
-    let reopened_status = saved_item_status(
-        client
-            .get(format!("{url}/api/status"))
-            .header("Origin", &url)
-            .bearer_auth(TOKEN),
-        "reopened",
-    )
-    .await
-    .unwrap();
-    let reopened_pin = reopened_status["revision"].clone();
-    assert_eq!(reopened_pin["indexGeneration"], next["indexGeneration"]);
-    // Reopening the direct router may publish mandatory startup reconciliation again.
-    assert!(
-        reopened_pin["indexRevision"].as_u64().unwrap() >= next["indexRevision"].as_u64().unwrap()
-    );
-    let (status, views) = real_api(
-        &client,
-        &url,
-        TOKEN,
-        reqwest::Method::GET,
-        &saved_pin_route("/api/views", &reopened_pin),
-        None,
-    )
-    .await;
-    assert_eq!(status, reqwest::StatusCode::OK, "{views}");
-    let reopened = views
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|state| state["view"]["id"] == "real-view")
-        .unwrap();
-    assert_eq!(reopened["view"]["title"], "Edited while orphaned");
-    assert_eq!(reopened["attachment"]["result"]["reason"], "headerMismatch");
-    let legacy_view = views
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|state| state["view"]["id"] == "legacy-view")
-        .unwrap();
-    assert!(legacy_view["view"].get("anchor").is_none());
-    assert_eq!(legacy_view["attachment"]["availability"], "anchorless");
-    let (status, notes) = real_api(
-        &client,
-        &url,
-        TOKEN,
-        reqwest::Method::GET,
-        &saved_pin_route("/api/annotations", &reopened_pin),
-        None,
-    )
-    .await;
-    assert_eq!(status, reqwest::StatusCode::OK, "{notes}");
-    let reopened_note = notes
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|state| state["annotation"]["id"] == "real-note")
-        .unwrap();
-    assert_eq!(reopened_note["annotation"]["title"], "New title");
-    assert_eq!(reopened_note["annotation"]["body"], "Edited while orphaned");
-    let legacy_note = notes
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|state| state["annotation"]["id"] == "legacy-note")
-        .unwrap();
-    assert!(legacy_note["annotation"].get("anchor").is_none());
-    assert!(legacy_note["annotation"].get("title").is_none());
-    assert_eq!(legacy_note["attachment"]["availability"], "anchorless");
-    assert!(legacy_note["orphaned"].as_bool().unwrap());
-
-    let legacy_view_edit = serde_json::json!({
-        "id":"legacy-view","title":"Legacy edited","query":{"seed":seed}
-    });
-    let (status, legacy_view) = real_api(
-        &client,
-        &url,
-        TOKEN,
-        reqwest::Method::PUT,
-        &saved_pin_route("/api/views/legacy-view", &reopened_pin),
-        Some(legacy_view_edit),
-    )
-    .await;
-    assert_eq!(status, reqwest::StatusCode::OK, "{legacy_view}");
-    assert!(legacy_view["view"].get("anchor").is_none());
-    assert_eq!(legacy_view["attachment"]["availability"], "anchorless");
-    let legacy_note_edit = serde_json::json!({
-        "id":"legacy-note","nodeId":seed,"body":"Legacy edited","title":"Legacy title"
-    });
-    let (status, legacy_note) = real_api(
-        &client,
-        &url,
-        TOKEN,
-        reqwest::Method::PUT,
-        &saved_pin_route("/api/annotations/legacy-note", &reopened_pin),
-        Some(legacy_note_edit),
-    )
-    .await;
-    assert_eq!(status, reqwest::StatusCode::OK, "{legacy_note}");
-    assert!(legacy_note["annotation"].get("anchor").is_none());
-    assert_eq!(legacy_note["annotation"]["title"], "Legacy title");
-    assert_eq!(legacy_note["attachment"]["availability"], "anchorless");
-    assert!(raw_anchor(&stored_payload(&record_db, "views", "legacy-view")).is_none());
-    assert!(raw_anchor(&stored_payload(&record_db, "annotations", "legacy-note")).is_none());
 }
 
 #[test]

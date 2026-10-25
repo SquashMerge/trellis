@@ -53,7 +53,7 @@ files are not silently treated as JavaScript.
 
 ## Inspect another repository
 
-Run Trellis from its own directory. Indexes and saved records use fixed per-user storage;
+Run Trellis from its own directory. Indexes use fixed per-user storage; retired saved records remain in place and ignored;
 `--state-dir` is removed. Put the required private token outside the inspected checkout:
 
 ```sh

@@ -1,5 +1,3 @@
-pub mod acp;
-pub mod answer;
 pub mod auth;
 pub mod behavior;
 mod behavior_bindings;
@@ -41,7 +39,3 @@ pub mod store;
 #[doc(hidden)]
 pub mod testing;
 pub mod watch;
-
-pub mod jev;
-pub mod live_jev;
-pub mod planning;

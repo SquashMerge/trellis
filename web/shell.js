@@ -6,7 +6,7 @@
   const hide = (id, value) => { if (get(id)) get(id).hidden = value; };
   const make = (tag, value) => { const node = document.createElement(tag); if (value !== undefined) node.textContent = value; return node; };
   const describe = value => typeof value === "string" ? value : JSON.stringify(value, null, 2);
-  const views = {sequence:"sequence-panel", classes:"classes-panel", libraries:"dependency-library", tools:"tools-panel"};
+  const views = {sequence:"sequence-panel", classes:"classes-panel", libraries:"dependency-library"};
   let openSource = null, sourceReturnFocus = null, activeView = "sequence";
   function drawer(name, open) {
     if (open && window.matchMedia?.("(max-width: 900px)").matches) drawer(name === "explorer" ? "inspector" : "explorer", false);

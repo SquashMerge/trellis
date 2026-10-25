@@ -3,8 +3,7 @@
 ## Purpose
 
 Inspect indexed JavaScript without executing the workspace. This is an evidence API,
-not a question-answering service. Keep the measured graph separate from later ACP/Jev
-presentation decisions. Display static call views, not runtime sequences.
+not a question-answering service. Display static call views, not runtime sequences.
 
 ## Integration
 
@@ -22,13 +21,12 @@ Graph schema version 1; database schema version 2. `src/model.rs` defines serial
 1. `GET /api/status`. Revision 0 means no snapshot; show an explicit Index action.
 2. `POST /api/index` with `{}` (or `{expectedRevision: n}`) starts a background job, 202.
 3. Poll `GET /api/jobs/{id}` only while running/cancelling. Indexing never starts on a read.
-4. `GET /api/symbols?q=transition&limit=50` returns `{revision, items: Symbol[]}`.
-5. `POST /api/query` with the selected ID and bounded options returns `ViewResult`.
-6. `GET /api/source?path=<encoded-relative-path>&revision=<view.revision>` returns
-   `{revision, file:{path, hash, language, text}}`. On 409, refresh the query; never pair a
-   new source body with old source spans. An already cached old body is valid only for
-   that exact revision/path pair.
-7. Save queries/notes through the routes below. Read orphan status on every reload.
+4. Browse files and methods, then open Sequence, Classes or Libraries.
+5. Read cached source at the selected complete `{indexGeneration,indexRevision}` pin;
+   never pair new source bytes with old source spans.
+
+The Tools-only symbols/query, saved-state, question and provider HTTP routes are removed.
+CLI symbols/query and MCP evidence tools remain supported through their shared services.
 
 Source hashes are SHA-256. Ranges use **UTF-8 bytes**, not JavaScript string offsets.
 Lines and byte columns are 1-based, and end positions are exclusive. Whole-line highlighting
@@ -66,13 +64,6 @@ interface ViewResult {
   revision: number; query: Required<ViewQuery>; nodes: Symbol[]; calls: CallSite[];
   regions: ControlRegion[]; truncated: boolean; omittedNodes: number; warnings: string[];
 }
-interface SavedView {
-  id: string; title: string; query: ViewQuery;
-  pins: Record<string,{x:number,y:number}>; hidden: string[];
-}
-interface SavedViewState { view: SavedView; orphanedIds: string[] }
-interface Annotation { id: string; nodeId: string; body: string }
-interface AnnotationState { annotation: Annotation; orphaned: boolean }
 interface IndexJob {
   id: string; state: 'running'|'cancelling'|'completed'|'cancelled'|'failed';
   progress: {phase: string; completed: number; total: number};
@@ -87,23 +78,10 @@ semanticState, changedFiles), and diagnostics `{path:string|null,code,message}[]
 Global semanticState measures paired-manifest freshness, not working-tree liveness or
 perfect semantic coverage. Surface diagnostics and parse errors separately.
 
-## Saved state
+## Retired state
 
-- `GET /api/views` -> SavedViewState[]. `GET /api/views/{id}` -> SavedViewState.
-- `PUT /api/views/{id}` with a full SavedView -> SavedViewState. Body ID must match route.
-- `DELETE /api/views/{id}` -> 204, or 404 if absent.
-- `GET /api/annotations` -> AnnotationState[].
-- `PUT /api/annotations/{id}` with a full Annotation -> AnnotationState.
-- `DELETE /api/annotations/{id}` -> 204/404.
-
-PUT is full replacement/upsert, not PATCH. Preserve unknown-to-your-UI pin/hidden data
-when editing an existing record. The basic inspector only creates queries without layout
-overrides. A future canvas must apply pins and hidden IDs itself; `/api/query` returns
-facts and does not silently alter them using saved preferences.
-
-Do not discard orphaned records. Local/provisional IDs include a source hash and may
-orphan on any file edit. A later byte-identical rebuild can reattach them. There is no
-automatic rename reconciliation. Global SCIP IDs retain the indexer's identity semantics.
+Saved views and notes were retired by the [owner ruling 2026-10-24, #305](https://github.com/SquashMerge/trellis/issues/305#issuecomment-6394175295). Existing files remain
+in place and ignored. There is no saved-state API, migration or deletion command.
 
 ## Limits and error states
 
@@ -113,9 +91,8 @@ seed even when excluded. A call target can lie outside the displayed node budget
 `truncated` is not an empty-success state; explain it and allow an explicit refinement.
 `omittedNodes` only counts encountered omitted targets, not the entire unseen graph.
 
-Unknown request fields are rejected. JSON bodies ≤1MiB. Titles ≤256 bytes, notes ≤65536
-bytes, record IDs ≤128 ASCII `[A-Za-z0-9._-]`, opaque symbol IDs ≤8192 bytes, pins/hidden
-lists ≤150. These are byte limits, not HTML maxlength character guarantees.
+Unknown request fields are rejected. JSON bodies ≤1MiB. These are byte limits,
+not HTML maxlength character guarantees.
 
 Errors: `{error:{code,message}}`. 401 auth, 403 Host/Origin, 404 missing seed/data/job,
 409 revision_conflict or job_active, 413 oversized body, 400/422 malformed input. Failed

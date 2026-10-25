@@ -161,8 +161,6 @@ fn stale_generation_cancel_and_revision_never_publish() {
         IndexOptions::new(workspace.clone()),
         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
         "127.0.0.1:7331".parse().unwrap(),
-        None,
-        None,
         workspace.clone(),
         vec![],
         Some(CatalogOptions::default()),

@@ -311,11 +311,15 @@ async fn fresh_registry_restart_serves_prior_head_without_startup_mutation_or_fi
         .clone()
         .oneshot(
             Request::builder()
-                .method("DELETE")
-                .uri(format!("/api/checkouts/{}/views/missing", id.root_key))
+                .method("POST")
+                .uri(format!(
+                    "/api/checkouts/{}/dependencies/refresh",
+                    id.root_key
+                ))
                 .header("host", "127.0.0.1:7331")
+                .header("content-type", "application/json")
                 .header("authorization", format!("Bearer {token}"))
-                .body(Body::empty())
+                .body(Body::from("{}"))
                 .unwrap(),
         )
         .await
@@ -370,16 +374,20 @@ async fn fresh_registry_restart_serves_prior_head_without_startup_mutation_or_fi
     let allowed = app
         .oneshot(
             Request::builder()
-                .method("DELETE")
-                .uri(format!("/api/checkouts/{}/views/missing", id.root_key))
+                .method("POST")
+                .uri(format!(
+                    "/api/checkouts/{}/dependencies/refresh",
+                    id.root_key
+                ))
                 .header("host", "127.0.0.1:7331")
+                .header("content-type", "application/json")
                 .header("authorization", format!("Bearer {token}"))
-                .body(Body::empty())
+                .body(Body::from("{}"))
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(allowed.status(), StatusCode::NO_CONTENT);
+    assert_eq!(allowed.status(), StatusCode::ACCEPTED);
     drop(allowed);
     drop(unhold);
     holder.join().unwrap();
@@ -1908,20 +1916,17 @@ async fn failed_serve_configuration_publishes_nothing() {
     };
     ready(&runtime).await;
     let scheduler = runtime.browser_scheduler().unwrap();
-    // A not-yet-created Jev budget passes validation; building it fails
-    // because its parent directory is read-only.
+    // The directory exists for validation, but the build cannot open it.
     let read_only = base.path().join("read-only");
     fs::create_dir(&read_only).unwrap();
     std::fs::set_permissions(
         &read_only,
-        std::os::unix::fs::PermissionsExt::from_mode(0o500),
+        std::os::unix::fs::PermissionsExt::from_mode(0o000),
     )
     .unwrap();
     let options = CheckoutOptions(serde_json::json!({
         "maxFileBytes": 4096,
-        "jevBudgetDir": read_only.join("budget"),
-        "jevBudgetCents": 100,
-        "jevKey": "test-key",
+        "browseRoot": read_only,
     }));
     let token = base.path().join("token");
     let error = BrowserProvisioner::new()
@@ -1937,7 +1942,6 @@ async fn failed_serve_configuration_publishes_nothing() {
     assert!(!error.to_string().is_empty());
     assert!(registry.lock().await.registration(&key).is_none());
     assert_eq!(scheduler.config().options.max_file_bytes, 2_097_152);
-    assert!(scheduler.config().provider.is_none());
     assert!(!token.exists(), "a refused registration mints no token");
     std::fs::set_permissions(
         &read_only,
@@ -2837,7 +2841,7 @@ async fn serve_without_a_live_runtime_refuses_an_unbuildable_configuration() {
     fs::create_dir(&read_only).unwrap();
     fs::set_permissions(
         &read_only,
-        std::os::unix::fs::PermissionsExt::from_mode(0o500),
+        std::os::unix::fs::PermissionsExt::from_mode(0o000),
     )
     .unwrap();
     let token = base.path().join("token");
@@ -2846,9 +2850,7 @@ async fn serve_without_a_live_runtime_refuses_an_unbuildable_configuration() {
             &registry,
             &identity,
             CheckoutOptions(serde_json::json!({
-                "jevBudgetDir": read_only.join("budget"),
-                "jevBudgetCents": 100,
-                "jevKey": "test-key",
+                "browseRoot": read_only,
             })),
             "127.0.0.1:0".parse().unwrap(),
             &token,
@@ -2971,13 +2973,11 @@ async fn serve_with_already_recorded_options_still_builds() {
     fs::create_dir(&read_only).unwrap();
     fs::set_permissions(
         &read_only,
-        std::os::unix::fs::PermissionsExt::from_mode(0o500),
+        std::os::unix::fs::PermissionsExt::from_mode(0o000),
     )
     .unwrap();
     let options = CheckoutOptions(serde_json::json!({
-        "jevBudgetDir": read_only.join("budget"),
-        "jevBudgetCents": 100,
-        "jevKey": "test-key",
+        "browseRoot": read_only,
     }));
     let mut registry = CheckoutRegistry::with_roots(roots(base.path()));
     registry.register(&identity, options.clone()).unwrap();

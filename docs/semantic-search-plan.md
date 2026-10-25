@@ -106,16 +106,16 @@ every chunk below it.
 - **Boosts:** the same module as the caller's current file, public over private, production over
   test code.
 - **Optional Jev rerank (opt-in, off by default).** Jev is a single-forward-pass relevance
-  decision model that Trellis already calls for live sequence-diagram call selection
-  ([live Jev](live-jev.md)). A rerank stage would send the query and the top ~50 hybrid candidates
+  decision model evaluated in the historical selection research. The live Tools provider is retired;
+  any future rerank needs a new provider/accounting contract. A rerank stage would send the query and the top ~50 hybrid candidates
   (symbol card plus a bounded code excerpt each) for one relevance judgment per candidate, and
   reorder by that judgment. This is the per-candidate judgment that
   [jevgrep](https://github.com/dzhng/jevgrep) applies across a whole folder → file → declaration
   crawl, limited here to candidates the local index already found.
-  - It sends source to the hosted provider, so it follows the live-Jev rules: explicit opt-in, a
+  - It sends source to the hosted provider, so a new contract would require explicit opt-in, a
     `JEV_KEY` from the environment, a reservation budget ledger, and validated labels. Search
     without it stays fully local.
-  - **Batch, and budget per query.** Live Jev reserves 10 cents per outbound attempt against a
+  - **Batch, and budget per query.** The retired live Jev contract reserved 10 cents per outbound attempt against a
     capped ledger (the documented cap is $5, so at most 50 attempts). One attempt per candidate
     would spend the whole cap on a single query, so that design is ruled out. The rerank sends
     **one batched attempt per query**, with all candidates in one bounded packet, labelled together.

@@ -686,7 +686,7 @@ async fn executable_daemon_is_socket_only_until_explicit_serve_and_registers_two
         .root_key;
     for (method, path) in [
         (reqwest::Method::GET, "/api/status"),
-        (reqwest::Method::GET, "/api/jev/status"),
+        (reqwest::Method::GET, "/api/dependencies"),
         (reqwest::Method::POST, "/api/index"),
     ] {
         let response = client
@@ -1714,28 +1714,6 @@ fn cold_cli_reads_start_daemon_and_keep_data_envelopes() {
         String::from_utf8_lossy(&gc.stderr)
     );
     assert!(serde_json::from_slice::<Value>(&gc.stdout).is_ok());
-}
-
-#[tokio::test]
-async fn serve_first_carries_jev_credential_to_new_daemon() {
-    let temp = short_temp();
-    let home = temp.path().join("home");
-    fs::create_dir(&home).unwrap();
-    let root = checkout(temp.path(), "serve-first");
-    let _daemon = AutoDaemonGuard::for_home(&home);
-    let token = home.join("token");
-    let bind = free_address();
-    let mut command = serve(&home, &root, bind, &token);
-    command
-        .env("JEV_KEY", "fixture-serve-first")
-        .arg("--jev-budget-dir")
-        .arg(home.join("budget"))
-        .arg("--jev-budget-cents")
-        .arg("10");
-    let mut child = detached(command);
-    ready(&reqwest::Client::new(), bind, &mut child.0, &home).await;
-    let indexed = run(&home, "index", &root);
-    assert!(indexed["status"]["catchingUp"].is_boolean());
 }
 
 /// A test-elected daemon outlives its electing CLI but not its owning test

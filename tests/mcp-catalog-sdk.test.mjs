@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 
-const require = createRequire(new URL("../runtime/acp/package.json", import.meta.url));
+const require = createRequire(new URL("./mcp/package.json", import.meta.url));
 const { ListToolsResultSchema } = require("@modelcontextprotocol/sdk/types.js");
 const tools = JSON.parse(readFileSync(new URL("./fixtures/mcp/catalog.json", import.meta.url)));
 

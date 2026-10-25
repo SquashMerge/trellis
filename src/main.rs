@@ -48,10 +48,8 @@ enum Command {
     Metrics(MetricsArgs),
     /// Query a bounded static call view. This is not a runtime sequence.
     Query(QueryArgs),
-    /// Inspect existing derived indexes and saved records without changing them.
+    /// Inspect existing derived indexes without changing them.
     Gc(GcArgs),
-    /// Permanently remove one saved workspace record by its exact ID.
-    Forget(ForgetArgs),
 }
 #[cfg(feature = "test-support")]
 #[derive(Args)]
@@ -78,13 +76,6 @@ struct GitReadArgs {
     mode: String,
     #[arg(long)]
     path: Option<String>,
-}
-#[derive(Args)]
-struct ForgetArgs {
-    record_id: String,
-    /// Confirm without an interactive terminal.
-    #[arg(long)]
-    yes: bool,
 }
 #[derive(Args)]
 struct GcArgs {
@@ -137,21 +128,6 @@ struct ServeArgs {
     /// Existing private token file or a path at which to securely create one.
     #[arg(long)]
     token_file: Option<PathBuf>,
-    /// Explicit opt-in to source-bearing Jev requests; durable shared budget directory.
-    #[arg(long, requires = "jev_budget_cents")]
-    jev_budget_dir: Option<PathBuf>,
-    /// Authorized reservation cap in cents. Existing ledger caps cannot be changed.
-    #[arg(long, requires = "jev_budget_dir", value_parser = clap::value_parser!(u64).range(10..=500))]
-    jev_budget_cents: Option<u64>,
-    /// Explicit opt-in: trusted executable ACP runner (not a command from the inspected repository).
-    #[arg(long, requires_all = ["acp_state_dir", "acp_max_attempts"])]
-    acp_runner: Option<PathBuf>,
-    /// Separate private ACP allowance/audit directory. Never use a Jev budget directory.
-    #[arg(long, requires_all = ["acp_runner", "acp_max_attempts"])]
-    acp_state_dir: Option<PathBuf>,
-    /// Authorized ACP attempt allowance; immutable across restarts. Not a monetary cap.
-    #[arg(long, requires_all = ["acp_runner", "acp_state_dir"], value_parser = clap::value_parser!(u64).range(1..=20))]
-    acp_max_attempts: Option<u64>,
 }
 #[derive(Args)]
 struct SymbolsArgs {
@@ -273,40 +249,6 @@ async fn main() -> Result<()> {
         Command::Gc(_) => {
             let request = daemon_request("gc_report", serde_json::json!({}));
             print_json(&send_daemon(&request, true)?)?;
-        }
-        Command::Forget(args) => {
-            use std::io::{self, Write};
-            let deleted = TopologyRoots::production()?.forget_with_confirmation(
-                &args.record_id,
-                |record, paths| {
-                    eprintln!("Record ID: {}", record.id);
-                    eprintln!(
-                        "Saved views: {}; annotations: {}",
-                        record.views, record.annotations
-                    );
-                    for path in paths {
-                        eprintln!("Saved path: {path}");
-                    }
-                    eprintln!("WARNING: every checkout sharing this UUID loses these saved items.");
-                    if args.yes {
-                        return Ok(true);
-                    }
-                    ensure!(
-                        unsafe { libc::isatty(libc::STDIN_FILENO) } == 1,
-                        "confirmation requires a terminal or --yes"
-                    );
-                    eprint!("Type the exact record ID to forget: ");
-                    io::stderr().flush()?;
-                    let mut answer = String::new();
-                    io::stdin().read_line(&mut answer)?;
-                    Ok(answer.trim_end_matches(['\r', '\n']) == record.id)
-                },
-            )?;
-            ensure!(
-                deleted,
-                "record ID confirmation did not match; no files removed"
-            );
-            eprintln!("Forgot record {}", args.record_id);
         }
         command @ (Command::Index(_)
         | Command::Status(_)
@@ -854,19 +796,7 @@ async fn serve_via_daemon(args: &ServeArgs) -> Result<()> {
         .as_ref()
         .context("serve requires explicit --token-file")?;
     let (roots, identity) = args.index.workspace.resolve_unattached()?;
-    let mut destinations = vec![token_file.clone()];
-    destinations.extend(args.jev_budget_dir.iter().cloned());
-    destinations.extend(args.acp_state_dir.iter().cloned());
-    roots.validate_external(&identity, &destinations)?;
-    if args.jev_budget_dir.is_some() {
-        let key = std::env::var("JEV_KEY")
-            .map_err(|_| anyhow::anyhow!("JEV_KEY must be configured to enable live Jev"))?;
-        ensure!(
-            !key.trim().is_empty()
-                && reqwest::header::HeaderValue::from_str(&format!("Bearer {key}")).is_ok(),
-            "JEV_KEY must be configured to enable live Jev"
-        );
-    }
+    roots.validate_external(&identity, std::slice::from_ref(token_file))?;
     let token_parent = token_file
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -912,16 +842,6 @@ async fn serve_via_daemon(args: &ServeArgs) -> Result<()> {
             .clone()
             .or_else(|| std::env::var_os("CARGO_HOME").map(PathBuf::from))
             .or_else(|| directories::BaseDirs::new().map(|d| d.home_dir().join(".cargo"))),
-        jev_budget_dir: args.jev_budget_dir.clone(),
-        jev_budget_cents: args.jev_budget_cents,
-        jev_key: if args.jev_budget_dir.is_some() {
-            Some(std::env::var("JEV_KEY")?)
-        } else {
-            None
-        },
-        acp_runner: args.acp_runner.clone(),
-        acp_state_dir: args.acp_state_dir.clone(),
-        acp_max_attempts: args.acp_max_attempts,
     };
     let mut options_json = serde_json::to_value(options)?;
     let fields = options_json

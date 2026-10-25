@@ -71,8 +71,6 @@ fn setup(enabled: bool) -> Fixture {
         IndexOptions::new(workspace.clone()),
         TOKEN.into(),
         "127.0.0.1:7331".parse().unwrap(),
-        None,
-        None,
         workspace,
         vec![],
         enabled.then_some(CatalogOptions {
@@ -233,9 +231,10 @@ async fn startup_catalog_is_separate_paged_and_source_is_explicit() {
         .0,
         404
     );
-    let (_, workspace_symbols) =
-        request(&fixture.app, "GET", "/api/symbols?q=LibraryType", "").await;
-    assert!(workspace_symbols["items"].as_array().unwrap().is_empty());
+    let (code, workspace_classes) =
+        request(&fixture.app, "GET", "/api/classes?q=LibraryType", "").await;
+    assert_eq!(code, 200, "{workspace_classes}");
+    assert!(workspace_classes["items"].as_array().unwrap().is_empty());
 }
 #[tokio::test]
 async fn source_hash_and_workspace_revision_reject_stale_reads() {

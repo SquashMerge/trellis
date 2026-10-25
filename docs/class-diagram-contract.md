@@ -6,7 +6,7 @@ Status: implemented, reviewed and deployed. See [usage](class-diagrams.md) and
 User: add working class diagrams with right-click menu that pulls up related classes.
 Inspected workspaces are read-only inputs. Do not write their source, execute their commands,
 imports or builds, install dependencies, or invoke providers. No Git initialization/commit.
-Existing tokens, budgets, saved views/annotations and workspace states must remain intact.
+Existing tokens and workspace states must remain intact. Retired saved records and provider budgets remain in place and ignored.
 
 Initial meaningful support: Java/Python declared classes/types, direct members, inheritance and explicit
 declared field/parameter/return type references. No inferred receiver types, runtime dispatch, ownership,

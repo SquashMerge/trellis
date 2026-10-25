@@ -329,16 +329,9 @@ fn optional_operational_failures_do_not_schedule_recovery() {
 }
 
 #[test]
-fn selected_anchor_index_decode_failure_schedules_rebuild() {
+fn native_declaration_index_decode_failure_schedules_rebuild() {
     let (_state, root, store) = published_store(1);
-    let response = store.evidence_response().unwrap();
     let pin = store.status().unwrap().revision;
-    let id = response.mcp_find("f0", 10, Some(pin)).unwrap().symbols[0]
-        .declaration
-        .syntax_id
-        .clone();
-    response.finish(()).unwrap();
-    drop(response);
     {
         let db = store.cache_write().unwrap();
         db.execute_batch(
@@ -347,18 +340,21 @@ fn selected_anchor_index_decode_failure_schedules_rebuild() {
         .unwrap();
     }
     let response = store.evidence_response().unwrap();
-    let error = Store::selected_anchor_in(&response.db, &store, &id, true)
+    let error = response
+        .mcp_find("f0", 10, Some(pin))
         .map_err(|error| response.report_index_failure(error))
-        .unwrap_err();
+        .err()
+        .expect("corrupt native manifest must reject find");
     drop(response);
     assert_rebuild(&store, &error);
     let repaired = reindex(&store, root.path());
     let response = store.evidence_response().unwrap();
-    let id = response.mcp_find("f0", 10, Some(repaired)).unwrap().symbols[0]
-        .declaration
-        .syntax_id
-        .clone();
-    Store::selected_anchor_in(&response.db, &store, &id, true).unwrap();
+    let found = response.mcp_find("f0", 10, Some(repaired)).unwrap();
+    // Find also matches syntax-ID substrings, including unnamed modules.
+    assert!(found.symbols.iter().any(|symbol| {
+        symbol.declaration.name.as_deref() == Some("f0")
+            && symbol.declaration.document.path == "f0.js"
+    }));
     response.finish(()).unwrap();
 }
 

@@ -1,5 +1,7 @@
 # First Rust daemon validation
 
+> Historical validation/analysis. Saved views, notes and Jev/ACP providers described below were retired by the [owner ruling 2026-10-24, #305](https://github.com/SquashMerge/trellis/issues/305#issuecomment-6394175295). Their old files remain in place and ignored. Historical observations are not current feature or startup instructions.
+
 **2026-09-18 · local macOS run · Rust/Cargo 1.98.0.**
 This validates the first native indexing/storage/API slice, not the full product or
 sequence-diagram usefulness. [Machine-readable record](daemon-validation.json).
