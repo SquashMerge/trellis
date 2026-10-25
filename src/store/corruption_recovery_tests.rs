@@ -349,14 +349,12 @@ fn native_declaration_index_decode_failure_schedules_rebuild() {
     assert_rebuild(&store, &error);
     let repaired = reindex(&store, root.path());
     let response = store.evidence_response().unwrap();
-    assert_eq!(
-        response
-            .mcp_find("f0", 10, Some(repaired))
-            .unwrap()
-            .symbols
-            .len(),
-        1
-    );
+    let found = response.mcp_find("f0", 10, Some(repaired)).unwrap();
+    // Find also matches syntax-ID substrings, including unnamed modules.
+    assert!(found.symbols.iter().any(|symbol| {
+        symbol.declaration.name.as_deref() == Some("f0")
+            && symbol.declaration.document.path == "f0.js"
+    }));
     response.finish(()).unwrap();
 }
 
